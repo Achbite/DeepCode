@@ -1,0 +1,14 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "jsx": "react-jsx",
+    "types": ["node", "vite/client"],
+    "baseUrl": ".",
+    "paths": {
+      "@deepcode/protocol": ["../packages/protocol/src/index.ts"],
+      "@deepcode/protocol/*": ["../packages/protocol/src/*"]
+    }
+  },
+  "include": ["src", "vite-env.d.ts", "../packages/protocol/src/**/*"]
+}

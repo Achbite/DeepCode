@@ -1,0 +1,351 @@
+/**
+ * 工作台布局样式
+ * 参考 VSCode 开源内核布局：
+ * - CSS Grid 三栏 + 底栏 + 顶栏
+ * - 暗色主题配色
+ * - VSCode 风格面板标题和占位样式
+ */
+
+/* ---- CSS 变量：暗色主题 ---- */
+:root {
+  --bg-base: #1e1e1e;
+  --bg-panel: #252526;
+  --bg-activity: #333333;
+  --bg-header: #3c3c3c;
+  --border-color: #444444;
+  --text-main: #cccccc;
+  --text-highlight: #ffffff;
+  --status-ok: #89d185;
+  --panel-title-bg: #2d2d2d;
+  --accent-color: #007acc;
+}
+
+/* ---- 全局重置 ---- */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body, html {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background-color: var(--bg-base);
+  color: var(--text-main);
+  overflow: hidden;
+}
+
+/* ---- 核心 Grid 布局 ---- */
+.workbench-layout {
+  display: grid;
+  height: 100vh;
+  width: 100vw;
+  grid-template-columns: 48px 250px 1fr 350px;
+  grid-template-rows: 40px 1fr 220px;
+  grid-template-areas:
+    "header  header  header  header"
+    "activity sidebar editor  agent"
+    "activity sidebar bottom  agent";
+}
+
+/* 通过父级 class 控制侧边栏隐藏 */
+.workbench-layout--no-sidebar {
+  grid-template-columns: 48px 1fr 350px;
+  grid-template-areas:
+    "header  header  header"
+    "activity editor  agent"
+    "activity bottom  agent";
+}
+
+/* ---- 顶栏 ---- */
+.header {
+  grid-area: header;
+  background-color: var(--bg-header);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 13px;
+}
+
+.header__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header__subtitle {
+  color: #888;
+}
+
+.header__version {
+  color: #888;
+  font-size: 11px;
+}
+
+.header__save-msg {
+  color: #89d185;
+  font-size: 11px;
+  margin-right: 16px;
+}
+
+.header__heartbeat {
+  color: #888;
+  font-size: 11px;
+}
+
+.status-group {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}
+
+.status-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--status-ok);
+}
+
+.status-dot.disconnected {
+  background-color: #f48771;
+}
+
+.status-dot.checking {
+  background-color: #cca700;
+}
+
+.status-dot.error {
+  background-color: #f48771;
+}
+
+/* ---- 活动栏 ---- */
+.activity-bar {
+  grid-area: activity;
+  background-color: var(--bg-activity);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 0;
+  border-right: 1px solid var(--border-color);
+}
+
+.activity-bar__top {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.activity-bar__bottom {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.activity-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  background-color: transparent;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-size: 16px;
+  cursor: pointer;
+  color: #cccccc;
+  text-align: center;
+  line-height: 1;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.activity-icon:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+}
+
+.activity-icon.active {
+  color: #ffffff;
+  border-left: 2px solid #ffffff;
+  border-radius: 0;
+}
+
+.activity-icon--disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.activity-icon--disabled:hover {
+  background-color: transparent;
+  color: #cccccc;
+}
+
+/* ---- 侧边栏 ---- */
+.sidebar {
+  grid-area: sidebar;
+  background-color: var(--bg-panel);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- 编辑器区域 ---- */
+.editor-area {
+  grid-area: editor;
+  background-color: var(--bg-base);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ---- 编辑器 Tab 栏 ---- */
+.editor-tabs {
+  display: flex;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-color);
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+
+.editor-tab {
+  padding: 8px 16px;
+  font-size: 13px;
+  cursor: pointer;
+  background: #2d2d2d;
+  color: #888;
+  border-top: 2px solid transparent;
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.editor-tab--active {
+  background: var(--bg-base);
+  color: #fff;
+  border-top: 2px solid var(--accent-color);
+}
+
+.editor-tab--settings .editor-tab__name {
+  color: #d7ba7d;
+}
+
+.editor-tab__close {
+  cursor: pointer;
+  font-size: 11px;
+  opacity: 0.6;
+}
+
+.editor-tab__close:hover {
+  opacity: 1;
+}
+
+.editor-tab__name {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.editor-tab__dirty {
+  color: #888;
+  font-size: 11px;
+}
+
+/* ---- Agent 面板 ---- */
+.agent-panel {
+  grid-area: agent;
+  background-color: var(--bg-panel);
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- 底部面板 ---- */
+.bottom-panel {
+  grid-area: bottom;
+  background-color: var(--bg-panel);
+  display: flex;
+  flex-direction: column;
+}
+
+.bottom-tabs {
+  display: flex;
+  background-color: var(--bg-panel);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.bottom-panel__content {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-top: 1px solid var(--border-color);
+  overflow: auto;
+}
+
+.tab {
+  padding: 6px 16px;
+  font-size: 12px;
+  cursor: pointer;
+  border-right: 1px solid var(--border-color);
+  color: var(--text-main);
+  background-color: var(--bg-panel);
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.tab:hover {
+  background-color: var(--bg-base);
+}
+
+.tab.active {
+  background-color: var(--bg-base);
+  color: var(--text-highlight);
+  border-top: 2px solid var(--accent-color);
+}
+
+/* ---- 通用面板标题 ---- */
+.panel-header {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background-color: var(--panel-title-bg);
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-highlight);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+/* ---- 占位内容样式 ---- */
+.placeholder-content {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  text-align: center;
+  font-size: 13px;
+  color: #888;
+  border: 1px dashed #555;
+  margin: 10px;
+  border-radius: 4px;
+}
+
+.placeholder-content .stage-hint {
+  font-size: 11px;
+  margin-top: 12px;
+  color: #666;
+}

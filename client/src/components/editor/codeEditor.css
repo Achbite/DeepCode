@@ -1,0 +1,141 @@
+/**
+ * CodeEditor 组件样式
+ * 暗色主题，与 workbenchLayout.css 共享 CSS 变量
+ */
+
+.code-editor {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-base, #1e1e1e);
+  color: var(--text-main, #d4d4d4);
+  font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas,
+    "Courier New", monospace;
+  font-size: 13px;
+}
+
+/* ---- 空状态 ---- */
+.code-editor--empty,
+.code-editor--readonly {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.code-editor__empty-inner {
+  text-align: center;
+  color: #888;
+  font-size: 13px;
+}
+
+.code-editor__empty-icon {
+  font-size: 32px;
+  margin-bottom: 16px;
+}
+
+.code-editor__empty-hint {
+  font-size: 11px;
+  margin-top: 8px;
+  color: #666;
+}
+
+/* ---- 二进制 / 大文件 提示卡片 ---- */
+.code-editor__notice {
+  max-width: 480px;
+  padding: 24px;
+  border: 1px dashed #555;
+  border-radius: 6px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.code-editor__notice-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #ddd;
+  margin-bottom: 12px;
+}
+
+.code-editor__notice-body {
+  font-size: 12px;
+  color: #aaa;
+  margin-bottom: 8px;
+  word-break: break-all;
+}
+
+.code-editor__notice-hint {
+  font-size: 11px;
+  color: #777;
+}
+
+/* ---- 主体 ---- */
+.code-editor__body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+/* ---- 行号面板 ---- */
+.code-editor__line-numbers {
+  width: 56px;
+  background: #1e1e1e;
+  color: #858585;
+  text-align: right;
+  user-select: none;
+  border-right: 1px solid #333;
+  overflow: hidden; /* 由 textarea 滚动驱动；这里不显示自己的滚动条 */
+  flex-shrink: 0;
+}
+
+.code-editor__line-numbers-text {
+  margin: 0;
+  padding: 0 8px 0 0;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: pre;
+}
+
+/* ---- 文本编辑区 ---- */
+.code-editor__textarea {
+  flex: 1;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border: none;
+  outline: none;
+  resize: none;
+  font-size: 13px;
+  line-height: 20px;
+  padding: 0 16px;
+  font-family: inherit;
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
+}
+
+/* ---- 底部状态栏 ---- */
+.code-editor__statusbar {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 12px;
+  background: #007acc;
+  color: #fff;
+  font-size: 12px;
+  line-height: 22px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+}
+
+.code-editor__statusbar-left,
+.code-editor__statusbar-right {
+  display: flex;
+  gap: 16px;
+}
+
+.code-editor__dirty-flag {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 3px;
+  padding: 0 6px;
+}
