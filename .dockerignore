@@ -1,0 +1,14 @@
+node_modules
+**/node_modules
+**/dist
+**/.next
+**/.turbo
+**/.vite
+**/target
+**/.git
+bin
+_check_output.txt
+_agent_tmp_*
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1.7
+# ====================================================================
+# DeepCode 开发容器（Dockerfile.dev）
+# 用途：作为 `make shell` 的开发壳子；常驻运行，反复 exec 进入。
+# 与 Dockerfile.tauri（一次性多阶段构建）不同，本镜像是单阶段开发环境，
+# 包含完整工具链：Rust + Node 22 + pnpm + Tauri CLI + mingw-w64（Windows 交叉编译）+ @yao-pkg/pkg。
+# ====================================================================
+
+FROM rust:1.81-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PNPM_HOME=/root/.local/share/pnpm \
+    PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ---- 1. 系统依赖 ----
+# - 基础工具：curl/git/build-essential/pkg-config
+# - Tauri Linux 运行时依赖：webkit2gtk-4.1 / libsoup-3.0 / librsvg / patchelf / ayatana-appindicator
+# - Windows 交叉编译：gcc-mingw-w64-x86-64 + binutils-mingw-w64
+# - 健康检查辅助：iputils-ping / netcat-openbsd / jq
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl wget ca-certificates git \
+        build-essential pkg-config make file \
+        libssl-dev \
+        libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+        libayatana-appindicator3-dev librsvg2-dev patchelf \
+        gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
+        iputils-ping netcat-openbsd jq xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- 2. Node.js 22 LTS ----
+# 官方 NodeSource 安装脚本；本镜像仅用于开发，不追求最小体积
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/* \
+ && node --version && npm --version
+
+# ---- 3. pnpm ----
+# 通过 corepack 启用，避免全局 npm install 污染
+RUN corepack enable && corepack prepare pnpm@9.12.0 --activate \
+ && mkdir -p $PNPM_HOME && pnpm --version
+
+# ---- 4. Rust Windows 交叉目标 ----
+# 让 Rust 支持 x86_64-pc-windows-gnu，配合 mingw-w64 工具链产出 Windows 二进制
+RUN rustup target add x86_64-pc-windows-gnu \
+ && rustup component add rustfmt clippy
+
+# ---- 5. Tauri CLI（cargo 安装，固定大版本）----
+# 仅作为开发辅助；本期 build.sh 不强制调用 tauri build
+RUN cargo install tauri-cli --version "^2.0" --locked
+
+# ---- 6. @yao-pkg/pkg（Node 服务端打 Windows .exe）----
+# vercel/pkg 已归档，社区维护活跃 fork：@yao-pkg/pkg 支持 Node 22
+RUN pnpm add -g @yao-pkg/pkg@latest \
+ && pkg --version || true
+
+# ---- 7. 入口脚本 ----
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+WORKDIR /workspace
+
+# 默认前台保活；Makefile 通过 docker exec 进入交互式 bash
+CMD ["/usr/local/bin/entrypoint.sh"]

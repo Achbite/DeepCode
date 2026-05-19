@@ -1,0 +1,70 @@
+# DeepCode Tauri 容器化构建镜像
+#
+# 用途：在 Linux 容器内固定 Rust / Node / pnpm / Tauri CLI 版本，输出统一的桌面打包产物。
+# 本镜像默认产出 Linux 平台的 .deb / .AppImage；Windows / macOS 打包仍需各自原生 runner。
+#
+# 用法：
+#   docker build -f Dockerfile.tauri -t deepcode-tauri-builder .
+#   docker run --rm -v "$PWD/bin:/out" deepcode-tauri-builder
+#
+# 规则：
+#   - 二进制产物输出到 /out（宿主机 ./bin），不入库；
+#   - 镜像内不写入任何 Git 凭据。
+
+FROM rust:1.81-bookworm AS rust-base
+
+# Tauri v2 系统依赖（Debian/Ubuntu）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libwebkit2gtk-4.1-dev \
+        build-essential \
+        curl \
+        wget \
+        file \
+        libxdo-dev \
+        libssl-dev \
+        libayatana-appindicator3-dev \
+        librsvg2-dev \
+        ca-certificates \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node 20 + pnpm 9（Corepack）
+ENV NODE_VERSION=20.18.1
+RUN curl -fsSL https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz \
+        -o /tmp/node.tar.xz \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.xz \
+    && corepack enable \
+    && corepack prepare pnpm@9.12.0 --activate
+
+# Tauri CLI（与 tauri 子包 devDependencies 保持一致）
+RUN cargo install tauri-cli --version "^2.0" --locked
+
+# ---- 构建阶段 ----
+FROM rust-base AS builder
+WORKDIR /workspace
+
+# 先拷依赖文件，最大化 Docker 层缓存
+COPY pnpm-workspace.yaml pnpm-lock.yaml* package.json ./
+COPY client/package.json ./client/
+COPY server/package.json ./server/
+COPY tauri/package.json ./tauri/
+COPY packages/ ./packages/
+
+RUN pnpm install --frozen-lockfile=false
+
+# 拷源码
+COPY . .
+
+# 前端构建
+RUN pnpm --filter @deepcode/client build
+
+# Tauri 构建（产物默认在 tauri/src-tauri/target/release/bundle）
+RUN pnpm tauri:build
+
+# ---- 输出阶段 ----
+FROM debian:bookworm-slim AS exporter
+WORKDIR /out
+COPY --from=builder /workspace/tauri/src-tauri/target/release/bundle /out/bundle
+# 默认入口：把产物 cp 到挂载的 /out（如果调用方挂载了卷）
+CMD ["sh", "-c", "cp -r /out/bundle/* /out/ 2>/dev/null || true; ls -la /out"]

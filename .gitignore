@@ -9,6 +9,13 @@ node_modules/
 **/.next/
 **/.turbo/
 **/.vite/
+.build-cache/
+.pnpm-store/
+
+# ---- 本地可执行打包产物 ----
+# bin/ 用于输出 Tauri 等本地打包结果；二进制产物不入库
+bin/*
+!bin/.gitkeep
 
 # ---- 日志 ----
 *.log

@@ -7,10 +7,18 @@
     "dev": "concurrently -n server,client -c blue,green \"pnpm dev:server\" \"pnpm dev:client\"",
     "dev:client": "pnpm --filter @deepcode/client dev",
     "dev:server": "pnpm --filter @deepcode/server dev",
-    "typecheck": "pnpm -r typecheck"
+    "build": "pnpm -r build",
+    "build:client": "pnpm --filter @deepcode/client build",
+    "build:server": "pnpm --filter @deepcode/server build",
+    "start": "pnpm --filter @deepcode/server start",
+    "typecheck": "pnpm -r typecheck",
+    "tauri": "pnpm --filter @deepcode/tauri tauri",
+    "tauri:dev": "pnpm --filter @deepcode/tauri tauri dev",
+    "tauri:build": "pnpm --filter @deepcode/tauri tauri build"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
+    "esbuild": "^0.25.0",
     "typescript": "^5.7.0"
   },
   "engines": {
