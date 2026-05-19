@@ -1,41 +1,117 @@
 /**
- * 基本文件编辑器组件
+ * 基本文件编辑器组件（Monaco Editor 版本）
  *
- * 首期实现：textarea + 行号面板 + 状态栏。
- * 阶段 5 后续将替换为 Monaco Editor，本组件只承担"已能打开/编辑/保存"的最小闭环。
- *
- * 关键修复点（相对早期版本）：
- *   1. 行号面板使用同一 scrollTop 与 textarea 同步，整体由 textarea 滚动驱动。
- *   2. 编辑器状态栏不再硬编码列号，根据光标实时计算。
- *   3. Tab 键不再失焦，转为插入两空格缩进。
- *   4. 大文件 / 二进制文件给出只读提示。
- *   5. 所有 hooks 调用全部位于组件顶部，无条件提前返回，遵守 React Hooks 规则。
+ * 接入要点：
+ *   1. 使用 @monaco-editor/react 的 Editor 组件实现语法高亮、Ctrl+S 保存等；
+ *   2. 每个 modelKey 对应一个 ITextModel；关闭 Tab 时由外部调用 closeModel(modelKey) 释放；
+ *   3. 根据 filePath 扩展名推断 languageId，未知类型默认 plaintext；
+ *   4. value 受控；onChange 回调驱动 editorStore；
+ *   5. 二进制文件 / 超过 1 MiB 大文件给出只读提示，不创建 Monaco model；
+ *   6. 状态栏显示行/列/语言/编码/大小/dirty；
+ *   7. Ctrl+S / Cmd+S 触发 onSave。
  */
-import React, { useRef, useCallback, useMemo, useEffect, useState } from 'react';
+import React, { useRef, useCallback, useEffect, useState } from 'react';
+import Editor, { OnMount } from '@monaco-editor/react';
+import type { editor as MonacoEditor } from 'monaco-editor';
 import './codeEditor.css';
 
+// ---- 公共接口 ----
 interface CodeEditorProps {
   /** 当前打开的文件路径（null 表示无文件） */
   filePath: string | null;
+  /** modelKey：editorStore 中的 Tab id（folderId::path），用于唯一定位 ITextModel */
+  modelKey: string | null;
   /** 文件内容 */
   content: string;
   /** 内容变更回调 */
   onContentChange: (content: string) => void;
   /** 是否处于已修改未保存状态 */
   isDirty: boolean;
-  /** 是否为二进制（只读展示） */
+  /** 是否为二进制 */
   binary?: boolean;
   /** 文件大小，字节 */
   sizeBytes?: number;
-  /** 保存文件回调 */
-  onSave: (filePath: string, content: string) => void;
+  /** 保存文件回调（参数为 modelKey） */
+  onSave: (modelKey: string) => void;
 }
 
 // ---- 编辑器常量 ----
-const TAB_SIZE = 2;
+const LARGE_FILE_THRESHOLD = 1 * 1024 * 1024; // 1 MiB
+
+const EXT_TO_LANGUAGE: Record<string, string> = {
+  ts: 'typescript',
+  tsx: 'typescript',
+  js: 'javascript',
+  jsx: 'javascript',
+  json: 'json',
+  md: 'markdown',
+  css: 'css',
+  scss: 'css',
+  less: 'css',
+  html: 'html',
+  htm: 'html',
+  xml: 'xml',
+  svg: 'xml',
+  yaml: 'yaml',
+  yml: 'yaml',
+  py: 'python',
+  rb: 'ruby',
+  go: 'go',
+  java: 'java',
+  c: 'c',
+  h: 'c',
+  cpp: 'cpp',
+  cc: 'cpp',
+  cxx: 'cpp',
+  hpp: 'cpp',
+  hh: 'cpp',
+  cs: 'csharp',
+  rs: 'rust',
+  sql: 'sql',
+  sh: 'shell',
+  bash: 'shell',
+  zsh: 'shell',
+  ps1: 'powershell',
+  dockerfile: 'dockerfile',
+  makefile: 'makefile',
+  r: 'r',
+  lua: 'lua',
+  php: 'php',
+  swift: 'swift',
+  kt: 'kotlin',
+  kts: 'kotlin',
+  scala: 'scala',
+  vue: 'html',
+  dart: 'dart',
+  toml: 'ini',
+  ini: 'ini',
+  cfg: 'ini',
+  conf: 'ini',
+  gitignore: 'plaintext',
+  env: 'plaintext',
+};
+
+function inferLanguageId(filePath: string | null): string {
+  if (!filePath) return 'plaintext';
+  const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+  return EXT_TO_LANGUAGE[ext] ?? 'plaintext';
+}
+
+// ---- ITextModel 缓存（modelKey -> model） ----
+const modelCache = new Map<string, MonacoEditor.ITextModel>();
+
+/** 释放指定 modelKey 的 ITextModel */
+function closeModel(modelKey: string): void {
+  const model = modelCache.get(modelKey);
+  if (model) {
+    model.dispose();
+    modelCache.delete(modelKey);
+  }
+}
 
 const CodeEditor: React.FC<CodeEditorProps> = ({
   filePath,
+  modelKey,
   content,
   onContentChange,
   isDirty,
@@ -43,90 +119,46 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
   sizeBytes = 0,
   onSave,
 }) => {
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const lineNumbersRef = useRef<HTMLDivElement>(null);
+  const monacoRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const [cursorLine, setCursorLine] = useState(1);
   const [cursorCol, setCursorCol] = useState(1);
+  const [monacoLanguage, setMonacoLanguage] = useState('plaintext');
 
-  // ---- 行计算（content 变化才重算） ----
-  const lineCount = useMemo(() => {
-    if (!content) return 1;
-    let count = 1;
-    for (let i = 0; i < content.length; i++) {
-      if (content.charCodeAt(i) === 10 /* \n */) count++;
-    }
-    return count;
-  }, [content]);
+  useEffect(() => {
+    setMonacoLanguage(inferLanguageId(filePath));
+  }, [filePath]);
 
-  // ---- 行号文本（纯文本 pre 渲染，避免大文件 DOM 爆炸） ----
-  const lineNumbersText = useMemo(() => {
-    const arr = new Array<string>(lineCount);
-    for (let i = 0; i < lineCount; i++) {
-      arr[i] = String(i + 1);
-    }
-    return arr.join('\n');
-  }, [lineCount]);
-
-  // ---- 滚动同步：textarea 滚动 -> 行号面板 ----
-  const syncScroll = useCallback(() => {
-    if (textareaRef.current && lineNumbersRef.current) {
-      lineNumbersRef.current.scrollTop = textareaRef.current.scrollTop;
+  const updateCursor = useCallback(() => {
+    const editor = monacoRef.current;
+    if (!editor) return;
+    const pos = editor.getPosition();
+    if (pos) {
+      setCursorLine(pos.lineNumber);
+      setCursorCol(pos.column);
     }
   }, []);
 
-  // 内容变化后强制对齐一次（如外部覆盖了 content）
-  useEffect(() => {
-    syncScroll();
-  }, [content, syncScroll]);
+  const handleEditorMount: OnMount = useCallback((editor, monaco) => {
+    monacoRef.current = editor;
 
-  // ---- 光标位置追踪 ----
-  const updateCursor = useCallback(() => {
-    const textarea = textareaRef.current;
-    if (!textarea) return;
-    const before = content.substring(0, textarea.selectionStart);
-    const lines = before.split('\n');
-    setCursorLine(lines.length);
-    setCursorCol(lines[lines.length - 1].length + 1);
-  }, [content]);
+    editor.onDidChangeCursorPosition(() => {
+      updateCursor();
+    });
+    updateCursor();
 
-  // ---- 键盘处理：Ctrl+S 保存、Tab 缩进 ----
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      // Ctrl+S / Cmd+S 保存
-      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-        e.preventDefault();
-        if (filePath && isDirty) {
-          onSave(filePath, content);
+    editor.addCommand(
+      // eslint-disable-next-line no-bitwise
+      monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
+      () => {
+        if (modelKey && isDirty) {
+          onSave(modelKey);
         }
-        return;
       }
-
-      // Tab：插入两空格而非失焦
-      if (e.key === 'Tab') {
-        e.preventDefault();
-        const textarea = e.currentTarget;
-        const start = textarea.selectionStart;
-        const end = textarea.selectionEnd;
-        const indent = ' '.repeat(TAB_SIZE);
-        const next =
-          content.substring(0, start) + indent + content.substring(end);
-        onContentChange(next);
-        // 在下一帧把光标定位到缩进末尾
-        requestAnimationFrame(() => {
-          if (textareaRef.current) {
-            const pos = start + indent.length;
-            textareaRef.current.selectionStart = pos;
-            textareaRef.current.selectionEnd = pos;
-          }
-        });
-        return;
-      }
-    },
-    [filePath, isDirty, content, onSave, onContentChange]
-  );
+    );
+  }, [modelKey, isDirty, onSave, updateCursor]);
 
   // ---- 空状态 ----
-  if (!filePath) {
+  if (!filePath || !modelKey) {
     return (
       <div className="code-editor code-editor--empty">
         <div className="code-editor__empty-inner">
@@ -140,7 +172,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     );
   }
 
-  // ---- 二进制：只读提示 ----
+  // ---- 二进制 ----
   if (binary) {
     return (
       <div className="code-editor code-editor--readonly">
@@ -157,26 +189,52 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     );
   }
 
+  // ---- 大文件 ----
+  if (sizeBytes > LARGE_FILE_THRESHOLD) {
+    return (
+      <div className="code-editor code-editor--readonly">
+        <div className="code-editor__notice">
+          <div className="code-editor__notice-title">大文件</div>
+          <div className="code-editor__notice-body">
+            {filePath} 大小为 {sizeBytes.toLocaleString()} 字节，超过{' '}
+            {(LARGE_FILE_THRESHOLD / 1024 / 1024).toFixed(0)} MiB 阈值，
+            当前以只读提示方式展示，不在编辑器中打开。
+          </div>
+          <div className="code-editor__notice-hint">
+            提示：Monaco 打开大文件可能导致性能问题
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- Monaco 编辑器主体 ----
   return (
     <div className="code-editor">
       <div className="code-editor__body">
-        {/* ---- 行号面板 ---- */}
-        <div ref={lineNumbersRef} className="code-editor__line-numbers">
-          <pre className="code-editor__line-numbers-text">{lineNumbersText}</pre>
-        </div>
-
-        {/* ---- 文本编辑区 ---- */}
-        <textarea
-          ref={textareaRef}
-          className="code-editor__textarea"
+        <Editor
+          className="code-editor__monaco"
+          height="100%"
+          language={monacoLanguage}
           value={content}
-          onChange={(e) => onContentChange(e.target.value)}
-          onScroll={syncScroll}
-          onKeyDown={handleKeyDown}
-          onKeyUp={updateCursor}
-          onClick={updateCursor}
-          spellCheck={false}
-          wrap="off"
+          onChange={(value) => onContentChange(value ?? '')}
+          onMount={handleEditorMount}
+          theme="vs-dark"
+          options={{
+            fontSize: 13,
+            fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, "Courier New", monospace',
+            tabSize: 2,
+            minimap: { enabled: false },
+            wordWrap: 'off',
+            scrollBeyondLastLine: false,
+            renderWhitespace: 'none',
+            lineNumbers: 'on',
+            glyphMargin: false,
+            folding: true,
+            links: true,
+            automaticLayout: true,
+          }}
+          path={modelKey}
         />
       </div>
 
@@ -188,8 +246,8 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
           <span>{sizeBytes.toLocaleString()} B</span>
         </div>
         <div className="code-editor__statusbar-right">
-          <span>Spaces: {TAB_SIZE}</span>
-          <span>Plain Text</span>
+          <span>Spaces: 2</span>
+          <span>{monacoLanguage}</span>
           {isDirty && <span className="code-editor__dirty-flag">未保存</span>}
         </div>
       </div>
@@ -197,4 +255,5 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
   );
 };
 
+export { closeModel };
 export default CodeEditor;

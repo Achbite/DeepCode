@@ -6,9 +6,12 @@
     "types": ["node", "vite/client"],
     "baseUrl": ".",
     "paths": {
-      "@deepcode/protocol": ["../packages/protocol/src/index.ts"],
-      "@deepcode/protocol/*": ["../packages/protocol/src/*"]
+      "@deepcode/protocol": ["../packages/protocol/dist/index.d.ts"],
+      "@deepcode/protocol/*": ["../packages/protocol/dist/*"]
     }
   },
-  "include": ["src", "vite-env.d.ts", "../packages/protocol/src/**/*"]
+  "references": [
+    { "path": "../packages/protocol" }
+  ],
+  "include": ["src", "vite-env.d.ts"]
 }

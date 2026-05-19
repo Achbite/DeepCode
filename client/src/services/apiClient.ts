@@ -1,6 +1,8 @@
 /**
  * REST API 客户端
- * 封装与后端的 HTTP 通信；DTO 全部来自共享 protocol 包
+ *
+ * 封装与后端的 HTTP 通信；DTO 全部来自共享 protocol 包。
+ * 工作区模型升级版：所有文件 API 都接受可选 folderId；省略时由后端落到 folders[0]。
  */
 import type {
   ApiResponse,
@@ -8,6 +10,11 @@ import type {
   FileTreeNode,
   FileReadResult,
   FileWriteResult,
+  WorkspaceState,
+  OpenWorkspaceResult,
+  PatchWorkspaceSettingsResult,
+  BrowsePathResult,
+  InitialLocations,
 } from '@deepcode/protocol';
 
 const API_BASE = '/api';
@@ -33,10 +40,10 @@ function toErrorResponse(err: unknown): ApiResponse<never> {
   };
 }
 
-/** 获取后端健康状态 */
-export async function getHealth(): Promise<ApiResponse<HealthStatus>> {
+/** 通用 GET 包装 */
+async function getJson<T>(url: string): Promise<ApiResponse<T>> {
   try {
-    const response = await fetch(`${API_BASE}/health`);
+    const response = await fetch(url);
     if (!response.ok) {
       return {
         ok: false,
@@ -44,65 +51,23 @@ export async function getHealth(): Promise<ApiResponse<HealthStatus>> {
         message: `HTTP ${response.status}: ${response.statusText}`,
       };
     }
-    return (await response.json()) as ApiResponse<HealthStatus>;
+    return (await response.json()) as ApiResponse<T>;
   } catch (err) {
     return toErrorResponse(err);
   }
 }
 
-/** 获取工作区目录树 */
-export async function getFileTree(
-  relativePath?: string
-): Promise<ApiResponse<FileTreeNode[]>> {
+/** 通用 JSON Body 请求 */
+async function sendJson<T>(
+  url: string,
+  method: 'POST' | 'PATCH' | 'PUT',
+  body: unknown
+): Promise<ApiResponse<T>> {
   try {
-    const params = relativePath
-      ? `?path=${encodeURIComponent(relativePath)}`
-      : '';
-    const response = await fetch(`${API_BASE}/files/tree${params}`);
-    if (!response.ok) {
-      return {
-        ok: false,
-        error: 'http_error',
-        message: `HTTP ${response.status}: ${response.statusText}`,
-      };
-    }
-    return (await response.json()) as ApiResponse<FileTreeNode[]>;
-  } catch (err) {
-    return toErrorResponse(err);
-  }
-}
-
-/** 读取文件内容 */
-export async function readFile(
-  filePath: string
-): Promise<ApiResponse<FileReadResult>> {
-  try {
-    const response = await fetch(
-      `${API_BASE}/files/read?path=${encodeURIComponent(filePath)}`
-    );
-    if (!response.ok) {
-      return {
-        ok: false,
-        error: 'http_error',
-        message: `HTTP ${response.status}: ${response.statusText}`,
-      };
-    }
-    return (await response.json()) as ApiResponse<FileReadResult>;
-  } catch (err) {
-    return toErrorResponse(err);
-  }
-}
-
-/** 写入文件内容 */
-export async function writeFile(
-  filePath: string,
-  content: string
-): Promise<ApiResponse<FileWriteResult>> {
-  try {
-    const response = await fetch(`${API_BASE}/files/write`, {
-      method: 'POST',
+    const response = await fetch(url, {
+      method,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: filePath, content }),
+      body: JSON.stringify(body),
     });
     if (!response.ok) {
       return {
@@ -111,11 +76,104 @@ export async function writeFile(
         message: `HTTP ${response.status}: ${response.statusText}`,
       };
     }
-    return (await response.json()) as ApiResponse<FileWriteResult>;
+    return (await response.json()) as ApiResponse<T>;
   } catch (err) {
     return toErrorResponse(err);
   }
 }
 
-// 重新导出共享 DTO，方便组件直接 import 自 services/apiClient
-export type { FileTreeNode, FileReadResult, FileWriteResult };
+// ---- 健康检查 ----
+
+export function getHealth(): Promise<ApiResponse<HealthStatus>> {
+  return getJson<HealthStatus>(`${API_BASE}/health`);
+}
+
+// ---- 工作区 ----
+
+export function getCurrentWorkspace(): Promise<ApiResponse<WorkspaceState>> {
+  return getJson<WorkspaceState>(`${API_BASE}/workspaces/current`);
+}
+
+export function openWorkspace(
+  path: string
+): Promise<ApiResponse<OpenWorkspaceResult>> {
+  return sendJson<OpenWorkspaceResult>(
+    `${API_BASE}/workspaces/open`,
+    'POST',
+    { path }
+  );
+}
+
+export function patchWorkspaceSettings(
+  settings: Record<string, unknown>
+): Promise<ApiResponse<PatchWorkspaceSettingsResult>> {
+  return sendJson<PatchWorkspaceSettingsResult>(
+    `${API_BASE}/workspaces/current/settings`,
+    'PATCH',
+    { settings }
+  );
+}
+
+// ---- 文件系统浏览（仅用于"Open Workspace"对话框）----
+
+export function getInitialLocations(): Promise<ApiResponse<InitialLocations>> {
+  return getJson<InitialLocations>(`${API_BASE}/fs/initial-locations`);
+}
+
+export function browsePath(
+  absolutePath?: string
+): Promise<ApiResponse<BrowsePathResult>> {
+  const qs = buildQuery({ path: absolutePath });
+  return getJson<BrowsePathResult>(`${API_BASE}/fs/browse${qs}`);
+}
+
+// ---- 文件 ----
+
+/** 拼接 ?folderId=&path= 形态的查询串 */
+function buildQuery(params: Record<string, string | undefined>): string {
+  const segments: string[] = [];
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === '') continue;
+    segments.push(`${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
+  }
+  return segments.length === 0 ? '' : `?${segments.join('&')}`;
+}
+
+export function getFileTree(
+  folderId?: string,
+  relativePath?: string
+): Promise<ApiResponse<FileTreeNode[]>> {
+  const qs = buildQuery({ folderId, path: relativePath });
+  return getJson<FileTreeNode[]>(`${API_BASE}/files/tree${qs}`);
+}
+
+export function readFile(
+  filePath: string,
+  folderId?: string
+): Promise<ApiResponse<FileReadResult>> {
+  const qs = buildQuery({ folderId, path: filePath });
+  return getJson<FileReadResult>(`${API_BASE}/files/read${qs}`);
+}
+
+export function writeFile(
+  filePath: string,
+  content: string,
+  folderId?: string
+): Promise<ApiResponse<FileWriteResult>> {
+  return sendJson<FileWriteResult>(
+    `${API_BASE}/files/write`,
+    'POST',
+    { folderId, path: filePath, content }
+  );
+}
+
+// 重新导出共享 DTO
+export type {
+  FileTreeNode,
+  FileReadResult,
+  FileWriteResult,
+  WorkspaceState,
+  OpenWorkspaceResult,
+  BrowsePathResult,
+  InitialLocations,
+};

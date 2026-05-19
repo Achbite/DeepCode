@@ -1,5 +1,5 @@
 /**
- * CodeEditor 组件样式
+ * CodeEditor 组件样式（Monaco Editor 版本）
  * 暗色主题，与 workbenchLayout.css 共享 CSS 变量
  */
 
@@ -77,42 +77,10 @@
   overflow: hidden;
 }
 
-/* ---- 行号面板 ---- */
-.code-editor__line-numbers {
-  width: 56px;
-  background: #1e1e1e;
-  color: #858585;
-  text-align: right;
-  user-select: none;
-  border-right: 1px solid #333;
-  overflow: hidden; /* 由 textarea 滚动驱动；这里不显示自己的滚动条 */
-  flex-shrink: 0;
-}
-
-.code-editor__line-numbers-text {
-  margin: 0;
-  padding: 0 8px 0 0;
-  font-family: inherit;
-  font-size: 13px;
-  line-height: 20px;
-  white-space: pre;
-}
-
-/* ---- 文本编辑区 ---- */
-.code-editor__textarea {
+/* ---- Monaco 编辑器容器 ---- */
+.code-editor__monaco {
   flex: 1;
-  background: #1e1e1e;
-  color: #d4d4d4;
-  border: none;
-  outline: none;
-  resize: none;
-  font-size: 13px;
-  line-height: 20px;
-  padding: 0 16px;
-  font-family: inherit;
-  tab-size: 2;
-  white-space: pre;
-  overflow: auto;
+  overflow: hidden;
 }
 
 /* ---- 底部状态栏 ---- */
