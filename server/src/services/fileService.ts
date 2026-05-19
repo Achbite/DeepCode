@@ -1,10 +1,12 @@
 /**
  * 文件操作服务
- * 提供工作区目录树、文件读取、文件写入功能
- * 安全约束：
- *   1. 所有路径都必须落在 WORKSPACE_ROOT 之内，使用 path.relative 防穿越
- *   2. 默认 WORKSPACE_ROOT 指向项目根下的 ./workspace 子目录，避免 Agent 修改自身仓库
- *   3. 文件读取设有大小阈值，二进制内容不返回给前端
+ *
+ * 工作区模型升级版：
+ *   - 不再依赖模块级 WORKSPACE_ROOT；改为按 folderId 在每次调用时解析根目录；
+ *   - 路径安全：所有相对路径解析后必须落在 folder.absolutePath 之内；
+ *   - 大文件 / 二进制 / 写入大小阈值与上版保持一致。
+ *
+ * 该文件不再持有任何"全局工作区"状态；状态由 workspaceService 管理。
  */
 import { readdir, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { join, resolve, normalize, relative, isAbsolute, sep } from 'node:path';
@@ -13,8 +15,9 @@ import type {
   FileReadResult,
   FileWriteResult,
 } from '@deepcode/protocol';
+import { resolveFolder } from './workspaceService.js';
 
-// ---- 常量与工作区根目录 ----
+// ---- 常量 ----
 
 /** 文件读取大小阈值；超过此值返回提示信息而不灌入 content */
 const READ_SIZE_LIMIT_BYTES = 1024 * 1024; // 1 MiB
@@ -36,65 +39,35 @@ const EXCLUDED_DIR_NAMES = new Set([
   '.cache',
   '.venv',
   '__pycache__',
+  'target',
 ]);
-
-/**
- * 解析工作区根目录
- * 优先级：
- *   1. WORKSPACE_ROOT 环境变量（绝对路径或相对当前进程工作目录）
- *   2. 进程工作目录下的 ./workspace 子目录
- * 不再回落到 process.cwd() 本身，避免 Agent 写入仓库自身
- */
-function resolveWorkspaceRoot(): string {
-  const envRoot = process.env.WORKSPACE_ROOT;
-  if (envRoot && envRoot.trim() !== '') {
-    return normalize(resolve(process.cwd(), envRoot));
-  }
-  return normalize(resolve(process.cwd(), 'workspace'));
-}
-
-const WORKSPACE_ROOT = resolveWorkspaceRoot();
-
-/**
- * 获取当前工作区根目录（供路由层日志或调试使用）
- */
-export function getWorkspaceRoot(): string {
-  return WORKSPACE_ROOT;
-}
 
 // ---- 路径安全 ----
 
 /**
- * 把用户传入的相对路径解析为绝对路径，并保证落在 WORKSPACE_ROOT 之内。
- * 防穿越策略：使用 path.relative 比对结果不能以 .. 开头，也不能是绝对路径。
+ * 把用户传入的相对路径解析为绝对路径，并保证落在 folder root 之内。
  *
- * @throws 路径越界、路径包含非法字符等情况抛出 Error
+ * @param folderRoot folder 的绝对路径（POSIX 风格亦可，内部会再 normalize）
+ * @param inputPath  相对 folder root 的 POSIX 路径
+ * @throws 路径越界、绝对路径输入等情况抛出 Error
  */
-function safePath(inputPath: string | undefined): string {
-  // 空路径表示工作区根
+function safePath(folderRoot: string, inputPath: string | undefined): string {
   const raw = inputPath ?? '';
-
-  // 用户不应传入绝对路径；统一按相对工作区根处理
   if (isAbsolute(raw)) {
     throw new Error(`不允许使用绝对路径: ${inputPath}`);
   }
-
-  const absolute = normalize(resolve(WORKSPACE_ROOT, raw));
-  const rel = relative(WORKSPACE_ROOT, absolute);
-
-  // path.relative 返回 "" / "subdir" / "../foo"；带 .. 即越界
+  const root = normalize(folderRoot);
+  const absolute = normalize(resolve(root, raw));
+  const rel = relative(root, absolute);
   if (rel.startsWith('..') || isAbsolute(rel)) {
     throw new Error(`路径穿越检测: ${inputPath}`);
   }
-
   return absolute;
 }
 
-/**
- * 把绝对路径转换为前端使用的 POSIX 风格相对路径
- */
-function toRelativePosix(absolutePath: string): string {
-  const rel = relative(WORKSPACE_ROOT, absolutePath);
+/** 把绝对路径转换为前端使用的 POSIX 风格相对路径（相对于 folder root） */
+function toRelativePosix(folderRoot: string, absolutePath: string): string {
+  const rel = relative(normalize(folderRoot), absolutePath);
   return rel.split(sep).join('/');
 }
 
@@ -102,21 +75,28 @@ function toRelativePosix(absolutePath: string): string {
 
 /**
  * 读取目录树
- * @param relativePath 相对工作区的路径，默认为根目录
+ *
+ * @param folderId 目标 WorkspaceFolder id；省略使用首个 folder
+ * @param relativePath 起始相对路径，默认为 folder 根
  * @param maxDepth 最大递归深度，默认 3
  */
 export async function readDirectoryTree(
+  folderId: string | undefined,
   relativePath?: string,
   maxDepth: number = 3
 ): Promise<FileTreeNode[]> {
-  // 工作区根目录必须存在；不存在时自动创建空目录，避免首次启动 500
-  await mkdir(WORKSPACE_ROOT, { recursive: true });
+  const folder = resolveFolder(folderId);
+  const folderRoot = folder.absolutePath;
 
-  const targetPath = safePath(relativePath);
-  return readDirRecursive(targetPath, maxDepth);
+  // folder root 必须存在；不存在时自动创建（fallback 工作区可能首次启动）
+  await mkdir(folderRoot, { recursive: true });
+
+  const targetPath = safePath(folderRoot, relativePath);
+  return readDirRecursive(folderRoot, targetPath, maxDepth);
 }
 
 async function readDirRecursive(
+  folderRoot: string,
   absolutePath: string,
   depth: number
 ): Promise<FileTreeNode[]> {
@@ -133,15 +113,18 @@ async function readDirRecursive(
   });
 
   for (const entry of sorted) {
-    // 隐藏文件（以 . 开头）和黑名单目录直接跳过
     if (entry.name.startsWith('.')) continue;
     if (entry.isDirectory() && EXCLUDED_DIR_NAMES.has(entry.name)) continue;
 
     const entryAbsolutePath = join(absolutePath, entry.name);
-    const entryRelativePath = toRelativePosix(entryAbsolutePath);
+    const entryRelativePath = toRelativePosix(folderRoot, entryAbsolutePath);
 
     if (entry.isDirectory()) {
-      const children = await readDirRecursive(entryAbsolutePath, depth - 1);
+      const children = await readDirRecursive(
+        folderRoot,
+        entryAbsolutePath,
+        depth - 1
+      );
       nodes.push({
         name: entry.name,
         path: entryRelativePath,
@@ -155,17 +138,13 @@ async function readDirRecursive(
         type: 'file',
       });
     }
-    // 其他类型（symlink / fifo / socket）暂不展示
   }
-
   return nodes;
 }
 
 // ---- 文件读写 ----
 
-/**
- * 简单的二进制内容嗅探：前 1024 字节内出现空字节即视为二进制
- */
+/** 简单的二进制内容嗅探：前 1024 字节内出现空字节即视为二进制 */
 function looksBinary(buffer: Buffer): boolean {
   const sniffLen = Math.min(buffer.length, 1024);
   for (let i = 0; i < sniffLen; i++) {
@@ -176,12 +155,16 @@ function looksBinary(buffer: Buffer): boolean {
 
 /**
  * 读取文件内容
- * 大文件返回提示而非原始内容；二进制文件返回 binary=true 且 content 为空
+ *
+ * 大文件返回提示而非原始内容；二进制文件返回 binary=true 且 content 为空。
  */
 export async function readFileContent(
+  folderId: string | undefined,
   relativePath: string
 ): Promise<FileReadResult> {
-  const absolutePath = safePath(relativePath);
+  const folder = resolveFolder(folderId);
+  const folderRoot = folder.absolutePath;
+  const absolutePath = safePath(folderRoot, relativePath);
   const fileStat = await stat(absolutePath);
 
   if (!fileStat.isFile()) {
@@ -189,22 +172,22 @@ export async function readFileContent(
   }
 
   const sizeBytes = fileStat.size;
-  const posixPath = toRelativePosix(absolutePath);
+  const posixPath = toRelativePosix(folderRoot, absolutePath);
 
-  // ---- 1. 文件超出阈值：不读内容，由前端展示提示 ----
   if (sizeBytes > READ_SIZE_LIMIT_BYTES) {
     return {
+      folderId: folder.id,
       path: posixPath,
-      content: `// 文件过大（${sizeBytes} 字节，阈值 ${READ_SIZE_LIMIT_BYTES} 字节），暂不直接打开。\n// 请在阶段 5 接入 Monaco 后查看。`,
+      content: `// 文件过大（${sizeBytes} 字节，阈值 ${READ_SIZE_LIMIT_BYTES} 字节），已自动切换到只读提示模式。`,
       sizeBytes,
       binary: false,
     };
   }
 
-  // ---- 2. 读取原始 buffer，做二进制嗅探 ----
   const buffer = await readFile(absolutePath);
   if (looksBinary(buffer)) {
     return {
+      folderId: folder.id,
       path: posixPath,
       content: '',
       sizeBytes,
@@ -213,6 +196,7 @@ export async function readFileContent(
   }
 
   return {
+    folderId: folder.id,
     path: posixPath,
     content: buffer.toString('utf-8'),
     sizeBytes,
@@ -222,13 +206,17 @@ export async function readFileContent(
 
 /**
  * 写入文件内容
- * 自动创建不存在的父目录
+ *
+ * 自动创建不存在的父目录；写入前检查大小阈值。
  */
 export async function writeFileContent(
+  folderId: string | undefined,
   relativePath: string,
   content: string
 ): Promise<FileWriteResult> {
-  const absolutePath = safePath(relativePath);
+  const folder = resolveFolder(folderId);
+  const folderRoot = folder.absolutePath;
+  const absolutePath = safePath(folderRoot, relativePath);
 
   const sizeBytes = Buffer.byteLength(content, 'utf-8');
   if (sizeBytes > WRITE_SIZE_LIMIT_BYTES) {
@@ -237,14 +225,13 @@ export async function writeFileContent(
     );
   }
 
-  // 确保父目录存在
   const dir = join(absolutePath, '..');
   await mkdir(dir, { recursive: true });
-
   await writeFile(absolutePath, content, 'utf-8');
 
   return {
-    path: toRelativePosix(absolutePath),
+    folderId: folder.id,
+    path: toRelativePosix(folderRoot, absolutePath),
     saved: true,
     sizeBytes,
   };

@@ -1,10 +1,12 @@
 /**
  * 文件操作路由
- * GET  /api/files/tree    - 获取工作区目录树
- * GET  /api/files/read    - 读取文件内容
- * POST /api/files/write   - 写入文件内容
+ *
+ * GET  /api/files/tree?folderId=&path=    - 获取目录树
+ * GET  /api/files/read?folderId=&path=    - 读取文件内容
+ * POST /api/files/write                   - 写入文件内容（folderId/path/content）
  *
  * 所有响应统一使用 ApiResponse<T> 包装；错误使用机器可读 error 字段。
+ * 所有路径都基于 folderId 解析；不传 folderId 时使用当前工作区 folders[0]。
  */
 import type { FastifyInstance } from 'fastify';
 import {
@@ -27,7 +29,7 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/files/tree', async (request) => {
     const query = request.query as FileTreeQuery;
     try {
-      const tree = await readDirectoryTree(query.path);
+      const tree = await readDirectoryTree(query.folderId, query.path);
       const response: ApiResponse<FileTreeNode[]> = {
         ok: true,
         data: tree,
@@ -55,9 +57,8 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
       };
       return response;
     }
-
     try {
-      const result = await readFileContent(query.path);
+      const result = await readFileContent(query.folderId, query.path);
       const response: ApiResponse<FileReadResult> = {
         ok: true,
         data: result,
@@ -85,9 +86,8 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
       };
       return response;
     }
-
     try {
-      const result = await writeFileContent(body.path, body.content);
+      const result = await writeFileContent(body.folderId, body.path, body.content);
       const response: ApiResponse<FileWriteResult> = {
         ok: true,
         data: result,
