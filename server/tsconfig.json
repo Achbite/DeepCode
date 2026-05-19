@@ -1,0 +1,15 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@deepcode/protocol": ["../packages/protocol/src/index.ts"],
+      "@deepcode/protocol/*": ["../packages/protocol/src/*"]
+    }
+  },
+  "include": ["src", "../packages/protocol/src/**/*"]
+}
