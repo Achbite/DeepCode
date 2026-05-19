@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/capabilities/2.0.0",
+  "identifier": "default",
+  "description": "DeepCode 默认能力集：仅放开 dialog 与自定义命令；不开放任意文件 / shell。",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default"
+  ]
+}
