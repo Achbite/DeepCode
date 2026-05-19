@@ -1,3 +1,4 @@
-export * from './api';
-export * from './events';
-export * from './files';
+export * from './api.js';
+export * from './events.js';
+export * from './files.js';
+export * from './workspace.js';
