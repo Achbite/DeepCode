@@ -1,44 +1,61 @@
-# DeepCode - 轻量级代码环境专用 AI Agent IDE
+# DeepCode
 
-> 基于 Monaco Editor + xterm.js + 本地 Node.js 后端的轻量级 AI Agent IDE
+> 轻量级 AI Agent 代码工作台 — 自建外壳 + 本地 Node.js 后端，专注于纯代码工作流。
 
-## 项目概述
+## 简介
 
-DeepCode 是一个运行在本地、专注代码开发场景的轻量级 AI Agent IDE。它结合了现代代码编辑器的体验和 AI Agent 的智能辅助能力，为开发者提供纯净、可控的开发环境。
+DeepCode 是一个面向个人编程工作流的轻量级 AI 代理工具，定位区别于通用 IDE：
 
-## 核心特性
+- 只保留编辑器、文件浏览、终端、源代码管理与 AI 对话侧栏。
+- 前端基于 Monaco Editor 内核（首期使用简化文本编辑器，后续阶段接入 Monaco）。
+- 终端基于 xterm.js + 后端 `node-pty`（后续阶段接入）。
+- 后端基于本地 Node.js（Fastify + WebSocket）只监听 `127.0.0.1`。
+- AI Agent 工作流遵循"规划 → 执行 → 验证"循环，所有写入和命令执行需经审批。
 
-- 🚀 **轻量启动**：默认只显示文件树、编辑器、终端、Git 面板、Agent 对话面板
-- 🤖 **智能辅助**：AI Agent 能读文件、生成补丁、预览 Diff、运行命令
-- 🔒 **安全可控**：所有高风险操作都需要用户确认，确保代码安全
-- 📁 **本地优先**：所有数据存储在本地，保护隐私和安全
-- 🛠️ **工具闭环**：完整的文件编辑、终端执行、Git 版本控制能力
+## 工程结构
 
-## 技术架构
-
-- **前端**：React + TypeScript + Monaco Editor + xterm.js
-- **后端**：Node.js + TypeScript + Fastify/Express
-- **通信**：REST API + WebSocket
-- **权限**：多层安全门禁 + 审批中心
-
-## 开发状态
-
-项目目前处于初期开发阶段，正在构建基础架构。
-
-## 快速开始
-
-```bash
-# 克隆项目
-git clone https://github.com/Achbite/DeepCode.git
-cd DeepCode
-
-# 安装依赖
-npm run setup
-
-# 启动开发环境
-npm run dev
+```text
+deepagent/
+├── client/           # 前端轻量工作台（React + Vite + Monaco / xterm.js 待接入）
+├── server/           # 本地 Agent 后端（Fastify + WebSocket + node-pty 待接入）
+├── packages/
+│   └── protocol/     # Client / Server 共享协议
+└── workspace/        # 默认工作区目录（用户文件，运行时只读写此目录内）
 ```
 
-## 许可证
+## 第一阶段进展
 
-MIT License
+- 双包骨架（`client` / `server` / `packages/protocol`）已就绪。
+- `/api/health` + `/ws/heartbeat` 已就绪。
+- `/api/files/tree` + `/api/files/read` + `/api/files/write` 已就绪（阶段 4-5 提前点）。
+- 基础文件树 + 简化文本编辑器已就绪（阶段 4-5 提前点）。
+- 默认工作区 = `./workspace`，可用 `WORKSPACE_ROOT` 环境变量覆盖。
+
+详细规划见 `技术方案/开发规划方案.md` 与 `技术方案/临时上下文存储.md`。
+
+## 开发命令
+
+```bash
+pnpm install
+pnpm dev          # 同时启动 client 和 server
+pnpm dev:client   # 仅前端 Vite (http://127.0.0.1:5173)
+pnpm dev:server   # 仅后端 Fastify (http://127.0.0.1:31245)
+pnpm typecheck    # 全工作区类型检查
+```
+
+## 端口与环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `AGENT_LIGHT_PORT` | `31245` | 后端监听端口 |
+| `WORKSPACE_ROOT` | `./workspace` | Agent 文件读写根目录；不允许出此目录 |
+
+## 安全约束
+
+- 后端只监听 `127.0.0.1`，不开放局域网。
+- 文件读写严格限制在 `WORKSPACE_ROOT` 内，使用 `path.relative` 防穿越。
+- `.env` 与构建产物不入库。
+
+## 许可
+
+待补。

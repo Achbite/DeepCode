@@ -1,0 +1,19 @@
+{
+  "name": "deepcode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeepCode - 轻量级 AI Agent 代码工作台",
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,green \"pnpm dev:server\" \"pnpm dev:client\"",
+    "dev:client": "pnpm --filter @deepcode/client dev",
+    "dev:server": "pnpm --filter @deepcode/server dev",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

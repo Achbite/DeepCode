@@ -1,0 +1,42 @@
+# ---- 依赖 ----
+node_modules/
+*/node_modules/
+**/node_modules/
+
+# ---- 构建产物 ----
+**/dist/
+**/build/
+**/.next/
+**/.turbo/
+**/.vite/
+
+# ---- 日志 ----
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ---- 环境与密钥 ----
+.env
+.env.*
+!.env.example
+
+# ---- IDE / 系统 ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- 工程临时文件 ----
+_check_output.txt
+_agent_tmp_*
+*.tsbuildinfo
+
+# ---- 默认工作区运行产物 ----
+# workspace/ 目录本身保留，但内部用户数据不入库；如需用户工作区不入库，取消下一行注释
+# workspace/**
+# 但保留 .gitkeep
+!workspace/.gitkeep
