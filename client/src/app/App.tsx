@@ -10,7 +10,10 @@ import React, { useEffect } from 'react';
 import WorkbenchLayout from './layout/WorkbenchLayout';
 import useAppStatusStore from '../state/appStatusStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
-import { getHealth } from '../services/apiClient';
+import {
+  getRuntimeType,
+  getRuntimeStatus,
+} from '../services/runtimeAdapter';
 import {
   connectHeartbeat,
   disconnectHeartbeat,
@@ -34,10 +37,24 @@ const App: React.FC = () => {
     loadWorkspace();
   }, [loadWorkspace]);
 
-  // ---- 2. API health 检查 ----
+  // ---- 2. 运行时状态检测 + API health 检查 ----
   useEffect(() => {
     let cancelled = false;
-    const checkApiHealth = async () => {
+    let interval: ReturnType<typeof setInterval> | null = null;
+
+    const checkRuntimeAndHealth = async () => {
+      const runtimeStatus = await getRuntimeStatus();
+      if (cancelled) return;
+
+      if (runtimeStatus.runtime === 'tauri') {
+        // Tauri 模式：runtime 在进程生命周期内不会变，置位即可，无需轮询
+        setApiStatus('connected');
+        setServerVersion(runtimeStatus.version);
+        return;
+      }
+
+      // Web 模式：HTTP health check
+      const { getHealth } = await import('../services/apiClient');
       const result = await getHealth();
       if (cancelled) return;
       if (result.ok && result.data) {
@@ -49,11 +66,18 @@ const App: React.FC = () => {
       }
     };
 
-    checkApiHealth();
-    const interval = setInterval(checkApiHealth, 30000);
+    // 首次执行；Web 模式追加 30s 轮询；Tauri 模式不轮询
+    (async () => {
+      await checkRuntimeAndHealth();
+      if (cancelled) return;
+      if (getRuntimeType() === 'web') {
+        interval = setInterval(checkRuntimeAndHealth, 30000);
+      }
+    })();
+
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      if (interval !== null) clearInterval(interval);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

@@ -7,7 +7,7 @@
  *   - file Tab id 为 `${folderId}::${path}` 复合形式。
  */
 import './workbenchLayout.css';
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import FileTree from '../../components/file-tree/FileTree';
 import CodeEditor from '../../components/editor/CodeEditor';
 import TerminalPlaceholder from '../../components/terminal/TerminalPlaceholder';
@@ -21,6 +21,7 @@ import {
   SETTINGS_TAB_ID,
   buildFileTabId,
 } from '../../state/editorStore';
+import { getRuntimeType } from '../../services/runtimeAdapter';
 
 interface WorkbenchLayoutProps {
   apiStatus: string;
@@ -46,6 +47,8 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   const updateContent = useEditorStore((s) => s.updateContent);
   const saveFile = useEditorStore((s) => s.saveFile);
   const setActiveTab = useEditorStore((s) => s.setActiveTab);
+
+  const [runtimeType] = useState(getRuntimeType);
 
   const activeTab = tabs.find((t) => {
     const id = t.kind === 'file' ? buildFileTabId(t.folderId, t.path) : t.id;
@@ -107,7 +110,12 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
       <header className="header">
         <div className="header__title">
           <strong>DeepCode</strong>
-          <span className="header__subtitle">Workspace</span>
+          <span className="header__subtitle">
+            Workspace
+            <span className="header__runtime-badge">
+              [{runtimeType === 'tauri' ? 'Tauri' : 'Web'}]
+            </span>
+          </span>
           {serverVersion && (
             <span className="header__version">v{serverVersion}</span>
           )}

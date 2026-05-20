@@ -9,7 +9,7 @@
  * 在 Web 上接入 server 的 /api/fs/browse 、在 Tauri 上可接入 invoke('pick_workspace_path')。
  */
 import React, { useState, useEffect, useCallback } from 'react';
-import { getFileTree } from '../../services/apiClient';
+import { getFileTree } from '../../services/runtimeAdapter';
 import type { FileTreeNode } from '@deepcode/protocol';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useUiStore } from '../../state/uiStore';

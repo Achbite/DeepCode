@@ -9,7 +9,7 @@
  * 下相同相对路径冲突；切换工作区时由调用方自行决定是否清理旧 Tab。
  */
 import { create } from 'zustand';
-import { readFile, writeFile } from '../services/apiClient';
+import { readFile, writeFile } from '../services/runtimeAdapter';
 import { closeModel } from '../components/editor/CodeEditor';
 import { useWorkspaceStore } from './workspaceStore';
 

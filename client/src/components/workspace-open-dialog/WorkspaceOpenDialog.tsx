@@ -16,7 +16,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   browsePath,
   getInitialLocations,
-} from '../../services/apiClient';
+  pickWorkspacePath,
+  getRuntimeType,
+} from '../../services/runtimeAdapter';
 import type {
   BrowseEntry,
   BrowsePathResult,
@@ -201,6 +203,26 @@ const WorkspaceOpenDialog: React.FC = () => {
           >
             Go
           </button>
+          {getRuntimeType() === 'tauri' && (
+            <button
+              className="ws-open-dialog__btn"
+              onClick={async () => {
+                const result = await pickWorkspacePath();
+                if (result.ok && result.data) {
+                  closeAllFileTabs();
+                  const wsResult = await openWorkspace(result.data);
+                  if (wsResult.ok) {
+                    hide();
+                  } else {
+                    setError(`打开工作区失败：${wsResult.message}`);
+                  }
+                }
+              }}
+              title="使用系统原生对话框选择目录"
+            >
+              📂 Native…
+            </button>
+          )}
           <label className="ws-open-dialog__toggle" title="显示以 . 开头的隐藏项">
             <input
               type="checkbox"

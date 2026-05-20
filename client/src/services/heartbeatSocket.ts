@@ -1,9 +1,13 @@
 /**
  * WebSocket 心跳客户端
  * 连接 /ws/heartbeat，发送 ping，接收 pong 和 server.ready
+ *
+ * Tauri 模式下没有 Node HTTP server，window.location.host 是 tauri.localhost，
+ * 真实 WebSocket 连接必然失败。因此 Tauri 模式直接进入"原生已连接"状态，不创建套接字。
  */
 import type { HeartbeatServerEvent } from '@deepcode/protocol';
 import useAppStatusStore from '../state/appStatusStore';
+import { getRuntimeType } from './runtimeAdapter';
 
 const WS_BASE = `ws://${window.location.host}/ws`;
 const HEARTBEAT_INTERVAL_MS = 5000; // 5秒发送一次 ping
@@ -16,6 +20,14 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
  */
 export function connectHeartbeat(): void {
   const store = useAppStatusStore.getState();
+
+  // Tauri 模式：没有 HTTP/WS server，直接置 connected 并停止后续连接尝试
+  if (getRuntimeType() === 'tauri') {
+    store.setWsStatus('connected');
+    store.setLastHeartbeatAt(new Date().toISOString());
+    return;
+  }
+
   store.setWsStatus('checking');
 
   ws = new WebSocket(`${WS_BASE}/heartbeat`);

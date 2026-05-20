@@ -10,8 +10,8 @@
 import { create } from 'zustand';
 import {
   getCurrentWorkspace,
-  openWorkspace as apiOpenWorkspace,
-} from '../services/apiClient';
+  openWorkspace as runtimeOpenWorkspace,
+} from '../services/runtimeAdapter';
 import type {
   WorkspaceFolderSpec,
   WorkspaceSpec,
@@ -85,7 +85,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   openWorkspace: async (path: string) => {
     set({ loading: true });
-    const result = await apiOpenWorkspace(path);
+    const result = await runtimeOpenWorkspace(path);
     if (result.ok && result.data) {
       const ws = result.data.workspace;
       set({
