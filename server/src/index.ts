@@ -17,6 +17,7 @@ import { registerHealthRoutes } from './api/healthRoutes.js';
 import { registerFileRoutes } from './api/fileRoutes.js';
 import { registerWorkspaceRoutes } from './api/workspaceRoutes.js';
 import { registerFsBrowseRoutes } from './api/fsBrowseRoutes.js';
+import { registerUserSettingsRoutes } from './api/userSettingsRoutes.js';
 import { registerHeartbeatWs } from './ws/heartbeatWs.js';
 import {
   loadInitialWorkspace,
@@ -45,6 +46,7 @@ async function main(): Promise<ServerStartResult> {
   await registerWorkspaceRoutes(app);
   await registerFsBrowseRoutes(app);
   await registerFileRoutes(app);
+  await registerUserSettingsRoutes(app);
   await registerHeartbeatWs(app);
 
   // ---- 6. 可选：静态前端托管 ----

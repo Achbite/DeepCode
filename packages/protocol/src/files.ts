@@ -63,3 +63,31 @@ export interface FileWriteResult {
   saved: boolean;
   sizeBytes: number;
 }
+
+// ---- 新建文件 / 新建文件夹（阶段 4 S4-1）----
+
+/** POST /api/files 请求体 —— 新建空文件或带初始内容的文件 */
+export interface CreateFileRequest {
+  /** 目标 WorkspaceFolder 的 id；省略时使用当前工作区 folders[0] */
+  folderId?: string;
+  /** 待新建文件相对 folder 根的 POSIX 路径 */
+  path: string;
+  /** 初始内容；省略则创建空文件 */
+  content?: string;
+}
+
+/** POST /api/folders 请求体 —— 新建空目录（递归创建中间目录） */
+export interface CreateFolderRequest {
+  /** 目标 WorkspaceFolder 的 id；省略时使用当前工作区 folders[0] */
+  folderId?: string;
+  /** 待新建目录相对 folder 根的 POSIX 路径 */
+  path: string;
+}
+
+/** POST /api/folders 成功响应 data 字段 */
+export interface CreateFolderResult {
+  folderId: string;
+  /** 新建目录相对 folder 根的 POSIX 路径 */
+  path: string;
+  created: boolean;
+}

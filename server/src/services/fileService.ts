@@ -6,22 +6,24 @@
  *   - 路径安全：所有相对路径解析后必须落在 folder.absolutePath 之内；
  *   - 大文件 / 二进制 / 写入大小阈值 / 目录树节点上限与 Tauri Rust 端 fs.rs 对齐。
  */
-import { readdir, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
+import { readdir, readFile, writeFile, mkdir, stat, access } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import { join, resolve, normalize, relative, isAbsolute, sep } from 'node:path';
 import type {
   FileTreeNode,
   FileReadResult,
   FileWriteResult,
+  CreateFolderResult,
 } from '@deepcode/protocol';
 import { resolveFolder } from './workspaceService.js';
 
 // ---- 常量 ----
 
 /** 文件读取大小阈值；超过此值返回提示信息而不灌入 content */
-const READ_SIZE_LIMIT_BYTES = 1024 * 1024; // 1 MiB
+const READ_SIZE_LIMIT_BYTES = 16 * 1024 * 1024; // 16 MiB
 
 /** 写入大小阈值（防止前端误传超大内容） */
-const WRITE_SIZE_LIMIT_BYTES = 8 * 1024 * 1024; // 8 MiB
+const WRITE_SIZE_LIMIT_BYTES = 16 * 1024 * 1024; // 16 MiB
 
 /** 目录树最大递归深度；防止 monorepo 深目录把响应撑爆 */
 const MAX_TREE_DEPTH = 6;
@@ -253,5 +255,97 @@ export async function writeFileContent(
     path: toRelativePosix(folderRoot, absolutePath),
     saved: true,
     sizeBytes,
+  };
+}
+
+// ---- 新建文件 / 新建目录（阶段 4 / S4-1）----
+
+/**
+ * 新建文件
+ *
+ * 语义与 VSCode 一致：路径已存在时报错（`file_already_exists`），不覆盖。
+ * 需要覆盖请走 writeFileContent。
+ * 父目录不存在时递归创建，与 VSCode New File 体验一致。
+ */
+export async function createFile(
+  folderId: string | undefined,
+  relativePath: string,
+  initialContent: string = ''
+): Promise<FileWriteResult> {
+  if (!relativePath || relativePath.trim() === '') {
+    throw new Error('路径不能为空');
+  }
+  const folder = resolveFolder(folderId);
+  const folderRoot = folder.absolutePath;
+  const absolutePath = safePath(folderRoot, relativePath);
+
+  // 存在性检查：文件或目录已存在则报错
+  try {
+    await access(absolutePath, fsConstants.F_OK);
+    throw new Error(`file_already_exists: ${relativePath}`);
+  } catch (err: any) {
+    if (err && err.code !== 'ENOENT') {
+      // 已存在或其他错误直接上抛
+      throw err;
+    }
+    // ENOENT 是预期状态，继续创建
+  }
+
+  const sizeBytes = Buffer.byteLength(initialContent, 'utf-8');
+  if (sizeBytes > WRITE_SIZE_LIMIT_BYTES) {
+    throw new Error(
+      `写入内容过大（${sizeBytes} 字节，阈值 ${WRITE_SIZE_LIMIT_BYTES} 字节）`
+    );
+  }
+
+  const dir = join(absolutePath, '..');
+  await mkdir(dir, { recursive: true });
+  await writeFile(absolutePath, initialContent, 'utf-8');
+
+  return {
+    folderId: folder.id,
+    path: toRelativePosix(folderRoot, absolutePath),
+    saved: true,
+    sizeBytes,
+  };
+}
+
+/**
+ * 新建目录（递归创建中间目录）
+ *
+ * 与 VSCode 一致：使用 mkdir recursive；路径已存在为目录时返回 created=false 不报错；
+ * 路径已存在为文件时报错 file_already_exists。
+ */
+export async function createFolderEntry(
+  folderId: string | undefined,
+  relativePath: string
+): Promise<CreateFolderResult> {
+  if (!relativePath || relativePath.trim() === '') {
+    throw new Error('路径不能为空');
+  }
+  const folder = resolveFolder(folderId);
+  const folderRoot = folder.absolutePath;
+  const absolutePath = safePath(folderRoot, relativePath);
+
+  let created = true;
+  try {
+    const st = await stat(absolutePath);
+    if (st.isFile()) {
+      throw new Error(`file_already_exists: ${relativePath}`);
+    }
+    // 已存在为目录：mkdir recursive 幂等，标记 created=false
+    created = false;
+  } catch (err: any) {
+    if (err && err.code && err.code !== 'ENOENT') {
+      throw err;
+    }
+  }
+
+  await mkdir(absolutePath, { recursive: true });
+
+  return {
+    folderId: folder.id,
+    path: toRelativePosix(folderRoot, absolutePath),
+    created,
   };
 }

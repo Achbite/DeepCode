@@ -4,6 +4,8 @@
  * GET  /api/files/tree?folderId=&path=    - 获取目录树
  * GET  /api/files/read?folderId=&path=    - 读取文件内容
  * POST /api/files/write                   - 写入文件内容（folderId/path/content）
+ * POST /api/files/create                  - 新建文件（已存在报错 file_already_exists）
+ * POST /api/folders/create                - 新建目录（递归创建中间目录）
  *
  * 所有响应统一使用 ApiResponse<T> 包装；错误使用机器可读 error 字段。
  * 所有路径都基于 folderId 解析；不传 folderId 时使用当前工作区 folders[0]。
@@ -13,6 +15,8 @@ import {
   readDirectoryTree,
   readFileContent,
   writeFileContent,
+  createFile,
+  createFolderEntry,
 } from '../services/fileService.js';
 import type {
   ApiResponse,
@@ -22,6 +26,9 @@ import type {
   FileWriteRequest,
   FileReadResult,
   FileWriteResult,
+  CreateFileRequest,
+  CreateFolderRequest,
+  CreateFolderResult,
 } from '@deepcode/protocol';
 
 export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
@@ -98,6 +105,67 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
       const response: ApiResponse<never> = {
         ok: false,
         error: 'file_write_error',
+        message,
+      };
+      return response;
+    }
+  });
+
+  // ---- 新建文件（阶段 4 / S4-1）----
+  app.post('/api/files/create', async (request) => {
+    const body = request.body as CreateFileRequest;
+    if (!body || !body.path) {
+      const response: ApiResponse<never> = {
+        ok: false,
+        error: 'missing_param',
+        message: '缺少 path 参数',
+      };
+      return response;
+    }
+    try {
+      const result = await createFile(body.folderId, body.path, body.content ?? '');
+      const response: ApiResponse<FileWriteResult> = {
+        ok: true,
+        data: result,
+      };
+      return response;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // 区分 file_already_exists，方便前端展示“该名称已存在”提示
+      const isExist = message.startsWith('file_already_exists');
+      const response: ApiResponse<never> = {
+        ok: false,
+        error: isExist ? 'file_already_exists' : 'file_create_error',
+        message,
+      };
+      return response;
+    }
+  });
+
+  // ---- 新建目录（阶段 4 / S4-1）----
+  app.post('/api/folders/create', async (request) => {
+    const body = request.body as CreateFolderRequest;
+    if (!body || !body.path) {
+      const response: ApiResponse<never> = {
+        ok: false,
+        error: 'missing_param',
+        message: '缺少 path 参数',
+      };
+      return response;
+    }
+    try {
+      const result = await createFolderEntry(body.folderId, body.path);
+      const response: ApiResponse<CreateFolderResult> = {
+        ok: true,
+        data: result,
+      };
+      return response;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const isExist = message.startsWith('file_already_exists');
+      const response: ApiResponse<never> = {
+        ok: false,
+        error: isExist ? 'file_already_exists' : 'folder_create_error',
         message,
       };
       return response;
