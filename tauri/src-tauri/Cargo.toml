@@ -20,6 +20,9 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
+tauri-plugin-fs = "2"
+# ISO 8601 时间格式化；替代 src/workspace.rs 中手写的 humantime_iso 实现
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [features]
 # 默认发布版裁剪 dev tools；开发时由 tauri dev 注入

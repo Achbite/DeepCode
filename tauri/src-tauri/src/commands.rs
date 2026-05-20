@@ -3,14 +3,17 @@
 // Tauri 命令模块
 //
 // 当前阶段说明：
-//   - DeepCode 主链路（文件读写、工作区管理、心跳）仍由 Node 后端通过 HTTP/WS 提供；
-//   - 这里的命令只覆盖"必须 Native 才能完成的能力"和"为后续 LLM/Skill 接入预留的空操作接口"；
-//   - 所有 Stub 命令一律返回 NotImplemented 错误，避免误以为已生效。
+//   - 工作区管理、文件系统读写已由 Rust command 承接；
+//   - LLM / Skill 仍为空操作 stub，待后续阶段接入；
+//   - 所有 command 返回结构与 protocol DTO 字段同构，方便前端 adapter 复用。
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
 use thiserror::Error;
+
+use crate::fs;
+use crate::workspace;
 
 // ---- 错误模型 ----
 
@@ -33,25 +36,113 @@ impl From<String> for CommandError {
     }
 }
 
-// ---- 应用信息 ----
+// ---- 运行时状态 ----
 
-/// 返回当前应用版本号；与 tauri.conf.json 的 version 字段一致。
-#[tauri::command]
-pub fn get_app_version(app: AppHandle) -> String {
-    app.package_info().version.to_string()
+/// 运行时状态信息
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatus {
+    pub runtime: String,
+    pub version: String,
+    pub platform: String,
+    pub arch: String,
 }
 
-// ---- 工作区路径选择 ----
-
-/// 弹出原生 dialog 让用户选择目录或 .code-workspace 文件。
+/// 返回当前运行时状态：类型、版本、平台、架构。
 ///
-/// 返回值是用户选择的绝对路径（POSIX 风格），调用方应再调用 Node 后端的
-/// POST /api/workspaces/open 完成实际打开。
-///
-/// 当前阶段：实现"目录选择"路径；.code-workspace 文件选择由前端 UI 通过 prompt
-/// 输入路径完成，dialog 仅作为可选体验提升。
+/// 平台与架构使用 `std::env::consts` 运行期常量，而非编译期 `env!("TARGET")`；
+/// 后者在 proc macro 阶段不可用（Cargo 只在 build script 阶段设置 TARGET）。
 #[tauri::command]
-pub async fn pick_workspace_path(app: AppHandle) -> Result<String, CommandError> {
+pub fn get_runtime_status(app: AppHandle) -> RuntimeStatus {
+    RuntimeStatus {
+        runtime: "tauri".into(),
+        version: app.package_info().version.to_string(),
+        platform: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+    }
+}
+
+// ---- 工作区 ----
+
+/// 获取当前活动工作区状态
+#[tauri::command]
+pub fn get_current_workspace(
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> workspace::WorkspaceState {
+    state.get_current()
+}
+
+/// 打开工作区（目录或 .code-workspace 文件）
+#[tauri::command]
+pub fn open_workspace(
+    path: String,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<workspace::OpenWorkspaceResult, CommandError> {
+    state
+        .open_workspace(&path)
+        .map_err(CommandError::Other)
+}
+
+// ---- 文件系统浏览（用于 Open Workspace 对话框）----
+
+/// 获取初始位置（Home / Drives）
+#[tauri::command]
+pub fn get_initial_locations() -> fs::InitialLocations {
+    fs::get_initial_locations()
+}
+
+/// 浏览指定绝对路径下的子项
+#[tauri::command]
+pub fn browse_path(path: String) -> Result<fs::BrowsePathResult, CommandError> {
+    fs::browse_path(&path).map_err(CommandError::Other)
+}
+
+// ---- 文件 ----
+
+/// 列活动 folder 的目录树
+#[tauri::command]
+pub fn list_file_tree(
+    folder_id: String,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<Vec<fs::FileTreeNode>, CommandError> {
+    let folder_root = state
+        .get_folder_abs_path(&folder_id)
+        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
+    fs::build_file_tree(&folder_root, &folder_id).map_err(CommandError::Other)
+}
+
+/// 读取工作区内文本文件
+#[tauri::command]
+pub fn read_text_file(
+    folder_id: String,
+    path: String,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<fs::FileReadResult, CommandError> {
+    let folder_root = state
+        .get_folder_abs_path(&folder_id)
+        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
+    fs::read_text_file(&folder_root, &folder_id, &path).map_err(CommandError::Other)
+}
+
+/// 写入工作区内文本文件
+#[tauri::command]
+pub fn write_text_file(
+    folder_id: String,
+    path: String,
+    content: String,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<fs::FileWriteResult, CommandError> {
+    let folder_root = state
+        .get_folder_abs_path(&folder_id)
+        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
+    fs::write_text_file(&folder_root, &folder_id, &path, &content).map_err(CommandError::Other)
+}
+
+// ---- 原生对话框 ----
+
+/// 弹出原生 dialog 让用户选择目录
+#[tauri::command]
+pub async fn pick_workspace_directory(app: AppHandle) -> Result<String, CommandError> {
     use std::sync::mpsc;
 
     let (tx, rx) = mpsc::channel::<Option<String>>();
@@ -69,15 +160,37 @@ pub async fn pick_workspace_path(app: AppHandle) -> Result<String, CommandError>
     }
 }
 
-// ---- LLM 空操作 Stub ----
+/// 弹出原生 dialog 让用户选择 .code-workspace 文件
+#[tauri::command]
+pub async fn pick_workspace_file(app: AppHandle) -> Result<String, CommandError> {
+    use std::sync::mpsc;
 
+    let (tx, rx) = mpsc::channel::<Option<String>>();
+    app.dialog()
+        .file()
+        .add_filter("VSCode Workspace", &["code-workspace"])
+        .pick_file(move |file| {
+            let path = file.and_then(|p| p.into_path().ok()).map(|p| {
+                p.to_string_lossy().replace('\\', "/")
+            });
+            let _ = tx.send(path);
+        });
+
+    let result = rx.recv().map_err(|e| CommandError::Other(e.to_string()))?;
+    match result {
+        Some(path) => Ok(path),
+        None => Err(CommandError::UserCancelled),
+    }
+}
+
+// ---- LLM 空操作 Stub ----
+//
+// stub 阶段 payload 仅用于冻结前后端契约，字段本身不被读取；后续阶段接入真实 LLM 后才会使用。
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct LlmInvokePayload {
-    /// 模型 profile 名（前端 Prompt Profiles 选择项），当前阶段忽略
     pub profile: String,
-    /// 用户消息
     pub prompt: String,
-    /// 可选的上下文片段
     pub context_snippets: Option<Vec<String>>,
 }
 
@@ -86,10 +199,7 @@ pub struct LlmInvokeResult {
     pub status: String,
 }
 
-/// LLM 调用空操作 stub。
-///
-/// 该命令是"前端 -> 系统级 LLM 适配层"的契约占位，当前阶段不连接任何真实模型；
-/// 任何调用都会立即返回 NotImplemented 错误，提醒上层尚未接入。
+/// LLM 调用空操作 stub
 #[tauri::command]
 pub fn llm_invoke_stub(_payload: LlmInvokePayload) -> Result<LlmInvokeResult, CommandError> {
     Err(CommandError::NotImplemented(
@@ -98,12 +208,12 @@ pub fn llm_invoke_stub(_payload: LlmInvokePayload) -> Result<LlmInvokeResult, Co
 }
 
 // ---- Skill 空操作 Stub ----
-
+//
+// 同 LLM stub：兑现前不被读取，仅用于冻结 schema。
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct SkillInvokePayload {
-    /// Skill 名称
     pub skill_name: String,
-    /// 调用参数（任意 JSON）
     pub args: serde_json::Value,
 }
 
@@ -112,9 +222,7 @@ pub struct SkillInvokeResult {
     pub status: String,
 }
 
-/// Skill 调用空操作 stub。
-///
-/// 与 llm_invoke_stub 相同逻辑：仅作为前端 -> Skill Runtime 的契约占位。
+/// Skill 调用空操作 stub
 #[tauri::command]
 pub fn skill_invoke_stub(_payload: SkillInvokePayload) -> Result<SkillInvokeResult, CommandError> {
     Err(CommandError::NotImplemented(

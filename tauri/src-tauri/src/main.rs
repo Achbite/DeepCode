@@ -1,21 +1,38 @@
-// 应用入口
+// main.rs
 //
-// 仅做 Tauri Builder 装配；具体命令在 commands.rs 中实现。
-// 当前阶段所有 LLM / Skill 命令均以"空操作 stub"形式存在，留给后续阶段填实。
-
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Tauri 应用入口
+//
+// 注册所有 command 和 managed state，启动 Tauri 窗口。
 
 mod commands;
+mod fs;
+mod workspace;
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .manage(workspace::WorkspaceManager::new())
         .invoke_handler(tauri::generate_handler![
-            commands::pick_workspace_path,
-            commands::get_app_version,
+            // 运行时状态
+            commands::get_runtime_status,
+            // 工作区
+            commands::get_current_workspace,
+            commands::open_workspace,
+            // 文件系统浏览
+            commands::get_initial_locations,
+            commands::browse_path,
+            // 文件
+            commands::list_file_tree,
+            commands::read_text_file,
+            commands::write_text_file,
+            // 原生对话框
+            commands::pick_workspace_directory,
+            commands::pick_workspace_file,
+            // Stub
             commands::llm_invoke_stub,
             commands::skill_invoke_stub,
         ])
         .run(tauri::generate_context!())
-        .expect("启动 DeepCode Tauri 应用失败");
+        .expect("启动 Tauri 应用失败");
 }

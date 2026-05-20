@@ -1,0 +1,341 @@
+// workspace.rs
+//
+// 工作区管理逻辑
+//
+// 维护当前活动工作区的 folders、name、source 等状态，
+// 供 commands.rs 调用，避免 command 函数堆实现细节。
+
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+// ---- DTO：与 protocol DTO 字段同构 ----
+
+/// 工作区来源类型
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceSourceKind {
+    Directory,
+    CodeWorkspace,
+    Fallback,
+}
+
+/// 工作区中的单个根文件夹
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFolderSpec {
+    pub id: String,
+    pub name: String,
+    pub absolute_path: String,
+    pub original_path: String,
+    pub is_absolute: bool,
+}
+
+/// 不支持但保留的字段
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnsupportedField {
+    pub key: String,
+    pub kind: String,
+}
+
+/// 当前活动工作区完整描述
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSpec {
+    pub id: String,
+    pub name: String,
+    pub source: WorkspaceSourceKind,
+    pub source_path: Option<String>,
+    pub folders: Vec<WorkspaceFolderSpec>,
+    pub settings: serde_json::Value,
+    pub unsupported_fields: Vec<UnsupportedField>,
+    pub opened_at: String,
+}
+
+/// GET /api/workspaces/current 成功响应 data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceState {
+    pub current: WorkspaceSpec,
+    pub fallback_used: bool,
+    pub last_error: Option<String>,
+}
+
+/// POST /api/workspaces/open 成功响应 data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenWorkspaceResult {
+    pub workspace: WorkspaceSpec,
+}
+
+// ---- 工作区管理器 ----
+
+/// 工作区管理器（Tauri managed state）
+pub struct WorkspaceManager {
+    inner: Mutex<WorkspaceManagerInner>,
+}
+
+struct WorkspaceManagerInner {
+    /// 当前活动工作区；首次 open_workspace 之前为 None
+    current: Option<WorkspaceSpec>,
+    /// 打开计数器，用于生成 id
+    next_id: u32,
+}
+
+impl WorkspaceManager {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(WorkspaceManagerInner {
+                current: None,
+                next_id: 1,
+            }),
+        }
+    }
+
+    /// 获取当前工作区状态；若未打开则返回 fallback
+    pub fn get_current(&self) -> WorkspaceState {
+        let inner = self.inner.lock().unwrap();
+        match &inner.current {
+            Some(ws) => WorkspaceState {
+                current: ws.clone(),
+                fallback_used: false,
+                last_error: None,
+            },
+            None => {
+                // 返回 fallback 工作区：当前工作目录
+                let cwd = std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."));
+                let folder_name = cwd
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "workspace".into());
+                let abs = to_posix(&cwd);
+                let fallback = WorkspaceSpec {
+                    id: "fallback".into(),
+                    name: folder_name,
+                    source: WorkspaceSourceKind::Fallback,
+                    source_path: None,
+                    folders: vec![WorkspaceFolderSpec {
+                        id: "wf-0".into(),
+                        name: abs.split('/').last().unwrap_or("workspace").into(),
+                        absolute_path: abs.clone(),
+                        original_path: abs,
+                        is_absolute: true,
+                    }],
+                    settings: serde_json::json!({}),
+                    unsupported_fields: vec![],
+                    opened_at: chrono_now_iso(),
+                };
+                WorkspaceState {
+                    current: fallback,
+                    fallback_used: true,
+                    last_error: None,
+                }
+            }
+        }
+    }
+
+    /// 打开工作区（目录或 .code-workspace 文件）
+    pub fn open_workspace(&self, path: &str) -> Result<OpenWorkspaceResult, String> {
+        let p = PathBuf::from(path);
+        if !p.exists() {
+            return Err(format!("路径不存在: {}", path));
+        }
+
+        let abs = p
+            .canonicalize()
+            .map_err(|e| format!("路径规范化失败: {}", e))?;
+        let abs_posix = to_posix(&abs);
+
+        let (source, name, folders, source_path, settings, unsupported) =
+            if abs.is_dir() {
+                // 目录模式
+                let dir_name = abs
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "workspace".into());
+                (
+                    WorkspaceSourceKind::Directory,
+                    dir_name,
+                    vec![WorkspaceFolderSpec {
+                        id: "wf-0".into(),
+                        name: abs
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "workspace".into()),
+                        absolute_path: abs_posix.clone(),
+                        original_path: abs_posix,
+                        is_absolute: true,
+                    }],
+                    None::<String>,
+                    serde_json::json!({}),
+                    vec![] as Vec<UnsupportedField>,
+                )
+            } else if is_code_workspace_file(&abs) {
+                // .code-workspace 文件模式
+                let content = std::fs::read_to_string(&abs)
+                    .map_err(|e| format!("读取 .code-workspace 失败: {}", e))?;
+                let ws_json: serde_json::Value = serde_json::from_str(&content)
+                    .map_err(|e| format!("解析 .code-workspace JSON 失败: {}", e))?;
+
+                let file_name = abs
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "workspace".into());
+
+                let folders_val = ws_json.get("folders").and_then(|v| v.as_array());
+                let parent = abs.parent().unwrap_or(Path::new("."));
+
+                let mut folder_specs = Vec::new();
+                if let Some(arr) = folders_val {
+                    for (i, item) in arr.iter().enumerate() {
+                        let raw_path = item
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(".");
+                        let resolved = if Path::new(raw_path).is_absolute() {
+                            PathBuf::from(raw_path)
+                        } else {
+                            parent.join(raw_path)
+                        };
+                        let canonical = match resolved.canonicalize() {
+                            Ok(c) => c,
+                            Err(_) => resolved.clone(),
+                        };
+                        let folder_name = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                canonical
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| format!("folder-{}", i))
+                            });
+                        folder_specs.push(WorkspaceFolderSpec {
+                            id: format!("wf-{}", i),
+                            name: folder_name,
+                            absolute_path: to_posix(&canonical),
+                            original_path: raw_path.into(),
+                            is_absolute: Path::new(raw_path).is_absolute(),
+                        });
+                    }
+                }
+
+                if folder_specs.is_empty() {
+                    folder_specs.push(WorkspaceFolderSpec {
+                        id: "wf-0".into(),
+                        name: file_name.clone(),
+                        absolute_path: to_posix(parent),
+                        original_path: ".".into(),
+                        is_absolute: false,
+                    });
+                }
+
+                // 提取 deepcode. 前缀的 settings
+                let settings_obj = ws_json
+                    .get("settings")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| {
+                        let mut dc = serde_json::Map::new();
+                        for (k, v) in obj {
+                            if k.starts_with("deepcode.") {
+                                dc.insert(k.clone(), v.clone());
+                            }
+                        }
+                        serde_json::Value::Object(dc)
+                    })
+                    .unwrap_or(serde_json::json!({}));
+
+                // 识别不支持的字段
+                let known_keys = ["folders", "settings"];
+                let unsupported: Vec<UnsupportedField> = ws_json
+                    .as_object()
+                    .map(|obj| {
+                        obj.iter()
+                            .filter(|(k, _)| !known_keys.contains(&k.as_str()))
+                            .map(|(k, v)| UnsupportedField {
+                                key: k.clone(),
+                                kind: match v {
+                                    serde_json::Value::Object(_) => "object".into(),
+                                    serde_json::Value::Array(_) => "array".into(),
+                                    serde_json::Value::String(_) => "string".into(),
+                                    serde_json::Value::Number(_) => "number".into(),
+                                    serde_json::Value::Bool(_) => "boolean".into(),
+                                    serde_json::Value::Null => "null".into(),
+                                },
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                (
+                    WorkspaceSourceKind::CodeWorkspace,
+                    file_name,
+                    folder_specs,
+                    Some(abs_posix),
+                    settings_obj,
+                    unsupported,
+                )
+            } else {
+                return Err(format!(
+                    "路径既不是目录也不是 .code-workspace 文件: {}",
+                    path
+                ));
+            };
+
+        let mut inner = self.inner.lock().unwrap();
+        let id = format!("ws-{}", inner.next_id);
+        inner.next_id += 1;
+
+        let ws = WorkspaceSpec {
+            id,
+            name,
+            source,
+            source_path,
+            folders,
+            settings,
+            unsupported_fields: unsupported,
+            opened_at: chrono_now_iso(),
+        };
+
+        inner.current = Some(ws.clone());
+
+        Ok(OpenWorkspaceResult { workspace: ws })
+    }
+
+    /// 按 folderId 获取 folder 的绝对路径
+    pub fn get_folder_abs_path(&self, folder_id: &str) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner.current.as_ref().and_then(|ws| {
+            ws.folders
+                .iter()
+                .find(|f| f.id == folder_id)
+                .map(|f| f.absolute_path.clone())
+        })
+    }
+}
+
+// ---- helper ----
+
+/// 路径转 POSIX 风格字符串
+fn to_posix(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// 判断是否为 .code-workspace 文件
+fn is_code_workspace_file(p: &Path) -> bool {
+    p.file_name()
+        .map(|name| {
+            name.to_string_lossy()
+                .to_lowercase()
+                .ends_with(".code-workspace")
+        })
+        .unwrap_or(false)
+}
+
+/// 当前时间 ISO 8601 格式（UTC）
+fn chrono_now_iso() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
