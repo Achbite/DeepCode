@@ -28,6 +28,14 @@ interface WorkspaceStateData {
   activeFolderId: string | null;
   /** 是否正在加载（首次或刷新） */
   loading: boolean;
+  /**
+   * 文件树重染染计数器（阶段 4 / S4-2）
+   *
+   * 每次工作区切换 / 刷新接口调用递增。FileTree useEffect 依赖该字段，
+   * 即使 activeFolderId 未变（同 id 不同源事件）也能强制重拉取目录树，
+   * 避免“Open Workspace 后文件树仍是旧内容”的 race。
+   */
+  treeRevision: number;
 }
 
 interface WorkspaceActions {
@@ -37,6 +45,8 @@ interface WorkspaceActions {
   openWorkspace: (path: string) => Promise<{ ok: boolean; message?: string }>;
   /** 切换当前 folder */
   selectFolder: (folderId: string) => void;
+  /** 手动递增 treeRevision（阶段 4 / S4-2），用于新建 / 删除 / 重命名后主动刷新文件树 */
+  bumpTreeRevision: () => void;
 }
 
 interface WorkspaceDerived {
@@ -52,6 +62,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   lastError: null,
   activeFolderId: null,
   loading: false,
+  treeRevision: 0,
 
   getActiveFolder: () => {
     const { current, activeFolderId } = get();
@@ -68,13 +79,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const result = await getCurrentWorkspace();
     if (result.ok && result.data) {
       const ws = result.data.current;
-      set({
+      set((state) => ({
         current: ws,
-        fallbackUsed: result.data.fallbackUsed,
-        lastError: result.data.lastError,
+        fallbackUsed: result.data!.fallbackUsed,
+        lastError: result.data!.lastError,
         activeFolderId: ws.folders[0]?.id ?? null,
         loading: false,
-      });
+        treeRevision: state.treeRevision + 1,
+      }));
     } else {
       set({
         lastError: result.message ?? '工作区加载失败',
@@ -88,13 +100,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const result = await runtimeOpenWorkspace(path);
     if (result.ok && result.data) {
       const ws = result.data.workspace;
-      set({
+      set((state) => ({
         current: ws,
         fallbackUsed: false,
         lastError: null,
         activeFolderId: ws.folders[0]?.id ?? null,
         loading: false,
-      });
+        treeRevision: state.treeRevision + 1,
+      }));
       return { ok: true };
     }
     const message = result.message ?? '打开工作区失败';
@@ -107,5 +120,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   selectFolder: (folderId: string) => {
     set({ activeFolderId: folderId });
+  },
+
+  bumpTreeRevision: () => {
+    set((state) => ({ treeRevision: state.treeRevision + 1 }));
   },
 }));

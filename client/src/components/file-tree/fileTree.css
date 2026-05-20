@@ -1,0 +1,229 @@
+/**
+ * FileTree 样式（阶段 4 / S4-1）
+ *
+ * 设计要求：
+ *   - 与 VSCode Explorer 视觉对齐：紧凑行高、轻量 hover、单色调；
+ *   - 颜色 / 间距全部走 CSS 变量；禁止在 .tsx 中再写 inline 颜色 / 间距；
+ *   - 工具栏图标按钮悬停才显（mouseenter 显，mouseleave 隐），与 VSCode 一致；
+ *   - 图标使用 currentColor，由父容器的 color 控制冷暖。
+ *
+ * 主题变量：与项目 dark theme 子集对齐，未引入主题切换前先内联 fallback。
+ */
+
+.file-tree {
+  --ft-bg: #252526;
+  --ft-fg: #cccccc;
+  --ft-fg-muted: #888;
+  --ft-fg-emphasis: #fff;
+  --ft-border: #444;
+  --ft-border-soft: #2c2c2c;
+  --ft-hover-bg: rgba(255, 255, 255, 0.05);
+  --ft-selected-bg: rgba(0, 122, 204, 0.3);
+  --ft-accent-warn: #d19a66;
+  --ft-accent-error: #f44;
+  --ft-row-padding-y: 3px;
+  --ft-row-indent: 16px;
+
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  font-size: 13px;
+  color: var(--ft-fg);
+  background: var(--ft-bg);
+}
+
+/* ---- 顶部 Explorer 标题栏 ---- */
+.file-tree__titlebar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px 8px 16px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--ft-fg);
+  border-bottom: 1px solid var(--ft-border);
+  user-select: none;
+}
+
+/* 工具栏：默认隐藏图标按钮，hover Explorer 行时再显（VSCode 行为） */
+.file-tree__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.file-tree__titlebar:hover .file-tree__toolbar,
+.file-tree__toolbar:focus-within {
+  opacity: 1;
+}
+
+.file-tree__toolbar-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--ft-fg);
+  cursor: pointer;
+  padding: 0;
+}
+
+.file-tree__toolbar-btn:hover {
+  background: var(--ft-hover-bg);
+}
+
+.file-tree__toolbar-btn:disabled {
+  cursor: not-allowed;
+  color: var(--ft-fg-muted);
+}
+
+.file-tree__toolbar-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* ---- 工作区摘要 ---- */
+.file-tree__summary {
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--ft-fg-muted);
+  border-bottom: 1px solid var(--ft-border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.file-tree__summary-name {
+  color: #ddd;
+}
+
+.file-tree__summary-source {
+  color: #666;
+  margin-left: 6px;
+}
+
+.file-tree__summary-fallback {
+  color: var(--ft-accent-warn);
+  margin-left: 6px;
+}
+
+.file-tree__summary-folder-select {
+  background: #1e1e1e;
+  color: #ddd;
+  border: 1px solid var(--ft-border);
+  font-size: 12px;
+  margin-left: 4px;
+}
+
+/* ---- 状态行 ---- */
+.file-tree__status {
+  padding: 16px;
+  font-size: 12px;
+}
+
+.file-tree__status--loading {
+  color: var(--ft-fg-muted);
+}
+
+.file-tree__status--error {
+  color: var(--ft-accent-error);
+}
+
+/* ---- 树节点容器 ---- */
+.file-tree__body {
+  flex: 1;
+  overflow: auto;
+  padding: 4px 0;
+}
+
+/* ---- 单行节点 ---- */
+.file-tree__row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: var(--ft-row-padding-y) 8px var(--ft-row-padding-y) 12px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--ft-fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-tree__row--depth-0 { padding-left: 12px; }
+.file-tree__row--depth-1 { padding-left: 28px; }
+.file-tree__row--depth-2 { padding-left: 44px; }
+.file-tree__row--depth-3 { padding-left: 60px; }
+.file-tree__row--depth-4 { padding-left: 76px; }
+.file-tree__row--depth-5 { padding-left: 92px; }
+.file-tree__row--depth-6 { padding-left: 108px; }
+.file-tree__row--depth-7 { padding-left: 124px; }
+.file-tree__row--depth-8 { padding-left: 140px; }
+.file-tree__row--depth-9 { padding-left: 156px; }
+.file-tree__row--depth-10 { padding-left: 172px; }
+.file-tree__row--depth-11 { padding-left: 188px; }
+.file-tree__row--depth-12 { padding-left: 204px; }
+
+.file-tree__row:hover {
+  background: var(--ft-hover-bg);
+}
+
+.file-tree__row--selected {
+  background: var(--ft-selected-bg);
+  color: var(--ft-fg-emphasis);
+}
+
+.file-tree__row--selected:hover {
+  background: var(--ft-selected-bg);
+}
+
+.file-tree__chevron {
+  width: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ft-fg-muted);
+  flex: 0 0 12px;
+}
+
+.file-tree__icon {
+  flex: 0 0 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #c5c5c5;
+}
+
+.file-tree__row--selected .file-tree__icon {
+  color: var(--ft-fg-emphasis);
+}
+
+.file-tree__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- 新建文件 / 新建文件夹 inline 输入框 ---- */
+.file-tree__new-input {
+  flex: 1;
+  background: #3c3c3c;
+  border: 1px solid #007acc;
+  color: var(--ft-fg);
+  font-size: 13px;
+  padding: 1px 4px;
+  outline: none;
+  min-width: 0;
+}
+
+.file-tree__new-error {
+  color: var(--ft-accent-error);
+  font-size: 11px;
+  padding: 2px 12px 4px;
+}

@@ -1,39 +1,74 @@
 /**
- * 文件树组件
+ * 文件树组件（阶段 4 / S4-1 + S4-2 重构版）
  *
- * 显示当前活动 WorkspaceFolder 下的目录结构，支持展开/折叠目录、点击文件打开。
- * 顶部显示当前工作区与活动 folder；包含 Open Workspace / 切换 folder 入口。
+ * 改造目标：
+ *   1. 全部使用 Codicons inline SVG，移除旧文本图标。
+ *   2. 工具栏对齐 VSCode 顺序：[New File] [New Folder] [Refresh]，hover 标题行才显。
+ *   3. 抽出 inline style 到 fileTree.css，颜色 / 间距走 CSS 变量。
+ *   4. useEffect 依赖加 treeRevision，Open Workspace 后强制刷新。
+ *   5. 新建文件 / 新建文件夹采用 VSCode 风格 inline 输入：Enter 提交 / Esc 取消 / 失焦取消。
  *
- * Open Workspace 点击后默认弹出 WorkspaceOpenDialog（可视化选目录 / .code-workspace）；
- * Tauri 阶段可考虑切换为原生 plugin-dialog，但合同套接口不变：
- * 在 Web 上接入 server 的 /api/fs/browse 、在 Tauri 上可接入 invoke('pick_workspace_path')。
+ * 主体逻辑保留：
+ *   - getFileTree 走 runtimeAdapter 双轨；
+ *   - 由父组件传入 onFileSelect / selectedTabId；
+ *   - Open Workspace 入口由 uiStore 弹模态对话框承担。
  */
-import React, { useState, useEffect, useCallback } from 'react';
-import { getFileTree } from '../../services/runtimeAdapter';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  getFileTree,
+  createFile,
+  createFolder,
+} from '../../services/runtimeAdapter';
 import type { FileTreeNode } from '@deepcode/protocol';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useUiStore } from '../../state/uiStore';
+import {
+  ChevronRightIcon,
+  ChevronDownIcon,
+  FolderIcon,
+  FolderOpenIcon,
+  FileIcon,
+  RefreshIcon,
+  NewFileIcon,
+  NewFolderIcon,
+} from './icons';
+import './fileTree.css';
 
 interface FileTreeProps {
   onFileSelect: (filePath: string, folderId: string) => void;
   selectedTabId: string | null;
 }
 
+// 待新建条目类型；null 表示当前没有新建中的输入
+type PendingCreateKind = 'file' | 'folder';
+
+interface PendingCreate {
+  kind: PendingCreateKind;
+  /** 新建项相对 folder 根的父目录 POSIX 路径；空串表示 folder 根 */
+  parentPath: string;
+}
+
+function getDepthClass(depth: number): string {
+  return `file-tree__row--depth-${Math.max(0, Math.min(depth, 12))}`;
+}
+
 const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
   const workspace = useWorkspaceStore((s) => s.current);
   const fallbackUsed = useWorkspaceStore((s) => s.fallbackUsed);
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
+  const treeRevision = useWorkspaceStore((s) => s.treeRevision);
+  const bumpTreeRevision = useWorkspaceStore((s) => s.bumpTreeRevision);
   const selectFolder = useWorkspaceStore((s) => s.selectFolder);
   const showWorkspaceOpenDialog = useUiStore((s) => s.showWorkspaceOpenDialog);
-  // closeAllFileTabs / openWorkspace 调用迁移到 WorkspaceOpenDialog 内部，
-  // FileTree 仅负责发起对话框 + 刷新当前 folder 的目录。
 
   const [tree, setTree] = useState<FileTreeNode[]>([]);
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState<PendingCreate | null>(null);
+  const [pendingError, setPendingError] = useState<string | null>(null);
 
-  // ---- 加载目录树（按 activeFolderId） ----
+  // ---- 加载目录树（按 activeFolderId + treeRevision 触发） ----
   const loadTree = useCallback(async () => {
     if (!activeFolderId) {
       setTree([]);
@@ -50,14 +85,62 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
     setLoading(false);
   }, [activeFolderId]);
 
+  // 关键：依赖 [activeFolderId, treeRevision]，工作区切换或主动 bump 都会重拉
   useEffect(() => {
     loadTree();
-  }, [loadTree]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeFolderId, treeRevision]);
 
-  // ---- Open Workspace 入口（可视化对话框）----
+  // ---- Open Workspace 入口 ----
   const handleOpenWorkspace = () => {
     showWorkspaceOpenDialog();
   };
+
+  // ---- 工具栏：刷新 / 新建文件 / 新建文件夹 ----
+  const handleRefresh = () => {
+    bumpTreeRevision();
+  };
+
+  const startCreate = (kind: PendingCreateKind) => {
+    setPending({ kind, parentPath: '' });
+    setPendingError(null);
+  };
+
+  const cancelCreate = () => {
+    setPending(null);
+    setPendingError(null);
+  };
+
+  const submitCreate = useCallback(
+    async (name: string) => {
+      if (!pending || !activeFolderId) return;
+      const trimmed = name.trim();
+      if (!trimmed) {
+        cancelCreate();
+        return;
+      }
+      // 拼接完整相对路径；POSIX 风格
+      const target = pending.parentPath
+        ? `${pending.parentPath}/${trimmed}`
+        : trimmed;
+
+      const result =
+        pending.kind === 'file'
+          ? await createFile(target, '', activeFolderId)
+          : await createFolder(target, activeFolderId);
+
+      if (result.ok) {
+        setPending(null);
+        setPendingError(null);
+        bumpTreeRevision();
+      } else if (result.error === 'file_already_exists') {
+        setPendingError(`已存在：${trimmed}`);
+      } else {
+        setPendingError(result.message || '创建失败');
+      }
+    },
+    [pending, activeFolderId, bumpTreeRevision]
+  );
 
   const toggleDir = (dirPath: string) => {
     setExpandedDirs((prev) => {
@@ -83,30 +166,16 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
       return (
         <div key={node.path}>
           <div
+            className={`file-tree__row ${getDepthClass(depth)}`}
             onClick={() => toggleDir(node.path)}
-            style={{
-              padding: '3px 8px 3px 12px',
-              paddingLeft: 12 + depth * 16,
-              fontSize: 13,
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 4,
-              color: '#ccc',
-            }}
-            onMouseEnter={(e) => {
-              (e.currentTarget as HTMLElement).style.background =
-                'rgba(255,255,255,0.05)';
-            }}
-            onMouseLeave={(e) => {
-              (e.currentTarget as HTMLElement).style.background = 'transparent';
-            }}
           >
-            <span style={{ fontSize: 10, width: 12 }}>
-              {isExpanded ? '▼' : '▶'}
+            <span className="file-tree__chevron">
+              {isExpanded ? <ChevronDownIcon size={12} /> : <ChevronRightIcon size={12} />}
             </span>
-            <span>📁</span>
-            <span>{node.name}</span>
+            <span className="file-tree__icon">
+              {isExpanded ? <FolderOpenIcon /> : <FolderIcon />}
+            </span>
+            <span className="file-tree__name">{node.name}</span>
           </div>
           {isExpanded &&
             node.children?.map((child) => renderNode(child, depth + 1))}
@@ -114,131 +183,89 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
       );
     }
 
-    // 文件节点
     return (
       <div
         key={node.path}
+        className={
+          `file-tree__row ${getDepthClass(depth + 1)}` +
+          (isSelected ? ' file-tree__row--selected' : '')
+        }
         onClick={() => {
           if (activeFolderId) onFileSelect(node.path, activeFolderId);
         }}
-        style={{
-          padding: '3px 8px 3px 12px',
-          paddingLeft: 12 + (depth + 1) * 16,
-          fontSize: 13,
-          cursor: 'pointer',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 4,
-          background: isSelected ? 'rgba(0,122,204,0.3)' : 'transparent',
-          color: isSelected ? '#fff' : '#ccc',
-        }}
-        onMouseEnter={(e) => {
-          if (!isSelected) {
-            (e.currentTarget as HTMLElement).style.background =
-              'rgba(255,255,255,0.05)';
-          }
-        }}
-        onMouseLeave={(e) => {
-          if (!isSelected) {
-            (e.currentTarget as HTMLElement).style.background = 'transparent';
-          }
-        }}
       >
-        <span>📄</span>
-        <span>{node.name}</span>
+        <span className="file-tree__icon">
+          <FileIcon />
+        </span>
+        <span className="file-tree__name">{node.name}</span>
       </div>
     );
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      {/* ---- 顶部：Explorer + 工作区信息 + 操作 ---- */}
-      <div
-        style={{
-          padding: '8px 16px',
-          fontSize: 11,
-          fontWeight: 'bold',
-          textTransform: 'uppercase' as const,
-          letterSpacing: 0.5,
-          borderBottom: '1px solid #444',
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-        }}
-      >
+    <div className="file-tree">
+      {/* ---- 顶部：Explorer + 工具栏（hover 时显） ---- */}
+      <div className="file-tree__titlebar">
         <span>Explorer</span>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div className="file-tree__toolbar">
           <button
-            onClick={handleOpenWorkspace}
-            style={{
-              background: 'none',
-              border: '1px solid #555',
-              color: '#ccc',
-              cursor: 'pointer',
-              fontSize: 11,
-              padding: '1px 6px',
-              borderRadius: 3,
-              textTransform: 'none' as const,
-              letterSpacing: 0,
-              fontWeight: 'normal' as const,
-            }}
-            title="打开工作区（目录 或 .code-workspace）"
+            className="file-tree__toolbar-btn"
+            onClick={() => startCreate('file')}
+            disabled={!activeFolderId}
+            title="新建文件"
+            aria-label="新建文件"
           >
-            Open…
+            <NewFileIcon />
           </button>
           <button
-            onClick={loadTree}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: '#888',
-              cursor: 'pointer',
-              fontSize: 14,
-              padding: 0,
-            }}
-            title="刷新"
+            className="file-tree__toolbar-btn"
+            onClick={() => startCreate('folder')}
+            disabled={!activeFolderId}
+            title="新建文件夹"
+            aria-label="新建文件夹"
           >
-            🔄
+            <NewFolderIcon />
+          </button>
+          <button
+            className="file-tree__toolbar-btn"
+            onClick={handleRefresh}
+            disabled={!activeFolderId}
+            title="刷新文件树"
+            aria-label="刷新"
+          >
+            <RefreshIcon />
+          </button>
+          <button
+            className="file-tree__toolbar-btn"
+            onClick={handleOpenWorkspace}
+            title="打开工作区（目录或 .code-workspace）"
+            aria-label="打开工作区"
+          >
+            <FolderOpenIcon />
           </button>
         </div>
       </div>
 
       {/* ---- 工作区摘要 ---- */}
       {workspace && (
-        <div
-          style={{
-            padding: '6px 16px',
-            fontSize: 12,
-            color: '#aaa',
-            borderBottom: '1px solid #2c2c2c',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 2,
-          }}
-        >
+        <div className="file-tree__summary">
           <div>
-            <span style={{ color: '#888' }}>Workspace:</span>{' '}
-            <span style={{ color: '#ddd' }}>{workspace.name}</span>
-            <span style={{ color: '#666', marginLeft: 6 }}>
+            <span>Workspace:</span>{' '}
+            <span className="file-tree__summary-name">{workspace.name}</span>
+            <span className="file-tree__summary-source">
               [{workspace.source}]
             </span>
             {fallbackUsed && (
-              <span style={{ color: '#d19a66', marginLeft: 6 }}>fallback</span>
+              <span className="file-tree__summary-fallback">fallback</span>
             )}
           </div>
           {workspace.folders.length > 1 ? (
             <div>
-              <span style={{ color: '#888' }}>Folder:</span>{' '}
+              <span>Folder:</span>{' '}
               <select
+                className="file-tree__summary-folder-select"
                 value={activeFolderId ?? ''}
                 onChange={(e) => selectFolder(e.target.value)}
-                style={{
-                  background: '#1e1e1e',
-                  color: '#ddd',
-                  border: '1px solid #444',
-                  fontSize: 12,
-                  marginLeft: 4,
-                }}
               >
                 {workspace.folders.map((f) => (
                   <option key={f.id} value={f.id}>
@@ -249,24 +276,83 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
             </div>
           ) : workspace.folders.length === 1 ? (
             <div>
-              <span style={{ color: '#888' }}>Folder:</span>{' '}
-              <span style={{ color: '#ccc' }}>{workspace.folders[0].name}</span>
+              <span>Folder:</span>{' '}
+              <span className="file-tree__summary-name">
+                {workspace.folders[0].name}
+              </span>
             </div>
           ) : null}
         </div>
       )}
 
+      {/* ---- 内容区 ---- */}
       {loading && (
-        <div style={{ padding: 16, color: '#888', fontSize: 12 }}>加载中...</div>
+        <div className="file-tree__status file-tree__status--loading">加载中...</div>
       )}
       {error && (
-        <div style={{ padding: 16, color: '#f44', fontSize: 12 }}>{error}</div>
+        <div className="file-tree__status file-tree__status--error">{error}</div>
       )}
       {!loading && !error && (
-        <div style={{ flex: 1, overflow: 'auto', padding: '4px 0' }}>
+        <div className="file-tree__body">
+          {/* 新建文件 / 新建文件夹 inline 输入；置于树顶部 */}
+          {pending && (
+            <NewItemRow
+              kind={pending.kind}
+              onSubmit={submitCreate}
+              onCancel={cancelCreate}
+            />
+          )}
+          {pendingError && (
+            <div className="file-tree__new-error">{pendingError}</div>
+          )}
           {tree.map((node) => renderNode(node))}
         </div>
       )}
+    </div>
+  );
+};
+
+// ---- inline 输入子组件（VSCode 风格：Enter 提交 / Esc 取消 / 失焦取消）----
+
+interface NewItemRowProps {
+  kind: PendingCreateKind;
+  onSubmit: (name: string) => void;
+  onCancel: () => void;
+}
+
+const NewItemRow: React.FC<NewItemRowProps> = ({ kind, onSubmit, onCancel }) => {
+  const [value, setValue] = useState('');
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  return (
+    <div className={`file-tree__row ${getDepthClass(1)}`}>
+      <span className="file-tree__icon">
+        {kind === 'file' ? <FileIcon /> : <FolderIcon />}
+      </span>
+      <input
+        ref={inputRef}
+        className="file-tree__new-input"
+        value={value}
+        placeholder={kind === 'file' ? '文件名（可包含子路径，如 a/b.txt）' : '文件夹名'}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            onSubmit(value);
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            onCancel();
+          }
+        }}
+        onBlur={() => {
+          // 默认失焦取消（与 VSCode 一致；避免误提交）
+          onCancel();
+        }}
+      />
     </div>
   );
 };
