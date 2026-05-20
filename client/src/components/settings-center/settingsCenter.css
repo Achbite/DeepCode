@@ -140,3 +140,114 @@
 .settings-kv tr:last-child td {
   border-bottom: none;
 }
+
+/* ---- 表单字段 ---- */
+.settings-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.settings-field:last-child {
+  border-bottom: none;
+}
+
+.settings-field__title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.settings-field__label {
+  color: var(--text-highlight, #fff);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.settings-field__source {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 10px;
+  color: #aaa;
+}
+
+.settings-field__source--workspace {
+  color: #d7ba7d;
+  border-color: rgba(215, 186, 125, 0.45);
+}
+
+.settings-field__source--user {
+  color: #89d185;
+  border-color: rgba(137, 209, 133, 0.45);
+}
+
+.settings-field__key,
+.settings-field__description,
+.settings-field__default,
+.settings-card__hint {
+  color: #888;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-field__control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.settings-field__input,
+.settings-field__select {
+  width: 220px;
+  min-height: 28px;
+  background: #1f1f1f;
+  color: var(--text-main, #ccc);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.settings-field__checkbox {
+  width: 16px;
+  height: 16px;
+}
+
+.settings-field__reset,
+.settings-action-button {
+  min-height: 28px;
+  border: 1px solid var(--border-color, #444);
+  border-radius: 4px;
+  background: #2d2d2d;
+  color: var(--text-main, #ccc);
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.settings-field__reset:hover,
+.settings-action-button:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.settings-error {
+  margin-top: 10px;
+  color: #f48771;
+  font-size: 12px;
+}
+
+.settings-workspace-fields {
+  margin-top: 12px;
+}
+
+.settings-raw-details {
+  margin-top: 12px;
+  color: #aaa;
+  font-size: 12px;
+}
+

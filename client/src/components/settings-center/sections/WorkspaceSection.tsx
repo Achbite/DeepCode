@@ -7,12 +7,25 @@
 import React from 'react';
 import { useWorkspaceStore } from '../../../state/workspaceStore';
 import { useUiStore } from '../../../state/uiStore';
+import SettingsField from '../SettingsField';
+import {
+  SETTING_DEFINITIONS,
+  useSettingsStore,
+} from '../../../state/settingsStore';
+import type { UserSettingValue } from '@deepcode/protocol';
 
 const WorkspaceSection: React.FC = () => {
   const workspace = useWorkspaceStore((s) => s.current);
   const fallbackUsed = useWorkspaceStore((s) => s.fallbackUsed);
   const lastError = useWorkspaceStore((s) => s.lastError);
   const showWorkspaceOpenDialog = useUiStore((s) => s.showWorkspaceOpenDialog);
+  const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
+  const sources = useSettingsStore((s) => s.sources);
+  const patchWorkspaceSetting = useSettingsStore((s) => s.patchWorkspaceSetting);
+
+  const handleWorkspaceSettingChange = (key: string, value: UserSettingValue) => {
+    void patchWorkspaceSetting(key, value);
+  };
 
   const handleOpen = () => {
     showWorkspaceOpenDialog();
@@ -121,28 +134,38 @@ const WorkspaceSection: React.FC = () => {
 
       {/* ---- DeepCode 命名空间设置 ---- */}
       <div className="settings-card">
-        <h3 className="settings-card__title">DeepCode 设置（只读）</h3>
-        {Object.keys(workspace.settings).length === 0 ? (
-          <div className="settings-card__body">
-            尚未配置任何 <code>deepcode.*</code> 命名空间设置。
-          </div>
-        ) : (
-          <table className="settings-kv">
-            <tbody>
-              {Object.entries(workspace.settings).map(([k, v]) => (
-                <tr key={k}>
-                  <td>{k}</td>
-                  <td>
-                    <code>{JSON.stringify(v)}</code>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-        <div className="settings-card__body" style={{ marginTop: 6, color: '#888' }}>
-          仅 <code>deepcode.</code> 前缀键会被纳入；编辑能力将在后续阶段开放。
+        <h3 className="settings-card__title">DeepCode 工作区设置</h3>
+        <div className="settings-card__body">
+          当前只写入内存态 <code>deepcode.*</code> 设置，用于验证工作区覆盖优先级；后续阶段再决定是否落盘到 <code>.code-workspace</code>。
         </div>
+        <div className="settings-workspace-fields">
+          {SETTING_DEFINITIONS.map((definition) => (
+            <SettingsField
+              key={definition.key}
+              definition={definition}
+              value={effectiveSettings[definition.key]}
+              source={sources[definition.key] ?? 'default'}
+              onChange={handleWorkspaceSettingChange}
+            />
+          ))}
+        </div>
+        {Object.keys(workspace.settings).length > 0 && (
+          <details className="settings-raw-details">
+            <summary>查看 raw deepcode.* 设置</summary>
+            <table className="settings-kv">
+              <tbody>
+                {Object.entries(workspace.settings).map(([k, v]) => (
+                  <tr key={k}>
+                    <td>{k}</td>
+                    <td>
+                      <code>{JSON.stringify(v)}</code>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </details>
+        )}
       </div>
 
       {/* ---- 未支持字段 ---- */}

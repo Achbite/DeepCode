@@ -1,9 +1,16 @@
 /**
  * Common Settings 板块（Settings 中心）
  *
- * 仅展示项目运行时的关键只读信息；工作区相关字段已迁移到 Workspace 板块。
+ * 阶段 5：接入真实用户设置表单，并显示三层设置叠加后的来源。
  */
-import React from 'react';
+import React, { useMemo } from 'react';
+import SettingsField from '../SettingsField';
+import {
+  SETTING_DEFINITIONS,
+  useSettingsStore,
+  type SettingDefinition,
+} from '../../../state/settingsStore';
+import type { UserSettingValue } from '@deepcode/protocol';
 
 interface CommonSettingsSectionProps {
   serverVersion?: string;
@@ -11,11 +18,43 @@ interface CommonSettingsSectionProps {
   wsStatus: string;
 }
 
+function groupDefinitions(): Record<string, SettingDefinition[]> {
+  return SETTING_DEFINITIONS.reduce<Record<string, SettingDefinition[]>>(
+    (acc, item) => {
+      if (!acc[item.group]) acc[item.group] = [];
+      acc[item.group].push(item);
+      return acc;
+    },
+    {}
+  );
+}
+
+const GROUP_TITLES: Record<string, string> = {
+  editor: 'Editor',
+  files: 'Files',
+  explorer: 'Explorer',
+  workbench: 'Workbench',
+};
+
 const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
   serverVersion,
   apiStatus,
   wsStatus,
 }) => {
+  const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
+  const sources = useSettingsStore((s) => s.sources);
+  const loading = useSettingsStore((s) => s.loading);
+  const errorMessage = useSettingsStore((s) => s.errorMessage);
+  const storePath = useSettingsStore((s) => s.storePath);
+  const patchUserSetting = useSettingsStore((s) => s.patchUserSetting);
+  const resetUserSetting = useSettingsStore((s) => s.resetUserSetting);
+
+  const grouped = useMemo(() => groupDefinitions(), []);
+
+  const handleChange = (key: string, value: UserSettingValue) => {
+    void patchUserSetting(key, value);
+  };
+
   return (
     <div>
       <h2 className="settings-title">Common Settings</h2>
@@ -41,25 +80,37 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
               <td>{wsStatus}</td>
             </tr>
             <tr>
-              <td>默认服务端口</td>
-              <td>31245（环境变量 DEEPCODE_PORT 可覆盖）</td>
-            </tr>
-            <tr>
-              <td>当前活动工作区</td>
-              <td>详见 Workspace 板块</td>
+              <td>用户设置文件</td>
+              <td>{storePath ?? '尚未加载'}</td>
             </tr>
           </tbody>
         </table>
+        {errorMessage && (
+          <div className="settings-error">{errorMessage}</div>
+        )}
       </div>
 
-      <div className="settings-card">
-        <h3 className="settings-card__title">阶段说明</h3>
-        <p className="settings-card__body">
-          当前为阶段 2.5 工作区与 Tauri 集成里程碑：已落地 VSCode 兼容工作区
-          管理、Tauri 打包骨架；Skill / Prompt / Doctor / Ruler 的真实能力将在
-          后续阶段接入。所有"高级配置"统一收纳在本设置中心。
-        </p>
-      </div>
+      {Object.entries(grouped).map(([group, definitions]) => (
+        <div className="settings-card" key={group}>
+          <h3 className="settings-card__title">{GROUP_TITLES[group] ?? group}</h3>
+          <div className="settings-card__body">
+            {definitions.map((definition) => (
+              <SettingsField
+                key={definition.key}
+                definition={definition}
+                value={effectiveSettings[definition.key]}
+                source={sources[definition.key] ?? 'default'}
+                disabled={loading || sources[definition.key] === 'workspace'}
+                onChange={handleChange}
+                onReset={(key) => void resetUserSetting(key)}
+              />
+            ))}
+          </div>
+          <div className="settings-card__hint">
+            Workspace 来源的值由当前工作区覆盖，需到 Workspace 板块调整。
+          </div>
+        </div>
+      ))}
     </div>
   );
 };
