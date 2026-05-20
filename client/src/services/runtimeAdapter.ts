@@ -24,19 +24,24 @@ import type {
 
 export type RuntimeType = 'web' | 'tauri';
 
-let _runtime: RuntimeType | null = null;
-
 /**
  * 检测当前运行时类型。
- * Tauri v2 会在 window.__TAURI_INTERNALS__ 注入标识。
+ *
+ * Tauri v2 在 webview 启动时会注入两个全局：
+ *   - window.isTauri          : 官方稳定 API，由 @tauri-apps/api/core 的 isTauri() 检测
+ *   - window.__TAURI_INTERNALS__ : 内部 IPC 句柄，命名前缀带下划线属于实现细节
+ *
+ * 历史 bug：之前缓存第一次 getRuntimeType() 的结果，且只检查 __TAURI_INTERNALS__。
+ * release 模式下 React 首次 useEffect 触发的时机可能早于 webview-init.js 注入这个内部字段，
+ * 导致永久缓存为 'web'，所有 /api/* fetch 走出到 tauri.localhost/api/* 命中 ERR_CONNECTION_REFUSED 白屏。
+ *
+ * 修复：每次都重新读取（开销可忽略），同时优先用 window.isTauri 这个稳定字段。
  */
 export function getRuntimeType(): RuntimeType {
-  if (_runtime) return _runtime;
-  _runtime =
-    typeof window !== 'undefined' && !!(window as any).__TAURI_INTERNALS__
-      ? 'tauri'
-      : 'web';
-  return _runtime;
+  if (typeof window === 'undefined') return 'web';
+  const w = window as any;
+  if (w.isTauri || w.__TAURI_INTERNALS__ || w.__TAURI__) return 'tauri';
+  return 'web';
 }
 
 /** 运行时状态信息 */

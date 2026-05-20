@@ -3,6 +3,11 @@
 // Tauri 应用入口
 //
 // 注册所有 command 和 managed state，启动 Tauri 窗口。
+//
+// `windows_subsystem = "windows"` 仅在 release 编译时生效；让 PE 加载器把进程
+// 当作 GUI 子系统启动，不再分配控制台窗口（消除黑色 cmd 闪窗）。
+// debug 模式仍保留控制台便于查看 println! / panic 信息。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
 mod fs;
