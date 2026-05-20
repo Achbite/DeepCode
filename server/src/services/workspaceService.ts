@@ -122,8 +122,9 @@ function parseCodeWorkspaceFile(filePath: string): {
 function resolveFolders(
   rawFolders: Array<{ path: string; name?: string }>,
   baseDir: string
-): WorkspaceFolderSpec[] {
+): { folders: WorkspaceFolderSpec[]; warnings: string[] } {
   const result: WorkspaceFolderSpec[] = [];
+  const warnings: string[] = [];
   rawFolders.forEach((entry, idx) => {
     const original = entry.path;
     const absoluteRaw = isAbsolute(original)
@@ -131,17 +132,12 @@ function resolveFolders(
       : normalize(resolve(baseDir, original));
 
     if (!existsSync(absoluteRaw)) {
-      // 不存在：跳过该 folder，但保留警告
-      lastError =
-        (lastError ? `${lastError}\n` : '') +
-        `folder 路径不存在已忽略: ${original}`;
+      warnings.push(`folder 路径不存在已忽略: ${original}`);
       return;
     }
     const st = statSync(absoluteRaw);
     if (!st.isDirectory()) {
-      lastError =
-        (lastError ? `${lastError}\n` : '') +
-        `folder 路径不是目录已忽略: ${original}`;
+      warnings.push(`folder 路径不是目录已忽略: ${original}`);
       return;
     }
     const name = entry.name ?? basename(absoluteRaw);
@@ -153,7 +149,7 @@ function resolveFolders(
       isAbsolute: isAbsolute(original),
     });
   });
-  return result;
+  return { folders: result, warnings };
 }
 
 /** 构造一个目录型 WorkspaceSpec */
@@ -183,7 +179,12 @@ function buildDirectoryWorkspace(absoluteDir: string): WorkspaceSpec {
 function buildCodeWorkspace(filePath: string): WorkspaceSpec {
   const { folders, settings, unsupported } = parseCodeWorkspaceFile(filePath);
   const baseDir = dirname(filePath);
-  const resolved = resolveFolders(folders, baseDir);
+  const { folders: resolved, warnings } = resolveFolders(folders, baseDir);
+  // 把本次解析产生的 warnings 合并到模块级 lastError；
+  // 由调用方在解析前重置 lastError，避免跨 open 累积。
+  if (warnings.length > 0) {
+    lastError = warnings.join('\n');
+  }
   if (resolved.length === 0) {
     throw new Error('.code-workspace 中所有 folders 路径都无效，无法打开工作区');
   }

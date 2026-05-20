@@ -1,12 +1,10 @@
 /**
  * 文件操作服务
  *
- * 工作区模型升级版：
- *   - 不再依赖模块级 WORKSPACE_ROOT；改为按 folderId 在每次调用时解析根目录；
+ * 设计要点：
+ *   - 按 folderId 在每次调用时解析根目录；状态由 workspaceService 管理；
  *   - 路径安全：所有相对路径解析后必须落在 folder.absolutePath 之内；
- *   - 大文件 / 二进制 / 写入大小阈值与上版保持一致。
- *
- * 该文件不再持有任何"全局工作区"状态；状态由 workspaceService 管理。
+ *   - 大文件 / 二进制 / 写入大小阈值 / 目录树节点上限与 Tauri Rust 端 fs.rs 对齐。
  */
 import { readdir, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { join, resolve, normalize, relative, isAbsolute, sep } from 'node:path';
@@ -24,6 +22,12 @@ const READ_SIZE_LIMIT_BYTES = 1024 * 1024; // 1 MiB
 
 /** 写入大小阈值（防止前端误传超大内容） */
 const WRITE_SIZE_LIMIT_BYTES = 8 * 1024 * 1024; // 8 MiB
+
+/** 目录树最大递归深度；防止 monorepo 深目录把响应撑爆 */
+const MAX_TREE_DEPTH = 6;
+
+/** 目录树最大总节点数；超过即截断，避免一次性给前端 megabyte 级 JSON */
+const MAX_TREE_NODES = 5000;
 
 /** 默认排除的目录名（不递归进入） */
 const EXCLUDED_DIR_NAMES = new Set([
@@ -49,12 +53,19 @@ const EXCLUDED_DIR_NAMES = new Set([
  *
  * @param folderRoot folder 的绝对路径（POSIX 风格亦可，内部会再 normalize）
  * @param inputPath  相对 folder root 的 POSIX 路径
- * @throws 路径越界、绝对路径输入等情况抛出 Error
+ * @throws 路径越界、绝对路径输入、Windows 盘符前缀、含 NUL 字节等情况抛出 Error
  */
 function safePath(folderRoot: string, inputPath: string | undefined): string {
   const raw = inputPath ?? '';
+  if (raw.includes('\0')) {
+    throw new Error(`路径含非法字符: ${inputPath}`);
+  }
   if (isAbsolute(raw)) {
     throw new Error(`不允许使用绝对路径: ${inputPath}`);
+  }
+  // 顯式拒绝 Windows 盘符前缀（举例："C:foo"在 Windows 上会被 resolve 误作盘符相对路径）
+  if (/^[a-zA-Z]:/.test(raw)) {
+    throw new Error(`不允许使用含盘符前缀的路径: ${inputPath}`);
   }
   const root = normalize(folderRoot);
   const absolute = normalize(resolve(root, raw));
@@ -78,12 +89,12 @@ function toRelativePosix(folderRoot: string, absolutePath: string): string {
  *
  * @param folderId 目标 WorkspaceFolder id；省略使用首个 folder
  * @param relativePath 起始相对路径，默认为 folder 根
- * @param maxDepth 最大递归深度，默认 3
+ * @param maxDepth 最大递归深度，默认 6；上限为 MAX_TREE_DEPTH
  */
 export async function readDirectoryTree(
   folderId: string | undefined,
   relativePath?: string,
-  maxDepth: number = 3
+  maxDepth: number = MAX_TREE_DEPTH
 ): Promise<FileTreeNode[]> {
   const folder = resolveFolder(folderId);
   const folderRoot = folder.absolutePath;
@@ -92,15 +103,19 @@ export async function readDirectoryTree(
   await mkdir(folderRoot, { recursive: true });
 
   const targetPath = safePath(folderRoot, relativePath);
-  return readDirRecursive(folderRoot, targetPath, maxDepth);
+  // 节点计数器随递归传递；超过 MAX_TREE_NODES 即截断
+  const counter = { count: 0 };
+  return readDirRecursive(folderRoot, targetPath, Math.min(maxDepth, MAX_TREE_DEPTH), counter);
 }
 
 async function readDirRecursive(
   folderRoot: string,
   absolutePath: string,
-  depth: number
+  depth: number,
+  counter: { count: number }
 ): Promise<FileTreeNode[]> {
   if (depth <= 0) return [];
+  if (counter.count >= MAX_TREE_NODES) return [];
 
   const entries = await readdir(absolutePath, { withFileTypes: true });
   const nodes: FileTreeNode[] = [];
@@ -113,6 +128,7 @@ async function readDirRecursive(
   });
 
   for (const entry of sorted) {
+    if (counter.count >= MAX_TREE_NODES) break;
     if (entry.name.startsWith('.')) continue;
     if (entry.isDirectory() && EXCLUDED_DIR_NAMES.has(entry.name)) continue;
 
@@ -123,8 +139,10 @@ async function readDirRecursive(
       const children = await readDirRecursive(
         folderRoot,
         entryAbsolutePath,
-        depth - 1
+        depth - 1,
+        counter
       );
+      counter.count += 1;
       nodes.push({
         name: entry.name,
         path: entryRelativePath,
@@ -132,6 +150,7 @@ async function readDirRecursive(
         children,
       });
     } else if (entry.isFile()) {
+      counter.count += 1;
       nodes.push({
         name: entry.name,
         path: entryRelativePath,
