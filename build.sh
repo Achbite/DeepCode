@@ -255,6 +255,64 @@ WIN_LAUNCHER
 if [ "$BUILD_TAURI" = "1" ]; then
     echo "==[build][opt]== build tauri rust (linux + windows-gnu)"
     if [ -d "$TAURI_RUST_DIR" ]; then
+        # ---- 0. 准备 WebView2 Fixed Runtime（仅 Windows 目标需要）----
+        # tauri.conf.json 配置了 webviewInstallMode.type=fixedRuntime，
+        # 必须在 src-tauri/ 下放置 Microsoft 官方 Fixed Version Runtime 解压目录，
+        # 否则 cargo tauri bundle / cargo build 都会报 "fixed runtime path does not exist"。
+        #
+        # 下载源选型：
+        #   - Microsoft 官方 https://msedge.sf.dl.delivery.mp.microsoft.com/... 有版本号化的 cab，
+        #     但仅最新若干版本保留，旧版本 404；URL 也无公开稳定列表。
+        #   - westinyang/WebView2RuntimeArchive 是社区维护的 GitHub Release 镜像，长期保留旧版本，
+        #     直接通过 release tag 拉取，URL 稳定且 CDN 命中率高（GitHub release-assets）。
+        #
+        # 策略：
+        #   - 把 cab 缓存到宿主可见的 .build-cache/webview2/，避免重复下载（约 130MB）
+        #   - 解包目标目录名必须与 tauri.conf.json 的 path 字段一致：
+        #     Microsoft.WebView2.FixedVersionRuntime.x64
+        #   - 版本固定，可通过 WEBVIEW2_VER 环境变量覆盖。运行期不会再"被偷偷自动更新"，
+        #     与"应用自包含运行依赖"的产品诉求一致（VSCode 形态：Chromium 与系统 Edge 解耦）。
+        WEBVIEW2_VER="${WEBVIEW2_VER:-130.0.2849.80}"
+        WEBVIEW2_CACHE_DIR="$ROOT_DIR/.build-cache/webview2"
+        WEBVIEW2_CAB="$WEBVIEW2_CACHE_DIR/Microsoft.WebView2.FixedVersionRuntime.${WEBVIEW2_VER}.x64.cab"
+        WEBVIEW2_RUNTIME_DIR_NAME="Microsoft.WebView2.FixedVersionRuntime.x64"
+        WEBVIEW2_RUNTIME_DIR="$TAURI_RUST_DIR/$WEBVIEW2_RUNTIME_DIR_NAME"
+
+        mkdir -p "$WEBVIEW2_CACHE_DIR"
+
+        if [ ! -f "$WEBVIEW2_CAB" ]; then
+            echo "==[build][webview2]== 缓存未命中，下载 WebView2 Fixed Runtime ${WEBVIEW2_VER} (~130MB)"
+            WEBVIEW2_URL="https://github.com/westinyang/WebView2RuntimeArchive/releases/download/${WEBVIEW2_VER}/Microsoft.WebView2.FixedVersionRuntime.${WEBVIEW2_VER}.x64.cab"
+            curl -fL --retry 3 --retry-delay 2 -o "$WEBVIEW2_CAB.tmp" "$WEBVIEW2_URL"
+            mv "$WEBVIEW2_CAB.tmp" "$WEBVIEW2_CAB"
+            echo "==[build][webview2]== 下载完成: $WEBVIEW2_CAB ($(du -h "$WEBVIEW2_CAB" | cut -f1))"
+        else
+            echo "==[build][webview2]== 命中缓存: $WEBVIEW2_CAB"
+        fi
+
+        # 解包 cab → src-tauri/Microsoft.WebView2.FixedVersionRuntime.x64/
+        # cabextract 默认会保留 cab 内顶层目录，Microsoft 官方 cab 顶层名形如
+        # "Microsoft.WebView2.FixedVersionRuntime.130.0.2849.80.x64"，需要重命名成
+        # tauri.conf.json 中的稳定 path（不带版本号），便于版本升级时只改 WEBVIEW2_VER。
+        if [ ! -f "$WEBVIEW2_RUNTIME_DIR/msedgewebview2.exe" ]; then
+            rm -rf "$WEBVIEW2_RUNTIME_DIR"
+            EXTRACT_TMP="$WEBVIEW2_CACHE_DIR/extract-${WEBVIEW2_VER}"
+            rm -rf "$EXTRACT_TMP" && mkdir -p "$EXTRACT_TMP"
+            echo "==[build][webview2]== 解包 cab → $EXTRACT_TMP"
+            cabextract -q -d "$EXTRACT_TMP" "$WEBVIEW2_CAB"
+            # cab 顶层目录名包含完整版本号；直接 mv 成稳定名
+            INNER_DIR=$(find "$EXTRACT_TMP" -maxdepth 1 -mindepth 1 -type d | head -1)
+            if [ -z "$INNER_DIR" ]; then
+                echo "==[build][webview2][error]== cab 解包后未找到顶层目录" >&2
+                exit 1
+            fi
+            mv "$INNER_DIR" "$WEBVIEW2_RUNTIME_DIR"
+            rm -rf "$EXTRACT_TMP"
+            echo "==[build][webview2]== Runtime 已就绪: $WEBVIEW2_RUNTIME_DIR ($(du -sh "$WEBVIEW2_RUNTIME_DIR" | cut -f1))"
+        else
+            echo "==[build][webview2]== Runtime 已存在: $WEBVIEW2_RUNTIME_DIR"
+        fi
+
         # 1) Linux 原生：cargo build 已足够（Linux 桌面不依赖 NSIS / 不分发 installer）
         ( cd "$TAURI_RUST_DIR" && cargo build --release --target x86_64-unknown-linux-gnu )
         cp -v "$TAURI_RUST_DIR/target/x86_64-unknown-linux-gnu/release/deepcode" "$LINUX_DIR/deepcode"
@@ -275,6 +333,19 @@ if [ "$BUILD_TAURI" = "1" ]; then
             fi
         else
             echo "==[build][warn]== NSIS bundle 在 cross 环境下生成失败；保留 deepcode.exe + WebView2Loader.dll 作为 portable 形态"
+        fi
+
+        # 4) 拷贝 WebView2 Fixed Runtime 到便携目录，让用户解压 win-x64/ 后无需额外依赖即可双击启动
+        # 注意：
+        #   - cross-bundler 构建的 NSIS *-setup.exe 在 Linux→Windows-GNU 路径下不会嵌入 fixedRuntime
+        #     （Tauri 资源 bundler 在 cross 模式下能力不全），所以也把 Runtime 显式放进 win-x64/，
+        #     setup.exe 安装到目标机器后，再通过 install 后处理脚本拷贝过去（暂时由便携同目录承担）
+        #   - 解压目录名与 tauri.conf.json 的 webviewInstallMode.path 一致：
+        #     "./Microsoft.WebView2.FixedVersionRuntime.x64/" → 同名拷贝到 deepcode.exe 边上即可
+        if [ -d "$WEBVIEW2_RUNTIME_DIR" ]; then
+            echo "==[build][opt]== copy WebView2 Fixed Runtime to win-x64/ for portable distribution"
+            cp -r "$WEBVIEW2_RUNTIME_DIR" "$WIN_DIR/$WEBVIEW2_RUNTIME_DIR_NAME"
+            echo "==[build][opt]== Portable Runtime size: $(du -sh "$WIN_DIR/$WEBVIEW2_RUNTIME_DIR_NAME" | cut -f1)"
         fi
 
         # Tauri 模式：清理 Web 模式残留（前端已嵌入二进制，server/start.* 不再需要）
@@ -309,17 +380,16 @@ DeepCode for Windows
 推荐安装方式（如果存在 *-setup.exe）:
   双击 DeepCode_<version>_x64-setup.exe 走标准安装流程；
   会让你选目标目录（例如 D:\DeepCode），并在开始菜单注册快捷方式。
-  安装器会自动检测并补装 Microsoft Edge WebView2 Runtime。
+  安装目录形态接近 VSCode：exe + WebView2 完整运行时（EBWebView/）+ 资源。
 
 便携启动方式（portable，免安装）:
-  保持 deepcode.exe 与 WebView2Loader.dll 同目录，双击 deepcode.exe。
-  整个 win-x64/ 目录视为一个分发单元；压缩或分发时不可遗漏 dll。
+  保持 deepcode.exe + WebView2Loader.dll + EBWebView/ 同目录，双击 deepcode.exe。
+  整个 win-x64/ 目录视为一个分发单元；压缩或分发时不可遗漏 dll 与 EBWebView/ 整个目录。
 
 系统要求:
   - Windows 10 1803 或 Windows 11
-  - Microsoft Edge WebView2 Runtime（Win11 预装；Win10 通常已随 Edge 安装）
-  - 如启动后窗口空白，从 https://developer.microsoft.com/microsoft-edge/webview2/
-    下载并安装 Evergreen Bootstrapper
+  - 不依赖系统 Edge / WebView2 Runtime，应用自带固定版本 Chromium 内核
+    (与 VSCode/Electron 模型一致，即"应用自包含全部渲染依赖")
 WIN_README
     else
         echo "==[build][warn]== tauri/src-tauri 不存在，跳过 Rust 构建"
@@ -330,7 +400,17 @@ fi
 echo ""
 echo "==[build]== DONE. 产物清单："
 echo "----------------------------------------"
-( cd "$BIN_DIR" && find . -maxdepth 3 -type f | sort )
+( cd "$BIN_DIR" && find . -maxdepth 2 -mindepth 1 \
+    \( -type f -o \( -type d -name 'Microsoft.WebView2.*' \) \) \
+    | sort | while read -r p; do
+        if [ -d "$BIN_DIR/$p" ]; then
+            sz=$(du -sh "$BIN_DIR/$p" 2>/dev/null | cut -f1)
+            echo "  $p/   ($sz, dir)"
+        else
+            sz=$(du -h "$BIN_DIR/$p" 2>/dev/null | cut -f1)
+            echo "  $p   ($sz)"
+        fi
+    done )
 echo "----------------------------------------"
 if [ "$BUILD_TAURI" = "1" ]; then
     echo "Linux/WSL 用户:  ./bin/linux-x64/deepcode  (双击或命令行直接运行)"

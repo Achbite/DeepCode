@@ -12,6 +12,11 @@ node_modules/
 .build-cache/
 .pnpm-store/
 
+# ---- WebView2 Fixed Runtime（仅构建期下载，不入库；547MB）----
+# build.sh 在 BUILD_TAURI=1 时自动下载到 src-tauri/Microsoft.WebView2.FixedVersionRuntime.x64/
+# .build-cache/webview2/ 已被上面规则覆盖
+**/Microsoft.WebView2.FixedVersionRuntime*/
+
 # ---- 本地可执行打包产物 ----
 # bin/ 用于输出 Tauri 等本地打包结果；二进制产物不入库
 bin/*

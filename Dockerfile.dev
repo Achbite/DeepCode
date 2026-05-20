@@ -24,6 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # - Tauri Linux 运行时依赖：webkit2gtk-4.1 / libsoup-3.0 / librsvg / patchelf / ayatana-appindicator
 # - Windows 交叉编译：gcc-mingw-w64-x86-64 + binutils-mingw-w64
 # - Tauri NSIS bundler：nsis + nsis-pluginapi（Tauri 在 Linux→Windows-GNU cross 路径下产 *-setup.exe 必须）
+# - WebView2 Fixed Runtime 解包：cabextract（Microsoft 官方分发 *.cab 形态，需要解压成 EBWebView/ 目录树供 Tauri 嵌入）
 # - 健康检查辅助：iputils-ping / netcat-openbsd / jq
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl wget ca-certificates git \
@@ -33,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libayatana-appindicator3-dev librsvg2-dev patchelf \
         gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
         nsis nsis-pluginapi \
+        cabextract \
         iputils-ping netcat-openbsd jq xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
