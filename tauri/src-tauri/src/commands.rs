@@ -13,6 +13,7 @@ use tauri_plugin_dialog::DialogExt;
 use thiserror::Error;
 
 use crate::fs;
+use crate::user_settings;
 use crate::workspace;
 
 // ---- 错误模型 ----
@@ -83,6 +84,17 @@ pub fn open_workspace(
         .map_err(CommandError::Other)
 }
 
+/// 合并当前工作区 DeepCode 命名空间设置（内存态）
+#[tauri::command]
+pub fn patch_workspace_settings(
+    settings: serde_json::Value,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<workspace::PatchWorkspaceSettingsResult, CommandError> {
+    state
+        .patch_workspace_settings(settings)
+        .map_err(CommandError::Other)
+}
+
 // ---- 文件系统浏览（用于 Open Workspace 对话框）----
 
 /// 获取初始位置（Home / Drives）
@@ -136,6 +148,34 @@ pub fn write_text_file(
         .get_folder_abs_path(&folder_id)
         .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
     fs::write_text_file(&folder_root, &folder_id, &path, &content).map_err(CommandError::Other)
+}
+
+/// 新建文件（阶段 4 / S4-1）
+#[tauri::command]
+pub fn create_file(
+    folder_id: String,
+    path: String,
+    content: Option<String>,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<fs::FileWriteResult, CommandError> {
+    let folder_root = state
+        .get_folder_abs_path(&folder_id)
+        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
+    let initial = content.unwrap_or_default();
+    fs::create_file(&folder_root, &folder_id, &path, &initial).map_err(CommandError::Other)
+}
+
+/// 新建目录（阶段 4 / S4-1）
+#[tauri::command]
+pub fn create_folder(
+    folder_id: String,
+    path: String,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<fs::CreateFolderResult, CommandError> {
+    let folder_root = state
+        .get_folder_abs_path(&folder_id)
+        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
+    fs::create_folder(&folder_root, &folder_id, &path).map_err(CommandError::Other)
 }
 
 // ---- 原生对话框 ----
@@ -228,4 +268,20 @@ pub fn skill_invoke_stub(_payload: SkillInvokePayload) -> Result<SkillInvokeResu
     Err(CommandError::NotImplemented(
         "skill_invoke 接口尚未接入；当前为骨架阶段".into(),
     ))
+}
+
+// ---- 用户设置（阶段 4 / S4-4）----
+
+/// 获取当前用户设置（默认值 + 用户覆盖）
+#[tauri::command]
+pub fn get_user_settings() -> user_settings::GetUserSettingsResult {
+    user_settings::get_user_settings()
+}
+
+/// 浅合并用户设置；patches 中显式 null = 恢复默认值
+#[tauri::command]
+pub fn patch_user_settings(
+    patches: std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<user_settings::PatchUserSettingsResult, CommandError> {
+    user_settings::patch_user_settings(patches).map_err(CommandError::Other)
 }

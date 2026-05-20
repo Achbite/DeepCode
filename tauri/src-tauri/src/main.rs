@@ -11,6 +11,7 @@
 
 mod commands;
 mod fs;
+mod user_settings;
 mod workspace;
 
 fn main() {
@@ -24,6 +25,7 @@ fn main() {
             // 工作区
             commands::get_current_workspace,
             commands::open_workspace,
+            commands::patch_workspace_settings,
             // 文件系统浏览
             commands::get_initial_locations,
             commands::browse_path,
@@ -31,9 +33,14 @@ fn main() {
             commands::list_file_tree,
             commands::read_text_file,
             commands::write_text_file,
+            commands::create_file,
+            commands::create_folder,
             // 原生对话框
             commands::pick_workspace_directory,
             commands::pick_workspace_file,
+            // 用户设置
+            commands::get_user_settings,
+            commands::patch_user_settings,
             // Stub
             commands::llm_invoke_stub,
             commands::skill_invoke_stub,

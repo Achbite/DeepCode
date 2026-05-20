@@ -43,6 +43,15 @@ pub struct FileWriteResult {
     pub size_bytes: u64,
 }
 
+/// 新建目录结果（阶段 4 / S4-1）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateFolderResult {
+    pub folder_id: String,
+    pub path: String,
+    pub created: bool,
+}
+
 /// 浏览条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,11 +92,11 @@ pub struct InitialLocations {
 
 // ---- 常量 ----
 
-/// 文本文件大小阈值（1MB）；超过此大小视为大文件，读取但标记
-const TEXT_FILE_SIZE_LIMIT: u64 = 1 * 1024 * 1024;
+/// 文本文件大小阈值（16 MiB）；超过此大小返回只读提示，不灌入编辑器
+const TEXT_FILE_SIZE_LIMIT: u64 = 16 * 1024 * 1024;
 
-/// 写入文件大小限制（8MB），与 Node 端 fileService 对齐
-const WRITE_SIZE_LIMIT: u64 = 8 * 1024 * 1024;
+/// 写入文件大小限制（16 MiB），与 Node 端 fileService 对齐
+const WRITE_SIZE_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// 二进制嗅探：前 8KB 中出现 NUL 字节则认定为二进制
 const BINARY_SNIFF_SIZE: usize = 8192;
@@ -215,7 +224,7 @@ fn visit_dir(
 
 /// 读取工作区内文本文件
 ///
-/// 与 Node 端 fileService.readFileContent 行为对齐：超过 1 MiB 阈值返回提示文本而非内容；
+/// 与 Node 端 fileService.readFileContent 行为对齐：超过 16 MiB 阈值返回提示文本而非内容；
 /// 二进制文件 content 留空并设置 binary=true。
 pub fn read_text_file(
     folder_root: &str,
@@ -302,6 +311,91 @@ pub fn write_text_file(
         path: relative_path.into(),
         saved: true,
         size_bytes,
+    })
+}
+
+// ---- 新建文件 / 新建目录（阶段 4 / S4-1）----
+
+/// 新建文件
+///
+/// 与 VSCode 一致：路径已存在不覆盖，返回 file_already_exists 错误。
+/// 父目录不存在时递归创建。
+pub fn create_file(
+    folder_root: &str,
+    folder_id: &str,
+    relative_path: &str,
+    initial_content: &str,
+) -> Result<FileWriteResult, String> {
+    if relative_path.trim().is_empty() {
+        return Err("路径不能为空".into());
+    }
+
+    let content_bytes = initial_content.len() as u64;
+    if content_bytes > WRITE_SIZE_LIMIT {
+        return Err(format!(
+            "写入内容过大（{} 字节，阈值 {} 字节）",
+            content_bytes, WRITE_SIZE_LIMIT
+        ));
+    }
+
+    let full_path = resolve_and_validate(folder_root, relative_path)?;
+
+    if full_path.exists() {
+        return Err(format!("file_already_exists: {}", relative_path));
+    }
+
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("创建父目录失败: {}", e))?;
+    }
+
+    fs::write(&full_path, initial_content)
+        .map_err(|e| format!("写入文件失败: {}", e))?;
+
+    let size_bytes = fs::metadata(&full_path)
+        .map(|m| m.len())
+        .unwrap_or(content_bytes);
+
+    Ok(FileWriteResult {
+        folder_id: folder_id.into(),
+        path: relative_path.into(),
+        saved: true,
+        size_bytes,
+    })
+}
+
+/// 新建目录（递归创建中间目录）
+///
+/// 路径已存在为目录时返回 created=false 不报错；路径已存在为文件时报 file_already_exists。
+pub fn create_folder(
+    folder_root: &str,
+    folder_id: &str,
+    relative_path: &str,
+) -> Result<CreateFolderResult, String> {
+    if relative_path.trim().is_empty() {
+        return Err("路径不能为空".into());
+    }
+
+    let full_path = resolve_and_validate(folder_root, relative_path)?;
+
+    let mut created = true;
+    if full_path.exists() {
+        let meta = fs::metadata(&full_path)
+            .map_err(|e| format!("读取元数据失败: {}", e))?;
+        if meta.is_file() {
+            return Err(format!("file_already_exists: {}", relative_path));
+        }
+        // 已存在为目录：mkdir recursive 幂等，标记 created=false
+        created = false;
+    }
+
+    fs::create_dir_all(&full_path)
+        .map_err(|e| format!("创建目录失败: {}", e))?;
+
+    Ok(CreateFolderResult {
+        folder_id: folder_id.into(),
+        path: relative_path.into(),
+        created,
     })
 }
 

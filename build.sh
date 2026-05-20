@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ====================================================================
-# DeepCode 容器内构建脚本（根目录版本，进容器后直接 ./build.sh）
+# DeepCode 容器内构建脚本（根目录版本，进容器后直接 ./build.sh  BUILD_TAURI=1 ./build.sh）
 # 职责：编译并输出双平台产物到 ./bin/
 #   - bin/linux-x64/   Linux 桌面便携产物（Tauri 模式：deepcode；Web 模式：deepcode-server + start.sh + web/）
-#   - bin/win-x64/     Windows 桌面便携产物（Tauri 模式：deepcode.exe + WebView2Loader.dll + Runtime；
-#                                            Web 模式：deepcode-server.exe + start.bat + web/）
+#   - bin/win-x64/     Windows 桌面便携产物（Tauri 模式：deepcode.exe + WebView2Loader.dll；
+#                      Web 模式：deepcode-server.exe + start.bat + web/）
 #   - bin/installers/  一次性 GUI 安装包（Tauri 模式：DeepCode_*_x64-setup.exe）
 #
 # 设计要点：
@@ -24,7 +24,7 @@ export PATH="/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/l
 # ---- 路径与常量 ----
 # 产物目录布局对标 VSCode 风格：可执行产物（用户直接拿来跑的目录）与安装器（一次性安装包）分开放。
 #   bin/linux-x64/  Linux 桌面便携产物（直接 ./deepcode）
-#   bin/win-x64/    Windows 桌面便携产物（exe + dll + WebView2 Runtime 同目录，类 VSCode 安装目录形态）
+#   bin/win-x64/    Windows 桌面便携产物（exe + dll 两件主体，依赖系统 WebView2 Runtime）
 #   bin/installers/ 一次性 setup 安装包（NSIS *-setup.exe 等）
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$ROOT_DIR/bin"
@@ -263,63 +263,16 @@ WIN_LAUNCHER
 if [ "$BUILD_TAURI" = "1" ]; then
     echo "==[build][opt]== build tauri rust (linux + windows-gnu)"
     if [ -d "$TAURI_RUST_DIR" ]; then
-        # ---- 0. 准备 WebView2 Fixed Runtime（仅 Windows 目标需要）----
-        # tauri.conf.json 配置了 webviewInstallMode.type=fixedRuntime，
-        # 必须在 src-tauri/ 下放置 Microsoft 官方 Fixed Version Runtime 解压目录，
-        # 否则 cargo tauri bundle / cargo build 都会报 "fixed runtime path does not exist"。
-        #
-        # 下载源选型：
-        #   - Microsoft 官方 https://msedge.sf.dl.delivery.mp.microsoft.com/... 有版本号化的 cab，
-        #     但仅最新若干版本保留，旧版本 404；URL 也无公开稳定列表。
-        #   - westinyang/WebView2RuntimeArchive 是社区维护的 GitHub Release 镜像，长期保留旧版本，
-        #     直接通过 release tag 拉取，URL 稳定且 CDN 命中率高（GitHub release-assets）。
-        #
-        # 策略：
-        #   - 把 cab 缓存到宿主可见的 .build-cache/webview2/，避免重复下载（约 130MB）
-        #   - 解包目标目录名必须与 tauri.conf.json 的 path 字段一致：
-        #     Microsoft.WebView2.FixedVersionRuntime.x64
-        #   - 版本固定，可通过 WEBVIEW2_VER 环境变量覆盖。运行期不会再"被偷偷自动更新"，
-        #     与"应用自包含运行依赖"的产品诉求一致（VSCode 形态：Chromium 与系统 Edge 解耦）。
-        WEBVIEW2_VER="${WEBVIEW2_VER:-130.0.2849.80}"
-        WEBVIEW2_CACHE_DIR="$ROOT_DIR/.build-cache/webview2"
-        WEBVIEW2_CAB="$WEBVIEW2_CACHE_DIR/Microsoft.WebView2.FixedVersionRuntime.${WEBVIEW2_VER}.x64.cab"
-        WEBVIEW2_RUNTIME_DIR_NAME="Microsoft.WebView2.FixedVersionRuntime.x64"
-        WEBVIEW2_RUNTIME_DIR="$TAURI_RUST_DIR/$WEBVIEW2_RUNTIME_DIR_NAME"
-
-        mkdir -p "$WEBVIEW2_CACHE_DIR"
-
-        if [ ! -f "$WEBVIEW2_CAB" ]; then
-            echo "==[build][webview2]== 缓存未命中，下载 WebView2 Fixed Runtime ${WEBVIEW2_VER} (~130MB)"
-            WEBVIEW2_URL="https://github.com/westinyang/WebView2RuntimeArchive/releases/download/${WEBVIEW2_VER}/Microsoft.WebView2.FixedVersionRuntime.${WEBVIEW2_VER}.x64.cab"
-            curl -fL --retry 3 --retry-delay 2 -o "$WEBVIEW2_CAB.tmp" "$WEBVIEW2_URL"
-            mv "$WEBVIEW2_CAB.tmp" "$WEBVIEW2_CAB"
-            echo "==[build][webview2]== 下载完成: $WEBVIEW2_CAB ($(du -h "$WEBVIEW2_CAB" | cut -f1))"
-        else
-            echo "==[build][webview2]== 命中缓存: $WEBVIEW2_CAB"
-        fi
-
-        # 解包 cab → src-tauri/Microsoft.WebView2.FixedVersionRuntime.x64/
-        # cabextract 默认会保留 cab 内顶层目录，Microsoft 官方 cab 顶层名形如
-        # "Microsoft.WebView2.FixedVersionRuntime.130.0.2849.80.x64"，需要重命名成
-        # tauri.conf.json 中的稳定 path（不带版本号），便于版本升级时只改 WEBVIEW2_VER。
-        if [ ! -f "$WEBVIEW2_RUNTIME_DIR/msedgewebview2.exe" ]; then
-            rm -rf "$WEBVIEW2_RUNTIME_DIR"
-            EXTRACT_TMP="$WEBVIEW2_CACHE_DIR/extract-${WEBVIEW2_VER}"
-            rm -rf "$EXTRACT_TMP" && mkdir -p "$EXTRACT_TMP"
-            echo "==[build][webview2]== 解包 cab → $EXTRACT_TMP"
-            cabextract -q -d "$EXTRACT_TMP" "$WEBVIEW2_CAB"
-            # cab 顶层目录名包含完整版本号；直接 mv 成稳定名
-            INNER_DIR=$(find "$EXTRACT_TMP" -maxdepth 1 -mindepth 1 -type d | head -1)
-            if [ -z "$INNER_DIR" ]; then
-                echo "==[build][webview2][error]== cab 解包后未找到顶层目录" >&2
-                exit 1
-            fi
-            mv "$INNER_DIR" "$WEBVIEW2_RUNTIME_DIR"
-            rm -rf "$EXTRACT_TMP"
-            echo "==[build][webview2]== Runtime 已就绪: $WEBVIEW2_RUNTIME_DIR ($(du -sh "$WEBVIEW2_RUNTIME_DIR" | cut -f1))"
-        else
-            echo "==[build][webview2]== Runtime 已存在: $WEBVIEW2_RUNTIME_DIR"
-        fi
+        # ---- 0. WebView2 依赖说明（embedBootstrapper 模式）----
+        # tauri.conf.json 配置 webviewInstallMode.type=embedBootstrapper：
+        #   - 不在打包产物中嵌入 547MB Fixed Runtime。
+        #   - Tauri 会在 NSIS 安装包中嵌入 ~1.8MB 官方 Bootstrapper（MicrosoftEdgeWebview2Setup.exe）。
+        #   - 用户首次运行 setup.exe 时，Bootstrapper 检测系统是否已有运行时：
+        #       · 已有（Win11 / 已装 Edge 的 Win10）→ 跳过；
+        #       · 未安装 → 联网从微软下载安装（首次 ≈130MB，后续复用）。
+        # 最终用户机器上 DeepCode 安装目录仅含 deepcode.exe + WebView2Loader.dll（~22MB），
+        # 类 VSCode "exe + dll + 资源文件"的轻量分发形态。
+        echo "==[build][webview2]== webviewInstallMode=embedBootstrapper；不下载 / 嵌入 547M Fixed Runtime"
 
         # 1) Linux 原生：cargo tauri build --no-bundle
         # 关键：必须用 cargo tauri build 而非裸 cargo build，原因是 Tauri CLI 会自动注入
@@ -346,18 +299,10 @@ if [ "$BUILD_TAURI" = "1" ]; then
             echo "==[build][warn]== NSIS bundle 输出目录不存在；可能 cross 环境失败，便携形态仍可用"
         fi
 
-        # 4) 拷贝 WebView2 Fixed Runtime 到便携目录，让用户解压 win-x64/ 后无需额外依赖即可双击启动
-        # 注意：
-        #   - cross-bundler 构建的 NSIS *-setup.exe 在 Linux→Windows-GNU 路径下不会嵌入 fixedRuntime
-        #     （Tauri 资源 bundler 在 cross 模式下能力不全），所以也把 Runtime 显式放进 win-x64/，
-        #     setup.exe 安装到目标机器后，再通过 install 后处理脚本拷贝过去（暂时由便携同目录承担）
-        #   - 解压目录名与 tauri.conf.json 的 webviewInstallMode.path 一致：
-        #     "./Microsoft.WebView2.FixedVersionRuntime.x64/" → 同名拷贝到 deepcode.exe 边上即可
-        if [ -d "$WEBVIEW2_RUNTIME_DIR" ]; then
-            echo "==[build][opt]== copy WebView2 Fixed Runtime to win-x64/ for portable distribution"
-            cp -r "$WEBVIEW2_RUNTIME_DIR" "$WIN_DIR/$WEBVIEW2_RUNTIME_DIR_NAME"
-            echo "==[build][opt]== Portable Runtime size: $(du -sh "$WIN_DIR/$WEBVIEW2_RUNTIME_DIR_NAME" | cut -f1)"
-        fi
+        # 4) Tauri 模式下便携产物仅包含 deepcode.exe + WebView2Loader.dll
+        #    【已切换为 embedBootstrapper】不再拷贝 547MB Fixed Runtime。
+        #    便携用户需确保本机已安装 WebView2 Runtime（Win11 默认自带；老版 Win10 可
+        #    走安装版 setup.exe 自动拉 Bootstrapper）。
 
         # Tauri 模式：清理 Web 模式残留（前端已嵌入二进制，server/start.* 不再需要）
         rm -f  "$LINUX_DIR/deepcode-server" "$LINUX_DIR/start.sh"
@@ -390,7 +335,7 @@ DeepCode 安装包目录
 ==================
 
 本目录存放标准 GUI 安装器（一次性使用）：
-  DeepCode_<version>_x64-setup.exe   Windows NSIS 安装器（自带 WebView2 Fixed Runtime）
+  DeepCode_<version>_x64-setup.exe   Windows NSIS 安装器（嵌入 ~1.8MB Bootstrapper，首次安装时检测 / 下载 WebView2 Runtime）
 
 与便携产物的关系：
   - 便携形态： ../win-x64/        解压即用，不写注册表，不创建快捷方式
@@ -405,26 +350,24 @@ INSTALLERS_README
 DeepCode for Windows
 ====================
 
-本目录是 Windows 桌面便携产物（与 VSCode 安装目录形态对标）：
-  deepcode.exe                                  主程序
-  WebView2Loader.dll                            WebView2 加载器（PE 同目录约束）
-  Microsoft.WebView2.FixedVersionRuntime.x64/   自带 Chromium 固定版本运行时
+本目录是 Windows 桌面便携产物（exe + dll 两件主体，类 VSCode / Codex 轻量分发形态）：
+  deepcode.exe                主程序（嵌入前端 React + Monaco 资源）
+  WebView2Loader.dll          WebView2 加载器（PE 同目录约束）
 
-便携启动（推荐）:
-  双击 deepcode.exe 即可运行；无需安装、不依赖系统 Edge / WebView2 Runtime。
+便携启动（推荐 Win11 / 已装 Edge 的 Win10）:
+  双击 deepcode.exe 即可运行。该形态不携带运行时，依赖系统已安装的 WebView2 Runtime。
 
-标准安装:
-  到 ../installers/DeepCode_<version>_x64-setup.exe 走 NSIS 安装流程，
-  会让你选目标目录（例如 D:\DeepCode），并在开始菜单注册快捷方式。
+标准安装（推荐老版 Win10 / 不确定是否已装 Runtime 的机器）:
+  使用 ../installers/DeepCode_<version>_x64-setup.exe 走 NSIS 安装流程。
+  安装器嵌入了 ~1.8MB 微软官方 Bootstrapper，会自动检测 / 联网下载缺失的 Runtime。
 
 系统要求:
   - Windows 10 1803 或 Windows 11
-  - 不依赖系统 Edge / WebView2 Runtime，应用自带固定版本 Chromium 内核
-    （与 VSCode/Electron 模型一致，"应用自包含全部渲染依赖"）
+  - WebView2 Runtime（Win11 默认自带；Win10 可由安装器自动拉取）
 
 注意:
-  - deepcode.exe + WebView2Loader.dll + EBWebView 目录必须保持同一父目录；
-  - 整个 win-x64/ 视为一个分发单元，压缩或拷贝时不可遗漏 dll 与 EBWebView。
+  - deepcode.exe 与 WebView2Loader.dll 必须保持同一父目录，压缩 / 拷贝时不可遗漏 dll。
+  - 首次启动会在用户目录下生成 EBWebView/ 缓存（WebView2 运行期产生，可安全删除）。
 WIN_README
     else
         echo "==[build][warn]== tauri/src-tauri 不存在，跳过 Rust 构建"
@@ -435,8 +378,7 @@ fi
 echo ""
 echo "==[build]== DONE. 产物清单："
 echo "----------------------------------------"
-( cd "$BIN_DIR" && find . -maxdepth 2 -mindepth 1 \
-    \( -type f -o \( -type d -name 'Microsoft.WebView2.*' \) \) \
+( cd "$BIN_DIR" && find . -maxdepth 2 -mindepth 1 -type f \
     | sort | while read -r p; do
         if [ -d "$BIN_DIR/$p" ]; then
             sz=$(du -sh "$BIN_DIR/$p" 2>/dev/null | cut -f1)

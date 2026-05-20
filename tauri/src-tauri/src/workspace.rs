@@ -69,6 +69,13 @@ pub struct OpenWorkspaceResult {
     pub workspace: WorkspaceSpec,
 }
 
+/// PATCH /api/workspaces/current/settings 成功响应 data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchWorkspaceSettingsResult {
+    pub settings: serde_json::Value,
+}
+
 // ---- 工作区管理器 ----
 
 /// 工作区管理器（Tauri managed state）
@@ -93,46 +100,45 @@ impl WorkspaceManager {
         }
     }
 
-    /// 获取当前工作区状态；若未打开则返回 fallback
+    /// 获取当前工作区状态；若未打开则初始化 fallback，保证后续文件操作能解析 wf-0
     pub fn get_current(&self) -> WorkspaceState {
-        let inner = self.inner.lock().unwrap();
-        match &inner.current {
-            Some(ws) => WorkspaceState {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(ws) = &inner.current {
+            return WorkspaceState {
                 current: ws.clone(),
-                fallback_used: false,
+                fallback_used: matches!(ws.source, WorkspaceSourceKind::Fallback),
                 last_error: None,
-            },
-            None => {
-                // 返回 fallback 工作区：当前工作目录
-                let cwd = std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."));
-                let folder_name = cwd
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "workspace".into());
-                let abs = to_posix(&cwd);
-                let fallback = WorkspaceSpec {
-                    id: "fallback".into(),
-                    name: folder_name,
-                    source: WorkspaceSourceKind::Fallback,
-                    source_path: None,
-                    folders: vec![WorkspaceFolderSpec {
-                        id: "wf-0".into(),
-                        name: abs.split('/').last().unwrap_or("workspace").into(),
-                        absolute_path: abs.clone(),
-                        original_path: abs,
-                        is_absolute: true,
-                    }],
-                    settings: serde_json::json!({}),
-                    unsupported_fields: vec![],
-                    opened_at: chrono_now_iso(),
-                };
-                WorkspaceState {
-                    current: fallback,
-                    fallback_used: true,
-                    last_error: None,
-                }
-            }
+            };
+        }
+
+        // 返回 fallback 工作区：当前工作目录，同时写入 current 作为事实源
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let folder_name = cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "workspace".into());
+        let abs = to_posix(&cwd);
+        let fallback = WorkspaceSpec {
+            id: "fallback".into(),
+            name: folder_name,
+            source: WorkspaceSourceKind::Fallback,
+            source_path: None,
+            folders: vec![WorkspaceFolderSpec {
+                id: "wf-0".into(),
+                name: abs.split('/').last().unwrap_or("workspace").into(),
+                absolute_path: abs.clone(),
+                original_path: abs,
+                is_absolute: true,
+            }],
+            settings: serde_json::json!({}),
+            unsupported_fields: vec![],
+            opened_at: chrono_now_iso(),
+        };
+        inner.current = Some(fallback.clone());
+        WorkspaceState {
+            current: fallback,
+            fallback_used: true,
+            last_error: None,
         }
     }
 
@@ -303,6 +309,45 @@ impl WorkspaceManager {
         inner.current = Some(ws.clone());
 
         Ok(OpenWorkspaceResult { workspace: ws })
+    }
+
+    /// 合并 DeepCode 命名空间设置（Tauri 内存态，与 Node server 行为对齐）
+    pub fn patch_workspace_settings(
+        &self,
+        settings: serde_json::Value,
+    ) -> Result<PatchWorkspaceSettingsResult, String> {
+        let mut inner = self.inner.lock().unwrap();
+        let ws = inner
+            .current
+            .as_mut()
+            .ok_or_else(|| "工作区尚未初始化，请先调用 get_current_workspace".to_string())?;
+        let patch_obj = settings
+            .as_object()
+            .ok_or_else(|| "settings 必须是对象".to_string())?;
+
+        let mut next = match ws.settings.as_object() {
+            Some(obj) => obj.clone(),
+            None => serde_json::Map::new(),
+        };
+        let mut rejected: Vec<String> = Vec::new();
+        for (key, value) in patch_obj {
+            if !key.starts_with("deepcode.") {
+                rejected.push(key.clone());
+                continue;
+            }
+            next.insert(key.clone(), value.clone());
+        }
+        if !rejected.is_empty() {
+            return Err(format!(
+                "仅允许 'deepcode.' 前缀的设置键；被拒绝: {}",
+                rejected.join(", ")
+            ));
+        }
+
+        ws.settings = serde_json::Value::Object(next.clone());
+        Ok(PatchWorkspaceSettingsResult {
+            settings: serde_json::Value::Object(next),
+        })
     }
 
     /// 按 folderId 获取 folder 的绝对路径
