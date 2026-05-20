@@ -241,21 +241,86 @@ WIN_LAUNCHER
 
 # ---- 可选：Tauri Rust 端原生二进制 ----
 # BUILD_TAURI=1 时：用 Rust + WebView 把前端静态资源嵌入二进制，产出"真正的桌面应用"。
-# 此时 Node server / start.* 启动器 / web/ 静态资源对最终用户都不再必要，会从 bin/ 中移除，
-# 只保留 deepcode（Linux 原生 ELF）和 deepcode.exe（Windows PE32+）。
+# 此时 Node server / start.* 启动器 / web/ 静态资源对最终用户都不再必要，会从 bin/ 中移除。
+#
+# 最终交付形态：
+#   bin/linux-x64/deepcode                  Linux 原生桌面 ELF（直接执行）
+#   bin/win-x64/deepcode.exe                Windows 桌面 EXE（含 WebView2Loader.dll 同目录分发）
+#   bin/win-x64/WebView2Loader.dll          WebView2 加载器（与 deepcode.exe 同目录是 PE 加载器协议要求）
+#   bin/win-x64/DeepCode_<ver>_x64-setup.exe  NSIS 安装器（如可生成）
+#
+# NSIS bundler 在 Linux→Windows-GNU cross 环境下要求容器装 nsis 包；
+# 若 Tauri 内部依赖 Windows-only 的资源工具（如 signtool），cross 不可用时
+# 仍输出 deepcode.exe + dll，跳过 installer，不影响主流程。
 if [ "$BUILD_TAURI" = "1" ]; then
     echo "==[build][opt]== build tauri rust (linux + windows-gnu)"
     if [ -d "$TAURI_RUST_DIR" ]; then
+        # 1) Linux 原生：cargo build 已足够（Linux 桌面不依赖 NSIS / 不分发 installer）
         ( cd "$TAURI_RUST_DIR" && cargo build --release --target x86_64-unknown-linux-gnu )
-        ( cd "$TAURI_RUST_DIR" && cargo build --release --target x86_64-pc-windows-gnu )
-        # 拷贝最终桌面可执行文件
-        cp -v "$TAURI_RUST_DIR/target/x86_64-unknown-linux-gnu/release/deepcode"     "$LINUX_DIR/deepcode"
-        cp -v "$TAURI_RUST_DIR/target/x86_64-pc-windows-gnu/release/deepcode.exe"    "$WIN_DIR/deepcode.exe"
+        cp -v "$TAURI_RUST_DIR/target/x86_64-unknown-linux-gnu/release/deepcode" "$LINUX_DIR/deepcode"
         chmod +x "$LINUX_DIR/deepcode"
-        # Tauri 模式：清理 Web 模式残留（前端已嵌入二进制；Node server 已无需）
+
+        # 2) Windows 交叉：先用 cargo build 拿到 deepcode.exe + WebView2Loader.dll
+        ( cd "$TAURI_RUST_DIR" && cargo build --release --target x86_64-pc-windows-gnu )
+        cp -v "$TAURI_RUST_DIR/target/x86_64-pc-windows-gnu/release/deepcode.exe"        "$WIN_DIR/deepcode.exe"
+        cp -v "$TAURI_RUST_DIR/target/x86_64-pc-windows-gnu/release/WebView2Loader.dll"  "$WIN_DIR/WebView2Loader.dll"
+
+        # 3) 尝试产 NSIS installer（可能因 cross 环境不全失败，失败不阻塞主流程）
+        echo "==[build][opt]== try cargo tauri bundle (NSIS for windows)"
+        if ( cd "$ROOT_DIR/tauri" && cargo tauri bundle --bundles nsis --target x86_64-pc-windows-gnu ) ; then
+            INSTALLER_DIR="$TAURI_RUST_DIR/target/x86_64-pc-windows-gnu/release/bundle/nsis"
+            if [ -d "$INSTALLER_DIR" ]; then
+                # 拷贝 *-setup.exe 到 win-x64/，文件名保留版本号
+                find "$INSTALLER_DIR" -maxdepth 1 -name '*-setup.exe' -exec cp -v {} "$WIN_DIR/" \;
+            fi
+        else
+            echo "==[build][warn]== NSIS bundle 在 cross 环境下生成失败；保留 deepcode.exe + WebView2Loader.dll 作为 portable 形态"
+        fi
+
+        # Tauri 模式：清理 Web 模式残留（前端已嵌入二进制，server/start.* 不再需要）
         rm -f  "$LINUX_DIR/deepcode-server" "$LINUX_DIR/start.sh"
         rm -f  "$WIN_DIR/deepcode-server.exe" "$WIN_DIR/start.bat"
         rm -rf "$LINUX_DIR/web" "$WIN_DIR/web"
+
+        # README：分发约束 + WSLg 启动指引
+        cat > "$LINUX_DIR/README.txt" <<'LINUX_README'
+DeepCode for Linux / WSL
+========================
+
+直接启动:
+  ./deepcode
+
+Windows + WSL 用户:
+  在 WSL 中运行：./deepcode 即可借助 WSLg 在 Windows 桌面显示窗口。
+  要求 WSL2 + Windows 11（或 Windows 10 已启用 WSLg 的版本）。
+
+系统要求:
+  - 已安装 webkit2gtk-4.1（包名因发行版而异：
+    Debian/Ubuntu: libwebkit2gtk-4.1-0
+    Arch: webkit2gtk-4.1
+    Fedora: webkit2gtk4.1）
+  - GTK3 / libsoup-3.0 运行时
+LINUX_README
+
+        cat > "$WIN_DIR/README.txt" <<'WIN_README'
+DeepCode for Windows
+====================
+
+推荐安装方式（如果存在 *-setup.exe）:
+  双击 DeepCode_<version>_x64-setup.exe 走标准安装流程；
+  会让你选目标目录（例如 D:\DeepCode），并在开始菜单注册快捷方式。
+  安装器会自动检测并补装 Microsoft Edge WebView2 Runtime。
+
+便携启动方式（portable，免安装）:
+  保持 deepcode.exe 与 WebView2Loader.dll 同目录，双击 deepcode.exe。
+  整个 win-x64/ 目录视为一个分发单元；压缩或分发时不可遗漏 dll。
+
+系统要求:
+  - Windows 10 1803 或 Windows 11
+  - Microsoft Edge WebView2 Runtime（Win11 预装；Win10 通常已随 Edge 安装）
+  - 如启动后窗口空白，从 https://developer.microsoft.com/microsoft-edge/webview2/
+    下载并安装 Evergreen Bootstrapper
+WIN_README
     else
         echo "==[build][warn]== tauri/src-tauri 不存在，跳过 Rust 构建"
     fi
@@ -269,7 +334,8 @@ echo "----------------------------------------"
 echo "----------------------------------------"
 if [ "$BUILD_TAURI" = "1" ]; then
     echo "Linux/WSL 用户:  ./bin/linux-x64/deepcode  (双击或命令行直接运行)"
-    echo "Windows 用户:    bin\\win-x64\\deepcode.exe (双击运行)"
+    echo "Windows 用户:    bin\\win-x64\\DeepCode_*_x64-setup.exe (推荐，标准安装)"
+    echo "                  或 bin\\win-x64\\deepcode.exe (便携，需配 WebView2Loader.dll)"
 else
     echo "Linux/WSL 用户:  cd bin/linux-x64 && ./start.sh"
     echo "Windows 兼容版:  bin\\win-x64\\start.bat  (推荐改用 WSL 跑 linux-x64)"

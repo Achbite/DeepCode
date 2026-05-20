@@ -37,7 +37,18 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "DeepCode AI 代码工作台",
-    "longDescription": "DeepCode 是一个轻量级 AI Agent 代码工作台，前端基于 React + Monaco，后端采用 Tauri (Rust) + 可选 Node 服务。"
+    "longDescription": "DeepCode 是一个轻量级 AI Agent 代码工作台，前端基于 React + Monaco，后端采用 Tauri (Rust) + 可选 Node 服务。",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "displayLanguageSelector": true,
+        "languages": ["English", "SimpChinese"],
+        "installerIcon": "icons/icon.ico",
+        "installMode": "perMachine"
+      }
+    }
   },
   "plugins": {}
 }
