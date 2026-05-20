@@ -16,6 +16,7 @@ import AgentPanelPlaceholder from '../../components/agent-panel/AgentPanelPlaceh
 import ApprovalCenterPlaceholder from '../../components/approval-center/ApprovalCenterPlaceholder';
 import SettingsCenter from '../../components/settings-center/SettingsCenter';
 import WorkspaceOpenDialog from '../../components/workspace-open-dialog/WorkspaceOpenDialog';
+import CodeWorkspaceChoiceDialog from '../../components/code-workspace-choice-dialog/CodeWorkspaceChoiceDialog';
 import {
   useEditorStore,
   SETTINGS_TAB_ID,
@@ -286,6 +287,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
 
       {/* ---- 全局模态：可视化 Open Workspace ---- */}
       <WorkspaceOpenDialog />
+      <CodeWorkspaceChoiceDialog />
     </div>
   );
 };

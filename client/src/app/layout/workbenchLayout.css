@@ -7,7 +7,8 @@
  */
 
 /* ---- CSS 变量：暗色主题 ---- */
-:root {
+:root,
+:root[data-theme='vs-dark'] {
   --bg-base: #1e1e1e;
   --bg-panel: #252526;
   --bg-activity: #333333;
@@ -18,6 +19,19 @@
   --status-ok: #89d185;
   --panel-title-bg: #2d2d2d;
   --accent-color: #007acc;
+}
+
+:root[data-theme='vs-light'] {
+  --bg-base: #ffffff;
+  --bg-panel: #f3f3f3;
+  --bg-activity: #e8e8e8;
+  --bg-header: #dddddd;
+  --border-color: #cccccc;
+  --text-main: #333333;
+  --text-highlight: #111111;
+  --status-ok: #16825d;
+  --panel-title-bg: #eeeeee;
+  --accent-color: #006ab1;
 }
 
 /* ---- 全局重置 ---- */

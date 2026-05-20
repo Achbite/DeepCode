@@ -7,9 +7,11 @@
  *   3. 启动 WebSocket 心跳。
  */
 import React, { useEffect } from 'react';
+import { loader } from '@monaco-editor/react';
 import WorkbenchLayout from './layout/WorkbenchLayout';
 import useAppStatusStore from '../state/appStatusStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
+import { useSettingsStore } from '../state/settingsStore';
 import {
   getRuntimeType,
   getRuntimeStatus,
@@ -18,6 +20,8 @@ import {
   connectHeartbeat,
   disconnectHeartbeat,
 } from '../services/heartbeatSocket';
+
+const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
 
 const App: React.FC = () => {
   const {
@@ -31,11 +35,38 @@ const App: React.FC = () => {
   } = useAppStatusStore();
 
   const loadWorkspace = useWorkspaceStore((s) => s.loadCurrent);
+  const workspaceSettings = useWorkspaceStore((s) => s.current?.settings ?? EMPTY_WORKSPACE_SETTINGS);
+  const loadUserSettings = useSettingsStore((s) => s.loadUserSettings);
+  const syncWorkspaceSettings = useSettingsStore((s) => s.syncWorkspaceSettings);
+  const colorTheme = useSettingsStore((s) => String(s.effectiveSettings['workbench.colorTheme'] ?? 'vs-dark'));
 
-  // ---- 1. 启动时加载工作区 ----
+  // ---- 1. 启动时加载工作区与用户设置 ----
   useEffect(() => {
     loadWorkspace();
-  }, [loadWorkspace]);
+    loadUserSettings();
+  }, [loadWorkspace, loadUserSettings]);
+
+  // ---- 1.1 工作区设置叠加 ----
+  useEffect(() => {
+    syncWorkspaceSettings(workspaceSettings);
+  }, [workspaceSettings, syncWorkspaceSettings]);
+
+  // ---- 1.2 主题同步 ----
+  useEffect(() => {
+    document.documentElement.dataset.theme = colorTheme;
+  }, [colorTheme]);
+
+  // ---- 1.3 Monaco / 通信模块预热，降低首次打开文件冷启动耗时 ----
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      loader.init().catch(() => undefined);
+      void import('../services/apiClient');
+      if (getRuntimeType() === 'tauri') {
+        void import('@tauri-apps/api/core');
+      }
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   // ---- 2. 运行时状态检测 + API health 检查 ----
   useEffect(() => {
