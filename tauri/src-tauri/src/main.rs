@@ -35,12 +35,25 @@ fn main() {
             commands::write_text_file,
             commands::create_file,
             commands::create_folder,
+            commands::rename_entry,
             // 原生对话框
             commands::pick_workspace_directory,
             commands::pick_workspace_file,
             // 用户设置
             commands::get_user_settings,
             commands::patch_user_settings,
+            // 阶段 6 桥接
+            commands::get_llm_profiles,
+            commands::patch_llm_profiles,
+            commands::probe_llm_profile,
+            commands::llm_chat,
+            commands::code_search,
+            commands::create_agent_session,
+            commands::get_current_agent_session,
+            commands::append_agent_events,
+            commands::list_agent_tools,
+            commands::evaluate_agent_permission,
+            commands::execute_agent_tool,
             // Stub
             commands::llm_invoke_stub,
             commands::skill_invoke_stub,

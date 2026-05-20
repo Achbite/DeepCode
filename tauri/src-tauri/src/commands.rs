@@ -178,6 +178,20 @@ pub fn create_folder(
     fs::create_folder(&folder_root, &folder_id, &path).map_err(CommandError::Other)
 }
 
+/// 重命名文件或目录
+#[tauri::command]
+pub fn rename_entry(
+    folder_id: String,
+    old_path: String,
+    new_path: String,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<fs::RenameEntryResult, CommandError> {
+    let folder_root = state
+        .get_folder_abs_path(&folder_id)
+        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
+    fs::rename_entry(&folder_root, &folder_id, &old_path, &new_path).map_err(CommandError::Other)
+}
+
 // ---- 原生对话框 ----
 
 /// 弹出原生 dialog 让用户选择目录
@@ -284,4 +298,115 @@ pub fn patch_user_settings(
     patches: std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<user_settings::PatchUserSettingsResult, CommandError> {
     user_settings::patch_user_settings(patches).map_err(CommandError::Other)
+}
+
+// ---- 阶段 6 Tauri 桥接占位 ----
+//
+// Web/Node 模式已经接入真实实现。桌面壳先注册同名 command，避免前端在 Tauri
+// 模式下遇到 unknown command；后续再把 secret store、LLM adapter、session JSONL
+// 移植到 Rust 侧。
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmProfilesResult {
+    pub profiles: Vec<serde_json::Value>,
+    pub default_profile_id: Option<String>,
+    pub store_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionResult {
+    pub session: serde_json::Value,
+    pub events: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeSearchResult {
+    pub matches: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListToolsResult {
+    pub tools: Vec<serde_json::Value>,
+}
+
+#[tauri::command]
+pub fn get_llm_profiles() -> LlmProfilesResult {
+    LlmProfilesResult {
+        profiles: Vec::new(),
+        default_profile_id: None,
+        store_path: None,
+    }
+}
+
+#[tauri::command]
+pub fn patch_llm_profiles(_request: serde_json::Value) -> Result<LlmProfilesResult, CommandError> {
+    Err(CommandError::NotImplemented(
+        "Tauri 模式 LLM profile 写入尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
+    ))
+}
+
+#[tauri::command]
+pub fn probe_llm_profile(_request: serde_json::Value) -> Result<serde_json::Value, CommandError> {
+    Err(CommandError::NotImplemented(
+        "Tauri 模式 LLM 探活尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
+    ))
+}
+
+#[tauri::command]
+pub fn llm_chat(_request: serde_json::Value) -> Result<serde_json::Value, CommandError> {
+    Err(CommandError::NotImplemented(
+        "Tauri 模式 LLM chat 尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
+    ))
+}
+
+#[tauri::command]
+pub fn code_search(_request: serde_json::Value) -> CodeSearchResult {
+    CodeSearchResult { matches: Vec::new() }
+}
+
+#[tauri::command]
+pub fn create_agent_session(_request: serde_json::Value) -> Result<AgentSessionResult, CommandError> {
+    Err(CommandError::NotImplemented(
+        "Tauri 模式 Agent session 尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
+    ))
+}
+
+#[tauri::command]
+pub fn get_current_agent_session() -> Option<AgentSessionResult> {
+    None
+}
+
+#[tauri::command]
+pub fn append_agent_events(
+    _session_id: String,
+    _request: serde_json::Value,
+) -> Result<AgentSessionResult, CommandError> {
+    Err(CommandError::NotImplemented(
+        "Tauri 模式 Agent session 写入尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
+    ))
+}
+
+#[tauri::command]
+pub fn list_agent_tools(_mode: Option<String>) -> ListToolsResult {
+    ListToolsResult { tools: Vec::new() }
+}
+
+#[tauri::command]
+pub fn evaluate_agent_permission(
+    _request: serde_json::Value,
+) -> Result<serde_json::Value, CommandError> {
+    Err(CommandError::NotImplemented(
+        "Tauri Agent permission gate is not implemented yet; use Web/Node mode for Stage 6 validation.".into(),
+    ))
+}
+
+#[tauri::command]
+pub fn execute_agent_tool(_request: serde_json::Value) -> Result<serde_json::Value, CommandError> {
+    Err(CommandError::NotImplemented(
+        "Tauri Agent tool executor is not implemented yet; use Web/Node mode for Stage 6 validation.".into(),
+    ))
 }

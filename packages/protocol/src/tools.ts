@@ -1,0 +1,85 @@
+import type { AgentMode } from './agent.js';
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: object;
+  riskLevel: 'low' | 'medium' | 'high';
+  needsApproval: boolean;
+  allowedModes: AgentMode[];
+}
+
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: unknown;
+}
+
+export interface ToolResult {
+  callId: string;
+  ok: boolean;
+  output?: unknown;
+  error?: string;
+}
+
+export interface ToolExecutionRequest {
+  mode: AgentMode;
+  toolCall: ToolCall;
+  approved?: boolean;
+}
+
+export interface PermissionEvaluationRequest {
+  mode: AgentMode;
+  toolCall: ToolCall;
+}
+
+export interface ListToolsResult {
+  tools: ToolDefinition[];
+}
+
+export interface FsReadInput {
+  path: string;
+  folderId?: string;
+}
+
+export interface FsWriteInput {
+  path: string;
+  content: string;
+  folderId?: string;
+}
+
+export interface FsListInput {
+  path: string;
+  folderId?: string;
+  depth?: number;
+}
+
+export interface FsDiffInput {
+  path: string;
+  newContent: string;
+  folderId?: string;
+}
+
+export interface CodeSearchInput {
+  query: string;
+  isRegex?: boolean;
+  include?: string[];
+  folderId?: string;
+}
+
+export interface ShellProposeInput {
+  command: string;
+  reason?: string;
+}
+
+export interface CodeSearchMatch {
+  folderId: string;
+  path: string;
+  line: number;
+  column: number;
+  preview: string;
+}
+
+export interface CodeSearchResult {
+  matches: CodeSearchMatch[];
+}

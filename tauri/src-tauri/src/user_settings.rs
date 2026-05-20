@@ -66,6 +66,23 @@ fn build_default_settings() -> BTreeMap<String, JsonValue> {
     m.insert("explorer.confirmDelete".into(), JsonValue::from(false));
     // 工作台
     m.insert("workbench.colorTheme".into(), JsonValue::from("vs-dark"));
+    // Agent / Skill / Prompt
+    m.insert("skills.pythonPath".into(), JsonValue::from("python"));
+    m.insert("skills.autoLoad".into(), JsonValue::from(true));
+    m.insert("skills.mounts".into(), JsonValue::from("[]"));
+    m.insert(
+        "prompt.defaultProfileId".into(),
+        JsonValue::from("default-agent"),
+    );
+    m.insert(
+        "prompt.profiles".into(),
+        JsonValue::from("[{\"id\":\"default-agent\",\"name\":\"Default Agent\",\"description\":\"通用代码协作 Agent\",\"systemPrompt\":\"You are DeepCode Agent. Work inside the current workspace, explain important risks, and ask for approval before writing files.\",\"enabled\":true}]"),
+    );
+    m.insert("ruler.enabled".into(), JsonValue::from(true));
+    m.insert(
+        "ruler.rules".into(),
+        JsonValue::from("[{\"id\":\"default-safety\",\"name\":\"Default Safety Boundary\",\"source\":\"system\",\"priority\":100,\"path\":\"<builtin>/default-safety.md\",\"content\":\"Default to plan mode. Read before write. Show diff before saving files. Never run destructive commands without explicit approval.\",\"enabled\":true}]"),
+    );
     m
 }
 

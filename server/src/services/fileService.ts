@@ -6,7 +6,7 @@
  *   - 路径安全：所有相对路径解析后必须落在 folder.absolutePath 之内；
  *   - 大文件 / 二进制 / 写入大小阈值 / 目录树节点上限与 Tauri Rust 端 fs.rs 对齐。
  */
-import { readdir, readFile, writeFile, mkdir, stat, access } from 'node:fs/promises';
+import { readdir, readFile, writeFile, mkdir, stat, access, rename } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { join, resolve, normalize, relative, isAbsolute, sep } from 'node:path';
 import type {
@@ -14,6 +14,7 @@ import type {
   FileReadResult,
   FileWriteResult,
   CreateFolderResult,
+  RenameEntryResult,
 } from '@deepcode/protocol';
 import { resolveFolder } from './workspaceService.js';
 
@@ -347,5 +348,46 @@ export async function createFolderEntry(
     folderId: folder.id,
     path: toRelativePosix(folderRoot, absolutePath),
     created,
+  };
+}
+
+/**
+ * 重命名文件或目录。
+ *
+ * 与 VSCode Explorer 基础语义一致：目标已存在时报错，不覆盖；允许在
+ * 同一 WorkspaceFolder 内移动，但不能越出 folder root。
+ */
+export async function renameEntry(
+  folderId: string | undefined,
+  oldPath: string,
+  newPath: string
+): Promise<RenameEntryResult> {
+  if (!oldPath || !newPath || oldPath.trim() === '' || newPath.trim() === '') {
+    throw new Error('路径不能为空');
+  }
+  const folder = resolveFolder(folderId);
+  const folderRoot = folder.absolutePath;
+  const oldAbs = safePath(folderRoot, oldPath);
+  const newAbs = safePath(folderRoot, newPath);
+
+  await access(oldAbs, fsConstants.F_OK);
+  try {
+    await access(newAbs, fsConstants.F_OK);
+    throw new Error(`file_already_exists: ${newPath}`);
+  } catch (err: any) {
+    if (err && err.code !== 'ENOENT') {
+      throw err;
+    }
+  }
+
+  const parent = join(newAbs, '..');
+  await mkdir(parent, { recursive: true });
+  await rename(oldAbs, newAbs);
+
+  return {
+    folderId: folder.id,
+    oldPath: toRelativePosix(folderRoot, oldAbs),
+    newPath: toRelativePosix(folderRoot, newAbs),
+    renamed: true,
   };
 }

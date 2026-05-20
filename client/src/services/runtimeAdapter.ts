@@ -15,6 +15,7 @@ import type {
   FileReadResult,
   FileWriteResult,
   CreateFolderResult,
+  RenameEntryResult,
   WorkspaceState,
   OpenWorkspaceResult,
   BrowsePathResult,
@@ -23,6 +24,23 @@ import type {
   PatchUserSettingsRequest,
   PatchUserSettingsResult,
   PatchWorkspaceSettingsResult,
+  LlmProfilesResult,
+  PatchLlmProfilesRequest,
+  LlmProbeRequest,
+  LlmProbeResult,
+  LlmChatRequest,
+  LlmChatResult,
+  CodeSearchInput,
+  CodeSearchResult,
+  AgentMode,
+  CreateAgentSessionRequest,
+  AgentSessionResult,
+  AppendAgentEventsRequest,
+  ListToolsResult,
+  PermissionEvaluationRequest,
+  PermissionDecision,
+  ToolExecutionRequest,
+  ToolResult,
 } from '@deepcode/protocol';
 
 // ---- 运行时检测 ----
@@ -311,6 +329,29 @@ export async function createFolder(
   return apiCreateFolder(folderPath, folderId);
 }
 
+export async function renameEntry(
+  oldPath: string,
+  newPath: string,
+  folderId?: string
+): Promise<ApiResponse<RenameEntryResult>> {
+  if (getRuntimeType() === 'tauri') {
+    if (!folderId) {
+      return {
+        ok: false,
+        error: 'missing_folder_id',
+        message: 'Tauri 模式下 folderId 不能为空',
+      };
+    }
+    return tauriInvoke<RenameEntryResult>('rename_entry', {
+      folderId,
+      oldPath,
+      newPath,
+    });
+  }
+  const { renameEntry: apiRenameEntry } = await import('./apiClient');
+  return apiRenameEntry(oldPath, newPath, folderId);
+}
+
 // ---- 用户设置（阶段 4 / S4-4）----
 
 export async function getUserSettings(): Promise<ApiResponse<GetUserSettingsResult>> {
@@ -329,4 +370,113 @@ export async function patchUserSettings(
   }
   const { patchUserSettings: apiPatchUserSettings } = await import('./apiClient');
   return apiPatchUserSettings(patches);
+}
+
+// ---- LLM profiles / chat（阶段 6 / S6-1）----
+
+export async function getLlmProfiles(): Promise<ApiResponse<LlmProfilesResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<LlmProfilesResult>('get_llm_profiles');
+  }
+  const { getLlmProfiles: apiGetLlmProfiles } = await import('./apiClient');
+  return apiGetLlmProfiles();
+}
+
+export async function patchLlmProfiles(
+  request: PatchLlmProfilesRequest
+): Promise<ApiResponse<LlmProfilesResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<LlmProfilesResult>('patch_llm_profiles', { request });
+  }
+  const { patchLlmProfiles: apiPatchLlmProfiles } = await import('./apiClient');
+  return apiPatchLlmProfiles(request);
+}
+
+export async function probeLlmProfile(
+  request: LlmProbeRequest
+): Promise<ApiResponse<LlmProbeResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<LlmProbeResult>('probe_llm_profile', { request });
+  }
+  const { probeLlmProfile: apiProbeLlmProfile } = await import('./apiClient');
+  return apiProbeLlmProfile(request);
+}
+
+export async function llmChat(
+  request: LlmChatRequest
+): Promise<ApiResponse<LlmChatResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<LlmChatResult>('llm_chat', { request });
+  }
+  const { llmChat: apiLlmChat } = await import('./apiClient');
+  return apiLlmChat(request);
+}
+
+export async function codeSearch(
+  request: CodeSearchInput
+): Promise<ApiResponse<CodeSearchResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<CodeSearchResult>('code_search', { request });
+  }
+  const { codeSearch: apiCodeSearch } = await import('./apiClient');
+  return apiCodeSearch(request);
+}
+
+export async function createAgentSession(
+  request: CreateAgentSessionRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AgentSessionResult>('create_agent_session', { request });
+  }
+  const { createAgentSession: apiCreateAgentSession } = await import('./apiClient');
+  return apiCreateAgentSession(request);
+}
+
+export async function getCurrentAgentSession(): Promise<ApiResponse<AgentSessionResult | null>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AgentSessionResult | null>('get_current_agent_session');
+  }
+  const { getCurrentAgentSession: apiGetCurrentAgentSession } = await import('./apiClient');
+  return apiGetCurrentAgentSession();
+}
+
+export async function appendAgentEvents(
+  sessionId: string,
+  request: AppendAgentEventsRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AgentSessionResult>('append_agent_events', { sessionId, request });
+  }
+  const { appendAgentEvents: apiAppendAgentEvents } = await import('./apiClient');
+  return apiAppendAgentEvents(sessionId, request);
+}
+
+export async function listAgentTools(
+  mode?: AgentMode
+): Promise<ApiResponse<ListToolsResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<ListToolsResult>('list_agent_tools', { mode });
+  }
+  const { listAgentTools: apiListAgentTools } = await import('./apiClient');
+  return apiListAgentTools(mode);
+}
+
+export async function evaluateAgentPermission(
+  request: PermissionEvaluationRequest
+): Promise<ApiResponse<PermissionDecision>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<PermissionDecision>('evaluate_agent_permission', { request });
+  }
+  const { evaluateAgentPermission: apiEvaluateAgentPermission } = await import('./apiClient');
+  return apiEvaluateAgentPermission(request);
+}
+
+export async function executeAgentTool(
+  request: ToolExecutionRequest
+): Promise<ApiResponse<ToolResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<ToolResult>('execute_agent_tool', { request });
+  }
+  const { executeAgentTool: apiExecuteAgentTool } = await import('./apiClient');
+  return apiExecuteAgentTool(request);
 }

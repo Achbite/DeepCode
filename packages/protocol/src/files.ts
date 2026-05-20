@@ -91,3 +91,21 @@ export interface CreateFolderResult {
   path: string;
   created: boolean;
 }
+
+/** POST /api/files/rename 请求体 —— 文件或目录重命名 / 移动 */
+export interface RenameEntryRequest {
+  /** 目标 WorkspaceFolder 的 id；省略时使用当前工作区 folders[0] */
+  folderId?: string;
+  /** 原始相对路径 */
+  oldPath: string;
+  /** 新相对路径；资源管理器重命名通常只改变末段名称 */
+  newPath: string;
+}
+
+/** POST /api/files/rename 成功响应 data 字段 */
+export interface RenameEntryResult {
+  folderId: string;
+  oldPath: string;
+  newPath: string;
+  renamed: boolean;
+}

@@ -1,27 +1,27 @@
 /**
- * 文件树组件（阶段 4 / S4-1 + S4-2 重构版）
+ * 文件树组件
  *
- * 改造目标：
- *   1. 全部使用 Codicons inline SVG，移除旧文本图标。
- *   2. 工具栏对齐 VSCode 顺序：[New File] [New Folder] [Refresh]，hover 标题行才显。
- *   3. 抽出 inline style 到 fileTree.css，颜色 / 间距走 CSS 变量。
- *   4. useEffect 依赖加 treeRevision，Open Workspace 后强制刷新。
- *   5. 新建文件 / 新建文件夹采用 VSCode 风格 inline 输入：Enter 提交 / Esc 取消 / 失焦取消。
- *
- * 主体逻辑保留：
- *   - getFileTree 走 runtimeAdapter 双轨；
- *   - 由父组件传入 onFileSelect / selectedTabId；
- *   - Open Workspace 入口由 uiStore 弹模态对话框承担。
+ * VSCode 风格资源管理器基础交互：
+ *   - 当前焦点目录决定 toolbar 新建文件 / 文件夹落点；
+ *   - 右键菜单按资源类型显示 Explorer 操作；
+ *   - 文件 / 文件夹均支持 inline rename；
+ *   - 文件树右键可把文件 / 文件夹添加到当前 Agent 对话。
  */
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   getFileTree,
   createFile,
   createFolder,
+  renameEntry,
 } from '../../services/runtimeAdapter';
 import type { FileTreeNode } from '@deepcode/protocol';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useUiStore } from '../../state/uiStore';
+import {
+  useEditorStore,
+  buildFileTabId,
+} from '../../state/editorStore';
+import { useAgentSessionStore } from '../../state/agentSessionStore';
 import {
   ChevronRightIcon,
   ChevronDownIcon,
@@ -39,17 +39,56 @@ interface FileTreeProps {
   selectedTabId: string | null;
 }
 
-// 待新建条目类型；null 表示当前没有新建中的输入
 type PendingCreateKind = 'file' | 'folder';
+
+interface ResourceTarget {
+  kind: 'file' | 'directory';
+  path: string;
+  name: string;
+  folderId: string;
+}
 
 interface PendingCreate {
   kind: PendingCreateKind;
-  /** 新建项相对 folder 根的父目录 POSIX 路径；空串表示 folder 根 */
   parentPath: string;
+}
+
+interface PendingRename {
+  target: ResourceTarget;
+}
+
+interface ContextMenuState {
+  x: number;
+  y: number;
+  target: ResourceTarget;
 }
 
 function getDepthClass(depth: number): string {
   return `file-tree__row--depth-${Math.max(0, Math.min(depth, 12))}`;
+}
+
+function basename(path: string): string {
+  if (!path) return '';
+  return path.split('/').filter(Boolean).pop() ?? path;
+}
+
+function parentPathOf(path: string): string {
+  const parts = path.split('/').filter(Boolean);
+  parts.pop();
+  return parts.join('/');
+}
+
+function joinPath(parentPath: string, name: string): string {
+  const trimmed = name.trim().replace(/^\/+|\/+$/g, '');
+  return parentPath ? `${parentPath}/${trimmed}` : trimmed;
+}
+
+function replacePathPrefix(path: string, oldPath: string, newPath: string): string {
+  if (path === oldPath) return newPath;
+  if (path.startsWith(`${oldPath}/`)) {
+    return `${newPath}/${path.slice(oldPath.length + 1)}`;
+  }
+  return path;
 }
 
 const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
@@ -59,16 +98,30 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
   const treeRevision = useWorkspaceStore((s) => s.treeRevision);
   const bumpTreeRevision = useWorkspaceStore((s) => s.bumpTreeRevision);
   const selectFolder = useWorkspaceStore((s) => s.selectFolder);
+  const getActiveFolder = useWorkspaceStore((s) => s.getActiveFolder);
   const showWorkspaceOpenDialog = useUiStore((s) => s.showWorkspaceOpenDialog);
+  const renamePathInTabs = useEditorStore((s) => s.renamePathInTabs);
+  const addAgentAttachment = useAgentSessionStore((s) => s.addAttachment);
 
   const [tree, setTree] = useState<FileTreeNode[]>([]);
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [pending, setPending] = useState<PendingCreate | null>(null);
+  const [pendingCreate, setPendingCreate] = useState<PendingCreate | null>(null);
+  const [pendingRename, setPendingRename] = useState<PendingRename | null>(null);
   const [pendingError, setPendingError] = useState<string | null>(null);
+  const [selectedResource, setSelectedResource] = useState<ResourceTarget | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 
-  // ---- 加载目录树（按 activeFolderId + treeRevision 触发） ----
+  const rootTarget: ResourceTarget | null = activeFolderId
+    ? {
+        kind: 'directory',
+        path: '',
+        name: getActiveFolder()?.name ?? 'Workspace Root',
+        folderId: activeFolderId,
+      }
+    : null;
+
   const loadTree = useCallback(async () => {
     if (!activeFolderId) {
       setTree([]);
@@ -85,61 +138,145 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
     setLoading(false);
   }, [activeFolderId]);
 
-  // 关键：依赖 [activeFolderId, treeRevision]，工作区切换或主动 bump 都会重拉
   useEffect(() => {
     loadTree();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeFolderId, treeRevision]);
+  }, [loadTree, treeRevision]);
 
-  // ---- Open Workspace 入口 ----
-  const handleOpenWorkspace = () => {
-    showWorkspaceOpenDialog();
+  useEffect(() => {
+    const close = () => setContextMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setContextMenu(null);
+        setPendingCreate(null);
+        setPendingRename(null);
+      }
+    };
+    window.addEventListener('click', close);
+    window.addEventListener('blur', close);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('blur', close);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, []);
+
+  const getCreateParentPath = (): string => {
+    if (!selectedResource) return '';
+    return selectedResource.kind === 'directory'
+      ? selectedResource.path
+      : parentPathOf(selectedResource.path);
   };
 
-  // ---- 工具栏：刷新 / 新建文件 / 新建文件夹 ----
-  const handleRefresh = () => {
-    bumpTreeRevision();
+  const focusTarget = (target: ResourceTarget) => {
+    setSelectedResource(target);
   };
 
-  const startCreate = (kind: PendingCreateKind) => {
-    setPending({ kind, parentPath: '' });
+  const startCreate = (kind: PendingCreateKind, parentPath = getCreateParentPath()) => {
+    if (!activeFolderId) return;
+    setPendingCreate({ kind, parentPath });
+    setPendingRename(null);
     setPendingError(null);
+    if (parentPath) {
+      setExpandedDirs((prev) => new Set(prev).add(parentPath));
+    }
   };
 
-  const cancelCreate = () => {
-    setPending(null);
+  const startRename = (target: ResourceTarget) => {
+    setSelectedResource(target);
+    setPendingCreate(null);
+    setPendingRename({ target });
+    setPendingError(null);
+    setContextMenu(null);
+  };
+
+  const cancelInlineEdit = () => {
+    setPendingCreate(null);
+    setPendingRename(null);
     setPendingError(null);
   };
 
   const submitCreate = useCallback(
     async (name: string) => {
-      if (!pending || !activeFolderId) return;
+      if (!pendingCreate || !activeFolderId) return;
       const trimmed = name.trim();
       if (!trimmed) {
-        cancelCreate();
+        cancelInlineEdit();
         return;
       }
-      // 拼接完整相对路径；POSIX 风格
-      const target = pending.parentPath
-        ? `${pending.parentPath}/${trimmed}`
-        : trimmed;
-
+      const target = joinPath(pendingCreate.parentPath, trimmed);
       const result =
-        pending.kind === 'file'
+        pendingCreate.kind === 'file'
           ? await createFile(target, '', activeFolderId)
           : await createFolder(target, activeFolderId);
 
       if (result.ok) {
-        setPending(null);
+        setPendingCreate(null);
         setPendingError(null);
         bumpTreeRevision();
+        if (pendingCreate.kind === 'file') {
+          void onFileSelect(target, activeFolderId);
+        } else {
+          setExpandedDirs((prev) => new Set(prev).add(target));
+          setSelectedResource({
+            kind: 'directory',
+            path: target,
+            name: basename(target),
+            folderId: activeFolderId,
+          });
+        }
       } else if (result.error === 'file_already_exists') {
         setPendingError(`已存在：${trimmed}`);
       } else {
         setPendingError(result.message || '创建失败');
       }
     },
-    [pending, activeFolderId, bumpTreeRevision]
+    [pendingCreate, activeFolderId, bumpTreeRevision, onFileSelect]
+  );
+
+  const submitRename = useCallback(
+    async (name: string) => {
+      if (!pendingRename) return;
+      const trimmed = name.trim();
+      if (!trimmed) {
+        cancelInlineEdit();
+        return;
+      }
+      if (/[\\/]/.test(trimmed)) {
+        setPendingError('重命名只修改当前名称，不支持路径分隔符');
+        return;
+      }
+      const { target } = pendingRename;
+      const nextPath = joinPath(parentPathOf(target.path), trimmed);
+      if (nextPath === target.path) {
+        cancelInlineEdit();
+        return;
+      }
+      const result = await renameEntry(target.path, nextPath, target.folderId);
+      if (result.ok && result.data) {
+        setExpandedDirs((prev) => {
+          const next = new Set<string>();
+          for (const path of prev) {
+            next.add(replacePathPrefix(path, target.path, nextPath));
+          }
+          return next;
+        });
+        renamePathInTabs(target.folderId, target.path, nextPath);
+        setSelectedResource({
+          ...target,
+          path: nextPath,
+          name: trimmed,
+        });
+        setPendingRename(null);
+        setPendingError(null);
+        bumpTreeRevision();
+      } else if (result.error === 'file_already_exists') {
+        setPendingError(`已存在：${trimmed}`);
+      } else {
+        setPendingError(result.message || '重命名失败');
+      }
+    },
+    [pendingRename, renamePathInTabs, bumpTreeRevision]
   );
 
   const toggleDir = (dirPath: string) => {
@@ -151,23 +288,96 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
     });
   };
 
-  // ---- 渲染节点 ----
+  const openContextMenu = (
+    event: React.MouseEvent,
+    target: ResourceTarget
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setSelectedResource(target);
+    setContextMenu({ x: event.clientX, y: event.clientY, target });
+  };
+
+  const addToAgent = (target: ResourceTarget, scope: 'message' | 'session' = 'message') => {
+    addAgentAttachment({
+      kind: target.kind,
+      path: target.path,
+      folderId: target.folderId,
+      source: 'contextMenu',
+      scope,
+    });
+    setContextMenu(null);
+  };
+
+  const isSelected = (target: ResourceTarget, activeFileSelected = false) => {
+    if (selectedResource) {
+      return (
+        selectedResource.folderId === target.folderId &&
+        selectedResource.path === target.path &&
+        selectedResource.kind === target.kind
+      );
+    }
+    return activeFileSelected;
+  };
+
+  const renderCreateRow = (parentPath: string, depth: number) => {
+    if (!pendingCreate || pendingCreate.parentPath !== parentPath) return null;
+    return (
+      <InlineEditRow
+        key={`create:${parentPath}:${pendingCreate.kind}`}
+        depth={depth}
+        kind={pendingCreate.kind === 'file' ? 'file' : 'directory'}
+        initialValue=""
+        placeholder={pendingCreate.kind === 'file' ? '文件名' : '文件夹名'}
+        onSubmit={submitCreate}
+        onCancel={cancelInlineEdit}
+      />
+    );
+  };
+
   const renderNode = (
     node: FileTreeNode,
     depth: number = 0
   ): React.ReactNode => {
-    const isExpanded = expandedDirs.has(node.path);
-    const tabIdForThis = activeFolderId
-      ? `${activeFolderId}::${node.path}`
-      : null;
-    const isSelected = tabIdForThis !== null && selectedTabId === tabIdForThis;
+    if (!activeFolderId) return null;
+    const target: ResourceTarget = {
+      kind: node.type,
+      path: node.path,
+      name: node.name,
+      folderId: activeFolderId,
+    };
+    const isRenaming =
+      pendingRename?.target.folderId === target.folderId &&
+      pendingRename.target.path === target.path;
+
+    if (isRenaming) {
+      return (
+        <InlineEditRow
+          key={`rename:${target.path}`}
+          depth={node.type === 'directory' ? depth : depth + 1}
+          kind={node.type}
+          initialValue={node.name}
+          placeholder="新名称"
+          onSubmit={submitRename}
+          onCancel={cancelInlineEdit}
+        />
+      );
+    }
 
     if (node.type === 'directory') {
+      const isExpanded = expandedDirs.has(node.path);
+      const selected = isSelected(target);
       return (
         <div key={node.path}>
           <div
-            className={`file-tree__row ${getDepthClass(depth)}`}
-            onClick={() => toggleDir(node.path)}
+            className={`file-tree__row ${getDepthClass(depth)} ${
+              selected ? 'file-tree__row--selected' : ''
+            }`}
+            onClick={() => {
+              focusTarget(target);
+              toggleDir(node.path);
+            }}
+            onContextMenu={(event) => openContextMenu(event, target)}
           >
             <span className="file-tree__chevron">
               {isExpanded ? <ChevronDownIcon size={12} /> : <ChevronRightIcon size={12} />}
@@ -177,22 +387,32 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
             </span>
             <span className="file-tree__name">{node.name}</span>
           </div>
-          {isExpanded &&
-            node.children?.map((child) => renderNode(child, depth + 1))}
+          {isExpanded && (
+            <>
+              {renderCreateRow(node.path, depth + 1)}
+              {node.children?.map((child) => renderNode(child, depth + 1))}
+            </>
+          )}
         </div>
       );
     }
+
+    const tabIdForThis = `${activeFolderId}::${node.path}`;
+    const activeFileSelected = selectedTabId === tabIdForThis;
+    const selected = isSelected(target, activeFileSelected);
 
     return (
       <div
         key={node.path}
         className={
           `file-tree__row ${getDepthClass(depth + 1)}` +
-          (isSelected ? ' file-tree__row--selected' : '')
+          (selected ? ' file-tree__row--selected' : '')
         }
         onClick={() => {
-          if (activeFolderId) onFileSelect(node.path, activeFolderId);
+          setSelectedResource(target);
+          onFileSelect(node.path, activeFolderId);
         }}
+        onContextMenu={(event) => openContextMenu(event, target)}
       >
         <span className="file-tree__icon">
           <FileIcon />
@@ -204,7 +424,6 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
 
   return (
     <div className="file-tree">
-      {/* ---- 顶部：Explorer + 工具栏（hover 时显） ---- */}
       <div className="file-tree__titlebar">
         <span>Explorer</span>
         <div className="file-tree__toolbar">
@@ -228,7 +447,7 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
           </button>
           <button
             className="file-tree__toolbar-btn"
-            onClick={handleRefresh}
+            onClick={() => bumpTreeRevision()}
             disabled={!activeFolderId}
             title="刷新文件树"
             aria-label="刷新"
@@ -237,7 +456,7 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
           </button>
           <button
             className="file-tree__toolbar-btn"
-            onClick={handleOpenWorkspace}
+            onClick={showWorkspaceOpenDialog}
             title="打开工作区（目录或 .code-workspace）"
             aria-label="打开工作区"
           >
@@ -246,7 +465,6 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
         </div>
       </div>
 
-      {/* ---- 工作区摘要 ---- */}
       {workspace && (
         <div className="file-tree__summary">
           <div>
@@ -265,7 +483,10 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
               <select
                 className="file-tree__summary-folder-select"
                 value={activeFolderId ?? ''}
-                onChange={(e) => selectFolder(e.target.value)}
+                onChange={(e) => {
+                  selectFolder(e.target.value);
+                  setSelectedResource(null);
+                }}
               >
                 {workspace.folders.map((f) => (
                   <option key={f.id} value={f.id}>
@@ -275,7 +496,11 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
               </select>
             </div>
           ) : workspace.folders.length === 1 ? (
-            <div>
+            <div
+              onContextMenu={(event) => {
+                if (rootTarget) openContextMenu(event, rootTarget);
+              }}
+            >
               <span>Folder:</span>{' '}
               <span className="file-tree__summary-name">
                 {workspace.folders[0].name}
@@ -285,7 +510,6 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
         </div>
       )}
 
-      {/* ---- 内容区 ---- */}
       {loading && (
         <div className="file-tree__status file-tree__status--loading">加载中...</div>
       )}
@@ -293,43 +517,73 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
         <div className="file-tree__status file-tree__status--error">{error}</div>
       )}
       {!loading && !error && (
-        <div className="file-tree__body">
-          {/* 新建文件 / 新建文件夹 inline 输入；置于树顶部 */}
-          {pending && (
-            <NewItemRow
-              kind={pending.kind}
-              onSubmit={submitCreate}
-              onCancel={cancelCreate}
-            />
-          )}
+        <div
+          className="file-tree__body"
+          onContextMenu={(event) => {
+            if (event.currentTarget === event.target && rootTarget) {
+              openContextMenu(event, rootTarget);
+            }
+          }}
+        >
+          {renderCreateRow('', 1)}
           {pendingError && (
             <div className="file-tree__new-error">{pendingError}</div>
           )}
           {tree.map((node) => renderNode(node))}
         </div>
       )}
+
+      {contextMenu && (
+        <ExplorerContextMenu
+          state={contextMenu}
+          onNewFile={() => {
+            startCreate('file', contextMenu.target.kind === 'directory'
+              ? contextMenu.target.path
+              : parentPathOf(contextMenu.target.path));
+            setContextMenu(null);
+          }}
+          onNewFolder={() => {
+            startCreate('folder', contextMenu.target.kind === 'directory'
+              ? contextMenu.target.path
+              : parentPathOf(contextMenu.target.path));
+            setContextMenu(null);
+          }}
+          onRename={() => startRename(contextMenu.target)}
+          onAddToAgent={() => addToAgent(contextMenu.target, 'message')}
+          onAddToAgentSession={() => addToAgent(contextMenu.target, 'session')}
+        />
+      )}
     </div>
   );
 };
 
-// ---- inline 输入子组件（VSCode 风格：Enter 提交 / Esc 取消 / 失焦取消）----
-
-interface NewItemRowProps {
-  kind: PendingCreateKind;
+interface InlineEditRowProps {
+  depth: number;
+  kind: 'file' | 'directory';
+  initialValue: string;
+  placeholder: string;
   onSubmit: (name: string) => void;
   onCancel: () => void;
 }
 
-const NewItemRow: React.FC<NewItemRowProps> = ({ kind, onSubmit, onCancel }) => {
-  const [value, setValue] = useState('');
+const InlineEditRow: React.FC<InlineEditRowProps> = ({
+  depth,
+  kind,
+  initialValue,
+  placeholder,
+  onSubmit,
+  onCancel,
+}) => {
+  const [value, setValue] = useState(initialValue);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     inputRef.current?.focus();
+    inputRef.current?.select();
   }, []);
 
   return (
-    <div className={`file-tree__row ${getDepthClass(1)}`}>
+    <div className={`file-tree__row ${getDepthClass(depth)}`}>
       <span className="file-tree__icon">
         {kind === 'file' ? <FileIcon /> : <FolderIcon />}
       </span>
@@ -337,7 +591,7 @@ const NewItemRow: React.FC<NewItemRowProps> = ({ kind, onSubmit, onCancel }) => 
         ref={inputRef}
         className="file-tree__new-input"
         value={value}
-        placeholder={kind === 'file' ? '文件名（可包含子路径，如 a/b.txt）' : '文件夹名'}
+        placeholder={placeholder}
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === 'Enter') {
@@ -348,13 +602,44 @@ const NewItemRow: React.FC<NewItemRowProps> = ({ kind, onSubmit, onCancel }) => 
             onCancel();
           }
         }}
-        onBlur={() => {
-          // 默认失焦取消（与 VSCode 一致；避免误提交）
-          onCancel();
-        }}
+        onBlur={onCancel}
       />
     </div>
   );
 };
+
+interface ExplorerContextMenuProps {
+  state: ContextMenuState;
+  onNewFile: () => void;
+  onNewFolder: () => void;
+  onRename: () => void;
+  onAddToAgent: () => void;
+  onAddToAgentSession: () => void;
+}
+
+const ExplorerContextMenu: React.FC<ExplorerContextMenuProps> = ({
+  state,
+  onNewFile,
+  onNewFolder,
+  onRename,
+  onAddToAgent,
+  onAddToAgentSession,
+}) => (
+  <div
+    className="file-tree__context-menu"
+    style={{ left: state.x, top: state.y }}
+    onClick={(event) => event.stopPropagation()}
+  >
+    <div className="file-tree__context-title">
+      {state.target.path || state.target.name}
+    </div>
+    <button onClick={onNewFile}>New File</button>
+    <button onClick={onNewFolder}>New Folder</button>
+    {state.target.path && <button onClick={onRename}>Rename</button>}
+    <div className="file-tree__context-separator" />
+    <button onClick={onAddToAgent}>Add to Agent Message</button>
+    <button onClick={onAddToAgentSession}>Pin to Agent Session</button>
+  </div>
+);
 
 export default FileTree;

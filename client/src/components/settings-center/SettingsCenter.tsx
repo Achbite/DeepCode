@@ -14,10 +14,12 @@ import SkillRuntimeSection from './sections/SkillRuntimeSection';
 import PromptProfilesSection from './sections/PromptProfilesSection';
 import RuntimeDoctorSection from './sections/RuntimeDoctorSection';
 import RulerRulesSection from './sections/RulerRulesSection';
+import LlmSection from './sections/LlmSection';
 
 type SettingsKey =
   | 'workspace'
   | 'common'
+  | 'llm'
   | 'skill'
   | 'prompt'
   | 'doctor'
@@ -38,6 +40,7 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { key: 'workspace', icon: '🗂', label: 'Workspace' },
   { key: 'common', icon: '🛠', label: 'Common Settings' },
+  { key: 'llm', icon: '◎', label: 'LLM Providers' },
   { key: 'skill', icon: '🛠️', label: 'Skill Runtime' },
   { key: 'prompt', icon: '📝', label: 'Prompt Profiles' },
   { key: 'doctor', icon: '🩺', label: 'Runtime Doctor' },
@@ -63,6 +66,8 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
             serverVersion={serverVersion}
           />
         );
+      case 'llm':
+        return <LlmSection />;
       case 'skill':
         return <SkillRuntimeSection />;
       case 'prompt':

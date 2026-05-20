@@ -4,3 +4,6 @@ export * from './files.js';
 export * from './workspace.js';
 export * from './userSettings.js';
 export * from './htmlRenderer.js';
+export * from './agent.js';
+export * from './tools.js';
+export * from './llm.js';

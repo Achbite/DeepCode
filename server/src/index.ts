@@ -18,6 +18,10 @@ import { registerFileRoutes } from './api/fileRoutes.js';
 import { registerWorkspaceRoutes } from './api/workspaceRoutes.js';
 import { registerFsBrowseRoutes } from './api/fsBrowseRoutes.js';
 import { registerUserSettingsRoutes } from './api/userSettingsRoutes.js';
+import { registerLlmRoutes } from './api/llmRoutes.js';
+import { registerCodeSearchRoutes } from './api/codeSearchRoutes.js';
+import { registerAgentRoutes } from './api/agentRoutes.js';
+import { registerAgentToolRoutes } from './api/agentToolRoutes.js';
 import { registerHeartbeatWs } from './ws/heartbeatWs.js';
 import {
   loadInitialWorkspace,
@@ -47,6 +51,10 @@ async function main(): Promise<ServerStartResult> {
   await registerFsBrowseRoutes(app);
   await registerFileRoutes(app);
   await registerUserSettingsRoutes(app);
+  await registerLlmRoutes(app);
+  await registerCodeSearchRoutes(app);
+  await registerAgentToolRoutes(app);
+  await registerAgentRoutes(app);
   await registerHeartbeatWs(app);
 
   // ---- 6. 可选：静态前端托管 ----

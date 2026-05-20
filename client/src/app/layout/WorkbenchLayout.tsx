@@ -22,6 +22,7 @@ import {
   SETTINGS_TAB_ID,
   buildFileTabId,
 } from '../../state/editorStore';
+import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { getRuntimeType } from '../../services/runtimeAdapter';
 
 interface WorkbenchLayoutProps {
@@ -48,6 +49,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   const updateContent = useEditorStore((s) => s.updateContent);
   const saveFile = useEditorStore((s) => s.saveFile);
   const setActiveTab = useEditorStore((s) => s.setActiveTab);
+  const addAgentAttachment = useAgentSessionStore((s) => s.addAttachment);
 
   const [runtimeType] = useState(getRuntimeType);
 
@@ -214,6 +216,17 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
                 <div
                   key={id}
                   onClick={() => setActiveTab(id)}
+                  onContextMenu={(e) => {
+                    if (tab.kind !== 'file') return;
+                    e.preventDefault();
+                    addAgentAttachment({
+                      kind: 'file',
+                      path: tab.path,
+                      folderId: tab.folderId,
+                      source: 'contextMenu',
+                      scope: 'message',
+                    });
+                  }}
                   className={`editor-tab ${
                     isActive ? 'editor-tab--active' : ''
                   } ${tab.kind === 'settings' ? 'editor-tab--settings' : ''}`}

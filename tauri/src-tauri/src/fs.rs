@@ -52,6 +52,16 @@ pub struct CreateFolderResult {
     pub created: bool,
 }
 
+/// 重命名结果（文件或目录）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameEntryResult {
+    pub folder_id: String,
+    pub old_path: String,
+    pub new_path: String,
+    pub renamed: bool,
+}
+
 /// 浏览条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -396,6 +406,41 @@ pub fn create_folder(
         folder_id: folder_id.into(),
         path: relative_path.into(),
         created,
+    })
+}
+
+/// 重命名文件或目录；目标已存在时不覆盖。
+pub fn rename_entry(
+    folder_root: &str,
+    folder_id: &str,
+    old_path: &str,
+    new_path: &str,
+) -> Result<RenameEntryResult, String> {
+    if old_path.trim().is_empty() || new_path.trim().is_empty() {
+        return Err("路径不能为空".into());
+    }
+
+    let old_full = resolve_and_validate(folder_root, old_path)?;
+    let new_full = resolve_and_validate(folder_root, new_path)?;
+
+    if !old_full.exists() {
+        return Err(format!("源路径不存在: {}", old_path));
+    }
+    if new_full.exists() {
+        return Err(format!("file_already_exists: {}", new_path));
+    }
+    if let Some(parent) = new_full.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("创建目标父目录失败: {}", e))?;
+    }
+    fs::rename(&old_full, &new_full)
+        .map_err(|e| format!("重命名失败: {}", e))?;
+
+    Ok(RenameEntryResult {
+        folder_id: folder_id.into(),
+        old_path: old_path.into(),
+        new_path: new_path.into(),
+        renamed: true,
     })
 }
 

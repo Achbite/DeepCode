@@ -55,6 +55,16 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   // 用户 vscode 是 "Visual Studio 2017 Dark - C++"，本项目暂不引入完整主题包，
   // 简化为 vs-dark；阶段 5 引入主题切换最小集后再扩展。
   'workbench.colorTheme': 'vs-dark',
+  // ---- Agent / Skill / Prompt ----
+  'skills.pythonPath': 'python',
+  'skills.autoLoad': true,
+  'skills.mounts': '[]',
+  'prompt.defaultProfileId': 'default-agent',
+  'prompt.profiles':
+    '[{"id":"default-agent","name":"Default Agent","description":"通用代码协作 Agent","systemPrompt":"You are DeepCode Agent. Work inside the current workspace, explain important risks, and ask for approval before writing files.","enabled":true}]',
+  'ruler.enabled': true,
+  'ruler.rules':
+    '[{"id":"default-safety","name":"Default Safety Boundary","source":"system","priority":100,"path":"<builtin>/default-safety.md","content":"Default to plan mode. Read before write. Show diff before saving files. Never run destructive commands without explicit approval.","enabled":true}]',
 };
 
 /** GET /api/user-settings 成功响应 data 字段 */

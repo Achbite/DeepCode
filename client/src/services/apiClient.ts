@@ -11,6 +11,7 @@ import type {
   FileReadResult,
   FileWriteResult,
   CreateFolderResult,
+  RenameEntryResult,
   WorkspaceState,
   OpenWorkspaceResult,
   PatchWorkspaceSettingsResult,
@@ -19,6 +20,23 @@ import type {
   GetUserSettingsResult,
   PatchUserSettingsResult,
   UserSettingValue,
+  LlmProfilesResult,
+  PatchLlmProfilesRequest,
+  LlmProbeRequest,
+  LlmProbeResult,
+  LlmChatRequest,
+  LlmChatResult,
+  CodeSearchInput,
+  CodeSearchResult,
+  AgentMode,
+  CreateAgentSessionRequest,
+  AgentSessionResult,
+  AppendAgentEventsRequest,
+  ListToolsResult,
+  PermissionEvaluationRequest,
+  PermissionDecision,
+  ToolExecutionRequest,
+  ToolResult,
 } from '@deepcode/protocol';
 
 const API_BASE = '/api';
@@ -194,6 +212,18 @@ export function createFolder(
   );
 }
 
+export function renameEntry(
+  oldPath: string,
+  newPath: string,
+  folderId?: string
+): Promise<ApiResponse<RenameEntryResult>> {
+  return sendJson<RenameEntryResult>(
+    `${API_BASE}/files/rename`,
+    'POST',
+    { folderId, oldPath, newPath }
+  );
+}
+
 // ---- 用户设置（阶段 4 / S4-4）----
 
 export function getUserSettings(): Promise<ApiResponse<GetUserSettingsResult>> {
@@ -210,12 +240,111 @@ export function patchUserSettings(
   );
 }
 
+// ---- LLM profiles / chat（阶段 6 / S6-1）----
+
+export function getLlmProfiles(): Promise<ApiResponse<LlmProfilesResult>> {
+  return getJson<LlmProfilesResult>(`${API_BASE}/llm/profiles`);
+}
+
+export function patchLlmProfiles(
+  request: PatchLlmProfilesRequest
+): Promise<ApiResponse<LlmProfilesResult>> {
+  return sendJson<LlmProfilesResult>(
+    `${API_BASE}/llm/profiles`,
+    'PATCH',
+    request
+  );
+}
+
+export function probeLlmProfile(
+  request: LlmProbeRequest
+): Promise<ApiResponse<LlmProbeResult>> {
+  return sendJson<LlmProbeResult>(
+    `${API_BASE}/llm/probe`,
+    'POST',
+    request
+  );
+}
+
+export function llmChat(
+  request: LlmChatRequest
+): Promise<ApiResponse<LlmChatResult>> {
+  return sendJson<LlmChatResult>(
+    `${API_BASE}/llm/chat`,
+    'POST',
+    request
+  );
+}
+
+export function codeSearch(
+  request: CodeSearchInput
+): Promise<ApiResponse<CodeSearchResult>> {
+  return sendJson<CodeSearchResult>(
+    `${API_BASE}/code/search`,
+    'POST',
+    request
+  );
+}
+
+export function createAgentSession(
+  request: CreateAgentSessionRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return sendJson<AgentSessionResult>(
+    `${API_BASE}/agent/sessions`,
+    'POST',
+    request
+  );
+}
+
+export function getCurrentAgentSession(): Promise<ApiResponse<AgentSessionResult | null>> {
+  return getJson<AgentSessionResult | null>(`${API_BASE}/agent/sessions/current`);
+}
+
+export function appendAgentEvents(
+  sessionId: string,
+  request: AppendAgentEventsRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return sendJson<AgentSessionResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`,
+    'POST',
+    request
+  );
+}
+
+export function listAgentTools(
+  mode?: AgentMode
+): Promise<ApiResponse<ListToolsResult>> {
+  const qs = buildQuery({ mode });
+  return getJson<ListToolsResult>(`${API_BASE}/agent/tools${qs}`);
+}
+
+export function evaluateAgentPermission(
+  request: PermissionEvaluationRequest
+): Promise<ApiResponse<PermissionDecision>> {
+  return sendJson<PermissionDecision>(
+    `${API_BASE}/agent/permissions/evaluate`,
+    'POST',
+    request
+  );
+}
+
+export function executeAgentTool(
+  request: ToolExecutionRequest
+): Promise<ApiResponse<ToolResult>> {
+  return sendJson<ToolResult>(
+    `${API_BASE}/agent/tools/execute`,
+    'POST',
+    request
+  );
+}
+
 // 重新导出共享 DTO
 export type {
   FileTreeNode,
   FileReadResult,
   FileWriteResult,
   CreateFolderResult,
+  RenameEntryResult,
   WorkspaceState,
   OpenWorkspaceResult,
   BrowsePathResult,

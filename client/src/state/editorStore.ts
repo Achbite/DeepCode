@@ -67,6 +67,8 @@ interface EditorActions {
   updateContent: (tabId: string, content: string) => void;
   saveFile: (tabId: string) => Promise<void>;
   setActiveTab: (tabId: string) => void;
+  /** 资源管理器重命名后同步已打开文件 Tab 的路径 */
+  renamePathInTabs: (folderId: string, oldPath: string, newPath: string) => void;
   /** 切换工作区时调用：关闭所有 file Tab，保留 settings Tab */
   closeAllFileTabs: () => void;
 }
@@ -267,6 +269,36 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   setActiveTab: (tabId) => {
     set({ activeTabId: tabId });
+  },
+
+  renamePathInTabs: (folderId, oldPath, newPath) => {
+    const isNested = (path: string) =>
+      path === oldPath || path.startsWith(`${oldPath}/`);
+
+    set((state) => {
+      let nextActiveTabId = state.activeTabId;
+      const tabs = state.tabs.map((tab) => {
+        if (tab.kind !== 'file' || tab.folderId !== folderId || !isNested(tab.path)) {
+          return tab;
+        }
+        const oldTabId = buildFileTabId(tab.folderId, tab.path);
+        const nextPath =
+          tab.path === oldPath
+            ? newPath
+            : `${newPath}/${tab.path.slice(oldPath.length + 1)}`;
+        closeModel(oldTabId);
+        const nextTabId = buildFileTabId(tab.folderId, nextPath);
+        if (state.activeTabId === oldTabId) {
+          nextActiveTabId = nextTabId;
+        }
+        return { ...tab, path: nextPath };
+      });
+      return {
+        tabs,
+        activeTabId: nextActiveTabId,
+        saveMessage: `已重命名: ${oldPath.split('/').pop()} → ${newPath.split('/').pop()}`,
+      };
+    });
   },
 
   closeAllFileTabs: () => {

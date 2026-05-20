@@ -17,6 +17,7 @@ import {
   writeFileContent,
   createFile,
   createFolderEntry,
+  renameEntry,
 } from '../services/fileService.js';
 import type {
   ApiResponse,
@@ -29,6 +30,8 @@ import type {
   CreateFileRequest,
   CreateFolderRequest,
   CreateFolderResult,
+  RenameEntryRequest,
+  RenameEntryResult,
 } from '@deepcode/protocol';
 
 export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
@@ -166,6 +169,36 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
       const response: ApiResponse<never> = {
         ok: false,
         error: isExist ? 'file_already_exists' : 'folder_create_error',
+        message,
+      };
+      return response;
+    }
+  });
+
+  // ---- 重命名文件 / 目录（编辑器基建）----
+  app.post('/api/files/rename', async (request) => {
+    const body = request.body as RenameEntryRequest;
+    if (!body || !body.oldPath || !body.newPath) {
+      const response: ApiResponse<never> = {
+        ok: false,
+        error: 'missing_param',
+        message: '缺少 oldPath 或 newPath 参数',
+      };
+      return response;
+    }
+    try {
+      const result = await renameEntry(body.folderId, body.oldPath, body.newPath);
+      const response: ApiResponse<RenameEntryResult> = {
+        ok: true,
+        data: result,
+      };
+      return response;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const isExist = message.startsWith('file_already_exists');
+      const response: ApiResponse<never> = {
+        ok: false,
+        error: isExist ? 'file_already_exists' : 'file_rename_error',
         message,
       };
       return response;
