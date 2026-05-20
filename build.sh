@@ -240,16 +240,22 @@ endlocal
 WIN_LAUNCHER
 
 # ---- 可选：Tauri Rust 端原生二进制 ----
+# BUILD_TAURI=1 时：用 Rust + WebView 把前端静态资源嵌入二进制，产出"真正的桌面应用"。
+# 此时 Node server / start.* 启动器 / web/ 静态资源对最终用户都不再必要，会从 bin/ 中移除，
+# 只保留 deepcode（Linux 原生 ELF）和 deepcode.exe（Windows PE32+）。
 if [ "$BUILD_TAURI" = "1" ]; then
     echo "==[build][opt]== build tauri rust (linux + windows-gnu)"
     if [ -d "$TAURI_RUST_DIR" ]; then
-        ( cd "$TAURI_RUST_DIR" && cargo build --release --target x86_64-unknown-linux-gnu ) || true
-        ( cd "$TAURI_RUST_DIR" && cargo build --release --target x86_64-pc-windows-gnu )   || true
-        # 拷贝产物（如成功）
-        find "$TAURI_RUST_DIR/target/x86_64-unknown-linux-gnu/release" -maxdepth 1 -type f -executable \
-            -not -name '*.d' -exec cp -v {} "$LINUX_DIR/" \; 2>/dev/null || true
-        find "$TAURI_RUST_DIR/target/x86_64-pc-windows-gnu/release"    -maxdepth 1 -name '*.exe'      \
-            -exec cp -v {} "$WIN_DIR/"   \; 2>/dev/null || true
+        ( cd "$TAURI_RUST_DIR" && cargo build --release --target x86_64-unknown-linux-gnu )
+        ( cd "$TAURI_RUST_DIR" && cargo build --release --target x86_64-pc-windows-gnu )
+        # 拷贝最终桌面可执行文件
+        cp -v "$TAURI_RUST_DIR/target/x86_64-unknown-linux-gnu/release/deepcode"     "$LINUX_DIR/deepcode"
+        cp -v "$TAURI_RUST_DIR/target/x86_64-pc-windows-gnu/release/deepcode.exe"    "$WIN_DIR/deepcode.exe"
+        chmod +x "$LINUX_DIR/deepcode"
+        # Tauri 模式：清理 Web 模式残留（前端已嵌入二进制；Node server 已无需）
+        rm -f  "$LINUX_DIR/deepcode-server" "$LINUX_DIR/start.sh"
+        rm -f  "$WIN_DIR/deepcode-server.exe" "$WIN_DIR/start.bat"
+        rm -rf "$LINUX_DIR/web" "$WIN_DIR/web"
     else
         echo "==[build][warn]== tauri/src-tauri 不存在，跳过 Rust 构建"
     fi
@@ -261,5 +267,10 @@ echo "==[build]== DONE. 产物清单："
 echo "----------------------------------------"
 ( cd "$BIN_DIR" && find . -maxdepth 3 -type f | sort )
 echo "----------------------------------------"
-echo "Linux/WSL 用户:  cd bin/linux-x64 && ./start.sh"
-echo "Windows 兼容版:  bin\\win-x64\\start.bat  (推荐改用 WSL 跑 linux-x64)"
+if [ "$BUILD_TAURI" = "1" ]; then
+    echo "Linux/WSL 用户:  ./bin/linux-x64/deepcode  (双击或命令行直接运行)"
+    echo "Windows 用户:    bin\\win-x64\\deepcode.exe (双击运行)"
+else
+    echo "Linux/WSL 用户:  cd bin/linux-x64 && ./start.sh"
+    echo "Windows 兼容版:  bin\\win-x64\\start.bat  (推荐改用 WSL 跑 linux-x64)"
+fi

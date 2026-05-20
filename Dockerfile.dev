@@ -6,7 +6,10 @@
 # 包含完整工具链：Rust + Node 22 + pnpm + Tauri CLI + mingw-w64（Windows 交叉编译）+ @yao-pkg/pkg。
 # ====================================================================
 
-FROM rust:1.81-bookworm
+# 基础镜像：Rust 1.88+ 才能满足 Tauri v2 当前传递依赖的最低版本要求
+# （darling 0.23 / serde_with 3.20 / plist 1.9 / time 0.3.47 / icu 2.2 等均要求 rustc >= 1.86~1.88）。
+# Tauri 上游依赖追新激进，本镜像取相对靠近的稳定 tag，必要时再升。
+FROM rust:1.88-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
