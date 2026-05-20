@@ -70,6 +70,17 @@
   color: #777;
 }
 
+/* ---- 大文件非阻塞预警 ---- */
+.code-editor__large-file-warning {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border-color, #444);
+  background: rgba(209, 154, 102, 0.12);
+  color: #d19a66;
+  font-size: 12px;
+  line-height: 20px;
+}
+
 /* ---- 主体 ---- */
 .code-editor__body {
   flex: 1;

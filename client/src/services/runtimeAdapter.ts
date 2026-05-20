@@ -14,10 +14,15 @@ import type {
   FileTreeNode,
   FileReadResult,
   FileWriteResult,
+  CreateFolderResult,
   WorkspaceState,
   OpenWorkspaceResult,
   BrowsePathResult,
   InitialLocations,
+  GetUserSettingsResult,
+  PatchUserSettingsRequest,
+  PatchUserSettingsResult,
+  PatchWorkspaceSettingsResult,
 } from '@deepcode/protocol';
 
 // ---- 运行时检测 ----
@@ -118,6 +123,14 @@ async function tauriInvoke<T>(command: string, args?: Record<string, unknown>): 
       };
     }
 
+    if (errStr.includes('file_already_exists')) {
+      return {
+        ok: false,
+        error: 'file_already_exists',
+        message: errStr,
+      };
+    }
+
     return {
       ok: false,
       error: 'tauri_error',
@@ -142,6 +155,16 @@ export async function openWorkspace(path: string): Promise<ApiResponse<OpenWorks
   }
   const { openWorkspace: apiOpenWorkspace } = await import('./apiClient');
   return apiOpenWorkspace(path);
+}
+
+export async function patchWorkspaceSettings(
+  settings: Record<string, unknown>
+): Promise<ApiResponse<PatchWorkspaceSettingsResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<PatchWorkspaceSettingsResult>('patch_workspace_settings', { settings });
+  }
+  const { patchWorkspaceSettings: apiPatchWorkspaceSettings } = await import('./apiClient');
+  return apiPatchWorkspaceSettings(settings);
 }
 
 // ---- 文件系统浏览（用于 Open Workspace 对话框）----
@@ -240,4 +263,70 @@ export async function writeFile(
   }
   const { writeFile: apiWriteFile } = await import('./apiClient');
   return apiWriteFile(filePath, content, folderId);
+}
+
+// ---- 新建文件 / 新建目录（阶段 4 / S4-1）----
+
+export async function createFile(
+  filePath: string,
+  content?: string,
+  folderId?: string
+): Promise<ApiResponse<FileWriteResult>> {
+  if (getRuntimeType() === 'tauri') {
+    if (!folderId) {
+      return {
+        ok: false,
+        error: 'missing_folder_id',
+        message: 'Tauri 模式下 folderId 不能为空',
+      };
+    }
+    return tauriInvoke<FileWriteResult>('create_file', {
+      folderId,
+      path: filePath,
+      content: content ?? '',
+    });
+  }
+  const { createFile: apiCreateFile } = await import('./apiClient');
+  return apiCreateFile(filePath, content, folderId);
+}
+
+export async function createFolder(
+  folderPath: string,
+  folderId?: string
+): Promise<ApiResponse<CreateFolderResult>> {
+  if (getRuntimeType() === 'tauri') {
+    if (!folderId) {
+      return {
+        ok: false,
+        error: 'missing_folder_id',
+        message: 'Tauri 模式下 folderId 不能为空',
+      };
+    }
+    return tauriInvoke<CreateFolderResult>('create_folder', {
+      folderId,
+      path: folderPath,
+    });
+  }
+  const { createFolder: apiCreateFolder } = await import('./apiClient');
+  return apiCreateFolder(folderPath, folderId);
+}
+
+// ---- 用户设置（阶段 4 / S4-4）----
+
+export async function getUserSettings(): Promise<ApiResponse<GetUserSettingsResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<GetUserSettingsResult>('get_user_settings');
+  }
+  const { getUserSettings: apiGetUserSettings } = await import('./apiClient');
+  return apiGetUserSettings();
+}
+
+export async function patchUserSettings(
+  patches: PatchUserSettingsRequest['patches']
+): Promise<ApiResponse<PatchUserSettingsResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<PatchUserSettingsResult>('patch_user_settings', { patches });
+  }
+  const { patchUserSettings: apiPatchUserSettings } = await import('./apiClient');
+  return apiPatchUserSettings(patches);
 }

@@ -10,11 +10,15 @@ import type {
   FileTreeNode,
   FileReadResult,
   FileWriteResult,
+  CreateFolderResult,
   WorkspaceState,
   OpenWorkspaceResult,
   PatchWorkspaceSettingsResult,
   BrowsePathResult,
   InitialLocations,
+  GetUserSettingsResult,
+  PatchUserSettingsResult,
+  UserSettingValue,
 } from '@deepcode/protocol';
 
 const API_BASE = '/api';
@@ -167,11 +171,51 @@ export function writeFile(
   );
 }
 
+export function createFile(
+  filePath: string,
+  content?: string,
+  folderId?: string
+): Promise<ApiResponse<FileWriteResult>> {
+  return sendJson<FileWriteResult>(
+    `${API_BASE}/files/create`,
+    'POST',
+    { folderId, path: filePath, content: content ?? '' }
+  );
+}
+
+export function createFolder(
+  folderPath: string,
+  folderId?: string
+): Promise<ApiResponse<CreateFolderResult>> {
+  return sendJson<CreateFolderResult>(
+    `${API_BASE}/folders/create`,
+    'POST',
+    { folderId, path: folderPath }
+  );
+}
+
+// ---- 用户设置（阶段 4 / S4-4）----
+
+export function getUserSettings(): Promise<ApiResponse<GetUserSettingsResult>> {
+  return getJson<GetUserSettingsResult>(`${API_BASE}/user-settings`);
+}
+
+export function patchUserSettings(
+  patches: Record<string, UserSettingValue>
+): Promise<ApiResponse<PatchUserSettingsResult>> {
+  return sendJson<PatchUserSettingsResult>(
+    `${API_BASE}/user-settings`,
+    'PATCH',
+    { patches }
+  );
+}
+
 // 重新导出共享 DTO
 export type {
   FileTreeNode,
   FileReadResult,
   FileWriteResult,
+  CreateFolderResult,
   WorkspaceState,
   OpenWorkspaceResult,
   BrowsePathResult,

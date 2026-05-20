@@ -51,8 +51,17 @@ interface EditorStateData {
 }
 
 interface EditorActions {
-  /** 打开文件（已打开则切换到 tab）；folderId 省略时使用当前活动 folder */
-  openFile: (filePath: string, folderId?: string) => Promise<void>;
+  /**
+   * 打开文件（已打开则切换到 tab）；folderId 省略时使用当前活动 folder。
+   *
+   * `forceJson` （阶段 4 / S4-3）：当为 true 时跳过对 .code-workspace 的拦截，
+   * 直接当作普通 JSON 文件读取并在 Monaco 中编辑 / 保存。
+   */
+  openFile: (
+    filePath: string,
+    folderId?: string,
+    forceJson?: boolean
+  ) => Promise<void>;
   openSettings: () => void;
   closeTab: (tabId: string) => void;
   updateContent: (tabId: string, content: string) => void;
@@ -128,15 +137,16 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   // ---- 打开文件 ----
-  openFile: async (filePath, folderIdArg) => {
-    // 自动识别 .code-workspace：直接切换工作区，不当作普通文件读取
-    if (isCodeWorkspaceFile(filePath)) {
-      // .code-workspace 通常需要绝对路径才能打开；当前列表里看到的相对路径
-      // 不足以驱动 openWorkspace。此处只提示，实际由 FileTree / Settings UI
-      // 通过绝对路径输入打开。
-      set({
-        saveMessage:
-          '⚠️ .code-workspace 文件需要通过 "Open Workspace" 入口打开（输入绝对路径）',
+  openFile: async (filePath, folderIdArg, forceJson) => {
+    // .code-workspace 双击处理（阶段 4 / S4-3）：
+    //   - 默认弹三选项模态：Open as Workspace / Open as JSON File / Cancel
+    //   - 调用方传 forceJson=true 表示用户已选择 "Open as JSON File"，跳过拦截走普通读文件流程。
+    if (isCodeWorkspaceFile(filePath) && !forceJson) {
+      // 动态导入避免循环依赖：uiStore 不反向依赖 editorStore
+      const { useUiStore } = await import('./uiStore');
+      useUiStore.getState().showCodeWorkspaceChoice({
+        path: filePath,
+        folderId: folderIdArg,
       });
       return;
     }
