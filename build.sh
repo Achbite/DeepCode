@@ -2,15 +2,17 @@
 # ====================================================================
 # DeepCode 容器内构建脚本（根目录版本，进容器后直接 ./build.sh）
 # 职责：编译并输出双平台产物到 ./bin/
-#   - bin/linux-x64/  : 服务端 Node 单文件可执行（Linux x64） + 前端 dist
-#   - bin/win-x64/    : 服务端 Node 单文件 .exe（Windows x64）   + 前端 dist
-# 不在本期产出：Tauri GUI 的 Windows 安装包（需要 Windows runner + WebView2 SDK，跨平台不可行）
+#   - bin/linux-x64/   Linux 桌面便携产物（Tauri 模式：deepcode；Web 模式：deepcode-server + start.sh + web/）
+#   - bin/win-x64/     Windows 桌面便携产物（Tauri 模式：deepcode.exe + WebView2Loader.dll + Runtime；
+#                                            Web 模式：deepcode-server.exe + start.bat + web/）
+#   - bin/installers/  一次性 GUI 安装包（Tauri 模式：DeepCode_*_x64-setup.exe）
 #
 # 设计要点：
 #   1. server 是 ESM (`"type": "module"`)，pkg 不直吃 ESM；先用 esbuild 打成单文件 CJS bundle，再喂给 pkg。
-#   2. client 是纯前端静态资源，跨平台共用一份 dist/。
-#   3. tauri Rust 端可选构建（默认开启 Linux release，Windows 通过 mingw 交叉编译）。
-#   4. 任何阶段失败立即终止；产物目录使用 rm -rf 重建，确保干净。
+#   2. client 是纯前端静态资源；Web 模式跨平台共用一份 dist/，Tauri 模式由 cargo tauri build 嵌入到 binary。
+#   3. tauri Rust 端可选构建（BUILD_TAURI=1 启用，默认关闭，避免首次构建过慢）；走 cargo tauri build
+#      让 Tauri CLI 自动启用 custom-protocol feature，否则 release build 仍走 devUrl 导致白屏。
+#   4. 任何阶段失败立即终止；产物目录使用 find -delete 清内容方式重建，规避 NTFS DrvFs 句柄缓存问题。
 # ====================================================================
 set -euo pipefail
 
@@ -20,10 +22,15 @@ set -euo pipefail
 export PATH="/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
 # ---- 路径与常量 ----
+# 产物目录布局对标 VSCode 风格：可执行产物（用户直接拿来跑的目录）与安装器（一次性安装包）分开放。
+#   bin/linux-x64/  Linux 桌面便携产物（直接 ./deepcode）
+#   bin/win-x64/    Windows 桌面便携产物（exe + dll + WebView2 Runtime 同目录，类 VSCode 安装目录形态）
+#   bin/installers/ 一次性 setup 安装包（NSIS *-setup.exe 等）
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$ROOT_DIR/bin"
 LINUX_DIR="$BIN_DIR/linux-x64"
 WIN_DIR="$BIN_DIR/win-x64"
+INSTALLERS_DIR="$BIN_DIR/installers"
 SERVER_DIR="$ROOT_DIR/server"
 CLIENT_DIR="$ROOT_DIR/client"
 TAURI_RUST_DIR="$ROOT_DIR/tauri/src-tauri"
@@ -56,9 +63,10 @@ pnpm --filter @deepcode/client   run build
 # 这些目录或子文件时，可能短时间内仍持有 inode 句柄缓存，rm 整个目录会触发 EACCES。
 # 清内容则只动子项，规避这个边界条件，且与 build 反复迭代场景兼容性更好。
 echo "==[build][3/6]== prepare bin/ directories"
-mkdir -p "$LINUX_DIR" "$WIN_DIR"
-find "$LINUX_DIR" -mindepth 1 -delete 2>/dev/null || true
-find "$WIN_DIR"   -mindepth 1 -delete 2>/dev/null || true
+mkdir -p "$LINUX_DIR" "$WIN_DIR" "$INSTALLERS_DIR"
+find "$LINUX_DIR"      -mindepth 1 -delete 2>/dev/null || true
+find "$WIN_DIR"        -mindepth 1 -delete 2>/dev/null || true
+find "$INSTALLERS_DIR" -mindepth 1 -delete 2>/dev/null || true
 
 # ---- 4. server 单文件可执行（双平台）----
 # 先用 esbuild 把 ESM dist 打成 CJS 单文件 bundle，再交给 @yao-pkg/pkg 打成原生可执行
@@ -313,26 +321,29 @@ if [ "$BUILD_TAURI" = "1" ]; then
             echo "==[build][webview2]== Runtime 已存在: $WEBVIEW2_RUNTIME_DIR"
         fi
 
-        # 1) Linux 原生：cargo build 已足够（Linux 桌面不依赖 NSIS / 不分发 installer）
-        ( cd "$TAURI_RUST_DIR" && cargo build --release --target x86_64-unknown-linux-gnu )
+        # 1) Linux 原生：cargo tauri build --no-bundle
+        # 关键：必须用 cargo tauri build 而非裸 cargo build，原因是 Tauri CLI 会自动注入
+        # --features custom-protocol，让前端 dist 通过自定义协议嵌入到 binary；
+        # 否则 release 模式仍走 devUrl=http://localhost:5173，启动后白屏 ERR_CONNECTION_REFUSED。
+        # --no-bundle 跳过 deb/AppImage 等 Linux 包，只产 ELF 可执行（我们只分发 portable 形态）。
+        ( cd "$ROOT_DIR/tauri" && cargo tauri build --no-bundle --target x86_64-unknown-linux-gnu )
         cp -v "$TAURI_RUST_DIR/target/x86_64-unknown-linux-gnu/release/deepcode" "$LINUX_DIR/deepcode"
         chmod +x "$LINUX_DIR/deepcode"
 
-        # 2) Windows 交叉：先用 cargo build 拿到 deepcode.exe + WebView2Loader.dll
-        ( cd "$TAURI_RUST_DIR" && cargo build --release --target x86_64-pc-windows-gnu )
+        # 2) Windows 交叉：cargo tauri build --bundles nsis
+        # 同样必须经 Tauri CLI 调度，确保 custom-protocol feature 生效；
+        # 同步产 NSIS 安装器，单步完成（之前的两步 cargo build + cargo tauri bundle 会编译两次，浪费时间）。
+        # cross 模式下 Tauri 会打印 "experimental" 警告，实测 130/131 系列 cab 与 mingw 链路稳定。
+        ( cd "$ROOT_DIR/tauri" && cargo tauri build --bundles nsis --target x86_64-pc-windows-gnu )
         cp -v "$TAURI_RUST_DIR/target/x86_64-pc-windows-gnu/release/deepcode.exe"        "$WIN_DIR/deepcode.exe"
         cp -v "$TAURI_RUST_DIR/target/x86_64-pc-windows-gnu/release/WebView2Loader.dll"  "$WIN_DIR/WebView2Loader.dll"
 
-        # 3) 尝试产 NSIS installer（可能因 cross 环境不全失败，失败不阻塞主流程）
-        echo "==[build][opt]== try cargo tauri bundle (NSIS for windows)"
-        if ( cd "$ROOT_DIR/tauri" && cargo tauri bundle --bundles nsis --target x86_64-pc-windows-gnu ) ; then
-            INSTALLER_DIR="$TAURI_RUST_DIR/target/x86_64-pc-windows-gnu/release/bundle/nsis"
-            if [ -d "$INSTALLER_DIR" ]; then
-                # 拷贝 *-setup.exe 到 win-x64/，文件名保留版本号
-                find "$INSTALLER_DIR" -maxdepth 1 -name '*-setup.exe' -exec cp -v {} "$WIN_DIR/" \;
-            fi
+        # 3) 拷贝 *-setup.exe 到 bin/installers/（与可执行产物分开）
+        NSIS_OUT_DIR="$TAURI_RUST_DIR/target/x86_64-pc-windows-gnu/release/bundle/nsis"
+        if [ -d "$NSIS_OUT_DIR" ]; then
+            find "$NSIS_OUT_DIR" -maxdepth 1 -name '*-setup.exe' -exec cp -v {} "$INSTALLERS_DIR/" \;
         else
-            echo "==[build][warn]== NSIS bundle 在 cross 环境下生成失败；保留 deepcode.exe + WebView2Loader.dll 作为 portable 形态"
+            echo "==[build][warn]== NSIS bundle 输出目录不存在；可能 cross 环境失败，便携形态仍可用"
         fi
 
         # 4) 拷贝 WebView2 Fixed Runtime 到便携目录，让用户解压 win-x64/ 后无需额外依赖即可双击启动
@@ -373,23 +384,47 @@ Windows + WSL 用户:
   - GTK3 / libsoup-3.0 运行时
 LINUX_README
 
+        # installers/ 目录写一份说明，避免用户拿到孤立 setup.exe 不知道与便携产物的关系
+        cat > "$INSTALLERS_DIR/README.txt" <<'INSTALLERS_README'
+DeepCode 安装包目录
+==================
+
+本目录存放标准 GUI 安装器（一次性使用）：
+  DeepCode_<version>_x64-setup.exe   Windows NSIS 安装器（自带 WebView2 Fixed Runtime）
+
+与便携产物的关系：
+  - 便携形态： ../win-x64/        解压即用，不写注册表，不创建快捷方式
+  - 安装形态： 当前目录 *-setup.exe，会安装到用户选定的目录（例如 D:\DeepCode），
+              并注册开始菜单 / 桌面快捷方式 / 卸载入口。
+  - 两种形态运行时表现完全一致，选其一即可；分发场景不同：
+    * 团队 / IT 集中部署：用 setup.exe；
+    * 单机临时使用 / U 盘携带：用 win-x64/。
+INSTALLERS_README
+
         cat > "$WIN_DIR/README.txt" <<'WIN_README'
 DeepCode for Windows
 ====================
 
-推荐安装方式（如果存在 *-setup.exe）:
-  双击 DeepCode_<version>_x64-setup.exe 走标准安装流程；
-  会让你选目标目录（例如 D:\DeepCode），并在开始菜单注册快捷方式。
-  安装目录形态接近 VSCode：exe + WebView2 完整运行时（EBWebView/）+ 资源。
+本目录是 Windows 桌面便携产物（与 VSCode 安装目录形态对标）：
+  deepcode.exe                                  主程序
+  WebView2Loader.dll                            WebView2 加载器（PE 同目录约束）
+  Microsoft.WebView2.FixedVersionRuntime.x64/   自带 Chromium 固定版本运行时
 
-便携启动方式（portable，免安装）:
-  保持 deepcode.exe + WebView2Loader.dll + EBWebView/ 同目录，双击 deepcode.exe。
-  整个 win-x64/ 目录视为一个分发单元；压缩或分发时不可遗漏 dll 与 EBWebView/ 整个目录。
+便携启动（推荐）:
+  双击 deepcode.exe 即可运行；无需安装、不依赖系统 Edge / WebView2 Runtime。
+
+标准安装:
+  到 ../installers/DeepCode_<version>_x64-setup.exe 走 NSIS 安装流程，
+  会让你选目标目录（例如 D:\DeepCode），并在开始菜单注册快捷方式。
 
 系统要求:
   - Windows 10 1803 或 Windows 11
   - 不依赖系统 Edge / WebView2 Runtime，应用自带固定版本 Chromium 内核
-    (与 VSCode/Electron 模型一致，即"应用自包含全部渲染依赖")
+    （与 VSCode/Electron 模型一致，"应用自包含全部渲染依赖"）
+
+注意:
+  - deepcode.exe + WebView2Loader.dll + EBWebView 目录必须保持同一父目录；
+  - 整个 win-x64/ 视为一个分发单元，压缩或拷贝时不可遗漏 dll 与 EBWebView。
 WIN_README
     else
         echo "==[build][warn]== tauri/src-tauri 不存在，跳过 Rust 构建"
@@ -413,9 +448,9 @@ echo "----------------------------------------"
     done )
 echo "----------------------------------------"
 if [ "$BUILD_TAURI" = "1" ]; then
-    echo "Linux/WSL 用户:  ./bin/linux-x64/deepcode  (双击或命令行直接运行)"
-    echo "Windows 用户:    bin\\win-x64\\DeepCode_*_x64-setup.exe (推荐，标准安装)"
-    echo "                  或 bin\\win-x64\\deepcode.exe (便携，需配 WebView2Loader.dll)"
+    echo "Linux/WSL 用户:    ./bin/linux-x64/deepcode      (双击或命令行直接运行)"
+    echo "Windows 便携用户:  bin\\win-x64\\deepcode.exe      (整个 win-x64/ 目录视为一个分发单元)"
+    echo "Windows 安装版:    bin\\installers\\DeepCode_*_x64-setup.exe  (走 NSIS 安装到用户目录如 D:\\DeepCode)"
 else
     echo "Linux/WSL 用户:  cd bin/linux-x64 && ./start.sh"
     echo "Windows 兼容版:  bin\\win-x64\\start.bat  (推荐改用 WSL 跑 linux-x64)"
