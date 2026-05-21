@@ -1,0 +1,62 @@
+.window-controls {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: stretch;
+  height: 100%;
+}
+
+.window-control {
+  position: relative;
+  width: 46px;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--muted, #8d94a3);
+  cursor: pointer;
+}
+
+.window-control:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-strong, #fff);
+}
+
+.window-control--close:hover {
+  background: var(--danger, #f48771);
+  color: #fff;
+}
+
+.window-control::before,
+.window-control::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.window-control--minimize::before {
+  width: 12px;
+  height: 1px;
+  background: currentColor;
+}
+
+.window-control--maximize::before {
+  width: 11px;
+  height: 9px;
+  border: 1px solid currentColor;
+}
+
+.window-control--close::before,
+.window-control--close::after {
+  width: 13px;
+  height: 1px;
+  background: currentColor;
+}
+
+.window-control--close::before {
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+.window-control--close::after {
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
