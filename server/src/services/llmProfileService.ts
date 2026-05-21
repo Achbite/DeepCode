@@ -5,7 +5,7 @@ import type {
   LlmProfilesResult,
   PatchLlmProfilesRequest,
 } from '@deepcode/protocol';
-import { resolveDeepCodeConfigDir } from './appDataPath.js';
+import { resolveDeepCodeSettingsDir } from './appDataPath.js';
 import {
   deleteLlmSecret,
   getSecretStorePath,
@@ -17,7 +17,7 @@ interface LlmProfilesFile {
   defaultProfileId?: string;
 }
 
-const STORE_PATH = join(resolveDeepCodeConfigDir(), 'llm-profiles.json');
+const STORE_PATH = join(resolveDeepCodeSettingsDir(), 'llm-profiles.json');
 
 let cache: LlmProfilesFile | null = null;
 

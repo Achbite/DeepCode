@@ -32,6 +32,7 @@ function groupDefinitions(): Record<string, SettingDefinition[]> {
 const GROUP_TITLES: Record<string, string> = {
   editor: 'Editor',
   files: 'Files',
+  keyboard: 'Keyboard',
   explorer: 'Explorer',
   workbench: 'Workbench',
 };

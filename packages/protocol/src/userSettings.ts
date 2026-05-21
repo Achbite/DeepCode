@@ -47,8 +47,11 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   // ---- 文件 ----
   'files.autoSave': 'afterDelay', // ← 来自当前 vscode 用户设置
   'files.autoSaveDelay': 1000,
+  'files.hotExit': true,
   'files.encoding': 'utf8',
   'files.eol': '\n',
+  // ---- 键盘 ----
+  'keyboard.enableBasicShortcuts': true,
   // ---- 资源管理器 ----
   'explorer.confirmDelete': false, // ← 来自当前 vscode 用户设置
   // ---- 工作台 ----

@@ -29,7 +29,7 @@ export interface SettingDefinition {
   key: string;
   label: string;
   description: string;
-  group: 'editor' | 'files' | 'explorer' | 'workbench';
+  group: 'editor' | 'files' | 'keyboard' | 'explorer' | 'workbench';
   control: SettingControlType;
   options?: Array<{ label: string; value: string }>;
 }
@@ -141,6 +141,20 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     description: '自动保存延迟，单位毫秒。',
     group: 'files',
     control: 'number',
+  },
+  {
+    key: 'files.hotExit',
+    label: 'Hot Exit',
+    description: '刷新或重启后保留未保存草稿，再次打开文件时恢复。',
+    group: 'files',
+    control: 'boolean',
+  },
+  {
+    key: 'keyboard.enableBasicShortcuts',
+    label: 'Basic Shortcuts',
+    description: '启用 Ctrl+S 保存、Ctrl+Shift+S 全部保存、Ctrl+, 打开设置等基础快捷键。',
+    group: 'keyboard',
+    control: 'boolean',
   },
   {
     key: 'explorer.confirmDelete',

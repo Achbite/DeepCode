@@ -421,3 +421,11 @@ pub fn execute_agent_tool(_request: serde_json::Value) -> Result<serde_json::Val
         "Tauri Agent tool executor is not implemented yet; use Web/Node mode for Stage 6 validation.".into(),
     ))
 }
+
+// 窗口管理
+#[tauri::command]
+pub fn window_close_ask_status(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    // 通过 emit 向前端询问状态，此函数仅用于标记接口存在
+    // 实际逻辑前端自行处理
+    Ok(false)
+}

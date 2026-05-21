@@ -3,7 +3,8 @@
 // 用户设置 Rust 实现（阶段 4 / S4-4）
 //
 // 与 server 端 [userSettingsService.ts](../../server/src/services/userSettingsService.ts) 行为对齐：
-//   - 持久化路径：Linux/macOS XDG_CONFIG_HOME 或 $HOME/.config；Windows %APPDATA%
+//   - 持久化路径：config/user/<user>/settings/user-settings.json；
+//     Linux/macOS 基于 XDG_CONFIG_HOME 或 $HOME/.config；Windows 基于 %APPDATA%
 //   - 仅保存"用户实际写入"的 key，从默认值派生的 key 不进入 overrides
 //   - PATCH 中显式 null = 恢复默认（从 overrides 中移除该 key）
 //   - 原子写：tmp + rename，防止半写损坏
@@ -60,8 +61,14 @@ fn build_default_settings() -> BTreeMap<String, JsonValue> {
     // 文件
     m.insert("files.autoSave".into(), JsonValue::from("afterDelay"));
     m.insert("files.autoSaveDelay".into(), JsonValue::from(1000));
+    m.insert("files.hotExit".into(), JsonValue::from(true));
     m.insert("files.encoding".into(), JsonValue::from("utf8"));
     m.insert("files.eol".into(), JsonValue::from("\n"));
+    // 键盘
+    m.insert(
+        "keyboard.enableBasicShortcuts".into(),
+        JsonValue::from(true),
+    );
     // 资源管理器
     m.insert("explorer.confirmDelete".into(), JsonValue::from(false));
     // 工作台
@@ -89,13 +96,36 @@ fn build_default_settings() -> BTreeMap<String, JsonValue> {
 // ---- 持久化路径 ----
 
 fn resolve_store_path() -> PathBuf {
+    fn user_id() -> String {
+        std::env::var("DEEPCODE_USER_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "local".into())
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    let user_config = |base: PathBuf| {
+        base.join("config")
+            .join("user")
+            .join(user_id())
+            .join("settings")
+    };
+
     if cfg!(target_os = "windows") {
         let appdata = std::env::var("APPDATA").ok().unwrap_or_else(|| {
             // fallback: %USERPROFILE%/AppData/Roaming
             let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
             format!("{}/AppData/Roaming", home)
         });
-        PathBuf::from(appdata).join("DeepCode").join("user-settings.json")
+        user_config(PathBuf::from(appdata).join("DeepCode")).join("user-settings.json")
     } else {
         let xdg = std::env::var("XDG_CONFIG_HOME").ok();
         let base = match xdg {
@@ -105,7 +135,7 @@ fn resolve_store_path() -> PathBuf {
                 PathBuf::from(home).join(".config")
             }
         };
-        base.join("deepcode").join("user-settings.json")
+        user_config(base.join("deepcode")).join("user-settings.json")
     }
 }
 

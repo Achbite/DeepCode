@@ -6,14 +6,13 @@
  *   - 将 patch 合并到内存覆盖集 + 原子写文件
  *
  * 持久化路径（与平台约定一致）：
- *   - Linux/macOS/WSL: $XDG_CONFIG_HOME/deepcode/user-settings.json
+ *   - Linux/macOS/WSL: $XDG_CONFIG_HOME/deepcode/config/user/<user>/settings/user-settings.json
  *                      （未设 XDG_CONFIG_HOME 时落到 $HOME/.config/deepcode/）
- *   - Windows:        %APPDATA%/DeepCode/user-settings.json
+ *   - Windows:        %APPDATA%/DeepCode/config/user/<user>/settings/user-settings.json
  *
  * 不在本阶段范围：Settings UI / 把这些值实时应用到 Monaco 选项 / 工作区级覆盖
  */
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
-import { homedir, platform } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
   DEFAULT_USER_SETTINGS,
@@ -22,19 +21,12 @@ import {
   type GetUserSettingsResult,
   type PatchUserSettingsResult,
 } from '@deepcode/protocol';
+import { resolveDeepCodeSettingsDir } from './appDataPath.js';
 
 // ---- 路径解析 ----
 
 function resolveStorePath(): string {
-  if (platform() === 'win32') {
-    const appData = process.env.APPDATA;
-    const base = appData && appData.length > 0 ? appData : join(homedir(), 'AppData', 'Roaming');
-    return join(base, 'DeepCode', 'user-settings.json');
-  }
-  // Linux / macOS / WSL：遵循 XDG Base Directory 规范
-  const xdg = process.env.XDG_CONFIG_HOME;
-  const base = xdg && xdg.length > 0 ? xdg : join(homedir(), '.config');
-  return join(base, 'deepcode', 'user-settings.json');
+  return join(resolveDeepCodeSettingsDir(), 'user-settings.json');
 }
 
 const STORE_PATH = resolveStorePath();
