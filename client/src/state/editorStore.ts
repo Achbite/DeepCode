@@ -33,6 +33,8 @@ export interface OpenFile {
   originalContent: string;
   /** 是否被修改过且未保存 */
   isDirty: boolean;
+  /** 编辑器内存版本；用于自动保存等订阅精确感知内容变更 */
+  version: number;
   /** 文件大小（字节） */
   sizeBytes: number;
   /** 文件是否被识别为二进制 */
@@ -65,12 +67,17 @@ interface EditorActions {
   openSettings: () => void;
   closeTab: (tabId: string) => void;
   updateContent: (tabId: string, content: string) => void;
-  saveFile: (tabId: string) => Promise<void>;
+  /** 保存文件；支持 tabId 单参数 或 folderId + path 双参数 */
+  saveFile: (tabIdOrFolderId: string, path?: string) => Promise<boolean>;
+  saveAllDirtyFiles: () => Promise<boolean>;
+  discardAllDirtyFiles: () => void;
   setActiveTab: (tabId: string) => void;
   /** 资源管理器重命名后同步已打开文件 Tab 的路径 */
   renamePathInTabs: (folderId: string, oldPath: string, newPath: string) => void;
   /** 切换工作区时调用：关闭所有 file Tab，保留 settings Tab */
   closeAllFileTabs: () => void;
+  /** 判断是否有未保存的文件 */
+  hasAnyDirtyFile: () => boolean;
 }
 
 interface EditorDerived {
@@ -88,7 +95,7 @@ export function buildFileTabId(folderId: string, path: string): string {
   return `${folderId}::${path}`;
 }
 
-function getTabId(tab: EditorTab): string {
+export function getTabId(tab: EditorTab): string {
   return tab.kind === 'file' ? buildFileTabId(tab.folderId, tab.path) : tab.id;
 }
 
@@ -105,6 +112,67 @@ function pickNextActive(
 /** 把 .code-workspace 拓展名识别为工作区文件 */
 function isCodeWorkspaceFile(path: string): boolean {
   return /\.code-workspace$/i.test(path);
+}
+
+const DRAFTS_STORAGE_KEY = 'deepcode.editor.drafts.v1';
+
+interface StoredDraft {
+  folderId: string;
+  path: string;
+  content: string;
+  originalContent: string;
+  updatedAt: number;
+}
+
+function canUseLocalStorage(): boolean {
+  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
+}
+
+function readDrafts(): Record<string, StoredDraft> {
+  if (!canUseLocalStorage()) return {};
+  try {
+    const raw = window.localStorage.getItem(DRAFTS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeDrafts(drafts: Record<string, StoredDraft>): void {
+  if (!canUseLocalStorage()) return;
+  window.localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(drafts));
+}
+
+function persistDraft(tab: Extract<EditorTab, { kind: 'file' }>): void {
+  const drafts = readDrafts();
+  drafts[getTabId(tab)] = {
+    folderId: tab.folderId,
+    path: tab.path,
+    content: tab.content,
+    originalContent: tab.originalContent,
+    updatedAt: Date.now(),
+  };
+  writeDrafts(drafts);
+}
+
+function removeDraft(tabId: string): void {
+  const drafts = readDrafts();
+  if (!(tabId in drafts)) return;
+  delete drafts[tabId];
+  writeDrafts(drafts);
+}
+
+function getUsableDraft(tabId: string, diskContent: string): StoredDraft | null {
+  const draft = readDrafts()[tabId];
+  if (!draft || draft.content === diskContent) {
+    removeDraft(tabId);
+    return null;
+  }
+  if (draft.originalContent !== diskContent) {
+    return null;
+  }
+  return draft;
 }
 
 // ---- Zustand store ----
@@ -176,13 +244,15 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       return;
     }
 
+    const draft = getUsableDraft(tabId, result.data.content);
     const newTab: EditorTab = {
       kind: 'file',
       folderId: result.data.folderId,
       path: result.data.path,
-      content: result.data.content,
+      content: draft?.content ?? result.data.content,
       originalContent: result.data.content,
-      isDirty: false,
+      isDirty: Boolean(draft),
+      version: 0,
       sizeBytes: result.data.sizeBytes,
       binary: result.data.binary,
     };
@@ -226,21 +296,37 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   updateContent: (tabId, content) => {
+    const current = get().tabs.find((t) => getTabId(t) === tabId);
+    if (current?.kind === 'file') {
+      const next = { ...current, content, isDirty: content !== current.originalContent };
+      if (next.isDirty) {
+        persistDraft(next);
+      } else {
+        removeDraft(tabId);
+      }
+    }
     set((state) => ({
       tabs: state.tabs.map((t) => {
         if (t.kind !== 'file') return t;
         if (getTabId(t) !== tabId) return t;
-        return { ...t, content, isDirty: content !== t.originalContent };
+        return {
+          ...t,
+          content,
+          isDirty: content !== t.originalContent,
+          version: t.version + 1,
+        };
       }),
     }));
   },
 
-  saveFile: async (tabId) => {
+  saveFile: async (arg1: string, arg2?: string) => {
+    const tabId = arg2 ? buildFileTabId(arg1, arg2) : arg1;
     const tab = get().tabs.find((t) => getTabId(t) === tabId);
-    if (!tab || tab.kind !== 'file') return;
+    if (!tab || tab.kind !== 'file') return false;
 
     const result = await writeFile(tab.path, tab.content, tab.folderId);
     if (result.ok && result.data) {
+      removeDraft(tabId);
       set((state) => ({
         tabs: state.tabs.map((t) => {
           if (t.kind !== 'file' || getTabId(t) !== tabId) return t;
@@ -248,6 +334,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
             ...t,
             originalContent: tab.content,
             isDirty: false,
+            version: t.version + 1,
             sizeBytes: result.data!.sizeBytes,
           };
         }),
@@ -260,11 +347,42 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
           set({ saveMessage: null });
         }
       }, 3000);
+      return true;
     } else {
       set({
         saveMessage: `❌ 保存失败: ${result.message ?? '未知错误'}`,
       });
+      return false;
     }
+  },
+
+  saveAllDirtyFiles: async () => {
+    const dirtyTabs = get().tabs.filter(
+      (tab): tab is Extract<EditorTab, { kind: 'file' }> =>
+        tab.kind === 'file' && tab.isDirty
+    );
+    let ok = true;
+    for (const tab of dirtyTabs) {
+      const saved = await get().saveFile(buildFileTabId(tab.folderId, tab.path));
+      ok = ok && saved;
+    }
+    return ok;
+  },
+
+  discardAllDirtyFiles: () => {
+    set((state) => ({
+      tabs: state.tabs.map((tab) => {
+        if (tab.kind !== 'file' || !tab.isDirty) return tab;
+        removeDraft(buildFileTabId(tab.folderId, tab.path));
+        return {
+          ...tab,
+          content: tab.originalContent,
+          isDirty: false,
+          version: tab.version + 1,
+        };
+      }),
+      saveMessage: null,
+    }));
   },
 
   setActiveTab: (tabId) => {
@@ -303,7 +421,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   closeAllFileTabs: () => {
     set((state) => {
-      // 释放每个 file Tab 的 model
+      // 閲婃斁姣忎釜 file Tab 鐨?model
       for (const tab of state.tabs) {
         if (tab.kind === 'file') {
           closeModel(buildFileTabId(tab.folderId, tab.path));
@@ -317,5 +435,13 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         activeTabId: nextActive,
       };
     });
+  },
+
+  /**
+   * 鍒ゆ柇鏄惁鏈変换浣曟湭淇濆瓨鐨勬枃浠�
+   */
+  hasAnyDirtyFile: () => {
+    const state = get();
+    return state.tabs.some((tab) => tab.kind === 'file' && tab.isDirty);
   },
 }));

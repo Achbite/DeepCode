@@ -184,12 +184,20 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
       // eslint-disable-next-line no-bitwise
       monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
       () => {
-        if (modelKey && isDirty) {
+        if (modelKey) {
           onSave(modelKey);
         }
       }
     );
-  }, [modelKey, isDirty, onSave, updateCursor, applyEditorOptions]);
+
+    editor.addCommand(
+      // eslint-disable-next-line no-bitwise
+      monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyA,
+      () => {
+        void editor.getAction('editor.action.selectAll')?.run();
+      }
+    );
+  }, [modelKey, onSave, updateCursor, applyEditorOptions]);
 
   // ---- 空状态 ----
   if (!filePath || !modelKey) {
