@@ -1,23 +1,9 @@
-/**
- * WorkspaceOpenDialog —— "Open Workspace" 可视化对话框
- *
- * 行为参考 VSCode 的 "File ▸ Open Folder..." / "File ▸ Open Workspace from File..."：
- *   - 顶部地址栏显示当前浏览的绝对路径，可手动输入或点击 [Up] 回退
- *   - 左侧 Quick Locations 提供 Home / Drives / Current Workspace 快捷入口
- *   - 右侧列表展示当前目录下的子项；目录单击进入；.code-workspace 文件高亮
- *   - 底部三个动作：Cancel / Open as Folder（目录打开）/ Open File（仅 .code-workspace 时启用）
- *
- * 浏览器同源策略下无法直接拿到本地绝对路径，因此**列目录由 server 端完成**：
- *   - GET /api/fs/browse?path=<abs>
- *   - GET /api/fs/initial-locations
- * 用户最终选定的绝对路径再走 POST /api/workspaces/open 切换工作区。
- */
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   browsePath,
   getInitialLocations,
-  pickWorkspacePath,
   getRuntimeType,
+  pickWorkspacePath,
 } from '../../services/runtimeAdapter';
 import type {
   BrowseEntry,
@@ -37,49 +23,12 @@ const WorkspaceOpenDialog: React.FC = () => {
 
   const [locations, setLocations] = useState<InitialLocation[]>([]);
   const [browseResult, setBrowseResult] = useState<BrowsePathResult | null>(null);
-  // 地址栏输入：未提交前与浏览结果分离，按 Enter 或点击 Go 才提交
   const [addressInput, setAddressInput] = useState('');
-  // 用户在右侧列表中选中的条目（高亮 + Open File 启用条件）
   const [selectedEntry, setSelectedEntry] = useState<BrowseEntry | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(false);
 
-  // ---- 打开对话框时加载初始位置；关闭时清理状态 ----
-  useEffect(() => {
-    if (!visible) {
-      setBrowseResult(null);
-      setSelectedEntry(null);
-      setError(null);
-      setAddressInput('');
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      setLoading(true);
-      const init = await getInitialLocations();
-      if (cancelled) return;
-      if (init.ok && init.data) {
-        setLocations(init.data.locations);
-        // 默认进入第一个起点（Home）；若失败由列表层报错
-        const first = init.data.locations[0];
-        if (first) {
-          await navigateTo(first.absolutePath);
-        } else {
-          setLoading(false);
-        }
-      } else {
-        setError(init.message ?? '加载初始位置失败');
-        setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible]);
-
-  // ---- 浏览到指定路径 ----
   const navigateTo = async (absolutePath: string): Promise<void> => {
     setLoading(true);
     setError(null);
@@ -94,177 +43,218 @@ const WorkspaceOpenDialog: React.FC = () => {
     setLoading(false);
   };
 
-  // ---- 列表过滤：默认隐藏 . 开头的隐藏项 ----
-  const visibleEntries = useMemo<BrowseEntry[]>(() => {
-    if (!browseResult) return [];
-    return showHidden
-      ? browseResult.entries
-      : browseResult.entries.filter((e) => !e.hidden);
-  }, [browseResult, showHidden]);
-
-  // ---- 双击 / 单击逻辑 ----
-  const handleEntryClick = (entry: BrowseEntry) => {
-    setSelectedEntry(entry);
-  };
-  const handleEntryDoubleClick = (entry: BrowseEntry) => {
-    if (entry.type === 'directory') {
-      navigateTo(entry.absolutePath);
-    } else if (entry.isCodeWorkspace) {
-      // 双击 .code-workspace 等价于 Open File
-      handleOpenFile(entry);
+  useEffect(() => {
+    if (!visible) {
+      setBrowseResult(null);
+      setSelectedEntry(null);
+      setError(null);
+      setAddressInput('');
+      return;
     }
-  };
 
-  // ---- 打开当前目录作为 Folder ----
-  const handleOpenFolder = async () => {
-    if (!browseResult) return;
-    closeAllFileTabs();
-    const result = await openWorkspace(browseResult.absolutePath);
-    if (result.ok) {
-      hide();
-    } else {
-      setError(`打开工作区失败：${result.message}`);
-    }
-  };
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const init = await getInitialLocations();
+      if (cancelled) return;
+      if (init.ok && init.data) {
+        setLocations(init.data.locations);
+        const first = init.data.locations[0];
+        if (first) {
+          await navigateTo(first.absolutePath);
+        } else {
+          setLoading(false);
+        }
+      } else {
+        setError(init.message ?? '加载初始位置失败');
+        setLoading(false);
+      }
+    })();
 
-  // ---- 打开 .code-workspace 文件 ----
-  const handleOpenFile = async (entry: BrowseEntry) => {
-    if (!entry.isCodeWorkspace) return;
-    closeAllFileTabs();
-    const result = await openWorkspace(entry.absolutePath);
-    if (result.ok) {
-      hide();
-    } else {
-      setError(`打开工作区失败：${result.message}`);
-    }
-  };
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible]);
 
-  // ---- 地址栏 Enter 提交 ----
-  const handleAddressKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter' && addressInput.trim() !== '') {
-      navigateTo(addressInput.trim());
-    }
-  };
-
-  // ---- ESC 关闭 ----
   useEffect(() => {
     if (!visible) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') hide();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') hide();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [visible, hide]);
 
+  const visibleEntries = useMemo<BrowseEntry[]>(() => {
+    if (!browseResult) return [];
+    return showHidden
+      ? browseResult.entries
+      : browseResult.entries.filter((entry) => !entry.hidden);
+  }, [browseResult, showHidden]);
+
+  const handleEntryDoubleClick = (entry: BrowseEntry) => {
+    if (entry.type === 'directory') {
+      void navigateTo(entry.absolutePath);
+      return;
+    }
+    if (entry.isCodeWorkspace) {
+      void handleOpenWorkspaceFile(entry);
+    }
+  };
+
+  const handleOpenFolder = async () => {
+    if (!browseResult) return;
+    const targetPath =
+      selectedEntry?.type === 'directory'
+        ? selectedEntry.absolutePath
+        : browseResult.absolutePath;
+
+    closeAllFileTabs();
+    const result = await openWorkspace(targetPath);
+    if (result.ok) {
+      hide();
+      return;
+    }
+    setError(`打开文件夹失败: ${result.message}`);
+  };
+
+  const handleOpenWorkspaceFile = async (entry: BrowseEntry) => {
+    if (!entry.isCodeWorkspace) return;
+    closeAllFileTabs();
+    const result = await openWorkspace(entry.absolutePath);
+    if (result.ok) {
+      hide();
+      return;
+    }
+    setError(`打开工作区文件失败: ${result.message}`);
+  };
+
+  const handleNativeOpenFolder = async () => {
+    const result = await pickWorkspacePath();
+    if (!result.ok || !result.data) {
+      if (result.error !== 'user_cancelled') {
+        setError(result.message ?? '系统目录选择失败');
+      }
+      return;
+    }
+    closeAllFileTabs();
+    const wsResult = await openWorkspace(result.data);
+    if (wsResult.ok) {
+      hide();
+      return;
+    }
+    setError(`打开文件夹失败: ${wsResult.message}`);
+  };
+
+  const handleAddressKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Enter' && addressInput.trim() !== '') {
+      void navigateTo(addressInput.trim());
+    }
+  };
+
   if (!visible) return null;
 
-  const canOpenFile = selectedEntry?.type === 'file' && selectedEntry.isCodeWorkspace;
+  const canOpenWorkspaceFile = selectedEntry?.type === 'file' && selectedEntry.isCodeWorkspace;
+  const selectedPath = selectedEntry?.absolutePath ?? browseResult?.absolutePath ?? '';
+  const folderButtonLabel = selectedEntry?.type === 'directory'
+    ? 'Open Selected Folder'
+    : 'Open Current Folder';
 
   return (
     <div className="ws-open-dialog__backdrop" onClick={hide}>
       <div
         className="ws-open-dialog"
-        onClick={(e) => e.stopPropagation()}
+        onClick={(event) => event.stopPropagation()}
         role="dialog"
         aria-modal="true"
+        aria-label="Open Workspace"
       >
-        {/* ---- 标题栏 ---- */}
         <div className="ws-open-dialog__header">
           <span>Open Workspace</span>
           <button
             className="ws-open-dialog__close"
             onClick={hide}
-            title="关闭 (Esc)"
+            title="Close"
+            type="button"
           >
-            ✕
+            x
           </button>
         </div>
 
-        {/* ---- 地址栏 ---- */}
         <div className="ws-open-dialog__addressbar">
           <button
             className="ws-open-dialog__btn"
             disabled={!browseResult?.parentPath}
-            onClick={() => browseResult?.parentPath && navigateTo(browseResult.parentPath)}
-            title="上一级"
+            onClick={() => browseResult?.parentPath && void navigateTo(browseResult.parentPath)}
+            title="Go to parent folder"
+            type="button"
           >
-            ↑ Up
+            Up
           </button>
           <input
             className="ws-open-dialog__address"
             value={addressInput}
             placeholder="输入或粘贴绝对路径，按 Enter 跳转"
-            onChange={(e) => setAddressInput(e.target.value)}
+            onChange={(event) => setAddressInput(event.target.value)}
             onKeyDown={handleAddressKeyDown}
           />
           <button
             className="ws-open-dialog__btn"
-            onClick={() => addressInput.trim() && navigateTo(addressInput.trim())}
+            onClick={() => addressInput.trim() && void navigateTo(addressInput.trim())}
+            type="button"
           >
             Go
           </button>
           {getRuntimeType() === 'tauri' && (
             <button
               className="ws-open-dialog__btn"
-              onClick={async () => {
-                const result = await pickWorkspacePath();
-                if (result.ok && result.data) {
-                  closeAllFileTabs();
-                  const wsResult = await openWorkspace(result.data);
-                  if (wsResult.ok) {
-                    hide();
-                  } else {
-                    setError(`打开工作区失败：${wsResult.message}`);
-                  }
-                }
-              }}
-              title="使用系统原生对话框选择目录"
+              onClick={() => void handleNativeOpenFolder()}
+              title="使用系统目录选择器打开文件夹"
+              type="button"
             >
-              📂 Native…
+              System Folder
             </button>
           )}
           <label className="ws-open-dialog__toggle" title="显示以 . 开头的隐藏项">
             <input
               type="checkbox"
               checked={showHidden}
-              onChange={(e) => setShowHidden(e.target.checked)}
+              onChange={(event) => setShowHidden(event.target.checked)}
             />
-            <span>显示隐藏项</span>
+            <span>Hidden</span>
           </label>
         </div>
 
-        {/* ---- 主体：左侧快捷入口 + 右侧列表 ---- */}
         <div className="ws-open-dialog__body">
           <aside className="ws-open-dialog__sidebar">
             <div className="ws-open-dialog__sidebar-title">Quick Locations</div>
-            {locations.map((loc) => (
-              <div
-                key={`${loc.kind}::${loc.absolutePath}`}
+            {locations.map((location) => (
+              <button
+                key={`${location.kind}::${location.absolutePath}`}
                 className="ws-open-dialog__sidebar-item"
-                onClick={() => navigateTo(loc.absolutePath)}
-                title={loc.absolutePath}
+                onClick={() => void navigateTo(location.absolutePath)}
+                title={location.absolutePath}
+                type="button"
               >
                 <span className="ws-open-dialog__sidebar-icon">
-                  {loc.kind === 'home' ? '🏠' : loc.kind === 'drive' ? '💽' : '📂'}
+                  {location.kind === 'home' ? 'HOME' : location.kind === 'drive' ? 'DISK' : 'WS'}
                 </span>
-                <span>{loc.label}</span>
-              </div>
+                <span>{location.label}</span>
+              </button>
             ))}
           </aside>
 
           <main className="ws-open-dialog__main">
-            {loading && <div className="ws-open-dialog__placeholder">加载中…</div>}
-            {error && (
-              <div className="ws-open-dialog__error">{error}</div>
-            )}
+            {loading && <div className="ws-open-dialog__placeholder">加载中...</div>}
+            {error && <div className="ws-open-dialog__error">{error}</div>}
             {!loading && !error && visibleEntries.length === 0 && (
-              <div className="ws-open-dialog__placeholder">（空目录）</div>
+              <div className="ws-open-dialog__placeholder">空目录</div>
             )}
             {!loading && !error && visibleEntries.length > 0 && (
               <ul className="ws-open-dialog__entries">
                 {visibleEntries.map((entry) => {
-                  const isSelected =
-                    selectedEntry?.absolutePath === entry.absolutePath;
+                  const isSelected = selectedEntry?.absolutePath === entry.absolutePath;
                   return (
                     <li
                       key={entry.absolutePath}
@@ -273,16 +263,16 @@ const WorkspaceOpenDialog: React.FC = () => {
                         (isSelected ? ' ws-open-dialog__entry--selected' : '') +
                         (entry.isCodeWorkspace ? ' ws-open-dialog__entry--code-workspace' : '')
                       }
-                      onClick={() => handleEntryClick(entry)}
+                      onClick={() => setSelectedEntry(entry)}
                       onDoubleClick={() => handleEntryDoubleClick(entry)}
                       title={entry.absolutePath}
                     >
                       <span className="ws-open-dialog__entry-icon">
                         {entry.type === 'directory'
-                          ? '📁'
+                          ? 'DIR'
                           : entry.isCodeWorkspace
-                            ? '🗂️'
-                            : '📄'}
+                            ? 'WS'
+                            : 'FILE'}
                       </span>
                       <span className="ws-open-dialog__entry-name">{entry.name}</span>
                       {entry.isCodeWorkspace && (
@@ -296,39 +286,35 @@ const WorkspaceOpenDialog: React.FC = () => {
           </main>
         </div>
 
-        {/* ---- 底部动作栏 ---- */}
         <div className="ws-open-dialog__footer">
           <div className="ws-open-dialog__footer-info">
-            {browseResult && (
+            {selectedPath && (
               <span>
-                Selected:{' '}
-                <strong>
-                  {selectedEntry
-                    ? selectedEntry.absolutePath
-                    : browseResult.absolutePath}
-                </strong>
+                Selected: <strong>{selectedPath}</strong>
               </span>
             )}
           </div>
           <div className="ws-open-dialog__footer-actions">
-            <button className="ws-open-dialog__btn" onClick={hide}>
+            <button className="ws-open-dialog__btn" onClick={hide} type="button">
               Cancel
             </button>
             <button
               className="ws-open-dialog__btn ws-open-dialog__btn--secondary"
-              disabled={!canOpenFile}
-              onClick={() => selectedEntry && handleOpenFile(selectedEntry)}
-              title={canOpenFile ? '打开 .code-workspace 文件' : '请选中一个 .code-workspace 文件'}
+              disabled={!canOpenWorkspaceFile}
+              onClick={() => selectedEntry && void handleOpenWorkspaceFile(selectedEntry)}
+              title="打开选中的 .code-workspace 文件"
+              type="button"
             >
-              Open File
+              Open Workspace File
             </button>
             <button
               className="ws-open-dialog__btn ws-open-dialog__btn--primary"
               disabled={!browseResult}
-              onClick={handleOpenFolder}
-              title="把当前目录作为工作区打开"
+              onClick={() => void handleOpenFolder()}
+              title="打开选中的文件夹；未选中文件夹时打开当前目录"
+              type="button"
             >
-              Open as Folder
+              {folderButtonLabel}
             </button>
           </div>
         </div>

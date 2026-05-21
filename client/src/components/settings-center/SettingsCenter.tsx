@@ -1,11 +1,3 @@
-/**
- * DeepCode Settings 中心
- *
- * 设计意图（参考 VSCode）：
- *   1. ⚙️ 按钮位于左下角 Activity Bar，点击在主编辑区"新建/聚焦"一个 Settings Tab；
- *   2. 设置中心采用左侧导航 + 右侧详情；
- *   3. Workspace / Common / Skill / Prompt / Doctor / Ruler 等高级配置统一收纳。
- */
 import React, { useState } from 'react';
 import './settingsCenter.css';
 import WorkspaceSection from './sections/WorkspaceSection';
@@ -38,13 +30,13 @@ interface NavItem {
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { key: 'workspace', icon: '🗂', label: 'Workspace' },
-  { key: 'common', icon: '🛠', label: 'Common Settings' },
-  { key: 'llm', icon: '◎', label: 'LLM Providers' },
-  { key: 'skill', icon: '🛠️', label: 'Skill Runtime' },
-  { key: 'prompt', icon: '📝', label: 'Prompt Profiles' },
-  { key: 'doctor', icon: '🩺', label: 'Runtime Doctor' },
-  { key: 'ruler', icon: '📏', label: 'Ruler Rules' },
+  { key: 'workspace', icon: 'WS', label: 'Workspace' },
+  { key: 'common', icon: 'CM', label: 'Common Settings' },
+  { key: 'llm', icon: 'AI', label: 'LLM Providers' },
+  { key: 'skill', icon: 'SK', label: 'Skill Runtime' },
+  { key: 'prompt', icon: 'PR', label: 'Prompt Profiles' },
+  { key: 'doctor', icon: 'DR', label: 'Runtime Doctor' },
+  { key: 'ruler', icon: 'RL', label: 'Ruler Rules' },
 ];
 
 const SettingsCenter: React.FC<SettingsCenterProps> = ({
@@ -86,16 +78,17 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
       <nav className="settings-nav">
         <div className="settings-nav__title">DeepCode Settings</div>
         {NAV_ITEMS.map((item) => (
-          <div
+          <button
             key={item.key}
             className={`settings-nav-item ${
               activeKey === item.key ? 'settings-nav-item--active' : ''
             }`}
             onClick={() => setActiveKey(item.key)}
+            type="button"
           >
             <span className="settings-nav-item__icon">{item.icon}</span>
             <span>{item.label}</span>
-          </div>
+          </button>
         ))}
       </nav>
       <section className="settings-body">{renderBody()}</section>

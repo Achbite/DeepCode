@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import type { AgentContextAttachment } from '@deepcode/protocol';
 import ContextAttachmentPicker from './ContextAttachmentPicker';
 
@@ -20,6 +20,8 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   onRemoveAttachment,
 }) => {
   const [value, setValue] = useState('');
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const mention = useMemo(() => {
     const match = value.match(/@([^@\s]*)$/);
@@ -38,9 +40,17 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     if (mention) {
       setValue(`${value.slice(0, mention.start)}${value.slice(mention.start + mention.query.length + 1)}`);
     }
+    setPickerOpen(false);
+  };
+
+  const toggleAttachmentPicker = () => {
+    if (loading) return;
+    setPickerOpen((open) => !open);
+    requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
   const chips = [...sessionAttachments, ...messageAttachments];
+  const showAttachmentPicker = pickerOpen || Boolean(mention);
 
   return (
     <div className="agent-composer">
@@ -59,8 +69,27 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           ))}
         </div>
       )}
+      <div className="agent-composer__mention-row">
+        <button
+          className="agent-composer__mention-button"
+          type="button"
+          title="Attach file or folder"
+          aria-label="Attach file or folder"
+          disabled={loading}
+          onClick={toggleAttachmentPicker}
+        >
+          @
+        </button>
+        {showAttachmentPicker && (
+          <ContextAttachmentPicker
+            query={mention?.query ?? ''}
+            onPick={pickAttachment}
+          />
+        )}
+      </div>
       <div className="agent-composer__input-wrap">
         <textarea
+          ref={textareaRef}
           value={value}
           onChange={(event) => setValue(event.target.value)}
           onKeyDown={(event) => {
@@ -72,15 +101,11 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           placeholder="Ask DeepCode Agent..."
           disabled={loading}
         />
-        {mention && (
-          <ContextAttachmentPicker
-            query={mention.query}
-            onPick={pickAttachment}
-          />
-        )}
       </div>
       <div className="agent-composer__footer">
-        <span>@ to attach files or folders</span>
+        <div className="agent-composer__footer-left">
+          <span className="agent-mode-pill">Plan</span>
+        </div>
         <button onClick={send} disabled={loading || !value.trim()}>
           Send
         </button>

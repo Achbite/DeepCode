@@ -1,29 +1,19 @@
-/**
- * 工作台总布局
- *
- * 结构（VSCode 还原版）：
- *   - 48px Activity Bar：上方 Explorer / Source Control / Search，底部 ⚙️ Settings / 👤 Accounts；
- *   - ⚙️ 在主编辑区切换到 Settings Tab；
- *   - file Tab id 为 `${folderId}::${path}` 复合形式。
- */
 import './workbenchLayout.css';
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import FileTree from '../../components/file-tree/FileTree';
 import CodeEditor from '../../components/editor/CodeEditor';
 import TerminalPlaceholder from '../../components/terminal/TerminalPlaceholder';
 import GitPanelPlaceholder from '../../components/git-panel/GitPanelPlaceholder';
 import AgentPanelPlaceholder from '../../components/agent-panel/AgentPanelPlaceholder';
-import ApprovalCenterPlaceholder from '../../components/approval-center/ApprovalCenterPlaceholder';
 import SettingsCenter from '../../components/settings-center/SettingsCenter';
 import WorkspaceOpenDialog from '../../components/workspace-open-dialog/WorkspaceOpenDialog';
 import CodeWorkspaceChoiceDialog from '../../components/code-workspace-choice-dialog/CodeWorkspaceChoiceDialog';
+import WindowControls from '../../components/window-controls/WindowControls';
 import {
   useEditorStore,
-  SETTINGS_TAB_ID,
   buildFileTabId,
 } from '../../state/editorStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
-import { getRuntimeType } from '../../services/runtimeAdapter';
 
 interface WorkbenchLayoutProps {
   apiStatus: string;
@@ -33,16 +23,90 @@ interface WorkbenchLayoutProps {
 }
 
 type SidebarPanel = 'explorer' | 'git' | 'search';
+type ActivityIconName = SidebarPanel | 'settings' | 'account';
+
+const ActivityIcon: React.FC<{ name: ActivityIconName }> = ({ name }) => {
+  const commonProps = {
+    width: 18,
+    height: 18,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.8,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const,
+    'aria-hidden': true,
+  };
+
+  switch (name) {
+    case 'explorer':
+      return (
+        <svg {...commonProps}>
+          <path d="M3.5 6.5h6l1.8 2h9.2v9.8a1.2 1.2 0 0 1-1.2 1.2H4.7a1.2 1.2 0 0 1-1.2-1.2V6.5Z" />
+          <path d="M3.5 6.5V5.7a1.2 1.2 0 0 1 1.2-1.2h4.6l1.7 2" />
+        </svg>
+      );
+    case 'git':
+      return (
+        <svg {...commonProps}>
+          <circle cx="6.5" cy="5.8" r="2.1" />
+          <circle cx="17.5" cy="18.2" r="2.1" />
+          <circle cx="6.5" cy="18.2" r="2.1" />
+          <path d="M6.5 7.9v8.2" />
+          <path d="M8.3 6.9c4.6.6 7.1 2.9 8 9.2" />
+        </svg>
+      );
+    case 'search':
+      return (
+        <svg {...commonProps}>
+          <circle cx="10.5" cy="10.5" r="6" />
+          <path d="m15 15 5 5" />
+        </svg>
+      );
+    case 'settings':
+      return (
+        <svg {...commonProps}>
+          <circle cx="12" cy="12" r="3.2" />
+          <path d="M19.4 13.5a7.8 7.8 0 0 0 0-3l2-1.2-2-3.4-2.2 1a8.6 8.6 0 0 0-2.6-1.5L14.3 3h-4.6l-.4 2.4a8.6 8.6 0 0 0-2.6 1.5l-2.2-1-2 3.4 2 1.2a7.8 7.8 0 0 0 0 3l-2 1.2 2 3.4 2.2-1a8.6 8.6 0 0 0 2.6 1.5l.4 2.4h4.6l.4-2.4a8.6 8.6 0 0 0 2.6-1.5l2.2 1 2-3.4-2.1-1.2Z" />
+        </svg>
+      );
+    case 'account':
+      return (
+        <svg {...commonProps}>
+          <circle cx="12" cy="8" r="3.5" />
+          <path d="M5 20a7 7 0 0 1 14 0" />
+        </svg>
+      );
+    default:
+      return null;
+  }
+};
+
+const getLanguageLabel = (filePath?: string | null) => {
+  if (!filePath) return 'Plain Text';
+  const ext = filePath.split('.').pop()?.toLowerCase();
+  if (!ext || ext === filePath) return 'Plain Text';
+  const known: Record<string, string> = {
+    ts: 'TypeScript',
+    tsx: 'TypeScript React',
+    js: 'JavaScript',
+    jsx: 'JavaScript React',
+    json: 'JSON',
+    md: 'Markdown',
+    css: 'CSS',
+    html: 'HTML',
+    rs: 'Rust',
+  };
+  return known[ext] ?? ext.toUpperCase();
+};
 
 const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   apiStatus,
   wsStatus,
   serverVersion,
-  lastHeartbeatAt,
 }) => {
   const tabs = useEditorStore((s) => s.tabs);
   const activeTabId = useEditorStore((s) => s.activeTabId);
-  const saveMessage = useEditorStore((s) => s.saveMessage);
   const openFile = useEditorStore((s) => s.openFile);
   const openSettings = useEditorStore((s) => s.openSettings);
   const closeTab = useEditorStore((s) => s.closeTab);
@@ -51,10 +115,8 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   const setActiveTab = useEditorStore((s) => s.setActiveTab);
   const addAgentAttachment = useAgentSessionStore((s) => s.addAttachment);
 
-  const [runtimeType] = useState(getRuntimeType);
-
-  const activeTab = tabs.find((t) => {
-    const id = t.kind === 'file' ? buildFileTabId(t.folderId, t.path) : t.id;
+  const activeTab = tabs.find((tab) => {
+    const id = tab.kind === 'file' ? buildFileTabId(tab.folderId, tab.path) : tab.id;
     return id === activeTabId;
   });
   const activeFile = activeTab && activeTab.kind === 'file' ? activeTab : null;
@@ -66,10 +128,10 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   const toggleSidebarPanel = (panel: SidebarPanel) => {
     if (activeSidebar === panel && sidebarVisible) {
       setSidebarVisible(false);
-    } else {
-      setActiveSidebar(panel);
-      setSidebarVisible(true);
+      return;
     }
+    setActiveSidebar(panel);
+    setSidebarVisible(true);
   };
 
   const renderSidebarContent = () => {
@@ -77,7 +139,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
       case 'explorer':
         return (
           <FileTree
-            onFileSelect={(p, fid) => openFile(p, fid)}
+            onFileSelect={(path, folderId) => openFile(path, folderId)}
             selectedTabId={activeFile ? buildFileTabId(activeFile.folderId, activeFile.path) : null}
           />
         );
@@ -93,8 +155,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
           <>
             <div className="panel-header">Search</div>
             <div className="placeholder-content">
-              SearchPanelPlaceholder
-              <div className="stage-hint">(后续阶段接入工作区搜索)</div>
+              Search panel is reserved for the workspace search stage.
             </div>
           </>
         );
@@ -104,121 +165,85 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   };
 
   return (
-    <div
-      className={`workbench-layout ${
-        !sidebarVisible ? 'workbench-layout--no-sidebar' : ''
-      }`}
-    >
-      {/* ---- 顶栏 ---- */}
+    <div className={`workbench-layout ${!sidebarVisible ? 'workbench-layout--no-sidebar' : ''}`}>
       <header className="header">
         <div className="header__title">
           <strong>DeepCode</strong>
-          <span className="header__subtitle">
-            Workspace
-            <span className="header__runtime-badge">
-              [{runtimeType === 'tauri' ? 'Tauri' : 'Web'}]
-            </span>
-          </span>
-          {serverVersion && (
-            <span className="header__version">v{serverVersion}</span>
-          )}
         </div>
-        <div className="status-group">
-          {saveMessage && <span className="header__save-msg">{saveMessage}</span>}
-          <div className="status-item">
-            <div className={`status-dot ${apiStatus}`} />
-            <span>API: {apiStatus}</span>
-          </div>
-          <div className="status-item">
-            <div className={`status-dot ${wsStatus}`} />
-            <span>WS: {wsStatus}</span>
-          </div>
-          {lastHeartbeatAt && (
-            <span className="header__heartbeat">
-              最后心跳: {lastHeartbeatAt}
-            </span>
-          )}
-        </div>
+        <WindowControls />
       </header>
 
-      {/* ---- 活动栏 ---- */}
       <div className="activity-bar">
         <div className="activity-bar__top">
-          <div
+          <button
             className={`activity-icon ${
               activeSidebar === 'explorer' && sidebarVisible ? 'active' : ''
             }`}
-            title="文件资源管理器"
+            title="Explorer"
+            aria-label="Explorer"
             onClick={() => toggleSidebarPanel('explorer')}
           >
-            📁
-          </div>
-          <div
-            className={`activity-icon ${
-              activeSidebar === 'git' && sidebarVisible ? 'active' : ''
-            }`}
+            <ActivityIcon name="explorer" />
+          </button>
+          <button
+            className={`activity-icon ${activeSidebar === 'git' && sidebarVisible ? 'active' : ''}`}
             title="Source Control"
+            aria-label="Source Control"
             onClick={() => toggleSidebarPanel('git')}
           >
-            🌿
-          </div>
-          <div
+            <ActivityIcon name="git" />
+          </button>
+          <button
             className={`activity-icon ${
               activeSidebar === 'search' && sidebarVisible ? 'active' : ''
             }`}
             title="Search"
+            aria-label="Search"
             onClick={() => toggleSidebarPanel('search')}
           >
-            🔍
-          </div>
+            <ActivityIcon name="search" />
+          </button>
         </div>
 
         <div className="activity-bar__bottom">
-          <div
+          <button
             className={`activity-icon ${isSettingsActive ? 'active' : ''}`}
             title="Settings"
+            aria-label="Settings"
             onClick={() => openSettings()}
           >
-            ⚙️
-          </div>
-          <div
+            <ActivityIcon name="settings" />
+          </button>
+          <button
             className="activity-icon activity-icon--disabled"
-            title="Accounts (占位)"
+            title="Accounts"
+            aria-label="Accounts"
+            disabled
           >
-            👤
-          </div>
+            <ActivityIcon name="account" />
+          </button>
         </div>
       </div>
 
-      {/* ---- 侧边栏 ---- */}
-      {sidebarVisible && (
-        <aside className="sidebar panel">{renderSidebarContent()}</aside>
-      )}
+      {sidebarVisible && <aside className="sidebar panel">{renderSidebarContent()}</aside>}
 
-      {/* ---- 中间：编辑器 ---- */}
       <main className="editor-area panel">
         {tabs.length > 0 && (
           <div className="editor-tabs">
             {tabs.map((tab) => {
-              const id = tab.kind === 'file'
-                ? buildFileTabId(tab.folderId, tab.path)
-                : tab.id;
+              const id = tab.kind === 'file' ? buildFileTabId(tab.folderId, tab.path) : tab.id;
               const isActive = id === activeTabId;
-              const title = tab.kind === 'file'
-                ? `[${tab.folderId}] ${tab.path}`
-                : tab.title;
-              const label = tab.kind === 'file'
-                ? `📄 ${tab.path.split('/').pop()}`
-                : `⚙️ ${tab.title}`;
+              const title = tab.kind === 'file' ? `[${tab.folderId}] ${tab.path}` : tab.title;
+              const label = tab.kind === 'file' ? tab.path.split('/').pop() : tab.title;
               const isDirty = tab.kind === 'file' ? tab.isDirty : false;
 
               return (
-                <div
+                <button
                   key={id}
                   onClick={() => setActiveTab(id)}
-                  onContextMenu={(e) => {
+                  onContextMenu={(event) => {
                     if (tab.kind !== 'file') return;
-                    e.preventDefault();
+                    event.preventDefault();
                     addAgentAttachment({
                       kind: 'file',
                       path: tab.path,
@@ -227,23 +252,24 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
                       scope: 'message',
                     });
                   }}
-                  className={`editor-tab ${
-                    isActive ? 'editor-tab--active' : ''
-                  } ${tab.kind === 'settings' ? 'editor-tab--settings' : ''}`}
+                  className={`editor-tab ${isActive ? 'editor-tab--active' : ''} ${
+                    tab.kind === 'settings' ? 'editor-tab--settings' : ''
+                  }`}
                   title={title}
+                  type="button"
                 >
+                  <span className="editor-tab__name">{label}</span>
+                  {isDirty && <span className="editor-tab__dirty">*</span>}
                   <span
                     className="editor-tab__close"
-                    onClick={(e) => {
-                      e.stopPropagation();
+                    onClick={(event) => {
+                      event.stopPropagation();
                       closeTab(id);
                     }}
                   >
-                    ✕
+                    x
                   </span>
-                  <span className="editor-tab__name">{label}</span>
-                  {isDirty && <span className="editor-tab__dirty">●</span>}
-                </div>
+                </button>
               );
             })}
           </div>
@@ -258,19 +284,11 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         ) : (
           <CodeEditor
             filePath={activeFile?.path ?? null}
-            modelKey={
-              activeFile
-                ? buildFileTabId(activeFile.folderId, activeFile.path)
-                : null
-            }
+            modelKey={activeFile ? buildFileTabId(activeFile.folderId, activeFile.path) : null}
             content={activeFile?.content ?? ''}
             onContentChange={(content) => {
-              if (activeFile) {
-                updateContent(
-                  buildFileTabId(activeFile.folderId, activeFile.path),
-                  content
-                );
-              }
+              if (!activeFile) return;
+              updateContent(buildFileTabId(activeFile.folderId, activeFile.path), content);
             }}
             isDirty={activeFile?.isDirty ?? false}
             binary={activeFile?.binary ?? false}
@@ -280,25 +298,28 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         )}
       </main>
 
-      {/* ---- 右侧：Agent 面板 ---- */}
       <aside className="agent-panel panel">
-        <div className="panel-header">Agent Runtime</div>
         <AgentPanelPlaceholder />
       </aside>
 
-      {/* ---- 底部面板 ---- */}
       <footer className="bottom-panel panel">
-        <div className="bottom-tabs">
-          <div className="tab active">Terminal</div>
-          <div className="tab">Approval Center</div>
-        </div>
         <div className="bottom-panel__content">
           <TerminalPlaceholder />
-          <ApprovalCenterPlaceholder />
         </div>
       </footer>
 
-      {/* ---- 全局模态：可视化 Open Workspace ---- */}
+      <footer className="status-bar">
+        <div className="status-bar__group">
+          <span>{activeFile ? `${activeFile.path}${activeFile.isDirty ? '*' : ''}` : 'No file'}</span>
+          <span>{getLanguageLabel(activeFile?.path)}</span>
+          <span>UTF-8</span>
+        </div>
+        <div className="status-bar__group">
+          <span>API {apiStatus}</span>
+          <span>WS {wsStatus}</span>
+        </div>
+      </footer>
+
       <WorkspaceOpenDialog />
       <CodeWorkspaceChoiceDialog />
     </div>

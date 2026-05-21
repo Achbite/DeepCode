@@ -1,64 +1,45 @@
-/**
- * FileTree 样式（阶段 4 / S4-1）
- *
- * 设计要求：
- *   - 与 VSCode Explorer 视觉对齐：紧凑行高、轻量 hover、单色调；
- *   - 颜色 / 间距全部走 CSS 变量；禁止在 .tsx 中再写 inline 颜色 / 间距；
- *   - 工具栏图标按钮悬停才显（mouseenter 显，mouseleave 隐），与 VSCode 一致；
- *   - 图标使用 currentColor，由父容器的 color 控制冷暖。
- *
- * 主题变量：与项目 dark theme 子集对齐，未引入主题切换前先内联 fallback。
- */
-
 .file-tree {
-  --ft-bg: #252526;
-  --ft-fg: #cccccc;
-  --ft-fg-muted: #888;
-  --ft-fg-emphasis: #fff;
-  --ft-border: #444;
-  --ft-border-soft: #2c2c2c;
-  --ft-hover-bg: rgba(255, 255, 255, 0.05);
-  --ft-selected-bg: rgba(0, 122, 204, 0.3);
-  --ft-accent-warn: #d19a66;
-  --ft-accent-error: #f44;
-  --ft-row-padding-y: 3px;
-  --ft-row-indent: 16px;
+  --ft-bg: var(--panel, #25262a);
+  --ft-bg-2: var(--panel-2, #2b2d31);
+  --ft-fg: var(--text, #d9dce2);
+  --ft-fg-muted: var(--muted, #8d94a3);
+  --ft-fg-strong: var(--text-strong, #fff);
+  --ft-border: var(--line, #3f4248);
+  --ft-hover-bg: rgba(255, 255, 255, 0.055);
+  --ft-selected-bg: rgba(47, 139, 253, 0.24);
+  --ft-accent: var(--accent, #2f8bfd);
+  --ft-warn: var(--warn, #d7ba7d);
+  --ft-danger: var(--danger, #f48771);
 
   display: flex;
   flex-direction: column;
   height: 100%;
-  font-size: 13px;
-  color: var(--ft-fg);
+  min-height: 0;
   background: var(--ft-bg);
+  color: var(--ft-fg);
+  font-size: 12px;
 }
 
-/* ---- 顶部 Explorer 标题栏 ---- */
 .file-tree__titlebar {
+  min-height: 34px;
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  padding: 8px 12px 8px 16px;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid var(--ft-border);
+  color: var(--ft-fg);
   font-size: 11px;
   font-weight: 700;
+  letter-spacing: 0.6px;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--ft-fg);
-  border-bottom: 1px solid var(--ft-border);
   user-select: none;
 }
 
-/* 工具栏：默认隐藏图标按钮，hover Explorer 行时再显（VSCode 行为） */
 .file-tree__toolbar {
   display: flex;
   align-items: center;
   gap: 2px;
-  opacity: 0;
-  transition: opacity 0.12s ease;
-}
-
-.file-tree__titlebar:hover .file-tree__toolbar,
-.file-tree__toolbar:focus-within {
-  opacity: 1;
 }
 
 .file-tree__toolbar-btn {
@@ -67,21 +48,22 @@
   justify-content: center;
   width: 22px;
   height: 22px;
-  background: transparent;
-  border: none;
-  border-radius: 4px;
-  color: var(--ft-fg);
-  cursor: pointer;
   padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ft-fg-muted);
+  cursor: pointer;
 }
 
 .file-tree__toolbar-btn:hover {
   background: var(--ft-hover-bg);
+  color: var(--ft-fg-strong);
 }
 
 .file-tree__toolbar-btn:disabled {
   cursor: not-allowed;
-  color: var(--ft-fg-muted);
+  opacity: 0.45;
 }
 
 .file-tree__toolbar-btn svg {
@@ -89,72 +71,78 @@
   height: 14px;
 }
 
-/* ---- 工作区摘要 ---- */
 .file-tree__summary {
-  padding: 6px 16px;
-  font-size: 12px;
+  display: grid;
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   color: var(--ft-fg-muted);
-  border-bottom: 1px solid var(--ft-border-soft);
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .file-tree__summary-name {
-  color: #ddd;
+  color: var(--ft-fg);
 }
 
-.file-tree__summary-source {
-  color: #666;
+.file-tree__summary-source,
+.file-tree__summary-fallback {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
   margin-left: 6px;
+  padding: 0 6px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 999px;
+  color: var(--ft-fg-muted);
+  font-size: 10px;
 }
 
 .file-tree__summary-fallback {
-  color: var(--ft-accent-warn);
-  margin-left: 6px;
+  color: var(--ft-warn);
+  border-color: rgba(215, 186, 125, 0.35);
 }
 
 .file-tree__summary-folder-select {
-  background: #1e1e1e;
-  color: #ddd;
-  border: 1px solid var(--ft-border);
-  font-size: 12px;
+  max-width: 150px;
+  min-height: 24px;
   margin-left: 4px;
+  border: 1px solid var(--ft-border);
+  border-radius: 4px;
+  background: var(--bg, #1e1f22);
+  color: var(--ft-fg);
+  font-size: 11px;
 }
 
-/* ---- 状态行 ---- */
 .file-tree__status {
-  padding: 16px;
+  padding: 14px 12px;
+  color: var(--ft-fg-muted);
   font-size: 12px;
 }
 
-.file-tree__status--loading {
-  color: var(--ft-fg-muted);
+.file-tree__status--error,
+.file-tree__new-error {
+  color: var(--ft-danger);
 }
 
-.file-tree__status--error {
-  color: var(--ft-accent-error);
-}
-
-/* ---- 树节点容器 ---- */
 .file-tree__body {
   flex: 1;
+  min-height: 0;
   overflow: auto;
-  padding: 4px 0;
+  padding: 5px 0;
 }
 
-/* ---- 单行节点 ---- */
 .file-tree__row {
+  min-height: 24px;
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: var(--ft-row-padding-y) 8px var(--ft-row-padding-y) 12px;
-  cursor: pointer;
-  user-select: none;
+  padding: 0 8px 0 12px;
   color: var(--ft-fg);
-  white-space: nowrap;
+  cursor: pointer;
   overflow: hidden;
-  text-overflow: ellipsis;
+  user-select: none;
+  white-space: nowrap;
 }
 
 .file-tree__row--depth-0 { padding-left: 12px; }
@@ -175,101 +163,101 @@
   background: var(--ft-hover-bg);
 }
 
-.file-tree__row--selected {
-  background: var(--ft-selected-bg);
-  color: var(--ft-fg-emphasis);
-}
-
+.file-tree__row--selected,
 .file-tree__row--selected:hover {
   background: var(--ft-selected-bg);
+  color: var(--ft-fg-strong);
+}
+
+.file-tree__chevron,
+.file-tree__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
 }
 
 .file-tree__chevron {
   width: 12px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
   color: var(--ft-fg-muted);
-  flex: 0 0 12px;
 }
 
 .file-tree__icon {
-  flex: 0 0 16px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: #c5c5c5;
+  width: 16px;
+  color: #c5cbd4;
 }
 
-.file-tree__row--selected .file-tree__icon {
-  color: var(--ft-fg-emphasis);
+.file-tree__row--selected .file-tree__icon,
+.file-tree__row:hover .file-tree__icon {
+  color: var(--ft-fg-strong);
 }
 
 .file-tree__name {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-/* ---- 新建文件 / 新建文件夹 inline 输入框 ---- */
 .file-tree__new-input {
   flex: 1;
-  background: #3c3c3c;
-  border: 1px solid #007acc;
-  color: var(--ft-fg);
-  font-size: 13px;
-  padding: 1px 4px;
-  outline: none;
   min-width: 0;
+  height: 21px;
+  padding: 0 5px;
+  border: 1px solid var(--ft-accent);
+  border-radius: 3px;
+  outline: none;
+  background: var(--bg, #1e1f22);
+  color: var(--ft-fg);
+  font-size: 12px;
 }
 
 .file-tree__new-error {
-  color: var(--ft-accent-error);
+  padding: 3px 12px 5px;
   font-size: 11px;
-  padding: 2px 12px 4px;
 }
 
-/* ---- Explorer context menu ---- */
 .file-tree__context-menu {
   position: fixed;
   z-index: 1000;
-  min-width: 190px;
-  max-width: 280px;
-  padding: 4px 0;
-  background: #252526;
-  border: 1px solid #454545;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.38);
+  min-width: 210px;
+  max-width: 300px;
+  padding: 4px;
+  border: 1px solid var(--ft-border);
+  border-radius: 5px;
+  background: var(--ft-bg-2);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.42);
   color: var(--ft-fg);
   font-size: 12px;
 }
 
 .file-tree__context-title {
-  padding: 5px 12px;
+  padding: 6px 8px 7px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   color: var(--ft-fg-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  border-bottom: 1px solid var(--ft-border-soft);
 }
 
 .file-tree__context-menu button {
   width: 100%;
-  height: 26px;
-  border: none;
+  height: 27px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
   background: transparent;
   color: var(--ft-fg);
-  text-align: left;
-  padding: 0 12px;
   cursor: pointer;
-  font-size: 12px;
+  text-align: left;
 }
 
 .file-tree__context-menu button:hover {
-  background: var(--accent-color, #007acc);
+  background: var(--ft-accent);
   color: #fff;
 }
 
 .file-tree__context-separator {
   height: 1px;
-  margin: 4px 0;
-  background: var(--ft-border-soft);
+  margin: 4px 2px;
+  background: rgba(255, 255, 255, 0.08);
 }

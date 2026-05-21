@@ -1,10 +1,4 @@
-/**
- * Workspace 板块（Settings 中心）
- *
- * 展示当前活动工作区的来源、folders 列表、DeepCode 命名空间设置与未支持字段。
- * 提供 Open Workspace 入口：弹出可视化对话框，与 FileTree 顶部按钮一致。
- */
-import React from 'react';
+import React, { useState } from 'react';
 import { useWorkspaceStore } from '../../../state/workspaceStore';
 import { useUiStore } from '../../../state/uiStore';
 import SettingsField from '../SettingsField';
@@ -18,17 +12,26 @@ const WorkspaceSection: React.FC = () => {
   const workspace = useWorkspaceStore((s) => s.current);
   const fallbackUsed = useWorkspaceStore((s) => s.fallbackUsed);
   const lastError = useWorkspaceStore((s) => s.lastError);
+  const saveWorkspaceFile = useWorkspaceStore((s) => s.saveWorkspaceFile);
   const showWorkspaceOpenDialog = useUiStore((s) => s.showWorkspaceOpenDialog);
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const sources = useSettingsStore((s) => s.sources);
   const patchWorkspaceSetting = useSettingsStore((s) => s.patchWorkspaceSetting);
 
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
+
   const handleWorkspaceSettingChange = (key: string, value: UserSettingValue) => {
     void patchWorkspaceSetting(key, value);
   };
 
-  const handleOpen = () => {
-    showWorkspaceOpenDialog();
+  const handleSaveWorkspaceFile = async () => {
+    setSaveMessage(null);
+    const result = await saveWorkspaceFile();
+    if (result.ok) {
+      setSaveMessage(`已保存: ${result.path}`);
+      return;
+    }
+    setSaveMessage(result.message ?? '保存 workspace 文件失败');
   };
 
   if (!workspace) {
@@ -46,13 +49,31 @@ const WorkspaceSection: React.FC = () => {
     <div>
       <h2 className="settings-title">Workspace</h2>
 
-      {/* ---- 概览 ---- */}
       <div className="settings-card">
-        <h3 className="settings-card__title">当前工作区</h3>
+        <div className="settings-card__header-row">
+          <h3 className="settings-card__title">Current Workspace</h3>
+          <div className="settings-action-row">
+            <button
+              className="settings-action-button"
+              onClick={showWorkspaceOpenDialog}
+              type="button"
+            >
+              Open Folder...
+            </button>
+            <button
+              className="settings-action-button"
+              onClick={() => void handleSaveWorkspaceFile()}
+              type="button"
+            >
+              Save Workspace File
+            </button>
+          </div>
+        </div>
+
         <table className="settings-kv">
           <tbody>
             <tr>
-              <td>名称</td>
+              <td>Name</td>
               <td>{workspace.name}</td>
             </tr>
             <tr>
@@ -60,70 +81,50 @@ const WorkspaceSection: React.FC = () => {
               <td>{workspace.id}</td>
             </tr>
             <tr>
-              <td>来源类型</td>
+              <td>Source</td>
               <td>
                 {workspace.source}
-                {fallbackUsed && (
-                  <span style={{ color: '#d19a66', marginLeft: 8 }}>
-                    (fallback)
-                  </span>
-                )}
+                {fallbackUsed && <span className="settings-source-note">fallback</span>}
               </td>
             </tr>
             {workspace.sourcePath && (
               <tr>
-                <td>来源文件</td>
-                <td style={{ wordBreak: 'break-all' }}>{workspace.sourcePath}</td>
+                <td>Workspace File</td>
+                <td className="settings-path">{workspace.sourcePath}</td>
               </tr>
             )}
             <tr>
-              <td>打开时间</td>
+              <td>Opened At</td>
               <td>{workspace.openedAt}</td>
             </tr>
           </tbody>
         </table>
-        <div style={{ marginTop: 8 }}>
-          <button
-            onClick={handleOpen}
-            style={{
-              background: '#0e639c',
-              color: '#fff',
-              border: 'none',
-              padding: '4px 12px',
-              fontSize: 12,
-              borderRadius: 3,
-              cursor: 'pointer',
-            }}
+
+        {(lastError || saveMessage) && (
+          <div
+            className={
+              lastError ? 'settings-status settings-status--error' : 'settings-status'
+            }
           >
-            Open Workspace…
-          </button>
-          {lastError && (
-            <span style={{ color: '#f48771', marginLeft: 12, fontSize: 12 }}>
-              {lastError}
-            </span>
-          )}
-        </div>
+            {lastError ?? saveMessage}
+          </div>
+        )}
       </div>
 
-      {/* ---- folders ---- */}
       <div className="settings-card">
         <h3 className="settings-card__title">Folders ({workspace.folders.length})</h3>
         <table className="settings-kv">
           <tbody>
-            {workspace.folders.map((f) => (
-              <tr key={f.id}>
-                <td>{f.id}</td>
+            {workspace.folders.map((folder) => (
+              <tr key={folder.id}>
+                <td>{folder.id}</td>
                 <td>
                   <div>
-                    <strong>{f.name}</strong>
+                    <strong>{folder.name}</strong>
                   </div>
-                  <div style={{ color: '#888', fontSize: 11, wordBreak: 'break-all' }}>
-                    {f.absolutePath}
-                  </div>
-                  {!f.isAbsolute && (
-                    <div style={{ color: '#888', fontSize: 11 }}>
-                      原始（相对）: {f.originalPath}
-                    </div>
+                  <div className="settings-path">{folder.absolutePath}</div>
+                  {!folder.isAbsolute && (
+                    <div className="settings-path">Relative: {folder.originalPath}</div>
                   )}
                 </td>
               </tr>
@@ -132,11 +133,10 @@ const WorkspaceSection: React.FC = () => {
         </table>
       </div>
 
-      {/* ---- DeepCode 命名空间设置 ---- */}
       <div className="settings-card">
-        <h3 className="settings-card__title">DeepCode 工作区设置</h3>
+        <h3 className="settings-card__title">DeepCode Workspace Settings</h3>
         <div className="settings-card__body">
-          当前只写入内存态 <code>deepcode.*</code> 设置，用于验证工作区覆盖优先级；后续阶段再决定是否落盘到 <code>.code-workspace</code>。
+          这些设置保存在当前工作区上下文中；保存为 .code-workspace 后会写入 workspace 文件的 settings 字段。
         </div>
         <div className="settings-workspace-fields">
           {SETTING_DEFINITIONS.map((definition) => (
@@ -151,14 +151,14 @@ const WorkspaceSection: React.FC = () => {
         </div>
         {Object.keys(workspace.settings).length > 0 && (
           <details className="settings-raw-details">
-            <summary>查看 raw deepcode.* 设置</summary>
+            <summary>Raw deepcode.* settings</summary>
             <table className="settings-kv">
               <tbody>
-                {Object.entries(workspace.settings).map(([k, v]) => (
-                  <tr key={k}>
-                    <td>{k}</td>
+                {Object.entries(workspace.settings).map(([key, value]) => (
+                  <tr key={key}>
+                    <td>{key}</td>
                     <td>
-                      <code>{JSON.stringify(v)}</code>
+                      <code>{JSON.stringify(value)}</code>
                     </td>
                   </tr>
                 ))}
@@ -168,22 +168,21 @@ const WorkspaceSection: React.FC = () => {
         )}
       </div>
 
-      {/* ---- 未支持字段 ---- */}
       {workspace.unsupportedFields.length > 0 && (
         <div className="settings-card">
-          <h3 className="settings-card__title">未支持字段（兼容提示）</h3>
+          <h3 className="settings-card__title">Unsupported Workspace Fields</h3>
           <table className="settings-kv">
             <tbody>
-              {workspace.unsupportedFields.map((u) => (
-                <tr key={u.key}>
-                  <td>{u.key}</td>
-                  <td>{u.kind}</td>
+              {workspace.unsupportedFields.map((field) => (
+                <tr key={field.key}>
+                  <td>{field.key}</td>
+                  <td>{field.kind}</td>
                 </tr>
               ))}
             </tbody>
           </table>
-          <div className="settings-card__body" style={{ color: '#888' }}>
-            DeepCode 当前不解析 VSCode 特有字段（extensions / tasks / launch / remoteAuthority）。
+          <div className="settings-card__body">
+            DeepCode 当前不解析 VSCode 专用字段，例如 extensions、tasks、launch、remoteAuthority。
           </div>
         </div>
       )}

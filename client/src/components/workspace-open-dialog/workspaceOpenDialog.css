@@ -135,6 +135,9 @@
   padding: 6px 14px;
 }
 .ws-open-dialog__sidebar-item {
+  width: 100%;
+  border: none;
+  background: transparent;
   padding: 6px 14px;
   display: flex;
   align-items: center;
@@ -145,14 +148,18 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  text-align: left;
 }
 .ws-open-dialog__sidebar-item:hover {
   background: rgba(255, 255, 255, 0.04);
   color: #fff;
 }
 .ws-open-dialog__sidebar-icon {
-  width: 18px;
+  width: 34px;
   text-align: center;
+  color: #888;
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .ws-open-dialog__main {
@@ -180,6 +187,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 26px;
   padding: 4px 16px;
   cursor: pointer;
   user-select: none;
@@ -196,9 +204,11 @@
   color: #d4a017;
 }
 .ws-open-dialog__entry-icon {
-  width: 18px;
+  width: 34px;
   text-align: center;
-  font-size: 13px;
+  color: #888;
+  font-size: 10px;
+  font-weight: 700;
 }
 .ws-open-dialog__entry-name {
   flex: 1;
