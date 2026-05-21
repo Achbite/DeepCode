@@ -58,6 +58,8 @@ fn main() {
             // Stub
             commands::llm_invoke_stub,
             commands::skill_invoke_stub,
+            // 窗口管理
+            commands::window_close_ask_status,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

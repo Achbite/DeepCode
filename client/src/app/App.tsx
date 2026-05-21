@@ -1,13 +1,15 @@
 /**
- * App 入口组件
+ * App entry.
  *
- * 启动顺序：
- *   1. 拉取一次工作区状态（确保 folder 列表存在）；
- *   2. 启动 API health 检查 + 30s 周期；
- *   3. 启动 WebSocket 心跳。
+ * Boot order:
+ *   1. Load workspace and user settings.
+ *   2. Start runtime health check.
+ *   3. Start heartbeat.
+ *   4. Register editor-level shortcuts, auto-save and close guard.
  */
-import React, { useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { loader } from '@monaco-editor/react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import WorkbenchLayout from './layout/WorkbenchLayout';
 import useAppStatusStore from '../state/appStatusStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
@@ -20,8 +22,37 @@ import {
   connectHeartbeat,
   disconnectHeartbeat,
 } from '../services/heartbeatSocket';
+import { getTabId, useEditorStore } from '../state/editorStore';
+import type { ConfirmDialogAction, ConfirmDialogData } from '../types/ui';
+import './app.css';
 
 const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
+
+const CLOSED_CONFIRM_DIALOG: ConfirmDialogData = {
+  open: false,
+  title: '',
+  message: '',
+};
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return (
+    target.isContentEditable ||
+    target.tagName === 'TEXTAREA' ||
+    target.tagName === 'INPUT' ||
+    target.getAttribute('role') === 'textbox' ||
+    Boolean(target.closest('.monaco-editor'))
+  );
+}
+
+function asNumber(value: unknown, fallback: number): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function asBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
 
 const App: React.FC = () => {
   const {
@@ -38,25 +69,103 @@ const App: React.FC = () => {
   const workspaceSettings = useWorkspaceStore((s) => s.current?.settings ?? EMPTY_WORKSPACE_SETTINGS);
   const loadUserSettings = useSettingsStore((s) => s.loadUserSettings);
   const syncWorkspaceSettings = useSettingsStore((s) => s.syncWorkspaceSettings);
-  const colorTheme = useSettingsStore((s) => String(s.effectiveSettings['workbench.colorTheme'] ?? 'vs-dark'));
+  const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
+  const colorTheme = String(effectiveSettings['workbench.colorTheme'] ?? 'vs-dark');
+  const autoSave = String(effectiveSettings['files.autoSave'] ?? 'off');
+  const autoSaveDelay = asNumber(effectiveSettings['files.autoSaveDelay'], 1000);
+  const hotExit = asBoolean(effectiveSettings['files.hotExit'], true);
+  const enableBasicShortcuts = asBoolean(
+    effectiveSettings['keyboard.enableBasicShortcuts'],
+    true
+  );
 
-  // ---- 1. 启动时加载工作区与用户设置 ----
+  const dirtySignature = useEditorStore((s) =>
+    s.tabs
+      .flatMap((tab) =>
+        tab.kind === 'file' && tab.isDirty
+          ? [`${getTabId(tab)}:${tab.version}`]
+          : []
+      )
+      .join('|')
+  );
+
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogData>(CLOSED_CONFIRM_DIALOG);
+
+  const closeConfirmDialog = useCallback(() => {
+    setConfirmDialog(CLOSED_CONFIRM_DIALOG);
+  }, []);
+
+  const saveCurrentActiveFile = useCallback(async () => {
+    const { activeTabId, tabs, saveFile } = useEditorStore.getState();
+    const activeTab = tabs.find((tab) => getTabId(tab) === activeTabId);
+    if (activeTab?.kind !== 'file') return false;
+    return saveFile(getTabId(activeTab));
+  }, []);
+
+  const showUnsavedCloseDialog = useCallback(() => {
+    const { hasAnyDirtyFile, saveAllDirtyFiles, discardAllDirtyFiles } =
+      useEditorStore.getState();
+    if (!hasAnyDirtyFile()) return;
+
+    const closeWindow = () => {
+      closeConfirmDialog();
+      window.setTimeout(() => {
+        void getCurrentWindow().destroy();
+      }, 50);
+    };
+
+    const actions: ConfirmDialogAction[] = [
+      {
+        label: '保存并退出',
+        variant: 'primary',
+        onClick: async () => {
+          const ok = await saveAllDirtyFiles();
+          if (ok) {
+            closeWindow();
+          }
+        },
+      },
+      {
+        label: '不保存',
+        variant: 'danger',
+        onClick: () => {
+          discardAllDirtyFiles();
+          closeWindow();
+        },
+      },
+      {
+        label: '取消',
+        variant: 'secondary',
+        onClick: closeConfirmDialog,
+      },
+    ];
+
+    setConfirmDialog({
+      open: true,
+      title: '保存更改',
+      message: '当前有未保存的文件。退出前需要保存这些更改吗？',
+      detail: '选择“不保存”会放弃当前编辑器中的未保存内容；选择“取消”将返回 DeepCode。',
+      actions,
+    });
+  }, [closeConfirmDialog]);
+
+  // ---- 1. Load workspace and user settings ----
   useEffect(() => {
     loadWorkspace();
     loadUserSettings();
   }, [loadWorkspace, loadUserSettings]);
 
-  // ---- 1.1 工作区设置叠加 ----
+  // ---- 1.1 Workspace settings overlay ----
   useEffect(() => {
     syncWorkspaceSettings(workspaceSettings);
   }, [workspaceSettings, syncWorkspaceSettings]);
 
-  // ---- 1.2 主题同步 ----
+  // ---- 1.2 Theme sync ----
   useEffect(() => {
     document.documentElement.dataset.theme = colorTheme;
   }, [colorTheme]);
 
-  // ---- 1.3 Monaco / 通信模块预热，降低首次打开文件冷启动耗时 ----
+  // ---- 1.3 Monaco / communication warmup ----
   useEffect(() => {
     const timer = window.setTimeout(() => {
       loader.init().catch(() => undefined);
@@ -68,7 +177,7 @@ const App: React.FC = () => {
     return () => window.clearTimeout(timer);
   }, []);
 
-  // ---- 2. 运行时状态检测 + API health 检查 ----
+  // ---- 2. Runtime status + API health ----
   useEffect(() => {
     let cancelled = false;
     let interval: ReturnType<typeof setInterval> | null = null;
@@ -78,13 +187,11 @@ const App: React.FC = () => {
       if (cancelled) return;
 
       if (runtimeStatus.runtime === 'tauri') {
-        // Tauri 模式：runtime 在进程生命周期内不会变，置位即可，无需轮询
         setApiStatus('connected');
         setServerVersion(runtimeStatus.version);
         return;
       }
 
-      // Web 模式：HTTP health check
       const { getHealth } = await import('../services/apiClient');
       const result = await getHealth();
       if (cancelled) return;
@@ -97,7 +204,6 @@ const App: React.FC = () => {
       }
     };
 
-    // 首次执行；Web 模式追加 30s 轮询；Tauri 模式不轮询
     (async () => {
       await checkRuntimeAndHealth();
       if (cancelled) return;
@@ -113,7 +219,7 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---- 3. WebSocket 心跳 ----
+  // ---- 3. Heartbeat ----
   useEffect(() => {
     connectHeartbeat();
     return () => {
@@ -121,13 +227,131 @@ const App: React.FC = () => {
     };
   }, []);
 
+  // ---- 4. Basic shortcuts ----
+  useEffect(() => {
+    if (!enableBasicShortcuts) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      const ctrl = event.ctrlKey || event.metaKey;
+      if (!ctrl) return;
+
+      const key = event.key.toLowerCase();
+      if (key === 's') {
+        event.preventDefault();
+        if (event.shiftKey) {
+          void useEditorStore.getState().saveAllDirtyFiles();
+        } else {
+          void saveCurrentActiveFile();
+        }
+        return;
+      }
+
+      if (key === ',') {
+        event.preventDefault();
+        useEditorStore.getState().openSettings();
+        return;
+      }
+
+      if (key === 'w' && !isEditableTarget(event.target)) {
+        event.preventDefault();
+        const { activeTabId, closeTab } = useEditorStore.getState();
+        if (activeTabId) closeTab(activeTabId);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [enableBasicShortcuts, saveCurrentActiveFile]);
+
+  // ---- 5. Auto save ----
+  useEffect(() => {
+    if (autoSave !== 'afterDelay' || !dirtySignature) return;
+    const delay = Math.max(250, autoSaveDelay);
+    const timer = window.setTimeout(() => {
+      void useEditorStore.getState().saveAllDirtyFiles();
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [autoSave, autoSaveDelay, dirtySignature]);
+
+  // ---- 6. Close guard ----
+  useEffect(() => {
+    if (!hotExit) return;
+
+    if (getRuntimeType() !== 'tauri') {
+      const onBeforeUnload = (event: BeforeUnloadEvent) => {
+        if (useEditorStore.getState().hasAnyDirtyFile()) {
+          event.preventDefault();
+          event.returnValue = '';
+        }
+      };
+      window.addEventListener('beforeunload', onBeforeUnload);
+      return () => window.removeEventListener('beforeunload', onBeforeUnload);
+    }
+
+    const appWindow = getCurrentWindow();
+    let disposed = false;
+    let cleanup: (() => void) | null = null;
+
+    void appWindow.onCloseRequested((event) => {
+      if (useEditorStore.getState().hasAnyDirtyFile()) {
+        event.preventDefault();
+        showUnsavedCloseDialog();
+      }
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        cleanup = unlisten;
+      }
+    });
+
+    return () => {
+      disposed = true;
+      cleanup?.();
+    };
+  }, [hotExit, showUnsavedCloseDialog]);
+
   return (
-    <WorkbenchLayout
-      apiStatus={apiStatus}
-      wsStatus={wsStatus}
-      serverVersion={serverVersion}
-      lastHeartbeatAt={lastHeartbeatAt}
-    />
+    <>
+      <WorkbenchLayout
+        apiStatus={apiStatus}
+        wsStatus={wsStatus}
+        serverVersion={serverVersion}
+        lastHeartbeatAt={lastHeartbeatAt}
+      />
+      {confirmDialog.open && (
+        <div className="app-dialog-backdrop" role="presentation">
+          <div
+            className="app-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="app-confirm-title"
+          >
+            <div className="app-dialog__title" id="app-confirm-title">
+              {confirmDialog.title}
+            </div>
+            <div className="app-dialog__message">{confirmDialog.message}</div>
+            {confirmDialog.detail && (
+              <div className="app-dialog__detail">{confirmDialog.detail}</div>
+            )}
+            <div className="app-dialog__actions">
+              {(confirmDialog.actions ?? []).map((action) => (
+                <button
+                  key={action.label}
+                  type="button"
+                  className={`app-dialog__button app-dialog__button--${
+                    action.variant ?? 'secondary'
+                  }`}
+                  onClick={() => void action.onClick()}
+                >
+                  {action.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 };
 
