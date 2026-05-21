@@ -12,12 +12,15 @@ import type { FastifyInstance } from 'fastify';
 import {
   getWorkspaceState,
   openWorkspace,
+  saveWorkspaceFile,
   patchWorkspaceSettings,
 } from '../services/workspaceService.js';
 import type {
   ApiResponse,
   OpenWorkspaceRequest,
   OpenWorkspaceResult,
+  SaveWorkspaceFileRequest,
+  SaveWorkspaceFileResult,
   PatchWorkspaceSettingsRequest,
   PatchWorkspaceSettingsResult,
   WorkspaceState,
@@ -66,6 +69,26 @@ export async function registerWorkspaceRoutes(
   });
 
   // ---- 合并 DeepCode 命名空间设置 ----
+  app.post('/api/workspaces/save-file', async (request) => {
+    const body = request.body as SaveWorkspaceFileRequest | undefined;
+    try {
+      const result = saveWorkspaceFile(body?.folderId, body?.fileName);
+      const response: ApiResponse<SaveWorkspaceFileResult> = {
+        ok: true,
+        data: result,
+      };
+      return response;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const response: ApiResponse<never> = {
+        ok: false,
+        error: 'workspace_save_file_error',
+        message,
+      };
+      return response;
+    }
+  });
+
   app.patch('/api/workspaces/current/settings', async (request) => {
     const body = request.body as PatchWorkspaceSettingsRequest | undefined;
     if (!body || typeof body.settings !== 'object' || body.settings === null) {

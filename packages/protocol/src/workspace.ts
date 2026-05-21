@@ -106,6 +106,26 @@ export interface OpenWorkspaceResult {
   workspace: WorkspaceSpec;
 }
 
+/** POST /api/workspaces/save-file 请求体 */
+export interface SaveWorkspaceFileRequest {
+  /** 目标 WorkspaceFolder；省略时使用当前 active/default folder */
+  folderId?: string;
+  /** 可选文件名；省略时使用当前工作区名生成 <name>.code-workspace */
+  fileName?: string;
+}
+
+/** POST /api/workspaces/save-file 成功响应 data 字段 */
+export interface SaveWorkspaceFileResult {
+  /** 生成或覆盖的 .code-workspace 文件绝对路径 */
+  workspaceFilePath: string;
+  /** 保存后重新打开的工作区状态 */
+  workspace: WorkspaceSpec;
+  /** 本次是否创建了新文件 */
+  created: boolean;
+  /** 本次是否覆盖了已有文件 */
+  overwritten: boolean;
+}
+
 /** PATCH /api/workspaces/current/settings 请求体 */
 export interface PatchWorkspaceSettingsRequest {
   /**

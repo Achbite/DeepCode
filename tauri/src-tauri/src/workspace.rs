@@ -69,6 +69,15 @@ pub struct OpenWorkspaceResult {
     pub workspace: WorkspaceSpec,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveWorkspaceFileResult {
+    pub workspace_file_path: String,
+    pub workspace: WorkspaceSpec,
+    pub created: bool,
+    pub overwritten: bool,
+}
+
 /// PATCH /api/workspaces/current/settings 成功响应 data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -311,6 +320,81 @@ impl WorkspaceManager {
         Ok(OpenWorkspaceResult { workspace: ws })
     }
 
+    pub fn save_workspace_file(
+        &self,
+        folder_id: Option<String>,
+        file_name: Option<String>,
+    ) -> Result<SaveWorkspaceFileResult, String> {
+        let (current, target_folder) = {
+            let inner = self.inner.lock().unwrap();
+            let ws = inner
+                .current
+                .as_ref()
+                .ok_or_else(|| "工作区尚未初始化，请先调用 get_current_workspace".to_string())?
+                .clone();
+            let folder = match folder_id.as_deref() {
+                Some(id) => ws
+                    .folders
+                    .iter()
+                    .find(|f| f.id == id)
+                    .cloned()
+                    .ok_or_else(|| format!("未知 folderId: {}", id))?,
+                None => ws
+                    .folders
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "当前工作区没有 folder".to_string())?,
+            };
+            (ws, folder)
+        };
+
+        let root = PathBuf::from(&target_folder.absolute_path);
+        if !root.is_dir() {
+            return Err(format!(
+                "目标 folder 不存在或不是目录: {}",
+                target_folder.absolute_path
+            ));
+        }
+
+        let workspace_file_name =
+            sanitize_workspace_file_name(file_name.as_deref().unwrap_or(&current.name));
+        let workspace_file = root.join(workspace_file_name);
+        if workspace_file.parent() != Some(root.as_path()) {
+            return Err("workspace 文件只能保存到当前 folder 根目录".into());
+        }
+
+        let folders: Vec<serde_json::Value> = current
+            .folders
+            .iter()
+            .map(|folder| {
+                let path = workspace_folder_path_for_file(&root, folder, &target_folder.id);
+                serde_json::json!({
+                    "path": path,
+                    "name": folder.name,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "folders": folders,
+            "settings": current.settings,
+        });
+
+        let existed = workspace_file.exists();
+        let content = serde_json::to_string_pretty(&payload)
+            .map_err(|e| format!("序列化 workspace 文件失败: {}", e))?;
+        std::fs::write(&workspace_file, format!("{}\n", content))
+            .map_err(|e| format!("写入 workspace 文件失败: {}", e))?;
+
+        let workspace_file_path = to_posix(&workspace_file);
+        let opened = self.open_workspace(&workspace_file_path)?;
+        Ok(SaveWorkspaceFileResult {
+            workspace_file_path,
+            workspace: opened.workspace,
+            created: !existed,
+            overwritten: existed,
+        })
+    }
+
     /// 合并 DeepCode 命名空间设置（Tauri 内存态，与 Node server 行为对齐）
     pub fn patch_workspace_settings(
         &self,
@@ -378,6 +462,46 @@ fn is_code_workspace_file(p: &Path) -> bool {
                 .ends_with(".code-workspace")
         })
         .unwrap_or(false)
+}
+
+fn sanitize_workspace_file_name(input: &str) -> String {
+    let trimmed = input.trim();
+    let raw = if trimmed.is_empty() {
+        "workspace.code-workspace".to_string()
+    } else if trimmed.to_lowercase().ends_with(".code-workspace") {
+        trimmed.to_string()
+    } else {
+        format!("{}.code-workspace", trimmed)
+    };
+    let sanitized: String = raw
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            ch if ch.is_control() => '-',
+            ch => ch,
+        })
+        .collect();
+    if sanitized == ".code-workspace" {
+        "workspace.code-workspace".into()
+    } else {
+        sanitized
+    }
+}
+
+fn workspace_folder_path_for_file(
+    workspace_file_dir: &Path,
+    folder: &WorkspaceFolderSpec,
+    target_folder_id: &str,
+) -> String {
+    if folder.id == target_folder_id {
+        return ".".into();
+    }
+    let folder_abs = PathBuf::from(&folder.absolute_path);
+    match folder_abs.strip_prefix(workspace_file_dir) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".into(),
+        Ok(relative) => to_posix(relative),
+        Err(_) => folder.absolute_path.clone(),
+    }
 }
 
 /// 当前时间 ISO 8601 格式（UTC）

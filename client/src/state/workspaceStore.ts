@@ -11,6 +11,7 @@ import { create } from 'zustand';
 import {
   getCurrentWorkspace,
   openWorkspace as runtimeOpenWorkspace,
+  saveWorkspaceFile as runtimeSaveWorkspaceFile,
 } from '../services/runtimeAdapter';
 import type {
   WorkspaceFolderSpec,
@@ -43,6 +44,8 @@ interface WorkspaceActions {
   loadCurrent: () => Promise<void>;
   /** 打开工作区（绝对路径或 .code-workspace 文件） */
   openWorkspace: (path: string) => Promise<{ ok: boolean; message?: string }>;
+  /** 将当前 folder 保存为 .code-workspace 文件，并切换到该 workspace 文件 */
+  saveWorkspaceFile: (fileName?: string) => Promise<{ ok: boolean; path?: string; message?: string }>;
   /** 切换当前 folder */
   selectFolder: (folderId: string) => void;
   /** 手动递增 treeRevision（阶段 4 / S4-2），用于新建 / 删除 / 重命名后主动刷新文件树 */
@@ -111,6 +114,37 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       return { ok: true };
     }
     const message = result.message ?? '打开工作区失败';
+    set({
+      lastError: message,
+      loading: false,
+    });
+    return { ok: false, message };
+  },
+
+  saveWorkspaceFile: async (fileName?: string) => {
+    const folderId = get().activeFolderId ?? get().current?.folders[0]?.id;
+    if (!folderId) {
+      const message = '当前没有可保存的 workspace folder';
+      set({ lastError: message });
+      return { ok: false, message };
+    }
+
+    set({ loading: true });
+    const result = await runtimeSaveWorkspaceFile({ folderId, fileName });
+    if (result.ok && result.data) {
+      const ws = result.data.workspace;
+      set((state) => ({
+        current: ws,
+        fallbackUsed: false,
+        lastError: null,
+        activeFolderId: ws.folders[0]?.id ?? null,
+        loading: false,
+        treeRevision: state.treeRevision + 1,
+      }));
+      return { ok: true, path: result.data.workspaceFilePath };
+    }
+
+    const message = result.message ?? '保存 workspace 文件失败';
     set({
       lastError: message,
       loading: false,

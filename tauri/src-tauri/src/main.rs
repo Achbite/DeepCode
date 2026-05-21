@@ -25,6 +25,7 @@ fn main() {
             // 工作区
             commands::get_current_workspace,
             commands::open_workspace,
+            commands::save_workspace_file,
             commands::patch_workspace_settings,
             // 文件系统浏览
             commands::get_initial_locations,

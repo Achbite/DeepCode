@@ -13,13 +13,14 @@
  *   - folders[].path 解析后必须是已存在的目录；不存在时该 folder 被丢弃，并写入 lastError；
  *   - openWorkspace 接收的绝对路径仅在该路由放行；后续文件读写全部按 folderId 锁定在 folder 之内。
  */
-import { existsSync, statSync, readFileSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
 import {
   basename,
   dirname,
   isAbsolute,
   normalize,
+  relative,
   resolve,
   extname,
 } from 'node:path';
@@ -30,6 +31,7 @@ import type {
   WorkspaceState,
   WorkspaceSummary,
   UnsupportedField,
+  SaveWorkspaceFileResult,
 } from '@deepcode/protocol';
 
 // ---- 常量 ----
@@ -60,6 +62,31 @@ let openCounter = 0;
 /** 将本机绝对路径转为 POSIX 风格（仅用于展示） */
 function toPosix(abs: string): string {
   return abs.split('\\').join('/');
+}
+
+function fromPosixMaybe(abs: string): string {
+  return normalize(abs);
+}
+
+function sanitizeWorkspaceFileName(input: string): string {
+  const fallback = 'workspace.code-workspace';
+  const trimmed = input.trim() || fallback;
+  const withExt = /\.code-workspace$/i.test(trimmed)
+    ? trimmed
+    : `${trimmed}.code-workspace`;
+  const sanitized = withExt.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-');
+  return sanitized === '.code-workspace' ? fallback : sanitized;
+}
+
+function workspaceFolderPathForFile(
+  workspaceFileDir: string,
+  folder: WorkspaceFolderSpec,
+  targetFolderId: string
+): string {
+  if (folder.id === targetFolderId) return '.';
+  const folderAbs = fromPosixMaybe(folder.absolutePath);
+  const rel = toPosix(relative(workspaceFileDir, folderAbs));
+  return rel === '' ? '.' : rel;
 }
 
 /** 读取并解析 .code-workspace JSON 文件；失败抛出 Error */
@@ -279,6 +306,62 @@ export function openWorkspace(absolutePath: string): WorkspaceSpec {
   currentWorkspace = spec;
   fallbackUsed = false;
   return spec;
+}
+
+/**
+ * 将当前工作区保存成 VSCode 兼容 .code-workspace 文件。
+ *
+ * 文件写入到指定 folder 根目录下；保存成功后立即以该 .code-workspace
+ * 重新打开，使 Workspace 面板和后续启动逻辑都能看到 sourcePath。
+ */
+export function saveWorkspaceFile(
+  folderId?: string,
+  fileName?: string
+): SaveWorkspaceFileResult {
+  const ws = getCurrentWorkspace();
+  const targetFolder = folderId
+    ? ws.folders.find((folder) => folder.id === folderId)
+    : ws.folders[0];
+
+  if (!targetFolder) {
+    throw new Error(`未知 folderId: ${folderId ?? '(default)'}`);
+  }
+
+  const targetRoot = fromPosixMaybe(targetFolder.absolutePath);
+  if (!existsSync(targetRoot) || !statSync(targetRoot).isDirectory()) {
+    throw new Error(`目标 folder 不存在或不是目录: ${targetFolder.absolutePath}`);
+  }
+
+  const workspaceFileName = sanitizeWorkspaceFileName(fileName ?? ws.name);
+  const workspaceFilePath = resolve(targetRoot, workspaceFileName);
+  const normalizedTargetRoot = normalize(targetRoot);
+  const normalizedWorkspaceFilePath = normalize(workspaceFilePath);
+  if (dirname(normalizedWorkspaceFilePath) !== normalizedTargetRoot) {
+    throw new Error('workspace 文件只能保存到当前 folder 根目录');
+  }
+
+  const settings = { ...ws.settings };
+  const payload = {
+    folders: ws.folders.map((folder) => ({
+      path: workspaceFolderPathForFile(normalizedTargetRoot, folder, targetFolder.id),
+      name: folder.name,
+    })),
+    settings,
+  };
+  const existed = existsSync(normalizedWorkspaceFilePath);
+  writeFileSync(
+    normalizedWorkspaceFilePath,
+    `${JSON.stringify(payload, null, 2)}\n`,
+    'utf-8'
+  );
+
+  const nextWorkspace = openWorkspace(normalizedWorkspaceFilePath);
+  return {
+    workspaceFilePath: toPosix(normalizedWorkspaceFilePath),
+    workspace: nextWorkspace,
+    created: !existed,
+    overwritten: existed,
+  };
 }
 
 /** 获取当前活动工作区；启动后必然存在 */

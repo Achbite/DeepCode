@@ -84,6 +84,17 @@ pub fn open_workspace(
         .map_err(CommandError::Other)
 }
 
+#[tauri::command]
+pub fn save_workspace_file(
+    folder_id: Option<String>,
+    file_name: Option<String>,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<workspace::SaveWorkspaceFileResult, CommandError> {
+    state
+        .save_workspace_file(folder_id, file_name)
+        .map_err(CommandError::Other)
+}
+
 /// 合并当前工作区 DeepCode 命名空间设置（内存态）
 #[tauri::command]
 pub fn patch_workspace_settings(

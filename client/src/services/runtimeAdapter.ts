@@ -18,6 +18,8 @@ import type {
   RenameEntryResult,
   WorkspaceState,
   OpenWorkspaceResult,
+  SaveWorkspaceFileRequest,
+  SaveWorkspaceFileResult,
   BrowsePathResult,
   InitialLocations,
   GetUserSettingsResult,
@@ -99,6 +101,29 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
   }
 }
 
+export async function minimizeAppWindow(): Promise<void> {
+  if (getRuntimeType() === 'tauri') {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    await getCurrentWindow().minimize();
+  }
+}
+
+export async function toggleMaximizeAppWindow(): Promise<void> {
+  if (getRuntimeType() === 'tauri') {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    await getCurrentWindow().toggleMaximize();
+  }
+}
+
+export async function closeAppWindow(): Promise<void> {
+  if (getRuntimeType() === 'tauri') {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    await getCurrentWindow().close();
+    return;
+  }
+  window.close();
+}
+
 // ---- Tauri invoke helper ----
 
 /**
@@ -173,6 +198,19 @@ export async function openWorkspace(path: string): Promise<ApiResponse<OpenWorks
   }
   const { openWorkspace: apiOpenWorkspace } = await import('./apiClient');
   return apiOpenWorkspace(path);
+}
+
+export async function saveWorkspaceFile(
+  request: SaveWorkspaceFileRequest
+): Promise<ApiResponse<SaveWorkspaceFileResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<SaveWorkspaceFileResult>('save_workspace_file', {
+      folderId: request.folderId,
+      fileName: request.fileName,
+    });
+  }
+  const { saveWorkspaceFile: apiSaveWorkspaceFile } = await import('./apiClient');
+  return apiSaveWorkspaceFile(request);
 }
 
 export async function patchWorkspaceSettings(

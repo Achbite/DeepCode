@@ -14,6 +14,8 @@ import type {
   RenameEntryResult,
   WorkspaceState,
   OpenWorkspaceResult,
+  SaveWorkspaceFileRequest,
+  SaveWorkspaceFileResult,
   PatchWorkspaceSettingsResult,
   BrowsePathResult,
   InitialLocations,
@@ -123,6 +125,16 @@ export function openWorkspace(
     `${API_BASE}/workspaces/open`,
     'POST',
     { path }
+  );
+}
+
+export function saveWorkspaceFile(
+  request: SaveWorkspaceFileRequest
+): Promise<ApiResponse<SaveWorkspaceFileResult>> {
+  return sendJson<SaveWorkspaceFileResult>(
+    `${API_BASE}/workspaces/save-file`,
+    'POST',
+    request
   );
 }
 
