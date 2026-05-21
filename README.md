@@ -1,6 +1,7 @@
 # DeepCode
 
 > 轻量级 AI Agent 代码工作台 — 自建外壳 + 本地 Node.js 后端，专注于纯代码工作流。
+> 会针对deepseek进行专门的优化
 
 ## 简介
 
