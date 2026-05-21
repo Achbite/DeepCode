@@ -92,12 +92,9 @@ function replacePathPrefix(path: string, oldPath: string, newPath: string): stri
 }
 
 const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
-  const workspace = useWorkspaceStore((s) => s.current);
-  const fallbackUsed = useWorkspaceStore((s) => s.fallbackUsed);
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
   const treeRevision = useWorkspaceStore((s) => s.treeRevision);
   const bumpTreeRevision = useWorkspaceStore((s) => s.bumpTreeRevision);
-  const selectFolder = useWorkspaceStore((s) => s.selectFolder);
   const getActiveFolder = useWorkspaceStore((s) => s.getActiveFolder);
   const showWorkspaceOpenDialog = useUiStore((s) => s.showWorkspaceOpenDialog);
   const renamePathInTabs = useEditorStore((s) => s.renamePathInTabs);
@@ -464,51 +461,6 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
           </button>
         </div>
       </div>
-
-      {workspace && (
-        <div className="file-tree__summary">
-          <div>
-            <span>Workspace:</span>{' '}
-            <span className="file-tree__summary-name">{workspace.name}</span>
-            <span className="file-tree__summary-source">
-              [{workspace.source}]
-            </span>
-            {fallbackUsed && (
-              <span className="file-tree__summary-fallback">fallback</span>
-            )}
-          </div>
-          {workspace.folders.length > 1 ? (
-            <div>
-              <span>Folder:</span>{' '}
-              <select
-                className="file-tree__summary-folder-select"
-                value={activeFolderId ?? ''}
-                onChange={(e) => {
-                  selectFolder(e.target.value);
-                  setSelectedResource(null);
-                }}
-              >
-                {workspace.folders.map((f) => (
-                  <option key={f.id} value={f.id}>
-                    {f.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-          ) : workspace.folders.length === 1 ? (
-            <div
-              onContextMenu={(event) => {
-                if (rootTarget) openContextMenu(event, rootTarget);
-              }}
-            >
-              <span>Folder:</span>{' '}
-              <span className="file-tree__summary-name">
-                {workspace.folders[0].name}
-              </span>
-            </div>
-          ) : null}
-        </div>
-      )}
 
       {loading && (
         <div className="file-tree__status file-tree__status--loading">加载中...</div>

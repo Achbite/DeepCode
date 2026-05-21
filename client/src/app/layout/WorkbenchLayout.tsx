@@ -1,5 +1,5 @@
 import './workbenchLayout.css';
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import FileTree from '../../components/file-tree/FileTree';
 import CodeEditor from '../../components/editor/CodeEditor';
 import TerminalPlaceholder from '../../components/terminal/TerminalPlaceholder';
@@ -24,6 +24,27 @@ interface WorkbenchLayoutProps {
 
 type SidebarPanel = 'explorer' | 'git' | 'search';
 type ActivityIconName = SidebarPanel | 'settings' | 'account';
+type PanelResizeKind = 'sidebar' | 'agent' | 'bottom';
+
+const SIDEBAR_WIDTH_KEY = 'deepcode.layout.sidebarWidth';
+const AGENT_WIDTH_KEY = 'deepcode.layout.agentWidth';
+const BOTTOM_HEIGHT_KEY = 'deepcode.layout.bottomHeight';
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function readStoredLayoutSize(
+  key: string,
+  fallback: number,
+  min: number,
+  max: number
+): number {
+  if (typeof window === 'undefined') return fallback;
+  const stored = Number(window.localStorage.getItem(key));
+  if (!Number.isFinite(stored)) return fallback;
+  return clampNumber(stored, min, max);
+}
 
 const ActivityIcon: React.FC<{ name: ActivityIconName }> = ({ name }) => {
   const commonProps = {
@@ -124,6 +145,28 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
 
   const [activeSidebar, setActiveSidebar] = useState<SidebarPanel>('explorer');
   const [sidebarVisible, setSidebarVisible] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    readStoredLayoutSize(SIDEBAR_WIDTH_KEY, 260, 180, 420)
+  );
+  const [agentWidth, setAgentWidth] = useState(() =>
+    readStoredLayoutSize(AGENT_WIDTH_KEY, 380, 300, 620)
+  );
+  const [bottomHeight, setBottomHeight] = useState(() =>
+    readStoredLayoutSize(BOTTOM_HEIGHT_KEY, 220, 140, 520)
+  );
+  const [terminalMinimized, setTerminalMinimized] = useState(false);
+
+  useEffect(() => {
+    window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    window.localStorage.setItem(AGENT_WIDTH_KEY, String(agentWidth));
+  }, [agentWidth]);
+
+  useEffect(() => {
+    window.localStorage.setItem(BOTTOM_HEIGHT_KEY, String(bottomHeight));
+  }, [bottomHeight]);
 
   const toggleSidebarPanel = (panel: SidebarPanel) => {
     if (activeSidebar === panel && sidebarVisible) {
@@ -164,8 +207,57 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
     }
   };
 
+  const startPanelResize = (
+    kind: PanelResizeKind,
+    event: React.MouseEvent<HTMLDivElement>
+  ) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startSidebarWidth = sidebarWidth;
+    const startAgentWidth = agentWidth;
+    const startBottomHeight = bottomHeight;
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      if (kind === 'sidebar') {
+        setSidebarWidth(clampNumber(startSidebarWidth + moveEvent.clientX - startX, 180, 420));
+      } else if (kind === 'agent') {
+        setAgentWidth(clampNumber(startAgentWidth - (moveEvent.clientX - startX), 300, 620));
+      } else {
+        const maxBottomHeight = Math.max(140, window.innerHeight - 240);
+        setBottomHeight(
+          clampNumber(startBottomHeight - (moveEvent.clientY - startY), 140, maxBottomHeight)
+        );
+      }
+    };
+
+    const onMouseUp = () => {
+      document.body.classList.remove('workbench-resizing');
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+
+    document.body.classList.add('workbench-resizing');
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  };
+
+  const layoutStyle = {
+    '--sidebar-width': `${sidebarWidth}px`,
+    '--agent-width': `${agentWidth}px`,
+    '--bottom-height': terminalMinimized ? '0px' : `${bottomHeight}px`,
+  } as React.CSSProperties;
+
   return (
-    <div className={`workbench-layout ${!sidebarVisible ? 'workbench-layout--no-sidebar' : ''}`}>
+    <div
+      className={`workbench-layout ${!sidebarVisible ? 'workbench-layout--no-sidebar' : ''} ${
+        terminalMinimized ? 'workbench-layout--terminal-minimized' : ''
+      }`}
+      style={layoutStyle}
+      onContextMenu={(event) => {
+        event.preventDefault();
+      }}
+    >
       <header className="header">
         <div className="header__title">
           <strong>DeepCode</strong>
@@ -302,11 +394,13 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         <AgentPanelPlaceholder />
       </aside>
 
-      <footer className="bottom-panel panel">
-        <div className="bottom-panel__content">
-          <TerminalPlaceholder />
-        </div>
-      </footer>
+      {!terminalMinimized && (
+        <footer className="bottom-panel panel">
+          <div className="bottom-panel__content">
+            <TerminalPlaceholder onMinimize={() => setTerminalMinimized(true)} />
+          </div>
+        </footer>
+      )}
 
       <footer className="status-bar">
         <div className="status-bar__group">
@@ -319,6 +413,40 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
           <span>WS {wsStatus}</span>
         </div>
       </footer>
+
+      {sidebarVisible && (
+        <div
+          className="workbench-resizer workbench-resizer--sidebar"
+          role="separator"
+          aria-label="Resize Explorer"
+          onMouseDown={(event) => startPanelResize('sidebar', event)}
+        />
+      )}
+      <div
+        className="workbench-resizer workbench-resizer--agent"
+        role="separator"
+        aria-label="Resize Agent panel"
+        onMouseDown={(event) => startPanelResize('agent', event)}
+      />
+      {!terminalMinimized && (
+        <div
+          className="workbench-resizer workbench-resizer--bottom"
+          role="separator"
+          aria-label="Resize Terminal panel"
+          onMouseDown={(event) => startPanelResize('bottom', event)}
+        />
+      )}
+      {terminalMinimized && (
+        <button
+          className="terminal-expand-button"
+          type="button"
+          title="Expand terminal"
+          aria-label="Expand terminal"
+          onClick={() => setTerminalMinimized(false)}
+        >
+          &gt;_
+        </button>
+      )}
 
       <WorkspaceOpenDialog />
       <CodeWorkspaceChoiceDialog />

@@ -1,0 +1,72 @@
+.app-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.app-dialog {
+  width: min(460px, calc(100vw - 40px));
+  border: 1px solid var(--line, #3f4248);
+  border-radius: 6px;
+  background: var(--panel, #25262a);
+  color: var(--text, #d9dce2);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+  padding: 18px 20px;
+}
+
+.app-dialog__title {
+  color: var(--text-strong, #fff);
+  font-size: 15px;
+  font-weight: 650;
+  margin-bottom: 10px;
+}
+
+.app-dialog__message,
+.app-dialog__detail {
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.app-dialog__detail {
+  margin-top: 8px;
+  color: var(--muted, #8d94a3);
+}
+
+.app-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.app-dialog__button {
+  min-height: 28px;
+  border: 1px solid var(--line, #3f4248);
+  border-radius: 4px;
+  background: var(--panel-2, #2b2d31);
+  color: var(--text, #d9dce2);
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.app-dialog__button:hover {
+  border-color: rgba(47, 139, 253, 0.55);
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text-strong, #fff);
+}
+
+.app-dialog__button--primary {
+  border-color: var(--accent, #2f8bfd);
+  background: var(--accent, #2f8bfd);
+  color: #fff;
+}
+
+.app-dialog__button--danger {
+  border-color: rgba(244, 135, 113, 0.5);
+  color: var(--danger, #f48771);
+}

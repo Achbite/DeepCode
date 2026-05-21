@@ -71,49 +71,6 @@
   height: 14px;
 }
 
-.file-tree__summary {
-  display: grid;
-  gap: 4px;
-  padding: 8px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  color: var(--ft-fg-muted);
-  font-size: 11px;
-  line-height: 1.35;
-}
-
-.file-tree__summary-name {
-  color: var(--ft-fg);
-}
-
-.file-tree__summary-source,
-.file-tree__summary-fallback {
-  display: inline-flex;
-  align-items: center;
-  min-height: 18px;
-  margin-left: 6px;
-  padding: 0 6px;
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-radius: 999px;
-  color: var(--ft-fg-muted);
-  font-size: 10px;
-}
-
-.file-tree__summary-fallback {
-  color: var(--ft-warn);
-  border-color: rgba(215, 186, 125, 0.35);
-}
-
-.file-tree__summary-folder-select {
-  max-width: 150px;
-  min-height: 24px;
-  margin-left: 4px;
-  border: 1px solid var(--ft-border);
-  border-radius: 4px;
-  background: var(--bg, #1e1f22);
-  color: var(--ft-fg);
-  font-size: 11px;
-}
-
 .file-tree__status {
   padding: 14px 12px;
   color: var(--ft-fg-muted);
