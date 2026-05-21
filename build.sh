@@ -68,6 +68,24 @@ find "$LINUX_DIR"      -mindepth 1 -delete 2>/dev/null || true
 find "$WIN_DIR"        -mindepth 1 -delete 2>/dev/null || true
 find "$INSTALLERS_DIR" -mindepth 1 -delete 2>/dev/null || true
 
+# ---- 3.1 预留配置目录结构 ----
+# 打包产物中保留 config/global 与 config/user/local 两条线：
+#   - global: 随产品分发的默认 skills / prompts / ruler
+#   - user/local: 当前单机用户的设置、会话、密钥、skills、prompts、ruler
+# 后续联网或多账号时，只需要把 local 替换为实际 user id，不再调整目录协议。
+for TARGET_DIR in "$LINUX_DIR" "$WIN_DIR"; do
+    mkdir -p \
+        "$TARGET_DIR/config/global/skills" \
+        "$TARGET_DIR/config/global/prompts" \
+        "$TARGET_DIR/config/global/ruler" \
+        "$TARGET_DIR/config/user/local/settings" \
+        "$TARGET_DIR/config/user/local/skills" \
+        "$TARGET_DIR/config/user/local/prompts" \
+        "$TARGET_DIR/config/user/local/ruler" \
+        "$TARGET_DIR/config/user/local/secrets" \
+        "$TARGET_DIR/config/user/local/sessions"
+done
+
 # ---- 4. server 单文件可执行（双平台）----
 # 先用 esbuild 把 ESM dist 打成 CJS 单文件 bundle，再交给 @yao-pkg/pkg 打成原生可执行
 echo "==[build][4/6]== bundle server (esbuild) and package (pkg)"
