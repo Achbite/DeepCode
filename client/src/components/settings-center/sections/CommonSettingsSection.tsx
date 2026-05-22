@@ -36,6 +36,7 @@ const GROUP_TITLES: Record<string, string> = {
   explorer: 'Explorer',
   workbench: 'Workbench',
   terminal: 'Terminal',
+  agent: 'Agent',
 };
 
 const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({

@@ -29,7 +29,7 @@ export interface SettingDefinition {
   key: string;
   label: string;
   description: string;
-  group: 'editor' | 'files' | 'keyboard' | 'explorer' | 'workbench' | 'terminal';
+  group: 'editor' | 'files' | 'keyboard' | 'explorer' | 'workbench' | 'terminal' | 'agent';
   control: SettingControlType;
   options?: Array<{ label: string; value: string }>;
 }
@@ -203,6 +203,78 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     description: '终端后台启动超时时间，单位毫秒。',
     group: 'terminal',
     control: 'number',
+  },
+  {
+    key: 'agent.defaultMode',
+    label: 'Default Permission Mode',
+    description: 'Default permission mode for new Agent sessions.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Read Only', value: 'readOnly' },
+      { label: 'Plan', value: 'plan' },
+      { label: 'Ask Before Write', value: 'askBeforeWrite' },
+    ],
+  },
+  {
+    key: 'agent.defaultWorkflow',
+    label: 'Default Workflow',
+    description: 'Default Agent behavior when a user sends a task.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Plan First', value: 'planFirst' },
+      { label: 'Act On Request', value: 'actOnRequest' },
+    ],
+  },
+  {
+    key: 'agent.permissions.allowFileRead',
+    label: 'Allow File Read',
+    description: 'Allow Agent tools to read workspace files.',
+    group: 'agent',
+    control: 'boolean',
+  },
+  {
+    key: 'agent.permissions.allowFileWrite',
+    label: 'Allow File Write',
+    description: 'Allow Agent tools to request file writes. Writes still require approval.',
+    group: 'agent',
+    control: 'boolean',
+  },
+  {
+    key: 'agent.permissions.allowCodeSearch',
+    label: 'Allow Code Search',
+    description: 'Allow Agent tools to search code in the workspace.',
+    group: 'agent',
+    control: 'boolean',
+  },
+  {
+    key: 'agent.permissions.allowShellPropose',
+    label: 'Allow Shell Proposals',
+    description: 'Allow Agent to propose shell commands without executing them.',
+    group: 'agent',
+    control: 'boolean',
+  },
+  {
+    key: 'agent.permissions.allowShellExec',
+    label: 'Allow Shell Execution Requests',
+    description: 'Allow Agent to request or execute shell commands through the Agent permission policy.',
+    group: 'agent',
+    control: 'boolean',
+  },
+  {
+    key: 'agent.shell.autoExecuteCommands',
+    label: 'Auto Execute Commands',
+    description: 'Allow non-blacklisted shell.exec requests to run automatically when shell execution is enabled.',
+    group: 'agent',
+    control: 'boolean',
+  },
+  {
+    key: 'agent.shell.commandBlacklist',
+    label: 'Command Blacklist',
+    description: 'Comma-separated command fragments that always require manual approval before shell execution.',
+    group: 'agent',
+    control: 'text',
   },
 ];
 
