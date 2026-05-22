@@ -98,17 +98,17 @@ command -v x86_64-w64-mingw32-gcc >/dev/null \
 pass "tooling ok"
 
 # ---- 2. 协议包构建 ----
-info "[2/6] pnpm --filter @deepcode/protocol build"
-if pnpm --filter @deepcode/protocol build; then
-    pass "protocol build ok"
+info "[2/6] pnpm --filter @deepcode/protocol build && pnpm --filter @deepcode/agent-core build"
+if pnpm --filter @deepcode/protocol build && pnpm --filter @deepcode/agent-core build; then
+    pass "protocol/agent-core build ok"
 else
-    fail "protocol build 失败"; exit 2
+    fail "protocol/agent-core build 失败"; exit 2
 fi
 
 # ---- 3. 静态类型检查 ----
-info "[3/6] protocol + server typecheck"
-if pnpm --filter @deepcode/protocol typecheck && pnpm --filter @deepcode/server typecheck; then
-    pass "protocol/server typecheck ok"
+info "[3/6] protocol + agent-core + server typecheck"
+if pnpm --filter @deepcode/protocol typecheck && pnpm --filter @deepcode/agent-core typecheck && pnpm --filter @deepcode/server typecheck; then
+    pass "protocol/agent-core/server typecheck ok"
 else
     fail "typecheck 失败"; exit 3
 fi
@@ -336,6 +336,42 @@ PACKAGE_HASH_AFTER="$(sha256sum "$ROOT_DIR/package.json" | awk '{print $1}')"
 [ "$PACKAGE_HASH_BEFORE" = "$PACKAGE_HASH_AFTER" ] \
     && pass "askBeforeWrite 未审批 fs.write 未写盘" \
     || { fail "askBeforeWrite 未审批 fs.write 修改了文件"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+
+SESSIONS_BEFORE="$(curl -fsS -m 3 "$TERMINAL_SESSIONS_URL" || true)"
+run_agent_fixture "007-shell-exec.deepcode.md" "plan" "true" '
+    .ok == true
+    and ([.data.observations[].toolName] | index("shell.exec") != null)
+    and ([.data.observations[].status] | index("blocked") != null)
+' "plan 模式阻止 shell.exec"
+
+run_agent_fixture "007-shell-exec.deepcode.md" "askBeforeWrite" "true" '
+    .ok == true
+    and ([.data.observations[].toolName] | index("shell.exec") != null)
+    and ([.data.observations[].status] | index("needsApproval") != null)
+' "askBeforeWrite 未审批 shell.exec 进入 needsApproval"
+
+SHELL_EXEC_APPROVED_BODY="$(jq -Rs '{content: ., mode: "askBeforeWrite", execute: true, approveAll: true}' < "$ROOT_DIR/fixtures/agent-actions/007-shell-exec.deepcode.md")"
+SHELL_EXEC_APPROVED_RESP="$(curl -fsS -m 10 -H 'Content-Type: application/json' -d "$SHELL_EXEC_APPROVED_BODY" "$AGENT_FIXTURE_URL" || true)"
+info "approved shell.exec -> $SHELL_EXEC_APPROVED_RESP"
+echo "$SHELL_EXEC_APPROVED_RESP" | jq -e '
+    .ok == true
+    and ([.data.observations[].toolName] | index("shell.exec") != null)
+    and ([.data.observations[].status] | index("ok") != null)
+    and ([.data.observations[].output.executed?] | index(true) != null)
+    and ([.data.observations[].output.stdout? | strings] | map(contains("deepcode-agent-shell")) | index(true) != null)
+    and ([.data.observations[].output.cleanupStatus? | strings] | length >= 1)
+' >/dev/null 2>&1 \
+    && pass "askBeforeWrite 已审批 shell.exec 使用 Agent 临时 shell 执行并清理" \
+    || { fail "askBeforeWrite 已审批 shell.exec 断言失败"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+
+SESSIONS_AFTER="$(curl -fsS -m 3 "$TERMINAL_SESSIONS_URL" || true)"
+BEFORE_COUNT="$(echo "$SESSIONS_BEFORE" | jq '.data.sessions | length' 2>/dev/null || echo -1)"
+AFTER_COUNT="$(echo "$SESSIONS_AFTER" | jq '.data.sessions | length' 2>/dev/null || echo -2)"
+[ "$BEFORE_COUNT" = "$AFTER_COUNT" ] \
+    && pass "Agent 临时 shell 未污染用户终端 session 列表" \
+    || { fail "Agent shell 修改了用户终端 session 数量 before=$BEFORE_COUNT after=$AFTER_COUNT"; exit "$NEXT_FAIL_CODE"; }
 NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
 
 PROMPT_LAYERS_BODY="$(curl -fsS -m 3 "$AGENT_PROMPT_LAYERS_URL" || true)"

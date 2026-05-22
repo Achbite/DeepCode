@@ -12,7 +12,7 @@ import {
   evaluateAgentPermission,
   executeAgentTool,
   listAgentTools,
-} from '../services/agentToolService.js';
+} from '../modules/agent/index.js';
 
 function errorResponse(error: string, err: unknown): ApiResponse<never> {
   return {

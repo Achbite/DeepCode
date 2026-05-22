@@ -11,7 +11,7 @@ import type {
 import {
   parseAgentActions,
   runAgentFixture,
-} from '../services/agentActionParserService.js';
+} from '../modules/agent/index.js';
 import {
   listPromptLayers,
   listSkills,
