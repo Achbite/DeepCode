@@ -1,12 +1,15 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { TerminalSession } from '@deepcode/protocol';
+import {
+  createTerminalSession,
+  deleteTerminalSession,
+  getTerminalEvents,
+  listTerminalSessions,
+  restartTerminalSession,
+  sendTerminalInput,
+  updateTerminalSession,
+} from '../../services/apiClient';
 import './terminalPanel.css';
-
-interface TerminalSession {
-  id: string;
-  name: string;
-  shell: string;
-  lines: string[];
-}
 
 interface TerminalContextMenu {
   x: number;
@@ -24,29 +27,135 @@ interface TerminalPlaceholderProps {
   onMinimize: () => void;
 }
 
-const INITIAL_TERMINALS: TerminalSession[] = [
-  {
-    id: 'terminal-1',
-    name: 'Terminal 1',
-    shell: 'PowerShell',
-    lines: [
-      'DeepCode terminal surface',
-      'Shell backend will attach here when node-pty is enabled.',
-    ],
-  },
-];
-
 const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize }) => {
-  const [sessions, setSessions] = useState<TerminalSession[]>(INITIAL_TERMINALS);
-  const [activeId, setActiveId] = useState(INITIAL_TERMINALS[0].id);
+  const [sessions, setSessions] = useState<TerminalSession[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [outputBySession, setOutputBySession] = useState<Record<string, string>>({});
+  const [command, setCommand] = useState('');
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<TerminalContextMenu | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const dragStateRef = useRef<TerminalDragState | null>(null);
+  const lastSequenceRef = useRef<Record<string, number>>({});
+  const sessionsRef = useRef<TerminalSession[]>([]);
+  const activeIdRef = useRef<string | null>(null);
 
   const active = sessions.find((session) => session.id === activeId) ?? sessions[0];
+  const activeOutput = active ? outputBySession[active.id] ?? '' : '';
+
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
+
+  const applySessions = useCallback(
+    (nextSessions: TerminalSession[], preferredActiveId?: string) => {
+      const sorted = [...nextSessions].sort((a, b) => a.order - b.order);
+      const preferred = preferredActiveId
+        ? sorted.find((session) => session.id === preferredActiveId)
+        : undefined;
+      const current = activeIdRef.current
+        ? sorted.find((session) => session.id === activeIdRef.current)
+        : undefined;
+
+      sessionsRef.current = sorted;
+      setSessions(sorted);
+      setActiveId((preferred ?? current ?? sorted[0])?.id ?? null);
+    },
+    []
+  );
+
+  const refreshSessions = useCallback(async (preferredActiveId?: string) => {
+    const result = await listTerminalSessions();
+    if (!result.ok || !result.data) return;
+    applySessions(result.data.sessions, preferredActiveId);
+  }, [applySessions]);
+
+  const createTerminal = useCallback(async () => {
+    const currentSessions = sessionsRef.current;
+    const result = await createTerminalSession({
+      name: `Terminal ${currentSessions.length + 1}`,
+    });
+    if (!result.ok || !result.data) return;
+    applySessions([...currentSessions, result.data], result.data.id);
+    void refreshSessions(result.data.id);
+  }, [applySessions, refreshSessions]);
+
+  const closeTerminal = useCallback(async (sessionId: string) => {
+    const currentSessions = sessionsRef.current;
+    const closingIndex = currentSessions.findIndex((session) => session.id === sessionId);
+    if (closingIndex < 0) return;
+
+    const result = await deleteTerminalSession(sessionId);
+    if (!result.ok) return;
+
+    const nextSessions = currentSessions.filter((session) => session.id !== sessionId);
+    const fallbackActive =
+      nextSessions[Math.min(closingIndex, Math.max(0, nextSessions.length - 1))]?.id ??
+      nextSessions[0]?.id;
+    setOutputBySession((prev) => {
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+    lastSequenceRef.current[sessionId] = 0;
+    applySessions(nextSessions, fallbackActive);
+    setContextMenu(null);
+    setRenamingId(null);
+    void refreshSessions(fallbackActive);
+  }, [applySessions, refreshSessions]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const result = await listTerminalSessions();
+      if (cancelled) return;
+      if (result.ok && result.data && result.data.sessions.length > 0) {
+        applySessions(result.data.sessions);
+        return;
+      }
+      const created = await createTerminalSession({ name: 'Terminal 1' });
+      if (!cancelled && created.ok && created.data) {
+        applySessions([created.data], created.data.id);
+        void refreshSessions(created.data.id);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [applySessions, refreshSessions]);
+
+  useEffect(() => {
+    if (!active?.id) return;
+    const timer = window.setInterval(async () => {
+      const after = lastSequenceRef.current[active.id] ?? 0;
+      const result = await getTerminalEvents(active.id, after);
+      if (!result.ok || !result.data || result.data.events.length === 0) return;
+      const text = result.data.events
+        .map((event) => {
+          if (event.sequence > (lastSequenceRef.current[event.sessionId] ?? 0)) {
+            lastSequenceRef.current[event.sessionId] = event.sequence;
+          }
+          if (event.type === 'exit') return `\n[process exited ${event.exitCode ?? ''}]\n`;
+          if (event.type === 'error') return `\n[error] ${event.data ?? ''}\n`;
+          if (event.type === 'status') return '';
+          return event.data ?? '';
+        })
+        .join('');
+      if (!text) return;
+      setOutputBySession((prev) => ({
+        ...prev,
+        [active.id]: `${prev[active.id] ?? ''}${text}`,
+      }));
+      void refreshSessions();
+    }, 600);
+    return () => window.clearInterval(timer);
+  }, [active?.id, refreshSessions]);
 
   const moveSession = useCallback((sourceId: string, targetId: string) => {
     if (sourceId === targetId) return;
@@ -57,7 +166,10 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
       const next = [...prev];
       const [moved] = next.splice(sourceIndex, 1);
       next.splice(targetIndex, 0, moved);
-      return next;
+      next.forEach((session, order) => {
+        void updateTerminalSession(session.id, { order });
+      });
+      return next.map((session, order) => ({ ...session, order }));
     });
   }, []);
 
@@ -72,23 +184,29 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
       }
       setContextMenu(null);
     };
-    const closeOnBlur = () => setContextMenu(null);
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         setContextMenu(null);
         setRenamingId(null);
       }
+      if (event.key === 'Delete' && renamingId === null) {
+        const target = event.target as HTMLElement | null;
+        const sessionElement = target?.closest<HTMLElement>('[data-terminal-id]');
+        const sessionId = sessionElement?.dataset.terminalId;
+        if (sessionId) {
+          event.preventDefault();
+          void closeTerminal(sessionId);
+        }
+      }
     };
 
     window.addEventListener('click', close);
-    window.addEventListener('blur', closeOnBlur);
     window.addEventListener('keydown', onKeyDown);
     return () => {
       window.removeEventListener('click', close);
-      window.removeEventListener('blur', closeOnBlur);
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, []);
+  }, [closeTerminal, renamingId]);
 
   useEffect(() => {
     renameInputRef.current?.focus();
@@ -125,18 +243,6 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     };
   }, [moveSession]);
 
-  const createTerminal = () => {
-    const nextIndex = sessions.length + 1;
-    const next: TerminalSession = {
-      id: `terminal-${Date.now()}`,
-      name: `Terminal ${nextIndex}`,
-      shell: 'PowerShell',
-      lines: ['New terminal session ready.'],
-    };
-    setSessions((prev) => [...prev, next]);
-    setActiveId(next.id);
-  };
-
   const openContextMenu = (
     event: React.MouseEvent<HTMLDivElement>,
     sessionId: string
@@ -153,54 +259,66 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     setContextMenu(null);
   };
 
-  const submitRename = () => {
+  const submitRename = async () => {
     if (!renamingId) return;
     const name = renameValue.trim();
     if (name) {
-      setSessions((prev) =>
-        prev.map((session) =>
-          session.id === renamingId ? { ...session, name } : session
-        )
-      );
+      const result = await updateTerminalSession(renamingId, { name });
+      if (result.ok && result.data) {
+        setSessions((prev) =>
+          prev.map((session) => (session.id === renamingId ? result.data! : session))
+        );
+      }
     }
     setRenamingId(null);
     setRenameValue('');
   };
 
-  const restartSession = (sessionId: string) => {
-    const session = sessions.find((item) => item.id === sessionId);
-    setSessions((prev) =>
-      prev.map((item) =>
-        item.id === sessionId
-          ? {
-              ...item,
-              lines: [
-                `${session?.name ?? 'Terminal'} restarted.`,
-                'Shell backend will attach here when node-pty is enabled.',
-              ],
-            }
-          : item
-      )
-    );
-    setActiveId(sessionId);
+  const restartSession = async (sessionId: string) => {
+    const result = await restartTerminalSession(sessionId);
+    if (result.ok && result.data) {
+      setSessions((prev) =>
+        prev.map((session) => (session.id === sessionId ? result.data! : session))
+      );
+      setActiveId(result.data.id);
+      setOutputBySession((prev) => ({ ...prev, [result.data!.id]: '' }));
+    }
     setContextMenu(null);
+  };
+
+  const submitCommand = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!active || command.trim() === '') return;
+    const line = `${command}\n`;
+    setOutputBySession((prev) => ({
+      ...prev,
+      [active.id]: `${prev[active.id] ?? ''}${active.shellKind} $ ${command}\n`,
+    }));
+    setCommand('');
+    await sendTerminalInput(active.id, { data: line });
   };
 
   return (
     <div className="terminal-panel">
       <div className="terminal-panel__body">
         <div className="terminal-panel__screen">
-          {active.lines.map((line, index) => (
-            <div key={`${active.id}:${index}`}>{line}</div>
-          ))}
-          <div className="terminal-panel__prompt">
-            <span>{active.shell}</span>
+          <pre className="terminal-panel__output">
+            {activeOutput || 'DeepCode terminal surface\nCreate or select a terminal session.'}
+          </pre>
+          <form className="terminal-panel__prompt" onSubmit={submitCommand}>
+            <span>{active?.shellKind ?? 'shell'}</span>
+            <input
+              className="terminal-panel__command-input"
+              value={command}
+              onChange={(event) => setCommand(event.target.value)}
+              disabled={!active || active.status !== 'running'}
+              aria-label="Terminal input"
+            />
             <span className="terminal-panel__cursor">_</span>
-          </div>
+          </form>
         </div>
 
         <aside className="terminal-panel__sidebar" aria-label="Terminal sessions">
-          {/* 顶部工具栏：Apple 风格的 Flex 布局和 SVG 图标 */}
           <div className="terminal-panel__sidebar-header" aria-label="Terminal panel controls">
             <span className="terminal-panel__sidebar-title">TERMINAL</span>
             <div className="terminal-panel__sidebar-actions">
@@ -209,7 +327,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
                 type="button"
                 title="New terminal"
                 aria-label="New terminal"
-                onClick={createTerminal}
+                onClick={() => void createTerminal()}
               >
                 <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
                   <path d="M8 3.5v9m-4.5-4.5h9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
@@ -229,14 +347,13 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
             </div>
           </div>
 
-          {/* 终端会话列表 */}
           <div className="terminal-panel__session-list">
             {sessions.map((session) => (
               <div
                 key={session.id}
                 data-terminal-id={session.id}
                 className={`terminal-panel__session ${
-                  session.id === active.id ? 'terminal-panel__session--active' : ''
+                  session.id === active?.id ? 'terminal-panel__session--active' : ''
                 } ${draggedId === session.id ? 'terminal-panel__session--dragging' : ''}`}
                 onMouseDown={(event) => {
                   if (event.button === 2) {
@@ -253,15 +370,9 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
                 }}
                 onClick={() => setActiveId(session.id)}
                 onContextMenu={(event) => openContextMenu(event, session.id)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    setActiveId(session.id);
-                  }
-                }}
                 role="button"
                 tabIndex={0}
-                title={session.name}
+                title={`${session.name} (${session.status})`}
               >
                 <div className="terminal-panel__session-icon">
                   <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -279,13 +390,13 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
                       onKeyDown={(event) => {
                         if (event.key === 'Enter') {
                           event.preventDefault();
-                          submitRename();
+                          void submitRename();
                         } else if (event.key === 'Escape') {
                           event.preventDefault();
                           setRenamingId(null);
                         }
                       }}
-                      onBlur={submitRename}
+                      onBlur={() => void submitRename()}
                     />
                   ) : (
                     <span className="terminal-panel__session-name">{session.name}</span>
@@ -303,7 +414,8 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
           y={contextMenu.y}
           session={sessions.find((session) => session.id === contextMenu.sessionId)}
           onRename={startRename}
-          onRestart={() => restartSession(contextMenu.sessionId)}
+          onRestart={() => void restartSession(contextMenu.sessionId)}
+          onClose={() => void closeTerminal(contextMenu.sessionId)}
         />
       )}
     </div>
@@ -316,6 +428,7 @@ interface TerminalSessionMenuProps {
   session?: TerminalSession;
   onRename: (session: TerminalSession) => void;
   onRestart: () => void;
+  onClose: () => void;
 }
 
 const TerminalSessionMenu: React.FC<TerminalSessionMenuProps> = ({
@@ -324,6 +437,7 @@ const TerminalSessionMenu: React.FC<TerminalSessionMenuProps> = ({
   session,
   onRename,
   onRestart,
+  onClose,
 }) => {
   if (!session) return null;
   return (
@@ -338,6 +452,9 @@ const TerminalSessionMenu: React.FC<TerminalSessionMenuProps> = ({
       </button>
       <button type="button" onClick={onRestart}>
         Restart Terminal
+      </button>
+      <button type="button" className="terminal-panel__context-danger" onClick={onClose}>
+        Close Terminal
       </button>
     </div>
   );

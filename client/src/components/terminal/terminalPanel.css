@@ -4,8 +4,8 @@
   min-width: 0;
   min-height: 0;
   display: flex;
-  background: #111213;
-  color: #d6d6d6;
+  background: var(--terminal-bg, #000);
+  color: #d4d4d4;
 }
 
 .terminal-panel__body {
@@ -14,20 +14,20 @@
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 220px;
-  background: #111213;
+  background: var(--terminal-bg, #000);
 }
 
 .terminal-panel__screen {
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  padding: 12px 14px;
-  border-top: 1px solid #25272b;
-  background: #111213;
-  color: #d6d6d6;
-  font-family: "Cascadia Code", Consolas, "Courier New", monospace;
+  padding: 14px 16px;
+  border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  background: var(--terminal-bg, #000);
+  color: #d4d4d4;
+  font-family: "Cascadia Code", "SF Mono", Consolas, "Courier New", monospace;
   font-size: 12px;
-  line-height: 1.55;
+  line-height: 1.6;
 }
 
 .terminal-panel__prompt {
@@ -35,17 +35,39 @@
   align-items: center;
   gap: 8px;
   margin-top: 6px;
-  color: #7ee787;
+  color: var(--ok, #34c759);
+}
+
+.terminal-panel__output {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+  color: inherit;
+}
+
+.terminal-panel__command-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: #f5f5f7;
+  font: inherit;
+}
+
+.terminal-panel__command-input:disabled {
+  color: #6f7782;
 }
 
 .terminal-panel__cursor {
-  color: #d6d6d6;
+  color: #d4d4d4;
 }
 
 .terminal-panel__sidebar {
   width: 220px;
-  background: #141516;
-  border-left: 1px solid #25272b;
+  background: var(--terminal-bg, #000);
+  border-left: 1px solid var(--line, rgba(255, 255, 255, 0.08));
   display: flex;
   flex-direction: column;
 }
@@ -54,17 +76,17 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
+  padding: 0 10px 0 12px;
   height: 38px;
-  border-bottom: 1px solid #25272b;
-  background: #141516;
+  border-bottom: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  background: var(--terminal-bg, #000);
 }
 
 .terminal-panel__sidebar-title {
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 0.5px;
-  color: #808791;
+  color: var(--text-muted, #a1a1aa);
   text-transform: uppercase;
   user-select: none;
 }
@@ -82,15 +104,14 @@
   justify-content: center;
   border: 1px solid transparent;
   background: transparent;
-  color: #9aa2af;
-  border-radius: 6px;
+  color: var(--text-muted, #a1a1aa);
+  border-radius: var(--radius-sm, 4px);
   cursor: pointer;
-  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
 
 .terminal-panel__icon-btn:hover {
-  border-color: #34373d;
-  background: #202225;
+  border-color: var(--line, rgba(255, 255, 255, 0.08));
+  background: rgba(255, 255, 255, 0.08);
   color: #ffffff;
 }
 
@@ -102,44 +123,46 @@
 .terminal-panel__session-list {
   flex: 1;
   overflow-y: auto;
-  padding: 4px 8px;
+  padding: 6px 8px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
+  background: var(--terminal-bg, #000);
 }
 
 .terminal-panel__session {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  color: #9aa2af;
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: var(--radius-md, 6px);
+  color: var(--text-muted, #a1a1aa);
   border: 1px solid transparent;
-  transition: background 0.1s ease, color 0.1s ease;
   user-select: none;
   cursor: grab;
 }
 
 .terminal-panel__session:hover {
-  background: #1c1e21;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-main, #ededed);
 }
 
 .terminal-panel__session--active {
-  border-color: #34373d;
-  background: #23262a;
+  border-color: rgba(10, 132, 255, 0.28);
+  background: rgba(10, 132, 255, 0.22);
   color: #ffffff;
 }
 
 .terminal-panel__session--dragging {
-  opacity: 0.45;
+  opacity: 0.48;
   cursor: grabbing;
 }
 
 .terminal-panel__session-icon {
   display: flex;
   align-items: center;
-  opacity: 0.8;
+  opacity: 0.85;
   color: inherit;
 }
 
@@ -157,7 +180,7 @@
 
 .terminal-panel__session-name {
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 550;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -165,15 +188,16 @@
 
 .terminal-panel__rename-input {
   width: 100%;
-  height: 22px;
-  border: 1px solid #4b5360;
-  border-radius: 4px;
+  height: 24px;
+  border: 1px solid var(--accent, #0a84ff);
+  border-radius: var(--radius-sm, 4px);
   outline: none;
-  background: #111213;
+  background: rgba(0, 0, 0, 0.35);
   color: #fff;
   padding: 0 6px;
   font-size: 12px;
   font-family: inherit;
+  box-shadow: 0 0 0 3px var(--accent-soft, rgba(10, 132, 255, 0.15));
 }
 
 .terminal-panel__context-menu {
@@ -182,18 +206,18 @@
   min-width: 180px;
   max-width: 260px;
   padding: 4px;
-  border: 1px solid #34373d;
-  border-radius: 5px;
-  background: #181a1d;
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.42);
-  color: var(--text, #d9dce2);
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-md, 6px);
+  background: var(--bg-surface, #1c1c20);
+  box-shadow: var(--shadow-md, 0 12px 30px rgba(0, 0, 0, 0.42));
+  color: var(--text-main, #ededed);
   font-size: 12px;
 }
 
 .terminal-panel__context-title {
   padding: 6px 8px 7px;
-  border-bottom: 1px solid #2a2d32;
-  color: #9aa2af;
+  border-bottom: 1px solid var(--line-soft, rgba(255, 255, 255, 0.04));
+  color: var(--text-muted, #a1a1aa);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -201,17 +225,26 @@
 
 .terminal-panel__context-menu button {
   width: 100%;
-  height: 27px;
+  height: 28px;
   padding: 0 8px;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius-sm, 4px);
   background: transparent;
-  color: var(--text, #d9dce2);
+  color: var(--text-main, #ededed);
   cursor: pointer;
   text-align: left;
 }
 
 .terminal-panel__context-menu button:hover {
-  background: #25282d;
+  background: var(--accent-soft, rgba(10, 132, 255, 0.15));
   color: #fff;
+}
+
+.terminal-panel__context-menu button.terminal-panel__context-danger {
+  color: #ff6b5f;
+}
+
+.terminal-panel__context-menu button.terminal-panel__context-danger:hover {
+  background: rgba(255, 59, 48, 0.14);
+  color: #ff9f97;
 }

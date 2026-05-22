@@ -1,17 +1,19 @@
 .window-controls {
   margin-left: auto;
   display: inline-flex;
-  align-items: stretch;
+  align-items: center;
+  gap: 4px;
   height: 100%;
 }
 
 .window-control {
   position: relative;
-  width: 46px;
-  height: 100%;
+  width: 30px;
+  height: 28px;
   border: 0;
+  border-radius: var(--radius-sm, 4px);
   background: transparent;
-  color: var(--muted, #8d94a3);
+  color: var(--text-muted, #a1a1aa);
   cursor: pointer;
 }
 
@@ -21,7 +23,7 @@
 }
 
 .window-control--close:hover {
-  background: var(--danger, #f48771);
+  background: var(--danger, #ff3b30);
   color: #fff;
 }
 

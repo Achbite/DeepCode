@@ -7,8 +7,7 @@
  *   3. Start heartbeat.
  *   4. Register editor-level shortcuts, auto-save and close guard.
  */
-import React, { useCallback, useEffect, useState } from 'react';
-import WorkbenchLayout from './layout/WorkbenchLayout';
+import React, { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import useAppStatusStore from '../state/appStatusStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
 import { useSettingsStore } from '../state/settingsStore';
@@ -23,6 +22,8 @@ import {
 import { getTabId, useEditorStore } from '../state/editorStore';
 import type { ConfirmDialogAction, ConfirmDialogData } from '../types/ui';
 import './app.css';
+
+const WorkbenchLayout = lazy(() => import('./layout/WorkbenchLayout'));
 
 const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
 
@@ -82,6 +83,19 @@ function scheduleIdle(task: () => void, timeout = 1200): () => void {
   const id = window.setTimeout(task, timeout);
   return () => window.clearTimeout(id);
 }
+
+const BootShellFallback: React.FC = () => (
+  <div className="app-boot-shell" aria-label="DeepCode is starting">
+    <div className="app-boot-shell__header">DeepCode</div>
+    <div className="app-boot-shell__body">
+      <div className="app-boot-shell__rail" />
+      <div className="app-boot-shell__side" />
+      <div className="app-boot-shell__center">Starting DeepCode...</div>
+      <div className="app-boot-shell__agent" />
+    </div>
+    <div className="app-boot-shell__status" />
+  </div>
+);
 
 async function destroyCurrentWindow(): Promise<void> {
   if (getRuntimeType() !== 'tauri') {
@@ -365,12 +379,14 @@ const App: React.FC = () => {
 
   return (
     <>
-      <WorkbenchLayout
-        apiStatus={apiStatus}
-        wsStatus={wsStatus}
-        serverVersion={serverVersion}
-        lastHeartbeatAt={lastHeartbeatAt}
-      />
+      <Suspense fallback={<BootShellFallback />}>
+        <WorkbenchLayout
+          apiStatus={apiStatus}
+          wsStatus={wsStatus}
+          serverVersion={serverVersion}
+          lastHeartbeatAt={lastHeartbeatAt}
+        />
+      </Suspense>
       {confirmDialog.open && (
         <div className="app-dialog-backdrop" role="presentation">
           <div

@@ -1,3 +1,59 @@
+.app-boot-shell {
+  display: grid;
+  grid-template-rows: 38px 1fr 22px;
+  width: 100vw;
+  height: 100vh;
+  background: #0a0a0c;
+  color: #ededed;
+}
+
+.app-boot-shell__header {
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: #18181b;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.app-boot-shell__body {
+  display: grid;
+  grid-template-columns: 48px 260px minmax(360px, 1fr) 380px;
+  min-height: 0;
+}
+
+.app-boot-shell__rail {
+  background: #18181b;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.app-boot-shell__side,
+.app-boot-shell__agent {
+  background: #131316;
+}
+
+.app-boot-shell__side {
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.app-boot-shell__agent {
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.app-boot-shell__center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #a1a1aa;
+  font-size: 12px;
+}
+
+.app-boot-shell__status {
+  background: #0a84ff;
+}
+
 .app-dialog-backdrop {
   position: fixed;
   inset: 0;

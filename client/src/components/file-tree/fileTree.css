@@ -1,15 +1,15 @@
 .file-tree {
-  --ft-bg: var(--panel, #25262a);
-  --ft-bg-2: var(--panel-2, #2b2d31);
-  --ft-fg: var(--text, #d9dce2);
-  --ft-fg-muted: var(--muted, #8d94a3);
+  --ft-bg: var(--bg-panel, #131316);
+  --ft-bg-2: var(--bg-surface, #1c1c20);
+  --ft-fg: var(--text-main, #ededed);
+  --ft-fg-muted: var(--text-muted, #a1a1aa);
   --ft-fg-strong: var(--text-strong, #fff);
-  --ft-border: var(--line, #3f4248);
-  --ft-hover-bg: rgba(255, 255, 255, 0.055);
-  --ft-selected-bg: rgba(47, 139, 253, 0.24);
-  --ft-accent: var(--accent, #2f8bfd);
-  --ft-warn: var(--warn, #d7ba7d);
-  --ft-danger: var(--danger, #f48771);
+  --ft-border: var(--line, rgba(255, 255, 255, 0.08));
+  --ft-hover-bg: rgba(255, 255, 255, 0.04);
+  --ft-selected-bg: var(--accent-soft, rgba(10, 132, 255, 0.15));
+  --ft-accent: var(--accent, #0a84ff);
+  --ft-warn: var(--warn, #ffcc00);
+  --ft-danger: var(--danger, #ff3b30);
 
   display: flex;
   flex-direction: column;
@@ -21,17 +21,17 @@
 }
 
 .file-tree__titlebar {
-  min-height: 34px;
+  min-height: 36px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 0 8px 0 12px;
+  padding: 0 8px 0 14px;
   border-bottom: 1px solid var(--ft-border);
-  color: var(--ft-fg);
+  color: var(--ft-fg-strong);
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.6px;
+  letter-spacing: 0.5px;
   text-transform: uppercase;
   user-select: none;
 }
@@ -46,18 +46,18 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   padding: 0;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius-sm, 4px);
   background: transparent;
   color: var(--ft-fg-muted);
   cursor: pointer;
 }
 
 .file-tree__toolbar-btn:hover {
-  background: var(--ft-hover-bg);
+  background: rgba(255, 255, 255, 0.08);
   color: var(--ft-fg-strong);
 }
 
@@ -86,7 +86,7 @@
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 5px 0;
+  padding: 5px 8px;
 }
 
 .file-tree__empty {
@@ -112,49 +112,52 @@
 }
 
 .file-tree__empty-action {
-  height: 28px;
-  padding: 0 10px;
+  height: 30px;
+  padding: 0 12px;
   border: 1px solid var(--ft-border);
-  border-radius: 4px;
-  background: var(--ft-bg-2);
+  border-radius: var(--radius-md, 6px);
+  background: rgba(255, 255, 255, 0.06);
   color: var(--ft-fg);
   cursor: pointer;
 }
 
 .file-tree__empty-action:hover {
-  border-color: var(--ft-accent);
+  border-color: rgba(10, 132, 255, 0.55);
+  background: rgba(255, 255, 255, 0.1);
   color: var(--ft-fg-strong);
 }
 
 .file-tree__row {
-  min-height: 24px;
+  min-height: 26px;
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 0 8px 0 12px;
-  color: var(--ft-fg);
+  gap: 5px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm, 4px);
+  color: var(--ft-fg-muted);
   cursor: pointer;
   overflow: hidden;
   user-select: none;
   white-space: nowrap;
 }
 
-.file-tree__row--depth-0 { padding-left: 12px; }
-.file-tree__row--depth-1 { padding-left: 28px; }
-.file-tree__row--depth-2 { padding-left: 44px; }
-.file-tree__row--depth-3 { padding-left: 60px; }
-.file-tree__row--depth-4 { padding-left: 76px; }
-.file-tree__row--depth-5 { padding-left: 92px; }
-.file-tree__row--depth-6 { padding-left: 108px; }
-.file-tree__row--depth-7 { padding-left: 124px; }
-.file-tree__row--depth-8 { padding-left: 140px; }
-.file-tree__row--depth-9 { padding-left: 156px; }
-.file-tree__row--depth-10 { padding-left: 172px; }
-.file-tree__row--depth-11 { padding-left: 188px; }
-.file-tree__row--depth-12 { padding-left: 204px; }
+.file-tree__row--depth-0 { padding-left: 8px; }
+.file-tree__row--depth-1 { padding-left: 24px; }
+.file-tree__row--depth-2 { padding-left: 40px; }
+.file-tree__row--depth-3 { padding-left: 56px; }
+.file-tree__row--depth-4 { padding-left: 72px; }
+.file-tree__row--depth-5 { padding-left: 88px; }
+.file-tree__row--depth-6 { padding-left: 104px; }
+.file-tree__row--depth-7 { padding-left: 120px; }
+.file-tree__row--depth-8 { padding-left: 136px; }
+.file-tree__row--depth-9 { padding-left: 152px; }
+.file-tree__row--depth-10 { padding-left: 168px; }
+.file-tree__row--depth-11 { padding-left: 184px; }
+.file-tree__row--depth-12 { padding-left: 200px; }
 
 .file-tree__row:hover {
   background: var(--ft-hover-bg);
+  color: var(--ft-fg);
 }
 
 .file-tree__row--selected,
@@ -178,7 +181,7 @@
 
 .file-tree__icon {
   width: 16px;
-  color: #c5cbd4;
+  color: #c7cad1;
 }
 
 .file-tree__row--selected .file-tree__icon,
@@ -195,14 +198,15 @@
 .file-tree__new-input {
   flex: 1;
   min-width: 0;
-  height: 21px;
-  padding: 0 5px;
+  height: 22px;
+  padding: 0 6px;
   border: 1px solid var(--ft-accent);
-  border-radius: 3px;
+  border-radius: var(--radius-sm, 4px);
   outline: none;
-  background: var(--bg, #1e1f22);
+  background: rgba(0, 0, 0, 0.22);
   color: var(--ft-fg);
   font-size: 12px;
+  box-shadow: 0 0 0 3px var(--accent-soft, rgba(10, 132, 255, 0.15));
 }
 
 .file-tree__new-error {
@@ -217,16 +221,16 @@
   max-width: 300px;
   padding: 4px;
   border: 1px solid var(--ft-border);
-  border-radius: 5px;
+  border-radius: var(--radius-md, 6px);
   background: var(--ft-bg-2);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.42);
+  box-shadow: var(--shadow-md, 0 12px 30px rgba(0, 0, 0, 0.42));
   color: var(--ft-fg);
   font-size: 12px;
 }
 
 .file-tree__context-title {
   padding: 6px 8px 7px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  border-bottom: 1px solid var(--line-soft, rgba(255, 255, 255, 0.04));
   color: var(--ft-fg-muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -235,10 +239,10 @@
 
 .file-tree__context-menu button {
   width: 100%;
-  height: 27px;
+  height: 28px;
   padding: 0 8px;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius-sm, 4px);
   background: transparent;
   color: var(--ft-fg);
   cursor: pointer;
@@ -246,12 +250,12 @@
 }
 
 .file-tree__context-menu button:hover {
-  background: var(--ft-accent);
+  background: var(--accent-soft, rgba(10, 132, 255, 0.15));
   color: #fff;
 }
 
 .file-tree__context-separator {
   height: 1px;
   margin: 4px 2px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--line-soft, rgba(255, 255, 255, 0.04));
 }
