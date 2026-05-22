@@ -13,6 +13,7 @@ use tauri_plugin_dialog::DialogExt;
 use thiserror::Error;
 
 use crate::fs;
+use crate::llm_profiles;
 use crate::terminal;
 use crate::user_settings;
 use crate::workspace;
@@ -449,7 +450,12 @@ pub struct ListToolsResult {
 }
 
 #[tauri::command]
-pub fn get_llm_profiles() -> LlmProfilesResult {
+pub fn get_llm_profiles() -> llm_profiles::LlmProfilesResult {
+    return llm_profiles::get_profiles();
+}
+
+#[allow(dead_code)]
+pub fn get_llm_profiles_stub() -> LlmProfilesResult {
     LlmProfilesResult {
         profiles: vec![
             serde_json::json!({
@@ -483,26 +489,27 @@ pub fn get_llm_profiles() -> LlmProfilesResult {
 }
 
 #[tauri::command]
-pub fn patch_llm_profiles(_request: serde_json::Value) -> Result<LlmProfilesResult, CommandError> {
-    Err(CommandError::NotImplemented(
-        "Tauri 模式 LLM profile 写入尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
-    ))
+pub fn patch_llm_profiles(
+    request: serde_json::Value,
+) -> Result<llm_profiles::LlmProfilesResult, CommandError> {
+    llm_profiles::patch_profiles(request).map_err(CommandError::Other)
 }
 
 #[tauri::command]
-pub fn probe_llm_profile(_request: serde_json::Value) -> Result<serde_json::Value, CommandError> {
-    Err(CommandError::NotImplemented(
-        "Tauri 模式 LLM 探活尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
-    ))
+pub async fn probe_llm_profile(
+    request: serde_json::Value,
+) -> Result<serde_json::Value, CommandError> {
+    llm_profiles::probe_profile(request)
+        .await
+        .map_err(CommandError::Other)
 }
 
 #[tauri::command]
-pub fn llm_chat(_request: serde_json::Value) -> Result<serde_json::Value, CommandError> {
-    Err(CommandError::NotImplemented(
-        "Tauri 模式 LLM chat 尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
-    ))
+pub async fn llm_chat(request: serde_json::Value) -> Result<serde_json::Value, CommandError> {
+    llm_profiles::chat(request)
+        .await
+        .map_err(CommandError::Other)
 }
-
 fn empty_agent_workflow_config() -> serde_json::Value {
     serde_json::json!({
         "plan": {},

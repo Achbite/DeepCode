@@ -11,6 +11,7 @@
 
 mod commands;
 mod fs;
+mod llm_profiles;
 mod terminal;
 mod user_settings;
 mod workspace;

@@ -142,6 +142,38 @@ export async function closeAppWindow(): Promise<void> {
 
 // ---- Tauri invoke helper ----
 
+function stringifyUnknownError(err: unknown): string {
+  if (typeof err === 'string') return err;
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === 'object') {
+    const record = err as Record<string, unknown>;
+    for (const key of ['message', 'error', 'Other', 'NotImplemented']) {
+      const value = record[key];
+      if (typeof value === 'string' && value.trim()) return value;
+    }
+    try {
+      return JSON.stringify(err);
+    } catch {
+      // Ignore JSON serialization failures and fall through.
+    }
+  }
+  return String(err);
+}
+
+function parseTauriErrorPayload(err: unknown, fallback: string): Record<string, unknown> | null {
+  if (err && typeof err === 'object' && !Array.isArray(err)) {
+    return err as Record<string, unknown>;
+  }
+  try {
+    const parsed = JSON.parse(fallback);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * 封装 Tauri invoke 调用，将 Rust Result<T, CommandError> 映射为 ApiResponse<T>。
  *
@@ -158,12 +190,12 @@ async function tauriInvoke<T>(command: string, args?: Record<string, unknown>): 
     const data = await invoke<T>(command, args);
     return { ok: true, data };
   } catch (err: any) {
-    const errStr = typeof err === 'string' ? err : String(err);
+    const errStr = stringifyUnknownError(err);
 
     // 尝试解析 JSON 格式的 CommandError
-    try {
-      const parsed = JSON.parse(errStr);
-      if (parsed.NotImplemented) {
+    const parsed = parseTauriErrorPayload(err, errStr);
+    if (parsed) {
+      if (typeof parsed.NotImplemented === 'string') {
         return {
           ok: false,
           error: 'not_implemented',
@@ -171,15 +203,13 @@ async function tauriInvoke<T>(command: string, args?: Record<string, unknown>): 
         };
       }
       if (parsed.Other) {
-        const message = String(parsed.Other);
+        const message = stringifyUnknownError(parsed.Other);
         return {
           ok: false,
           error: message.includes('wsl_missing') ? 'wsl_missing' : 'tauri_error',
           message,
         };
       }
-    } catch {
-      // 非 JSON，继续
     }
 
     if (errStr === 'user_cancelled') {
