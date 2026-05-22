@@ -14,11 +14,8 @@ import { useSettingsStore } from '../state/settingsStore';
 import {
   getRuntimeType,
   getRuntimeStatus,
+  warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
-import {
-  connectHeartbeat,
-  disconnectHeartbeat,
-} from '../services/heartbeatSocket';
 import { getTabId, useEditorStore } from '../state/editorStore';
 import type { ConfirmDialogAction, ConfirmDialogData } from '../types/ui';
 import './app.css';
@@ -126,6 +123,9 @@ const App: React.FC = () => {
   const autoSave = String(effectiveSettings['files.autoSave'] ?? 'off');
   const autoSaveDelay = asNumber(effectiveSettings['files.autoSaveDelay'], 1000);
   const hotExit = asBoolean(effectiveSettings['files.hotExit'], true);
+  const terminalPrewarm = String(
+    effectiveSettings['terminal.integrated.prewarm'] ?? 'afterStartup'
+  );
   const enableBasicShortcuts = asBoolean(
     effectiveSettings['keyboard.enableBasicShortcuts'],
     true
@@ -203,9 +203,9 @@ const App: React.FC = () => {
 
   // ---- 1. Load workspace and user settings ----
   useEffect(() => {
-    markStartup('deepcode:first-shell');
+    markStartup('deepcode:first-workbench-shell');
     return afterFirstPaint(() => {
-      void loadWorkspace().finally(() => markStartup('deepcode:workspace-ready'));
+      void loadWorkspace().finally(() => markStartup('deepcode:workspace-loaded'));
       void loadUserSettings().finally(() => markStartup('deepcode:settings-loaded'));
     });
   }, [loadWorkspace, loadUserSettings]);
@@ -281,18 +281,41 @@ const App: React.FC = () => {
 
   // ---- 3. Heartbeat ----
   useEffect(() => {
+    let disconnect: (() => void) | null = null;
+    let cancelled = false;
     const cancel = afterFirstPaint(() => {
       if (getRuntimeType() === 'web') {
-        connectHeartbeat();
+        void import('../services/heartbeatSocket').then((heartbeat) => {
+          if (cancelled) return;
+          heartbeat.connectHeartbeat();
+          disconnect = heartbeat.disconnectHeartbeat;
+        });
       }
     });
     return () => {
+      cancelled = true;
       cancel();
-      if (getRuntimeType() === 'web') {
-        disconnectHeartbeat();
-      }
+      disconnect?.();
     };
   }, []);
+
+  // ---- 3.1 Terminal runtime warmup ----
+  useEffect(() => {
+    if (terminalPrewarm !== 'afterStartup') return;
+    let cancelIdle: (() => void) | null = null;
+    const cancelFirstPaint = afterFirstPaint(() => {
+      cancelIdle = scheduleIdle(() => {
+        markStartup('deepcode:terminal-warmup-start');
+        void warmupTerminalRuntime().finally(() =>
+          markStartup('deepcode:terminal-warmup-ready')
+        );
+      }, 1600);
+    });
+    return () => {
+      cancelFirstPaint();
+      cancelIdle?.();
+    };
+  }, [terminalPrewarm]);
 
   // ---- 4. Basic shortcuts ----
   useEffect(() => {
