@@ -1,0 +1,13 @@
+# DeepCode builds and tests in Docker/WSL. Keep repository text files LF-only.
+* text=auto eol=lf
+
+# Binary artifacts.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.dll binary
+*.exe binary
+*.zip binary
