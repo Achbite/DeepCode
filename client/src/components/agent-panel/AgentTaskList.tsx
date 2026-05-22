@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { AgentEvent } from '@deepcode/protocol';
 import MarkdownContent from './MarkdownContent';
+import { compactDisplayText, sanitizeDisplayText } from './displayText';
 
 interface AgentTaskView {
   id: string;
@@ -33,16 +34,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function stringField(payload: unknown, key: string): string | undefined {
   if (!isRecord(payload)) return undefined;
   const value = payload[key];
-  return typeof value === 'string' && value.trim() ? value : undefined;
-}
-
-function toolName(payload: unknown): string {
-  return (
-    stringField(payload, 'toolName') ??
-    stringField(payload, 'name') ??
-    stringField(payload, 'callId') ??
-    'tool'
-  );
+  return typeof value === 'string' && value.trim() ? sanitizeDisplayText(value) : undefined;
 }
 
 function numberField(payload: unknown, key: string): number | undefined {
@@ -51,16 +43,22 @@ function numberField(payload: unknown, key: string): number | undefined {
   return typeof value === 'number' ? value : undefined;
 }
 
-function compact(value: string, limit = 140): string {
-  const singleLine = value.replace(/\s+/g, ' ').trim();
-  return singleLine.length > limit ? `${singleLine.slice(0, limit - 1)}...` : singleLine;
-}
-
 function asCommand(markdown: string, id?: string): TaskCommandView {
   return {
     id: id ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    markdown,
+    markdown: sanitizeDisplayText(markdown),
   };
+}
+
+function toolName(payload: unknown): string {
+  if (!isRecord(payload)) return 'tool';
+  const toolCall = isRecord(payload.toolCall) ? payload.toolCall : undefined;
+  return (
+    stringField(payload, 'toolName') ??
+    stringField(payload, 'name') ??
+    stringField(toolCall, 'name') ??
+    'tool'
+  );
 }
 
 function normalizeActionType(action: Record<string, unknown>): string {
@@ -69,43 +67,39 @@ function normalizeActionType(action: Record<string, unknown>): string {
     (typeof action.action === 'string' && action.action) ||
     (typeof action.name === 'string' && action.name) ||
     'unknown';
-  return raw.trim();
+  return sanitizeDisplayText(raw).trim();
 }
 
 function actionText(action: Record<string, unknown>): string {
   const type = normalizeActionType(action);
-  const path = typeof action.path === 'string' ? action.path : undefined;
-  const query = typeof action.query === 'string' ? action.query : undefined;
-  const command = typeof action.command === 'string' ? action.command : undefined;
+  const path = typeof action.path === 'string' ? sanitizeDisplayText(action.path) : undefined;
+  const query = typeof action.query === 'string' ? sanitizeDisplayText(action.query) : undefined;
+  const command = typeof action.command === 'string' ? sanitizeDisplayText(action.command) : undefined;
   const result =
-    (typeof action.result === 'string' && action.result) ||
-    (typeof action.content === 'string' && action.content) ||
-    (typeof action.message === 'string' && action.message);
+    (typeof action.result === 'string' && sanitizeDisplayText(action.result)) ||
+    (typeof action.content === 'string' && sanitizeDisplayText(action.content)) ||
+    (typeof action.message === 'string' && sanitizeDisplayText(action.message));
 
-  if (type === 'final') {
-    return result ? result.trim() : 'Final response prepared.';
-  }
-  if (type === 'fs.read') return `Read file \`${path ?? '(missing path)'}\`.`;
-  if (type === 'fs.list') return `List directory \`${path ?? '.'}\`.`;
-  if (type === 'code.search') return `Search code for \`${query ?? '(missing query)'}\`.`;
-  if (type === 'fs.diff') return `Prepare diff for \`${path ?? '(missing path)'}\`.`;
-  if (type === 'fs.write') return `Write file \`${path ?? '(missing path)'}\`.`;
+  if (type === 'final') return result ? result.trim() : 'Final response prepared.';
+  if (type === 'fs.read') return `读取文件 \`${path ?? '(missing path)'}\`。`;
+  if (type === 'fs.list') return `列出目录 \`${path ?? '.'}\`。`;
+  if (type === 'code.search') return `搜索代码 \`${query ?? '(missing query)'}\`。`;
+  if (type === 'fs.diff') return `准备文件差异 \`${path ?? '(missing path)'}\`。`;
+  if (type === 'fs.write') return `写入文件 \`${path ?? '(missing path)'}\`。`;
   if (type === 'patch.plan') {
     const startLine = numberField(action, 'startLine');
     const endLine = numberField(action, 'endLine');
-    const range = startLine && endLine ? ` lines ${startLine}-${endLine}` : '';
-    return `Plan patch for \`${path ?? '(missing path)'}\`${range}.`;
+    const range = startLine && endLine ? ` 第 ${startLine}-${endLine} 行` : '';
+    return `规划补丁 \`${path ?? '(missing path)'}\`${range}。`;
   }
-  if (type === 'shell.propose') return `Propose shell command: \`${command ?? '(missing command)'}\`.`;
-  if (type === 'shell.exec') return `Execute shell command after approval: \`${command ?? '(missing command)'}\`.`;
-  return result ? result.trim() : `Parsed action \`${type}\`.`;
+  if (type === 'shell.propose') return `建议命令：\`${command ?? '(missing command)'}\`。`;
+  if (type === 'shell.exec') return `审批后执行命令：\`${command ?? '(missing command)'}\`。`;
+  return result ? result.trim() : `解析到动作 \`${type}\`。`;
 }
 
 function parseActionObject(value: unknown): Record<string, unknown>[] {
   if (!isRecord(value)) return [];
-  if (Array.isArray(value.actions)) {
-    return value.actions.filter(isRecord);
-  }
+  if (Array.isArray(value.actions)) return value.actions.filter(isRecord);
   if (typeof value.action === 'string' || typeof value.type === 'string' || typeof value.name === 'string') {
     return [value];
   }
@@ -117,14 +111,11 @@ function parseDeepcodeActionBlocks(content: string): {
   actions: Record<string, unknown>[];
 } {
   const actions: Record<string, unknown>[] = [];
-  let text = content.replace(/```deepcode-action\s*([\s\S]*?)```/g, (_block, rawJson: string) => {
+  let text = sanitizeDisplayText(content).replace(/```deepcode-action\s*([\s\S]*?)```/g, (_block, rawJson: string) => {
     try {
       actions.push(...parseActionObject(JSON.parse(rawJson.trim())));
     } catch {
-      actions.push({
-        type: 'unknown',
-        result: 'Agent returned an invalid deepcode-action block.',
-      });
+      actions.push({ type: 'unknown', result: 'Agent returned an invalid deepcode-action block.' });
     }
     return '';
   }).trim();
@@ -135,10 +126,7 @@ function parseDeepcodeActionBlocks(content: string): {
     try {
       actions.push(...parseActionObject(JSON.parse(rawJson)));
     } catch {
-      actions.push({
-        type: 'unknown',
-        result: 'Agent prepared a structured action.',
-      });
+      actions.push({ type: 'unknown', result: 'Agent prepared a structured action.' });
     }
     text = text.slice(0, unclosedBlockIndex).trim();
   }
@@ -148,21 +136,17 @@ function parseDeepcodeActionBlocks(content: string): {
 
 function humanizeAgentOutput(content: string): string {
   const parsed = parseDeepcodeActionBlocks(content);
-  const actionLines = parsed.actions
-    .map(actionText)
-    .filter((line) => line.trim().length > 0);
+  const actionLines = parsed.actions.map(actionText).filter((line) => line.trim().length > 0);
 
   if (parsed.text && actionLines.length > 0) {
     return `${parsed.text}\n\n${actionLines.map((line) => `- ${line}`).join('\n')}`;
   }
-  if (actionLines.length > 0) {
-    return actionLines.join('\n\n');
-  }
-  return parsed.text || compact(content, 400);
+  if (actionLines.length > 0) return actionLines.join('\n\n');
+  return parsed.text || compactDisplayText(content, 400);
 }
 
 function pushCommand(task: AgentTaskView, markdown: string, id?: string): void {
-  const normalized = markdown.trim();
+  const normalized = sanitizeDisplayText(markdown).trim();
   if (!normalized) return;
   task.commands.push(asCommand(normalized, id));
 }
@@ -175,16 +159,13 @@ function latestTurnEvents(events: AgentEvent[]): AgentEvent[] {
   return lastUserIndex >= 0 ? events.slice(lastUserIndex + 1) : events;
 }
 
-function defaultTasks(): AgentTaskView[] {
+function defaultTasks(loading: boolean): AgentTaskView[] {
   return [
     {
       id: 'task-waiting',
-      title: '等待 Agent 生成任务规划',
-      status: 'waiting',
-      commands: [
-        asCommand('任务开始后，这里显示 plan / check / complete / review 阶段。'),
-        asCommand('文件读取、代码搜索、patch、shell 等动作会进入对应阶段。'),
-      ],
+      title: loading ? 'Agent 正在准备任务' : '等待 Agent 任务',
+      status: loading ? 'running' : 'waiting',
+      commands: [],
     },
   ];
 }
@@ -219,11 +200,12 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
       if (status === 'error') task.status = 'error';
 
       const summary = stringField(event.payload, 'summary');
+      const details = stringField(event.payload, 'details');
       const profileId = stringField(event.payload, 'profileId');
       pushCommand(
         task,
         `**${status}**${profileId ? ` · \`${profileId}\`` : ''}${
-          summary ? `\n\n${humanizeAgentOutput(summary)}` : ''
+          details ?? summary ? `\n\n${humanizeAgentOutput(details ?? summary ?? '')}` : ''
         }`,
         event.id
       );
@@ -247,7 +229,7 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
       const task = ensureTask(tasks, 'complete');
       focusTaskId = task.id;
       task.status = task.status === 'planned' ? 'running' : task.status;
-      pushCommand(task, `Tool call: \`${toolName(event.payload)}\``, event.id);
+      pushCommand(task, `调用工具：\`${toolName(event.payload)}\``, event.id);
       continue;
     }
 
@@ -258,7 +240,7 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
       const error = stringField(event.payload, 'error');
       pushCommand(
         task,
-        `Tool result: \`${toolName(event.payload)}\` · **${ok ? 'ok' : 'needs attention'}**${
+        `工具结果：\`${toolName(event.payload)}\` · **${ok ? 'ok' : 'needs attention'}**${
           error ? `\n\n${error}` : ''
         }`,
         event.id
@@ -270,7 +252,7 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
       const task = ensureTask(tasks, 'complete');
       focusTaskId = task.id;
       task.status = 'running';
-      pushCommand(task, `Permission required: \`${toolName(event.payload)}\``, event.id);
+      pushCommand(task, `需要确认：\`${toolName(event.payload)}\``, event.id);
       continue;
     }
 
@@ -285,11 +267,7 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
 
   const result = Array.from(tasks.values());
   if (result.length === 0) {
-    const waiting = defaultTasks();
-    if (loading) {
-      waiting[0].status = 'running';
-      waiting[0].commands.unshift(asCommand('Agent 正在准备任务阶段...'));
-    }
+    const waiting = defaultTasks(loading);
     return {
       tasks: waiting,
       focusTaskId: waiting[0]?.id,
@@ -353,7 +331,9 @@ const AgentTaskList: React.FC<AgentTaskListProps> = ({ events, loading }) => {
                       </div>
                     ))
                   ) : (
-                    <div className="agent-task-command">等待阶段事件...</div>
+                    <div className="agent-task-command">
+                      <MarkdownContent content="等待阶段事件。" />
+                    </div>
                   )}
                 </div>
               )}

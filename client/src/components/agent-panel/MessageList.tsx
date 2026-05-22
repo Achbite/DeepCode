@@ -2,6 +2,8 @@ import React from 'react';
 import type { AgentEvent } from '@deepcode/protocol';
 import MarkdownContent from './MarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
+import { sanitizeDisplayText } from './displayText';
+import { submitAgentFeedback } from '../../services/runtimeAdapter';
 
 interface MessageListProps {
   events: AgentEvent[];
@@ -19,7 +21,7 @@ function stringField(payload: unknown, key: string): string | undefined {
 }
 
 function payloadText(payload: unknown): string {
-  return (
+  return sanitizeDisplayText(
     stringField(payload, 'content') ??
     stringField(payload, 'message') ??
     stringField(payload, 'summary') ??
@@ -62,12 +64,7 @@ function isAgentThoughtEvent(event: AgentEvent): boolean {
 }
 
 function isExecutionProgressEvent(event: AgentEvent): boolean {
-  return (
-    event.kind === 'workflow_stage' ||
-    event.kind === 'tool_call' ||
-    event.kind === 'tool_result' ||
-    event.kind === 'permission_result'
-  );
+  return event.kind === 'workflow_stage';
 }
 
 interface TraceGroup {
@@ -76,8 +73,21 @@ interface TraceGroup {
 }
 
 type RenderItem =
-  | { type: 'event'; event: AgentEvent }
+  | { type: 'event'; event: AgentEvent; autoOpen?: boolean }
   | { type: 'trace'; group: TraceGroup };
+
+function eventCallId(event: AgentEvent): string | undefined {
+  if (!isRecord(event.payload)) return undefined;
+  return stringField(event.payload, 'callId') ?? stringField(event.payload, 'id');
+}
+
+function hasLaterResult(events: AgentEvent[], index: number): boolean {
+  const callId = eventCallId(events[index]);
+  if (!callId) return false;
+  return events
+    .slice(index + 1)
+    .some((event) => event.kind === 'tool_result' && eventCallId(event) === callId);
+}
 
 function pickFallbackAssistantEvent(events: AgentEvent[]): AgentEvent | null {
   const candidates = events.filter((event) => {
@@ -138,18 +148,14 @@ function createRenderItems(events: AgentEvent[]): RenderItem[] {
       const visibleAssistant = pickVisibleAssistantEvent(turnEvents, thoughtEvents);
       const visibleAssistantId = visibleAssistant?.id;
 
-      if (thoughtEvents.length > 0) {
-        const group: TraceGroup = {
-          id: `thought-${event.id}-${thoughtEvents[thoughtEvents.length - 1].id}`,
-          events: thoughtEvents,
-        };
-        items.push({ type: 'trace', group });
-      }
-
       for (const turnEvent of turnEvents) {
         if (visibleAssistantId && turnEvent.id === visibleAssistantId) continue;
         if (isHiddenConversationEvent(turnEvent)) continue;
-        items.push({ type: 'event', event: turnEvent });
+        items.push({
+          type: 'event',
+          event: turnEvent,
+          autoOpen: turnEvent.kind === 'tool_call' && !hasLaterResult(turnEvents, turnEvents.indexOf(turnEvent)),
+        });
       }
 
       if (visibleAssistant) {
@@ -262,7 +268,38 @@ function renderTraceGroup(group: TraceGroup) {
   );
 }
 
-function renderMessage(event: AgentEvent) {
+function feedback(event: AgentEvent, rating: 'up' | 'down'): void {
+  window.dispatchEvent(new CustomEvent('deepcode:agent-feedback', {
+    detail: {
+      eventId: event.id,
+      kind: event.kind,
+      rating,
+    },
+  }));
+  void submitAgentFeedback({
+    eventId: event.id,
+    sessionId: event.sessionId,
+    kind: event.kind,
+    rating,
+  });
+}
+
+function copyMessage(text: string): void {
+  void navigator.clipboard?.writeText(text);
+}
+
+function MessageActions({ event, text }: { event: AgentEvent; text: string }) {
+  if (event.kind === 'user_msg') return null;
+  return (
+    <div className="agent-message-actions" aria-label="Agent message actions">
+      <button type="button" title="Copy" onClick={() => copyMessage(text)}>Copy</button>
+      <button type="button" title="Good response" onClick={() => feedback(event, 'up')}>Up</button>
+      <button type="button" title="Bad response" onClick={() => feedback(event, 'down')}>Down</button>
+    </div>
+  );
+}
+
+function renderMessage(event: AgentEvent, autoOpen = false) {
   if (event.kind === 'workflow_stage') {
     return renderWorkflowStage(event);
   }
@@ -275,13 +312,13 @@ function renderMessage(event: AgentEvent) {
     event.kind === 'permission_request' ||
     event.kind === 'permission_result'
   ) {
-    return <ToolCallBubble key={event.id} event={event} />;
+    return <ToolCallBubble key={event.id} event={event} autoOpen={autoOpen} />;
   }
 
   const speaker = event.kind === 'user_msg' ? 'You' : 'Agent';
   const pending = isRecord(event.payload) && event.payload.pending === true;
   const text = payloadText(event.payload);
-  const renderMarkdown = event.kind === 'assistant_msg';
+  const renderMarkdown = event.kind === 'assistant_msg' || event.kind === 'user_msg';
   return (
     <div
       key={event.id}
@@ -294,6 +331,7 @@ function renderMessage(event: AgentEvent) {
       <div className={`agent-message__body ${renderMarkdown ? 'agent-message__body--markdown' : 'agent-message__body--plain'}`}>
         {renderMarkdown ? <MarkdownContent content={text} /> : text}
       </div>
+      <MessageActions event={event} text={text} />
     </div>
   );
 }
@@ -310,7 +348,7 @@ const MessageList: React.FC<MessageListProps> = ({ events, loading = false }) =>
     )}
 
     {createRenderItems(events).map((item) =>
-      item.type === 'trace' ? renderTraceGroup(item.group) : renderMessage(item.event)
+      item.type === 'trace' ? renderTraceGroup(item.group) : renderMessage(item.event, item.autoOpen)
     )}
 
     {loading && (

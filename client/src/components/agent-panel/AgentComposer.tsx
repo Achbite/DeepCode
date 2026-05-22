@@ -26,6 +26,12 @@ interface AgentModifiedFileView {
 
 const MODIFIED_FILES: AgentModifiedFileView[] = [];
 
+function attachmentLabel(attachment: AgentContextAttachment): string {
+  if (attachment.kind === 'directory') return `Dir ${attachment.path || '.'}`;
+  if (attachment.kind === 'panelSnapshot') return `Panel ${attachment.path || 'snapshot'}`;
+  return `File ${attachment.path || '.'}`;
+}
+
 const AgentComposer: React.FC<AgentComposerProps> = ({
   messageAttachments,
   sessionAttachments,
@@ -49,7 +55,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   }, [value]);
 
   const send = () => {
-    if (!value.trim() || loading) return;
+    if (!value.trim()) return;
     onSend(value);
     setValue('');
   };
@@ -60,11 +66,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       setValue(`${value.slice(0, mention.start)}${value.slice(mention.start + mention.query.length + 1)}`);
     }
     setPickerOpen(false);
-  };
-
-  const toggleAttachmentPicker = () => {
-    if (loading) return;
-    setPickerOpen((open) => !open);
   };
 
   const chips = [...sessionAttachments, ...messageAttachments];
@@ -79,9 +80,10 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               className={`agent-chip agent-chip--${attachment.scope}`}
               title={attachment.path || 'workspace root'}
               onClick={() => onRemoveAttachment(attachment.path, attachment.scope)}
+              type="button"
             >
-              {attachment.kind === 'directory' ? 'Dir' : 'File'} {attachment.path || '.'}
-              <span>×</span>
+              {attachmentLabel(attachment)}
+              <span>x</span>
             </button>
           ))}
         </div>
@@ -104,15 +106,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
                 </span>
                 <span className="agent-change-file__savepoint">{file.savepoint}</span>
                 <div className="agent-change-file__actions">
-                  <button type="button" title="Open diff">
-                    diff
-                  </button>
-                  <button type="button" title="Reject changes">
-                    X
-                  </button>
-                  <button type="button" title="Accept changes">
-                    √
-                  </button>
+                  <button type="button" title="Open diff">diff</button>
+                  <button type="button" title="Reject changes">X</button>
+                  <button type="button" title="Accept changes">OK</button>
                 </div>
               </div>
             ))}
@@ -130,8 +126,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               send();
             }
           }}
-          placeholder="Ask DeepCode Agent..."
-          disabled={loading}
+          placeholder={loading ? 'Add guidance while Agent is running...' : 'Ask DeepCode Agent...'}
         />
         {mention && (
           <ContextAttachmentPicker
@@ -148,8 +143,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               type="button"
               title="Add file or folder"
               aria-label="Add file or folder"
-              disabled={loading}
-              onClick={toggleAttachmentPicker}
+              onClick={() => setPickerOpen((open) => !open)}
             >
               +
             </button>
@@ -163,12 +157,12 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           <AgentWorkflowSelector
             profiles={profiles}
             config={workflowConfig}
-            disabled={loading}
+            disabled={false}
             onChange={onWorkflowConfigChange}
           />
         </div>
-        <button onClick={send} disabled={loading || !value.trim()}>
-          Send
+        <button onClick={send} disabled={!value.trim()} type="button">
+          {loading ? 'Guide' : 'Send'}
         </button>
       </div>
     </div>

@@ -4,6 +4,8 @@ import type {
   ApiResponse,
   AppendAgentEventsRequest,
   CreateAgentSessionRequest,
+  AgentFeedbackRequest,
+  AgentFeedbackResult,
   GetAgentWorkflowConfigResult,
   PatchAgentWorkflowConfigRequest,
   ResolveAgentPermissionRequest,
@@ -118,5 +120,16 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
     } catch (err) {
       return errorResponse('agent_permission_resolve_error', err);
     }
+  });
+
+  app.post('/api/agent/feedback', async (request) => {
+    const body = request.body as AgentFeedbackRequest;
+    return {
+      ok: true,
+      data: {
+        accepted: Boolean(body.eventId && body.rating),
+        message: 'Agent feedback endpoint is reserved for future model-quality data collection.',
+      },
+    } satisfies ApiResponse<AgentFeedbackResult>;
   });
 }

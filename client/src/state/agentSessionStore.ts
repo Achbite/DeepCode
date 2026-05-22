@@ -23,6 +23,11 @@ interface PendingPermission {
   request: PermissionRequest;
 }
 
+interface QueuedAgentMessage {
+  content: string;
+  attachments: AgentContextAttachment[];
+}
+
 interface AgentSessionState {
   session: AgentSession | null;
   events: AgentEvent[];
@@ -36,6 +41,7 @@ interface AgentSessionState {
   messageAttachments: AgentContextAttachment[];
   sessionAttachments: AgentContextAttachment[];
   pendingPermission: PendingPermission | null;
+  queuedMessages: QueuedAgentMessage[];
 }
 
 interface AgentSessionActions {
@@ -48,7 +54,7 @@ interface AgentSessionActions {
   addAttachment: (attachment: AgentContextAttachment) => void;
   removeAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
   clearMessageAttachments: () => void;
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (content: string, attachmentsOverride?: AgentContextAttachment[]) => Promise<void>;
   acceptPermission: () => Promise<void>;
   rejectPermission: () => Promise<void>;
 }
@@ -105,6 +111,13 @@ function createLocalEvent(
   };
 }
 
+function readMessageAttachments(state: Store, override?: AgentContextAttachment[]): AgentContextAttachment[] {
+  return override ?? [
+    ...state.sessionAttachments,
+    ...state.messageAttachments,
+  ];
+}
+
 export const useAgentSessionStore = create<Store>((set, get) => ({
   session: null,
   events: [],
@@ -116,6 +129,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   messageAttachments: [],
   sessionAttachments: [],
   pendingPermission: null,
+  queuedMessages: [],
 
   loadOrCreate: async () => {
     if (get().session || get().loading) return;
@@ -147,7 +161,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       });
     } else {
       set({
-        errorMessage: created.message ?? current.message ?? 'Agent 会话初始化失败',
+        errorMessage: created.message ?? current.message ?? 'Agent session initialization failed',
         loading: false,
       });
     }
@@ -206,16 +220,30 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
 
   clearMessageAttachments: () => set({ messageAttachments: [] }),
 
-  sendMessage: async (content) => {
+  sendMessage: async (content, attachmentsOverride) => {
     const trimmed = content.trim();
     if (!trimmed) return;
     await get().loadOrCreate();
     const session = get().session;
     if (!session) return;
-    const attachments = [
-      ...get().sessionAttachments,
-      ...get().messageAttachments,
-    ];
+
+    const attachments = readMessageAttachments(get(), attachmentsOverride);
+    if (get().loading) {
+      const queuedEvent = createLocalEvent(session.id, 'user_msg', {
+        content: trimmed,
+        attachments,
+        pending: true,
+        queued: true,
+      });
+      set((state) => ({
+        events: [...state.events, queuedEvent],
+        messageAttachments: [],
+        queuedMessages: [...state.queuedMessages, { content: trimmed, attachments }],
+        errorMessage: null,
+      }));
+      return;
+    }
+
     const localUserEvent = createLocalEvent(session.id, 'user_msg', {
       content: trimmed,
       attachments,
@@ -227,6 +255,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       loading: true,
       errorMessage: null,
     }));
+
     try {
       const result = await sendAgentMessage(session.id, {
         content: trimmed,
@@ -240,12 +269,12 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         throw new Error(result.message ?? 'Agent message failed');
       }
       const data = result.data;
-      set(() => ({
+      set({
         session: data.session,
         events: data.events,
         pendingPermission: findLatestPendingPermission(data.events),
         loading: false,
-      }));
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
@@ -256,6 +285,14 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         errorMessage: message,
         loading: false,
       }));
+    }
+
+    const nextQueuedMessage = get().queuedMessages[0];
+    if (nextQueuedMessage) {
+      set((state) => ({
+        queuedMessages: state.queuedMessages.slice(1),
+      }));
+      void get().sendMessage(nextQueuedMessage.content, nextQueuedMessage.attachments);
     }
   },
 

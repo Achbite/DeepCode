@@ -1,3 +1,5 @@
+import type { PanelSemanticSnapshot } from './browser.js';
+
 export type AgentMode = 'readOnly' | 'plan' | 'askBeforeWrite';
 export type AgentWorkflowMode = 'planFirst' | 'actOnRequest';
 export type AgentWorkflowStage = 'plan' | 'check' | 'complete' | 'review';
@@ -45,11 +47,12 @@ export interface AgentSession {
 }
 
 export interface AgentContextAttachment {
-  kind: 'file' | 'directory';
+  kind: 'file' | 'directory' | 'panelSnapshot';
   path: string;
   folderId?: string;
-  source: 'mention' | 'contextMenu';
+  source: 'mention' | 'contextMenu' | 'browser';
   scope: 'message' | 'session';
+  snapshot?: PanelSemanticSnapshot;
 }
 
 export interface AgentContextSnapshot {
@@ -97,6 +100,21 @@ export interface SendAgentMessageRequest {
 
 export interface ResolveAgentPermissionRequest {
   decision: 'accept' | 'reject';
+}
+
+export type AgentFeedbackRating = 'up' | 'down';
+
+export interface AgentFeedbackRequest {
+  eventId: string;
+  sessionId?: string;
+  kind?: AgentEventKind;
+  rating: AgentFeedbackRating;
+  note?: string;
+}
+
+export interface AgentFeedbackResult {
+  accepted: boolean;
+  message: string;
 }
 
 export interface AppendAgentEventsRequest {

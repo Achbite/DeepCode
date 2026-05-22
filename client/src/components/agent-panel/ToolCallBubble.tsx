@@ -1,8 +1,10 @@
 import React from 'react';
 import type { AgentEvent } from '@deepcode/protocol';
+import { compactDisplayText, sanitizeDisplayText } from './displayText';
 
 interface ToolCallBubbleProps {
   event: AgentEvent;
+  autoOpen?: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -10,38 +12,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() ? value : undefined;
+  return typeof value === 'string' && value.trim() ? sanitizeDisplayText(value) : undefined;
 }
 
-function getPath(payload: Record<string, unknown>): string | undefined {
-  const input = isRecord(payload.input) ? payload.input : undefined;
-  const args = isRecord(payload.arguments) ? payload.arguments : undefined;
-  return (
-    stringValue(payload.path) ??
-    stringValue(input?.path) ??
-    stringValue(args?.path) ??
-    stringValue(input?.cwd) ??
-    stringValue(args?.cwd)
-  );
+function nestedRecord(payload: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  return isRecord(payload[key]) ? payload[key] as Record<string, unknown> : undefined;
 }
 
-function getCommand(payload: Record<string, unknown>): string | undefined {
-  const input = isRecord(payload.input) ? payload.input : undefined;
-  const args = isRecord(payload.arguments) ? payload.arguments : undefined;
+function getArgs(payload: Record<string, unknown>): Record<string, unknown> {
   return (
-    stringValue(payload.command) ??
-    stringValue(input?.command) ??
-    stringValue(args?.command)
+    nestedRecord(payload, 'arguments') ??
+    nestedRecord(payload, 'input') ??
+    nestedRecord(payload, 'argumentsPreview') ??
+    nestedRecord(payload, 'output') ??
+    payload
   );
 }
 
 function getToolName(payload: unknown): string {
   if (!isRecord(payload)) return 'tool';
+  const toolCall = nestedRecord(payload, 'toolCall');
   return (
     stringValue(payload.toolName) ??
     stringValue(payload.name) ??
+    stringValue(toolCall?.name) ??
     stringValue(payload.actionType) ??
-    stringValue(payload.callId) ??
     'tool'
   );
 }
@@ -52,55 +47,91 @@ function getStatus(payload: unknown): string | undefined {
   return stringValue(payload.status) ?? stringValue(payload.decision);
 }
 
-function getSummary(payload: unknown): string {
-  if (!isRecord(payload)) {
-    return typeof payload === 'string' ? payload : 'No details';
-  }
-  const command = getCommand(payload);
-  if (command) return command;
-  const path = getPath(payload);
-  if (path) return path;
+function getCommand(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  const args = getArgs(payload);
+  return stringValue(args.command) ?? stringValue(payload.command);
+}
+
+function getPath(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  const args = getArgs(payload);
+  return stringValue(args.path) ?? stringValue(args.cwd) ?? stringValue(payload.path);
+}
+
+function getOutputText(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  const output = nestedRecord(payload, 'output');
+  const stdout = stringValue(output?.stdout);
+  const stderr = stringValue(output?.stderr);
+  const error = stringValue(payload.error);
   const summary = stringValue(payload.summary) ?? stringValue(payload.message);
-  if (summary) return summary;
-  if (payload.output && typeof payload.output !== 'object') return String(payload.output);
-  if (isRecord(payload.output)) {
-    const outputSummary = stringValue(payload.output.summary) ?? stringValue(payload.output.message);
-    if (outputSummary) return outputSummary;
-  }
-  return 'Details available';
+  return [stdout, stderr, error, summary].filter(Boolean).join('\n').trim() || undefined;
 }
 
-function eventLabel(kind: AgentEvent['kind']): string {
-  switch (kind) {
-    case 'tool_call':
-      return 'Tool call';
-    case 'tool_result':
-      return 'Tool result';
-    case 'permission_request':
-      return 'Permission required';
-    case 'permission_result':
-      return 'Permission result';
-    default:
-      return kind;
+function eventLabel(event: AgentEvent): string {
+  if (event.kind === 'tool_call') {
+    const name = getToolName(event.payload);
+    return name.startsWith('shell.') ? '执行命令' : '执行工具';
   }
+  if (event.kind === 'tool_result') return '输出结果';
+  if (event.kind === 'permission_request') return '确认请求';
+  if (event.kind === 'permission_result') return '确认结果';
+  return event.kind;
 }
 
-const ToolCallBubble: React.FC<ToolCallBubbleProps> = ({ event }) => {
-  const toolName = getToolName(event.payload);
+function cardTitle(event: AgentEvent): string {
+  const name = getToolName(event.payload);
+  const command = getCommand(event.payload);
+  const path = getPath(event.payload);
+  if (event.kind === 'tool_call' && command) return command;
+  if (event.kind === 'permission_request') {
+    const summary = isRecord(event.payload) ? stringValue(event.payload.summary) : undefined;
+    return summary ?? name;
+  }
+  if (command) return command;
+  if (path) return path;
+  return name;
+}
+
+function renderDetails(event: AgentEvent) {
+  const outputText = getOutputText(event.payload);
+  if (event.kind === 'tool_result' && outputText) {
+    return (
+      <div className="agent-tool-bubble__output">
+        <div className="agent-tool-bubble__output-title">Output</div>
+        <pre>{sanitizeDisplayText(outputText)}</pre>
+      </div>
+    );
+  }
+  if (event.kind === 'permission_request') {
+    const risk = isRecord(event.payload) ? stringValue(event.payload.riskLevel) : undefined;
+    return <div className="agent-tool-bubble__summary">{risk ? `Risk: ${risk}` : '等待用户确认。'}</div>;
+  }
+  if (event.kind === 'permission_result') {
+    const decision = isRecord(event.payload) ? stringValue(event.payload.decision) : undefined;
+    return <div className="agent-tool-bubble__summary">{decision ?? '权限已处理。'}</div>;
+  }
+  return <div className="agent-tool-bubble__summary">{compactDisplayText(cardTitle(event), 220)}</div>;
+}
+
+const ToolCallBubble: React.FC<ToolCallBubbleProps> = ({ event, autoOpen = false }) => {
   const status = getStatus(event.payload);
-  const summary = getSummary(event.payload);
+  const title = sanitizeDisplayText(cardTitle(event));
 
   return (
     <div className={`agent-tool-bubble agent-tool-bubble--${event.kind}`}>
-      <div className="agent-tool-bubble__header">
-        <span>{eventLabel(event.kind)}</span>
-        {status && <span className={`agent-tool-bubble__status agent-tool-bubble__status--${status}`}>{status}</span>}
-      </div>
-      <div className="agent-tool-bubble__title">{toolName}</div>
-      <div className="agent-tool-bubble__summary">{summary}</div>
-      <details className="agent-raw-details">
-        <summary>Raw payload</summary>
-        <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+      <details className="agent-tool-bubble__details" open={autoOpen}>
+        <summary>
+          <span className="agent-tool-bubble__label">{eventLabel(event)}</span>
+          <span className="agent-tool-bubble__title" title={title}>{compactDisplayText(title, 260)}</span>
+          {status && <span className={`agent-tool-bubble__status agent-tool-bubble__status--${status}`}>{status}</span>}
+        </summary>
+        {renderDetails(event)}
+        <details className="agent-raw-details">
+          <summary>Raw payload</summary>
+          <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+        </details>
       </details>
     </div>
   );

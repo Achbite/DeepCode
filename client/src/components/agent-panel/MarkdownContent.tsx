@@ -1,4 +1,5 @@
 import React from 'react';
+import { sanitizeDisplayText } from './displayText';
 
 function renderInlineMarkdown(text: string): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
@@ -51,7 +52,7 @@ interface MarkdownContentProps {
 }
 
 const MarkdownContent: React.FC<MarkdownContentProps> = ({ content }) => {
-  const lines = content.replace(/\r\n/g, '\n').split('\n');
+  const lines = sanitizeDisplayText(content).replace(/\r\n/g, '\n').split('\n');
   const blocks: React.ReactNode[] = [];
   let index = 0;
 

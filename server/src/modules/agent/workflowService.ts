@@ -128,11 +128,16 @@ async function executeOrAsk(
   mode: AgentMode,
   toolCall: ToolCall
 ): Promise<AgentEvent[]> {
+  const withToolName = (result: ToolResult): ToolResult & { toolName: string } => ({
+    ...result,
+    toolName: toolCall.name,
+  });
   const events: AgentEvent[] = [newEvent(sessionId, 'tool_call', toolCall)];
   const decision = await evaluateAgentPermission({ mode, toolCall });
   if (decision.action === 'deny') {
     events.push(newEvent(sessionId, 'tool_result', {
       callId: toolCall.id,
+      toolName: toolCall.name,
       ok: false,
       error: decision.reason,
     }));
@@ -149,7 +154,7 @@ async function executeOrAsk(
     return events;
   }
   const result = await executeAgentTool({ mode, toolCall });
-  events.push(newEvent(sessionId, 'tool_result', result));
+  events.push(newEvent(sessionId, 'tool_result', withToolName(result)));
   return events;
 }
 
@@ -175,6 +180,7 @@ async function runParsedTextActions(
     if (action.type === 'patch.plan') {
       events.push(newEvent(sessionId, 'tool_result', {
         callId: action.id,
+        toolName: 'patch.plan',
         ok: false,
         status: 'needsApproval',
         output: action.payload,
@@ -327,10 +333,14 @@ export async function resolveAgentPermission(
       toolCall: pending.toolCall,
       approved: true,
     });
-    events.push(newEvent(pending.sessionId, 'tool_result', result));
+    events.push(newEvent(pending.sessionId, 'tool_result', {
+      ...result,
+      toolName: pending.toolCall.name,
+    }));
   } else {
     events.push(newEvent(pending.sessionId, 'tool_result', {
       callId: pending.toolCall.id,
+      toolName: pending.toolCall.name,
       ok: false,
       error: 'permission_rejected',
     }));
