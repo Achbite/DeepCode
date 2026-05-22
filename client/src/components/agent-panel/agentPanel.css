@@ -9,6 +9,10 @@
 
 .agent-task-list {
   flex: 0 0 auto;
+  max-height: min(42vh, 320px);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   border-bottom: 1px solid var(--line, rgba(255, 255, 255, 0.08));
   background: var(--bg-surface, #1c1c20);
 }
@@ -30,6 +34,8 @@
   display: grid;
   gap: 8px;
   padding: 0 12px 12px;
+  min-height: 0;
+  overflow: auto;
 }
 
 .agent-task-item {
@@ -87,10 +93,24 @@
   box-shadow: 0 0 8px rgba(10, 132, 255, 0.45);
 }
 
+.agent-task-item--completed .agent-task-item__dot {
+  background: #4ade80;
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.35);
+}
+
+.agent-task-item--error .agent-task-item__dot {
+  background: #ff6b5f;
+  box-shadow: 0 0 8px rgba(255, 107, 95, 0.35);
+}
+
 .agent-task-item__commands {
   display: grid;
   gap: 5px;
   padding: 0 9px 10px 27px;
+  max-height: min(24vh, 210px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .agent-task-command {
@@ -98,6 +118,19 @@
   padding-left: 8px;
   color: var(--text-muted, #a1a1aa);
   line-height: 1.45;
+}
+
+.agent-task-command .agent-markdown {
+  gap: 6px;
+  color: var(--text-muted, #a1a1aa);
+}
+
+.agent-task-command .agent-markdown__paragraph {
+  line-height: 1.45;
+}
+
+.agent-task-command .agent-markdown__list {
+  gap: 4px;
 }
 
 .agent-message-list {
@@ -131,6 +164,7 @@
 .agent-message,
 .agent-tool-bubble,
 .agent-permission {
+  max-width: 92%;
   border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
   border-radius: var(--radius-lg, 8px);
   background: var(--bg-surface, #1c1c20);
@@ -140,13 +174,28 @@
 }
 
 .agent-message--user_msg {
+  align-self: flex-end;
+  width: fit-content;
+  max-width: 86%;
   border-color: rgba(10, 132, 255, 0.35);
   background: rgba(10, 132, 255, 0.08);
+}
+
+.agent-message--assistant_msg {
+  align-self: flex-start;
+}
+
+.agent-message--user_msg .agent-message__meta {
+  justify-content: flex-end;
 }
 
 .agent-message__meta,
 .agent-tool-bubble__header,
 .agent-permission__meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin-bottom: 5px;
   color: var(--text-muted, #a1a1aa);
   font-size: 10px;
@@ -156,8 +205,306 @@
 }
 
 .agent-message__body {
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.agent-message__body--plain {
   white-space: pre-wrap;
+}
+
+.agent-markdown {
+  display: grid;
+  gap: 8px;
+  color: var(--text-main, #ededed);
+}
+
+.agent-markdown__heading {
+  margin: 0;
+  color: var(--text-strong, #fff);
+  font-weight: 750;
+  line-height: 1.25;
+}
+
+.agent-markdown__heading--1 {
+  font-size: 16px;
+}
+
+.agent-markdown__heading--2 {
+  font-size: 14px;
+}
+
+.agent-markdown__heading--3,
+.agent-markdown__heading--4 {
+  font-size: 13px;
+}
+
+.agent-markdown__paragraph {
+  margin: 0;
+}
+
+.agent-markdown__list {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.agent-markdown__list li {
+  padding-left: 2px;
+}
+
+.agent-markdown__quote {
+  margin: 0;
+  border-left: 2px solid rgba(10, 132, 255, 0.5);
+  color: var(--text-muted, #a1a1aa);
+  padding: 2px 0 2px 9px;
+}
+
+.agent-markdown code {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-sm, 4px);
+  background: rgba(0, 0, 0, 0.28);
+  color: var(--text-strong, #fff);
+  padding: 1px 4px;
+  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
+  font-size: 0.92em;
+}
+
+.agent-markdown a {
+  color: var(--accent, #0a84ff);
+  text-decoration: none;
+}
+
+.agent-markdown a:hover {
+  text-decoration: underline;
+}
+
+.agent-markdown__code-block {
+  position: relative;
+  max-height: 240px;
+  overflow: auto;
+  margin: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-md, 6px);
+  background: rgba(0, 0, 0, 0.32);
+  padding: 9px;
+}
+
+.agent-markdown__code-block code {
+  display: block;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  white-space: pre;
+}
+
+.agent-markdown__code-language {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-muted, #a1a1aa);
+  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.agent-message__stage {
+  color: var(--accent, #0a84ff);
+  font-weight: 650;
+  text-transform: none;
+}
+
+.agent-stage-event,
+.agent-thinking,
+.agent-error-card,
+.agent-thinking-trace,
+.agent-trace-output {
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-md, 6px);
+  background: rgba(255, 255, 255, 0.035);
+  padding: 8px 9px;
+  font-size: 12px;
+  box-shadow: var(--shadow-sm, 0 1px 2px rgba(0, 0, 0, 0.3));
+}
+
+.agent-stage-event__header,
+.agent-thinking {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-main, #ededed);
+  font-weight: 650;
+}
+
+.agent-thinking-trace {
+  align-self: stretch;
+  max-width: 100%;
+  padding: 0;
+  border-color: rgba(10, 132, 255, 0.28);
+  background: rgba(10, 132, 255, 0.075);
+  overflow: hidden;
+}
+
+.agent-thinking-trace > summary {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  padding: 0 11px;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.agent-thinking-trace > summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-thinking-trace[open] > summary {
+  border-bottom: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+}
+
+.agent-thinking-trace__title {
+  color: var(--text-main, #ededed);
+}
+
+.agent-thinking-trace__left {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.agent-thinking-trace__icon {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(10, 132, 255, 0.35);
+  border-radius: 50%;
+  color: var(--accent, #0a84ff);
+  font-size: 13px;
+  line-height: 1;
+  transition: transform 120ms ease;
+}
+
+.agent-thinking-trace[open] .agent-thinking-trace__icon {
+  transform: rotate(90deg);
+}
+
+.agent-thinking-trace__hint {
+  color: var(--text-muted, #a1a1aa);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.agent-thinking-trace__body {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+}
+
+.agent-trace-empty {
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
   line-height: 1.45;
+}
+
+.agent-trace-output {
+  box-shadow: none;
+}
+
+.agent-stage-event--started {
+  border-color: rgba(10, 132, 255, 0.35);
+}
+
+.agent-stage-event--completed {
+  border-color: rgba(48, 209, 88, 0.25);
+}
+
+.agent-stage-event--error,
+.agent-error-card {
+  border-color: rgba(255, 69, 58, 0.35);
+  background: rgba(255, 69, 58, 0.07);
+}
+
+.agent-stage-event__profile {
+  margin-left: auto;
+  max-width: 150px;
+  overflow: hidden;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 10px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-stage-event__details,
+.agent-raw-details {
+  margin-top: 6px;
+  color: var(--text-muted, #a1a1aa);
+  line-height: 1.45;
+}
+
+.agent-stage-event__details summary,
+.agent-raw-details summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.agent-spinner {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  border: 2px solid rgba(10, 132, 255, 0.22);
+  border-top-color: var(--accent, #0a84ff);
+  border-radius: 50%;
+  animation: agent-spin 0.8s linear infinite;
+}
+
+@keyframes agent-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.agent-tool-bubble__title {
+  margin-bottom: 4px;
+  color: var(--text-main, #ededed);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.agent-tool-bubble__summary {
+  overflow-wrap: anywhere;
+  color: var(--text-main, #ededed);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.agent-tool-bubble__status {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  padding: 1px 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.agent-tool-bubble__status--ok,
+.agent-tool-bubble__status--accept {
+  color: var(--success, #30d158);
+}
+
+.agent-tool-bubble__status--error,
+.agent-tool-bubble__status--reject,
+.agent-tool-bubble__status--denied {
+  color: var(--danger, #ff453a);
 }
 
 .agent-tool-bubble pre,

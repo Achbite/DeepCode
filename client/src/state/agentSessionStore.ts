@@ -91,6 +91,20 @@ function settingWorkflow(value: unknown): AgentWorkflowMode {
   return value === 'actOnRequest' ? 'actOnRequest' : 'planFirst';
 }
 
+function createLocalEvent(
+  sessionId: string,
+  kind: AgentEvent['kind'],
+  payload: unknown
+): AgentEvent {
+  return {
+    id: `local-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    sessionId,
+    ts: new Date().toISOString(),
+    kind,
+    payload,
+  };
+}
+
 export const useAgentSessionStore = create<Store>((set, get) => ({
   session: null,
   events: [],
@@ -202,8 +216,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       ...get().sessionAttachments,
       ...get().messageAttachments,
     ];
+    const localUserEvent = createLocalEvent(session.id, 'user_msg', {
+      content: trimmed,
+      attachments,
+      pending: true,
+    });
     set((state) => ({
-      events: state.events,
+      events: [...state.events, localUserEvent],
       messageAttachments: [],
       loading: true,
       errorMessage: null,
@@ -228,10 +247,15 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         loading: false,
       }));
     } catch (err) {
-      set({
-        errorMessage: err instanceof Error ? err.message : String(err),
+      const message = err instanceof Error ? err.message : String(err);
+      set((state) => ({
+        events: [
+          ...state.events,
+          createLocalEvent(session.id, 'error', { message }),
+        ],
+        errorMessage: message,
         loading: false,
-      });
+      }));
     }
   },
 
