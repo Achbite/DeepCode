@@ -1,4 +1,4 @@
-# DeepCode
+﻿# DeepCode
 
 > 轻量级 AI Agent 代码工作台 — Tauri (Rust) 桌面外壳 + 本地 Node.js 后端 + React 前端，专注纯代码工作流。
 > 针对 DeepSeek 模型进行专项优化。
@@ -227,3 +227,63 @@ Client、Server、Tauri 三端共享的 TypeScript 类型定义：
 ## 许可
 
 本工程项目遵循MIT开源协议
+
+## 特别鸣谢
+
+DeepCode 的规划、实现和迭代过程中使用了多种 AI 编程工具辅助完成需求拆解、架构讨论、代码生成、前端风格探索和文档整理。特别感谢 Codex 在工程实现、代码审查与方案落地中的协作，Gemini 3.1 Pro 在前端视觉与交互方向上的设计辅助，以及 Claude Opus 4.6/4.7 在项目规划、系统设计和阶段目标拆解中的支持。
+
+本项目仍以人工确认的需求、权限边界、代码审查和测试结果作为最终事实源；AI 工具输出仅作为辅助材料进入工程决策流程。
+
+## 参考文献
+
+[1] OpenAI. *Codex CLI*. GitHub repository, commit `22dd9ad3929253ed24d7ee4f10f238e95ab25f37`. Available: https://github.com/openai/codex. Accessed: 2026-05-22.
+
+[2] SST. *OpenCode*. GitHub repository, commit `7afd477d1a1a147440f810c122d2f4b408e1b95c`. Available: https://github.com/sst/opencode. Accessed: 2026-05-22.
+
+[3] Continue. *Continue*. GitHub repository, commit `cb273098d968906d25ee737b454f0b5f13ea2482`. Available: https://github.com/continuedev/continue. Accessed: 2026-05-22.
+
+[4] Aider-AI. *Aider*. GitHub repository, commit `6435cb8b1e885d7275327d4b61206b1b1618dfe1`. Available: https://github.com/Aider-AI/aider. Accessed: 2026-05-22.
+
+[5] Cline. *Cline*. GitHub repository, commit `b4d1b83bad502f940dfe8d9d796e1eba5d260c2a`. Available: https://github.com/cline/cline. Accessed: 2026-05-22.
+
+[6] Roo Code. *Roo-Code*. GitHub repository, commit `b867ec9145750d0ae1ff7f02d35406e9bf2a0b16`. Available: https://github.com/RooCodeInc/Roo-Code. Accessed: 2026-05-22.
+
+[7] SWE-agent. *SWE-agent*. GitHub repository, commit `0f4f3bba990e01ca8460b9963abdcd89e38042f2`. Available: https://github.com/SWE-agent/SWE-agent. Accessed: 2026-05-22.
+
+[8] All Hands AI. *OpenHands*. GitHub repository, commit `e3d9abfd014ffd4283d03071fdb88c1c8edc77f6`. Available: https://github.com/All-Hands-AI/OpenHands. Accessed: 2026-05-22.
+
+[9] Anthropic. *Claude Code official and internal documentation*. Internal/reference documentation. Accessed: 2026-05-22.
+
+[10] OpenAI. *Codex CLI internal documentation*. Internal/reference documentation. Accessed: 2026-05-22.
+
+[11] Matt Pocock. *Skills*. GitHub repository. Available: https://github.com/mattpocock/skills. Accessed: 2026-05-22.
+
+[12] Nous Research. *Hermes Agent*. GitHub repository. Available: https://github.com/nousresearch/hermes-agent. Accessed: 2026-05-22.
+
+[13] Multica AI. *Andrej Karpathy Skills*. GitHub repository. Available: https://github.com/multica-ai/andrej-karpathy-skills. Accessed: 2026-05-22.
+
+[14] Addy Osmani. *Agent Skills*. GitHub repository. Available: https://github.com/addyosmani/agent-skills. Accessed: 2026-05-22.
+
+[15] Jesse Vincent. *Superpowers*. GitHub repository. Available: https://github.com/obra/superpowers. Accessed: 2026-05-22.
+
+[16] Affaan M. *Everything Claude Code*. GitHub repository. Available: https://github.com/affaan-m/everything-claude-code. Accessed: 2026-05-22.
+
+[17] GitHub. *Spec Kit*. GitHub repository. Available: https://github.com/github/spec-kit. Accessed: 2026-05-22.
+
+[18] Datawhale China. *Hello Agents*. GitHub repository. Available: https://github.com/datawhalechina/hello-agents. Accessed: 2026-05-22.
+
+[19] Ruvnet. *Ruflo*. GitHub repository. Available: https://github.com/ruvnet/ruflo. Accessed: 2026-05-22.
+
+[20] Anthropic. *Skills*. GitHub repository. Available: https://github.com/anthropics/skills. Accessed: 2026-05-22.
+
+[21] Siteboon. *ClaudeCodeUI*. GitHub repository. Available: https://github.com/siteboon/claudecodeui. Accessed: 2026-05-22.
+
+[22] JackProAI. *JackProAi ClaudeCode 3.1*. GitHub repository. Available: https://github.com/JackProAi/JackProAi-claudecode3.1. Accessed: 2026-05-22.
+
+[23] LING71671. *Open-ClaudeCode*. GitHub repository. Available: https://github.com/LING71671/Open-ClaudeCode. Accessed: 2026-05-22.
+
+[24] Yeachan Heo. *Oh My Codex*. GitHub repository. Available: https://github.com/Yeachan-Heo/oh-my-codex. Accessed: 2026-05-22.
+
+[25] Libukai. *Awesome Agent Skills*. GitHub repository. Available: https://github.com/libukai/awesome-agent-skills. Accessed: 2026-05-22.
+
+[26] Earendil Works. *Pi*. GitHub repository. Available: https://github.com/earendil-works/pi. Accessed: 2026-05-22.
