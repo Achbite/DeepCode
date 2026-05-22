@@ -264,16 +264,16 @@ button {
   left: 16px;
   right: 16px;
   top: 2px;
-  height: 1px;
+  height: 2px;
   background: linear-gradient(
     90deg,
     transparent,
-    rgba(10, 132, 255, 0.28) 18%,
-    rgba(10, 132, 255, 0.78) 50%,
-    rgba(10, 132, 255, 0.28) 82%,
+    rgba(10, 132, 255, 0.34) 18%,
+    rgba(10, 132, 255, 0.92) 50%,
+    rgba(10, 132, 255, 0.34) 82%,
     transparent
   );
-  box-shadow: 0 0 10px rgba(10, 132, 255, 0.35);
+  box-shadow: 0 0 12px rgba(10, 132, 255, 0.42);
 }
 
 .workbench-layout--no-sidebar .workbench-resizer--sidebar,
@@ -631,11 +631,12 @@ body.workbench-resizing * {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  border-top: 1px solid var(--divider-line);
+  border-top: 1px solid rgba(255, 255, 255, 0.18);
   background: var(--terminal-bg);
   box-shadow:
-    inset 0 1px 0 var(--divider-highlight),
-    0 -10px 24px -26px var(--divider-shadow);
+    inset 0 1px 0 rgba(255, 255, 255, 0.055),
+    0 -1px 0 rgba(0, 0, 0, 0.88),
+    0 -12px 28px -26px rgba(0, 0, 0, 0.9);
   overflow: hidden;
 }
 

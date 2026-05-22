@@ -8,7 +8,7 @@ import {
   restartTerminalSession,
   sendTerminalInput,
   updateTerminalSession,
-} from '../../services/apiClient';
+} from '../../services/runtimeAdapter';
 import './terminalPanel.css';
 
 interface TerminalContextMenu {
@@ -36,6 +36,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
   const [contextMenu, setContextMenu] = useState<TerminalContextMenu | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [terminalError, setTerminalError] = useState<string | null>(null);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const dragStateRef = useRef<TerminalDragState | null>(null);
   const lastSequenceRef = useRef<Record<string, number>>({});
@@ -44,6 +45,9 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
 
   const active = sessions.find((session) => session.id === activeId) ?? sessions[0];
   const activeOutput = active ? outputBySession[active.id] ?? '' : '';
+
+  const describeFailure = (result: { error?: string; message?: string }) =>
+    result.message || result.error || 'Terminal request failed';
 
   useEffect(() => {
     sessionsRef.current = sessions;
@@ -72,7 +76,11 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
 
   const refreshSessions = useCallback(async (preferredActiveId?: string) => {
     const result = await listTerminalSessions();
-    if (!result.ok || !result.data) return;
+    if (!result.ok || !result.data) {
+      setTerminalError(describeFailure(result));
+      return;
+    }
+    setTerminalError(null);
     applySessions(result.data.sessions, preferredActiveId);
   }, [applySessions]);
 
@@ -81,7 +89,11 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     const result = await createTerminalSession({
       name: `Terminal ${currentSessions.length + 1}`,
     });
-    if (!result.ok || !result.data) return;
+    if (!result.ok || !result.data) {
+      setTerminalError(describeFailure(result));
+      return;
+    }
+    setTerminalError(null);
     applySessions([...currentSessions, result.data], result.data.id);
     void refreshSessions(result.data.id);
   }, [applySessions, refreshSessions]);
@@ -92,7 +104,11 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     if (closingIndex < 0) return;
 
     const result = await deleteTerminalSession(sessionId);
-    if (!result.ok) return;
+    if (!result.ok) {
+      setTerminalError(describeFailure(result));
+      return;
+    }
+    setTerminalError(null);
 
     const nextSessions = currentSessions.filter((session) => session.id !== sessionId);
     const fallbackActive =
@@ -116,13 +132,10 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
       const result = await listTerminalSessions();
       if (cancelled) return;
       if (result.ok && result.data && result.data.sessions.length > 0) {
+        setTerminalError(null);
         applySessions(result.data.sessions);
-        return;
-      }
-      const created = await createTerminalSession({ name: 'Terminal 1' });
-      if (!cancelled && created.ok && created.data) {
-        applySessions([created.data], created.data.id);
-        void refreshSessions(created.data.id);
+      } else if (!result.ok) {
+        setTerminalError(describeFailure(result));
       }
     })();
     return () => {
@@ -135,7 +148,12 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     const timer = window.setInterval(async () => {
       const after = lastSequenceRef.current[active.id] ?? 0;
       const result = await getTerminalEvents(active.id, after);
-      if (!result.ok || !result.data || result.data.events.length === 0) return;
+      if (!result.ok || !result.data) {
+        setTerminalError(describeFailure(result));
+        return;
+      }
+      if (result.data.events.length === 0) return;
+      setTerminalError(null);
       const text = result.data.events
         .map((event) => {
           if (event.sequence > (lastSequenceRef.current[event.sessionId] ?? 0)) {
@@ -265,9 +283,12 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     if (name) {
       const result = await updateTerminalSession(renamingId, { name });
       if (result.ok && result.data) {
+        setTerminalError(null);
         setSessions((prev) =>
           prev.map((session) => (session.id === renamingId ? result.data! : session))
         );
+      } else if (!result.ok) {
+        setTerminalError(describeFailure(result));
       }
     }
     setRenamingId(null);
@@ -277,11 +298,14 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
   const restartSession = async (sessionId: string) => {
     const result = await restartTerminalSession(sessionId);
     if (result.ok && result.data) {
+      setTerminalError(null);
       setSessions((prev) =>
         prev.map((session) => (session.id === sessionId ? result.data! : session))
       );
       setActiveId(result.data.id);
       setOutputBySession((prev) => ({ ...prev, [result.data!.id]: '' }));
+    } else if (!result.ok) {
+      setTerminalError(describeFailure(result));
     }
     setContextMenu(null);
   };
@@ -295,13 +319,23 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
       [active.id]: `${prev[active.id] ?? ''}${active.shellKind} $ ${command}\n`,
     }));
     setCommand('');
-    await sendTerminalInput(active.id, { data: line });
+    const result = await sendTerminalInput(active.id, { data: line });
+    if (!result.ok) {
+      setTerminalError(describeFailure(result));
+    } else {
+      setTerminalError(null);
+    }
   };
 
   return (
     <div className="terminal-panel">
       <div className="terminal-panel__body">
         <div className="terminal-panel__screen">
+          {terminalError && (
+            <div className="terminal-panel__error" role="status">
+              {terminalError}
+            </div>
+          )}
           <pre className="terminal-panel__output">
             {activeOutput || 'DeepCode terminal surface\nCreate or select a terminal session.'}
           </pre>

@@ -13,6 +13,7 @@ use tauri_plugin_dialog::DialogExt;
 use thiserror::Error;
 
 use crate::fs;
+use crate::terminal;
 use crate::user_settings;
 use crate::workspace;
 
@@ -34,6 +35,12 @@ pub enum CommandError {
 impl From<String> for CommandError {
     fn from(s: String) -> Self {
         CommandError::Other(s)
+    }
+}
+
+impl From<terminal::TerminalError> for CommandError {
+    fn from(err: terminal::TerminalError) -> Self {
+        CommandError::Other(err.to_string())
     }
 }
 
@@ -317,6 +324,88 @@ pub fn patch_user_settings(
 // Web/Node 模式已经接入真实实现。桌面壳先注册同名 command，避免前端在 Tauri
 // 模式下遇到 unknown command；后续再把 secret store、LLM adapter、session JSONL
 // 移植到 Rust 侧。
+
+// ---- Terminal ----
+
+#[tauri::command]
+pub fn get_terminal_capabilities(
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> terminal::TerminalCapability {
+    state.capabilities()
+}
+
+#[tauri::command]
+pub fn list_terminal_sessions(
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> terminal::TerminalSessionsResult {
+    state.list_sessions()
+}
+
+#[tauri::command]
+pub fn create_terminal_session(
+    request: terminal::CreateTerminalSessionRequest,
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> Result<terminal::TerminalSession, CommandError> {
+    state.create_session(request).map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn send_terminal_input(
+    session_id: String,
+    request: terminal::TerminalInputRequest,
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> Result<terminal::TerminalSession, CommandError> {
+    state
+        .send_input(&session_id, request)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn resize_terminal_session(
+    session_id: String,
+    request: terminal::TerminalResizeRequest,
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> Result<terminal::TerminalSession, CommandError> {
+    state
+        .resize_session(&session_id, request)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn update_terminal_session(
+    session_id: String,
+    request: terminal::UpdateTerminalSessionRequest,
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> Result<terminal::TerminalSession, CommandError> {
+    state
+        .update_session(&session_id, request)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn restart_terminal_session(
+    session_id: String,
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> Result<terminal::TerminalSession, CommandError> {
+    state.restart_session(&session_id).map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn delete_terminal_session(
+    session_id: String,
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> Result<terminal::TerminalSession, CommandError> {
+    state.delete_session(&session_id).map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn get_terminal_events(
+    session_id: Option<String>,
+    after: Option<u64>,
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> terminal::TerminalEventsResult {
+    state.get_events(session_id.as_deref(), after)
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

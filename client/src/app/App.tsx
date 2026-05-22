@@ -223,12 +223,12 @@ const App: React.FC = () => {
   // ---- 1.3 Monaco / communication warmup ----
   useEffect(() => {
     return scheduleIdle(() => {
-      void import('@monaco-editor/react')
-        .then(({ loader }) => loader.init())
-        .catch(() => undefined);
-      if (getRuntimeType() === 'tauri') {
-        void import('@tauri-apps/api/core');
-      } else {
+      if (import.meta.env.DEV) {
+        void import('@monaco-editor/react')
+          .then(({ loader }) => loader.init())
+          .catch(() => undefined);
+      }
+      if (getRuntimeType() === 'web') {
         void import('../services/apiClient');
       }
     });
@@ -282,11 +282,15 @@ const App: React.FC = () => {
   // ---- 3. Heartbeat ----
   useEffect(() => {
     const cancel = afterFirstPaint(() => {
-      connectHeartbeat();
+      if (getRuntimeType() === 'web') {
+        connectHeartbeat();
+      }
     });
     return () => {
       cancel();
-      disconnectHeartbeat();
+      if (getRuntimeType() === 'web') {
+        disconnectHeartbeat();
+      }
     };
   }, []);
 

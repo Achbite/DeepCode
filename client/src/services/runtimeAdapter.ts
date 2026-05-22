@@ -43,6 +43,13 @@ import type {
   PermissionDecision,
   ToolExecutionRequest,
   ToolResult,
+  CreateTerminalSessionRequest,
+  TerminalCapability,
+  TerminalEventsResult,
+  TerminalInputRequest,
+  TerminalResizeRequest,
+  TerminalSession,
+  TerminalSessionsResult,
 } from '@deepcode/protocol';
 
 // ---- 运行时检测 ----
@@ -65,6 +72,10 @@ export type RuntimeType = 'web' | 'tauri';
 export function getRuntimeType(): RuntimeType {
   if (typeof window === 'undefined') return 'web';
   const w = window as any;
+  const location = window.location;
+  if (location.protocol === 'tauri:' || location.hostname === 'tauri.localhost') {
+    return 'tauri';
+  }
   if (w.isTauri || w.__TAURI_INTERNALS__ || w.__TAURI__) return 'tauri';
   return 'web';
 }
@@ -154,6 +165,14 @@ async function tauriInvoke<T>(command: string, args?: Record<string, unknown>): 
           message: parsed.NotImplemented,
         };
       }
+      if (parsed.Other) {
+        const message = String(parsed.Other);
+        return {
+          ok: false,
+          error: message.includes('wsl_missing') ? 'wsl_missing' : 'tauri_error',
+          message,
+        };
+      }
     } catch {
       // 非 JSON，继续
     }
@@ -178,6 +197,14 @@ async function tauriInvoke<T>(command: string, args?: Record<string, unknown>): 
       return {
         ok: false,
         error: 'no_workspace',
+        message: errStr,
+      };
+    }
+
+    if (errStr.includes('wsl_missing')) {
+      return {
+        ok: false,
+        error: 'wsl_missing',
         message: errStr,
       };
     }
@@ -354,6 +381,101 @@ export async function renameEntry(
   }
   const { renameEntry: apiRenameEntry } = await import('./apiClient');
   return apiRenameEntry(oldPath, newPath, folderId);
+}
+
+// ---- Terminal runtime ----
+
+export async function getTerminalCapabilities(): Promise<ApiResponse<TerminalCapability>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalCapability>('get_terminal_capabilities');
+  }
+  const { getTerminalCapabilities: apiGetTerminalCapabilities } = await import('./apiClient');
+  return apiGetTerminalCapabilities();
+}
+
+export async function listTerminalSessions(): Promise<ApiResponse<TerminalSessionsResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalSessionsResult>('list_terminal_sessions');
+  }
+  const { listTerminalSessions: apiListTerminalSessions } = await import('./apiClient');
+  return apiListTerminalSessions();
+}
+
+export async function createTerminalSession(
+  request: CreateTerminalSessionRequest
+): Promise<ApiResponse<TerminalSession>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalSession>('create_terminal_session', { request });
+  }
+  const { createTerminalSession: apiCreateTerminalSession } = await import('./apiClient');
+  return apiCreateTerminalSession(request);
+}
+
+export async function sendTerminalInput(
+  sessionId: string,
+  request: TerminalInputRequest
+): Promise<ApiResponse<TerminalSession>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalSession>('send_terminal_input', { sessionId, request });
+  }
+  const { sendTerminalInput: apiSendTerminalInput } = await import('./apiClient');
+  return apiSendTerminalInput(sessionId, request);
+}
+
+export async function resizeTerminalSession(
+  sessionId: string,
+  request: TerminalResizeRequest
+): Promise<ApiResponse<TerminalSession>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalSession>('resize_terminal_session', { sessionId, request });
+  }
+  const { resizeTerminalSession: apiResizeTerminalSession } = await import('./apiClient');
+  return apiResizeTerminalSession(sessionId, request);
+}
+
+export async function updateTerminalSession(
+  sessionId: string,
+  request: Partial<Pick<TerminalSession, 'name' | 'order'>>
+): Promise<ApiResponse<TerminalSession>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalSession>('update_terminal_session', { sessionId, request });
+  }
+  const { updateTerminalSession: apiUpdateTerminalSession } = await import('./apiClient');
+  return apiUpdateTerminalSession(sessionId, request);
+}
+
+export async function restartTerminalSession(
+  sessionId: string
+): Promise<ApiResponse<TerminalSession>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalSession>('restart_terminal_session', { sessionId });
+  }
+  const { restartTerminalSession: apiRestartTerminalSession } = await import('./apiClient');
+  return apiRestartTerminalSession(sessionId);
+}
+
+export async function deleteTerminalSession(
+  sessionId: string
+): Promise<ApiResponse<TerminalSession>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalSession>('delete_terminal_session', { sessionId });
+  }
+  const { deleteTerminalSession: apiDeleteTerminalSession } = await import('./apiClient');
+  return apiDeleteTerminalSession(sessionId);
+}
+
+export async function getTerminalEvents(
+  sessionId?: string,
+  after?: number
+): Promise<ApiResponse<TerminalEventsResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalEventsResult>('get_terminal_events', {
+      sessionId: sessionId ?? null,
+      after: after ?? 0,
+    });
+  }
+  const { getTerminalEvents: apiGetTerminalEvents } = await import('./apiClient');
+  return apiGetTerminalEvents(sessionId, after);
 }
 
 // ---- 用户设置（阶段 4 / S4-4）----

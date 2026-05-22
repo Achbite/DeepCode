@@ -11,6 +11,7 @@
 
 mod commands;
 mod fs;
+mod terminal;
 mod user_settings;
 mod workspace;
 
@@ -19,6 +20,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(workspace::WorkspaceManager::new())
+        .manage(terminal::TerminalManager::new())
         .invoke_handler(tauri::generate_handler![
             // 运行时状态
             commands::get_runtime_status,
@@ -43,6 +45,15 @@ fn main() {
             // 用户设置
             commands::get_user_settings,
             commands::patch_user_settings,
+            commands::get_terminal_capabilities,
+            commands::list_terminal_sessions,
+            commands::create_terminal_session,
+            commands::send_terminal_input,
+            commands::resize_terminal_session,
+            commands::update_terminal_session,
+            commands::restart_terminal_session,
+            commands::delete_terminal_session,
+            commands::get_terminal_events,
             // 阶段 6 桥接
             commands::get_llm_profiles,
             commands::patch_llm_profiles,
