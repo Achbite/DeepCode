@@ -39,6 +39,21 @@ import type {
   PermissionDecision,
   ToolExecutionRequest,
   ToolResult,
+  ShellEnvironmentStatus,
+  TerminalCapability,
+  TerminalSession,
+  TerminalEvent,
+  TerminalSessionsResult,
+  TerminalEventsResult,
+  CreateTerminalSessionRequest,
+  TerminalInputRequest,
+  TerminalResizeRequest,
+  AgentActionParseRequest,
+  AgentActionParseResult,
+  AgentFixtureRunRequest,
+  AgentFixtureRunResult,
+  PromptLayerResult,
+  SkillReferenceResult,
 } from '@deepcode/protocol';
 
 const API_BASE = '/api';
@@ -84,7 +99,7 @@ async function getJson<T>(url: string): Promise<ApiResponse<T>> {
 /** 通用 JSON Body 请求 */
 async function sendJson<T>(
   url: string,
-  method: 'POST' | 'PATCH' | 'PUT',
+  method: 'POST' | 'PATCH' | 'PUT' | 'DELETE',
   body: unknown
 ): Promise<ApiResponse<T>> {
   try {
@@ -350,6 +365,120 @@ export function executeAgentTool(
   );
 }
 
+export function getShellEnvironment(): Promise<ApiResponse<ShellEnvironmentStatus>> {
+  return getJson<ShellEnvironmentStatus>(`${API_BASE}/runtime/shell`);
+}
+
+export function getTerminalCapabilities(): Promise<ApiResponse<TerminalCapability>> {
+  return getJson<TerminalCapability>(`${API_BASE}/terminal/capabilities`);
+}
+
+export function listTerminalSessions(): Promise<ApiResponse<TerminalSessionsResult>> {
+  return getJson<TerminalSessionsResult>(`${API_BASE}/terminal/sessions`);
+}
+
+export function createTerminalSession(
+  request: CreateTerminalSessionRequest
+): Promise<ApiResponse<TerminalSession>> {
+  return sendJson<TerminalSession>(
+    `${API_BASE}/terminal/sessions`,
+    'POST',
+    request
+  );
+}
+
+export function sendTerminalInput(
+  sessionId: string,
+  request: TerminalInputRequest
+): Promise<ApiResponse<TerminalSession>> {
+  return sendJson<TerminalSession>(
+    `${API_BASE}/terminal/sessions/${encodeURIComponent(sessionId)}/input`,
+    'POST',
+    request
+  );
+}
+
+export function resizeTerminalSession(
+  sessionId: string,
+  request: TerminalResizeRequest
+): Promise<ApiResponse<TerminalSession>> {
+  return sendJson<TerminalSession>(
+    `${API_BASE}/terminal/sessions/${encodeURIComponent(sessionId)}/resize`,
+    'POST',
+    request
+  );
+}
+
+export function updateTerminalSession(
+  sessionId: string,
+  request: Partial<Pick<TerminalSession, 'name' | 'order'>>
+): Promise<ApiResponse<TerminalSession>> {
+  return sendJson<TerminalSession>(
+    `${API_BASE}/terminal/sessions/${encodeURIComponent(sessionId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export function restartTerminalSession(
+  sessionId: string
+): Promise<ApiResponse<TerminalSession>> {
+  return sendJson<TerminalSession>(
+    `${API_BASE}/terminal/sessions/${encodeURIComponent(sessionId)}/restart`,
+    'POST',
+    {}
+  );
+}
+
+export function deleteTerminalSession(
+  sessionId: string
+): Promise<ApiResponse<TerminalSession>> {
+  return sendJson<TerminalSession>(
+    `${API_BASE}/terminal/sessions/${encodeURIComponent(sessionId)}`,
+    'DELETE',
+    {}
+  );
+}
+
+export function getTerminalEvents(
+  sessionId?: string,
+  after?: number
+): Promise<ApiResponse<TerminalEventsResult>> {
+  const qs = buildQuery({
+    sessionId,
+    after: after === undefined ? undefined : String(after),
+  });
+  return getJson<TerminalEventsResult>(`${API_BASE}/terminal/events${qs}`);
+}
+
+export function parseAgentActions(
+  request: AgentActionParseRequest
+): Promise<ApiResponse<AgentActionParseResult>> {
+  return sendJson<AgentActionParseResult>(
+    `${API_BASE}/agent/parse-actions`,
+    'POST',
+    request
+  );
+}
+
+export function runAgentFixture(
+  request: AgentFixtureRunRequest
+): Promise<ApiResponse<AgentFixtureRunResult>> {
+  return sendJson<AgentFixtureRunResult>(
+    `${API_BASE}/agent/fixtures/run`,
+    'POST',
+    request
+  );
+}
+
+export function getAgentPromptLayers(): Promise<ApiResponse<PromptLayerResult>> {
+  return getJson<PromptLayerResult>(`${API_BASE}/agent/prompt-layers`);
+}
+
+export function getAgentSkills(): Promise<ApiResponse<SkillReferenceResult>> {
+  return getJson<SkillReferenceResult>(`${API_BASE}/agent/skills`);
+}
+
 // 重新导出共享 DTO
 export type {
   FileTreeNode,
@@ -361,4 +490,8 @@ export type {
   OpenWorkspaceResult,
   BrowsePathResult,
   InitialLocations,
+  TerminalSession,
+  TerminalEvent,
+  TerminalCapability,
+  ShellEnvironmentStatus,
 };

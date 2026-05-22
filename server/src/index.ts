@@ -22,6 +22,9 @@ import { registerLlmRoutes } from './api/llmRoutes.js';
 import { registerCodeSearchRoutes } from './api/codeSearchRoutes.js';
 import { registerAgentRoutes } from './api/agentRoutes.js';
 import { registerAgentToolRoutes } from './api/agentToolRoutes.js';
+import { registerAgentActionRoutes } from './api/agentActionRoutes.js';
+import { registerRuntimeRoutes } from './api/runtimeRoutes.js';
+import { registerTerminalRoutes } from './api/terminalRoutes.js';
 import { registerHeartbeatWs } from './ws/heartbeatWs.js';
 import {
   loadInitialWorkspace,
@@ -53,7 +56,10 @@ async function main(): Promise<ServerStartResult> {
   await registerUserSettingsRoutes(app);
   await registerLlmRoutes(app);
   await registerCodeSearchRoutes(app);
+  await registerRuntimeRoutes(app);
+  await registerTerminalRoutes(app);
   await registerAgentToolRoutes(app);
+  await registerAgentActionRoutes(app);
   await registerAgentRoutes(app);
   await registerHeartbeatWs(app);
 
