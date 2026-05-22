@@ -73,16 +73,18 @@ export interface WorkspaceSpec {
  * 工作区状态摘要，用于健康检查与启动日志。
  */
 export interface WorkspaceSummary {
-  id: string;
-  name: string;
-  source: WorkspaceSourceKind;
+  /** 是否存在当前活动工作区 */
+  available: boolean;
+  id: string | null;
+  name: string | null;
+  source: WorkspaceSourceKind | null;
   /** folders 数量；首期常为 1 */
   folderCount: number;
 }
 
 /** GET /api/workspaces/current 成功响应 data 字段 */
 export interface WorkspaceState {
-  current: WorkspaceSpec;
+  current: WorkspaceSpec | null;
   /** 当前是否使用 fallback 工作区（首次启动或上次工作区不可用） */
   fallbackUsed: boolean;
   /** 上一次 openWorkspace 失败原因；成功后清空 */

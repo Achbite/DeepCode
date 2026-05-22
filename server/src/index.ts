@@ -34,7 +34,7 @@ async function main(): Promise<ServerStartResult> {
   const config = loadConfig();
   validateLocalHost(config);
 
-  // ---- 2. 初始化 fallback 工作区 ----
+  // ---- 2. 初始化可选工作区 ----
   loadInitialWorkspace();
 
   // ---- 3. 创建 Fastify 实例 ----
@@ -82,15 +82,19 @@ async function main(): Promise<ServerStartResult> {
 
   // ---- 7. 启动监听 ----
   await app.listen({ host: config.host, port: config.port });
-  const ws = getCurrentWorkspace();
   console.log(
     `✅ DeepCode Server 已启动: http://${config.host}:${config.port}`
   );
-  console.log(
-    `   当前工作区: ${ws.name} (source=${ws.source}, folders=${ws.folders.length})`
-  );
-  for (const f of ws.folders) {
-    console.log(`     - [${f.id}] ${f.name} -> ${f.absolutePath}`);
+  const ws = getCurrentWorkspace();
+  if (ws) {
+    console.log(
+      `   当前工作区: ${ws.name} (source=${ws.source}, folders=${ws.folders.length})`
+    );
+    for (const f of ws.folders) {
+      console.log(`     - [${f.id}] ${f.name} -> ${f.absolutePath}`);
+    }
+  } else {
+    console.log('   当前工作区: none (waiting for user to open a folder)');
   }
 
   return {

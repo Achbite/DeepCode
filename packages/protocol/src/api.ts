@@ -23,6 +23,6 @@ export interface HealthStatus {
   status: 'ok';
   version: string;
   timestamp: string;
-  /** 当前活动工作区摘要；启动后总是存在（至少为 fallback 工作区） */
+  /** 当前活动工作区摘要；无工作区时 available=false */
   workspace: WorkspaceSummary;
 }

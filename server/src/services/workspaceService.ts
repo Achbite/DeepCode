@@ -2,7 +2,7 @@
  * 工作区服务
  *
  * 职责：
- *   1. 启动时根据环境变量决定 fallback 工作区（DEEPCODE_WORKSPACE，缺省为 ./workspace）；
+ *   1. 启动时仅在 DEEPCODE_WORKSPACE 存在时打开工作区；默认保持空工作区；
  *   2. 解析 .code-workspace 文件 / 普通目录为 WorkspaceSpec；
  *   3. 维护当前活动工作区与 fallbackUsed / lastError 状态；
  *   4. 提供 folderId -> 绝对路径的解析；
@@ -14,7 +14,6 @@
  *   - openWorkspace 接收的绝对路径仅在该路由放行；后续文件读写全部按 folderId 锁定在 folder 之内。
  */
 import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
-import { mkdirSync } from 'node:fs';
 import {
   basename,
   dirname,
@@ -46,9 +45,6 @@ const UNSUPPORTED_TOP_LEVEL_KEYS = [
 
 /** DeepCode 工作区设置的命名空间前缀；只有该前缀的键会被纳入 workspace.settings */
 const DEEPCODE_SETTINGS_PREFIX = 'deepcode.';
-
-/** fallback 工作区目录名 */
-const FALLBACK_WORKSPACE_DIR = 'workspace';
 
 // ---- 内部状态 ----
 
@@ -250,38 +246,33 @@ function classifyTarget(absolutePath: string): WorkspaceSourceKind {
 // ---- public API ----
 
 /**
- * 启动时初始化 fallback 工作区。
+ * 启动时初始化工作区。
  *
- * 优先级：
- *   1. 环境变量 DEEPCODE_WORKSPACE 指定的绝对/相对路径
- *   2. ./workspace 子目录（自动创建）
+ * 仅当环境变量 DEEPCODE_WORKSPACE 存在时尝试打开；默认启动为空工作区，
+ * 避免冷启动时扫描或创建 fallback 目录。
  */
-export function loadInitialWorkspace(): WorkspaceSpec {
+export function loadInitialWorkspace(): WorkspaceSpec | null {
   lastError = null;
   const envRoot = process.env.DEEPCODE_WORKSPACE;
-  let target: string;
-  if (envRoot && envRoot.trim() !== '') {
-    target = isAbsolute(envRoot)
-      ? normalize(envRoot)
-      : normalize(resolve(process.cwd(), envRoot));
-  } else {
-    target = normalize(resolve(process.cwd(), FALLBACK_WORKSPACE_DIR));
+  currentWorkspace = null;
+  fallbackUsed = false;
+
+  if (!envRoot || envRoot.trim() === '') {
+    return null;
   }
 
-  // 不存在时自动创建（fallback 行为）
-  if (!existsSync(target)) {
-    mkdirSync(target, { recursive: true });
-  }
-  const st = statSync(target);
-  if (!st.isDirectory()) {
-    throw new Error(`DEEPCODE_WORKSPACE 必须指向目录: ${target}`);
-  }
+  const target = isAbsolute(envRoot)
+    ? normalize(envRoot)
+    : normalize(resolve(process.cwd(), envRoot));
 
-  currentWorkspace = buildDirectoryWorkspace(target);
-  // fallback 工作区 ID 固定为 'fallback'，与多次 open 区分
-  currentWorkspace = { ...currentWorkspace, id: 'fallback' };
-  fallbackUsed = true;
-  return currentWorkspace;
+  try {
+    return openWorkspace(target);
+  } catch (err) {
+    lastError = err instanceof Error ? err.message : String(err);
+    currentWorkspace = null;
+    fallbackUsed = false;
+    return null;
+  }
 }
 
 /**
@@ -319,6 +310,9 @@ export function saveWorkspaceFile(
   fileName?: string
 ): SaveWorkspaceFileResult {
   const ws = getCurrentWorkspace();
+  if (!ws) {
+    throw new Error('no_workspace: no active workspace is available');
+  }
   const targetFolder = folderId
     ? ws.folders.find((folder) => folder.id === folderId)
     : ws.folders[0];
@@ -364,18 +358,15 @@ export function saveWorkspaceFile(
   };
 }
 
-/** 获取当前活动工作区；启动后必然存在 */
-export function getCurrentWorkspace(): WorkspaceSpec {
-  if (!currentWorkspace) {
-    throw new Error('工作区尚未初始化，请先调用 loadInitialWorkspace');
-  }
+/** 获取当前活动工作区；无工作区时返回 null */
+export function getCurrentWorkspace(): WorkspaceSpec | null {
   return currentWorkspace;
 }
 
 /** 获取工作区状态包装（含 fallbackUsed / lastError） */
 export function getWorkspaceState(): WorkspaceState {
   return {
-    current: getCurrentWorkspace(),
+    current: currentWorkspace,
     fallbackUsed,
     lastError,
   };
@@ -383,8 +374,18 @@ export function getWorkspaceState(): WorkspaceState {
 
 /** 摘要：用于健康检查与启动日志 */
 export function getWorkspaceSummary(): WorkspaceSummary {
-  const ws = getCurrentWorkspace();
+  const ws = currentWorkspace;
+  if (!ws) {
+    return {
+      available: false,
+      id: null,
+      name: null,
+      source: null,
+      folderCount: 0,
+    };
+  }
   return {
+    available: true,
     id: ws.id,
     name: ws.name,
     source: ws.source,
@@ -401,6 +402,9 @@ export function getWorkspaceSummary(): WorkspaceSummary {
  */
 export function resolveFolder(folderId?: string): WorkspaceFolderSpec {
   const ws = getCurrentWorkspace();
+  if (!ws) {
+    throw new Error('no_workspace: no active workspace folder is available');
+  }
   if (!folderId) {
     return ws.folders[0];
   }
@@ -421,6 +425,9 @@ export function patchWorkspaceSettings(
   patch: Record<string, unknown>
 ): Record<string, unknown> {
   const ws = getCurrentWorkspace();
+  if (!ws) {
+    throw new Error('no_workspace: no active workspace is available');
+  }
   const next: Record<string, unknown> = { ...ws.settings };
   const rejected: string[] = [];
   for (const [k, v] of Object.entries(patch)) {

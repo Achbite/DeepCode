@@ -8,10 +8,11 @@ export async function registerCodeSearchRoutes(app: FastifyInstance): Promise<vo
       const data = await searchCode(request.body as CodeSearchInput);
       return { ok: true, data } satisfies ApiResponse<CodeSearchResult>;
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       return {
         ok: false,
-        error: 'code_search_error',
-        message: err instanceof Error ? err.message : String(err),
+        error: message.startsWith('no_workspace:') ? 'no_workspace' : 'code_search_error',
+        message,
       } satisfies ApiResponse<never>;
     }
   });

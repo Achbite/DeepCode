@@ -34,6 +34,14 @@ import type {
   RenameEntryResult,
 } from '@deepcode/protocol';
 
+function routeError(fallback: string, err: unknown): { error: string; message: string } {
+  const message = err instanceof Error ? err.message : String(err);
+  return {
+    error: message.startsWith('no_workspace:') ? 'no_workspace' : fallback,
+    message,
+  };
+}
+
 export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
   // ---- 获取目录树 ----
   app.get('/api/files/tree', async (request) => {
@@ -46,11 +54,10 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
       };
       return response;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const failure = routeError('file_tree_error', err);
       const response: ApiResponse<never> = {
         ok: false,
-        error: 'file_tree_error',
-        message,
+        ...failure,
       };
       return response;
     }
@@ -75,11 +82,10 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
       };
       return response;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const failure = routeError('file_read_error', err);
       const response: ApiResponse<never> = {
         ok: false,
-        error: 'file_read_error',
-        message,
+        ...failure,
       };
       return response;
     }
@@ -104,11 +110,10 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
       };
       return response;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const failure = routeError('file_write_error', err);
       const response: ApiResponse<never> = {
         ok: false,
-        error: 'file_write_error',
-        message,
+        ...failure,
       };
       return response;
     }
@@ -138,7 +143,11 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
       const isExist = message.startsWith('file_already_exists');
       const response: ApiResponse<never> = {
         ok: false,
-        error: isExist ? 'file_already_exists' : 'file_create_error',
+        error: message.startsWith('no_workspace:')
+          ? 'no_workspace'
+          : isExist
+            ? 'file_already_exists'
+            : 'file_create_error',
         message,
       };
       return response;
@@ -168,7 +177,11 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
       const isExist = message.startsWith('file_already_exists');
       const response: ApiResponse<never> = {
         ok: false,
-        error: isExist ? 'file_already_exists' : 'folder_create_error',
+        error: message.startsWith('no_workspace:')
+          ? 'no_workspace'
+          : isExist
+            ? 'file_already_exists'
+            : 'folder_create_error',
         message,
       };
       return response;
@@ -198,7 +211,11 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
       const isExist = message.startsWith('file_already_exists');
       const response: ApiResponse<never> = {
         ok: false,
-        error: isExist ? 'file_already_exists' : 'file_rename_error',
+        error: message.startsWith('no_workspace:')
+          ? 'no_workspace'
+          : isExist
+            ? 'file_already_exists'
+            : 'file_rename_error',
         message,
       };
       return response;

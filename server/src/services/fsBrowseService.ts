@@ -161,7 +161,7 @@ export function getInitialLocations(): InitialLocations {
   // 当前活动工作区
   try {
     const ws = getCurrentWorkspace();
-    if (ws.folders.length > 0) {
+    if (ws && ws.folders.length > 0) {
       const first = ws.folders[0];
       locations.push({
         label: `Current Workspace · ${first.name}`,

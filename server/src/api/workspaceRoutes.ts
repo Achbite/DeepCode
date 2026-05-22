@@ -26,6 +26,14 @@ import type {
   WorkspaceState,
 } from '@deepcode/protocol';
 
+function workspaceRouteError(fallback: string, err: unknown): { error: string; message: string } {
+  const message = err instanceof Error ? err.message : String(err);
+  return {
+    error: message.startsWith('no_workspace:') ? 'no_workspace' : fallback,
+    message,
+  };
+}
+
 export async function registerWorkspaceRoutes(
   app: FastifyInstance
 ): Promise<void> {
@@ -79,11 +87,10 @@ export async function registerWorkspaceRoutes(
       };
       return response;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const failure = workspaceRouteError('workspace_save_file_error', err);
       const response: ApiResponse<never> = {
         ok: false,
-        error: 'workspace_save_file_error',
-        message,
+        ...failure,
       };
       return response;
     }
@@ -107,11 +114,10 @@ export async function registerWorkspaceRoutes(
       };
       return response;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const failure = workspaceRouteError('workspace_settings_error', err);
       const response: ApiResponse<never> = {
         ok: false,
-        error: 'workspace_settings_error',
-        message,
+        ...failure,
       };
       return response;
     }
