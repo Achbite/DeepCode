@@ -125,82 +125,83 @@ pub fn browse_path(path: String) -> Result<fs::BrowsePathResult, CommandError> {
 /// 列活动 folder 的目录树
 #[tauri::command]
 pub fn list_file_tree(
-    folder_id: String,
+    folder_id: Option<String>,
     state: tauri::State<'_, workspace::WorkspaceManager>,
 ) -> Result<Vec<fs::FileTreeNode>, CommandError> {
-    let folder_root = state
-        .get_folder_abs_path(&folder_id)
-        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
-    fs::build_file_tree(&folder_root, &folder_id).map_err(CommandError::Other)
+    let folder = state
+        .resolve_folder(folder_id.as_deref())
+        .map_err(CommandError::Other)?;
+    fs::build_file_tree(&folder.absolute_path, &folder.id).map_err(CommandError::Other)
 }
 
 /// 读取工作区内文本文件
 #[tauri::command]
 pub fn read_text_file(
-    folder_id: String,
+    folder_id: Option<String>,
     path: String,
     state: tauri::State<'_, workspace::WorkspaceManager>,
 ) -> Result<fs::FileReadResult, CommandError> {
-    let folder_root = state
-        .get_folder_abs_path(&folder_id)
-        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
-    fs::read_text_file(&folder_root, &folder_id, &path).map_err(CommandError::Other)
+    let folder = state
+        .resolve_folder(folder_id.as_deref())
+        .map_err(CommandError::Other)?;
+    fs::read_text_file(&folder.absolute_path, &folder.id, &path).map_err(CommandError::Other)
 }
 
 /// 写入工作区内文本文件
 #[tauri::command]
 pub fn write_text_file(
-    folder_id: String,
+    folder_id: Option<String>,
     path: String,
     content: String,
     state: tauri::State<'_, workspace::WorkspaceManager>,
 ) -> Result<fs::FileWriteResult, CommandError> {
-    let folder_root = state
-        .get_folder_abs_path(&folder_id)
-        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
-    fs::write_text_file(&folder_root, &folder_id, &path, &content).map_err(CommandError::Other)
+    let folder = state
+        .resolve_folder(folder_id.as_deref())
+        .map_err(CommandError::Other)?;
+    fs::write_text_file(&folder.absolute_path, &folder.id, &path, &content).map_err(CommandError::Other)
 }
 
 /// 新建文件（阶段 4 / S4-1）
 #[tauri::command]
 pub fn create_file(
-    folder_id: String,
+    folder_id: Option<String>,
     path: String,
     content: Option<String>,
     state: tauri::State<'_, workspace::WorkspaceManager>,
 ) -> Result<fs::FileWriteResult, CommandError> {
-    let folder_root = state
-        .get_folder_abs_path(&folder_id)
-        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
+    let folder = state
+        .resolve_folder(folder_id.as_deref())
+        .map_err(CommandError::Other)?;
     let initial = content.unwrap_or_default();
-    fs::create_file(&folder_root, &folder_id, &path, &initial).map_err(CommandError::Other)
+    fs::create_file(&folder.absolute_path, &folder.id, &path, &initial).map_err(CommandError::Other)
 }
 
 /// 新建目录（阶段 4 / S4-1）
 #[tauri::command]
 pub fn create_folder(
-    folder_id: String,
+    folder_id: Option<String>,
     path: String,
     state: tauri::State<'_, workspace::WorkspaceManager>,
 ) -> Result<fs::CreateFolderResult, CommandError> {
-    let folder_root = state
-        .get_folder_abs_path(&folder_id)
-        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
-    fs::create_folder(&folder_root, &folder_id, &path).map_err(CommandError::Other)
+    let folder = state
+        .resolve_folder(folder_id.as_deref())
+        .map_err(CommandError::Other)?;
+    fs::create_folder(&folder.absolute_path, &folder.id, &path).map_err(CommandError::Other)
 }
 
 /// 重命名文件或目录
 #[tauri::command]
 pub fn rename_entry(
-    folder_id: String,
+    folder_id: Option<String>,
     old_path: String,
     new_path: String,
     state: tauri::State<'_, workspace::WorkspaceManager>,
 ) -> Result<fs::RenameEntryResult, CommandError> {
-    let folder_root = state
-        .get_folder_abs_path(&folder_id)
-        .ok_or_else(|| CommandError::Other(format!("folderId 不存在: {}", folder_id)))?;
-    fs::rename_entry(&folder_root, &folder_id, &old_path, &new_path).map_err(CommandError::Other)
+    let folder = state
+        .resolve_folder(folder_id.as_deref())
+        .map_err(CommandError::Other)?;
+    fs::rename_entry(&folder.absolute_path, &folder.id, &old_path, &new_path)
+        .map_err(CommandError::Other)
 }
 
 // ---- 原生对话框 ----
@@ -424,7 +425,7 @@ pub fn execute_agent_tool(_request: serde_json::Value) -> Result<serde_json::Val
 
 // 窗口管理
 #[tauri::command]
-pub fn window_close_ask_status(app_handle: tauri::AppHandle) -> Result<bool, String> {
+pub fn window_close_ask_status(_app_handle: tauri::AppHandle) -> Result<bool, String> {
     // 通过 emit 向前端询问状态，此函数仅用于标记接口存在
     // 实际逻辑前端自行处理
     Ok(false)

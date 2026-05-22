@@ -57,7 +57,7 @@ pub struct WorkspaceSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceState {
-    pub current: WorkspaceSpec,
+    pub current: Option<WorkspaceSpec>,
     pub fallback_used: bool,
     pub last_error: Option<String>,
 }
@@ -109,44 +109,20 @@ impl WorkspaceManager {
         }
     }
 
-    /// 获取当前工作区状态；若未打开则初始化 fallback，保证后续文件操作能解析 wf-0
+    /// 获取当前工作区状态；若未打开则返回空状态，等待用户主动打开目录或 workspace 文件
     pub fn get_current(&self) -> WorkspaceState {
-        let mut inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         if let Some(ws) = &inner.current {
             return WorkspaceState {
-                current: ws.clone(),
+                current: Some(ws.clone()),
                 fallback_used: matches!(ws.source, WorkspaceSourceKind::Fallback),
                 last_error: None,
             };
         }
 
-        // 返回 fallback 工作区：当前工作目录，同时写入 current 作为事实源
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let folder_name = cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "workspace".into());
-        let abs = to_posix(&cwd);
-        let fallback = WorkspaceSpec {
-            id: "fallback".into(),
-            name: folder_name,
-            source: WorkspaceSourceKind::Fallback,
-            source_path: None,
-            folders: vec![WorkspaceFolderSpec {
-                id: "wf-0".into(),
-                name: abs.split('/').last().unwrap_or("workspace").into(),
-                absolute_path: abs.clone(),
-                original_path: abs,
-                is_absolute: true,
-            }],
-            settings: serde_json::json!({}),
-            unsupported_fields: vec![],
-            opened_at: chrono_now_iso(),
-        };
-        inner.current = Some(fallback.clone());
         WorkspaceState {
-            current: fallback,
-            fallback_used: true,
+            current: None,
+            fallback_used: false,
             last_error: None,
         }
     }
@@ -434,15 +410,26 @@ impl WorkspaceManager {
         })
     }
 
-    /// 按 folderId 获取 folder 的绝对路径
-    pub fn get_folder_abs_path(&self, folder_id: &str) -> Option<String> {
+    /// 解析 folder；folder_id 为空时使用当前工作区第一个 folder。
+    pub fn resolve_folder(&self, folder_id: Option<&str>) -> Result<WorkspaceFolderSpec, String> {
         let inner = self.inner.lock().unwrap();
-        inner.current.as_ref().and_then(|ws| {
-            ws.folders
+        let ws = inner
+            .current
+            .as_ref()
+            .ok_or_else(|| "no_workspace: no active workspace folder is available".to_string())?;
+        match folder_id {
+            Some(id) if !id.is_empty() => ws
+                .folders
                 .iter()
-                .find(|f| f.id == folder_id)
-                .map(|f| f.absolute_path.clone())
-        })
+                .find(|f| f.id == id)
+                .cloned()
+                .ok_or_else(|| format!("folderId 不存在: {}", id)),
+            _ => ws
+                .folders
+                .first()
+                .cloned()
+                .ok_or_else(|| "no_workspace: no active workspace folder is available".to_string()),
+        }
     }
 }
 
