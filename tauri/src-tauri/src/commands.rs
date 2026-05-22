@@ -1,35 +1,35 @@
 // commands.rs
 //
-// Tauri 命令模块
+// Tauri 鍛戒护妯″潡
 //
-// 当前阶段说明：
-//   - 工作区管理、文件系统读写已由 Rust command 承接；
-//   - LLM / Skill 仍为空操作 stub，待后续阶段接入；
-//   - 所有 command 返回结构与 protocol DTO 字段同构，方便前端 adapter 复用。
-
+// 褰撳墠闃舵璇存槑锛?//   - 宸ヤ綔鍖虹鐞嗐€佹枃浠剁郴缁熻鍐欏凡鐢?Rust command 鎵挎帴锛?//   - LLM / Skill 浠嶄负绌烘搷浣?stub锛屽緟鍚庣画闃舵鎺ュ叆锛?//   - 鎵€鏈?command 杩斿洖缁撴瀯涓?protocol DTO 瀛楁鍚屾瀯锛屾柟渚垮墠绔?adapter 澶嶇敤銆?
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
 use thiserror::Error;
 
+use crate::agent;
 use crate::fs;
 use crate::llm_profiles;
 use crate::terminal;
 use crate::user_settings;
 use crate::workspace;
 
-// ---- 错误模型 ----
+// ---- 閿欒妯″瀷 ----
+
 
 #[derive(Debug, Error, Serialize)]
 pub enum CommandError {
-    /// 命令尚未实现（用于 LLM / Skill 等空操作 stub）
-    #[error("not_implemented: {0}")]
+    /// 鍛戒护灏氭湭瀹炵幇锛堢敤浜?LLM / Skill 绛夌┖鎿嶄綔 stub锛?
+#[error("not_implemented: {0}")]
     NotImplemented(String),
-    /// 用户在原生对话框中取消选择
-    #[error("user_cancelled")]
+    /// 鐢ㄦ埛鍦ㄥ師鐢熷璇濇涓彇娑堥€夋嫨
+
+#[error("user_cancelled")]
     UserCancelled,
-    /// 通用错误
-    #[error("{0}")]
+    /// 閫氱敤閿欒
+
+#[error("{0}")]
     Other(String),
 }
 
@@ -45,9 +45,9 @@ impl From<terminal::TerminalError> for CommandError {
     }
 }
 
-// ---- 运行时状态 ----
+// ---- 杩愯鏃剁姸鎬?----
 
-/// 运行时状态信息
+/// 杩愯鏃剁姸鎬佷俊鎭?
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStatus {
@@ -57,10 +57,8 @@ pub struct RuntimeStatus {
     pub arch: String,
 }
 
-/// 返回当前运行时状态：类型、版本、平台、架构。
-///
-/// 平台与架构使用 `std::env::consts` 运行期常量，而非编译期 `env!("TARGET")`；
-/// 后者在 proc macro 阶段不可用（Cargo 只在 build script 阶段设置 TARGET）。
+/// 杩斿洖褰撳墠杩愯鏃剁姸鎬侊細绫诲瀷銆佺増鏈€佸钩鍙般€佹灦鏋勩€?///
+/// 骞冲彴涓庢灦鏋勪娇鐢?`std::env::consts` 杩愯鏈熷父閲忥紝鑰岄潪缂栬瘧鏈?`env!("TARGET")`锛?/// 鍚庤€呭湪 proc macro 闃舵涓嶅彲鐢紙Cargo 鍙湪 build script 闃舵璁剧疆 TARGET锛夈€?
 #[tauri::command]
 pub fn get_runtime_status(app: AppHandle) -> RuntimeStatus {
     RuntimeStatus {
@@ -71,9 +69,9 @@ pub fn get_runtime_status(app: AppHandle) -> RuntimeStatus {
     }
 }
 
-// ---- 工作区 ----
+// ---- 宸ヤ綔鍖?----
 
-/// 获取当前活动工作区状态
+/// 鑾峰彇褰撳墠娲诲姩宸ヤ綔鍖虹姸鎬?
 #[tauri::command]
 pub fn get_current_workspace(
     state: tauri::State<'_, workspace::WorkspaceManager>,
@@ -81,7 +79,7 @@ pub fn get_current_workspace(
     state.get_current()
 }
 
-/// 打开工作区（目录或 .code-workspace 文件）
+/// 鎵撳紑宸ヤ綔鍖猴紙鐩綍鎴?.code-workspace 鏂囦欢锛?
 #[tauri::command]
 pub fn open_workspace(
     path: String,
@@ -91,6 +89,7 @@ pub fn open_workspace(
         .open_workspace(&path)
         .map_err(CommandError::Other)
 }
+
 
 #[tauri::command]
 pub fn save_workspace_file(
@@ -103,7 +102,8 @@ pub fn save_workspace_file(
         .map_err(CommandError::Other)
 }
 
-/// 合并当前工作区 DeepCode 命名空间设置（内存态）
+/// 鍚堝苟褰撳墠宸ヤ綔鍖?DeepCode 鍛藉悕绌洪棿璁剧疆锛堝唴瀛樻€侊級
+
 #[tauri::command]
 pub fn patch_workspace_settings(
     settings: serde_json::Value,
@@ -114,23 +114,25 @@ pub fn patch_workspace_settings(
         .map_err(CommandError::Other)
 }
 
-// ---- 文件系统浏览（用于 Open Workspace 对话框）----
+// ---- 鏂囦欢绯荤粺娴忚锛堢敤浜?Open Workspace 瀵硅瘽妗嗭級----
 
-/// 获取初始位置（Home / Drives）
+/// 鑾峰彇鍒濆浣嶇疆锛圚ome / Drives锛?
 #[tauri::command]
 pub fn get_initial_locations() -> fs::InitialLocations {
     fs::get_initial_locations()
 }
 
-/// 浏览指定绝对路径下的子项
+/// 娴忚鎸囧畾缁濆璺緞涓嬬殑瀛愰」
+
 #[tauri::command]
 pub fn browse_path(path: String) -> Result<fs::BrowsePathResult, CommandError> {
     fs::browse_path(&path).map_err(CommandError::Other)
 }
 
-// ---- 文件 ----
+// ---- 鏂囦欢 ----
 
-/// 列活动 folder 的目录树
+/// 鍒楁椿鍔?folder 鐨勭洰褰曟爲
+
 #[tauri::command]
 pub fn list_file_tree(
     folder_id: Option<String>,
@@ -142,7 +144,8 @@ pub fn list_file_tree(
     fs::build_file_tree(&folder.absolute_path, &folder.id).map_err(CommandError::Other)
 }
 
-/// 读取工作区内文本文件
+/// 璇诲彇宸ヤ綔鍖哄唴鏂囨湰鏂囦欢
+
 #[tauri::command]
 pub fn read_text_file(
     folder_id: Option<String>,
@@ -155,7 +158,8 @@ pub fn read_text_file(
     fs::read_text_file(&folder.absolute_path, &folder.id, &path).map_err(CommandError::Other)
 }
 
-/// 写入工作区内文本文件
+/// 鍐欏叆宸ヤ綔鍖哄唴鏂囨湰鏂囦欢
+
 #[tauri::command]
 pub fn write_text_file(
     folder_id: Option<String>,
@@ -169,7 +173,7 @@ pub fn write_text_file(
     fs::write_text_file(&folder.absolute_path, &folder.id, &path, &content).map_err(CommandError::Other)
 }
 
-/// 新建文件（阶段 4 / S4-1）
+/// 鏂板缓鏂囦欢锛堥樁娈?4 / S4-1锛?
 #[tauri::command]
 pub fn create_file(
     folder_id: Option<String>,
@@ -184,7 +188,7 @@ pub fn create_file(
     fs::create_file(&folder.absolute_path, &folder.id, &path, &initial).map_err(CommandError::Other)
 }
 
-/// 新建目录（阶段 4 / S4-1）
+/// 鏂板缓鐩綍锛堥樁娈?4 / S4-1锛?
 #[tauri::command]
 pub fn create_folder(
     folder_id: Option<String>,
@@ -197,7 +201,8 @@ pub fn create_folder(
     fs::create_folder(&folder.absolute_path, &folder.id, &path).map_err(CommandError::Other)
 }
 
-/// 重命名文件或目录
+/// 閲嶅懡鍚嶆枃浠舵垨鐩綍
+
 #[tauri::command]
 pub fn rename_entry(
     folder_id: Option<String>,
@@ -212,9 +217,10 @@ pub fn rename_entry(
         .map_err(CommandError::Other)
 }
 
-// ---- 原生对话框 ----
+// ---- 鍘熺敓瀵硅瘽妗?----
 
-/// 弹出原生 dialog 让用户选择目录
+/// 寮瑰嚭鍘熺敓 dialog 璁╃敤鎴烽€夋嫨鐩綍
+
 #[tauri::command]
 pub async fn pick_workspace_directory(app: AppHandle) -> Result<String, CommandError> {
     use std::sync::mpsc;
@@ -234,7 +240,8 @@ pub async fn pick_workspace_directory(app: AppHandle) -> Result<String, CommandE
     }
 }
 
-/// 弹出原生 dialog 让用户选择 .code-workspace 文件
+/// 寮瑰嚭鍘熺敓 dialog 璁╃敤鎴烽€夋嫨 .code-workspace 鏂囦欢
+
 #[tauri::command]
 pub async fn pick_workspace_file(app: AppHandle) -> Result<String, CommandError> {
     use std::sync::mpsc;
@@ -257,9 +264,10 @@ pub async fn pick_workspace_file(app: AppHandle) -> Result<String, CommandError>
     }
 }
 
-// ---- LLM 空操作 Stub ----
+// ---- LLM 绌烘搷浣?Stub ----
 //
-// stub 阶段 payload 仅用于冻结前后端契约，字段本身不被读取；后续阶段接入真实 LLM 后才会使用。
+// stub 闃舵 payload 浠呯敤浜庡喕缁撳墠鍚庣濂戠害锛屽瓧娈垫湰韬笉琚鍙栵紱鍚庣画闃舵鎺ュ叆鐪熷疄 LLM 鍚庢墠浼氫娇鐢ㄣ€?#[allow(dead_code)]
+
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct LlmInvokePayload {
@@ -268,22 +276,25 @@ pub struct LlmInvokePayload {
     pub context_snippets: Option<Vec<String>>,
 }
 
+
 #[derive(Debug, Serialize)]
 pub struct LlmInvokeResult {
     pub status: String,
 }
 
-/// LLM 调用空操作 stub
+/// LLM 璋冪敤绌烘搷浣?stub
+
 #[tauri::command]
 pub fn llm_invoke_stub(_payload: LlmInvokePayload) -> Result<LlmInvokeResult, CommandError> {
     Err(CommandError::NotImplemented(
-        "llm_invoke 接口尚未接入；当前为骨架阶段".into(),
+        "llm_invoke 鎺ュ彛灏氭湭鎺ュ叆锛涘綋鍓嶄负楠ㄦ灦闃舵".into(),
     ))
 }
 
-// ---- Skill 空操作 Stub ----
+// ---- Skill 绌烘搷浣?Stub ----
 //
-// 同 LLM stub：兑现前不被读取，仅用于冻结 schema。
+// 鍚?LLM stub锛氬厬鐜板墠涓嶈璇诲彇锛屼粎鐢ㄤ簬鍐荤粨 schema銆?#[allow(dead_code)]
+
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct SkillInvokePayload {
@@ -291,28 +302,30 @@ pub struct SkillInvokePayload {
     pub args: serde_json::Value,
 }
 
+
 #[derive(Debug, Serialize)]
 pub struct SkillInvokeResult {
     pub status: String,
 }
 
-/// Skill 调用空操作 stub
+/// Skill 璋冪敤绌烘搷浣?stub
+
 #[tauri::command]
 pub fn skill_invoke_stub(_payload: SkillInvokePayload) -> Result<SkillInvokeResult, CommandError> {
     Err(CommandError::NotImplemented(
-        "skill_invoke 接口尚未接入；当前为骨架阶段".into(),
+        "skill_invoke 鎺ュ彛灏氭湭鎺ュ叆锛涘綋鍓嶄负楠ㄦ灦闃舵".into(),
     ))
 }
 
-// ---- 用户设置（阶段 4 / S4-4）----
+// ---- 鐢ㄦ埛璁剧疆锛堥樁娈?4 / S4-4锛?---
 
-/// 获取当前用户设置（默认值 + 用户覆盖）
+/// 鑾峰彇褰撳墠鐢ㄦ埛璁剧疆锛堥粯璁ゅ€?+ 鐢ㄦ埛瑕嗙洊锛?
 #[tauri::command]
 pub fn get_user_settings() -> user_settings::GetUserSettingsResult {
     user_settings::get_user_settings()
 }
 
-/// 浅合并用户设置；patches 中显式 null = 恢复默认值
+/// 娴呭悎骞剁敤鎴疯缃紱patches 涓樉寮?null = 鎭㈠榛樿鍊?
 #[tauri::command]
 pub fn patch_user_settings(
     patches: std::collections::BTreeMap<String, serde_json::Value>,
@@ -320,13 +333,13 @@ pub fn patch_user_settings(
     user_settings::patch_user_settings(patches).map_err(CommandError::Other)
 }
 
-// ---- 阶段 6 Tauri 桥接占位 ----
+// ---- 闃舵 6 Tauri 妗ユ帴鍗犱綅 ----
 //
-// Web/Node 模式已经接入真实实现。桌面壳先注册同名 command，避免前端在 Tauri
-// 模式下遇到 unknown command；后续再把 secret store、LLM adapter、session JSONL
-// 移植到 Rust 侧。
-
+// Web/Node 妯″紡宸茬粡鎺ュ叆鐪熷疄瀹炵幇銆傛闈㈠３鍏堟敞鍐屽悓鍚?command锛岄伩鍏嶅墠绔湪 Tauri
+// 妯″紡涓嬮亣鍒?unknown command锛涘悗缁啀鎶?secret store銆丩LM adapter銆乻ession JSONL
+// 绉绘鍒?Rust 渚с€?
 // ---- Terminal ----
+
 
 #[tauri::command]
 pub fn get_terminal_capabilities(
@@ -335,12 +348,14 @@ pub fn get_terminal_capabilities(
     state.capabilities()
 }
 
+
 #[tauri::command]
 pub fn get_terminal_warmup_status(
     state: tauri::State<'_, terminal::TerminalManager>,
 ) -> terminal::TerminalWarmupStatus {
     state.warmup_status()
 }
+
 
 #[tauri::command]
 pub fn warmup_terminal_runtime(
@@ -349,12 +364,14 @@ pub fn warmup_terminal_runtime(
     state.warmup()
 }
 
+
 #[tauri::command]
 pub fn list_terminal_sessions(
     state: tauri::State<'_, terminal::TerminalManager>,
 ) -> terminal::TerminalSessionsResult {
     state.list_sessions()
 }
+
 
 #[tauri::command]
 pub fn create_terminal_session(
@@ -363,6 +380,7 @@ pub fn create_terminal_session(
 ) -> Result<terminal::TerminalSession, CommandError> {
     state.create_session(request).map_err(CommandError::from)
 }
+
 
 #[tauri::command]
 pub fn send_terminal_input(
@@ -375,6 +393,7 @@ pub fn send_terminal_input(
         .map_err(CommandError::from)
 }
 
+
 #[tauri::command]
 pub fn resize_terminal_session(
     session_id: String,
@@ -385,6 +404,7 @@ pub fn resize_terminal_session(
         .resize_session(&session_id, request)
         .map_err(CommandError::from)
 }
+
 
 #[tauri::command]
 pub fn update_terminal_session(
@@ -397,6 +417,7 @@ pub fn update_terminal_session(
         .map_err(CommandError::from)
 }
 
+
 #[tauri::command]
 pub fn restart_terminal_session(
     session_id: String,
@@ -405,6 +426,7 @@ pub fn restart_terminal_session(
     state.restart_session(&session_id).map_err(CommandError::from)
 }
 
+
 #[tauri::command]
 pub fn delete_terminal_session(
     session_id: String,
@@ -412,6 +434,7 @@ pub fn delete_terminal_session(
 ) -> Result<terminal::TerminalSession, CommandError> {
     state.delete_session(&session_id).map_err(CommandError::from)
 }
+
 
 #[tauri::command]
 pub fn get_terminal_events(
@@ -422,6 +445,7 @@ pub fn get_terminal_events(
     state.get_events(session_id.as_deref(), after)
 }
 
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmProfilesResult {
@@ -430,6 +454,7 @@ pub struct LlmProfilesResult {
     pub store_path: Option<String>,
 }
 
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSessionResult {
@@ -437,17 +462,20 @@ pub struct AgentSessionResult {
     pub events: Vec<serde_json::Value>,
 }
 
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeSearchResult {
     pub matches: Vec<serde_json::Value>,
 }
 
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListToolsResult {
     pub tools: Vec<serde_json::Value>,
 }
+
 
 #[tauri::command]
 pub fn get_llm_profiles() -> llm_profiles::LlmProfilesResult {
@@ -488,12 +516,14 @@ pub fn get_llm_profiles_stub() -> LlmProfilesResult {
     }
 }
 
+
 #[tauri::command]
 pub fn patch_llm_profiles(
     request: serde_json::Value,
 ) -> Result<llm_profiles::LlmProfilesResult, CommandError> {
     llm_profiles::patch_profiles(request).map_err(CommandError::Other)
 }
+
 
 #[tauri::command]
 pub async fn probe_llm_profile(
@@ -504,198 +534,122 @@ pub async fn probe_llm_profile(
         .map_err(CommandError::Other)
 }
 
+
 #[tauri::command]
 pub async fn llm_chat(request: serde_json::Value) -> Result<serde_json::Value, CommandError> {
     llm_profiles::chat(request)
         .await
         .map_err(CommandError::Other)
 }
-fn empty_agent_workflow_config() -> serde_json::Value {
-    serde_json::json!({
-        "plan": {},
-        "check": {},
-        "complete": {},
-        "review": {}
-    })
-}
-
-fn normalize_agent_workflow_config(raw: Option<&serde_json::Value>) -> serde_json::Value {
-    let source = raw.and_then(|value| value.as_object());
-    let mut config = serde_json::Map::new();
-    for stage in ["plan", "check", "complete", "review"] {
-        let profile_id = source
-            .and_then(|map| map.get(stage))
-            .and_then(|value| value.get("profileId"))
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty());
-        config.insert(
-            stage.to_string(),
-            match profile_id {
-                Some(profile_id) => serde_json::json!({ "profileId": profile_id }),
-                None => serde_json::json!({}),
-            },
-        );
-    }
-    serde_json::Value::Object(config)
-}
-
 #[tauri::command]
 pub fn get_agent_workflow_config() -> serde_json::Value {
-    serde_json::json!({
-        "config": empty_agent_workflow_config(),
-        "storePath": null,
-        "initialized": false
-    })
+    agent::get_workflow_config()
 }
 
-#[tauri::command]
-pub fn patch_agent_workflow_config(request: serde_json::Value) -> serde_json::Value {
-    let body = request.get("request").unwrap_or(&request);
-    let config = normalize_agent_workflow_config(body.get("config"));
-    let initialized = ["plan", "check", "complete", "review"]
-        .iter()
-        .any(|stage| {
-            config
-                .get(stage)
-                .and_then(|value| value.get("profileId"))
-                .and_then(|value| value.as_str())
-                .is_some()
-        });
-    serde_json::json!({
-        "config": config,
-        "storePath": null,
-        "initialized": initialized
-    })
-}
 
 #[tauri::command]
-pub fn code_search(_request: serde_json::Value) -> CodeSearchResult {
-    CodeSearchResult { matches: Vec::new() }
+pub fn patch_agent_workflow_config(
+    request: serde_json::Value,
+) -> Result<serde_json::Value, CommandError> {
+    agent::patch_workflow_config(request).map_err(CommandError::Other)
 }
 
-#[tauri::command]
-pub fn create_agent_session(_request: serde_json::Value) -> Result<AgentSessionResult, CommandError> {
-    Err(CommandError::NotImplemented(
-        "Tauri 模式 Agent session 尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
-    ))
-}
 
 #[tauri::command]
-pub fn get_current_agent_session() -> Option<AgentSessionResult> {
-    None
+pub fn code_search(
+    request: serde_json::Value,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> serde_json::Value {
+    agent::code_search(request, &state)
 }
+
+
+#[tauri::command]
+pub fn create_agent_session(
+    request: serde_json::Value,
+    agent_state: tauri::State<'_, agent::AgentManager>,
+) -> agent::AgentSessionResult {
+    agent_state.create_session(request)
+}
+
+
+#[tauri::command]
+pub fn get_current_agent_session(
+    agent_state: tauri::State<'_, agent::AgentManager>,
+) -> Option<agent::AgentSessionResult> {
+    agent_state.current_session()
+}
+
 
 #[tauri::command]
 pub fn append_agent_events(
-    _session_id: String,
-    _request: serde_json::Value,
-) -> Result<AgentSessionResult, CommandError> {
-    Err(CommandError::NotImplemented(
-        "Tauri 模式 Agent session 写入尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
-    ))
+    session_id: String,
+    request: serde_json::Value,
+    agent_state: tauri::State<'_, agent::AgentManager>,
+) -> Result<agent::AgentSessionResult, CommandError> {
+    agent_state
+        .append_events(&session_id, request)
+        .map_err(CommandError::Other)
 }
 
+
 #[tauri::command]
-pub fn list_agent_tools(_mode: Option<String>) -> ListToolsResult {
+pub fn list_agent_tools(mode: Option<String>) -> ListToolsResult {
     ListToolsResult {
-        tools: vec![
-            serde_json::json!({
-                "name": "fs.read",
-                "description": "Read a text file from the active workspace.",
-                "inputSchema": { "type": "object", "required": ["path"], "properties": { "path": { "type": "string" }, "folderId": { "type": "string" } } },
-                "riskLevel": "low",
-                "needsApproval": false,
-                "allowedModes": ["readOnly", "plan", "askBeforeWrite"]
-            }),
-            serde_json::json!({
-                "name": "fs.list",
-                "description": "List a workspace directory tree with a bounded depth.",
-                "inputSchema": { "type": "object", "properties": { "path": { "type": "string" }, "folderId": { "type": "string" }, "depth": { "type": "number" } } },
-                "riskLevel": "low",
-                "needsApproval": false,
-                "allowedModes": ["readOnly", "plan", "askBeforeWrite"]
-            }),
-            serde_json::json!({
-                "name": "fs.diff",
-                "description": "Preview a file diff without writing content.",
-                "inputSchema": { "type": "object", "required": ["path", "newContent"], "properties": { "path": { "type": "string" }, "folderId": { "type": "string" }, "newContent": { "type": "string" } } },
-                "riskLevel": "low",
-                "needsApproval": false,
-                "allowedModes": ["readOnly", "plan", "askBeforeWrite"]
-            }),
-            serde_json::json!({
-                "name": "code.search",
-                "description": "Search text across the workspace with bounded results.",
-                "inputSchema": { "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "isRegex": { "type": "boolean" }, "include": { "type": "array", "items": { "type": "string" } }, "folderId": { "type": "string" } } },
-                "riskLevel": "low",
-                "needsApproval": false,
-                "allowedModes": ["readOnly", "plan", "askBeforeWrite"]
-            }),
-            serde_json::json!({
-                "name": "shell.propose",
-                "description": "Return a proposed shell command. The command is never executed.",
-                "inputSchema": { "type": "object", "required": ["command"], "properties": { "command": { "type": "string" }, "reason": { "type": "string" } } },
-                "riskLevel": "medium",
-                "needsApproval": false,
-                "allowedModes": ["plan", "askBeforeWrite"]
-            }),
-            serde_json::json!({
-                "name": "shell.exec",
-                "description": "Run a command in an Agent-owned temporary shell after explicit approval.",
-                "inputSchema": { "type": "object", "required": ["command"], "properties": { "command": { "type": "string" }, "cwd": { "type": "string" }, "timeoutMs": { "type": "number" }, "reason": { "type": "string" } } },
-                "riskLevel": "high",
-                "needsApproval": true,
-                "allowedModes": ["askBeforeWrite"]
-            }),
-            serde_json::json!({
-                "name": "fs.write",
-                "description": "Write a text file after an explicit permission approval.",
-                "inputSchema": { "type": "object", "required": ["path", "content"], "properties": { "path": { "type": "string" }, "content": { "type": "string" }, "folderId": { "type": "string" } } },
-                "riskLevel": "high",
-                "needsApproval": true,
-                "allowedModes": ["askBeforeWrite"]
-            })
-        ],
+        tools: agent::list_tools(mode)
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
     }
 }
 
+
 #[tauri::command]
 pub fn evaluate_agent_permission(
-    _request: serde_json::Value,
+    request: serde_json::Value,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
 ) -> Result<serde_json::Value, CommandError> {
-    Err(CommandError::NotImplemented(
-        "Tauri Agent permission gate is not implemented yet; use Web/Node mode for Stage 6 validation.".into(),
-    ))
+    Ok(agent::evaluate_permission(request, &state))
 }
 
-#[tauri::command]
-pub fn execute_agent_tool(_request: serde_json::Value) -> Result<serde_json::Value, CommandError> {
-    Err(CommandError::NotImplemented(
-        "Tauri Agent tool executor is not implemented yet; use Web/Node mode for Stage 6 validation.".into(),
-    ))
-}
 
 #[tauri::command]
-pub fn send_agent_message(
-    _session_id: String,
-    _request: serde_json::Value,
-) -> Result<AgentSessionResult, CommandError> {
-    Err(CommandError::NotImplemented(
-        "Tauri Agent workflow runner is not implemented yet; use Web/Node mode for Stage 6 validation.".into(),
-    ))
+pub fn execute_agent_tool(
+    request: serde_json::Value,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<serde_json::Value, CommandError> {
+    Ok(agent::execute_tool(request, &state))
 }
+
+
+#[tauri::command]
+pub async fn send_agent_message(
+    session_id: String,
+    request: serde_json::Value,
+    agent_state: tauri::State<'_, agent::AgentManager>,
+    workspace_state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<agent::AgentSessionResult, CommandError> {
+    agent_state
+        .send_message(&session_id, request, &workspace_state)
+        .await
+        .map_err(CommandError::Other)
+}
+
 
 #[tauri::command]
 pub fn resolve_agent_permission(
-    _permission_id: String,
-    _request: serde_json::Value,
-) -> Result<AgentSessionResult, CommandError> {
-    Err(CommandError::NotImplemented(
-        "Tauri Agent permission resolution is not implemented yet; use Web/Node mode for Stage 6 validation.".into(),
-    ))
+    permission_id: String,
+    request: serde_json::Value,
+    agent_state: tauri::State<'_, agent::AgentManager>,
+    workspace_state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<agent::AgentSessionResult, CommandError> {
+    agent_state
+        .resolve_permission(&permission_id, request, &workspace_state)
+        .map_err(CommandError::Other)
 }
 
-// 窗口管理
+// Window management
+
 #[tauri::command]
 pub fn submit_agent_feedback(request: serde_json::Value) -> serde_json::Value {
     let body = request.get("request").unwrap_or(&request);
@@ -715,6 +669,7 @@ fn browser_runtime_stub(message: &str, inspect_state: &str, current_url: Option<
     })
 }
 
+
 #[tauri::command]
 pub fn get_browser_runtime_status() -> serde_json::Value {
     browser_runtime_stub(
@@ -723,6 +678,7 @@ pub fn get_browser_runtime_status() -> serde_json::Value {
         None,
     )
 }
+
 
 #[tauri::command]
 pub fn open_browser_preview(request: serde_json::Value) -> serde_json::Value {
@@ -740,6 +696,7 @@ pub fn open_browser_preview(request: serde_json::Value) -> serde_json::Value {
     browser_runtime_stub(&message, "off", current_url)
 }
 
+
 #[tauri::command]
 pub fn reload_browser_preview() -> serde_json::Value {
     browser_runtime_stub(
@@ -748,6 +705,7 @@ pub fn reload_browser_preview() -> serde_json::Value {
         None,
     )
 }
+
 
 #[tauri::command]
 pub fn set_browser_inspect_mode(request: serde_json::Value) -> serde_json::Value {
@@ -761,6 +719,7 @@ pub fn set_browser_inspect_mode(request: serde_json::Value) -> serde_json::Value
     browser_runtime_stub(&message, inspect_state, None)
 }
 
+
 #[tauri::command]
 pub fn get_selected_panel_snapshot() -> serde_json::Value {
     serde_json::json!({
@@ -768,6 +727,7 @@ pub fn get_selected_panel_snapshot() -> serde_json::Value {
         "message": "No panel snapshot is available yet. DOM capture is reserved for a later stage."
     })
 }
+
 
 #[tauri::command]
 pub fn attach_panel_snapshot_to_agent() -> serde_json::Value {
@@ -778,9 +738,10 @@ pub fn attach_panel_snapshot_to_agent() -> serde_json::Value {
     })
 }
 
+
 #[tauri::command]
 pub fn window_close_ask_status(_app_handle: tauri::AppHandle) -> Result<bool, String> {
-    // 通过 emit 向前端询问状态，此函数仅用于标记接口存在
-    // 实际逻辑前端自行处理
+    // 閫氳繃 emit 鍚戝墠绔闂姸鎬侊紝姝ゅ嚱鏁颁粎鐢ㄤ簬鏍囪鎺ュ彛瀛樺湪
+    // 瀹為檯閫昏緫鍓嶇鑷澶勭悊
     Ok(false)
 }

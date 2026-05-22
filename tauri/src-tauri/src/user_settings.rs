@@ -42,7 +42,7 @@ pub struct PatchUserSettingsResult {
 /// 默认设置；与 protocol/userSettings.ts DEFAULT_USER_SETTINGS 同构。
 fn build_default_settings() -> BTreeMap<String, JsonValue> {
     let mut m = BTreeMap::new();
-    // 编辑器
+
     m.insert("editor.tabSize".into(), JsonValue::from(4));
     m.insert("editor.insertSpaces".into(), JsonValue::from(true));
     m.insert("editor.wordWrap".into(), JsonValue::from("off"));
@@ -58,32 +58,47 @@ fn build_default_settings() -> BTreeMap<String, JsonValue> {
         "editor.unicodeHighlight.invisibleCharacters".into(),
         JsonValue::from(false),
     );
-    // 文件
+
     m.insert("files.autoSave".into(), JsonValue::from("afterDelay"));
     m.insert("files.autoSaveDelay".into(), JsonValue::from(1000));
     m.insert("files.hotExit".into(), JsonValue::from(true));
     m.insert("files.encoding".into(), JsonValue::from("utf8"));
     m.insert("files.eol".into(), JsonValue::from("\n"));
-    // 键盘
-    m.insert(
-        "keyboard.enableBasicShortcuts".into(),
-        JsonValue::from(true),
-    );
-    // 资源管理器
+
+    m.insert("keyboard.enableBasicShortcuts".into(), JsonValue::from(true));
     m.insert("explorer.confirmDelete".into(), JsonValue::from(false));
-    // 工作台
+
     m.insert("workbench.colorTheme".into(), JsonValue::from("vs-dark"));
-    // Agent / Skill / Prompt
+    m.insert("workbench.language".into(), JsonValue::from("zh-CN"));
+    m.insert("workbench.styleTokenOverrides".into(), JsonValue::from("{}"));
+
+    m.insert(
+        "terminal.integrated.defaultProfile.windows".into(),
+        JsonValue::from("wsl"),
+    );
+    m.insert("terminal.integrated.prewarm".into(), JsonValue::from("afterStartup"));
+    m.insert("terminal.integrated.spawnTimeoutMs".into(), JsonValue::from(8000));
+
+    m.insert("agent.defaultMode".into(), JsonValue::from("plan"));
+    m.insert("agent.defaultWorkflow".into(), JsonValue::from("planFirst"));
+    m.insert("agent.permissions.allowFileRead".into(), JsonValue::from(true));
+    m.insert("agent.permissions.allowFileWrite".into(), JsonValue::from(true));
+    m.insert("agent.permissions.allowCodeSearch".into(), JsonValue::from(true));
+    m.insert("agent.permissions.allowShellPropose".into(), JsonValue::from(true));
+    m.insert("agent.permissions.allowShellExec".into(), JsonValue::from(true));
+    m.insert("agent.shell.autoExecuteCommands".into(), JsonValue::from(false));
+    m.insert(
+        "agent.shell.commandBlacklist".into(),
+        JsonValue::from("rm -rf, del /f, format, shutdown, reboot, git reset --hard, git clean -fd"),
+    );
+
     m.insert("skills.pythonPath".into(), JsonValue::from("python"));
     m.insert("skills.autoLoad".into(), JsonValue::from(true));
     m.insert("skills.mounts".into(), JsonValue::from("[]"));
-    m.insert(
-        "prompt.defaultProfileId".into(),
-        JsonValue::from("default-agent"),
-    );
+    m.insert("prompt.defaultProfileId".into(), JsonValue::from("default-agent"));
     m.insert(
         "prompt.profiles".into(),
-        JsonValue::from("[{\"id\":\"default-agent\",\"name\":\"Default Agent\",\"description\":\"通用代码协作 Agent\",\"systemPrompt\":\"You are DeepCode Agent. Work inside the current workspace, explain important risks, and ask for approval before writing files.\",\"enabled\":true}]"),
+        JsonValue::from("[{\"id\":\"default-agent\",\"name\":\"Default Agent\",\"description\":\"Default coding assistant profile\",\"systemPrompt\":\"You are DeepCode Agent. Work inside the current workspace, explain important risks, and ask for approval before writing files.\",\"enabled\":true}]"),
     );
     m.insert("ruler.enabled".into(), JsonValue::from(true));
     m.insert(

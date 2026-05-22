@@ -195,7 +195,7 @@ const App: React.FC = () => {
     setConfirmDialog({
       open: true,
       title: '保存更改',
-      message: '当前有未保存的文件。退出前需要保存这些更改吗？',
+      message: '当前有未保存的文件。退出前是否保存这些更改？',
       detail: '选择“不保存”会放弃当前编辑器中的未保存内容；选择“取消”将返回 DeepCode。',
       actions,
     });
@@ -203,7 +203,6 @@ const App: React.FC = () => {
 
   // ---- 1. Load workspace and user settings ----
   useEffect(() => {
-    markStartup('deepcode:first-workbench-shell');
     return afterFirstPaint(() => {
       void loadWorkspace().finally(() => markStartup('deepcode:workspace-loaded'));
       void loadUserSettings().finally(() => markStartup('deepcode:settings-loaded'));
@@ -257,7 +256,7 @@ const App: React.FC = () => {
         setServerVersion(result.data.version);
       } else {
         setApiStatus('error');
-        setErrorMessage(result.message || 'API 不可达');
+        setErrorMessage(result.message || 'API unavailable');
       }
     };
 
@@ -302,6 +301,7 @@ const App: React.FC = () => {
   // ---- 3.1 Terminal runtime warmup ----
   useEffect(() => {
     if (terminalPrewarm !== 'afterStartup') return;
+    if (getRuntimeType() === 'tauri' && import.meta.env.PROD) return;
     let cancelIdle: (() => void) | null = null;
     const cancelFirstPaint = afterFirstPaint(() => {
       cancelIdle = scheduleIdle(() => {

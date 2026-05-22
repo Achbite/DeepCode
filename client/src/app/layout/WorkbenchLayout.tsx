@@ -10,7 +10,6 @@ import {
   useEditorStore,
   buildFileTabId,
 } from '../../state/editorStore';
-import { useAgentSessionStore } from '../../state/agentSessionStore';
 
 interface WorkbenchLayoutProps {
   apiStatus: string;
@@ -86,7 +85,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   const updateContent = useEditorStore((s) => s.updateContent);
   const saveFile = useEditorStore((s) => s.saveFile);
   const setActiveTab = useEditorStore((s) => s.setActiveTab);
-  const addAgentAttachment = useAgentSessionStore((s) => s.addAttachment);
 
   const activeTab = tabs.find((tab) => {
     const id = tab.kind === 'file' ? buildFileTabId(tab.folderId, tab.path) : tab.id;
@@ -108,6 +106,14 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   );
   const [terminalMinimized, setTerminalMinimized] = useState(false);
   const [editorMode, setEditorMode] = useState<InternalBrowserMode>('code');
+
+  useEffect(() => {
+    if (typeof performance === 'undefined') return;
+    performance.mark('deepcode:first-workbench-shell');
+    window.requestAnimationFrame(() => {
+      performance.mark('deepcode:first-interactive-shell');
+    });
+  }, []);
 
   useEffect(() => {
     window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
@@ -203,6 +209,17 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
     '--bottom-height': terminalMinimized ? '0px' : `${bottomHeight}px`,
   } as React.CSSProperties;
 
+  const addFileTabToAgentContext = async (tab: Extract<(typeof tabs)[number], { kind: 'file' }>) => {
+    const { useAgentSessionStore } = await import('../../state/agentSessionStore');
+    useAgentSessionStore.getState().addAttachment({
+      kind: 'file',
+      path: tab.path,
+      folderId: tab.folderId,
+      source: 'contextMenu',
+      scope: 'message',
+    });
+  };
+
   return (
     <div
       className={`workbench-layout ${!sidebarVisible ? 'workbench-layout--no-sidebar' : ''} ${
@@ -294,13 +311,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
                   onContextMenu={(event) => {
                     if (tab.kind !== 'file') return;
                     event.preventDefault();
-                    addAgentAttachment({
-                      kind: 'file',
-                      path: tab.path,
-                      folderId: tab.folderId,
-                      source: 'contextMenu',
-                      scope: 'message',
-                    });
+                    void addFileTabToAgentContext(tab);
                   }}
                   className={`editor-tab ${isActive ? 'editor-tab--active' : ''} ${
                     tab.kind === 'settings' ? 'editor-tab--settings' : ''
