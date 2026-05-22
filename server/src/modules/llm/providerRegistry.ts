@@ -6,12 +6,38 @@ import type {
   ToolDefinition,
 } from '@deepcode/protocol';
 
+interface ToolNameMap {
+  toProvider: Map<string, string>;
+  fromProvider: Map<string, string>;
+}
+
 function safeJsonParse(raw: string): unknown {
   try {
     return JSON.parse(raw);
   } catch {
     return raw;
   }
+}
+
+function createToolNameMap(tools: ToolDefinition[] | undefined): ToolNameMap {
+  const toProvider = new Map<string, string>();
+  const fromProvider = new Map<string, string>();
+  const used = new Set<string>();
+
+  for (const tool of tools ?? []) {
+    const base = tool.name.replace(/[^a-zA-Z0-9_-]/g, '_') || 'tool';
+    let providerName = base;
+    let suffix = 2;
+    while (used.has(providerName)) {
+      providerName = `${base}_${suffix}`;
+      suffix += 1;
+    }
+    used.add(providerName);
+    toProvider.set(tool.name, providerName);
+    fromProvider.set(providerName, tool.name);
+  }
+
+  return { toProvider, fromProvider };
 }
 
 function normalizeOpenAiBaseUrl(profile: LlmProviderProfile): string {
@@ -40,22 +66,22 @@ function toOpenAiMessages(messages: LlmChatRequest['messages']) {
   }));
 }
 
-function toOpenAiTools(tools: ToolDefinition[] | undefined) {
+function toOpenAiTools(tools: ToolDefinition[] | undefined, names: ToolNameMap) {
   if (!tools || tools.length === 0) return undefined;
   return tools.map((tool) => ({
     type: 'function',
     function: {
-      name: tool.name.replace(/[^\w.-]/g, '_'),
+      name: names.toProvider.get(tool.name) ?? tool.name,
       description: tool.description,
       parameters: tool.inputSchema,
     },
   }));
 }
 
-function toAnthropicTools(tools: ToolDefinition[] | undefined) {
+function toAnthropicTools(tools: ToolDefinition[] | undefined, names: ToolNameMap) {
   if (!tools || tools.length === 0) return undefined;
   return tools.map((tool) => ({
-    name: tool.name.replace(/[^\w.-]/g, '_'),
+    name: names.toProvider.get(tool.name) ?? tool.name,
     description: tool.description,
     input_schema: tool.inputSchema,
   }));
@@ -75,7 +101,7 @@ function splitAnthropicMessages(messages: LlmChatRequest['messages']) {
   return { system, chatMessages };
 }
 
-function parseOpenAiChoice(choice: any): LlmChatResult {
+function parseOpenAiChoice(choice: any, names?: ToolNameMap): LlmChatResult {
   const chunks: LlmChatChunk[] = [];
   if (choice?.content) {
     chunks.push({ type: 'delta', content: String(choice.content) });
@@ -85,7 +111,8 @@ function parseOpenAiChoice(choice: any): LlmChatResult {
       type: 'tool_call',
       toolCall: {
         id: String(toolCall.id),
-        name: String(toolCall.function?.name ?? ''),
+        name: names?.fromProvider.get(String(toolCall.function?.name ?? '')) ??
+          String(toolCall.function?.name ?? ''),
         arguments: safeJsonParse(toolCall.function?.arguments ?? '{}'),
       },
     });
@@ -114,6 +141,7 @@ export class LlmProviderRegistry {
     apiKey: string,
     request: LlmChatRequest
   ): Promise<LlmChatResult> {
+    const toolNames = createToolNameMap(request.tools);
     const providerOptions =
       profile.thinking || profile.reasoningEffort
         ? {
@@ -131,7 +159,7 @@ export class LlmProviderRegistry {
       body: JSON.stringify({
         model: profile.model,
         messages: toOpenAiMessages(request.messages),
-        tools: toOpenAiTools(request.tools),
+        tools: toOpenAiTools(request.tools, toolNames),
         temperature: profile.temperature,
         max_tokens: profile.maxTokens,
         stream: false,
@@ -145,7 +173,7 @@ export class LlmProviderRegistry {
     }
 
     const json: any = await response.json();
-    return parseOpenAiChoice(json.choices?.[0]?.message);
+    return parseOpenAiChoice(json.choices?.[0]?.message, toolNames);
   }
 
   private async callAnthropic(
@@ -153,6 +181,7 @@ export class LlmProviderRegistry {
     apiKey: string,
     request: LlmChatRequest
   ): Promise<LlmChatResult> {
+    const toolNames = createToolNameMap(request.tools);
     const { system, chatMessages } = splitAnthropicMessages(request.messages);
     const response = await fetch(normalizeAnthropicBaseUrl(profile), {
       method: 'POST',
@@ -167,7 +196,7 @@ export class LlmProviderRegistry {
         temperature: profile.temperature,
         system: system || undefined,
         messages: chatMessages,
-        tools: toAnthropicTools(request.tools),
+        tools: toAnthropicTools(request.tools, toolNames),
       }),
     });
 
@@ -187,7 +216,7 @@ export class LlmProviderRegistry {
           type: 'tool_call',
           toolCall: {
             id: String(part.id),
-            name: String(part.name),
+            name: toolNames.fromProvider.get(String(part.name)) ?? String(part.name),
             arguments: part.input ?? {},
           },
         });
@@ -201,6 +230,7 @@ export class LlmProviderRegistry {
     profile: LlmProviderProfile,
     request: LlmChatRequest
   ): Promise<LlmChatResult> {
+    const toolNames = createToolNameMap(request.tools);
     const response = await fetch(normalizeOllamaBaseUrl(profile), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -210,7 +240,7 @@ export class LlmProviderRegistry {
           role: message.role === 'tool' ? 'user' : message.role,
           content: message.content,
         })),
-        tools: toOpenAiTools(request.tools),
+        tools: toOpenAiTools(request.tools, toolNames),
         stream: false,
         options: {
           temperature: profile.temperature,
@@ -225,6 +255,6 @@ export class LlmProviderRegistry {
     }
 
     const json: any = await response.json();
-    return parseOpenAiChoice(json.message);
+    return parseOpenAiChoice(json.message, toolNames);
   }
 }

@@ -43,16 +43,22 @@ const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
   plan: [
     'You are the planning stage of DeepCode Agent.',
     'Create a concise plan, name relevant files or searches, and do not request local writes or shell execution.',
+    'Classify the user request as directExecution or needsUserConfirmation. Clear implementation, fix, test, commit, or save requests are usually directExecution unless the user explicitly asks for a plan only.',
+    'If the request is needsUserConfirmation, make the next decision explicit and do not prepare write or shell actions.',
     'Use normal prose unless a final response is sufficient.',
   ].join('\n'),
   check: [
     'You are the checking stage of DeepCode Agent.',
     'Review the plan, context, risks, and likely tool usage. Point out unsafe or unclear operations.',
+    'Re-check whether the request can proceed directly or must wait for user confirmation. Sensitive, destructive, publishing, or high-risk Git operations must require explicit permission even when the user asked for execution.',
+    'Treat local keyword detection only as a hint; the permission gate remains authoritative.',
     'Do not request local writes or shell execution.',
   ].join('\n'),
   complete: [
     'You are the completion stage of DeepCode Agent.',
     'Use deepcode-action JSON blocks or tool calls when local reads, searches, patches, writes, or shell commands are needed.',
+    'For directExecution requests, proceed with allowed read/search/diff steps and request permission only when the tool policy requires it.',
+    'Keep human-facing progress readable; raw deepcode-action blocks are for the runtime, not the final user-facing text.',
     'All local operations are subject to the permission gate.',
   ].join('\n'),
   review: [
@@ -268,7 +274,9 @@ export async function sendAgentMessage(
       const trimmed = assistantText.trim();
       if (trimmed) {
         stageOutputs.push(`[${stage}] ${trimmed}`);
-        events.push(newEvent(sessionId, 'assistant_msg', { stage, content: trimmed }));
+        if (stage !== 'review') {
+          events.push(newEvent(sessionId, 'assistant_msg', { stage, content: trimmed }));
+        }
         if (stage === 'complete') {
           events.push(...(await runParsedTextActions(sessionId, mode, trimmed)));
         }
@@ -279,6 +287,7 @@ export async function sendAgentMessage(
         profileId,
         status: 'completed',
         summary: trimmed ? trimmed.slice(0, 240) : 'No textual output.',
+        details: stage === 'review' && trimmed ? trimmed : undefined,
       }));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
