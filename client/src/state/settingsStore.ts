@@ -1,11 +1,3 @@
-/**
- * 设置状态管理
- *
- * 设计意图：
- *   1. 汇总默认设置、用户覆盖、工作区覆盖三层配置；
- *   2. 对外暴露 Monaco 编辑器可直接消费的 effective settings；
- *   3. 统一封装用户设置与工作区 deepcode.* 设置写回。
- */
 import { create } from 'zustand';
 import { useMemo } from 'react';
 import {
@@ -18,8 +10,6 @@ import {
   patchUserSettings,
   patchWorkspaceSettings,
 } from '../services/runtimeAdapter';
-
-// ---- 类型定义 ----
 
 export type SettingSource = 'default' | 'user' | 'workspace';
 
@@ -66,27 +56,54 @@ interface SettingsActions {
 
 type SettingsStore = SettingsStateData & SettingsActions;
 
-// ---- 设置定义 ----
-
 export const SETTING_DEFINITIONS: SettingDefinition[] = [
+  {
+    key: 'workbench.language',
+    label: 'Display Language',
+    description: 'Choose the UI language. Language packs are loaded from local i18n files; reload the workbench after changing this value.',
+    group: 'workbench',
+    control: 'select',
+    options: [
+      { label: 'Simplified Chinese', value: 'zh-CN' },
+      { label: 'English', value: 'en-US' },
+    ],
+  },
+  {
+    key: 'workbench.colorTheme',
+    label: 'Color Theme',
+    description: 'Workbench color theme.',
+    group: 'workbench',
+    control: 'select',
+    options: [
+      { label: 'Dark', value: 'vs-dark' },
+      { label: 'Light', value: 'vs-light' },
+    ],
+  },
+  {
+    key: 'workbench.styleTokenOverrides',
+    label: 'Style Token Overrides',
+    description: 'Reserved JSON style-token override map for future custom themes.',
+    group: 'workbench',
+    control: 'text',
+  },
   {
     key: 'editor.tabSize',
     label: 'Tab Size',
-    description: '编辑器缩进宽度。',
+    description: 'Editor indentation width.',
     group: 'editor',
     control: 'number',
   },
   {
     key: 'editor.insertSpaces',
     label: 'Insert Spaces',
-    description: '按 Tab 时插入空格而非制表符。',
+    description: 'Insert spaces when pressing Tab.',
     group: 'editor',
     control: 'boolean',
   },
   {
     key: 'editor.wordWrap',
     label: 'Word Wrap',
-    description: '编辑器自动换行策略。',
+    description: 'Editor line wrapping strategy.',
     group: 'editor',
     control: 'select',
     options: [
@@ -99,21 +116,21 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
   {
     key: 'editor.fontSize',
     label: 'Font Size',
-    description: '编辑器字体大小。',
+    description: 'Editor font size.',
     group: 'editor',
     control: 'number',
   },
   {
     key: 'editor.fontFamily',
     label: 'Font Family',
-    description: '编辑器字体族。',
+    description: 'Editor font family.',
     group: 'editor',
     control: 'text',
   },
   {
     key: 'editor.renderWhitespace',
     label: 'Render Whitespace',
-    description: '空白字符显示策略。',
+    description: 'Whitespace rendering strategy.',
     group: 'editor',
     control: 'select',
     options: [
@@ -127,7 +144,7 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
   {
     key: 'files.autoSave',
     label: 'Auto Save',
-    description: '文件自动保存策略。',
+    description: 'File auto-save strategy.',
     group: 'files',
     control: 'select',
     options: [
@@ -138,46 +155,35 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
   {
     key: 'files.autoSaveDelay',
     label: 'Auto Save Delay',
-    description: '自动保存延迟，单位毫秒。',
+    description: 'Auto-save delay in milliseconds.',
     group: 'files',
     control: 'number',
   },
   {
     key: 'files.hotExit',
     label: 'Hot Exit',
-    description: '刷新或重启后保留未保存草稿，再次打开文件时恢复。',
+    description: 'Keep unsaved editor state across reload or restart.',
     group: 'files',
     control: 'boolean',
   },
   {
     key: 'keyboard.enableBasicShortcuts',
     label: 'Basic Shortcuts',
-    description: '启用 Ctrl+S 保存、Ctrl+Shift+S 全部保存、Ctrl+, 打开设置等基础快捷键。',
+    description: 'Enable basic shortcuts such as Ctrl+S, Ctrl+Shift+S, Ctrl+A and Ctrl+,.',
     group: 'keyboard',
     control: 'boolean',
   },
   {
     key: 'explorer.confirmDelete',
     label: 'Confirm Delete',
-    description: '删除资源前是否确认。',
+    description: 'Ask for confirmation before deleting resources.',
     group: 'explorer',
     control: 'boolean',
   },
   {
-    key: 'workbench.colorTheme',
-    label: 'Color Theme',
-    description: '工作台主题。',
-    group: 'workbench',
-    control: 'select',
-    options: [
-      { label: 'Dark', value: 'vs-dark' },
-      { label: 'Light', value: 'vs-light' },
-    ],
-  },
-  {
     key: 'terminal.integrated.defaultProfile.windows',
     label: 'Windows Terminal Profile',
-    description: 'Windows 打包态默认终端环境；Agent shell 默认使用 Unix 指令语义。',
+    description: 'Default packaged Windows shell. WSL keeps Agent commands Unix-compatible.',
     group: 'terminal',
     control: 'select',
     options: [
@@ -189,7 +195,7 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
   {
     key: 'terminal.integrated.prewarm',
     label: 'Terminal Prewarm',
-    description: '启动首屏后预热终端运行时，降低第一次新建终端的等待感。',
+    description: 'Warm terminal runtime after startup to reduce first terminal latency.',
     group: 'terminal',
     control: 'select',
     options: [
@@ -200,7 +206,7 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
   {
     key: 'terminal.integrated.spawnTimeoutMs',
     label: 'Terminal Spawn Timeout',
-    description: '终端后台启动超时时间，单位毫秒。',
+    description: 'Terminal background spawn timeout in milliseconds.',
     group: 'terminal',
     control: 'number',
   },
@@ -280,8 +286,6 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
 
 const KNOWN_SETTING_KEYS = new Set(Object.keys(DEFAULT_USER_SETTINGS));
 
-// ---- 合并与标准化 ----
-
 function isSupportedSettingValue(value: unknown): value is UserSettingValue {
   return (
     typeof value === 'string' ||
@@ -297,9 +301,7 @@ function getDefaultValue(key: string): UserSettingValue {
 
 function normalizeSettingValue(key: string, value: unknown): UserSettingValue {
   const defaultValue = getDefaultValue(key);
-  if (typeof defaultValue === 'boolean') {
-    return Boolean(value);
-  }
+  if (typeof defaultValue === 'boolean') return Boolean(value);
   if (typeof defaultValue === 'number') {
     const n = typeof value === 'number' ? value : Number(value);
     return Number.isFinite(n) ? n : defaultValue;
@@ -346,14 +348,8 @@ function buildEffectiveSettings(
   return { effectiveSettings, sources };
 }
 
-// ---- Store ----
-
 export const useSettingsStore = create<SettingsStore>((set, get) => {
-  const initialEffective = buildEffectiveSettings(
-    DEFAULT_USER_SETTINGS,
-    {},
-    []
-  );
+  const initialEffective = buildEffectiveSettings(DEFAULT_USER_SETTINGS, {}, []);
 
   return {
     userSettings: DEFAULT_USER_SETTINGS,
@@ -372,7 +368,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
       if (!result.ok || !result.data) {
         set({
           loading: false,
-          errorMessage: result.message ?? '加载用户设置失败',
+          errorMessage: result.message ?? 'Failed to load user settings.',
         });
         return;
       }
@@ -409,7 +405,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
       const normalized = normalizeSettingValue(key, value);
       const result = await patchUserSettings({ [key]: normalized });
       if (!result.ok || !result.data) {
-        set({ errorMessage: result.message ?? `保存设置失败: ${key}` });
+        set({ errorMessage: result.message ?? `Failed to save setting: ${key}` });
         return;
       }
       const overriddenKeys = Array.from(
@@ -435,7 +431,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         [`deepcode.${key}`]: normalized,
       });
       if (!result.ok || !result.data) {
-        set({ errorMessage: result.message ?? `保存工作区设置失败: ${key}` });
+        set({ errorMessage: result.message ?? `Failed to save workspace setting: ${key}` });
         return;
       }
       const next = buildEffectiveSettings(
@@ -454,7 +450,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     resetUserSetting: async (key) => {
       const result = await patchUserSettings({ [key]: null });
       if (!result.ok || !result.data) {
-        set({ errorMessage: result.message ?? `恢复默认失败: ${key}` });
+        set({ errorMessage: result.message ?? `Failed to reset setting: ${key}` });
         return;
       }
       const overriddenKeys = get().overriddenKeys.filter((k) => k !== key);
@@ -476,16 +472,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
   };
 });
 
-/**
- * Monaco 编辑器有效选项 hook（阶段 5 / S5-2）
- *
- * 实现要点：
- *   - **不要**在单个 selector 中返回新对象，会触发 React 18 + Zustand "getSnapshot
- *     should be cached" 无限重渲染或在 release 模式下静默崩溃黑屏。
- *   - 拆为多个原始值 selector：每个 selector 返回 number / boolean / string，
- *     Zustand 默认 Object.is 比较，原始值天然稳定。
- *   - 用 useMemo 把这些原始值聚合成稳定对象，供 CodeEditor.tsx 单次 useEffect 消费。
- */
 export function useEditorOptions(): EditorEffectiveOptions {
   const tabSize = useSettingsStore((s) =>
     Number(s.effectiveSettings['editor.tabSize'] ?? 4)

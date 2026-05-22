@@ -1,8 +1,3 @@
-/**
- * Common Settings 板块（Settings 中心）
- *
- * 阶段 5：接入真实用户设置表单，并显示三层设置叠加后的来源。
- */
 import React, { useMemo } from 'react';
 import SettingsField from '../SettingsField';
 import {
@@ -16,33 +11,47 @@ interface CommonSettingsSectionProps {
   serverVersion?: string;
   apiStatus: string;
   wsStatus: string;
-}
-
-function groupDefinitions(): Record<string, SettingDefinition[]> {
-  return SETTING_DEFINITIONS.reduce<Record<string, SettingDefinition[]>>(
-    (acc, item) => {
-      if (!acc[item.group]) acc[item.group] = [];
-      acc[item.group].push(item);
-      return acc;
-    },
-    {}
-  );
+  query?: string;
 }
 
 const GROUP_TITLES: Record<string, string> = {
+  workbench: 'Workbench',
   editor: 'Editor',
   files: 'Files',
   keyboard: 'Keyboard',
   explorer: 'Explorer',
-  workbench: 'Workbench',
   terminal: 'Terminal',
   agent: 'Agent',
 };
+
+const GROUP_ORDER = ['workbench', 'editor', 'files', 'keyboard', 'explorer', 'terminal', 'agent'];
+
+function matchesQuery(definition: SettingDefinition, query: string): boolean {
+  if (!query.trim()) return true;
+  const target = [
+    definition.key,
+    definition.label,
+    definition.description,
+    definition.group,
+  ].join(' ').toLowerCase();
+  return target.includes(query.trim().toLowerCase());
+}
+
+function groupDefinitions(query = ''): Record<string, SettingDefinition[]> {
+  return SETTING_DEFINITIONS
+    .filter((definition) => matchesQuery(definition, query))
+    .reduce<Record<string, SettingDefinition[]>>((acc, item) => {
+      if (!acc[item.group]) acc[item.group] = [];
+      acc[item.group].push(item);
+      return acc;
+    }, {});
+}
 
 const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
   serverVersion,
   apiStatus,
   wsStatus,
+  query = '',
 }) => {
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const sources = useSettingsStore((s) => s.sources);
@@ -52,7 +61,11 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
   const patchUserSetting = useSettingsStore((s) => s.patchUserSetting);
   const resetUserSetting = useSettingsStore((s) => s.resetUserSetting);
 
-  const grouped = useMemo(() => groupDefinitions(), []);
+  const grouped = useMemo(() => groupDefinitions(query), [query]);
+  const orderedGroups = useMemo(
+    () => GROUP_ORDER.filter((group) => grouped[group]?.length),
+    [grouped]
+  );
 
   const handleChange = (key: string, value: UserSettingValue) => {
     void patchUserSetting(key, value);
@@ -63,41 +76,50 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
       <h2 className="settings-title">Common Settings</h2>
 
       <div className="settings-card">
-        <h3 className="settings-card__title">运行时信息</h3>
+        <h3 className="settings-card__title">Runtime Information</h3>
         <table className="settings-kv">
           <tbody>
             <tr>
-              <td>产品名</td>
+              <td>Product</td>
               <td>DeepCode</td>
             </tr>
             <tr>
-              <td>服务端版本</td>
-              <td>{serverVersion ?? '—'}</td>
+              <td>Server version</td>
+              <td>{serverVersion ?? '-'}</td>
             </tr>
             <tr>
-              <td>API 状态</td>
+              <td>API status</td>
               <td>{apiStatus}</td>
             </tr>
             <tr>
-              <td>WebSocket 状态</td>
+              <td>WebSocket status</td>
               <td>{wsStatus}</td>
             </tr>
             <tr>
-              <td>用户设置文件</td>
-              <td>{storePath ?? '尚未加载'}</td>
+              <td>User settings file</td>
+              <td>{storePath ?? 'Not loaded yet'}</td>
             </tr>
           </tbody>
         </table>
-        {errorMessage && (
-          <div className="settings-error">{errorMessage}</div>
-        )}
+        {errorMessage && <div className="settings-error">{errorMessage}</div>}
       </div>
 
-      {Object.entries(grouped).map(([group, definitions]) => (
+      {orderedGroups.length === 0 && (
+        <div className="settings-card">
+          <div className="settings-card__body">No settings match the current search.</div>
+        </div>
+      )}
+
+      {orderedGroups.map((group) => (
         <div className="settings-card" key={group}>
           <h3 className="settings-card__title">{GROUP_TITLES[group] ?? group}</h3>
           <div className="settings-card__body">
-            {definitions.map((definition) => (
+            {group === 'workbench' && (
+              <div className="settings-card__inline-placeholder">
+                Language packs are reserved under <code>config/i18n/*.json</code>. Changing the display language is stored now; full UI reload/localization wiring lands in a later stage.
+              </div>
+            )}
+            {(grouped[group] ?? []).map((definition) => (
               <SettingsField
                 key={definition.key}
                 definition={definition}
@@ -110,7 +132,7 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
             ))}
           </div>
           <div className="settings-card__hint">
-            Workspace 来源的值由当前工作区覆盖，需到 Workspace 板块调整。
+            Workspace-sourced values are controlled by the current workspace and must be changed in workspace settings.
           </div>
         </div>
       ))}

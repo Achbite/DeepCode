@@ -1,0 +1,7 @@
+{
+  "$schema": "https://deepcode.local/schemas/i18n.schema.json",
+  "locale": "en-US",
+  "name": "English",
+  "status": "reserved",
+  "notes": "Reserved localization pack. Full UI binding is planned for a later stage."
+}

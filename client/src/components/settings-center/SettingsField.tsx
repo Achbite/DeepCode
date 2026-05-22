@@ -1,8 +1,3 @@
-/**
- * 通用设置字段控件
- *
- * 设计意图：根据设置定义渲染最小表单控件，并显示来源、默认值和说明。
- */
 import React from 'react';
 import { DEFAULT_USER_SETTINGS, type UserSettingValue } from '@deepcode/protocol';
 import type { SettingDefinition, SettingSource } from '../../state/settingsStore';
@@ -102,7 +97,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
         <div className="settings-field__key">{definition.key}</div>
         <div className="settings-field__description">{definition.description}</div>
         <div className="settings-field__default">
-          默认值：<code>{JSON.stringify(defaultValue)}</code>
+          Default: <code>{JSON.stringify(defaultValue)}</code>
         </div>
       </div>
       <div className="settings-field__control">

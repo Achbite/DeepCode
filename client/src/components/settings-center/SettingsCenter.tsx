@@ -45,6 +45,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   serverVersion,
 }) => {
   const [activeKey, setActiveKey] = useState<SettingsKey>('workspace');
+  const [searchQuery, setSearchQuery] = useState('');
 
   const renderBody = () => {
     switch (activeKey) {
@@ -56,6 +57,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
             apiStatus={apiStatus}
             wsStatus={wsStatus}
             serverVersion={serverVersion}
+            query={searchQuery}
           />
         );
       case 'llm':
@@ -77,6 +79,17 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     <div className="settings-center">
       <nav className="settings-nav">
         <div className="settings-nav__title">DeepCode Settings</div>
+        <label className="settings-search" aria-label="Search settings">
+          <span>Search</span>
+          <input
+            value={searchQuery}
+            onChange={(event) => {
+              setSearchQuery(event.target.value);
+              if (event.target.value.trim()) setActiveKey('common');
+            }}
+            placeholder="Search settings"
+          />
+        </label>
         {NAV_ITEMS.map((item) => (
           <button
             key={item.key}
