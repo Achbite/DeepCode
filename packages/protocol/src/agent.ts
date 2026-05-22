@@ -1,4 +1,29 @@
 export type AgentMode = 'readOnly' | 'plan' | 'askBeforeWrite';
+export type AgentWorkflowMode = 'planFirst' | 'actOnRequest';
+export type AgentWorkflowStage = 'plan' | 'check' | 'complete' | 'review';
+
+export const AGENT_WORKFLOW_STAGES: AgentWorkflowStage[] = [
+  'plan',
+  'check',
+  'complete',
+  'review',
+];
+
+export interface AgentWorkflowStageConfig {
+  profileId?: string;
+}
+
+export type AgentWorkflowConfig = Record<AgentWorkflowStage, AgentWorkflowStageConfig>;
+
+export interface GetAgentWorkflowConfigResult {
+  config: AgentWorkflowConfig;
+  storePath?: string;
+  initialized: boolean;
+}
+
+export interface PatchAgentWorkflowConfigRequest {
+  config: Partial<Record<AgentWorkflowStage, AgentWorkflowStageConfig | null>>;
+}
 
 export type AgentEventKind =
   | 'user_msg'
@@ -7,6 +32,7 @@ export type AgentEventKind =
   | 'tool_result'
   | 'permission_request'
   | 'permission_result'
+  | 'workflow_stage'
   | 'error';
 
 export interface AgentSession {
@@ -64,6 +90,8 @@ export interface SendAgentMessageRequest {
   content: string;
   attachments?: AgentContextAttachment[];
   mode?: AgentMode;
+  workflow?: AgentWorkflowMode;
+  workflowConfig?: AgentWorkflowConfig;
   profileId?: string;
 }
 

@@ -8,11 +8,14 @@
     "types": ["node"],
     "baseUrl": ".",
     "paths": {
+      "@deepcode/agent-core": ["../packages/agent-core/dist/index.d.ts"],
+      "@deepcode/agent-core/*": ["../packages/agent-core/dist/*"],
       "@deepcode/protocol": ["../packages/protocol/dist/index.d.ts"],
       "@deepcode/protocol/*": ["../packages/protocol/dist/*"]
     }
   },
   "references": [
+    { "path": "../packages/agent-core" },
     { "path": "../packages/protocol" }
   ],
   "include": ["src"]

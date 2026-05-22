@@ -61,6 +61,16 @@ importers:
         specifier: ^6.0.0
         version: 6.4.2(@types/node@22.19.19)(tsx@4.22.1)
 
+  packages/agent-core:
+    dependencies:
+      '@deepcode/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+    devDependencies:
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
   packages/protocol:
     devDependencies:
       typescript:
@@ -69,6 +79,9 @@ importers:
 
   server:
     dependencies:
+      '@deepcode/agent-core':
+        specifier: workspace:*
+        version: link:../packages/agent-core
       '@deepcode/protocol':
         specifier: workspace:*
         version: link:../packages/protocol

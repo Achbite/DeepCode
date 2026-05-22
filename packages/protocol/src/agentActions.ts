@@ -8,6 +8,7 @@ export type ParsedAgentActionType =
   | 'fs.write'
   | 'fs.diff'
   | 'shell.propose'
+  | 'shell.exec'
   | 'final';
 
 export interface ParsedAgentActionError {
@@ -54,6 +55,9 @@ export interface AgentObservation {
 export interface AgentFixtureRunRequest extends AgentActionParseRequest {
   sessionId?: string;
   execute?: boolean;
+  approveAll?: boolean;
+  approvedActionIds?: string[];
+  approvedToolNames?: string[];
 }
 
 export interface AgentFixtureRunResult {

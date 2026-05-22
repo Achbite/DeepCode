@@ -81,6 +81,23 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
     allowedModes: ['plan', 'askBeforeWrite'],
   },
   {
+    name: 'shell.exec',
+    description: 'Run a command in an Agent-owned temporary shell after explicit approval.',
+    inputSchema: {
+      type: 'object',
+      required: ['command'],
+      properties: {
+        command: { type: 'string' },
+        cwd: { type: 'string' },
+        timeoutMs: { type: 'number' },
+        reason: { type: 'string' },
+      },
+    },
+    riskLevel: 'high',
+    needsApproval: true,
+    allowedModes: ['askBeforeWrite'],
+  },
+  {
     name: 'fs.write',
     description: 'Write a text file after an explicit permission approval.',
     inputSchema: {

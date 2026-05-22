@@ -72,6 +72,26 @@ export interface ShellProposeInput {
   reason?: string;
 }
 
+export interface ShellExecInput {
+  command: string;
+  cwd?: string;
+  timeoutMs?: number;
+  reason?: string;
+}
+
+export interface ShellExecResult {
+  command: string;
+  cwd: string;
+  executed: boolean;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  truncated: boolean;
+  tempSessionId: string;
+  cleanupStatus: 'terminated' | 'alreadyExited' | 'failed';
+}
+
 export interface CodeSearchMatch {
   folderId: string;
   path: string;
