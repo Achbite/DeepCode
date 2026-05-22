@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 const MAX_EVENTS_PER_SESSION: usize = 500;
 const SPAWN_TIMEOUT_MS: u64 = 8000;
 const KILL_SPAWN_THROTTLE_MS: u64 = 250;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalError {
@@ -457,11 +459,7 @@ fn spawn_session_async(
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                command.creation_flags(0x08000000);
-            }
+            hide_subprocess_window(&mut command);
 
             let mut child = command.spawn().map_err(map_spawn_error)?;
             let stdin = child
@@ -740,7 +738,9 @@ fn wsl_available() -> bool {
     if !cfg!(windows) {
         return false;
     }
-    Command::new("where")
+    let mut command = Command::new("where");
+    hide_subprocess_window(&mut command);
+    command
         .arg("wsl.exe")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -748,6 +748,15 @@ fn wsl_available() -> bool {
         .map(|status| status.success())
         .unwrap_or(false)
 }
+
+#[cfg(windows)]
+fn hide_subprocess_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_subprocess_window(_command: &mut Command) {}
 
 fn wsl_status() -> Option<WslStatus> {
     if !cfg!(windows) {

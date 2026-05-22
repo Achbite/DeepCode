@@ -451,8 +451,33 @@ pub struct ListToolsResult {
 #[tauri::command]
 pub fn get_llm_profiles() -> LlmProfilesResult {
     LlmProfilesResult {
-        profiles: Vec::new(),
-        default_profile_id: None,
+        profiles: vec![
+            serde_json::json!({
+                "id": "deepseek-v4-flash-openai",
+                "name": "DeepSeek V4 Flash",
+                "kind": "openaiCompatible",
+                "baseUrl": "https://api.deepseek.com",
+                "model": "deepseek-v4-flash",
+                "maxTokens": 4096,
+                "temperature": 0.2,
+                "reasoningEffort": "medium",
+                "thinking": "enabled",
+                "enabled": true
+            }),
+            serde_json::json!({
+                "id": "deepseek-v4-pro-openai",
+                "name": "DeepSeek V4 Pro",
+                "kind": "openaiCompatible",
+                "baseUrl": "https://api.deepseek.com",
+                "model": "deepseek-v4-pro",
+                "maxTokens": 4096,
+                "temperature": 0.2,
+                "reasoningEffort": "high",
+                "thinking": "enabled",
+                "enabled": true
+            }),
+        ],
+        default_profile_id: Some("deepseek-v4-flash-openai".into()),
         store_path: None,
     }
 }
@@ -476,6 +501,64 @@ pub fn llm_chat(_request: serde_json::Value) -> Result<serde_json::Value, Comman
     Err(CommandError::NotImplemented(
         "Tauri 模式 LLM chat 尚未移植；请先使用 Web/Node 模式验证阶段 6".into(),
     ))
+}
+
+fn empty_agent_workflow_config() -> serde_json::Value {
+    serde_json::json!({
+        "plan": {},
+        "check": {},
+        "complete": {},
+        "review": {}
+    })
+}
+
+fn normalize_agent_workflow_config(raw: Option<&serde_json::Value>) -> serde_json::Value {
+    let source = raw.and_then(|value| value.as_object());
+    let mut config = serde_json::Map::new();
+    for stage in ["plan", "check", "complete", "review"] {
+        let profile_id = source
+            .and_then(|map| map.get(stage))
+            .and_then(|value| value.get("profileId"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty());
+        config.insert(
+            stage.to_string(),
+            match profile_id {
+                Some(profile_id) => serde_json::json!({ "profileId": profile_id }),
+                None => serde_json::json!({}),
+            },
+        );
+    }
+    serde_json::Value::Object(config)
+}
+
+#[tauri::command]
+pub fn get_agent_workflow_config() -> serde_json::Value {
+    serde_json::json!({
+        "config": empty_agent_workflow_config(),
+        "storePath": null,
+        "initialized": false
+    })
+}
+
+#[tauri::command]
+pub fn patch_agent_workflow_config(request: serde_json::Value) -> serde_json::Value {
+    let body = request.get("request").unwrap_or(&request);
+    let config = normalize_agent_workflow_config(body.get("config"));
+    let initialized = ["plan", "check", "complete", "review"]
+        .iter()
+        .any(|stage| {
+            config
+                .get(stage)
+                .and_then(|value| value.get("profileId"))
+                .and_then(|value| value.as_str())
+                .is_some()
+        });
+    serde_json::json!({
+        "config": config,
+        "storePath": null,
+        "initialized": initialized
+    })
 }
 
 #[tauri::command]
@@ -507,7 +590,66 @@ pub fn append_agent_events(
 
 #[tauri::command]
 pub fn list_agent_tools(_mode: Option<String>) -> ListToolsResult {
-    ListToolsResult { tools: Vec::new() }
+    ListToolsResult {
+        tools: vec![
+            serde_json::json!({
+                "name": "fs.read",
+                "description": "Read a text file from the active workspace.",
+                "inputSchema": { "type": "object", "required": ["path"], "properties": { "path": { "type": "string" }, "folderId": { "type": "string" } } },
+                "riskLevel": "low",
+                "needsApproval": false,
+                "allowedModes": ["readOnly", "plan", "askBeforeWrite"]
+            }),
+            serde_json::json!({
+                "name": "fs.list",
+                "description": "List a workspace directory tree with a bounded depth.",
+                "inputSchema": { "type": "object", "properties": { "path": { "type": "string" }, "folderId": { "type": "string" }, "depth": { "type": "number" } } },
+                "riskLevel": "low",
+                "needsApproval": false,
+                "allowedModes": ["readOnly", "plan", "askBeforeWrite"]
+            }),
+            serde_json::json!({
+                "name": "fs.diff",
+                "description": "Preview a file diff without writing content.",
+                "inputSchema": { "type": "object", "required": ["path", "newContent"], "properties": { "path": { "type": "string" }, "folderId": { "type": "string" }, "newContent": { "type": "string" } } },
+                "riskLevel": "low",
+                "needsApproval": false,
+                "allowedModes": ["readOnly", "plan", "askBeforeWrite"]
+            }),
+            serde_json::json!({
+                "name": "code.search",
+                "description": "Search text across the workspace with bounded results.",
+                "inputSchema": { "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "isRegex": { "type": "boolean" }, "include": { "type": "array", "items": { "type": "string" } }, "folderId": { "type": "string" } } },
+                "riskLevel": "low",
+                "needsApproval": false,
+                "allowedModes": ["readOnly", "plan", "askBeforeWrite"]
+            }),
+            serde_json::json!({
+                "name": "shell.propose",
+                "description": "Return a proposed shell command. The command is never executed.",
+                "inputSchema": { "type": "object", "required": ["command"], "properties": { "command": { "type": "string" }, "reason": { "type": "string" } } },
+                "riskLevel": "medium",
+                "needsApproval": false,
+                "allowedModes": ["plan", "askBeforeWrite"]
+            }),
+            serde_json::json!({
+                "name": "shell.exec",
+                "description": "Run a command in an Agent-owned temporary shell after explicit approval.",
+                "inputSchema": { "type": "object", "required": ["command"], "properties": { "command": { "type": "string" }, "cwd": { "type": "string" }, "timeoutMs": { "type": "number" }, "reason": { "type": "string" } } },
+                "riskLevel": "high",
+                "needsApproval": true,
+                "allowedModes": ["askBeforeWrite"]
+            }),
+            serde_json::json!({
+                "name": "fs.write",
+                "description": "Write a text file after an explicit permission approval.",
+                "inputSchema": { "type": "object", "required": ["path", "content"], "properties": { "path": { "type": "string" }, "content": { "type": "string" }, "folderId": { "type": "string" } } },
+                "riskLevel": "high",
+                "needsApproval": true,
+                "allowedModes": ["askBeforeWrite"]
+            })
+        ],
+    }
 }
 
 #[tauri::command]
@@ -523,6 +665,26 @@ pub fn evaluate_agent_permission(
 pub fn execute_agent_tool(_request: serde_json::Value) -> Result<serde_json::Value, CommandError> {
     Err(CommandError::NotImplemented(
         "Tauri Agent tool executor is not implemented yet; use Web/Node mode for Stage 6 validation.".into(),
+    ))
+}
+
+#[tauri::command]
+pub fn send_agent_message(
+    _session_id: String,
+    _request: serde_json::Value,
+) -> Result<AgentSessionResult, CommandError> {
+    Err(CommandError::NotImplemented(
+        "Tauri Agent workflow runner is not implemented yet; use Web/Node mode for Stage 6 validation.".into(),
+    ))
+}
+
+#[tauri::command]
+pub fn resolve_agent_permission(
+    _permission_id: String,
+    _request: serde_json::Value,
+) -> Result<AgentSessionResult, CommandError> {
+    Err(CommandError::NotImplemented(
+        "Tauri Agent permission resolution is not implemented yet; use Web/Node mode for Stage 6 validation.".into(),
     ))
 }
 

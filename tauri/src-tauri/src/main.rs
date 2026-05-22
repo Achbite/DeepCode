@@ -61,6 +61,8 @@ fn main() {
             commands::patch_llm_profiles,
             commands::probe_llm_profile,
             commands::llm_chat,
+            commands::get_agent_workflow_config,
+            commands::patch_agent_workflow_config,
             commands::code_search,
             commands::create_agent_session,
             commands::get_current_agent_session,
@@ -68,6 +70,8 @@ fn main() {
             commands::list_agent_tools,
             commands::evaluate_agent_permission,
             commands::execute_agent_tool,
+            commands::send_agent_message,
+            commands::resolve_agent_permission,
             // Stub
             commands::llm_invoke_stub,
             commands::skill_invoke_stub,
