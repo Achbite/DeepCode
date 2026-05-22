@@ -4,25 +4,32 @@ import type {
   AgentEvent,
   AgentMode,
   AgentSession,
+  AgentWorkflowConfig,
+  AgentWorkflowMode,
   PermissionRequest,
-  ToolCall,
 } from '@deepcode/protocol';
+import { AGENT_WORKFLOW_STAGES } from '@deepcode/protocol';
 import {
-  appendAgentEvents,
   createAgentSession,
+  getAgentWorkflowConfig,
   getCurrentAgentSession,
+  patchAgentWorkflowConfig,
+  resolveAgentPermission,
+  sendAgentMessage,
 } from '../services/runtimeAdapter';
-import { resolvePendingTool, runAgentTurn } from '../services/agentRuntime';
+import { useSettingsStore } from './settingsStore';
 
 interface PendingPermission {
   request: PermissionRequest;
-  toolCall: ToolCall;
 }
 
 interface AgentSessionState {
   session: AgentSession | null;
   events: AgentEvent[];
   mode: AgentMode;
+  workflow: AgentWorkflowMode;
+  workflowConfig: AgentWorkflowConfig | null;
+  workflowConfigStorePath?: string;
   profileId?: string;
   loading: boolean;
   errorMessage: string | null;
@@ -33,7 +40,10 @@ interface AgentSessionState {
 
 interface AgentSessionActions {
   loadOrCreate: () => Promise<void>;
+  loadWorkflowConfig: () => Promise<void>;
+  patchWorkflowConfig: (config: AgentWorkflowConfig) => Promise<void>;
   setMode: (mode: AgentMode) => void;
+  setWorkflow: (workflow: AgentWorkflowMode) => void;
   setProfileId: (profileId?: string) => void;
   addAttachment: (attachment: AgentContextAttachment) => void;
   removeAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
@@ -54,20 +64,39 @@ function mergeAttachments(
   return [...filtered, next];
 }
 
-function newEvent(sessionId: string, kind: AgentEvent['kind'], payload: unknown): AgentEvent {
-  return {
-    id: `evt-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    sessionId,
-    ts: new Date().toISOString(),
-    kind,
-    payload,
-  };
+function findLatestPendingPermission(events: AgentEvent[]): PendingPermission | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.kind === 'permission_result') return null;
+    if (event.kind === 'permission_request') {
+      return { request: event.payload as PermissionRequest };
+    }
+  }
+  return null;
+}
+
+function emptyWorkflowConfig(): AgentWorkflowConfig {
+  return Object.fromEntries(
+    AGENT_WORKFLOW_STAGES.map((stage) => [stage, {}])
+  ) as AgentWorkflowConfig;
+}
+
+function settingMode(value: unknown): AgentMode {
+  return value === 'readOnly' || value === 'askBeforeWrite' || value === 'plan'
+    ? value
+    : 'plan';
+}
+
+function settingWorkflow(value: unknown): AgentWorkflowMode {
+  return value === 'actOnRequest' ? 'actOnRequest' : 'planFirst';
 }
 
 export const useAgentSessionStore = create<Store>((set, get) => ({
   session: null,
   events: [],
   mode: 'plan',
+  workflow: 'planFirst',
+  workflowConfig: null,
   loading: false,
   errorMessage: null,
   messageAttachments: [],
@@ -77,6 +106,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   loadOrCreate: async () => {
     if (get().session || get().loading) return;
     set({ loading: true, errorMessage: null });
+    const settings = useSettingsStore.getState().effectiveSettings;
+    const initialMode = settingMode(settings['agent.defaultMode']);
+    const workflow = settingWorkflow(settings['agent.defaultWorkflow']);
+    set({ mode: initialMode, workflow });
+    await get().loadWorkflowConfig();
     const current = await getCurrentAgentSession();
     if (current.ok && current.data) {
       set({
@@ -88,7 +122,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       });
       return;
     }
-    const created = await createAgentSession({ initialMode: 'plan' });
+    const created = await createAgentSession({ initialMode });
     if (created.ok && created.data) {
       set({
         session: created.data.session,
@@ -105,7 +139,33 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
   },
 
+  loadWorkflowConfig: async () => {
+    const result = await getAgentWorkflowConfig();
+    if (result.ok && result.data) {
+      set({
+        workflowConfig: result.data.config,
+        workflowConfigStorePath: result.data.storePath,
+      });
+      return;
+    }
+    set({ workflowConfig: emptyWorkflowConfig() });
+  },
+
+  patchWorkflowConfig: async (config) => {
+    set({ workflowConfig: config });
+    const result = await patchAgentWorkflowConfig({ config });
+    if (result.ok && result.data) {
+      set({
+        workflowConfig: result.data.config,
+        workflowConfigStorePath: result.data.storePath,
+      });
+    } else {
+      set({ errorMessage: result.message ?? 'Agent workflow config save failed' });
+    }
+  },
+
   setMode: (mode) => set({ mode }),
+  setWorkflow: (workflow) => set({ workflow }),
   setProfileId: (profileId) => set({ profileId }),
 
   addAttachment: (attachment) => {
@@ -142,28 +202,29 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       ...get().sessionAttachments,
       ...get().messageAttachments,
     ];
-    const userEvent = newEvent(session.id, 'user_msg', {
-      content: trimmed,
-      attachments: get().messageAttachments,
-    });
-    void appendAgentEvents(session.id, { events: [userEvent] });
     set((state) => ({
-      events: [...state.events, userEvent],
+      events: state.events,
       messageAttachments: [],
       loading: true,
       errorMessage: null,
     }));
     try {
-      const result = await runAgentTurn({
-        sessionId: session.id,
+      const result = await sendAgentMessage(session.id, {
         content: trimmed,
         attachments,
         mode: get().mode,
+        workflow: get().workflow,
+        workflowConfig: get().workflowConfig ?? undefined,
         profileId: get().profileId,
       });
-      set((state) => ({
-        events: [...state.events, ...result.events],
-        pendingPermission: result.pending ?? null,
+      if (!result.ok || !result.data) {
+        throw new Error(result.message ?? 'Agent message failed');
+      }
+      const data = result.data;
+      set(() => ({
+        session: data.session,
+        events: data.events,
+        pendingPermission: findLatestPendingPermission(data.events),
         loading: false,
       }));
     } catch (err) {
@@ -179,12 +240,17 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const session = get().session;
     if (!pending || !session) return;
     set({ loading: true, pendingPermission: null });
-    const events = await resolvePendingTool({
-      sessionId: session.id,
-      toolCall: pending.toolCall,
-      accepted: true,
-    });
-    set((state) => ({ events: [...state.events, ...events], loading: false }));
+    const result = await resolveAgentPermission(pending.request.id, { decision: 'accept' });
+    if (result.ok && result.data) {
+      set({
+        session: result.data.session,
+        events: result.data.events,
+        pendingPermission: findLatestPendingPermission(result.data.events),
+        loading: false,
+      });
+    } else {
+      set({ errorMessage: result.message ?? 'Permission resolve failed', loading: false });
+    }
   },
 
   rejectPermission: async () => {
@@ -192,11 +258,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const session = get().session;
     if (!pending || !session) return;
     set({ loading: true, pendingPermission: null });
-    const events = await resolvePendingTool({
-      sessionId: session.id,
-      toolCall: pending.toolCall,
-      accepted: false,
-    });
-    set((state) => ({ events: [...state.events, ...events], loading: false }));
+    const result = await resolveAgentPermission(pending.request.id, { decision: 'reject' });
+    if (result.ok && result.data) {
+      set({
+        session: result.data.session,
+        events: result.data.events,
+        pendingPermission: findLatestPendingPermission(result.data.events),
+        loading: false,
+      });
+    } else {
+      set({ errorMessage: result.message ?? 'Permission resolve failed', loading: false });
+    }
   },
 }));

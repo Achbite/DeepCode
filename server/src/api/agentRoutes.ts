@@ -4,12 +4,24 @@ import type {
   ApiResponse,
   AppendAgentEventsRequest,
   CreateAgentSessionRequest,
+  GetAgentWorkflowConfigResult,
+  PatchAgentWorkflowConfigRequest,
+  ResolveAgentPermissionRequest,
+  SendAgentMessageRequest,
 } from '@deepcode/protocol';
 import {
   appendAgentEvents,
   createAgentSession,
   getAgentSession,
 } from '../services/agentSessionStore.js';
+import {
+  resolveAgentPermission,
+  sendAgentMessage,
+} from '../modules/agent/workflowService.js';
+import {
+  getAgentWorkflowConfig,
+  patchAgentWorkflowConfig,
+} from '../services/agentWorkflowConfigService.js';
 
 function errorResponse(error: string, err: unknown): ApiResponse<never> {
   return {
@@ -20,6 +32,24 @@ function errorResponse(error: string, err: unknown): ApiResponse<never> {
 }
 
 export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
+  app.get('/api/agent/workflow-config', async () => {
+    try {
+      const data = await getAgentWorkflowConfig();
+      return { ok: true, data } satisfies ApiResponse<GetAgentWorkflowConfigResult>;
+    } catch (err) {
+      return errorResponse('agent_workflow_config_load_error', err);
+    }
+  });
+
+  app.patch('/api/agent/workflow-config', async (request) => {
+    try {
+      const data = await patchAgentWorkflowConfig(request.body as PatchAgentWorkflowConfigRequest);
+      return { ok: true, data } satisfies ApiResponse<GetAgentWorkflowConfigResult>;
+    } catch (err) {
+      return errorResponse('agent_workflow_config_patch_error', err);
+    }
+  });
+
   app.post('/api/agent/sessions', async (request) => {
     try {
       const body = request.body as CreateAgentSessionRequest | undefined;
@@ -64,6 +94,29 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
       return { ok: true, data } satisfies ApiResponse<AgentSessionResult>;
     } catch (err) {
       return errorResponse('agent_events_append_error', err);
+    }
+  });
+
+  app.post('/api/agent/sessions/:id/messages', async (request) => {
+    try {
+      const { id } = request.params as { id: string };
+      const data = await sendAgentMessage(id, request.body as SendAgentMessageRequest);
+      return { ok: true, data } satisfies ApiResponse<AgentSessionResult>;
+    } catch (err) {
+      return errorResponse('agent_message_send_error', err);
+    }
+  });
+
+  app.post('/api/agent/permissions/:id/resolve', async (request) => {
+    try {
+      const { id } = request.params as { id: string };
+      const data = await resolveAgentPermission(
+        id,
+        request.body as ResolveAgentPermissionRequest
+      );
+      return { ok: true, data } satisfies ApiResponse<AgentSessionResult>;
+    } catch (err) {
+      return errorResponse('agent_permission_resolve_error', err);
     }
   });
 }

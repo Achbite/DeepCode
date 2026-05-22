@@ -38,6 +38,10 @@ import type {
   CreateAgentSessionRequest,
   AgentSessionResult,
   AppendAgentEventsRequest,
+  SendAgentMessageRequest,
+  ResolveAgentPermissionRequest,
+  GetAgentWorkflowConfigResult,
+  PatchAgentWorkflowConfigRequest,
   ListToolsResult,
   PermissionEvaluationRequest,
   PermissionDecision,
@@ -592,6 +596,46 @@ export async function appendAgentEvents(
   }
   const { appendAgentEvents: apiAppendAgentEvents } = await import('./apiClient');
   return apiAppendAgentEvents(sessionId, request);
+}
+
+export async function sendAgentMessage(
+  sessionId: string,
+  request: SendAgentMessageRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AgentSessionResult>('send_agent_message', { sessionId, request });
+  }
+  const { sendAgentMessage: apiSendAgentMessage } = await import('./apiClient');
+  return apiSendAgentMessage(sessionId, request);
+}
+
+export async function resolveAgentPermission(
+  permissionId: string,
+  request: ResolveAgentPermissionRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AgentSessionResult>('resolve_agent_permission', { permissionId, request });
+  }
+  const { resolveAgentPermission: apiResolveAgentPermission } = await import('./apiClient');
+  return apiResolveAgentPermission(permissionId, request);
+}
+
+export async function getAgentWorkflowConfig(): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<GetAgentWorkflowConfigResult>('get_agent_workflow_config');
+  }
+  const { getAgentWorkflowConfig: apiGetAgentWorkflowConfig } = await import('./apiClient');
+  return apiGetAgentWorkflowConfig();
+}
+
+export async function patchAgentWorkflowConfig(
+  request: PatchAgentWorkflowConfigRequest
+): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<GetAgentWorkflowConfigResult>('patch_agent_workflow_config', { request });
+  }
+  const { patchAgentWorkflowConfig: apiPatchAgentWorkflowConfig } = await import('./apiClient');
+  return apiPatchAgentWorkflowConfig(request);
 }
 
 export async function listAgentTools(

@@ -1,14 +1,22 @@
 import React, { useMemo, useRef, useState } from 'react';
-import type { AgentContextAttachment } from '@deepcode/protocol';
+import type {
+  AgentContextAttachment,
+  AgentWorkflowConfig,
+  LlmProviderProfile,
+} from '@deepcode/protocol';
 import ContextAttachmentPicker from './ContextAttachmentPicker';
+import AgentWorkflowSelector from './AgentWorkflowSelector';
 
 interface AgentComposerProps {
   messageAttachments: AgentContextAttachment[];
   sessionAttachments: AgentContextAttachment[];
+  workflowConfig: AgentWorkflowConfig | null;
+  profiles: LlmProviderProfile[];
   loading: boolean;
   onSend: (content: string) => void;
   onAddAttachment: (attachment: AgentContextAttachment) => void;
   onRemoveAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
+  onWorkflowConfigChange: (config: AgentWorkflowConfig) => void;
 }
 
 interface AgentModifiedFileView {
@@ -21,10 +29,13 @@ const MODIFIED_FILES: AgentModifiedFileView[] = [];
 const AgentComposer: React.FC<AgentComposerProps> = ({
   messageAttachments,
   sessionAttachments,
+  workflowConfig,
+  profiles,
   loading,
   onSend,
   onAddAttachment,
   onRemoveAttachment,
+  onWorkflowConfigChange,
 }) => {
   const [value, setValue] = useState('');
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -149,6 +160,12 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               />
             )}
           </div>
+          <AgentWorkflowSelector
+            profiles={profiles}
+            config={workflowConfig}
+            disabled={loading}
+            onChange={onWorkflowConfigChange}
+          />
         </div>
         <button onClick={send} disabled={loading || !value.trim()}>
           Send

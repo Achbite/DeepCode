@@ -34,6 +34,10 @@ import type {
   CreateAgentSessionRequest,
   AgentSessionResult,
   AppendAgentEventsRequest,
+  SendAgentMessageRequest,
+  ResolveAgentPermissionRequest,
+  GetAgentWorkflowConfigResult,
+  PatchAgentWorkflowConfigRequest,
   ListToolsResult,
   PermissionEvaluationRequest,
   PermissionDecision,
@@ -335,6 +339,42 @@ export function appendAgentEvents(
   return sendJson<AgentSessionResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`,
     'POST',
+    request
+  );
+}
+
+export function sendAgentMessage(
+  sessionId: string,
+  request: SendAgentMessageRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return sendJson<AgentSessionResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/messages`,
+    'POST',
+    request
+  );
+}
+
+export function resolveAgentPermission(
+  permissionId: string,
+  request: ResolveAgentPermissionRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return sendJson<AgentSessionResult>(
+    `${API_BASE}/agent/permissions/${encodeURIComponent(permissionId)}/resolve`,
+    'POST',
+    request
+  );
+}
+
+export function getAgentWorkflowConfig(): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
+  return getJson<GetAgentWorkflowConfigResult>(`${API_BASE}/agent/workflow-config`);
+}
+
+export function patchAgentWorkflowConfig(
+  request: PatchAgentWorkflowConfigRequest
+): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
+  return sendJson<GetAgentWorkflowConfigResult>(
+    `${API_BASE}/agent/workflow-config`,
+    'PATCH',
     request
   );
 }
