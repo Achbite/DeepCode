@@ -1,13 +1,6 @@
 import './workbenchLayout.css';
-import React, { useEffect, useState } from 'react';
-import FileTree from '../../components/file-tree/FileTree';
-import CodeEditor from '../../components/editor/CodeEditor';
-import TerminalPlaceholder from '../../components/terminal/TerminalPlaceholder';
+import React, { Suspense, lazy, useEffect, useState } from 'react';
 import GitPanelPlaceholder from '../../components/git-panel/GitPanelPlaceholder';
-import AgentPanelPlaceholder from '../../components/agent-panel/AgentPanelPlaceholder';
-import SettingsCenter from '../../components/settings-center/SettingsCenter';
-import WorkspaceOpenDialog from '../../components/workspace-open-dialog/WorkspaceOpenDialog';
-import CodeWorkspaceChoiceDialog from '../../components/code-workspace-choice-dialog/CodeWorkspaceChoiceDialog';
 import WindowControls from '../../components/window-controls/WindowControls';
 import {
   useEditorStore,
@@ -25,6 +18,14 @@ interface WorkbenchLayoutProps {
 type SidebarPanel = 'explorer' | 'git' | 'search';
 type ActivityIconName = SidebarPanel | 'settings' | 'account';
 type PanelResizeKind = 'sidebar' | 'agent' | 'bottom';
+
+const FileTree = lazy(() => import('../../components/file-tree/FileTree'));
+const CodeEditor = lazy(() => import('../../components/editor/CodeEditor'));
+const TerminalPlaceholder = lazy(() => import('../../components/terminal/TerminalPlaceholder'));
+const AgentPanelPlaceholder = lazy(() => import('../../components/agent-panel/AgentPanelPlaceholder'));
+const SettingsCenter = lazy(() => import('../../components/settings-center/SettingsCenter'));
+const WorkspaceOpenDialog = lazy(() => import('../../components/workspace-open-dialog/WorkspaceOpenDialog'));
+const CodeWorkspaceChoiceDialog = lazy(() => import('../../components/code-workspace-choice-dialog/CodeWorkspaceChoiceDialog'));
 
 const SIDEBAR_WIDTH_KEY = 'deepcode.layout.sidebarWidth';
 const AGENT_WIDTH_KEY = 'deepcode.layout.agentWidth';
@@ -45,6 +46,22 @@ function readStoredLayoutSize(
   if (!Number.isFinite(stored)) return fallback;
   return clampNumber(stored, min, max);
 }
+
+const PanelFallback: React.FC<{ label?: string }> = ({ label = 'Loading...' }) => (
+  <div className="workbench-panel-fallback">{label}</div>
+);
+
+const EmptyEditorSurface: React.FC = () => (
+  <div className="workbench-empty-editor">
+    <div className="workbench-empty-editor__inner">
+      <div className="workbench-empty-editor__icon" aria-hidden="true">
+        FILE
+      </div>
+      <div>打开一个文件开始编辑</div>
+      <div className="workbench-empty-editor__hint">使用左侧文件树选择文件</div>
+    </div>
+  </div>
+);
 
 const ActivityIcon: React.FC<{ name: ActivityIconName }> = ({ name }) => {
   const commonProps = {
@@ -181,10 +198,12 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
     switch (activeSidebar) {
       case 'explorer':
         return (
-          <FileTree
-            onFileSelect={(path, folderId) => openFile(path, folderId)}
-            selectedTabId={activeFile ? buildFileTabId(activeFile.folderId, activeFile.path) : null}
-          />
+          <Suspense fallback={<PanelFallback label="Loading Explorer..." />}>
+            <FileTree
+              onFileSelect={(path, folderId) => openFile(path, folderId)}
+              selectedTabId={activeFile ? buildFileTabId(activeFile.folderId, activeFile.path) : null}
+            />
+          </Suspense>
         );
       case 'git':
         return (
@@ -368,36 +387,45 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         )}
 
         {isSettingsActive ? (
-          <SettingsCenter
-            apiStatus={apiStatus}
-            wsStatus={wsStatus}
-            serverVersion={serverVersion}
-          />
+          <Suspense fallback={<PanelFallback label="Loading Settings..." />}>
+            <SettingsCenter
+              apiStatus={apiStatus}
+              wsStatus={wsStatus}
+              serverVersion={serverVersion}
+            />
+          </Suspense>
+        ) : activeFile ? (
+          <Suspense fallback={<PanelFallback label="Loading Editor..." />}>
+            <CodeEditor
+              filePath={activeFile.path}
+              modelKey={buildFileTabId(activeFile.folderId, activeFile.path)}
+              content={activeFile.content}
+              onContentChange={(content) => {
+                updateContent(buildFileTabId(activeFile.folderId, activeFile.path), content);
+              }}
+              isDirty={activeFile.isDirty}
+              binary={activeFile.binary}
+              sizeBytes={activeFile.sizeBytes}
+              onSave={(modelKey) => saveFile(modelKey)}
+            />
+          </Suspense>
         ) : (
-          <CodeEditor
-            filePath={activeFile?.path ?? null}
-            modelKey={activeFile ? buildFileTabId(activeFile.folderId, activeFile.path) : null}
-            content={activeFile?.content ?? ''}
-            onContentChange={(content) => {
-              if (!activeFile) return;
-              updateContent(buildFileTabId(activeFile.folderId, activeFile.path), content);
-            }}
-            isDirty={activeFile?.isDirty ?? false}
-            binary={activeFile?.binary ?? false}
-            sizeBytes={activeFile?.sizeBytes ?? 0}
-            onSave={(modelKey) => saveFile(modelKey)}
-          />
+          <EmptyEditorSurface />
         )}
       </main>
 
       <aside className="agent-panel panel">
-        <AgentPanelPlaceholder />
+        <Suspense fallback={<PanelFallback label="Loading Agent..." />}>
+          <AgentPanelPlaceholder />
+        </Suspense>
       </aside>
 
       {!terminalMinimized && (
         <footer className="bottom-panel panel">
           <div className="bottom-panel__content">
-            <TerminalPlaceholder onMinimize={() => setTerminalMinimized(true)} />
+            <Suspense fallback={<PanelFallback label="Loading Terminal..." />}>
+              <TerminalPlaceholder onMinimize={() => setTerminalMinimized(true)} />
+            </Suspense>
           </div>
         </footer>
       )}
@@ -448,8 +476,10 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         </button>
       )}
 
-      <WorkspaceOpenDialog />
-      <CodeWorkspaceChoiceDialog />
+      <Suspense fallback={null}>
+        <WorkspaceOpenDialog />
+        <CodeWorkspaceChoiceDialog />
+      </Suspense>
     </div>
   );
 };

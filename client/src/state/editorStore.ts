@@ -10,7 +10,7 @@
  */
 import { create } from 'zustand';
 import { readFile, writeFile } from '../services/runtimeAdapter';
-import { closeModel } from '../components/editor/CodeEditor';
+import { closeModel } from '../components/editor/modelRegistry';
 import { useWorkspaceStore } from './workspaceStore';
 
 // ---- Tab 模型 ----

@@ -17,6 +17,10 @@ import App from './app/App';
 
 const ROOT_EL_ID = 'root';
 
+if (typeof performance !== 'undefined') {
+  performance.mark('deepcode:react-start');
+}
+
 function showBootstrapError(label: string, err: unknown): void {
   // 直接 DOM 操作，避免依赖 React 已经成功挂载
   const root = document.getElementById(ROOT_EL_ID);

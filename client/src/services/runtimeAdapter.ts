@@ -174,6 +174,14 @@ async function tauriInvoke<T>(command: string, args?: Record<string, unknown>): 
       };
     }
 
+    if (errStr.includes('no_workspace')) {
+      return {
+        ok: false,
+        error: 'no_workspace',
+        message: errStr,
+      };
+    }
+
     return {
       ok: false,
       error: 'tauri_error',
@@ -264,14 +272,7 @@ export async function getFileTree(
   relativePath?: string
 ): Promise<ApiResponse<FileTreeNode[]>> {
   if (getRuntimeType() === 'tauri') {
-    if (!folderId) {
-      return {
-        ok: false,
-        error: 'missing_folder_id',
-        message: 'Tauri 模式下 folderId 不能为空',
-      };
-    }
-    return tauriInvoke<FileTreeNode[]>('list_file_tree', { folderId });
+    return tauriInvoke<FileTreeNode[]>('list_file_tree', { folderId: folderId ?? null });
   }
   const { getFileTree: apiGetFileTree } = await import('./apiClient');
   return apiGetFileTree(folderId, relativePath);
@@ -282,15 +283,8 @@ export async function readFile(
   folderId?: string
 ): Promise<ApiResponse<FileReadResult>> {
   if (getRuntimeType() === 'tauri') {
-    if (!folderId) {
-      return {
-        ok: false,
-        error: 'missing_folder_id',
-        message: 'Tauri 模式下 folderId 不能为空',
-      };
-    }
     return tauriInvoke<FileReadResult>('read_text_file', {
-      folderId,
+      folderId: folderId ?? null,
       path: filePath,
     });
   }
@@ -304,15 +298,8 @@ export async function writeFile(
   folderId?: string
 ): Promise<ApiResponse<FileWriteResult>> {
   if (getRuntimeType() === 'tauri') {
-    if (!folderId) {
-      return {
-        ok: false,
-        error: 'missing_folder_id',
-        message: 'Tauri 模式下 folderId 不能为空',
-      };
-    }
     return tauriInvoke<FileWriteResult>('write_text_file', {
-      folderId,
+      folderId: folderId ?? null,
       path: filePath,
       content,
     });
@@ -329,15 +316,8 @@ export async function createFile(
   folderId?: string
 ): Promise<ApiResponse<FileWriteResult>> {
   if (getRuntimeType() === 'tauri') {
-    if (!folderId) {
-      return {
-        ok: false,
-        error: 'missing_folder_id',
-        message: 'Tauri 模式下 folderId 不能为空',
-      };
-    }
     return tauriInvoke<FileWriteResult>('create_file', {
-      folderId,
+      folderId: folderId ?? null,
       path: filePath,
       content: content ?? '',
     });
@@ -351,15 +331,8 @@ export async function createFolder(
   folderId?: string
 ): Promise<ApiResponse<CreateFolderResult>> {
   if (getRuntimeType() === 'tauri') {
-    if (!folderId) {
-      return {
-        ok: false,
-        error: 'missing_folder_id',
-        message: 'Tauri 模式下 folderId 不能为空',
-      };
-    }
     return tauriInvoke<CreateFolderResult>('create_folder', {
-      folderId,
+      folderId: folderId ?? null,
       path: folderPath,
     });
   }
@@ -373,15 +346,8 @@ export async function renameEntry(
   folderId?: string
 ): Promise<ApiResponse<RenameEntryResult>> {
   if (getRuntimeType() === 'tauri') {
-    if (!folderId) {
-      return {
-        ok: false,
-        error: 'missing_folder_id',
-        message: 'Tauri 模式下 folderId 不能为空',
-      };
-    }
     return tauriInvoke<RenameEntryResult>('rename_entry', {
-      folderId,
+      folderId: folderId ?? null,
       oldPath,
       newPath,
     });

@@ -8,8 +8,6 @@
  *   4. Register editor-level shortcuts, auto-save and close guard.
  */
 import React, { useCallback, useEffect, useState } from 'react';
-import { loader } from '@monaco-editor/react';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 import WorkbenchLayout from './layout/WorkbenchLayout';
 import useAppStatusStore from '../state/appStatusStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
@@ -52,6 +50,46 @@ function asNumber(value: unknown, fallback: number): number {
 
 function asBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
+}
+
+function markStartup(name: string): void {
+  if (typeof performance === 'undefined') return;
+  performance.mark(name);
+  if (import.meta.env.DEV) {
+    // eslint-disable-next-line no-console
+    console.debug(`[startup] ${name}`, Math.round(performance.now()));
+  }
+}
+
+function afterFirstPaint(task: () => void): () => void {
+  let cancelled = false;
+  const frame = window.requestAnimationFrame(() => {
+    window.setTimeout(() => {
+      if (!cancelled) task();
+    }, 0);
+  });
+  return () => {
+    cancelled = true;
+    window.cancelAnimationFrame(frame);
+  };
+}
+
+function scheduleIdle(task: () => void, timeout = 1200): () => void {
+  if (window.requestIdleCallback) {
+    const id = window.requestIdleCallback(() => task(), { timeout });
+    return () => window.cancelIdleCallback?.(id);
+  }
+  const id = window.setTimeout(task, timeout);
+  return () => window.clearTimeout(id);
+}
+
+async function destroyCurrentWindow(): Promise<void> {
+  if (getRuntimeType() !== 'tauri') {
+    window.close();
+    return;
+  }
+  const { getCurrentWindow } = await import('@tauri-apps/api/window');
+  await getCurrentWindow().destroy();
 }
 
 const App: React.FC = () => {
@@ -110,7 +148,7 @@ const App: React.FC = () => {
     const closeWindow = () => {
       closeConfirmDialog();
       window.setTimeout(() => {
-        void getCurrentWindow().destroy();
+        void destroyCurrentWindow();
       }, 50);
     };
 
@@ -151,8 +189,11 @@ const App: React.FC = () => {
 
   // ---- 1. Load workspace and user settings ----
   useEffect(() => {
-    loadWorkspace();
-    loadUserSettings();
+    markStartup('deepcode:first-shell');
+    return afterFirstPaint(() => {
+      void loadWorkspace().finally(() => markStartup('deepcode:workspace-ready'));
+      void loadUserSettings().finally(() => markStartup('deepcode:settings-loaded'));
+    });
   }, [loadWorkspace, loadUserSettings]);
 
   // ---- 1.1 Workspace settings overlay ----
@@ -167,14 +208,16 @@ const App: React.FC = () => {
 
   // ---- 1.3 Monaco / communication warmup ----
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      loader.init().catch(() => undefined);
-      void import('../services/apiClient');
+    return scheduleIdle(() => {
+      void import('@monaco-editor/react')
+        .then(({ loader }) => loader.init())
+        .catch(() => undefined);
       if (getRuntimeType() === 'tauri') {
         void import('@tauri-apps/api/core');
+      } else {
+        void import('../services/apiClient');
       }
-    }, 300);
-    return () => window.clearTimeout(timer);
+    });
   }, []);
 
   // ---- 2. Runtime status + API health ----
@@ -204,16 +247,19 @@ const App: React.FC = () => {
       }
     };
 
-    (async () => {
-      await checkRuntimeAndHealth();
-      if (cancelled) return;
-      if (getRuntimeType() === 'web') {
-        interval = setInterval(checkRuntimeAndHealth, 30000);
-      }
-    })();
+    const cancelFirstPaint = afterFirstPaint(() => {
+      void (async () => {
+        await checkRuntimeAndHealth();
+        if (cancelled) return;
+        if (getRuntimeType() === 'web') {
+          interval = setInterval(checkRuntimeAndHealth, 30000);
+        }
+      })();
+    });
 
     return () => {
       cancelled = true;
+      cancelFirstPaint();
       if (interval !== null) clearInterval(interval);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -221,8 +267,11 @@ const App: React.FC = () => {
 
   // ---- 3. Heartbeat ----
   useEffect(() => {
-    connectHeartbeat();
+    const cancel = afterFirstPaint(() => {
+      connectHeartbeat();
+    });
     return () => {
+      cancel();
       disconnectHeartbeat();
     };
   }, []);
@@ -288,22 +337,25 @@ const App: React.FC = () => {
       return () => window.removeEventListener('beforeunload', onBeforeUnload);
     }
 
-    const appWindow = getCurrentWindow();
     let disposed = false;
     let cleanup: (() => void) | null = null;
 
-    void appWindow.onCloseRequested((event) => {
-      if (useEditorStore.getState().hasAnyDirtyFile()) {
-        event.preventDefault();
-        showUnsavedCloseDialog();
-      }
-    }).then((unlisten) => {
-      if (disposed) {
-        unlisten();
-      } else {
-        cleanup = unlisten;
-      }
-    });
+    void import('@tauri-apps/api/window')
+      .then(({ getCurrentWindow }) =>
+        getCurrentWindow().onCloseRequested((event) => {
+          if (useEditorStore.getState().hasAnyDirtyFile()) {
+            event.preventDefault();
+            showUnsavedCloseDialog();
+          }
+        })
+      )
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          cleanup = unlisten;
+        }
+      });
 
     return () => {
       disposed = true;

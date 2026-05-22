@@ -86,7 +86,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         current: ws,
         fallbackUsed: result.data!.fallbackUsed,
         lastError: result.data!.lastError,
-        activeFolderId: ws.folders[0]?.id ?? null,
+        activeFolderId: ws?.folders[0]?.id ?? null,
         loading: false,
         treeRevision: state.treeRevision + 1,
       }));
