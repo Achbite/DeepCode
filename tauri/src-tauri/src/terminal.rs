@@ -5,11 +5,14 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 const MAX_EVENTS_PER_SESSION: usize = 500;
+const SPAWN_TIMEOUT_MS: u64 = 8000;
+const KILL_SPAWN_THROTTLE_MS: u64 = 250;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalError {
@@ -72,6 +75,17 @@ pub struct TerminalCapability {
     pub supports_pty: bool,
     pub agent_uses_unix_commands: bool,
     pub shell: ShellEnvironmentStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalWarmupStatus {
+    pub state: String,
+    pub default_shell: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub message: Option<String>,
+    pub problems: Vec<ShellProblem>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,15 +164,33 @@ struct ShellSpec {
 
 struct TerminalRecord {
     session: TerminalSession,
-    child: Child,
-    stdin: ChildStdin,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
     events: Vec<TerminalEvent>,
     sequence: u64,
 }
 
-#[derive(Default)]
 struct TerminalState {
     sessions: HashMap<String, TerminalRecord>,
+    warmup: TerminalWarmupStatus,
+    last_spawn_at: Option<Instant>,
+}
+
+impl Default for TerminalState {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            warmup: TerminalWarmupStatus {
+                state: "idle".into(),
+                default_shell: default_shell_kind_fast().into(),
+                started_at: None,
+                completed_at: None,
+                message: None,
+                problems: Vec::new(),
+            },
+            last_spawn_at: None,
+        }
+    }
 }
 
 pub struct TerminalManager {
@@ -178,6 +210,58 @@ impl TerminalManager {
         terminal_capability()
     }
 
+    pub fn warmup_status(&self) -> TerminalWarmupStatus {
+        self.state
+            .lock()
+            .expect("terminal state poisoned")
+            .warmup
+            .clone()
+    }
+
+    pub fn warmup(&self) -> TerminalWarmupStatus {
+        {
+            let mut state = self.state.lock().expect("terminal state poisoned");
+            if state.warmup.state == "warming" || state.warmup.state == "ready" {
+                return state.warmup.clone();
+            }
+            state.warmup = TerminalWarmupStatus {
+                state: "warming".into(),
+                default_shell: default_shell_kind_fast().into(),
+                started_at: Some(now_iso()),
+                completed_at: None,
+                message: Some("warming terminal runtime".into()),
+                problems: Vec::new(),
+            };
+        }
+
+        let state = Arc::clone(&self.state);
+        thread::spawn(move || {
+            let status = shell_environment_status();
+            let mut state = state.lock().expect("terminal state poisoned");
+            state.warmup = if status.available {
+                TerminalWarmupStatus {
+                    state: "ready".into(),
+                    default_shell: status.preferred_shell,
+                    started_at: state.warmup.started_at.clone(),
+                    completed_at: Some(now_iso()),
+                    message: Some("terminal runtime ready".into()),
+                    problems: status.problems,
+                }
+            } else {
+                TerminalWarmupStatus {
+                    state: "error".into(),
+                    default_shell: status.preferred_shell,
+                    started_at: state.warmup.started_at.clone(),
+                    completed_at: Some(now_iso()),
+                    message: Some("terminal runtime unavailable".into()),
+                    problems: status.problems,
+                }
+            };
+        });
+
+        self.warmup_status()
+    }
+
     pub fn list_sessions(&self) -> TerminalSessionsResult {
         let mut sessions: Vec<TerminalSession> = self
             .state
@@ -195,68 +279,45 @@ impl TerminalManager {
         &self,
         request: CreateTerminalSessionRequest,
     ) -> Result<TerminalSession, TerminalError> {
-        let shell = resolve_shell(request.shell_kind.as_deref(), request.cwd.as_deref())?;
         let order = self.state.lock().expect("terminal state poisoned").sessions.len() as u32;
         let id_number = self.next_id.fetch_add(1, Ordering::SeqCst);
         let id = format!("term-{}-{}", Utc::now().timestamp_millis(), id_number);
         let now = now_iso();
+        let shell_kind = request
+            .shell_kind
+            .unwrap_or_else(|| default_shell_kind_fast().to_string());
+        let cwd = request.cwd.unwrap_or_else(default_cwd_string);
         let name = request.name.unwrap_or_else(|| format!("Terminal {}", order + 1));
-
-        let mut command = Command::new(&shell.command);
-        command.args(&shell.args);
-        if !shell.cwd.is_empty() && shell.kind != "wsl" {
-            command.current_dir(&shell.cwd);
-        }
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-
-        let mut child = command.spawn().map_err(map_spawn_error)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| TerminalError::Other("terminal_stdin_unavailable".into()))?;
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
 
         let session = TerminalSession {
             id: id.clone(),
             name,
-            shell_kind: shell.kind,
-            cwd: shell.cwd,
-            status: "running".into(),
+            shell_kind: shell_kind.clone(),
+            cwd: cwd.clone(),
+            status: "starting".into(),
             created_at: now.clone(),
             updated_at: now,
             order,
             exit_code: None,
         };
 
-        let record = TerminalRecord {
-            session: session.clone(),
-            child,
-            stdin,
-            events: Vec::new(),
-            sequence: 0,
-        };
-
         {
             let mut state = self.state.lock().expect("terminal state poisoned");
-            state.sessions.insert(id.clone(), record);
-            push_event_locked(&mut state, &id, "status", Some("running".into()), None);
+            state.sessions.insert(
+                id.clone(),
+                TerminalRecord {
+                    session: session.clone(),
+                    child: None,
+                    stdin: None,
+                    events: Vec::new(),
+                    sequence: 0,
+                },
+            );
+            push_event_locked(&mut state, &id, "status", Some("starting".into()), None);
         }
 
-        if let Some(stdout) = stdout {
-            spawn_reader_thread(Arc::clone(&self.state), id.clone(), stdout, "stdout");
-        }
-        if let Some(stderr) = stderr {
-            spawn_reader_thread(Arc::clone(&self.state), id.clone(), stderr, "stderr");
-        }
+        spawn_session_async(Arc::clone(&self.state), id.clone(), shell_kind, cwd);
+        spawn_start_timeout_watcher(Arc::clone(&self.state), id);
 
         Ok(session)
     }
@@ -274,8 +335,12 @@ impl TerminalManager {
         if record.session.status != "running" {
             return Err(TerminalError::Other("terminal_session_not_running".into()));
         }
-        record.stdin.write_all(request.data.as_bytes())?;
-        record.stdin.flush()?;
+        let stdin = record
+            .stdin
+            .as_mut()
+            .ok_or_else(|| TerminalError::Other("terminal_stdin_unavailable".into()))?;
+        stdin.write_all(request.data.as_bytes())?;
+        stdin.flush()?;
         record.session.updated_at = now_iso();
         Ok(record.session.clone())
     }
@@ -338,7 +403,9 @@ impl TerminalManager {
             .sessions
             .remove(session_id)
             .ok_or_else(|| TerminalError::NotFound(session_id.to_string()))?;
-        let _ = record.child.kill();
+        if let Some(child) = record.child.as_mut() {
+            let _ = child.kill();
+        }
         record.session.status = "exited".into();
         record.session.updated_at = now_iso();
         record.session.exit_code = record.session.exit_code.or(Some(0));
@@ -368,6 +435,114 @@ impl TerminalManager {
         });
         TerminalEventsResult { events }
     }
+}
+
+fn spawn_session_async(
+    state: Arc<Mutex<TerminalState>>,
+    session_id: String,
+    shell_kind: String,
+    cwd: String,
+) {
+    thread::spawn(move || {
+        throttle_spawn(Arc::clone(&state));
+
+        let result = (|| -> Result<(Child, ChildStdin, Option<std::process::ChildStdout>, Option<std::process::ChildStderr>, ShellSpec), TerminalError> {
+            let shell = resolve_shell(Some(&shell_kind), Some(&cwd))?;
+            let mut command = Command::new(&shell.command);
+            command.args(&shell.args);
+            if !shell.cwd.is_empty() && shell.kind != "wsl" {
+                command.current_dir(&shell.cwd);
+            }
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+
+            let mut child = command.spawn().map_err(map_spawn_error)?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| TerminalError::Other("terminal_stdin_unavailable".into()))?;
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            Ok((child, stdin, stdout, stderr, shell))
+        })();
+
+        match result {
+            Ok((child, stdin, stdout, stderr, shell)) => {
+                {
+                    let mut state = state.lock().expect("terminal state poisoned");
+                    if let Some(record) = state.sessions.get_mut(&session_id) {
+                        record.child = Some(child);
+                        record.stdin = Some(stdin);
+                        record.session.status = "running".into();
+                        record.session.shell_kind = shell.kind;
+                        record.session.cwd = shell.cwd;
+                        record.session.updated_at = now_iso();
+                        push_event_locked(&mut state, &session_id, "ready", Some("ready".into()), None);
+                        push_event_locked(&mut state, &session_id, "status", Some("running".into()), None);
+                    }
+                }
+                if let Some(stdout) = stdout {
+                    spawn_reader_thread(Arc::clone(&state), session_id.clone(), stdout, "stdout");
+                }
+                if let Some(stderr) = stderr {
+                    spawn_reader_thread(Arc::clone(&state), session_id, stderr, "stderr");
+                }
+            }
+            Err(err) => {
+                let mut state = state.lock().expect("terminal state poisoned");
+                if let Some(record) = state.sessions.get_mut(&session_id) {
+                    record.session.status = "error".into();
+                    record.session.updated_at = now_iso();
+                }
+                push_event_locked(&mut state, &session_id, "error", Some(err.to_string()), None);
+            }
+        }
+    });
+}
+
+fn throttle_spawn(state: Arc<Mutex<TerminalState>>) {
+    let wait = {
+        let state = state.lock().expect("terminal state poisoned");
+        state
+            .last_spawn_at
+            .and_then(|instant| {
+                let elapsed = instant.elapsed();
+                let interval = Duration::from_millis(KILL_SPAWN_THROTTLE_MS);
+                (elapsed < interval).then_some(interval - elapsed + Duration::from_millis(50))
+            })
+    };
+    if let Some(wait) = wait {
+        thread::sleep(wait);
+    }
+    let mut state = state.lock().expect("terminal state poisoned");
+    state.last_spawn_at = Some(Instant::now());
+}
+
+fn spawn_start_timeout_watcher(state: Arc<Mutex<TerminalState>>, session_id: String) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(SPAWN_TIMEOUT_MS));
+        let mut state = state.lock().expect("terminal state poisoned");
+        if let Some(record) = state.sessions.get_mut(&session_id) {
+            if record.session.status == "starting" {
+                record.session.status = "error".into();
+                record.session.updated_at = now_iso();
+                push_event_locked(
+                    &mut state,
+                    &session_id,
+                    "error",
+                    Some("terminal_spawn_timeout".into()),
+                    None,
+                );
+            }
+        }
+    });
 }
 
 fn spawn_reader_thread<R>(
@@ -481,9 +656,9 @@ fn shell_environment_status() -> ShellEnvironmentStatus {
         },
         Err(err) => ShellEnvironmentStatus {
             os,
-            preferred_shell: default_shell_kind().into(),
+            preferred_shell: default_shell_kind_fast().into(),
             available: false,
-            command: default_shell_command().into(),
+            command: default_shell_command_fast().into(),
             args: Vec::new(),
             wsl: wsl_status(),
             problems: vec![ShellProblem {
@@ -498,7 +673,7 @@ fn shell_environment_status() -> ShellEnvironmentStatus {
 fn resolve_shell(kind: Option<&str>, cwd: Option<&str>) -> Result<ShellSpec, TerminalError> {
     let requested = kind
         .map(str::to_string)
-        .unwrap_or_else(|| default_shell_kind().to_string());
+        .unwrap_or_else(|| default_shell_kind_fast().to_string());
     let cwd = cwd
         .map(str::to_string)
         .unwrap_or_else(default_cwd_string);
@@ -596,13 +771,9 @@ fn host_os() -> String {
     .into()
 }
 
-fn default_shell_kind() -> &'static str {
+fn default_shell_kind_fast() -> &'static str {
     if cfg!(windows) {
-        if wsl_available() {
-            "wsl"
-        } else {
-            "powershell"
-        }
+        "wsl"
     } else if cfg!(target_os = "macos") {
         "zsh"
     } else {
@@ -610,13 +781,9 @@ fn default_shell_kind() -> &'static str {
     }
 }
 
-fn default_shell_command() -> &'static str {
+fn default_shell_command_fast() -> &'static str {
     if cfg!(windows) {
-        if wsl_available() {
-            "wsl.exe"
-        } else {
-            "powershell.exe"
-        }
+        "wsl.exe"
     } else if cfg!(target_os = "macos") {
         "/bin/zsh"
     } else {

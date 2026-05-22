@@ -50,6 +50,7 @@ import type {
   TerminalResizeRequest,
   TerminalSession,
   TerminalSessionsResult,
+  TerminalWarmupStatus,
 } from '@deepcode/protocol';
 
 // ---- 运行时检测 ----
@@ -391,6 +392,22 @@ export async function getTerminalCapabilities(): Promise<ApiResponse<TerminalCap
   }
   const { getTerminalCapabilities: apiGetTerminalCapabilities } = await import('./apiClient');
   return apiGetTerminalCapabilities();
+}
+
+export async function getTerminalWarmupStatus(): Promise<ApiResponse<TerminalWarmupStatus>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalWarmupStatus>('get_terminal_warmup_status');
+  }
+  const { getTerminalWarmupStatus: apiGetTerminalWarmupStatus } = await import('./apiClient');
+  return apiGetTerminalWarmupStatus();
+}
+
+export async function warmupTerminalRuntime(): Promise<ApiResponse<TerminalWarmupStatus>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<TerminalWarmupStatus>('warmup_terminal_runtime');
+  }
+  const { warmupTerminalRuntime: apiWarmupTerminalRuntime } = await import('./apiClient');
+  return apiWarmupTerminalRuntime();
 }
 
 export async function listTerminalSessions(): Promise<ApiResponse<TerminalSessionsResult>> {

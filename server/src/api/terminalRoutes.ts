@@ -8,16 +8,19 @@ import type {
   TerminalResizeRequest,
   TerminalSession,
   TerminalSessionsResult,
+  TerminalWarmupStatus,
 } from '@deepcode/protocol';
 import {
   createTerminalSession,
   deleteTerminalSession,
   getTerminalCapability,
   getTerminalEvents,
+  getTerminalWarmupStatus,
   listTerminalSessions,
   resizeTerminalSession,
   restartTerminalSession,
   updateTerminalSession,
+  warmupTerminalRuntime,
   writeTerminalInput,
 } from '../services/terminalService.js';
 
@@ -35,6 +38,20 @@ export async function registerTerminalRoutes(app: FastifyInstance): Promise<void
       ok: true,
       data: getTerminalCapability(),
     } satisfies ApiResponse<TerminalCapability>;
+  });
+
+  app.get('/api/terminal/warmup', async () => {
+    return {
+      ok: true,
+      data: getTerminalWarmupStatus(),
+    } satisfies ApiResponse<TerminalWarmupStatus>;
+  });
+
+  app.post('/api/terminal/warmup', async () => {
+    return {
+      ok: true,
+      data: warmupTerminalRuntime(),
+    } satisfies ApiResponse<TerminalWarmupStatus>;
   });
 
   app.get('/api/terminal/sessions', async () => {

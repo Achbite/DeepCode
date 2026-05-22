@@ -46,6 +46,8 @@ fn main() {
             commands::get_user_settings,
             commands::patch_user_settings,
             commands::get_terminal_capabilities,
+            commands::get_terminal_warmup_status,
+            commands::warmup_terminal_runtime,
             commands::list_terminal_sessions,
             commands::create_terminal_session,
             commands::send_terminal_input,

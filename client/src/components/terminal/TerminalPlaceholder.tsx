@@ -49,6 +49,17 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
   const describeFailure = (result: { error?: string; message?: string }) =>
     result.message || result.error || 'Terminal request failed';
 
+  const defaultPendingShell = (): TerminalSession['shellKind'] =>
+    navigator.platform.toLowerCase().includes('win') ? 'wsl' : 'bash';
+
+  const defaultOutput = () => {
+    if (!active) return 'DeepCode terminal surface\nCreate or select a terminal session.';
+    if (active.status === 'starting') return `Starting ${active.shellKind.toUpperCase()}...`;
+    if (active.status === 'error') return `${active.name} failed to start.`;
+    if (active.status === 'exited') return `${active.name} exited.`;
+    return 'DeepCode terminal surface\nCreate or select a terminal session.';
+  };
+
   useEffect(() => {
     sessionsRef.current = sessions;
   }, [sessions]);
@@ -86,11 +97,25 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
 
   const createTerminal = useCallback(async () => {
     const currentSessions = sessionsRef.current;
+    const now = new Date().toISOString();
+    const pending: TerminalSession = {
+      id: `pending-${Date.now()}`,
+      name: `Terminal ${currentSessions.length + 1}`,
+      shellKind: defaultPendingShell(),
+      cwd: '',
+      status: 'starting',
+      createdAt: now,
+      updatedAt: now,
+      order: currentSessions.length,
+      exitCode: null,
+    };
+    applySessions([...currentSessions, pending], pending.id);
     const result = await createTerminalSession({
       name: `Terminal ${currentSessions.length + 1}`,
     });
     if (!result.ok || !result.data) {
       setTerminalError(describeFailure(result));
+      applySessions(currentSessions, activeIdRef.current ?? undefined);
       return;
     }
     setTerminalError(null);
@@ -161,6 +186,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
           }
           if (event.type === 'exit') return `\n[process exited ${event.exitCode ?? ''}]\n`;
           if (event.type === 'error') return `\n[error] ${event.data ?? ''}\n`;
+          if (event.type === 'ready') return '';
           if (event.type === 'status') return '';
           return event.data ?? '';
         })
@@ -337,7 +363,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
             </div>
           )}
           <pre className="terminal-panel__output">
-            {activeOutput || 'DeepCode terminal surface\nCreate or select a terminal session.'}
+            {activeOutput || defaultOutput()}
           </pre>
           <form className="terminal-panel__prompt" onSubmit={submitCommand}>
             <span>{active?.shellKind ?? 'shell'}</span>
@@ -434,6 +460,9 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
                     />
                   ) : (
                     <span className="terminal-panel__session-name">{session.name}</span>
+                  )}
+                  {session.status !== 'running' && (
+                    <span className="terminal-panel__session-status">{session.status}</span>
                   )}
                 </div>
               </div>

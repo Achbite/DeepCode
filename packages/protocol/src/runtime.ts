@@ -48,7 +48,7 @@ export interface TerminalSession {
   name: string;
   shellKind: ShellRuntimeKind;
   cwd: string;
-  status: 'starting' | 'running' | 'exited' | 'failed';
+  status: 'starting' | 'running' | 'exited' | 'error';
   createdAt: string;
   updatedAt: string;
   order: number;
@@ -59,10 +59,19 @@ export interface TerminalEvent {
   id: string;
   sessionId: string;
   sequence: number;
-  type: 'stdout' | 'stderr' | 'exit' | 'error' | 'status';
+  type: 'stdout' | 'stderr' | 'exit' | 'error' | 'status' | 'ready';
   data?: string;
   exitCode?: number | null;
   timestamp: string;
+}
+
+export interface TerminalWarmupStatus {
+  state: 'idle' | 'warming' | 'ready' | 'error';
+  defaultShell: ShellRuntimeKind;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  message?: string | null;
+  problems: ShellProblem[];
 }
 
 export interface CreateTerminalSessionRequest {

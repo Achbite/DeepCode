@@ -59,6 +59,9 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   // 简化为 vs-dark；阶段 5 引入主题切换最小集后再扩展。
   'workbench.colorTheme': 'vs-dark',
   // ---- Agent / Skill / Prompt ----
+  'terminal.integrated.defaultProfile.windows': 'wsl',
+  'terminal.integrated.prewarm': 'afterStartup',
+  'terminal.integrated.spawnTimeoutMs': 8000,
   'skills.pythonPath': 'python',
   'skills.autoLoad': true,
   'skills.mounts': '[]',

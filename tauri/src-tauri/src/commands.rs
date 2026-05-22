@@ -335,6 +335,20 @@ pub fn get_terminal_capabilities(
 }
 
 #[tauri::command]
+pub fn get_terminal_warmup_status(
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> terminal::TerminalWarmupStatus {
+    state.warmup_status()
+}
+
+#[tauri::command]
+pub fn warmup_terminal_runtime(
+    state: tauri::State<'_, terminal::TerminalManager>,
+) -> terminal::TerminalWarmupStatus {
+    state.warmup()
+}
+
+#[tauri::command]
 pub fn list_terminal_sessions(
     state: tauri::State<'_, terminal::TerminalManager>,
 ) -> terminal::TerminalSessionsResult {

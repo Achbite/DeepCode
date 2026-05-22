@@ -11,6 +11,7 @@ import type {
   TerminalResizeRequest,
   TerminalSession,
   TerminalSessionsResult,
+  TerminalWarmupStatus,
 } from '@deepcode/protocol';
 import { getShellEnvironmentStatus } from './runtimeShellService.js';
 
@@ -23,6 +24,14 @@ interface TerminalSessionRecord {
 
 const sessions = new Map<string, TerminalSessionRecord>();
 let sessionCounter = 0;
+let warmupStatus: TerminalWarmupStatus = {
+  state: 'idle',
+  defaultShell: getShellEnvironmentStatus().preferredShell,
+  startedAt: null,
+  completedAt: null,
+  message: null,
+  problems: [],
+};
 
 function now(): string {
   return new Date().toISOString();
@@ -102,6 +111,36 @@ export function getTerminalCapability(): TerminalCapability {
   };
 }
 
+export function getTerminalWarmupStatus(): TerminalWarmupStatus {
+  return warmupStatus;
+}
+
+export function warmupTerminalRuntime(): TerminalWarmupStatus {
+  if (warmupStatus.state === 'warming' || warmupStatus.state === 'ready') {
+    return warmupStatus;
+  }
+  warmupStatus = {
+    state: 'warming',
+    defaultShell: getShellEnvironmentStatus().preferredShell,
+    startedAt: now(),
+    completedAt: null,
+    message: 'warming terminal runtime',
+    problems: [],
+  };
+  setTimeout(() => {
+    const shell = getShellEnvironmentStatus();
+    warmupStatus = {
+      state: shell.available ? 'ready' : 'error',
+      defaultShell: shell.preferredShell,
+      startedAt: warmupStatus.startedAt,
+      completedAt: now(),
+      message: shell.available ? 'terminal runtime ready' : 'terminal runtime unavailable',
+      problems: shell.problems,
+    };
+  }, 0);
+  return warmupStatus;
+}
+
 export function listTerminalSessions(): TerminalSessionsResult {
   return {
     sessions: Array.from(sessions.values())
@@ -152,10 +191,11 @@ export function createTerminalSession(
   child.on('spawn', () => {
     record.session.status = 'running';
     record.session.updatedAt = now();
+    appendEvent(record, 'ready', 'ready');
     appendEvent(record, 'status', 'running');
   });
   child.on('error', (err) => {
-    record.session.status = 'failed';
+    record.session.status = 'error';
     record.session.updatedAt = now();
     appendEvent(record, 'error', err.message);
   });

@@ -29,7 +29,7 @@ export interface SettingDefinition {
   key: string;
   label: string;
   description: string;
-  group: 'editor' | 'files' | 'keyboard' | 'explorer' | 'workbench';
+  group: 'editor' | 'files' | 'keyboard' | 'explorer' | 'workbench' | 'terminal';
   control: SettingControlType;
   options?: Array<{ label: string; value: string }>;
 }
@@ -173,6 +173,36 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
       { label: 'Dark', value: 'vs-dark' },
       { label: 'Light', value: 'vs-light' },
     ],
+  },
+  {
+    key: 'terminal.integrated.defaultProfile.windows',
+    label: 'Windows Terminal Profile',
+    description: 'Windows 打包态默认终端环境；Agent shell 默认使用 Unix 指令语义。',
+    group: 'terminal',
+    control: 'select',
+    options: [
+      { label: 'WSL', value: 'wsl' },
+      { label: 'PowerShell', value: 'powershell' },
+      { label: 'Command Prompt', value: 'cmd' },
+    ],
+  },
+  {
+    key: 'terminal.integrated.prewarm',
+    label: 'Terminal Prewarm',
+    description: '启动首屏后预热终端运行时，降低第一次新建终端的等待感。',
+    group: 'terminal',
+    control: 'select',
+    options: [
+      { label: 'After Startup', value: 'afterStartup' },
+      { label: 'Off', value: 'off' },
+    ],
+  },
+  {
+    key: 'terminal.integrated.spawnTimeoutMs',
+    label: 'Terminal Spawn Timeout',
+    description: '终端后台启动超时时间，单位毫秒。',
+    group: 'terminal',
+    control: 'number',
   },
 ];
 

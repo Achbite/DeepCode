@@ -45,6 +45,7 @@ import type {
   TerminalEvent,
   TerminalSessionsResult,
   TerminalEventsResult,
+  TerminalWarmupStatus,
   CreateTerminalSessionRequest,
   TerminalInputRequest,
   TerminalResizeRequest,
@@ -373,6 +374,14 @@ export function getTerminalCapabilities(): Promise<ApiResponse<TerminalCapabilit
   return getJson<TerminalCapability>(`${API_BASE}/terminal/capabilities`);
 }
 
+export function getTerminalWarmupStatus(): Promise<ApiResponse<TerminalWarmupStatus>> {
+  return getJson<TerminalWarmupStatus>(`${API_BASE}/terminal/warmup`);
+}
+
+export function warmupTerminalRuntime(): Promise<ApiResponse<TerminalWarmupStatus>> {
+  return sendJson<TerminalWarmupStatus>(`${API_BASE}/terminal/warmup`, 'POST', {});
+}
+
 export function listTerminalSessions(): Promise<ApiResponse<TerminalSessionsResult>> {
   return getJson<TerminalSessionsResult>(`${API_BASE}/terminal/sessions`);
 }
@@ -493,5 +502,6 @@ export type {
   TerminalSession,
   TerminalEvent,
   TerminalCapability,
+  TerminalWarmupStatus,
   ShellEnvironmentStatus,
 };

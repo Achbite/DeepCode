@@ -193,7 +193,9 @@
   flex: 1;
   min-width: 0;
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
 }
 
 .terminal-panel__session-name {
@@ -202,6 +204,13 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.terminal-panel__session-status {
+  color: #8a8f98;
+  font-size: 10px;
+  line-height: 1.2;
+  text-transform: uppercase;
 }
 
 .terminal-panel__rename-input {

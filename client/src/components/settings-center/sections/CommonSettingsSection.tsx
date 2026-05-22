@@ -35,6 +35,7 @@ const GROUP_TITLES: Record<string, string> = {
   keyboard: 'Keyboard',
   explorer: 'Explorer',
   workbench: 'Workbench',
+  terminal: 'Terminal',
 };
 
 const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
