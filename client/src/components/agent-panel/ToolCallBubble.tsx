@@ -72,11 +72,11 @@ function getOutputText(payload: unknown): string | undefined {
 function eventLabel(event: AgentEvent): string {
   if (event.kind === 'tool_call') {
     const name = getToolName(event.payload);
-    return name.startsWith('shell.') ? '执行命令' : '执行工具';
+    return name.startsWith('shell.') ? 'Run command' : 'Run tool';
   }
-  if (event.kind === 'tool_result') return '输出结果';
-  if (event.kind === 'permission_request') return '确认请求';
-  if (event.kind === 'permission_result') return '确认结果';
+  if (event.kind === 'tool_result') return 'Tool result';
+  if (event.kind === 'permission_request') return 'Permission request';
+  if (event.kind === 'permission_result') return 'Permission result';
   return event.kind;
 }
 
@@ -106,11 +106,11 @@ function renderDetails(event: AgentEvent) {
   }
   if (event.kind === 'permission_request') {
     const risk = isRecord(event.payload) ? stringValue(event.payload.riskLevel) : undefined;
-    return <div className="agent-tool-bubble__summary">{risk ? `Risk: ${risk}` : '等待用户确认。'}</div>;
+    return <div className="agent-tool-bubble__summary">{risk ? `Risk: ${risk}` : 'Waiting for user approval.'}</div>;
   }
   if (event.kind === 'permission_result') {
     const decision = isRecord(event.payload) ? stringValue(event.payload.decision) : undefined;
-    return <div className="agent-tool-bubble__summary">{decision ?? '权限已处理。'}</div>;
+    return <div className="agent-tool-bubble__summary">{decision ?? 'Permission resolved.'}</div>;
   }
   return <div className="agent-tool-bubble__summary">{compactDisplayText(cardTitle(event), 220)}</div>;
 }

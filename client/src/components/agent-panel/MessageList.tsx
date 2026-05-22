@@ -10,6 +10,16 @@ interface MessageListProps {
   loading?: boolean;
 }
 
+interface TraceGroup {
+  id: string;
+  events: AgentEvent[];
+}
+
+type RenderItem =
+  | { type: 'event'; event: AgentEvent; autoOpen?: boolean }
+  | { type: 'trace'; group: TraceGroup }
+  | { type: 'turnActions'; id: string; events: AgentEvent[]; targetEvent: AgentEvent };
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -48,6 +58,84 @@ function eventStage(event: AgentEvent): string | undefined {
   return stringField(event.payload, 'stage');
 }
 
+function eventCallId(event: AgentEvent): string | undefined {
+  if (!isRecord(event.payload)) return undefined;
+  return stringField(event.payload, 'callId') ?? stringField(event.payload, 'id');
+}
+
+function nestedRecord(payload: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  return isRecord(payload[key]) ? payload[key] as Record<string, unknown> : undefined;
+}
+
+function eventToolName(event: AgentEvent): string {
+  if (!isRecord(event.payload)) return 'tool';
+  const toolCall = nestedRecord(event.payload, 'toolCall');
+  return (
+    stringField(event.payload, 'toolName') ??
+    stringField(event.payload, 'name') ??
+    (toolCall ? stringField(toolCall, 'name') : undefined) ??
+    stringField(event.payload, 'actionType') ??
+    'tool'
+  );
+}
+
+function eventCommand(event: AgentEvent): string | undefined {
+  if (!isRecord(event.payload)) return undefined;
+  const args =
+    nestedRecord(event.payload, 'arguments') ??
+    nestedRecord(event.payload, 'input') ??
+    nestedRecord(event.payload, 'output') ??
+    event.payload;
+  return stringField(args, 'command') ?? stringField(event.payload, 'command');
+}
+
+function eventPath(event: AgentEvent): string | undefined {
+  if (!isRecord(event.payload)) return undefined;
+  const args =
+    nestedRecord(event.payload, 'arguments') ??
+    nestedRecord(event.payload, 'input') ??
+    nestedRecord(event.payload, 'output') ??
+    event.payload;
+  return stringField(args, 'path') ?? stringField(args, 'cwd') ?? stringField(event.payload, 'path');
+}
+
+function eventStatus(event: AgentEvent): string | undefined {
+  if (!isRecord(event.payload)) return undefined;
+  if (typeof event.payload.ok === 'boolean') return event.payload.ok ? 'ok' : 'error';
+  return stringField(event.payload, 'status') ?? stringField(event.payload, 'decision');
+}
+
+function eventOutput(event: AgentEvent): string | undefined {
+  if (!isRecord(event.payload)) return undefined;
+  const output = nestedRecord(event.payload, 'output');
+  const values = [
+    output ? stringField(output, 'stdout') : undefined,
+    output ? stringField(output, 'stderr') : undefined,
+    stringField(event.payload, 'error'),
+    stringField(event.payload, 'summary'),
+    stringField(event.payload, 'message'),
+  ].filter(Boolean);
+  return values.length > 0 ? sanitizeDisplayText(values.join('\n')) : undefined;
+}
+
+function hasLaterResult(events: AgentEvent[], index: number): boolean {
+  const later = events.slice(index + 1);
+  const callId = eventCallId(events[index]);
+  if (callId) {
+    return later.some((event) => event.kind === 'tool_result' && eventCallId(event) === callId);
+  }
+  return later.some((event) => event.kind === 'tool_result');
+}
+
+function hasLaterPermissionResult(events: AgentEvent[], index: number): boolean {
+  const later = events.slice(index + 1);
+  const callId = eventCallId(events[index]);
+  if (callId) {
+    return later.some((event) => event.kind === 'permission_result' && eventCallId(event) === callId);
+  }
+  return later.some((event) => event.kind === 'permission_result');
+}
+
 function isAgentThoughtEvent(event: AgentEvent): boolean {
   if (event.kind === 'assistant_msg') {
     const stage = eventStage(event);
@@ -67,26 +155,17 @@ function isExecutionProgressEvent(event: AgentEvent): boolean {
   return event.kind === 'workflow_stage';
 }
 
-interface TraceGroup {
-  id: string;
-  events: AgentEvent[];
+function isHiddenConversationEvent(event: AgentEvent): boolean {
+  return isAgentThoughtEvent(event) || isExecutionProgressEvent(event);
 }
 
-type RenderItem =
-  | { type: 'event'; event: AgentEvent; autoOpen?: boolean }
-  | { type: 'trace'; group: TraceGroup };
-
-function eventCallId(event: AgentEvent): string | undefined {
-  if (!isRecord(event.payload)) return undefined;
-  return stringField(event.payload, 'callId') ?? stringField(event.payload, 'id');
-}
-
-function hasLaterResult(events: AgentEvent[], index: number): boolean {
-  const callId = eventCallId(events[index]);
-  if (!callId) return false;
-  return events
-    .slice(index + 1)
-    .some((event) => event.kind === 'tool_result' && eventCallId(event) === callId);
+function isTurnComplete(events: AgentEvent[]): boolean {
+  return !events.some((event, index) => {
+    if (event.kind === 'workflow_stage' && stageStatus(event.payload) === 'started') return true;
+    if (event.kind === 'tool_call' && !hasLaterResult(events, index)) return true;
+    if (event.kind === 'permission_request' && !hasLaterPermissionResult(events, index)) return true;
+    return isRecord(event.payload) && event.payload.pending === true;
+  });
 }
 
 function pickFallbackAssistantEvent(events: AgentEvent[]): AgentEvent | null {
@@ -117,17 +196,11 @@ function pickVisibleAssistantEvent(events: AgentEvent[], thoughtEvents: AgentEve
     const stage = eventStage(event);
     return !stage || stage === 'complete';
   });
-  if (visible.length > 0) {
-    return visible[visible.length - 1];
-  }
+  if (visible.length > 0) return visible[visible.length - 1];
   return pickFallbackAssistantEvent(thoughtEvents);
 }
 
-function isHiddenConversationEvent(event: AgentEvent): boolean {
-  return isAgentThoughtEvent(event) || isExecutionProgressEvent(event);
-}
-
-function createRenderItems(events: AgentEvent[]): RenderItem[] {
+function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[] {
   const items: RenderItem[] = [];
   let index = 0;
 
@@ -148,6 +221,10 @@ function createRenderItems(events: AgentEvent[]): RenderItem[] {
       const visibleAssistant = pickVisibleAssistantEvent(turnEvents, thoughtEvents);
       const visibleAssistantId = visibleAssistant?.id;
 
+      if (visibleAssistant) {
+        items.push({ type: 'event', event: visibleAssistant });
+      }
+
       for (const turnEvent of turnEvents) {
         if (visibleAssistantId && turnEvent.id === visibleAssistantId) continue;
         if (isHiddenConversationEvent(turnEvent)) continue;
@@ -158,8 +235,13 @@ function createRenderItems(events: AgentEvent[]): RenderItem[] {
         });
       }
 
-      if (visibleAssistant) {
-        items.push({ type: 'event', event: visibleAssistant });
+      if (visibleAssistant && !loading && isTurnComplete(turnEvents)) {
+        items.push({
+          type: 'turnActions',
+          id: `turn-actions-${event.id}`,
+          events: [event, ...turnEvents],
+          targetEvent: visibleAssistant,
+        });
       }
       continue;
     }
@@ -176,13 +258,52 @@ function createRenderItems(events: AgentEvent[]): RenderItem[] {
   return items;
 }
 
+function workflowCopyText(events: AgentEvent[]): string {
+  const blocks = events.map((event) => {
+    if (event.kind === 'user_msg') return `User\n${payloadText(event.payload)}`;
+    if (event.kind === 'assistant_msg') {
+      const stage = eventStage(event);
+      return `${stage ? `Agent (${stage})` : 'Agent'}\n${payloadText(event.payload)}`;
+    }
+    if (event.kind === 'workflow_stage') {
+      const stage = stringField(event.payload, 'stage') ?? 'workflow';
+      const status = stageStatus(event.payload);
+      const profile = stringField(event.payload, 'profileId');
+      const summary = stringField(event.payload, 'summary') ?? stringField(event.payload, 'details');
+      return [`Stage ${stage} - ${status}${profile ? ` - ${profile}` : ''}`, summary].filter(Boolean).join('\n');
+    }
+    if (event.kind === 'tool_call') {
+      return [
+        `Tool call - ${eventToolName(event)}`,
+        eventCommand(event) ? `command: ${eventCommand(event)}` : undefined,
+        eventPath(event) ? `path: ${eventPath(event)}` : undefined,
+      ].filter(Boolean).join('\n');
+    }
+    if (event.kind === 'tool_result') {
+      return [
+        `Tool result - ${eventToolName(event)} - ${eventStatus(event) ?? 'done'}`,
+        eventOutput(event),
+      ].filter(Boolean).join('\n');
+    }
+    if (event.kind === 'permission_request') {
+      return [
+        `Permission request - ${eventToolName(event)}`,
+        stringField(event.payload, 'summary') ?? eventCommand(event) ?? eventPath(event),
+      ].filter(Boolean).join('\n');
+    }
+    if (event.kind === 'permission_result') {
+      return `Permission result - ${eventStatus(event) ?? 'resolved'}`;
+    }
+    if (event.kind === 'error') return `Error\n${payloadText(event.payload)}`;
+    return `${event.kind}\n${payloadText(event.payload)}`;
+  });
+
+  return blocks.filter(Boolean).join('\n\n---\n\n');
+}
+
 function thoughtTraceTitle(events: AgentEvent[]): string {
   const stages = Array.from(
-    new Set(
-      events
-        .map((event) => eventStage(event))
-        .filter((stage): stage is string => Boolean(stage))
-    )
+    new Set(events.map((event) => eventStage(event)).filter((stage): stage is string => Boolean(stage)))
   );
   const active = events.some(
     (event) => event.kind === 'workflow_stage' && stageStatus(event.payload) === 'started'
@@ -197,10 +318,7 @@ function renderWorkflowStage(event: AgentEvent) {
   const summary = stringField(event.payload, 'summary');
   const details = stringField(event.payload, 'details') ?? summary;
   return (
-    <div
-      key={event.id}
-      className={`agent-stage-event agent-stage-event--${status}`}
-    >
+    <div key={event.id} className={`agent-stage-event agent-stage-event--${status}`}>
       <div className="agent-stage-event__header">
         {status === 'started' && <span className="agent-spinner" />}
         <span>{stageLabel(event.payload)}</span>
@@ -233,9 +351,7 @@ function renderError(event: AgentEvent) {
 }
 
 function renderTraceEvent(event: AgentEvent) {
-  if (event.kind === 'workflow_stage') {
-    return renderWorkflowStage(event);
-  }
+  if (event.kind === 'workflow_stage') return renderWorkflowStage(event);
   if (event.kind === 'assistant_msg') {
     const stage = eventStage(event) ?? 'thought';
     return (
@@ -245,9 +361,7 @@ function renderTraceEvent(event: AgentEvent) {
       </div>
     );
   }
-  if (event.kind === 'error') {
-    return renderError(event);
-  }
+  if (event.kind === 'error') return renderError(event);
   return <ToolCallBubble key={event.id} event={event} />;
 }
 
@@ -288,24 +402,20 @@ function copyMessage(text: string): void {
   void navigator.clipboard?.writeText(text);
 }
 
-function MessageActions({ event, text }: { event: AgentEvent; text: string }) {
-  if (event.kind === 'user_msg') return null;
+function TurnActions({ events, targetEvent }: { events: AgentEvent[]; targetEvent: AgentEvent }) {
+  const text = workflowCopyText(events);
   return (
-    <div className="agent-message-actions" aria-label="Agent message actions">
-      <button type="button" title="Copy" onClick={() => copyMessage(text)}>Copy</button>
-      <button type="button" title="Good response" onClick={() => feedback(event, 'up')}>Up</button>
-      <button type="button" title="Bad response" onClick={() => feedback(event, 'down')}>Down</button>
+    <div className="agent-turn-actions" aria-label="Agent workflow actions">
+      <button type="button" title="Copy workflow output" onClick={() => copyMessage(text)}>Copy workflow</button>
+      <button type="button" title="Good response" onClick={() => feedback(targetEvent, 'up')}>Up</button>
+      <button type="button" title="Bad response" onClick={() => feedback(targetEvent, 'down')}>Down</button>
     </div>
   );
 }
 
 function renderMessage(event: AgentEvent, autoOpen = false) {
-  if (event.kind === 'workflow_stage') {
-    return renderWorkflowStage(event);
-  }
-  if (event.kind === 'error') {
-    return renderError(event);
-  }
+  if (event.kind === 'workflow_stage') return renderWorkflowStage(event);
+  if (event.kind === 'error') return renderError(event);
   if (
     event.kind === 'tool_call' ||
     event.kind === 'tool_result' ||
@@ -320,10 +430,7 @@ function renderMessage(event: AgentEvent, autoOpen = false) {
   const text = payloadText(event.payload);
   const renderMarkdown = event.kind === 'assistant_msg' || event.kind === 'user_msg';
   return (
-    <div
-      key={event.id}
-      className={`agent-message agent-message--${event.kind}`}
-    >
+    <div key={event.id} className={`agent-message agent-message--${event.kind}`}>
       <div className="agent-message__meta">
         {speaker}
         {pending && <span className="agent-message__stage">Sending...</span>}
@@ -331,7 +438,6 @@ function renderMessage(event: AgentEvent, autoOpen = false) {
       <div className={`agent-message__body ${renderMarkdown ? 'agent-message__body--markdown' : 'agent-message__body--plain'}`}>
         {renderMarkdown ? <MarkdownContent content={text} /> : text}
       </div>
-      <MessageActions event={event} text={text} />
     </div>
   );
 }
@@ -347,9 +453,13 @@ const MessageList: React.FC<MessageListProps> = ({ events, loading = false }) =>
       </div>
     )}
 
-    {createRenderItems(events).map((item) =>
-      item.type === 'trace' ? renderTraceGroup(item.group) : renderMessage(item.event, item.autoOpen)
-    )}
+    {createRenderItems(events, loading).map((item) => {
+      if (item.type === 'trace') return renderTraceGroup(item.group);
+      if (item.type === 'turnActions') {
+        return <TurnActions key={item.id} events={item.events} targetEvent={item.targetEvent} />;
+      }
+      return renderMessage(item.event, item.autoOpen);
+    })}
 
     {loading && (
       <div className="agent-thinking">

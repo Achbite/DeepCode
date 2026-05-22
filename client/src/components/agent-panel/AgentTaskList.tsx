@@ -8,6 +8,8 @@ interface AgentTaskView {
   title: string;
   status: 'waiting' | 'planned' | 'running' | 'completed' | 'error';
   commands: TaskCommandView[];
+  hasToolActivity: boolean;
+  hasMeaningfulOutput: boolean;
 }
 
 interface TaskCommandView {
@@ -80,7 +82,7 @@ function actionText(action: Record<string, unknown>): string {
     (typeof action.content === 'string' && sanitizeDisplayText(action.content)) ||
     (typeof action.message === 'string' && sanitizeDisplayText(action.message));
 
-  if (type === 'final') return result ? result.trim() : 'Final response prepared.';
+  if (type === 'final') return result ? result.trim() : '最终回复已准备。';
   if (type === 'fs.read') return `读取文件 \`${path ?? '(missing path)'}\`。`;
   if (type === 'fs.list') return `列出目录 \`${path ?? '.'}\`。`;
   if (type === 'code.search') return `搜索代码 \`${query ?? '(missing query)'}\`。`;
@@ -93,7 +95,7 @@ function actionText(action: Record<string, unknown>): string {
     return `规划补丁 \`${path ?? '(missing path)'}\`${range}。`;
   }
   if (type === 'shell.propose') return `建议命令：\`${command ?? '(missing command)'}\`。`;
-  if (type === 'shell.exec') return `审批后执行命令：\`${command ?? '(missing command)'}\`。`;
+  if (type === 'shell.exec') return `执行命令：\`${command ?? '(missing command)'}\`。`;
   return result ? result.trim() : `解析到动作 \`${type}\`。`;
 }
 
@@ -149,6 +151,7 @@ function pushCommand(task: AgentTaskView, markdown: string, id?: string): void {
   const normalized = sanitizeDisplayText(markdown).trim();
   if (!normalized) return;
   task.commands.push(asCommand(normalized, id));
+  task.hasMeaningfulOutput = true;
 }
 
 function latestTurnEvents(events: AgentEvent[]): AgentEvent[] {
@@ -166,6 +169,8 @@ function defaultTasks(loading: boolean): AgentTaskView[] {
       title: loading ? 'Agent 正在准备任务' : '等待 Agent 任务',
       status: loading ? 'running' : 'waiting',
       commands: [],
+      hasToolActivity: false,
+      hasMeaningfulOutput: false,
     },
   ];
 }
@@ -179,13 +184,46 @@ function ensureTask(tasks: Map<string, AgentTaskView>, stage: string): AgentTask
     title: `${STAGE_LABELS[stage] ?? stage} stage`,
     status: 'planned',
     commands: [],
+    hasToolActivity: false,
+    hasMeaningfulOutput: false,
   };
   tasks.set(id, next);
   return next;
 }
 
+function hasToolActivity(events: AgentEvent[]): boolean {
+  return events.some((event) =>
+    event.kind === 'tool_call' ||
+    event.kind === 'tool_result' ||
+    event.kind === 'permission_request' ||
+    event.kind === 'permission_result'
+  );
+}
+
+function shouldShowWorkflowSummary(stage: string, status: string, toolActivity: boolean): boolean {
+  if (status === 'started' || status === 'error') return true;
+  if (!toolActivity) return stage === 'complete' || stage === 'review';
+  return stage === 'complete';
+}
+
+function compactTasks(tasks: AgentTaskView[], focusTaskId: string | undefined, toolActivity: boolean): AgentTaskView[] {
+  if (tasks.length <= 1) return tasks;
+
+  if (toolActivity) {
+    const filtered = tasks.filter((task) => task.hasToolActivity || task.status === 'running' || task.status === 'error');
+    return filtered.length > 0 ? filtered : tasks;
+  }
+
+  const focused = tasks.find((task) => task.id === focusTaskId && task.hasMeaningfulOutput);
+  if (focused) return [focused];
+
+  const meaningful = tasks.filter((task) => task.hasMeaningfulOutput);
+  return meaningful.length > 0 ? [meaningful[meaningful.length - 1]] : [tasks[tasks.length - 1]];
+}
+
 function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
   const turnEvents = latestTurnEvents(events);
+  const toolActivity = hasToolActivity(turnEvents);
   const tasks = new Map<string, AgentTaskView>();
   let focusTaskId: string | undefined;
 
@@ -202,19 +240,23 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
       const summary = stringField(event.payload, 'summary');
       const details = stringField(event.payload, 'details');
       const profileId = stringField(event.payload, 'profileId');
-      pushCommand(
-        task,
-        `**${status}**${profileId ? ` · \`${profileId}\`` : ''}${
-          details ?? summary ? `\n\n${humanizeAgentOutput(details ?? summary ?? '')}` : ''
-        }`,
-        event.id
-      );
+      if (shouldShowWorkflowSummary(stage, status, toolActivity)) {
+        const detailText = details ?? summary;
+        pushCommand(
+          task,
+          `**${status}**${profileId ? ` · \`${profileId}\`` : ''}${
+            detailText ? `\n\n${humanizeAgentOutput(detailText)}` : ''
+          }`,
+          event.id
+        );
+      }
       continue;
     }
 
     if (event.kind === 'assistant_msg') {
       const stage = stringField(event.payload, 'stage');
       if (!stage) continue;
+      if (toolActivity && stage !== 'complete') continue;
       const task = ensureTask(tasks, stage);
       focusTaskId = task.id;
       pushCommand(
@@ -228,6 +270,7 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
     if (event.kind === 'tool_call') {
       const task = ensureTask(tasks, 'complete');
       focusTaskId = task.id;
+      task.hasToolActivity = true;
       task.status = task.status === 'planned' ? 'running' : task.status;
       pushCommand(task, `调用工具：\`${toolName(event.payload)}\``, event.id);
       continue;
@@ -236,6 +279,7 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
     if (event.kind === 'tool_result') {
       const task = ensureTask(tasks, 'complete');
       focusTaskId = task.id;
+      task.hasToolActivity = true;
       const ok = isRecord(event.payload) && event.payload.ok === true;
       const error = stringField(event.payload, 'error');
       pushCommand(
@@ -251,8 +295,17 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
     if (event.kind === 'permission_request') {
       const task = ensureTask(tasks, 'complete');
       focusTaskId = task.id;
+      task.hasToolActivity = true;
       task.status = 'running';
       pushCommand(task, `需要确认：\`${toolName(event.payload)}\``, event.id);
+      continue;
+    }
+
+    if (event.kind === 'permission_result') {
+      const task = ensureTask(tasks, 'complete');
+      focusTaskId = task.id;
+      task.hasToolActivity = true;
+      pushCommand(task, `确认结果：\`${toolName(event.payload)}\``, event.id);
       continue;
     }
 
@@ -273,9 +326,16 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
       focusTaskId: waiting[0]?.id,
     };
   }
+
+  const compacted = compactTasks(result, focusTaskId, toolActivity);
+  const nextFocus =
+    compacted.find((task) => task.id === focusTaskId)?.id ??
+    compacted.find((task) => task.status === 'running')?.id ??
+    compacted[0]?.id;
+
   return {
-    tasks: result,
-    focusTaskId: focusTaskId ?? result.find((task) => task.status === 'running')?.id ?? result[0]?.id,
+    tasks: compacted,
+    focusTaskId: nextFocus,
   };
 }
 
