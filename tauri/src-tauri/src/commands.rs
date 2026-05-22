@@ -697,6 +697,88 @@ pub fn resolve_agent_permission(
 
 // 窗口管理
 #[tauri::command]
+pub fn submit_agent_feedback(request: serde_json::Value) -> serde_json::Value {
+    let body = request.get("request").unwrap_or(&request);
+    serde_json::json!({
+        "accepted": body.get("eventId").is_some() && body.get("rating").is_some(),
+        "message": "Agent feedback command is reserved for future model-quality data collection."
+    })
+}
+
+fn browser_runtime_stub(message: &str, inspect_state: &str, current_url: Option<String>) -> serde_json::Value {
+    serde_json::json!({
+        "status": "idle",
+        "inspectState": inspect_state,
+        "currentUrl": current_url,
+        "message": message,
+        "snapshot": null
+    })
+}
+
+#[tauri::command]
+pub fn get_browser_runtime_status() -> serde_json::Value {
+    browser_runtime_stub(
+        "Internal browser runtime is a skeleton only. Real preview loading, DOM capture, and Agent attachment are reserved for a later stage.",
+        "off",
+        None,
+    )
+}
+
+#[tauri::command]
+pub fn open_browser_preview(request: serde_json::Value) -> serde_json::Value {
+    let body = request.get("request").unwrap_or(&request);
+    let current_url = body
+        .get("url")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let message = match &current_url {
+        Some(url) => format!("Preview target recorded: {url}. Real loading is not implemented yet."),
+        None => "Preview target is empty. Real loading is not implemented yet.".to_string(),
+    };
+    browser_runtime_stub(&message, "off", current_url)
+}
+
+#[tauri::command]
+pub fn reload_browser_preview() -> serde_json::Value {
+    browser_runtime_stub(
+        "Reload requested. Real browser reload is not implemented yet.",
+        "off",
+        None,
+    )
+}
+
+#[tauri::command]
+pub fn set_browser_inspect_mode(request: serde_json::Value) -> serde_json::Value {
+    let body = request.get("request").unwrap_or(&request);
+    let inspect_state = body
+        .get("inspectState")
+        .and_then(|value| value.as_str())
+        .filter(|value| matches!(*value, "off" | "selecting" | "selected"))
+        .unwrap_or("off");
+    let message = format!("Inspect mode set to {inspect_state}. DOM selection is not implemented yet.");
+    browser_runtime_stub(&message, inspect_state, None)
+}
+
+#[tauri::command]
+pub fn get_selected_panel_snapshot() -> serde_json::Value {
+    serde_json::json!({
+        "snapshot": null,
+        "message": "No panel snapshot is available yet. DOM capture is reserved for a later stage."
+    })
+}
+
+#[tauri::command]
+pub fn attach_panel_snapshot_to_agent() -> serde_json::Value {
+    serde_json::json!({
+        "attached": false,
+        "snapshot": null,
+        "message": "Panel snapshot attachment is reserved for a later stage."
+    })
+}
+
+#[tauri::command]
 pub fn window_close_ask_status(_app_handle: tauri::AppHandle) -> Result<bool, String> {
     // 通过 emit 向前端询问状态，此函数仅用于标记接口存在
     // 实际逻辑前端自行处理

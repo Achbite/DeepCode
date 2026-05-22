@@ -24,7 +24,34 @@ export class ContextSourceRegistry {
     }
 
     for (const attachment of attachments) {
-      if (attachment.kind === 'file') {
+      if (attachment.kind === 'panelSnapshot') {
+        const snapshot = attachment.snapshot;
+        if (!snapshot) {
+          lines.push('', 'Attached panel snapshot: unavailable (browser snapshot capture is not implemented yet).');
+          continue;
+        }
+        lines.push(
+          '',
+          `Attached panel snapshot: ${snapshot.panelTitle ?? snapshot.selector}`,
+          '```json',
+          JSON.stringify(
+            {
+              id: snapshot.id,
+              url: snapshot.url,
+              capturedAt: snapshot.capturedAt,
+              selector: snapshot.selector,
+              panelKind: snapshot.panelKind,
+              panelTitle: snapshot.panelTitle,
+              textContent: snapshot.textContent,
+              sourceHints: snapshot.sourceHints,
+              relatedFiles: snapshot.relatedFiles,
+            },
+            null,
+            2
+          ).slice(0, 8000),
+          '```'
+        );
+      } else if (attachment.kind === 'file') {
         try {
           const file = await readFileContent(attachment.folderId, attachment.path);
           lines.push('', `Attached file: ${attachment.path}`, '```', file.content.slice(0, 16000), '```');

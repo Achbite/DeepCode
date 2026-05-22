@@ -1,7 +1,11 @@
 import './workbenchLayout.css';
 import React, { Suspense, lazy, useEffect, useState } from 'react';
+import type { InternalBrowserMode } from '@deepcode/protocol';
 import GitPanelPlaceholder from '../../components/git-panel/GitPanelPlaceholder';
 import WindowControls from '../../components/window-controls/WindowControls';
+import BrowserModeSwitch from '../../components/internal-browser/BrowserModeSwitch';
+import ActivityIcon from './ActivityIcon';
+import EmptyEditorSurface from './EmptyEditorSurface';
 import {
   useEditorStore,
   buildFileTabId,
@@ -16,7 +20,6 @@ interface WorkbenchLayoutProps {
 }
 
 type SidebarPanel = 'explorer' | 'git' | 'search';
-type ActivityIconName = SidebarPanel | 'settings' | 'account';
 type PanelResizeKind = 'sidebar' | 'agent' | 'bottom';
 
 const FileTree = lazy(() => import('../../components/file-tree/FileTree'));
@@ -24,6 +27,7 @@ const CodeEditor = lazy(() => import('../../components/editor/CodeEditor'));
 const TerminalPlaceholder = lazy(() => import('../../components/terminal/TerminalPlaceholder'));
 const AgentPanelPlaceholder = lazy(() => import('../../components/agent-panel/AgentPanelPlaceholder'));
 const SettingsCenter = lazy(() => import('../../components/settings-center/SettingsCenter'));
+const InternalBrowserPanel = lazy(() => import('../../components/internal-browser/InternalBrowserPanel'));
 const WorkspaceOpenDialog = lazy(() => import('../../components/workspace-open-dialog/WorkspaceOpenDialog'));
 const CodeWorkspaceChoiceDialog = lazy(() => import('../../components/code-workspace-choice-dialog/CodeWorkspaceChoiceDialog'));
 
@@ -50,75 +54,6 @@ function readStoredLayoutSize(
 const PanelFallback: React.FC<{ label?: string }> = ({ label = 'Loading...' }) => (
   <div className="workbench-panel-fallback">{label}</div>
 );
-
-const EmptyEditorSurface: React.FC = () => (
-  <div className="workbench-empty-editor">
-    <div className="workbench-empty-editor__inner">
-      <div className="workbench-empty-editor__icon" aria-hidden="true">
-        FILE
-      </div>
-      <div>打开一个文件开始编辑</div>
-      <div className="workbench-empty-editor__hint">使用左侧文件树选择文件</div>
-    </div>
-  </div>
-);
-
-const ActivityIcon: React.FC<{ name: ActivityIconName }> = ({ name }) => {
-  const commonProps = {
-    width: 18,
-    height: 18,
-    viewBox: '0 0 24 24',
-    fill: 'none',
-    stroke: 'currentColor',
-    strokeWidth: 1.8,
-    strokeLinecap: 'round' as const,
-    strokeLinejoin: 'round' as const,
-    'aria-hidden': true,
-  };
-
-  switch (name) {
-    case 'explorer':
-      return (
-        <svg {...commonProps}>
-          <path d="M3.5 6.5h6l1.8 2h9.2v9.8a1.2 1.2 0 0 1-1.2 1.2H4.7a1.2 1.2 0 0 1-1.2-1.2V6.5Z" />
-          <path d="M3.5 6.5V5.7a1.2 1.2 0 0 1 1.2-1.2h4.6l1.7 2" />
-        </svg>
-      );
-    case 'git':
-      return (
-        <svg {...commonProps}>
-          <circle cx="6.5" cy="5.8" r="2.1" />
-          <circle cx="17.5" cy="18.2" r="2.1" />
-          <circle cx="6.5" cy="18.2" r="2.1" />
-          <path d="M6.5 7.9v8.2" />
-          <path d="M8.3 6.9c4.6.6 7.1 2.9 8 9.2" />
-        </svg>
-      );
-    case 'search':
-      return (
-        <svg {...commonProps}>
-          <circle cx="10.5" cy="10.5" r="6" />
-          <path d="m15 15 5 5" />
-        </svg>
-      );
-    case 'settings':
-      return (
-        <svg {...commonProps}>
-          <circle cx="12" cy="12" r="3.2" />
-          <path d="M19.4 13.5a7.8 7.8 0 0 0 0-3l2-1.2-2-3.4-2.2 1a8.6 8.6 0 0 0-2.6-1.5L14.3 3h-4.6l-.4 2.4a8.6 8.6 0 0 0-2.6 1.5l-2.2-1-2 3.4 2 1.2a7.8 7.8 0 0 0 0 3l-2 1.2 2 3.4 2.2-1a8.6 8.6 0 0 0 2.6 1.5l.4 2.4h4.6l.4-2.4a8.6 8.6 0 0 0 2.6-1.5l2.2 1 2-3.4-2.1-1.2Z" />
-        </svg>
-      );
-    case 'account':
-      return (
-        <svg {...commonProps}>
-          <circle cx="12" cy="8" r="3.5" />
-          <path d="M5 20a7 7 0 0 1 14 0" />
-        </svg>
-      );
-    default:
-      return null;
-  }
-};
 
 const getLanguageLabel = (filePath?: string | null) => {
   if (!filePath) return 'Plain Text';
@@ -172,6 +107,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
     readStoredLayoutSize(BOTTOM_HEIGHT_KEY, 220, 140, 520)
   );
   const [terminalMinimized, setTerminalMinimized] = useState(false);
+  const [editorMode, setEditorMode] = useState<InternalBrowserMode>('code');
 
   useEffect(() => {
     window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
@@ -339,11 +275,11 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
       {sidebarVisible && <aside className="sidebar panel">{renderSidebarContent()}</aside>}
 
       <main className="editor-area panel">
-        {tabs.length > 0 && (
-          <div className="editor-tabs">
+        <div className="editor-tabs">
+          <div className="editor-tabs__list">
             {tabs.map((tab) => {
               const id = tab.kind === 'file' ? buildFileTabId(tab.folderId, tab.path) : tab.id;
-              const isActive = id === activeTabId;
+              const isActive = id === activeTabId && editorMode === 'code';
               const title = tab.kind === 'file' ? `[${tab.folderId}] ${tab.path}` : tab.title;
               const label = tab.kind === 'file' ? tab.path.split('/').pop() : tab.title;
               const isDirty = tab.kind === 'file' ? tab.isDirty : false;
@@ -351,7 +287,10 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
               return (
                 <button
                   key={id}
-                  onClick={() => setActiveTab(id)}
+                  onClick={() => {
+                    setEditorMode('code');
+                    setActiveTab(id);
+                  }}
                   onContextMenu={(event) => {
                     if (tab.kind !== 'file') return;
                     event.preventDefault();
@@ -384,9 +323,14 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
               );
             })}
           </div>
-        )}
+          <BrowserModeSwitch mode={editorMode} onChange={setEditorMode} />
+        </div>
 
-        {isSettingsActive ? (
+        {editorMode === 'browser' ? (
+          <Suspense fallback={<PanelFallback label="Loading Browser Skeleton..." />}>
+            <InternalBrowserPanel />
+          </Suspense>
+        ) : isSettingsActive ? (
           <Suspense fallback={<PanelFallback label="Loading Settings..." />}>
             <SettingsCenter
               apiStatus={apiStatus}

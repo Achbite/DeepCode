@@ -36,6 +36,8 @@ import type {
   AppendAgentEventsRequest,
   SendAgentMessageRequest,
   ResolveAgentPermissionRequest,
+  AgentFeedbackRequest,
+  AgentFeedbackResult,
   GetAgentWorkflowConfigResult,
   PatchAgentWorkflowConfigRequest,
   ListToolsResult,
@@ -59,6 +61,11 @@ import type {
   AgentFixtureRunResult,
   PromptLayerResult,
   SkillReferenceResult,
+  BrowserRuntimeStatusResult,
+  OpenBrowserPreviewRequest,
+  SetBrowserInspectModeRequest,
+  PanelSnapshotResult,
+  AttachPanelSnapshotResult,
 } from '@deepcode/protocol';
 
 const API_BASE = '/api';
@@ -365,6 +372,16 @@ export function resolveAgentPermission(
   );
 }
 
+export function submitAgentFeedback(
+  request: AgentFeedbackRequest
+): Promise<ApiResponse<AgentFeedbackResult>> {
+  return sendJson<AgentFeedbackResult>(
+    `${API_BASE}/agent/feedback`,
+    'POST',
+    request
+  );
+}
+
 export function getAgentWorkflowConfig(): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
   return getJson<GetAgentWorkflowConfigResult>(`${API_BASE}/agent/workflow-config`);
 }
@@ -528,6 +545,42 @@ export function getAgentSkills(): Promise<ApiResponse<SkillReferenceResult>> {
   return getJson<SkillReferenceResult>(`${API_BASE}/agent/skills`);
 }
 
+export function getBrowserRuntimeStatus(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
+  return getJson<BrowserRuntimeStatusResult>(`${API_BASE}/browser/runtime-status`);
+}
+
+export function openBrowserPreview(
+  request: OpenBrowserPreviewRequest
+): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
+  return sendJson<BrowserRuntimeStatusResult>(`${API_BASE}/browser/open`, 'POST', request);
+}
+
+export function reloadBrowserPreview(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
+  return sendJson<BrowserRuntimeStatusResult>(`${API_BASE}/browser/reload`, 'POST', {});
+}
+
+export function setBrowserInspectMode(
+  request: SetBrowserInspectModeRequest
+): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
+  return sendJson<BrowserRuntimeStatusResult>(
+    `${API_BASE}/browser/inspect-mode`,
+    'POST',
+    request
+  );
+}
+
+export function getSelectedPanelSnapshot(): Promise<ApiResponse<PanelSnapshotResult>> {
+  return getJson<PanelSnapshotResult>(`${API_BASE}/browser/panel-snapshot`);
+}
+
+export function attachPanelSnapshotToAgent(): Promise<ApiResponse<AttachPanelSnapshotResult>> {
+  return sendJson<AttachPanelSnapshotResult>(
+    `${API_BASE}/browser/panel-snapshot/attach`,
+    'POST',
+    {}
+  );
+}
+
 // 重新导出共享 DTO
 export type {
   FileTreeNode,
@@ -544,4 +597,6 @@ export type {
   TerminalCapability,
   TerminalWarmupStatus,
   ShellEnvironmentStatus,
+  BrowserRuntimeStatusResult,
+  PanelSnapshotResult,
 };

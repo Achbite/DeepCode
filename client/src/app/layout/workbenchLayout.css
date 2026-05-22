@@ -29,7 +29,7 @@
   --ok: #34c759;
   --warn: #ffcc00;
   --danger: #ff3b30;
-  --status-bg: #007aff;
+  --status-bg: #0a70d1;
 
   --radius: 6px;
   --radius-sm: 4px;
@@ -83,7 +83,7 @@
   --ok: #248a3d;
   --warn: #9a7b00;
   --danger: #d70015;
-  --status-bg: #007aff;
+  --status-bg: #0a70d1;
 
   --radius: 6px;
   --radius-sm: 4px;
@@ -500,14 +500,23 @@ body.workbench-resizing * {
   display: flex;
   min-height: 38px;
   padding: 0 8px;
-  gap: 2px;
+  gap: 10px;
   align-items: flex-end;
+  justify-content: space-between;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--divider-line);
   box-shadow: inset 0 -1px 0 var(--divider-highlight);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.editor-tabs__list {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  flex-shrink: 0;
 }
 
 .editor-tab {

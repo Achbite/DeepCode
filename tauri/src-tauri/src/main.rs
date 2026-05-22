@@ -73,6 +73,13 @@ fn main() {
             commands::execute_agent_tool,
             commands::send_agent_message,
             commands::resolve_agent_permission,
+            commands::submit_agent_feedback,
+            commands::get_browser_runtime_status,
+            commands::open_browser_preview,
+            commands::reload_browser_preview,
+            commands::set_browser_inspect_mode,
+            commands::get_selected_panel_snapshot,
+            commands::attach_panel_snapshot_to_agent,
             // Stub
             commands::llm_invoke_stub,
             commands::skill_invoke_stub,

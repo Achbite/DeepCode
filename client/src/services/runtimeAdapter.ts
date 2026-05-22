@@ -40,6 +40,8 @@ import type {
   AppendAgentEventsRequest,
   SendAgentMessageRequest,
   ResolveAgentPermissionRequest,
+  AgentFeedbackRequest,
+  AgentFeedbackResult,
   GetAgentWorkflowConfigResult,
   PatchAgentWorkflowConfigRequest,
   ListToolsResult,
@@ -55,6 +57,11 @@ import type {
   TerminalSession,
   TerminalSessionsResult,
   TerminalWarmupStatus,
+  BrowserRuntimeStatusResult,
+  OpenBrowserPreviewRequest,
+  SetBrowserInspectModeRequest,
+  PanelSnapshotResult,
+  AttachPanelSnapshotResult,
 } from '@deepcode/protocol';
 
 // ---- 运行时检测 ----
@@ -650,6 +657,16 @@ export async function resolveAgentPermission(
   return apiResolveAgentPermission(permissionId, request);
 }
 
+export async function submitAgentFeedback(
+  request: AgentFeedbackRequest
+): Promise<ApiResponse<AgentFeedbackResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AgentFeedbackResult>('submit_agent_feedback', { request });
+  }
+  const { submitAgentFeedback: apiSubmitAgentFeedback } = await import('./apiClient');
+  return apiSubmitAgentFeedback(request);
+}
+
 export async function getAgentWorkflowConfig(): Promise<ApiResponse<GetAgentWorkflowConfigResult>> {
   if (getRuntimeType() === 'tauri') {
     return tauriInvoke<GetAgentWorkflowConfigResult>('get_agent_workflow_config');
@@ -696,4 +713,58 @@ export async function executeAgentTool(
   }
   const { executeAgentTool: apiExecuteAgentTool } = await import('./apiClient');
   return apiExecuteAgentTool(request);
+}
+
+// ---- Internal browser skeleton ----
+
+export async function getBrowserRuntimeStatus(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<BrowserRuntimeStatusResult>('get_browser_runtime_status');
+  }
+  const { getBrowserRuntimeStatus: apiGetBrowserRuntimeStatus } = await import('./apiClient');
+  return apiGetBrowserRuntimeStatus();
+}
+
+export async function openBrowserPreview(
+  request: OpenBrowserPreviewRequest
+): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<BrowserRuntimeStatusResult>('open_browser_preview', { request });
+  }
+  const { openBrowserPreview: apiOpenBrowserPreview } = await import('./apiClient');
+  return apiOpenBrowserPreview(request);
+}
+
+export async function reloadBrowserPreview(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<BrowserRuntimeStatusResult>('reload_browser_preview');
+  }
+  const { reloadBrowserPreview: apiReloadBrowserPreview } = await import('./apiClient');
+  return apiReloadBrowserPreview();
+}
+
+export async function setBrowserInspectMode(
+  request: SetBrowserInspectModeRequest
+): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<BrowserRuntimeStatusResult>('set_browser_inspect_mode', { request });
+  }
+  const { setBrowserInspectMode: apiSetBrowserInspectMode } = await import('./apiClient');
+  return apiSetBrowserInspectMode(request);
+}
+
+export async function getSelectedPanelSnapshot(): Promise<ApiResponse<PanelSnapshotResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<PanelSnapshotResult>('get_selected_panel_snapshot');
+  }
+  const { getSelectedPanelSnapshot: apiGetSelectedPanelSnapshot } = await import('./apiClient');
+  return apiGetSelectedPanelSnapshot();
+}
+
+export async function attachPanelSnapshotToAgent(): Promise<ApiResponse<AttachPanelSnapshotResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AttachPanelSnapshotResult>('attach_panel_snapshot_to_agent');
+  }
+  const { attachPanelSnapshotToAgent: apiAttachPanelSnapshotToAgent } = await import('./apiClient');
+  return apiAttachPanelSnapshotToAgent();
 }
