@@ -1,6 +1,7 @@
 {
   "name": "@deepcode/tauri",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "description": "DeepCode Tauri 桌面壳（Rust 后端 + Web 前端）",
   "scripts": {

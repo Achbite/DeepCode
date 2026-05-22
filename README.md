@@ -9,12 +9,12 @@
 
 ### 环境要求
 
-| 依赖 | 最低版本 | 说明 |
-| --- | --- | --- |
-| Node.js | 20+ | 后端运行时 & 前端构建 |
-| pnpm | 9+ | 包管理器 |
-| Rust | 1.77+ | Tauri 桌面壳编译 |
-| Docker | 24+ | 开发容器（可选，WSL 环境推荐） |
+| 依赖    | 最低版本 | 说明                           |
+| ------- | -------- | ------------------------------ |
+| Node.js | 20+      | 后端运行时 & 前端构建          |
+| pnpm    | 9+       | 包管理器                       |
+| Rust    | 1.77+    | Tauri 桌面壳编译               |
+| Docker  | 24+      | 开发容器（可选，WSL 环境推荐） |
 
 ### 开发模式
 
@@ -148,49 +148,49 @@ deepagent/
 
 ### 前端组件架构
 
-| 组件 | 职责 |
-| --- | --- |
-| `WorkbenchLayout` | 主布局容器，管理侧边栏/编辑器/底部面板/Agent面板的拖拽调整与持久化 |
-| `FileTree` | 文件浏览器，支持新建/重命名/删除/拖拽排序，Codicons SVG 图标 |
-| `CodeEditor` | Monaco Editor 封装，支持多标签、Ctrl+S 保存、草稿恢复(hotExit) |
-| `TerminalPlaceholder` | 终端面板骨架，多会话管理、右键菜单、拖拽排序 |
-| `AgentPanel` | AI 对话侧栏，消息列表 + 输入框 + 上下文附件 + 权限审批 |
-| `SettingsCenter` | 用户设置 UI，三层合并（默认 → 用户 → 工作区） |
-| `WindowControls` | 自定义窗口控制按钮（最小化/最大化/关闭），仅 Tauri 模式渲染 |
+| 组件                    | 职责                                                               |
+| ----------------------- | ------------------------------------------------------------------ |
+| `WorkbenchLayout`     | 主布局容器，管理侧边栏/编辑器/底部面板/Agent面板的拖拽调整与持久化 |
+| `FileTree`            | 文件浏览器，支持新建/重命名/删除/拖拽排序，Codicons SVG 图标       |
+| `CodeEditor`          | Monaco Editor 封装，支持多标签、Ctrl+S 保存、草稿恢复(hotExit)     |
+| `TerminalPlaceholder` | 终端面板骨架，多会话管理、右键菜单、拖拽排序                       |
+| `AgentPanel`          | AI 对话侧栏，消息列表 + 输入框 + 上下文附件 + 权限审批             |
+| `SettingsCenter`      | 用户设置 UI，三层合并（默认 → 用户 → 工作区）                    |
+| `WindowControls`      | 自定义窗口控制按钮（最小化/最大化/关闭），仅 Tauri 模式渲染        |
 
 ### 状态管理 (Zustand)
 
-| Store | 职责 |
-| --- | --- |
-| `editorStore` | 标签页管理、文件内容缓存、dirty 状态、保存/草稿恢复 |
-| `workspaceStore` | 当前工作区路径、文件树数据、目录刷新 |
-| `settingsStore` | 三层设置合并（default → user → workspace）、实时应用 |
-| `agentSessionStore` | Agent 会话、消息历史、工具调用记录 |
-| `appStatusStore` | 全局应用状态（连接状态、错误） |
-| `uiStore` | UI 临时状态（对话框、面板可见性） |
+| Store                 | 职责                                                   |
+| --------------------- | ------------------------------------------------------ |
+| `editorStore`       | 标签页管理、文件内容缓存、dirty 状态、保存/草稿恢复    |
+| `workspaceStore`    | 当前工作区路径、文件树数据、目录刷新                   |
+| `settingsStore`     | 三层设置合并（default → user → workspace）、实时应用 |
+| `agentSessionStore` | Agent 会话、消息历史、工具调用记录                     |
+| `appStatusStore`    | 全局应用状态（连接状态、错误）                         |
+| `uiStore`           | UI 临时状态（对话框、面板可见性）                      |
 
 ### Tauri Rust 后端
 
-| 模块 | 职责 |
-| --- | --- |
-| `fs.rs` | 文件读写（16MB 阈值）、目录树扫描、路径安全校验 |
-| `workspace.rs` | 工作区打开/扫描/保存 `.code-workspace`、工作区设置 |
-| `user_settings.rs` | 用户设置 CRUD、配置目录分层（global/user） |
-| `commands.rs` | Tauri command 注册入口、文件系统浏览 |
+| 模块                 | 职责                                                 |
+| -------------------- | ---------------------------------------------------- |
+| `fs.rs`            | 文件读写（16MB 阈值）、目录树扫描、路径安全校验      |
+| `workspace.rs`     | 工作区打开/扫描/保存 `.code-workspace`、工作区设置 |
+| `user_settings.rs` | 用户设置 CRUD、配置目录分层（global/user）           |
+| `commands.rs`      | Tauri command 注册入口、文件系统浏览                 |
 
 ### Node.js 后端服务
 
-| 服务 | 职责 |
-| --- | --- |
-| `fileService` | 文件 CRUD、路径防穿越、大小限制 |
-| `workspaceService` | 工作区管理、`.code-workspace` 解析 |
-| `userSettingsService` | 用户设置持久化（原子写） |
-| `llmService` | LLM API 代理（DeepSeek 优先） |
-| `llmProfileService` | 模型配置管理 |
-| `agentToolService` | Agent 工具注册与执行 |
-| `codeSearchService` | 代码搜索（grep 模式） |
-| `secretStore` | 密钥安全存储 |
-| `fsBrowseService` | 系统级目录浏览（工作区选择器） |
+| 服务                    | 职责                                 |
+| ----------------------- | ------------------------------------ |
+| `fileService`         | 文件 CRUD、路径防穿越、大小限制      |
+| `workspaceService`    | 工作区管理、`.code-workspace` 解析 |
+| `userSettingsService` | 用户设置持久化（原子写）             |
+| `llmService`          | LLM API 代理（DeepSeek 优先）        |
+| `llmProfileService`   | 模型配置管理                         |
+| `agentToolService`    | Agent 工具注册与执行                 |
+| `codeSearchService`   | 代码搜索（grep 模式）                |
+| `secretStore`         | 密钥安全存储                         |
+| `fsBrowseService`     | 系统级目录浏览（工作区选择器）       |
 
 ### 协议层 (packages/protocol)
 
@@ -217,13 +217,13 @@ Client、Server、Tauri 三端共享的 TypeScript 类型定义：
 
 ## 环境变量
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `AGENT_LIGHT_PORT` | `31245` | Node.js 后端监听端口 |
-| `WORKSPACE_ROOT` | `./workspace` | Agent 文件读写根目录 |
+| 变量                 | 默认值          | 说明                 |
+| -------------------- | --------------- | -------------------- |
+| `AGENT_LIGHT_PORT` | `31245`       | Node.js 后端监听端口 |
+| `WORKSPACE_ROOT`   | `./workspace` | Agent 文件读写根目录 |
 
 ---
 
 ## 许可
 
-待补。
+本工程项目遵循MIT开源协议

@@ -3,6 +3,7 @@ name = "deepcode"
 version = "0.1.0"
 description = "DeepCode 桌面壳"
 authors = ["DeepCode Team"]
+license = "MIT"
 edition = "2021"
 rust-version = "1.77"
 
