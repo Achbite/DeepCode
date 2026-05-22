@@ -6,6 +6,9 @@ export type LlmProviderKind =
   | 'codex'
   | 'ollama';
 
+export type LlmReasoningEffort = 'low' | 'medium' | 'high';
+export type LlmThinkingMode = 'enabled' | 'disabled';
+
 export interface LlmProviderProfile {
   id: string;
   name: string;
@@ -14,9 +17,53 @@ export interface LlmProviderProfile {
   model: string;
   maxTokens?: number;
   temperature?: number;
+  reasoningEffort?: LlmReasoningEffort;
+  thinking?: LlmThinkingMode;
   secretRef?: string;
   enabled: boolean;
 }
+
+export const DEEPSEEK_OPENAI_BASE_URL = 'https://api.deepseek.com';
+export const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
+
+export const DEEPSEEK_LLM_MODEL_OPTIONS = [
+  'deepseek-v4-flash',
+  'deepseek-v4-pro',
+  'deepseek-chat',
+  'deepseek-reasoner',
+] as const;
+
+export const DEPRECATED_DEEPSEEK_LLM_MODELS = [
+  'deepseek-chat',
+  'deepseek-reasoner',
+] as const;
+
+export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
+  {
+    id: 'deepseek-v4-flash-openai',
+    name: 'DeepSeek V4 Flash',
+    kind: 'openaiCompatible',
+    baseUrl: DEEPSEEK_OPENAI_BASE_URL,
+    model: 'deepseek-v4-flash',
+    maxTokens: 4096,
+    temperature: 0.2,
+    reasoningEffort: 'medium',
+    thinking: 'enabled',
+    enabled: true,
+  },
+  {
+    id: 'deepseek-v4-pro-openai',
+    name: 'DeepSeek V4 Pro',
+    kind: 'openaiCompatible',
+    baseUrl: DEEPSEEK_OPENAI_BASE_URL,
+    model: 'deepseek-v4-pro',
+    maxTokens: 4096,
+    temperature: 0.2,
+    reasoningEffort: 'high',
+    thinking: 'enabled',
+    enabled: true,
+  },
+];
 
 export interface LlmProfilesResult {
   profiles: LlmProviderProfile[];

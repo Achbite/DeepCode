@@ -5,12 +5,14 @@ import type {
   LlmProfilesResult,
   PatchLlmProfilesRequest,
 } from '@deepcode/protocol';
+import { DEFAULT_LLM_PROVIDER_PROFILES } from '@deepcode/protocol';
 import { resolveDeepCodeSettingsDir } from './appDataPath.js';
 import {
   deleteLlmSecret,
   getSecretStorePath,
   saveLlmSecret,
 } from './secretStore.js';
+import { ensureDefaultAgentWorkflowConfig } from './agentWorkflowConfigService.js';
 
 interface LlmProfilesFile {
   profiles: LlmProviderProfile[];
@@ -21,6 +23,13 @@ const STORE_PATH = join(resolveDeepCodeSettingsDir(), 'llm-profiles.json');
 
 let cache: LlmProfilesFile | null = null;
 
+function createDefaultProfilesFile(): LlmProfilesFile {
+  return {
+    profiles: DEFAULT_LLM_PROVIDER_PROFILES.map((profile) => ({ ...profile })),
+    defaultProfileId: DEFAULT_LLM_PROVIDER_PROFILES[0]?.id,
+  };
+}
+
 function sanitizeProfile(profile: LlmProviderProfile): LlmProviderProfile {
   return {
     id: String(profile.id || '').trim(),
@@ -30,6 +39,12 @@ function sanitizeProfile(profile: LlmProviderProfile): LlmProviderProfile {
     model: String(profile.model || '').trim(),
     maxTokens: typeof profile.maxTokens === 'number' ? profile.maxTokens : undefined,
     temperature: typeof profile.temperature === 'number' ? profile.temperature : undefined,
+    reasoningEffort: ['low', 'medium', 'high'].includes(String(profile.reasoningEffort))
+      ? profile.reasoningEffort
+      : undefined,
+    thinking: ['enabled', 'disabled'].includes(String(profile.thinking))
+      ? profile.thinking
+      : undefined,
     secretRef: profile.secretRef || undefined,
     enabled: profile.enabled !== false,
   };
@@ -41,17 +56,24 @@ async function loadProfiles(): Promise<LlmProfilesFile> {
     const raw = await readFile(STORE_PATH, 'utf-8');
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object' && Array.isArray(parsed.profiles)) {
+      const profiles = parsed.profiles
+        .map(sanitizeProfile)
+        .filter((p: LlmProviderProfile) => p.id && p.name && p.model);
       cache = {
-        profiles: parsed.profiles.map(sanitizeProfile).filter((p: LlmProviderProfile) => p.id && p.name && p.model),
-        defaultProfileId: typeof parsed.defaultProfileId === 'string'
-          ? parsed.defaultProfileId
-          : undefined,
+        profiles,
+        defaultProfileId:
+          typeof parsed.defaultProfileId === 'string'
+            ? parsed.defaultProfileId
+            : profiles[0]?.id,
       };
+      if (cache.profiles.length === 0) {
+        cache = createDefaultProfilesFile();
+      }
     } else {
-      cache = { profiles: [] };
+      cache = createDefaultProfilesFile();
     }
   } catch {
-    cache = { profiles: [] };
+    cache = createDefaultProfilesFile();
   }
   return cache;
 }
@@ -116,6 +138,7 @@ export async function patchLlmProfiles(
   };
   cache = file;
   await persistProfiles(file);
+  await ensureDefaultAgentWorkflowConfig(file.profiles);
 
   return {
     profiles: file.profiles,

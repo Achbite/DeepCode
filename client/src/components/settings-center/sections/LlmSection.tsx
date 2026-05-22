@@ -1,4 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import {
+  DEEPSEEK_ANTHROPIC_BASE_URL,
+  DEEPSEEK_LLM_MODEL_OPTIONS,
+  DEEPSEEK_OPENAI_BASE_URL,
+  DEPRECATED_DEEPSEEK_LLM_MODELS,
+} from '@deepcode/protocol';
 import type { LlmProviderKind, LlmProviderProfile } from '@deepcode/protocol';
 import {
   getLlmProfiles,
@@ -13,15 +19,66 @@ const PROVIDERS: Array<{ value: LlmProviderKind; label: string }> = [
   { value: 'ollama', label: 'Ollama' },
 ];
 
-function createProfile(): LlmProviderProfile {
-  const id = `profile-${Date.now()}`;
+const PROFILE_PRESETS: Array<{
+  label: string;
+  profile: Omit<LlmProviderProfile, 'id'>;
+}> = [
+  {
+    label: 'DeepSeek Flash',
+    profile: {
+      name: 'DeepSeek V4 Flash',
+      kind: 'openaiCompatible',
+      baseUrl: DEEPSEEK_OPENAI_BASE_URL,
+      model: 'deepseek-v4-flash',
+      maxTokens: 4096,
+      temperature: 0.2,
+      reasoningEffort: 'medium',
+      thinking: 'enabled',
+      enabled: true,
+    },
+  },
+  {
+    label: 'DeepSeek Pro',
+    profile: {
+      name: 'DeepSeek V4 Pro',
+      kind: 'openaiCompatible',
+      baseUrl: DEEPSEEK_OPENAI_BASE_URL,
+      model: 'deepseek-v4-pro',
+      maxTokens: 4096,
+      temperature: 0.2,
+      reasoningEffort: 'high',
+      thinking: 'enabled',
+      enabled: true,
+    },
+  },
+  {
+    label: 'DeepSeek Anthropic',
+    profile: {
+      name: 'DeepSeek V4 Flash (Anthropic)',
+      kind: 'anthropic',
+      baseUrl: DEEPSEEK_ANTHROPIC_BASE_URL,
+      model: 'deepseek-v4-flash',
+      maxTokens: 4096,
+      temperature: 0.2,
+      reasoningEffort: 'medium',
+      thinking: 'enabled',
+      enabled: true,
+    },
+  },
+];
+
+function createProfile(
+  preset?: Partial<Omit<LlmProviderProfile, 'id'>>
+): LlmProviderProfile {
+  const id = `profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   return {
     id,
-    name: 'OpenAI Compatible',
+    name: preset?.name ?? 'OpenAI Compatible',
     kind: 'openaiCompatible',
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-4o-mini',
     enabled: true,
+    ...preset,
   };
 }
 
@@ -45,7 +102,7 @@ const LlmSection: React.FC = () => {
       setDefaultProfileId(result.data.defaultProfileId);
       setStorePath(result.data.storePath);
     } else {
-      setMessage(result.message ?? '加载 LLM profiles 失败');
+      setMessage(result.message ?? 'Failed to load LLM profiles');
     }
     setLoading(false);
   };
@@ -65,8 +122,10 @@ const LlmSection: React.FC = () => {
     );
   };
 
-  const addProfile = () => {
-    const profile = createProfile();
+  const addProfile = (
+    preset?: Partial<Omit<LlmProviderProfile, 'id'>>
+  ) => {
+    const profile = createProfile(preset);
     setProfiles((prev) => [...prev, profile]);
     setDefaultProfileId((prev) => prev ?? profile.id);
   };
@@ -96,27 +155,28 @@ const LlmSection: React.FC = () => {
       setDefaultProfileId(result.data.defaultProfileId);
       setStorePath(result.data.storePath);
       setSecrets({});
-      setMessage('LLM profiles 已保存');
+      setMessage('LLM profiles saved');
+      window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated'));
     } else {
-      setMessage(result.message ?? '保存 LLM profiles 失败');
+      setMessage(result.message ?? 'Failed to save LLM profiles');
     }
     setLoading(false);
   };
 
   const probe = async (profileId: string) => {
-    setProbeState((prev) => ({ ...prev, [profileId]: '探活中...' }));
+    setProbeState((prev) => ({ ...prev, [profileId]: 'Probing...' }));
     const result = await probeLlmProfile({ profileId });
     if (result.ok && result.data) {
       setProbeState((prev) => ({
         ...prev,
         [profileId]: result.data!.ok
           ? `OK ${result.data!.latencyMs ?? 0}ms`
-          : result.data!.error ?? '探活失败',
+          : result.data!.error ?? 'Probe failed',
       }));
     } else {
       setProbeState((prev) => ({
         ...prev,
-        [profileId]: result.message ?? '探活失败',
+        [profileId]: result.message ?? 'Probe failed',
       }));
     }
   };
@@ -133,17 +193,28 @@ const LlmSection: React.FC = () => {
       <div className="settings-card">
         <h3 className="settings-card__title">Provider Profiles</h3>
         <p className="settings-card__body">
-          配置 Agent Runtime 使用的模型。API key 使用本地加密存储，profile 中只保存 secretRef。
+          Configure the model used by Agent Runtime. API keys are stored in the
+          local encrypted secret store; profiles only keep a secretRef.
         </p>
 
         <div className="settings-toolbar-row">
           <button
             className="settings-action-button"
-            onClick={addProfile}
+            onClick={() => addProfile()}
             disabled={loading}
           >
             Add Profile
           </button>
+          {PROFILE_PRESETS.map((preset) => (
+            <button
+              className="settings-action-button"
+              key={preset.label}
+              onClick={() => addProfile(preset.profile)}
+              disabled={loading}
+            >
+              {preset.label}
+            </button>
+          ))}
           <button
             className="settings-action-button"
             onClick={() => void save()}
@@ -179,7 +250,8 @@ const LlmSection: React.FC = () => {
 
         {profiles.length === 0 && (
           <div className="settings-card__hint">
-            暂无 LLM profile。点击 Add Profile 创建第一个 OpenAI-compatible 配置。
+            No LLM profile is configured. Add a generic OpenAI-compatible
+            profile or use one of the DeepSeek presets.
           </div>
         )}
 
@@ -229,19 +301,33 @@ const LlmSection: React.FC = () => {
                     onChange={(e) =>
                       updateProfile(profile.id, { baseUrl: e.target.value })
                     }
-                    placeholder="https://api.openai.com/v1"
+                    placeholder="https://api.deepseek.com"
                   />
                 </label>
                 <label>
                   <span>Model</span>
                   <input
                     className="settings-field__input"
+                    list="deepseek-model-options"
                     value={profile.model}
                     onChange={(e) =>
                       updateProfile(profile.id, { model: e.target.value })
                     }
-                    placeholder="gpt-4o-mini"
+                    placeholder="deepseek-v4-flash"
                   />
+                  <datalist id="deepseek-model-options">
+                    {DEEPSEEK_LLM_MODEL_OPTIONS.map((model) => (
+                      <option
+                        key={model}
+                        value={model}
+                        label={
+                          (DEPRECATED_DEEPSEEK_LLM_MODELS as readonly string[]).includes(model)
+                            ? `${model} (deprecated 2026-07-24)`
+                            : model
+                        }
+                      />
+                    ))}
+                  </datalist>
                 </label>
                 <label>
                   <span>API Key</span>
@@ -258,6 +344,43 @@ const LlmSection: React.FC = () => {
                     placeholder={profile.secretRef ? 'Configured' : 'Paste key to save'}
                   />
                 </label>
+                <label>
+                  <span>Thinking</span>
+                  <select
+                    className="settings-field__select"
+                    value={profile.thinking ?? ''}
+                    onChange={(e) =>
+                      updateProfile(profile.id, {
+                        thinking: e.target.value
+                          ? (e.target.value as LlmProviderProfile['thinking'])
+                          : undefined,
+                      })
+                    }
+                  >
+                    <option value="">Default</option>
+                    <option value="enabled">Enabled</option>
+                    <option value="disabled">Disabled</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Reasoning effort</span>
+                  <select
+                    className="settings-field__select"
+                    value={profile.reasoningEffort ?? ''}
+                    onChange={(e) =>
+                      updateProfile(profile.id, {
+                        reasoningEffort: e.target.value
+                          ? (e.target.value as LlmProviderProfile['reasoningEffort'])
+                          : undefined,
+                      })
+                    }
+                  >
+                    <option value="">Default</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </label>
               </div>
 
               <div className="llm-profile__actions">
@@ -265,7 +388,7 @@ const LlmSection: React.FC = () => {
                   className="settings-action-button"
                   onClick={() => void probe(profile.id)}
                   disabled={loading || !profile.secretRef || !!secrets[profile.id]}
-                  title={secrets[profile.id] ? '请先保存新 API key 后再探活' : 'Probe'}
+                  title={secrets[profile.id] ? 'Save the new API key before probing' : 'Probe'}
                 >
                   Probe
                 </button>
