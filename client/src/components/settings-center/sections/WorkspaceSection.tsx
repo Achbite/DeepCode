@@ -39,7 +39,19 @@ const WorkspaceSection: React.FC = () => {
       <div>
         <h2 className="settings-title">Workspace</h2>
         <div className="settings-card">
-          <div className="settings-card__body">工作区尚未加载。</div>
+          <div className="settings-card__header-row">
+            <h3 className="settings-card__title">No Workspace Opened</h3>
+            <button
+              className="settings-action-button"
+              onClick={showWorkspaceOpenDialog}
+              type="button"
+            >
+              Open Folder...
+            </button>
+          </div>
+          <div className="settings-card__body">
+            DeepCode will stay empty until you open a folder or a .code-workspace file.
+          </div>
         </div>
       </div>
     );

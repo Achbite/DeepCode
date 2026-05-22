@@ -4,9 +4,85 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent Light IDE</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        background: #1e1f22;
+      }
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        overflow: hidden;
+        background: #1e1f22;
+        color: #d9dce2;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
+      .boot-shell {
+        display: grid;
+        grid-template-rows: 38px 1fr 22px;
+        width: 100vw;
+        height: 100vh;
+        background: #1e1f22;
+      }
+      .boot-shell__header {
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        border-bottom: 1px solid #3f4248;
+        background: #34363b;
+        color: #fff;
+        font-size: 13px;
+        font-weight: 650;
+      }
+      .boot-shell__body {
+        display: grid;
+        grid-template-columns: 48px 260px minmax(360px, 1fr) 380px;
+        min-height: 0;
+      }
+      .boot-shell__rail {
+        background: #303238;
+        border-right: 1px solid #3f4248;
+      }
+      .boot-shell__side,
+      .boot-shell__agent {
+        background: #25262a;
+      }
+      .boot-shell__side {
+        border-right: 1px solid #3f4248;
+      }
+      .boot-shell__agent {
+        border-left: 1px solid #3f4248;
+      }
+      .boot-shell__center {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #8d94a3;
+        font-size: 12px;
+      }
+      .boot-shell__status {
+        background: #007acc;
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="boot-shell">
+        <div class="boot-shell__header">DeepCode</div>
+        <div class="boot-shell__body">
+          <div class="boot-shell__rail"></div>
+          <div class="boot-shell__side"></div>
+          <div class="boot-shell__center">Starting DeepCode...</div>
+          <div class="boot-shell__agent"></div>
+        </div>
+        <div class="boot-shell__status"></div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

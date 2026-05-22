@@ -122,6 +122,8 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
   const loadTree = useCallback(async () => {
     if (!activeFolderId) {
       setTree([]);
+      setLoading(false);
+      setError(null);
       return;
     }
     setLoading(true);
@@ -468,7 +470,22 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
       {error && (
         <div className="file-tree__status file-tree__status--error">{error}</div>
       )}
-      {!loading && !error && (
+      {!activeFolderId && (
+        <div className="file-tree__empty">
+          <div className="file-tree__empty-title">No Folder Opened</div>
+          <div className="file-tree__empty-body">
+            Open a folder or workspace file to populate Explorer.
+          </div>
+          <button
+            className="file-tree__empty-action"
+            type="button"
+            onClick={showWorkspaceOpenDialog}
+          >
+            Open Folder...
+          </button>
+        </div>
+      )}
+      {activeFolderId && !loading && !error && (
         <div
           className="file-tree__body"
           onContextMenu={(event) => {

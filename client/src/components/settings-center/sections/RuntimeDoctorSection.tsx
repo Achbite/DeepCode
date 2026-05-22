@@ -77,7 +77,7 @@ const RuntimeDoctorSection: React.FC = () => {
             ? fallbackUsed
               ? 'warn'
               : 'ok'
-            : 'error',
+            : 'warn',
         detail:
           workspace && workspace.folders.length > 0
             ? `${workspace.name}: ${workspace.folders.length} folder(s)${

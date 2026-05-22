@@ -14,6 +14,7 @@ import React, { useRef, useCallback, useEffect, useState } from 'react';
 import Editor, { OnMount } from '@monaco-editor/react';
 import type { editor as MonacoEditor } from 'monaco-editor';
 import { useEditorOptions } from '../../state/settingsStore';
+import { registerModel } from './modelRegistry';
 import './codeEditor.css';
 
 // ---- 公共接口 ----
@@ -102,18 +103,6 @@ function inferLanguageId(filePath: string | null): string {
   return EXT_TO_LANGUAGE[ext] ?? 'plaintext';
 }
 
-// ---- ITextModel 缓存（modelKey -> model） ----
-const modelCache = new Map<string, MonacoEditor.ITextModel>();
-
-/** 释放指定 modelKey 的 ITextModel */
-function closeModel(modelKey: string): void {
-  const model = modelCache.get(modelKey);
-  if (model) {
-    model.dispose();
-    modelCache.delete(modelKey);
-  }
-}
-
 const CodeEditor: React.FC<CodeEditorProps> = ({
   filePath,
   modelKey,
@@ -173,6 +162,9 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
 
   const handleEditorMount: OnMount = useCallback((editor, monaco) => {
     monacoRef.current = editor;
+    if (modelKey) {
+      registerModel(modelKey, editor.getModel());
+    }
 
     editor.onDidChangeCursorPosition(() => {
       updateCursor();
@@ -198,6 +190,11 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
       }
     );
   }, [modelKey, onSave, updateCursor, applyEditorOptions]);
+
+  useEffect(() => {
+    if (!modelKey) return;
+    registerModel(modelKey, monacoRef.current?.getModel() ?? null);
+  }, [modelKey, content]);
 
   // ---- 空状态 ----
   if (!filePath || !modelKey) {
@@ -303,5 +300,4 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
   );
 };
 
-export { closeModel };
 export default CodeEditor;
