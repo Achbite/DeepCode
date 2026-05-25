@@ -1,22 +1,30 @@
 import type { FastifyInstance } from 'fastify';
 import type {
+  AgentFeedbackRequest,
+  AgentFeedbackResult,
+  AgentSessionListResult,
   AgentSessionResult,
   ApiResponse,
   AppendAgentEventsRequest,
+  ArchiveAgentSessionRequest,
   CreateAgentSessionRequest,
-  AgentFeedbackRequest,
-  AgentFeedbackResult,
   GetAgentEventSnapshotResult,
   GetAgentWorkflowConfigResult,
+  ListAgentSessionsRequest,
   PatchAgentWorkflowConfigRequest,
+  RenameAgentSessionRequest,
   ResolveAgentPermissionRequest,
   SendAgentMessageRequest,
   TraceLedgerSnapshot,
 } from '@deepcode/protocol';
 import {
+  activateAgentSession,
   appendAgentEvents,
+  archiveAgentSession,
   createAgentSession,
   getAgentSession,
+  listAgentSessions,
+  renameAgentSession,
 } from '../services/agentSessionStore.js';
 import {
   resolveAgentPermission,
@@ -33,6 +41,13 @@ function errorResponse(error: string, err: unknown): ApiResponse<never> {
     ok: false,
     error,
     message: err instanceof Error ? err.message : String(err),
+  };
+}
+
+function readSessionScope(query: ListAgentSessionsRequest): ListAgentSessionsRequest {
+  return {
+    workspaceId: query.workspaceId,
+    workspaceHash: query.workspaceHash,
   };
 }
 
@@ -57,17 +72,32 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/api/agent/sessions', async (request) => {
     try {
-      const body = request.body as CreateAgentSessionRequest | undefined;
-      const data = await createAgentSession(body?.initialMode, body?.profileId);
+      const data = await createAgentSession((request.body as CreateAgentSessionRequest | undefined) ?? {});
       return { ok: true, data } satisfies ApiResponse<AgentSessionResult>;
     } catch (err) {
       return errorResponse('agent_session_create_error', err);
     }
   });
 
-  app.get('/api/agent/sessions/current', async () => {
+  app.get('/api/agent/sessions', async (request) => {
     try {
-      const data = await getAgentSession();
+      const query = request.query as ListAgentSessionsRequest & { includeArchived?: boolean | string };
+      const data = await listAgentSessions({
+        ...readSessionScope(query),
+        includeArchived: query.includeArchived === true || String(query.includeArchived) === 'true',
+      });
+      return { ok: true, data } satisfies ApiResponse<AgentSessionListResult>;
+    } catch (err) {
+      return errorResponse('agent_session_list_error', err);
+    }
+  });
+
+  app.get('/api/agent/sessions/current', async (request) => {
+    try {
+      const data = await getAgentSession(
+        undefined,
+        readSessionScope(request.query as ListAgentSessionsRequest)
+      );
       return { ok: true, data } satisfies ApiResponse<AgentSessionResult | null>;
     } catch (err) {
       return errorResponse('agent_session_load_error', err);
@@ -82,12 +112,44 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
         return {
           ok: false,
           error: 'agent_session_not_found',
-          message: '会话不存在',
+          message: 'Agent session not found.',
         } satisfies ApiResponse<never>;
       }
       return { ok: true, data } satisfies ApiResponse<AgentSessionResult>;
     } catch (err) {
       return errorResponse('agent_session_load_error', err);
+    }
+  });
+
+  app.post('/api/agent/sessions/:id/activate', async (request) => {
+    try {
+      const { id } = request.params as { id: string };
+      const data = await activateAgentSession(id);
+      return { ok: true, data } satisfies ApiResponse<AgentSessionResult>;
+    } catch (err) {
+      return errorResponse('agent_session_activate_error', err);
+    }
+  });
+
+  app.patch('/api/agent/sessions/:id', async (request) => {
+    try {
+      const { id } = request.params as { id: string };
+      const body = request.body as RenameAgentSessionRequest;
+      const data = await renameAgentSession(id, body.title);
+      return { ok: true, data } satisfies ApiResponse<AgentSessionResult>;
+    } catch (err) {
+      return errorResponse('agent_session_rename_error', err);
+    }
+  });
+
+  app.post('/api/agent/sessions/:id/archive', async (request) => {
+    try {
+      const { id } = request.params as { id: string };
+      const body = request.body as ArchiveAgentSessionRequest | undefined;
+      const data = await archiveAgentSession(id, body?.archived ?? true);
+      return { ok: true, data } satisfies ApiResponse<AgentSessionListResult>;
+    } catch (err) {
+      return errorResponse('agent_session_archive_error', err);
     }
   });
 

@@ -303,6 +303,43 @@ echo "$TRACE_SNAPSHOT_RESP" | jq -e '
     && pass "TraceLedger snapshot 事件映射正确" \
     || { fail "TraceLedger snapshot 断言失败"; exit 12; }
 
+info "[6b/6] stage 8 agent session switch smoke"
+S8_SCOPE="s8-session-smoke"
+S8_SESSION_A_BODY="$(jq -nc --arg scope "$S8_SCOPE" '{initialMode:"plan", workspaceHash:$scope, title:"S8 Alpha"}')"
+S8_SESSION_A_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$S8_SESSION_A_BODY" "$AGENT_SESSIONS_URL" || true)"
+S8_SESSION_A_ID="$(echo "$S8_SESSION_A_RESP" | jq -r '.data.session.id // empty' 2>/dev/null || true)"
+S8_SESSION_B_BODY="$(jq -nc --arg scope "$S8_SCOPE" '{initialMode:"plan", workspaceHash:$scope, title:"S8 Beta"}')"
+S8_SESSION_B_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$S8_SESSION_B_BODY" "$AGENT_SESSIONS_URL" || true)"
+S8_SESSION_B_ID="$(echo "$S8_SESSION_B_RESP" | jq -r '.data.session.id // empty' 2>/dev/null || true)"
+if [ -z "$S8_SESSION_A_ID" ] || [ -z "$S8_SESSION_B_ID" ]; then
+    fail "Agent session smoke 创建失败"; exit 13
+fi
+
+S8_LIST_RESP="$(curl -fsS -m 3 "$AGENT_SESSIONS_URL?workspaceHash=$S8_SCOPE" || true)"
+info "session list -> $S8_LIST_RESP"
+echo "$S8_LIST_RESP" | jq -e --arg sid "$S8_SESSION_B_ID" '
+    .ok == true
+    and .data.currentSessionId == $sid
+    and ([.data.sessions[].id] | index($sid) != null)
+' >/dev/null 2>&1 \
+    && pass "Agent session list/current ok" \
+    || { fail "Agent session list/current 断言失败"; exit 14; }
+
+S8_ACTIVATE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{}' "$AGENT_SESSIONS_URL/$S8_SESSION_A_ID/activate" || true)"
+echo "$S8_ACTIVATE_RESP" | jq -e --arg sid "$S8_SESSION_A_ID" '.ok == true and .data.session.id == $sid' >/dev/null 2>&1 \
+    && pass "Agent session activate ok" \
+    || { fail "Agent session activate 断言失败"; exit 15; }
+
+S8_RENAME_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -X PATCH -d '{"title":"S8 Alpha Renamed"}' "$AGENT_SESSIONS_URL/$S8_SESSION_A_ID" || true)"
+echo "$S8_RENAME_RESP" | jq -e '.ok == true and .data.session.title == "S8 Alpha Renamed"' >/dev/null 2>&1 \
+    && pass "Agent session rename ok" \
+    || { fail "Agent session rename 断言失败"; exit 16; }
+
+S8_ARCHIVE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{"archived":true}' "$AGENT_SESSIONS_URL/$S8_SESSION_B_ID/archive" || true)"
+echo "$S8_ARCHIVE_RESP" | jq -e --arg sid "$S8_SESSION_B_ID" '.ok == true and ([.data.sessions[].id] | index($sid) == null)' >/dev/null 2>&1 \
+    && pass "Agent session archive ok" \
+    || { fail "Agent session archive 断言失败"; exit 17; }
+
 run_agent_fixture() {
     local fixture="$1"
     local mode="${2:-plan}"

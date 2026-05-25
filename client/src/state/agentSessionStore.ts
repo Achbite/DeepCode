@@ -7,19 +7,25 @@ import type {
   AgentTraceEvent,
   AgentWorkflowConfig,
   AgentWorkflowMode,
+  ListAgentSessionsRequest,
   PermissionRequest,
 } from '@deepcode/protocol';
 import { AGENT_WORKFLOW_STAGES } from '@deepcode/protocol';
 import {
+  activateAgentSession,
+  archiveAgentSession,
   createAgentSession,
   getAgentWorkflowConfig,
   getAgentEventSnapshot,
   getCurrentAgentSession,
+  listAgentSessions,
   patchAgentWorkflowConfig,
+  renameAgentSession,
   resolveAgentPermission,
   sendAgentMessage,
 } from '../services/runtimeAdapter';
 import { useSettingsStore } from './settingsStore';
+import { useWorkspaceStore } from './workspaceStore';
 
 interface PendingPermission {
   request: PermissionRequest;
@@ -32,6 +38,9 @@ interface QueuedAgentMessage {
 
 interface AgentSessionState {
   session: AgentSession | null;
+  sessions: AgentSession[];
+  currentSessionId?: string;
+  workspaceScopeKey?: string;
   events: AgentEvent[];
   traceEvents: AgentTraceEvent[];
   mode: AgentMode;
@@ -49,6 +58,11 @@ interface AgentSessionState {
 
 interface AgentSessionActions {
   loadOrCreate: () => Promise<void>;
+  refreshSessions: () => Promise<void>;
+  createNewSession: () => Promise<void>;
+  activateSession: (sessionId: string) => Promise<void>;
+  renameSession: (sessionId: string, title: string) => Promise<void>;
+  archiveSession: (sessionId: string) => Promise<void>;
   refreshTraceEvents: (sessionId?: string) => Promise<void>;
   loadWorkflowConfig: () => Promise<void>;
   patchWorkflowConfig: (config: AgentWorkflowConfig) => Promise<void>;
@@ -122,8 +136,37 @@ function readMessageAttachments(state: Store, override?: AgentContextAttachment[
   ];
 }
 
+function simpleHash(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `ws-${(hash >>> 0).toString(16)}`;
+}
+
+function currentWorkspaceScope(): ListAgentSessionsRequest {
+  const workspace = useWorkspaceStore.getState().current;
+  if (!workspace) return {};
+  const workspaceKey = workspace.folders
+    .map((folder) => folder.absolutePath || folder.originalPath || folder.id)
+    .join('|');
+  return {
+    workspaceId: workspace.id,
+    workspaceHash: workspaceKey ? simpleHash(workspaceKey) : workspace.id,
+  };
+}
+
+function currentWorkspaceScopeKey(): string {
+  const scope = currentWorkspaceScope();
+  return scope.workspaceHash ?? scope.workspaceId ?? 'no-workspace';
+}
+
 export const useAgentSessionStore = create<Store>((set, get) => ({
   session: null,
+  sessions: [],
+  currentSessionId: undefined,
+  workspaceScopeKey: undefined,
   events: [],
   traceEvents: [],
   mode: 'plan',
@@ -137,17 +180,28 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   queuedMessages: [],
 
   loadOrCreate: async () => {
-    if (get().session || get().loading) return;
+    const nextScopeKey = currentWorkspaceScopeKey();
+    if (get().session && get().workspaceScopeKey === nextScopeKey) return;
+    if (get().loading) return;
     set({ loading: true, errorMessage: null });
     const settings = useSettingsStore.getState().effectiveSettings;
     const initialMode = settingMode(settings['agent.defaultMode']);
     const workflow = settingWorkflow(settings['agent.defaultWorkflow']);
     set({ mode: initialMode, workflow });
     await get().loadWorkflowConfig();
-    const current = await getCurrentAgentSession();
+    const scope = currentWorkspaceScope();
+    const list = await listAgentSessions(scope);
+    if (list.ok && list.data) {
+      set({
+        sessions: list.data.sessions,
+        currentSessionId: list.data.currentSessionId,
+      });
+    }
+    const current = await getCurrentAgentSession(scope);
     if (current.ok && current.data) {
       set({
         session: current.data.session,
+        workspaceScopeKey: nextScopeKey,
         events: current.data.events,
         mode: current.data.session.mode,
         profileId: current.data.session.profileId,
@@ -156,10 +210,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       void get().refreshTraceEvents(current.data.session.id);
       return;
     }
-    const created = await createAgentSession({ initialMode });
+    const created = await createAgentSession({ initialMode, ...scope });
     if (created.ok && created.data) {
       set({
         session: created.data.session,
+        workspaceScopeKey: nextScopeKey,
+        sessions: [created.data.session, ...get().sessions.filter((item) => item.id !== created.data!.session.id)],
+        currentSessionId: created.data.session.id,
         events: created.data.events,
         mode: created.data.session.mode,
         profileId: created.data.session.profileId,
@@ -172,6 +229,91 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         loading: false,
       });
     }
+  },
+
+  refreshSessions: async () => {
+    const result = await listAgentSessions(currentWorkspaceScope());
+    if (result.ok && result.data) {
+      set({
+        sessions: result.data.sessions,
+        currentSessionId: result.data.currentSessionId,
+      });
+    }
+  },
+
+  createNewSession: async () => {
+    const settings = useSettingsStore.getState().effectiveSettings;
+    const initialMode = settingMode(settings['agent.defaultMode']);
+    const result = await createAgentSession({ initialMode, ...currentWorkspaceScope() });
+    if (result.ok && result.data) {
+      set({
+        session: result.data.session,
+        workspaceScopeKey: currentWorkspaceScopeKey(),
+        sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
+        currentSessionId: result.data.session.id,
+        events: result.data.events,
+        traceEvents: [],
+        mode: result.data.session.mode,
+        profileId: result.data.session.profileId,
+        pendingPermission: null,
+        errorMessage: null,
+      });
+      void get().refreshSessions();
+      return;
+    }
+    set({ errorMessage: result.message ?? 'Agent session create failed' });
+  },
+
+  activateSession: async (sessionId) => {
+    if (get().session?.id === sessionId) return;
+    set({ loading: true, errorMessage: null });
+    const result = await activateAgentSession(sessionId);
+    if (result.ok && result.data) {
+      set({
+        session: result.data.session,
+        workspaceScopeKey: currentWorkspaceScopeKey(),
+        currentSessionId: result.data.session.id,
+        events: result.data.events,
+        traceEvents: [],
+        mode: result.data.session.mode,
+        profileId: result.data.session.profileId,
+        pendingPermission: findLatestPendingPermission(result.data.events),
+        loading: false,
+      });
+      void get().refreshTraceEvents(result.data.session.id);
+      void get().refreshSessions();
+      return;
+    }
+    set({ errorMessage: result.message ?? 'Agent session activate failed', loading: false });
+  },
+
+  renameSession: async (sessionId, title) => {
+    const result = await renameAgentSession(sessionId, { title });
+    if (result.ok && result.data) {
+      set((state) => ({
+        session: state.session?.id === sessionId ? result.data!.session : state.session,
+        sessions: state.sessions.map((item) => item.id === sessionId ? result.data!.session : item),
+      }));
+      return;
+    }
+    set({ errorMessage: result.message ?? 'Agent session rename failed' });
+  },
+
+  archiveSession: async (sessionId) => {
+    const result = await archiveAgentSession(sessionId, { archived: true });
+    if (result.ok && result.data) {
+      const wasActive = get().session?.id === sessionId;
+      set({
+        sessions: result.data.sessions,
+        currentSessionId: result.data.currentSessionId,
+        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null } : {}),
+      });
+      if (wasActive) {
+        await get().loadOrCreate();
+      }
+      return;
+    }
+    set({ errorMessage: result.message ?? 'Agent session archive failed' });
   },
 
   refreshTraceEvents: async (sessionId) => {
@@ -276,7 +418,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     let pollingStopped = false;
     const refreshProgress = async () => {
       if (pollingStopped) return;
-      const current = await getCurrentAgentSession();
+      const current = await getCurrentAgentSession(currentWorkspaceScope());
       if (current.ok && current.data?.session.id === session.id) {
         set({
           session: current.data.session,
@@ -308,6 +450,8 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       set({
         session: data.session,
+        sessions: [data.session, ...get().sessions.filter((item) => item.id !== data.session.id)],
+        currentSessionId: data.session.id,
         events: data.events,
         pendingPermission: findLatestPendingPermission(data.events),
         loading: false,

@@ -449,9 +449,50 @@ pub fn create_agent_session(
 
 #[tauri::command]
 pub fn get_current_agent_session(
+    request: Option<serde_json::Value>,
     agent_state: tauri::State<'_, agent::AgentManager>,
 ) -> Option<agent::AgentSessionResult> {
-    agent_state.current_session()
+    agent_state.current_session(request.unwrap_or_else(|| serde_json::json!({})))
+}
+
+#[tauri::command]
+pub fn list_agent_sessions(
+    request: Option<serde_json::Value>,
+    agent_state: tauri::State<'_, agent::AgentManager>,
+) -> serde_json::Value {
+    agent_state.list_sessions(request.unwrap_or_else(|| serde_json::json!({})))
+}
+
+#[tauri::command]
+pub fn activate_agent_session(
+    session_id: String,
+    agent_state: tauri::State<'_, agent::AgentManager>,
+) -> Result<agent::AgentSessionResult, CommandError> {
+    agent_state
+        .activate_session(&session_id)
+        .map_err(CommandError::Other)
+}
+
+#[tauri::command]
+pub fn rename_agent_session(
+    session_id: String,
+    request: serde_json::Value,
+    agent_state: tauri::State<'_, agent::AgentManager>,
+) -> Result<agent::AgentSessionResult, CommandError> {
+    agent_state
+        .rename_session(&session_id, request)
+        .map_err(CommandError::Other)
+}
+
+#[tauri::command]
+pub fn archive_agent_session(
+    session_id: String,
+    request: serde_json::Value,
+    agent_state: tauri::State<'_, agent::AgentManager>,
+) -> Result<serde_json::Value, CommandError> {
+    agent_state
+        .archive_session(&session_id, request)
+        .map_err(CommandError::Other)
 }
 
 #[tauri::command]

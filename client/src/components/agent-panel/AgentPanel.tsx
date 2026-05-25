@@ -2,7 +2,9 @@ import React, { useEffect, useState } from 'react';
 import type { LlmProviderProfile } from '@deepcode/protocol';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
+import { useWorkspaceStore } from '../../state/workspaceStore';
 import AgentComposer from './AgentComposer';
+import AgentSessionSelector from './AgentSessionSelector';
 import AgentTaskList from './AgentTaskList';
 import MessageList from './MessageList';
 import PermissionRequestBubble from './PermissionRequestBubble';
@@ -10,6 +12,8 @@ import './agentPanel.css';
 
 const AgentPanel: React.FC = () => {
   const events = useAgentSessionStore((s) => s.events);
+  const session = useAgentSessionStore((s) => s.session);
+  const sessions = useAgentSessionStore((s) => s.sessions);
   const traceEvents = useAgentSessionStore((s) => s.traceEvents);
   const profileId = useAgentSessionStore((s) => s.profileId);
   const workflowConfig = useAgentSessionStore((s) => s.workflowConfig);
@@ -19,6 +23,11 @@ const AgentPanel: React.FC = () => {
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const pendingPermission = useAgentSessionStore((s) => s.pendingPermission);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
+  const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
+  const createNewSession = useAgentSessionStore((s) => s.createNewSession);
+  const activateSession = useAgentSessionStore((s) => s.activateSession);
+  const renameSession = useAgentSessionStore((s) => s.renameSession);
+  const archiveSession = useAgentSessionStore((s) => s.archiveSession);
   const loadWorkflowConfig = useAgentSessionStore((s) => s.loadWorkflowConfig);
   const patchWorkflowConfig = useAgentSessionStore((s) => s.patchWorkflowConfig);
   const setProfileId = useAgentSessionStore((s) => s.setProfileId);
@@ -27,11 +36,13 @@ const AgentPanel: React.FC = () => {
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
+  const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
 
   const [profiles, setProfiles] = useState<LlmProviderProfile[]>([]);
 
   useEffect(() => {
     void loadOrCreate();
+    void refreshSessions();
     void loadWorkflowConfig();
     const loadProfiles = () => getLlmProfiles().then((result) => {
       if (result.ok && result.data) {
@@ -46,10 +57,25 @@ const AgentPanel: React.FC = () => {
     };
     window.addEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
     return () => window.removeEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
-  }, [loadOrCreate, loadWorkflowConfig, profileId, setProfileId]);
+  }, [loadOrCreate, loadWorkflowConfig, profileId, refreshSessions, setProfileId]);
+
+  useEffect(() => {
+    void loadOrCreate();
+    void refreshSessions();
+  }, [loadOrCreate, refreshSessions, workspaceRevision]);
 
   return (
     <div className="agent-panel-shell">
+      <AgentSessionSelector
+        session={session}
+        sessions={sessions}
+        loading={loading}
+        onNew={() => void createNewSession()}
+        onActivate={(sessionId) => void activateSession(sessionId)}
+        onRename={(sessionId, title) => void renameSession(sessionId, title)}
+        onArchive={(sessionId) => void archiveSession(sessionId)}
+      />
+
       <AgentTaskList events={events} traceEvents={traceEvents} loading={loading} />
 
       <MessageList events={events} loading={loading} />

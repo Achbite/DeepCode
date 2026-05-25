@@ -373,6 +373,7 @@ export type AgentEventVisibility =
   | 'hidden';
 
 export type AgentDisplayDensity = 'compact' | 'balanced' | 'verbose';
+export type AgentSessionTitleSource = 'pending' | 'auto' | 'user';
 
 export type AgentEventPresentation =
   | 'body'
@@ -397,6 +398,12 @@ export interface AgentSession {
   title?: string;
   mode: AgentMode;
   profileId?: string;
+  workspaceId?: string;
+  workspaceHash?: string;
+  archivedAt?: string;
+  lastSummary?: string;
+  titleSource?: AgentSessionTitleSource;
+  eventCount?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -442,7 +449,30 @@ export interface AgentEvent {
 
 export interface CreateAgentSessionRequest {
   initialMode?: AgentMode;
+  mode?: AgentMode;
   profileId?: string;
+  workspaceId?: string;
+  workspaceHash?: string;
+  title?: string;
+}
+
+export interface ListAgentSessionsRequest {
+  workspaceId?: string;
+  workspaceHash?: string;
+  includeArchived?: boolean;
+}
+
+export interface AgentSessionListResult {
+  sessions: AgentSession[];
+  currentSessionId?: string;
+}
+
+export interface RenameAgentSessionRequest {
+  title: string;
+}
+
+export interface ArchiveAgentSessionRequest {
+  archived?: boolean;
 }
 
 export interface SendAgentMessageRequest {

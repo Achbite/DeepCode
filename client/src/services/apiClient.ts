@@ -31,7 +31,11 @@ import type {
   CodeSearchInput,
   CodeSearchResult,
   AgentMode,
+  AgentSessionListResult,
   CreateAgentSessionRequest,
+  ListAgentSessionsRequest,
+  RenameAgentSessionRequest,
+  ArchiveAgentSessionRequest,
   AgentSessionResult,
   AppendAgentEventsRequest,
   SendAgentMessageRequest,
@@ -336,8 +340,57 @@ export function createAgentSession(
   );
 }
 
-export function getCurrentAgentSession(): Promise<ApiResponse<AgentSessionResult | null>> {
-  return getJson<AgentSessionResult | null>(`${API_BASE}/agent/sessions/current`);
+export function listAgentSessions(
+  request: ListAgentSessionsRequest = {}
+): Promise<ApiResponse<AgentSessionListResult>> {
+  const qs = buildQuery({
+    workspaceId: request.workspaceId,
+    workspaceHash: request.workspaceHash,
+    includeArchived: request.includeArchived ? 'true' : undefined,
+  });
+  return getJson<AgentSessionListResult>(`${API_BASE}/agent/sessions${qs}`);
+}
+
+export function getCurrentAgentSession(
+  request: ListAgentSessionsRequest = {}
+): Promise<ApiResponse<AgentSessionResult | null>> {
+  const qs = buildQuery({
+    workspaceId: request.workspaceId,
+    workspaceHash: request.workspaceHash,
+  });
+  return getJson<AgentSessionResult | null>(`${API_BASE}/agent/sessions/current${qs}`);
+}
+
+export function activateAgentSession(
+  sessionId: string
+): Promise<ApiResponse<AgentSessionResult>> {
+  return sendJson<AgentSessionResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/activate`,
+    'POST',
+    {}
+  );
+}
+
+export function renameAgentSession(
+  sessionId: string,
+  request: RenameAgentSessionRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return sendJson<AgentSessionResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export function archiveAgentSession(
+  sessionId: string,
+  request: ArchiveAgentSessionRequest = { archived: true }
+): Promise<ApiResponse<AgentSessionListResult>> {
+  return sendJson<AgentSessionListResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/archive`,
+    'POST',
+    request
+  );
 }
 
 export function appendAgentEvents(

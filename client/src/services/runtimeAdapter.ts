@@ -35,7 +35,11 @@ import type {
   CodeSearchInput,
   CodeSearchResult,
   AgentMode,
+  AgentSessionListResult,
   CreateAgentSessionRequest,
+  ListAgentSessionsRequest,
+  RenameAgentSessionRequest,
+  ArchiveAgentSessionRequest,
   AgentSessionResult,
   AppendAgentEventsRequest,
   SendAgentMessageRequest,
@@ -618,12 +622,56 @@ export async function createAgentSession(
   return apiCreateAgentSession(request);
 }
 
-export async function getCurrentAgentSession(): Promise<ApiResponse<AgentSessionResult | null>> {
+export async function listAgentSessions(
+  request: ListAgentSessionsRequest = {}
+): Promise<ApiResponse<AgentSessionListResult>> {
   if (getRuntimeType() === 'tauri') {
-    return tauriInvoke<AgentSessionResult | null>('get_current_agent_session');
+    return tauriInvoke<AgentSessionListResult>('list_agent_sessions', { request });
+  }
+  const { listAgentSessions: apiListAgentSessions } = await import('./apiClient');
+  return apiListAgentSessions(request);
+}
+
+export async function getCurrentAgentSession(
+  request: ListAgentSessionsRequest = {}
+): Promise<ApiResponse<AgentSessionResult | null>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AgentSessionResult | null>('get_current_agent_session', { request });
   }
   const { getCurrentAgentSession: apiGetCurrentAgentSession } = await import('./apiClient');
-  return apiGetCurrentAgentSession();
+  return apiGetCurrentAgentSession(request);
+}
+
+export async function activateAgentSession(
+  sessionId: string
+): Promise<ApiResponse<AgentSessionResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AgentSessionResult>('activate_agent_session', { sessionId });
+  }
+  const { activateAgentSession: apiActivateAgentSession } = await import('./apiClient');
+  return apiActivateAgentSession(sessionId);
+}
+
+export async function renameAgentSession(
+  sessionId: string,
+  request: RenameAgentSessionRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AgentSessionResult>('rename_agent_session', { sessionId, request });
+  }
+  const { renameAgentSession: apiRenameAgentSession } = await import('./apiClient');
+  return apiRenameAgentSession(sessionId, request);
+}
+
+export async function archiveAgentSession(
+  sessionId: string,
+  request: ArchiveAgentSessionRequest = { archived: true }
+): Promise<ApiResponse<AgentSessionListResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<AgentSessionListResult>('archive_agent_session', { sessionId, request });
+  }
+  const { archiveAgentSession: apiArchiveAgentSession } = await import('./apiClient');
+  return apiArchiveAgentSession(sessionId, request);
 }
 
 export async function appendAgentEvents(

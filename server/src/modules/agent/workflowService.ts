@@ -20,6 +20,7 @@ import { getAgentWorkflowConfig } from '../../services/agentWorkflowConfigServic
 import {
   appendAgentEvents,
   getAgentSession,
+  setAgentSessionAutoTitle,
 } from '../../services/agentSessionStore.js';
 import { ContextSourceRegistry } from '../context/contextSourceRegistry.js';
 import { ContextBudgetPolicy } from '../context/contextBudgetPolicy.js';
@@ -483,6 +484,83 @@ function appendObservationContext(stageOutputs: string[], stage: AgentWorkflowSt
   stageOutputs.push(`[${stage} observations]\n${summaries.join('\n')}`);
 }
 
+function extractLlmText(result: Awaited<ReturnType<typeof chatWithLlm>>): string {
+  const assistantContent = result.assistantMessage?.content?.trim();
+  if (assistantContent) return assistantContent;
+  return result.chunks
+    .filter((chunk) => chunk.type === 'delta' && chunk.content)
+    .map((chunk) => chunk.content)
+    .join('')
+    .trim();
+}
+
+function parseSessionTitleJson(raw: string): { title?: string; summary?: string } {
+  const trimmed = raw.trim();
+  const jsonText = trimmed.match(/\{[\s\S]*\}/)?.[0] ?? trimmed;
+  try {
+    const parsed = JSON.parse(jsonText) as { title?: unknown; summary?: unknown };
+    return {
+      title: typeof parsed.title === 'string' ? parsed.title.trim() : undefined,
+      summary: typeof parsed.summary === 'string' ? parsed.summary.trim() : undefined,
+    };
+  } catch {
+    return { title: trimmed.split(/\r?\n/)[0]?.trim() };
+  }
+}
+
+function fallbackSessionTitle(content: string): string {
+  return content.trim().replace(/\s+/g, ' ').slice(0, 48) || 'Agent Session';
+}
+
+async function maybeAutoTitleSession(
+  latest: AgentSessionResult,
+  profileId: string | undefined,
+  userContent: string,
+  finalContent: string
+): Promise<AgentSessionResult> {
+  if (!profileId) return latest;
+  if (latest.session.titleSource === 'user' || latest.session.titleSource === 'auto') return latest;
+  const source = [
+    `User request:\n${userContent}`,
+    `Assistant final answer:\n${finalContent}`,
+  ].join('\n\n').slice(0, 6000);
+
+  try {
+    const result = await chatWithLlm({
+      profileId,
+      stream: false,
+      responseFormat: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: [
+            'Generate a concise DeepCode Agent session title and summary.',
+            'Return only valid JSON exactly like {"title":"...","summary":"..."}.',
+            'The title should be 4-12 Chinese characters or a short technical phrase.',
+            'Do not include markdown, quotes outside JSON, or private details.',
+          ].join('\n'),
+        },
+        {
+          role: 'user',
+          content: `Summarize this conversation as JSON:\n\n${source}`,
+        },
+      ],
+    });
+    const parsed = parseSessionTitleJson(extractLlmText(result));
+    return setAgentSessionAutoTitle(
+      latest.session.id,
+      parsed.title || fallbackSessionTitle(userContent),
+      parsed.summary || finalContent
+    );
+  } catch {
+    return setAgentSessionAutoTitle(
+      latest.session.id,
+      fallbackSessionTitle(userContent),
+      finalContent
+    );
+  }
+}
+
 export async function sendAgentMessage(
   sessionId: string,
   request: SendAgentMessageRequest
@@ -534,10 +612,12 @@ export async function sendAgentMessage(
   const workflow = request.workflow ?? 'planFirst';
   let emittedFinal = false;
   let lastUserVisibleText = '';
+  let lastUsedProfileId: string | undefined;
 
   for (const stage of AGENT_WORKFLOW_STAGES) {
     const profileId = workflowConfig[stage]?.profileId;
     if (!profileId) continue;
+    lastUsedProfileId = profileId;
     const profile = profilesById.get(profileId);
     const stageRunId = `stage-${stage}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const llmCallId = `llm-${stage}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -728,6 +808,15 @@ export async function sendAgentMessage(
       kind: 'final',
       content: lastUserVisibleText.trim(),
     })]);
+  }
+
+  if (lastUserVisibleText.trim()) {
+    latest = await maybeAutoTitleSession(
+      latest,
+      lastUsedProfileId,
+      request.content,
+      lastUserVisibleText.trim()
+    );
   }
 
   return latest;

@@ -39,6 +39,7 @@ struct PendingPermission {
 struct AgentState {
     sessions: HashMap<String, AgentSessionResult>,
     current_session_id: Option<String>,
+    current_by_workspace: HashMap<String, String>,
     pending_permissions: HashMap<String, PendingPermission>,
     trace_events: HashMap<String, Vec<Value>>,
 }
@@ -56,14 +57,29 @@ impl AgentManager {
 
     pub fn create_session(&self, request: Value) -> AgentSessionResult {
         let body = request.get("request").unwrap_or(&request);
-        let mode = string_field(body, "initialMode").unwrap_or_else(|| "plan".into());
+        let mode = string_field(body, "initialMode")
+            .or_else(|| string_field(body, "mode"))
+            .unwrap_or_else(|| "plan".into());
         let profile_id = string_field(body, "profileId");
+        let workspace_id = string_field(body, "workspaceId");
+        let workspace_hash = string_field(body, "workspaceHash");
+        let title = string_field(body, "title").unwrap_or_else(|| "New Agent Session".into());
+        let title_source = if string_field(body, "title").is_some() {
+            "user"
+        } else {
+            "pending"
+        };
         let id = format!("agent-{}", Utc::now().timestamp_millis());
         let now = now_iso();
         let session = json!({
             "id": id,
+            "title": title,
+            "titleSource": title_source,
             "mode": mode,
             "profileId": profile_id,
+            "workspaceId": workspace_id,
+            "workspaceHash": workspace_hash,
+            "eventCount": 0,
             "createdAt": now,
             "updatedAt": now
         });
@@ -73,15 +89,172 @@ impl AgentManager {
         };
         let mut state = self.state.lock().expect("agent state poisoned");
         state.current_session_id = Some(id.clone());
+        state
+            .current_by_workspace
+            .insert(workspace_key(&result.session), id.clone());
         state.trace_events.insert(id.clone(), Vec::new());
         state.sessions.insert(id, result.clone());
         result
     }
 
-    pub fn current_session(&self) -> Option<AgentSessionResult> {
+    pub fn list_sessions(&self, request: Value) -> Value {
         let state = self.state.lock().expect("agent state poisoned");
-        let id = state.current_session_id.as_ref()?;
-        state.sessions.get(id).cloned()
+        let body = request.get("request").unwrap_or(&request);
+        let include_archived = body
+            .get("includeArchived")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut sessions: Vec<Value> = state
+            .sessions
+            .values()
+            .map(session_with_event_count)
+            .filter(|session| include_archived || string_field(session, "archivedAt").is_none())
+            .filter(|session| session_matches_scope(session, body))
+            .collect();
+        sessions.sort_by(|a, b| {
+            string_field(b, "updatedAt")
+                .unwrap_or_default()
+                .cmp(&string_field(a, "updatedAt").unwrap_or_default())
+        });
+        json!({
+            "sessions": sessions,
+            "currentSessionId": select_current_session_id(&state, body)
+        })
+    }
+
+    pub fn current_session(&self, request: Value) -> Option<AgentSessionResult> {
+        let state = self.state.lock().expect("agent state poisoned");
+        let body = request.get("request").unwrap_or(&request);
+        let id = select_current_session_id(&state, body)?;
+        state.sessions.get(&id).map(result_with_event_count)
+    }
+
+    pub fn activate_session(&self, session_id: &str) -> Result<AgentSessionResult, String> {
+        let mut state = self.state.lock().expect("agent state poisoned");
+        let result = state
+            .sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| format!("Agent session not found: {session_id}"))?;
+        if string_field(&result.session, "archivedAt").is_some() {
+            return Err(format!("Agent session is archived: {session_id}"));
+        }
+        state.current_session_id = Some(session_id.to_string());
+        state
+            .current_by_workspace
+            .insert(workspace_key(&result.session), session_id.to_string());
+        Ok(result_with_event_count(&result))
+    }
+
+    pub fn rename_session(&self, session_id: &str, request: Value) -> Result<AgentSessionResult, String> {
+        let body = request.get("request").unwrap_or(&request);
+        let title = string_field(body, "title")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "New Agent Session".into());
+        let mut state = self.state.lock().expect("agent state poisoned");
+        let result = state
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Agent session not found: {session_id}"))?;
+        set_json_field(&mut result.session, "title", json!(title));
+        set_json_field(&mut result.session, "titleSource", json!("user"));
+        set_json_field(&mut result.session, "updatedAt", json!(now_iso()));
+        Ok(result_with_event_count(result))
+    }
+
+    pub fn archive_session(&self, session_id: &str, request: Value) -> Result<Value, String> {
+        let body = request.get("request").unwrap_or(&request);
+        let archived = body
+            .get("archived")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let mut state = self.state.lock().expect("agent state poisoned");
+        let key = {
+            let result = state
+                .sessions
+                .get_mut(session_id)
+                .ok_or_else(|| format!("Agent session not found: {session_id}"))?;
+            if archived {
+                set_json_field(&mut result.session, "archivedAt", json!(now_iso()));
+            } else if let Some(record) = result.session.as_object_mut() {
+                record.remove("archivedAt");
+            }
+            set_json_field(&mut result.session, "updatedAt", json!(now_iso()));
+            workspace_key(&result.session)
+        };
+        if state.current_session_id.as_deref() == Some(session_id) {
+            state.current_session_id = None;
+        }
+        if state.current_by_workspace.get(&key).map(String::as_str) == Some(session_id) {
+            state.current_by_workspace.remove(&key);
+        }
+        drop(state);
+        Ok(self.list_sessions(json!({ "request": body })))
+    }
+
+    fn set_auto_title_session(
+        &self,
+        session_id: &str,
+        title: &str,
+        summary: &str,
+    ) -> Result<AgentSessionResult, String> {
+        let mut state = self.state.lock().expect("agent state poisoned");
+        let result = state
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Agent session not found: {session_id}"))?;
+        let source = string_field(&result.session, "titleSource").unwrap_or_else(|| "pending".into());
+        if source == "user" || source == "auto" {
+            return Ok(result_with_event_count(result));
+        }
+        let title = take_chars(&title.trim().replace('\n', " "), 48);
+        set_json_field(
+            &mut result.session,
+            "title",
+            json!(if title.trim().is_empty() { "Agent Session" } else { title.as_str() }),
+        );
+        set_json_field(&mut result.session, "titleSource", json!("auto"));
+        if !summary.trim().is_empty() {
+            set_json_field(
+                &mut result.session,
+                "lastSummary",
+                json!(take_chars(&summary.trim().replace('\n', " "), 160)),
+            );
+        }
+        set_json_field(&mut result.session, "updatedAt", json!(now_iso()));
+        Ok(result_with_event_count(result))
+    }
+
+    async fn auto_title_session(
+        &self,
+        session_id: &str,
+        profile_id: Option<&str>,
+        user_content: &str,
+        summary: &str,
+    ) -> Result<AgentSessionResult, String> {
+        if let Some(profile_id) = profile_id {
+            if let Some((title, generated_summary)) =
+                generate_session_title(profile_id, user_content, summary).await
+            {
+                let summary_text = if generated_summary.trim().is_empty() {
+                    summary.to_string()
+                } else {
+                    generated_summary
+                };
+                return self.set_auto_title_session(session_id, &title, &summary_text);
+            }
+        }
+
+        let fallback = take_chars(&user_content.trim().replace('\n', " "), 48);
+        self.set_auto_title_session(
+            session_id,
+            if fallback.trim().is_empty() {
+                "Agent Session"
+            } else {
+                fallback.as_str()
+            },
+            summary,
+        )
     }
 
     pub fn append_events(
@@ -233,6 +406,7 @@ impl AgentManager {
         let mut stage_outputs: Vec<String> = Vec::new();
         let mut emitted_final = false;
         let mut last_user_visible_text = String::new();
+        let mut last_used_profile_id: Option<String> = None;
 
         for stage in STAGES {
             let Some(profile_id) = workflow_config
@@ -244,6 +418,7 @@ impl AgentManager {
             else {
                 continue;
             };
+            last_used_profile_id = Some(profile_id.clone());
 
             let stage_run_id = format!("stage-{stage}-{}", Utc::now().timestamp_micros());
             let llm_call_id = format!("llm-{stage}-{}", Utc::now().timestamp_micros());
@@ -563,6 +738,17 @@ impl AgentManager {
             )?;
         }
 
+        if !last_user_visible_text.trim().is_empty() {
+            latest = self
+                .auto_title_session(
+                    session_id,
+                    last_used_profile_id.as_deref(),
+                    &content,
+                    last_user_visible_text.trim(),
+                )
+                .await?;
+        }
+
         Ok(latest)
     }
 
@@ -627,6 +813,11 @@ impl AgentManager {
         events: Vec<Value>,
     ) -> Result<AgentSessionResult, String> {
         let trace_events = agent_events_to_trace(session_id, &events);
+        let latest_summary = events
+            .iter()
+            .rev()
+            .find(|event| matches!(event_kind(event).as_str(), "user_msg" | "assistant_msg"))
+            .map(event_summary);
         let mut state = self.state.lock().expect("agent state poisoned");
         if !state.sessions.contains_key(session_id) {
             return Err(format!("Agent session not found: {session_id}"));
@@ -651,15 +842,23 @@ impl AgentManager {
             }
         }
 
-        let session = state
-            .sessions
-            .get_mut(session_id)
-            .expect("session existence checked above");
-        session.events.extend(events);
-        if let Some(obj) = session.session.as_object_mut() {
-            obj.insert("updatedAt".into(), Value::String(now_iso()));
-        }
-        Ok(session.clone())
+        let (key, result) = {
+            let session = state
+                .sessions
+                .get_mut(session_id)
+                .expect("session existence checked above");
+            session.events.extend(events);
+            if let Some(obj) = session.session.as_object_mut() {
+                if let Some(summary) = latest_summary.as_ref() {
+                    obj.insert("lastSummary".into(), Value::String(take_chars(summary, 160)));
+                }
+                obj.insert("updatedAt".into(), Value::String(now_iso()));
+            }
+            (workspace_key(&session.session), result_with_event_count(session))
+        };
+        state.current_session_id = Some(session_id.to_string());
+        state.current_by_workspace.insert(key, session_id.to_string());
+        Ok(result)
     }
 
     fn emit_events_direct(
@@ -1790,6 +1989,144 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn set_json_field(target: &mut Value, key: &str, value: Value) {
+    if let Some(record) = target.as_object_mut() {
+        record.insert(key.to_string(), value);
+    }
+}
+
+fn session_with_event_count(result: &AgentSessionResult) -> Value {
+    let mut session = result.session.clone();
+    set_json_field(&mut session, "eventCount", json!(result.events.len()));
+    session
+}
+
+fn result_with_event_count(result: &AgentSessionResult) -> AgentSessionResult {
+    AgentSessionResult {
+        session: session_with_event_count(result),
+        events: result.events.clone(),
+    }
+}
+
+async fn generate_session_title(
+    profile_id: &str,
+    user_content: &str,
+    summary: &str,
+) -> Option<(String, String)> {
+    let prompt = "Return json only. Create a concise DeepCode Agent session title and summary from the user request and assistant result. The title should be 4-12 Chinese characters or a short technical phrase. Do not include markdown, quotes, secrets, or private paths. JSON schema: {\"title\":\"...\",\"summary\":\"...\"}.";
+    let response = llm_profiles::chat(json!({
+        "profileId": profile_id,
+        "messages": [
+            { "role": "system", "content": prompt },
+            {
+                "role": "user",
+                "content": format!(
+                    "User request:\n{}\n\nAssistant visible result:\n{}",
+                    user_content,
+                    summary
+                )
+            }
+        ],
+        "responseFormat": { "type": "json_object" },
+        "stream": false
+    }))
+    .await
+    .ok()?;
+
+    let mut content = String::new();
+    for chunk in response
+        .get("chunks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if string_field(chunk, "type").as_deref() == Some("delta") {
+            if let Some(delta) = string_field(chunk, "content") {
+                content.push_str(&delta);
+            }
+        }
+    }
+
+    let parsed = parse_json_object(&content)?;
+    let title = string_field(&parsed, "title")?;
+    let generated_summary = string_field(&parsed, "summary").unwrap_or_else(|| summary.into());
+    Some((take_chars(&title, 48), take_chars(&generated_summary, 160)))
+}
+
+fn parse_json_object(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    let without_fence = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|value| value.trim())
+        .and_then(|value| value.strip_suffix("```").map(str::trim))
+        .unwrap_or(trimmed);
+
+    if let Ok(value) = serde_json::from_str::<Value>(without_fence) {
+        if value.is_object() {
+            return Some(value);
+        }
+    }
+
+    let start = without_fence.find('{')?;
+    let end = without_fence.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<Value>(&without_fence[start..=end])
+        .ok()
+        .filter(Value::is_object)
+}
+
+fn workspace_key(value: &Value) -> String {
+    string_field(value, "workspaceHash")
+        .or_else(|| string_field(value, "workspaceId"))
+        .unwrap_or_else(|| "no-workspace".into())
+}
+
+fn session_matches_scope(session: &Value, scope: &Value) -> bool {
+    if string_field(scope, "workspaceHash").is_none() && string_field(scope, "workspaceId").is_none()
+    {
+        return true;
+    }
+    workspace_key(session) == workspace_key(scope)
+}
+
+fn select_current_session_id(state: &AgentState, scope: &Value) -> Option<String> {
+    let key = workspace_key(scope);
+    if let Some(id) = state.current_by_workspace.get(&key) {
+        if let Some(session) = state.sessions.get(id) {
+            if string_field(&session.session, "archivedAt").is_none()
+                && session_matches_scope(&session.session, scope)
+            {
+                return Some(id.clone());
+            }
+        }
+    }
+    if let Some(id) = state.current_session_id.as_ref() {
+        if let Some(session) = state.sessions.get(id) {
+            if string_field(&session.session, "archivedAt").is_none()
+                && session_matches_scope(&session.session, scope)
+            {
+                return Some(id.clone());
+            }
+        }
+    }
+    state
+        .sessions
+        .iter()
+        .filter(|(_, result)| {
+            string_field(&result.session, "archivedAt").is_none()
+                && session_matches_scope(&result.session, scope)
+        })
+        .max_by(|(_, a), (_, b)| {
+            string_field(&a.session, "updatedAt")
+                .unwrap_or_default()
+                .cmp(&string_field(&b.session, "updatedAt").unwrap_or_default())
+        })
+        .map(|(id, _)| id.clone())
 }
 
 fn now_iso() -> String {
