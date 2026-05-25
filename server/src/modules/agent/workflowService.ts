@@ -58,12 +58,15 @@ const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
     'You are the completion stage of DeepCode Agent.',
     'Use deepcode-action JSON blocks or tool calls when local reads, searches, patches, writes, or shell commands are needed.',
     'For directExecution requests, proceed with allowed read/search/diff steps and request permission only when the tool policy requires it.',
+    'When the user asks to render or return Markdown, tables, formulas, or diagrams, return the actual Markdown content, not a description of what would be returned.',
     'Keep human-facing progress readable; raw deepcode-action blocks are for the runtime, not the final user-facing text.',
     'All local operations are subject to the permission gate.',
   ].join('\n'),
   review: [
     'You are the review stage of DeepCode Agent.',
-    'Summarize what happened, observations, remaining risks, and next steps. Do not perform new local operations.',
+    'Produce the final user-facing answer for the conversation. Keep it direct and avoid internal audit sections unless the user asked for a review.',
+    'If the user requested Markdown, tables, formulas, or diagrams, include the actual renderable Markdown in the final answer.',
+    'Do not perform new local operations.',
   ].join('\n'),
 };
 
@@ -85,13 +88,17 @@ function observationEvent(sessionId: string, observation: AgentObservation): Age
   if (observation.status === 'error' || observation.status === 'blocked') {
     return newEvent(sessionId, 'tool_result', {
       callId: observation.actionId,
+      toolName: observation.toolName,
       ok: false,
+      status: observation.status,
       error: observation.error?.message ?? observation.summary,
     });
   }
   return newEvent(sessionId, 'tool_result', {
     callId: observation.actionId,
+    toolName: observation.toolName,
     ok: true,
+    status: observation.status,
     output: observation.output,
   });
 }
@@ -128,9 +135,10 @@ async function executeOrAsk(
   mode: AgentMode,
   toolCall: ToolCall
 ): Promise<AgentEvent[]> {
-  const withToolName = (result: ToolResult): ToolResult & { toolName: string } => ({
+  const withToolName = (result: ToolResult): ToolResult & { toolName: string; status: 'ok' | 'error' } => ({
     ...result,
     toolName: toolCall.name,
+    status: result.ok ? 'ok' : 'error',
   });
   const events: AgentEvent[] = [newEvent(sessionId, 'tool_call', toolCall)];
   const decision = await evaluateAgentPermission({ mode, toolCall });
@@ -139,6 +147,7 @@ async function executeOrAsk(
       callId: toolCall.id,
       toolName: toolCall.name,
       ok: false,
+      status: 'blocked',
       error: decision.reason,
     }));
     return events;
@@ -169,6 +178,7 @@ async function runParsedTextActions(
     if (action.status !== 'parsed') {
       events.push(newEvent(sessionId, 'error', {
         message: action.errors?.[0]?.message ?? 'Invalid action',
+        code: action.errors?.[0]?.code ?? 'invalid_action',
         action,
       }));
       continue;
@@ -229,6 +239,7 @@ export async function sendAgentMessage(
 
     events.push(newEvent(sessionId, 'workflow_stage', {
       stage,
+      phase: stage,
       profileId,
       status: 'started',
     }));
@@ -272,6 +283,8 @@ export async function sendAgentMessage(
         if (chunk.type === 'error') {
           events.push(newEvent(sessionId, 'error', {
             stage,
+            phase: stage,
+            code: 'llm_stream_error',
             message: chunk.error ?? 'LLM stream error',
           }));
         }
@@ -290,6 +303,7 @@ export async function sendAgentMessage(
 
       events.push(newEvent(sessionId, 'workflow_stage', {
         stage,
+        phase: stage,
         profileId,
         status: 'completed',
         summary: trimmed ? trimmed.slice(0, 240) : 'No textual output.',
@@ -299,11 +313,12 @@ export async function sendAgentMessage(
       const message = err instanceof Error ? err.message : String(err);
       events.push(newEvent(sessionId, 'workflow_stage', {
         stage,
+        phase: stage,
         profileId,
         status: 'error',
         summary: message,
       }));
-      events.push(newEvent(sessionId, 'error', { stage, message }));
+      events.push(newEvent(sessionId, 'error', { stage, phase: stage, code: 'llm_stage_error', message }));
     }
   }
 
@@ -324,6 +339,8 @@ export async function resolveAgentPermission(
     newEvent(pending.sessionId, 'permission_result', {
       permissionId,
       decision: request.decision,
+      toolName: pending.toolCall.name,
+      status: request.decision === 'accept' ? 'accepted' : 'rejected',
     }),
   ];
 
@@ -342,6 +359,7 @@ export async function resolveAgentPermission(
       callId: pending.toolCall.id,
       toolName: pending.toolCall.name,
       ok: false,
+      status: 'error',
       error: 'permission_rejected',
     }));
   }

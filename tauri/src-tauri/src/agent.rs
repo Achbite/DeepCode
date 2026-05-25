@@ -161,7 +161,7 @@ impl AgentManager {
             events.push(new_event(
                 session_id,
                 "workflow_stage",
-                json!({ "stage": stage, "profileId": profile_id, "status": "started" }),
+                json!({ "stage": stage, "phase": stage, "profileId": profile_id, "status": "started" }),
             ));
 
             let prior = if stage_outputs.is_empty() {
@@ -218,7 +218,12 @@ impl AgentManager {
                                 events.push(new_event(
                                     session_id,
                                     "error",
-                                    json!({ "stage": stage, "message": string_field(chunk, "error").unwrap_or_else(|| "LLM stream error".into()) }),
+                                    json!({
+                                        "stage": stage,
+                                        "phase": stage,
+                                        "code": "llm_stream_error",
+                                        "message": string_field(chunk, "error").unwrap_or_else(|| "LLM stream error".into())
+                                    }),
                                 ));
                             }
                             _ => {}
@@ -250,6 +255,7 @@ impl AgentManager {
                         "workflow_stage",
                         json!({
                             "stage": stage,
+                            "phase": stage,
                             "profileId": profile_id,
                             "status": "completed",
                             "summary": if trimmed.is_empty() { "No textual output.".into() } else { take_chars(&trimmed, 240) },
@@ -261,9 +267,9 @@ impl AgentManager {
                     events.push(new_event(
                         session_id,
                         "workflow_stage",
-                        json!({ "stage": stage, "profileId": profile_id, "status": "error", "summary": err }),
+                        json!({ "stage": stage, "phase": stage, "profileId": profile_id, "status": "error", "summary": err }),
                     ));
-                    events.push(new_event(session_id, "error", json!({ "stage": stage, "message": err })));
+                    events.push(new_event(session_id, "error", json!({ "stage": stage, "phase": stage, "code": "llm_stage_error", "message": err })));
                 }
             }
         }
@@ -289,7 +295,12 @@ impl AgentManager {
         let mut events = vec![new_event(
             &pending.session_id,
             "permission_result",
-            json!({ "permissionId": permission_id, "decision": decision }),
+            json!({
+                "permissionId": permission_id,
+                "decision": decision,
+                "toolName": pending.tool_call.get("name").cloned().unwrap_or_else(|| json!("tool")),
+                "status": if decision == "accept" { "accepted" } else { "rejected" }
+            }),
         )];
         if decision == "accept" {
             let result = execute_agent_tool_value(
@@ -313,6 +324,7 @@ impl AgentManager {
                     "callId": pending.tool_call.get("id").cloned().unwrap_or_else(|| json!("tool-call")),
                     "toolName": pending.tool_call.get("name").cloned().unwrap_or_else(|| json!("tool")),
                     "ok": false,
+                    "status": "error",
                     "error": "permission_rejected"
                 }),
             ));
@@ -353,6 +365,7 @@ impl AgentManager {
                         "callId": tool_call.get("id").cloned().unwrap_or_else(|| json!("tool-call")),
                         "toolName": tool_call.get("name").cloned().unwrap_or_else(|| json!("tool")),
                         "ok": false,
+                        "status": "blocked",
                         "error": string_field(&decision, "reason").unwrap_or_else(|| "permission denied".into())
                     }),
                 ));
@@ -397,7 +410,7 @@ impl AgentManager {
                 events.push(new_event(
                     session_id,
                     "error",
-                    json!({ "message": "Invalid action", "action": action }),
+                    json!({ "code": "invalid_action", "message": "Invalid action", "action": action }),
                 ));
                 continue;
             }
@@ -975,8 +988,8 @@ fn stage_prompt(stage: &str) -> &'static str {
     match stage {
         "plan" => "You are the planning stage. Create a concise plan and classify whether this is directExecution or needsUserConfirmation. Do not request local writes or shell execution.",
         "check" => "You are the checking stage. Review plan, context, risks, and likely tool usage. Do not request local writes or shell execution.",
-        "complete" => "You are the completion stage. Use deepcode-action JSON blocks or tool calls when local operations are needed. All local operations are subject to the permission gate.",
-        "review" => "You are the review stage. Summarize what happened, observations, remaining risks, and next steps. Do not perform new local operations.",
+        "complete" => "You are the completion stage. Use deepcode-action JSON blocks or tool calls when local operations are needed. When the user asks to render or return Markdown, tables, formulas, or diagrams, return the actual Markdown content, not a description of what would be returned. All local operations are subject to the permission gate.",
+        "review" => "You are the review stage. Produce the final user-facing answer for the conversation. Keep it direct and avoid internal audit sections unless the user asked for a review. If the user requested Markdown, tables, formulas, or diagrams, include the actual renderable Markdown in the final answer. Do not perform new local operations.",
         _ => "You are DeepCode Agent.",
     }
 }
@@ -1077,21 +1090,36 @@ fn tool_success(tool_call: &Value, output: Value) -> Value {
     json!({
         "callId": tool_call.get("id").cloned().unwrap_or_else(|| json!("tool-call")),
         "ok": true,
+        "status": "ok",
         "output": output
     })
 }
 
 fn tool_failure(tool_call: &Value, error: String) -> Value {
+    let message = if error.starts_with("no_workspace:") {
+        "当前没有打开工作区。请先在 Explorer 中打开一个文件夹或 .code-workspace 文件，然后再读取、搜索或修改文件。".to_string()
+    } else {
+        error
+    };
     json!({
         "callId": tool_call.get("id").cloned().unwrap_or_else(|| json!("tool-call")),
         "ok": false,
-        "error": error
+        "status": "error",
+        "error": message
     })
 }
 
 fn with_tool_name(mut result: Value, tool_call: &Value) -> Value {
     if let Some(obj) = result.as_object_mut() {
         obj.insert("toolName".into(), tool_call.get("name").cloned().unwrap_or_else(|| json!("tool")));
+        if !obj.contains_key("status") {
+            let status = if obj.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                "ok"
+            } else {
+                "error"
+            };
+            obj.insert("status".into(), json!(status));
+        }
     }
     result
 }

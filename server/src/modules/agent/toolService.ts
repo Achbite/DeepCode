@@ -199,8 +199,15 @@ function success(callId: string, output: unknown): ToolResult {
   return { callId, ok: true, output };
 }
 
+function humanizeToolError(error: string): string {
+  if (error.startsWith('no_workspace:')) {
+    return '当前没有打开工作区。请先在 Explorer 中打开一个文件夹或 .code-workspace 文件，然后再读取、搜索或修改文件。';
+  }
+  return error;
+}
+
 function failure(callId: string, error: string): ToolResult {
-  return { callId, ok: false, error };
+  return { callId, ok: false, error: humanizeToolError(error) };
 }
 
 export function listAgentTools(mode?: AgentMode): ListToolsResult {
