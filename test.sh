@@ -136,6 +136,28 @@ assert.equal(isWorkflowTerminal(result.state), false);
 NODE
 pass "WorkflowMachine complete.blocked(test_failed) -> plan fixture ok"
 
+info "[3c/6] DeepSeek V4 profile capability defaults"
+node --input-type=module <<'NODE'
+import assert from 'node:assert/strict';
+import {
+  DEFAULT_LLM_PROVIDER_PROFILES,
+  DEEPSEEK_LLM_MODEL_OPTIONS,
+} from './packages/protocol/dist/index.js';
+
+const flash = DEFAULT_LLM_PROVIDER_PROFILES.find((profile) => profile.model === 'deepseek-v4-flash');
+const pro = DEFAULT_LLM_PROVIDER_PROFILES.find((profile) => profile.model === 'deepseek-v4-pro');
+
+assert.ok(DEEPSEEK_LLM_MODEL_OPTIONS.includes('deepseek-v4-flash'));
+assert.ok(DEEPSEEK_LLM_MODEL_OPTIONS.includes('deepseek-v4-pro'));
+assert.equal(flash?.contextWindowTokens, 1000000);
+assert.equal(flash?.maxOutputTokens, 384000);
+assert.equal(flash?.reasoningEffort, 'high');
+assert.equal(pro?.contextWindowTokens, 1000000);
+assert.equal(pro?.maxOutputTokens, 384000);
+assert.equal(pro?.reasoningEffort, 'max');
+NODE
+pass "DeepSeek V4 1M context/max output defaults ok"
+
 # ---- 4. 启动 server 并 ping ----
 info "[4/6] start server on port $TEST_PORT"
 # 链路测试固定直跑源码，避免 stale dist 掩盖新路由 / 新协议问题。
@@ -233,7 +255,7 @@ fi
 TRACE_APPEND_BODY="$(jq -nc --arg sid "$TRACE_SESSION_ID" --arg ts "$(date -Iseconds)" '{
   events: [
     {id:"evt-trace-user", sessionId:$sid, ts:$ts, kind:"user_msg", payload:{content:"trace smoke", channel:"user", visibility:"conversation", turnId:"evt-trace-user", sequence:1}},
-    {id:"evt-trace-stage-start", sessionId:$sid, ts:$ts, kind:"workflow_stage", payload:{stage:"complete", status:"started", profileId:"smoke-profile", channel:"task", visibility:"task", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", sequence:2}},
+    {id:"evt-trace-stage-start", sessionId:$sid, ts:$ts, kind:"workflow_stage", payload:{stage:"complete", status:"started", profileId:"smoke-profile", contextBudget:{usedTokens:1200, limitTokens:1000000, reservedOutputTokens:384000, truncated:false}, channel:"task", visibility:"task", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", sequence:2}},
     {id:"evt-trace-reasoning", sessionId:$sid, ts:$ts, kind:"assistant_msg", payload:{stage:"complete", content:"thinking trace smoke", channel:"reasoning", visibility:"trace", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", sequence:3}},
     {id:"evt-trace-progress", sessionId:$sid, ts:$ts, kind:"assistant_msg", payload:{stage:"complete", content:"I will propose a command.", channel:"progress", visibility:"conversation", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", sequence:4}},
     {id:"evt-trace-tool-call", sessionId:$sid, ts:$ts, kind:"tool_call", payload:{id:"tool-smoke", name:"shell.propose", arguments:{command:"echo trace-smoke"}, channel:"tool", visibility:"conversation", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", batchId:"batch-smoke", batchLabel:"执行命令", sequence:5}},
@@ -270,6 +292,7 @@ echo "$TRACE_SNAPSHOT_RESP" | jq -e '
     .ok == true
     and (.data.trace.events | type == "array")
     and ([.data.trace.events[].kind] | index("turn.started") != null)
+    and ([.data.trace.events[].kind] | index("context.budget") != null)
     and ([.data.trace.events[].kind] | index("stage.started") != null)
     and ([.data.trace.events[].kind] | index("tool.requested") != null)
     and ([.data.trace.events[].kind] | index("tool.completed") != null)
