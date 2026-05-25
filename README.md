@@ -280,26 +280,48 @@ DeepCode 的设计、实现和验证过程使用了 AI 编程工具辅助完成�
 
 ## 参考文献
 
-[1] OpenAI. *Codex CLI*. GitHub repository. Available: https://github.com/openai/codex. Accessed: 2026-05-22.
+本节按仓库去重记录 DeepCode 的架构、Agent 工作流、Skill 组织和扩展机制参考来源。引用仅表示设计启发，不表示复制外部源码或兼容外部项目实现。
 
-[2] SST. *OpenCode*. GitHub repository. Available: https://github.com/sst/opencode. Accessed: 2026-05-22.
+### 核心 Agent / IDE 架构参考
 
-[3] Continue. *Continue*. GitHub repository. Available: https://github.com/continuedev/continue. Accessed: 2026-05-22.
+[1] openai/codex. *Codex CLI*. GitHub repository. Available: https://github.com/openai/codex. Accessed: 2026-05-25.
 
-[4] Aider-AI. *Aider*. GitHub repository. Available: https://github.com/Aider-AI/aider. Accessed: 2026-05-22.
+[2] sst/opencode. *OpenCode*. GitHub repository. Available: https://github.com/sst/opencode. Accessed: 2026-05-25.
 
-[5] Cline. *Cline*. GitHub repository. Available: https://github.com/cline/cline. Accessed: 2026-05-22.
+[3] continuedev/continue. *Continue*. GitHub repository. Available: https://github.com/continuedev/continue. Accessed: 2026-05-25.
 
-[6] Roo Code. *Roo-Code*. GitHub repository. Available: https://github.com/RooCodeInc/Roo-Code. Accessed: 2026-05-22.
+[4] Aider-AI/aider. *Aider*. GitHub repository. Available: https://github.com/Aider-AI/aider. Accessed: 2026-05-25.
 
-[7] SWE-agent. *SWE-agent*. GitHub repository. Available: https://github.com/SWE-agent/SWE-agent. Accessed: 2026-05-22.
+[5] cline/cline. *Cline*. GitHub repository. Available: https://github.com/cline/cline. Accessed: 2026-05-25.
 
-[8] All Hands AI. *OpenHands*. GitHub repository. Available: https://github.com/All-Hands-AI/OpenHands. Accessed: 2026-05-22.
+[6] RooCodeInc/Roo-Code. *Roo-Code*. GitHub repository. Available: https://github.com/RooCodeInc/Roo-Code. Accessed: 2026-05-25.
 
-[9] Microsoft. *Visual Studio Code terminal and extension host architecture*. Documentation and source repository. Available: https://github.com/microsoft/vscode. Accessed: 2026-05-22.
+[7] SWE-agent/SWE-agent. *SWE-agent*. GitHub repository. Available: https://github.com/SWE-agent/SWE-agent. Accessed: 2026-05-25.
 
-[10] Earendil Works. *Pi*. GitHub repository. Available: https://github.com/earendil-works/pi. Accessed: 2026-05-22.
+[8] All-Hands-AI/OpenHands. *OpenHands*. GitHub repository. Available: https://github.com/All-Hands-AI/OpenHands. Accessed: 2026-05-25.
 
-[11] Anthropic. *Skills*. GitHub repository. Available: https://github.com/anthropics/skills. Accessed: 2026-05-22.
+[9] microsoft/vscode. *Visual Studio Code*. GitHub repository. Available: https://github.com/microsoft/vscode. Accessed: 2026-05-25.
 
-[12] GitHub. *Spec Kit*. GitHub repository. Available: https://github.com/github/spec-kit. Accessed: 2026-05-22.
+[10] earendil-works/pi. *Pi*. GitHub repository. Available: https://github.com/earendil-works/pi. Accessed: 2026-05-25.
+
+### Skill / Agent 生态参考
+
+[11] mattpocock/skills. *Skills*. GitHub repository. Available: https://github.com/mattpocock/skills. Accessed: 2026-05-25.
+
+[12] nousresearch/hermes-agent. *Hermes Agent*. GitHub repository. Available: https://github.com/nousresearch/hermes-agent. Accessed: 2026-05-25.
+
+[13] multica-ai/andrej-karpathy-skills. *Andrej Karpathy Skills*. GitHub repository. Available: https://github.com/multica-ai/andrej-karpathy-skills. Accessed: 2026-05-25.
+
+[14] addyosmani/agent-skills. *Agent Skills*. GitHub repository. Available: https://github.com/addyosmani/agent-skills. Accessed: 2026-05-25.
+
+[15] obra/superpowers. *Superpowers*. GitHub repository. Available: https://github.com/obra/superpowers. Accessed: 2026-05-25.
+
+[16] affaan-m/everything-claude-code. *Everything Claude Code*. GitHub repository. Available: https://github.com/affaan-m/everything-claude-code. Accessed: 2026-05-25.
+
+[17] github/spec-kit. *Spec Kit*. GitHub repository. Available: https://github.com/github/spec-kit. Accessed: 2026-05-25.
+
+[18] datawhalechina/hello-agents. *Hello Agents*. GitHub repository. Available: https://github.com/datawhalechina/hello-agents. Accessed: 2026-05-25.
+
+[19] ruvnet/ruflo. *Ruflo*. GitHub repository. Available: https://github.com/ruvnet/ruflo. Accessed: 2026-05-25.
+
+[20] anthropics/skills. *Skills*. GitHub repository. Available: https://github.com/anthropics/skills. Accessed: 2026-05-25.
