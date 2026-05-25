@@ -77,28 +77,28 @@ function actionText(action: Record<string, unknown>): string {
   const path = typeof action.path === 'string' ? sanitizeDisplayText(action.path) : undefined;
   const query = typeof action.query === 'string' ? sanitizeDisplayText(action.query) : undefined;
   const command = typeof action.command === 'string' ? sanitizeDisplayText(action.command) : undefined;
-  const result =
-    (typeof action.result === 'string' && sanitizeDisplayText(action.result)) ||
-    (typeof action.content === 'string' && sanitizeDisplayText(action.content)) ||
-    (typeof action.message === 'string' && sanitizeDisplayText(action.message));
+  const result = [
+    typeof action.result === 'string' ? sanitizeDisplayText(action.result) : undefined,
+    typeof action.content === 'string' ? sanitizeDisplayText(action.content) : undefined,
+    typeof action.message === 'string' ? sanitizeDisplayText(action.message) : undefined,
+  ].find((value): value is string => Boolean(value && value.trim()));
 
-  if (type === 'final') return result ? result.trim() : '最终回复已准备。';
-  if (type === 'fs.read') return `读取文件 \`${path ?? '(missing path)'}\`。`;
-  if (type === 'fs.list') return `列出目录 \`${path ?? '.'}\`。`;
-  if (type === 'code.search') return `搜索代码 \`${query ?? '(missing query)'}\`。`;
-  if (type === 'fs.diff') return `准备文件差异 \`${path ?? '(missing path)'}\`。`;
-  if (type === 'fs.write') return `写入文件 \`${path ?? '(missing path)'}\`。`;
+  if (type === 'final') return result ? result.trim() : '\u6700\u7ec8\u56de\u590d\u5df2\u51c6\u5907\u3002';
+  if (type === 'fs.read') return `\u8bfb\u53d6\u6587\u4ef6 \`${path ?? '(missing path)'}\`\u3002`;
+  if (type === 'fs.list') return `\u5217\u51fa\u76ee\u5f55 \`${path ?? '.'}\`\u3002`;
+  if (type === 'code.search') return `\u641c\u7d22\u4ee3\u7801 \`${query ?? '(missing query)'}\`\u3002`;
+  if (type === 'fs.diff') return `\u51c6\u5907\u6587\u4ef6\u5dee\u5f02 \`${path ?? '(missing path)'}\`\u3002`;
+  if (type === 'fs.write') return `\u5199\u5165\u6587\u4ef6 \`${path ?? '(missing path)'}\`\u3002`;
   if (type === 'patch.plan') {
     const startLine = numberField(action, 'startLine');
     const endLine = numberField(action, 'endLine');
-    const range = startLine && endLine ? ` 第 ${startLine}-${endLine} 行` : '';
-    return `规划补丁 \`${path ?? '(missing path)'}\`${range}。`;
+    const range = startLine && endLine ? ` \u7b2c ${startLine}-${endLine} \u884c` : '';
+    return `\u89c4\u5212\u8865\u4e01 \`${path ?? '(missing path)'}\`${range}\u3002`;
   }
-  if (type === 'shell.propose') return `建议命令：\`${command ?? '(missing command)'}\`。`;
-  if (type === 'shell.exec') return `执行命令：\`${command ?? '(missing command)'}\`。`;
-  return result ? result.trim() : `解析到动作 \`${type}\`。`;
+  if (type === 'shell.propose') return `\u5efa\u8bae\u547d\u4ee4\uff1a\`${command ?? '(missing command)'}\`\u3002`;
+  if (type === 'shell.exec') return `\u6267\u884c\u547d\u4ee4\uff1a\`${command ?? '(missing command)'}\`\u3002`;
+  return result ? result.trim() : `\u89e3\u6790\u5230\u52a8\u4f5c \`${type}\`\u3002`;
 }
-
 function parseActionObject(value: unknown): Record<string, unknown>[] {
   if (!isRecord(value)) return [];
   if (Array.isArray(value.actions)) return value.actions.filter(isRecord);
@@ -217,7 +217,7 @@ function defaultTasks(loading: boolean): AgentTaskView[] {
   return [
     {
       id: 'task-waiting',
-      title: loading ? 'Agent 正在准备任务' : '等待 Agent 任务',
+      title: loading ? '\u0041gent \u6b63\u5728\u51c6\u5907\u4efb\u52a1' : '\u7b49\u5f85 Agent \u4efb\u52a1',
       status: loading ? 'running' : 'waiting',
       commands: [],
       hasToolActivity: false,
@@ -225,6 +225,7 @@ function defaultTasks(loading: boolean): AgentTaskView[] {
     },
   ];
 }
+
 
 function ensureTask(tasks: Map<string, AgentTaskView>, stage: string): AgentTaskView {
   const id = `stage-${stage}`;

@@ -30,9 +30,10 @@ const PROFILE_PRESETS: Array<{
       kind: 'openaiCompatible',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
       model: 'deepseek-v4-flash',
-      maxTokens: 4096,
+      contextWindowTokens: 1000000,
+      maxOutputTokens: 384000,
       temperature: 0.2,
-      reasoningEffort: 'medium',
+      reasoningEffort: 'high',
       thinking: 'enabled',
       enabled: true,
     },
@@ -44,9 +45,10 @@ const PROFILE_PRESETS: Array<{
       kind: 'openaiCompatible',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
       model: 'deepseek-v4-pro',
-      maxTokens: 4096,
+      contextWindowTokens: 1000000,
+      maxOutputTokens: 384000,
       temperature: 0.2,
-      reasoningEffort: 'high',
+      reasoningEffort: 'max',
       thinking: 'enabled',
       enabled: true,
     },
@@ -58,9 +60,10 @@ const PROFILE_PRESETS: Array<{
       kind: 'anthropic',
       baseUrl: DEEPSEEK_ANTHROPIC_BASE_URL,
       model: 'deepseek-v4-flash',
-      maxTokens: 4096,
+      contextWindowTokens: 1000000,
+      maxOutputTokens: 384000,
       temperature: 0.2,
-      reasoningEffort: 'medium',
+      reasoningEffort: 'high',
       thinking: 'enabled',
       enabled: true,
     },
@@ -80,6 +83,13 @@ function createProfile(
     enabled: true,
     ...preset,
   };
+}
+
+function optionalNumber(value: string): number | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 const LlmSection: React.FC = () => {
@@ -345,6 +355,37 @@ const LlmSection: React.FC = () => {
                   />
                 </label>
                 <label>
+                  <span>Context window tokens</span>
+                  <input
+                    className="settings-field__input"
+                    type="number"
+                    min={1}
+                    value={profile.contextWindowTokens ?? ''}
+                    onChange={(e) =>
+                      updateProfile(profile.id, {
+                        contextWindowTokens: optionalNumber(e.target.value),
+                      })
+                    }
+                    placeholder="1000000"
+                  />
+                </label>
+                <label>
+                  <span>Max output tokens</span>
+                  <input
+                    className="settings-field__input"
+                    type="number"
+                    min={1}
+                    value={profile.maxOutputTokens ?? profile.maxTokens ?? ''}
+                    onChange={(e) =>
+                      updateProfile(profile.id, {
+                        maxOutputTokens: optionalNumber(e.target.value),
+                        maxTokens: undefined,
+                      })
+                    }
+                    placeholder="384000"
+                  />
+                </label>
+                <label>
                   <span>Thinking</span>
                   <select
                     className="settings-field__select"
@@ -379,9 +420,15 @@ const LlmSection: React.FC = () => {
                     <option value="low">Low</option>
                     <option value="medium">Medium</option>
                     <option value="high">High</option>
+                    <option value="max">Max</option>
                   </select>
                 </label>
               </div>
+              {profile.thinking === 'enabled' && (
+                <div className="settings-card__hint">
+                  Thinking mode providers such as DeepSeek may ignore sampling parameters like temperature.
+                </div>
+              )}
 
               <div className="llm-profile__actions">
                 <button
