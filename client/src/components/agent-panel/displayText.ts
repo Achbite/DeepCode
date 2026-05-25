@@ -9,8 +9,8 @@ function hasLikelyCorruptedQuestionRuns(text: string): boolean {
 }
 
 function sanitizeLine(line: string): string {
-  const text = line.replace(REPLACEMENT_CHAR_PATTERN, '').trim();
-  if (!text) return '';
+  const text = line.replace(REPLACEMENT_CHAR_PATTERN, '');
+  if (!text.trim()) return '';
   if (hasLikelyCorruptedQuestionRuns(text)) return '';
   return text.replace(QUESTION_RUN_PATTERN, '...');
 }
@@ -21,9 +21,12 @@ export function sanitizeDisplayText(value: string): string {
     .replace(/\r\n/g, '\n')
     .split('\n')
     .map(sanitizeLine)
-    .filter(Boolean);
+    .join('\n')
+    .replace(/\n{4,}/g, '\n\n\n')
+    .trim()
+    .split('\n');
 
-  if (lines.length === 0 && value.trim()) {
+  if (lines.every((line) => !line.trim()) && value.trim()) {
     return 'Message hidden because it contains invalid encoding.';
   }
 

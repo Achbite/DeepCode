@@ -189,6 +189,10 @@
   justify-content: flex-end;
 }
 
+.agent-message--user_msg .agent-markdown__paragraph {
+  white-space: pre-wrap;
+}
+
 .agent-message__meta,
 .agent-tool-bubble__header,
 .agent-permission__meta {
@@ -261,6 +265,46 @@
   padding: 2px 0 2px 9px;
 }
 
+.agent-markdown__table-wrap {
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-md, 6px);
+}
+
+.agent-markdown__table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 360px;
+  font-size: 12px;
+}
+
+.agent-markdown__table th,
+.agent-markdown__table td {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  padding: 7px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.agent-markdown__table th {
+  color: var(--text-strong, #fff);
+  background: rgba(255, 255, 255, 0.045);
+  font-weight: 700;
+}
+
+.agent-markdown__table tr:last-child td {
+  border-bottom: 0;
+}
+
+.agent-markdown input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  margin: 0 6px 0 0;
+  vertical-align: -2px;
+  accent-color: var(--accent, #0a84ff);
+}
+
 .agent-markdown code {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: var(--radius-sm, 4px);
@@ -325,6 +369,20 @@
   white-space: pre-wrap;
 }
 
+.agent-markdown .katex-display {
+  max-width: 100%;
+  overflow: auto hidden;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(10, 132, 255, 0.24);
+  border-radius: var(--radius-md, 6px);
+  background: rgba(10, 132, 255, 0.08);
+}
+
+.agent-markdown .katex {
+  color: var(--text-strong, #fff);
+}
+
 .agent-mermaid-card {
   display: grid;
   gap: 8px;
@@ -332,6 +390,19 @@
   border-radius: var(--radius-md, 6px);
   background: rgba(10, 132, 255, 0.075);
   padding: 9px;
+}
+
+.agent-mermaid-card__svg {
+  max-width: 100%;
+  overflow: auto;
+}
+
+.agent-mermaid-card__svg svg {
+  display: block;
+  max-width: 100%;
+  min-width: 280px;
+  height: auto;
+  margin: 0 auto;
 }
 
 .agent-mermaid-card__title {

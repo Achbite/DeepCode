@@ -127,15 +127,6 @@ function hasLaterResult(events: AgentEvent[], index: number): boolean {
   return later.some((event) => event.kind === 'tool_result');
 }
 
-function hasLaterPermissionResult(events: AgentEvent[], index: number): boolean {
-  const later = events.slice(index + 1);
-  const callId = eventCallId(events[index]);
-  if (callId) {
-    return later.some((event) => event.kind === 'permission_result' && eventCallId(event) === callId);
-  }
-  return later.some((event) => event.kind === 'permission_result');
-}
-
 function isAgentThoughtEvent(event: AgentEvent): boolean {
   if (event.kind === 'assistant_msg') {
     const stage = eventStage(event);
@@ -162,10 +153,24 @@ function isHiddenConversationEvent(event: AgentEvent): boolean {
 function isTurnComplete(events: AgentEvent[]): boolean {
   return !events.some((event, index) => {
     if (event.kind === 'workflow_stage' && stageStatus(event.payload) === 'started') return true;
-    if (event.kind === 'tool_call' && !hasLaterResult(events, index)) return true;
-    if (event.kind === 'permission_request' && !hasLaterPermissionResult(events, index)) return true;
     return isRecord(event.payload) && event.payload.pending === true;
   });
+}
+
+function stageEventAsAssistant(event: AgentEvent, sourceStage: string): AgentEvent | null {
+  const details = stringField(event.payload, 'details');
+  const summary = stringField(event.payload, 'summary');
+  const content = details ?? summary;
+  if (!content || content === 'No textual output.') return null;
+  return {
+    ...event,
+    id: `stage-final-${event.id}`,
+    kind: 'assistant_msg',
+    payload: {
+      content,
+      sourceStage,
+    },
+  };
 }
 
 function pickFallbackAssistantEvent(events: AgentEvent[]): AgentEvent | null {
@@ -191,12 +196,28 @@ function pickFallbackAssistantEvent(events: AgentEvent[]): AgentEvent | null {
 }
 
 function pickVisibleAssistantEvent(events: AgentEvent[], thoughtEvents: AgentEvent[]): AgentEvent | null {
-  const visible = events.filter((event) => {
+  const directFinal = events.filter((event) => {
     if (event.kind !== 'assistant_msg') return false;
     const stage = eventStage(event);
-    return !stage || stage === 'complete';
+    return !stage;
   });
-  if (visible.length > 0) return visible[visible.length - 1];
+  if (directFinal.length > 0) return directFinal[directFinal.length - 1];
+
+  const completedReview = [...events].reverse().find((event) =>
+    event.kind === 'workflow_stage' &&
+    eventStage(event) === 'review' &&
+    stageStatus(event.payload) === 'completed'
+  );
+  if (completedReview) {
+    const reviewAssistant = stageEventAsAssistant(completedReview, 'review');
+    if (reviewAssistant) return reviewAssistant;
+  }
+
+  const completeVisible = events.filter((event) =>
+    event.kind === 'assistant_msg' && eventStage(event) === 'complete'
+  );
+  if (completeVisible.length > 0) return completeVisible[completeVisible.length - 1];
+
   return pickFallbackAssistantEvent(thoughtEvents);
 }
 
