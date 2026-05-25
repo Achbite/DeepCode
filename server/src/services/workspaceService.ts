@@ -13,7 +13,7 @@
  *   - folders[].path 解析后必须是已存在的目录；不存在时该 folder 被丢弃，并写入 lastError；
  *   - openWorkspace 接收的绝对路径仅在该路由放行；后续文件读写全部按 folderId 锁定在 folder 之内。
  */
-import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import {
   basename,
   dirname,
@@ -72,6 +72,35 @@ function sanitizeWorkspaceFileName(input: string): string {
     : `${trimmed}.code-workspace`;
   const sanitized = withExt.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-');
   return sanitized === '.code-workspace' ? fallback : sanitized;
+}
+
+function findRootWorkspaceFile(absoluteDir: string): string | null {
+  let entries: string[];
+  try {
+    entries = readdirSync(absoluteDir);
+  } catch {
+    return null;
+  }
+
+  const workspaceFiles = entries
+    .filter((entry) => entry.toLowerCase().endsWith('.code-workspace'))
+    .map((entry) => resolve(absoluteDir, entry))
+    .filter((entryPath) => {
+      try {
+        return statSync(entryPath).isFile();
+      } catch {
+        return false;
+      }
+    })
+    .sort((a, b) => basename(a).localeCompare(basename(b)));
+
+  if (workspaceFiles.length === 0) return null;
+
+  const expectedName = `${basename(absoluteDir)}.code-workspace`.toLowerCase();
+  const exact = workspaceFiles.find(
+    (entryPath) => basename(entryPath).toLowerCase() === expectedName
+  );
+  return exact ?? workspaceFiles[0] ?? null;
 }
 
 function workspaceFolderPathForFile(
@@ -292,7 +321,10 @@ export function openWorkspace(absolutePath: string): WorkspaceSpec {
   if (kind === 'code-workspace') {
     spec = buildCodeWorkspace(normalized);
   } else {
-    spec = buildDirectoryWorkspace(normalized);
+    const rootWorkspaceFile = findRootWorkspaceFile(normalized);
+    spec = rootWorkspaceFile
+      ? buildCodeWorkspace(rootWorkspaceFile)
+      : buildDirectoryWorkspace(normalized);
   }
   currentWorkspace = spec;
   fallbackUsed = false;

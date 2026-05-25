@@ -137,12 +137,17 @@ impl WorkspaceManager {
         let abs = p
             .canonicalize()
             .map_err(|e| format!("路径规范化失败: {}", e))?;
-        let abs_posix = to_posix(&abs);
+        let open_target = if abs.is_dir() {
+            find_root_workspace_file(&abs).unwrap_or_else(|| abs.clone())
+        } else {
+            abs.clone()
+        };
+        let open_target_posix = to_posix(&open_target);
 
         let (source, name, folders, source_path, settings, unsupported) =
-            if abs.is_dir() {
+            if open_target.is_dir() {
                 // 目录模式
-                let dir_name = abs
+                let dir_name = open_target
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "workspace".into());
@@ -151,32 +156,32 @@ impl WorkspaceManager {
                     dir_name,
                     vec![WorkspaceFolderSpec {
                         id: "wf-0".into(),
-                        name: abs
+                        name: open_target
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| "workspace".into()),
-                        absolute_path: abs_posix.clone(),
-                        original_path: abs_posix,
+                        absolute_path: open_target_posix.clone(),
+                        original_path: open_target_posix,
                         is_absolute: true,
                     }],
                     None::<String>,
                     serde_json::json!({}),
                     vec![] as Vec<UnsupportedField>,
                 )
-            } else if is_code_workspace_file(&abs) {
+            } else if is_code_workspace_file(&open_target) {
                 // .code-workspace 文件模式
-                let content = std::fs::read_to_string(&abs)
+                let content = std::fs::read_to_string(&open_target)
                     .map_err(|e| format!("读取 .code-workspace 失败: {}", e))?;
                 let ws_json: serde_json::Value = serde_json::from_str(&content)
                     .map_err(|e| format!("解析 .code-workspace JSON 失败: {}", e))?;
 
-                let file_name = abs
+                let file_name = open_target
                     .file_stem()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "workspace".into());
 
                 let folders_val = ws_json.get("folders").and_then(|v| v.as_array());
-                let parent = abs.parent().unwrap_or(Path::new("."));
+                let parent = open_target.parent().unwrap_or(Path::new("."));
 
                 let mut folder_specs = Vec::new();
                 if let Some(arr) = folders_val {
@@ -265,7 +270,7 @@ impl WorkspaceManager {
                     WorkspaceSourceKind::CodeWorkspace,
                     file_name,
                     folder_specs,
-                    Some(abs_posix),
+                    Some(open_target_posix),
                     settings_obj,
                     unsupported,
                 )
@@ -449,6 +454,45 @@ fn is_code_workspace_file(p: &Path) -> bool {
                 .ends_with(".code-workspace")
         })
         .unwrap_or(false)
+}
+
+fn find_root_workspace_file(dir: &Path) -> Option<PathBuf> {
+    let expected_name = dir
+        .file_name()
+        .map(|name| format!("{}.code-workspace", name.to_string_lossy()).to_lowercase());
+    let mut workspace_files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_code_workspace_file(path))
+        .collect();
+
+    if workspace_files.is_empty() {
+        return None;
+    }
+
+    workspace_files.sort_by(|a, b| {
+        a.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default()
+            .cmp(
+                &b.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )
+    });
+
+    if let Some(expected) = expected_name {
+        if let Some(exact) = workspace_files.iter().find(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_lowercase() == expected)
+                .unwrap_or(false)
+        }) {
+            return Some(exact.clone());
+        }
+    }
+
+    workspace_files.into_iter().next()
 }
 
 fn sanitize_workspace_file_name(input: &str) -> String {
