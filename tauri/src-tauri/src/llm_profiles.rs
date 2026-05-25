@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -77,9 +78,10 @@ fn default_profiles_file() -> LlmProfilesFile {
                 "kind": "openaiCompatible",
                 "baseUrl": "https://api.deepseek.com",
                 "model": "deepseek-v4-flash",
-                "maxTokens": 4096,
+                "contextWindowTokens": 1000000,
+                "maxOutputTokens": 384000,
                 "temperature": 0.2,
-                "reasoningEffort": "medium",
+                "reasoningEffort": "high",
                 "thinking": "enabled",
                 "enabled": true
             }),
@@ -89,9 +91,10 @@ fn default_profiles_file() -> LlmProfilesFile {
                 "kind": "openaiCompatible",
                 "baseUrl": "https://api.deepseek.com",
                 "model": "deepseek-v4-pro",
-                "maxTokens": 4096,
+                "contextWindowTokens": 1000000,
+                "maxOutputTokens": 384000,
                 "temperature": 0.2,
-                "reasoningEffort": "high",
+                "reasoningEffort": "max",
                 "thinking": "enabled",
                 "enabled": true
             }),
@@ -147,6 +150,8 @@ fn sanitize_profile(raw: &Value) -> Option<Value> {
     let id = string_field(raw, "id")?;
     let name = string_field(raw, "name")?;
     let model = string_field(raw, "model")?;
+    let is_deepseek_v4 = model == "deepseek-v4-flash" || model == "deepseek-v4-pro";
+    let is_deepseek_v4_pro = model == "deepseek-v4-pro";
     let kind = string_field(raw, "kind").unwrap_or_else(|| "openaiCompatible".into());
     let mut profile = Map::new();
     profile.insert("id".into(), Value::String(id));
@@ -162,12 +167,24 @@ fn sanitize_profile(raw: &Value) -> Option<Value> {
             profile.insert(key.into(), Value::String(value));
         }
     }
-    for key in ["maxTokens", "temperature"] {
+    for key in ["contextWindowTokens", "maxOutputTokens", "maxTokens", "temperature"] {
         if let Some(value) = raw.get(key).and_then(Value::as_f64) {
             if let Some(number) = serde_json::Number::from_f64(value) {
                 profile.insert(key.into(), Value::Number(number));
             }
         }
+    }
+    if is_deepseek_v4 && !profile.contains_key("contextWindowTokens") {
+        profile.insert("contextWindowTokens".into(), Value::Number(1000000.into()));
+    }
+    if is_deepseek_v4 && !profile.contains_key("maxOutputTokens") {
+        profile.insert("maxOutputTokens".into(), Value::Number(384000.into()));
+    }
+    if is_deepseek_v4 && !profile.contains_key("reasoningEffort") {
+        profile.insert(
+            "reasoningEffort".into(),
+            Value::String(if is_deepseek_v4_pro { "max" } else { "high" }.into()),
+        );
     }
     Some(Value::Object(profile))
 }
@@ -414,13 +431,49 @@ fn openai_messages(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
         .map(|message| {
-            json!({
+            let mut next = json!({
                 "role": string_field(message, "role").unwrap_or_else(|| "user".into()),
                 "content": string_field(message, "content").unwrap_or_default(),
                 "tool_call_id": string_field(message, "toolCallId")
-            })
+            });
+            if let Some(reasoning) = string_field(message, "reasoningContent") {
+                next["reasoning_content"] = Value::String(reasoning);
+            }
+            if let Some(tool_calls) = message.get("toolCalls").cloned() {
+                next["tool_calls"] = tool_calls;
+            }
+            next
         })
         .collect()
+}
+
+fn provider_user_id(request: &Value) -> String {
+    let raw = string_field(request, "providerUserId")
+        .or_else(|| std::env::var("DEEPCODE_PROVIDER_USER_ID").ok())
+        .or_else(|| std::env::var("DEEPCODE_USER_ID").ok())
+        .unwrap_or_else(|| "local".into());
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    format!("dc_{:016x}", hasher.finish())
+}
+
+fn profile_number(profile: &Value, key: &str) -> Option<Value> {
+    profile.get(key).and_then(Value::as_f64).and_then(|value| {
+        serde_json::Number::from_f64(value).map(Value::Number)
+    })
+}
+
+fn max_output_tokens(profile: &Value) -> Option<Value> {
+    profile_number(profile, "maxOutputTokens").or_else(|| profile_number(profile, "maxTokens"))
+}
+
+fn is_deepseek_profile(profile: &Value) -> bool {
+    string_field(profile, "baseUrl")
+        .map(|base| base.contains("api.deepseek.com"))
+        .unwrap_or(false)
+        || string_field(profile, "model")
+            .map(|model| model.starts_with("deepseek-"))
+            .unwrap_or(false)
 }
 
 async fn call_openai_compatible(
@@ -440,7 +493,7 @@ async fn call_openai_compatible(
         "messages": openai_messages(&messages),
         "tools": tools,
         "temperature": profile.get("temperature").cloned(),
-        "max_tokens": profile.get("maxTokens").cloned(),
+        "max_tokens": max_output_tokens(profile),
         "stream": false
     });
 
@@ -449,6 +502,17 @@ async fn call_openai_compatible(
     }
     if let Some(effort) = string_field(profile, "reasoningEffort") {
         body["reasoning_effort"] = Value::String(effort);
+    }
+    if is_deepseek_profile(profile) {
+        body["user_id"] = Value::String(provider_user_id(request));
+        if string_field(profile, "thinking").as_deref() == Some("enabled") {
+            if let Some(map) = body.as_object_mut() {
+                map.remove("temperature");
+            }
+        }
+    }
+    if let Some(response_format) = request.get("responseFormat").cloned() {
+        body["response_format"] = response_format;
     }
 
     let response = reqwest::Client::new()
