@@ -144,6 +144,22 @@
   cursor: pointer;
 }
 
+.agent-session-menu__rename {
+  min-width: 0;
+}
+
+.agent-session-menu__rename input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid rgba(10, 132, 255, 0.42);
+  border-radius: 5px;
+  background: var(--bg-surface, #1c1c20);
+  color: var(--text-main, #ededed);
+  font-size: 12px;
+  padding: 6px 7px;
+  outline: none;
+}
+
 .agent-session-menu__title,
 .agent-session-menu__meta {
   overflow: hidden;

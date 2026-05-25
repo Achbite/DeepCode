@@ -41,6 +41,8 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
   onArchive,
 }) => {
   const [open, setOpen] = useState(false);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
   const activeSessions = useMemo(
     () => sessions.filter((item) => !item.archivedAt),
     [sessions]
@@ -49,6 +51,22 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
   const newTitle = session && isEmptySession(session)
     ? 'Current session is empty'
     : 'New Agent session';
+
+  const startRename = (item: AgentSession) => {
+    setRenamingId(item.id);
+    setRenameValue(sessionTitle(item));
+  };
+
+  const cancelRename = () => {
+    setRenamingId(null);
+    setRenameValue('');
+  };
+
+  const commitRename = (sessionId: string) => {
+    const nextTitle = renameValue.trim();
+    if (nextTitle) onRename(sessionId, nextTitle);
+    cancelRename();
+  };
 
   return (
     <div className="agent-session-bar">
@@ -82,46 +100,62 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
             {activeSessions.length === 0 && (
               <div className="agent-session-menu__empty">No sessions yet.</div>
             )}
-            {activeSessions.map((item) => (
-              <div
-                key={item.id}
-                className={`agent-session-menu__item${item.id === session?.id ? ' agent-session-menu__item--active' : ''}`}
-              >
-                <button
-                  type="button"
-                  className="agent-session-menu__main"
-                  onClick={() => {
-                    setOpen(false);
-                    onActivate(item.id);
-                  }}
+            {activeSessions.map((item) => {
+              const isRenaming = renamingId === item.id;
+              return (
+                <div
+                  key={item.id}
+                  className={`agent-session-menu__item${item.id === session?.id ? ' agent-session-menu__item--active' : ''}`}
                 >
-                  <span className="agent-session-menu__title">{sessionTitle(item)}</span>
-                  <span className="agent-session-menu__meta">
-                    {formatTime(item.updatedAt)}
-                    {item.lastSummary ? ` · ${item.lastSummary}` : ''}
-                  </span>
-                </button>
-                <div className="agent-session-menu__actions">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const nextTitle = window.prompt('Rename Agent session', sessionTitle(item));
-                      if (nextTitle !== null) onRename(item.id, nextTitle);
-                    }}
-                  >
-                    Rename
-                  </button>
-                  {!isEmptySession(item) && (
+                  {isRenaming ? (
+                    <div className="agent-session-menu__rename">
+                      <input
+                        autoFocus
+                        value={renameValue}
+                        onChange={(event) => setRenameValue(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') commitRename(item.id);
+                          if (event.key === 'Escape') cancelRename();
+                        }}
+                        aria-label="Agent session title"
+                      />
+                    </div>
+                  ) : (
                     <button
                       type="button"
-                      onClick={() => onArchive(item.id)}
+                      className="agent-session-menu__main"
+                      onClick={() => {
+                        setOpen(false);
+                        onActivate(item.id);
+                      }}
                     >
-                      Del
+                      <span className="agent-session-menu__title">{sessionTitle(item)}</span>
+                      <span className="agent-session-menu__meta">
+                        {formatTime(item.updatedAt)}
+                        {item.lastSummary ? ` - ${item.lastSummary}` : ''}
+                      </span>
                     </button>
                   )}
+                  <div className="agent-session-menu__actions">
+                    {isRenaming ? (
+                      <>
+                        <button type="button" onClick={() => commitRename(item.id)}>Save</button>
+                        <button type="button" onClick={cancelRename}>Cancel</button>
+                      </>
+                    ) : (
+                      <>
+                        <button type="button" onClick={() => startRename(item)}>Rename</button>
+                        {!isEmptySession(item) && (
+                          <button type="button" onClick={() => onArchive(item.id)}>
+                            Del
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
