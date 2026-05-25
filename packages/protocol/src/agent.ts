@@ -10,7 +10,23 @@ export type AgentWorkUnitScopeKind = 'file' | 'range' | 'docSection' | 'symbol';
 export type AgentWorkUnitStatus = 'queued' | 'running' | 'waitingReview' | 'completed' | 'blocked' | 'cancelled';
 export type AgentChangeOperationKind = 'write' | 'edit' | 'delete' | 'rename' | 'shellGeneratedChange';
 export type AgentValidationKind = 'test' | 'lint' | 'typecheck' | 'format' | 'policy' | 'secretScan' | 'manualReview';
+export type AgentReviewGateStatus = 'accepted' | 'needsReplan' | 'needsUserReview' | 'aborted';
 export type AgentTraceEventKind =
+  | 'turn.started'
+  | 'turn.completed'
+  | 'stage.started'
+  | 'stage.completed'
+  | 'stage.failed'
+  | 'llm.requested'
+  | 'llm.completed'
+  | 'tool.requested'
+  | 'tool.completed'
+  | 'tool.failed'
+  | 'permission.requested'
+  | 'permission.resolved'
+  | 'shell.output'
+  | 'file.changed'
+  | 'user.guidance'
   | 'workflow.transition'
   | 'workflow.outcome'
   | 'llm.request'
@@ -25,6 +41,8 @@ export type AgentTraceEventKind =
   | 'browser.panel_snapshot_created'
   | 'browser.panel_snapshot_attached'
   | 'error';
+export type AgentTraceEventLevel = 'debug' | 'info' | 'warn' | 'error';
+export type AgentTraceEventSource = 'web' | 'tauri' | 'agent' | 'runtime' | 'user';
 
 export type AgentReplanReason =
   | 'invalid_plan'
@@ -189,15 +207,49 @@ export interface AgentWorkflowTransition {
 
 export interface AgentTraceEvent {
   id: string;
-  sessionId: string;
-  ts: string;
-  kind: AgentTraceEventKind;
-  phase?: AgentWorkflowPhase;
   eventId?: string;
+  sessionId: string;
+  turnId?: string;
+  ts: string;
+  timestamp?: string;
+  kind: AgentTraceEventKind;
+  source?: AgentTraceEventSource;
+  level?: AgentTraceEventLevel;
+  phase?: AgentWorkflowPhase;
   toolCallId?: string;
   workUnitId?: string;
   summary: string;
   payload?: unknown;
+}
+
+export interface AgentTraceEventFilter {
+  turnId?: string;
+  phase?: AgentWorkflowPhase;
+  kind?: AgentTraceEventKind;
+  toolCallId?: string;
+  afterEventId?: string;
+  limit?: number;
+}
+
+export interface TraceLedgerSnapshot {
+  sessionId: string;
+  events: AgentTraceEvent[];
+  eventCount: number;
+  updatedAt: string;
+}
+
+export interface GetAgentEventSnapshotResult {
+  sessionId: string;
+  trace: TraceLedgerSnapshot;
+}
+
+export interface AckAgentEventRequest {
+  eventId: string;
+}
+
+export interface AckAgentEventResult {
+  accepted: boolean;
+  eventId: string;
 }
 
 export interface AgentWorkUnitScope {
@@ -218,6 +270,14 @@ export interface AgentWorkUnit {
   planStepId?: string;
   dependsOn?: string[];
   createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentWorkQueueSnapshot {
+  runId: string;
+  units: AgentWorkUnit[];
+  activeOwners: Record<string, string>;
+  blockedUnits: AgentWorkUnit[];
   updatedAt: string;
 }
 
@@ -260,6 +320,19 @@ export interface AgentValidationResult {
   createdAt: string;
 }
 
+export interface AgentReviewGateResult {
+  id: string;
+  runId: string;
+  status: AgentReviewGateStatus;
+  summary: string;
+  satisfiedCriteria: string[];
+  missingCriteria: string[];
+  evidenceRefs: string[];
+  changeSetId?: string;
+  validationResultIds: string[];
+  createdAt: string;
+}
+
 export interface GetAgentWorkflowConfigResult {
   config: AgentWorkflowConfig;
   storePath?: string;
@@ -279,6 +352,44 @@ export type AgentEventKind =
   | 'permission_result'
   | 'workflow_stage'
   | 'error';
+
+export type AgentEventChannel =
+  | 'user'
+  | 'reasoning'
+  | 'progress'
+  | 'action'
+  | 'tool'
+  | 'observation'
+  | 'final'
+  | 'task'
+  | 'error';
+
+export type AgentEventVisibility =
+  | 'conversation'
+  | 'task'
+  | 'trace'
+  | 'both'
+  | 'hidden';
+
+export type AgentDisplayDensity = 'compact' | 'balanced' | 'verbose';
+
+export type AgentEventPresentation =
+  | 'body'
+  | 'collapsible'
+  | 'stageSummary'
+  | 'traceOnly';
+
+export interface AgentEventDisplayHint {
+  presentation?: AgentEventPresentation;
+  defaultOpen?: boolean;
+  importance?: 'primary' | 'secondary' | 'debug';
+}
+
+export interface AgentDisplayPolicy {
+  density: AgentDisplayDensity;
+  defaultOpenByChannel?: Partial<Record<AgentEventChannel, boolean>>;
+  presentationByChannel?: Partial<Record<AgentEventChannel, AgentEventPresentation>>;
+}
 
 export interface AgentSession {
   id: string;
@@ -325,6 +436,7 @@ export interface AgentEvent {
   ts: string;
   kind: AgentEventKind;
   payload: unknown;
+  display?: AgentEventDisplayHint;
 }
 
 export interface CreateAgentSessionRequest {

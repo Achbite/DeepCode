@@ -92,7 +92,7 @@ export interface LlmChatRequest {
 }
 
 export interface LlmChatChunk {
-  type: 'delta' | 'tool_call' | 'done' | 'error';
+  type: 'delta' | 'reasoning_delta' | 'tool_call' | 'done' | 'error';
   content?: string;
   toolCall?: ToolCall;
   error?: string;
