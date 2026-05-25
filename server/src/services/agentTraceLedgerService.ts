@@ -208,6 +208,25 @@ function llmTraceForWorkflowStage(event: AgentEvent, turnId: string): AgentTrace
   };
 }
 
+function contextBudgetTraceForWorkflowStage(event: AgentEvent, turnId: string): AgentTraceEvent | null {
+  if (event.kind !== 'workflow_stage') return null;
+  if (!isRecord(event.payload)) return null;
+  const contextBudget = objectField(event.payload, 'contextBudget');
+  if (!contextBudget) return null;
+  const base = traceEventFromAgentEvent(event, turnId);
+  const usedTokens = contextBudget.usedTokens;
+  const limitTokens = contextBudget.limitTokens;
+  const truncated = contextBudget.truncated === true;
+  return {
+    ...base,
+    id: `${base.id}-context-budget`,
+    kind: 'context.budget',
+    level: truncated ? 'warn' : 'info',
+    summary: `Context budget used ${usedTokens ?? '?'} / ${limitTokens ?? '?'} tokens${truncated ? ' (truncated)' : ''}.`,
+    payload: contextBudget,
+  };
+}
+
 function filterEvents(
   events: AgentTraceEvent[],
   filter: AgentTraceEventFilter = {}
@@ -280,6 +299,8 @@ export async function appendAgentTraceFromEvents(
     traceEvents.push(traceEventFromAgentEvent(event, turnId));
     const llmTrace = llmTraceForWorkflowStage(event, turnId);
     if (llmTrace) traceEvents.push(llmTrace);
+    const contextTrace = contextBudgetTraceForWorkflowStage(event, turnId);
+    if (contextTrace) traceEvents.push(contextTrace);
   }
 
   const sawFinal = agentEvents.some((event) =>

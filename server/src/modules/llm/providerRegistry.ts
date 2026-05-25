@@ -1,10 +1,13 @@
 import type {
   LlmChatChunk,
+  LlmChatMessage,
   LlmChatRequest,
   LlmChatResult,
   LlmProviderProfile,
+  ToolCall,
   ToolDefinition,
 } from '@deepcode/protocol';
+import { createHash } from 'node:crypto';
 
 interface ToolNameMap {
   toProvider: Map<string, string>;
@@ -58,12 +61,52 @@ function normalizeOllamaBaseUrl(profile: LlmProviderProfile): string {
   return `${base}/api/chat`;
 }
 
-function toOpenAiMessages(messages: LlmChatRequest['messages']) {
-  return messages.map((message) => ({
-    role: message.role === 'tool' ? 'tool' : message.role,
-    content: message.content,
-    tool_call_id: message.toolCallId,
+function providerUserId(request: LlmChatRequest): string {
+  const raw = request.providerUserId?.trim() ||
+    process.env.DEEPCODE_PROVIDER_USER_ID?.trim() ||
+    process.env.DEEPCODE_USER_ID?.trim() ||
+    'local';
+  const digest = createHash('sha256').update(raw).digest('hex').slice(0, 24);
+  return `dc_${digest}`;
+}
+
+function isDeepSeekProfile(profile: LlmProviderProfile): boolean {
+  return Boolean(profile.baseUrl?.includes('api.deepseek.com')) ||
+    profile.model.startsWith('deepseek-');
+}
+
+function outputTokenLimit(profile: LlmProviderProfile): number | undefined {
+  return profile.maxOutputTokens ?? profile.maxTokens;
+}
+
+function shouldSendSamplingParameters(profile: LlmProviderProfile): boolean {
+  return !(isDeepSeekProfile(profile) && profile.thinking === 'enabled');
+}
+
+function toProviderToolCalls(toolCalls: ToolCall[] | undefined, names: ToolNameMap) {
+  if (!toolCalls || toolCalls.length === 0) return undefined;
+  return toolCalls.map((toolCall) => ({
+    id: toolCall.id,
+    type: 'function',
+    function: {
+      name: names.toProvider.get(toolCall.name) ?? toolCall.name,
+      arguments: JSON.stringify(toolCall.arguments ?? {}),
+    },
   }));
+}
+
+function toOpenAiMessages(messages: LlmChatRequest['messages'], names: ToolNameMap) {
+  return messages.map((message) => {
+    const next: Record<string, unknown> = {
+      role: message.role === 'tool' ? 'tool' : message.role,
+      content: message.content,
+    };
+    if (message.toolCallId) next.tool_call_id = message.toolCallId;
+    if (message.reasoningContent) next.reasoning_content = message.reasoningContent;
+    const toolCalls = toProviderToolCalls(message.toolCalls, names);
+    if (message.role === 'assistant' && toolCalls) next.tool_calls = toolCalls;
+    return next;
+  });
 }
 
 function toOpenAiTools(tools: ToolDefinition[] | undefined, names: ToolNameMap) {
@@ -135,6 +178,19 @@ function collectOpenAiReasoning(choice: any): string[] {
   return result;
 }
 
+function parseOpenAiToolCalls(choice: any, names?: ToolNameMap): ToolCall[] {
+  const toolCalls: ToolCall[] = [];
+  for (const toolCall of choice?.tool_calls ?? []) {
+    toolCalls.push({
+      id: String(toolCall.id),
+      name: names?.fromProvider.get(String(toolCall.function?.name ?? '')) ??
+        String(toolCall.function?.name ?? ''),
+      arguments: safeJsonParse(toolCall.function?.arguments ?? '{}'),
+    });
+  }
+  return toolCalls;
+}
+
 function parseOpenAiChoice(choice: any, names?: ToolNameMap): LlmChatResult {
   const chunks: LlmChatChunk[] = [];
   for (const reasoning of collectOpenAiReasoning(choice)) {
@@ -143,19 +199,21 @@ function parseOpenAiChoice(choice: any, names?: ToolNameMap): LlmChatResult {
   if (choice?.content) {
     chunks.push({ type: 'delta', content: String(choice.content) });
   }
-  for (const toolCall of choice?.tool_calls ?? []) {
+  const toolCalls = parseOpenAiToolCalls(choice, names);
+  for (const toolCall of toolCalls) {
     chunks.push({
       type: 'tool_call',
-      toolCall: {
-        id: String(toolCall.id),
-        name: names?.fromProvider.get(String(toolCall.function?.name ?? '')) ??
-          String(toolCall.function?.name ?? ''),
-        arguments: safeJsonParse(toolCall.function?.arguments ?? '{}'),
-      },
+      toolCall,
     });
   }
   chunks.push({ type: 'done' });
-  return { chunks };
+  const assistantMessage: LlmChatMessage = {
+    role: 'assistant',
+    content: String(choice?.content ?? ''),
+    reasoningContent: collectOpenAiReasoning(choice).join('\n') || undefined,
+    toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+  };
+  return { chunks, assistantMessage };
 }
 
 export class LlmProviderRegistry {
@@ -195,12 +253,15 @@ export class LlmProviderRegistry {
       },
       body: JSON.stringify({
         model: profile.model,
-        messages: toOpenAiMessages(request.messages),
+        messages: toOpenAiMessages(request.messages, toolNames),
         tools: toOpenAiTools(request.tools, toolNames),
-        temperature: profile.temperature,
-        max_tokens: profile.maxTokens,
+        ...(shouldSendSamplingParameters(profile) ? { temperature: profile.temperature } : {}),
+        max_tokens: outputTokenLimit(profile),
         stream: false,
+        ...(request.responseFormat ? { response_format: request.responseFormat } : {}),
+        ...(isDeepSeekProfile(profile) ? { user_id: providerUserId(request) } : {}),
         ...providerOptions,
+        ...(request.providerOptions ?? {}),
       }),
     });
 
@@ -229,11 +290,14 @@ export class LlmProviderRegistry {
       },
       body: JSON.stringify({
         model: profile.model,
-        max_tokens: profile.maxTokens ?? 4096,
-        temperature: profile.temperature,
+        max_tokens: outputTokenLimit(profile) ?? 4096,
+        ...(shouldSendSamplingParameters(profile) ? { temperature: profile.temperature } : {}),
         system: system || undefined,
         messages: chatMessages,
         tools: toAnthropicTools(request.tools, toolNames),
+        ...(isDeepSeekProfile(profile) ? { metadata: { user_id: providerUserId(request) } } : {}),
+        ...(isDeepSeekProfile(profile) && profile.thinking ? { thinking: { type: profile.thinking } } : {}),
+        ...(isDeepSeekProfile(profile) && profile.reasoningEffort ? { output_config: { effort: profile.reasoningEffort } } : {}),
       }),
     });
 
@@ -281,7 +345,7 @@ export class LlmProviderRegistry {
         stream: false,
         options: {
           temperature: profile.temperature,
-          num_predict: profile.maxTokens,
+          num_predict: outputTokenLimit(profile),
         },
       }),
     });

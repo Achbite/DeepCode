@@ -31,17 +31,35 @@ function createDefaultProfilesFile(): LlmProfilesFile {
 }
 
 function sanitizeProfile(profile: LlmProviderProfile): LlmProviderProfile {
+  const model = String(profile.model || '').trim();
+  const deepSeekV4 = model === 'deepseek-v4-flash' || model === 'deepseek-v4-pro';
   return {
     id: String(profile.id || '').trim(),
     name: String(profile.name || '').trim(),
     kind: profile.kind,
     baseUrl: profile.baseUrl?.trim() || undefined,
-    model: String(profile.model || '').trim(),
+    model,
+    contextWindowTokens:
+      typeof profile.contextWindowTokens === 'number'
+        ? profile.contextWindowTokens
+        : deepSeekV4
+          ? 1000000
+          : undefined,
+    maxOutputTokens:
+      typeof profile.maxOutputTokens === 'number'
+        ? profile.maxOutputTokens
+        : deepSeekV4
+          ? 384000
+          : undefined,
     maxTokens: typeof profile.maxTokens === 'number' ? profile.maxTokens : undefined,
     temperature: typeof profile.temperature === 'number' ? profile.temperature : undefined,
-    reasoningEffort: ['low', 'medium', 'high'].includes(String(profile.reasoningEffort))
+    reasoningEffort: ['low', 'medium', 'high', 'max'].includes(String(profile.reasoningEffort))
       ? profile.reasoningEffort
-      : undefined,
+      : deepSeekV4
+        ? model === 'deepseek-v4-pro'
+          ? 'max'
+          : 'high'
+        : undefined,
     thinking: ['enabled', 'disabled'].includes(String(profile.thinking))
       ? profile.thinking
       : undefined,

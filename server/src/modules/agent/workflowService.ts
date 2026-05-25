@@ -22,6 +22,7 @@ import {
   getAgentSession,
 } from '../../services/agentSessionStore.js';
 import { ContextSourceRegistry } from '../context/contextSourceRegistry.js';
+import { ContextBudgetPolicy } from '../context/contextBudgetPolicy.js';
 import {
   evaluateAgentPermission,
   executeAgentTool,
@@ -60,6 +61,7 @@ interface ToolBatchContext extends EventContext {
 
 const parser = new AgentActionParser();
 const contextRegistry = new ContextSourceRegistry();
+const contextBudgetPolicy = new ContextBudgetPolicy();
 const pendingPermissions = new Map<string, PendingPermission>();
 
 const OUTPUT_ENVELOPE_PROMPT = [
@@ -526,6 +528,8 @@ export async function sendAgentMessage(
   }
 
   const promptText = await contextRegistry.buildPromptText(request.attachments ?? []);
+  const profileCatalog = await getLlmProfiles();
+  const profilesById = new Map(profileCatalog.profiles.map((profile) => [profile.id, profile]));
   const stageOutputs: string[] = [];
   const workflow = request.workflow ?? 'planFirst';
   let emittedFinal = false;
@@ -534,6 +538,7 @@ export async function sendAgentMessage(
   for (const stage of AGENT_WORKFLOW_STAGES) {
     const profileId = workflowConfig[stage]?.profileId;
     if (!profileId) continue;
+    const profile = profilesById.get(profileId);
     const stageRunId = `stage-${stage}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const llmCallId = `llm-${stage}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const baseContext: EventContext = {
@@ -544,6 +549,14 @@ export async function sendAgentMessage(
       llmCallId,
     };
 
+    const priorOutput = stageOutputs.length > 0
+      ? `\n\nPrevious workflow stage output:\n${stageOutputs.join('\n\n')}`
+      : '';
+    const contextBudget = contextBudgetPolicy.evaluate(
+      [promptText, request.content, priorOutput].join('\n\n'),
+      profile
+    );
+
     await emit([newEvent(sessionId, 'workflow_stage', {
       stage,
       phase: stage,
@@ -551,13 +564,11 @@ export async function sendAgentMessage(
       llmCallId,
       profileId,
       status: 'started',
+      contextBudget,
       channel: 'task',
       visibility: 'task',
     })]);
 
-    const priorOutput = stageOutputs.length > 0
-      ? `\n\nPrevious workflow stage output:\n${stageOutputs.join('\n\n')}`
-      : '';
     const messages: LlmChatMessage[] = [
       {
         role: 'system',
@@ -630,7 +641,7 @@ export async function sendAgentMessage(
       } else if (stage === 'complete' && stageToolCalls.length > 0) {
         await emit([assistantSegmentEvent(sessionId, baseContext, {
           kind: 'say',
-          content: '我会先按当前任务调用工具获取事实，再根据结果继续判断。',
+          content: '\u6211\u4f1a\u5148\u6309\u5f53\u524d\u4efb\u52a1\u8c03\u7528\u5de5\u5177\u83b7\u53d6\u4e8b\u5b9e\uff0c\u518d\u6839\u636e\u7ed3\u679c\u7ee7\u7eed\u5224\u65ad\u3002',
         })]);
       }
 
@@ -662,13 +673,14 @@ export async function sendAgentMessage(
           .map(toolObservationSummary)
           .filter((summary): summary is string => Boolean(summary))
           .slice(0, 8);
+        const observationSummary = '\u5df2\u7ecf\u83b7\u53d6\u5de5\u5177\u7ed3\u679c\uff0c\u7ee7\u7eed\u6839\u636e\u7ed3\u679c\u5224\u65ad\u3002';
         await emit([assistantSegmentEvent(sessionId, baseContext, {
           kind: 'observe',
           content: summaries.length > 0
-            ? `已经获取工具结果，继续根据结果判断。\n\n${summaries.join('\n')}`
-            : '已经获取工具结果，继续根据结果判断。',
+            ? `${observationSummary}\n\n${summaries.join('\n')}`
+            : observationSummary,
         })]);
-        lastUserVisibleText = '已经获取工具结果，继续根据结果判断。';
+        lastUserVisibleText = observationSummary;
       }
 
       await emit([newEvent(sessionId, 'workflow_stage', {
