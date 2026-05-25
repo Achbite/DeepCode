@@ -101,8 +101,45 @@ function splitAnthropicMessages(messages: LlmChatRequest['messages']) {
   return { system, chatMessages };
 }
 
+function collectOpenAiReasoning(choice: any): string[] {
+  const fields = [
+    choice?.reasoning_content,
+    choice?.reasoning,
+    choice?.thinking,
+    choice?.thoughts,
+  ];
+  const result: string[] = [];
+
+  for (const field of fields) {
+    if (!field) continue;
+    if (typeof field === 'string') {
+      result.push(field);
+      continue;
+    }
+    if (Array.isArray(field)) {
+      const text = field
+        .map((part) => {
+          if (typeof part === 'string') return part;
+          if (part?.text) return String(part.text);
+          if (part?.content) return String(part.content);
+          return '';
+        })
+        .filter(Boolean)
+        .join('\n');
+      if (text) result.push(text);
+      continue;
+    }
+    result.push(JSON.stringify(field));
+  }
+
+  return result;
+}
+
 function parseOpenAiChoice(choice: any, names?: ToolNameMap): LlmChatResult {
   const chunks: LlmChatChunk[] = [];
+  for (const reasoning of collectOpenAiReasoning(choice)) {
+    chunks.push({ type: 'reasoning_delta', content: reasoning });
+  }
   if (choice?.content) {
     chunks.push({ type: 'delta', content: String(choice.content) });
   }

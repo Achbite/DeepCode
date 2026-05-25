@@ -6,10 +6,12 @@ import type {
   CreateAgentSessionRequest,
   AgentFeedbackRequest,
   AgentFeedbackResult,
+  GetAgentEventSnapshotResult,
   GetAgentWorkflowConfigResult,
   PatchAgentWorkflowConfigRequest,
   ResolveAgentPermissionRequest,
   SendAgentMessageRequest,
+  TraceLedgerSnapshot,
 } from '@deepcode/protocol';
 import {
   appendAgentEvents,
@@ -24,6 +26,7 @@ import {
   getAgentWorkflowConfig,
   patchAgentWorkflowConfig,
 } from '../services/agentWorkflowConfigService.js';
+import { appendTraceEvents, getTraceSnapshot } from '../services/agentTraceLedgerService.js';
 
 function errorResponse(error: string, err: unknown): ApiResponse<never> {
   return {
@@ -88,6 +91,37 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
+  app.get('/api/agent/sessions/:id/trace', async (request) => {
+    try {
+      const { id } = request.params as { id: string };
+      const query = request.query as {
+        turnId?: string;
+        phase?: TraceLedgerSnapshot['events'][number]['phase'];
+        kind?: TraceLedgerSnapshot['events'][number]['kind'];
+        toolCallId?: string;
+        afterEventId?: string;
+        limit?: string;
+      };
+      const trace = await getTraceSnapshot(id, {
+        turnId: query.turnId,
+        phase: query.phase,
+        kind: query.kind,
+        toolCallId: query.toolCallId,
+        afterEventId: query.afterEventId,
+        limit: query.limit ? Number(query.limit) : undefined,
+      });
+      return {
+        ok: true,
+        data: {
+          sessionId: id,
+          trace,
+        },
+      } satisfies ApiResponse<GetAgentEventSnapshotResult>;
+    } catch (err) {
+      return errorResponse('agent_trace_load_error', err);
+    }
+  });
+
   app.post('/api/agent/sessions/:id/events', async (request) => {
     try {
       const { id } = request.params as { id: string };
@@ -124,11 +158,28 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/api/agent/feedback', async (request) => {
     const body = request.body as AgentFeedbackRequest;
+    if (body.sessionId && body.eventId && body.rating) {
+      await appendTraceEvents(body.sessionId, [
+        {
+          id: `trace-feedback-${body.eventId}-${body.rating}`,
+          eventId: body.eventId,
+          sessionId: body.sessionId,
+          turnId: body.eventId,
+          ts: new Date().toISOString(),
+          timestamp: new Date().toISOString(),
+          kind: 'user.guidance',
+          source: 'user',
+          level: 'info',
+          summary: `User feedback: ${body.rating}`,
+          payload: body,
+        },
+      ]);
+    }
     return {
       ok: true,
       data: {
         accepted: Boolean(body.eventId && body.rating),
-        message: 'Agent feedback endpoint is reserved for future model-quality data collection.',
+        message: 'Agent feedback was recorded as a trace guidance event when sessionId is available.',
       },
     } satisfies ApiResponse<AgentFeedbackResult>;
   });

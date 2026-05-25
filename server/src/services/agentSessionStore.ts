@@ -7,6 +7,7 @@ import type {
   AgentSessionResult,
 } from '@deepcode/protocol';
 import { resolveDeepCodeConfigDir } from './appDataPath.js';
+import { appendAgentTraceFromEvents } from './agentTraceLedgerService.js';
 
 interface SessionFileHeader {
   kind: 'session';
@@ -124,6 +125,7 @@ export async function appendAgentEvents(
       nextEvents.map((event) => JSON.stringify(event)).join('\n') + '\n',
       'utf-8'
     );
+    await appendAgentTraceFromEvents(sessionId, nextEvents);
   }
   await persistIndex();
   return { session, events: current };

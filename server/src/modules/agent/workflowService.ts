@@ -35,9 +35,42 @@ interface PendingPermission {
   mode: AgentMode;
 }
 
+type AgentOutputSegmentKind = 'reasoning' | 'say' | 'plan' | 'observe' | 'final';
+
+interface AgentOutputSegment {
+  kind: AgentOutputSegmentKind;
+  content: string;
+}
+
+interface EventContext {
+  turnId?: string;
+  sequence?: number;
+  stage?: AgentWorkflowStage;
+  phase?: AgentWorkflowStage;
+  stageRunId?: string;
+  llmCallId?: string;
+  batchId?: string;
+  batchLabel?: string;
+}
+
+interface ToolBatchContext extends EventContext {
+  batchId: string;
+  batchLabel: string;
+}
+
 const parser = new AgentActionParser();
 const contextRegistry = new ContextSourceRegistry();
 const pendingPermissions = new Map<string, PendingPermission>();
+
+const OUTPUT_ENVELOPE_PROMPT = [
+  'Format user-visible Agent output as ordered logical sections when useful:',
+  '<reasoning>brief visible reasoning or provider-independent planning notes</reasoning>',
+  '<say>short progress message for the user</say>',
+  '<plan>task steps or execution strategy</plan>',
+  '<observe>judgement based on tool observations</observe>',
+  '<final>final answer to the user</final>',
+  'Use only the sections that match the current stage. Local operations must still be expressed as provider tool calls or ```deepcode-action JSON blocks. Do not put deepcode-action JSON inside <final>.',
+].join('\n');
 
 const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
   plan: [
@@ -45,7 +78,7 @@ const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
     'Create a concise plan, name relevant files or searches, and do not request local writes or shell execution.',
     'Classify the user request as directExecution or needsUserConfirmation. Clear implementation, fix, test, commit, or save requests are usually directExecution unless the user explicitly asks for a plan only.',
     'If the request is needsUserConfirmation, make the next decision explicit and do not prepare write or shell actions.',
-    'Use normal prose unless a final response is sufficient.',
+    'Prefer <plan> for the plan and <say> for short progress notes. If the request only needs a direct answer, use <final>.',
   ].join('\n'),
   check: [
     'You are the checking stage of DeepCode Agent.',
@@ -53,12 +86,14 @@ const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
     'Re-check whether the request can proceed directly or must wait for user confirmation. Sensitive, destructive, publishing, or high-risk Git operations must require explicit permission even when the user asked for execution.',
     'Treat local keyword detection only as a hint; the permission gate remains authoritative.',
     'Do not request local writes or shell execution.',
+    'Use <observe> for the check result.',
   ].join('\n'),
   complete: [
     'You are the completion stage of DeepCode Agent.',
     'Use deepcode-action JSON blocks or tool calls when local reads, searches, patches, writes, or shell commands are needed.',
     'For directExecution requests, proceed with allowed read/search/diff steps and request permission only when the tool policy requires it.',
     'When the user asks to render or return Markdown, tables, formulas, or diagrams, return the actual Markdown content, not a description of what would be returned.',
+    'Before tool actions, use <say> to tell the user what you are about to inspect or run. After observations, use <observe> to explain the result. Use <final> only for the final answer.',
     'Keep human-facing progress readable; raw deepcode-action blocks are for the runtime, not the final user-facing text.',
     'All local operations are subject to the permission gate.',
   ].join('\n'),
@@ -66,18 +101,121 @@ const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
     'You are the review stage of DeepCode Agent.',
     'Produce the final user-facing answer for the conversation. Keep it direct and avoid internal audit sections unless the user asked for a review.',
     'If the user requested Markdown, tables, formulas, or diagrams, include the actual renderable Markdown in the final answer.',
+    'Use <final> for the final answer.',
     'Do not perform new local operations.',
   ].join('\n'),
 };
 
-function newEvent(sessionId: string, kind: AgentEvent['kind'], payload: unknown): AgentEvent {
+function newEvent(
+  sessionId: string,
+  kind: AgentEvent['kind'],
+  payload: unknown,
+  display?: AgentEvent['display']
+): AgentEvent {
   return {
     id: `evt-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     sessionId,
     ts: new Date().toISOString(),
     kind,
     payload,
+    ...(display ? { display } : {}),
   };
+}
+
+function withContext(payload: unknown, context: EventContext, extra: Record<string, unknown> = {}): unknown {
+  if (isRecord(payload)) {
+    return { ...payload, ...context, ...extra };
+  }
+  return { value: payload, ...context, ...extra };
+}
+
+function redactForDisplay(text: string): string {
+  return text
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
+    .replace(/(api[_-]?key|token|secret)\s*[:=]\s*["']?[^"'\s]+/gi, '$1=[REDACTED]');
+}
+
+function stripDeepcodeActionBlocks(content: string): string {
+  return content
+    .replace(/```deepcode-action\s*[\s\S]*?```/g, '')
+    .replace(/```json\s*\{\s*"action"\s*:\s*[\s\S]*?```/g, '')
+    .trim();
+}
+
+function parseTaggedSegments(content: string, fallbackKind: AgentOutputSegmentKind): AgentOutputSegment[] {
+  const segments: AgentOutputSegment[] = [];
+  const usedRanges: Array<[number, number]> = [];
+  const tagPattern = /<(reasoning|think|say|plan|observe|final)>\s*([\s\S]*?)\s*<\/\1>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = tagPattern.exec(content)) !== null) {
+    const rawKind = match[1].toLowerCase();
+    const kind: AgentOutputSegmentKind = rawKind === 'think' ? 'reasoning' : rawKind as AgentOutputSegmentKind;
+    const text = stripDeepcodeActionBlocks(match[2]).trim();
+    if (text) segments.push({ kind, content: redactForDisplay(text) });
+    usedRanges.push([match.index, match.index + match[0].length]);
+  }
+
+  let remainder = content;
+  for (const [start, end] of [...usedRanges].reverse()) {
+    remainder = `${remainder.slice(0, start)}\n${remainder.slice(end)}`;
+  }
+  const cleanRemainder = stripDeepcodeActionBlocks(remainder).trim();
+  if (cleanRemainder) {
+    segments.push({ kind: fallbackKind, content: redactForDisplay(cleanRemainder) });
+  }
+
+  return segments;
+}
+
+function segmentChannel(kind: AgentOutputSegmentKind): string {
+  if (kind === 'reasoning') return 'reasoning';
+  if (kind === 'observe') return 'observation';
+  if (kind === 'final') return 'final';
+  return 'progress';
+}
+
+function segmentLabel(kind: AgentOutputSegmentKind): string {
+  if (kind === 'reasoning') return '思考中';
+  if (kind === 'observe') return '检查结果';
+  if (kind === 'final') return '最终回复';
+  if (kind === 'plan') return '执行计划';
+  return 'Agent';
+}
+
+function fallbackSegmentKind(stage: AgentWorkflowStage): AgentOutputSegmentKind {
+  if (stage === 'review') return 'final';
+  if (stage === 'check') return 'observe';
+  if (stage === 'plan') return 'plan';
+  return 'say';
+}
+
+function assistantSegmentEvent(
+  sessionId: string,
+  context: EventContext,
+  segment: AgentOutputSegment
+): AgentEvent {
+  const presentation = segment.kind === 'reasoning' ? 'collapsible' : 'body';
+  return newEvent(sessionId, 'assistant_msg', withContext({
+    content: segment.content,
+    label: segmentLabel(segment.kind),
+  }, context, {
+    channel: segmentChannel(segment.kind),
+    visibility: segment.kind === 'reasoning' ? 'trace' : 'conversation',
+  }), {
+    presentation,
+    defaultOpen: false,
+    importance: segment.kind === 'final' ? 'primary' : 'secondary',
+  });
+}
+
+function toolBatchLabel(toolCalls: ToolCall[]): string {
+  if (toolCalls.length === 0) return '执行工具';
+  const names = toolCalls.map((call) => call.name);
+  if (names.every((name) => name === 'fs.read' || name === 'fs.list')) return '读取文件中';
+  if (names.every((name) => name === 'code.search')) return '检索代码中';
+  if (names.every((name) => name.startsWith('shell.'))) return '执行命令';
+  return '执行工具';
 }
 
 function observationEvent(sessionId: string, observation: AgentObservation): AgentEvent {
@@ -133,23 +271,46 @@ async function resolveWorkflowConfig(
 async function executeOrAsk(
   sessionId: string,
   mode: AgentMode,
-  toolCall: ToolCall
+  toolCall: ToolCall,
+  emit?: (events: AgentEvent[]) => Promise<void>,
+  context: ToolBatchContext = {
+    batchId: `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    batchLabel: '执行工具',
+  }
 ): Promise<AgentEvent[]> {
   const withToolName = (result: ToolResult): ToolResult & { toolName: string; status: 'ok' | 'error' } => ({
     ...result,
     toolName: toolCall.name,
     status: result.ok ? 'ok' : 'error',
   });
-  const events: AgentEvent[] = [newEvent(sessionId, 'tool_call', toolCall)];
+  const events: AgentEvent[] = [newEvent(sessionId, 'tool_call', withContext(toolCall, context, {
+    channel: 'tool',
+    visibility: 'conversation',
+    toolCall,
+  }), {
+    presentation: 'collapsible',
+    defaultOpen: true,
+    importance: 'secondary',
+  })];
+  if (emit) await emit(events);
   const decision = await evaluateAgentPermission({ mode, toolCall });
   if (decision.action === 'deny') {
-    events.push(newEvent(sessionId, 'tool_result', {
+    const resultEvent = newEvent(sessionId, 'tool_result', withContext({
       callId: toolCall.id,
       toolName: toolCall.name,
       ok: false,
       status: 'blocked',
       error: decision.reason,
-    }));
+    }, context, {
+      channel: 'tool',
+      visibility: 'conversation',
+    }), {
+      presentation: 'collapsible',
+      defaultOpen: true,
+      importance: 'secondary',
+    });
+    events.push(resultEvent);
+    if (emit) await emit([resultEvent]);
     return events;
   }
   if (decision.action === 'ask' && decision.request) {
@@ -159,50 +320,165 @@ async function executeOrAsk(
       toolCall,
       mode,
     });
-    events.push(newEvent(sessionId, 'permission_request', decision.request));
+    const permissionEvent = newEvent(sessionId, 'permission_request', withContext(decision.request, context, {
+      channel: 'tool',
+      visibility: 'conversation',
+    }), {
+      presentation: 'collapsible',
+      defaultOpen: true,
+      importance: 'secondary',
+    });
+    events.push(permissionEvent);
+    if (emit) await emit([permissionEvent]);
     return events;
   }
   const result = await executeAgentTool({ mode, toolCall });
-  events.push(newEvent(sessionId, 'tool_result', withToolName(result)));
+  const resultEvent = newEvent(sessionId, 'tool_result', withContext(withToolName(result), context, {
+    channel: 'tool',
+    visibility: 'conversation',
+  }), {
+    presentation: 'collapsible',
+    defaultOpen: false,
+    importance: 'secondary',
+  });
+  events.push(resultEvent);
+  if (emit) await emit([resultEvent]);
   return events;
 }
 
 async function runParsedTextActions(
   sessionId: string,
   mode: AgentMode,
-  content: string
+  content: string,
+  emit?: (events: AgentEvent[]) => Promise<void>,
+  context: EventContext = {}
 ): Promise<AgentEvent[]> {
   const events: AgentEvent[] = [];
+  const add = async (event: AgentEvent) => {
+    events.push(event);
+    if (emit) await emit([event]);
+  };
   const parse = parser.parse({ content, mode });
+  const parsedToolCalls = parse.actions
+    .filter((action) => action.status === 'parsed' && action.type !== 'final' && action.type !== 'patch.plan')
+    .map((action) => toToolCall(action))
+    .filter((toolCall): toolCall is ToolCall => Boolean(toolCall));
+  const batchId = parsedToolCalls.length > 0
+    ? `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    : undefined;
+  const batchLabel = toolBatchLabel(parsedToolCalls);
   for (const action of parse.actions) {
     if (action.status !== 'parsed') {
-      events.push(newEvent(sessionId, 'error', {
+      await add(newEvent(sessionId, 'error', {
+        ...context,
+        channel: 'error',
+        visibility: 'conversation',
         message: action.errors?.[0]?.message ?? 'Invalid action',
         code: action.errors?.[0]?.code ?? 'invalid_action',
         action,
+      }, {
+        presentation: 'collapsible',
+        defaultOpen: true,
+        importance: 'secondary',
       }));
       continue;
     }
     if (action.type === 'final') {
-      events.push(newEvent(sessionId, 'assistant_msg', action.payload));
+      await add(newEvent(sessionId, 'assistant_msg', withContext(action.payload, context, {
+        channel: 'final',
+        visibility: 'conversation',
+        label: '最终回复',
+      }), {
+        presentation: 'body',
+        defaultOpen: true,
+        importance: 'primary',
+      }));
       continue;
     }
     if (action.type === 'patch.plan') {
-      events.push(newEvent(sessionId, 'tool_result', {
+      await add(newEvent(sessionId, 'tool_result', withContext({
         callId: action.id,
         toolName: 'patch.plan',
         ok: false,
         status: 'needsApproval',
         output: action.payload,
         error: 'patch_plan_needs_approval',
+      }, {
+        ...context,
+        batchId: batchId ?? `batch-${action.id}`,
+        batchLabel: '规划补丁',
+      }, {
+        channel: 'tool',
+        visibility: 'conversation',
+      }), {
+        presentation: 'collapsible',
+        defaultOpen: true,
+        importance: 'secondary',
       }));
       continue;
     }
     const toolCall = toToolCall(action);
     if (!toolCall) continue;
-    events.push(...(await executeOrAsk(sessionId, mode, toolCall)));
+    const toolEvents = await executeOrAsk(sessionId, mode, toolCall, emit, {
+      ...context,
+      batchId: batchId ?? `batch-${toolCall.id}`,
+      batchLabel,
+    });
+    events.push(...toolEvents);
   }
   return events;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function previewValue(value: unknown, limit = 900): string {
+  if (value === undefined || value === null) return '';
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  if (!text) return '';
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return normalized.length > limit ? `${normalized.slice(0, limit - 1)}…` : normalized;
+}
+
+function toolNameFromEvent(event: AgentEvent): string {
+  if (!isRecord(event.payload)) return 'tool';
+  const toolCall = isRecord(event.payload.toolCall) ? event.payload.toolCall : undefined;
+  return previewValue(event.payload.toolName ?? event.payload.name ?? toolCall?.name ?? 'tool', 120);
+}
+
+function toolObservationSummary(event: AgentEvent): string | null {
+  if (!isRecord(event.payload)) return null;
+  if (event.kind === 'tool_call') {
+    const toolCall = isRecord(event.payload.toolCall) ? event.payload.toolCall : event.payload;
+    const args = isRecord(toolCall.arguments) ? toolCall.arguments : {};
+    return `- Tool requested: ${toolNameFromEvent(event)} ${previewValue(args, 420)}`;
+  }
+  if (event.kind === 'tool_result') {
+    const status = typeof event.payload.ok === 'boolean'
+      ? (event.payload.ok ? 'ok' : 'error')
+      : previewValue(event.payload.status ?? 'done', 80);
+    const output = event.payload.output ?? event.payload.error ?? event.payload.summary ?? event.payload.message;
+    return `- Tool result: ${toolNameFromEvent(event)} status=${status} ${previewValue(output, 720)}`;
+  }
+  if (event.kind === 'permission_request') {
+    return `- Permission requested: ${toolNameFromEvent(event)} ${previewValue(event.payload.summary ?? event.payload, 520)}`;
+  }
+  if (event.kind === 'permission_result') {
+    return `- Permission result: ${previewValue(event.payload, 420)}`;
+  }
+  if (event.kind === 'error') {
+    return `- Runtime error: ${previewValue(event.payload, 520)}`;
+  }
+  return null;
+}
+
+function appendObservationContext(stageOutputs: string[], stage: AgentWorkflowStage, events: AgentEvent[]): void {
+  const summaries = events
+    .map(toolObservationSummary)
+    .filter((summary): summary is string => Boolean(summary));
+  if (summaries.length === 0) return;
+  stageOutputs.push(`[${stage} observations]\n${summaries.join('\n')}`);
 }
 
 export async function sendAgentMessage(
@@ -214,35 +490,70 @@ export async function sendAgentMessage(
     throw new Error(`Agent session not found: ${sessionId}`);
   }
   const mode = request.mode ?? current.session.mode;
-  const events: AgentEvent[] = [
-    newEvent(sessionId, 'user_msg', {
-      content: request.content,
-      attachments: request.attachments ?? [],
-    }),
-  ];
+  let latest: AgentSessionResult = current;
+  let sequence = 0;
+  let turnId = '';
+  const emit = async (nextEvents: AgentEvent[]) => {
+    if (nextEvents.length === 0) return;
+    const decorated = nextEvents.map((event) => ({
+      ...event,
+      payload: withContext(event.payload, {
+        turnId,
+        sequence: sequence += 1,
+      }),
+    }));
+    latest = await appendAgentEvents(sessionId, decorated);
+  };
+
+  const userEvent = newEvent(sessionId, 'user_msg', {
+    content: request.content,
+    attachments: request.attachments ?? [],
+    channel: 'user',
+    visibility: 'conversation',
+  });
+  turnId = userEvent.id;
+  await emit([userEvent]);
 
   const workflowConfig = await resolveWorkflowConfig(request, current);
   if (!hasConfiguredStage(workflowConfig)) {
-    events.push(newEvent(sessionId, 'assistant_msg', {
+    await emit([newEvent(sessionId, 'assistant_msg', {
       content: 'Please configure a valid LLM provider profile and assign it to at least one Agent workflow stage.',
-    }));
-    return appendAgentEvents(sessionId, events);
+      channel: 'final',
+      visibility: 'conversation',
+      label: 'Agent',
+    })]);
+    return latest;
   }
 
   const promptText = await contextRegistry.buildPromptText(request.attachments ?? []);
   const stageOutputs: string[] = [];
   const workflow = request.workflow ?? 'planFirst';
+  let emittedFinal = false;
+  let lastUserVisibleText = '';
 
   for (const stage of AGENT_WORKFLOW_STAGES) {
     const profileId = workflowConfig[stage]?.profileId;
     if (!profileId) continue;
-
-    events.push(newEvent(sessionId, 'workflow_stage', {
+    const stageRunId = `stage-${stage}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const llmCallId = `llm-${stage}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const baseContext: EventContext = {
+      turnId,
       stage,
       phase: stage,
+      stageRunId,
+      llmCallId,
+    };
+
+    await emit([newEvent(sessionId, 'workflow_stage', {
+      stage,
+      phase: stage,
+      stageRunId,
+      llmCallId,
       profileId,
       status: 'started',
-    }));
+      channel: 'task',
+      visibility: 'task',
+    })]);
 
     const priorOutput = stageOutputs.length > 0
       ? `\n\nPrevious workflow stage output:\n${stageOutputs.join('\n\n')}`
@@ -252,6 +563,7 @@ export async function sendAgentMessage(
         role: 'system',
         content: [
           promptText,
+          OUTPUT_ENVELOPE_PROMPT,
           STAGE_PROMPTS[stage],
           `Current permission mode: ${mode}.`,
           `Default workflow behavior: ${workflow}.`,
@@ -265,6 +577,8 @@ export async function sendAgentMessage(
     ];
 
     let assistantText = '';
+    let reasoningText = '';
+    const stageToolCalls: ToolCall[] = [];
     try {
       const response = await chatWithLlm({
         profileId,
@@ -274,55 +588,137 @@ export async function sendAgentMessage(
       });
 
       for (const chunk of response.chunks) {
+        if (chunk.type === 'reasoning_delta' && chunk.content) {
+          reasoningText += chunk.content;
+        }
         if (chunk.type === 'delta' && chunk.content) {
           assistantText += chunk.content;
         }
         if (stage === 'complete' && chunk.type === 'tool_call' && chunk.toolCall) {
-          events.push(...(await executeOrAsk(sessionId, mode, chunk.toolCall)));
+          stageToolCalls.push(chunk.toolCall);
         }
         if (chunk.type === 'error') {
-          events.push(newEvent(sessionId, 'error', {
+          await emit([newEvent(sessionId, 'error', {
             stage,
             phase: stage,
+            stageRunId,
+            llmCallId,
+            channel: 'error',
+            visibility: 'conversation',
             code: 'llm_stream_error',
             message: chunk.error ?? 'LLM stream error',
-          }));
+          })]);
         }
       }
 
       const trimmed = assistantText.trim();
+      const observationEvents: AgentEvent[] = [];
+      if (reasoningText.trim()) {
+        await emit([assistantSegmentEvent(sessionId, baseContext, {
+          kind: 'reasoning',
+          content: reasoningText.trim(),
+        })]);
+      }
       if (trimmed) {
         stageOutputs.push(`[${stage}] ${trimmed}`);
-        if (stage !== 'review') {
-          events.push(newEvent(sessionId, 'assistant_msg', { stage, content: trimmed }));
+        const segments = parseTaggedSegments(trimmed, fallbackSegmentKind(stage));
+        for (const segment of segments) {
+          await emit([assistantSegmentEvent(sessionId, baseContext, segment)]);
+          if (segment.kind === 'final') emittedFinal = true;
+          if (segment.kind !== 'reasoning') lastUserVisibleText = segment.content;
         }
-        if (stage === 'complete') {
-          events.push(...(await runParsedTextActions(sessionId, mode, trimmed)));
+      } else if (stage === 'complete' && stageToolCalls.length > 0) {
+        await emit([assistantSegmentEvent(sessionId, baseContext, {
+          kind: 'say',
+          content: '我会先按当前任务调用工具获取事实，再根据结果继续判断。',
+        })]);
+      }
+
+      if (stage === 'complete') {
+        const batchId = stageToolCalls.length > 0
+          ? `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`
+          : undefined;
+        const batchLabel = toolBatchLabel(stageToolCalls);
+        for (const toolCall of stageToolCalls) {
+          const toolEvents = await executeOrAsk(sessionId, mode, toolCall, emit, {
+            ...baseContext,
+            batchId: batchId ?? `batch-${toolCall.id}`,
+            batchLabel,
+          });
+          observationEvents.push(...toolEvents);
         }
       }
 
-      events.push(newEvent(sessionId, 'workflow_stage', {
+      if (trimmed) {
+        if (stage === 'complete') {
+          const parsedEvents = await runParsedTextActions(sessionId, mode, trimmed, emit, baseContext);
+          observationEvents.push(...parsedEvents);
+        }
+      }
+
+      appendObservationContext(stageOutputs, stage, observationEvents);
+      if (observationEvents.length > 0) {
+        const summaries = observationEvents
+          .map(toolObservationSummary)
+          .filter((summary): summary is string => Boolean(summary))
+          .slice(0, 8);
+        await emit([assistantSegmentEvent(sessionId, baseContext, {
+          kind: 'observe',
+          content: summaries.length > 0
+            ? `已经获取工具结果，继续根据结果判断。\n\n${summaries.join('\n')}`
+            : '已经获取工具结果，继续根据结果判断。',
+        })]);
+        lastUserVisibleText = '已经获取工具结果，继续根据结果判断。';
+      }
+
+      await emit([newEvent(sessionId, 'workflow_stage', {
         stage,
         phase: stage,
+        stageRunId,
+        llmCallId,
         profileId,
         status: 'completed',
         summary: trimmed ? trimmed.slice(0, 240) : 'No textual output.',
-        details: stage === 'review' && trimmed ? trimmed : undefined,
-      }));
+        channel: 'task',
+        visibility: 'task',
+      })]);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      events.push(newEvent(sessionId, 'workflow_stage', {
+      await emit([newEvent(sessionId, 'workflow_stage', {
         stage,
         phase: stage,
+        stageRunId,
+        llmCallId,
         profileId,
         status: 'error',
         summary: message,
-      }));
-      events.push(newEvent(sessionId, 'error', { stage, phase: stage, code: 'llm_stage_error', message }));
+        channel: 'task',
+        visibility: 'task',
+      })]);
+      await emit([newEvent(sessionId, 'error', {
+        ...baseContext,
+        channel: 'error',
+        visibility: 'conversation',
+        code: 'llm_stage_error',
+        message,
+      })]);
     }
   }
 
-  return appendAgentEvents(sessionId, events);
+  if (!emittedFinal && lastUserVisibleText.trim()) {
+    await emit([assistantSegmentEvent(sessionId, {
+      turnId,
+      stage: 'review',
+      phase: 'review',
+      stageRunId: `stage-final-${Date.now()}`,
+      llmCallId: `llm-final-${Date.now()}`,
+    }, {
+      kind: 'final',
+      content: lastUserVisibleText.trim(),
+    })]);
+  }
+
+  return latest;
 }
 
 export async function resolveAgentPermission(

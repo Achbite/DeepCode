@@ -8,6 +8,11 @@ import { resolveFolder } from '../../services/workspaceService.js';
 const DEFAULT_TIMEOUT_MS = 8000;
 const MAX_TIMEOUT_MS = 30000;
 const OUTPUT_LIMIT = 64 * 1024;
+const SHELL_ENCODING_PREAMBLE = [
+  'export LANG="${LANG:-C.UTF-8}"',
+  'export LC_ALL="${LC_ALL:-C.UTF-8}"',
+  'export PYTHONIOENCODING="utf-8"',
+].join('; ');
 
 let tempShellCounter = 0;
 
@@ -26,6 +31,7 @@ function shellCommand(command: string): {
   command: string;
   args: string[];
 } {
+  const normalizedCommand = `${SHELL_ENCODING_PREAMBLE}\n${command}`;
   const shell = getShellEnvironmentStatus();
   if (shell.os === 'windows') {
     if (!shell.wsl?.installed) {
@@ -34,14 +40,14 @@ function shellCommand(command: string): {
     return {
       shellKind: 'wsl',
       command: 'wsl.exe',
-      args: ['--', 'bash', '-lc', command],
+      args: ['--', 'bash', '-lc', normalizedCommand],
     };
   }
   const bash = existsSync('/bin/bash') ? '/bin/bash' : 'bash';
   return {
     shellKind: 'bash',
     command: bash,
-    args: ['-lc', command],
+    args: ['-lc', normalizedCommand],
   };
 }
 
