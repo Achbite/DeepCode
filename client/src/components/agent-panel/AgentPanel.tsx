@@ -10,6 +10,7 @@ import './agentPanel.css';
 
 const AgentPanel: React.FC = () => {
   const events = useAgentSessionStore((s) => s.events);
+  const traceEvents = useAgentSessionStore((s) => s.traceEvents);
   const profileId = useAgentSessionStore((s) => s.profileId);
   const workflowConfig = useAgentSessionStore((s) => s.workflowConfig);
   const loading = useAgentSessionStore((s) => s.loading);
@@ -49,7 +50,7 @@ const AgentPanel: React.FC = () => {
 
   return (
     <div className="agent-panel-shell">
-      <AgentTaskList events={events} loading={loading} />
+      <AgentTaskList events={events} traceEvents={traceEvents} loading={loading} />
 
       <MessageList events={events} loading={loading} />
 

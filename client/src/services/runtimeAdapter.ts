@@ -42,6 +42,8 @@ import type {
   ResolveAgentPermissionRequest,
   AgentFeedbackRequest,
   AgentFeedbackResult,
+  AgentTraceEvent,
+  GetAgentEventSnapshotResult,
   GetAgentWorkflowConfigResult,
   PatchAgentWorkflowConfigRequest,
   ListToolsResult,
@@ -644,6 +646,69 @@ export async function sendAgentMessage(
   }
   const { sendAgentMessage: apiSendAgentMessage } = await import('./apiClient');
   return apiSendAgentMessage(sessionId, request);
+}
+
+export async function getAgentEventSnapshot(
+  sessionId: string
+): Promise<ApiResponse<GetAgentEventSnapshotResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<GetAgentEventSnapshotResult>('get_agent_event_snapshot', { sessionId });
+  }
+  const { getAgentEventSnapshot: apiGetAgentEventSnapshot } = await import('./apiClient');
+  return apiGetAgentEventSnapshot(sessionId);
+}
+
+const agentEventSubscriptions = new Map<string, number>();
+
+export function subscribeAgentEvents(
+  sessionId: string,
+  onEvent: (event: AgentTraceEvent) => void,
+  intervalMs = 1200
+): string {
+  let lastTraceId: string | undefined;
+  let stopped = false;
+  const subscriptionId = `agent-events-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  const poll = async () => {
+    if (stopped) return;
+    const snapshot = await getAgentEventSnapshot(sessionId);
+    if (!snapshot.ok || !snapshot.data) return;
+    const events = snapshot.data.trace.events;
+    const startIndex = lastTraceId
+      ? events.findIndex((event) => event.id === lastTraceId) + 1
+      : 0;
+    const nextEvents = events.slice(Math.max(0, startIndex));
+    for (const event of nextEvents) onEvent(event);
+    if (events.length > 0) lastTraceId = events[events.length - 1].id;
+  };
+
+  void poll();
+  const handle = window.setInterval(() => {
+    void poll();
+  }, intervalMs);
+  agentEventSubscriptions.set(subscriptionId, handle);
+  return subscriptionId;
+}
+
+export function unsubscribeAgentEvents(subscriptionId: string): void {
+  const handle = agentEventSubscriptions.get(subscriptionId);
+  if (handle !== undefined) {
+    window.clearInterval(handle);
+    agentEventSubscriptions.delete(subscriptionId);
+  }
+}
+
+export async function ackAgentEvent(eventId: string): Promise<ApiResponse<{ accepted: boolean; eventId: string }>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<{ accepted: boolean; eventId: string }>('ack_agent_event', { eventId });
+  }
+  return {
+    ok: true,
+    data: {
+      accepted: true,
+      eventId,
+    },
+  };
 }
 
 export async function resolveAgentPermission(

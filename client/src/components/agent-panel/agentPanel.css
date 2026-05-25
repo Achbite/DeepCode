@@ -643,6 +643,68 @@
   margin: 0;
 }
 
+.agent-tool-batch {
+  align-self: stretch;
+  max-width: 100%;
+  border: 1px solid rgba(10, 132, 255, 0.22);
+  border-radius: var(--radius-md, 6px);
+  background: rgba(10, 132, 255, 0.06);
+  overflow: hidden;
+}
+
+.agent-tool-batch > summary {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  padding: 0 10px;
+}
+
+.agent-tool-batch > summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-tool-batch__label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-main, #ededed);
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-tool-batch__status {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  padding: 1px 6px;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.agent-tool-batch__status--running {
+  color: var(--accent, #0a84ff);
+}
+
+.agent-tool-batch__status--done {
+  color: var(--success, #30d158);
+}
+
+.agent-tool-batch__status--error {
+  color: var(--danger, #ff453a);
+}
+
+.agent-tool-batch__body {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+}
+
 .agent-tool-bubble__details > summary {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto;

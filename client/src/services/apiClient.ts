@@ -38,6 +38,7 @@ import type {
   ResolveAgentPermissionRequest,
   AgentFeedbackRequest,
   AgentFeedbackResult,
+  GetAgentEventSnapshotResult,
   GetAgentWorkflowConfigResult,
   PatchAgentWorkflowConfigRequest,
   ListToolsResult,
@@ -358,6 +359,14 @@ export function sendAgentMessage(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/messages`,
     'POST',
     request
+  );
+}
+
+export function getAgentEventSnapshot(
+  sessionId: string
+): Promise<ApiResponse<GetAgentEventSnapshotResult>> {
+  return getJson<GetAgentEventSnapshotResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/trace`
   );
 }
 

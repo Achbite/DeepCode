@@ -4,6 +4,7 @@ import type {
   AgentEvent,
   AgentMode,
   AgentSession,
+  AgentTraceEvent,
   AgentWorkflowConfig,
   AgentWorkflowMode,
   PermissionRequest,
@@ -12,6 +13,7 @@ import { AGENT_WORKFLOW_STAGES } from '@deepcode/protocol';
 import {
   createAgentSession,
   getAgentWorkflowConfig,
+  getAgentEventSnapshot,
   getCurrentAgentSession,
   patchAgentWorkflowConfig,
   resolveAgentPermission,
@@ -31,6 +33,7 @@ interface QueuedAgentMessage {
 interface AgentSessionState {
   session: AgentSession | null;
   events: AgentEvent[];
+  traceEvents: AgentTraceEvent[];
   mode: AgentMode;
   workflow: AgentWorkflowMode;
   workflowConfig: AgentWorkflowConfig | null;
@@ -46,6 +49,7 @@ interface AgentSessionState {
 
 interface AgentSessionActions {
   loadOrCreate: () => Promise<void>;
+  refreshTraceEvents: (sessionId?: string) => Promise<void>;
   loadWorkflowConfig: () => Promise<void>;
   patchWorkflowConfig: (config: AgentWorkflowConfig) => Promise<void>;
   setMode: (mode: AgentMode) => void;
@@ -121,6 +125,7 @@ function readMessageAttachments(state: Store, override?: AgentContextAttachment[
 export const useAgentSessionStore = create<Store>((set, get) => ({
   session: null,
   events: [],
+  traceEvents: [],
   mode: 'plan',
   workflow: 'planFirst',
   workflowConfig: null,
@@ -148,6 +153,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         profileId: current.data.session.profileId,
         loading: false,
       });
+      void get().refreshTraceEvents(current.data.session.id);
       return;
     }
     const created = await createAgentSession({ initialMode });
@@ -159,11 +165,21 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         profileId: created.data.session.profileId,
         loading: false,
       });
+      void get().refreshTraceEvents(created.data.session.id);
     } else {
       set({
         errorMessage: created.message ?? current.message ?? 'Agent session initialization failed',
         loading: false,
       });
+    }
+  },
+
+  refreshTraceEvents: async (sessionId) => {
+    const id = sessionId ?? get().session?.id;
+    if (!id) return;
+    const result = await getAgentEventSnapshot(id);
+    if (result.ok && result.data) {
+      set({ traceEvents: result.data.trace.events });
     }
   },
 
@@ -256,6 +272,25 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       errorMessage: null,
     }));
 
+    let progressTimer: number | undefined;
+    let pollingStopped = false;
+    const refreshProgress = async () => {
+      if (pollingStopped) return;
+      const current = await getCurrentAgentSession();
+      if (current.ok && current.data?.session.id === session.id) {
+        set({
+          session: current.data.session,
+          events: current.data.events,
+          pendingPermission: findLatestPendingPermission(current.data.events),
+        });
+        await get().refreshTraceEvents(session.id);
+      }
+    };
+    progressTimer = window.setInterval(() => {
+      void refreshProgress();
+    }, 300);
+    void refreshProgress();
+
     try {
       const result = await sendAgentMessage(session.id, {
         content: trimmed,
@@ -269,13 +304,18 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         throw new Error(result.message ?? 'Agent message failed');
       }
       const data = result.data;
+      pollingStopped = true;
+      if (progressTimer !== undefined) window.clearInterval(progressTimer);
       set({
         session: data.session,
         events: data.events,
         pendingPermission: findLatestPendingPermission(data.events),
         loading: false,
       });
+      void get().refreshTraceEvents(data.session.id);
     } catch (err) {
+      pollingStopped = true;
+      if (progressTimer !== undefined) window.clearInterval(progressTimer);
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
         events: [
@@ -309,6 +349,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         pendingPermission: findLatestPendingPermission(result.data.events),
         loading: false,
       });
+      void get().refreshTraceEvents(result.data.session.id);
     } else {
       set({ errorMessage: result.message ?? 'Permission resolve failed', loading: false });
     }
@@ -327,6 +368,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         pendingPermission: findLatestPendingPermission(result.data.events),
         loading: false,
       });
+      void get().refreshTraceEvents(result.data.session.id);
     } else {
       set({ errorMessage: result.message ?? 'Permission resolve failed', loading: false });
     }

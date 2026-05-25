@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { AgentEvent } from '@deepcode/protocol';
+import type { AgentEvent, AgentTraceEvent } from '@deepcode/protocol';
 import MarkdownContent from './MarkdownContent';
 import { compactDisplayText, sanitizeDisplayText } from './displayText';
 
@@ -162,6 +162,57 @@ function latestTurnEvents(events: AgentEvent[]): AgentEvent[] {
   return lastUserIndex >= 0 ? events.slice(lastUserIndex + 1) : events;
 }
 
+function tracePayload(trace: AgentTraceEvent): Record<string, unknown> {
+  return isRecord(trace.payload) ? trace.payload : {};
+}
+
+function traceEvent(
+  trace: AgentTraceEvent,
+  kind: AgentEvent['kind'],
+  payload: Record<string, unknown>
+): AgentEvent {
+  return {
+    id: trace.eventId ?? trace.id,
+    sessionId: trace.sessionId,
+    ts: trace.timestamp ?? trace.ts,
+    kind,
+    payload,
+  };
+}
+
+function traceEventsToAgentEvents(traceEvents: AgentTraceEvent[]): AgentEvent[] {
+  return traceEvents.flatMap((trace) => {
+    const payload = tracePayload(trace);
+    const phase = trace.phase ?? stringField(payload, 'stage') ?? stringField(payload, 'phase');
+    const profileId = stringField(payload, 'profileId');
+    const summary = trace.summary ?? stringField(payload, 'summary') ?? stringField(payload, 'details');
+
+    switch (trace.kind) {
+      case 'turn.started':
+        return [traceEvent(trace, 'user_msg', { ...payload, content: summary ?? stringField(payload, 'content') ?? '' })];
+      case 'stage.started':
+        return [traceEvent(trace, 'workflow_stage', { ...payload, stage: phase, status: 'started', profileId, summary })];
+      case 'stage.completed':
+        return [traceEvent(trace, 'workflow_stage', { ...payload, stage: phase, status: 'completed', profileId, summary })];
+      case 'stage.failed':
+        return [traceEvent(trace, 'workflow_stage', { ...payload, stage: phase, status: 'error', profileId, summary })];
+      case 'tool.requested':
+        return [traceEvent(trace, 'tool_call', payload)];
+      case 'tool.completed':
+      case 'tool.failed':
+        return [traceEvent(trace, 'tool_result', payload)];
+      case 'permission.requested':
+        return [traceEvent(trace, 'permission_request', payload)];
+      case 'permission.resolved':
+        return [traceEvent(trace, 'permission_result', payload)];
+      case 'error':
+        return [traceEvent(trace, 'error', { ...payload, message: summary ?? stringField(payload, 'message') ?? 'Trace error' })];
+      default:
+        return [];
+    }
+  });
+}
+
 function defaultTasks(loading: boolean): AgentTaskView[] {
   return [
     {
@@ -206,19 +257,8 @@ function shouldShowWorkflowSummary(stage: string, status: string, toolActivity: 
   return stage === 'complete';
 }
 
-function compactTasks(tasks: AgentTaskView[], focusTaskId: string | undefined, toolActivity: boolean): AgentTaskView[] {
-  if (tasks.length <= 1) return tasks;
-
-  if (toolActivity) {
-    const filtered = tasks.filter((task) => task.hasToolActivity || task.status === 'running' || task.status === 'error');
-    return filtered.length > 0 ? filtered : tasks;
-  }
-
-  const focused = tasks.find((task) => task.id === focusTaskId && task.hasMeaningfulOutput);
-  if (focused) return [focused];
-
-  const meaningful = tasks.filter((task) => task.hasMeaningfulOutput);
-  return meaningful.length > 0 ? [meaningful[meaningful.length - 1]] : [tasks[tasks.length - 1]];
+function compactTasks(tasks: AgentTaskView[]): AgentTaskView[] {
+  return tasks;
 }
 
 function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
@@ -327,7 +367,7 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
     };
   }
 
-  const compacted = compactTasks(result, focusTaskId, toolActivity);
+  const compacted = compactTasks(result);
   const nextFocus =
     compacted.find((task) => task.id === focusTaskId)?.id ??
     compacted.find((task) => task.status === 'running')?.id ??
@@ -341,11 +381,16 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
 
 interface AgentTaskListProps {
   events: AgentEvent[];
+  traceEvents?: AgentTraceEvent[];
   loading: boolean;
 }
 
-const AgentTaskList: React.FC<AgentTaskListProps> = ({ events, loading }) => {
-  const taskState = useMemo(() => deriveTasks(events, loading), [events, loading]);
+const AgentTaskList: React.FC<AgentTaskListProps> = ({ events, traceEvents = [], loading }) => {
+  const taskEvents = useMemo(
+    () => (traceEvents.length > 0 ? traceEventsToAgentEvents(traceEvents) : events),
+    [events, traceEvents]
+  );
+  const taskState = useMemo(() => deriveTasks(taskEvents, loading), [taskEvents, loading]);
   const tasks = taskState.tasks;
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
   const lastAutoFocusIdRef = useRef<string | null>(null);

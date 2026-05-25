@@ -20,8 +20,10 @@ function nestedRecord(payload: Record<string, unknown>, key: string): Record<str
 }
 
 function getArgs(payload: Record<string, unknown>): Record<string, unknown> {
+  const toolCall = nestedRecord(payload, 'toolCall');
   return (
     nestedRecord(payload, 'arguments') ??
+    (toolCall ? nestedRecord(toolCall, 'arguments') : undefined) ??
     nestedRecord(payload, 'input') ??
     nestedRecord(payload, 'argumentsPreview') ??
     nestedRecord(payload, 'output') ??
@@ -72,11 +74,11 @@ function getOutputText(payload: unknown): string | undefined {
 function eventLabel(event: AgentEvent): string {
   if (event.kind === 'tool_call') {
     const name = getToolName(event.payload);
-    return name.startsWith('shell.') ? 'Run command' : 'Run tool';
+    return name.startsWith('shell.') ? '执行命令' : '执行工具';
   }
-  if (event.kind === 'tool_result') return 'Tool result';
-  if (event.kind === 'permission_request') return 'Permission request';
-  if (event.kind === 'permission_result') return 'Permission result';
+  if (event.kind === 'tool_result') return '输出结果';
+  if (event.kind === 'permission_request') return '确认请求';
+  if (event.kind === 'permission_result') return '确认结果';
   return event.kind;
 }
 
@@ -84,13 +86,13 @@ function cardTitle(event: AgentEvent): string {
   const name = getToolName(event.payload);
   const command = getCommand(event.payload);
   const path = getPath(event.payload);
-  if (event.kind === 'tool_call' && command) return command;
+  if (event.kind === 'tool_call' && command) return `${name} · ${command}`;
   if (event.kind === 'permission_request') {
     const summary = isRecord(event.payload) ? stringValue(event.payload.summary) : undefined;
     return summary ?? name;
   }
-  if (command) return command;
-  if (path) return path;
+  if (command) return `${name} · ${command}`;
+  if (path) return `${name} · ${path}`;
   return name;
 }
 
@@ -106,11 +108,11 @@ function renderDetails(event: AgentEvent) {
   }
   if (event.kind === 'permission_request') {
     const risk = isRecord(event.payload) ? stringValue(event.payload.riskLevel) : undefined;
-    return <div className="agent-tool-bubble__summary">{risk ? `Risk: ${risk}` : 'Waiting for user approval.'}</div>;
+    return <div className="agent-tool-bubble__summary">{risk ? `风险等级：${risk}` : '等待用户确认。'}</div>;
   }
   if (event.kind === 'permission_result') {
     const decision = isRecord(event.payload) ? stringValue(event.payload.decision) : undefined;
-    return <div className="agent-tool-bubble__summary">{decision ?? 'Permission resolved.'}</div>;
+    return <div className="agent-tool-bubble__summary">{decision ?? '权限已处理。'}</div>;
   }
   return <div className="agent-tool-bubble__summary">{compactDisplayText(cardTitle(event), 220)}</div>;
 }
