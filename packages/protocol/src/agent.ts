@@ -179,6 +179,8 @@ export type AgentStageOutcome =
       summary?: string;
     };
 
+export type AgentOutcomeKind = AgentStageOutcome['kind'];
+
 export interface AgentWorkflowState {
   sessionId: string;
   phase: AgentWorkflowPhase;

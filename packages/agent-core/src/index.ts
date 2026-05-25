@@ -4,4 +4,5 @@ export * from './permissionGate.js';
 export * from './toolRegistry.js';
 export * from './workflowRunner.js';
 export * from './workflowMachine.js';
+export * from './stageOutcomeParser.js';
 export * from './utils.js';

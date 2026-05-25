@@ -119,6 +119,8 @@ node --input-type=module <<'NODE'
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import {
+  normalizeOutcome,
+  parseStageOutcome,
   transitionWorkflowState,
   isWorkflowTerminal,
 } from './packages/agent-core/dist/index.js';
@@ -133,8 +135,72 @@ assert.equal(result.transition.from, fixture.expected.transitionFrom);
 assert.equal(result.transition.to, fixture.expected.transitionTo);
 assert.equal(result.transition.reason, fixture.expected.transitionReason);
 assert.equal(isWorkflowTerminal(result.state), false);
+
+const planText = `Before text.
+\`\`\`deepcode-outcome
+{
+  "kind": "plan.proposed",
+  "plan": {
+    "id": "plan-smoke",
+    "goal": "Scan workspace",
+    "assumptions": ["Workspace is open"],
+    "steps": [
+      {
+        "id": "step-list",
+        "title": "List root",
+        "intent": "Read workspace root",
+        "expectedTool": "fs.list",
+        "expectedFiles": ["."],
+        "riskLevel": "low"
+      }
+    ],
+    "successCriteria": ["Root entries are known"],
+    "allowedTools": ["fs.list"],
+    "forbiddenActions": ["fs.write"],
+    "evidenceRequired": ["file_read"]
+  },
+  "confidence": 0.82,
+  "summary": "Plan ready."
+}
+\`\`\``;
+const planParsed = parseStageOutcome(planText, { stage: 'plan' });
+assert.equal(planParsed.source, 'jsonBlock');
+assert.equal(planParsed.outcome.kind, 'plan.proposed');
+assert.equal(planParsed.outcome.plan.steps[0].expectedTool, 'fs.list');
+
+const checkText = `\`\`\`deepcode-workflow-outcome
+{
+  "outcome": {
+    "kind": "check.rejected",
+    "reason": "missing_context",
+    "evidence": [
+      {"id": "e1", "kind": "review_note", "summary": "No workspace root evidence yet.", "ok": false}
+    ],
+    "summary": "Need more context."
+  }
+}
+\`\`\``;
+const checkParsed = parseStageOutcome(checkText, { stage: 'check' });
+assert.equal(checkParsed.outcome.kind, 'check.rejected');
+assert.equal(checkParsed.outcome.reason, 'missing_context');
+assert.equal(checkParsed.outcome.evidence[0].kind, 'review_note');
+
+const fallbackParsed = parseStageOutcome('plain assistant text without outcome', {
+  stage: 'complete',
+  fallbackSummary: 'plain text only',
+});
+assert.equal(fallbackParsed.source, 'fallback');
+assert.equal(fallbackParsed.outcome.kind, 'complete.blocked');
+assert.equal(fallbackParsed.outcome.reason, 'insufficient_evidence');
+
+const normalized = normalizeOutcome(fallbackParsed.outcome, [
+  { id: 'tool-1', kind: 'tool_result', summary: 'fs.list returned ok', ok: true },
+]);
+assert.equal(normalized.kind, 'complete.blocked');
+assert.equal(normalized.evidence.length, 1);
 NODE
 pass "WorkflowMachine complete.blocked(test_failed) -> plan fixture ok"
+pass "StageOutcome parser structured/fallback fixture ok"
 
 info "[3c/6] DeepSeek V4 profile capability defaults"
 node --input-type=module <<'NODE'
