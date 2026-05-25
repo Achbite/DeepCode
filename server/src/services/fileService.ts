@@ -8,7 +8,7 @@
  */
 import { readdir, readFile, writeFile, mkdir, stat, access, rename } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
-import { join, resolve, normalize, relative, isAbsolute, sep } from 'node:path';
+import { dirname, join, resolve, normalize, relative, isAbsolute, sep } from 'node:path';
 import type {
   FileTreeNode,
   FileReadResult,
@@ -247,7 +247,7 @@ export async function writeFileContent(
     );
   }
 
-  const dir = join(absolutePath, '..');
+  const dir = dirname(absolutePath);
   await mkdir(dir, { recursive: true });
   await writeFile(absolutePath, content, 'utf-8');
 
@@ -299,7 +299,7 @@ export async function createFile(
     );
   }
 
-  const dir = join(absolutePath, '..');
+  const dir = dirname(absolutePath);
   await mkdir(dir, { recursive: true });
   await writeFile(absolutePath, initialContent, 'utf-8');
 
@@ -380,7 +380,7 @@ export async function renameEntry(
     }
   }
 
-  const parent = join(newAbs, '..');
+  const parent = dirname(newAbs);
   await mkdir(parent, { recursive: true });
   await rename(oldAbs, newAbs);
 

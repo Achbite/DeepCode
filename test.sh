@@ -34,6 +34,7 @@ TERMINAL_SESSIONS_URL="http://127.0.0.1:${TEST_PORT}/api/terminal/sessions"
 TERMINAL_EVENTS_URL="http://127.0.0.1:${TEST_PORT}/api/terminal/events"
 AGENT_PARSE_URL="http://127.0.0.1:${TEST_PORT}/api/agent/parse-actions"
 AGENT_FIXTURE_URL="http://127.0.0.1:${TEST_PORT}/api/agent/fixtures/run"
+AGENT_TOOL_EXECUTE_URL="http://127.0.0.1:${TEST_PORT}/api/agent/tools/execute"
 AGENT_PROMPT_LAYERS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/prompt-layers"
 AGENT_SKILLS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/skills"
 AGENT_SESSIONS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/sessions"
@@ -537,6 +538,100 @@ PACKAGE_HASH_AFTER="$(sha256sum "$ROOT_DIR/package.json" | awk '{print $1}')"
 [ "$PACKAGE_HASH_BEFORE" = "$PACKAGE_HASH_AFTER" ] \
     && pass "askBeforeWrite 未审批 fs.write 未写盘" \
     || { fail "askBeforeWrite 未审批 fs.write 修改了文件"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+
+WRITE_SMOKE_DIR="$(mktemp -d /tmp/deepcode-write-smoke-XXXXXX)"
+WRITE_SMOKE_OPEN="$(jq -nc --arg path "$WRITE_SMOKE_DIR" '{path: $path}')"
+WRITE_SMOKE_OPEN_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$WRITE_SMOKE_OPEN" "$OPEN_WS_URL" || true)"
+info "open write smoke workspace -> $WRITE_SMOKE_OPEN_RESP"
+echo "$WRITE_SMOKE_OPEN_RESP" | jq -e '.ok == true and (.data.workspace.folders[0].absolutePath | type == "string")' >/dev/null 2>&1 \
+    && pass "fs.write approved smoke workspace opened" \
+    || { fail "fs.write approved smoke workspace open failed"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+
+WRITE_APPROVED_BODY="$(jq -nc '{
+  mode: "askBeforeWrite",
+  approved: true,
+  toolCall: {
+    id: "write-approved-create",
+    name: "fs.write",
+    arguments: {
+      path: "main.cpp",
+      content: "#include <iostream>\n\nint main() {\n    std::cout << \"Hello, World!\" << std::endl;\n    return 0;\n}\n"
+    }
+  }
+}')"
+WRITE_APPROVED_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$WRITE_APPROVED_BODY" "$AGENT_TOOL_EXECUTE_URL" || true)"
+info "approved fs.write create -> $WRITE_APPROVED_RESP"
+echo "$WRITE_APPROVED_RESP" | jq -e '.ok == true and .data.ok == true and .data.output.saved == true and .data.output.path == "main.cpp"' >/dev/null 2>&1 \
+    && grep -q 'Hello, World!' "$WRITE_SMOKE_DIR/main.cpp" \
+    && pass "approved fs.write can create file" \
+    || { fail "approved fs.write create failed"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+
+WRITE_OVERWRITE_BODY="$(jq -nc '{
+  mode: "askBeforeWrite",
+  approved: true,
+  toolCall: {
+    id: "write-approved-overwrite",
+    name: "fs.write",
+    arguments: {
+      path: "main.cpp",
+      content: "#include <iostream>\n\nint main() {\n    std::cout << \"Hello again\" << std::endl;\n    return 0;\n}\n"
+    }
+  }
+}')"
+WRITE_OVERWRITE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$WRITE_OVERWRITE_BODY" "$AGENT_TOOL_EXECUTE_URL" || true)"
+info "approved fs.write overwrite -> $WRITE_OVERWRITE_RESP"
+echo "$WRITE_OVERWRITE_RESP" | jq -e '.ok == true and .data.ok == true and .data.output.saved == true and .data.output.path == "main.cpp"' >/dev/null 2>&1 \
+    && grep -q 'Hello again' "$WRITE_SMOKE_DIR/main.cpp" \
+    && pass "approved fs.write can overwrite file" \
+    || { fail "approved fs.write overwrite failed"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+
+WRITE_RESTORE_SESSION="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{"initialMode":"plan"}' "$AGENT_SESSIONS_URL" || true)"
+WRITE_RESTORE_SESSION_ID="$(echo "$WRITE_RESTORE_SESSION" | jq -r '.data.session.id // empty' 2>/dev/null || true)"
+if [ -z "$WRITE_RESTORE_SESSION_ID" ]; then
+    fail "fs.write permission restore session create failed"; exit "$NEXT_FAIL_CODE"
+fi
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+WRITE_RESTORE_EVENT_BODY="$(jq -nc --arg sid "$WRITE_RESTORE_SESSION_ID" --arg ts "$(date -Iseconds)" '{
+  events: [{
+    id: "evt-write-restore-permission",
+    sessionId: $sid,
+    ts: $ts,
+    kind: "permission_request",
+    payload: {
+      id: "perm-write-restore",
+      toolName: "fs.write",
+      riskLevel: "high",
+      summary: "Allow fs.write restore smoke",
+      argumentsPreview: {
+        path: "restored.cpp",
+        content: "#include <iostream>\n\nint main() {\n    std::cout << \"Restored write\" << std::endl;\n    return 0;\n}\n"
+      },
+      channel: "tool",
+      visibility: "conversation"
+    }
+  }]
+}')"
+WRITE_RESTORE_APPEND="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$WRITE_RESTORE_EVENT_BODY" "$AGENT_SESSIONS_URL/$WRITE_RESTORE_SESSION_ID/events" || true)"
+echo "$WRITE_RESTORE_APPEND" | jq -e '.ok == true' >/dev/null 2>&1 \
+    || { fail "fs.write permission restore append failed"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+WRITE_RESTORE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{"decision":"accept"}' "http://127.0.0.1:${TEST_PORT}/api/agent/permissions/perm-write-restore/resolve" || true)"
+info "restored permission fs.write -> $WRITE_RESTORE_RESP"
+echo "$WRITE_RESTORE_RESP" | jq -e '.ok == true and ([.data.events[].kind] | index("tool_result") != null) and ([.data.events[].kind] | index("assistant_msg") != null)' >/dev/null 2>&1 \
+    && grep -q 'Restored write' "$WRITE_SMOKE_DIR/restored.cpp" \
+    && pass "permission resolve can restore fs.write from session event" \
+    || { fail "permission restore fs.write failed"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+
+rm -rf "$WRITE_SMOKE_DIR"
+OPEN_WS_BODY="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$OPEN_BODY" "$OPEN_WS_URL" || true)"
+echo "$OPEN_WS_BODY" | jq -e '.ok == true' >/dev/null 2>&1 \
+    && pass "fs.write approved smoke reopened project workspace" \
+    || { fail "fs.write approved smoke failed to reopen project workspace"; exit "$NEXT_FAIL_CODE"; }
 NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
 
 SESSIONS_BEFORE="$(curl -fsS -m 3 "$TERMINAL_SESSIONS_URL" || true)"

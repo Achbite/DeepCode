@@ -65,6 +65,72 @@ const contextRegistry = new ContextSourceRegistry();
 const contextBudgetPolicy = new ContextBudgetPolicy();
 const pendingPermissions = new Map<string, PendingPermission>();
 
+function permissionRequestPayload(value: unknown): PermissionRequest | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    typeof value.id !== 'string' ||
+    typeof value.toolName !== 'string' ||
+    typeof value.summary !== 'string' ||
+    (value.riskLevel !== 'low' && value.riskLevel !== 'medium' && value.riskLevel !== 'high')
+  ) {
+    return undefined;
+  }
+  return {
+    id: value.id,
+    toolName: value.toolName,
+    riskLevel: value.riskLevel,
+    summary: value.summary,
+    diff: typeof value.diff === 'string' ? value.diff : undefined,
+    argumentsPreview: value.argumentsPreview,
+  };
+}
+
+async function restorePendingPermission(permissionId: string): Promise<PendingPermission | undefined> {
+  const current = await getAgentSession();
+  if (!current) return undefined;
+
+  for (let i = current.events.length - 1; i >= 0; i -= 1) {
+    const event = current.events[i];
+    if (event.kind === 'permission_result') {
+      const payload = isRecord(event.payload) ? event.payload : {};
+      if (payload.permissionId === permissionId) return undefined;
+    }
+    if (event.kind !== 'permission_request') continue;
+
+    const request = permissionRequestPayload(event.payload);
+    if (!request || request.id !== permissionId) continue;
+
+    return {
+      sessionId: current.session.id,
+      request,
+      toolCall: {
+        id: `restored-${permissionId}`,
+        name: request.toolName,
+        arguments: isRecord(request.argumentsPreview) ? request.argumentsPreview : {},
+      },
+      mode: 'askBeforeWrite',
+    };
+  }
+  return undefined;
+}
+
+function summarizeAcceptedToolResult(toolName: string, result: ToolResult): string {
+  if (!result.ok) {
+    return `${toolName} 执行失败：${result.error ?? 'unknown error'}`;
+  }
+  const output = isRecord(result.output) ? result.output : {};
+  const path = typeof output.path === 'string' ? output.path : undefined;
+  if (toolName === 'fs.write') {
+    return path ? `已写入文件 \`${path}\`。` : '已完成文件写入。';
+  }
+  if (toolName === 'fs.read') {
+    return path ? `已读取文件 \`${path}\`。` : '已完成文件读取。';
+  }
+  if (toolName === 'fs.list') return '已完成目录读取。';
+  if (toolName === 'shell.exec') return '命令已执行完成。';
+  return `${toolName} 已执行完成。`;
+}
+
 const OUTPUT_ENVELOPE_PROMPT = [
   'Format user-visible Agent output as ordered logical sections when useful:',
   '<reasoning>brief visible reasoning or provider-independent planning notes</reasoning>',
@@ -444,13 +510,60 @@ function previewValue(value: unknown, limit = 900): string {
   return normalized.length > limit ? `${normalized.slice(0, limit - 1)}…` : normalized;
 }
 
+function isDirectExecutionRequest(content: string): boolean {
+  const text = content.toLowerCase();
+  const directPatterns = [
+    /直接/,
+    /执行/,
+    /实现/,
+    /修改/,
+    /写入/,
+    /写代码/,
+    /完成/,
+    /修复/,
+    /提交/,
+    /保存/,
+    /创建/,
+    /删除/,
+    /\bimplement\b/,
+    /\bmodify\b/,
+    /\bwrite\b/,
+    /\bfix\b/,
+    /\bcommit\b/,
+    /\bexecute\b/,
+  ];
+  const planOnlyPatterns = [
+    /不要修改/,
+    /不要写/,
+    /只.?方案/,
+    /只.?规划/,
+    /不要执行/,
+    /\bdo not modify\b/,
+    /\bplan only\b/,
+  ];
+  return directPatterns.some((pattern) => pattern.test(text))
+    && !planOnlyPatterns.some((pattern) => pattern.test(text));
+}
+
+function operationModeForStage(
+  stage: AgentWorkflowStage,
+  requestedMode: AgentMode,
+  userContent: string
+): AgentMode {
+  if (stage !== 'complete') return requestedMode;
+  if (requestedMode === 'readOnly') return requestedMode;
+  return requestedMode === 'plan' && isDirectExecutionRequest(userContent)
+    ? 'askBeforeWrite'
+    : requestedMode;
+}
+
 function toolNameFromEvent(event: AgentEvent): string {
   if (!isRecord(event.payload)) return 'tool';
   const toolCall = isRecord(event.payload.toolCall) ? event.payload.toolCall : undefined;
   return previewValue(event.payload.toolName ?? event.payload.name ?? toolCall?.name ?? 'tool', 120);
 }
 
-function toolObservationSummary(event: AgentEvent): string | null {
+function toolObservationModelSummary(event: AgentEvent): string | null {
   if (!isRecord(event.payload)) return null;
   if (event.kind === 'tool_call') {
     const toolCall = isRecord(event.payload.toolCall) ? event.payload.toolCall : event.payload;
@@ -476,12 +589,64 @@ function toolObservationSummary(event: AgentEvent): string | null {
   return null;
 }
 
+function outputRecord(event: AgentEvent): Record<string, unknown> | undefined {
+  return isRecord(event.payload) && isRecord(event.payload.output)
+    ? event.payload.output
+    : undefined;
+}
+
+function toolObservationDisplaySummary(event: AgentEvent): string | null {
+  if (!isRecord(event.payload)) return null;
+  if (event.kind === 'tool_call') {
+    const name = toolNameFromEvent(event);
+    const toolCall = isRecord(event.payload.toolCall) ? event.payload.toolCall : event.payload;
+    const args = isRecord(toolCall.arguments) ? toolCall.arguments : {};
+    const path = previewValue(args.path ?? args.cwd ?? '', 180);
+    const command = previewValue(args.command ?? '', 220);
+    return `- 调用工具：${name}${path ? ` · ${path}` : ''}${command ? ` · ${command}` : ''}`;
+  }
+  if (event.kind === 'tool_result') {
+    const status = typeof event.payload.ok === 'boolean'
+      ? (event.payload.ok ? 'ok' : 'error')
+      : previewValue(event.payload.status ?? 'done', 80);
+    const output = outputRecord(event);
+    const path = previewValue(output?.path ?? output?.cwd ?? '', 180);
+    const size = typeof output?.sizeBytes === 'number' ? ` · ${output.sizeBytes} bytes` : '';
+    const exit = typeof output?.exitCode === 'number' ? ` · exit ${output.exitCode}` : '';
+    const error = previewValue(event.payload.error ?? '', 260);
+    return `- 工具结果：${toolNameFromEvent(event)} · ${status}${path ? ` · ${path}` : ''}${size}${exit}${error ? ` · ${error}` : ''}`;
+  }
+  if (event.kind === 'permission_request') {
+    return `- 等待确认：${toolNameFromEvent(event)} ${previewValue(event.payload.summary ?? event.payload, 260)}`;
+  }
+  if (event.kind === 'permission_result') {
+    return `- 确认结果：${previewValue(event.payload, 220)}`;
+  }
+  if (event.kind === 'error') {
+    return `- 运行错误：${previewValue(event.payload, 260)}`;
+  }
+  return null;
+}
+
 function appendObservationContext(stageOutputs: string[], stage: AgentWorkflowStage, events: AgentEvent[]): void {
   const summaries = events
-    .map(toolObservationSummary)
+    .map(toolObservationModelSummary)
     .filter((summary): summary is string => Boolean(summary));
   if (summaries.length === 0) return;
   stageOutputs.push(`[${stage} observations]\n${summaries.join('\n')}`);
+}
+
+function hasPendingPermission(events: AgentEvent[]): boolean {
+  return events.some((event) => event.kind === 'permission_request');
+}
+
+function hasToolOrPermissionEvents(events: AgentEvent[]): boolean {
+  return events.some((event) =>
+    event.kind === 'tool_call' ||
+    event.kind === 'tool_result' ||
+    event.kind === 'permission_request' ||
+    event.kind === 'permission_result'
+  );
 }
 
 function extractLlmText(result: Awaited<ReturnType<typeof chatWithLlm>>): string {
@@ -614,186 +779,207 @@ export async function sendAgentMessage(
   let lastUserVisibleText = '';
   let lastUsedProfileId: string | undefined;
 
+  let haltWorkflow = false;
+
   for (const stage of AGENT_WORKFLOW_STAGES) {
+    if (haltWorkflow) break;
     const profileId = workflowConfig[stage]?.profileId;
     if (!profileId) continue;
     lastUsedProfileId = profileId;
     const profile = profilesById.get(profileId);
     const stageRunId = `stage-${stage}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const llmCallId = `llm-${stage}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const baseContext: EventContext = {
-      turnId,
-      stage,
-      phase: stage,
-      stageRunId,
-      llmCallId,
-    };
+    const stageMode = operationModeForStage(stage, mode, request.content);
+    const maxStageCalls = stage === 'complete' ? 4 : 1;
 
-    const priorOutput = stageOutputs.length > 0
-      ? `\n\nPrevious workflow stage output:\n${stageOutputs.join('\n\n')}`
-      : '';
-    const contextBudget = contextBudgetPolicy.evaluate(
-      [promptText, request.content, priorOutput].join('\n\n'),
-      profile
-    );
+    for (let stageCallIndex = 0; stageCallIndex < maxStageCalls; stageCallIndex += 1) {
+      const llmCallId = `llm-${stage}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const baseContext: EventContext = {
+        turnId,
+        stage,
+        phase: stage,
+        stageRunId,
+        llmCallId,
+      };
 
-    await emit([newEvent(sessionId, 'workflow_stage', {
-      stage,
-      phase: stage,
-      stageRunId,
-      llmCallId,
-      profileId,
-      status: 'started',
-      contextBudget,
-      channel: 'task',
-      visibility: 'task',
-    })]);
+      const priorOutput = stageOutputs.length > 0
+        ? `\n\nPrevious workflow stage output:\n${stageOutputs.join('\n\n')}`
+        : '';
+      const contextBudget = contextBudgetPolicy.evaluate(
+        [promptText, request.content, priorOutput].join('\n\n'),
+        profile
+      );
 
-    const messages: LlmChatMessage[] = [
-      {
-        role: 'system',
-        content: [
-          promptText,
-          OUTPUT_ENVELOPE_PROMPT,
-          STAGE_PROMPTS[stage],
-          `Current permission mode: ${mode}.`,
-          `Default workflow behavior: ${workflow}.`,
-          'Natural language alone must never trigger local operations; only explicit tool calls or deepcode-action blocks may do so.',
-        ].join('\n\n'),
-      },
-      {
-        role: 'user',
-        content: `${request.content}${priorOutput}`,
-      },
-    ];
-
-    let assistantText = '';
-    let reasoningText = '';
-    const stageToolCalls: ToolCall[] = [];
-    try {
-      const response = await chatWithLlm({
+      await emit([newEvent(sessionId, 'workflow_stage', {
+        stage,
+        phase: stage,
+        stageRunId,
+        llmCallId,
         profileId,
-        messages,
-        tools: stage === 'complete' ? listAgentTools(mode).tools : undefined,
-        stream: false,
-      });
+        status: 'started',
+        contextBudget,
+        channel: 'task',
+        visibility: 'task',
+      })]);
 
-      for (const chunk of response.chunks) {
-        if (chunk.type === 'reasoning_delta' && chunk.content) {
-          reasoningText += chunk.content;
+      const messages: LlmChatMessage[] = [
+        {
+          role: 'system',
+          content: [
+            promptText,
+            OUTPUT_ENVELOPE_PROMPT,
+            STAGE_PROMPTS[stage],
+            `Current user session mode: ${mode}.`,
+            `Current local operation mode for this stage: ${stageMode}.`,
+            `Default workflow behavior: ${workflow}.`,
+            'Natural language alone must never trigger local operations; only explicit tool calls or deepcode-action blocks may do so.',
+            stage === 'complete' && stageCallIndex > 0
+              ? 'You have received tool observations from the previous sub-step. Continue the task: either request the next required tool action or provide a final answer if the work is complete.'
+              : '',
+          ].filter(Boolean).join('\n\n'),
+        },
+        {
+          role: 'user',
+          content: `${request.content}${priorOutput}`,
+        },
+      ];
+
+      let assistantText = '';
+      let reasoningText = '';
+      const stageToolCalls: ToolCall[] = [];
+      try {
+        const response = await chatWithLlm({
+          profileId,
+          messages,
+          tools: stage === 'complete' ? listAgentTools(stageMode).tools : undefined,
+          stream: false,
+        });
+
+        for (const chunk of response.chunks) {
+          if (chunk.type === 'reasoning_delta' && chunk.content) {
+            reasoningText += chunk.content;
+          }
+          if (chunk.type === 'delta' && chunk.content) {
+            assistantText += chunk.content;
+          }
+          if (stage === 'complete' && chunk.type === 'tool_call' && chunk.toolCall) {
+            stageToolCalls.push(chunk.toolCall);
+          }
+          if (chunk.type === 'error') {
+            await emit([newEvent(sessionId, 'error', {
+              stage,
+              phase: stage,
+              stageRunId,
+              llmCallId,
+              channel: 'error',
+              visibility: 'conversation',
+              code: 'llm_stream_error',
+              message: chunk.error ?? 'LLM stream error',
+            })]);
+          }
         }
-        if (chunk.type === 'delta' && chunk.content) {
-          assistantText += chunk.content;
-        }
-        if (stage === 'complete' && chunk.type === 'tool_call' && chunk.toolCall) {
-          stageToolCalls.push(chunk.toolCall);
-        }
-        if (chunk.type === 'error') {
-          await emit([newEvent(sessionId, 'error', {
-            stage,
-            phase: stage,
-            stageRunId,
-            llmCallId,
-            channel: 'error',
-            visibility: 'conversation',
-            code: 'llm_stream_error',
-            message: chunk.error ?? 'LLM stream error',
+
+        const trimmed = assistantText.trim();
+        const observationEvents: AgentEvent[] = [];
+        if (reasoningText.trim()) {
+          await emit([assistantSegmentEvent(sessionId, baseContext, {
+            kind: 'reasoning',
+            content: reasoningText.trim(),
           })]);
         }
-      }
-
-      const trimmed = assistantText.trim();
-      const observationEvents: AgentEvent[] = [];
-      if (reasoningText.trim()) {
-        await emit([assistantSegmentEvent(sessionId, baseContext, {
-          kind: 'reasoning',
-          content: reasoningText.trim(),
-        })]);
-      }
-      if (trimmed) {
-        stageOutputs.push(`[${stage}] ${trimmed}`);
-        const segments = parseTaggedSegments(trimmed, fallbackSegmentKind(stage));
-        for (const segment of segments) {
-          await emit([assistantSegmentEvent(sessionId, baseContext, segment)]);
-          if (segment.kind === 'final') emittedFinal = true;
-          if (segment.kind !== 'reasoning') lastUserVisibleText = segment.content;
+        if (trimmed) {
+          stageOutputs.push(`[${stage}] ${trimmed}`);
+          const segments = parseTaggedSegments(trimmed, fallbackSegmentKind(stage));
+          for (const segment of segments) {
+            await emit([assistantSegmentEvent(sessionId, baseContext, segment)]);
+            if (segment.kind === 'final') emittedFinal = true;
+            if (segment.kind !== 'reasoning') lastUserVisibleText = segment.content;
+          }
+        } else if (stage === 'complete' && stageToolCalls.length > 0) {
+          await emit([assistantSegmentEvent(sessionId, baseContext, {
+            kind: 'say',
+            content: '我会先按当前任务调用工具获取事实，再根据结果继续判断。',
+          })]);
         }
-      } else if (stage === 'complete' && stageToolCalls.length > 0) {
-        await emit([assistantSegmentEvent(sessionId, baseContext, {
-          kind: 'say',
-          content: '\u6211\u4f1a\u5148\u6309\u5f53\u524d\u4efb\u52a1\u8c03\u7528\u5de5\u5177\u83b7\u53d6\u4e8b\u5b9e\uff0c\u518d\u6839\u636e\u7ed3\u679c\u7ee7\u7eed\u5224\u65ad\u3002',
-        })]);
-      }
 
-      if (stage === 'complete') {
-        const batchId = stageToolCalls.length > 0
-          ? `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`
-          : undefined;
-        const batchLabel = toolBatchLabel(stageToolCalls);
-        for (const toolCall of stageToolCalls) {
-          const toolEvents = await executeOrAsk(sessionId, mode, toolCall, emit, {
-            ...baseContext,
-            batchId: batchId ?? `batch-${toolCall.id}`,
-            batchLabel,
-          });
-          observationEvents.push(...toolEvents);
-        }
-      }
-
-      if (trimmed) {
         if (stage === 'complete') {
-          const parsedEvents = await runParsedTextActions(sessionId, mode, trimmed, emit, baseContext);
+          const batchId = stageToolCalls.length > 0
+            ? `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`
+            : undefined;
+          const batchLabel = toolBatchLabel(stageToolCalls);
+          for (const toolCall of stageToolCalls) {
+            const toolEvents = await executeOrAsk(sessionId, stageMode, toolCall, emit, {
+              ...baseContext,
+              batchId: batchId ?? `batch-${toolCall.id}`,
+              batchLabel,
+            });
+            observationEvents.push(...toolEvents);
+          }
+        }
+
+        if (trimmed && stage === 'complete') {
+          const parsedEvents = await runParsedTextActions(sessionId, stageMode, trimmed, emit, baseContext);
           observationEvents.push(...parsedEvents);
         }
-      }
 
-      appendObservationContext(stageOutputs, stage, observationEvents);
-      if (observationEvents.length > 0) {
-        const summaries = observationEvents
-          .map(toolObservationSummary)
-          .filter((summary): summary is string => Boolean(summary))
-          .slice(0, 8);
-        const observationSummary = '\u5df2\u7ecf\u83b7\u53d6\u5de5\u5177\u7ed3\u679c\uff0c\u7ee7\u7eed\u6839\u636e\u7ed3\u679c\u5224\u65ad\u3002';
-        await emit([assistantSegmentEvent(sessionId, baseContext, {
-          kind: 'observe',
-          content: summaries.length > 0
-            ? `${observationSummary}\n\n${summaries.join('\n')}`
-            : observationSummary,
+        appendObservationContext(stageOutputs, stage, observationEvents);
+        if (observationEvents.length > 0) {
+          const summaries = observationEvents
+            .map(toolObservationDisplaySummary)
+            .filter((summary): summary is string => Boolean(summary))
+            .slice(0, 8);
+          const waitingPermission = hasPendingPermission(observationEvents);
+          const observationSummary = waitingPermission
+            ? '已生成需要用户确认的本地操作，请在确认卡片中处理后继续。'
+            : '已经获取工具结果，继续根据结果判断。';
+          await emit([assistantSegmentEvent(sessionId, baseContext, {
+            kind: 'observe',
+            content: summaries.length > 0
+              ? `${observationSummary}\n\n${summaries.join('\n')}`
+              : observationSummary,
+          })]);
+          lastUserVisibleText = observationSummary;
+          if (waitingPermission) {
+            haltWorkflow = true;
+          }
+        }
+
+        await emit([newEvent(sessionId, 'workflow_stage', {
+          stage,
+          phase: stage,
+          stageRunId,
+          llmCallId,
+          profileId,
+          status: 'completed',
+          summary: trimmed ? trimmed.slice(0, 240) : 'No textual output.',
+          channel: 'task',
+          visibility: 'task',
         })]);
-        lastUserVisibleText = observationSummary;
-      }
 
-      await emit([newEvent(sessionId, 'workflow_stage', {
-        stage,
-        phase: stage,
-        stageRunId,
-        llmCallId,
-        profileId,
-        status: 'completed',
-        summary: trimmed ? trimmed.slice(0, 240) : 'No textual output.',
-        channel: 'task',
-        visibility: 'task',
-      })]);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await emit([newEvent(sessionId, 'workflow_stage', {
-        stage,
-        phase: stage,
-        stageRunId,
-        llmCallId,
-        profileId,
-        status: 'error',
-        summary: message,
-        channel: 'task',
-        visibility: 'task',
-      })]);
-      await emit([newEvent(sessionId, 'error', {
-        ...baseContext,
-        channel: 'error',
-        visibility: 'conversation',
-        code: 'llm_stage_error',
-        message,
-      })]);
+        if (haltWorkflow) break;
+        if (stage !== 'complete') break;
+        if (!hasToolOrPermissionEvents(observationEvents)) break;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await emit([newEvent(sessionId, 'workflow_stage', {
+          stage,
+          phase: stage,
+          stageRunId,
+          llmCallId,
+          profileId,
+          status: 'error',
+          summary: message,
+          channel: 'task',
+          visibility: 'task',
+        })]);
+        await emit([newEvent(sessionId, 'error', {
+          ...baseContext,
+          channel: 'error',
+          visibility: 'conversation',
+          code: 'llm_stage_error',
+          message,
+        })]);
+        break;
+      }
     }
   }
 
@@ -826,7 +1012,7 @@ export async function resolveAgentPermission(
   permissionId: string,
   request: ResolveAgentPermissionRequest
 ): Promise<AgentSessionResult> {
-  const pending = pendingPermissions.get(permissionId);
+  const pending = pendingPermissions.get(permissionId) ?? await restorePendingPermission(permissionId);
   if (!pending) {
     throw new Error(`Agent permission not found: ${permissionId}`);
   }
@@ -851,6 +1037,16 @@ export async function resolveAgentPermission(
       ...result,
       toolName: pending.toolCall.name,
     }));
+    events.push(newEvent(pending.sessionId, 'assistant_msg', {
+      content: summarizeAcceptedToolResult(pending.toolCall.name, result),
+      label: 'Agent',
+      channel: 'final',
+      visibility: 'conversation',
+    }, {
+      presentation: 'body',
+      defaultOpen: true,
+      importance: result.ok ? 'primary' : 'secondary',
+    }));
   } else {
     events.push(newEvent(pending.sessionId, 'tool_result', {
       callId: pending.toolCall.id,
@@ -858,6 +1054,16 @@ export async function resolveAgentPermission(
       ok: false,
       status: 'error',
       error: 'permission_rejected',
+    }));
+    events.push(newEvent(pending.sessionId, 'assistant_msg', {
+      content: `已取消 ${pending.toolCall.name}。`,
+      label: 'Agent',
+      channel: 'final',
+      visibility: 'conversation',
+    }, {
+      presentation: 'body',
+      defaultOpen: true,
+      importance: 'secondary',
     }));
   }
 
