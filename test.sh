@@ -36,6 +36,7 @@ AGENT_PARSE_URL="http://127.0.0.1:${TEST_PORT}/api/agent/parse-actions"
 AGENT_FIXTURE_URL="http://127.0.0.1:${TEST_PORT}/api/agent/fixtures/run"
 AGENT_PROMPT_LAYERS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/prompt-layers"
 AGENT_SKILLS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/skills"
+AGENT_SESSIONS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/sessions"
 LOG_FILE="/tmp/_deepcode_server_$$.log"
 PID_FILE="/tmp/_deepcode_server_$$.pid"
 
@@ -137,14 +138,8 @@ pass "WorkflowMachine complete.blocked(test_failed) -> plan fixture ok"
 
 # ---- 4. 启动 server 并 ping ----
 info "[4/6] start server on port $TEST_PORT"
-# 优先用已构建产物（dist/index.js）；不存在则用 tsx 直跑源码
-SERVER_ENTRY=""
-if [ -f "$ROOT_DIR/server/dist/index.js" ]; then
-    SERVER_ENTRY="node $ROOT_DIR/server/dist/index.js"
-else
-    info "server/dist 不存在，使用 tsx 直跑源码"
-    SERVER_ENTRY="pnpm --filter @deepcode/server exec tsx $ROOT_DIR/server/src/index.ts"
-fi
+# 链路测试固定直跑源码，避免 stale dist 掩盖新路由 / 新协议问题。
+SERVER_ENTRY="pnpm --filter @deepcode/server exec tsx $ROOT_DIR/server/src/index.ts"
 
 DEEPCODE_PORT="$TEST_PORT" \
 DEEPCODE_HOST="127.0.0.1" \
@@ -227,6 +222,64 @@ echo "$TERMINAL_CAP_BODY" | jq -e '
     && pass "/api/terminal/capabilities 返回结构正确" \
     || { fail "/api/terminal/capabilities 字段断言失败"; exit 9; }
 
+info "[6a/6] stage 7 trace ledger smoke"
+TRACE_SESSION_BODY="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{"initialMode":"plan"}' "$AGENT_SESSIONS_URL" || true)"
+info "trace session -> $TRACE_SESSION_BODY"
+TRACE_SESSION_ID="$(echo "$TRACE_SESSION_BODY" | jq -r '.data.session.id // empty' 2>/dev/null || true)"
+if [ -z "$TRACE_SESSION_ID" ]; then
+    fail "Agent trace smoke session 创建失败"; exit 10
+fi
+
+TRACE_APPEND_BODY="$(jq -nc --arg sid "$TRACE_SESSION_ID" --arg ts "$(date -Iseconds)" '{
+  events: [
+    {id:"evt-trace-user", sessionId:$sid, ts:$ts, kind:"user_msg", payload:{content:"trace smoke", channel:"user", visibility:"conversation", turnId:"evt-trace-user", sequence:1}},
+    {id:"evt-trace-stage-start", sessionId:$sid, ts:$ts, kind:"workflow_stage", payload:{stage:"complete", status:"started", profileId:"smoke-profile", channel:"task", visibility:"task", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", sequence:2}},
+    {id:"evt-trace-reasoning", sessionId:$sid, ts:$ts, kind:"assistant_msg", payload:{stage:"complete", content:"thinking trace smoke", channel:"reasoning", visibility:"trace", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", sequence:3}},
+    {id:"evt-trace-progress", sessionId:$sid, ts:$ts, kind:"assistant_msg", payload:{stage:"complete", content:"I will propose a command.", channel:"progress", visibility:"conversation", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", sequence:4}},
+    {id:"evt-trace-tool-call", sessionId:$sid, ts:$ts, kind:"tool_call", payload:{id:"tool-smoke", name:"shell.propose", arguments:{command:"echo trace-smoke"}, channel:"tool", visibility:"conversation", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", batchId:"batch-smoke", batchLabel:"执行命令", sequence:5}},
+    {id:"evt-trace-tool-result", sessionId:$sid, ts:$ts, kind:"tool_result", payload:{callId:"tool-smoke", toolName:"shell.propose", ok:true, status:"ok", output:{dryRun:true, executed:false}, channel:"tool", visibility:"conversation", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", batchId:"batch-smoke", batchLabel:"执行命令", sequence:6}},
+    {id:"evt-trace-observe", sessionId:$sid, ts:$ts, kind:"assistant_msg", payload:{stage:"complete", content:"Tool result checked.", channel:"observation", visibility:"conversation", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", sequence:7}},
+    {id:"evt-trace-stage-done", sessionId:$sid, ts:$ts, kind:"workflow_stage", payload:{stage:"complete", status:"completed", profileId:"smoke-profile", summary:"trace smoke completed", channel:"task", visibility:"task", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", sequence:8}},
+    {id:"evt-trace-assistant", sessionId:$sid, ts:$ts, kind:"assistant_msg", payload:{content:"trace smoke done", channel:"final", visibility:"conversation", turnId:"evt-trace-user", stageRunId:"stage-smoke", llmCallId:"llm-smoke", sequence:9}}
+  ]
+}')"
+TRACE_APPEND_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$TRACE_APPEND_BODY" "$AGENT_SESSIONS_URL/$TRACE_SESSION_ID/events" || true)"
+info "trace append -> $TRACE_APPEND_RESP"
+echo "$TRACE_APPEND_RESP" | jq -e '.ok == true and (.data.events | length >= 6)' >/dev/null 2>&1 \
+    && pass "Agent events append ok" \
+    || { fail "Agent events append 断言失败"; exit 11; }
+
+echo "$TRACE_APPEND_RESP" | jq -e '
+    .ok == true
+    and ([.data.events[].payload.channel] | index("reasoning") != null)
+    and ([.data.events[].payload.channel] | index("progress") != null)
+    and ([.data.events[].payload.channel] | index("tool") != null)
+    and ([.data.events[].payload.channel] | index("observation") != null)
+    and ([.data.events[].payload.channel] | index("final") != null)
+    and ([.data.events[].payload.batchId] | index("batch-smoke") != null)
+    and ([.data.events[].payload.sequence] == ([.data.events[].payload.sequence] | sort))
+' >/dev/null 2>&1 \
+    && pass "Agent turn timeline payload ok" \
+    || { fail "Agent turn timeline payload 断言失败"; exit 11; }
+
+TRACE_SNAPSHOT_RESP="$(curl -fsS -m 3 "$AGENT_SESSIONS_URL/$TRACE_SESSION_ID/trace" || true)"
+info "trace snapshot -> $TRACE_SNAPSHOT_RESP"
+[ -n "$TRACE_SNAPSHOT_RESP" ] \
+    || { fail "TraceLedger snapshot 返回为空"; exit 12; }
+echo "$TRACE_SNAPSHOT_RESP" | jq -e '
+    .ok == true
+    and (.data.trace.events | type == "array")
+    and ([.data.trace.events[].kind] | index("turn.started") != null)
+    and ([.data.trace.events[].kind] | index("stage.started") != null)
+    and ([.data.trace.events[].kind] | index("tool.requested") != null)
+    and ([.data.trace.events[].kind] | index("tool.completed") != null)
+    and ([.data.trace.events[].kind] | index("stage.completed") != null)
+    and ([.data.trace.events[].kind] | index("llm.completed") != null)
+    and ([.data.trace.events[].kind] | index("turn.completed") != null)
+' >/dev/null 2>&1 \
+    && pass "TraceLedger snapshot 事件映射正确" \
+    || { fail "TraceLedger snapshot 断言失败"; exit 12; }
+
 run_agent_fixture() {
     local fixture="$1"
     local mode="${2:-plan}"
@@ -262,7 +315,7 @@ parse_agent_fixture() {
     NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
 }
 
-NEXT_FAIL_CODE=10
+NEXT_FAIL_CODE=20
 
 parse_agent_fixture "001-read-search.deepcode.md" '
     .ok == true
