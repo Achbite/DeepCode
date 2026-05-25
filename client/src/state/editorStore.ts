@@ -437,9 +437,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     });
   },
 
-  /**
-   * 鍒ゆ柇鏄惁鏈変换浣曟湭淇濆瓨鐨勬枃浠�
-   */
+  /** 判断是否有未保存的文件 */
   hasAnyDirtyFile: () => {
     const state = get();
     return state.tabs.some((tab) => tab.kind === 'file' && tab.isDirty);
