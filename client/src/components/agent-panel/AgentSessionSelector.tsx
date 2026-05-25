@@ -45,6 +45,10 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
     () => sessions.filter((item) => !item.archivedAt),
     [sessions]
   );
+  const newDisabled = Boolean(loading || (session && isEmptySession(session)));
+  const newTitle = session && isEmptySession(session)
+    ? 'Current session is empty'
+    : 'New Agent session';
 
   return (
     <div className="agent-session-bar">
@@ -61,9 +65,9 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
       <button
         className="agent-session-bar__new"
         type="button"
-        disabled={loading}
+        disabled={newDisabled}
         onClick={onNew}
-        title="New Agent session"
+        title={newTitle}
       >
         +
       </button>
@@ -72,7 +76,7 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
         <div className="agent-session-menu">
           <div className="agent-session-menu__header">
             <span>Current Workspace</span>
-            <button type="button" onClick={onNew} disabled={loading}>New</button>
+            <button type="button" onClick={onNew} disabled={newDisabled} title={newTitle}>New</button>
           </div>
           <div className="agent-session-menu__list">
             {activeSessions.length === 0 && (

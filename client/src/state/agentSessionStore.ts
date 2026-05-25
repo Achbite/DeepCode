@@ -162,6 +162,10 @@ function currentWorkspaceScopeKey(): string {
   return scope.workspaceHash ?? scope.workspaceId ?? 'no-workspace';
 }
 
+function isEmptyAgentSession(session: AgentSession | null | undefined): boolean {
+  return Boolean(session) && (session?.eventCount ?? 0) === 0;
+}
+
 export const useAgentSessionStore = create<Store>((set, get) => ({
   session: null,
   sessions: [],
@@ -242,6 +246,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   },
 
   createNewSession: async () => {
+    if (isEmptyAgentSession(get().session)) {
+      set({ errorMessage: null });
+      return;
+    }
     const settings = useSettingsStore.getState().effectiveSettings;
     const initialMode = settingMode(settings['agent.defaultMode']);
     const result = await createAgentSession({ initialMode, ...currentWorkspaceScope() });
