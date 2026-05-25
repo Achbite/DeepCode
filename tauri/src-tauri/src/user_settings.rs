@@ -65,37 +65,72 @@ fn build_default_settings() -> BTreeMap<String, JsonValue> {
     m.insert("files.encoding".into(), JsonValue::from("utf8"));
     m.insert("files.eol".into(), JsonValue::from("\n"));
 
-    m.insert("keyboard.enableBasicShortcuts".into(), JsonValue::from(true));
+    m.insert(
+        "keyboard.enableBasicShortcuts".into(),
+        JsonValue::from(true),
+    );
     m.insert("explorer.confirmDelete".into(), JsonValue::from(false));
 
     m.insert("workbench.colorTheme".into(), JsonValue::from("vs-dark"));
     m.insert("workbench.language".into(), JsonValue::from("zh-CN"));
-    m.insert("workbench.styleTokenOverrides".into(), JsonValue::from("{}"));
+    m.insert(
+        "workbench.styleTokenOverrides".into(),
+        JsonValue::from("{}"),
+    );
 
     m.insert(
         "terminal.integrated.defaultProfile.windows".into(),
         JsonValue::from("wsl"),
     );
-    m.insert("terminal.integrated.prewarm".into(), JsonValue::from("afterStartup"));
-    m.insert("terminal.integrated.spawnTimeoutMs".into(), JsonValue::from(8000));
+    m.insert(
+        "terminal.integrated.prewarm".into(),
+        JsonValue::from("afterStartup"),
+    );
+    m.insert(
+        "terminal.integrated.spawnTimeoutMs".into(),
+        JsonValue::from(8000),
+    );
 
     m.insert("agent.defaultMode".into(), JsonValue::from("plan"));
     m.insert("agent.defaultWorkflow".into(), JsonValue::from("planFirst"));
-    m.insert("agent.permissions.allowFileRead".into(), JsonValue::from(true));
-    m.insert("agent.permissions.allowFileWrite".into(), JsonValue::from(true));
-    m.insert("agent.permissions.allowCodeSearch".into(), JsonValue::from(true));
-    m.insert("agent.permissions.allowShellPropose".into(), JsonValue::from(true));
-    m.insert("agent.permissions.allowShellExec".into(), JsonValue::from(true));
-    m.insert("agent.shell.autoExecuteCommands".into(), JsonValue::from(false));
+    m.insert(
+        "agent.permissions.allowFileRead".into(),
+        JsonValue::from(true),
+    );
+    m.insert(
+        "agent.permissions.allowFileWrite".into(),
+        JsonValue::from(true),
+    );
+    m.insert(
+        "agent.permissions.allowCodeSearch".into(),
+        JsonValue::from(true),
+    );
+    m.insert(
+        "agent.permissions.allowShellPropose".into(),
+        JsonValue::from(true),
+    );
+    m.insert(
+        "agent.permissions.allowShellExec".into(),
+        JsonValue::from(true),
+    );
+    m.insert(
+        "agent.shell.autoExecuteCommands".into(),
+        JsonValue::from(false),
+    );
     m.insert(
         "agent.shell.commandBlacklist".into(),
-        JsonValue::from("rm -rf, del /f, format, shutdown, reboot, git reset --hard, git clean -fd"),
+        JsonValue::from(
+            "rm -rf, del /f, format, shutdown, reboot, git reset --hard, git clean -fd",
+        ),
     );
 
     m.insert("skills.pythonPath".into(), JsonValue::from("python"));
     m.insert("skills.autoLoad".into(), JsonValue::from(true));
     m.insert("skills.mounts".into(), JsonValue::from("[]"));
-    m.insert("prompt.defaultProfileId".into(), JsonValue::from("default-agent"));
+    m.insert(
+        "prompt.defaultProfileId".into(),
+        JsonValue::from("default-agent"),
+    );
     m.insert(
         "prompt.profiles".into(),
         JsonValue::from("[{\"id\":\"default-agent\",\"name\":\"Default Agent\",\"description\":\"Default coding assistant profile\",\"systemPrompt\":\"You are DeepCode Agent. Work inside the current workspace, explain important risks, and ask for approval before writing files.\",\"enabled\":true}]"),
@@ -247,12 +282,11 @@ fn persist_overrides(s: &State) -> Result<(), String> {
         .ok_or_else(|| "持久化路径无父目录".to_string())?;
     fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败: {}", e))?;
 
-    let tmp = s.store_path.with_extension(format!(
-        "json.{}.tmp",
-        std::process::id()
-    ));
-    let json = serde_json::to_string_pretty(&s.overrides)
-        .map_err(|e| format!("序列化失败: {}", e))?;
+    let tmp = s
+        .store_path
+        .with_extension(format!("json.{}.tmp", std::process::id()));
+    let json =
+        serde_json::to_string_pretty(&s.overrides).map_err(|e| format!("序列化失败: {}", e))?;
     fs::write(&tmp, json).map_err(|e| format!("写入临时文件失败: {}", e))?;
     fs::rename(&tmp, &s.store_path).map_err(|e| format!("rename 失败: {}", e))?;
     Ok(())

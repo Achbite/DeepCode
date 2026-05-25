@@ -9,8 +9,8 @@
 // debug 模式仍保留控制台便于查看 println! / panic 信息。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod commands;
 mod agent;
+mod commands;
 mod fs;
 mod llm_profiles;
 mod terminal;
@@ -70,6 +70,8 @@ fn main() {
             commands::create_agent_session,
             commands::get_current_agent_session,
             commands::append_agent_events,
+            commands::get_agent_event_snapshot,
+            commands::ack_agent_event,
             commands::list_agent_tools,
             commands::evaluate_agent_permission,
             commands::execute_agent_tool,
@@ -82,9 +84,6 @@ fn main() {
             commands::set_browser_inspect_mode,
             commands::get_selected_panel_snapshot,
             commands::attach_panel_snapshot_to_agent,
-            // Stub
-            commands::llm_invoke_stub,
-            commands::skill_invoke_stub,
             // 窗口管理
             commands::window_close_ask_status,
         ])

@@ -281,7 +281,12 @@ impl TerminalManager {
         &self,
         request: CreateTerminalSessionRequest,
     ) -> Result<TerminalSession, TerminalError> {
-        let order = self.state.lock().expect("terminal state poisoned").sessions.len() as u32;
+        let order = self
+            .state
+            .lock()
+            .expect("terminal state poisoned")
+            .sessions
+            .len() as u32;
         let id_number = self.next_id.fetch_add(1, Ordering::SeqCst);
         let id = format!("term-{}-{}", Utc::now().timestamp_millis(), id_number);
         let now = now_iso();
@@ -289,7 +294,9 @@ impl TerminalManager {
             .shell_kind
             .unwrap_or_else(|| default_shell_kind_fast().to_string());
         let cwd = request.cwd.unwrap_or_else(default_cwd_string);
-        let name = request.name.unwrap_or_else(|| format!("Terminal {}", order + 1));
+        let name = request
+            .name
+            .unwrap_or_else(|| format!("Terminal {}", order + 1));
 
         let session = TerminalSession {
             id: id.clone(),
@@ -357,7 +364,10 @@ impl TerminalManager {
             &mut state,
             session_id,
             "status",
-            Some(format!("resize accepted: {}x{}", request.cols, request.rows)),
+            Some(format!(
+                "resize accepted: {}x{}",
+                request.cols, request.rows
+            )),
             None,
         );
         let record = state
@@ -482,8 +492,20 @@ fn spawn_session_async(
                         record.session.shell_kind = shell.kind;
                         record.session.cwd = shell.cwd;
                         record.session.updated_at = now_iso();
-                        push_event_locked(&mut state, &session_id, "ready", Some("ready".into()), None);
-                        push_event_locked(&mut state, &session_id, "status", Some("running".into()), None);
+                        push_event_locked(
+                            &mut state,
+                            &session_id,
+                            "ready",
+                            Some("ready".into()),
+                            None,
+                        );
+                        push_event_locked(
+                            &mut state,
+                            &session_id,
+                            "status",
+                            Some("running".into()),
+                            None,
+                        );
                     }
                 }
                 if let Some(stdout) = stdout {
@@ -499,7 +521,13 @@ fn spawn_session_async(
                     record.session.status = "error".into();
                     record.session.updated_at = now_iso();
                 }
-                push_event_locked(&mut state, &session_id, "error", Some(err.to_string()), None);
+                push_event_locked(
+                    &mut state,
+                    &session_id,
+                    "error",
+                    Some(err.to_string()),
+                    None,
+                );
             }
         }
     });
@@ -508,13 +536,11 @@ fn spawn_session_async(
 fn throttle_spawn(state: Arc<Mutex<TerminalState>>) {
     let wait = {
         let state = state.lock().expect("terminal state poisoned");
-        state
-            .last_spawn_at
-            .and_then(|instant| {
-                let elapsed = instant.elapsed();
-                let interval = Duration::from_millis(KILL_SPAWN_THROTTLE_MS);
-                (elapsed < interval).then_some(interval - elapsed + Duration::from_millis(50))
-            })
+        state.last_spawn_at.and_then(|instant| {
+            let elapsed = instant.elapsed();
+            let interval = Duration::from_millis(KILL_SPAWN_THROTTLE_MS);
+            (elapsed < interval).then_some(interval - elapsed + Duration::from_millis(50))
+        })
     };
     if let Some(wait) = wait {
         thread::sleep(wait);
@@ -672,9 +698,7 @@ fn resolve_shell(kind: Option<&str>, cwd: Option<&str>) -> Result<ShellSpec, Ter
     let requested = kind
         .map(str::to_string)
         .unwrap_or_else(|| default_shell_kind_fast().to_string());
-    let cwd = cwd
-        .map(str::to_string)
-        .unwrap_or_else(default_cwd_string);
+    let cwd = cwd.map(str::to_string).unwrap_or_else(default_cwd_string);
 
     match requested.as_str() {
         "wsl" => {
@@ -690,7 +714,12 @@ fn resolve_shell(kind: Option<&str>, cwd: Option<&str>) -> Result<ShellSpec, Ter
         }
         "powershell" => Ok(ShellSpec {
             kind: "powershell".into(),
-            command: if cfg!(windows) { "powershell.exe" } else { "pwsh" }.into(),
+            command: if cfg!(windows) {
+                "powershell.exe"
+            } else {
+                "pwsh"
+            }
+            .into(),
             args: vec!["-NoLogo".into()],
             cwd,
         }),
@@ -712,7 +741,12 @@ fn resolve_shell(kind: Option<&str>, cwd: Option<&str>) -> Result<ShellSpec, Ter
         }),
         _ => Ok(ShellSpec {
             kind: "bash".into(),
-            command: if cfg!(windows) { "wsl.exe" } else { "/bin/bash" }.into(),
+            command: if cfg!(windows) {
+                "wsl.exe"
+            } else {
+                "/bin/bash"
+            }
+            .into(),
             args: if cfg!(windows) {
                 if !wsl_available() {
                     return Err(TerminalError::WslMissing);

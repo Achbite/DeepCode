@@ -109,6 +109,40 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn reasoning_value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().filter_map(reasoning_value_to_string).collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        Value::Object(_) => string_field(value, "content")
+            .or_else(|| string_field(value, "text"))
+            .or_else(|| string_field(value, "reasoning"))
+            .or_else(|| string_field(value, "summary")),
+        _ => None,
+    }
+}
+
+fn collect_openai_reasoning(message: &Value) -> Vec<String> {
+    ["reasoning_content", "reasoning", "thinking", "thoughts"]
+        .iter()
+        .filter_map(|key| message.get(*key))
+        .filter_map(reasoning_value_to_string)
+        .collect()
+}
+
 fn sanitize_profile(raw: &Value) -> Option<Value> {
     let id = string_field(raw, "id")?;
     let name = string_field(raw, "name")?;
@@ -152,8 +186,16 @@ fn read_profiles_file() -> LlmProfilesFile {
     }
     let default_profile_id = file
         .default_profile_id
-        .filter(|id| profiles.iter().any(|profile| string_field(profile, "id").as_deref() == Some(id.as_str())))
-        .or_else(|| profiles.first().and_then(|profile| string_field(profile, "id")));
+        .filter(|id| {
+            profiles
+                .iter()
+                .any(|profile| string_field(profile, "id").as_deref() == Some(id.as_str()))
+        })
+        .or_else(|| {
+            profiles
+                .first()
+                .and_then(|profile| string_field(profile, "id"))
+        });
     LlmProfilesFile {
         profiles,
         default_profile_id,
@@ -235,8 +277,11 @@ pub fn patch_profiles(request: Value) -> Result<LlmProfilesResult, String> {
             continue;
         }
         let provided_secret = secrets.and_then(|map| map.get(&id));
-        let mut next_secret_ref = string_field(&profile, "secretRef")
-            .or_else(|| previous_by_id.get(&id).and_then(|old| string_field(old, "secretRef")));
+        let mut next_secret_ref = string_field(&profile, "secretRef").or_else(|| {
+            previous_by_id
+                .get(&id)
+                .and_then(|old| string_field(old, "secretRef"))
+        });
 
         match provided_secret {
             Some(Value::String(value)) if !value.trim().is_empty() => {
@@ -275,7 +320,11 @@ pub fn patch_profiles(request: Value) -> Result<LlmProfilesResult, String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|id| seen.contains(id))
-        .or_else(|| next_profiles.first().and_then(|profile| string_field(profile, "id")));
+        .or_else(|| {
+            next_profiles
+                .first()
+                .and_then(|profile| string_field(profile, "id"))
+        });
 
     let file = LlmProfilesFile {
         profiles: next_profiles,
@@ -300,7 +349,8 @@ fn secret_for_profile(profile: &Value) -> Option<String> {
 }
 
 fn normalize_openai_url(profile: &Value) -> String {
-    let base = string_field(profile, "baseUrl").unwrap_or_else(|| "https://api.openai.com/v1".into());
+    let base =
+        string_field(profile, "baseUrl").unwrap_or_else(|| "https://api.openai.com/v1".into());
     let base = base.trim_end_matches('/');
     if base.ends_with("/chat/completions") {
         base.to_string()
@@ -373,7 +423,11 @@ fn openai_messages(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-async fn call_openai_compatible(profile: &Value, api_key: &str, request: &Value) -> Result<Value, String> {
+async fn call_openai_compatible(
+    profile: &Value,
+    api_key: &str,
+    request: &Value,
+) -> Result<Value, String> {
     let messages = request
         .get("messages")
         .and_then(Value::as_array)
@@ -412,9 +466,14 @@ async fn call_openai_compatible(profile: &Value, api_key: &str, request: &Value)
         .await
         .map_err(|err| format!("LLM response read failed: {err}"))?;
     if !status.is_success() {
-        return Err(format!("LLM HTTP {}: {}", status.as_u16(), text.chars().take(500).collect::<String>()));
+        return Err(format!(
+            "LLM HTTP {}: {}",
+            status.as_u16(),
+            text.chars().take(500).collect::<String>()
+        ));
     }
-    let json: Value = serde_json::from_str(&text).map_err(|err| format!("LLM JSON parse failed: {err}"))?;
+    let json: Value =
+        serde_json::from_str(&text).map_err(|err| format!("LLM JSON parse failed: {err}"))?;
     let message = json
         .get("choices")
         .and_then(Value::as_array)
@@ -423,6 +482,9 @@ async fn call_openai_compatible(profile: &Value, api_key: &str, request: &Value)
         .cloned()
         .unwrap_or_else(|| json!({}));
     let mut chunks = Vec::new();
+    for reasoning in collect_openai_reasoning(&message) {
+        chunks.push(json!({ "type": "reasoning_delta", "content": reasoning }));
+    }
     if let Some(content) = string_field(&message, "content") {
         if !content.is_empty() {
             chunks.push(json!({ "type": "delta", "content": content }));
@@ -442,7 +504,8 @@ async fn call_openai_compatible(profile: &Value, api_key: &str, request: &Value)
             .get("function")
             .and_then(|function| string_field(function, "arguments"))
             .unwrap_or_else(|| "{}".into());
-        let arguments = serde_json::from_str::<Value>(&arguments_raw).unwrap_or(Value::String(arguments_raw));
+        let arguments =
+            serde_json::from_str::<Value>(&arguments_raw).unwrap_or(Value::String(arguments_raw));
         chunks.push(json!({
             "type": "tool_call",
             "toolCall": {
@@ -458,7 +521,8 @@ async fn call_openai_compatible(profile: &Value, api_key: &str, request: &Value)
 
 pub async fn probe_profile(request: Value) -> Result<Value, String> {
     let body = request.get("request").unwrap_or(&request);
-    let profile_id = string_field(body, "profileId").ok_or_else(|| "missing profileId".to_string())?;
+    let profile_id =
+        string_field(body, "profileId").ok_or_else(|| "missing profileId".to_string())?;
     let profile = profile_by_id(&profile_id)?;
     if profile.get("enabled").and_then(Value::as_bool) == Some(false) {
         return Err("LLM profile is disabled".into());
@@ -506,7 +570,8 @@ pub async fn probe_profile(request: Value) -> Result<Value, String> {
 
 pub async fn chat(request: Value) -> Result<Value, String> {
     let body = request.get("request").unwrap_or(&request);
-    let profile_id = string_field(body, "profileId").ok_or_else(|| "missing profileId".to_string())?;
+    let profile_id =
+        string_field(body, "profileId").ok_or_else(|| "missing profileId".to_string())?;
     let profile = profile_by_id(&profile_id)?;
     if profile.get("enabled").and_then(Value::as_bool) == Some(false) {
         return Err("LLM profile is disabled".into());

@@ -243,8 +243,7 @@ pub fn read_text_file(
 ) -> Result<FileReadResult, String> {
     let full_path = resolve_and_validate(folder_root, relative_path)?;
 
-    let metadata = fs::metadata(&full_path)
-        .map_err(|e| format!("读取文件元数据失败: {}", e))?;
+    let metadata = fs::metadata(&full_path).map_err(|e| format!("读取文件元数据失败: {}", e))?;
 
     if metadata.is_dir() {
         return Err(format!("路径是目录，不是文件: {}", relative_path));
@@ -271,8 +270,7 @@ pub fn read_text_file(
     let content = if binary {
         String::new()
     } else {
-        fs::read_to_string(&full_path)
-            .map_err(|e| format!("读取文件内容失败: {}", e))?
+        fs::read_to_string(&full_path).map_err(|e| format!("读取文件内容失败: {}", e))?
     };
 
     Ok(FileReadResult {
@@ -305,12 +303,10 @@ pub fn write_text_file(
 
     // 确保父目录存在
     if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("创建父目录失败: {}", e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {}", e))?;
     }
 
-    fs::write(&full_path, content)
-        .map_err(|e| format!("写入文件失败: {}", e))?;
+    fs::write(&full_path, content).map_err(|e| format!("写入文件失败: {}", e))?;
 
     let size_bytes = fs::metadata(&full_path)
         .map(|m| m.len())
@@ -355,12 +351,10 @@ pub fn create_file(
     }
 
     if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("创建父目录失败: {}", e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {}", e))?;
     }
 
-    fs::write(&full_path, initial_content)
-        .map_err(|e| format!("写入文件失败: {}", e))?;
+    fs::write(&full_path, initial_content).map_err(|e| format!("写入文件失败: {}", e))?;
 
     let size_bytes = fs::metadata(&full_path)
         .map(|m| m.len())
@@ -390,8 +384,7 @@ pub fn create_folder(
 
     let mut created = true;
     if full_path.exists() {
-        let meta = fs::metadata(&full_path)
-            .map_err(|e| format!("读取元数据失败: {}", e))?;
+        let meta = fs::metadata(&full_path).map_err(|e| format!("读取元数据失败: {}", e))?;
         if meta.is_file() {
             return Err(format!("file_already_exists: {}", relative_path));
         }
@@ -399,8 +392,7 @@ pub fn create_folder(
         created = false;
     }
 
-    fs::create_dir_all(&full_path)
-        .map_err(|e| format!("创建目录失败: {}", e))?;
+    fs::create_dir_all(&full_path).map_err(|e| format!("创建目录失败: {}", e))?;
 
     Ok(CreateFolderResult {
         folder_id: folder_id.into(),
@@ -430,11 +422,9 @@ pub fn rename_entry(
         return Err(format!("file_already_exists: {}", new_path));
     }
     if let Some(parent) = new_full.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("创建目标父目录失败: {}", e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("创建目标父目录失败: {}", e))?;
     }
-    fs::rename(&old_full, &new_full)
-        .map_err(|e| format!("重命名失败: {}", e))?;
+    fs::rename(&old_full, &new_full).map_err(|e| format!("重命名失败: {}", e))?;
 
     Ok(RenameEntryResult {
         folder_id: folder_id.into(),
@@ -460,8 +450,7 @@ pub fn browse_path(absolute_path: &str) -> Result<BrowsePathResult, String> {
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .filter(|p| !p.is_empty());
 
-    let entries = fs::read_dir(&target)
-        .map_err(|e| format!("读取目录失败: {}", e))?;
+    let entries = fs::read_dir(&target).map_err(|e| format!("读取目录失败: {}", e))?;
 
     let mut result: Vec<BrowseEntry> = Vec::new();
 
@@ -471,7 +460,9 @@ pub fn browse_path(absolute_path: &str) -> Result<BrowsePathResult, String> {
         let full_path = entry.path();
         let abs_entry = full_path.to_string_lossy().replace('\\', "/");
 
-        let metadata = entry.metadata().map_err(|e| format!("读取元数据失败: {}", e))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|e| format!("读取元数据失败: {}", e))?;
 
         let is_dir = metadata.is_dir();
         let is_code_ws = !is_dir && name.to_lowercase().ends_with(".code-workspace");
@@ -480,20 +471,24 @@ pub fn browse_path(absolute_path: &str) -> Result<BrowsePathResult, String> {
         result.push(BrowseEntry {
             name,
             absolute_path: abs_entry,
-            entry_type: if is_dir { "directory".into() } else { "file".into() },
+            entry_type: if is_dir {
+                "directory".into()
+            } else {
+                "file".into()
+            },
             is_code_workspace: is_code_ws,
             hidden,
         });
     }
 
     // 排序：目录优先 + 名称升序
-    result.sort_by(|a, b| {
-        match (a.entry_type.as_str(), b.entry_type.as_str()) {
+    result.sort_by(
+        |a, b| match (a.entry_type.as_str(), b.entry_type.as_str()) {
             ("directory", "file") => std::cmp::Ordering::Less,
             ("file", "directory") => std::cmp::Ordering::Greater,
             _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
-    });
+        },
+    );
 
     Ok(BrowsePathResult {
         absolute_path: abs_posix,
@@ -610,8 +605,8 @@ fn resolve_and_validate(folder_root: &str, relative_path: &str) -> Result<PathBu
 fn is_binary_file(path: &Path) -> Result<bool, String> {
     let mut file = fs::File::open(path).map_err(|e| format!("打开文件失败: {}", e))?;
     let mut buf = [0u8; BINARY_SNIFF_SIZE];
-    let n = std::io::Read::read(&mut file, &mut buf)
-        .map_err(|e| format!("读取文件头部失败: {}", e))?;
+    let n =
+        std::io::Read::read(&mut file, &mut buf).map_err(|e| format!("读取文件头部失败: {}", e))?;
     Ok(buf[..n].contains(&0))
 }
 

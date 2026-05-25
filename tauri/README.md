@@ -1,7 +1,7 @@
 # DeepCode Tauri 子包
 
 > 桌面壳工程：前端复用 `@deepcode/client`，后端使用 Rust + Tauri v2，
-> 系统级能力（原生 dialog、LLM 网关、Skill 运行时桥）通过 `#[tauri::command]` 暴露给前端。
+> 系统级能力（原生 dialog、工作区文件、终端、LLM profile/chat、Agent runtime）通过 `#[tauri::command]` 暴露给前端。
 
 ## 目录结构
 
@@ -15,7 +15,10 @@ tauri/
     capabilities/default.json Tauri v2 权限集（仅 core + dialog）
     src/
       main.rs                 应用入口（注册插件与命令）
-      commands.rs             命令实现（pick_workspace_path / LLM / Skill stub）
+      commands.rs             Tauri command 薄转发层
+      agent.rs                打包态 Agent session / tool / trace runtime
+      llm_profiles.rs         LLM profile、secret 与 chat 调用
+      terminal.rs             用户终端与 Agent 临时 shell runtime
     icons/                    应用图标资源（待设计稿替换）
 ```
 
@@ -40,9 +43,10 @@ pnpm tauri:build
 
 ## 命令说明
 
-| 命令 | 用途 | 状态 |
+| 命令族 | 用途 | 状态 |
 | --- | --- | --- |
-| `get_app_version` | 返回 Tauri app 版本 | 已实现 |
-| `pick_workspace_path` | 弹原生 dialog 选目录 | 已实现 |
-| `llm_invoke_stub` | LLM 网关空操作占位 | NotImplemented |
-| `skill_invoke_stub` | Skill 运行时桥空操作占位 | NotImplemented |
+| Runtime / Workspace / File | 运行状态、工作区打开、文件树、文本读写 | 已实现 |
+| LLM Profiles / Chat | DeepSeek / OpenAI-compatible profile、probe、chat | 已实现 |
+| Agent Session | 会话、消息、权限、工具、事件快照、TraceLedger | 已实现 |
+| Terminal | 用户终端、WSL 探测、Agent 临时 shell | 已实现 |
+| Internal Browser | Browser 骨架、inspect/snapshot/attach 占位 | 接口预留 |
