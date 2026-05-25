@@ -1,0 +1,32 @@
+{
+  "description": "WorkflowMachine should replan when complete is blocked by a test failure.",
+  "initial": {
+    "sessionId": "fixture-workflow-transition",
+    "phase": "complete",
+    "status": "running",
+    "iteration": 0,
+    "maxIterations": 2,
+    "observations": []
+  },
+  "outcome": {
+    "kind": "complete.blocked",
+    "reason": "test_failed",
+    "evidence": [
+      {
+        "id": "obs-test-failed",
+        "kind": "shell_exit_code",
+        "summary": "Fixture test command failed.",
+        "ok": false
+      }
+    ],
+    "suggestedRepair": "Replan around the failing test evidence."
+  },
+  "expected": {
+    "phase": "plan",
+    "status": "running",
+    "iteration": 1,
+    "transitionFrom": "complete",
+    "transitionTo": "plan",
+    "transitionReason": "test_failed"
+  }
+}

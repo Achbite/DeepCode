@@ -113,6 +113,28 @@ else
     fail "typecheck 失败"; exit 3
 fi
 
+info "[3b/6] agent-core WorkflowMachine fixture"
+node --input-type=module <<'NODE'
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+import {
+  transitionWorkflowState,
+  isWorkflowTerminal,
+} from './packages/agent-core/dist/index.js';
+
+const fixture = JSON.parse(fs.readFileSync('./fixtures/agent-actions/008-workflow-transition.deepcode.json', 'utf8'));
+const result = transitionWorkflowState(fixture.initial, fixture.outcome);
+
+assert.equal(result.state.phase, fixture.expected.phase);
+assert.equal(result.state.status, fixture.expected.status);
+assert.equal(result.state.iteration, fixture.expected.iteration);
+assert.equal(result.transition.from, fixture.expected.transitionFrom);
+assert.equal(result.transition.to, fixture.expected.transitionTo);
+assert.equal(result.transition.reason, fixture.expected.transitionReason);
+assert.equal(isWorkflowTerminal(result.state), false);
+NODE
+pass "WorkflowMachine complete.blocked(test_failed) -> plan fixture ok"
+
 # ---- 4. 启动 server 并 ping ----
 info "[4/6] start server on port $TEST_PORT"
 # 优先用已构建产物（dist/index.js）；不存在则用 tsx 直跑源码
