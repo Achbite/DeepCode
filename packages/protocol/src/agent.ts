@@ -17,6 +17,7 @@ export type AgentTraceEventKind =
   | 'stage.started'
   | 'stage.completed'
   | 'stage.failed'
+  | 'context.budget'
   | 'llm.requested'
   | 'llm.completed'
   | 'tool.requested'

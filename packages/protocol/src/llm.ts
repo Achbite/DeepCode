@@ -6,8 +6,9 @@ export type LlmProviderKind =
   | 'codex'
   | 'ollama';
 
-export type LlmReasoningEffort = 'low' | 'medium' | 'high';
+export type LlmReasoningEffort = 'low' | 'medium' | 'high' | 'max';
 export type LlmThinkingMode = 'enabled' | 'disabled';
+export type LlmResponseFormat = { type: 'json_object' };
 
 export interface LlmProviderProfile {
   id: string;
@@ -15,6 +16,8 @@ export interface LlmProviderProfile {
   kind: LlmProviderKind;
   baseUrl?: string;
   model: string;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
   maxTokens?: number;
   temperature?: number;
   reasoningEffort?: LlmReasoningEffort;
@@ -45,9 +48,10 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     kind: 'openaiCompatible',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     model: 'deepseek-v4-flash',
-    maxTokens: 4096,
+    contextWindowTokens: 1000000,
+    maxOutputTokens: 384000,
     temperature: 0.2,
-    reasoningEffort: 'medium',
+    reasoningEffort: 'high',
     thinking: 'enabled',
     enabled: true,
   },
@@ -57,9 +61,10 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     kind: 'openaiCompatible',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     model: 'deepseek-v4-pro',
-    maxTokens: 4096,
+    contextWindowTokens: 1000000,
+    maxOutputTokens: 384000,
     temperature: 0.2,
-    reasoningEffort: 'high',
+    reasoningEffort: 'max',
     thinking: 'enabled',
     enabled: true,
   },
@@ -80,6 +85,7 @@ export interface PatchLlmProfilesRequest {
 export interface LlmChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  reasoningContent?: string;
   toolCalls?: ToolCall[];
   toolCallId?: string;
 }
@@ -89,6 +95,9 @@ export interface LlmChatRequest {
   messages: LlmChatMessage[];
   tools?: ToolDefinition[];
   stream?: boolean;
+  providerUserId?: string;
+  responseFormat?: LlmResponseFormat;
+  providerOptions?: Record<string, unknown>;
 }
 
 export interface LlmChatChunk {
@@ -100,6 +109,7 @@ export interface LlmChatChunk {
 
 export interface LlmChatResult {
   chunks: LlmChatChunk[];
+  assistantMessage?: LlmChatMessage;
 }
 
 export interface LlmProbeRequest {
