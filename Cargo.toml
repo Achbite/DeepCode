@@ -1,0 +1,32 @@
+[workspace]
+members = [
+  "crates/deepcode-kernel-abi",
+  "crates/deepcode-kernel-core",
+  "crates/deepcode-kernel-config",
+  "crates/deepcode-kernel-policy",
+  "crates/deepcode-kernel-prompt",
+  "crates/deepcode-kernel-skills",
+  "crates/deepcode-kernel-workflow",
+  "crates/deepcode-kernel-ledger",
+]
+exclude = ["tauri/src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+authors = ["DeepCode Team"]
+
+[workspace.dependencies]
+deepcode-kernel-abi = { path = "crates/deepcode-kernel-abi" }
+deepcode-kernel-config = { path = "crates/deepcode-kernel-config" }
+deepcode-kernel-ledger = { path = "crates/deepcode-kernel-ledger" }
+deepcode-kernel-policy = { path = "crates/deepcode-kernel-policy" }
+deepcode-kernel-prompt = { path = "crates/deepcode-kernel-prompt" }
+deepcode-kernel-skills = { path = "crates/deepcode-kernel-skills" }
+deepcode-kernel-workflow = { path = "crates/deepcode-kernel-workflow" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
