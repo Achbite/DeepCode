@@ -3,11 +3,12 @@
 # DeepCode 容器内链路测试脚本（根目录版本，进容器后直接 ./test.sh）
 # 职责：
 #   1. 环境检查：rust / node / pnpm / pkg / mingw / 网络
-#   2. 协议包构建：生成 @deepcode/protocol dist 类型
-#   3. 静态检查：本阶段相关 protocol + server typecheck（不强依赖前端 Monaco 环境）
-#   4. 链路 ping：启动 server → 探测 /api/health → 关闭
-#   5. 关键工作区接口烟雾测试：默认空工作区 + 主动打开工作区
-#   6. 阶段 6T 自动测试：Agent action parser、fixture runner、权限状态
+#   2. 阶段 0 Kernel 骨架检查：根级 Rust workspace cargo check/test
+#   3. 协议包构建：生成 @deepcode/protocol dist 类型
+#   4. 静态检查：本阶段相关 protocol + server typecheck（不强依赖前端 Monaco 环境）
+#   5. 链路 ping：启动 server → 探测 /api/health → 关闭
+#   6. 关键工作区接口烟雾测试：默认空工作区 + 主动打开工作区
+#   7. Agent 自动测试：action parser、fixture runner、权限状态、会话和 Trace
 # 设计要点：
 #   - 不长时间挂起，整体目标 < 60s
 #   - 任一关键阶段失败立即非零退出，便于 CI 接入
@@ -23,6 +24,13 @@ export PATH="/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/l
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+# /mnt/e 等 DrvFs 挂载点上可能残留 root-owned target/；阶段 0 Rust 骨架检查统一写入 /tmp。
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/deepcode-cargo-target}"
+ROOT_CARGO_LOCK_WAS_PRESENT=0
+if [ -f "$ROOT_DIR/Cargo.lock" ]; then
+    ROOT_CARGO_LOCK_WAS_PRESENT=1
+fi
+
 # 默认端口与 health 路径与 server/src/services/configService.ts、healthRoutes.ts 对齐
 TEST_PORT="${DEEPCODE_TEST_PORT:-31246}"
 HEALTH_URL="http://127.0.0.1:${TEST_PORT}/api/health"
@@ -34,12 +42,14 @@ TERMINAL_SESSIONS_URL="http://127.0.0.1:${TEST_PORT}/api/terminal/sessions"
 TERMINAL_EVENTS_URL="http://127.0.0.1:${TEST_PORT}/api/terminal/events"
 AGENT_PARSE_URL="http://127.0.0.1:${TEST_PORT}/api/agent/parse-actions"
 AGENT_FIXTURE_URL="http://127.0.0.1:${TEST_PORT}/api/agent/fixtures/run"
+AGENT_PERMISSION_EVALUATE_URL="http://127.0.0.1:${TEST_PORT}/api/agent/permissions/evaluate"
 AGENT_TOOL_EXECUTE_URL="http://127.0.0.1:${TEST_PORT}/api/agent/tools/execute"
 AGENT_PROMPT_LAYERS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/prompt-layers"
 AGENT_SKILLS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/skills"
 AGENT_SESSIONS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/sessions"
 LOG_FILE="/tmp/_deepcode_server_$$.log"
 PID_FILE="/tmp/_deepcode_server_$$.pid"
+WORKSPACE_BINDING_SMOKE_DIR=""
 
 pass() { echo -e "\033[32m[PASS]\033[0m $*"; }
 fail() { echo -e "\033[31m[FAIL]\033[0m $*"; }
@@ -78,6 +88,12 @@ cleanup() {
         rm -f "$PID_FILE"
     fi
     rm -f "$LOG_FILE"
+    if [ -n "${WORKSPACE_BINDING_SMOKE_DIR:-}" ]; then
+        rm -rf "$WORKSPACE_BINDING_SMOKE_DIR"
+    fi
+    if [ "${ROOT_CARGO_LOCK_WAS_PRESENT:-0}" = "0" ]; then
+        rm -f "$ROOT_DIR/Cargo.lock"
+    fi
 }
 trap cleanup EXIT
 
@@ -85,10 +101,11 @@ echo "============================================================"
 echo " DeepCode link-test  ($(date -Is))"
 echo " ROOT_DIR=$ROOT_DIR"
 echo " TEST_PORT=$TEST_PORT"
+echo " CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 echo "============================================================"
 
 # ---- 1. 环境检查 ----
-info "[1/6] tooling versions"
+info "[1/7] tooling versions"
 require_tool rustc "使用 rustup 安装 Rust toolchain。" || exit 1
 require_tool cargo "使用 rustup 安装 Rust toolchain。" || exit 1
 require_tool node "安装 Node.js 20+，例如通过 nvm 安装并启用 LTS/Current 版本。" || exit 1
@@ -99,23 +116,31 @@ command -v x86_64-w64-mingw32-gcc >/dev/null \
     || info "mingw-w64 未就绪（不影响本测试）"
 pass "tooling ok"
 
-# ---- 2. 协议包构建 ----
-info "[2/6] pnpm --filter @deepcode/protocol build && pnpm --filter @deepcode/agent-core build"
+# ---- 2. 阶段 0 Kernel 骨架检查 ----
+info "[2/7] stage 0 rust kernel workspace cargo check/test"
+if cargo check --workspace && cargo test --workspace; then
+    pass "stage 0 rust kernel workspace check/test ok"
+else
+    fail "stage 0 rust kernel workspace check/test 失败"; exit 2
+fi
+
+# ---- 3. 协议包构建 ----
+info "[3/7] pnpm --filter @deepcode/protocol build && pnpm --filter @deepcode/agent-core build"
 if pnpm --filter @deepcode/protocol build && pnpm --filter @deepcode/agent-core build; then
     pass "protocol/agent-core build ok"
 else
-    fail "protocol/agent-core build 失败"; exit 2
+    fail "protocol/agent-core build 失败"; exit 3
 fi
 
-# ---- 3. 静态类型检查 ----
-info "[3/6] protocol + agent-core + server typecheck"
+# ---- 4. 静态类型检查 ----
+info "[4/7] protocol + agent-core + server typecheck"
 if pnpm --filter @deepcode/protocol typecheck && pnpm --filter @deepcode/agent-core typecheck && pnpm --filter @deepcode/server typecheck; then
     pass "protocol/agent-core/server typecheck ok"
 else
-    fail "typecheck 失败"; exit 3
+    fail "typecheck 失败"; exit 4
 fi
 
-info "[3b/6] agent-core WorkflowMachine fixture"
+info "[4b/7] agent-core WorkflowMachine fixture"
 node --input-type=module <<'NODE'
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
@@ -203,7 +228,7 @@ NODE
 pass "WorkflowMachine complete.blocked(test_failed) -> plan fixture ok"
 pass "StageOutcome parser structured/fallback fixture ok"
 
-info "[3c/6] DeepSeek V4 profile capability defaults"
+info "[4c/7] DeepSeek V4 profile capability defaults"
 node --input-type=module <<'NODE'
 import assert from 'node:assert/strict';
 import {
@@ -225,8 +250,8 @@ assert.equal(pro?.reasoningEffort, 'max');
 NODE
 pass "DeepSeek V4 1M context/max output defaults ok"
 
-# ---- 4. 启动 server 并 ping ----
-info "[4/6] start server on port $TEST_PORT"
+# ---- 5. 启动 server 并 ping ----
+info "[5/7] start server on port $TEST_PORT"
 # 链路测试固定直跑源码，避免 stale dist 掩盖新路由 / 新协议问题。
 SERVER_ENTRY="pnpm --filter @deepcode/server exec tsx $ROOT_DIR/server/src/index.ts"
 
@@ -249,7 +274,7 @@ done
 if [ "$ready" -ne 1 ]; then
     fail "server 启动失败 / health 端点不通；最后 30 行日志："
     tail -n 30 "$LOG_FILE" || true
-    exit 4
+    exit 5
 fi
 pass "server up, health endpoint reachable"
 
@@ -259,11 +284,11 @@ WS_BODY="$(curl -fsS -m 2 "$WS_URL" || true)"
 info "health  -> $HEALTH_BODY"
 info "current -> $WS_BODY"
 
-# ---- 5. 关键接口字段烟雾断言 ----
-info "[5/6] smoke assertions"
+# ---- 6. 关键接口字段烟雾断言 ----
+info "[6/7] smoke assertions"
 echo "$HEALTH_BODY" | jq -e '.ok == true' >/dev/null 2>&1 \
     && pass "/api/health 返回 ok=true" \
-    || { fail "/api/health 字段断言失败"; exit 5; }
+    || { fail "/api/health 字段断言失败"; exit 6; }
 
 # 默认应为空工作区；后续测试再主动打开 ROOT_DIR。
 echo "$WS_BODY" | jq -e '
@@ -272,7 +297,92 @@ echo "$WS_BODY" | jq -e '
     and (.data.fallbackUsed | type == "boolean")
 ' >/dev/null 2>&1 \
     && pass "/api/workspaces/current 默认空工作区结构正确" \
-    || { fail "/api/workspaces/current 默认空工作区断言失败"; exit 6; }
+    || { fail "/api/workspaces/current 默认空工作区断言失败"; exit 7; }
+
+NO_WS_PERMISSION_BODY="$(jq -nc '{
+  mode: "askBeforeWrite",
+  toolCall: {
+    id: "no-workspace-write-deny",
+    name: "fs.write",
+    arguments: {
+      path: "_agent_tmp_no_workspace.txt",
+      content: "blocked\n"
+    }
+  }
+}')"
+NO_WS_PERMISSION_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$NO_WS_PERMISSION_BODY" "$AGENT_PERMISSION_EVALUATE_URL" || true)"
+info "no workspace fs.write permission preflight -> $NO_WS_PERMISSION_RESP"
+echo "$NO_WS_PERMISSION_RESP" | jq -e '
+    .ok == true
+    and .data.action == "deny"
+    and (.data.reason | contains("no_workspace"))
+    and (.data.request | not)
+' >/dev/null 2>&1 \
+    && pass "no workspace fs.write 在权限卡片前被拒绝" \
+    || { fail "no workspace fs.write 权限前置校验失败"; exit 8; }
+
+WORKSPACE_BINDING_SMOKE_DIR="$(mktemp -d /tmp/deepcode-binding-smoke-XXXXXX)"
+WORKSPACE_BINDING_FILE="$WORKSPACE_BINDING_SMOKE_DIR/CPP_Project.code-workspace"
+printf '{\n  "folders": [\n    { "path": "." }\n  ],\n  "settings": {}\n}\n' > "$WORKSPACE_BINDING_FILE"
+WORKSPACE_BINDING_WRITE_BODY="$(jq -nc --arg openPath "$WORKSPACE_BINDING_FILE" '{
+  mode: "askBeforeWrite",
+  approved: true,
+  workspaceBinding: {
+    workspaceId: "binding-smoke",
+    workspaceHash: "binding-smoke",
+    openPath: $openPath,
+    activeFolderId: "wf-0"
+  },
+  toolCall: {
+    id: "binding-write-create",
+    name: "fs.write",
+    arguments: {
+      path: "_agent_tmp_workspace_binding.txt",
+      content: "workspace binding smoke\n"
+    }
+  }
+}')"
+WORKSPACE_BINDING_WRITE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$WORKSPACE_BINDING_WRITE_BODY" "$AGENT_TOOL_EXECUTE_URL" || true)"
+info "workspace binding fs.write restore -> $WORKSPACE_BINDING_WRITE_RESP"
+echo "$WORKSPACE_BINDING_WRITE_RESP" | jq -e '.ok == true and .data.ok == true and .data.output.saved == true and .data.output.path == "_agent_tmp_workspace_binding.txt"' >/dev/null 2>&1 \
+    && grep -q 'workspace binding smoke' "$WORKSPACE_BINDING_SMOKE_DIR/_agent_tmp_workspace_binding.txt" \
+    && pass "workspaceBinding openPath can restore workspace and write file" \
+    || { fail "workspaceBinding fs.write restore failed"; exit 9; }
+
+WORKSPACE_BINDING_READ_BODY="$(jq -nc '{
+  mode: "plan",
+  toolCall: {
+    id: "binding-read-created",
+    name: "fs.read",
+    arguments: {
+      path: "_agent_tmp_workspace_binding.txt"
+    }
+  }
+}')"
+WORKSPACE_BINDING_READ_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$WORKSPACE_BINDING_READ_BODY" "$AGENT_TOOL_EXECUTE_URL" || true)"
+info "workspace binding fs.read -> $WORKSPACE_BINDING_READ_RESP"
+echo "$WORKSPACE_BINDING_READ_RESP" | jq -e '.ok == true and .data.ok == true and (.data.output.content | contains("workspace binding smoke"))' >/dev/null 2>&1 \
+    && pass "workspaceBinding restored workspace can read file" \
+    || { fail "workspaceBinding fs.read failed"; exit 10; }
+
+WORKSPACE_BINDING_DIFF_BODY="$(jq -nc '{
+  mode: "plan",
+  toolCall: {
+    id: "binding-diff-created",
+    name: "fs.diff",
+    arguments: {
+      path: "_agent_tmp_workspace_binding.txt",
+      newContent: "workspace binding smoke updated\n"
+    }
+  }
+}')"
+WORKSPACE_BINDING_DIFF_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$WORKSPACE_BINDING_DIFF_BODY" "$AGENT_TOOL_EXECUTE_URL" || true)"
+info "workspace binding fs.diff -> $WORKSPACE_BINDING_DIFF_RESP"
+echo "$WORKSPACE_BINDING_DIFF_RESP" | jq -e '.ok == true and .data.ok == true and (.data.output | contains("workspace binding smoke updated"))' >/dev/null 2>&1 \
+    && pass "workspaceBinding restored workspace can diff file" \
+    || { fail "workspaceBinding fs.diff failed"; exit 11; }
+
+rm -f "$WORKSPACE_BINDING_SMOKE_DIR/_agent_tmp_workspace_binding.txt"
 
 OPEN_BODY="$(jq -nc --arg path "$ROOT_DIR" '{path: $path}')"
 OPEN_WS_BODY="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$OPEN_BODY" "$OPEN_WS_URL" || true)"
@@ -284,10 +394,10 @@ echo "$OPEN_WS_BODY" | jq -e '
     and (.data.workspace.folders[0].id | type == "string")
 ' >/dev/null 2>&1 \
     && pass "/api/workspaces/open 可打开项目根目录" \
-    || { fail "/api/workspaces/open 字段断言失败"; exit 7; }
+    || { fail "/api/workspaces/open 字段断言失败"; exit 12; }
 
-# ---- 6. 阶段 6T Agent 行为格式化脚本测试 ----
-info "[6/6] stage 6T Agent action fixture assertions"
+# ---- 7. Agent 行为格式化脚本测试 ----
+info "[7/7] Agent action fixture assertions"
 
 SHELL_BODY="$(curl -fsS -m 3 "$RUNTIME_SHELL_URL" || true)"
 info "runtime shell -> $SHELL_BODY"
@@ -298,7 +408,7 @@ echo "$SHELL_BODY" | jq -e '
     and (.data.problems | type == "array")
 ' >/dev/null 2>&1 \
     && pass "/api/runtime/shell 返回结构正确" \
-    || { fail "/api/runtime/shell 字段断言失败"; exit 8; }
+    || { fail "/api/runtime/shell 字段断言失败"; exit 9; }
 
 TERMINAL_CAP_BODY="$(curl -fsS -m 3 "$TERMINAL_CAP_URL" || true)"
 info "terminal capabilities -> $TERMINAL_CAP_BODY"
@@ -309,9 +419,9 @@ echo "$TERMINAL_CAP_BODY" | jq -e '
     and (.data.shell | type == "object")
 ' >/dev/null 2>&1 \
     && pass "/api/terminal/capabilities 返回结构正确" \
-    || { fail "/api/terminal/capabilities 字段断言失败"; exit 9; }
+    || { fail "/api/terminal/capabilities 字段断言失败"; exit 10; }
 
-info "[6a/6] stage 7 trace ledger smoke"
+info "[7a/7] trace ledger smoke"
 TRACE_SESSION_BODY="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{"initialMode":"plan"}' "$AGENT_SESSIONS_URL" || true)"
 info "trace session -> $TRACE_SESSION_BODY"
 TRACE_SESSION_ID="$(echo "$TRACE_SESSION_BODY" | jq -r '.data.session.id // empty' 2>/dev/null || true)"
@@ -349,12 +459,12 @@ echo "$TRACE_APPEND_RESP" | jq -e '
     and ([.data.events[].payload.sequence] == ([.data.events[].payload.sequence] | sort))
 ' >/dev/null 2>&1 \
     && pass "Agent turn timeline payload ok" \
-    || { fail "Agent turn timeline payload 断言失败"; exit 11; }
+    || { fail "Agent turn timeline payload 断言失败"; exit 12; }
 
 TRACE_SNAPSHOT_RESP="$(curl -fsS -m 3 "$AGENT_SESSIONS_URL/$TRACE_SESSION_ID/trace" || true)"
 info "trace snapshot -> $TRACE_SNAPSHOT_RESP"
 [ -n "$TRACE_SNAPSHOT_RESP" ] \
-    || { fail "TraceLedger snapshot 返回为空"; exit 12; }
+    || { fail "TraceLedger snapshot 返回为空"; exit 13; }
 echo "$TRACE_SNAPSHOT_RESP" | jq -e '
     .ok == true
     and (.data.trace.events | type == "array")
@@ -368,9 +478,9 @@ echo "$TRACE_SNAPSHOT_RESP" | jq -e '
     and ([.data.trace.events[].kind] | index("turn.completed") != null)
 ' >/dev/null 2>&1 \
     && pass "TraceLedger snapshot 事件映射正确" \
-    || { fail "TraceLedger snapshot 断言失败"; exit 12; }
+    || { fail "TraceLedger snapshot 断言失败"; exit 14; }
 
-info "[6b/6] stage 8 agent session switch smoke"
+info "[7b/7] agent session switch smoke"
 S8_SCOPE="s8-session-smoke"
 S8_SESSION_A_BODY="$(jq -nc --arg scope "$S8_SCOPE" '{initialMode:"plan", workspaceHash:$scope, title:"S8 Alpha"}')"
 S8_SESSION_A_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$S8_SESSION_A_BODY" "$AGENT_SESSIONS_URL" || true)"
@@ -379,7 +489,7 @@ S8_SESSION_B_BODY="$(jq -nc --arg scope "$S8_SCOPE" '{initialMode:"plan", worksp
 S8_SESSION_B_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$S8_SESSION_B_BODY" "$AGENT_SESSIONS_URL" || true)"
 S8_SESSION_B_ID="$(echo "$S8_SESSION_B_RESP" | jq -r '.data.session.id // empty' 2>/dev/null || true)"
 if [ -z "$S8_SESSION_A_ID" ] || [ -z "$S8_SESSION_B_ID" ]; then
-    fail "Agent session smoke 创建失败"; exit 13
+    fail "Agent session smoke 创建失败"; exit 15
 fi
 
 S8_LIST_RESP="$(curl -fsS -m 3 "$AGENT_SESSIONS_URL?workspaceHash=$S8_SCOPE" || true)"
@@ -390,29 +500,29 @@ echo "$S8_LIST_RESP" | jq -e --arg sid "$S8_SESSION_B_ID" '
     and ([.data.sessions[].id] | index($sid) != null)
 ' >/dev/null 2>&1 \
     && pass "Agent session list/current ok" \
-    || { fail "Agent session list/current 断言失败"; exit 14; }
+    || { fail "Agent session list/current 断言失败"; exit 16; }
 
 S8_ACTIVATE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{}' "$AGENT_SESSIONS_URL/$S8_SESSION_A_ID/activate" || true)"
 echo "$S8_ACTIVATE_RESP" | jq -e --arg sid "$S8_SESSION_A_ID" '.ok == true and .data.session.id == $sid' >/dev/null 2>&1 \
     && pass "Agent session activate ok" \
-    || { fail "Agent session activate 断言失败"; exit 15; }
+    || { fail "Agent session activate 断言失败"; exit 17; }
 
 S8_RENAME_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -X PATCH -d '{"title":"S8 Alpha Renamed"}' "$AGENT_SESSIONS_URL/$S8_SESSION_A_ID" || true)"
 echo "$S8_RENAME_RESP" | jq -e '.ok == true and .data.session.title == "S8 Alpha Renamed"' >/dev/null 2>&1 \
     && pass "Agent session rename ok" \
-    || { fail "Agent session rename 断言失败"; exit 16; }
+    || { fail "Agent session rename 断言失败"; exit 18; }
 
 S8_ARCHIVE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{"archived":true}' "$AGENT_SESSIONS_URL/$S8_SESSION_B_ID/archive" || true)"
 echo "$S8_ARCHIVE_RESP" | jq -e --arg sid "$S8_SESSION_B_ID" '.ok == true and ([.data.sessions[].id] | index($sid) == null)' >/dev/null 2>&1 \
     && pass "Agent session archive ok" \
-    || { fail "Agent session archive 断言失败"; exit 17; }
+    || { fail "Agent session archive 断言失败"; exit 19; }
 
-info "[6c/6] agent run cancel endpoint smoke"
+info "[7c/7] agent run cancel endpoint smoke"
 CANCEL_SESSION_BODY="$(jq -nc --arg scope "agent-cancel-smoke" '{initialMode:"plan", workspaceHash:$scope, title:"Cancel Smoke"}')"
 CANCEL_SESSION_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$CANCEL_SESSION_BODY" "$AGENT_SESSIONS_URL" || true)"
 CANCEL_SESSION_ID="$(echo "$CANCEL_SESSION_RESP" | jq -r '.data.session.id // empty' 2>/dev/null || true)"
 if [ -z "$CANCEL_SESSION_ID" ]; then
-    fail "Agent cancel smoke session create failed"; exit 18
+    fail "Agent cancel smoke session create failed"; exit 20
 fi
 CANCEL_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{}' "$AGENT_SESSIONS_URL/$CANCEL_SESSION_ID/cancel" || true)"
 info "agent cancel -> $CANCEL_RESP"
@@ -422,7 +532,7 @@ echo "$CANCEL_RESP" | jq -e '
     and ([.data.events[].payload.channel] | index("final") != null)
 ' >/dev/null 2>&1 \
     && pass "Agent run cancel endpoint ok" \
-    || { fail "Agent run cancel endpoint assertion failed"; exit 19; }
+    || { fail "Agent run cancel endpoint assertion failed"; exit 21; }
 
 run_agent_fixture() {
     local fixture="$1"
@@ -459,7 +569,7 @@ parse_agent_fixture() {
     NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
 }
 
-NEXT_FAIL_CODE=20
+NEXT_FAIL_CODE=22
 
 parse_agent_fixture "001-read-search.deepcode.md" '
     .ok == true
@@ -555,6 +665,29 @@ PACKAGE_HASH_AFTER="$(sha256sum "$ROOT_DIR/package.json" | awk '{print $1}')"
 [ "$PACKAGE_HASH_BEFORE" = "$PACKAGE_HASH_AFTER" ] \
     && pass "askBeforeWrite 未审批 fs.write 未写盘" \
     || { fail "askBeforeWrite 未审批 fs.write 修改了文件"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+
+ABS_WRITE_PERMISSION_BODY="$(jq -nc '{
+  mode: "askBeforeWrite",
+  toolCall: {
+    id: "absolute-write-deny",
+    name: "fs.write",
+    arguments: {
+      path: "/tmp/deepcode-agent-test.txt",
+      content: "blocked\n"
+    }
+  }
+}')"
+ABS_WRITE_PERMISSION_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$ABS_WRITE_PERMISSION_BODY" "$AGENT_PERMISSION_EVALUATE_URL" || true)"
+info "absolute fs.write permission preflight -> $ABS_WRITE_PERMISSION_RESP"
+echo "$ABS_WRITE_PERMISSION_RESP" | jq -e '
+    .ok == true
+    and .data.action == "deny"
+    and (.data.reason | contains("workspace-relative"))
+    and (.data.request | not)
+' >/dev/null 2>&1 \
+    && pass "absolute fs.write 在权限卡片前被拒绝" \
+    || { fail "absolute fs.write 权限前置校验失败"; exit "$NEXT_FAIL_CODE"; }
 NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
 
 WRITE_SMOKE_DIR="$(mktemp -d /tmp/deepcode-write-smoke-XXXXXX)"
@@ -693,10 +826,11 @@ info "prompt layers -> $PROMPT_LAYERS_BODY"
 info "skills -> $SKILLS_BODY"
 echo "$PROMPT_LAYERS_BODY" | jq -e '.ok == true and (.data.layers | type == "array") and (.data.layers | length >= 1)' >/dev/null 2>&1 \
     && pass "prompt layers 接口可用" \
-    || { fail "prompt layers 断言失败"; exit 18; }
+    || { fail "prompt layers 断言失败"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
 echo "$SKILLS_BODY" | jq -e '.ok == true and (.data.skills | type == "array")' >/dev/null 2>&1 \
     && pass "skills 接口可用" \
-    || { fail "skills 断言失败"; exit 19; }
+    || { fail "skills 断言失败"; exit "$NEXT_FAIL_CODE"; }
 
 echo ""
 echo "============================================================"
