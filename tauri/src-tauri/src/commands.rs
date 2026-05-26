@@ -6,6 +6,8 @@
 // file, terminal, LLM profile, and Agent behavior should live in their own
 // modules so Web and Tauri can share the same front-end runtime contract.
 use serde::Serialize;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
 use thiserror::Error;
@@ -585,26 +587,78 @@ pub fn submit_agent_feedback(
     agent_state.append_feedback_trace(request)
 }
 
-fn browser_runtime_stub(
-    message: &str,
-    inspect_state: &str,
+#[derive(Default)]
+struct BrowserRuntimeStubState {
     current_url: Option<String>,
-) -> serde_json::Value {
+    inspect_state: String,
+    last_action: Option<String>,
+    last_action_at: Option<String>,
+    last_action_result: Option<String>,
+    attached: bool,
+}
+
+static BROWSER_RUNTIME_STUB_STATE: OnceLock<Mutex<BrowserRuntimeStubState>> = OnceLock::new();
+
+fn browser_runtime_state() -> &'static Mutex<BrowserRuntimeStubState> {
+    BROWSER_RUNTIME_STUB_STATE.get_or_init(|| {
+        Mutex::new(BrowserRuntimeStubState {
+            inspect_state: "off".to_string(),
+            ..BrowserRuntimeStubState::default()
+        })
+    })
+}
+
+fn browser_action_time() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn record_browser_action(state: &mut BrowserRuntimeStubState, action: &str, result: &str) {
+    state.last_action = Some(action.to_string());
+    state.last_action_at = Some(browser_action_time());
+    state.last_action_result = Some(result.to_string());
+}
+
+fn browser_runtime_stub(message: &str, state: &BrowserRuntimeStubState) -> serde_json::Value {
     serde_json::json!({
         "status": "idle",
-        "inspectState": inspect_state,
-        "currentUrl": current_url,
+        "inspectState": state.inspect_state.clone(),
+        "currentUrl": state.current_url.clone(),
         "message": message,
-        "snapshot": null
+        "snapshot": null,
+        "lastAction": state.last_action.clone(),
+        "lastActionAt": state.last_action_at.clone(),
+        "capabilities": {
+            "status": "available",
+            "openTargetRecording": "available",
+            "reloadRecording": "available",
+            "inspectModeRecording": "available",
+            "domCapture": "reserved",
+            "agentAttachment": "reserved"
+        },
+        "diagnostics": {
+            "currentUrl": state.current_url.clone(),
+            "runtimeStatus": "idle",
+            "inspectState": state.inspect_state.clone(),
+            "hasSnapshot": false,
+            "attached": state.attached,
+            "lastAction": state.last_action.clone(),
+            "lastActionAt": state.last_action_at.clone(),
+            "lastActionResult": state.last_action_result.clone()
+        }
     })
 }
 
 #[tauri::command]
 pub fn get_browser_runtime_status() -> serde_json::Value {
+    let state = browser_runtime_state()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     browser_runtime_stub(
         "Internal browser runtime is a skeleton only. Real preview loading, DOM capture, and Agent attachment are reserved for a later stage.",
-        "off",
-        None,
+        &state,
     )
 }
 
@@ -623,15 +677,29 @@ pub fn open_browser_preview(request: serde_json::Value) -> serde_json::Value {
         }
         None => "Preview target is empty. Real loading is not implemented yet.".to_string(),
     };
-    browser_runtime_stub(&message, "off", current_url)
+    let mut state = browser_runtime_state()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    state.current_url = current_url;
+    state.inspect_state = "off".to_string();
+    let result = if state.current_url.is_some() {
+        "ok"
+    } else {
+        "unavailable"
+    };
+    record_browser_action(&mut state, "open", result);
+    browser_runtime_stub(&message, &state)
 }
 
 #[tauri::command]
 pub fn reload_browser_preview() -> serde_json::Value {
+    let mut state = browser_runtime_state()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    record_browser_action(&mut state, "reload", "ok");
     browser_runtime_stub(
         "Reload requested. Real browser reload is not implemented yet.",
-        "off",
-        None,
+        &state,
     )
 }
 
@@ -645,11 +713,20 @@ pub fn set_browser_inspect_mode(request: serde_json::Value) -> serde_json::Value
         .unwrap_or("off");
     let message =
         format!("Inspect mode set to {inspect_state}. DOM selection is not implemented yet.");
-    browser_runtime_stub(&message, inspect_state, None)
+    let mut state = browser_runtime_state()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    state.inspect_state = inspect_state.to_string();
+    record_browser_action(&mut state, "inspect", "ok");
+    browser_runtime_stub(&message, &state)
 }
 
 #[tauri::command]
 pub fn get_selected_panel_snapshot() -> serde_json::Value {
+    let mut state = browser_runtime_state()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    record_browser_action(&mut state, "snapshot", "reserved");
     serde_json::json!({
         "snapshot": null,
         "message": "No panel snapshot is available yet. DOM capture is reserved for a later stage."
@@ -658,6 +735,11 @@ pub fn get_selected_panel_snapshot() -> serde_json::Value {
 
 #[tauri::command]
 pub fn attach_panel_snapshot_to_agent() -> serde_json::Value {
+    let mut state = browser_runtime_state()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    state.attached = false;
+    record_browser_action(&mut state, "attach", "reserved");
     serde_json::json!({
         "attached": false,
         "snapshot": null,

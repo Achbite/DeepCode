@@ -9,6 +9,12 @@ interface PanelSnapshotCardProps {
   language: UiLanguage;
 }
 
+function boundingRectText(snapshot: PanelSemanticSnapshot): string | null {
+  if (!snapshot.boundingRect) return null;
+  const { x, y, width, height } = snapshot.boundingRect;
+  return `x:${x} y:${y} w:${width} h:${height}`;
+}
+
 const PanelSnapshotCard: React.FC<PanelSnapshotCardProps> = ({
   snapshot,
   message,
@@ -32,17 +38,45 @@ const PanelSnapshotCard: React.FC<PanelSnapshotCardProps> = ({
       </div>
       <dl>
         <div>
-          <dt>URL</dt>
+          <dt>{t(language, 'browser.url')}</dt>
           <dd>{snapshot.url}</dd>
+        </div>
+        <div>
+          <dt>{t(language, 'browser.capturedAt')}</dt>
+          <dd>{snapshot.capturedAt}</dd>
         </div>
         <div>
           <dt>{t(language, 'browser.selector')}</dt>
           <dd>{snapshot.selector}</dd>
         </div>
+        {snapshot.panelKind && (
+          <div>
+            <dt>{t(language, 'browser.panelKind')}</dt>
+            <dd>{snapshot.panelKind}</dd>
+          </div>
+        )}
+        {boundingRectText(snapshot) && (
+          <div>
+            <dt>{t(language, 'browser.boundingRect')}</dt>
+            <dd>{boundingRectText(snapshot)}</dd>
+          </div>
+        )}
         {snapshot.textContent && (
           <div>
             <dt>{t(language, 'browser.text')}</dt>
             <dd>{snapshot.textContent}</dd>
+          </div>
+        )}
+        {snapshot.sourceHints && snapshot.sourceHints.length > 0 && (
+          <div>
+            <dt>{t(language, 'browser.sourceHints')}</dt>
+            <dd>{snapshot.sourceHints.join(', ')}</dd>
+          </div>
+        )}
+        {snapshot.relatedFiles && snapshot.relatedFiles.length > 0 && (
+          <div>
+            <dt>{t(language, 'browser.relatedFiles')}</dt>
+            <dd>{snapshot.relatedFiles.join(', ')}</dd>
           </div>
         )}
       </dl>

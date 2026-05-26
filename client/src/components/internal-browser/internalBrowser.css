@@ -151,6 +151,7 @@
 }
 
 .internal-browser-panel__meta div,
+.browser-test-status-card,
 .panel-snapshot-card {
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
@@ -166,6 +167,8 @@
 }
 
 .internal-browser-panel__meta span,
+.browser-test-status-card dt,
+.browser-test-status-card__capability span,
 .panel-snapshot-card dt {
   color: var(--text-muted);
   font-size: 11px;
@@ -174,6 +177,75 @@
 .internal-browser-panel__meta strong {
   color: var(--text-main);
   font-size: 12px;
+}
+
+.browser-test-status-card {
+  padding: 12px;
+}
+
+.browser-test-status-card__title {
+  margin-bottom: 10px;
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.browser-test-status-card__capabilities {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.browser-test-status-card__capability {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.browser-test-status-card__state {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font-size: 10px;
+}
+
+.browser-test-status-card__state--available {
+  border-color: rgba(52, 199, 89, 0.32);
+  color: var(--ok);
+}
+
+.browser-test-status-card__state--reserved {
+  border-color: rgba(255, 204, 0, 0.3);
+  color: var(--warn);
+}
+
+.browser-test-status-card__diagnostics {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 12px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.browser-test-status-card__diagnostics div {
+  display: grid;
+  grid-template-columns: minmax(70px, 0.42fr) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.browser-test-status-card__diagnostics dt,
+.browser-test-status-card__diagnostics dd {
+  margin: 0;
+}
+
+.browser-test-status-card__diagnostics dd {
+  color: var(--text-main);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-word;
 }
 
 .panel-snapshot-card {

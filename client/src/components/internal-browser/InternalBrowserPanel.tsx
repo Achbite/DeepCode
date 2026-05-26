@@ -2,6 +2,7 @@ import './internalBrowser.css';
 import type React from 'react';
 import { useEffect, useState } from 'react';
 import type {
+  BrowserRuntimeCapability,
   BrowserInspectState,
   BrowserRuntimeStatusResult,
   PanelSemanticSnapshot,
@@ -19,6 +20,14 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 
 const DEFAULT_PREVIEW_URL = 'http://127.0.0.1:5173/';
+const CAPABILITY_ORDER: BrowserRuntimeCapability[] = [
+  'status',
+  'openTargetRecording',
+  'reloadRecording',
+  'inspectModeRecording',
+  'domCapture',
+  'agentAttachment',
+];
 
 type BrowserAction =
   | 'idle'
@@ -37,6 +46,14 @@ function statusMessage(
   return runtime.message ?? t(language, 'browser.status.runtime', { status: runtime.status });
 }
 
+function translatedValue(
+  language: UiLanguage,
+  keyPrefix: string,
+  value?: string | null
+): string {
+  return value ? t(language, `${keyPrefix}.${value}`) : t(language, 'browser.none');
+}
+
 const InternalBrowserPanel: React.FC = () => {
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
@@ -47,6 +64,23 @@ const InternalBrowserPanel: React.FC = () => {
   const [message, setMessage] = useState(t(language, 'browser.message.reserved'));
   const [activeAction, setActiveAction] = useState<BrowserAction>('idle');
   const [attached, setAttached] = useState(false);
+
+  const applyRuntime = (
+    data: BrowserRuntimeStatusResult,
+    nextMessage?: string
+  ) => {
+    setRuntime(data);
+    setSnapshot(data.snapshot ?? null);
+    setAttached(data.diagnostics?.attached ?? false);
+    setMessage(nextMessage ?? statusMessage(data, language));
+  };
+
+  const refreshRuntime = async (nextMessage?: string) => {
+    const response = await getBrowserRuntimeStatus();
+    if (response.ok && response.data) {
+      applyRuntime(response.data, nextMessage);
+    }
+  };
 
   const runAction = async (
     action: BrowserAction,
@@ -66,9 +100,7 @@ const InternalBrowserPanel: React.FC = () => {
       const response = await getBrowserRuntimeStatus();
       if (cancelled) return;
       if (response.ok && response.data) {
-        setRuntime(response.data);
-        setSnapshot(response.data.snapshot ?? null);
-        setMessage(statusMessage(response.data, language));
+        applyRuntime(response.data);
       } else {
         setMessage(response.message ?? t(language, 'browser.message.statusUnavailable'));
       }
@@ -97,8 +129,7 @@ const InternalBrowserPanel: React.FC = () => {
             runAction('open', async () => {
               const response = await openBrowserPreview({ url });
               if (response.ok && response.data) {
-                setRuntime(response.data);
-                setMessage(statusMessage(response.data, language));
+                applyRuntime(response.data);
               } else {
                 setMessage(response.message ?? t(language, 'browser.message.openUnavailable'));
               }
@@ -114,8 +145,7 @@ const InternalBrowserPanel: React.FC = () => {
             runAction('reload', async () => {
               const response = await reloadBrowserPreview();
               if (response.ok && response.data) {
-                setRuntime(response.data);
-                setMessage(statusMessage(response.data, language));
+                applyRuntime(response.data);
               } else {
                 setMessage(response.message ?? t(language, 'browser.message.reloadUnavailable'));
               }
@@ -132,8 +162,7 @@ const InternalBrowserPanel: React.FC = () => {
               const nextState: BrowserInspectState = inspectState === 'selecting' ? 'off' : 'selecting';
               const response = await setBrowserInspectMode({ inspectState: nextState });
               if (response.ok && response.data) {
-                setRuntime(response.data);
-                setMessage(statusMessage(response.data, language));
+                applyRuntime(response.data);
               } else {
                 setMessage(response.message ?? t(language, 'browser.message.inspectUnavailable'));
               }
@@ -153,7 +182,9 @@ const InternalBrowserPanel: React.FC = () => {
               if (response.ok && response.data) {
                 setSnapshot(response.data.snapshot);
                 setAttached(false);
-                setMessage(response.data.message ?? t(language, 'browser.message.snapshotUnavailable'));
+                await refreshRuntime(
+                  response.data.message ?? t(language, 'browser.message.snapshotUnavailable')
+                );
               } else {
                 setMessage(response.message ?? t(language, 'browser.message.snapshotCaptureUnavailable'));
               }
@@ -171,7 +202,9 @@ const InternalBrowserPanel: React.FC = () => {
               if (response.ok && response.data) {
                 setSnapshot(response.data.snapshot);
                 setAttached(response.data.attached);
-                setMessage(response.data.message ?? t(language, 'browser.message.attachmentReserved'));
+                await refreshRuntime(
+                  response.data.message ?? t(language, 'browser.message.attachmentReserved')
+                );
               } else {
                 setMessage(response.message ?? t(language, 'browser.message.attachUnavailable'));
               }
@@ -194,13 +227,57 @@ const InternalBrowserPanel: React.FC = () => {
           <div className="internal-browser-panel__meta">
             <div>
               <span>{t(language, 'browser.status')}</span>
-              <strong>{runtime?.status ?? 'idle'}</strong>
+              <strong>{translatedValue(language, 'browser.runtimeStatus', runtime?.status ?? 'idle')}</strong>
             </div>
             <div>
               <span>{t(language, 'browser.inspect')}</span>
-              <strong>{inspectState}</strong>
+              <strong>{translatedValue(language, 'browser.inspectState', inspectState)}</strong>
             </div>
           </div>
+          <section className="browser-test-status-card">
+            <div className="browser-test-status-card__title">
+              {t(language, 'browser.testStatus')}
+            </div>
+            <div className="browser-test-status-card__capabilities">
+              {CAPABILITY_ORDER.map((capability) => {
+                const state = runtime?.capabilities?.[capability] ?? 'reserved';
+                return (
+                  <div key={capability} className="browser-test-status-card__capability">
+                    <span>{t(language, `browser.capability.${capability}`)}</span>
+                    <strong className={`browser-test-status-card__state browser-test-status-card__state--${state}`}>
+                      {t(language, `browser.capabilityState.${state}`)}
+                    </strong>
+                  </div>
+                );
+              })}
+            </div>
+            <dl className="browser-test-status-card__diagnostics">
+              <div>
+                <dt>{t(language, 'browser.currentUrl')}</dt>
+                <dd>{runtime?.diagnostics?.currentUrl || t(language, 'browser.none')}</dd>
+              </div>
+              <div>
+                <dt>{t(language, 'browser.lastAction')}</dt>
+                <dd>{translatedValue(language, 'browser.action', runtime?.diagnostics?.lastAction)}</dd>
+              </div>
+              <div>
+                <dt>{t(language, 'browser.lastActionAt')}</dt>
+                <dd>{runtime?.diagnostics?.lastActionAt || t(language, 'browser.none')}</dd>
+              </div>
+              <div>
+                <dt>{t(language, 'browser.lastActionResult')}</dt>
+                <dd>{translatedValue(language, 'browser.actionResult', runtime?.diagnostics?.lastActionResult)}</dd>
+              </div>
+              <div>
+                <dt>{t(language, 'browser.hasSnapshot')}</dt>
+                <dd>{runtime?.diagnostics?.hasSnapshot ? t(language, 'browser.yes') : t(language, 'browser.no')}</dd>
+              </div>
+              <div>
+                <dt>{t(language, 'browser.snapshotAttached')}</dt>
+                <dd>{runtime?.diagnostics?.attached ? t(language, 'browser.yes') : t(language, 'browser.no')}</dd>
+              </div>
+            </dl>
+          </section>
           <PanelSnapshotCard
             snapshot={snapshot}
             message={message}
