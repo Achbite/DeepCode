@@ -445,6 +445,11 @@
   white-space: pre-wrap;
 }
 
+.agent-markdown-fallback {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .agent-message__meta,
 .agent-tool-bubble__header,
 .agent-permission__meta {

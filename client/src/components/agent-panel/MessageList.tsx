@@ -1,7 +1,7 @@
 import React from 'react';
 import type { AgentDisplayPolicy, AgentEvent, AgentEventPresentation } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import MarkdownContent from './MarkdownContent';
+import MarkdownContent from './LazyMarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
 import { compactDisplayText, sanitizeDisplayText } from './displayText';
 import { submitAgentFeedback } from '../../services/runtimeAdapter';

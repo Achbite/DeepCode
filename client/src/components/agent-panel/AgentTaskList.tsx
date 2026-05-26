@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { AgentEvent, AgentTraceEvent } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import MarkdownContent from './MarkdownContent';
+import MarkdownContent from './LazyMarkdownContent';
 import { compactDisplayText, sanitizeDisplayText } from './displayText';
 
 interface AgentTaskView {
