@@ -24,6 +24,7 @@ const AgentPanel: React.FC = () => {
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const pendingPermission = useAgentSessionStore((s) => s.pendingPermission);
+  const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
@@ -96,7 +97,12 @@ const AgentPanel: React.FC = () => {
         <PermissionRequestBubble
           request={pendingPermission.request}
           language={language}
-          disabled={loading}
+          disabled={Boolean(resolvingPermission)}
+          resolvingDecision={
+            resolvingPermission?.id === pendingPermission.request.id
+              ? resolvingPermission.decision
+              : null
+          }
           onAccept={() => void acceptPermission()}
           onReject={() => void rejectPermission()}
         />

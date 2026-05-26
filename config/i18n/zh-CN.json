@@ -402,6 +402,8 @@
     "agent.message.readyTitle": "Agent 已就绪",
     "agent.message.readyBody": "可用 @ 或资源管理器右键添加文件，然后提出聚焦任务。",
     "agent.message.thinking": "Agent 正在思考...",
+    "agent.message.expand": "展开",
+    "agent.message.collapse": "收起",
     "agent.message.copyWorkflow": "复制工作流",
     "agent.message.copyWorkflowTitle": "复制工作流输出",
     "agent.message.actions": "Agent 工作流操作",
@@ -439,7 +441,9 @@
     "agent.tool.permissionHandled": "权限已处理。",
     "agent.tool.rawPayload": "原始 payload",
     "agent.permission.accept": "接受",
-    "agent.permission.reject": "拒绝"
+    "agent.permission.reject": "拒绝",
+    "agent.permission.accepting": "已接受，执行中...",
+    "agent.permission.rejecting": "已拒绝，处理中..."
   },
   "settings": {
     "workbench.language": {

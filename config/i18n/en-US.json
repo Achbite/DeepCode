@@ -402,6 +402,8 @@
     "agent.message.readyTitle": "Agent Ready",
     "agent.message.readyBody": "Add files with @ or Explorer right click, then ask for a focused edit.",
     "agent.message.thinking": "Agent is thinking...",
+    "agent.message.expand": "Expand",
+    "agent.message.collapse": "Collapse",
     "agent.message.copyWorkflow": "Copy workflow",
     "agent.message.copyWorkflowTitle": "Copy workflow output",
     "agent.message.actions": "Agent workflow actions",
@@ -439,7 +441,9 @@
     "agent.tool.permissionHandled": "Permission handled.",
     "agent.tool.rawPayload": "Raw payload",
     "agent.permission.accept": "Accept",
-    "agent.permission.reject": "Reject"
+    "agent.permission.reject": "Reject",
+    "agent.permission.accepting": "Accepted, running...",
+    "agent.permission.rejecting": "Rejected, resolving..."
   },
   "settings": {
     "workbench.language": {

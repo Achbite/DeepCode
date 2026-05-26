@@ -33,6 +33,11 @@ interface PendingPermission {
   request: PermissionRequest;
 }
 
+type PermissionResolution = {
+  id: string;
+  decision: 'accept' | 'reject';
+};
+
 interface QueuedAgentMessage {
   content: string;
   attachments: AgentContextAttachment[];
@@ -55,6 +60,7 @@ interface AgentSessionState {
   messageAttachments: AgentContextAttachment[];
   sessionAttachments: AgentContextAttachment[];
   pendingPermission: PendingPermission | null;
+  resolvingPermission: PermissionResolution | null;
   queuedMessages: QueuedAgentMessage[];
 }
 
@@ -206,6 +212,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   messageAttachments: [],
   sessionAttachments: [],
   pendingPermission: null,
+  resolvingPermission: null,
   queuedMessages: [],
 
   loadOrCreate: async () => {
@@ -289,6 +296,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         mode: result.data.session.mode,
         profileId: result.data.session.profileId,
         pendingPermission: null,
+        resolvingPermission: null,
         errorMessage: null,
       });
       void get().refreshSessions();
@@ -311,6 +319,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         mode: result.data.session.mode,
         profileId: result.data.session.profileId,
         pendingPermission: findLatestPendingPermission(result.data.events),
+        resolvingPermission: null,
         loading: false,
       });
       void get().refreshTraceEvents(result.data.session.id);
@@ -339,7 +348,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       set({
         sessions: result.data.sessions,
         currentSessionId: result.data.currentSessionId,
-        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null } : {}),
+        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null } : {}),
       });
       if (wasActive) {
         await get().loadOrCreate();
@@ -495,6 +504,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         currentSessionId: data.session.id,
         events: data.events,
         pendingPermission: findLatestPendingPermission(data.events),
+        resolvingPermission: null,
         loading: false,
       });
       void get().refreshTraceEvents(data.session.id);
@@ -546,6 +556,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       loading: false,
       queuedMessages: [],
       pendingPermission: null,
+      resolvingPermission: null,
       errorMessage: null,
     });
 
@@ -557,6 +568,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         currentSessionId: result.data.session.id,
         events: result.data.events,
         pendingPermission: findLatestPendingPermission(result.data.events),
+        resolvingPermission: null,
         loading: false,
         errorMessage: null,
       });
@@ -583,38 +595,48 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   acceptPermission: async () => {
     const pending = get().pendingPermission;
     const session = get().session;
-    if (!pending || !session) return;
-    set({ loading: true, pendingPermission: null });
+    if (!pending || !session || get().resolvingPermission) return;
+    set({
+      loading: true,
+      resolvingPermission: { id: pending.request.id, decision: 'accept' },
+      errorMessage: null,
+    });
     const result = await resolveAgentPermission(pending.request.id, { decision: 'accept' });
     if (result.ok && result.data) {
       set({
         session: result.data.session,
         events: result.data.events,
         pendingPermission: findLatestPendingPermission(result.data.events),
+        resolvingPermission: null,
         loading: false,
       });
       void get().refreshTraceEvents(result.data.session.id);
     } else {
-      set({ errorMessage: result.message ?? 'Permission resolve failed', loading: false });
+      set({ errorMessage: result.message ?? 'Permission resolve failed', resolvingPermission: null, loading: false });
     }
   },
 
   rejectPermission: async () => {
     const pending = get().pendingPermission;
     const session = get().session;
-    if (!pending || !session) return;
-    set({ loading: true, pendingPermission: null });
+    if (!pending || !session || get().resolvingPermission) return;
+    set({
+      loading: true,
+      resolvingPermission: { id: pending.request.id, decision: 'reject' },
+      errorMessage: null,
+    });
     const result = await resolveAgentPermission(pending.request.id, { decision: 'reject' });
     if (result.ok && result.data) {
       set({
         session: result.data.session,
         events: result.data.events,
         pendingPermission: findLatestPendingPermission(result.data.events),
+        resolvingPermission: null,
         loading: false,
       });
       void get().refreshTraceEvents(result.data.session.id);
     } else {
-      set({ errorMessage: result.message ?? 'Permission resolve failed', loading: false });
+      set({ errorMessage: result.message ?? 'Permission resolve failed', resolvingPermission: null, loading: false });
     }
   },
 }));

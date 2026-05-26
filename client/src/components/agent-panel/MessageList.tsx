@@ -3,7 +3,7 @@ import type { AgentDisplayPolicy, AgentEvent, AgentEventPresentation } from '@de
 import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './MarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
-import { sanitizeDisplayText } from './displayText';
+import { compactDisplayText, sanitizeDisplayText } from './displayText';
 import { submitAgentFeedback } from '../../services/runtimeAdapter';
 
 interface MessageListProps {
@@ -15,6 +15,7 @@ interface MessageListProps {
 interface TraceGroup {
   id: string;
   events: AgentEvent[];
+  running?: boolean;
 }
 
 interface ToolBatchGroup {
@@ -50,6 +51,10 @@ const DEFAULT_AGENT_DISPLAY_POLICY: AgentDisplayPolicy = {
   },
 };
 
+const ASSISTANT_PREVIEW_TEXT_LIMIT = 180;
+const ASSISTANT_COLLAPSE_TEXT_LIMIT = 260;
+const ASSISTANT_COLLAPSE_LINE_LIMIT = 6;
+
 type RenderItem =
   | { type: 'event'; event: AgentEvent; autoOpen?: boolean }
   | { type: 'trace'; group: TraceGroup }
@@ -73,6 +78,23 @@ function payloadText(payload: unknown): string {
     stringField(payload, 'summary') ??
     (typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2) ?? 'No details')
   );
+}
+
+function shouldCollapseAssistantMessage(event: AgentEvent, text: string): boolean {
+  if (event.kind !== 'assistant_msg') return false;
+  if (eventChannel(event) === 'final') return false;
+  if (isRecord(event.payload) && event.payload.pending === true) return false;
+
+  const presentation = eventPresentation(event);
+  const channel = eventChannel(event);
+  const eligible =
+    presentation === 'collapsible' ||
+    channel === 'progress' ||
+    channel === 'observation';
+  if (!eligible) return false;
+
+  return text.length > ASSISTANT_COLLAPSE_TEXT_LIMIT ||
+    text.split('\n').length > ASSISTANT_COLLAPSE_LINE_LIMIT;
 }
 
 function titleCase(value: string): string {
@@ -286,6 +308,30 @@ function pickVisibleAssistantEvent(events: AgentEvent[]): AgentEvent | null {
   return null;
 }
 
+function hasMatchingStageResult(events: AgentEvent[], source: AgentEvent): boolean {
+  const stageRunId = eventStageRunId(source);
+  const stage = eventStage(source);
+  if (!stageRunId && !stage) return false;
+
+  return events.some((event) => {
+    if (event.kind !== 'workflow_stage') return false;
+    const status = stageStatus(event.payload);
+    if (status !== 'completed' && status !== 'error') return false;
+    if (stageRunId) return eventStageRunId(event) === stageRunId;
+    return eventStage(event) === stage;
+  });
+}
+
+function traceGroupRunning(groupEvents: AgentEvent[], turnEvents: AgentEvent[], loading: boolean): boolean {
+  if (!loading) return false;
+  return groupEvents.some((event) => {
+    const stageRunId = eventStageRunId(event);
+    const stage = eventStage(event);
+    if (!stageRunId && !stage) return false;
+    return !hasMatchingStageResult(turnEvents, event);
+  });
+}
+
 function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[] {
   const items: RenderItem[] = [];
   let index = 0;
@@ -321,6 +367,7 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
             group: {
               id: `trace-${event.id}-${groupEvents[0]?.id}`,
               events: groupEvents,
+              running: traceGroupRunning(groupEvents, turnEvents, loading),
             },
           });
           continue;
@@ -455,17 +502,14 @@ function workflowCopyText(events: AgentEvent[], language: UiLanguage): string {
   return blocks.filter(Boolean).join('\n\n---\n\n');
 }
 
-function thoughtTraceTitle(events: AgentEvent[], language: UiLanguage): string {
+function thoughtTraceTitle(events: AgentEvent[], language: UiLanguage, running = false): string {
   const stages = Array.from(
     new Set(events.map((event) => eventStage(event)).filter((stage): stage is string => Boolean(stage)))
-  );
-  const active = events.some(
-    (event) => event.kind === 'workflow_stage' && stageStatus(event.payload) === 'started'
   );
   const stageText = stages.length > 0
     ? ` - ${stages.map((stage) => localizedStage(stage, language)).join(' / ')}`
     : '';
-  const prefix = active ? t(language, 'agent.trace.thinking') : t(language, 'agent.trace.title');
+  const prefix = running ? t(language, 'agent.trace.thinking') : t(language, 'agent.trace.title');
   const countSuffix = t(language, 'agent.trace.count', { count: events.length });
   return `${prefix}${stageText} - ${countSuffix}`;
 }
@@ -528,22 +572,43 @@ function renderTraceEvent(event: AgentEvent, language: UiLanguage) {
   return <ToolCallBubble key={event.id} event={event} language={language} />;
 }
 
-function renderTraceGroup(group: TraceGroup, language: UiLanguage) {
+function TraceGroupCard({ group, language }: { group: TraceGroup; language: UiLanguage }) {
+  const [expanded, setExpanded] = React.useState(Boolean(group.running));
+  const wasRunningRef = React.useRef(Boolean(group.running));
+
+  React.useEffect(() => {
+    if (group.running) {
+      setExpanded(true);
+      wasRunningRef.current = true;
+      return;
+    }
+    if (wasRunningRef.current) {
+      setExpanded(false);
+      wasRunningRef.current = false;
+    }
+  }, [group.running]);
+
   return (
-    <details key={group.id} className="agent-thinking-trace">
-      <summary>
+    <div className={`agent-thinking-trace ${group.running ? 'agent-thinking-trace--running' : ''}`}>
+      <button
+        type="button"
+        className="agent-thinking-trace__summary"
+        onClick={() => setExpanded((value) => !value)}
+      >
         <span className="agent-thinking-trace__left">
-          <span className="agent-thinking-trace__icon">&gt;</span>
-          <span className="agent-thinking-trace__title">{thoughtTraceTitle(group.events, language)}</span>
+          <span className="agent-thinking-trace__dot" />
+          <span className="agent-thinking-trace__title">{thoughtTraceTitle(group.events, language, group.running)}</span>
         </span>
         <span className="agent-thinking-trace__hint">
-          {t(language, 'agent.trace.details')}
+          {expanded ? t(language, 'agent.ui.hide') : t(language, 'agent.ui.show')}
         </span>
-      </summary>
-      <div className="agent-thinking-trace__body">
-        {group.events.map((event) => renderTraceEvent(event, language))}
-      </div>
-    </details>
+      </button>
+      {expanded && (
+        <div className="agent-thinking-trace__body">
+          {group.events.map((event) => renderTraceEvent(event, language))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -658,6 +723,34 @@ function renderMessage(event: AgentEvent, language: UiLanguage, autoOpen = false
   const pending = isRecord(event.payload) && event.payload.pending === true;
   const text = payloadText(event.payload);
   const renderMarkdown = event.kind === 'assistant_msg' || event.kind === 'user_msg';
+  const shouldCollapse = shouldCollapseAssistantMessage(event, text);
+
+  if (shouldCollapse) {
+    return (
+      <details key={event.id} className="agent-message agent-message--assistant_msg agent-message--collapsible">
+        <summary className="agent-message-preview">
+          <span className="agent-message-preview__top">
+            <span className="agent-message-preview__meta">{speaker}</span>
+            <span className="agent-message-preview__toggle">
+              <span className="agent-message-preview__toggle-open">
+                {t(language, 'agent.message.expand')}
+              </span>
+              <span className="agent-message-preview__toggle-close">
+                {t(language, 'agent.message.collapse')}
+              </span>
+            </span>
+          </span>
+          <span className="agent-message-preview__summary">
+            {compactDisplayText(text, ASSISTANT_PREVIEW_TEXT_LIMIT)}
+          </span>
+        </summary>
+        <div className="agent-message__body agent-message__body--markdown agent-message__body--expanded">
+          <MarkdownContent content={text} />
+        </div>
+      </details>
+    );
+  }
+
   return (
     <div key={event.id} className={`agent-message agent-message--${event.kind}`}>
       <div className="agent-message__meta">
@@ -689,7 +782,7 @@ const MessageList: React.FC<MessageListProps> = ({ events, loading = false, lang
     )}
 
     {createRenderItems(events, loading).map((item) => {
-      if (item.type === 'trace') return renderTraceGroup(item.group, language);
+      if (item.type === 'trace') return <TraceGroupCard key={item.group.id} group={item.group} language={language} />;
       if (item.type === 'toolBatch') return renderToolBatch(item.group, language);
       if (item.type === 'turnActions') {
         return (
