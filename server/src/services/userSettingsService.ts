@@ -12,8 +12,8 @@
  *
  * 不在本阶段范围：Settings UI / 把这些值实时应用到 Monaco 选项 / 工作区级覆盖
  */
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import {
   DEFAULT_USER_SETTINGS,
   type UserSettings,
@@ -22,6 +22,7 @@ import {
   type PatchUserSettingsResult,
 } from '@deepcode/protocol';
 import { resolveDeepCodeSettingsDir } from './appDataPath.js';
+import { atomicWriteJsonFile } from './persistentFileService.js';
 
 // ---- 路径解析 ----
 
@@ -87,13 +88,7 @@ function mergeWithDefaults(): UserSettings {
 // ---- 原子写 ----
 
 async function persistOverrides(): Promise<void> {
-  const dir = dirname(STORE_PATH);
-  await mkdir(dir, { recursive: true });
-  const tmp = `${STORE_PATH}.${process.pid}.tmp`;
-  // 原子写：先写 tmp，再 rename。rename 在同一文件系统下是原子操作，
-  // 防止半写损坏。
-  await writeFile(tmp, JSON.stringify(overrides, null, 2), 'utf-8');
-  await rename(tmp, STORE_PATH);
+  await atomicWriteJsonFile(STORE_PATH, overrides);
 }
 
 // ---- public API ----

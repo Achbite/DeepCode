@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, rename, writeFile, appendFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, appendFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
   AgentEvent,
@@ -11,6 +11,7 @@ import type {
 } from '@deepcode/protocol';
 import { resolveDeepCodeConfigDir } from './appDataPath.js';
 import { appendAgentTraceFromEvents } from './agentTraceLedgerService.js';
+import { atomicWriteJsonFile } from './persistentFileService.js';
 
 interface SessionFileHeader {
   kind: 'session';
@@ -31,6 +32,7 @@ const events = new Map<string, AgentEvent[]>();
 const currentByWorkspace = new Map<string, string>();
 let currentSessionId: string | undefined;
 let loaded = false;
+let persistIndexQueue = Promise.resolve();
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -61,16 +63,19 @@ function sessionPath(sessionId: string): string {
   return join(SESSIONS_DIR, `${sessionId}.jsonl`);
 }
 
-async function persistIndex(): Promise<void> {
-  await ensureDir();
-  const tmp = `${SESSION_INDEX_PATH}.${process.pid}.tmp`;
+async function writeIndexSnapshot(): Promise<void> {
   const index: SessionIndexFile = {
     sessions: [...sessions.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
     currentSessionId,
     currentByWorkspace: Object.fromEntries(currentByWorkspace.entries()),
   };
-  await writeFile(tmp, JSON.stringify(index, null, 2), 'utf-8');
-  await rename(tmp, SESSION_INDEX_PATH);
+  await atomicWriteJsonFile(SESSION_INDEX_PATH, index);
+}
+
+async function persistIndex(): Promise<void> {
+  const queuedWrite = persistIndexQueue.then(writeIndexSnapshot, writeIndexSnapshot);
+  persistIndexQueue = queuedWrite.catch(() => undefined);
+  await queuedWrite;
 }
 
 async function loadIfNeeded(): Promise<void> {

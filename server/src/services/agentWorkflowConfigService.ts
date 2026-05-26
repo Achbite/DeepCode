@@ -1,5 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type {
   AgentWorkflowConfig,
   AgentWorkflowStage,
@@ -9,6 +9,7 @@ import type {
 } from '@deepcode/protocol';
 import { AGENT_WORKFLOW_STAGES } from '@deepcode/protocol';
 import { resolveDeepCodeConfigDir } from './appDataPath.js';
+import { atomicWriteJsonFile } from './persistentFileService.js';
 
 interface AgentWorkflowConfigFile {
   config: AgentWorkflowConfig;
@@ -63,10 +64,7 @@ async function loadFile(): Promise<AgentWorkflowConfigFile> {
 }
 
 async function persistFile(file: AgentWorkflowConfigFile): Promise<void> {
-  await mkdir(dirname(STORE_PATH), { recursive: true });
-  const tmp = `${STORE_PATH}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify(file, null, 2), 'utf-8');
-  await rename(tmp, STORE_PATH);
+  await atomicWriteJsonFile(STORE_PATH, file);
   cache = file;
 }
 

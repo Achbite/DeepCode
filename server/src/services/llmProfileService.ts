@@ -1,5 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type {
   LlmProviderProfile,
   LlmProfilesResult,
@@ -13,6 +13,7 @@ import {
   saveLlmSecret,
 } from './secretStore.js';
 import { ensureDefaultAgentWorkflowConfig } from './agentWorkflowConfigService.js';
+import { atomicWriteJsonFile } from './persistentFileService.js';
 
 interface LlmProfilesFile {
   profiles: LlmProviderProfile[];
@@ -97,10 +98,7 @@ async function loadProfiles(): Promise<LlmProfilesFile> {
 }
 
 async function persistProfiles(file: LlmProfilesFile): Promise<void> {
-  await mkdir(dirname(STORE_PATH), { recursive: true });
-  const tmp = `${STORE_PATH}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify(file, null, 2), 'utf-8');
-  await rename(tmp, STORE_PATH);
+  await atomicWriteJsonFile(STORE_PATH, file);
 }
 
 export async function getLlmProfiles(): Promise<LlmProfilesResult> {

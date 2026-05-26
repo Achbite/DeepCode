@@ -1,7 +1,8 @@
 import { randomBytes, createCipheriv, createDecipheriv, createHash } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile, chmod } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, readFile, writeFile, chmod } from 'node:fs/promises';
+import { join } from 'node:path';
 import { resolveDeepCodeConfigDir } from './appDataPath.js';
+import { atomicWriteJsonFile } from './persistentFileService.js';
 
 interface StoredSecret {
   iv: string;
@@ -58,10 +59,7 @@ async function loadStore(): Promise<SecretFile> {
 }
 
 async function persistStore(store: SecretFile): Promise<void> {
-  await mkdir(dirname(STORE_PATH), { recursive: true });
-  const tmp = `${STORE_PATH}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify(store, null, 2), 'utf-8');
-  await rename(tmp, STORE_PATH);
+  await atomicWriteJsonFile(STORE_PATH, store);
   try {
     await chmod(STORE_PATH, 0o600);
   } catch {
