@@ -250,6 +250,48 @@ assert.equal(pro?.reasoningEffort, 'max');
 NODE
 pass "DeepSeek V4 1M context/max output defaults ok"
 
+info "[4d/7] agent workflow structured memory fixture"
+(
+    cd server
+    pnpm exec tsx <<'TS'
+import assert from 'node:assert/strict';
+import {
+  createWorkflowStageMemory,
+  formatWorkflowStageMemory,
+  guardFinalAnswerForPendingObligations,
+  updateWorkflowStageMemoryFromToolEvents,
+} from './src/modules/agent/workflowMemory.ts';
+
+const request = '这是一个测试请求，返回你的身份信息，然后测试当前agent所有的功能组件，能否新建临时文件读写这个临时文件然后删除这个临时文件';
+const memory = createWorkflowStageMemory(request);
+assert.equal(memory.answerObligations.some((item) => item.id === 'identity'), true);
+assert.equal(memory.answerObligations.some((item) => item.id === 'toolComponentSummary'), true);
+assert.equal(memory.answerObligations.some((item) => item.id === 'tempFileLifecycleResult'), true);
+
+const prompt = formatWorkflowStageMemory(memory);
+assert.match(prompt, /Structured workflow memory/);
+assert.doesNotMatch(prompt, /Previous workflow stage output/);
+assert.match(prompt, /Current tool catalog does not include fs\.delete/);
+
+const blocked = guardFinalAnswerForPendingObligations(memory, '测试成功');
+assert.match(blocked, /DeepCode Agent/);
+assert.match(blocked, /测试未完成/);
+assert.doesNotMatch(blocked, /测试成功/);
+
+updateWorkflowStageMemoryFromToolEvents(memory, [
+  { id: '1', sessionId: 's', ts: 't', kind: 'tool_call', payload: { toolCall: { name: 'fs.list', arguments: { path: '.' } } } },
+  { id: '2', sessionId: 's', ts: 't', kind: 'tool_result', payload: { toolName: 'fs.list', ok: true, output: { path: '.' } } },
+  { id: '3', sessionId: 's', ts: 't', kind: 'tool_result', payload: { toolName: 'fs.write', ok: true, output: { path: '_agent_tmp_test.txt' } } },
+  { id: '4', sessionId: 's', ts: 't', kind: 'tool_result', payload: { toolName: 'fs.read', ok: true, output: { path: '_agent_tmp_test.txt' } } },
+  { id: '5', sessionId: 's', ts: 't', kind: 'tool_call', payload: { toolCall: { name: 'shell.exec', arguments: { command: 'rm _agent_tmp_test.txt' } } } },
+  { id: '6', sessionId: 's', ts: 't', kind: 'tool_result', payload: { toolName: 'shell.exec', ok: true, output: { exitCode: 0 } } },
+] as any);
+assert.equal(memory.pendingSteps.length, 0);
+assert.equal(guardFinalAnswerForPendingObligations(memory, '测试成功'), '测试成功');
+TS
+)
+pass "Agent workflow structured memory fixture ok"
+
 # ---- 5. 启动 server 并 ping ----
 info "[5/7] start server on port $TEST_PORT"
 # 链路测试固定直跑源码，避免 stale dist 掩盖新路由 / 新协议问题。

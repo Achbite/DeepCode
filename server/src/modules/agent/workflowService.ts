@@ -31,6 +31,13 @@ import {
   listAgentTools,
 } from './toolService.js';
 import { ensureWorkspaceBinding } from '../../services/workspaceService.js';
+import {
+  createWorkflowStageMemory,
+  formatWorkflowStageMemory,
+  guardFinalAnswerForPendingObligations,
+  updateWorkflowStageMemoryFromSegments,
+  updateWorkflowStageMemoryFromToolEvents,
+} from './workflowMemory.js';
 
 interface PendingPermission {
   sessionId: string;
@@ -173,9 +180,11 @@ const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
   plan: [
     'You are the planning stage of DeepCode Agent.',
     'Create a concise plan, name relevant files or searches, and do not request local writes or shell execution.',
+    'Do not answer the user\'s final business request in this stage. Record identity, result, and summary needs as final answer obligations for review/final.',
     'Classify the user request as directExecution or needsUserConfirmation. Clear implementation, fix, test, commit, or save requests are usually directExecution unless the user explicitly asks for a plan only.',
     'If the request is needsUserConfirmation, make the next decision explicit and do not prepare write or shell actions.',
-    'Prefer <plan> for the plan and <say> for short progress notes. If the request only needs a direct answer, use <final>.',
+    'Current tool catalog does not include fs.delete. If cleanup is needed, plan an exact workspace-scoped shell.exec cleanup step instead.',
+    'Prefer <plan> for the plan and only use <say> for short progress notes. If the request only needs a direct answer, use <final>.',
   ].join('\n'),
   check: [
     'You are the checking stage of DeepCode Agent.',
@@ -189,6 +198,8 @@ const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
     'You are the completion stage of DeepCode Agent.',
     'Use deepcode-action JSON blocks or tool calls when local reads, searches, patches, writes, or shell commands are needed.',
     'For directExecution requests, proceed with allowed read/search/diff steps and request permission only when the tool policy requires it.',
+    'Do not repeat identity text or final summary content from earlier user-visible messages; this stage owns tool progress, not the final answer.',
+    'For temporary file lifecycle tests, continue create -> read/verify -> exact shell.exec cleanup until complete, blocked, waiting for permission, or budget exhausted.',
     'When the user asks to render or return Markdown, tables, formulas, or diagrams, return the actual Markdown content, not a description of what would be returned.',
     'Before tool actions, use <say> to tell the user what you are about to inspect or run. After observations, use <observe> to explain the result. Use <final> only for the final answer.',
     'Keep human-facing progress readable; raw deepcode-action blocks are for the runtime, not the final user-facing text.',
@@ -196,7 +207,10 @@ const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
   ].join('\n'),
   review: [
     'You are the review stage of DeepCode Agent.',
-    'Produce the final user-facing answer for the conversation. Keep it direct and avoid internal audit sections unless the user asked for a review.',
+    'Produce the final user-facing answer for the conversation only when structured workflow memory shows completion criteria are satisfied.',
+    'Use Structured workflow memory as the source of facts. Do not summarize raw prior assistant prose, and do not repeat satisfied answer obligations.',
+    'If required critical steps are still pending, return a blocked/replan result instead of claiming success.',
+    'Keep the final answer direct and avoid internal audit sections unless the user asked for a review.',
     'If the user requested Markdown, tables, formulas, or diagrams, include the actual renderable Markdown in the final answer.',
     'Use <final> for the final answer.',
     'Do not perform new local operations.',
@@ -495,7 +509,8 @@ async function runParsedTextActions(
   mode: AgentMode,
   content: string,
   emit?: (events: AgentEvent[]) => Promise<void>,
-  context: EventContext = {}
+  context: EventContext = {},
+  guardFinalContent: (content: string) => string = (value) => value
 ): Promise<AgentEvent[]> {
   const events: AgentEvent[] = [];
   const deferredFinalEvents: AgentEvent[] = [];
@@ -529,7 +544,10 @@ async function runParsedTextActions(
       continue;
     }
     if (action.type === 'final') {
-      deferredFinalEvents.push(newEvent(sessionId, 'assistant_msg', withContext(action.payload, context, {
+      const finalPayload = isRecord(action.payload) && typeof action.payload.content === 'string'
+        ? { ...action.payload, content: guardFinalContent(action.payload.content) }
+        : action.payload;
+      deferredFinalEvents.push(newEvent(sessionId, 'assistant_msg', withContext(finalPayload, context, {
         channel: 'final',
         visibility: 'conversation',
         label: '最终回复',
@@ -644,32 +662,6 @@ function toolNameFromEvent(event: AgentEvent): string {
   return previewValue(event.payload.toolName ?? event.payload.name ?? toolCall?.name ?? 'tool', 120);
 }
 
-function toolObservationModelSummary(event: AgentEvent): string | null {
-  if (!isRecord(event.payload)) return null;
-  if (event.kind === 'tool_call') {
-    const toolCall = isRecord(event.payload.toolCall) ? event.payload.toolCall : event.payload;
-    const args = isRecord(toolCall.arguments) ? toolCall.arguments : {};
-    return `- Tool requested: ${toolNameFromEvent(event)} ${previewValue(args, 420)}`;
-  }
-  if (event.kind === 'tool_result') {
-    const status = typeof event.payload.ok === 'boolean'
-      ? (event.payload.ok ? 'ok' : 'error')
-      : previewValue(event.payload.status ?? 'done', 80);
-    const output = event.payload.output ?? event.payload.error ?? event.payload.summary ?? event.payload.message;
-    return `- Tool result: ${toolNameFromEvent(event)} status=${status} ${previewValue(output, 720)}`;
-  }
-  if (event.kind === 'permission_request') {
-    return `- Permission requested: ${toolNameFromEvent(event)} ${previewValue(event.payload.summary ?? event.payload, 520)}`;
-  }
-  if (event.kind === 'permission_result') {
-    return `- Permission result: ${previewValue(event.payload, 420)}`;
-  }
-  if (event.kind === 'error') {
-    return `- Runtime error: ${previewValue(event.payload, 520)}`;
-  }
-  return null;
-}
-
 function outputRecord(event: AgentEvent): Record<string, unknown> | undefined {
   return isRecord(event.payload) && isRecord(event.payload.output)
     ? event.payload.output
@@ -709,14 +701,6 @@ function toolObservationDisplaySummary(event: AgentEvent): string | null {
   return null;
 }
 
-function appendObservationContext(stageOutputs: string[], stage: AgentWorkflowStage, events: AgentEvent[]): void {
-  const summaries = events
-    .map(toolObservationModelSummary)
-    .filter((summary): summary is string => Boolean(summary));
-  if (summaries.length === 0) return;
-  stageOutputs.push(`[${stage} observations]\n${summaries.join('\n')}`);
-}
-
 function hasPendingPermission(events: AgentEvent[]): boolean {
   return events.some((event) => event.kind === 'permission_request');
 }
@@ -727,6 +711,14 @@ function hasToolOrPermissionEvents(events: AgentEvent[]): boolean {
     event.kind === 'tool_result' ||
     event.kind === 'permission_request' ||
     event.kind === 'permission_result'
+  );
+}
+
+function hasFinalAssistantEvent(events: AgentEvent[]): boolean {
+  return events.some((event) =>
+    event.kind === 'assistant_msg' &&
+    isRecord(event.payload) &&
+    event.payload.channel === 'final'
   );
 }
 
@@ -911,7 +903,7 @@ export async function sendAgentMessage(
   const languageInstruction = await resolveAgentLanguageInstruction();
   const profileCatalog = await getLlmProfiles();
   const profilesById = new Map(profileCatalog.profiles.map((profile) => [profile.id, profile]));
-  const stageOutputs: string[] = [];
+  const workflowMemory = createWorkflowStageMemory(request.content);
   const workflow = request.workflow ?? 'planFirst';
   let emittedFinal = false;
   let lastUserVisibleText = '';
@@ -944,11 +936,9 @@ export async function sendAgentMessage(
         llmCallId,
       };
 
-      const priorOutput = stageOutputs.length > 0
-        ? `\n\nPrevious workflow stage output:\n${stageOutputs.join('\n\n')}`
-        : '';
+      const structuredMemory = formatWorkflowStageMemory(workflowMemory);
       const contextBudget = contextBudgetPolicy.evaluate(
-        [promptText, request.content, priorOutput].join('\n\n'),
+        [promptText, request.content, structuredMemory].join('\n\n'),
         profile
       );
 
@@ -988,7 +978,7 @@ export async function sendAgentMessage(
         },
         {
           role: 'user',
-          content: `${request.content}${priorOutput}`,
+          content: `${request.content}\n\n${structuredMemory}`,
         },
       ];
 
@@ -1047,21 +1037,29 @@ export async function sendAgentMessage(
           })]);
         }
         if (trimmed) {
-          stageOutputs.push(`[${stage}] ${trimmed}`);
           const segments = parseTaggedSegments(trimmed, fallbackSegmentKind(stage));
           stageCallSummary = summarizeSegments(segments, 'Text output prepared.');
+          const emittedSegments: typeof segments = [];
           for (const segment of segments) {
-            const normalizedSegment = normalizeSegmentForStage(stage, segment);
+            let normalizedSegment = normalizeSegmentForStage(stage, segment);
             if (normalizedSegment.kind === 'final' && hasPlannedLocalActions) {
               continue;
             }
+            if (normalizedSegment.kind === 'final') {
+              normalizedSegment = {
+                ...normalizedSegment,
+                content: guardFinalAnswerForPendingObligations(workflowMemory, normalizedSegment.content),
+              };
+            }
             await emit([assistantSegmentEvent(sessionId, baseContext, normalizedSegment)]);
+            emittedSegments.push(normalizedSegment);
             if (normalizedSegment.kind === 'final') {
               emittedFinal = true;
               stageCallEmittedFinal = true;
             }
             if (normalizedSegment.kind !== 'reasoning') lastUserVisibleText = normalizedSegment.content;
           }
+          updateWorkflowStageMemoryFromSegments(workflowMemory, stage, emittedSegments);
         } else if (stage === 'complete' && stageToolCalls.length > 0) {
           await emit([assistantSegmentEvent(sessionId, baseContext, {
             kind: 'say',
@@ -1095,12 +1093,23 @@ export async function sendAgentMessage(
 
         if (trimmed && stage === 'complete') {
           if (runtimeActionMarkup) {
-            const parsedEvents = await runParsedTextActions(sessionId, stageMode, runtimeActionMarkup, emit, baseContext);
+            const parsedEvents = await runParsedTextActions(
+              sessionId,
+              stageMode,
+              runtimeActionMarkup,
+              emit,
+              baseContext,
+              (content) => guardFinalAnswerForPendingObligations(workflowMemory, content)
+            );
             observationEvents.push(...parsedEvents);
+            if (hasFinalAssistantEvent(parsedEvents)) {
+              emittedFinal = true;
+              stageCallEmittedFinal = true;
+            }
           }
         }
 
-        appendObservationContext(stageOutputs, stage, observationEvents);
+        updateWorkflowStageMemoryFromToolEvents(workflowMemory, observationEvents);
         if (observationEvents.length > 0) {
           const summaries = observationEvents
             .map(toolObservationDisplaySummary)
@@ -1168,6 +1177,7 @@ export async function sendAgentMessage(
   }
 
   if (!emittedFinal && !waitingForPermission && lastUserVisibleText.trim()) {
+    const fallbackFinal = guardFinalAnswerForPendingObligations(workflowMemory, lastUserVisibleText.trim());
     await emit([assistantSegmentEvent(sessionId, {
       turnId,
       stage: 'review',
@@ -1176,7 +1186,7 @@ export async function sendAgentMessage(
       llmCallId: `llm-final-${Date.now()}`,
     }, {
       kind: 'final',
-      content: lastUserVisibleText.trim(),
+      content: fallbackFinal,
     })]);
   }
 

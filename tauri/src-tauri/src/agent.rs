@@ -457,6 +457,8 @@ impl AgentManager {
 
         let context = build_prompt_text(&attachments, workspace);
         let mut stage_outputs: Vec<String> = Vec::new();
+        let needs_identity_answer = needs_identity_answer(&content);
+        let mut temp_lifecycle = TempFileLifecycle::new(needs_temp_file_lifecycle(&content));
         let mut emitted_final = false;
         let mut last_user_visible_text = String::new();
         let mut last_used_profile_id: Option<String> = None;
@@ -504,14 +506,7 @@ impl AgentManager {
                 )],
             )?;
 
-            let prior = if stage_outputs.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n\nPrevious workflow stage output:\n{}",
-                    stage_outputs.join("\n\n")
-                )
-            };
+            let prior = workflow_memory_prompt(&stage_outputs, &temp_lifecycle);
             let user_content = format!("{content}{prior}");
             let system_content = [
                 context.as_str(),
@@ -598,10 +593,18 @@ impl AgentManager {
                         )?;
                     }
                     if !trimmed.is_empty() {
-                        stage_outputs.push(format!("[{stage}] {trimmed}"));
+                        stage_outputs.push(format!(
+                            "[{stage} summary] {}",
+                            summarize_for_memory(&trimmed)
+                        ));
                         for (kind, content) in
                             parse_tagged_segments(&trimmed, fallback_segment_kind(stage))
                         {
+                            let segment_content = if kind == "final" {
+                                guard_final_answer(&content, &temp_lifecycle, needs_identity_answer)
+                            } else {
+                                content
+                            };
                             self.emit_events_direct(
                                 session_id,
                                 &mut latest,
@@ -611,14 +614,14 @@ impl AgentManager {
                                     session_id,
                                     &base_context,
                                     &kind,
-                                    &content,
+                                    &segment_content,
                                 )],
                             )?;
                             if kind == "final" {
                                 emitted_final = true;
                             }
                             if kind != "reasoning" {
-                                last_user_visible_text = content;
+                                last_user_visible_text = segment_content;
                             }
                         }
                         if stage == "complete" {
@@ -682,6 +685,7 @@ impl AgentManager {
                         }
                     }
 
+                    update_temp_file_lifecycle(&mut temp_lifecycle, &observation_events);
                     append_observation_context(&mut stage_outputs, stage, &observation_events);
                     if !observation_events.is_empty() {
                         let summaries: Vec<String> = observation_events
@@ -771,6 +775,11 @@ impl AgentManager {
         }
 
         if !emitted_final && !last_user_visible_text.trim().is_empty() {
+            let final_text = guard_final_answer(
+                last_user_visible_text.trim(),
+                &temp_lifecycle,
+                needs_identity_answer,
+            );
             let final_context = json!({
                 "turnId": turn_id,
                 "stage": "review",
@@ -787,7 +796,7 @@ impl AgentManager {
                     session_id,
                     &final_context,
                     "final",
-                    last_user_visible_text.trim(),
+                    &final_text,
                 )],
             )?;
         }
@@ -1864,10 +1873,10 @@ fn build_prompt_text(attachments: &[Value], workspace: &workspace::WorkspaceMana
 
 fn stage_prompt(stage: &str) -> &'static str {
     match stage {
-        "plan" => "You are the planning stage. Create a concise plan and classify whether this is directExecution or needsUserConfirmation. Do not request local writes or shell execution. Any planned fs.* path must be workspace-relative, never /tmp or an absolute path. Prefer <plan> for the plan and <say> for short progress notes. If the request only needs a direct answer, use <final>.",
+        "plan" => "You are the planning stage. Create a concise plan and classify whether this is directExecution or needsUserConfirmation. Do not request local writes or shell execution. Do not answer the user's final business request in this stage; record identity, result, and summary needs for review/final. Any planned fs.* path must be workspace-relative, never /tmp or an absolute path. Current tool catalog does not include fs.delete; temp cleanup must use exact workspace-scoped shell.exec when approved. Prefer <plan> for the plan and only use <say> for short progress notes. If the request only needs a direct answer, use <final>.",
         "check" => "You are the checking stage. Review plan, context, risks, and likely tool usage. If the plan proposes absolute fs.* paths such as /tmp, mark it unsafe and require workspace-relative paths. Do not request local writes or shell execution. Use <observe> for the check result.",
-        "complete" => "You are the completion stage. Use deepcode-action JSON blocks or tool calls when local operations are needed. fs.* paths must be workspace-relative; never use /tmp, absolute paths, drive paths, or .. segments. Before tool actions, use <say> to tell the user what you are about to inspect or run. After observations, use <observe> to explain the result. Use <final> only for the final answer. When the user asks to render or return Markdown, tables, formulas, or diagrams, return the actual Markdown content, not a description of what would be returned. All local operations are subject to the permission gate.",
-        "review" => "You are the review stage. Produce the final user-facing answer for the conversation. Keep it direct and avoid internal audit sections unless the user asked for a review. If the user requested Markdown, tables, formulas, or diagrams, include the actual renderable Markdown in the final answer. Use <final> for the final answer. Do not perform new local operations.",
+        "complete" => "You are the completion stage. Use deepcode-action JSON blocks or tool calls when local operations are needed. fs.* paths must be workspace-relative; never use /tmp, absolute paths, drive paths, or .. segments. Do not repeat identity text or final summary content from earlier user-visible messages. For temporary file lifecycle tests, continue create -> read/verify -> exact shell.exec cleanup until complete, blocked, waiting for permission, or budget exhausted. Before tool actions, use <say> to tell the user what you are about to inspect or run. After observations, use <observe> to explain the result. Use <final> only for the final answer. When the user asks to render or return Markdown, tables, formulas, or diagrams, return the actual Markdown content, not a description of what would be returned. All local operations are subject to the permission gate.",
+        "review" => "You are the review stage. Produce the final user-facing answer only when Structured workflow memory shows completion criteria are satisfied. Use Structured workflow memory as the source of facts; do not summarize raw prior assistant prose or repeat satisfied answer obligations. If required critical steps are still pending, return a blocked/replan result instead of claiming success. Keep it direct and avoid internal audit sections unless the user asked for a review. If the user requested Markdown, tables, formulas, or diagrams, include the actual renderable Markdown in the final answer. Use <final> for the final answer. Do not perform new local operations.",
         _ => "You are DeepCode Agent.",
     }
 }
@@ -2881,6 +2890,167 @@ fn append_observation_context(stage_outputs: &mut Vec<String>, stage: &str, even
     if !summaries.is_empty() {
         stage_outputs.push(format!("[{stage} observations]\n{}", summaries.join("\n")));
     }
+}
+
+#[derive(Clone, Debug)]
+struct TempFileLifecycle {
+    required: bool,
+    workspace_listed: bool,
+    created: bool,
+    read_back: bool,
+    cleanup_requested: bool,
+    cleaned: bool,
+}
+
+impl TempFileLifecycle {
+    fn new(required: bool) -> Self {
+        Self {
+            required,
+            workspace_listed: false,
+            created: false,
+            read_back: false,
+            cleanup_requested: false,
+            cleaned: false,
+        }
+    }
+
+    fn pending_steps(&self) -> Vec<&'static str> {
+        if !self.required {
+            return Vec::new();
+        }
+        let mut steps = Vec::new();
+        if !self.workspace_listed {
+            steps.push("列出工作区根目录");
+        }
+        if !self.created {
+            steps.push("创建工作区相对路径 _agent_tmp_* 临时文件");
+        }
+        if !self.read_back {
+            steps.push("读取临时文件并验证内容");
+        }
+        if !self.cleaned {
+            steps.push("通过受控 shell.exec 精确删除临时文件并确认无残留");
+        }
+        steps
+    }
+}
+
+fn needs_identity_answer(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    content.contains("身份")
+        || content.contains("你是谁")
+        || lower.contains("identity")
+        || lower.contains("who are you")
+}
+
+fn needs_temp_file_lifecycle(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    content.contains("临时文件")
+        || content.contains("读写")
+        || lower.contains("temporary file")
+        || lower.contains("temp file")
+}
+
+fn contains_temp_file_path(value: &str) -> bool {
+    value.contains("_agent_tmp_")
+}
+
+fn summarize_for_memory(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    take_chars(&normalized, 360)
+}
+
+fn workflow_memory_prompt(stage_outputs: &[String], temp: &TempFileLifecycle) -> String {
+    if stage_outputs.is_empty() && !temp.required {
+        return String::new();
+    }
+    let mut lines = vec![
+        "Structured workflow memory:".to_string(),
+        "Use this structured state instead of repeating prior assistant prose.".to_string(),
+        "Do not repeat satisfied answer obligations in later user-visible messages.".to_string(),
+        "Current tool catalog does not include fs.delete; temp cleanup must use exact workspace-scoped shell.exec when approved.".to_string(),
+    ];
+    if !stage_outputs.is_empty() {
+        lines.push("Stage summaries:".to_string());
+        lines.extend(stage_outputs.iter().rev().take(12).cloned().rev());
+    }
+    let pending = temp.pending_steps();
+    if !pending.is_empty() {
+        lines.push("Pending critical steps:".to_string());
+        lines.extend(pending.into_iter().map(|step| format!("- {step}")));
+    }
+    format!("\n\n{}", lines.join("\n"))
+}
+
+fn update_temp_file_lifecycle(temp: &mut TempFileLifecycle, events: &[Value]) {
+    if !temp.required {
+        return;
+    }
+    for event in events {
+        let payload = event_payload(event);
+        match event_kind(event).as_str() {
+            "tool_call" => {
+                let tool_call = payload.get("toolCall").unwrap_or(payload);
+                let name = string_field(tool_call, "name")
+                    .or_else(|| string_field(payload, "name"))
+                    .unwrap_or_default();
+                let args = tool_call
+                    .get("arguments")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let command = args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if name == "shell.exec"
+                    && contains_temp_file_path(command)
+                    && (command.contains("rm ")
+                        || command.contains("del ")
+                        || command.contains("Remove-Item"))
+                {
+                    temp.cleanup_requested = true;
+                }
+            }
+            "tool_result" => {
+                if !payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                    continue;
+                }
+                let name = string_field(payload, "toolName").unwrap_or_default();
+                let output = payload.get("output").unwrap_or(&Value::Null);
+                let path = string_field(output, "path").unwrap_or_default();
+                match name.as_str() {
+                    "fs.list" => temp.workspace_listed = true,
+                    "fs.write" if contains_temp_file_path(&path) => temp.created = true,
+                    "fs.read" if contains_temp_file_path(&path) => temp.read_back = true,
+                    "shell.exec" if temp.cleanup_requested => temp.cleaned = true,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn guard_final_answer(
+    candidate: &str,
+    temp: &TempFileLifecycle,
+    needs_identity_answer: bool,
+) -> String {
+    let pending = temp.pending_steps();
+    if pending.is_empty() {
+        return candidate.to_string();
+    }
+    let mut parts = Vec::new();
+    if needs_identity_answer {
+        parts.push("我是 DeepCode Agent，一个运行在本地并受权限门控约束的编码代理。".to_string());
+    }
+    parts.push(format!(
+        "测试未完成：{}。当前不能报告临时文件读写删除已成功。",
+        pending.join("、")
+    ));
+    parts.push("需要继续执行剩余工具步骤，或等待权限确认后再进入最终复核。".to_string());
+    parts.join("\n\n")
 }
 
 fn take_chars(value: &str, limit: usize) -> String {
