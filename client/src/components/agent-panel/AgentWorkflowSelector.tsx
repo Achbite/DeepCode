@@ -94,7 +94,7 @@ const AgentWorkflowSelector: React.FC<AgentWorkflowSelectorProps> = ({
                 <option value="">{t(language, 'agent.workflow.skip')}</option>
                 {validProfiles.map((profile) => (
                   <option key={profile.id} value={profile.id}>
-                    {profile.name} · {profile.model}
+                    {profile.model}
                   </option>
                 ))}
               </select>
