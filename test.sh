@@ -407,6 +407,23 @@ echo "$S8_ARCHIVE_RESP" | jq -e --arg sid "$S8_SESSION_B_ID" '.ok == true and ([
     && pass "Agent session archive ok" \
     || { fail "Agent session archive 断言失败"; exit 17; }
 
+info "[6c/6] agent run cancel endpoint smoke"
+CANCEL_SESSION_BODY="$(jq -nc --arg scope "agent-cancel-smoke" '{initialMode:"plan", workspaceHash:$scope, title:"Cancel Smoke"}')"
+CANCEL_SESSION_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$CANCEL_SESSION_BODY" "$AGENT_SESSIONS_URL" || true)"
+CANCEL_SESSION_ID="$(echo "$CANCEL_SESSION_RESP" | jq -r '.data.session.id // empty' 2>/dev/null || true)"
+if [ -z "$CANCEL_SESSION_ID" ]; then
+    fail "Agent cancel smoke session create failed"; exit 18
+fi
+CANCEL_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{}' "$AGENT_SESSIONS_URL/$CANCEL_SESSION_ID/cancel" || true)"
+info "agent cancel -> $CANCEL_RESP"
+echo "$CANCEL_RESP" | jq -e '
+    .ok == true
+    and ([.data.events[].payload.cancelled] | index(true) != null)
+    and ([.data.events[].payload.channel] | index("final") != null)
+' >/dev/null 2>&1 \
+    && pass "Agent run cancel endpoint ok" \
+    || { fail "Agent run cancel endpoint assertion failed"; exit 19; }
+
 run_agent_fixture() {
     local fixture="$1"
     local mode="${2:-plan}"

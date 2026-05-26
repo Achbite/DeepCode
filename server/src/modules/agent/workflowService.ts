@@ -17,6 +17,7 @@ import { AgentActionParser, toToolCall } from '@deepcode/agent-core';
 import { chatWithLlm } from '../../services/llmService.js';
 import { getLlmProfiles } from '../../services/llmProfileService.js';
 import { getAgentWorkflowConfig } from '../../services/agentWorkflowConfigService.js';
+import { getUserSettings } from '../../services/userSettingsService.js';
 import {
   appendAgentEvents,
   getAgentSession,
@@ -64,6 +65,9 @@ const parser = new AgentActionParser();
 const contextRegistry = new ContextSourceRegistry();
 const contextBudgetPolicy = new ContextBudgetPolicy();
 const pendingPermissions = new Map<string, PendingPermission>();
+const cancelledSessions = new Set<string>();
+
+const CANCELLED_MESSAGE = '\u5df2\u4e2d\u6b62\u5f53\u524d Agent \u8bf7\u6c42\u3002';
 
 function permissionRequestPayload(value: unknown): PermissionRequest | undefined {
   if (!isRecord(value)) return undefined;
@@ -141,6 +145,20 @@ const OUTPUT_ENVELOPE_PROMPT = [
   'Use only the sections that match the current stage. Local operations must still be expressed as provider tool calls or ```deepcode-action JSON blocks. Do not put deepcode-action JSON inside <final>.',
 ].join('\n');
 
+const SIMPLIFIED_CHINESE_OUTPUT_PROMPT = [
+  'Current workbench display language: zh-CN.',
+  'Write all user-facing DeepCode Agent output in Simplified Chinese by default, including <say>, <plan>, <observe>, <final>, permission summaries, and final answers.',
+  'Keep protocol tags, JSON keys, tool names, file paths, code, commands, and quoted source text unchanged.',
+  'If the user explicitly requests another language, follow the user request for that turn.',
+].join('\n');
+
+const ENGLISH_OUTPUT_PROMPT = [
+  'Current workbench display language: en-US.',
+  'Write user-facing DeepCode Agent output in English by default.',
+  'Keep protocol tags, JSON keys, tool names, file paths, code, commands, and quoted source text unchanged.',
+  'If the user explicitly requests another language, follow the user request for that turn.',
+].join('\n');
+
 const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
   plan: [
     'You are the planning stage of DeepCode Agent.',
@@ -174,6 +192,16 @@ const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
     'Do not perform new local operations.',
   ].join('\n'),
 };
+
+async function resolveAgentLanguageInstruction(): Promise<string> {
+  try {
+    const result = await getUserSettings();
+    const language = result.settings['workbench.language'];
+    return language === 'en-US' ? ENGLISH_OUTPUT_PROMPT : SIMPLIFIED_CHINESE_OUTPUT_PROMPT;
+  } catch {
+    return SIMPLIFIED_CHINESE_OUTPUT_PROMPT;
+  }
+}
 
 function newEvent(
   sessionId: string,
@@ -237,6 +265,31 @@ function parseTaggedSegments(content: string, fallbackKind: AgentOutputSegmentKi
   return segments;
 }
 
+function extractRuntimeActionMarkup(content: string): string {
+  const parts: string[] = [];
+  const blockPattern = /```deepcode-action\s*[\s\S]*?```/gi;
+  const selfClosingPattern = /<(load|check)\b[^>]*\/>/gi;
+  const pairedPattern = /<(shell|exec|patch)\b[^>]*>[\s\S]*?<\/\1>/gi;
+  for (const pattern of [blockPattern, selfClosingPattern, pairedPattern]) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      parts.push(match[0]);
+    }
+  }
+  return parts.join('\n\n');
+}
+
+function summarizeSegments(segments: AgentOutputSegment[], fallback: string): string {
+  const text = segments
+    .filter((segment) => segment.kind !== 'reasoning')
+    .map((segment) => segment.content.trim())
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+  const summary = text || fallback;
+  return summary.length > 240 ? `${summary.slice(0, 239)}...` : summary;
+}
+
 function segmentChannel(kind: AgentOutputSegmentKind): string {
   if (kind === 'reasoning') return 'reasoning';
   if (kind === 'observe') return 'observation';
@@ -257,6 +310,18 @@ function fallbackSegmentKind(stage: AgentWorkflowStage): AgentOutputSegmentKind 
   if (stage === 'check') return 'observe';
   if (stage === 'plan') return 'plan';
   return 'say';
+}
+
+function normalizeSegmentForStage(
+  stage: AgentWorkflowStage,
+  segment: AgentOutputSegment
+): AgentOutputSegment {
+  if (segment.kind !== 'final') return segment;
+  if (stage === 'complete' || stage === 'review') return segment;
+  return {
+    ...segment,
+    kind: fallbackSegmentKind(stage),
+  };
 }
 
 function assistantSegmentEvent(
@@ -423,6 +488,7 @@ async function runParsedTextActions(
   context: EventContext = {}
 ): Promise<AgentEvent[]> {
   const events: AgentEvent[] = [];
+  const deferredFinalEvents: AgentEvent[] = [];
   const add = async (event: AgentEvent) => {
     events.push(event);
     if (emit) await emit([event]);
@@ -453,7 +519,7 @@ async function runParsedTextActions(
       continue;
     }
     if (action.type === 'final') {
-      await add(newEvent(sessionId, 'assistant_msg', withContext(action.payload, context, {
+      deferredFinalEvents.push(newEvent(sessionId, 'assistant_msg', withContext(action.payload, context, {
         channel: 'final',
         visibility: 'conversation',
         label: '最终回复',
@@ -494,6 +560,11 @@ async function runParsedTextActions(
       batchLabel,
     });
     events.push(...toolEvents);
+  }
+  if (!hasPendingPermission(events)) {
+    for (const event of deferredFinalEvents) {
+      await add(event);
+    }
   }
   return events;
 }
@@ -726,6 +797,23 @@ async function maybeAutoTitleSession(
   }
 }
 
+export async function cancelAgentRun(sessionId: string): Promise<AgentSessionResult> {
+  const current = await getAgentSession(sessionId);
+  if (!current) {
+    throw new Error(`Agent session not found: ${sessionId}`);
+  }
+  cancelledSessions.add(sessionId);
+  return appendAgentEvents(sessionId, [
+    newEvent(sessionId, 'assistant_msg', {
+      content: CANCELLED_MESSAGE,
+      channel: 'final',
+      visibility: 'conversation',
+      label: 'Agent',
+      cancelled: true,
+    }),
+  ]);
+}
+
 export async function sendAgentMessage(
   sessionId: string,
   request: SendAgentMessageRequest
@@ -734,6 +822,7 @@ export async function sendAgentMessage(
   if (!current) {
     throw new Error(`Agent session not found: ${sessionId}`);
   }
+  cancelledSessions.delete(sessionId);
   const mode = request.mode ?? current.session.mode;
   let latest: AgentSessionResult = current;
   let sequence = 0;
@@ -748,6 +837,23 @@ export async function sendAgentMessage(
       }),
     }));
     latest = await appendAgentEvents(sessionId, decorated);
+  };
+  const stopIfCancelled = async (context?: EventContext): Promise<boolean> => {
+    if (!cancelledSessions.has(sessionId)) return false;
+    cancelledSessions.delete(sessionId);
+    if (context?.stage) {
+      await emit([newEvent(sessionId, 'workflow_stage', {
+        stage: context.stage,
+        phase: context.phase ?? context.stage,
+        stageRunId: context.stageRunId,
+        llmCallId: context.llmCallId,
+        status: 'aborted',
+        summary: CANCELLED_MESSAGE,
+        channel: 'task',
+        visibility: 'task',
+      })]);
+    }
+    return true;
   };
 
   const userEvent = newEvent(sessionId, 'user_msg', {
@@ -771,6 +877,7 @@ export async function sendAgentMessage(
   }
 
   const promptText = await contextRegistry.buildPromptText(request.attachments ?? []);
+  const languageInstruction = await resolveAgentLanguageInstruction();
   const profileCatalog = await getLlmProfiles();
   const profilesById = new Map(profileCatalog.profiles.map((profile) => [profile.id, profile]));
   const stageOutputs: string[] = [];
@@ -780,8 +887,13 @@ export async function sendAgentMessage(
   let lastUsedProfileId: string | undefined;
 
   let haltWorkflow = false;
+  let waitingForPermission = false;
 
   for (const stage of AGENT_WORKFLOW_STAGES) {
+    if (await stopIfCancelled()) {
+      haltWorkflow = true;
+      break;
+    }
     if (haltWorkflow) break;
     const profileId = workflowConfig[stage]?.profileId;
     if (!profileId) continue;
@@ -820,6 +932,10 @@ export async function sendAgentMessage(
         channel: 'task',
         visibility: 'task',
       })]);
+      if (await stopIfCancelled(baseContext)) {
+        haltWorkflow = true;
+        break;
+      }
 
       const messages: LlmChatMessage[] = [
         {
@@ -828,6 +944,7 @@ export async function sendAgentMessage(
             promptText,
             OUTPUT_ENVELOPE_PROMPT,
             STAGE_PROMPTS[stage],
+            languageInstruction,
             `Current user session mode: ${mode}.`,
             `Current local operation mode for this stage: ${stageMode}.`,
             `Default workflow behavior: ${workflow}.`,
@@ -853,6 +970,10 @@ export async function sendAgentMessage(
           tools: stage === 'complete' ? listAgentTools(stageMode).tools : undefined,
           stream: false,
         });
+        if (await stopIfCancelled(baseContext)) {
+          haltWorkflow = true;
+          break;
+        }
 
         for (const chunk of response.chunks) {
           if (chunk.type === 'reasoning_delta' && chunk.content) {
@@ -879,7 +1000,14 @@ export async function sendAgentMessage(
         }
 
         const trimmed = assistantText.trim();
+        const runtimeActionMarkup = trimmed && stage === 'complete'
+          ? extractRuntimeActionMarkup(trimmed)
+          : '';
+        const hasPlannedLocalActions = stage === 'complete'
+          && (stageToolCalls.length > 0 || Boolean(runtimeActionMarkup));
         const observationEvents: AgentEvent[] = [];
+        let stageCallSummary = 'No textual output.';
+        let stageCallEmittedFinal = false;
         if (reasoningText.trim()) {
           await emit([assistantSegmentEvent(sessionId, baseContext, {
             kind: 'reasoning',
@@ -889,10 +1017,18 @@ export async function sendAgentMessage(
         if (trimmed) {
           stageOutputs.push(`[${stage}] ${trimmed}`);
           const segments = parseTaggedSegments(trimmed, fallbackSegmentKind(stage));
+          stageCallSummary = summarizeSegments(segments, 'Text output prepared.');
           for (const segment of segments) {
-            await emit([assistantSegmentEvent(sessionId, baseContext, segment)]);
-            if (segment.kind === 'final') emittedFinal = true;
-            if (segment.kind !== 'reasoning') lastUserVisibleText = segment.content;
+            const normalizedSegment = normalizeSegmentForStage(stage, segment);
+            if (normalizedSegment.kind === 'final' && hasPlannedLocalActions) {
+              continue;
+            }
+            await emit([assistantSegmentEvent(sessionId, baseContext, normalizedSegment)]);
+            if (normalizedSegment.kind === 'final') {
+              emittedFinal = true;
+              stageCallEmittedFinal = true;
+            }
+            if (normalizedSegment.kind !== 'reasoning') lastUserVisibleText = normalizedSegment.content;
           }
         } else if (stage === 'complete' && stageToolCalls.length > 0) {
           await emit([assistantSegmentEvent(sessionId, baseContext, {
@@ -902,11 +1038,19 @@ export async function sendAgentMessage(
         }
 
         if (stage === 'complete') {
+          if (await stopIfCancelled(baseContext)) {
+            haltWorkflow = true;
+            break;
+          }
           const batchId = stageToolCalls.length > 0
             ? `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`
             : undefined;
           const batchLabel = toolBatchLabel(stageToolCalls);
           for (const toolCall of stageToolCalls) {
+            if (await stopIfCancelled(baseContext)) {
+              haltWorkflow = true;
+              break;
+            }
             const toolEvents = await executeOrAsk(sessionId, stageMode, toolCall, emit, {
               ...baseContext,
               batchId: batchId ?? `batch-${toolCall.id}`,
@@ -914,11 +1058,14 @@ export async function sendAgentMessage(
             });
             observationEvents.push(...toolEvents);
           }
+          if (haltWorkflow) break;
         }
 
         if (trimmed && stage === 'complete') {
-          const parsedEvents = await runParsedTextActions(sessionId, stageMode, trimmed, emit, baseContext);
-          observationEvents.push(...parsedEvents);
+          if (runtimeActionMarkup) {
+            const parsedEvents = await runParsedTextActions(sessionId, stageMode, runtimeActionMarkup, emit, baseContext);
+            observationEvents.push(...parsedEvents);
+          }
         }
 
         appendObservationContext(stageOutputs, stage, observationEvents);
@@ -938,9 +1085,14 @@ export async function sendAgentMessage(
               : observationSummary,
           })]);
           lastUserVisibleText = observationSummary;
+          stageCallSummary = observationSummary;
           if (waitingPermission) {
+            waitingForPermission = true;
             haltWorkflow = true;
           }
+        }
+        if (stage === 'complete' && stageCallEmittedFinal && !hasPendingPermission(observationEvents)) {
+          haltWorkflow = true;
         }
 
         await emit([newEvent(sessionId, 'workflow_stage', {
@@ -950,7 +1102,7 @@ export async function sendAgentMessage(
           llmCallId,
           profileId,
           status: 'completed',
-          summary: trimmed ? trimmed.slice(0, 240) : 'No textual output.',
+          summary: stageCallSummary,
           channel: 'task',
           visibility: 'task',
         })]);
@@ -983,7 +1135,7 @@ export async function sendAgentMessage(
     }
   }
 
-  if (!emittedFinal && lastUserVisibleText.trim()) {
+  if (!emittedFinal && !waitingForPermission && lastUserVisibleText.trim()) {
     await emit([assistantSegmentEvent(sessionId, {
       turnId,
       stage: 'review',

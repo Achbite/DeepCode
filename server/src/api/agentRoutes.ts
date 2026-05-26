@@ -27,6 +27,7 @@ import {
   renameAgentSession,
 } from '../services/agentSessionStore.js';
 import {
+  cancelAgentRun,
   resolveAgentPermission,
   sendAgentMessage,
 } from '../modules/agent/workflowService.js';
@@ -202,6 +203,16 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
       return { ok: true, data } satisfies ApiResponse<AgentSessionResult>;
     } catch (err) {
       return errorResponse('agent_message_send_error', err);
+    }
+  });
+
+  app.post('/api/agent/sessions/:id/cancel', async (request) => {
+    try {
+      const { id } = request.params as { id: string };
+      const data = await cancelAgentRun(id);
+      return { ok: true, data } satisfies ApiResponse<AgentSessionResult>;
+    } catch (err) {
+      return errorResponse('agent_message_cancel_error', err);
     }
   });
 

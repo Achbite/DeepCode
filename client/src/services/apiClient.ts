@@ -75,8 +75,27 @@ import type {
 
 const API_BASE = '/api';
 
+interface SendJsonOptions {
+  signal?: AbortSignal;
+}
+
+function isAbortError(err: unknown): boolean {
+  return (
+    err instanceof DOMException && err.name === 'AbortError'
+  ) || (
+    err instanceof Error && err.name === 'AbortError'
+  );
+}
+
 /** 把任意异常转换为 ApiResponse 错误结构 */
 function toErrorResponse(err: unknown): ApiResponse<never> {
+  if (isAbortError(err)) {
+    return {
+      ok: false,
+      error: 'request_aborted',
+      message: 'Request aborted.',
+    };
+  }
   const message = err instanceof Error ? err.message : String(err);
   if (
     message.includes('fetch') ||
@@ -117,13 +136,15 @@ async function getJson<T>(url: string): Promise<ApiResponse<T>> {
 async function sendJson<T>(
   url: string,
   method: 'POST' | 'PATCH' | 'PUT' | 'DELETE',
-  body: unknown
+  body: unknown,
+  options: SendJsonOptions = {}
 ): Promise<ApiResponse<T>> {
   try {
     const response = await fetch(url, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: options.signal,
     });
     if (!response.ok) {
       return {
@@ -406,12 +427,24 @@ export function appendAgentEvents(
 
 export function sendAgentMessage(
   sessionId: string,
-  request: SendAgentMessageRequest
+  request: SendAgentMessageRequest,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentSessionResult>> {
   return sendJson<AgentSessionResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/messages`,
     'POST',
-    request
+    request,
+    { signal }
+  );
+}
+
+export function cancelAgentRun(
+  sessionId: string
+): Promise<ApiResponse<AgentSessionResult>> {
+  return sendJson<AgentSessionResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/cancel`,
+    'POST',
+    {}
   );
 }
 

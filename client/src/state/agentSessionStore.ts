@@ -14,6 +14,7 @@ import { AGENT_WORKFLOW_STAGES } from '@deepcode/protocol';
 import {
   activateAgentSession,
   archiveAgentSession,
+  cancelAgentRun,
   createAgentSession,
   getAgentWorkflowConfig,
   getAgentEventSnapshot,
@@ -73,11 +74,14 @@ interface AgentSessionActions {
   removeAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
   clearMessageAttachments: () => void;
   sendMessage: (content: string, attachmentsOverride?: AgentContextAttachment[]) => Promise<void>;
+  cancelCurrentRun: () => Promise<void>;
   acceptPermission: () => Promise<void>;
   rejectPermission: () => Promise<void>;
 }
 
 type Store = AgentSessionState & AgentSessionActions;
+
+let activeAgentAbortController: AbortController | null = null;
 
 function mergeAttachments(
   list: AgentContextAttachment[],
@@ -441,6 +445,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }, 300);
     void refreshProgress();
 
+    const abortController = new AbortController();
+    activeAgentAbortController = abortController;
+    let wasAborted = false;
+
     try {
       const result = await sendAgentMessage(session.id, {
         content: trimmed,
@@ -449,8 +457,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         workflow: get().workflow,
         workflowConfig: get().workflowConfig ?? undefined,
         profileId: get().profileId,
-      });
+      }, abortController.signal);
       if (!result.ok || !result.data) {
+        if (result.error === 'request_aborted') {
+          throw new Error('request_aborted');
+        }
         throw new Error(result.message ?? 'Agent message failed');
       }
       const data = result.data;
@@ -469,14 +480,31 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       const message = err instanceof Error ? err.message : String(err);
-      set((state) => ({
-        events: [
-          ...state.events,
-          createLocalEvent(session.id, 'error', { message }),
-        ],
-        errorMessage: message,
-        loading: false,
-      }));
+      wasAborted = abortController.signal.aborted || message === 'request_aborted';
+      if (wasAborted) {
+        set({
+          loading: false,
+          errorMessage: null,
+          queuedMessages: [],
+        });
+      } else {
+        set((state) => ({
+          events: [
+            ...state.events,
+            createLocalEvent(session.id, 'error', { message }),
+          ],
+          errorMessage: message,
+          loading: false,
+        }));
+      }
+    } finally {
+      if (activeAgentAbortController === abortController) {
+        activeAgentAbortController = null;
+      }
+    }
+
+    if (wasAborted) {
+      return;
     }
 
     const nextQueuedMessage = get().queuedMessages[0];
@@ -486,6 +514,48 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       }));
       void get().sendMessage(nextQueuedMessage.content, nextQueuedMessage.attachments);
     }
+  },
+
+  cancelCurrentRun: async () => {
+    const session = get().session;
+    if (!session) return;
+    activeAgentAbortController?.abort();
+    set({
+      loading: false,
+      queuedMessages: [],
+      pendingPermission: null,
+      errorMessage: null,
+    });
+
+    const result = await cancelAgentRun(session.id);
+    if (result.ok && result.data) {
+      set({
+        session: result.data.session,
+        sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
+        currentSessionId: result.data.session.id,
+        events: result.data.events,
+        pendingPermission: findLatestPendingPermission(result.data.events),
+        loading: false,
+        errorMessage: null,
+      });
+      void get().refreshTraceEvents(result.data.session.id);
+      return;
+    }
+
+    set((state) => ({
+      events: [
+        ...state.events,
+        createLocalEvent(session.id, 'assistant_msg', {
+          content: "\u5df2\u4e2d\u6b62\u5f53\u524d Agent \u8bf7\u6c42\u3002",
+          channel: 'final',
+          visibility: 'conversation',
+          label: 'Agent',
+          cancelled: true,
+        }),
+      ],
+      loading: false,
+      errorMessage: result.message ?? null,
+    }));
   },
 
   acceptPermission: async () => {

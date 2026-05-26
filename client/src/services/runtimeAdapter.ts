@@ -687,13 +687,28 @@ export async function appendAgentEvents(
 
 export async function sendAgentMessage(
   sessionId: string,
-  request: SendAgentMessageRequest
+  request: SendAgentMessageRequest,
+  signal?: AbortSignal
 ): Promise<ApiResponse<AgentSessionResult>> {
   if (getRuntimeType() === 'tauri') {
     return tauriInvoke<AgentSessionResult>('send_agent_message', { sessionId, request });
   }
   const { sendAgentMessage: apiSendAgentMessage } = await import('./apiClient');
-  return apiSendAgentMessage(sessionId, request);
+  return apiSendAgentMessage(sessionId, request, signal);
+}
+
+export async function cancelAgentRun(
+  sessionId: string
+): Promise<ApiResponse<AgentSessionResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return {
+      ok: false,
+      error: 'not_implemented',
+      message: 'Tauri Agent cancellation is not implemented yet.',
+    };
+  }
+  const { cancelAgentRun: apiCancelAgentRun } = await import('./apiClient');
+  return apiCancelAgentRun(sessionId);
 }
 
 export async function getAgentEventSnapshot(
