@@ -4,6 +4,7 @@ import type {
   ToolCall,
 } from '@deepcode/protocol';
 import { ToolRegistry } from './toolRegistry.js';
+import { toolCallPathError } from './utils.js';
 
 export interface PermissionGateOptions {
   diffProvider?: (toolCall: ToolCall) => Promise<string | undefined>;
@@ -28,6 +29,14 @@ export class PermissionGate {
       return {
         action: 'deny',
         reason: `${tool.name} is not allowed in ${request.mode} mode.`,
+      };
+    }
+
+    const pathErr = toolCallPathError(request.toolCall);
+    if (pathErr) {
+      return {
+        action: 'deny',
+        reason: pathErr.message,
       };
     }
 

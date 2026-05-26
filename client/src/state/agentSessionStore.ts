@@ -5,6 +5,7 @@ import type {
   AgentMode,
   AgentSession,
   AgentTraceEvent,
+  AgentWorkspaceBinding,
   AgentWorkflowConfig,
   AgentWorkflowMode,
   ListAgentSessionsRequest,
@@ -164,6 +165,24 @@ function currentWorkspaceScope(): ListAgentSessionsRequest {
 function currentWorkspaceScopeKey(): string {
   const scope = currentWorkspaceScope();
   return scope.workspaceHash ?? scope.workspaceId ?? 'no-workspace';
+}
+
+function currentWorkspaceBinding(): AgentWorkspaceBinding | undefined {
+  const workspaceState = useWorkspaceStore.getState();
+  const workspace = workspaceState.current;
+  if (!workspace) return undefined;
+
+  const activeFolder = workspaceState.getActiveFolder();
+  const scope = currentWorkspaceScope();
+  const openPath = workspace.sourcePath ?? activeFolder?.absolutePath ?? workspace.folders[0]?.absolutePath;
+  if (!openPath) return undefined;
+
+  return {
+    workspaceId: workspace.id,
+    workspaceHash: scope.workspaceHash,
+    openPath,
+    activeFolderId: activeFolder?.id ?? workspaceState.activeFolderId ?? workspace.folders[0]?.id,
+  };
 }
 
 function isEmptyAgentSession(session: AgentSession | null | undefined): boolean {
@@ -453,6 +472,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const result = await sendAgentMessage(session.id, {
         content: trimmed,
         attachments,
+        workspaceBinding: currentWorkspaceBinding(),
         mode: get().mode,
         workflow: get().workflow,
         workflowConfig: get().workflowConfig ?? undefined,

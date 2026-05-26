@@ -1,4 +1,4 @@
-import type { AgentMode } from './agent.js';
+import type { AgentMode, AgentWorkspaceBinding } from './agent.js';
 
 export interface ToolDefinition {
   name: string;
@@ -25,12 +25,14 @@ export interface ToolResult {
 export interface ToolExecutionRequest {
   mode: AgentMode;
   toolCall: ToolCall;
+  workspaceBinding?: AgentWorkspaceBinding;
   approved?: boolean;
 }
 
 export interface PermissionEvaluationRequest {
   mode: AgentMode;
   toolCall: ToolCall;
+  workspaceBinding?: AgentWorkspaceBinding;
 }
 
 export interface ListToolsResult {

@@ -1,4 +1,6 @@
-import type { ParsedAgentActionError } from '@deepcode/protocol';
+import type { ParsedAgentActionError, ToolCall } from '@deepcode/protocol';
+
+const WORKSPACE_PATH_TOOL_NAMES = new Set(['fs.read', 'fs.list', 'fs.write', 'fs.diff']);
 
 export function nowIso(): string {
   return new Date().toISOString();
@@ -51,4 +53,20 @@ export function pathError(path: string | undefined): ParsedAgentActionError | un
     };
   }
   return undefined;
+}
+
+export function toolCallPathError(
+  toolCall: Pick<ToolCall, 'name' | 'arguments'>
+): ParsedAgentActionError | undefined {
+  if (!WORKSPACE_PATH_TOOL_NAMES.has(toolCall.name)) return undefined;
+  if (!isRecord(toolCall.arguments)) {
+    return { code: 'invalid_arguments', message: 'Tool arguments must be an object.' };
+  }
+
+  const rawPath = asString(toolCall.arguments.path);
+  if (toolCall.name === 'fs.list' && (rawPath === undefined || rawPath === '')) {
+    return undefined;
+  }
+
+  return pathError(rawPath);
 }

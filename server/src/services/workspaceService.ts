@@ -24,6 +24,7 @@ import {
   extname,
 } from 'node:path';
 import type {
+  AgentWorkspaceBinding,
   WorkspaceFolderSpec,
   WorkspaceSourceKind,
   WorkspaceSpec,
@@ -393,6 +394,15 @@ export function saveWorkspaceFile(
 /** 获取当前活动工作区；无工作区时返回 null */
 export function getCurrentWorkspace(): WorkspaceSpec | null {
   return currentWorkspace;
+}
+
+export function ensureWorkspaceBinding(binding?: AgentWorkspaceBinding): WorkspaceSpec | null {
+  if (currentWorkspace) return currentWorkspace;
+
+  const openPath = typeof binding?.openPath === 'string' ? binding.openPath.trim() : '';
+  if (!openPath) return null;
+
+  return openWorkspace(openPath);
 }
 
 /** 获取工作区状态包装（含 fallbackUsed / lastError） */

@@ -30,6 +30,7 @@ import {
   executeAgentTool,
   listAgentTools,
 } from './toolService.js';
+import { ensureWorkspaceBinding } from '../../services/workspaceService.js';
 
 interface PendingPermission {
   sessionId: string;
@@ -68,6 +69,8 @@ const pendingPermissions = new Map<string, PendingPermission>();
 const cancelledSessions = new Set<string>();
 
 const CANCELLED_MESSAGE = '\u5df2\u4e2d\u6b62\u5f53\u524d Agent \u8bf7\u6c42\u3002';
+const NO_WORKSPACE_USER_MESSAGE =
+  '当前没有打开工作区。请先打开一个文件夹或 .code-workspace 文件，然后再让 Agent 读取、搜索或修改文件。';
 
 function permissionRequestPayload(value: unknown): PermissionRequest | undefined {
   if (!isRecord(value)) return undefined;
@@ -157,6 +160,13 @@ const ENGLISH_OUTPUT_PROMPT = [
   'Write user-facing DeepCode Agent output in English by default.',
   'Keep protocol tags, JSON keys, tool names, file paths, code, commands, and quoted source text unchanged.',
   'If the user explicitly requests another language, follow the user request for that turn.',
+].join('\n');
+
+const WORKSPACE_PATH_PROMPT = [
+  'Workspace file tools are scoped to the active workspace.',
+  'For fs.read, fs.list, fs.diff, and fs.write, paths must be workspace-relative. Never use /tmp, absolute POSIX paths, Windows drive paths, leading backslashes, or .. segments for fs.* paths.',
+  'For temporary file tests, create a workspace-relative _agent_tmp_* file in the current workspace, verify it, then remove it with an exact workspace-scoped command only when shell execution has explicit approval.',
+  'If a plan proposes absolute fs.* paths, mark it unsafe and replan with workspace-relative paths.',
 ].join('\n');
 
 const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
@@ -866,6 +876,27 @@ export async function sendAgentMessage(
   await emit([userEvent]);
 
   const workflowConfig = await resolveWorkflowConfig(request, current);
+  try {
+    const workspace = ensureWorkspaceBinding(request.workspaceBinding);
+    if (!workspace) {
+      await emit([newEvent(sessionId, 'assistant_msg', {
+        content: NO_WORKSPACE_USER_MESSAGE,
+        channel: 'final',
+        visibility: 'conversation',
+        label: 'Agent',
+      })]);
+      return latest;
+    }
+  } catch (err) {
+    await emit([newEvent(sessionId, 'assistant_msg', {
+      content: `工作区绑定失败：${err instanceof Error ? err.message : String(err)}`,
+      channel: 'final',
+      visibility: 'conversation',
+      label: 'Agent',
+    })]);
+    return latest;
+  }
+
   if (!hasConfiguredStage(workflowConfig)) {
     await emit([newEvent(sessionId, 'assistant_msg', {
       content: 'Please configure a valid LLM provider profile and assign it to at least one Agent workflow stage.',
@@ -943,6 +974,7 @@ export async function sendAgentMessage(
           content: [
             promptText,
             OUTPUT_ENVELOPE_PROMPT,
+            WORKSPACE_PATH_PROMPT,
             STAGE_PROMPTS[stage],
             languageInstruction,
             `Current user session mode: ${mode}.`,

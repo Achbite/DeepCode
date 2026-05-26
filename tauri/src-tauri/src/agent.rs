@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs as stdfs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -20,6 +20,8 @@ const STAGES: [&str; 4] = ["plan", "check", "complete", "review"];
 const SEARCH_MAX_FILES: usize = 5000;
 const SEARCH_MAX_MATCHES: usize = 500;
 const SHELL_OUTPUT_LIMIT: usize = 64 * 1024;
+const NO_WORKSPACE_MESSAGE: &str =
+    "当前没有打开工作区。请先打开一个文件夹或 .code-workspace 文件，然后再让 Agent 读取、搜索或修改文件。";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -146,7 +148,11 @@ impl AgentManager {
         Ok(result_with_event_count(&result))
     }
 
-    pub fn rename_session(&self, session_id: &str, request: Value) -> Result<AgentSessionResult, String> {
+    pub fn rename_session(
+        &self,
+        session_id: &str,
+        request: Value,
+    ) -> Result<AgentSessionResult, String> {
         let body = request.get("request").unwrap_or(&request);
         let title = string_field(body, "title")
             .filter(|value| !value.trim().is_empty())
@@ -203,7 +209,8 @@ impl AgentManager {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("Agent session not found: {session_id}"))?;
-        let source = string_field(&result.session, "titleSource").unwrap_or_else(|| "pending".into());
+        let source =
+            string_field(&result.session, "titleSource").unwrap_or_else(|| "pending".into());
         if source == "user" || source == "auto" {
             return Ok(result_with_event_count(result));
         }
@@ -211,7 +218,11 @@ impl AgentManager {
         set_json_field(
             &mut result.session,
             "title",
-            json!(if title.trim().is_empty() { "Agent Session" } else { title.as_str() }),
+            json!(if title.trim().is_empty() {
+                "Agent Session"
+            } else {
+                title.as_str()
+            }),
         );
         set_json_field(&mut result.session, "titleSource", json!("auto"));
         if !summary.trim().is_empty() {
@@ -388,6 +399,48 @@ impl AgentManager {
         )?;
 
         let workflow_config = resolve_workflow_config(body, &current.session)?;
+        match ensure_workspace_binding(body, workspace) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.emit_events_direct(
+                    session_id,
+                    &mut latest,
+                    &turn_id,
+                    &mut sequence,
+                    vec![new_event(
+                        session_id,
+                        "assistant_msg",
+                        json!({
+                            "content": NO_WORKSPACE_MESSAGE,
+                            "channel": "final",
+                            "visibility": "conversation",
+                            "label": "Agent"
+                        }),
+                    )],
+                )?;
+                return Ok(latest);
+            }
+            Err(err) => {
+                self.emit_events_direct(
+                    session_id,
+                    &mut latest,
+                    &turn_id,
+                    &mut sequence,
+                    vec![new_event(
+                        session_id,
+                        "assistant_msg",
+                        json!({
+                            "content": format!("工作区绑定失败：{err}"),
+                            "channel": "final",
+                            "visibility": "conversation",
+                            "label": "Agent"
+                        }),
+                    )],
+                )?;
+                return Ok(latest);
+            }
+        }
+
         if !has_configured_stage(&workflow_config) {
             self.emit_events_direct(session_id, &mut latest, &turn_id, &mut sequence, vec![new_event(
                 session_id,
@@ -851,14 +904,22 @@ impl AgentManager {
             session.events.extend(events);
             if let Some(obj) = session.session.as_object_mut() {
                 if let Some(summary) = latest_summary.as_ref() {
-                    obj.insert("lastSummary".into(), Value::String(take_chars(summary, 160)));
+                    obj.insert(
+                        "lastSummary".into(),
+                        Value::String(take_chars(summary, 160)),
+                    );
                 }
                 obj.insert("updatedAt".into(), Value::String(now_iso()));
             }
-            (workspace_key(&session.session), result_with_event_count(session))
+            (
+                workspace_key(&session.session),
+                result_with_event_count(session),
+            )
         };
         state.current_session_id = Some(session_id.to_string());
-        state.current_by_workspace.insert(key, session_id.to_string());
+        state
+            .current_by_workspace
+            .insert(key, session_id.to_string());
         Ok(result)
     }
 
@@ -1202,9 +1263,73 @@ fn tool(
     })
 }
 
+fn is_workspace_path_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "fs.read" | "fs.list" | "fs.diff" | "fs.write")
+}
+
+fn has_windows_drive_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn workspace_tool_path_error(tool_call: &Value) -> Option<String> {
+    let tool_name = string_field(tool_call, "name").unwrap_or_default();
+    if !is_workspace_path_tool(&tool_name) {
+        return None;
+    }
+
+    let arguments = tool_call.get("arguments").unwrap_or(&Value::Null);
+    let path = string_field(arguments, "path").unwrap_or_default();
+    if tool_name == "fs.list" && path.is_empty() {
+        return None;
+    }
+    if path.is_empty() {
+        return Some("Missing path.".into());
+    }
+    if path.contains('\0') {
+        return Some("Path contains a NUL byte.".into());
+    }
+    if has_windows_drive_prefix(&path)
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || Path::new(&path).is_absolute()
+    {
+        return Some(format!(
+            "Agent action paths must be workspace-relative: {path}"
+        ));
+    }
+    if Path::new(&path).components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Some(format!("Path traversal is blocked: {path}"));
+    }
+    None
+}
+
+fn tool_requires_workspace(tool_name: &str) -> bool {
+    is_workspace_path_tool(tool_name) || tool_name == "code.search"
+}
+
+fn workspace_unavailable_reason(
+    tool_call: &Value,
+    workspace: &workspace::WorkspaceManager,
+) -> Option<String> {
+    let tool_name = string_field(tool_call, "name").unwrap_or_default();
+    if !tool_requires_workspace(&tool_name) {
+        return None;
+    }
+    if workspace.get_current().current.is_some() {
+        return None;
+    }
+    Some(format!("no_workspace: {NO_WORKSPACE_MESSAGE}"))
+}
+
 fn evaluate_agent_permission_value(
     request: Value,
-    _workspace: &workspace::WorkspaceManager,
+    workspace: &workspace::WorkspaceManager,
 ) -> Value {
     let body = request.get("request").unwrap_or(&request);
     let mode = string_field(body, "mode").unwrap_or_else(|| "plan".into());
@@ -1229,7 +1354,21 @@ fn evaluate_agent_permission_value(
         return json!({ "action": "deny", "reason": format!("{tool_name} is not available in {mode} mode") });
     }
 
+    if workspace.get_current().current.is_none() {
+        if let Err(err) = ensure_workspace_binding(body, workspace) {
+            return json!({ "action": "deny", "reason": format!("workspace_binding_error: {err}") });
+        }
+    }
+
     if let Some(reason) = settings_policy_deny_reason(&tool_call) {
+        return json!({ "action": "deny", "reason": reason });
+    }
+
+    if let Some(reason) = workspace_unavailable_reason(&tool_call, workspace) {
+        return json!({ "action": "deny", "reason": reason });
+    }
+
+    if let Some(reason) = workspace_tool_path_error(&tool_call) {
         return json!({ "action": "deny", "reason": reason });
     }
 
@@ -1260,7 +1399,7 @@ fn evaluate_agent_permission_value(
         .unwrap_or(false)
     {
         let diff = if tool_name == "fs.write" {
-            diff_preview_for_tool(&tool_call, _workspace).ok()
+            diff_preview_for_tool(&tool_call, workspace).ok()
         } else {
             None
         };
@@ -1282,10 +1421,11 @@ fn execute_agent_tool_value(request: Value, workspace: &workspace::WorkspaceMana
         .get("approved")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let decision = evaluate_agent_permission_value(
-        json!({ "mode": mode, "toolCall": tool_call.clone() }),
-        workspace,
-    );
+    let mut permission_request = json!({ "mode": mode, "toolCall": tool_call.clone() });
+    if let Some(binding) = body.get("workspaceBinding") {
+        permission_request["workspaceBinding"] = binding.clone();
+    }
+    let decision = evaluate_agent_permission_value(permission_request, workspace);
     match string_field(&decision, "action").as_deref() {
         Some("deny") => {
             return tool_failure(
@@ -1692,6 +1832,8 @@ fn build_prompt_text(attachments: &[Value], workspace: &workspace::WorkspaceMana
         "You are DeepCode Agent, a local coding assistant controlled by explicit permissions."
             .to_string(),
         "Use deepcode-action JSON blocks or provider tool calls for local operations.".to_string(),
+        "For fs.read, fs.list, fs.diff, and fs.write, paths must be workspace-relative. Never use /tmp, absolute POSIX paths, Windows drive paths, leading backslashes, or .. segments for fs.* paths. For temporary file tests, create a workspace-relative _agent_tmp_* file in the current workspace."
+            .to_string(),
     ];
     for attachment in attachments {
         let kind = string_field(attachment, "kind").unwrap_or_default();
@@ -1722,9 +1864,9 @@ fn build_prompt_text(attachments: &[Value], workspace: &workspace::WorkspaceMana
 
 fn stage_prompt(stage: &str) -> &'static str {
     match stage {
-        "plan" => "You are the planning stage. Create a concise plan and classify whether this is directExecution or needsUserConfirmation. Do not request local writes or shell execution. Prefer <plan> for the plan and <say> for short progress notes. If the request only needs a direct answer, use <final>.",
-        "check" => "You are the checking stage. Review plan, context, risks, and likely tool usage. Do not request local writes or shell execution. Use <observe> for the check result.",
-        "complete" => "You are the completion stage. Use deepcode-action JSON blocks or tool calls when local operations are needed. Before tool actions, use <say> to tell the user what you are about to inspect or run. After observations, use <observe> to explain the result. Use <final> only for the final answer. When the user asks to render or return Markdown, tables, formulas, or diagrams, return the actual Markdown content, not a description of what would be returned. All local operations are subject to the permission gate.",
+        "plan" => "You are the planning stage. Create a concise plan and classify whether this is directExecution or needsUserConfirmation. Do not request local writes or shell execution. Any planned fs.* path must be workspace-relative, never /tmp or an absolute path. Prefer <plan> for the plan and <say> for short progress notes. If the request only needs a direct answer, use <final>.",
+        "check" => "You are the checking stage. Review plan, context, risks, and likely tool usage. If the plan proposes absolute fs.* paths such as /tmp, mark it unsafe and require workspace-relative paths. Do not request local writes or shell execution. Use <observe> for the check result.",
+        "complete" => "You are the completion stage. Use deepcode-action JSON blocks or tool calls when local operations are needed. fs.* paths must be workspace-relative; never use /tmp, absolute paths, drive paths, or .. segments. Before tool actions, use <say> to tell the user what you are about to inspect or run. After observations, use <observe> to explain the result. Use <final> only for the final answer. When the user asks to render or return Markdown, tables, formulas, or diagrams, return the actual Markdown content, not a description of what would be returned. All local operations are subject to the permission gate.",
         "review" => "You are the review stage. Produce the final user-facing answer for the conversation. Keep it direct and avoid internal audit sections unless the user asked for a review. If the user requested Markdown, tables, formulas, or diagrams, include the actual renderable Markdown in the final answer. Use <final> for the final answer. Do not perform new local operations.",
         _ => "You are DeepCode Agent.",
     }
@@ -1744,6 +1886,26 @@ Write all user-facing DeepCode Agent output in Simplified Chinese by default, in
 Keep protocol tags, JSON keys, tool names, file paths, code, commands, and quoted source text unchanged.\n\
 If the user explicitly requests another language, follow the user request for that turn."
         }
+    }
+}
+
+fn ensure_workspace_binding(
+    body: &Value,
+    workspace: &workspace::WorkspaceManager,
+) -> Result<bool, String> {
+    if workspace.get_current().current.is_some() {
+        return Ok(true);
+    }
+
+    let open_path = body
+        .get("workspaceBinding")
+        .and_then(|binding| string_field(binding, "openPath"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    match open_path {
+        Some(path) => workspace.open_workspace(&path).map(|_| true),
+        None => Ok(false),
     }
 }
 
@@ -2114,7 +2276,8 @@ fn workspace_key(value: &Value) -> String {
 }
 
 fn session_matches_scope(session: &Value, scope: &Value) -> bool {
-    if string_field(scope, "workspaceHash").is_none() && string_field(scope, "workspaceId").is_none()
+    if string_field(scope, "workspaceHash").is_none()
+        && string_field(scope, "workspaceId").is_none()
     {
         return true;
     }
@@ -2743,5 +2906,51 @@ fn hide_subprocess_window(_command: &mut Command) {
     #[cfg(windows)]
     {
         _command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fs_write_call(path: &str) -> Value {
+        json!({
+            "name": "fs.write",
+            "arguments": {
+                "path": path,
+                "content": "test\n"
+            }
+        })
+    }
+
+    #[test]
+    fn workspace_tool_path_allows_relative_paths() {
+        assert!(workspace_tool_path_error(&fs_write_call("_agent_tmp_test.txt")).is_none());
+        assert!(workspace_tool_path_error(&fs_write_call("nested/_agent_tmp_test.txt")).is_none());
+    }
+
+    #[test]
+    fn workspace_tool_path_rejects_absolute_and_parent_paths() {
+        assert!(
+            workspace_tool_path_error(&fs_write_call("/tmp/deepcode-agent-test.txt"))
+                .is_some_and(|reason| reason.contains("workspace-relative"))
+        );
+        assert!(
+            workspace_tool_path_error(&fs_write_call("C:\\temp\\deepcode-agent-test.txt"))
+                .is_some_and(|reason| reason.contains("workspace-relative"))
+        );
+        assert!(
+            workspace_tool_path_error(&fs_write_call("../deepcode-agent-test.txt"))
+                .is_some_and(|reason| reason.contains("Path traversal"))
+        );
+    }
+
+    #[test]
+    fn workspace_tool_path_allows_empty_fs_list_root() {
+        let tool_call = json!({
+            "name": "fs.list",
+            "arguments": {}
+        });
+        assert!(workspace_tool_path_error(&tool_call).is_none());
     }
 }

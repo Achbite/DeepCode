@@ -23,9 +23,22 @@ import {
 } from '../../services/fileService.js';
 import { executeAgentShellCommand } from '../terminal/agentShellRuntime.js';
 import { getUserSettings } from '../../services/userSettingsService.js';
+import { ensureWorkspaceBinding, getCurrentWorkspace } from '../../services/workspaceService.js';
 
 const registry = new ToolRegistry();
 const permissionGate = new PermissionGate(registry, { diffProvider: diffForToolCall });
+const NO_WORKSPACE_REASON =
+  'no_workspace: 当前没有打开工作区。请先打开文件夹或 .code-workspace 文件。';
+
+function toolRequiresWorkspace(toolName: string): boolean {
+  return (
+    toolName === 'fs.read' ||
+    toolName === 'fs.list' ||
+    toolName === 'fs.diff' ||
+    toolName === 'fs.write' ||
+    toolName === 'code.search'
+  );
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -219,6 +232,17 @@ export function listAgentTools(mode?: AgentMode): ListToolsResult {
 export async function evaluateAgentPermission(
   request: PermissionEvaluationRequest
 ): Promise<PermissionDecision> {
+  if (!getCurrentWorkspace()) {
+    ensureWorkspaceBinding(request.workspaceBinding);
+  }
+
+  if (toolRequiresWorkspace(request.toolCall.name) && !getCurrentWorkspace()) {
+    return {
+      action: 'deny',
+      reason: NO_WORKSPACE_REASON,
+    };
+  }
+
   const policyDenyReason = await agentPolicyDenyReason(request.toolCall);
   if (policyDenyReason) {
     return {
@@ -237,6 +261,7 @@ export async function executeAgentTool(
   const decision = await evaluateAgentPermission({
     mode: request.mode,
     toolCall: request.toolCall,
+    workspaceBinding: request.workspaceBinding,
   });
 
   if (decision.action === 'deny') {

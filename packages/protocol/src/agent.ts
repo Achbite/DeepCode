@@ -425,6 +425,13 @@ export interface AgentContextSnapshot {
   truncated: boolean;
 }
 
+export interface AgentWorkspaceBinding {
+  workspaceId?: string;
+  workspaceHash?: string;
+  openPath?: string;
+  activeFolderId?: string;
+}
+
 export interface PermissionRequest {
   id: string;
   toolName: string;
@@ -480,6 +487,7 @@ export interface ArchiveAgentSessionRequest {
 export interface SendAgentMessageRequest {
   content: string;
   attachments?: AgentContextAttachment[];
+  workspaceBinding?: AgentWorkspaceBinding;
   mode?: AgentMode;
   workflow?: AgentWorkflowMode;
   workflowConfig?: AgentWorkflowConfig;
