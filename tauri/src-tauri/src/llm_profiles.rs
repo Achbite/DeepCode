@@ -112,6 +112,20 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn token_u32(value: &Value) -> Option<u32> {
+    if let Some(value) = value.as_u64() {
+        return (value > 0 && value <= u32::MAX as u64).then_some(value as u32);
+    }
+    if let Some(value) = value.as_i64() {
+        return (value > 0 && value <= u32::MAX as i64).then_some(value as u32);
+    }
+    let value = value.as_f64()?;
+    if !value.is_finite() || value <= 0.0 || value > u32::MAX as f64 || value.fract() != 0.0 {
+        return None;
+    }
+    Some(value as u32)
+}
+
 fn reasoning_value_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => {
@@ -167,17 +181,26 @@ fn sanitize_profile(raw: &Value) -> Option<Value> {
             profile.insert(key.into(), Value::String(value));
         }
     }
-    for key in ["contextWindowTokens", "maxOutputTokens", "maxTokens", "temperature"] {
-        if let Some(value) = raw.get(key).and_then(Value::as_f64) {
-            if let Some(number) = serde_json::Number::from_f64(value) {
-                profile.insert(key.into(), Value::Number(number));
-            }
+    for key in ["contextWindowTokens", "maxOutputTokens", "maxTokens"] {
+        if let Some(value) = raw.get(key).and_then(token_u32) {
+            profile.insert(key.into(), Value::Number(value.into()));
         }
     }
-    if is_deepseek_v4 && !profile.contains_key("contextWindowTokens") {
+    if let Some(value) = raw.get("temperature").and_then(Value::as_f64) {
+        if let Some(number) = serde_json::Number::from_f64(value) {
+            profile.insert("temperature".into(), Value::Number(number));
+        }
+    }
+    if is_deepseek_v4
+        && !profile.contains_key("contextWindowTokens")
+        && raw.get("contextWindowTokens").is_none()
+    {
         profile.insert("contextWindowTokens".into(), Value::Number(1000000.into()));
     }
-    if is_deepseek_v4 && !profile.contains_key("maxOutputTokens") {
+    if is_deepseek_v4
+        && !profile.contains_key("maxOutputTokens")
+        && raw.get("maxOutputTokens").is_none()
+    {
         profile.insert("maxOutputTokens".into(), Value::Number(384000.into()));
     }
     if is_deepseek_v4 && !profile.contains_key("reasoningEffort") {
@@ -457,14 +480,17 @@ fn provider_user_id(request: &Value) -> String {
     format!("dc_{:016x}", hasher.finish())
 }
 
-fn profile_number(profile: &Value, key: &str) -> Option<Value> {
-    profile.get(key).and_then(Value::as_f64).and_then(|value| {
-        serde_json::Number::from_f64(value).map(Value::Number)
-    })
+fn max_output_tokens(profile: &Value) -> Option<u32> {
+    profile
+        .get("maxOutputTokens")
+        .and_then(token_u32)
+        .or_else(|| profile.get("maxTokens").and_then(token_u32))
 }
 
-fn max_output_tokens(profile: &Value) -> Option<Value> {
-    profile_number(profile, "maxOutputTokens").or_else(|| profile_number(profile, "maxTokens"))
+fn apply_max_tokens(body: &mut Value, profile: &Value) {
+    if let Some(max_tokens) = max_output_tokens(profile) {
+        body["max_tokens"] = json!(max_tokens);
+    }
 }
 
 fn is_deepseek_profile(profile: &Value) -> bool {
@@ -493,9 +519,9 @@ async fn call_openai_compatible(
         "messages": openai_messages(&messages),
         "tools": tools,
         "temperature": profile.get("temperature").cloned(),
-        "max_tokens": max_output_tokens(profile),
         "stream": false
     });
+    apply_max_tokens(&mut body, profile);
 
     if let Some(thinking) = string_field(profile, "thinking") {
         body["thinking"] = json!({ "type": thinking });
@@ -649,4 +675,103 @@ pub async fn chat(request: Value) -> Result<Value, String> {
         return Err(format!("Tauri LLM provider not implemented yet: {kind}"));
     }
     call_openai_compatible(&profile, &api_key, body).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_profile(extra: Value) -> Value {
+        let mut profile = json!({
+            "id": "test",
+            "name": "Test",
+            "kind": "openaiCompatible",
+            "model": "test-model",
+            "enabled": true
+        });
+        let profile_map = profile.as_object_mut().expect("profile is an object");
+        let extra_map = extra.as_object().expect("extra is an object");
+        for (key, value) in extra_map {
+            profile_map.insert(key.clone(), value.clone());
+        }
+        profile
+    }
+
+    #[test]
+    fn token_fields_accept_integer_valued_float() {
+        let profile = sanitize_profile(&base_profile(json!({
+            "contextWindowTokens": 384000.0,
+            "maxOutputTokens": 384000.0
+        })))
+        .expect("profile should sanitize");
+
+        assert_eq!(profile["contextWindowTokens"], json!(384000_u32));
+        assert_eq!(profile["maxOutputTokens"], json!(384000_u32));
+        assert_eq!(max_output_tokens(&profile), Some(384000));
+
+        let mut body = json!({});
+        apply_max_tokens(&mut body, &profile);
+        assert_eq!(body["max_tokens"].as_u64(), Some(384000));
+    }
+
+    #[test]
+    fn token_fields_drop_real_fractional_values() {
+        let profile = sanitize_profile(&base_profile(json!({
+            "maxOutputTokens": 384000.5,
+            "maxTokens": 1200
+        })))
+        .expect("profile should sanitize");
+
+        assert!(profile.get("maxOutputTokens").is_none());
+        assert_eq!(max_output_tokens(&profile), Some(1200));
+
+        let mut body = json!({});
+        apply_max_tokens(&mut body, &profile);
+        assert_eq!(body["max_tokens"].as_u64(), Some(1200));
+    }
+
+    #[test]
+    fn token_fields_drop_negative_and_overflow_values() {
+        let profile = sanitize_profile(&base_profile(json!({
+            "contextWindowTokens": -1,
+            "maxOutputTokens": 4294967296_u64
+        })))
+        .expect("profile should sanitize");
+
+        assert!(profile.get("contextWindowTokens").is_none());
+        assert!(profile.get("maxOutputTokens").is_none());
+        assert_eq!(max_output_tokens(&profile), None);
+
+        let mut body = json!({});
+        apply_max_tokens(&mut body, &profile);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn invalid_explicit_deepseek_token_does_not_fallback_to_default() {
+        let profile = sanitize_profile(&base_profile(json!({
+            "model": "deepseek-v4-flash",
+            "maxOutputTokens": 384000.5
+        })))
+        .expect("profile should sanitize");
+
+        assert!(profile.get("maxOutputTokens").is_none());
+        assert_eq!(max_output_tokens(&profile), None);
+
+        let mut body = json!({});
+        apply_max_tokens(&mut body, &profile);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn temperature_remains_fractional() {
+        let profile = sanitize_profile(&base_profile(json!({
+            "temperature": 0.2,
+            "maxOutputTokens": 384000.0
+        })))
+        .expect("profile should sanitize");
+
+        assert_eq!(profile["temperature"], json!(0.2));
+        assert_eq!(profile["maxOutputTokens"], json!(384000_u32));
+    }
 }

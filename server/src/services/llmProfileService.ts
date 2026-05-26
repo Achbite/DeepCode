@@ -31,9 +31,24 @@ function createDefaultProfilesFile(): LlmProfilesFile {
   };
 }
 
+function normalizeTokenLimit(value: unknown): number | undefined {
+  if (typeof value !== 'number') return undefined;
+  if (!Number.isFinite(value) || value <= 0 || !Number.isInteger(value)) return undefined;
+  if (value > 0xffffffff) return undefined;
+  return value;
+}
+
 function sanitizeProfile(profile: LlmProviderProfile): LlmProviderProfile {
   const model = String(profile.model || '').trim();
   const deepSeekV4 = model === 'deepseek-v4-flash' || model === 'deepseek-v4-pro';
+  const hasContextWindowTokens = Object.prototype.hasOwnProperty.call(
+    profile,
+    'contextWindowTokens'
+  );
+  const hasMaxOutputTokens = Object.prototype.hasOwnProperty.call(profile, 'maxOutputTokens');
+  const contextWindowTokens = normalizeTokenLimit(profile.contextWindowTokens);
+  const maxOutputTokens = normalizeTokenLimit(profile.maxOutputTokens);
+  const maxTokens = normalizeTokenLimit(profile.maxTokens);
   return {
     id: String(profile.id || '').trim(),
     name: String(profile.name || '').trim(),
@@ -41,18 +56,10 @@ function sanitizeProfile(profile: LlmProviderProfile): LlmProviderProfile {
     baseUrl: profile.baseUrl?.trim() || undefined,
     model,
     contextWindowTokens:
-      typeof profile.contextWindowTokens === 'number'
-        ? profile.contextWindowTokens
-        : deepSeekV4
-          ? 1000000
-          : undefined,
+      contextWindowTokens ?? (!hasContextWindowTokens && deepSeekV4 ? 1000000 : undefined),
     maxOutputTokens:
-      typeof profile.maxOutputTokens === 'number'
-        ? profile.maxOutputTokens
-        : deepSeekV4
-          ? 384000
-          : undefined,
-    maxTokens: typeof profile.maxTokens === 'number' ? profile.maxTokens : undefined,
+      maxOutputTokens ?? (!hasMaxOutputTokens && deepSeekV4 ? 384000 : undefined),
+    maxTokens,
     temperature: typeof profile.temperature === 'number' ? profile.temperature : undefined,
     reasoningEffort: ['low', 'medium', 'high', 'max'].includes(String(profile.reasoningEffort))
       ? profile.reasoningEffort

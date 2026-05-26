@@ -75,8 +75,16 @@ function isDeepSeekProfile(profile: LlmProviderProfile): boolean {
     profile.model.startsWith('deepseek-');
 }
 
+function positiveIntegerTokenLimit(value: number | undefined): number | undefined {
+  if (typeof value !== 'number') return undefined;
+  if (!Number.isFinite(value) || value <= 0 || !Number.isInteger(value)) return undefined;
+  if (value > 0xffffffff) return undefined;
+  return value;
+}
+
 function outputTokenLimit(profile: LlmProviderProfile): number | undefined {
-  return profile.maxOutputTokens ?? profile.maxTokens;
+  return positiveIntegerTokenLimit(profile.maxOutputTokens) ??
+    positiveIntegerTokenLimit(profile.maxTokens);
 }
 
 function shouldSendSamplingParameters(profile: LlmProviderProfile): boolean {
