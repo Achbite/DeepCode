@@ -3,7 +3,7 @@
 # DeepCode 容器内链路测试脚本（根目录版本，进容器后直接 ./test.sh）
 # 职责：
 #   1. 环境检查：rust / node / pnpm / pkg / mingw / 网络
-#   2. 阶段 0 Kernel 骨架检查：根级 Rust workspace cargo check/test
+#   2. 阶段 1 Kernel ABI 检查：根级 Rust workspace cargo check/test
 #   3. 协议包构建：生成 @deepcode/protocol dist 类型
 #   4. 静态检查：本阶段相关 protocol + server typecheck（不强依赖前端 Monaco 环境）
 #   5. 链路 ping：启动 server → 探测 /api/health → 关闭
@@ -24,7 +24,7 @@ export PATH="/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/l
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-# /mnt/e 等 DrvFs 挂载点上可能残留 root-owned target/；阶段 0 Rust 骨架检查统一写入 /tmp。
+# /mnt/e 等 DrvFs 挂载点上可能残留 root-owned target/；Kernel ABI 检查统一写入 /tmp。
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/deepcode-cargo-target}"
 ROOT_CARGO_LOCK_WAS_PRESENT=0
 if [ -f "$ROOT_DIR/Cargo.lock" ]; then
@@ -116,12 +116,12 @@ command -v x86_64-w64-mingw32-gcc >/dev/null \
     || info "mingw-w64 未就绪（不影响本测试）"
 pass "tooling ok"
 
-# ---- 2. 阶段 0 Kernel 骨架检查 ----
-info "[2/7] stage 0 rust kernel workspace cargo check/test"
+# ---- 2. 阶段 1 Kernel ABI 检查 ----
+info "[2/7] stage 1 rust kernel ABI workspace cargo check/test"
 if cargo check --workspace && cargo test --workspace; then
-    pass "stage 0 rust kernel workspace check/test ok"
+    pass "stage 1 rust kernel ABI workspace check/test ok"
 else
-    fail "stage 0 rust kernel workspace check/test 失败"; exit 2
+    fail "stage 1 rust kernel ABI workspace check/test 失败"; exit 2
 fi
 
 # ---- 3. 协议包构建 ----
@@ -775,6 +775,15 @@ echo "$WRITE_RESTORE_RESP" | jq -e '.ok == true and ([.data.events[].kind] | ind
     && grep -q 'Restored write' "$WRITE_SMOKE_DIR/restored.cpp" \
     && pass "permission resolve can restore fs.write from session event" \
     || { fail "permission restore fs.write failed"; exit "$NEXT_FAIL_CODE"; }
+NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
+
+DELETE_ENTRY_BODY="$(jq -nc '{path: "main.cpp"}')"
+DELETE_ENTRY_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$DELETE_ENTRY_BODY" "http://127.0.0.1:${TEST_PORT}/api/files/delete" || true)"
+info "file delete smoke -> $DELETE_ENTRY_RESP"
+echo "$DELETE_ENTRY_RESP" | jq -e '.ok == true and .data.deleted == true and .data.path == "main.cpp" and .data.kind == "file"' >/dev/null 2>&1 \
+    && [ ! -e "$WRITE_SMOKE_DIR/main.cpp" ] \
+    && pass "file tree delete API removes workspace file" \
+    || { fail "file tree delete API failed"; exit "$NEXT_FAIL_CODE"; }
 NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
 
 rm -rf "$WRITE_SMOKE_DIR"

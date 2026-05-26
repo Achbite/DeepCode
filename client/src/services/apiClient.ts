@@ -12,6 +12,7 @@ import type {
   FileWriteResult,
   CreateFolderResult,
   RenameEntryResult,
+  DeleteEntryResult,
   WorkspaceState,
   OpenWorkspaceResult,
   SaveWorkspaceFileRequest,
@@ -286,6 +287,17 @@ export function renameEntry(
     `${API_BASE}/files/rename`,
     'POST',
     { folderId, oldPath, newPath }
+  );
+}
+
+export function deleteEntry(
+  filePath: string,
+  folderId?: string
+): Promise<ApiResponse<DeleteEntryResult>> {
+  return sendJson<DeleteEntryResult>(
+    `${API_BASE}/files/delete`,
+    'POST',
+    { folderId, path: filePath }
   );
 }
 

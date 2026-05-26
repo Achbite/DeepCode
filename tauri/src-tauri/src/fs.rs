@@ -62,6 +62,16 @@ pub struct RenameEntryResult {
     pub renamed: bool,
 }
 
+/// 删除结果（文件或目录）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteEntryResult {
+    pub folder_id: String,
+    pub path: String,
+    pub deleted: bool,
+    pub kind: String,
+}
+
 /// 浏览条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -431,6 +441,34 @@ pub fn rename_entry(
         old_path: old_path.into(),
         new_path: new_path.into(),
         renamed: true,
+    })
+}
+
+/// 删除文件或目录；禁止删除 WorkspaceFolder 根目录。
+pub fn delete_entry(
+    folder_root: &str,
+    folder_id: &str,
+    relative_path: &str,
+) -> Result<DeleteEntryResult, String> {
+    if relative_path.trim().is_empty() {
+        return Err("不允许删除工作区根目录".into());
+    }
+
+    let full_path = resolve_and_validate(folder_root, relative_path)?;
+    let metadata = fs::metadata(&full_path).map_err(|e| format!("读取元数据失败: {}", e))?;
+    let kind = if metadata.is_dir() {
+        fs::remove_dir_all(&full_path).map_err(|e| format!("删除目录失败: {}", e))?;
+        "directory"
+    } else {
+        fs::remove_file(&full_path).map_err(|e| format!("删除文件失败: {}", e))?;
+        "file"
+    };
+
+    Ok(DeleteEntryResult {
+        folder_id: folder_id.into(),
+        path: relative_path.into(),
+        deleted: true,
+        kind: kind.into(),
     })
 }
 

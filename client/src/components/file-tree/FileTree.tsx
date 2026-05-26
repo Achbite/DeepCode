@@ -13,6 +13,7 @@ import {
   createFile,
   createFolder,
   renameEntry,
+  deleteEntry,
 } from '../../services/runtimeAdapter';
 import type { FileTreeNode } from '@deepcode/protocol';
 import { useWorkspaceStore } from '../../state/workspaceStore';
@@ -100,6 +101,8 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
   const getActiveFolder = useWorkspaceStore((s) => s.getActiveFolder);
   const showWorkspaceOpenDialog = useUiStore((s) => s.showWorkspaceOpenDialog);
   const renamePathInTabs = useEditorStore((s) => s.renamePathInTabs);
+  const closeTab = useEditorStore((s) => s.closeTab);
+  const getOpenFiles = useEditorStore((s) => s.getOpenFiles);
   const addAgentAttachment = useAgentSessionStore((s) => s.addAttachment);
 
   const [tree, setTree] = useState<FileTreeNode[]>([]);
@@ -278,6 +281,55 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
       }
     },
     [pendingRename, renamePathInTabs, bumpTreeRevision, language]
+  );
+
+  const submitDelete = useCallback(
+    async (target: ResourceTarget) => {
+      if (!target.path) {
+        setPendingError(t(language, 'explorer.error.deleteRoot'));
+        return;
+      }
+      const confirmKey =
+        target.kind === 'directory'
+          ? 'explorer.confirm.deleteFolder'
+          : 'explorer.confirm.deleteFile';
+      const ok = window.confirm(t(language, confirmKey, { name: target.name }));
+      if (!ok) {
+        setContextMenu(null);
+        return;
+      }
+
+      const result = await deleteEntry(target.path, target.folderId);
+      if (result.ok && result.data) {
+        const isNested = (path: string) =>
+          path === target.path || path.startsWith(`${target.path}/`);
+        for (const file of getOpenFiles()) {
+          if (file.folderId === target.folderId && isNested(file.path)) {
+            closeTab(buildFileTabId(file.folderId, file.path));
+          }
+        }
+        setExpandedDirs((prev) => {
+          const next = new Set<string>();
+          for (const path of prev) {
+            if (!isNested(path)) next.add(path);
+          }
+          return next;
+        });
+        if (
+          selectedResource?.folderId === target.folderId &&
+          isNested(selectedResource.path)
+        ) {
+          setSelectedResource(null);
+        }
+        setContextMenu(null);
+        setPendingError(null);
+        bumpTreeRevision();
+      } else {
+        setContextMenu(null);
+        setPendingError(result.message || t(language, 'explorer.error.delete'));
+      }
+    },
+    [bumpTreeRevision, closeTab, getOpenFiles, language, selectedResource]
   );
 
   const toggleDir = (dirPath: string) => {
@@ -524,6 +576,7 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
             setContextMenu(null);
           }}
           onRename={() => startRename(contextMenu.target)}
+          onDelete={() => void submitDelete(contextMenu.target)}
           onAddToAgent={() => addToAgent(contextMenu.target, 'message')}
           onAddToAgentSession={() => addToAgent(contextMenu.target, 'session')}
           language={language}
@@ -589,6 +642,7 @@ interface ExplorerContextMenuProps {
   onNewFile: () => void;
   onNewFolder: () => void;
   onRename: () => void;
+  onDelete: () => void;
   onAddToAgent: () => void;
   onAddToAgentSession: () => void;
   language: UiLanguage;
@@ -599,6 +653,7 @@ const ExplorerContextMenu: React.FC<ExplorerContextMenuProps> = ({
   onNewFile,
   onNewFolder,
   onRename,
+  onDelete,
   onAddToAgent,
   onAddToAgentSession,
   language,
@@ -614,6 +669,11 @@ const ExplorerContextMenu: React.FC<ExplorerContextMenuProps> = ({
     <button onClick={onNewFile}>{t(language, 'explorer.newFile')}</button>
     <button onClick={onNewFolder}>{t(language, 'explorer.newFolder')}</button>
     {state.target.path && <button onClick={onRename}>{t(language, 'explorer.rename')}</button>}
+    {state.target.path && (
+      <button className="file-tree__context-danger" onClick={onDelete}>
+        {t(language, 'explorer.delete')}
+      </button>
+    )}
     <div className="file-tree__context-separator" />
     <button onClick={onAddToAgent}>{t(language, 'explorer.addToAgentMessage')}</button>
     <button onClick={onAddToAgentSession}>{t(language, 'explorer.pinToAgentSession')}</button>

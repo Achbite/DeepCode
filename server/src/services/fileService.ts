@@ -6,7 +6,7 @@
  *   - 路径安全：所有相对路径解析后必须落在 folder.absolutePath 之内；
  *   - 大文件 / 二进制 / 写入大小阈值 / 目录树节点上限与 Tauri Rust 端 fs.rs 对齐。
  */
-import { readdir, readFile, writeFile, mkdir, stat, access, rename } from 'node:fs/promises';
+import { readdir, readFile, writeFile, mkdir, stat, access, rename, rm } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { dirname, join, resolve, normalize, relative, isAbsolute, sep } from 'node:path';
 import type {
@@ -15,6 +15,7 @@ import type {
   FileWriteResult,
   CreateFolderResult,
   RenameEntryResult,
+  DeleteEntryResult,
 } from '@deepcode/protocol';
 import { resolveFolder } from './workspaceService.js';
 
@@ -389,5 +390,34 @@ export async function renameEntry(
     oldPath: toRelativePosix(folderRoot, oldAbs),
     newPath: toRelativePosix(folderRoot, newAbs),
     renamed: true,
+  };
+}
+
+/**
+ * 删除工作区内文件或目录。
+ *
+ * 删除入口只接受相对路径，禁止删除 WorkspaceFolder 根目录。目录删除使用
+ * recursive 语义以匹配资源管理器的基础体验，但路径必须先通过 safePath 约束。
+ */
+export async function deleteEntry(
+  folderId: string | undefined,
+  relativePath: string
+): Promise<DeleteEntryResult> {
+  if (!relativePath || relativePath.trim() === '') {
+    throw new Error('不允许删除工作区根目录');
+  }
+  const folder = resolveFolder(folderId);
+  const folderRoot = folder.absolutePath;
+  const absolutePath = safePath(folderRoot, relativePath);
+  const entryStat = await stat(absolutePath);
+  const kind = entryStat.isDirectory() ? 'directory' : 'file';
+
+  await rm(absolutePath, { recursive: kind === 'directory', force: false });
+
+  return {
+    folderId: folder.id,
+    path: toRelativePosix(folderRoot, absolutePath),
+    deleted: true,
+    kind,
   };
 }

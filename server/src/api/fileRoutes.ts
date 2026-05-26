@@ -6,6 +6,7 @@
  * POST /api/files/write                   - 写入文件内容（folderId/path/content）
  * POST /api/files/create                  - 新建文件（已存在报错 file_already_exists）
  * POST /api/folders/create                - 新建目录（递归创建中间目录）
+ * POST /api/files/delete                  - 删除文件或目录
  *
  * 所有响应统一使用 ApiResponse<T> 包装；错误使用机器可读 error 字段。
  * 所有路径都基于 folderId 解析；不传 folderId 时使用当前工作区 folders[0]。
@@ -18,6 +19,7 @@ import {
   createFile,
   createFolderEntry,
   renameEntry,
+  deleteEntry,
 } from '../services/fileService.js';
 import type {
   ApiResponse,
@@ -32,6 +34,8 @@ import type {
   CreateFolderResult,
   RenameEntryRequest,
   RenameEntryResult,
+  DeleteEntryRequest,
+  DeleteEntryResult,
 } from '@deepcode/protocol';
 
 function routeError(fallback: string, err: unknown): { error: string; message: string } {
@@ -216,6 +220,37 @@ export async function registerFileRoutes(app: FastifyInstance): Promise<void> {
           : isExist
             ? 'file_already_exists'
             : 'file_rename_error',
+        message,
+      };
+      return response;
+    }
+  });
+
+  // ---- 删除文件 / 目录（编辑器基建）----
+  app.post('/api/files/delete', async (request) => {
+    const body = request.body as DeleteEntryRequest;
+    if (!body || !body.path) {
+      const response: ApiResponse<never> = {
+        ok: false,
+        error: 'missing_param',
+        message: '缺少 path 参数',
+      };
+      return response;
+    }
+    try {
+      const result = await deleteEntry(body.folderId, body.path);
+      const response: ApiResponse<DeleteEntryResult> = {
+        ok: true,
+        data: result,
+      };
+      return response;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const response: ApiResponse<never> = {
+        ok: false,
+        error: message.startsWith('no_workspace:')
+          ? 'no_workspace'
+          : 'file_delete_error',
         message,
       };
       return response;

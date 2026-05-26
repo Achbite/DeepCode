@@ -16,6 +16,7 @@ import type {
   FileWriteResult,
   CreateFolderResult,
   RenameEntryResult,
+  DeleteEntryResult,
   WorkspaceState,
   OpenWorkspaceResult,
   SaveWorkspaceFileRequest,
@@ -429,6 +430,20 @@ export async function renameEntry(
   }
   const { renameEntry: apiRenameEntry } = await import('./apiClient');
   return apiRenameEntry(oldPath, newPath, folderId);
+}
+
+export async function deleteEntry(
+  filePath: string,
+  folderId?: string
+): Promise<ApiResponse<DeleteEntryResult>> {
+  if (getRuntimeType() === 'tauri') {
+    return tauriInvoke<DeleteEntryResult>('delete_entry', {
+      folderId: folderId ?? null,
+      path: filePath,
+    });
+  }
+  const { deleteEntry: apiDeleteEntry } = await import('./apiClient');
+  return apiDeleteEntry(filePath, folderId);
 }
 
 // ---- Terminal runtime ----

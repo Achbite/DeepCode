@@ -109,3 +109,21 @@ export interface RenameEntryResult {
   newPath: string;
   renamed: boolean;
 }
+
+/** POST /api/files/delete 请求体 —— 删除工作区内文件或目录 */
+export interface DeleteEntryRequest {
+  /** 目标 WorkspaceFolder 的 id；省略时使用当前工作区 folders[0] */
+  folderId?: string;
+  /** 待删除资源相对 folder 根的 POSIX 路径；不允许为空 */
+  path: string;
+}
+
+/** POST /api/files/delete 成功响应 data 字段 */
+export interface DeleteEntryResult {
+  folderId: string;
+  /** 已删除资源相对 folder 根的 POSIX 路径 */
+  path: string;
+  deleted: boolean;
+  /** 删除前识别到的资源类型 */
+  kind: 'file' | 'directory';
+}

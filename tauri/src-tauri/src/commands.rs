@@ -212,6 +212,19 @@ pub fn rename_entry(
         .map_err(CommandError::Other)
 }
 
+/// Deletes a file or folder inside the workspace.
+#[tauri::command]
+pub fn delete_entry(
+    folder_id: Option<String>,
+    path: String,
+    state: tauri::State<'_, workspace::WorkspaceManager>,
+) -> Result<fs::DeleteEntryResult, CommandError> {
+    let folder = state
+        .resolve_folder(folder_id.as_deref())
+        .map_err(CommandError::Other)?;
+    fs::delete_entry(&folder.absolute_path, &folder.id, &path).map_err(CommandError::Other)
+}
+
 // ---- Native dialogs ----
 
 /// Opens a native dialog for selecting a directory.

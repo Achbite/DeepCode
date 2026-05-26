@@ -42,6 +42,7 @@ fn main() {
             commands::create_file,
             commands::create_folder,
             commands::rename_entry,
+            commands::delete_entry,
             // 原生对话框
             commands::pick_workspace_directory,
             commands::pick_workspace_file,
