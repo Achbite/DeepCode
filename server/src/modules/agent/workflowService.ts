@@ -44,6 +44,7 @@ interface PendingPermission {
   request: PermissionRequest;
   toolCall: ToolCall;
   mode: AgentMode;
+  agentRequest?: SendAgentMessageRequest;
 }
 
 type AgentOutputSegmentKind = 'reasoning' | 'say' | 'plan' | 'observe' | 'final';
@@ -102,6 +103,13 @@ function permissionRequestPayload(value: unknown): PermissionRequest | undefined
 async function restorePendingPermission(permissionId: string): Promise<PendingPermission | undefined> {
   const current = await getAgentSession();
   if (!current) return undefined;
+  const latestUserContent = [...current.events]
+    .reverse()
+    .find((event) => event.kind === 'user_msg' && isRecord(event.payload) && typeof event.payload.content === 'string')
+    ?.payload;
+  const restoredAgentRequest: SendAgentMessageRequest | undefined = isRecord(latestUserContent) && typeof latestUserContent.content === 'string'
+    ? { content: latestUserContent.content, mode: current.session.mode }
+    : undefined;
 
   for (let i = current.events.length - 1; i >= 0; i -= 1) {
     const event = current.events[i];
@@ -123,6 +131,7 @@ async function restorePendingPermission(permissionId: string): Promise<PendingPe
         arguments: isRecord(request.argumentsPreview) ? request.argumentsPreview : {},
       },
       mode: 'askBeforeWrite',
+      agentRequest: restoredAgentRequest,
     };
   }
   return undefined;
@@ -189,6 +198,7 @@ const STAGE_PROMPTS: Record<AgentWorkflowStage, string> = {
   check: [
     'You are the checking stage of DeepCode Agent.',
     'Review the plan, context, risks, and likely tool usage. Point out unsafe or unclear operations.',
+    'Do not answer identity, final result, or tool summary obligations in this stage; leave them for review/final.',
     'Re-check whether the request can proceed directly or must wait for user confirmation. Sensitive, destructive, publishing, or high-risk Git operations must require explicit permission even when the user asked for execution.',
     'Treat local keyword detection only as a hint; the permission gate remains authoritative.',
     'Do not request local writes or shell execution.',
@@ -434,7 +444,8 @@ async function executeOrAsk(
   context: ToolBatchContext = {
     batchId: `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     batchLabel: '执行工具',
-  }
+  },
+  agentRequest?: SendAgentMessageRequest
 ): Promise<AgentEvent[]> {
   const withToolName = (result: ToolResult): ToolResult & { toolName: string; status: 'ok' | 'error' } => ({
     ...result,
@@ -477,6 +488,7 @@ async function executeOrAsk(
       request: decision.request,
       toolCall,
       mode,
+      agentRequest,
     });
     const permissionEvent = newEvent(sessionId, 'permission_request', withContext(decision.request, context, {
       channel: 'tool',
@@ -510,7 +522,8 @@ async function runParsedTextActions(
   content: string,
   emit?: (events: AgentEvent[]) => Promise<void>,
   context: EventContext = {},
-  guardFinalContent: (content: string) => string = (value) => value
+  guardFinalContent: (content: string) => string = (value) => value,
+  agentRequest?: SendAgentMessageRequest
 ): Promise<AgentEvent[]> {
   const events: AgentEvent[] = [];
   const deferredFinalEvents: AgentEvent[] = [];
@@ -586,7 +599,7 @@ async function runParsedTextActions(
       ...context,
       batchId: batchId ?? `batch-${toolCall.id}`,
       batchLabel,
-    });
+    }, agentRequest);
     events.push(...toolEvents);
   }
   if (!hasPendingPermission(events)) {
@@ -1085,7 +1098,7 @@ export async function sendAgentMessage(
               ...baseContext,
               batchId: batchId ?? `batch-${toolCall.id}`,
               batchLabel,
-            });
+            }, request);
             observationEvents.push(...toolEvents);
           }
           if (haltWorkflow) break;
@@ -1099,7 +1112,8 @@ export async function sendAgentMessage(
               runtimeActionMarkup,
               emit,
               baseContext,
-              (content) => guardFinalAnswerForPendingObligations(workflowMemory, content)
+              (content) => guardFinalAnswerForPendingObligations(workflowMemory, content),
+              request
             );
             observationEvents.push(...parsedEvents);
             if (hasFinalAssistantEvent(parsedEvents)) {
@@ -1202,6 +1216,273 @@ export async function sendAgentMessage(
   return latest;
 }
 
+async function continueAgentAfterPermission(
+  sessionId: string,
+  request: SendAgentMessageRequest,
+  seedEvents: AgentEvent[]
+): Promise<AgentEvent[]> {
+  const latest = await getAgentSession(sessionId);
+  if (!latest) {
+    return [newEvent(sessionId, 'error', {
+      channel: 'error',
+      visibility: 'conversation',
+      code: 'agent_session_not_found',
+      message: `Agent session not found: ${sessionId}`,
+    })];
+  }
+
+  const stage: AgentWorkflowStage = 'complete';
+  const mode = operationModeForStage(stage, request.mode ?? latest.session.mode, request.content);
+  const promptText = await contextRegistry.buildPromptText(request.attachments ?? []);
+  const languageInstruction = await resolveAgentLanguageInstruction();
+  const workflowConfig = await resolveWorkflowConfig(request, latest);
+  const profileId = workflowConfig.complete?.profileId;
+  if (!profileId) {
+    return [assistantSegmentEvent(sessionId, {
+      turnId: `evt-permission-resume-${Date.now()}`,
+      stage,
+      phase: stage,
+      stageRunId: `stage-resume-${Date.now()}`,
+      llmCallId: `llm-resume-${Date.now()}`,
+    }, {
+      kind: 'observe',
+      content: '已处理权限结果，但当前没有配置执行阶段模型，无法自动继续工作流。',
+    })];
+  }
+
+  const profileCatalog = await getLlmProfiles();
+  const profile = new Map(profileCatalog.profiles.map((item) => [item.id, item])).get(profileId);
+  if (!profile) {
+    return [assistantSegmentEvent(sessionId, {
+      turnId: `evt-permission-resume-${Date.now()}`,
+      stage,
+      phase: stage,
+      stageRunId: `stage-resume-${Date.now()}`,
+      llmCallId: `llm-resume-${Date.now()}`,
+    }, {
+      kind: 'observe',
+      content: `已处理权限结果，但找不到执行阶段模型 profile：${profileId}。`,
+    })];
+  }
+
+  const allKnownEvents = [...latest.events, ...seedEvents];
+  const workflowMemory = createWorkflowStageMemory(request.content);
+  updateWorkflowStageMemoryFromToolEvents(workflowMemory, allKnownEvents);
+
+  const continuationEvents: AgentEvent[] = [];
+  const emit = async (events: AgentEvent[]) => {
+    continuationEvents.push(...events);
+  };
+  const turnId = [...latest.events]
+    .reverse()
+    .find((event) => event.kind === 'user_msg')?.id ?? `evt-permission-resume-${Date.now()}`;
+
+  for (let stageCallIndex = 0; stageCallIndex < 3; stageCallIndex += 1) {
+    const stageRunId = `stage-${stage}-resume-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const llmCallId = `llm-${stage}-resume-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const baseContext: EventContext = {
+      turnId,
+      stage,
+      phase: stage,
+      stageRunId,
+      llmCallId,
+    };
+    const structuredMemory = formatWorkflowStageMemory(workflowMemory);
+    const contextBudget = contextBudgetPolicy.evaluate(
+      [promptText, request.content, structuredMemory].join('\n\n'),
+      profile
+    );
+
+    await emit([newEvent(sessionId, 'workflow_stage', {
+      stage,
+      phase: stage,
+      stageRunId,
+      llmCallId,
+      profileId,
+      status: 'started',
+      contextBudget,
+      channel: 'task',
+      visibility: 'task',
+      resumeReason: 'permission_accepted',
+    })]);
+
+    let assistantText = '';
+    let reasoningText = '';
+    const stageToolCalls: ToolCall[] = [];
+    const observationEvents: AgentEvent[] = [];
+    let stageCallSummary = 'No textual output.';
+    let stageCallEmittedFinal = false;
+
+    try {
+      const response = await chatWithLlm({
+        profileId,
+        messages: [
+          {
+            role: 'system',
+            content: [
+              promptText,
+              OUTPUT_ENVELOPE_PROMPT,
+              WORKSPACE_PATH_PROMPT,
+              STAGE_PROMPTS.complete,
+              languageInstruction,
+              `Current user session mode: ${request.mode ?? latest.session.mode}.`,
+              `Current local operation mode for this resumed stage: ${mode}.`,
+              'You are resuming after a permission request was accepted and its tool result is available in Structured workflow memory.',
+              'Continue only with the next required tool action, a permission request, or a blocked/final answer when completion criteria are satisfied.',
+              'Natural language alone must never trigger local operations; only explicit tool calls or deepcode-action blocks may do so.',
+            ].join('\n\n'),
+          },
+          {
+            role: 'user',
+            content: `${request.content}\n\n${structuredMemory}`,
+          },
+        ],
+        tools: listAgentTools(mode).tools,
+        stream: false,
+      });
+
+      for (const chunk of response.chunks) {
+        if (chunk.type === 'reasoning_delta' && chunk.content) reasoningText += chunk.content;
+        if (chunk.type === 'delta' && chunk.content) assistantText += chunk.content;
+        if (chunk.type === 'tool_call' && chunk.toolCall) stageToolCalls.push(chunk.toolCall);
+        if (chunk.type === 'error') {
+          await emit([newEvent(sessionId, 'error', {
+            ...baseContext,
+            channel: 'error',
+            visibility: 'conversation',
+            code: 'llm_stream_error',
+            message: chunk.error ?? 'LLM stream error',
+          })]);
+        }
+      }
+
+      if (reasoningText.trim()) {
+        await emit([assistantSegmentEvent(sessionId, baseContext, {
+          kind: 'reasoning',
+          content: reasoningText.trim(),
+        })]);
+      }
+
+      const trimmed = assistantText.trim();
+      const runtimeActionMarkup = trimmed ? extractRuntimeActionMarkup(trimmed) : '';
+      const hasPlannedLocalActions = stageToolCalls.length > 0 || Boolean(runtimeActionMarkup);
+      if (trimmed) {
+        const segments = parseTaggedSegments(trimmed, fallbackSegmentKind(stage));
+        stageCallSummary = summarizeSegments(segments, 'Text output prepared.');
+        const emittedSegments: typeof segments = [];
+        for (const segment of segments) {
+          let normalizedSegment = normalizeSegmentForStage(stage, segment);
+          if (normalizedSegment.kind === 'final' && hasPlannedLocalActions) continue;
+          if (normalizedSegment.kind === 'final') {
+            normalizedSegment = {
+              ...normalizedSegment,
+              content: guardFinalAnswerForPendingObligations(workflowMemory, normalizedSegment.content),
+            };
+          }
+          await emit([assistantSegmentEvent(sessionId, baseContext, normalizedSegment)]);
+          emittedSegments.push(normalizedSegment);
+          if (normalizedSegment.kind === 'final') stageCallEmittedFinal = true;
+        }
+        updateWorkflowStageMemoryFromSegments(workflowMemory, stage, emittedSegments);
+      } else if (stageToolCalls.length > 0) {
+        await emit([assistantSegmentEvent(sessionId, baseContext, {
+          kind: 'say',
+          content: '权限已确认，继续执行剩余工具步骤。',
+        })]);
+      }
+
+      const batchId = stageToolCalls.length > 0
+        ? `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`
+        : undefined;
+      const batchLabel = toolBatchLabel(stageToolCalls);
+      for (const toolCall of stageToolCalls) {
+        const toolEvents = await executeOrAsk(sessionId, mode, toolCall, emit, {
+          ...baseContext,
+          batchId: batchId ?? `batch-${toolCall.id}`,
+          batchLabel,
+        }, request);
+        observationEvents.push(...toolEvents);
+      }
+
+      if (trimmed && runtimeActionMarkup) {
+        const parsedEvents = await runParsedTextActions(
+          sessionId,
+          mode,
+          runtimeActionMarkup,
+          emit,
+          baseContext,
+          (content) => guardFinalAnswerForPendingObligations(workflowMemory, content),
+          request
+        );
+        observationEvents.push(...parsedEvents);
+        if (hasFinalAssistantEvent(parsedEvents)) stageCallEmittedFinal = true;
+      }
+
+      updateWorkflowStageMemoryFromToolEvents(workflowMemory, observationEvents);
+      if (observationEvents.length > 0) {
+        const summaries = observationEvents
+          .map(toolObservationDisplaySummary)
+          .filter((summary): summary is string => Boolean(summary))
+          .slice(0, 8);
+        const waitingPermission = hasPendingPermission(observationEvents);
+        const observationSummary = waitingPermission
+          ? '继续执行时需要新的本地操作确认，请在确认卡片中处理后继续。'
+          : '权限确认后的工具结果已纳入工作流，继续根据结果判断。';
+        await emit([assistantSegmentEvent(sessionId, baseContext, {
+          kind: 'observe',
+          content: summaries.length > 0
+            ? `${observationSummary}\n\n${summaries.join('\n')}`
+            : observationSummary,
+        })]);
+        stageCallSummary = observationSummary;
+        if (waitingPermission) {
+          stageCallEmittedFinal = false;
+        }
+      }
+
+      await emit([newEvent(sessionId, 'workflow_stage', {
+        stage,
+        phase: stage,
+        stageRunId,
+        llmCallId,
+        profileId,
+        status: 'completed',
+        summary: stageCallSummary,
+        channel: 'task',
+        visibility: 'task',
+        resumeReason: 'permission_accepted',
+      })]);
+
+      if (hasPendingPermission(observationEvents) || stageCallEmittedFinal) break;
+      if (!hasToolOrPermissionEvents(observationEvents)) break;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await emit([newEvent(sessionId, 'workflow_stage', {
+        stage,
+        phase: stage,
+        stageRunId,
+        llmCallId,
+        profileId,
+        status: 'error',
+        summary: message,
+        channel: 'task',
+        visibility: 'task',
+        resumeReason: 'permission_accepted',
+      })]);
+      await emit([newEvent(sessionId, 'error', {
+        ...baseContext,
+        channel: 'error',
+        visibility: 'conversation',
+        code: 'llm_stage_error',
+        message,
+      })]);
+      break;
+    }
+  }
+
+  return continuationEvents;
+}
+
 export async function resolveAgentPermission(
   permissionId: string,
   request: ResolveAgentPermissionRequest
@@ -1231,16 +1512,27 @@ export async function resolveAgentPermission(
       ...result,
       toolName: pending.toolCall.name,
     }));
-    events.push(newEvent(pending.sessionId, 'assistant_msg', {
-      content: summarizeAcceptedToolResult(pending.toolCall.name, result),
-      label: 'Agent',
-      channel: 'final',
-      visibility: 'conversation',
-    }, {
-      presentation: 'body',
-      defaultOpen: true,
-      importance: result.ok ? 'primary' : 'secondary',
-    }));
+    if (pending.agentRequest && result.ok) {
+      const continuationEvents = await continueAgentAfterPermission(
+        pending.sessionId,
+        pending.agentRequest,
+        events
+      );
+      events.push(...continuationEvents);
+    } else {
+      events.push(newEvent(pending.sessionId, 'assistant_msg', {
+        content: result.ok
+          ? `${summarizeAcceptedToolResult(pending.toolCall.name, result)}\n\n工作流上下文不可恢复，请继续发送“继续”以完成后续步骤。`
+          : summarizeAcceptedToolResult(pending.toolCall.name, result),
+        label: 'Agent',
+        channel: 'observation',
+        visibility: 'conversation',
+      }, {
+        presentation: 'body',
+        defaultOpen: true,
+        importance: 'secondary',
+      }));
+    }
   } else {
     events.push(newEvent(pending.sessionId, 'tool_result', {
       callId: pending.toolCall.id,

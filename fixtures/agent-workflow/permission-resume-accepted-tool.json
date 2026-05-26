@@ -1,0 +1,42 @@
+[
+  {
+    "id": "1",
+    "sessionId": "s",
+    "ts": "t",
+    "kind": "tool_call",
+    "payload": {
+      "toolCall": {
+        "name": "fs.list",
+        "arguments": {
+          "path": "."
+        }
+      }
+    }
+  },
+  {
+    "id": "2",
+    "sessionId": "s",
+    "ts": "t",
+    "kind": "tool_result",
+    "payload": {
+      "toolName": "fs.list",
+      "ok": true,
+      "output": {
+        "path": "."
+      }
+    }
+  },
+  {
+    "id": "3",
+    "sessionId": "s",
+    "ts": "t",
+    "kind": "tool_result",
+    "payload": {
+      "toolName": "fs.write",
+      "ok": true,
+      "output": {
+        "path": "_agent_tmp_functional_test.txt"
+      }
+    }
+  }
+]

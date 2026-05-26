@@ -849,10 +849,21 @@ impl AgentManager {
                 }),
                 workspace,
             );
+            let result_with_tool = with_tool_name(result, &pending.tool_call);
+            let resume_message = format!(
+                "{}\n\n桌面端当前已处理权限结果；完整自动续跑将由 Kernel workflow continuation 接管。请继续发送“继续”完成后续步骤。",
+                accepted_tool_result_message(&result_with_tool)
+            );
             events.push(new_event(
                 &pending.session_id,
                 "tool_result",
-                with_tool_name(result, &pending.tool_call),
+                result_with_tool,
+            ));
+            events.push(assistant_segment_event(
+                &pending.session_id,
+                &json!({}),
+                "observe",
+                &resume_message,
             ));
         } else {
             events.push(new_event(
@@ -1874,7 +1885,7 @@ fn build_prompt_text(attachments: &[Value], workspace: &workspace::WorkspaceMana
 fn stage_prompt(stage: &str) -> &'static str {
     match stage {
         "plan" => "You are the planning stage. Create a concise plan and classify whether this is directExecution or needsUserConfirmation. Do not request local writes or shell execution. Do not answer the user's final business request in this stage; record identity, result, and summary needs for review/final. Any planned fs.* path must be workspace-relative, never /tmp or an absolute path. Current tool catalog does not include fs.delete; temp cleanup must use exact workspace-scoped shell.exec when approved. Prefer <plan> for the plan and only use <say> for short progress notes. If the request only needs a direct answer, use <final>.",
-        "check" => "You are the checking stage. Review plan, context, risks, and likely tool usage. If the plan proposes absolute fs.* paths such as /tmp, mark it unsafe and require workspace-relative paths. Do not request local writes or shell execution. Use <observe> for the check result.",
+        "check" => "You are the checking stage. Review plan, context, risks, and likely tool usage. Do not answer identity, final result, or tool summary obligations in this stage; leave them for review/final. If the plan proposes absolute fs.* paths such as /tmp, mark it unsafe and require workspace-relative paths. Do not request local writes or shell execution. Use <observe> for the check result.",
         "complete" => "You are the completion stage. Use deepcode-action JSON blocks or tool calls when local operations are needed. fs.* paths must be workspace-relative; never use /tmp, absolute paths, drive paths, or .. segments. Do not repeat identity text or final summary content from earlier user-visible messages. For temporary file lifecycle tests, continue create -> read/verify -> exact shell.exec cleanup until complete, blocked, waiting for permission, or budget exhausted. Before tool actions, use <say> to tell the user what you are about to inspect or run. After observations, use <observe> to explain the result. Use <final> only for the final answer. When the user asks to render or return Markdown, tables, formulas, or diagrams, return the actual Markdown content, not a description of what would be returned. All local operations are subject to the permission gate.",
         "review" => "You are the review stage. Produce the final user-facing answer only when Structured workflow memory shows completion criteria are satisfied. Use Structured workflow memory as the source of facts; do not summarize raw prior assistant prose or repeat satisfied answer obligations. If required critical steps are still pending, return a blocked/replan result instead of claiming success. Keep it direct and avoid internal audit sections unless the user asked for a review. If the user requested Markdown, tables, formulas, or diagrams, include the actual renderable Markdown in the final answer. Use <final> for the final answer. Do not perform new local operations.",
         _ => "You are DeepCode Agent.",
@@ -2441,6 +2452,28 @@ fn event_summary(event: &Value) -> String {
         }
         "error" => string_field(payload, "message").unwrap_or_else(|| "Agent error.".into()),
         _ => kind,
+    }
+}
+
+fn accepted_tool_result_message(result: &Value) -> String {
+    let tool_name = string_field(result, "toolName").unwrap_or_else(|| "tool".into());
+    if !result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let error = string_field(result, "error").unwrap_or_else(|| "unknown error".into());
+        return format!("{tool_name} 执行失败：{error}");
+    }
+    let path = result
+        .get("output")
+        .and_then(|output| string_field(output, "path"));
+    match tool_name.as_str() {
+        "fs.write" => path
+            .map(|value| format!("已写入文件 `{value}`。"))
+            .unwrap_or_else(|| "已完成文件写入。".into()),
+        "fs.read" => path
+            .map(|value| format!("已读取文件 `{value}`。"))
+            .unwrap_or_else(|| "已完成文件读取。".into()),
+        "fs.list" => "已完成目录读取。".into(),
+        "shell.exec" => "命令已执行完成。".into(),
+        _ => format!("{tool_name} 已执行完成。"),
     }
 }
 

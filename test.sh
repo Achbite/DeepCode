@@ -255,6 +255,7 @@ info "[4d/7] agent workflow structured memory fixture"
     cd server
     pnpm exec tsx <<'TS'
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   createWorkflowStageMemory,
   formatWorkflowStageMemory,
@@ -262,7 +263,7 @@ import {
   updateWorkflowStageMemoryFromToolEvents,
 } from './src/modules/agent/workflowMemory.ts';
 
-const request = '这是一个测试请求，返回你的身份信息，然后测试当前agent所有的功能组件，能否新建临时文件读写这个临时文件然后删除这个临时文件';
+const request = fs.readFileSync('../fixtures/agent-workflow/identity-temp-lifecycle.request.txt', 'utf8').trim();
 const memory = createWorkflowStageMemory(request);
 assert.equal(memory.answerObligations.some((item) => item.id === 'identity'), true);
 assert.equal(memory.answerObligations.some((item) => item.id === 'toolComponentSummary'), true);
@@ -278,10 +279,13 @@ assert.match(blocked, /DeepCode Agent/);
 assert.match(blocked, /测试未完成/);
 assert.doesNotMatch(blocked, /测试成功/);
 
+const acceptedWriteEvents = JSON.parse(fs.readFileSync('../fixtures/agent-workflow/permission-resume-accepted-tool.json', 'utf8'));
+updateWorkflowStageMemoryFromToolEvents(memory, acceptedWriteEvents);
+assert.equal(memory.pendingSteps.includes('读取临时文件并验证内容'), true);
+assert.equal(memory.pendingSteps.some((step) => step.includes('shell.exec')), true);
+assert.match(guardFinalAnswerForPendingObligations(memory, '测试成功'), /测试未完成/);
+
 updateWorkflowStageMemoryFromToolEvents(memory, [
-  { id: '1', sessionId: 's', ts: 't', kind: 'tool_call', payload: { toolCall: { name: 'fs.list', arguments: { path: '.' } } } },
-  { id: '2', sessionId: 's', ts: 't', kind: 'tool_result', payload: { toolName: 'fs.list', ok: true, output: { path: '.' } } },
-  { id: '3', sessionId: 's', ts: 't', kind: 'tool_result', payload: { toolName: 'fs.write', ok: true, output: { path: '_agent_tmp_test.txt' } } },
   { id: '4', sessionId: 's', ts: 't', kind: 'tool_result', payload: { toolName: 'fs.read', ok: true, output: { path: '_agent_tmp_test.txt' } } },
   { id: '5', sessionId: 's', ts: 't', kind: 'tool_call', payload: { toolCall: { name: 'shell.exec', arguments: { command: 'rm _agent_tmp_test.txt' } } } },
   { id: '6', sessionId: 's', ts: 't', kind: 'tool_result', payload: { toolName: 'shell.exec', ok: true, output: { exitCode: 0 } } },
@@ -813,9 +817,15 @@ echo "$WRITE_RESTORE_APPEND" | jq -e '.ok == true' >/dev/null 2>&1 \
 NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
 WRITE_RESTORE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{"decision":"accept"}' "http://127.0.0.1:${TEST_PORT}/api/agent/permissions/perm-write-restore/resolve" || true)"
 info "restored permission fs.write -> $WRITE_RESTORE_RESP"
-echo "$WRITE_RESTORE_RESP" | jq -e '.ok == true and ([.data.events[].kind] | index("tool_result") != null) and ([.data.events[].kind] | index("assistant_msg") != null)' >/dev/null 2>&1 \
+echo "$WRITE_RESTORE_RESP" | jq -e '
+    .ok == true
+    and ([.data.events[].kind] | index("tool_result") != null)
+    and ([.data.events[].kind] | index("assistant_msg") != null)
+    and ([.data.events[].payload.channel] | index("final") == null)
+    and ([.data.events[].payload.channel] | index("observation") != null)
+' >/dev/null 2>&1 \
     && grep -q 'Restored write' "$WRITE_SMOKE_DIR/restored.cpp" \
-    && pass "permission resolve can restore fs.write from session event" \
+    && pass "permission resolve can restore fs.write without faking final completion" \
     || { fail "permission restore fs.write failed"; exit "$NEXT_FAIL_CODE"; }
 NEXT_FAIL_CODE=$((NEXT_FAIL_CODE + 1))
 
