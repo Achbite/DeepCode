@@ -220,14 +220,9 @@ const App: React.FC = () => {
     document.documentElement.dataset.theme = colorTheme;
   }, [colorTheme]);
 
-  // ---- 1.3 Monaco / communication warmup ----
+  // ---- 1.3 Communication warmup ----
   useEffect(() => {
     return scheduleIdle(() => {
-      if (import.meta.env.DEV) {
-        void import('@monaco-editor/react')
-          .then(({ loader }) => loader.init())
-          .catch(() => undefined);
-      }
       if (getRuntimeType() === 'web') {
         void import('../services/apiClient');
       }

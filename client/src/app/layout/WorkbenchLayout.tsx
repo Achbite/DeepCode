@@ -22,6 +22,7 @@ interface WorkbenchLayoutProps {
 
 type SidebarPanel = 'explorer' | 'git' | 'search';
 type PanelResizeKind = 'sidebar' | 'agent' | 'bottom';
+type HydrationPhase = 'shell' | 'primary' | 'idle';
 
 const FileTree = lazy(() => import('../../components/file-tree/FileTree'));
 const CodeEditor = lazy(() => import('../../components/editor/CodeEditor'));
@@ -55,6 +56,15 @@ function readStoredLayoutSize(
 const PanelFallback: React.FC<{ label: string }> = ({ label }) => (
   <div className="workbench-panel-fallback">{label}</div>
 );
+
+function scheduleWorkbenchIdle(task: () => void, timeout = 900): () => void {
+  if (window.requestIdleCallback) {
+    const id = window.requestIdleCallback(() => task(), { timeout });
+    return () => window.cancelIdleCallback?.(id);
+  }
+  const id = window.setTimeout(task, timeout);
+  return () => window.clearTimeout(id);
+}
 
 const getLanguageLabel = (filePath?: string | null) => {
   if (!filePath) return 'Plain Text';
@@ -112,6 +122,10 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   );
   const [terminalMinimized, setTerminalMinimized] = useState(false);
   const [editorMode, setEditorMode] = useState<InternalBrowserMode>('code');
+  const [hydrationPhase, setHydrationPhase] = useState<HydrationPhase>('shell');
+
+  const canLoadPrimary = hydrationPhase !== 'shell';
+  const canLoadIdle = hydrationPhase === 'idle';
 
   useEffect(() => {
     if (typeof performance === 'undefined') return;
@@ -119,6 +133,29 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
     window.requestAnimationFrame(() => {
       performance.mark('deepcode:first-interactive-shell');
     });
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let idleCancel: (() => void) | null = null;
+    let timeoutId: number | null = null;
+
+    const frameId = window.requestAnimationFrame(() => {
+      timeoutId = window.setTimeout(() => {
+        if (cancelled) return;
+        setHydrationPhase('primary');
+        idleCancel = scheduleWorkbenchIdle(() => {
+          if (!cancelled) setHydrationPhase('idle');
+        });
+      }, 0);
+    });
+
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frameId);
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      idleCancel?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -145,6 +182,9 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   const renderSidebarContent = () => {
     switch (activeSidebar) {
       case 'explorer':
+        if (!canLoadPrimary) {
+          return <PanelFallback label={t(language, 'workbench.loading.explorer')} />;
+        }
         return (
           <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.explorer')} />}>
             <FileTree
@@ -377,17 +417,25 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
       </main>
 
       <aside className="agent-panel panel">
-        <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.agent')} />}>
-          <AgentPanelPlaceholder />
-        </Suspense>
+        {canLoadPrimary ? (
+          <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.agent')} />}>
+            <AgentPanelPlaceholder />
+          </Suspense>
+        ) : (
+          <PanelFallback label={t(language, 'workbench.loading.agent')} />
+        )}
       </aside>
 
       {!terminalMinimized && (
         <footer className="bottom-panel panel">
           <div className="bottom-panel__content">
-            <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.terminal')} />}>
-              <TerminalPlaceholder language={language} onMinimize={() => setTerminalMinimized(true)} />
-            </Suspense>
+            {canLoadIdle ? (
+              <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.terminal')} />}>
+                <TerminalPlaceholder language={language} onMinimize={() => setTerminalMinimized(true)} />
+              </Suspense>
+            ) : (
+              <PanelFallback label={t(language, 'workbench.loading.terminal')} />
+            )}
           </div>
         </footer>
       )}
@@ -438,10 +486,12 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         </button>
       )}
 
-      <Suspense fallback={null}>
-        <WorkspaceOpenDialog />
-        <CodeWorkspaceChoiceDialog />
-      </Suspense>
+      {canLoadPrimary && (
+        <Suspense fallback={null}>
+          <WorkspaceOpenDialog />
+          <CodeWorkspaceChoiceDialog />
+        </Suspense>
+      )}
     </div>
   );
 };
