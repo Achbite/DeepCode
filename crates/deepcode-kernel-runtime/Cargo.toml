@@ -1,0 +1,19 @@
+[package]
+name = "deepcode-kernel-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DeepCode headless kernel runtime dispatch skeleton."
+
+[dependencies]
+deepcode-kernel-abi.workspace = true
+deepcode-kernel-config.workspace = true
+deepcode-kernel-ledger.workspace = true
+deepcode-kernel-policy.workspace = true
+deepcode-kernel-prompt.workspace = true
+deepcode-kernel-skills.workspace = true
+deepcode-kernel-workflow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

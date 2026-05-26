@@ -3,7 +3,7 @@
 # DeepCode 容器内链路测试脚本（根目录版本，进容器后直接 ./test.sh）
 # 职责：
 #   1. 环境检查：rust / node / pnpm / pkg / mingw / 网络
-#   2. 阶段 1 Kernel ABI 检查：根级 Rust workspace cargo check/test
+#   2. 阶段 3-5.5 Headless Kernel 检查：根级 Rust workspace cargo check/test
 #   3. 协议包构建：生成 @deepcode/protocol dist 类型
 #   4. 静态检查：本阶段相关 protocol + server typecheck（不强依赖前端 Monaco 环境）
 #   5. 链路 ping：启动 server → 探测 /api/health → 关闭
@@ -116,12 +116,12 @@ command -v x86_64-w64-mingw32-gcc >/dev/null \
     || info "mingw-w64 未就绪（不影响本测试）"
 pass "tooling ok"
 
-# ---- 2. 阶段 1 Kernel ABI 检查 ----
-info "[2/7] stage 1 rust kernel ABI workspace cargo check/test"
+# ---- 2. 阶段 3-5.5 Headless Kernel 检查 ----
+info "[2/7] stage 3-5.5 headless kernel workspace cargo check/test"
 if cargo check --workspace && cargo test --workspace; then
-    pass "stage 1 rust kernel ABI workspace check/test ok"
+    pass "stage 3-5.5 headless kernel workspace check/test ok"
 else
-    fail "stage 1 rust kernel ABI workspace check/test 失败"; exit 2
+    fail "stage 3-5.5 headless kernel workspace check/test 失败"; exit 2
 fi
 
 # ---- 3. 协议包构建 ----

@@ -66,8 +66,26 @@ impl Kernel {
                 }
                 self.not_implemented(request_id, "run.start")
             }
+            KernelCommand::RunCancel { request_id, .. } => {
+                self.not_implemented(request_id, "run.cancel")
+            }
+            KernelCommand::RunResume { request_id, .. } => {
+                self.not_implemented(request_id, "run.resume")
+            }
             KernelCommand::PermissionResolve { request_id, .. } => {
                 self.not_implemented(request_id, "permission.resolve")
+            }
+            KernelCommand::PlanAccept { request_id, .. } => {
+                self.not_implemented(request_id, "plan.accept")
+            }
+            KernelCommand::PlanReject { request_id, .. } => {
+                self.not_implemented(request_id, "plan.reject")
+            }
+            KernelCommand::PlanRevise { request_id, .. } => {
+                self.not_implemented(request_id, "plan.revise")
+            }
+            KernelCommand::PermissionGrantTemporary { request_id, .. } => {
+                self.not_implemented(request_id, "permission.grant_temporary")
             }
         }
     }

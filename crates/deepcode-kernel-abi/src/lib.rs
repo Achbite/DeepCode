@@ -52,10 +52,40 @@ pub enum KernelCommand {
         workflow_ref: Option<WorkflowRef>,
         run_overrides: Option<Value>,
     },
+    RunCancel {
+        request_id: RequestId,
+        run_id: RunId,
+    },
+    RunResume {
+        request_id: RequestId,
+        session_id: SessionId,
+    },
     PermissionResolve {
         request_id: RequestId,
         permission_id: String,
         decision: PermissionDecisionKind,
+    },
+    PlanAccept {
+        request_id: RequestId,
+        run_id: RunId,
+        plan_id: String,
+    },
+    PlanReject {
+        request_id: RequestId,
+        run_id: RunId,
+        plan_id: String,
+        reason: Option<String>,
+    },
+    PlanRevise {
+        request_id: RequestId,
+        run_id: RunId,
+        plan_id: String,
+        guidance: String,
+    },
+    PermissionGrantTemporary {
+        request_id: RequestId,
+        run_id: RunId,
+        grant: TemporaryGrantEnvelope,
     },
 }
 
@@ -74,6 +104,17 @@ pub struct WorkspaceBinding {
     pub open_path: Option<String>,
     pub active_folder_id: Option<String>,
     pub folder_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemporaryGrantEnvelope {
+    pub id: String,
+    pub capability: String,
+    pub resource_kind: String,
+    pub resource_path: Option<String>,
+    pub expires_after_sequence: Option<u64>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +244,68 @@ pub enum KernelEvent {
         snapshot_ref: ConfigSnapshotRef,
         sequence: Option<u64>,
     },
+    #[serde(rename = "plan.proposed")]
+    PlanProposed {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        plan_id: String,
+        summary: Option<String>,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "plan.accepted")]
+    PlanAccepted {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        plan_id: String,
+        auto_accepted: bool,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "plan.rejected")]
+    PlanRejected {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        plan_id: String,
+        reason: Option<String>,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "workflow.checkpointed")]
+    WorkflowCheckpointed {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        checkpoint_id: String,
+        phase: String,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "workflow.resumed")]
+    WorkflowResumed {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        checkpoint_id: String,
+        phase: String,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "tempArtifact.created")]
+    TempArtifactCreated {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        path: String,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "tempArtifact.cleaned")]
+    TempArtifactCleaned {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        path: String,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "tempCleanup.failed")]
+    TempCleanupFailed {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        path: String,
+        error: KernelErrorEnvelope,
+        sequence: Option<u64>,
+    },
     #[serde(rename = "error")]
     Error {
         request_id: Option<RequestId>,
@@ -273,6 +376,7 @@ pub struct ConfigSnapshot {
     pub source_refs: Vec<ConfigSourceRef>,
     pub effective: Value,
     pub hash: Option<String>,
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,6 +553,40 @@ mod tests {
         assert_eq!(encoded["messageKey"], "agent.done");
         assert_eq!(encoded["sequence"], 7);
 
+        let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize event");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn plan_command_and_checkpoint_event_round_trip() {
+        let command = KernelCommand::PermissionGrantTemporary {
+            request_id: RequestId("req-grant".to_string()),
+            run_id: RunId("run-1".to_string()),
+            grant: TemporaryGrantEnvelope {
+                id: "grant-1".to_string(),
+                capability: "workspace.write".to_string(),
+                resource_kind: "workspaceFile".to_string(),
+                resource_path: Some("src/main.rs".to_string()),
+                expires_after_sequence: Some(10),
+                reason: Some("approved test grant".to_string()),
+            },
+        };
+        let encoded = serde_json::to_value(&command).expect("serialize command");
+        assert_eq!(encoded["kind"], "permissionGrantTemporary");
+        assert_eq!(encoded["grant"]["resourceKind"], "workspaceFile");
+        let decoded: KernelCommand = serde_json::from_value(encoded).expect("deserialize command");
+        assert_eq!(decoded, command);
+
+        let event = KernelEvent::WorkflowCheckpointed {
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            checkpoint_id: "checkpoint-1".to_string(),
+            phase: "plan".to_string(),
+            sequence: Some(4),
+        };
+        let encoded = serde_json::to_value(&event).expect("serialize event");
+        assert_eq!(encoded["kind"], "workflow.checkpointed");
+        assert_eq!(encoded["checkpointId"], "checkpoint-1");
         let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize event");
         assert_eq!(decoded, event);
     }
