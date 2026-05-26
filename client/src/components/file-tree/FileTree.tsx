@@ -32,11 +32,13 @@ import {
   NewFileIcon,
   NewFolderIcon,
 } from './icons';
+import { t, type UiLanguage } from '../../i18n';
 import './fileTree.css';
 
 interface FileTreeProps {
   onFileSelect: (filePath: string, folderId: string) => void;
   selectedTabId: string | null;
+  language: UiLanguage;
 }
 
 type PendingCreateKind = 'file' | 'folder';
@@ -91,7 +93,7 @@ function replacePathPrefix(path: string, oldPath: string, newPath: string): stri
   return path;
 }
 
-const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
+const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, language }) => {
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
   const treeRevision = useWorkspaceStore((s) => s.treeRevision);
   const bumpTreeRevision = useWorkspaceStore((s) => s.bumpTreeRevision);
@@ -114,7 +116,7 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
     ? {
         kind: 'directory',
         path: '',
-        name: getActiveFolder()?.name ?? 'Workspace Root',
+        name: getActiveFolder()?.name ?? t(language, 'explorer.workspaceRoot'),
         folderId: activeFolderId,
       }
     : null;
@@ -132,10 +134,10 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
     if (result.ok && result.data) {
       setTree(result.data as FileTreeNode[]);
     } else {
-      setError(result.message || '加载文件树失败');
+      setError(result.message || t(language, 'explorer.error.loadTree'));
     }
     setLoading(false);
-  }, [activeFolderId]);
+  }, [activeFolderId, language]);
 
   useEffect(() => {
     loadTree();
@@ -225,12 +227,12 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
           });
         }
       } else if (result.error === 'file_already_exists') {
-        setPendingError(`已存在：${trimmed}`);
+        setPendingError(t(language, 'explorer.error.exists', { name: trimmed }));
       } else {
-        setPendingError(result.message || '创建失败');
+        setPendingError(result.message || t(language, 'explorer.error.create'));
       }
     },
-    [pendingCreate, activeFolderId, bumpTreeRevision, onFileSelect]
+    [pendingCreate, activeFolderId, bumpTreeRevision, onFileSelect, language]
   );
 
   const submitRename = useCallback(
@@ -242,7 +244,7 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
         return;
       }
       if (/[\\/]/.test(trimmed)) {
-        setPendingError('重命名只修改当前名称，不支持路径分隔符');
+        setPendingError(t(language, 'explorer.error.renameSeparator'));
         return;
       }
       const { target } = pendingRename;
@@ -270,12 +272,12 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
         setPendingError(null);
         bumpTreeRevision();
       } else if (result.error === 'file_already_exists') {
-        setPendingError(`已存在：${trimmed}`);
+        setPendingError(t(language, 'explorer.error.exists', { name: trimmed }));
       } else {
-        setPendingError(result.message || '重命名失败');
+        setPendingError(result.message || t(language, 'explorer.error.rename'));
       }
     },
-    [pendingRename, renamePathInTabs, bumpTreeRevision]
+    [pendingRename, renamePathInTabs, bumpTreeRevision, language]
   );
 
   const toggleDir = (dirPath: string) => {
@@ -327,7 +329,9 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
         depth={depth}
         kind={pendingCreate.kind === 'file' ? 'file' : 'directory'}
         initialValue=""
-        placeholder={pendingCreate.kind === 'file' ? '文件名' : '文件夹名'}
+        placeholder={pendingCreate.kind === 'file'
+          ? t(language, 'explorer.placeholder.fileName')
+          : t(language, 'explorer.placeholder.folderName')}
         onSubmit={submitCreate}
         onCancel={cancelInlineEdit}
       />
@@ -356,7 +360,7 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
           depth={node.type === 'directory' ? depth : depth + 1}
           kind={node.type}
           initialValue={node.name}
-          placeholder="新名称"
+          placeholder={t(language, 'explorer.placeholder.rename')}
           onSubmit={submitRename}
           onCancel={cancelInlineEdit}
         />
@@ -424,14 +428,14 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
   return (
     <div className="file-tree">
       <div className="file-tree__titlebar">
-        <span>Explorer</span>
+        <span>{t(language, 'explorer.title')}</span>
         <div className="file-tree__toolbar">
           <button
             className="file-tree__toolbar-btn"
             onClick={() => startCreate('file')}
             disabled={!activeFolderId}
-            title="新建文件"
-            aria-label="新建文件"
+            title={t(language, 'explorer.newFile')}
+            aria-label={t(language, 'explorer.newFile')}
           >
             <NewFileIcon />
           </button>
@@ -439,8 +443,8 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
             className="file-tree__toolbar-btn"
             onClick={() => startCreate('folder')}
             disabled={!activeFolderId}
-            title="新建文件夹"
-            aria-label="新建文件夹"
+            title={t(language, 'explorer.newFolder')}
+            aria-label={t(language, 'explorer.newFolder')}
           >
             <NewFolderIcon />
           </button>
@@ -448,16 +452,16 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
             className="file-tree__toolbar-btn"
             onClick={() => bumpTreeRevision()}
             disabled={!activeFolderId}
-            title="刷新文件树"
-            aria-label="刷新"
+            title={t(language, 'explorer.refresh')}
+            aria-label={t(language, 'explorer.refresh')}
           >
             <RefreshIcon />
           </button>
           <button
             className="file-tree__toolbar-btn"
             onClick={showWorkspaceOpenDialog}
-            title="打开工作区（目录或 .code-workspace）"
-            aria-label="打开工作区"
+            title={t(language, 'explorer.openWorkspace')}
+            aria-label={t(language, 'explorer.openWorkspace')}
           >
             <FolderOpenIcon />
           </button>
@@ -465,23 +469,25 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
       </div>
 
       {loading && (
-        <div className="file-tree__status file-tree__status--loading">加载中...</div>
+        <div className="file-tree__status file-tree__status--loading">
+          {t(language, 'explorer.loading')}
+        </div>
       )}
       {error && (
         <div className="file-tree__status file-tree__status--error">{error}</div>
       )}
       {!activeFolderId && (
         <div className="file-tree__empty">
-          <div className="file-tree__empty-title">No Folder Opened</div>
+          <div className="file-tree__empty-title">{t(language, 'explorer.emptyTitle')}</div>
           <div className="file-tree__empty-body">
-            Open a folder or workspace file to populate Explorer.
+            {t(language, 'explorer.emptyBody')}
           </div>
           <button
             className="file-tree__empty-action"
             type="button"
             onClick={showWorkspaceOpenDialog}
           >
-            Open Folder...
+            {t(language, 'explorer.openFolder')}
           </button>
         </div>
       )}
@@ -520,6 +526,7 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId }) => {
           onRename={() => startRename(contextMenu.target)}
           onAddToAgent={() => addToAgent(contextMenu.target, 'message')}
           onAddToAgentSession={() => addToAgent(contextMenu.target, 'session')}
+          language={language}
         />
       )}
     </div>
@@ -584,6 +591,7 @@ interface ExplorerContextMenuProps {
   onRename: () => void;
   onAddToAgent: () => void;
   onAddToAgentSession: () => void;
+  language: UiLanguage;
 }
 
 const ExplorerContextMenu: React.FC<ExplorerContextMenuProps> = ({
@@ -593,6 +601,7 @@ const ExplorerContextMenu: React.FC<ExplorerContextMenuProps> = ({
   onRename,
   onAddToAgent,
   onAddToAgentSession,
+  language,
 }) => (
   <div
     className="file-tree__context-menu"
@@ -602,12 +611,12 @@ const ExplorerContextMenu: React.FC<ExplorerContextMenuProps> = ({
     <div className="file-tree__context-title">
       {state.target.path || state.target.name}
     </div>
-    <button onClick={onNewFile}>New File</button>
-    <button onClick={onNewFolder}>New Folder</button>
-    {state.target.path && <button onClick={onRename}>Rename</button>}
+    <button onClick={onNewFile}>{t(language, 'explorer.newFile')}</button>
+    <button onClick={onNewFolder}>{t(language, 'explorer.newFolder')}</button>
+    {state.target.path && <button onClick={onRename}>{t(language, 'explorer.rename')}</button>}
     <div className="file-tree__context-separator" />
-    <button onClick={onAddToAgent}>Add to Agent Message</button>
-    <button onClick={onAddToAgentSession}>Pin to Agent Session</button>
+    <button onClick={onAddToAgent}>{t(language, 'explorer.addToAgentMessage')}</button>
+    <button onClick={onAddToAgentSession}>{t(language, 'explorer.pinToAgentSession')}</button>
   </div>
 );
 

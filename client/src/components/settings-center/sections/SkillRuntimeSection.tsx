@@ -5,6 +5,7 @@
  */
 import React, { useEffect, useMemo, useState } from 'react';
 import { useSettingsStore } from '../../../state/settingsStore';
+import { normalizeUiLanguage, t } from '../../../i18n';
 
 interface SkillMount {
   id: string;
@@ -47,6 +48,7 @@ const SkillRuntimeSection: React.FC = () => {
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const loading = useSettingsStore((s) => s.loading);
   const patchUserSetting = useSettingsStore((s) => s.patchUserSetting);
+  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
 
   const storedMounts = useMemo(
     () => safeParseMounts(effectiveSettings['skills.mounts']),
@@ -79,18 +81,18 @@ const SkillRuntimeSection: React.FC = () => {
     await patchUserSetting('skills.pythonPath', pythonPath.trim() || 'python');
     await patchUserSetting('skills.autoLoad', autoLoad);
     await patchUserSetting('skills.mounts', JSON.stringify(mounts, null, 2));
-    setMessage('Skill Runtime settings saved');
+    setMessage(t(language, 'settings.skill.saved'));
   };
 
   return (
     <div>
-      <h2 className="settings-title">Skill Runtime</h2>
+      <h2 className="settings-title">{t(language, 'settings.skill.title')}</h2>
 
       <div className="settings-card">
-        <h3 className="settings-card__title">Runtime</h3>
+        <h3 className="settings-card__title">{t(language, 'settings.skill.runtime')}</h3>
         <div className="settings-form-grid">
           <label>
-            <span>Python Path</span>
+            <span>{t(language, 'settings.skill.pythonPath')}</span>
             <input
               className="settings-field__input"
               value={pythonPath}
@@ -104,26 +106,26 @@ const SkillRuntimeSection: React.FC = () => {
               checked={autoLoad}
               onChange={(event) => setAutoLoad(event.target.checked)}
             />
-            Auto load enabled mounts
+            {t(language, 'settings.skill.autoLoad')}
           </label>
         </div>
       </div>
 
       <div className="settings-card">
         <div className="settings-card__header-row">
-          <h3 className="settings-card__title">Skill Mounts</h3>
+          <h3 className="settings-card__title">{t(language, 'settings.skill.mounts')}</h3>
           <button
             className="settings-action-button"
             onClick={() => setMounts((prev) => [...prev, createMount()])}
             disabled={loading}
           >
-            Add Mount
+            {t(language, 'settings.skill.addMount')}
           </button>
         </div>
 
         {mounts.length === 0 && (
           <div className="settings-card__hint">
-            Add a local folder that contains one or more DeepCode skills.
+            {t(language, 'settings.skill.emptyMounts')}
           </div>
         )}
 
@@ -138,7 +140,7 @@ const SkillRuntimeSection: React.FC = () => {
                     updateMount(mount.id, { enabled: event.target.checked })
                   }
                 />
-                Enabled
+                {t(language, 'settings.common.enabled')}
               </label>
               <input
                 className="settings-field__input"
@@ -146,7 +148,7 @@ const SkillRuntimeSection: React.FC = () => {
                 onChange={(event) =>
                   updateMount(mount.id, { name: event.target.value })
                 }
-                placeholder="Display name"
+                placeholder={t(language, 'settings.skill.displayName')}
               />
               <input
                 className="settings-field__input settings-field__input--wide"
@@ -162,7 +164,7 @@ const SkillRuntimeSection: React.FC = () => {
                 onChange={(event) =>
                   updateMount(mount.id, { description: event.target.value })
                 }
-                placeholder="What this mount provides"
+                placeholder={t(language, 'settings.skill.description')}
               />
               <button
                 className="settings-action-button"
@@ -170,7 +172,7 @@ const SkillRuntimeSection: React.FC = () => {
                   setMounts((prev) => prev.filter((item) => item.id !== mount.id))
                 }
               >
-                Remove
+                {t(language, 'settings.common.remove')}
               </button>
             </div>
           ))}
@@ -182,7 +184,7 @@ const SkillRuntimeSection: React.FC = () => {
             onClick={() => void save()}
             disabled={loading}
           >
-            Save Skill Settings
+            {t(language, 'settings.skill.save')}
           </button>
           {message && <span className="settings-save-message">{message}</span>}
         </div>

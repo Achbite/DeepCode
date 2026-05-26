@@ -1,8 +1,10 @@
 import React from 'react';
 import type { PermissionRequest } from '@deepcode/protocol';
+import { t, type UiLanguage } from '../../i18n';
 
 interface PermissionRequestBubbleProps {
   request: PermissionRequest;
+  language: UiLanguage;
   onAccept: () => void;
   onReject: () => void;
   disabled?: boolean;
@@ -10,6 +12,7 @@ interface PermissionRequestBubbleProps {
 
 const PermissionRequestBubble: React.FC<PermissionRequestBubbleProps> = ({
   request,
+  language,
   onAccept,
   onReject,
   disabled,
@@ -21,8 +24,8 @@ const PermissionRequestBubble: React.FC<PermissionRequestBubbleProps> = ({
     </div>
     {request.diff && <pre className="agent-permission__diff">{request.diff}</pre>}
     <div className="agent-permission__actions">
-      <button onClick={onAccept} disabled={disabled}>Accept</button>
-      <button onClick={onReject} disabled={disabled}>Reject</button>
+      <button onClick={onAccept} disabled={disabled}>{t(language, 'agent.permission.accept')}</button>
+      <button onClick={onReject} disabled={disabled}>{t(language, 'agent.permission.reject')}</button>
     </div>
   </div>
 );

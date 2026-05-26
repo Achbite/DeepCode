@@ -25,29 +25,36 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 0 8px 0 14px;
+  gap: 4px;
+  padding: 0 6px 0 10px;
   border-bottom: 1px solid var(--ft-border);
   color: var(--ft-fg-strong);
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
   text-transform: uppercase;
   user-select: none;
+}
+
+.file-tree__titlebar > span {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  line-height: 1;
 }
 
 .file-tree__toolbar {
   display: flex;
   align-items: center;
-  gap: 2px;
+  flex: 0 0 auto;
+  gap: 1px;
 }
 
 .file-tree__toolbar-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
+  width: 21px;
+  height: 21px;
   padding: 0;
   border: 0;
   border-radius: var(--radius-sm, 4px);

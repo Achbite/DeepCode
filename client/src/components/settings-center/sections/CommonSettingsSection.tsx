@@ -6,6 +6,8 @@ import {
   type SettingDefinition,
 } from '../../../state/settingsStore';
 import type { UserSettingValue } from '@deepcode/protocol';
+import { normalizeUiLanguage, t, type UiLanguage } from '../../../i18n';
+import { localizeSettingDefinition } from '../../../settingsLocalization';
 
 interface CommonSettingsSectionProps {
   serverVersion?: string;
@@ -14,35 +16,50 @@ interface CommonSettingsSectionProps {
   query?: string;
 }
 
-const GROUP_TITLES: Record<string, string> = {
-  workbench: 'Workbench',
-  editor: 'Editor',
-  files: 'Files',
-  keyboard: 'Keyboard',
-  explorer: 'Explorer',
-  terminal: 'Terminal',
-  agent: 'Agent',
+const GROUP_TITLE_KEYS: Record<string, string> = {
+  workbench: 'settings.group.workbench',
+  editor: 'settings.group.editor',
+  files: 'settings.group.files',
+  keyboard: 'settings.group.keyboard',
+  explorer: 'settings.group.explorer',
+  terminal: 'settings.group.terminal',
+  agent: 'settings.group.agent',
 };
 
 const GROUP_ORDER = ['workbench', 'editor', 'files', 'keyboard', 'explorer', 'terminal', 'agent'];
 
-function matchesQuery(definition: SettingDefinition, query: string): boolean {
+function groupTitle(group: string, language: UiLanguage): string {
+  const key = GROUP_TITLE_KEYS[group];
+  return key ? t(language, key) : group;
+}
+
+function matchesQuery(
+  definition: SettingDefinition,
+  query: string,
+  original: SettingDefinition
+): boolean {
   if (!query.trim()) return true;
   const target = [
     definition.key,
     definition.label,
     definition.description,
     definition.group,
+    original.label,
+    original.description,
   ].join(' ').toLowerCase();
   return target.includes(query.trim().toLowerCase());
 }
 
-function groupDefinitions(query = ''): Record<string, SettingDefinition[]> {
+function groupDefinitions(query: string, language: UiLanguage): Record<string, SettingDefinition[]> {
   return SETTING_DEFINITIONS
-    .filter((definition) => matchesQuery(definition, query))
+    .map((definition) => ({
+      original: definition,
+      localized: localizeSettingDefinition(definition, language),
+    }))
+    .filter(({ localized, original }) => matchesQuery(localized, query, original))
     .reduce<Record<string, SettingDefinition[]>>((acc, item) => {
-      if (!acc[item.group]) acc[item.group] = [];
-      acc[item.group].push(item);
+      if (!acc[item.localized.group]) acc[item.localized.group] = [];
+      acc[item.localized.group].push(item.localized);
       return acc;
     }, {});
 }
@@ -54,6 +71,7 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
   query = '',
 }) => {
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
+  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const sources = useSettingsStore((s) => s.sources);
   const loading = useSettingsStore((s) => s.loading);
   const errorMessage = useSettingsStore((s) => s.errorMessage);
@@ -61,7 +79,7 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
   const patchUserSetting = useSettingsStore((s) => s.patchUserSetting);
   const resetUserSetting = useSettingsStore((s) => s.resetUserSetting);
 
-  const grouped = useMemo(() => groupDefinitions(query), [query]);
+  const grouped = useMemo(() => groupDefinitions(query, language), [language, query]);
   const orderedGroups = useMemo(
     () => GROUP_ORDER.filter((group) => grouped[group]?.length),
     [grouped]
@@ -73,31 +91,33 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
 
   return (
     <div>
-      <h2 className="settings-title">Common Settings</h2>
+      <h2 className="settings-title">{t(language, 'settings.common.title')}</h2>
 
       <div className="settings-card">
-        <h3 className="settings-card__title">Runtime Information</h3>
+        <h3 className="settings-card__title">
+          {t(language, 'settings.runtime.title')}
+        </h3>
         <table className="settings-kv">
           <tbody>
             <tr>
-              <td>Product</td>
+              <td>{t(language, 'settings.runtime.product')}</td>
               <td>DeepCode</td>
             </tr>
             <tr>
-              <td>Server version</td>
+              <td>{t(language, 'settings.runtime.serverVersion')}</td>
               <td>{serverVersion ?? '-'}</td>
             </tr>
             <tr>
-              <td>API status</td>
+              <td>{t(language, 'settings.runtime.apiStatus')}</td>
               <td>{apiStatus}</td>
             </tr>
             <tr>
-              <td>WebSocket status</td>
+              <td>{t(language, 'settings.runtime.wsStatus')}</td>
               <td>{wsStatus}</td>
             </tr>
             <tr>
-              <td>User settings file</td>
-              <td>{storePath ?? 'Not loaded yet'}</td>
+              <td>{t(language, 'settings.runtime.userSettingsFile')}</td>
+              <td>{storePath ?? t(language, 'settings.runtime.notLoaded')}</td>
             </tr>
           </tbody>
         </table>
@@ -106,17 +126,21 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
 
       {orderedGroups.length === 0 && (
         <div className="settings-card">
-          <div className="settings-card__body">No settings match the current search.</div>
+          <div className="settings-card__body">
+            {t(language, 'settings.noSearchMatch')}
+          </div>
         </div>
       )}
 
       {orderedGroups.map((group) => (
         <div className="settings-card" key={group}>
-          <h3 className="settings-card__title">{GROUP_TITLES[group] ?? group}</h3>
+          <h3 className="settings-card__title">{groupTitle(group, language)}</h3>
           <div className="settings-card__body">
             {group === 'workbench' && (
               <div className="settings-card__inline-placeholder">
-                Language packs are reserved under <code>config/i18n/*.json</code>. Changing the display language is stored now; full UI reload/localization wiring lands in a later stage.
+                {t(language, 'settings.workbench.i18n.prefix')}
+                <code>config/i18n/*.json</code>
+                {t(language, 'settings.workbench.i18n.suffix')}
               </div>
             )}
             {(grouped[group] ?? []).map((definition) => (
@@ -125,6 +149,7 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
                 definition={definition}
                 value={effectiveSettings[definition.key]}
                 source={sources[definition.key] ?? 'default'}
+                language={language}
                 disabled={loading || sources[definition.key] === 'workspace'}
                 onChange={handleChange}
                 onReset={(key) => void resetUserSetting(key)}
@@ -132,7 +157,7 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
             ))}
           </div>
           <div className="settings-card__hint">
-            Workspace-sourced values are controlled by the current workspace and must be changed in workspace settings.
+            {t(language, 'settings.workspaceHint')}
           </div>
         </div>
       ))}

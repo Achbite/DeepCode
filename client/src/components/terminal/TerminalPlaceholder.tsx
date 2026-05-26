@@ -9,6 +9,7 @@ import {
   sendTerminalInput,
   updateTerminalSession,
 } from '../../services/runtimeAdapter';
+import { t, type UiLanguage } from '../../i18n';
 import './terminalPanel.css';
 
 interface TerminalContextMenu {
@@ -24,10 +25,11 @@ interface TerminalDragState {
 }
 
 interface TerminalPlaceholderProps {
+  language: UiLanguage;
   onMinimize: () => void;
 }
 
-const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize }) => {
+const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onMinimize }) => {
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [outputBySession, setOutputBySession] = useState<Record<string, string>>({});
@@ -46,18 +48,29 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
   const active = sessions.find((session) => session.id === activeId) ?? sessions[0];
   const activeOutput = active ? outputBySession[active.id] ?? '' : '';
 
-  const describeFailure = (result: { error?: string; message?: string }) =>
-    result.message || result.error || 'Terminal request failed';
+  const describeFailure = useCallback(
+    (result: { error?: string; message?: string }) =>
+      result.message || result.error || t(language, 'terminal.error.requestFailed'),
+    [language]
+  );
 
   const defaultPendingShell = (): TerminalSession['shellKind'] =>
     navigator.platform.toLowerCase().includes('win') ? 'wsl' : 'bash';
 
   const defaultOutput = () => {
-    if (!active) return 'DeepCode terminal surface\nCreate or select a terminal session.';
-    if (active.status === 'starting') return `Starting ${active.shellKind.toUpperCase()}...`;
-    if (active.status === 'error') return `${active.name} failed to start.`;
-    if (active.status === 'exited') return `${active.name} exited.`;
-    return 'DeepCode terminal surface\nCreate or select a terminal session.';
+    if (!active) {
+      return t(language, 'terminal.output.empty');
+    }
+    if (active.status === 'starting') {
+      return t(language, 'terminal.output.starting', { shell: active.shellKind.toUpperCase() });
+    }
+    if (active.status === 'error') {
+      return t(language, 'terminal.output.failed', { name: active.name });
+    }
+    if (active.status === 'exited') {
+      return t(language, 'terminal.output.exited', { name: active.name });
+    }
+    return t(language, 'terminal.output.empty');
   };
 
   useEffect(() => {
@@ -93,14 +106,15 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     }
     setTerminalError(null);
     applySessions(result.data.sessions, preferredActiveId);
-  }, [applySessions]);
+  }, [applySessions, describeFailure]);
 
   const createTerminal = useCallback(async () => {
     const currentSessions = sessionsRef.current;
     const now = new Date().toISOString();
+    const terminalName = t(language, 'terminal.defaultName', { index: currentSessions.length + 1 });
     const pending: TerminalSession = {
       id: `pending-${Date.now()}`,
-      name: `Terminal ${currentSessions.length + 1}`,
+      name: terminalName,
       shellKind: defaultPendingShell(),
       cwd: '',
       status: 'starting',
@@ -111,7 +125,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     };
     applySessions([...currentSessions, pending], pending.id);
     const result = await createTerminalSession({
-      name: `Terminal ${currentSessions.length + 1}`,
+      name: terminalName,
     });
     if (!result.ok || !result.data) {
       setTerminalError(describeFailure(result));
@@ -121,7 +135,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     setTerminalError(null);
     applySessions([...currentSessions, result.data], result.data.id);
     void refreshSessions(result.data.id);
-  }, [applySessions, refreshSessions]);
+  }, [applySessions, describeFailure, refreshSessions, language]);
 
   const closeTerminal = useCallback(async (sessionId: string) => {
     const currentSessions = sessionsRef.current;
@@ -149,7 +163,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     setContextMenu(null);
     setRenamingId(null);
     void refreshSessions(fallbackActive);
-  }, [applySessions, refreshSessions]);
+  }, [applySessions, refreshSessions, describeFailure]);
 
   useEffect(() => {
     let cancelled = false;
@@ -166,7 +180,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
     return () => {
       cancelled = true;
     };
-  }, [applySessions, refreshSessions]);
+  }, [applySessions, refreshSessions, describeFailure]);
 
   useEffect(() => {
     if (!active?.id) return;
@@ -199,7 +213,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
       void refreshSessions();
     }, 600);
     return () => window.clearInterval(timer);
-  }, [active?.id, refreshSessions]);
+  }, [active?.id, describeFailure, refreshSessions]);
 
   const moveSession = useCallback((sourceId: string, targetId: string) => {
     if (sourceId === targetId) return;
@@ -372,21 +386,21 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
               value={command}
               onChange={(event) => setCommand(event.target.value)}
               disabled={!active || active.status !== 'running'}
-              aria-label="Terminal input"
+              aria-label={t(language, 'terminal.input')}
             />
             <span className="terminal-panel__cursor">_</span>
           </form>
         </div>
 
-        <aside className="terminal-panel__sidebar" aria-label="Terminal sessions">
-          <div className="terminal-panel__sidebar-header" aria-label="Terminal panel controls">
-            <span className="terminal-panel__sidebar-title">TERMINAL</span>
+        <aside className="terminal-panel__sidebar" aria-label={t(language, 'terminal.sessions')}>
+          <div className="terminal-panel__sidebar-header" aria-label={t(language, 'terminal.controls')}>
+            <span className="terminal-panel__sidebar-title">{t(language, 'terminal.title')}</span>
             <div className="terminal-panel__sidebar-actions">
               <button
                 className="terminal-panel__icon-btn"
                 type="button"
-                title="New terminal"
-                aria-label="New terminal"
+                title={t(language, 'terminal.new')}
+                aria-label={t(language, 'terminal.new')}
                 onClick={() => void createTerminal()}
               >
                 <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -396,8 +410,8 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
               <button
                 className="terminal-panel__icon-btn"
                 type="button"
-                title="Minimize terminal"
-                aria-label="Minimize terminal"
+                title={t(language, 'terminal.minimize')}
+                aria-label={t(language, 'terminal.minimize')}
                 onClick={onMinimize}
               >
                 <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -479,6 +493,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ onMinimize })
           onRename={startRename}
           onRestart={() => void restartSession(contextMenu.sessionId)}
           onClose={() => void closeTerminal(contextMenu.sessionId)}
+          language={language}
         />
       )}
     </div>
@@ -492,6 +507,7 @@ interface TerminalSessionMenuProps {
   onRename: (session: TerminalSession) => void;
   onRestart: () => void;
   onClose: () => void;
+  language: UiLanguage;
 }
 
 const TerminalSessionMenu: React.FC<TerminalSessionMenuProps> = ({
@@ -501,6 +517,7 @@ const TerminalSessionMenu: React.FC<TerminalSessionMenuProps> = ({
   onRename,
   onRestart,
   onClose,
+  language,
 }) => {
   if (!session) return null;
   return (
@@ -511,13 +528,13 @@ const TerminalSessionMenu: React.FC<TerminalSessionMenuProps> = ({
     >
       <div className="terminal-panel__context-title">{session.name}</div>
       <button type="button" onClick={() => onRename(session)}>
-        Rename Terminal
+        {t(language, 'terminal.rename')}
       </button>
       <button type="button" onClick={onRestart}>
-        Restart Terminal
+        {t(language, 'terminal.restart')}
       </button>
       <button type="button" className="terminal-panel__context-danger" onClick={onClose}>
-        Close Terminal
+        {t(language, 'terminal.close')}
       </button>
     </div>
   );

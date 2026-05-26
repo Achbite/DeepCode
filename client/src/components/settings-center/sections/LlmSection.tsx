@@ -11,6 +11,8 @@ import {
   patchLlmProfiles,
   probeLlmProfile,
 } from '../../../services/runtimeAdapter';
+import { useSettingsStore } from '../../../state/settingsStore';
+import { normalizeUiLanguage, t } from '../../../i18n';
 
 const PROVIDERS: Array<{ value: LlmProviderKind; label: string }> = [
   { value: 'openaiCompatible', label: 'OpenAI Compatible' },
@@ -100,6 +102,9 @@ const LlmSection: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [probeState, setProbeState] = useState<Record<string, string>>({});
+  const language = normalizeUiLanguage(
+    useSettingsStore((s) => s.effectiveSettings['workbench.language'])
+  );
 
   const hasProfiles = profiles.length > 0;
 
@@ -112,7 +117,7 @@ const LlmSection: React.FC = () => {
       setDefaultProfileId(result.data.defaultProfileId);
       setStorePath(result.data.storePath);
     } else {
-      setMessage(result.message ?? 'Failed to load LLM profiles');
+      setMessage(result.message ?? t(language, 'settings.llm.loadFailed'));
     }
     setLoading(false);
   };
@@ -165,28 +170,28 @@ const LlmSection: React.FC = () => {
       setDefaultProfileId(result.data.defaultProfileId);
       setStorePath(result.data.storePath);
       setSecrets({});
-      setMessage('LLM profiles saved');
+      setMessage(t(language, 'settings.llm.saved'));
       window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated'));
     } else {
-      setMessage(result.message ?? 'Failed to save LLM profiles');
+      setMessage(result.message ?? t(language, 'settings.llm.saveFailed'));
     }
     setLoading(false);
   };
 
   const probe = async (profileId: string) => {
-    setProbeState((prev) => ({ ...prev, [profileId]: 'Probing...' }));
+    setProbeState((prev) => ({ ...prev, [profileId]: t(language, 'settings.llm.probing') }));
     const result = await probeLlmProfile({ profileId });
     if (result.ok && result.data) {
       setProbeState((prev) => ({
         ...prev,
         [profileId]: result.data!.ok
           ? `OK ${result.data!.latencyMs ?? 0}ms`
-          : result.data!.error ?? 'Probe failed',
+          : result.data!.error ?? t(language, 'settings.llm.probeFailed'),
       }));
     } else {
       setProbeState((prev) => ({
         ...prev,
-        [profileId]: result.message ?? 'Probe failed',
+        [profileId]: result.message ?? t(language, 'settings.llm.probeFailed'),
       }));
     }
   };
@@ -198,13 +203,12 @@ const LlmSection: React.FC = () => {
 
   return (
     <div>
-      <h2 className="settings-title">LLM Providers</h2>
+      <h2 className="settings-title">{t(language, 'settings.llm.title')}</h2>
 
       <div className="settings-card">
-        <h3 className="settings-card__title">Provider Profiles</h3>
+        <h3 className="settings-card__title">{t(language, 'settings.llm.profiles')}</h3>
         <p className="settings-card__body">
-          Configure the model used by Agent Runtime. API keys are stored in the
-          local encrypted secret store; profiles only keep a secretRef.
+          {t(language, 'settings.llm.body')}
         </p>
 
         <div className="settings-toolbar-row">
@@ -213,7 +217,7 @@ const LlmSection: React.FC = () => {
             onClick={() => addProfile()}
             disabled={loading}
           >
-            Add Profile
+            {t(language, 'settings.llm.addProfile')}
           </button>
           {PROFILE_PRESETS.map((preset) => (
             <button
@@ -230,20 +234,20 @@ const LlmSection: React.FC = () => {
             onClick={() => void save()}
             disabled={loading || !hasProfiles}
           >
-            Save
+            {t(language, 'settings.common.save')}
           </button>
           <button
             className="settings-action-button"
             onClick={() => void load()}
             disabled={loading}
           >
-            Reload
+            {t(language, 'settings.common.reload')}
           </button>
         </div>
 
         {defaultOptions.length > 0 && (
           <label className="llm-default-row">
-            <span>Default profile</span>
+            <span>{t(language, 'settings.llm.defaultProfile')}</span>
             <select
               className="settings-field__select"
               value={defaultProfileId ?? ''}
@@ -260,8 +264,7 @@ const LlmSection: React.FC = () => {
 
         {profiles.length === 0 && (
           <div className="settings-card__hint">
-            No LLM profile is configured. Add a generic OpenAI-compatible
-            profile or use one of the DeepSeek presets.
+            {t(language, 'settings.llm.empty')}
           </div>
         )}
 
@@ -273,7 +276,7 @@ const LlmSection: React.FC = () => {
                   className="settings-field__input"
                   value={profile.name}
                   onChange={(e) => updateProfile(profile.id, { name: e.target.value })}
-                  placeholder="Profile name"
+                  placeholder={t(language, 'settings.llm.profileName')}
                 />
                 <select
                   className="settings-field__select"
@@ -298,13 +301,13 @@ const LlmSection: React.FC = () => {
                       updateProfile(profile.id, { enabled: e.target.checked })
                     }
                   />
-                  Enabled
+                  {t(language, 'settings.common.enabled')}
                 </label>
               </div>
 
               <div className="llm-profile__grid">
                 <label>
-                  <span>Base URL</span>
+                  <span>{t(language, 'settings.llm.baseUrl')}</span>
                   <input
                     className="settings-field__input"
                     value={profile.baseUrl ?? ''}
@@ -315,7 +318,7 @@ const LlmSection: React.FC = () => {
                   />
                 </label>
                 <label>
-                  <span>Model</span>
+                  <span>{t(language, 'settings.llm.model')}</span>
                   <input
                     className="settings-field__input"
                     list="deepseek-model-options"
@@ -332,7 +335,7 @@ const LlmSection: React.FC = () => {
                         value={model}
                         label={
                           (DEPRECATED_DEEPSEEK_LLM_MODELS as readonly string[]).includes(model)
-                            ? `${model} (deprecated 2026-07-24)`
+                            ? t(language, 'settings.llm.deprecatedModel', { model })
                             : model
                         }
                       />
@@ -340,7 +343,7 @@ const LlmSection: React.FC = () => {
                   </datalist>
                 </label>
                 <label>
-                  <span>API Key</span>
+                  <span>{t(language, 'settings.llm.apiKey')}</span>
                   <input
                     className="settings-field__input"
                     type="password"
@@ -351,11 +354,13 @@ const LlmSection: React.FC = () => {
                         [profile.id]: e.target.value,
                       }))
                     }
-                    placeholder={profile.secretRef ? 'Configured' : 'Paste key to save'}
+                    placeholder={profile.secretRef
+                      ? t(language, 'settings.llm.configured')
+                      : t(language, 'settings.llm.pasteKey')}
                   />
                 </label>
                 <label>
-                  <span>Context window tokens</span>
+                  <span>{t(language, 'settings.llm.contextWindowTokens')}</span>
                   <input
                     className="settings-field__input"
                     type="number"
@@ -370,7 +375,7 @@ const LlmSection: React.FC = () => {
                   />
                 </label>
                 <label>
-                  <span>Max output tokens</span>
+                  <span>{t(language, 'settings.llm.maxOutputTokens')}</span>
                   <input
                     className="settings-field__input"
                     type="number"
@@ -386,7 +391,7 @@ const LlmSection: React.FC = () => {
                   />
                 </label>
                 <label>
-                  <span>Thinking</span>
+                  <span>{t(language, 'settings.llm.thinking')}</span>
                   <select
                     className="settings-field__select"
                     value={profile.thinking ?? ''}
@@ -398,13 +403,13 @@ const LlmSection: React.FC = () => {
                       })
                     }
                   >
-                    <option value="">Default</option>
-                    <option value="enabled">Enabled</option>
-                    <option value="disabled">Disabled</option>
+                    <option value="">{t(language, 'settings.source.default')}</option>
+                    <option value="enabled">{t(language, 'settings.common.enabled')}</option>
+                    <option value="disabled">{t(language, 'settings.common.disabled')}</option>
                   </select>
                 </label>
                 <label>
-                  <span>Reasoning effort</span>
+                  <span>{t(language, 'settings.llm.reasoningEffort')}</span>
                   <select
                     className="settings-field__select"
                     value={profile.reasoningEffort ?? ''}
@@ -416,17 +421,17 @@ const LlmSection: React.FC = () => {
                       })
                     }
                   >
-                    <option value="">Default</option>
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                    <option value="max">Max</option>
+                    <option value="">{t(language, 'settings.source.default')}</option>
+                    <option value="low">{t(language, 'settings.llm.effort.low')}</option>
+                    <option value="medium">{t(language, 'settings.llm.effort.medium')}</option>
+                    <option value="high">{t(language, 'settings.llm.effort.high')}</option>
+                    <option value="max">{t(language, 'settings.llm.effort.max')}</option>
                   </select>
                 </label>
               </div>
               {profile.thinking === 'enabled' && (
                 <div className="settings-card__hint">
-                  Thinking mode providers such as DeepSeek may ignore sampling parameters like temperature.
+                  {t(language, 'settings.llm.thinkingHint')}
                 </div>
               )}
 
@@ -435,16 +440,18 @@ const LlmSection: React.FC = () => {
                   className="settings-action-button"
                   onClick={() => void probe(profile.id)}
                   disabled={loading || !profile.secretRef || !!secrets[profile.id]}
-                  title={secrets[profile.id] ? 'Save the new API key before probing' : 'Probe'}
+                  title={secrets[profile.id]
+                    ? t(language, 'settings.llm.saveKeyBeforeProbe')
+                    : t(language, 'settings.llm.probe')}
                 >
-                  Probe
+                  {t(language, 'settings.llm.probe')}
                 </button>
                 <button
                   className="settings-action-button"
                   onClick={() => removeProfile(profile.id)}
                   disabled={loading}
                 >
-                  Remove
+                  {t(language, 'settings.common.remove')}
                 </button>
                 {probeState[profile.id] && (
                   <span className="llm-profile__status">
@@ -457,7 +464,9 @@ const LlmSection: React.FC = () => {
         </div>
 
         {storePath && (
-          <div className="settings-card__hint">Profile store: {storePath}</div>
+          <div className="settings-card__hint">
+            {t(language, 'settings.llm.profileStore', { path: storePath })}
+          </div>
         )}
         {message && <div className="settings-error">{message}</div>}
       </div>

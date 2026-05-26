@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import './settingsCenter.css';
+import { normalizeUiLanguage, t } from '../../i18n';
+import { useSettingsStore } from '../../state/settingsStore';
 import WorkspaceSection from './sections/WorkspaceSection';
 import CommonSettingsSection from './sections/CommonSettingsSection';
 import SkillRuntimeSection from './sections/SkillRuntimeSection';
@@ -29,16 +31,6 @@ interface NavItem {
   label: string;
 }
 
-const NAV_ITEMS: NavItem[] = [
-  { key: 'workspace', icon: 'WS', label: 'Workspace' },
-  { key: 'common', icon: 'CM', label: 'Common Settings' },
-  { key: 'llm', icon: 'AI', label: 'LLM Providers' },
-  { key: 'skill', icon: 'SK', label: 'Skill Runtime' },
-  { key: 'prompt', icon: 'PR', label: 'Prompt Profiles' },
-  { key: 'doctor', icon: 'DR', label: 'Runtime Doctor' },
-  { key: 'ruler', icon: 'RL', label: 'Ruler Rules' },
-];
-
 const SettingsCenter: React.FC<SettingsCenterProps> = ({
   apiStatus,
   wsStatus,
@@ -46,6 +38,18 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
 }) => {
   const [activeKey, setActiveKey] = useState<SettingsKey>('workspace');
   const [searchQuery, setSearchQuery] = useState('');
+  const language = normalizeUiLanguage(
+    useSettingsStore((s) => s.effectiveSettings['workbench.language'])
+  );
+  const navItems: NavItem[] = [
+    { key: 'workspace', icon: 'WS', label: t(language, 'settings.nav.workspace') },
+    { key: 'common', icon: 'CM', label: t(language, 'settings.nav.common') },
+    { key: 'llm', icon: 'AI', label: t(language, 'settings.nav.llm') },
+    { key: 'skill', icon: 'SK', label: t(language, 'settings.nav.skill') },
+    { key: 'prompt', icon: 'PR', label: t(language, 'settings.nav.prompt') },
+    { key: 'doctor', icon: 'DR', label: t(language, 'settings.nav.doctor') },
+    { key: 'ruler', icon: 'RL', label: t(language, 'settings.nav.ruler') },
+  ];
 
   const renderBody = () => {
     switch (activeKey) {
@@ -78,19 +82,21 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   return (
     <div className="settings-center">
       <nav className="settings-nav">
-        <div className="settings-nav__title">DeepCode Settings</div>
-        <label className="settings-search" aria-label="Search settings">
-          <span>Search</span>
+        <div className="settings-nav__title">
+          {t(language, 'settings.title')}
+        </div>
+        <label className="settings-search" aria-label={t(language, 'settings.search.placeholder')}>
+          <span>{t(language, 'settings.search.label')}</span>
           <input
             value={searchQuery}
             onChange={(event) => {
               setSearchQuery(event.target.value);
               if (event.target.value.trim()) setActiveKey('common');
             }}
-            placeholder="Search settings"
+            placeholder={t(language, 'settings.search.placeholder')}
           />
         </label>
-        {NAV_ITEMS.map((item) => (
+        {navItems.map((item) => (
           <button
             key={item.key}
             className={`settings-nav-item ${

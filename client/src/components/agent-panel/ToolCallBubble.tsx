@@ -1,9 +1,11 @@
 import React from 'react';
 import type { AgentEvent } from '@deepcode/protocol';
+import { t, type UiLanguage } from '../../i18n';
 import { compactDisplayText, sanitizeDisplayText } from './displayText';
 
 interface ToolCallBubbleProps {
   event: AgentEvent;
+  language: UiLanguage;
   autoOpen?: boolean;
 }
 
@@ -71,14 +73,16 @@ function getOutputText(payload: unknown): string | undefined {
   return [stdout, stderr, error, summary].filter(Boolean).join('\n').trim() || undefined;
 }
 
-function eventLabel(event: AgentEvent): string {
+function eventLabel(event: AgentEvent, language: UiLanguage): string {
   if (event.kind === 'tool_call') {
     const name = getToolName(event.payload);
-    return name.startsWith('shell.') ? '执行命令' : '执行工具';
+    return name.startsWith('shell.')
+      ? t(language, 'agent.tool.runCommand')
+      : t(language, 'agent.tool.runTool');
   }
-  if (event.kind === 'tool_result') return '输出结果';
-  if (event.kind === 'permission_request') return '确认请求';
-  if (event.kind === 'permission_result') return '确认结果';
+  if (event.kind === 'tool_result') return t(language, 'agent.tool.result');
+  if (event.kind === 'permission_request') return t(language, 'agent.tool.approvalRequest');
+  if (event.kind === 'permission_result') return t(language, 'agent.tool.approvalResult');
   return event.kind;
 }
 
@@ -96,28 +100,40 @@ function cardTitle(event: AgentEvent): string {
   return name;
 }
 
-function renderDetails(event: AgentEvent) {
+function renderDetails(event: AgentEvent, language: UiLanguage) {
   const outputText = getOutputText(event.payload);
   if (event.kind === 'tool_result' && outputText) {
     return (
       <div className="agent-tool-bubble__output">
-        <div className="agent-tool-bubble__output-title">Output</div>
+        <div className="agent-tool-bubble__output-title">
+          {t(language, 'agent.tool.output')}
+        </div>
         <pre>{sanitizeDisplayText(outputText)}</pre>
       </div>
     );
   }
   if (event.kind === 'permission_request') {
     const risk = isRecord(event.payload) ? stringValue(event.payload.riskLevel) : undefined;
-    return <div className="agent-tool-bubble__summary">{risk ? `风险等级：${risk}` : '等待用户确认。'}</div>;
+    return (
+      <div className="agent-tool-bubble__summary">
+        {risk
+          ? t(language, 'agent.tool.riskLevel', { risk })
+          : t(language, 'agent.tool.waitingApproval')}
+      </div>
+    );
   }
   if (event.kind === 'permission_result') {
     const decision = isRecord(event.payload) ? stringValue(event.payload.decision) : undefined;
-    return <div className="agent-tool-bubble__summary">{decision ?? '权限已处理。'}</div>;
+    return (
+      <div className="agent-tool-bubble__summary">
+        {decision ?? t(language, 'agent.tool.permissionHandled')}
+      </div>
+    );
   }
   return <div className="agent-tool-bubble__summary">{compactDisplayText(cardTitle(event), 220)}</div>;
 }
 
-const ToolCallBubble: React.FC<ToolCallBubbleProps> = ({ event, autoOpen = false }) => {
+const ToolCallBubble: React.FC<ToolCallBubbleProps> = ({ event, language, autoOpen = false }) => {
   const status = getStatus(event.payload);
   const title = sanitizeDisplayText(cardTitle(event));
 
@@ -125,13 +141,13 @@ const ToolCallBubble: React.FC<ToolCallBubbleProps> = ({ event, autoOpen = false
     <div className={`agent-tool-bubble agent-tool-bubble--${event.kind}`}>
       <details className="agent-tool-bubble__details" open={autoOpen}>
         <summary>
-          <span className="agent-tool-bubble__label">{eventLabel(event)}</span>
+          <span className="agent-tool-bubble__label">{eventLabel(event, language)}</span>
           <span className="agent-tool-bubble__title" title={title}>{compactDisplayText(title, 260)}</span>
           {status && <span className={`agent-tool-bubble__status agent-tool-bubble__status--${status}`}>{status}</span>}
         </summary>
-        {renderDetails(event)}
+        {renderDetails(event, language)}
         <details className="agent-raw-details">
-          <summary>Raw payload</summary>
+          <summary>{t(language, 'agent.tool.rawPayload')}</summary>
           <pre>{JSON.stringify(event.payload, null, 2)}</pre>
         </details>
       </details>

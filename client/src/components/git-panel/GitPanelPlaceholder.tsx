@@ -3,6 +3,7 @@
  * Stage 7 will attach Git status / diff / git.tree data.
  */
 import React, { useEffect, useState } from 'react';
+import { t, type UiLanguage } from '../../i18n';
 import './gitPanel.css';
 
 interface GitContextMenuState {
@@ -10,14 +11,18 @@ interface GitContextMenuState {
   y: number;
 }
 
-const RESERVED_ACTIONS = [
-  'Open File',
-  'Open Changes',
-  'View File History',
-  'Reveal in Explorer',
+const RESERVED_ACTION_KEYS = [
+  'git.openFile',
+  'git.openChanges',
+  'git.viewFileHistory',
+  'git.revealInExplorer',
 ];
 
-const GitPanelPlaceholder: React.FC = () => {
+interface GitPanelPlaceholderProps {
+  language: UiLanguage;
+}
+
+const GitPanelPlaceholder: React.FC<GitPanelPlaceholderProps> = ({ language }) => {
   const [contextMenu, setContextMenu] = useState<GitContextMenuState | null>(null);
 
   useEffect(() => {
@@ -46,8 +51,8 @@ const GitPanelPlaceholder: React.FC = () => {
       }}
     >
       <div className="placeholder-content">
-        GitPanelPlaceholder
-        <div className="stage-hint">(Stage 7: Git status / diff / git.tree)</div>
+        {t(language, 'git.placeholder')}
+        <div className="stage-hint">{t(language, 'git.stageHint')}</div>
       </div>
 
       {contextMenu && (
@@ -56,10 +61,10 @@ const GitPanelPlaceholder: React.FC = () => {
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(event) => event.stopPropagation()}
         >
-          <div className="git-panel-context-menu__title">Source Control</div>
-          {RESERVED_ACTIONS.map((action) => (
-            <button key={action} type="button" disabled title="Reserved for Git integration">
-              {action}
+          <div className="git-panel-context-menu__title">{t(language, 'workbench.sourceControl')}</div>
+          {RESERVED_ACTION_KEYS.map((key) => (
+            <button key={key} type="button" disabled title={t(language, 'git.reservedTitle')}>
+              {t(language, key)}
             </button>
           ))}
         </div>

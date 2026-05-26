@@ -2,7 +2,9 @@ import React, { useEffect, useState } from 'react';
 import type { LlmProviderProfile } from '@deepcode/protocol';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
+import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
+import { normalizeUiLanguage } from '../../i18n';
 import AgentComposer from './AgentComposer';
 import AgentSessionSelector from './AgentSessionSelector';
 import AgentTaskList from './AgentTaskList';
@@ -34,9 +36,13 @@ const AgentPanel: React.FC = () => {
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
   const sendMessage = useAgentSessionStore((s) => s.sendMessage);
+  const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
   const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
+  const language = normalizeUiLanguage(
+    useSettingsStore((s) => s.effectiveSettings['workbench.language'])
+  );
 
   const [profiles, setProfiles] = useState<LlmProviderProfile[]>([]);
 
@@ -69,6 +75,7 @@ const AgentPanel: React.FC = () => {
       <AgentSessionSelector
         session={session}
         sessions={sessions}
+        language={language}
         loading={loading}
         onNew={() => void createNewSession()}
         onActivate={(sessionId) => void activateSession(sessionId)}
@@ -76,13 +83,19 @@ const AgentPanel: React.FC = () => {
         onArchive={(sessionId) => void archiveSession(sessionId)}
       />
 
-      <AgentTaskList events={events} traceEvents={traceEvents} loading={loading} />
+      <AgentTaskList
+        events={events}
+        traceEvents={traceEvents}
+        loading={loading}
+        language={language}
+      />
 
-      <MessageList events={events} loading={loading} />
+      <MessageList events={events} loading={loading} language={language} />
 
       {pendingPermission && (
         <PermissionRequestBubble
           request={pendingPermission.request}
+          language={language}
           disabled={loading}
           onAccept={() => void acceptPermission()}
           onReject={() => void rejectPermission()}
@@ -96,8 +109,10 @@ const AgentPanel: React.FC = () => {
         sessionAttachments={sessionAttachments}
         workflowConfig={workflowConfig}
         profiles={profiles}
+        language={language}
         loading={loading}
         onSend={(content) => void sendMessage(content)}
+        onStop={() => void cancelCurrentRun()}
         onAddAttachment={addAttachment}
         onRemoveAttachment={removeAttachment}
         onWorkflowConfigChange={(config) => void patchWorkflowConfig(config)}

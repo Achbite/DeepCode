@@ -1,9 +1,11 @@
 import React, { useMemo, useState } from 'react';
 import type { AgentSession } from '@deepcode/protocol';
+import { t, type UiLanguage } from '../../i18n';
 
 interface AgentSessionSelectorProps {
   session: AgentSession | null;
   sessions: AgentSession[];
+  language: UiLanguage;
   loading?: boolean;
   onNew: () => void;
   onActivate: (sessionId: string) => void;
@@ -23,8 +25,8 @@ function formatTime(value?: string): string {
   });
 }
 
-function sessionTitle(session: AgentSession | null): string {
-  return session?.title?.trim() || 'New Agent Session';
+function sessionTitle(session: AgentSession | null, language: UiLanguage): string {
+  return session?.title?.trim() || t(language, 'agent.session.newTitle');
 }
 
 function isEmptySession(session: AgentSession): boolean {
@@ -34,6 +36,7 @@ function isEmptySession(session: AgentSession): boolean {
 const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
   session,
   sessions,
+  language,
   loading,
   onNew,
   onActivate,
@@ -49,12 +52,12 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
   );
   const newDisabled = Boolean(loading || (session && isEmptySession(session)));
   const newTitle = session && isEmptySession(session)
-    ? 'Current session is empty'
-    : 'New Agent session';
+    ? t(language, 'agent.session.emptyCurrent')
+    : t(language, 'agent.session.new');
 
   const startRename = (item: AgentSession) => {
     setRenamingId(item.id);
-    setRenameValue(sessionTitle(item));
+    setRenameValue(sessionTitle(item, language));
   };
 
   const cancelRename = () => {
@@ -74,11 +77,15 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
         className="agent-session-bar__selector"
         type="button"
         onClick={() => setOpen((value) => !value)}
-        title="Switch Agent session"
+        title={t(language, 'agent.session.switch')}
       >
-        <span className="agent-session-bar__eyebrow">Session</span>
-        <span className="agent-session-bar__title">{sessionTitle(session)}</span>
-        <span className="agent-session-bar__chevron">{open ? 'Hide' : 'Show'}</span>
+        <span className="agent-session-bar__eyebrow">
+          {t(language, 'agent.session.eyebrow')}
+        </span>
+        <span className="agent-session-bar__title">{sessionTitle(session, language)}</span>
+        <span className="agent-session-bar__chevron">
+          {open ? t(language, 'agent.ui.hide') : t(language, 'agent.ui.show')}
+        </span>
       </button>
       <button
         className="agent-session-bar__new"
@@ -93,12 +100,16 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
       {open && (
         <div className="agent-session-menu">
           <div className="agent-session-menu__header">
-            <span>Current Workspace</span>
-            <button type="button" onClick={onNew} disabled={newDisabled} title={newTitle}>New</button>
+            <span>{t(language, 'agent.session.currentWorkspace')}</span>
+            <button type="button" onClick={onNew} disabled={newDisabled} title={newTitle}>
+              {t(language, 'agent.session.newButton')}
+            </button>
           </div>
           <div className="agent-session-menu__list">
             {activeSessions.length === 0 && (
-              <div className="agent-session-menu__empty">No sessions yet.</div>
+              <div className="agent-session-menu__empty">
+                {t(language, 'agent.session.none')}
+              </div>
             )}
             {activeSessions.map((item) => {
               const isRenaming = renamingId === item.id;
@@ -117,7 +128,7 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
                           if (event.key === 'Enter') commitRename(item.id);
                           if (event.key === 'Escape') cancelRename();
                         }}
-                        aria-label="Agent session title"
+                        aria-label={t(language, 'agent.session.titleLabel')}
                       />
                     </div>
                   ) : (
@@ -129,7 +140,9 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
                         onActivate(item.id);
                       }}
                     >
-                      <span className="agent-session-menu__title">{sessionTitle(item)}</span>
+                      <span className="agent-session-menu__title">
+                        {sessionTitle(item, language)}
+                      </span>
                       <span className="agent-session-menu__meta">
                         {formatTime(item.updatedAt)}
                         {item.lastSummary ? ` - ${item.lastSummary}` : ''}
@@ -139,15 +152,21 @@ const AgentSessionSelector: React.FC<AgentSessionSelectorProps> = ({
                   <div className="agent-session-menu__actions">
                     {isRenaming ? (
                       <>
-                        <button type="button" onClick={() => commitRename(item.id)}>Save</button>
-                        <button type="button" onClick={cancelRename}>Cancel</button>
+                        <button type="button" onClick={() => commitRename(item.id)}>
+                          {t(language, 'agent.session.save')}
+                        </button>
+                        <button type="button" onClick={cancelRename}>
+                          {t(language, 'agent.session.cancel')}
+                        </button>
                       </>
                     ) : (
                       <>
-                        <button type="button" onClick={() => startRename(item)}>Rename</button>
+                        <button type="button" onClick={() => startRename(item)}>
+                          {t(language, 'agent.session.rename')}
+                        </button>
                         {!isEmptySession(item) && (
                           <button type="button" onClick={() => onArchive(item.id)}>
-                            Del
+                            {t(language, 'agent.session.delete')}
                           </button>
                         )}
                       </>

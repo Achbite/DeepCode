@@ -18,6 +18,7 @@ import {
 } from '../services/runtimeAdapter';
 import { getTabId, useEditorStore } from '../state/editorStore';
 import type { ConfirmDialogAction, ConfirmDialogData } from '../types/ui';
+import { t } from '../i18n';
 import './app.css';
 
 const WorkbenchLayout = lazy(() => import('./layout/WorkbenchLayout'));
@@ -82,12 +83,12 @@ function scheduleIdle(task: () => void, timeout = 1200): () => void {
 }
 
 const BootShellFallback: React.FC = () => (
-  <div className="app-boot-shell" aria-label="DeepCode is starting">
+  <div className="app-boot-shell" aria-label={t('zh-CN', 'app.startingAria')}>
     <div className="app-boot-shell__header">DeepCode</div>
     <div className="app-boot-shell__body">
       <div className="app-boot-shell__rail" />
       <div className="app-boot-shell__side" />
-      <div className="app-boot-shell__center">Starting DeepCode...</div>
+      <div className="app-boot-shell__center">{t('zh-CN', 'app.starting')}</div>
       <div className="app-boot-shell__agent" />
     </div>
     <div className="app-boot-shell__status" />

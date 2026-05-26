@@ -15,6 +15,8 @@ import {
   setBrowserInspectMode,
 } from '../../services/runtimeAdapter';
 import PanelSnapshotCard from './PanelSnapshotCard';
+import { useSettingsStore } from '../../state/settingsStore';
+import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 
 const DEFAULT_PREVIEW_URL = 'http://127.0.0.1:5173/';
 
@@ -27,16 +29,22 @@ type BrowserAction =
   | 'snapshot'
   | 'attach';
 
-function statusMessage(runtime: BrowserRuntimeStatusResult | null): string {
-  if (!runtime) return 'Browser runtime skeleton is idle.';
-  return runtime.message ?? `Browser runtime is ${runtime.status}.`;
+function statusMessage(
+  runtime: BrowserRuntimeStatusResult | null,
+  language: UiLanguage
+): string {
+  if (!runtime) return t(language, 'browser.status.idle');
+  return runtime.message ?? t(language, 'browser.status.runtime', { status: runtime.status });
 }
 
 const InternalBrowserPanel: React.FC = () => {
+  const language = normalizeUiLanguage(
+    useSettingsStore((s) => s.effectiveSettings['workbench.language'])
+  );
   const [url, setUrl] = useState(DEFAULT_PREVIEW_URL);
   const [runtime, setRuntime] = useState<BrowserRuntimeStatusResult | null>(null);
   const [snapshot, setSnapshot] = useState<PanelSemanticSnapshot | null>(null);
-  const [message, setMessage] = useState('Browser preview skeleton is reserved for Stage 7.');
+  const [message, setMessage] = useState(t(language, 'browser.message.reserved'));
   const [activeAction, setActiveAction] = useState<BrowserAction>('idle');
   const [attached, setAttached] = useState(false);
 
@@ -60,15 +68,15 @@ const InternalBrowserPanel: React.FC = () => {
       if (response.ok && response.data) {
         setRuntime(response.data);
         setSnapshot(response.data.snapshot ?? null);
-        setMessage(statusMessage(response.data));
+        setMessage(statusMessage(response.data, language));
       } else {
-        setMessage(response.message ?? 'Browser runtime status is not available.');
+        setMessage(response.message ?? t(language, 'browser.message.statusUnavailable'));
       }
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [language]);
 
   const inspectState: BrowserInspectState = runtime?.inspectState ?? 'off';
   const busy = activeAction !== 'idle';
@@ -79,7 +87,7 @@ const InternalBrowserPanel: React.FC = () => {
         <input
           value={url}
           onChange={(event) => setUrl(event.target.value)}
-          aria-label="Preview URL"
+          aria-label={t(language, 'browser.previewUrl')}
           placeholder="http://127.0.0.1:5173/"
         />
         <button
@@ -90,14 +98,14 @@ const InternalBrowserPanel: React.FC = () => {
               const response = await openBrowserPreview({ url });
               if (response.ok && response.data) {
                 setRuntime(response.data);
-                setMessage(statusMessage(response.data));
+                setMessage(statusMessage(response.data, language));
               } else {
-                setMessage(response.message ?? 'Open preview is not implemented yet.');
+                setMessage(response.message ?? t(language, 'browser.message.openUnavailable'));
               }
             })
           }
         >
-          Open
+          {t(language, 'browser.open')}
         </button>
         <button
           type="button"
@@ -107,14 +115,14 @@ const InternalBrowserPanel: React.FC = () => {
               const response = await reloadBrowserPreview();
               if (response.ok && response.data) {
                 setRuntime(response.data);
-                setMessage(statusMessage(response.data));
+                setMessage(statusMessage(response.data, language));
               } else {
-                setMessage(response.message ?? 'Reload preview is not implemented yet.');
+                setMessage(response.message ?? t(language, 'browser.message.reloadUnavailable'));
               }
             })
           }
         >
-          Reload
+          {t(language, 'browser.reload')}
         </button>
         <button
           type="button"
@@ -125,14 +133,16 @@ const InternalBrowserPanel: React.FC = () => {
               const response = await setBrowserInspectMode({ inspectState: nextState });
               if (response.ok && response.data) {
                 setRuntime(response.data);
-                setMessage(statusMessage(response.data));
+                setMessage(statusMessage(response.data, language));
               } else {
-                setMessage(response.message ?? 'Inspect mode is not implemented yet.');
+                setMessage(response.message ?? t(language, 'browser.message.inspectUnavailable'));
               }
             })
           }
         >
-          {inspectState === 'selecting' ? 'Stop Inspect' : 'Inspect'}
+          {inspectState === 'selecting'
+            ? t(language, 'browser.stopInspect')
+            : t(language, 'browser.inspect')}
         </button>
         <button
           type="button"
@@ -143,14 +153,14 @@ const InternalBrowserPanel: React.FC = () => {
               if (response.ok && response.data) {
                 setSnapshot(response.data.snapshot);
                 setAttached(false);
-                setMessage(response.data.message ?? 'Panel snapshot is not available yet.');
+                setMessage(response.data.message ?? t(language, 'browser.message.snapshotUnavailable'));
               } else {
-                setMessage(response.message ?? 'Panel snapshot capture is not implemented yet.');
+                setMessage(response.message ?? t(language, 'browser.message.snapshotCaptureUnavailable'));
               }
             })
           }
         >
-          Snapshot
+          {t(language, 'browser.snapshot')}
         </button>
         <button
           type="button"
@@ -161,37 +171,42 @@ const InternalBrowserPanel: React.FC = () => {
               if (response.ok && response.data) {
                 setSnapshot(response.data.snapshot);
                 setAttached(response.data.attached);
-                setMessage(response.data.message ?? 'Panel snapshot attachment is reserved.');
+                setMessage(response.data.message ?? t(language, 'browser.message.attachmentReserved'));
               } else {
-                setMessage(response.message ?? 'Attach snapshot is not implemented yet.');
+                setMessage(response.message ?? t(language, 'browser.message.attachUnavailable'));
               }
             })
           }
         >
-          Attach Snapshot
+          {t(language, 'browser.attachSnapshot')}
         </button>
       </div>
 
       <div className="internal-browser-panel__body">
         <section className="internal-browser-panel__preview">
           <div className="internal-browser-panel__placeholder">
-            <strong>Internal Browser Skeleton</strong>
-            <span>{busy ? 'Processing placeholder action...' : message}</span>
-            <small>No dev server, iframe, DOM capture, or Agent injection is started in this stage.</small>
+            <strong>{t(language, 'browser.skeletonTitle')}</strong>
+            <span>{busy ? t(language, 'browser.processing') : message}</span>
+            <small>{t(language, 'browser.skeletonHint')}</small>
           </div>
         </section>
         <aside className="internal-browser-panel__inspector">
           <div className="internal-browser-panel__meta">
             <div>
-              <span>Status</span>
+              <span>{t(language, 'browser.status')}</span>
               <strong>{runtime?.status ?? 'idle'}</strong>
             </div>
             <div>
-              <span>Inspect</span>
+              <span>{t(language, 'browser.inspect')}</span>
               <strong>{inspectState}</strong>
             </div>
           </div>
-          <PanelSnapshotCard snapshot={snapshot} message={message} attached={attached} />
+          <PanelSnapshotCard
+            snapshot={snapshot}
+            message={message}
+            attached={attached}
+            language={language}
+          />
         </aside>
       </div>
     </div>

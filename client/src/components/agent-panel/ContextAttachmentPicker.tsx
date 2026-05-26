@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import type { AgentContextAttachment, FileTreeNode } from '@deepcode/protocol';
 import { getFileTree } from '../../services/runtimeAdapter';
 import { useWorkspaceStore } from '../../state/workspaceStore';
+import { t, type UiLanguage } from '../../i18n';
 
 interface PickerItem {
   kind: 'file' | 'directory';
@@ -12,6 +13,7 @@ interface PickerItem {
 
 interface ContextAttachmentPickerProps {
   query: string;
+  language: UiLanguage;
   onPick: (attachment: AgentContextAttachment) => void;
 }
 
@@ -34,6 +36,7 @@ function flatten(
 
 const ContextAttachmentPicker: React.FC<ContextAttachmentPickerProps> = ({
   query,
+  language,
   onPick,
 }) => {
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
@@ -77,12 +80,17 @@ const ContextAttachmentPicker: React.FC<ContextAttachmentPickerProps> = ({
             });
           }}
         >
-          <span>{item.kind === 'directory' ? 'Folder' : 'File'}</span>
+          <span>{item.kind === 'directory'
+            ? t(language, 'agent.attachment.folder')
+            : t(language, 'agent.attachment.file')}
+          </span>
           <strong>{item.path}</strong>
         </button>
       ))}
       {filtered.length === 0 && (
-        <div className="agent-attachment-picker__empty">No matches</div>
+        <div className="agent-attachment-picker__empty">
+          {t(language, 'agent.attachment.noMatches')}
+        </div>
       )}
     </div>
   );

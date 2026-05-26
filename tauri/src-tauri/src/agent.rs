@@ -464,6 +464,7 @@ impl AgentManager {
                 context.as_str(),
                 output_envelope_prompt(),
                 stage_prompt(stage),
+                response_language_prompt(),
                 &format!("Current permission mode: {mode}."),
                 &format!("Default workflow behavior: {workflow}."),
                 "Natural language alone must never trigger local operations; only explicit tool calls or deepcode-action blocks may do so.",
@@ -1729,6 +1730,23 @@ fn stage_prompt(stage: &str) -> &'static str {
     }
 }
 
+fn response_language_prompt() -> &'static str {
+    match string_setting("workbench.language", "zh-CN").as_str() {
+        "en-US" => {
+            "Current workbench display language: en-US.\n\
+Write user-facing DeepCode Agent output in English by default.\n\
+Keep protocol tags, JSON keys, tool names, file paths, code, commands, and quoted source text unchanged.\n\
+If the user explicitly requests another language, follow the user request for that turn."
+        }
+        _ => {
+            "Current workbench display language: zh-CN.\n\
+Write all user-facing DeepCode Agent output in Simplified Chinese by default, including <say>, <plan>, <observe>, <final>, permission summaries, and final answers.\n\
+Keep protocol tags, JSON keys, tool names, file paths, code, commands, and quoted source text unchanged.\n\
+If the user explicitly requests another language, follow the user request for that turn."
+        }
+    }
+}
+
 fn permission_request(
     tool_call: &Value,
     risk_level: &str,
@@ -1786,6 +1804,15 @@ fn bool_setting(key: &str, fallback: bool) -> bool {
         .get(key)
         .and_then(Value::as_bool)
         .unwrap_or(fallback)
+}
+
+fn string_setting(key: &str, fallback: &str) -> String {
+    user_settings::get_user_settings()
+        .settings
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 fn command_blacklist() -> Vec<String> {

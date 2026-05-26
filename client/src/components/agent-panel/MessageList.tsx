@@ -1,5 +1,6 @@
 import React from 'react';
 import type { AgentDisplayPolicy, AgentEvent, AgentEventPresentation } from '@deepcode/protocol';
+import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './MarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
 import { sanitizeDisplayText } from './displayText';
@@ -8,6 +9,7 @@ import { submitAgentFeedback } from '../../services/runtimeAdapter';
 interface MessageListProps {
   events: AgentEvent[];
   loading?: boolean;
+  language: UiLanguage;
 }
 
 interface TraceGroup {
@@ -78,10 +80,40 @@ function titleCase(value: string): string {
   return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
 }
 
-function stageLabel(payload: unknown): string {
+const STAGE_LABEL_KEYS: Record<string, string> = {
+  plan: 'agent.stage.plan',
+  check: 'agent.stage.check',
+  complete: 'agent.stage.complete',
+  review: 'agent.stage.review',
+  workflow: 'agent.stage.workflow',
+};
+
+const STATUS_LABEL_KEYS: Record<string, string> = {
+  started: 'agent.status.started',
+  completed: 'agent.status.completed',
+  error: 'agent.status.error',
+  updated: 'agent.status.updated',
+  done: 'agent.status.done',
+  running: 'agent.status.running',
+};
+
+function localizedStage(value: string, language: UiLanguage): string {
+  const key = STAGE_LABEL_KEYS[value];
+  return key ? t(language, key) : titleCase(value);
+}
+
+function localizedStatus(value: string, language: UiLanguage): string {
+  const key = STATUS_LABEL_KEYS[value];
+  return key ? t(language, key) : value;
+}
+
+function stageLabel(payload: unknown, language: UiLanguage): string {
   const stage = stringField(payload, 'stage') ?? 'workflow';
   const status = stringField(payload, 'status') ?? 'updated';
-  return `${titleCase(stage)} ${status}`;
+  return t(language, 'agent.workflow.stageLabel', {
+    stage: localizedStage(stage, language),
+    status: localizedStatus(status, language),
+  });
 }
 
 function stageStatus(payload: unknown): string {
@@ -295,6 +327,15 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
         }
 
         if (isHiddenConversationEvent(turnEvent)) continue;
+        if (
+          finalAssistant &&
+          turnEvent.kind === 'assistant_msg' &&
+          eventChannel(turnEvent) === 'final' &&
+          turnEvent.id !== finalAssistant.id
+        ) {
+          renderedEventIds.add(turnEvent.id);
+          continue;
+        }
         if (finalAssistant && turnEvent.id === finalAssistant.id) {
           continue;
         }
@@ -361,61 +402,75 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
   return items;
 }
 
-function workflowCopyText(events: AgentEvent[]): string {
+function workflowCopyText(events: AgentEvent[], language: UiLanguage): string {
   const blocks = events.map((event) => {
-    if (event.kind === 'user_msg') return `User\n${payloadText(event.payload)}`;
+    if (event.kind === 'user_msg') {
+      return `${t(language, 'agent.copy.user')}\n${payloadText(event.payload)}`;
+    }
     if (event.kind === 'assistant_msg') {
       const stage = eventStage(event);
-      return `${stage ? `Agent (${stage})` : 'Agent'}\n${payloadText(event.payload)}`;
+      const channel = eventChannel(event);
+      const label =
+        channel === 'reasoning'
+          ? `${t(language, 'agent.copy.thinking')}${stage ? ` (${localizedStage(stage, language)})` : ''}`
+          : channel === 'observation'
+            ? `${t(language, 'agent.copy.observation')}${stage ? ` (${localizedStage(stage, language)})` : ''}`
+            : `${stage && channel !== 'final' ? `Agent (${localizedStage(stage, language)})` : 'Agent'}`;
+      return `${label}\n${payloadText(event.payload)}`;
     }
     if (event.kind === 'workflow_stage') {
       const stage = stringField(event.payload, 'stage') ?? 'workflow';
       const status = stageStatus(event.payload);
       const profile = stringField(event.payload, 'profileId');
-      const summary = stringField(event.payload, 'summary') ?? stringField(event.payload, 'details');
-      return [`Stage ${stage} - ${status}${profile ? ` - ${profile}` : ''}`, summary].filter(Boolean).join('\n');
+      return `${t(language, 'agent.copy.stage')} ${localizedStage(stage, language)} - ${localizedStatus(status, language)}${profile ? ` - ${profile}` : ''}`;
     }
     if (event.kind === 'tool_call') {
       return [
-        `Tool call - ${eventToolName(event)}`,
+        `${t(language, 'agent.copy.toolCall')} - ${eventToolName(event)}`,
         eventCommand(event) ? `command: ${eventCommand(event)}` : undefined,
         eventPath(event) ? `path: ${eventPath(event)}` : undefined,
       ].filter(Boolean).join('\n');
     }
     if (event.kind === 'tool_result') {
       return [
-        `Tool result - ${eventToolName(event)} - ${eventStatus(event) ?? 'done'}`,
+        `${t(language, 'agent.copy.toolResult')} - ${eventToolName(event)} - ${localizedStatus(eventStatus(event) ?? 'done', language)}`,
         eventOutput(event),
       ].filter(Boolean).join('\n');
     }
     if (event.kind === 'permission_request') {
       return [
-        `Permission request - ${eventToolName(event)}`,
+        `${t(language, 'agent.copy.permissionRequest')} - ${eventToolName(event)}`,
         stringField(event.payload, 'summary') ?? eventCommand(event) ?? eventPath(event),
       ].filter(Boolean).join('\n');
     }
     if (event.kind === 'permission_result') {
-      return `Permission result - ${eventStatus(event) ?? 'resolved'}`;
+      return `${t(language, 'agent.copy.permissionResult')} - ${eventStatus(event) ?? 'resolved'}`;
     }
-    if (event.kind === 'error') return `Error\n${payloadText(event.payload)}`;
+    if (event.kind === 'error') {
+      return `${t(language, 'agent.copy.error')}\n${payloadText(event.payload)}`;
+    }
     return `${event.kind}\n${payloadText(event.payload)}`;
   });
 
   return blocks.filter(Boolean).join('\n\n---\n\n');
 }
 
-function thoughtTraceTitle(events: AgentEvent[]): string {
+function thoughtTraceTitle(events: AgentEvent[], language: UiLanguage): string {
   const stages = Array.from(
     new Set(events.map((event) => eventStage(event)).filter((stage): stage is string => Boolean(stage)))
   );
   const active = events.some(
     (event) => event.kind === 'workflow_stage' && stageStatus(event.payload) === 'started'
   );
-  const stageText = stages.length > 0 ? ` - ${stages.join(' / ')}` : '';
-  return `${active ? '思考中' : '思考过程'}${stageText} - ${events.length} 条`;
+  const stageText = stages.length > 0
+    ? ` - ${stages.map((stage) => localizedStage(stage, language)).join(' / ')}`
+    : '';
+  const prefix = active ? t(language, 'agent.trace.thinking') : t(language, 'agent.trace.title');
+  const countSuffix = t(language, 'agent.trace.count', { count: events.length });
+  return `${prefix}${stageText} - ${countSuffix}`;
 }
 
-function renderWorkflowStage(event: AgentEvent) {
+function renderWorkflowStage(event: AgentEvent, language: UiLanguage) {
   const status = stageStatus(event.payload);
   const profileId = stringField(event.payload, 'profileId');
   const summary = stringField(event.payload, 'summary');
@@ -424,12 +479,15 @@ function renderWorkflowStage(event: AgentEvent) {
     <div key={event.id} className={`agent-stage-event agent-stage-event--${status}`}>
       <div className="agent-stage-event__header">
         {status === 'started' && <span className="agent-spinner" />}
-        <span>{stageLabel(event.payload)}</span>
+        <span>{stageLabel(event.payload, language)}</span>
         {profileId && <span className="agent-stage-event__profile">{profileId}</span>}
       </div>
       {details && (
         <details className="agent-stage-event__details">
-          <summary>{summary ? 'Stage summary' : 'Stage details'}</summary>
+          <summary>{summary
+            ? t(language, 'agent.workflow.summary')
+            : t(language, 'agent.workflow.details')}
+          </summary>
           <MarkdownContent content={details} />
         </details>
       )}
@@ -437,15 +495,15 @@ function renderWorkflowStage(event: AgentEvent) {
   );
 }
 
-function renderError(event: AgentEvent) {
+function renderError(event: AgentEvent, language: UiLanguage) {
   const message = payloadText(event.payload);
   return (
     <div key={event.id} className="agent-error-card">
-      <div className="agent-message__meta">Error</div>
+      <div className="agent-message__meta">{t(language, 'agent.error.title')}</div>
       <div className="agent-message__body agent-message__body--plain">{message}</div>
       {isRecord(event.payload) && (
         <details className="agent-raw-details">
-          <summary>Raw error</summary>
+          <summary>{t(language, 'agent.error.raw')}</summary>
           <pre>{JSON.stringify(event.payload, null, 2)}</pre>
         </details>
       )}
@@ -453,39 +511,43 @@ function renderError(event: AgentEvent) {
   );
 }
 
-function renderTraceEvent(event: AgentEvent) {
-  if (event.kind === 'workflow_stage') return renderWorkflowStage(event);
+function renderTraceEvent(event: AgentEvent, language: UiLanguage) {
+  if (event.kind === 'workflow_stage') return renderWorkflowStage(event, language);
   if (event.kind === 'assistant_msg') {
     const stage = eventStage(event) ?? 'thought';
     return (
       <div key={event.id} className="agent-trace-output">
-        <div className="agent-message__meta">{titleCase(stage)} output</div>
+        <div className="agent-message__meta">
+          {t(language, 'agent.trace.output', { stage: localizedStage(stage, language) })}
+        </div>
         <MarkdownContent content={payloadText(event.payload)} />
       </div>
     );
   }
-  if (event.kind === 'error') return renderError(event);
-  return <ToolCallBubble key={event.id} event={event} />;
+  if (event.kind === 'error') return renderError(event, language);
+  return <ToolCallBubble key={event.id} event={event} language={language} />;
 }
 
-function renderTraceGroup(group: TraceGroup) {
+function renderTraceGroup(group: TraceGroup, language: UiLanguage) {
   return (
     <details key={group.id} className="agent-thinking-trace">
       <summary>
         <span className="agent-thinking-trace__left">
           <span className="agent-thinking-trace__icon">&gt;</span>
-          <span className="agent-thinking-trace__title">{thoughtTraceTitle(group.events)}</span>
+          <span className="agent-thinking-trace__title">{thoughtTraceTitle(group.events, language)}</span>
         </span>
-        <span className="agent-thinking-trace__hint">Details</span>
+        <span className="agent-thinking-trace__hint">
+          {t(language, 'agent.trace.details')}
+        </span>
       </summary>
       <div className="agent-thinking-trace__body">
-        {group.events.map(renderTraceEvent)}
+        {group.events.map((event) => renderTraceEvent(event, language))}
       </div>
     </details>
   );
 }
 
-function renderToolBatch(group: ToolBatchGroup) {
+function renderToolBatch(group: ToolBatchGroup, language: UiLanguage) {
   const hasError = group.events.some((event) => eventStatus(event) === 'error');
   const allDone = group.events.some((event) => event.kind === 'tool_result' || event.kind === 'permission_result');
   const status = hasError ? 'error' : allDone ? 'done' : 'running';
@@ -494,11 +556,18 @@ function renderToolBatch(group: ToolBatchGroup) {
     <details key={group.id} className="agent-tool-batch" open={open}>
       <summary>
         <span className="agent-tool-batch__label">{group.label}</span>
-        <span className={`agent-tool-batch__status agent-tool-batch__status--${status}`}>{status}</span>
+        <span className={`agent-tool-batch__status agent-tool-batch__status--${status}`}>
+          {localizedStatus(status, language)}
+        </span>
       </summary>
       <div className="agent-tool-batch__body">
         {group.events.map((event, index) => (
-          <ToolCallBubble key={`${event.id}-${index}`} event={event} autoOpen={eventDefaultOpen(event) ?? group.autoOpen} />
+          <ToolCallBubble
+            key={`${event.id}-${index}`}
+            event={event}
+            language={language}
+            autoOpen={eventDefaultOpen(event) ?? group.autoOpen}
+          />
         ))}
       </div>
     </details>
@@ -547,31 +616,45 @@ async function copyMessage(text: string): Promise<void> {
   }
 }
 
-function TurnActions({ events, targetEvent }: { events: AgentEvent[]; targetEvent: AgentEvent }) {
-  const text = workflowCopyText(events);
+function TurnActions({
+  events,
+  targetEvent,
+  language,
+}: {
+  events: AgentEvent[];
+  targetEvent: AgentEvent;
+  language: UiLanguage;
+}) {
+  const text = workflowCopyText(events, language);
   return (
-    <div className="agent-turn-actions" aria-label="Agent workflow actions">
-      <button type="button" title="Copy workflow output" onClick={() => { void copyMessage(text); }}>Copy workflow</button>
-      <button type="button" title="Good response" onClick={() => feedback(targetEvent, 'up')}>Up</button>
-      <button type="button" title="Bad response" onClick={() => feedback(targetEvent, 'down')}>Down</button>
+    <div className="agent-turn-actions" aria-label={t(language, 'agent.message.actions')}>
+      <button type="button" title={t(language, 'agent.message.copyWorkflowTitle')} onClick={() => { void copyMessage(text); }}>
+        {t(language, 'agent.message.copyWorkflow')}
+      </button>
+      <button type="button" title={t(language, 'agent.message.feedbackUpTitle')} onClick={() => feedback(targetEvent, 'up')}>
+        {t(language, 'agent.message.feedbackUp')}
+      </button>
+      <button type="button" title={t(language, 'agent.message.feedbackDownTitle')} onClick={() => feedback(targetEvent, 'down')}>
+        {t(language, 'agent.message.feedbackDown')}
+      </button>
     </div>
   );
 }
 
-function renderMessage(event: AgentEvent, autoOpen = false) {
-  if (event.kind === 'workflow_stage') return renderWorkflowStage(event);
-  if (event.kind === 'error') return renderError(event);
+function renderMessage(event: AgentEvent, language: UiLanguage, autoOpen = false) {
+  if (event.kind === 'workflow_stage') return renderWorkflowStage(event, language);
+  if (event.kind === 'error') return renderError(event, language);
   if (
     event.kind === 'tool_call' ||
     event.kind === 'tool_result' ||
     event.kind === 'permission_request' ||
     event.kind === 'permission_result'
   ) {
-    return <ToolCallBubble key={event.id} event={event} autoOpen={autoOpen} />;
+    return <ToolCallBubble key={event.id} event={event} language={language} autoOpen={autoOpen} />;
   }
 
   const label = stringField(event.payload, 'label');
-  const speaker = event.kind === 'user_msg' ? 'You' : (label ?? 'Agent');
+  const speaker = event.kind === 'user_msg' ? t(language, 'agent.message.user') : (label ?? 'Agent');
   const pending = isRecord(event.payload) && event.payload.pending === true;
   const text = payloadText(event.payload);
   const renderMarkdown = event.kind === 'assistant_msg' || event.kind === 'user_msg';
@@ -579,7 +662,11 @@ function renderMessage(event: AgentEvent, autoOpen = false) {
     <div key={event.id} className={`agent-message agent-message--${event.kind}`}>
       <div className="agent-message__meta">
         {speaker}
-        {pending && <span className="agent-message__stage">Sending...</span>}
+        {pending && (
+          <span className="agent-message__stage">
+            {t(language, 'agent.message.sending')}
+          </span>
+        )}
       </div>
       <div className={`agent-message__body ${renderMarkdown ? 'agent-message__body--markdown' : 'agent-message__body--plain'}`}>
         {renderMarkdown ? <MarkdownContent content={text} /> : text}
@@ -588,30 +675,39 @@ function renderMessage(event: AgentEvent, autoOpen = false) {
   );
 }
 
-const MessageList: React.FC<MessageListProps> = ({ events, loading = false }) => (
+const MessageList: React.FC<MessageListProps> = ({ events, loading = false, language }) => (
   <div className="agent-message-list">
     {events.length === 0 && !loading && (
       <div className="agent-empty-state">
-        <div className="agent-empty-state__title">Agent Ready</div>
+        <div className="agent-empty-state__title">
+          {t(language, 'agent.message.readyTitle')}
+        </div>
         <div className="agent-empty-state__subtle">
-          Add files with @ or Explorer right click, then ask for a focused edit.
+          {t(language, 'agent.message.readyBody')}
         </div>
       </div>
     )}
 
     {createRenderItems(events, loading).map((item) => {
-      if (item.type === 'trace') return renderTraceGroup(item.group);
-      if (item.type === 'toolBatch') return renderToolBatch(item.group);
+      if (item.type === 'trace') return renderTraceGroup(item.group, language);
+      if (item.type === 'toolBatch') return renderToolBatch(item.group, language);
       if (item.type === 'turnActions') {
-        return <TurnActions key={item.id} events={item.events} targetEvent={item.targetEvent} />;
+        return (
+          <TurnActions
+            key={item.id}
+            events={item.events}
+            targetEvent={item.targetEvent}
+            language={language}
+          />
+        );
       }
-      return renderMessage(item.event, item.autoOpen);
+      return renderMessage(item.event, language, item.autoOpen);
     })}
 
     {loading && (
       <div className="agent-thinking">
         <span className="agent-spinner" />
-        <span>Agent is thinking...</span>
+        <span>{t(language, 'agent.message.thinking')}</span>
       </div>
     )}
   </div>

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useSettingsStore } from '../../../state/settingsStore';
 import { useWorkspaceStore } from '../../../state/workspaceStore';
+import { normalizeUiLanguage, t } from '../../../i18n';
 import {
   getLlmProfiles,
   getRuntimeStatus,
@@ -33,6 +34,10 @@ function statusLabel(status: DoctorStatus): string {
   return 'ERROR';
 }
 
+function enabledLabel(value: boolean, language: ReturnType<typeof normalizeUiLanguage>): string {
+  return value ? t(language, 'settings.common.enabled') : t(language, 'settings.common.disabled');
+}
+
 const RuntimeDoctorSection: React.FC = () => {
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const settingsError = useSettingsStore((s) => s.errorMessage);
@@ -41,6 +46,7 @@ const RuntimeDoctorSection: React.FC = () => {
   const fallbackUsed = useWorkspaceStore((s) => s.fallbackUsed);
   const workspaceError = useWorkspaceStore((s) => s.lastError);
   const workspaceLoading = useWorkspaceStore((s) => s.loading);
+  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
 
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [checks, setChecks] = useState<DoctorCheck[]>([]);
@@ -63,15 +69,17 @@ const RuntimeDoctorSection: React.FC = () => {
     const nextChecks: DoctorCheck[] = [
       {
         id: 'runtime',
-        title: 'Runtime bridge',
+        title: t(language, 'settings.doctor.check.runtime'),
         status: nextRuntime.version === 'unknown' ? 'warn' : 'ok',
-        detail: `${nextRuntime.runtime} on ${nextRuntime.platform}${
-          nextRuntime.arch ? `/${nextRuntime.arch}` : ''
-        }, version ${nextRuntime.version}`,
+        detail: t(language, 'settings.doctor.detail.runtime', {
+          runtime: nextRuntime.runtime,
+          platform: `${nextRuntime.platform}${nextRuntime.arch ? `/${nextRuntime.arch}` : ''}`,
+          version: nextRuntime.version,
+        }),
       },
       {
         id: 'workspace',
-        title: 'Workspace',
+        title: t(language, 'settings.doctor.check.workspace'),
         status:
           workspace && workspace.folders.length > 0
             ? fallbackUsed
@@ -80,67 +88,74 @@ const RuntimeDoctorSection: React.FC = () => {
             : 'warn',
         detail:
           workspace && workspace.folders.length > 0
-            ? `${workspace.name}: ${workspace.folders.length} folder(s)${
-                fallbackUsed ? ', fallback workspace is active' : ''
-              }`
-            : workspaceError ?? 'No active workspace folder is available.',
+            ? t(language, 'settings.doctor.detail.workspace', {
+                name: workspace.name,
+                count: workspace.folders.length,
+                fallback: fallbackUsed ? t(language, 'settings.doctor.fallbackActive') : '',
+              })
+            : workspaceError ?? t(language, 'settings.doctor.noWorkspace'),
       },
       {
         id: 'settings',
-        title: 'Settings store',
+        title: t(language, 'settings.doctor.check.settings'),
         status: settingsError ? 'error' : settingsStorePath ? 'ok' : 'warn',
-        detail: settingsError ?? settingsStorePath ?? 'Settings store path is not loaded yet.',
+        detail: settingsError ?? settingsStorePath ?? t(language, 'settings.doctor.settingsNotLoaded'),
       },
       {
         id: 'llm',
-        title: 'LLM profiles',
+        title: t(language, 'settings.doctor.check.llm'),
         status:
           llmProfiles.ok && llmProfiles.data && llmProfiles.data.profiles.length > 0
             ? 'ok'
             : 'warn',
         detail:
           llmProfiles.ok && llmProfiles.data
-            ? `${llmProfiles.data.profiles.length} profile(s), default ${
-                llmProfiles.data.defaultProfileId ?? 'not set'
-              }`
-            : llmProfiles.message ?? 'No profile is configured yet.',
+            ? t(language, 'settings.doctor.detail.llm', {
+                count: llmProfiles.data.profiles.length,
+                defaultProfile: llmProfiles.data.defaultProfileId ?? t(language, 'settings.doctor.notSet'),
+              })
+            : llmProfiles.message ?? t(language, 'settings.doctor.noLlm'),
       },
       {
         id: 'prompt',
-        title: 'Prompt profiles',
+        title: t(language, 'settings.doctor.check.prompt'),
         status: promptProfiles.length > 0 ? 'ok' : 'warn',
         detail:
           promptProfiles.length > 0
-            ? `${promptProfiles.length} prompt profile(s) configured.`
-            : 'No prompt profile is configured.',
+            ? t(language, 'settings.doctor.detail.prompt', { count: promptProfiles.length })
+            : t(language, 'settings.doctor.noPrompt'),
       },
       {
         id: 'skills',
-        title: 'Skill mounts',
+        title: t(language, 'settings.doctor.check.skills'),
         status: autoLoadSkills && skillMounts.length === 0 ? 'warn' : 'ok',
         detail:
           skillMounts.length > 0
-            ? `${skillMounts.length} skill mount(s), auto-load ${
-                autoLoadSkills ? 'enabled' : 'disabled'
-              }.`
-            : `No external skill mount is configured, auto-load ${
-                autoLoadSkills ? 'enabled' : 'disabled'
-              }.`,
+            ? t(language, 'settings.doctor.detail.skills', {
+                count: skillMounts.length,
+                autoLoad: enabledLabel(autoLoadSkills, language),
+              })
+            : t(language, 'settings.doctor.noSkills', {
+                autoLoad: enabledLabel(autoLoadSkills, language),
+              }),
       },
       {
         id: 'ruler',
-        title: 'Ruler rules',
+        title: t(language, 'settings.doctor.check.ruler'),
         status: rulerEnabled && rulerRules.length === 0 ? 'warn' : 'ok',
         detail:
           rulerRules.length > 0
-            ? `${rulerRules.length} rule(s), engine ${
-                rulerEnabled ? 'enabled' : 'disabled'
-              }.`
-            : `No custom rules, engine ${rulerEnabled ? 'enabled' : 'disabled'}.`,
+            ? t(language, 'settings.doctor.detail.ruler', {
+                count: rulerRules.length,
+                engine: enabledLabel(rulerEnabled, language),
+              })
+            : t(language, 'settings.doctor.noRuler', {
+                engine: enabledLabel(rulerEnabled, language),
+              }),
       },
       {
         id: 'tools',
-        title: 'Agent tool interface',
+        title: t(language, 'settings.doctor.check.tools'),
         status:
           agentTools.ok &&
           agentTools.data &&
@@ -149,8 +164,8 @@ const RuntimeDoctorSection: React.FC = () => {
             : 'error',
         detail:
           agentTools.ok && agentTools.data
-            ? `${agentTools.data.tools.length} tool(s) registered; writes are gated by Act mode approval.`
-            : agentTools.message ?? 'Agent tool interface is not reachable.',
+            ? t(language, 'settings.doctor.detail.tools', { count: agentTools.data.tools.length })
+            : agentTools.message ?? t(language, 'settings.doctor.toolsNotReachable'),
       },
     ];
 
@@ -165,6 +180,7 @@ const RuntimeDoctorSection: React.FC = () => {
     settingsStorePath,
     workspace,
     workspaceError,
+    language,
   ]);
 
   useEffect(() => {
@@ -176,15 +192,14 @@ const RuntimeDoctorSection: React.FC = () => {
 
   return (
     <div>
-      <h2 className="settings-title">Runtime Doctor</h2>
+      <h2 className="settings-title">{t(language, 'settings.doctor.title')}</h2>
 
       <div className="settings-card">
         <div className="settings-card__header-row">
           <div>
-            <h3 className="settings-card__title">Environment Diagnostics</h3>
+            <h3 className="settings-card__title">{t(language, 'settings.doctor.environment')}</h3>
             <p className="settings-card__body">
-              Checks the active runtime, workspace, settings, Agent profiles,
-              skills, rules, and minimum tool bridge.
+              {t(language, 'settings.doctor.body')}
             </p>
           </div>
           <button
@@ -192,21 +207,27 @@ const RuntimeDoctorSection: React.FC = () => {
             onClick={() => void refresh()}
             disabled={refreshing || workspaceLoading}
           >
-            {refreshing ? 'Checking...' : 'Refresh'}
+            {refreshing ? t(language, 'settings.doctor.checking') : t(language, 'settings.doctor.refresh')}
           </button>
         </div>
 
         <div className="doctor-summary">
           <span className={`doctor-pill ${errorCount > 0 ? 'doctor-pill--error' : ''}`}>
-            {errorCount} errors
+            {t(language, 'settings.doctor.errors', { count: errorCount })}
           </span>
           <span className={`doctor-pill ${warnCount > 0 ? 'doctor-pill--warn' : ''}`}>
-            {warnCount} warnings
+            {t(language, 'settings.doctor.warnings', { count: warnCount })}
           </span>
           <span className="doctor-pill">
-            {runtime ? `${runtime.runtime} runtime` : 'runtime pending'}
+            {runtime
+              ? t(language, 'settings.doctor.runtimePill', { runtime: runtime.runtime })
+              : t(language, 'settings.doctor.runtimePending')}
           </span>
-          {lastUpdated && <span className="doctor-updated">Updated {lastUpdated}</span>}
+          {lastUpdated && (
+            <span className="doctor-updated">
+              {t(language, 'settings.doctor.updated', { time: lastUpdated })}
+            </span>
+          )}
         </div>
       </div>
 

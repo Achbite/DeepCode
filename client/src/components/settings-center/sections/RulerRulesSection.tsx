@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useSettingsStore } from '../../../state/settingsStore';
+import { normalizeUiLanguage, t } from '../../../i18n';
 
 type RulerRuleSource = 'system' | 'user' | 'workspace' | 'project';
 
@@ -61,6 +62,7 @@ const RulerRulesSection: React.FC = () => {
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const loading = useSettingsStore((s) => s.loading);
   const patchUserSetting = useSettingsStore((s) => s.patchUserSetting);
+  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
 
   const storedRules = useMemo(
     () => safeParseRules(effectiveSettings['ruler.rules']),
@@ -88,22 +90,21 @@ const RulerRulesSection: React.FC = () => {
     setMessage(null);
     await patchUserSetting('ruler.enabled', enabled);
     await patchUserSetting('ruler.rules', JSON.stringify(rules, null, 2));
-    setMessage('Ruler rules saved');
+    setMessage(t(language, 'settings.ruler.saved'));
   };
 
   const enabledCount = rules.filter((rule) => rule.enabled).length;
 
   return (
     <div>
-      <h2 className="settings-title">Ruler Rules</h2>
+      <h2 className="settings-title">{t(language, 'settings.ruler.title')}</h2>
 
       <div className="settings-card">
         <div className="settings-card__header-row">
           <div>
-            <h3 className="settings-card__title">Rule Engine</h3>
+            <h3 className="settings-card__title">{t(language, 'settings.ruler.engine')}</h3>
             <p className="settings-card__body">
-              These rules are injected into Agent context before prompt profiles
-              and user input, so they work as persistent operating boundaries.
+              {t(language, 'settings.ruler.body')}
             </p>
           </div>
           <label className="settings-inline-check">
@@ -112,31 +113,30 @@ const RulerRulesSection: React.FC = () => {
               checked={enabled}
               onChange={(event) => setEnabled(event.target.checked)}
             />
-            Enabled
+            {t(language, 'settings.common.enabled')}
           </label>
         </div>
 
         <div className="settings-card__hint">
-          {enabledCount} active rule{enabledCount === 1 ? '' : 's'}.
+          {t(language, 'settings.ruler.activeCount', { count: enabledCount })}
         </div>
       </div>
 
       <div className="settings-card">
         <div className="settings-card__header-row">
-          <h3 className="settings-card__title">Rules</h3>
+          <h3 className="settings-card__title">{t(language, 'settings.ruler.rules')}</h3>
           <button
             className="settings-action-button"
             onClick={() => setRules((prev) => [...prev, createRule()])}
             disabled={loading}
           >
-            Add Rule
+            {t(language, 'settings.ruler.addRule')}
           </button>
         </div>
 
         {rules.length === 0 && (
           <div className="settings-card__hint">
-            Add a rule to define workflow, style, safety, or project-specific
-            guidance for Agent runs.
+            {t(language, 'settings.ruler.empty')}
           </div>
         )}
 
@@ -152,7 +152,7 @@ const RulerRulesSection: React.FC = () => {
                       updateRule(rule.id, { enabled: event.target.checked })
                     }
                   />
-                  Enabled
+                  {t(language, 'settings.common.enabled')}
                 </label>
                 <input
                   className="settings-field__input"
@@ -160,7 +160,7 @@ const RulerRulesSection: React.FC = () => {
                   onChange={(event) =>
                     updateRule(rule.id, { name: event.target.value })
                   }
-                  placeholder="Rule name"
+                  placeholder={t(language, 'settings.ruler.ruleName')}
                 />
                 <select
                   className="settings-field__select"
@@ -186,7 +186,7 @@ const RulerRulesSection: React.FC = () => {
                       priority: Number(event.target.value) || 0,
                     })
                   }
-                  title="Higher priority rules are injected first."
+                  title={t(language, 'settings.ruler.priorityTitle')}
                 />
                 <button
                   className="settings-action-button"
@@ -194,7 +194,7 @@ const RulerRulesSection: React.FC = () => {
                     setRules((prev) => prev.filter((item) => item.id !== rule.id))
                   }
                 >
-                  Remove
+                  {t(language, 'settings.common.remove')}
                 </button>
               </div>
 
@@ -212,7 +212,7 @@ const RulerRulesSection: React.FC = () => {
                 onChange={(event) =>
                   updateRule(rule.id, { content: event.target.value })
                 }
-                placeholder="Rule content"
+                placeholder={t(language, 'settings.ruler.ruleContent')}
               />
             </div>
           ))}
@@ -224,7 +224,7 @@ const RulerRulesSection: React.FC = () => {
             onClick={() => void save()}
             disabled={loading}
           >
-            Save Ruler Rules
+            {t(language, 'settings.ruler.save')}
           </button>
           {message && <span className="settings-save-message">{message}</span>}
         </div>

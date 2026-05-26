@@ -1,24 +1,26 @@
 import React from 'react';
 import { DEFAULT_USER_SETTINGS, type UserSettingValue } from '@deepcode/protocol';
 import type { SettingDefinition, SettingSource } from '../../state/settingsStore';
+import { t, type UiLanguage } from '../../i18n';
 
 interface SettingsFieldProps {
   definition: SettingDefinition;
   value: UserSettingValue | undefined;
   source: SettingSource;
+  language: UiLanguage;
   disabled?: boolean;
   onChange: (key: string, value: UserSettingValue) => void;
   onReset?: (key: string) => void;
 }
 
-function sourceLabel(source: SettingSource): string {
+function sourceLabel(source: SettingSource, language: UiLanguage): string {
   switch (source) {
     case 'workspace':
-      return 'Workspace';
+      return t(language, 'settings.source.workspace');
     case 'user':
-      return 'User';
+      return t(language, 'settings.source.user');
     default:
-      return 'Default';
+      return t(language, 'settings.source.default');
   }
 }
 
@@ -26,6 +28,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
   definition,
   value,
   source,
+  language,
   disabled = false,
   onChange,
   onReset,
@@ -91,13 +94,13 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
         <div className="settings-field__title-row">
           <span className="settings-field__label">{definition.label}</span>
           <span className={`settings-field__source settings-field__source--${source}`}>
-            {sourceLabel(source)}
+            {sourceLabel(source, language)}
           </span>
         </div>
         <div className="settings-field__key">{definition.key}</div>
         <div className="settings-field__description">{definition.description}</div>
         <div className="settings-field__default">
-          Default: <code>{JSON.stringify(defaultValue)}</code>
+          {t(language, 'settings.defaultValuePrefix')}<code>{JSON.stringify(defaultValue)}</code>
         </div>
       </div>
       <div className="settings-field__control">
@@ -109,7 +112,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
             disabled={disabled}
             onClick={() => onReset(definition.key)}
           >
-            Reset
+            {t(language, 'settings.reset')}
           </button>
         )}
       </div>

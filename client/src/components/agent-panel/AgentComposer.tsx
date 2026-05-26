@@ -4,6 +4,7 @@ import type {
   AgentWorkflowConfig,
   LlmProviderProfile,
 } from '@deepcode/protocol';
+import { t, type UiLanguage } from '../../i18n';
 import ContextAttachmentPicker from './ContextAttachmentPicker';
 import AgentWorkflowSelector from './AgentWorkflowSelector';
 
@@ -12,8 +13,10 @@ interface AgentComposerProps {
   sessionAttachments: AgentContextAttachment[];
   workflowConfig: AgentWorkflowConfig | null;
   profiles: LlmProviderProfile[];
+  language: UiLanguage;
   loading: boolean;
   onSend: (content: string) => void;
+  onStop: () => void;
   onAddAttachment: (attachment: AgentContextAttachment) => void;
   onRemoveAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
   onWorkflowConfigChange: (config: AgentWorkflowConfig) => void;
@@ -26,10 +29,14 @@ interface AgentModifiedFileView {
 
 const MODIFIED_FILES: AgentModifiedFileView[] = [];
 
-function attachmentLabel(attachment: AgentContextAttachment): string {
-  if (attachment.kind === 'directory') return `Dir ${attachment.path || '.'}`;
-  if (attachment.kind === 'panelSnapshot') return `Panel ${attachment.path || 'snapshot'}`;
-  return `File ${attachment.path || '.'}`;
+function attachmentLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
+  if (attachment.kind === 'directory') {
+    return `${t(language, 'agent.composer.dir')} ${attachment.path || '.'}`;
+  }
+  if (attachment.kind === 'panelSnapshot') {
+    return `${t(language, 'agent.composer.panel')} ${attachment.path || 'snapshot'}`;
+  }
+  return `${t(language, 'agent.composer.file')} ${attachment.path || '.'}`;
 }
 
 const AgentComposer: React.FC<AgentComposerProps> = ({
@@ -37,8 +44,10 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   sessionAttachments,
   workflowConfig,
   profiles,
+  language,
   loading,
   onSend,
+  onStop,
   onAddAttachment,
   onRemoveAttachment,
   onWorkflowConfigChange,
@@ -78,11 +87,11 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             <button
               key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}`}
               className={`agent-chip agent-chip--${attachment.scope}`}
-              title={attachment.path || 'workspace root'}
+              title={attachment.path || t(language, 'agent.composer.workspaceRoot')}
               onClick={() => onRemoveAttachment(attachment.path, attachment.scope)}
               type="button"
             >
-              {attachmentLabel(attachment)}
+              {attachmentLabel(attachment, language)}
               <span>x</span>
             </button>
           ))}
@@ -94,7 +103,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           type="button"
           onClick={() => setChangesOpen((open) => !open)}
         >
-          <span>Modified Files</span>
+          <span>{t(language, 'agent.composer.modifiedFiles')}</span>
           <span>{MODIFIED_FILES.length}</span>
         </button>
         {changesOpen && MODIFIED_FILES.length > 0 && (
@@ -106,9 +115,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
                 </span>
                 <span className="agent-change-file__savepoint">{file.savepoint}</span>
                 <div className="agent-change-file__actions">
-                  <button type="button" title="Open diff">diff</button>
-                  <button type="button" title="Reject changes">X</button>
-                  <button type="button" title="Accept changes">OK</button>
+                  <button type="button" title={t(language, 'agent.composer.openDiff')}>diff</button>
+                  <button type="button" title={t(language, 'agent.composer.rejectChanges')}>X</button>
+                  <button type="button" title={t(language, 'agent.composer.acceptChanges')}>OK</button>
                 </div>
               </div>
             ))}
@@ -126,11 +135,16 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               send();
             }
           }}
-          placeholder={loading ? 'Add guidance while Agent is running...' : 'Ask DeepCode Agent...'}
+          placeholder={
+            loading
+              ? t(language, 'agent.composer.placeholder.running')
+              : t(language, 'agent.composer.placeholder.idle')
+          }
         />
         {mention && (
           <ContextAttachmentPicker
             query={mention.query}
+            language={language}
             onPick={pickAttachment}
           />
         )}
@@ -141,8 +155,8 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             <button
               className="agent-add-file-button"
               type="button"
-              title="Add file or folder"
-              aria-label="Add file or folder"
+              title={t(language, 'agent.composer.addFile')}
+              aria-label={t(language, 'agent.composer.addFile')}
               onClick={() => setPickerOpen((open) => !open)}
             >
               +
@@ -150,6 +164,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             {pickerOpen && (
               <ContextAttachmentPicker
                 query=""
+                language={language}
                 onPick={pickAttachment}
               />
             )}
@@ -157,12 +172,21 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           <AgentWorkflowSelector
             profiles={profiles}
             config={workflowConfig}
+            language={language}
             disabled={false}
             onChange={onWorkflowConfigChange}
           />
         </div>
-        <button onClick={send} disabled={!value.trim()} type="button">
-          {loading ? 'Guide' : 'Send'}
+        <button
+          className={loading ? 'agent-composer__send-button--stop' : undefined}
+          onClick={loading ? onStop : send}
+          disabled={loading ? false : !value.trim()}
+          type="button"
+          title={loading
+            ? t(language, 'agent.composer.stopTitle')
+            : t(language, 'agent.composer.sendTitle')}
+        >
+          {loading ? t(language, 'agent.composer.stop') : t(language, 'agent.composer.send')}
         </button>
       </div>
     </div>

@@ -5,6 +5,7 @@
  */
 import React, { useEffect, useMemo, useState } from 'react';
 import { useSettingsStore } from '../../../state/settingsStore';
+import { normalizeUiLanguage, t } from '../../../i18n';
 
 interface PromptProfile {
   id: string;
@@ -48,6 +49,7 @@ const PromptProfilesSection: React.FC = () => {
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const loading = useSettingsStore((s) => s.loading);
   const patchUserSetting = useSettingsStore((s) => s.patchUserSetting);
+  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
 
   const storedProfiles = useMemo(
     () => safeParseProfiles(effectiveSettings['prompt.profiles']),
@@ -80,19 +82,19 @@ const PromptProfilesSection: React.FC = () => {
     await patchUserSetting('prompt.defaultProfileId', nextDefault);
     await patchUserSetting('prompt.profiles', JSON.stringify(profiles, null, 2));
     setDefaultProfileId(nextDefault);
-    setMessage('Prompt profiles saved');
+    setMessage(t(language, 'settings.prompt.saved'));
   };
 
   return (
     <div>
-      <h2 className="settings-title">Prompt Profiles</h2>
+      <h2 className="settings-title">{t(language, 'settings.prompt.title')}</h2>
 
       <div className="settings-card">
         <div className="settings-card__header-row">
           <div>
-            <h3 className="settings-card__title">Profiles</h3>
+            <h3 className="settings-card__title">{t(language, 'settings.prompt.profiles')}</h3>
             <p className="settings-card__body">
-              Profiles define the system prompt used by Agent conversations.
+              {t(language, 'settings.prompt.body')}
             </p>
           </div>
           <button
@@ -104,13 +106,13 @@ const PromptProfilesSection: React.FC = () => {
             }}
             disabled={loading}
           >
-            Add Profile
+            {t(language, 'settings.prompt.addProfile')}
           </button>
         </div>
 
         {profiles.length > 0 && (
           <label className="settings-default-row">
-            <span>Default profile</span>
+            <span>{t(language, 'settings.prompt.defaultProfile')}</span>
             <select
               className="settings-field__select"
               value={defaultProfileId}
@@ -137,7 +139,7 @@ const PromptProfilesSection: React.FC = () => {
                       updateProfile(profile.id, { enabled: event.target.checked })
                     }
                   />
-                  Enabled
+                  {t(language, 'settings.common.enabled')}
                 </label>
                 <input
                   className="settings-field__input"
@@ -145,7 +147,7 @@ const PromptProfilesSection: React.FC = () => {
                   onChange={(event) =>
                     updateProfile(profile.id, { name: event.target.value })
                   }
-                  placeholder="Profile name"
+                  placeholder={t(language, 'settings.prompt.profileName')}
                 />
                 <input
                   className="settings-field__input settings-field__input--wide"
@@ -153,7 +155,7 @@ const PromptProfilesSection: React.FC = () => {
                   onChange={(event) =>
                     updateProfile(profile.id, { description: event.target.value })
                   }
-                  placeholder="Description"
+                  placeholder={t(language, 'settings.prompt.description')}
                 />
                 <button
                   className="settings-action-button"
@@ -163,7 +165,7 @@ const PromptProfilesSection: React.FC = () => {
                     )
                   }
                 >
-                  Remove
+                  {t(language, 'settings.common.remove')}
                 </button>
               </div>
               <textarea
@@ -172,7 +174,7 @@ const PromptProfilesSection: React.FC = () => {
                 onChange={(event) =>
                   updateProfile(profile.id, { systemPrompt: event.target.value })
                 }
-                placeholder="System prompt"
+                placeholder={t(language, 'settings.prompt.systemPrompt')}
               />
             </div>
           ))}
@@ -184,7 +186,7 @@ const PromptProfilesSection: React.FC = () => {
             onClick={() => void save()}
             disabled={loading || profiles.length === 0}
           >
-            Save Prompt Profiles
+            {t(language, 'settings.prompt.save')}
           </button>
           {message && <span className="settings-save-message">{message}</span>}
         </div>

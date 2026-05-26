@@ -7,6 +7,8 @@ import {
   useSettingsStore,
 } from '../../../state/settingsStore';
 import type { UserSettingValue } from '@deepcode/protocol';
+import { normalizeUiLanguage, t } from '../../../i18n';
+import { localizeSettingDefinition } from '../../../settingsLocalization';
 
 const WorkspaceSection: React.FC = () => {
   const workspace = useWorkspaceStore((s) => s.current);
@@ -15,6 +17,7 @@ const WorkspaceSection: React.FC = () => {
   const saveWorkspaceFile = useWorkspaceStore((s) => s.saveWorkspaceFile);
   const showWorkspaceOpenDialog = useUiStore((s) => s.showWorkspaceOpenDialog);
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
+  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const sources = useSettingsStore((s) => s.sources);
   const patchWorkspaceSetting = useSettingsStore((s) => s.patchWorkspaceSetting);
 
@@ -37,20 +40,22 @@ const WorkspaceSection: React.FC = () => {
   if (!workspace) {
     return (
       <div>
-        <h2 className="settings-title">Workspace</h2>
+        <h2 className="settings-title">{t(language, 'workspace.title')}</h2>
         <div className="settings-card">
           <div className="settings-card__header-row">
-            <h3 className="settings-card__title">No Workspace Opened</h3>
+            <h3 className="settings-card__title">
+              {t(language, 'workspace.noneTitle')}
+            </h3>
             <button
               className="settings-action-button"
               onClick={showWorkspaceOpenDialog}
               type="button"
             >
-              Open Folder...
+              {t(language, 'workspace.openFolder')}
             </button>
           </div>
           <div className="settings-card__body">
-            DeepCode will stay empty until you open a folder or a .code-workspace file.
+            {t(language, 'workspace.noneBody')}
           </div>
         </div>
       </div>
@@ -59,25 +64,27 @@ const WorkspaceSection: React.FC = () => {
 
   return (
     <div>
-      <h2 className="settings-title">Workspace</h2>
+      <h2 className="settings-title">{t(language, 'workspace.title')}</h2>
 
       <div className="settings-card">
         <div className="settings-card__header-row">
-          <h3 className="settings-card__title">Current Workspace</h3>
+          <h3 className="settings-card__title">
+            {t(language, 'workspace.currentTitle')}
+          </h3>
           <div className="settings-action-row">
             <button
               className="settings-action-button"
               onClick={showWorkspaceOpenDialog}
               type="button"
             >
-              Open Folder...
+              {t(language, 'workspace.openFolder')}
             </button>
             <button
               className="settings-action-button"
               onClick={() => void handleSaveWorkspaceFile()}
               type="button"
             >
-              Save Workspace File
+              {t(language, 'workspace.saveFile')}
             </button>
           </div>
         </div>
@@ -85,7 +92,7 @@ const WorkspaceSection: React.FC = () => {
         <table className="settings-kv">
           <tbody>
             <tr>
-              <td>Name</td>
+              <td>{t(language, 'workspace.name')}</td>
               <td>{workspace.name}</td>
             </tr>
             <tr>
@@ -93,20 +100,24 @@ const WorkspaceSection: React.FC = () => {
               <td>{workspace.id}</td>
             </tr>
             <tr>
-              <td>Source</td>
+              <td>{t(language, 'workspace.source')}</td>
               <td>
                 {workspace.source}
-                {fallbackUsed && <span className="settings-source-note">fallback</span>}
+                {fallbackUsed && (
+                  <span className="settings-source-note">
+                    {t(language, 'workspace.fallback')}
+                  </span>
+                )}
               </td>
             </tr>
             {workspace.sourcePath && (
               <tr>
-                <td>Workspace File</td>
+                <td>{t(language, 'workspace.file')}</td>
                 <td className="settings-path">{workspace.sourcePath}</td>
               </tr>
             )}
             <tr>
-              <td>Opened At</td>
+              <td>{t(language, 'workspace.openedAt')}</td>
               <td>{workspace.openedAt}</td>
             </tr>
           </tbody>
@@ -124,7 +135,9 @@ const WorkspaceSection: React.FC = () => {
       </div>
 
       <div className="settings-card">
-        <h3 className="settings-card__title">Folders ({workspace.folders.length})</h3>
+        <h3 className="settings-card__title">
+          {t(language, 'workspace.folders')} ({workspace.folders.length})
+        </h3>
         <table className="settings-kv">
           <tbody>
             {workspace.folders.map((folder) => (
@@ -136,7 +149,10 @@ const WorkspaceSection: React.FC = () => {
                   </div>
                   <div className="settings-path">{folder.absolutePath}</div>
                   {!folder.isAbsolute && (
-                    <div className="settings-path">Relative: {folder.originalPath}</div>
+                    <div className="settings-path">
+                      {t(language, 'workspace.relativePrefix')}
+                      {folder.originalPath}
+                    </div>
                   )}
                 </td>
               </tr>
@@ -146,24 +162,27 @@ const WorkspaceSection: React.FC = () => {
       </div>
 
       <div className="settings-card">
-        <h3 className="settings-card__title">DeepCode Workspace Settings</h3>
+        <h3 className="settings-card__title">
+          {t(language, 'workspace.deepcodeSettings')}
+        </h3>
         <div className="settings-card__body">
-          这些设置保存在当前工作区上下文中；保存为 .code-workspace 后会写入 workspace 文件的 settings 字段。
+          {t(language, 'workspace.deepcodeSettingsBody')}
         </div>
         <div className="settings-workspace-fields">
-          {SETTING_DEFINITIONS.map((definition) => (
+          {SETTING_DEFINITIONS.map((definition) => localizeSettingDefinition(definition, language)).map((definition) => (
             <SettingsField
               key={definition.key}
               definition={definition}
               value={effectiveSettings[definition.key]}
               source={sources[definition.key] ?? 'default'}
+              language={language}
               onChange={handleWorkspaceSettingChange}
             />
           ))}
         </div>
         {Object.keys(workspace.settings).length > 0 && (
           <details className="settings-raw-details">
-            <summary>Raw deepcode.* settings</summary>
+            <summary>{t(language, 'workspace.rawSettings')}</summary>
             <table className="settings-kv">
               <tbody>
                 {Object.entries(workspace.settings).map(([key, value]) => (
@@ -182,7 +201,9 @@ const WorkspaceSection: React.FC = () => {
 
       {workspace.unsupportedFields.length > 0 && (
         <div className="settings-card">
-          <h3 className="settings-card__title">Unsupported Workspace Fields</h3>
+          <h3 className="settings-card__title">
+            {t(language, 'workspace.unsupportedFields')}
+          </h3>
           <table className="settings-kv">
             <tbody>
               {workspace.unsupportedFields.map((field) => (
@@ -194,7 +215,7 @@ const WorkspaceSection: React.FC = () => {
             </tbody>
           </table>
           <div className="settings-card__body">
-            DeepCode 当前不解析 VSCode 专用字段，例如 extensions、tasks、launch、remoteAuthority。
+            {t(language, 'workspace.unsupportedBody')}
           </div>
         </div>
       )}

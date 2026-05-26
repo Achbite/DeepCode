@@ -13,6 +13,8 @@ import type {
 import { useUiStore } from '../../state/uiStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useEditorStore } from '../../state/editorStore';
+import { useSettingsStore } from '../../state/settingsStore';
+import { normalizeUiLanguage, t } from '../../i18n';
 import './workspaceOpenDialog.css';
 
 const WorkspaceOpenDialog: React.FC = () => {
@@ -20,6 +22,9 @@ const WorkspaceOpenDialog: React.FC = () => {
   const hide = useUiStore((s) => s.hideWorkspaceOpenDialog);
   const openWorkspace = useWorkspaceStore((s) => s.openWorkspace);
   const closeAllFileTabs = useEditorStore((s) => s.closeAllFileTabs);
+  const language = normalizeUiLanguage(
+    useSettingsStore((s) => s.effectiveSettings['workbench.language'])
+  );
 
   const [locations, setLocations] = useState<InitialLocation[]>([]);
   const [browseResult, setBrowseResult] = useState<BrowsePathResult | null>(null);
@@ -38,7 +43,7 @@ const WorkspaceOpenDialog: React.FC = () => {
       setBrowseResult(result.data);
       setAddressInput(result.data.absolutePath);
     } else {
-      setError(result.message ?? '浏览目录失败');
+      setError(result.message ?? t(language, 'workspaceDialog.error.browse'));
     }
     setLoading(false);
   };
@@ -66,7 +71,7 @@ const WorkspaceOpenDialog: React.FC = () => {
           setLoading(false);
         }
       } else {
-        setError(init.message ?? '加载初始位置失败');
+        setError(init.message ?? t(language, 'workspaceDialog.error.initialLocations'));
         setLoading(false);
       }
     })();
@@ -116,7 +121,7 @@ const WorkspaceOpenDialog: React.FC = () => {
       hide();
       return;
     }
-    setError(`打开文件夹失败: ${result.message}`);
+    setError(t(language, 'workspaceDialog.error.openFolder', { message: result.message ?? '' }));
   };
 
   const handleOpenWorkspaceFile = async (entry: BrowseEntry) => {
@@ -127,14 +132,14 @@ const WorkspaceOpenDialog: React.FC = () => {
       hide();
       return;
     }
-    setError(`打开工作区文件失败: ${result.message}`);
+    setError(t(language, 'workspaceDialog.error.openWorkspaceFile', { message: result.message ?? '' }));
   };
 
   const handleNativeOpenFolder = async () => {
     const result = await pickWorkspacePath();
     if (!result.ok || !result.data) {
       if (result.error !== 'user_cancelled') {
-        setError(result.message ?? '系统目录选择失败');
+        setError(result.message ?? t(language, 'workspaceDialog.error.systemPicker'));
       }
       return;
     }
@@ -144,7 +149,7 @@ const WorkspaceOpenDialog: React.FC = () => {
       hide();
       return;
     }
-    setError(`打开文件夹失败: ${wsResult.message}`);
+    setError(t(language, 'workspaceDialog.error.openFolder', { message: wsResult.message ?? '' }));
   };
 
   const handleAddressKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
@@ -158,8 +163,8 @@ const WorkspaceOpenDialog: React.FC = () => {
   const canOpenWorkspaceFile = selectedEntry?.type === 'file' && selectedEntry.isCodeWorkspace;
   const selectedPath = selectedEntry?.absolutePath ?? browseResult?.absolutePath ?? '';
   const folderButtonLabel = selectedEntry?.type === 'directory'
-    ? 'Open Selected Folder'
-    : 'Open Current Folder';
+    ? t(language, 'workspaceDialog.openSelectedFolder')
+    : t(language, 'workspaceDialog.openCurrentFolder');
 
   return (
     <div className="ws-open-dialog__backdrop" onClick={hide}>
@@ -168,14 +173,14 @@ const WorkspaceOpenDialog: React.FC = () => {
         onClick={(event) => event.stopPropagation()}
         role="dialog"
         aria-modal="true"
-        aria-label="Open Workspace"
+        aria-label={t(language, 'workspaceDialog.title')}
       >
         <div className="ws-open-dialog__header">
-          <span>Open Workspace</span>
+          <span>{t(language, 'workspaceDialog.title')}</span>
           <button
             className="ws-open-dialog__close"
             onClick={hide}
-            title="Close"
+            title={t(language, 'window.close')}
             type="button"
           >
             x
@@ -187,15 +192,15 @@ const WorkspaceOpenDialog: React.FC = () => {
             className="ws-open-dialog__btn"
             disabled={!browseResult?.parentPath}
             onClick={() => browseResult?.parentPath && void navigateTo(browseResult.parentPath)}
-            title="Go to parent folder"
+            title={t(language, 'workspaceDialog.parent')}
             type="button"
           >
-            Up
+            {t(language, 'workspaceDialog.up')}
           </button>
           <input
             className="ws-open-dialog__address"
             value={addressInput}
-            placeholder="输入或粘贴绝对路径，按 Enter 跳转"
+            placeholder={t(language, 'workspaceDialog.addressPlaceholder')}
             onChange={(event) => setAddressInput(event.target.value)}
             onKeyDown={handleAddressKeyDown}
           />
@@ -204,31 +209,33 @@ const WorkspaceOpenDialog: React.FC = () => {
             onClick={() => addressInput.trim() && void navigateTo(addressInput.trim())}
             type="button"
           >
-            Go
+            {t(language, 'workspaceDialog.go')}
           </button>
           {getRuntimeType() === 'tauri' && (
             <button
               className="ws-open-dialog__btn"
               onClick={() => void handleNativeOpenFolder()}
-              title="使用系统目录选择器打开文件夹"
+              title={t(language, 'workspaceDialog.systemFolderTitle')}
               type="button"
             >
-              System Folder
+              {t(language, 'workspaceDialog.systemFolder')}
             </button>
           )}
-          <label className="ws-open-dialog__toggle" title="显示以 . 开头的隐藏项">
+          <label className="ws-open-dialog__toggle" title={t(language, 'workspaceDialog.hiddenTitle')}>
             <input
               type="checkbox"
               checked={showHidden}
               onChange={(event) => setShowHidden(event.target.checked)}
             />
-            <span>Hidden</span>
+            <span>{t(language, 'workspaceDialog.hidden')}</span>
           </label>
         </div>
 
         <div className="ws-open-dialog__body">
           <aside className="ws-open-dialog__sidebar">
-            <div className="ws-open-dialog__sidebar-title">Quick Locations</div>
+            <div className="ws-open-dialog__sidebar-title">
+              {t(language, 'workspaceDialog.quickLocations')}
+            </div>
             {locations.map((location) => (
               <button
                 key={`${location.kind}::${location.absolutePath}`}
@@ -246,10 +253,16 @@ const WorkspaceOpenDialog: React.FC = () => {
           </aside>
 
           <main className="ws-open-dialog__main">
-            {loading && <div className="ws-open-dialog__placeholder">加载中...</div>}
+            {loading && (
+              <div className="ws-open-dialog__placeholder">
+                {t(language, 'workspaceDialog.loading')}
+              </div>
+            )}
             {error && <div className="ws-open-dialog__error">{error}</div>}
             {!loading && !error && visibleEntries.length === 0 && (
-              <div className="ws-open-dialog__placeholder">空目录</div>
+              <div className="ws-open-dialog__placeholder">
+                {t(language, 'workspaceDialog.empty')}
+              </div>
             )}
             {!loading && !error && visibleEntries.length > 0 && (
               <ul className="ws-open-dialog__entries">
@@ -276,7 +289,9 @@ const WorkspaceOpenDialog: React.FC = () => {
                       </span>
                       <span className="ws-open-dialog__entry-name">{entry.name}</span>
                       {entry.isCodeWorkspace && (
-                        <span className="ws-open-dialog__entry-tag">workspace</span>
+                        <span className="ws-open-dialog__entry-tag">
+                          {t(language, 'workspaceDialog.workspaceTag')}
+                        </span>
                       )}
                     </li>
                   );
@@ -290,28 +305,28 @@ const WorkspaceOpenDialog: React.FC = () => {
           <div className="ws-open-dialog__footer-info">
             {selectedPath && (
               <span>
-                Selected: <strong>{selectedPath}</strong>
+                {t(language, 'workspaceDialog.selected')} <strong>{selectedPath}</strong>
               </span>
             )}
           </div>
           <div className="ws-open-dialog__footer-actions">
             <button className="ws-open-dialog__btn" onClick={hide} type="button">
-              Cancel
+              {t(language, 'workspaceDialog.cancel')}
             </button>
             <button
               className="ws-open-dialog__btn ws-open-dialog__btn--secondary"
               disabled={!canOpenWorkspaceFile}
               onClick={() => selectedEntry && void handleOpenWorkspaceFile(selectedEntry)}
-              title="打开选中的 .code-workspace 文件"
+              title={t(language, 'workspaceDialog.openWorkspaceFileTitle')}
               type="button"
             >
-              Open Workspace File
+              {t(language, 'workspaceDialog.openWorkspaceFile')}
             </button>
             <button
               className="ws-open-dialog__btn ws-open-dialog__btn--primary"
               disabled={!browseResult}
               onClick={() => void handleOpenFolder()}
-              title="打开选中的文件夹；未选中文件夹时打开当前目录"
+              title={t(language, 'workspaceDialog.openFolderTitle')}
               type="button"
             >
               {folderButtonLabel}

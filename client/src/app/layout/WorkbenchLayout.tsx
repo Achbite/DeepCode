@@ -6,10 +6,12 @@ import WindowControls from '../../components/window-controls/WindowControls';
 import BrowserModeSwitch from '../../components/internal-browser/BrowserModeSwitch';
 import ActivityIcon from './ActivityIcon';
 import EmptyEditorSurface from './EmptyEditorSurface';
+import { normalizeUiLanguage, t } from '../../i18n';
 import {
   useEditorStore,
   buildFileTabId,
 } from '../../state/editorStore';
+import { useSettingsStore } from '../../state/settingsStore';
 
 interface WorkbenchLayoutProps {
   apiStatus: string;
@@ -50,7 +52,7 @@ function readStoredLayoutSize(
   return clampNumber(stored, min, max);
 }
 
-const PanelFallback: React.FC<{ label?: string }> = ({ label = 'Loading...' }) => (
+const PanelFallback: React.FC<{ label: string }> = ({ label }) => (
   <div className="workbench-panel-fallback">{label}</div>
 );
 
@@ -85,6 +87,10 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   const updateContent = useEditorStore((s) => s.updateContent);
   const saveFile = useEditorStore((s) => s.saveFile);
   const setActiveTab = useEditorStore((s) => s.setActiveTab);
+  const language = normalizeUiLanguage(
+    useSettingsStore((s) => s.effectiveSettings['workbench.language'])
+  );
+  const settingsTitle = t(language, 'settings.title');
 
   const activeTab = tabs.find((tab) => {
     const id = tab.kind === 'file' ? buildFileTabId(tab.folderId, tab.path) : tab.id;
@@ -140,8 +146,9 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
     switch (activeSidebar) {
       case 'explorer':
         return (
-          <Suspense fallback={<PanelFallback label="Loading Explorer..." />}>
+          <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.explorer')} />}>
             <FileTree
+              language={language}
               onFileSelect={(path, folderId) => openFile(path, folderId)}
               selectedTabId={activeFile ? buildFileTabId(activeFile.folderId, activeFile.path) : null}
             />
@@ -150,16 +157,16 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
       case 'git':
         return (
           <>
-            <div className="panel-header">Source Control</div>
-            <GitPanelPlaceholder />
+            <div className="panel-header">{t(language, 'workbench.sourceControl')}</div>
+            <GitPanelPlaceholder language={language} />
           </>
         );
       case 'search':
         return (
           <>
-            <div className="panel-header">Search</div>
+            <div className="panel-header">{t(language, 'workbench.search')}</div>
             <div className="placeholder-content">
-              Search panel is reserved for the workspace search stage.
+              {t(language, 'workbench.searchReserved')}
             </div>
           </>
         );
@@ -234,7 +241,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         <div className="header__title">
           <strong>DeepCode</strong>
         </div>
-        <WindowControls />
+        <WindowControls language={language} />
       </header>
 
       <div className="activity-bar">
@@ -243,16 +250,16 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
             className={`activity-icon ${
               activeSidebar === 'explorer' && sidebarVisible ? 'active' : ''
             }`}
-            title="Explorer"
-            aria-label="Explorer"
+            title={t(language, 'explorer.title')}
+            aria-label={t(language, 'explorer.title')}
             onClick={() => toggleSidebarPanel('explorer')}
           >
             <ActivityIcon name="explorer" />
           </button>
           <button
             className={`activity-icon ${activeSidebar === 'git' && sidebarVisible ? 'active' : ''}`}
-            title="Source Control"
-            aria-label="Source Control"
+            title={t(language, 'workbench.sourceControl')}
+            aria-label={t(language, 'workbench.sourceControl')}
             onClick={() => toggleSidebarPanel('git')}
           >
             <ActivityIcon name="git" />
@@ -261,8 +268,8 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
             className={`activity-icon ${
               activeSidebar === 'search' && sidebarVisible ? 'active' : ''
             }`}
-            title="Search"
-            aria-label="Search"
+            title={t(language, 'workbench.search')}
+            aria-label={t(language, 'workbench.search')}
             onClick={() => toggleSidebarPanel('search')}
           >
             <ActivityIcon name="search" />
@@ -272,16 +279,16 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         <div className="activity-bar__bottom">
           <button
             className={`activity-icon ${isSettingsActive ? 'active' : ''}`}
-            title="Settings"
-            aria-label="Settings"
+            title={settingsTitle}
+            aria-label={settingsTitle}
             onClick={() => openSettings()}
           >
             <ActivityIcon name="settings" />
           </button>
           <button
             className="activity-icon activity-icon--disabled"
-            title="Accounts"
-            aria-label="Accounts"
+            title={t(language, 'workbench.accounts')}
+            aria-label={t(language, 'workbench.accounts')}
             disabled
           >
             <ActivityIcon name="account" />
@@ -297,8 +304,8 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
             {tabs.map((tab) => {
               const id = tab.kind === 'file' ? buildFileTabId(tab.folderId, tab.path) : tab.id;
               const isActive = id === activeTabId && editorMode === 'code';
-              const title = tab.kind === 'file' ? `[${tab.folderId}] ${tab.path}` : tab.title;
-              const label = tab.kind === 'file' ? tab.path.split('/').pop() : tab.title;
+              const title = tab.kind === 'file' ? `[${tab.folderId}] ${tab.path}` : settingsTitle;
+              const label = tab.kind === 'file' ? tab.path.split('/').pop() : settingsTitle;
               const isDirty = tab.kind === 'file' ? tab.isDirty : false;
 
               return (
@@ -334,15 +341,15 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
               );
             })}
           </div>
-          <BrowserModeSwitch mode={editorMode} onChange={setEditorMode} />
+          <BrowserModeSwitch mode={editorMode} language={language} onChange={setEditorMode} />
         </div>
 
         {editorMode === 'browser' ? (
-          <Suspense fallback={<PanelFallback label="Loading Browser Skeleton..." />}>
+          <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.browser')} />}>
             <InternalBrowserPanel />
           </Suspense>
         ) : isSettingsActive ? (
-          <Suspense fallback={<PanelFallback label="Loading Settings..." />}>
+          <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.settings')} />}>
             <SettingsCenter
               apiStatus={apiStatus}
               wsStatus={wsStatus}
@@ -350,7 +357,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
             />
           </Suspense>
         ) : activeFile ? (
-          <Suspense fallback={<PanelFallback label="Loading Editor..." />}>
+          <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.editor')} />}>
             <CodeEditor
               filePath={activeFile.path}
               modelKey={buildFileTabId(activeFile.folderId, activeFile.path)}
@@ -370,7 +377,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
       </main>
 
       <aside className="agent-panel panel">
-        <Suspense fallback={<PanelFallback label="Loading Agent..." />}>
+        <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.agent')} />}>
           <AgentPanelPlaceholder />
         </Suspense>
       </aside>
@@ -378,8 +385,8 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
       {!terminalMinimized && (
         <footer className="bottom-panel panel">
           <div className="bottom-panel__content">
-            <Suspense fallback={<PanelFallback label="Loading Terminal..." />}>
-              <TerminalPlaceholder onMinimize={() => setTerminalMinimized(true)} />
+            <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.terminal')} />}>
+              <TerminalPlaceholder language={language} onMinimize={() => setTerminalMinimized(true)} />
             </Suspense>
           </div>
         </footer>
@@ -401,21 +408,21 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         <div
           className="workbench-resizer workbench-resizer--sidebar"
           role="separator"
-          aria-label="Resize Explorer"
+          aria-label={t(language, 'workbench.resize.explorer')}
           onMouseDown={(event) => startPanelResize('sidebar', event)}
         />
       )}
       <div
         className="workbench-resizer workbench-resizer--agent"
         role="separator"
-        aria-label="Resize Agent panel"
+        aria-label={t(language, 'workbench.resize.agent')}
         onMouseDown={(event) => startPanelResize('agent', event)}
       />
       {!terminalMinimized && (
         <div
           className="workbench-resizer workbench-resizer--bottom"
           role="separator"
-          aria-label="Resize Terminal panel"
+          aria-label={t(language, 'workbench.resize.terminal')}
           onMouseDown={(event) => startPanelResize('bottom', event)}
         />
       )}
@@ -423,8 +430,8 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         <button
           className="terminal-expand-button"
           type="button"
-          title="Expand terminal"
-          aria-label="Expand terminal"
+          title={t(language, 'terminal.expand')}
+          aria-label={t(language, 'terminal.expand')}
           onClick={() => setTerminalMinimized(false)}
         >
           &gt;_

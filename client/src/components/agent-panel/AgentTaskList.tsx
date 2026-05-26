@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { AgentEvent, AgentTraceEvent } from '@deepcode/protocol';
+import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './MarkdownContent';
 import { compactDisplayText, sanitizeDisplayText } from './displayText';
 
@@ -22,12 +23,30 @@ interface AgentTaskState {
   focusTaskId?: string;
 }
 
-const STAGE_LABELS: Record<string, string> = {
-  plan: 'Plan',
-  check: 'Check',
-  complete: 'Complete',
-  review: 'Review',
+const STAGE_LABEL_KEYS: Record<string, string> = {
+  plan: 'agent.stage.plan',
+  check: 'agent.stage.check',
+  complete: 'agent.stage.complete',
+  review: 'agent.stage.review',
+  workflow: 'agent.stage.workflow',
 };
+
+const STATUS_LABEL_KEYS: Record<string, string> = {
+  started: 'agent.status.started',
+  completed: 'agent.status.completed',
+  error: 'agent.status.error',
+  updated: 'agent.status.updated',
+};
+
+function stageLabel(stage: string, language: UiLanguage): string {
+  const key = STAGE_LABEL_KEYS[stage];
+  return key ? t(language, key) : stage;
+}
+
+function statusLabel(status: string, language: UiLanguage): string {
+  const key = STATUS_LABEL_KEYS[status];
+  return key ? t(language, key) : status;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -72,7 +91,7 @@ function normalizeActionType(action: Record<string, unknown>): string {
   return sanitizeDisplayText(raw).trim();
 }
 
-function actionText(action: Record<string, unknown>): string {
+function actionText(action: Record<string, unknown>, language: UiLanguage): string {
   const type = normalizeActionType(action);
   const path = typeof action.path === 'string' ? sanitizeDisplayText(action.path) : undefined;
   const query = typeof action.query === 'string' ? sanitizeDisplayText(action.query) : undefined;
@@ -83,21 +102,39 @@ function actionText(action: Record<string, unknown>): string {
     typeof action.message === 'string' ? sanitizeDisplayText(action.message) : undefined,
   ].find((value): value is string => Boolean(value && value.trim()));
 
-  if (type === 'final') return result ? result.trim() : '\u6700\u7ec8\u56de\u590d\u5df2\u51c6\u5907\u3002';
-  if (type === 'fs.read') return `\u8bfb\u53d6\u6587\u4ef6 \`${path ?? '(missing path)'}\`\u3002`;
-  if (type === 'fs.list') return `\u5217\u51fa\u76ee\u5f55 \`${path ?? '.'}\`\u3002`;
-  if (type === 'code.search') return `\u641c\u7d22\u4ee3\u7801 \`${query ?? '(missing query)'}\`\u3002`;
-  if (type === 'fs.diff') return `\u51c6\u5907\u6587\u4ef6\u5dee\u5f02 \`${path ?? '(missing path)'}\`\u3002`;
-  if (type === 'fs.write') return `\u5199\u5165\u6587\u4ef6 \`${path ?? '(missing path)'}\`\u3002`;
+  if (type === 'final') {
+    return result ? result.trim() : t(language, 'agent.action.finalReady');
+  }
+  if (type === 'fs.read') {
+    return t(language, 'agent.action.fsRead', { path: path ?? '(missing path)' });
+  }
+  if (type === 'fs.list') {
+    return t(language, 'agent.action.fsList', { path: path ?? '.' });
+  }
+  if (type === 'code.search') {
+    return t(language, 'agent.action.codeSearch', { query: query ?? '(missing query)' });
+  }
+  if (type === 'fs.diff') {
+    return t(language, 'agent.action.fsDiff', { path: path ?? '(missing path)' });
+  }
+  if (type === 'fs.write') {
+    return t(language, 'agent.action.fsWrite', { path: path ?? '(missing path)' });
+  }
   if (type === 'patch.plan') {
     const startLine = numberField(action, 'startLine');
     const endLine = numberField(action, 'endLine');
-    const range = startLine && endLine ? ` \u7b2c ${startLine}-${endLine} \u884c` : '';
-    return `\u89c4\u5212\u8865\u4e01 \`${path ?? '(missing path)'}\`${range}\u3002`;
+    const range = startLine && endLine
+      ? t(language, 'agent.action.patchRange', { startLine, endLine })
+      : '';
+    return t(language, 'agent.action.patchPlan', { path: path ?? '(missing path)', range });
   }
-  if (type === 'shell.propose') return `\u5efa\u8bae\u547d\u4ee4\uff1a\`${command ?? '(missing command)'}\`\u3002`;
-  if (type === 'shell.exec') return `\u6267\u884c\u547d\u4ee4\uff1a\`${command ?? '(missing command)'}\`\u3002`;
-  return result ? result.trim() : `\u89e3\u6790\u5230\u52a8\u4f5c \`${type}\`\u3002`;
+  if (type === 'shell.propose') {
+    return t(language, 'agent.action.shellPropose', { command: command ?? '(missing command)' });
+  }
+  if (type === 'shell.exec') {
+    return t(language, 'agent.action.shellExec', { command: command ?? '(missing command)' });
+  }
+  return result ? result.trim() : t(language, 'agent.action.parsed', { type });
 }
 function parseActionObject(value: unknown): Record<string, unknown>[] {
   if (!isRecord(value)) return [];
@@ -108,7 +145,7 @@ function parseActionObject(value: unknown): Record<string, unknown>[] {
   return [];
 }
 
-function parseDeepcodeActionBlocks(content: string): {
+function parseDeepcodeActionBlocks(content: string, language: UiLanguage): {
   text: string;
   actions: Record<string, unknown>[];
 } {
@@ -117,7 +154,10 @@ function parseDeepcodeActionBlocks(content: string): {
     try {
       actions.push(...parseActionObject(JSON.parse(rawJson.trim())));
     } catch {
-      actions.push({ type: 'unknown', result: 'Agent returned an invalid deepcode-action block.' });
+      actions.push({
+        type: 'unknown',
+        result: t(language, 'agent.action.invalidBlock'),
+      });
     }
     return '';
   }).trim();
@@ -128,7 +168,10 @@ function parseDeepcodeActionBlocks(content: string): {
     try {
       actions.push(...parseActionObject(JSON.parse(rawJson)));
     } catch {
-      actions.push({ type: 'unknown', result: 'Agent prepared a structured action.' });
+      actions.push({
+        type: 'unknown',
+        result: t(language, 'agent.action.preparedStructured'),
+      });
     }
     text = text.slice(0, unclosedBlockIndex).trim();
   }
@@ -136,9 +179,11 @@ function parseDeepcodeActionBlocks(content: string): {
   return { text, actions };
 }
 
-function humanizeAgentOutput(content: string): string {
-  const parsed = parseDeepcodeActionBlocks(content);
-  const actionLines = parsed.actions.map(actionText).filter((line) => line.trim().length > 0);
+function humanizeAgentOutput(content: string, language: UiLanguage): string {
+  const parsed = parseDeepcodeActionBlocks(content, language);
+  const actionLines = parsed.actions
+    .map((action) => actionText(action, language))
+    .filter((line) => line.trim().length > 0);
 
   if (parsed.text && actionLines.length > 0) {
     return `${parsed.text}\n\n${actionLines.map((line) => `- ${line}`).join('\n')}`;
@@ -213,11 +258,13 @@ function traceEventsToAgentEvents(traceEvents: AgentTraceEvent[]): AgentEvent[] 
   });
 }
 
-function defaultTasks(loading: boolean): AgentTaskView[] {
+function defaultTasks(loading: boolean, language: UiLanguage): AgentTaskView[] {
   return [
     {
       id: 'task-waiting',
-      title: loading ? '\u0041gent \u6b63\u5728\u51c6\u5907\u4efb\u52a1' : '\u7b49\u5f85 Agent \u4efb\u52a1',
+      title: loading
+        ? t(language, 'agent.task.preparing')
+        : t(language, 'agent.task.waiting'),
       status: loading ? 'running' : 'waiting',
       commands: [],
       hasToolActivity: false,
@@ -227,13 +274,13 @@ function defaultTasks(loading: boolean): AgentTaskView[] {
 }
 
 
-function ensureTask(tasks: Map<string, AgentTaskView>, stage: string): AgentTaskView {
+function ensureTask(tasks: Map<string, AgentTaskView>, stage: string, language: UiLanguage): AgentTaskView {
   const id = `stage-${stage}`;
   const current = tasks.get(id);
   if (current) return current;
   const next: AgentTaskView = {
     id,
-    title: `${STAGE_LABELS[stage] ?? stage} stage`,
+    title: t(language, 'agent.task.stageSuffix', { stage: stageLabel(stage, language) }),
     status: 'planned',
     commands: [],
     hasToolActivity: false,
@@ -262,7 +309,7 @@ function compactTasks(tasks: AgentTaskView[]): AgentTaskView[] {
   return tasks;
 }
 
-function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
+function deriveTasks(events: AgentEvent[], loading: boolean, language: UiLanguage): AgentTaskState {
   const turnEvents = latestTurnEvents(events);
   const toolActivity = hasToolActivity(turnEvents);
   const tasks = new Map<string, AgentTaskView>();
@@ -272,7 +319,7 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
     if (event.kind === 'workflow_stage') {
       const stage = stringField(event.payload, 'stage') ?? 'workflow';
       const status = stringField(event.payload, 'status') ?? 'updated';
-      const task = ensureTask(tasks, stage);
+      const task = ensureTask(tasks, stage, language);
       focusTaskId = task.id;
       if (status === 'started') task.status = 'running';
       if (status === 'completed') task.status = 'completed';
@@ -285,8 +332,8 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
         const detailText = details ?? summary;
         pushCommand(
           task,
-          `**${status}**${profileId ? ` · \`${profileId}\`` : ''}${
-            detailText ? `\n\n${humanizeAgentOutput(detailText)}` : ''
+          `**${statusLabel(status, language)}**${profileId ? ` · \`${profileId}\`` : ''}${
+            detailText ? `\n\n${humanizeAgentOutput(detailText, language)}` : ''
           }`,
           event.id
         );
@@ -298,70 +345,91 @@ function deriveTasks(events: AgentEvent[], loading: boolean): AgentTaskState {
       const stage = stringField(event.payload, 'stage');
       if (!stage) continue;
       if (toolActivity && stage !== 'complete') continue;
-      const task = ensureTask(tasks, stage);
+      const task = ensureTask(tasks, stage, language);
       focusTaskId = task.id;
       pushCommand(
         task,
-        humanizeAgentOutput(stringField(event.payload, 'content') ?? 'Assistant stage output'),
+        humanizeAgentOutput(
+          stringField(event.payload, 'content') ??
+            t(language, 'agent.task.assistantOutput'),
+          language
+        ),
         event.id
       );
       continue;
     }
 
     if (event.kind === 'tool_call') {
-      const task = ensureTask(tasks, 'complete');
+      const task = ensureTask(tasks, 'complete', language);
       focusTaskId = task.id;
       task.hasToolActivity = true;
       task.status = task.status === 'planned' ? 'running' : task.status;
-      pushCommand(task, `调用工具：\`${toolName(event.payload)}\``, event.id);
+      pushCommand(
+        task,
+        t(language, 'agent.task.toolCall', { tool: toolName(event.payload) }),
+        event.id
+      );
       continue;
     }
 
     if (event.kind === 'tool_result') {
-      const task = ensureTask(tasks, 'complete');
+      const task = ensureTask(tasks, 'complete', language);
       focusTaskId = task.id;
       task.hasToolActivity = true;
       const ok = isRecord(event.payload) && event.payload.ok === true;
       const error = stringField(event.payload, 'error');
       pushCommand(
         task,
-        `工具结果：\`${toolName(event.payload)}\` · **${ok ? 'ok' : 'needs attention'}**${
-          error ? `\n\n${error}` : ''
-        }`,
+        `${t(language, 'agent.task.toolResult', {
+          tool: toolName(event.payload),
+          status: ok ? 'ok' : t(language, 'agent.status.needsAttention'),
+        })}${error ? `\n\n${error}` : ''}`,
         event.id
       );
       continue;
     }
 
     if (event.kind === 'permission_request') {
-      const task = ensureTask(tasks, 'complete');
+      const task = ensureTask(tasks, 'complete', language);
       focusTaskId = task.id;
       task.hasToolActivity = true;
       task.status = 'running';
-      pushCommand(task, `需要确认：\`${toolName(event.payload)}\``, event.id);
+      pushCommand(
+        task,
+        t(language, 'agent.task.needsApproval', { tool: toolName(event.payload) }),
+        event.id
+      );
       continue;
     }
 
     if (event.kind === 'permission_result') {
-      const task = ensureTask(tasks, 'complete');
+      const task = ensureTask(tasks, 'complete', language);
       focusTaskId = task.id;
       task.hasToolActivity = true;
-      pushCommand(task, `确认结果：\`${toolName(event.payload)}\``, event.id);
+      pushCommand(
+        task,
+        t(language, 'agent.task.approvalResult', { tool: toolName(event.payload) }),
+        event.id
+      );
       continue;
     }
 
     if (event.kind === 'error') {
       const stage = stringField(event.payload, 'stage') ?? 'complete';
-      const task = ensureTask(tasks, stage);
+      const task = ensureTask(tasks, stage, language);
       focusTaskId = task.id;
       task.status = 'error';
-      pushCommand(task, stringField(event.payload, 'message') ?? 'Stage error', event.id);
+      pushCommand(
+        task,
+        stringField(event.payload, 'message') ?? t(language, 'agent.task.stageError'),
+        event.id
+      );
     }
   }
 
   const result = Array.from(tasks.values());
   if (result.length === 0) {
-    const waiting = defaultTasks(loading);
+    const waiting = defaultTasks(loading, language);
     return {
       tasks: waiting,
       focusTaskId: waiting[0]?.id,
@@ -384,14 +452,18 @@ interface AgentTaskListProps {
   events: AgentEvent[];
   traceEvents?: AgentTraceEvent[];
   loading: boolean;
+  language: UiLanguage;
 }
 
-const AgentTaskList: React.FC<AgentTaskListProps> = ({ events, traceEvents = [], loading }) => {
+const AgentTaskList: React.FC<AgentTaskListProps> = ({ events, traceEvents = [], loading, language }) => {
   const taskEvents = useMemo(
     () => (traceEvents.length > 0 ? traceEventsToAgentEvents(traceEvents) : events),
     [events, traceEvents]
   );
-  const taskState = useMemo(() => deriveTasks(taskEvents, loading), [taskEvents, loading]);
+  const taskState = useMemo(
+    () => deriveTasks(taskEvents, loading, language),
+    [language, loading, taskEvents]
+  );
   const tasks = taskState.tasks;
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
   const lastAutoFocusIdRef = useRef<string | null>(null);
@@ -407,7 +479,7 @@ const AgentTaskList: React.FC<AgentTaskListProps> = ({ events, traceEvents = [],
   return (
     <div className="agent-task-list">
       <div className="agent-task-list__header">
-        <span>Agent Task</span>
+        <span>{t(language, 'agent.task.header')}</span>
       </div>
       <div className="agent-task-list__body">
         {tasks.map((task) => {
@@ -426,7 +498,9 @@ const AgentTaskList: React.FC<AgentTaskListProps> = ({ events, traceEvents = [],
               >
                 <span className="agent-task-item__dot" />
                 <span className="agent-task-item__title">{task.title}</span>
-                <span className="agent-task-item__chevron">{expanded ? 'Hide' : 'Show'}</span>
+                <span className="agent-task-item__chevron">
+                  {expanded ? t(language, 'agent.ui.hide') : t(language, 'agent.ui.show')}
+                </span>
               </button>
               {expanded && (
                 <div className="agent-task-item__commands">
@@ -438,7 +512,7 @@ const AgentTaskList: React.FC<AgentTaskListProps> = ({ events, traceEvents = [],
                     ))
                   ) : (
                     <div className="agent-task-command">
-                      <MarkdownContent content="等待阶段事件。" />
+                      <MarkdownContent content={t(language, 'agent.task.waitingStageEvents')} />
                     </div>
                   )}
                 </div>
