@@ -176,12 +176,14 @@ function currentWorkspaceBinding(): AgentWorkspaceBinding | undefined {
   const scope = currentWorkspaceScope();
   const openPath = workspace.sourcePath ?? activeFolder?.absolutePath ?? workspace.folders[0]?.absolutePath;
   if (!openPath) return undefined;
+  const folderKey = activeFolder?.absolutePath ?? activeFolder?.originalPath ?? activeFolder?.id;
 
   return {
     workspaceId: workspace.id,
     workspaceHash: scope.workspaceHash,
     openPath,
     activeFolderId: activeFolder?.id ?? workspaceState.activeFolderId ?? workspace.folders[0]?.id,
+    folderHash: folderKey ? simpleHash(folderKey) : undefined,
   };
 }
 

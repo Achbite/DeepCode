@@ -430,6 +430,7 @@ export interface AgentWorkspaceBinding {
   workspaceHash?: string;
   openPath?: string;
   activeFolderId?: string;
+  folderHash?: string;
 }
 
 export interface PermissionRequest {
