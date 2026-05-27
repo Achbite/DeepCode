@@ -1,6 +1,6 @@
 # DeepCode
 
-DeepCode 当前主入口是 Rust Kernel Web Host + React GUI。先按快速开始运行，再看后续功能和架构说明。
+DeepCode 当前可运行入口是 Rust Kernel Web Host + React GUI；正式桌面方向是 Tauri thin shell 承载同一套 GUI。先按快速开始运行，再看后续功能和架构说明。
 
 ## 快速开始
 
@@ -104,6 +104,8 @@ docker run --rm -t -v "$PWD:/workspace" -w /workspace deepcode-dev ./test.sh
 
 - Rust workspace `cargo fmt/check/test`
 - TS `protocol/session-core/gui` build/typecheck
+- Kernel Gateway `/api/kernel/commands`、`/api/kernel/snapshot`、`/api/kernel/events/stream`
+- session-core transcript / projection / resume 最小模型
 - Rust Axum Host `/api/*` smoke
 - LLM profile 保存、secretRef、token integer guard
 - Agent workflow permission resume 与临时文件生命周期
@@ -114,6 +116,12 @@ docker run --rm -t -v "$PWD:/workspace" -w /workspace deepcode-dev ./test.sh
 - Windows GNU 交叉编译产物 smoke
 - 旧 Node server、pkg、Tauri Agent 后端不进入默认链路
 
+如只需要快速开发检查，可跳过慢速打包 smoke：
+
+```bash
+DEEPCODE_SKIP_PACKAGING_SMOKE=1 ./test.sh
+```
+
 ## 当前能力
 
 ### 已可用
@@ -121,6 +129,7 @@ docker run --rm -t -v "$PWD:/workspace" -w /workspace deepcode-dev ./test.sh
 - **Rust Kernel Web Host**
   - 由 `deepcode-host-web` 提供 `/` 和 `/api/*`。
   - GUI 静态资源由同一个 Rust Host 服务。
+  - 新增 Kernel Gateway：`/api/kernel/commands`、`/api/kernel/snapshot`、`/api/kernel/events/stream`。
   - 未知 `/api/*` 返回结构化 JSON 错误，不回退旧 Node server。
 
 - **GUI Host**
@@ -150,18 +159,19 @@ docker run --rm -t -v "$PWD:/workspace" -w /workspace deepcode-dev ./test.sh
 
 ### 当前预留
 
-- **CLI / TUI**：当前分发目录提供入口脚本，但完整 CLI/TUI 交互体验仍是后续阶段；它们不会重新实现 Agent runtime。
+- **Tauri thin shell**：正式 GUI 壳方向已确定为 Tauri，但只允许承载窗口、文件选择、菜单、快捷键、系统集成和 Kernel Host bridge，不承载 Agent runtime。
+- **Browser Host**：保留为开发快速验证入口，不作为最终桌面运行模型。
+- **CLI / TUI**：当前分发目录提供轻量入口脚本；完整 CLI/TUI 交互体验仍是后续阶段，且不会重新实现 Agent runtime。
 - **MCP adapter**：当前只保留 ExternalConnector / SkillPack 兼容方向，尚未实现完整 MCP client adapter。
 - **Source Control / Git / Validator runtime**：ChangeSet、ReviewGate 和 validation 已有 Kernel 结构基础，真实 Git / lint / test 深度接入仍在后续阶段。
-- **桌面壳技术**：Tauri、Wry/Tao、Electron/Bun 或其他壳都只是 Host Shell 实现手段；当前不把 Tauri 作为核心架构依赖。
 
 ## 项目定位与架构
 
 DeepCode 是一个本地 AI Agent 代码工作台。当前项目已经从旧的多 runtime 形态收束为统一的 Rust Kernel 架构：
 
 ```text
-UI 层
-  GUI / CLI / TUI / Browser forwarder
+UI Shell
+  Tauri GUI / Browser Dev Host / CLI / TUI
   只负责展示、输入、审批和交互入口。
 
 TS 用户会话层
@@ -176,6 +186,8 @@ Rust Kernel 层
 ```
 
 核心原则：用户态只能提出意图，系统调用层传递结构化命令，内核态裁决资源访问、权限、工作流迁移、执行事实和完成判定。
+
+Browser Dev Host 是开发验证入口；正式 GUI 壳采用 Tauri thin shell。Tauri 只负责启动或连接本地 Kernel Host、加载打包后的 `web/`、文件选择和系统集成，不允许出现 Tauri-side Agent workflow、tool executor、permission evaluator 或 session truth。
 
 ## 分发目录
 

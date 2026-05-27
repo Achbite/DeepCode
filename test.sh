@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ====================================================================
-# DeepCode stage 5.8 LLM workflow and unified Kernel Host smoke test
+# DeepCode stage 5 closeout three-layer Kernel Host smoke test
 #
 # 默认入口必须是 Rust Kernel Web Host；TS 仅做 protocol/session-core/client。
 # 旧 Node server、pkg 打包链路、TS 工具执行/权限裁决不得进入默认链路。
@@ -8,6 +8,7 @@
 set -euo pipefail
 
 export PATH="/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+export CI="${CI:-true}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
@@ -15,10 +16,12 @@ cd "$ROOT_DIR"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/deepcode-cargo-target}"
 TEST_PORT="${DEEPCODE_TEST_PORT:-31246}"
 HEALTH_URL="http://127.0.0.1:${TEST_PORT}/api/health"
+KERNEL_COMMANDS_URL="http://127.0.0.1:${TEST_PORT}/api/kernel/commands"
+KERNEL_SNAPSHOT_URL="http://127.0.0.1:${TEST_PORT}/api/kernel/snapshot"
+KERNEL_EVENTS_URL="http://127.0.0.1:${TEST_PORT}/api/kernel/events/stream"
 CURRENT_WS_URL="http://127.0.0.1:${TEST_PORT}/api/workspaces/current"
 OPEN_WS_URL="http://127.0.0.1:${TEST_PORT}/api/workspaces/open"
 TOOL_EXECUTE_URL="http://127.0.0.1:${TEST_PORT}/api/agent/tools/execute"
-PERMISSION_URL="http://127.0.0.1:${TEST_PORT}/api/agent/permissions/evaluate"
 TOOLS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/tools"
 RUNTIME_SHELL_URL="http://127.0.0.1:${TEST_PORT}/api/runtime/shell"
 TERMINAL_CAP_URL="http://127.0.0.1:${TEST_PORT}/api/terminal/capabilities"
@@ -29,6 +32,7 @@ LLM_PROFILES_URL="http://127.0.0.1:${TEST_PORT}/api/llm/profiles"
 BROWSER_STATUS_URL="http://127.0.0.1:${TEST_PORT}/api/browser/runtime-status"
 AGENT_SESSIONS_URL="http://127.0.0.1:${TEST_PORT}/api/agent/sessions"
 AGENT_WORKFLOW_URL="http://127.0.0.1:${TEST_PORT}/api/agent/workflow-config"
+SESSION_STORE_URL="http://127.0.0.1:${TEST_PORT}/api/session-store"
 TERMINAL_WARMUP_URL="http://127.0.0.1:${TEST_PORT}/api/terminal/warmup"
 TERMINAL_SESSIONS_URL="http://127.0.0.1:${TEST_PORT}/api/terminal/sessions"
 LOG_FILE="/tmp/_deepcode_host_web_$$.log"
@@ -206,7 +210,7 @@ def body_for_filter(filter_text, args):
     compact = " ".join(filter_text.split())
     if compact == "{path:$path}":
         return {"path": args["path"]}
-    if "write-no-workspace" in compact:
+    if "write-no-workspace" in compact or "deny-no-workspace" in compact:
         return {
             "toolCall": {
                 "id": "write-no-workspace",
@@ -216,7 +220,6 @@ def body_for_filter(filter_text, args):
         }
     if "write-smoke" in compact:
         return {
-            "approved": True,
             "toolCall": {
                 "id": "write-smoke",
                 "name": "fs.write",
@@ -237,7 +240,6 @@ def body_for_filter(filter_text, args):
         }
     if "delete-smoke" in compact:
         return {
-            "approved": True,
             "toolCall": {"id": "delete-smoke", "name": "fs.delete", "arguments": {"path": "_agent_tmp_stage57.txt"}},
         }
     if "workspaceBinding" in compact and "workflowConfig" in compact:
@@ -287,7 +289,7 @@ def eval_filter(data, filter_text, args):
     checks = {
         '.ok == true and .data.service == "deepcode-host-web"': lambda: data.get("ok") is True and d.get("service") == "deepcode-host-web",
         '.ok == true and .data.current == null and (.data.fallbackUsed | type == "boolean")': lambda: data.get("ok") is True and d.get("current") is None and isinstance(d.get("fallbackUsed"), bool),
-        '.ok == true and .data.action == "deny" and (.data.reason | contains("no_workspace"))': lambda: data.get("ok") is True and d.get("action") == "deny" and "no_workspace" in str(d.get("reason", "")),
+        '.ok == true and .data.ok == false and .data.code == "no_workspace"': lambda: data.get("ok") is True and d.get("ok") is False and d.get("code") == "no_workspace",
         '.ok == true and .data.workspace.folders[0].id == "wf-0"': lambda: data.get("ok") is True and d.get("workspace", {}).get("folders", [{}])[0].get("id") == "wf-0",
         '.ok == true and (.data | type == "array") and (.data | length >= 1)': lambda: data.get("ok") is True and isinstance(d, list) and len(d) >= 1,
         '.ok == true and (.data.locations | length >= 1) and (.data.locations[0].absolutePath | type == "string")': lambda: data.get("ok") is True and len(d.get("locations", [])) >= 1 and isinstance(d.get("locations", [{}])[0].get("absolutePath"), str),
@@ -299,6 +301,11 @@ def eval_filter(data, filter_text, args):
         '.ok == true and .data.ok == true and (.data.output.matches | length >= 1)': lambda: data.get("ok") is True and d.get("ok") is True and len(d.get("output", {}).get("matches", [])) >= 1,
         '.ok == true and .data.ok == true and (.data.output.diff | contains("needle changed"))': lambda: data.get("ok") is True and d.get("ok") is True and "needle changed" in str(d.get("output", {}).get("diff", "")),
         '.ok == true and .data.ok == true and .data.output.deleted == true': lambda: data.get("ok") is True and d.get("ok") is True and d.get("output", {}).get("deleted") is True,
+        '.ok == true and .data.pendingPermission == true and .data.permission.capability == "cap.fs.write"': lambda: data.get("ok") is True and d.get("pendingPermission") is True and d.get("permission", {}).get("capability") == "cap.fs.write",
+        '.ok == true and .data.pendingPermission == true and .data.permission.capability == "cap.fs.delete"': lambda: data.get("ok") is True and d.get("pendingPermission") is True and d.get("permission", {}).get("capability") == "cap.fs.delete",
+        '.ok == true and .data.appended == 1': lambda: data.get("ok") is True and d.get("appended") == 1,
+        '.ok == true and (.data.events | length >= 1)': lambda: data.get("ok") is True and len(d.get("events", [])) >= 1,
+        '.ok == true and (.data.sessions | length >= 1)': lambda: data.get("ok") is True and len(d.get("sessions", [])) >= 1,
         '.ok == true and ([.data.skills[].id] | index("fs.delete") != null)': lambda: data.get("ok") is True and any(skill.get("id") == "fs.delete" for skill in d.get("skills", [])),
         '.data.skills[] | select(.id == "fs.delete") | .modelVisible == false': lambda: any(skill.get("id") == "fs.delete" and skill.get("modelVisible") is False for skill in d.get("skills", [])),
         '.ok == true and .data.agentUsesUnixCommands == true': lambda: data.get("ok") is True and d.get("agentUsesUnixCommands") is True,
@@ -319,6 +326,8 @@ def eval_filter(data, filter_text, args):
         '.ok == true and .data.state == "ready"': lambda: data.get("ok") is True and d.get("state") == "ready",
         '.ok == true and (.data.events | length >= 2)': lambda: data.get("ok") is True and len(d.get("events", [])) >= 2,
         '.ok == false and .error == "api_not_implemented"': lambda: data.get("ok") is False and data.get("error") == "api_not_implemented",
+        '.ok == true and (.events[] | select(.kind == "host.status")) and .snapshot != null': lambda: data.get("ok") is True and any(event.get("kind") == "host.status" for event in data.get("events", [])) and data.get("snapshot") is not None,
+        '.ok == true and .snapshot != null': lambda: data.get("ok") is True and data.get("snapshot") is not None,
     }
     if compact in checks:
         return checks[compact]()
@@ -327,6 +336,8 @@ def eval_filter(data, filter_text, args):
         return data.get("ok") is True and store.startswith(args["config"] + "/config/user/local/settings/") and "/bin/" not in store
     if compact == ".data.session.id":
         return d.get("session", {}).get("id", "")
+    if compact == ".data.permission.id":
+        return d.get("permission", {}).get("id", "")
     if compact == ".data.id":
         return d.get("id", "")
     if compact == ".ok == true and (.data.sessions[] | select(.id == $id))":
@@ -341,6 +352,8 @@ def eval_filter(data, filter_text, args):
         return [event.get("payload", {}).get("id", "") for event in d.get("events", []) if event.get("kind") == "permission_request" and event.get("payload", {}).get("toolName") == "fs.write"]
     if compact == '.ok == true and (.data.events[] | select(.kind == "tool_result" and .payload.toolName == "fs.read" and .payload.ok == true))':
         return data.get("ok") is True and has_event(data, "tool_result", tool="fs.read", ok=True)
+    if compact == '.ok == true and (.data.events[] | select(.kind == "tool_result" and .payload.toolName == "fs.write" and .payload.ok == true))':
+        return data.get("ok") is True and has_event(data, "tool_result", tool="fs.write", ok=True)
     if compact == '.ok == true and (.data.events[] | select(.kind == "tool_result" and .payload.toolName == "fs.delete" and .payload.ok == true))':
         return data.get("ok") is True and has_event(data, "tool_result", tool="fs.delete", ok=True)
     if compact == '.ok == true and ([.data.events[] | select(.kind == "assistant_msg" and (.payload.channel == "final") and (.payload.content | contains("DeepCode Agent")))] | length == 1)':
@@ -370,7 +383,7 @@ PY
 }
 
 echo "============================================================"
-echo " DeepCode stage 5.8 test ($(date -Is))"
+echo " DeepCode stage 5 closeout test ($(date -Is))"
 echo " ROOT_DIR=$ROOT_DIR"
 echo " TEST_PORT=$TEST_PORT"
 echo " PACKAGE_PORT=$PACKAGE_PORT"
@@ -380,15 +393,20 @@ echo "============================================================"
 info "[1/6] tooling"
 setup_node_toolchain
 setup_jq_toolchain
-for tool in rustc cargo node pnpm curl jq x86_64-w64-mingw32-gcc; do
+for tool in rustc cargo node pnpm curl jq; do
   require_tool "$tool"
 done
+if [ "${DEEPCODE_SKIP_PACKAGING_SMOKE:-0}" != "1" ]; then
+  require_tool x86_64-w64-mingw32-gcc
+fi
 pass "tooling ok"
 
 info "[2/6] Rust kernel workspace"
 cargo fmt --check --all
 cargo check --workspace
 cargo test --workspace
+cargo fmt --check --manifest-path shells/tauri/src-tauri/Cargo.toml
+cargo check --manifest-path shells/tauri/src-tauri/Cargo.toml
 pass "cargo fmt/check/test ok"
 
 info "[3/6] TS user/session/UI packages"
@@ -398,16 +416,65 @@ pnpm --filter @deepcode/session-core build
 pnpm --filter @deepcode/protocol typecheck
 pnpm --filter @deepcode/session-core typecheck
 pnpm --filter @deepcode/client typecheck
+node --input-type=module <<'NODE'
+import {
+  MemoryTranscriptStore,
+  appendUserMessageBeforeKernelDispatch,
+  createTranscriptMessage,
+  TranscriptChain,
+  ProjectionEngine,
+} from './userspace/session-core/dist/index.js';
+
+const store = new MemoryTranscriptStore();
+const user = await appendUserMessageBeforeKernelDispatch(store, {
+  sessionId: 'session-smoke',
+  content: 'hello kernel',
+});
+const progress = createTranscriptMessage({
+  sessionId: 'session-smoke',
+  parentUuid: user.uuid,
+  role: 'assistant',
+  channel: 'progress',
+  content: 'working',
+  visible: false,
+});
+await store.append(progress);
+const final = createTranscriptMessage({
+  sessionId: 'session-smoke',
+  parentUuid: user.uuid,
+  role: 'assistant',
+  channel: 'final',
+  content: 'done',
+});
+await store.append(final);
+const entries = await store.list('session-smoke');
+const chain = TranscriptChain.rebuild(entries, final.uuid);
+if (chain.length !== 2 || chain[0].uuid !== user.uuid || chain[1].uuid !== final.uuid) {
+  throw new Error('transcript parent chain should exclude invisible progress cards');
+}
+const cards = new ProjectionEngine().projectKernelEvents([{ kind: 'tool.completed', sequence: 7 }], 'session-smoke');
+if (cards.length !== 1 || cards[0].kind !== 'tool') {
+  throw new Error('kernel event projection should produce a tool card');
+}
+NODE
 pass "protocol/session-core/client typecheck ok"
 
 info "[3b/6] legacy default-route gates"
 ! grep -RInE '"server"|@deepcode/server' pnpm-workspace.yaml package.json
 ! grep -RInE 'deepcode-server|pkg@|pkg ' build.sh package.json
 ! grep -RInE 'PermissionGate|ToolRegistry|WorkflowMachine|child_process|spawn\(|exec\(' userspace/session-core/src
+! grep -RInE 'HostWorkflowMemory|pending_permissions|execute_tool_call|approved: Option|PermissionEvaluateRequest' crates/deepcode-host-web/src crates/deepcode-kernel-runtime/src
+! grep -RInE 'executeAgentTool|evaluateAgentPermission|agentRuntime|toolExecutors|permissionGate' userspace/gui/src
+test ! -e userspace/gui/src/services/agentRuntime.ts
+test ! -e userspace/gui/src/services/toolExecutors.ts
+test ! -e userspace/gui/src/services/permissionGate.ts
 test ! -e Dockerfile.tauri
 ! find client server tauri packages -type f 2>/dev/null | grep .
+test -f shells/tauri/src-tauri/Cargo.toml
+test -f shells/tauri/src-tauri/src/main.rs
+! grep -RInE 'Agent|workflow|tool executor|permission evaluator|session truth|KernelCommand|ToolInvoke|child_process|spawn\(|exec\(' shells/tauri/src-tauri/src
 bash -n build.sh
-pass "legacy Node server, Tauri backend, and TS runtime gates ok"
+pass "legacy Node server, old TS runtime, Host truth, and thick Tauri gates ok"
 
 info "[4/6] start Rust Axum host"
 DEEPCODE_HOST=127.0.0.1 \
@@ -438,6 +505,14 @@ HEALTH_BODY="$(curl -fsS -m 2 "$HEALTH_URL")"
 echo "$HEALTH_BODY" | jq -e '.ok == true and .data.service == "deepcode-host-web"' >/dev/null
 pass "/api/health ok"
 
+KERNEL_HEALTH_BODY="$(curl -fsS -m 3 -H 'Content-Type: application/json' \
+  -d '{"requestId":"kernel-health-smoke","command":{"kind":"healthCheck","requestId":"kernel-health-smoke"}}' \
+  "$KERNEL_COMMANDS_URL")"
+echo "$KERNEL_HEALTH_BODY" | jq -e '.ok == true and (.events[] | select(.kind == "host.status")) and .snapshot != null' >/dev/null
+curl -fsS -m 3 "$KERNEL_SNAPSHOT_URL" | jq -e '.ok == true and .snapshot != null' >/dev/null
+curl -fsS -m 3 "$KERNEL_EVENTS_URL" | grep -q '^event: kernel'
+pass "Kernel Gateway commands/snapshot/events stream ok"
+
 CURRENT_BODY="$(curl -fsS -m 2 "$CURRENT_WS_URL")"
 echo "$CURRENT_BODY" | jq -e '.ok == true and .data.current == null and (.data.fallbackUsed | type == "boolean")' >/dev/null
 pass "/api/workspaces/current starts empty"
@@ -449,8 +524,8 @@ NO_WS_PERMISSION_BODY="$(jq -nc '{
     arguments: { path: "_agent_tmp_no_workspace.txt", content: "blocked" }
   }
 }')"
-NO_WS_PERMISSION_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$NO_WS_PERMISSION_BODY" "$PERMISSION_URL")"
-echo "$NO_WS_PERMISSION_RESP" | jq -e '.ok == true and .data.action == "deny" and (.data.reason | contains("no_workspace"))' >/dev/null
+NO_WS_PERMISSION_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$NO_WS_PERMISSION_BODY" "$TOOL_EXECUTE_URL")"
+echo "$NO_WS_PERMISSION_RESP" | jq -e '.ok == true and .data.ok == false and .data.code == "no_workspace"' >/dev/null
 pass "permission preflight denies fs.write without workspace"
 
 SMOKE_DIR="$(mktemp -d /tmp/deepcode-stage57-smoke-XXXXXX)"
@@ -484,7 +559,6 @@ test -f "$SMOKE_DIR/SavedDeepCode.code-workspace"
 pass "current folder can be saved and reopened as .code-workspace"
 
 WRITE_BODY="$(jq -nc '{
-  approved: true,
   toolCall: {
     id: "write-smoke",
     name: "fs.write",
@@ -492,7 +566,12 @@ WRITE_BODY="$(jq -nc '{
   }
 }')"
 WRITE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$WRITE_BODY" "$TOOL_EXECUTE_URL")"
-echo "$WRITE_RESP" | jq -e '.ok == true and .data.ok == true and .data.output.saved == true' >/dev/null
+echo "$WRITE_RESP" | jq -e '.ok == true and .data.pendingPermission == true and .data.permission.capability == "cap.fs.write"' >/dev/null
+WRITE_PERMISSION_ID="$(echo "$WRITE_RESP" | jq -r '.data.permission.id')"
+WRITE_RESOLVE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' \
+  -d '{"decision":"accept"}' \
+  "http://127.0.0.1:${TEST_PORT}/api/agent/permissions/${WRITE_PERMISSION_ID}/resolve")"
+echo "$WRITE_RESOLVE_RESP" | jq -e '.ok == true and (.data.events[] | select(.kind == "tool_result" and .payload.toolName == "fs.write" and .payload.ok == true))' >/dev/null
 grep -q 'needle from kernel' "$SMOKE_DIR/_agent_tmp_stage57.txt"
 pass "fs.write goes through kernel syscall"
 
@@ -511,9 +590,14 @@ DIFF_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$DIFF_BODY" 
 echo "$DIFF_RESP" | jq -e '.ok == true and .data.ok == true and (.data.output.diff | contains("needle changed"))' >/dev/null
 pass "fs.diff is projected through kernel read syscall"
 
-DELETE_BODY="$(jq -nc '{approved:true,toolCall:{id:"delete-smoke",name:"fs.delete",arguments:{path:"_agent_tmp_stage57.txt"}}}')"
+DELETE_BODY="$(jq -nc '{toolCall:{id:"delete-smoke",name:"fs.delete",arguments:{path:"_agent_tmp_stage57.txt"}}}')"
 DELETE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d "$DELETE_BODY" "$TOOL_EXECUTE_URL")"
-echo "$DELETE_RESP" | jq -e '.ok == true and .data.ok == true and .data.output.deleted == true' >/dev/null
+echo "$DELETE_RESP" | jq -e '.ok == true and .data.pendingPermission == true and .data.permission.capability == "cap.fs.delete"' >/dev/null
+DELETE_PERMISSION_ID="$(echo "$DELETE_RESP" | jq -r '.data.permission.id')"
+DELETE_RESOLVE_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' \
+  -d '{"decision":"accept"}' \
+  "http://127.0.0.1:${TEST_PORT}/api/agent/permissions/${DELETE_PERMISSION_ID}/resolve")"
+echo "$DELETE_RESOLVE_RESP" | jq -e '.ok == true and (.data.events[] | select(.kind == "tool_result" and .payload.toolName == "fs.delete" and .payload.ok == true))' >/dev/null
 test ! -e "$SMOKE_DIR/_agent_tmp_stage57.txt"
 pass "fs.delete is hidden but available as controlled syscall"
 
@@ -564,6 +648,15 @@ test -n "$SESSION_ID"
 echo "$SESSION_RESP" | jq -e '.ok == true and .data.session.mode == "plan"' >/dev/null
 curl -fsS -m 3 "$AGENT_SESSIONS_URL" | jq -e --arg id "$SESSION_ID" '.ok == true and (.data.sessions[] | select(.id == $id))' >/dev/null
 curl -fsS -m 3 "http://127.0.0.1:${TEST_PORT}/api/agent/sessions/current" | jq -e --arg id "$SESSION_ID" '.ok == true and .data.session.id == $id' >/dev/null
+curl -fsS -m 3 -H 'Content-Type: application/json' \
+  -d '{"events":[{"kind":"assistant_msg","payload":{"channel":"progress","content":"session store smoke"}}]}' \
+  "${SESSION_STORE_URL}/${SESSION_ID}/projection" \
+  | jq -e '.ok == true and .data.appended == 1' >/dev/null
+curl -fsS -m 3 "${SESSION_STORE_URL}/${SESSION_ID}/projection" \
+  | jq -e '.ok == true and (.data.events | length >= 1)' >/dev/null
+curl -fsS -m 3 "${SESSION_STORE_URL}/index" \
+  | jq -e '.ok == true and (.data.sessions | length >= 1)' >/dev/null
+pass "Rust session storage API persists projection events"
 AGENT_MESSAGE_BODY="$(jq -nc --arg openPath "$WORKSPACE_FILE" '{
   content: "这是一个测试请求，返回你的身份信息，然后测试当前agent所有的功能组件，能否新建临时文件读写这个临时文件然后删除这个临时文件",
   mode: "askBeforeWrite",
@@ -631,6 +724,14 @@ curl -fsS -m 3 -X POST -H 'Content-Type: application/json' -d '{}' \
   | jq -e '.ok == false and .error == "api_not_implemented"' >/dev/null
 pass "unimplemented /api routes return JSON instead of HTTP 405"
 
+if [ "${DEEPCODE_SKIP_PACKAGING_SMOKE:-0}" = "1" ]; then
+  info "[6/6] unified build smoke skipped by DEEPCODE_SKIP_PACKAGING_SMOKE=1"
+  echo "============================================================"
+  pass "DeepCode stage 5 closeout fast test passed"
+  echo "============================================================"
+  exit 0
+fi
+
 info "[6/6] unified build smoke"
 ./build.sh
 test -x "$ROOT_DIR/bin/linux-x64/deepcode-kernel"
@@ -673,5 +774,5 @@ curl -fsS -m 3 "$PACKAGE_HEALTH_URL" | jq -e '.ok == true and .data.service == "
 pass "packaged linux GUI is served by Rust host for browser clients"
 
 echo "============================================================"
-pass "DeepCode stage 5.8 test passed"
+pass "DeepCode stage 5 closeout test passed"
 echo "============================================================"

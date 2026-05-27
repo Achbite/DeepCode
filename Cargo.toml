@@ -11,7 +11,9 @@ members = [
   "crates/deepcode-kernel-ledger",
   "crates/deepcode-host-web",
 ]
-exclude = []
+exclude = [
+  "shells/tauri/src-tauri",
+]
 resolver = "2"
 
 [workspace.package]

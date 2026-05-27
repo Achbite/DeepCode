@@ -2,5 +2,6 @@ packages:
   - "userspace/gui"
   - "userspace/protocol"
   - "userspace/session-core"
+  - "shells/tauri"
 allowBuilds:
   esbuild: true

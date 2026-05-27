@@ -24,6 +24,7 @@
 set -euo pipefail
 
 export PATH="/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+export CI="${CI:-true}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_ROOT="$ROOT_DIR/bin"
@@ -32,14 +33,21 @@ WIN_DIR="$BIN_ROOT/win64"
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
 CARGO_TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+PNPM_STORE_DIR="${PNPM_STORE_DIR:-$ROOT_DIR/.pnpm-store}"
+BUILD_TAURI_SHELL="${DEEPCODE_BUILD_TAURI_SHELL:-0}"
+
+export CARGO_TARGET_DIR="$CARGO_TARGET_ROOT"
 
 cd "$ROOT_DIR"
 
 echo "==[build]== DeepCode cross-platform build started at $(date -Is)"
 echo "==[build]== ROOT_DIR=$ROOT_DIR"
+echo "==[build]== CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
+echo "==[build]== DEEPCODE_BUILD_TAURI_SHELL=$BUILD_TAURI_SHELL"
 
 echo "==[build][1/6]== pnpm install"
-pnpm install --no-frozen-lockfile
+pnpm install --no-frozen-lockfile --store-dir "$PNPM_STORE_DIR"
 
 echo "==[build][2/6]== build TS user/session/UI packages"
 pnpm --filter @deepcode/protocol build
@@ -163,6 +171,12 @@ Entries:
   deepcode-cli          CLI host launcher placeholder over the same Kernel
   deepcode-tui          TUI host launcher placeholder over the same Kernel
 
+Optional desktop shell:
+  Tauri thin shell source lives in shells/tauri. It only opens the local Kernel
+  Host GUI URL and does not contain Agent runtime. Set DEEPCODE_BUILD_TAURI_SHELL=1
+  when running build.sh to attempt a local Tauri shell build if platform
+  dependencies are installed.
+
 Run the GUI launcher, then open:
   http://127.0.0.1:31245/
 
@@ -176,6 +190,20 @@ README
 
 write_readme "$LINUX_DIR" "linux-x64"
 write_readme "$WIN_DIR" "win64"
+
+if [ "$BUILD_TAURI_SHELL" = "1" ]; then
+  echo "==[build][opt]== build Tauri thin shell"
+  pnpm --filter @deepcode/tauri-shell tauri:build
+  TAURI_RELEASE="$ROOT_DIR/shells/tauri/src-tauri/target/release/deepcode-tauri-shell"
+  if [ -x "$TAURI_RELEASE" ]; then
+    cp -v "$TAURI_RELEASE" "$LINUX_DIR/deepcode-gui-shell"
+    chmod +x "$LINUX_DIR/deepcode-gui-shell"
+  else
+    echo "==[build][opt]== Tauri shell build completed, but no Linux release binary was found at $TAURI_RELEASE"
+  fi
+else
+  echo "==[build][opt]== Tauri thin shell build skipped; set DEEPCODE_BUILD_TAURI_SHELL=1 to enable"
+fi
 
 echo ""
 echo "==[build]== DONE"

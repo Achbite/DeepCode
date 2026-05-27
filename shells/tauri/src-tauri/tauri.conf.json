@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DeepCode",
+  "version": "0.1.0",
+  "identifier": "com.achbite.deepcode",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:31245",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DeepCode",
+        "width": 1500,
+        "height": 900,
+        "minWidth": 1100,
+        "minHeight": 700,
+        "url": "http://127.0.0.1:31245"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": []
+  }
+}

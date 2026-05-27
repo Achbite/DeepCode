@@ -8,9 +8,11 @@
     "dev": "concurrently -n kernel,client -c blue,green \"pnpm dev:kernel\" \"pnpm dev:client\"",
     "dev:client": "pnpm --filter @deepcode/client dev",
     "dev:kernel": "cargo run -p deepcode-host-web",
+    "dev:tauri": "pnpm --filter @deepcode/tauri-shell tauri:dev",
     "build": "pnpm --filter @deepcode/protocol build && pnpm --filter @deepcode/session-core build && pnpm --filter @deepcode/client build && cargo build --workspace",
     "build:client": "pnpm --filter @deepcode/client build",
     "build:kernel": "cargo build -p deepcode-host-web",
+    "build:tauri": "pnpm --filter @deepcode/tauri-shell tauri:build",
     "start": "cargo run -p deepcode-host-web",
     "typecheck": "pnpm --filter @deepcode/protocol typecheck && pnpm --filter @deepcode/session-core typecheck && pnpm --filter @deepcode/client typecheck"
   },

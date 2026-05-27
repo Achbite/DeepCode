@@ -19,10 +19,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # - 基础工具：curl/git/build-essential/pkg-config
 # - Windows 交叉编译基础：gcc-mingw-w64-x86-64 + binutils-mingw-w64
 # - 健康检查辅助：iputils-ping / netcat-openbsd / jq
+# - Tauri thin shell 静态检查/打包准备：WebKitGTK、AppIndicator、SVG、patchelf
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl wget ca-certificates git \
         build-essential pkg-config make file \
         libssl-dev \
+        libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf \
         gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
         iputils-ping netcat-openbsd jq xz-utils \
     && rm -rf /var/lib/apt/lists/*
