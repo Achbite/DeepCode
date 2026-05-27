@@ -2,7 +2,7 @@
 # ====================================================================
 # DeepCode 开发容器入口脚本
 # 职责：
-#   1. 打印环境概要（rustc / cargo / node / pnpm / pkg / tauri）
+#   1. 打印环境概要（rustc / cargo / node / pnpm）
 #   2. 校准 PATH 与可写权限（首次启动时确保 named volume 子目录存在）
 #   3. 前台保活，等待 docker exec 进入交互式 bash
 # 注意：本脚本 *不* 自动执行 pnpm install / cargo build，
@@ -29,15 +29,12 @@ print_version "rustc"    rustc
 print_version "cargo"    cargo
 print_version "node"     node
 print_version "pnpm"     pnpm
-print_version "pkg"      pkg
-print_version "tauri"    cargo-tauri || true
 
 # ---- 2. 准备 named volume 挂载点权限 ----
 # named volume 首次挂载时是空目录，root 拥有；这里显式确保可写
 for d in \
     /workspace/node_modules \
     /workspace/target \
-    /workspace/tauri/src-tauri/target \
     /usr/local/cargo/registry \
     /root/.local/share/pnpm/store
 do
@@ -48,8 +45,8 @@ done
 cat <<'TIP'
 [entrypoint] ----------------------------------------------
 [entrypoint]  容器已就绪。常用命令（项目根目录直接调用）：
-[entrypoint]    ./build.sh   编译并输出双平台产物到 ./bin/
-[entrypoint]    ./test.sh    环境检查 + 链路 ping
+[entrypoint]    ./build.sh   编译并输出统一分发目录到 ./bin/deepcode/
+[entrypoint]    ./test.sh    Kernel / userspace / Host smoke
 [entrypoint]    pnpm install （首次或 lockfile 变更时）
 [entrypoint] ----------------------------------------------
 TIP

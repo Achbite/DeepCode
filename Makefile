@@ -20,9 +20,8 @@ WORKDIR_IN_CTNR  := /workspace
 VOL_PNPM_STORE        := deepcode-pnpm-store
 VOL_CARGO_REGISTRY    := deepcode-cargo-registry
 VOL_CARGO_TARGET      := deepcode-cargo-target
-VOL_TAURI_TARGET      := deepcode-tauri-target
 VOL_NODE_MODULES      := deepcode-node-modules
-VOLUMES_ALL := $(VOL_PNPM_STORE) $(VOL_CARGO_REGISTRY) $(VOL_CARGO_TARGET) $(VOL_TAURI_TARGET) $(VOL_NODE_MODULES)
+VOLUMES_ALL := $(VOL_PNPM_STORE) $(VOL_CARGO_REGISTRY) $(VOL_CARGO_TARGET) $(VOL_NODE_MODULES)
 
 # ---- 容器运行参数 ----
 # - $(CURDIR) 在 WSL 内自动为 /mnt/e/Dev-Agent/deepagent，挂载到容器 /workspace
@@ -35,7 +34,6 @@ RUN_ARGS := \
 	-v $(VOL_PNPM_STORE):/root/.local/share/pnpm/store \
 	-v $(VOL_CARGO_REGISTRY):/usr/local/cargo/registry \
 	-v $(VOL_CARGO_TARGET):/workspace/target \
-	-v $(VOL_TAURI_TARGET):/workspace/tauri/src-tauri/target \
 	-v $(VOL_NODE_MODULES):/workspace/node_modules \
 	-e CARGO_HOME=/usr/local/cargo \
 	-e RUSTUP_HOME=/usr/local/rustup \
@@ -49,10 +47,10 @@ help:
 	@echo "DeepCode 开发容器入口"
 	@echo ""
 	@echo "  make shell   进入开发容器（容器存在则刷新重启后再 exec）"
-	@echo "  make clean   全量清理（容器 + 镜像 + 5 个 named volumes），下次 shell 全量重建"
+	@echo "  make clean   全量清理（容器 + 镜像 + 4 个 named volumes），下次 shell 全量重建"
 	@echo ""
 	@echo "进入容器后可手动执行："
-	@echo "  ./build.sh   编译并输出双平台产物到 bin/"
+	@echo "  ./build.sh   编译并输出统一分发目录到 bin/deepcode/"
 	@echo "  ./test.sh    运行链路 ping 与环境检查"
 
 # ---- _ensure_image：镜像不存在则构建 ----
