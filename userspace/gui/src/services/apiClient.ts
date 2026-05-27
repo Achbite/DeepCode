@@ -47,10 +47,6 @@ import type {
   GetAgentWorkflowConfigResult,
   PatchAgentWorkflowConfigRequest,
   ListToolsResult,
-  PermissionEvaluationRequest,
-  PermissionDecision,
-  ToolExecutionRequest,
-  ToolResult,
   ShellEnvironmentStatus,
   TerminalCapability,
   TerminalSession,
@@ -508,26 +504,6 @@ export function listAgentTools(
 ): Promise<ApiResponse<ListToolsResult>> {
   const qs = buildQuery({ mode });
   return getJson<ListToolsResult>(`${API_BASE}/agent/tools${qs}`);
-}
-
-export function evaluateAgentPermission(
-  request: PermissionEvaluationRequest
-): Promise<ApiResponse<PermissionDecision>> {
-  return sendJson<PermissionDecision>(
-    `${API_BASE}/agent/permissions/evaluate`,
-    'POST',
-    request
-  );
-}
-
-export function executeAgentTool(
-  request: ToolExecutionRequest
-): Promise<ApiResponse<ToolResult>> {
-  return sendJson<ToolResult>(
-    `${API_BASE}/agent/tools/execute`,
-    'POST',
-    request
-  );
 }
 
 export function getShellEnvironment(): Promise<ApiResponse<ShellEnvironmentStatus>> {

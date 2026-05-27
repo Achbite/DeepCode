@@ -51,8 +51,6 @@ import type {
   PatchUserSettingsRequest,
   PatchUserSettingsResult,
   PatchWorkspaceSettingsResult,
-  PermissionDecision,
-  PermissionEvaluationRequest,
   PromptLayerResult,
   RenameAgentSessionRequest,
   RenameEntryResult,
@@ -70,8 +68,6 @@ import type {
   TerminalSession,
   TerminalSessionsResult,
   TerminalWarmupStatus,
-  ToolExecutionRequest,
-  ToolResult,
   WorkspaceState,
 } from '@deepcode/protocol';
 
@@ -445,18 +441,6 @@ export function patchAgentWorkflowConfig(
 
 export function listAgentTools(mode?: AgentMode): Promise<ApiResponse<ListToolsResult>> {
   return api.listAgentTools(mode);
-}
-
-export function evaluateAgentPermission(
-  request: PermissionEvaluationRequest
-): Promise<ApiResponse<PermissionDecision>> {
-  return api.evaluateAgentPermission(request);
-}
-
-export function executeAgentTool(
-  request: ToolExecutionRequest
-): Promise<ApiResponse<ToolResult>> {
-  return api.executeAgentTool(request);
 }
 
 export function parseAgentActions(
