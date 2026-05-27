@@ -1,6 +1,6 @@
 # Markdown 渲染 smoke
 
-用于 Web / Tauri 人工验收 Agent 对话正文与 Agent Task 阶段面板的 GitHub Flavored Markdown、公式和 Mermaid 渲染。
+用于 GUI Host 人工验收 Agent 对话正文与 Agent Task 阶段面板的 GitHub Flavored Markdown、公式和 Mermaid 渲染。
 
 | 能力 | 预期 |
 | --- | --- |

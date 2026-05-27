@@ -1,5 +1,5 @@
 The Agent should follow this as a minimal local reasoning loop:
-read the package manifest, search for the Agent tool route registration,
+read the package manifest, search for the Kernel Web Host tool endpoint,
 propose a safe verification command, prepare a patch plan, and then summarize.
 
 ```deepcode-action
@@ -13,14 +13,14 @@ propose a safe verification command, prepare a patch plan, and then summarize.
     },
     {
       "type": "code.search",
-      "query": "registerAgentToolRoutes",
-      "include": ["server/src"]
+      "query": "agent_tools",
+      "include": ["crates/deepcode-host-web/src"]
     },
     {
       "type": "shell.propose",
-      "command": "pnpm --filter @deepcode/server typecheck",
+      "command": "cargo check -p deepcode-host-web",
       "cwd": ".",
-      "reason": "Verify server-side Agent protocol changes without executing automatically.",
+      "reason": "Verify Kernel Web Host protocol changes without executing automatically.",
       "risk": "low"
     },
     {
