@@ -5,21 +5,17 @@
   "private": true,
   "description": "DeepCode - 轻量级 AI Agent 代码工作台",
   "scripts": {
-    "dev": "concurrently -n server,client -c blue,green \"pnpm dev:server\" \"pnpm dev:client\"",
+    "dev": "concurrently -n kernel,client -c blue,green \"pnpm dev:kernel\" \"pnpm dev:client\"",
     "dev:client": "pnpm --filter @deepcode/client dev",
-    "dev:server": "pnpm --filter @deepcode/server dev",
-    "build": "pnpm -r build",
+    "dev:kernel": "cargo run -p deepcode-host-web",
+    "build": "pnpm --filter @deepcode/protocol build && pnpm --filter @deepcode/session-core build && pnpm --filter @deepcode/client build && cargo build --workspace",
     "build:client": "pnpm --filter @deepcode/client build",
-    "build:server": "pnpm --filter @deepcode/server build",
-    "start": "pnpm --filter @deepcode/server start",
-    "typecheck": "pnpm -r typecheck",
-    "tauri": "pnpm --filter @deepcode/tauri tauri",
-    "tauri:dev": "pnpm --filter @deepcode/tauri tauri dev",
-    "tauri:build": "pnpm --filter @deepcode/tauri tauri build"
+    "build:kernel": "cargo build -p deepcode-host-web",
+    "start": "cargo run -p deepcode-host-web",
+    "typecheck": "pnpm --filter @deepcode/protocol typecheck && pnpm --filter @deepcode/session-core typecheck && pnpm --filter @deepcode/client typecheck"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
-    "esbuild": "^0.25.0",
     "typescript": "^5.7.0"
   },
   "engines": {

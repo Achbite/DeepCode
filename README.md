@@ -1,31 +1,36 @@
-﻿# DeepCode
+# DeepCode
 
-DeepCode 是一个本地 AI Agent 工作台，当前以 GUI IDE 形态提供文件编辑、工作区资源管理、终端、LLM 对话、工具调用审批和 Tauri 桌面打包能力。
-
-长期架构目标是：
+DeepCode 是一个本地 Agent Kernel 工作台。当前代码正在收束为统一的三层架构：
 
 ```text
-DeepCode = Rust Agent Kernel + 可配置 Pack 体系 + GUI/CLI/TUI 多 Host Shell
+UI 层
+  GUI / CLI / TUI / Browser forwarder
+  只负责展示、输入、审批和交互入口。
+
+TS 用户会话层
+  @deepcode/session-core
+  负责用户态会话、附件、上下文拼装策略、事件投影和 Host 侧工作区绑定。
+  不负责权限裁决、工具执行、workflow、文件系统事实或完成判定。
+
+Rust 内核层
+  DeepCode Kernel + Host adapters
+  负责 workspace、context、policy、skill runtime、workflow、ledger、changeset、
+  validation 和 review。所有敏感操作只能通过 Kernel syscall 发起。
 ```
 
-当前 GUI 是首个 Host Shell。Server/Tauri 运行链路继续保持可用，Rust Kernel crates 先作为阶段 0 骨架旁路存在，后续逐步承载 Config、Prompt、Locale、Policy、Skill、Workflow、Ledger、ChangeSet 与 ReviewGate。
-
-核心原则：模型负责生成计划和结构化动作，本地运行时负责权限校验、工具执行和结果记录。
-
-当前优先支持 DeepSeek / OpenAI-compatible 模型，同时保留 Anthropic、Ollama、Codex-compatible 等 Provider 扩展接口。
-
+核心原则：用户态只能提出意图，系统调用层传递结构化命令，内核态裁决资源访问、权限、工作流迁移、执行事实和完成判定。
 
 ## 快速开始
 
 ### 环境要求
 
-| 依赖    | 建议版本     | 用途                      |
-| ------- | ------------ | ------------------------- |
-| Node.js | 20+          | Web/Server/Client 构建    |
-| pnpm    | 9+           | Monorepo 包管理           |
-| Rust    | 1.88+        | Tauri 构建、Kernel 骨架校验 |
-| Docker  | 24+          | 推荐构建环境              |
-| WSL     | Windows 推荐 | Windows 下默认 shell 环境 |
+| 依赖    | 建议版本     | 用途                                       |
+| ------- | ------------ | ------------------------------------------ |
+| Rust    | 1.88+        | Kernel crates、Axum Web Host、统一分发构建 |
+| Node.js | 20+          | TS protocol/session-core/client 构建       |
+| pnpm    | 9+           | TS workspace 包管理                        |
+| Docker  | 24+          | 推荐构建与测试环境                         |
+| WSL     | Windows 推荐 | Windows 默认 shell 与 Docker 集成环境      |
 
 ### 安装依赖
 
@@ -33,302 +38,142 @@ DeepCode = Rust Agent Kernel + 可配置 Pack 体系 + GUI/CLI/TUI 多 Host Shel
 pnpm install
 ```
 
-### Web 开发态
+### 开发态
 
 ```bash
 pnpm dev
 ```
 
-默认地址：
+默认入口：
 
-- Client: `http://127.0.0.1:5173`
-- Server: `http://127.0.0.1:31245`
+- Rust Kernel Web Host: `http://127.0.0.1:31245`
+- React Client: `http://127.0.0.1:5173`
 
 单独启动：
 
 ```bash
+pnpm dev:kernel   # cargo run -p deepcode-host-web
 pnpm dev:client
-pnpm dev:server
 ```
 
-### Tauri 开发态
-
-```bash
-pnpm tauri:dev
-```
-
-### Docker/WSL 构建
-
-```bash
-make shell
-```
-
-进入容器后执行：
+### 测试与构建
 
 ```bash
 ./test.sh
-BUILD_TAURI=1 ./build.sh
+./build.sh
 ```
 
-输出目录：
+`./build.sh` 输出 Linux 与 Windows 两个统一分发目录：
 
 ```text
 bin/
-├── linux-x64/deepcode
-├── win-x64/deepcode.exe
-├── win-x64/WebView2Loader.dll
-└── installers/DeepCode_0.1.0_x64-setup.exe
+├── linux-x64/
+│   ├── deepcode-kernel
+│   ├── deepcode-gui
+│   ├── deepcode-cli
+│   ├── deepcode-tui
+│   ├── web/
+│   ├── config/
+│   └── packs/
+└── win64/
+    ├── deepcode-kernel.exe
+    ├── deepcode-gui.bat
+    ├── deepcode-cli.bat
+    ├── deepcode-tui.bat
+    ├── web/
+    ├── config/
+    └── packs/
 ```
 
-## 项目介绍
+GUI、CLI、TUI 的区别只是入口不同；Kernel、配置、Pack、事件协议和工作区 syscall 共享同一套实现。
 
-- **IDE 基础能力**：工作区打开、文件树、编辑器、多标签、保存、草稿恢复、基础快捷键。
-- **Agent 工作流**：支持 `plan -> check -> complete -> review` 阶段模型配置，也支持直接执行类任务的精简工作流。
-- **权限门禁**：文件写入、补丁应用、Shell 执行进入统一 Permission Gate；命令黑名单可强制人工确认。
-- **临时 Shell**：Agent 执行命令使用独立临时 shell，不污染用户手动终端会话。
-- **LLM Provider**：支持配置 OpenAI-compatible / DeepSeek-compatible / Anthropic / Ollama profile。
-- **Tauri 桌面端**：打包态通过 Rust 原生命令承载文件、工作区、LLM、Agent、终端能力。
-- **Web 开发态**：通过 Vite + Fastify 快速调试 UI 与协议，避免频繁重新打包。
+`bin/<platform>/config` 只作为分发默认配置与 Pack 目录，不作为运行时用户设置写入位置。用户设置、LLM profile 与本地 secret 引用默认写入用户配置目录：
 
-## 架构概览
+- Linux：`$XDG_CONFIG_HOME/deepcode/config` 或 `~/.config/deepcode/config`
+- Windows：`%APPDATA%\DeepCode\config`
 
-DeepCode 正在从“GUI IDE + Agent runtime”演进为“Agent Kernel + 多 Host Shell”。当前阶段保持现有 GUI、Server、Tauri 路径稳定，同时建立根级 Rust workspace 作为 Kernel ABI/Core/Pack 子系统的落点：
+可通过 `DEEPCODE_CONFIG_DIR` 覆盖可写配置根目录。
+
+打包态 GUI 入口会启动同一个 Rust Kernel Web Host 并服务 `web/` 静态资源。启动 `bin/linux-x64/deepcode-gui` 或 `bin\win64\deepcode-gui.bat` 后，在 Codex 内部浏览器、Chrome 或普通浏览器中打开：
 
 ```text
-Host Shells
-  ├─ React GUI              当前首个 Host，负责展示、输入、审批、配置编辑
-  ├─ CLI                    后续复用同一 Kernel ABI
-  └─ TUI                    后续复用同一 Kernel ABI
-
-Kernel boundary
-  ├─ KernelCommand          Host -> Kernel 的结构化命令
-  ├─ KernelEvent            Kernel -> Host 的结构化事件
-  ├─ KernelSnapshot         会话、配置、权限、Trace 的快照
-  └─ WorkspaceBinding       Host 受控的运行工作区绑定
-
-Rust Kernel crates
-  ├─ deepcode-kernel-abi
-  ├─ deepcode-kernel-core
-  ├─ deepcode-kernel-config
-  ├─ deepcode-kernel-policy
-  ├─ deepcode-kernel-prompt
-  ├─ deepcode-kernel-skills
-  ├─ deepcode-kernel-workflow
-  └─ deepcode-kernel-ledger
+http://127.0.0.1:31245/
 ```
 
-现有 Web 开发态和 Tauri 打包态的差异仍被限制在 `runtimeAdapter` 之下：
+Codex 内部浏览器只是 Host 客户端；事实源仍然是 Rust Kernel。
 
-```text
-React Workbench UI
-  ├─ Editor / Explorer / Settings / Terminal / Agent Panel
-  └─ runtimeAdapter
-       ├─ Web dev: HTTP + WebSocket -> Node Fastify server
-       └─ Tauri: invoke/event -> Rust native commands
-
-Shared packages
-  ├─ @deepcode/protocol   DTO, settings schema, tool/event contracts
-  └─ @deepcode/agent-core action parser, workflow runner, permission model
-
-Stage 0 Rust Kernel workspace
-  ├─ deepcode-kernel-abi       KernelCommand / KernelEvent / KernelSnapshot
-  ├─ deepcode-kernel-core      Kernel facade 与 Host adapter 边界
-  ├─ deepcode-kernel-config    Config / Locale / CodeStyle 接口
-  ├─ deepcode-kernel-policy    Capability / Policy / Permission 接口
-  ├─ deepcode-kernel-prompt    PromptEnvelope / PromptCompiler 接口
-  ├─ deepcode-kernel-skills    SkillDescriptor / SkillRuntime 接口
-  ├─ deepcode-kernel-workflow  Workflow / WorkUnit / ChangeSet / Review 接口
-  └─ deepcode-kernel-ledger    EventLedger / RunConfigSnapshot 接口
-```
-
-阶段 0 的 Kernel crates 只提供接口、DTO、trait 和 fail-closed facade，不接管现有 Server/Tauri Agent 主循环。
-
-### 目录结构
+## 当前架构
 
 ```text
 deepagent/
-├── Cargo.toml                # 根级 Rust workspace，排除 tauri/src-tauri
-├── crates/                   # 阶段 0 Agent Kernel crate 骨架
-│   ├── deepcode-kernel-abi/
-│   ├── deepcode-kernel-core/
-│   ├── deepcode-kernel-config/
-│   ├── deepcode-kernel-policy/
-│   ├── deepcode-kernel-prompt/
-│   ├── deepcode-kernel-skills/
-│   ├── deepcode-kernel-workflow/
-│   └── deepcode-kernel-ledger/
-├── client/                  # React + Vite 前端
-│   └── src/
-│       ├── app/             # 应用入口与 WorkbenchLayout
-│       ├── components/      # IDE 与 Agent UI 组件
-│       ├── features/        # feature 分层入口
-│       ├── services/        # runtimeAdapter、apiClient 等薄适配层
-│       └── state/           # Zustand 状态
-├── server/                  # Web 开发态本地服务
-│   └── src/
-│       ├── api/             # REST 路由
-│       ├── modules/         # agent / llm / terminal / files / context
-│       ├── services/        # 兼容保留的业务服务
-│       └── ws/              # WebSocket 心跳
-├── packages/
-│   ├── protocol/            # 三端共享协议
-│   └── agent-core/          # Agent 纯 TS 核心，不依赖 React/Node/Tauri
-├── tauri/
-│   └── src-tauri/           # Tauri v2 Rust 后端
-│       └── src/
-│           ├── agent.rs
-│           ├── commands.rs
-│           ├── fs.rs
-│           ├── llm_profiles.rs
-│           ├── terminal.rs
-│           ├── user_settings.rs
-│           └── workspace.rs
-├── fixtures/agent-actions/  # Agent 行为协议测试夹具
-├── build.sh                 # Docker 内双端打包入口
-└── test.sh                  # 协议、服务端、Agent fixture smoke
+├── Cargo.toml
+├── crates/
+│   ├── deepcode-kernel-abi        # KernelCommand / KernelEvent / KernelSnapshot
+│   ├── deepcode-kernel-runtime    # Headless runtime dispatch 与 syscall
+│   ├── deepcode-kernel-policy     # capability / policy / permission gate
+│   ├── deepcode-kernel-skills     # SkillDescriptor 与受控外部进程 runtime
+│   ├── deepcode-kernel-workflow   # WorkflowMachine / WorkUnit / Review 结构
+│   ├── deepcode-kernel-ledger     # EventLedger 与 run snapshot
+│   ├── deepcode-kernel-config
+│   ├── deepcode-kernel-prompt
+│   └── deepcode-host-web          # Rust Axum Web Host，默认 /api 入口
+├── userspace/
+│   ├── protocol                   # TS 迁移期 DTO 投影
+│   ├── session-core               # TS 用户会话层
+│   └── gui                        # React GUI Host
+└── fixtures/                      # Agent/workflow/kernel fixture
 ```
 
-### Agent 执行链路
+旧多入口运行结构已退出默认源码树。默认开发、测试和打包链路走 Rust Kernel Web Host；TS 只保留 `userspace/protocol`、`userspace/session-core` 和 `userspace/gui` 三个用户态包。
+
+## Kernel syscall
+
+阶段 5.7 开始，工作区和 Skill 操作统一进入 Rust Kernel：
+
+- workspace: `open/current/list/read/write/create/rename/delete/search`
+- skill: `discover/invoke/result`
+- context: 外部只读引用与 `.deepcode/references` 托管副本入口
+- session/run: `run.start/resume/cancel`、permission、snapshot、event stream
+
+文件操作规则：
+
+- `workspace.open` 是 Host 受控入口，可以接收目录或 `.code-workspace` 绝对路径。
+- 其他 `workspace.*` syscall 只能使用工作区相对路径。
+- `..`、绝对路径、Windows 盘符均拒绝。
+- `.deepcode/prompts`、`.deepcode/skills`、`.deepcode/ruler`、`.deepcode/policy` 是配置资产，不被普通 workspace full access 覆盖。
+- `fs.delete` 是隐藏高风险能力，存在于 Kernel syscall 与受控 SkillDescriptor 中，但默认不暴露给模型工具目录。
+
+## Skill Runtime
+
+外部 Skill，包括 Python 脚本、二进制、shell wrapper、未来 MCP adapter wrapper，都必须经 Rust Kernel controlled process runtime 启动：
 
 ```text
-User message
-  -> ContextSourceRegistry
-  -> LLM Provider
-  -> AgentActionParser
-  -> Schema validation
-  -> PermissionGate
-  -> ToolExecutorRouter
-  -> Observation / Trace events
-  -> Final response
+SkillDescriptor
+  -> PolicyGate / PermissionGate
+  -> Kernel controlled process runtime
+  -> stdout/stderr/exit/timeout capture
+  -> SkillResult / Observation / EventLedger
 ```
 
-LLM 不直接读写本地资源。所有模型输出必须先被解析为结构化 action 或 tool call，再经过校验、权限判断和工具路由。
+TS、GUI、CLI、TUI、MCP server 和 LLM 都不能直接 spawn Skill 进程。
 
-当前运行链路还增加了 `WorkspaceBinding` 约束：
+## Windows / Linux / Docker 策略
 
-- `fs.read`、`fs.list`、`fs.diff`、`fs.write`、`code.search` 必须有当前工作区。
-- `fs.*` 路径只能是工作区相对路径，不能使用 `/tmp`、Windows 盘符、绝对路径或 `..` 穿越。
-- `.code-workspace` 只能通过 Host 受控的 `openWorkspace` / `workspaceBinding.openPath` 进入 runtime，不能由模型 tool call 自行指定。
-- 如果 runtime 丢失 current workspace，但 Host 请求携带有效 `WorkspaceBinding`，运行时会先恢复工作区绑定再执行工具。
+默认运行策略以 Linux 环境为主。Windows 用户启动 GUI 后，Agent shell 默认建议 WSL；如果未安装 WSL，应提示安装 WSL 与 Docker Desktop WSL integration。用户明确选择 PowerShell、cmd 或宿主机执行时，Host 可以记录 override，但 Kernel 仍负责权限、审计和边界检查。
 
-### 内置工具
+## 验证入口
 
-- `fs.read`
-- `fs.list`
-- `fs.diff`
-- `fs.write`
-- `code.search`
-- `patch.plan`
-- `shell.propose`
-- `shell.exec`
-- `final`
+`./test.sh` 覆盖当前阶段的默认门禁：
 
-`shell.exec` 使用 Agent 专用临时 shell。用户手动终端和 Agent 临时 shell 是两个独立运行域。
-
-## 构建与测试
-
-常用检查：
-
-```bash
-pnpm --filter @deepcode/protocol build
-pnpm --filter @deepcode/agent-core build
-pnpm --filter @deepcode/server typecheck
-pnpm --filter @deepcode/client typecheck
-pnpm --filter @deepcode/client build
-```
-
-完整 smoke：
-
-```bash
-./test.sh
-```
-
-Tauri/Rust：
-
-```bash
-cd tauri/src-tauri
-cargo check
-```
-
-Docker/WSL 打包：
-
-```bash
-BUILD_TAURI=1 ./build.sh
-```
-
-Windows 打包产物默认使用 WSL 作为命令行运行环境；如果没有 WSL，Agent 会返回结构化提示，建议安装 WSL 并配置 Docker。
-
-## 配置
-
-DeepCode 的配置目录按作用域拆分：
-
-```text
-config/
-├── global/          # 全局 prompts / skills / ruler
-├── user/local/      # 用户 settings / sessions / secrets
-└── i18n/            # 本地化资源预留
-```
-
-打包态用户配置默认写入系统用户目录，例如 Windows：
-
-```text
-C:\Users\<user>\AppData\Roaming\DeepCode\config\user\local\
-```
-
-### LLM Provider
-
-在 Settings -> LLM Providers 中添加模型配置。DeepSeek OpenAI-compatible 默认配置：
-
-| 字段             | 值                                           |
-| ---------------- | -------------------------------------------- |
-| Base URL         | `https://api.deepseek.com`                 |
-| Model            | `deepseek-v4-flash` 或 `deepseek-v4-pro` |
-| API Key          | 用户自行申请并保存                           |
-| Thinking         | 可选开启                                     |
-| Reasoning effort | `low` / `medium` / `high`              |
-
-API Key 只保存在本地 secret store，不应提交到 Git。
-
-### Agent 权限
-
-Settings -> Common Settings 中提供 Agent 权限开关：
-
-- 文件读取/写入权限
-- 代码搜索权限
-- Shell propose / exec 权限
-- Shell 自动执行开关
-- 命令黑名单
-
-黑名单命令即使开启自动执行也会进入人工确认。
-
-## 开发约束
-
-- UI 只调用 store/runtime facade，不直接调用 LLM SDK、shell spawn 或底层 executor。
-- `packages/agent-core` 保持纯 TypeScript、无 React/Node/Tauri 依赖。
-- 工具执行必须通过 Tool Registry、Permission Gate 和 Tool Executor Router。
-- Tauri 打包态不依赖 Node sidecar；Web/Node 只作为开发调试与协议验证入口。
-- 新增能力优先补协议 DTO、Web API、Tauri command stub，避免打包态出现 unknown command。
-- 敏感信息不得写入仓库、日志或测试夹具。
-
-## 贡献流程
-
-1. Fork 或创建分支。
-2. 保持变更按功能分组提交。
-3. 提交前至少运行：
-
-```bash
-pnpm --filter @deepcode/client typecheck
-pnpm --filter @deepcode/server typecheck
-./test.sh
-```
-
-4. 涉及 Tauri 或打包态能力时运行：
-
-```bash
-BUILD_TAURI=1 ./build.sh
-```
-
-5. PR 描述中写明影响范围、验证命令和已知限制。
+- Rust workspace `cargo check/test`
+- TS `protocol/session-core/client` typecheck
+- Rust Axum Host `/api/*` smoke
+- 打包态 Linux GUI 静态资源 smoke
+- Windows GNU 交叉编译产物 smoke
+- workspaceBinding 与工作区 syscall
+- hidden `fs.delete` 受控能力
+- `session-core` 不含工具执行、权限裁决、workflow runtime
+- 旧 Node server、pkg、Tauri 独立后端链路不进入默认构建
 
 ## 许可
 

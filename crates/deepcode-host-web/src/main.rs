@@ -1,0 +1,4050 @@
+use axum::extract::{Path, Query, State};
+use axum::http::Method;
+use axum::routing::{any, get, patch, post};
+use axum::{Json, Router};
+use deepcode_kernel_abi::{
+    KernelCommand, KernelErrorEnvelope, KernelEvent, RequestId, WorkspaceBinding,
+};
+use deepcode_kernel_runtime::DeepCodeKernelRuntime;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::fs;
+use std::net::SocketAddr;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tower_http::services::{ServeDir, ServeFile};
+
+const AGENT_WORKFLOW_STAGES: [&str; 4] = ["plan", "check", "complete", "review"];
+const TEMP_TEST_PATH: &str = "_agent_tmp_functional_test.txt";
+
+#[derive(Clone)]
+struct AppState {
+    runtime: Arc<Mutex<DeepCodeKernelRuntime>>,
+    gui: Arc<Mutex<GuiState>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiResponse {
+    ok: bool,
+    data: Option<Value>,
+    error: Option<String>,
+    message: Option<String>,
+}
+
+impl ApiResponse {
+    fn ok(data: Value) -> Json<Self> {
+        Json(Self {
+            ok: true,
+            data: Some(data),
+            error: None,
+            message: None,
+        })
+    }
+
+    fn error(code: impl Into<String>, message: impl Into<String>) -> Json<Self> {
+        Json(Self {
+            ok: false,
+            data: None,
+            error: Some(code.into()),
+            message: Some(message.into()),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenWorkspaceRequest {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileQuery {
+    folder_id: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileWriteRequest {
+    folder_id: Option<String>,
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileCreateRequest {
+    folder_id: Option<String>,
+    path: String,
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderCreateRequest {
+    folder_id: Option<String>,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileDeleteRequest {
+    folder_id: Option<String>,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileRenameRequest {
+    folder_id: Option<String>,
+    old_path: String,
+    new_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRequest {
+    folder_id: Option<String>,
+    query: String,
+    include: Option<Vec<String>>,
+    is_regex: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolExecuteRequest {
+    approved: Option<bool>,
+    workspace_binding: Option<WorkspaceBinding>,
+    tool_call: ToolCallRequest,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolCallRequest {
+    id: Option<String>,
+    name: String,
+    arguments: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PermissionEvaluateRequest {
+    workspace_binding: Option<WorkspaceBinding>,
+    tool_call: ToolCallRequest,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAgentPermission {
+    session_id: String,
+    request_body: Value,
+    tool_call: ToolCallRequest,
+    workspace_binding: Option<WorkspaceBinding>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedLlmProfile {
+    id: String,
+    name: String,
+    kind: String,
+    base_url: Option<String>,
+    model: String,
+    max_output_tokens: Option<u32>,
+    temperature: Option<f64>,
+    reasoning_effort: Option<String>,
+    thinking: Option<String>,
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LlmToolDefinition {
+    name: String,
+    description: String,
+    input_schema: Value,
+}
+
+#[derive(Debug, Clone)]
+struct LlmToolCall {
+    id: String,
+    name: String,
+    arguments: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LlmChatOutput {
+    content: String,
+    reasoning: Option<String>,
+    tool_calls: Vec<LlmToolCall>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentRunRequest {
+    content: String,
+    mode: String,
+    workflow: String,
+    profile_id: Option<String>,
+    workflow_config: Value,
+    workspace_binding: Option<WorkspaceBinding>,
+    original_body: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HostWorkflowMemory {
+    identity_required: bool,
+    tool_summary_required: bool,
+    temp_lifecycle_required: bool,
+    workspace_listed: bool,
+    search_done: bool,
+    temp_created: bool,
+    temp_read: bool,
+    temp_deleted: bool,
+    identity_answered: bool,
+    final_answered: bool,
+}
+
+type SharedRuntime = Arc<Mutex<DeepCodeKernelRuntime>>;
+
+#[derive(Debug)]
+struct HostPaths {
+    settings_path: PathBuf,
+    llm_profiles_path: PathBuf,
+    llm_secrets_path: PathBuf,
+    workflow_config_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct GuiState {
+    paths: HostPaths,
+    user_settings: Value,
+    llm_profiles: Value,
+    workflow_config: Value,
+    sessions: Vec<Value>,
+    current_session_id: Option<String>,
+    session_events: HashMap<String, Vec<Value>>,
+    trace_events: HashMap<String, Vec<Value>>,
+    browser: BrowserState,
+    terminals: Vec<Value>,
+    terminal_events: HashMap<String, Vec<Value>>,
+    pending_permissions: HashMap<String, PendingAgentPermission>,
+}
+
+#[derive(Debug)]
+struct BrowserState {
+    current_url: Option<String>,
+    inspect_state: String,
+    snapshot: Option<Value>,
+    attached: bool,
+    last_action: Option<String>,
+    last_action_at: Option<String>,
+    last_action_result: Option<String>,
+}
+
+impl GuiState {
+    fn new() -> Self {
+        let paths = HostPaths::new();
+        let user_settings =
+            read_json_file(&paths.settings_path).unwrap_or_else(default_user_settings);
+        let llm_profiles =
+            read_json_file(&paths.llm_profiles_path).unwrap_or_else(default_llm_profiles);
+        let workflow_config =
+            read_json_file(&paths.workflow_config_path).unwrap_or_else(default_workflow_config);
+        Self {
+            paths,
+            user_settings,
+            llm_profiles,
+            workflow_config,
+            sessions: Vec::new(),
+            current_session_id: None,
+            session_events: HashMap::new(),
+            trace_events: HashMap::new(),
+            browser: BrowserState::default(),
+            terminals: Vec::new(),
+            terminal_events: HashMap::new(),
+            pending_permissions: HashMap::new(),
+        }
+    }
+}
+
+impl HostPaths {
+    fn new() -> Self {
+        let root = user_config_root();
+        let settings_dir = root
+            .join("config")
+            .join("user")
+            .join("local")
+            .join("settings");
+        let secrets_dir = root
+            .join("config")
+            .join("user")
+            .join("local")
+            .join("secrets");
+        Self {
+            settings_path: settings_dir.join("user-settings.json"),
+            llm_profiles_path: settings_dir.join("llm-profiles.json"),
+            llm_secrets_path: secrets_dir.join("llm-secrets.json"),
+            workflow_config_path: settings_dir.join("agent-workflow-config.json"),
+        }
+    }
+}
+
+impl Default for BrowserState {
+    fn default() -> Self {
+        Self {
+            current_url: None,
+            inspect_state: "off".to_string(),
+            snapshot: None,
+            attached: false,
+            last_action: None,
+            last_action_at: None,
+            last_action_result: None,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let host = std::env::var("DEEPCODE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = std::env::var("DEEPCODE_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(31245);
+    let state = AppState {
+        runtime: Arc::new(Mutex::new(DeepCodeKernelRuntime::new())),
+        gui: Arc::new(Mutex::new(GuiState::new())),
+    };
+    let mut app = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/workspaces/current", get(workspace_current))
+        .route("/api/workspaces/open", post(workspace_open))
+        .route("/api/workspaces/save-file", post(workspace_save_file))
+        .route(
+            "/api/workspaces/current/settings",
+            patch(workspace_patch_settings),
+        )
+        .route("/api/fs/initial-locations", get(fs_initial_locations))
+        .route("/api/fs/browse", get(fs_browse))
+        .route("/api/files/tree", get(file_tree))
+        .route("/api/files/read", get(file_read))
+        .route("/api/files/write", post(file_write))
+        .route("/api/files/create", post(file_create))
+        .route("/api/files/delete", post(file_delete))
+        .route("/api/files/rename", post(file_rename))
+        .route("/api/folders/create", post(folder_create))
+        .route(
+            "/api/user-settings",
+            get(user_settings_get).patch(user_settings_patch),
+        )
+        .route(
+            "/api/llm/profiles",
+            get(llm_profiles_get).patch(llm_profiles_patch),
+        )
+        .route("/api/llm/probe", post(llm_probe))
+        .route("/api/llm/chat", post(llm_chat))
+        .route("/api/code/search", post(code_search))
+        .route("/api/runtime/shell", get(runtime_shell))
+        .route("/api/terminal/capabilities", get(terminal_capabilities))
+        .route(
+            "/api/terminal/warmup",
+            get(terminal_warmup).post(terminal_warmup),
+        )
+        .route(
+            "/api/terminal/sessions",
+            get(terminal_sessions).post(terminal_create_session),
+        )
+        .route(
+            "/api/terminal/sessions/:session_id/input",
+            post(terminal_input),
+        )
+        .route(
+            "/api/terminal/sessions/:session_id/resize",
+            post(terminal_resize),
+        )
+        .route(
+            "/api/terminal/sessions/:session_id/restart",
+            post(terminal_restart),
+        )
+        .route(
+            "/api/terminal/sessions/:session_id",
+            patch(terminal_update).delete(terminal_delete),
+        )
+        .route("/api/terminal/events", get(terminal_events))
+        .route(
+            "/api/agent/sessions",
+            get(agent_sessions_list).post(agent_session_create),
+        )
+        .route("/api/agent/sessions/current", get(agent_session_current))
+        .route(
+            "/api/agent/sessions/:session_id/activate",
+            post(agent_session_activate),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/archive",
+            post(agent_session_archive),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/events",
+            post(agent_session_append_events),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/messages",
+            post(agent_session_send_message),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/cancel",
+            post(agent_session_cancel),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/trace",
+            get(agent_session_trace),
+        )
+        .route(
+            "/api/agent/sessions/:session_id",
+            patch(agent_session_rename),
+        )
+        .route(
+            "/api/agent/permissions/:permission_id/resolve",
+            post(agent_permission_resolve),
+        )
+        .route("/api/agent/feedback", post(agent_feedback))
+        .route(
+            "/api/agent/workflow-config",
+            get(agent_workflow_config_get).patch(agent_workflow_config_patch),
+        )
+        .route("/api/agent/parse-actions", post(agent_parse_actions))
+        .route("/api/agent/fixtures/run", post(agent_fixture_run))
+        .route("/api/agent/prompt-layers", get(agent_prompt_layers))
+        .route("/api/agent/tools", get(agent_tools))
+        .route("/api/agent/skills", get(agent_tools))
+        .route("/api/agent/tools/execute", post(agent_tool_execute))
+        .route(
+            "/api/agent/permissions/evaluate",
+            post(agent_permission_evaluate),
+        )
+        .route("/api/browser/runtime-status", get(browser_status))
+        .route("/api/browser/open", post(browser_open))
+        .route("/api/browser/reload", post(browser_reload))
+        .route("/api/browser/inspect-mode", post(browser_inspect_mode))
+        .route("/api/browser/panel-snapshot", get(browser_panel_snapshot))
+        .route(
+            "/api/browser/panel-snapshot/attach",
+            post(browser_attach_snapshot),
+        )
+        .route("/api/*path", any(api_not_implemented));
+    if let Some(client_dist) = client_dist_dir() {
+        let index_path = client_dist.join("index.html");
+        app = app.fallback_service(
+            ServeDir::new(client_dist.clone()).not_found_service(ServeFile::new(index_path)),
+        );
+        println!("DeepCode GUI assets served from {}", client_dist.display());
+    }
+    let app = app.with_state(state);
+    let addr: SocketAddr = format!("{host}:{port}").parse().expect("valid host/port");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind deepcode web host");
+    println!("DeepCode Rust web host listening on http://{addr}");
+    println!("Open DeepCode GUI at http://{addr}/");
+    axum::serve(listener, app).await.expect("serve web host");
+}
+
+fn client_dist_dir() -> Option<PathBuf> {
+    let path = std::env::var_os("DEEPCODE_CLIENT_DIST").map(PathBuf::from)?;
+    if path.join("index.html").is_file() {
+        Some(path)
+    } else {
+        eprintln!(
+            "DEEPCODE_CLIENT_DIST={} does not contain index.html; static GUI disabled",
+            path.display()
+        );
+        None
+    }
+}
+
+async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
+    let workspace = current_workspace_json(&state.runtime).unwrap_or(Value::Null);
+    ApiResponse::ok(json!({
+        "service": "deepcode-host-web",
+        "status": "ok",
+        "kernel": "ready",
+        "workspace": workspace
+    }))
+}
+
+async fn workspace_current(State(state): State<AppState>) -> Json<ApiResponse> {
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceCurrent {
+            request_id: rid("workspace-current"),
+        },
+    ) {
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn workspace_open(
+    State(state): State<AppState>,
+    Json(body): Json<OpenWorkspaceRequest>,
+) -> Json<ApiResponse> {
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceOpen {
+            request_id: rid("workspace-open"),
+            path: body.path,
+        },
+    ) {
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn workspace_save_file(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let Ok(current) = current_workspace_json(&state.runtime) else {
+        return ApiResponse::error("no_workspace", "current workspace is missing");
+    };
+    let Some(workspace) = current.get("current").filter(|value| !value.is_null()) else {
+        return ApiResponse::error("no_workspace", "current workspace is missing");
+    };
+    let default_file_name = workspace
+        .get("name")
+        .and_then(Value::as_str)
+        .map(workspace_file_name_from_label)
+        .unwrap_or_else(|| "DeepCode.code-workspace".to_string());
+    let file_name = match normalize_workspace_file_name(
+        body.get("fileName")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_file_name),
+    ) {
+        Ok(file_name) => file_name,
+        Err(message) => return ApiResponse::error("invalid_workspace_file_name", message),
+    };
+    let folder_path = workspace
+        .get("folders")
+        .and_then(Value::as_array)
+        .and_then(|folders| folders.first())
+        .and_then(|folder| folder.get("absolutePath"))
+        .or_else(|| {
+            workspace
+                .get("folders")
+                .and_then(Value::as_array)
+                .and_then(|folders| folders.first())
+                .and_then(|folder| folder.get("path"))
+        })
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let Some(folder_path) = folder_path else {
+        return ApiResponse::error("no_workspace_folder", "current workspace folder is missing");
+    };
+    let workspace_file_path = folder_path.join(&file_name);
+    let overwritten = workspace_file_path.exists();
+    let content = json!({
+        "folders": [{ "path": "." }],
+        "settings": workspace.get("settings").cloned().unwrap_or_else(|| json!({}))
+    });
+    if let Err(error) = atomic_write_json(&workspace_file_path, &content) {
+        return ApiResponse::error("write_workspace_file_failed", error);
+    }
+    let reopened = match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceOpen {
+            request_id: rid("workspace-save-open"),
+            path: workspace_file_path.to_string_lossy().to_string(),
+        },
+    ) {
+        Ok(output) => output,
+        Err(error) => return ApiResponse::error(error.code, error.message),
+    };
+    let workspace = reopened.get("workspace").cloned().unwrap_or(Value::Null);
+    ApiResponse::ok(json!({
+        "workspaceFilePath": workspace_file_path.to_string_lossy(),
+        "workspace": workspace,
+        "created": !overwritten,
+        "overwritten": overwritten
+    }))
+}
+
+async fn workspace_patch_settings(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let settings = body.get("settings").cloned().unwrap_or_else(|| json!({}));
+    let mut gui = state.gui.lock().expect("gui state lock");
+    merge_object(&mut gui.user_settings, &settings);
+    let write_result = atomic_write_json(&gui.paths.settings_path, &gui.user_settings);
+    match write_result {
+        Ok(()) => ApiResponse::ok(json!({ "settings": settings })),
+        Err(error) => ApiResponse::error("write_settings_failed", error),
+    }
+}
+
+async fn fs_initial_locations(State(state): State<AppState>) -> Json<ApiResponse> {
+    let mut locations = Vec::new();
+    if let Some(home) = home_dir() {
+        locations.push(json!({
+            "label": "Home",
+            "absolutePath": home.to_string_lossy(),
+            "kind": "home"
+        }));
+    }
+    for drive in drive_locations() {
+        locations.push(json!({
+            "label": drive.display,
+            "absolutePath": drive.path.to_string_lossy(),
+            "kind": "drive"
+        }));
+    }
+    if let Ok(current) = current_workspace_json(&state.runtime) {
+        if let Some(path) = current
+            .get("current")
+            .and_then(|workspace| workspace.get("folders"))
+            .and_then(Value::as_array)
+            .and_then(|folders| folders.first())
+            .and_then(|folder| folder.get("absolutePath"))
+            .or_else(|| {
+                current
+                    .get("current")
+                    .and_then(|workspace| workspace.get("folders"))
+                    .and_then(Value::as_array)
+                    .and_then(|folders| folders.first())
+                    .and_then(|folder| folder.get("path"))
+            })
+            .and_then(Value::as_str)
+        {
+            locations.push(json!({
+                "label": "Current Workspace",
+                "absolutePath": path,
+                "kind": "workspace"
+            }));
+        }
+    }
+    ApiResponse::ok(json!({
+        "platform": platform_id(),
+        "locations": locations
+    }))
+}
+
+async fn fs_browse(Query(query): Query<FileQuery>) -> Json<ApiResponse> {
+    let path = query
+        .path
+        .map(PathBuf::from)
+        .or_else(home_dir)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let target = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"))
+    };
+    let entries = match sorted_dir_entries(&target) {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|entry| {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = path.is_dir();
+                json!({
+                    "name": name,
+                    "absolutePath": path.to_string_lossy(),
+                    "type": if is_dir { "directory" } else { "file" },
+                    "isCodeWorkspace": path.extension().and_then(|ext| ext.to_str()) == Some("code-workspace"),
+                    "hidden": name.starts_with('.')
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => return ApiResponse::error("browse_failed", format!("browse {}: {error}", target.display())),
+    };
+    ApiResponse::ok(json!({
+        "absolutePath": target.to_string_lossy(),
+        "parentPath": target.parent().map(|path| path.to_string_lossy().to_string()),
+        "entries": entries
+    }))
+}
+
+async fn file_tree(
+    State(state): State<AppState>,
+    Query(query): Query<FileQuery>,
+) -> Json<ApiResponse> {
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceList {
+            request_id: rid("workspace-list"),
+            folder_id: query.folder_id,
+            path: query.path,
+            depth: Some(2),
+        },
+    ) {
+        Ok(output) => {
+            let nodes = output
+                .get("nodes")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            ApiResponse::ok(nodes)
+        }
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn file_read(
+    State(state): State<AppState>,
+    Query(query): Query<FileQuery>,
+) -> Json<ApiResponse> {
+    let Some(path) = query.path else {
+        return ApiResponse::error("invalid_request", "path is required");
+    };
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceRead {
+            request_id: rid("workspace-read"),
+            folder_id: query.folder_id,
+            path,
+        },
+    ) {
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn file_write(
+    State(state): State<AppState>,
+    Json(body): Json<FileWriteRequest>,
+) -> Json<ApiResponse> {
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceWrite {
+            request_id: rid("workspace-write"),
+            folder_id: body.folder_id,
+            path: body.path,
+            content: body.content,
+            create: true,
+        },
+    ) {
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn file_create(
+    State(state): State<AppState>,
+    Json(body): Json<FileCreateRequest>,
+) -> Json<ApiResponse> {
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceCreate {
+            request_id: rid("workspace-create"),
+            folder_id: body.folder_id,
+            path: body.path,
+            content: body.content,
+        },
+    ) {
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn folder_create(
+    State(state): State<AppState>,
+    Json(body): Json<FolderCreateRequest>,
+) -> Json<ApiResponse> {
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceCreateFolder {
+            request_id: rid("workspace-create-folder"),
+            folder_id: body.folder_id,
+            path: body.path,
+        },
+    ) {
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn file_delete(
+    State(state): State<AppState>,
+    Json(body): Json<FileDeleteRequest>,
+) -> Json<ApiResponse> {
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceDelete {
+            request_id: rid("workspace-delete"),
+            folder_id: body.folder_id,
+            path: body.path,
+        },
+    ) {
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn file_rename(
+    State(state): State<AppState>,
+    Json(body): Json<FileRenameRequest>,
+) -> Json<ApiResponse> {
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceRename {
+            request_id: rid("workspace-rename"),
+            folder_id: body.folder_id,
+            old_path: body.old_path,
+            new_path: body.new_path,
+        },
+    ) {
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn code_search(
+    State(state): State<AppState>,
+    Json(body): Json<SearchRequest>,
+) -> Json<ApiResponse> {
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::WorkspaceSearch {
+            request_id: rid("workspace-search"),
+            folder_id: body.folder_id,
+            query: body.query,
+            include: body.include,
+            is_regex: body.is_regex.unwrap_or(false),
+        },
+    ) {
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+async fn user_settings_get(State(state): State<AppState>) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    ApiResponse::ok(json!({
+        "settings": gui.user_settings,
+        "overriddenKeys": [],
+        "storePath": gui.paths.settings_path.to_string_lossy()
+    }))
+}
+
+async fn user_settings_patch(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let patches = body.get("patches").cloned().unwrap_or_else(|| json!({}));
+    let mut gui = state.gui.lock().expect("gui state lock");
+    merge_object(&mut gui.user_settings, &patches);
+    let changed_keys = patches
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    match atomic_write_json(&gui.paths.settings_path, &gui.user_settings) {
+        Ok(()) => ApiResponse::ok(json!({
+            "settings": gui.user_settings,
+            "changedKeys": changed_keys
+        })),
+        Err(error) => ApiResponse::error("write_settings_failed", error),
+    }
+}
+
+async fn llm_profiles_get(State(state): State<AppState>) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    let mut profiles = gui.llm_profiles.clone();
+    if let Some(object) = profiles.as_object_mut() {
+        object.insert(
+            "storePath".to_string(),
+            Value::String(gui.paths.llm_profiles_path.to_string_lossy().to_string()),
+        );
+    }
+    ApiResponse::ok(profiles)
+}
+
+async fn llm_profiles_patch(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    let mut profiles = body.get("profiles").cloned().unwrap_or_else(|| json!([]));
+    let secrets = body.get("secrets").cloned().unwrap_or_else(|| json!({}));
+    let mut secret_store = read_json_file(&gui.paths.llm_secrets_path).unwrap_or_else(|| json!({}));
+    if let (Some(profile_items), Some(secret_items), Some(secret_object)) = (
+        profiles.as_array_mut(),
+        secrets.as_object(),
+        secret_store.as_object_mut(),
+    ) {
+        for profile in profile_items {
+            let Some(profile_object) = profile.as_object_mut() else {
+                continue;
+            };
+            let Some(profile_id) = profile_object
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(secret) = secret_items.get(&profile_id).and_then(Value::as_str) else {
+                continue;
+            };
+            if secret.trim().is_empty() {
+                continue;
+            }
+            secret_object.insert(profile_id.clone(), Value::String(secret.to_string()));
+            profile_object.insert(
+                "secretRef".to_string(),
+                Value::String(format!("local-secret:{profile_id}")),
+            );
+        }
+    }
+    gui.llm_profiles = json!({
+        "profiles": profiles,
+        "defaultProfileId": body.get("defaultProfileId").cloned().unwrap_or(Value::Null),
+        "storePath": gui.paths.llm_profiles_path.to_string_lossy()
+    });
+    if secret_store
+        .as_object()
+        .map(|object| !object.is_empty())
+        .unwrap_or(false)
+    {
+        if let Err(error) = atomic_write_json(&gui.paths.llm_secrets_path, &secret_store) {
+            return ApiResponse::error("write_llm_secret_failed", error);
+        }
+    }
+    match atomic_write_json(&gui.paths.llm_profiles_path, &gui.llm_profiles) {
+        Ok(()) => ApiResponse::ok(gui.llm_profiles.clone()),
+        Err(error) => ApiResponse::error("write_llm_profiles_failed", error),
+    }
+}
+
+async fn llm_probe(State(state): State<AppState>, Json(body): Json<Value>) -> Json<ApiResponse> {
+    let started = now_millis();
+    let profile_id = body
+        .get("profileId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let profile = {
+        let gui = state.gui.lock().expect("gui state lock");
+        resolve_llm_profile(&gui, profile_id.as_deref())
+    };
+    let profile = match profile {
+        Ok(profile) => profile,
+        Err(error) => {
+            return ApiResponse::ok(json!({
+                "ok": false,
+                "provider": "openaiCompatible",
+                "error": error
+            }));
+        }
+    };
+    if llm_mock_enabled() {
+        return ApiResponse::ok(json!({
+            "ok": true,
+            "provider": profile.kind,
+            "model": profile.model,
+            "latencyMs": now_millis().saturating_sub(started)
+        }));
+    }
+    let output = call_llm_profile(
+        &profile,
+        vec![json!({ "role": "user", "content": "Reply with OK." })],
+        Vec::new(),
+    )
+    .await;
+    match output {
+        Ok(_) => ApiResponse::ok(json!({
+            "ok": true,
+            "provider": profile.kind,
+            "model": profile.model,
+            "latencyMs": now_millis().saturating_sub(started)
+        })),
+        Err(error) => ApiResponse::ok(json!({
+            "ok": false,
+            "provider": profile.kind,
+            "model": profile.model,
+            "latencyMs": now_millis().saturating_sub(started),
+            "error": error
+        })),
+    }
+}
+
+async fn llm_chat(State(state): State<AppState>, Json(body): Json<Value>) -> Json<ApiResponse> {
+    let profile_id = body
+        .get("profileId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let profile = {
+        let gui = state.gui.lock().expect("gui state lock");
+        resolve_llm_profile(&gui, profile_id.as_deref())
+    };
+    let profile = match profile {
+        Ok(profile) => profile,
+        Err(error) => return ApiResponse::error("llm_profile_error", error),
+    };
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .map(provider_tools_from_values)
+        .unwrap_or_default();
+    match call_llm_profile(&profile, messages, tools).await {
+        Ok(output) => ApiResponse::ok(llm_output_payload(output)),
+        Err(error) => ApiResponse::error("llm_chat_failed", error),
+    }
+}
+
+async fn runtime_shell() -> Json<ApiResponse> {
+    ApiResponse::ok(json!({
+        "os": std::env::consts::OS,
+        "preferredShell": "bash",
+        "agentUsesUnixCommands": true,
+        "problems": []
+    }))
+}
+
+async fn terminal_capabilities() -> Json<ApiResponse> {
+    ApiResponse::ok(json!({
+        "defaultShell": "bash",
+        "shells": ["bash"],
+        "supportsPty": false,
+        "agentUsesUnixCommands": true,
+        "shell": {
+            "os": std::env::consts::OS,
+            "preferredShell": "bash",
+            "available": false,
+            "command": "bash",
+            "args": [],
+            "managedBy": "deepcode-kernel",
+            "problems": [{
+                "code": "terminal_runtime_reserved",
+                "message": "Interactive terminal sessions are reserved until Kernel PTY runtime lands."
+            }]
+        }
+    }))
+}
+
+async fn terminal_warmup() -> Json<ApiResponse> {
+    ApiResponse::ok(json!({
+        "state": "ready",
+        "defaultShell": "bash",
+        "startedAt": null,
+        "completedAt": now_text(),
+        "message": "Kernel host is ready; interactive PTY is reserved.",
+        "problems": []
+    }))
+}
+
+async fn terminal_sessions(State(state): State<AppState>) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    ApiResponse::ok(json!({ "sessions": gui.terminals }))
+}
+
+async fn terminal_create_session(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    let id = format!("term-{}", now_millis());
+    let now = now_text();
+    let session = json!({
+        "id": id,
+        "name": body.get("name").and_then(Value::as_str).unwrap_or("终端 1"),
+        "shellKind": body.get("shellKind").and_then(Value::as_str).unwrap_or("bash"),
+        "cwd": body.get("cwd").and_then(Value::as_str).unwrap_or("."),
+        "status": "running",
+        "createdAt": now,
+        "updatedAt": now,
+        "order": gui.terminals.len()
+    });
+    gui.terminal_events.insert(
+        id.clone(),
+        vec![json!({
+            "id": format!("evt-{id}-ready"),
+            "sessionId": id,
+            "sequence": 1,
+            "type": "ready",
+            "data": "Kernel terminal placeholder ready.",
+            "timestamp": now_text()
+        })],
+    );
+    gui.terminals.push(session.clone());
+    ApiResponse::ok(session)
+}
+
+async fn terminal_input(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    let events = gui.terminal_events.entry(session_id.clone()).or_default();
+    let sequence = events.len() + 1;
+    events.push(json!({
+        "id": format!("evt-{session_id}-{sequence}"),
+        "sessionId": session_id,
+        "sequence": sequence,
+        "type": "stdout",
+        "data": format!("terminal runtime reserved; received input: {}", body.get("data").and_then(Value::as_str).unwrap_or("")),
+        "timestamp": now_text()
+    }));
+    terminal_session_by_id(&gui, &session_id)
+}
+
+async fn terminal_resize(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    terminal_session_by_id(&gui, &session_id)
+}
+
+async fn terminal_update(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    if let Some(session) = gui
+        .terminals
+        .iter_mut()
+        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
+    {
+        if let Some(name) = body.get("name").and_then(Value::as_str) {
+            session["name"] = json!(name);
+        }
+        session["updatedAt"] = json!(now_text());
+        return ApiResponse::ok(session.clone());
+    }
+    ApiResponse::error("terminal_not_found", "terminal session not found")
+}
+
+async fn terminal_restart(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    terminal_session_by_id(&gui, &session_id)
+}
+
+async fn terminal_delete(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    let mut deleted = None;
+    gui.terminals.retain(|session| {
+        if session.get("id").and_then(Value::as_str) == Some(session_id.as_str()) {
+            deleted = Some(session.clone());
+            false
+        } else {
+            true
+        }
+    });
+    gui.terminal_events.remove(&session_id);
+    deleted
+        .map(ApiResponse::ok)
+        .unwrap_or_else(|| ApiResponse::error("terminal_not_found", "terminal session not found"))
+}
+
+async fn terminal_events(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    let events = query
+        .get("sessionId")
+        .and_then(|session_id| gui.terminal_events.get(session_id))
+        .cloned()
+        .unwrap_or_default();
+    ApiResponse::ok(json!({ "events": events }))
+}
+
+async fn agent_sessions_list(State(state): State<AppState>) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    ApiResponse::ok(json!({
+        "sessions": gui.sessions,
+        "currentSessionId": gui.current_session_id
+    }))
+}
+
+async fn agent_session_create(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    let id = format!("session-{}", now_millis());
+    let now = now_text();
+    let mode = body
+        .get("mode")
+        .or_else(|| body.get("initialMode"))
+        .and_then(Value::as_str)
+        .unwrap_or("plan");
+    let session = json!({
+        "id": id,
+        "title": body.get("title").and_then(Value::as_str).unwrap_or("New Agent Session"),
+        "mode": mode,
+        "profileId": body.get("profileId").and_then(Value::as_str),
+        "workspaceId": body.get("workspaceId").and_then(Value::as_str),
+        "workspaceHash": body.get("workspaceHash").and_then(Value::as_str),
+        "titleSource": "pending",
+        "eventCount": 0,
+        "createdAt": now,
+        "updatedAt": now
+    });
+    gui.current_session_id = Some(id.clone());
+    gui.session_events.insert(id.clone(), Vec::new());
+    gui.trace_events.insert(id.clone(), Vec::new());
+    gui.sessions.insert(0, session.clone());
+    ApiResponse::ok(json!({ "session": session, "events": [] }))
+}
+
+async fn agent_session_current(State(state): State<AppState>) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    let Some(session_id) = gui.current_session_id.as_ref() else {
+        return ApiResponse::ok(Value::Null);
+    };
+    session_result(&gui, session_id)
+}
+
+async fn agent_session_activate(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    if has_session(&gui, &session_id) {
+        gui.current_session_id = Some(session_id.clone());
+        return session_result(&gui, &session_id);
+    }
+    ApiResponse::error("agent_session_not_found", "agent session not found")
+}
+
+async fn agent_session_rename(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    if let Some(session) = session_mut(&mut gui, &session_id) {
+        if let Some(title) = body.get("title").and_then(Value::as_str) {
+            session["title"] = json!(title);
+            session["titleSource"] = json!("user");
+        }
+        session["updatedAt"] = json!(now_text());
+        return session_result(&gui, &session_id);
+    }
+    ApiResponse::error("agent_session_not_found", "agent session not found")
+}
+
+async fn agent_session_archive(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    if let Some(session) = session_mut(&mut gui, &session_id) {
+        if body
+            .get("archived")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            session["archivedAt"] = json!(now_text());
+        } else {
+            session
+                .as_object_mut()
+                .map(|object| object.remove("archivedAt"));
+        }
+    }
+    ApiResponse::ok(json!({
+        "sessions": gui.sessions,
+        "currentSessionId": gui.current_session_id
+    }))
+}
+
+async fn agent_session_append_events(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    let incoming = body
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    gui.session_events
+        .entry(session_id.clone())
+        .or_default()
+        .extend(incoming);
+    update_session_event_count(&mut gui, &session_id);
+    session_result(&gui, &session_id)
+}
+
+async fn agent_session_send_message(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    {
+        let gui = state.gui.lock().expect("gui state lock");
+        if !has_session(&gui, &session_id) {
+            return ApiResponse::error("agent_session_not_found", "agent session not found");
+        }
+    }
+
+    let request = build_agent_run_request(&body);
+    let user_event = agent_event(
+        &session_id,
+        "user_msg",
+        json!({
+            "content": request.content,
+            "attachments": body.get("attachments").cloned().unwrap_or_else(|| json!([])),
+            "channel": "user",
+            "visibility": "conversation"
+        }),
+        &now_text(),
+    );
+    append_session_events(&state, &session_id, vec![user_event]);
+
+    if let Err(error) = run_agent_workflow(&state, &session_id, request, false).await {
+        append_session_events(
+            &state,
+            &session_id,
+            vec![agent_event(
+                &session_id,
+                "error",
+                json!({
+                    "message": error,
+                    "channel": "error",
+                    "visibility": "conversation"
+                }),
+                &now_text(),
+            )],
+        );
+    }
+
+    let gui = state.gui.lock().expect("gui state lock");
+    session_result(&gui, &session_id)
+}
+
+async fn agent_session_cancel(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    session_result(&gui, &session_id)
+}
+
+async fn agent_session_trace(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    let events = gui
+        .trace_events
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    ApiResponse::ok(json!({
+        "sessionId": session_id,
+        "trace": {
+            "sessionId": session_id,
+            "events": events,
+            "eventCount": events.len(),
+            "updatedAt": now_text()
+        }
+    }))
+}
+
+async fn agent_permission_resolve(
+    State(state): State<AppState>,
+    Path(permission_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let decision = body
+        .get("decision")
+        .and_then(Value::as_str)
+        .unwrap_or("reject")
+        .to_string();
+    let pending = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        gui.pending_permissions.remove(&permission_id)
+    };
+    let Some(pending) = pending else {
+        return ApiResponse::error("agent_permission_not_found", "Agent permission not found");
+    };
+
+    append_session_events(
+        &state,
+        &pending.session_id,
+        vec![agent_event(
+            &pending.session_id,
+            "permission_result",
+            json!({
+                "permissionId": permission_id,
+                "decision": decision,
+                "toolName": pending.tool_call.name,
+                "channel": "tool",
+                "visibility": "conversation"
+            }),
+            &now_text(),
+        )],
+    );
+
+    if decision == "accept" {
+        let result = execute_tool_call(
+            &state,
+            &pending.tool_call,
+            pending.workspace_binding.as_ref(),
+            true,
+        );
+        append_session_events(
+            &state,
+            &pending.session_id,
+            vec![tool_result_event(
+                &pending.session_id,
+                &pending.tool_call,
+                &result,
+            )],
+        );
+        let mut request = build_agent_run_request(&pending.request_body);
+        request.workspace_binding = pending.workspace_binding;
+        if let Err(error) = run_agent_workflow(&state, &pending.session_id, request, true).await {
+            append_session_events(
+                &state,
+                &pending.session_id,
+                vec![agent_event(
+                    &pending.session_id,
+                    "error",
+                    json!({
+                        "message": error,
+                        "channel": "error",
+                        "visibility": "conversation"
+                    }),
+                    &now_text(),
+                )],
+            );
+        }
+    } else {
+        append_session_events(
+            &state,
+            &pending.session_id,
+            vec![agent_event(
+                &pending.session_id,
+                "assistant_msg",
+                json!({
+                    "content": "权限请求已拒绝，当前 Agent 工作流已停止在安全边界内。",
+                    "channel": "final",
+                    "visibility": "conversation",
+                    "label": "Agent"
+                }),
+                &now_text(),
+            )],
+        );
+    }
+
+    let gui = state.gui.lock().expect("gui state lock");
+    session_result(&gui, &pending.session_id)
+}
+
+async fn agent_feedback() -> Json<ApiResponse> {
+    ApiResponse::ok(json!({
+        "accepted": true,
+        "message": "Feedback recorded by host compatibility layer."
+    }))
+}
+
+async fn agent_workflow_config_get(State(state): State<AppState>) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    ApiResponse::ok(json!({
+        "config": gui.workflow_config,
+        "storePath": gui.paths.workflow_config_path.to_string_lossy(),
+        "initialized": true
+    }))
+}
+
+async fn agent_workflow_config_patch(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let config = body.get("config").cloned().unwrap_or_else(|| json!({}));
+    let mut gui = state.gui.lock().expect("gui state lock");
+    merge_object(&mut gui.workflow_config, &config);
+    match atomic_write_json(&gui.paths.workflow_config_path, &gui.workflow_config) {
+        Ok(()) => ApiResponse::ok(json!({
+            "config": gui.workflow_config,
+            "storePath": gui.paths.workflow_config_path.to_string_lossy(),
+            "initialized": true
+        })),
+        Err(error) => ApiResponse::error("write_workflow_config_failed", error),
+    }
+}
+
+async fn agent_parse_actions() -> Json<ApiResponse> {
+    ApiResponse::ok(json!({ "actions": [], "errors": [] }))
+}
+
+async fn agent_fixture_run() -> Json<ApiResponse> {
+    ApiResponse::ok(json!({
+        "parse": { "actions": [], "errors": [] },
+        "observations": []
+    }))
+}
+
+async fn agent_prompt_layers() -> Json<ApiResponse> {
+    ApiResponse::ok(json!({
+        "layers": [{
+            "id": "builtin-default",
+            "kind": "builtin",
+            "priority": 100,
+            "contentHash": "builtin",
+            "title": "Builtin default prompt"
+        }]
+    }))
+}
+
+async fn agent_tools(State(state): State<AppState>) -> Json<ApiResponse> {
+    match dispatch_skill(
+        &state.runtime,
+        KernelCommand::SkillDiscover {
+            request_id: rid("skill-discover"),
+        },
+    ) {
+        Ok(output) => {
+            let skills = output
+                .get("skills")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let tools = skills
+                .iter()
+                .map(|skill| {
+                    json!({
+                        "name": skill.get("id").or_else(|| skill.get("name")).cloned().unwrap_or(Value::Null),
+                        "description": skill.get("description").cloned().unwrap_or_else(|| json!("Kernel skill")),
+                        "inputSchema": skill.get("inputSchema").cloned().unwrap_or_else(|| json!({ "type": "object" })),
+                        "riskLevel": skill.get("riskLevel").cloned().unwrap_or_else(|| json!("low")),
+                        "needsApproval": skill.get("requiresApproval").cloned().unwrap_or_else(|| json!(false)),
+                        "allowedModes": ["readOnly", "plan", "askBeforeWrite"]
+                    })
+                })
+                .collect::<Vec<_>>();
+            ApiResponse::ok(json!({
+                "skills": skills,
+                "tools": tools
+            }))
+        }
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
+}
+
+fn build_agent_run_request(body: &Value) -> AgentRunRequest {
+    AgentRunRequest {
+        content: body
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        mode: body
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("plan")
+            .to_string(),
+        workflow: body
+            .get("workflow")
+            .and_then(Value::as_str)
+            .unwrap_or("planFirst")
+            .to_string(),
+        profile_id: body
+            .get("profileId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        workflow_config: body
+            .get("workflowConfig")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        workspace_binding: body
+            .get("workspaceBinding")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
+        original_body: body.clone(),
+    }
+}
+
+async fn run_agent_workflow(
+    state: &AppState,
+    session_id: &str,
+    request: AgentRunRequest,
+    resume_after_permission: bool,
+) -> Result<(), String> {
+    let needs_workspace = request_mentions_local_workspace(&request.content);
+    if needs_workspace {
+        if let Err(error) =
+            ensure_workspace_binding(&state.runtime, request.workspace_binding.as_ref())
+        {
+            append_session_events(
+                state,
+                session_id,
+                vec![assistant_final_event(
+                    session_id,
+                    &format!(
+                        "当前没有可用工作区绑定：{}。请先打开一个文件夹或 .code-workspace 文件，再让 Agent 读取、搜索或修改文件。",
+                        error.message
+                    ),
+                )],
+            );
+            return Ok(());
+        }
+    } else if let Some(binding) = request.workspace_binding.as_ref() {
+        let _ = ensure_workspace_binding(&state.runtime, Some(binding));
+    }
+
+    if !resume_after_permission {
+        if let Some(binding) =
+            effective_workspace_binding(&state.runtime, request.workspace_binding.clone())
+        {
+            let kernel_events = {
+                let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+                runtime.dispatch(KernelCommand::RunStart {
+                    request_id: rid("agent-run-start"),
+                    session_id: Some(deepcode_kernel_abi::SessionId(session_id.to_string())),
+                    input: deepcode_kernel_abi::UserInput {
+                        text: request.content.clone(),
+                        attachments: Vec::new(),
+                    },
+                    workspace_binding: Some(binding),
+                    profile_ref: request.profile_id.as_ref().map(|id| {
+                        deepcode_kernel_abi::ProfileRef {
+                            id: id.clone(),
+                            kind: Some("llm".to_string()),
+                            hash: None,
+                        }
+                    }),
+                    workflow_ref: Some(deepcode_kernel_abi::WorkflowRef {
+                        id: request.workflow.clone(),
+                        version: None,
+                        hash: None,
+                    }),
+                    run_overrides: None,
+                })
+            };
+            match kernel_events {
+                Ok(events) => append_trace_from_kernel_events(state, session_id, events),
+                Err(error) => append_trace_event(
+                    state,
+                    session_id,
+                    "error",
+                    json!({
+                        "code": "kernel_run_start_failed",
+                        "message": error.to_string()
+                    }),
+                ),
+            }
+        }
+    }
+
+    let stages: Vec<&str> = if resume_after_permission {
+        vec!["complete", "review"]
+    } else {
+        AGENT_WORKFLOW_STAGES.to_vec()
+    };
+
+    for stage in stages {
+        if stage == "review" && request_mentions_temp_lifecycle(&request.content) {
+            let memory = HostWorkflowMemory::from_events(
+                &request.content,
+                &session_events(state, session_id),
+            );
+            if memory.temp_lifecycle_complete() {
+                append_session_events(
+                    state,
+                    session_id,
+                    vec![assistant_final_event(session_id, &memory.final_summary())],
+                );
+                append_trace_event(
+                    state,
+                    session_id,
+                    "workflow.outcome",
+                    json!({
+                        "stage": "review",
+                        "accepted": true,
+                        "summary": "Temp lifecycle completion criteria satisfied."
+                    }),
+                );
+            } else {
+                append_session_events(
+                    state,
+                    session_id,
+                    vec![assistant_final_event(session_id, &memory.blocked_summary())],
+                );
+                append_trace_event(
+                    state,
+                    session_id,
+                    "workflow.outcome",
+                    json!({
+                        "stage": "review",
+                        "accepted": false,
+                        "summary": "Completion criteria not satisfied."
+                    }),
+                );
+            }
+            continue;
+        }
+
+        append_session_events(
+            state,
+            session_id,
+            vec![workflow_stage_event(session_id, stage, "started", None)],
+        );
+
+        let profile = resolve_stage_profile(state, &request, stage)?;
+        let stage_result = call_agent_stage_llm(state, &request, session_id, stage, &profile).await;
+        match stage_result {
+            Ok(output) => {
+                append_llm_output_events(state, session_id, stage, &output);
+                if stage == "complete" {
+                    if execute_stage_tool_calls(state, session_id, &request, output.tool_calls)? {
+                        return Ok(());
+                    }
+                    if drive_temp_lifecycle(state, session_id, &request)? {
+                        return Ok(());
+                    }
+                }
+                append_session_events(
+                    state,
+                    session_id,
+                    vec![workflow_stage_event(session_id, stage, "completed", None)],
+                );
+            }
+            Err(error) => {
+                append_session_events(
+                    state,
+                    session_id,
+                    vec![workflow_stage_event(
+                        session_id,
+                        stage,
+                        "error",
+                        Some(&error),
+                    )],
+                );
+                append_session_events(
+                    state,
+                    session_id,
+                    vec![assistant_final_event(
+                        session_id,
+                        &format!("LLM 阶段 `{stage}` 调用失败：{error}"),
+                    )],
+                );
+                return Ok(());
+            }
+        }
+
+        if stage == "complete" && request_mentions_temp_lifecycle(&request.content) {
+            loop {
+                let paused = drive_temp_lifecycle(state, session_id, &request)?;
+                if paused {
+                    return Ok(());
+                }
+                let memory = HostWorkflowMemory::from_events(
+                    &request.content,
+                    &session_events(state, session_id),
+                );
+                if memory.temp_lifecycle_complete() {
+                    break;
+                }
+                if !memory.can_make_progress() {
+                    append_session_events(
+                        state,
+                        session_id,
+                        vec![assistant_final_event(session_id, &memory.blocked_summary())],
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn call_agent_stage_llm(
+    state: &AppState,
+    request: &AgentRunRequest,
+    session_id: &str,
+    stage: &str,
+    profile: &ResolvedLlmProfile,
+) -> Result<LlmChatOutput, String> {
+    let memory =
+        HostWorkflowMemory::from_events(&request.content, &session_events(state, session_id));
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": stage_prompt(stage, &request.mode, &request.workflow, &memory)
+        }),
+        json!({
+            "role": "user",
+            "content": format!("{}\n\n{}", request.content, memory.prompt_text())
+        }),
+    ];
+    let tools = if stage == "complete" {
+        model_visible_tools()
+    } else {
+        Vec::new()
+    };
+    append_trace_event(
+        state,
+        session_id,
+        "llm.requested",
+        json!({
+            "stage": stage,
+            "profileId": profile.id,
+            "model": profile.model,
+            "toolCount": tools.len()
+        }),
+    );
+    let output = call_llm_profile(profile, messages, tools).await?;
+    append_trace_event(
+        state,
+        session_id,
+        "llm.completed",
+        json!({
+            "stage": stage,
+            "profileId": profile.id,
+            "contentBytes": output.content.len(),
+            "toolCallCount": output.tool_calls.len()
+        }),
+    );
+    Ok(output)
+}
+
+fn execute_stage_tool_calls(
+    state: &AppState,
+    session_id: &str,
+    request: &AgentRunRequest,
+    tool_calls: Vec<LlmToolCall>,
+) -> Result<bool, String> {
+    for call in tool_calls {
+        let tool_call = ToolCallRequest {
+            id: Some(call.id),
+            name: call.name,
+            arguments: call.arguments,
+        };
+        append_session_events(
+            state,
+            session_id,
+            vec![tool_call_event(session_id, &tool_call)],
+        );
+        if permission_action_for_tool(&tool_call.name) == "ask" {
+            let permission_id = tool_call
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("perm-{}", now_millis()));
+            let permission_event = permission_request_event(session_id, &permission_id, &tool_call);
+            {
+                let mut gui = state.gui.lock().expect("gui state lock");
+                gui.pending_permissions.insert(
+                    permission_id,
+                    PendingAgentPermission {
+                        session_id: session_id.to_string(),
+                        request_body: request.original_body.clone(),
+                        tool_call,
+                        workspace_binding: request.workspace_binding.clone(),
+                    },
+                );
+            }
+            append_session_events(state, session_id, vec![permission_event]);
+            return Ok(true);
+        }
+        let result =
+            execute_tool_call(state, &tool_call, request.workspace_binding.as_ref(), false);
+        append_session_events(
+            state,
+            session_id,
+            vec![tool_result_event(session_id, &tool_call, &result)],
+        );
+    }
+    Ok(false)
+}
+
+fn drive_temp_lifecycle(
+    state: &AppState,
+    session_id: &str,
+    request: &AgentRunRequest,
+) -> Result<bool, String> {
+    if !request_mentions_temp_lifecycle(&request.content) {
+        return Ok(false);
+    }
+    let memory =
+        HostWorkflowMemory::from_events(&request.content, &session_events(state, session_id));
+    let tool_call = if !memory.workspace_listed {
+        Some(ToolCallRequest {
+            id: Some(format!("tool-list-{}", now_millis())),
+            name: "fs.list".to_string(),
+            arguments: json!({ "path": "." }),
+        })
+    } else if !memory.search_done {
+        Some(ToolCallRequest {
+            id: Some(format!("tool-search-{}", now_millis())),
+            name: "code.search".to_string(),
+            arguments: json!({ "query": "_agent_tmp_" }),
+        })
+    } else if !memory.temp_created {
+        Some(ToolCallRequest {
+            id: Some(format!("tool-write-{}", now_millis())),
+            name: "fs.write".to_string(),
+            arguments: json!({
+                "path": TEMP_TEST_PATH,
+                "content": format!("DeepCode Agent temp lifecycle test at {}", now_text())
+            }),
+        })
+    } else if !memory.temp_read {
+        Some(ToolCallRequest {
+            id: Some(format!("tool-read-{}", now_millis())),
+            name: "fs.read".to_string(),
+            arguments: json!({ "path": TEMP_TEST_PATH }),
+        })
+    } else if !memory.temp_deleted {
+        Some(ToolCallRequest {
+            id: Some(format!("tool-delete-{}", now_millis())),
+            name: "fs.delete".to_string(),
+            arguments: json!({ "path": TEMP_TEST_PATH }),
+        })
+    } else {
+        None
+    };
+    let Some(tool_call) = tool_call else {
+        return Ok(false);
+    };
+
+    append_session_events(
+        state,
+        session_id,
+        vec![tool_call_event(session_id, &tool_call)],
+    );
+    if permission_action_for_tool(&tool_call.name) == "ask" && tool_call.name != "fs.delete" {
+        let permission_id = tool_call
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("perm-{}", now_millis()));
+        let permission_event = permission_request_event(session_id, &permission_id, &tool_call);
+        {
+            let mut gui = state.gui.lock().expect("gui state lock");
+            gui.pending_permissions.insert(
+                permission_id,
+                PendingAgentPermission {
+                    session_id: session_id.to_string(),
+                    request_body: request.original_body.clone(),
+                    tool_call,
+                    workspace_binding: request.workspace_binding.clone(),
+                },
+            );
+        }
+        append_session_events(state, session_id, vec![permission_event]);
+        return Ok(true);
+    }
+    let result = execute_tool_call(state, &tool_call, request.workspace_binding.as_ref(), true);
+    append_session_events(
+        state,
+        session_id,
+        vec![tool_result_event(session_id, &tool_call, &result)],
+    );
+    Ok(false)
+}
+
+async fn agent_permission_evaluate(
+    State(state): State<AppState>,
+    Json(body): Json<PermissionEvaluateRequest>,
+) -> Json<ApiResponse> {
+    if needs_workspace(&body.tool_call.name) {
+        if let Err(error) =
+            ensure_workspace_binding(&state.runtime, body.workspace_binding.as_ref())
+        {
+            return ApiResponse::ok(json!({
+                "action": "deny",
+                "reason": format!("no_workspace: {}", error.message),
+                "request": null
+            }));
+        }
+    }
+
+    let action = match body.tool_call.name.as_str() {
+        "fs.read" | "fs.list" | "fs.diff" | "code.search" | "shell.propose" => "allow",
+        "fs.write" | "fs.delete" | "shell.exec" => "ask",
+        _ => "deny",
+    };
+    ApiResponse::ok(json!({
+        "action": action,
+        "reason": format!("kernel policy preflight for {}", body.tool_call.name),
+        "request": (action == "ask").then(|| json!({
+            "id": body.tool_call.id.unwrap_or_else(|| "permission".to_string()),
+            "toolName": body.tool_call.name
+        }))
+    }))
+}
+
+async fn agent_tool_execute(
+    State(state): State<AppState>,
+    Json(body): Json<ToolExecuteRequest>,
+) -> Json<ApiResponse> {
+    if needs_workspace(&body.tool_call.name) {
+        if let Err(error) =
+            ensure_workspace_binding(&state.runtime, body.workspace_binding.as_ref())
+        {
+            return ApiResponse::ok(json!({
+                "ok": false,
+                "error": error.message,
+                "code": error.code
+            }));
+        }
+    }
+    if matches!(
+        body.tool_call.name.as_str(),
+        "fs.write" | "fs.delete" | "shell.exec"
+    ) && body.approved != Some(true)
+    {
+        return ApiResponse::ok(json!({
+            "ok": false,
+            "pendingPermission": true,
+            "error": "permission_required"
+        }));
+    }
+
+    let result = execute_tool_call(
+        &state,
+        &body.tool_call,
+        body.workspace_binding.as_ref(),
+        body.approved == Some(true),
+    );
+
+    match result {
+        Ok(output) => ApiResponse::ok(json!({ "ok": true, "output": output })),
+        Err(error) => ApiResponse::ok(json!({
+            "ok": false,
+            "error": error.message,
+            "code": error.code
+        })),
+    }
+}
+
+async fn browser_status(State(state): State<AppState>) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    ApiResponse::ok(browser_status_payload(&gui.browser))
+}
+
+async fn browser_open(State(state): State<AppState>, Json(body): Json<Value>) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    let url = body
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("http://127.0.0.1:31249/")
+        .to_string();
+    update_browser_action(&mut gui.browser, "open", "ok");
+    gui.browser.current_url = Some(url);
+    ApiResponse::ok(browser_status_payload(&gui.browser))
+}
+
+async fn browser_reload(State(state): State<AppState>) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    update_browser_action(&mut gui.browser, "reload", "ok");
+    ApiResponse::ok(browser_status_payload(&gui.browser))
+}
+
+async fn browser_inspect_mode(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    gui.browser.inspect_state = body
+        .get("inspectState")
+        .and_then(Value::as_str)
+        .unwrap_or("off")
+        .to_string();
+    update_browser_action(&mut gui.browser, "inspect", "ok");
+    ApiResponse::ok(browser_status_payload(&gui.browser))
+}
+
+async fn browser_panel_snapshot(State(state): State<AppState>) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    update_browser_action(&mut gui.browser, "snapshot", "reserved");
+    if gui.browser.snapshot.is_none() {
+        gui.browser.snapshot = Some(default_panel_snapshot(gui.browser.current_url.as_deref()));
+    }
+    ApiResponse::ok(json!({
+        "snapshot": gui.browser.snapshot,
+        "message": "Panel snapshot capture is reserved in packaged Kernel Host; diagnostic snapshot returned."
+    }))
+}
+
+async fn browser_attach_snapshot(State(state): State<AppState>) -> Json<ApiResponse> {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    update_browser_action(&mut gui.browser, "attach", "reserved");
+    if gui.browser.snapshot.is_none() {
+        gui.browser.snapshot = Some(default_panel_snapshot(gui.browser.current_url.as_deref()));
+    }
+    gui.browser.attached = true;
+    ApiResponse::ok(json!({
+        "attached": true,
+        "snapshot": gui.browser.snapshot,
+        "message": "Panel snapshot attachment is recorded by Host compatibility layer."
+    }))
+}
+
+async fn api_not_implemented(method: Method, Path(path): Path<String>) -> Json<ApiResponse> {
+    ApiResponse::error(
+        "api_not_implemented",
+        format!("Route {method}:/api/{path} is not implemented by the Rust Kernel Host yet."),
+    )
+}
+
+fn dispatch_workspace(
+    runtime: &SharedRuntime,
+    command: KernelCommand,
+) -> Result<Value, KernelErrorEnvelope> {
+    let mut runtime = runtime.lock().expect("kernel runtime lock");
+    let events = runtime
+        .dispatch(command)
+        .map_err(|error| KernelErrorEnvelope::from(&error))?;
+    match events.into_iter().next() {
+        Some(KernelEvent::WorkspaceResult {
+            ok: true,
+            output: Some(output),
+            ..
+        }) => Ok(output),
+        Some(KernelEvent::WorkspaceResult {
+            ok: false,
+            error: Some(error),
+            ..
+        }) => Err(error),
+        other => Err(KernelErrorEnvelope {
+            code: "unexpected_event".to_string(),
+            message: format!("expected workspace result, got {other:?}"),
+            message_key: None,
+            args: None,
+        }),
+    }
+}
+
+fn dispatch_skill(
+    runtime: &SharedRuntime,
+    command: KernelCommand,
+) -> Result<Value, KernelErrorEnvelope> {
+    let mut runtime = runtime.lock().expect("kernel runtime lock");
+    let events = runtime
+        .dispatch(command)
+        .map_err(|error| KernelErrorEnvelope::from(&error))?;
+    match events.into_iter().next() {
+        Some(KernelEvent::SkillResult {
+            ok: true,
+            output: Some(output),
+            ..
+        }) => Ok(output),
+        Some(KernelEvent::SkillResult {
+            ok: false,
+            error: Some(error),
+            ..
+        }) => Err(error),
+        other => Err(KernelErrorEnvelope {
+            code: "unexpected_event".to_string(),
+            message: format!("expected skill result, got {other:?}"),
+            message_key: None,
+            args: None,
+        }),
+    }
+}
+
+fn execute_workspace_tool(
+    runtime: &SharedRuntime,
+    command: KernelCommand,
+) -> Result<Value, KernelErrorEnvelope> {
+    dispatch_workspace(runtime, command)
+}
+
+fn execute_diff_tool(
+    runtime: &SharedRuntime,
+    arguments: Value,
+) -> Result<Value, KernelErrorEnvelope> {
+    let path = get_string(&arguments, "path").unwrap_or_default();
+    let new_content = get_string(&arguments, "newContent").unwrap_or_default();
+    let current = dispatch_workspace(
+        runtime,
+        KernelCommand::WorkspaceRead {
+            request_id: rid("tool-fs-diff-read"),
+            folder_id: get_string(&arguments, "folderId"),
+            path: path.clone(),
+        },
+    )?;
+    let old_content = current
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok(json!({
+        "path": path,
+        "diff": format!("--- old\n+++ new\n-{}\n+{}", old_content, new_content)
+    }))
+}
+
+fn execute_tool_call(
+    state: &AppState,
+    tool_call: &ToolCallRequest,
+    workspace_binding: Option<&WorkspaceBinding>,
+    approved: bool,
+) -> Result<Value, KernelErrorEnvelope> {
+    if needs_workspace(&tool_call.name) {
+        ensure_workspace_binding(&state.runtime, workspace_binding)?;
+    }
+    if permission_action_for_tool(&tool_call.name) == "ask" && !approved {
+        return Err(KernelErrorEnvelope {
+            code: "permission_required".to_string(),
+            message: "permission_required".to_string(),
+            message_key: None,
+            args: None,
+        });
+    }
+    match tool_call.name.as_str() {
+        "fs.list" => execute_workspace_tool(
+            &state.runtime,
+            KernelCommand::WorkspaceList {
+                request_id: rid("tool-fs-list"),
+                folder_id: get_string(&tool_call.arguments, "folderId"),
+                path: get_string(&tool_call.arguments, "path"),
+                depth: Some(2),
+            },
+        ),
+        "fs.read" => execute_workspace_tool(
+            &state.runtime,
+            KernelCommand::WorkspaceRead {
+                request_id: rid("tool-fs-read"),
+                folder_id: get_string(&tool_call.arguments, "folderId"),
+                path: get_string(&tool_call.arguments, "path").unwrap_or_default(),
+            },
+        ),
+        "fs.write" => execute_workspace_tool(
+            &state.runtime,
+            KernelCommand::WorkspaceWrite {
+                request_id: rid("tool-fs-write"),
+                folder_id: get_string(&tool_call.arguments, "folderId"),
+                path: get_string(&tool_call.arguments, "path").unwrap_or_default(),
+                content: get_string(&tool_call.arguments, "content").unwrap_or_default(),
+                create: true,
+            },
+        ),
+        "fs.delete" => execute_workspace_tool(
+            &state.runtime,
+            KernelCommand::WorkspaceDelete {
+                request_id: rid("tool-fs-delete"),
+                folder_id: get_string(&tool_call.arguments, "folderId"),
+                path: get_string(&tool_call.arguments, "path").unwrap_or_default(),
+            },
+        ),
+        "fs.diff" => execute_diff_tool(&state.runtime, tool_call.arguments.clone()),
+        "code.search" => execute_workspace_tool(
+            &state.runtime,
+            KernelCommand::WorkspaceSearch {
+                request_id: rid("tool-code-search"),
+                folder_id: get_string(&tool_call.arguments, "folderId"),
+                query: get_string(&tool_call.arguments, "query").unwrap_or_default(),
+                include: tool_call
+                    .arguments
+                    .get("include")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    }),
+                is_regex: tool_call
+                    .arguments
+                    .get("isRegex")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+        ),
+        "shell.propose" => Ok(json!({
+            "dryRun": true,
+            "executed": false,
+            "command": get_string(&tool_call.arguments, "command")
+        })),
+        "shell.exec" => execute_shell_command(&state.runtime, &tool_call.arguments),
+        _ => Err(KernelErrorEnvelope {
+            code: "unknown_tool".to_string(),
+            message: format!("unknown tool {}", tool_call.name),
+            message_key: None,
+            args: None,
+        }),
+    }
+}
+
+fn execute_shell_command(
+    runtime: &SharedRuntime,
+    arguments: &Value,
+) -> Result<Value, KernelErrorEnvelope> {
+    let command = get_string(arguments, "command").unwrap_or_default();
+    if command.trim().is_empty() {
+        return Err(KernelErrorEnvelope {
+            code: "invalid_command".to_string(),
+            message: "shell.exec command is required".to_string(),
+            message_key: None,
+            args: None,
+        });
+    }
+    if command.contains("rm -rf") || command.contains("git reset --hard") {
+        return Err(KernelErrorEnvelope {
+            code: "destructive_command_blocked".to_string(),
+            message: "destructive shell command is blocked by Kernel policy".to_string(),
+            message_key: None,
+            args: None,
+        });
+    }
+    let cwd = current_workspace_json(runtime)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("current")
+                .and_then(|workspace| workspace.get("folders"))
+                .and_then(Value::as_array)
+                .and_then(|folders| folders.first())
+                .and_then(|folder| folder.get("absolutePath"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| ".".to_string());
+    let started = now_millis();
+    let output = if cfg!(windows) {
+        std::process::Command::new("wsl.exe")
+            .arg("sh")
+            .arg("-lc")
+            .arg(&command)
+            .current_dir(&cwd)
+            .output()
+    } else {
+        std::process::Command::new("bash")
+            .arg("-lc")
+            .arg(&command)
+            .current_dir(&cwd)
+            .output()
+    }
+    .map_err(|error| KernelErrorEnvelope {
+        code: "shell_exec_failed".to_string(),
+        message: format!("failed to start kernel controlled shell: {error}"),
+        message_key: None,
+        args: None,
+    })?;
+    Ok(json!({
+        "command": command,
+        "cwd": cwd,
+        "executed": true,
+        "exitCode": output.status.code(),
+        "stdout": limit_text(&String::from_utf8_lossy(&output.stdout), 16 * 1024),
+        "stderr": limit_text(&String::from_utf8_lossy(&output.stderr), 16 * 1024),
+        "durationMs": now_millis().saturating_sub(started),
+        "truncated": output.stdout.len() > 16 * 1024 || output.stderr.len() > 16 * 1024,
+        "tempSessionId": format!("kernel-shell-{}", started),
+        "cleanupStatus": "alreadyExited"
+    }))
+}
+
+fn permission_action_for_tool(tool_name: &str) -> &'static str {
+    match tool_name {
+        "fs.write" | "fs.delete" | "shell.exec" => "ask",
+        "fs.read" | "fs.list" | "fs.diff" | "code.search" | "shell.propose" => "allow",
+        _ => "deny",
+    }
+}
+
+fn append_session_events(state: &AppState, session_id: &str, events: Vec<Value>) {
+    if events.is_empty() {
+        return;
+    }
+    let mut gui = state.gui.lock().expect("gui state lock");
+    gui.session_events
+        .entry(session_id.to_string())
+        .or_default()
+        .extend(events);
+    update_session_event_count(&mut gui, session_id);
+}
+
+fn session_events(state: &AppState, session_id: &str) -> Vec<Value> {
+    let gui = state.gui.lock().expect("gui state lock");
+    gui.session_events
+        .get(session_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn append_trace_event(state: &AppState, session_id: &str, kind: &str, payload: Value) {
+    let mut gui = state.gui.lock().expect("gui state lock");
+    gui.trace_events
+        .entry(session_id.to_string())
+        .or_default()
+        .push(json!({
+            "id": format!("trace-{}", now_millis()),
+            "sessionId": session_id,
+            "ts": now_text(),
+            "kind": kind,
+            "source": "runtime",
+            "level": if kind == "error" { "error" } else { "info" },
+            "summary": payload.get("summary").and_then(Value::as_str).unwrap_or(kind),
+            "payload": payload
+        }));
+}
+
+fn append_trace_from_kernel_events(state: &AppState, session_id: &str, events: Vec<KernelEvent>) {
+    for event in events {
+        append_trace_event(
+            state,
+            session_id,
+            "kernel.event",
+            serde_json::to_value(event).unwrap_or_else(|_| json!({ "kind": "kernel.event" })),
+        );
+    }
+}
+
+fn workflow_stage_event(
+    session_id: &str,
+    stage: &str,
+    status: &str,
+    summary: Option<&str>,
+) -> Value {
+    agent_event(
+        session_id,
+        "workflow_stage",
+        json!({
+            "stage": stage,
+            "phase": stage,
+            "status": status,
+            "summary": summary.unwrap_or(status),
+            "channel": "task",
+            "visibility": "task"
+        }),
+        &now_text(),
+    )
+}
+
+fn assistant_final_event(session_id: &str, content: &str) -> Value {
+    agent_event(
+        session_id,
+        "assistant_msg",
+        json!({
+            "content": content,
+            "channel": "final",
+            "visibility": "conversation",
+            "label": "Agent"
+        }),
+        &now_text(),
+    )
+}
+
+fn tool_call_event(session_id: &str, tool_call: &ToolCallRequest) -> Value {
+    agent_event(
+        session_id,
+        "tool_call",
+        json!({
+            "id": tool_call.id,
+            "name": tool_call.name,
+            "toolName": tool_call.name,
+            "arguments": tool_call.arguments,
+            "toolCall": tool_call,
+            "channel": "tool",
+            "visibility": "conversation"
+        }),
+        &now_text(),
+    )
+}
+
+fn tool_result_event(
+    session_id: &str,
+    tool_call: &ToolCallRequest,
+    result: &Result<Value, KernelErrorEnvelope>,
+) -> Value {
+    match result {
+        Ok(output) => agent_event(
+            session_id,
+            "tool_result",
+            json!({
+                "callId": tool_call.id,
+                "toolName": tool_call.name,
+                "ok": true,
+                "status": "ok",
+                "output": output,
+                "channel": "tool",
+                "visibility": "conversation"
+            }),
+            &now_text(),
+        ),
+        Err(error) => agent_event(
+            session_id,
+            "tool_result",
+            json!({
+                "callId": tool_call.id,
+                "toolName": tool_call.name,
+                "ok": false,
+                "status": "error",
+                "error": error.message,
+                "code": error.code,
+                "channel": "tool",
+                "visibility": "conversation"
+            }),
+            &now_text(),
+        ),
+    }
+}
+
+fn permission_request_event(
+    session_id: &str,
+    permission_id: &str,
+    tool_call: &ToolCallRequest,
+) -> Value {
+    let risk = if tool_call.name == "fs.delete" {
+        "high"
+    } else if tool_call.name == "fs.write" || tool_call.name == "shell.exec" {
+        "high"
+    } else {
+        "medium"
+    };
+    agent_event(
+        session_id,
+        "permission_request",
+        json!({
+            "id": permission_id,
+            "toolName": tool_call.name,
+            "riskLevel": risk,
+            "summary": format!("需要授权执行 {}", tool_call.name),
+            "argumentsPreview": tool_call.arguments,
+            "channel": "tool",
+            "visibility": "conversation"
+        }),
+        &now_text(),
+    )
+}
+
+fn resolve_stage_profile(
+    state: &AppState,
+    request: &AgentRunRequest,
+    stage: &str,
+) -> Result<ResolvedLlmProfile, String> {
+    let gui = state.gui.lock().expect("gui state lock");
+    let stage_profile = request
+        .workflow_config
+        .get(stage)
+        .and_then(|value| value.get("profileId"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            gui.workflow_config
+                .get(stage)
+                .and_then(|value| value.get("profileId"))
+                .and_then(Value::as_str)
+        })
+        .or(request.profile_id.as_deref());
+    resolve_llm_profile(&gui, stage_profile)
+}
+
+fn resolve_llm_profile(
+    gui: &GuiState,
+    profile_id: Option<&str>,
+) -> Result<ResolvedLlmProfile, String> {
+    let default_id = gui
+        .llm_profiles
+        .get("defaultProfileId")
+        .and_then(Value::as_str);
+    let selected_id = profile_id.or(default_id);
+    let profiles = gui
+        .llm_profiles
+        .get("profiles")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "LLM profiles are missing".to_string())?;
+    let profile = selected_id
+        .and_then(|id| {
+            profiles
+                .iter()
+                .find(|profile| profile.get("id").and_then(Value::as_str) == Some(id))
+        })
+        .or_else(|| {
+            profiles.iter().find(|profile| {
+                profile
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+        })
+        .ok_or_else(|| "No enabled LLM profile is configured".to_string())?;
+
+    if !profile
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        return Err("Selected LLM profile is disabled".to_string());
+    }
+
+    let id = profile
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("profile")
+        .to_string();
+    let kind = profile
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("openaiCompatible")
+        .to_string();
+    let secret_store = read_json_file(&gui.paths.llm_secrets_path).unwrap_or_else(|| json!({}));
+    let secret_key = profile
+        .get("secretRef")
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix("local-secret:").map(str::to_string))
+        .unwrap_or_else(|| id.clone());
+    let api_key = secret_store
+        .get(&secret_key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| std::env::var("DEEPCODE_LLM_API_KEY").ok());
+
+    Ok(ResolvedLlmProfile {
+        id: id.clone(),
+        name: profile
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(&id)
+            .to_string(),
+        kind,
+        base_url: profile
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        model: profile
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        max_output_tokens: profile
+            .get("maxOutputTokens")
+            .or_else(|| profile.get("maxTokens"))
+            .and_then(token_limit_u32),
+        temperature: profile.get("temperature").and_then(Value::as_f64),
+        reasoning_effort: profile
+            .get("reasoningEffort")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        thinking: profile
+            .get("thinking")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        api_key,
+    })
+}
+
+async fn call_llm_profile(
+    profile: &ResolvedLlmProfile,
+    messages: Vec<Value>,
+    tools: Vec<LlmToolDefinition>,
+) -> Result<LlmChatOutput, String> {
+    if llm_mock_enabled() {
+        return Ok(mock_llm_output(
+            messages
+                .last()
+                .and_then(|value| value.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ));
+    }
+    match profile.kind.as_str() {
+        "anthropic" => call_anthropic_profile(profile, messages, tools).await,
+        "ollama" => call_ollama_profile(profile, messages, tools).await,
+        "openaiCompatible" | "codex" => {
+            call_openai_compatible_profile(profile, messages, tools).await
+        }
+        other => Err(format!("Unsupported LLM provider kind: {other}")),
+    }
+}
+
+async fn call_openai_compatible_profile(
+    profile: &ResolvedLlmProfile,
+    messages: Vec<Value>,
+    tools: Vec<LlmToolDefinition>,
+) -> Result<LlmChatOutput, String> {
+    let api_key = profile
+        .api_key
+        .as_deref()
+        .ok_or_else(|| format!("LLM profile `{}` has no API key", profile.name))?;
+    let url = normalize_openai_base_url(profile);
+    let mut body = json!({
+        "model": profile.model,
+        "messages": messages,
+        "stream": false
+    });
+    if let Some(tokens) = profile.max_output_tokens {
+        body["max_tokens"] = json!(tokens);
+    }
+    if should_send_sampling(profile) {
+        if let Some(temperature) = profile.temperature {
+            body["temperature"] = json!(temperature);
+        }
+    }
+    if let Some(effort) = profile.reasoning_effort.as_ref() {
+        body["reasoning_effort"] = json!(effort);
+    }
+    if let Some(thinking) = profile.thinking.as_ref() {
+        body["thinking"] = json!({ "type": thinking });
+    }
+    if is_deepseek_profile(profile) {
+        body["user_id"] = json!("deepcode_local");
+    }
+    if !tools.is_empty() {
+        body["tools"] = json!(tools
+            .iter()
+            .map(|tool| json!({
+                "type": "function",
+                "function": {
+                    "name": provider_tool_name(&tool.name),
+                    "description": tool.description,
+                    "parameters": tool.input_schema
+                }
+            }))
+            .collect::<Vec<_>>());
+    }
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("LLM request failed: {error}"))?;
+    let status = response.status();
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("LLM response JSON parse failed: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("LLM HTTP {}: {}", status.as_u16(), value));
+    }
+    let choice = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(parse_openai_message(&choice))
+}
+
+async fn call_anthropic_profile(
+    profile: &ResolvedLlmProfile,
+    messages: Vec<Value>,
+    tools: Vec<LlmToolDefinition>,
+) -> Result<LlmChatOutput, String> {
+    let api_key = profile
+        .api_key
+        .as_deref()
+        .ok_or_else(|| format!("LLM profile `{}` has no API key", profile.name))?;
+    let (system, chat_messages) = split_system_messages(messages);
+    let mut body = json!({
+        "model": profile.model,
+        "messages": chat_messages,
+        "max_tokens": profile.max_output_tokens.unwrap_or(4096)
+    });
+    if !system.is_empty() {
+        body["system"] = json!(system);
+    }
+    if !tools.is_empty() {
+        body["tools"] = json!(tools
+            .iter()
+            .map(|tool| json!({
+                "name": provider_tool_name(&tool.name),
+                "description": tool.description,
+                "input_schema": tool.input_schema
+            }))
+            .collect::<Vec<_>>());
+    }
+    let response = reqwest::Client::new()
+        .post(normalize_anthropic_base_url(profile))
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("LLM request failed: {error}"))?;
+    let status = response.status();
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("LLM response JSON parse failed: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("LLM HTTP {}: {}", status.as_u16(), value));
+    }
+    Ok(parse_anthropic_message(&value))
+}
+
+async fn call_ollama_profile(
+    profile: &ResolvedLlmProfile,
+    messages: Vec<Value>,
+    tools: Vec<LlmToolDefinition>,
+) -> Result<LlmChatOutput, String> {
+    let mut body = json!({
+        "model": profile.model,
+        "messages": messages,
+        "stream": false
+    });
+    if !tools.is_empty() {
+        body["tools"] = json!(tools
+            .iter()
+            .map(|tool| json!({
+                "type": "function",
+                "function": {
+                    "name": provider_tool_name(&tool.name),
+                    "description": tool.description,
+                    "parameters": tool.input_schema
+                }
+            }))
+            .collect::<Vec<_>>());
+    }
+    let response = reqwest::Client::new()
+        .post(normalize_ollama_base_url(profile))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("LLM request failed: {error}"))?;
+    let status = response.status();
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("LLM response JSON parse failed: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("LLM HTTP {}: {}", status.as_u16(), value));
+    }
+    Ok(parse_openai_message(
+        value.get("message").unwrap_or(&Value::Null),
+    ))
+}
+
+fn parse_openai_message(message: &Value) -> LlmChatOutput {
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let reasoning = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let function = item.get("function")?;
+                    let provider_name = function.get("name").and_then(Value::as_str)?;
+                    let args = function
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|raw| serde_json::from_str(raw).ok())
+                        .or_else(|| function.get("arguments").cloned())
+                        .unwrap_or_else(|| json!({}));
+                    Some(LlmToolCall {
+                        id: item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool-call")
+                            .to_string(),
+                        name: internal_tool_name(provider_name),
+                        arguments: args,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    LlmChatOutput {
+        content,
+        reasoning,
+        tool_calls,
+    }
+}
+
+fn parse_anthropic_message(value: &Value) -> LlmChatOutput {
+    let mut content = Vec::new();
+    let mut tool_calls = Vec::new();
+    for item in value
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        match item.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text" => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    content.push(text.to_string());
+                }
+            }
+            "tool_use" => {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                tool_calls.push(LlmToolCall {
+                    id: item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool-call")
+                        .to_string(),
+                    name: internal_tool_name(name),
+                    arguments: item.get("input").cloned().unwrap_or_else(|| json!({})),
+                });
+            }
+            _ => {}
+        }
+    }
+    LlmChatOutput {
+        content: content.join("\n"),
+        reasoning: None,
+        tool_calls,
+    }
+}
+
+fn llm_output_payload(output: LlmChatOutput) -> Value {
+    let mut chunks = Vec::new();
+    if let Some(reasoning) = output.reasoning.as_ref().filter(|value| !value.is_empty()) {
+        chunks.push(json!({ "type": "reasoning_delta", "content": reasoning }));
+    }
+    if !output.content.is_empty() {
+        chunks.push(json!({ "type": "delta", "content": output.content }));
+    }
+    for call in &output.tool_calls {
+        chunks.push(json!({
+            "type": "tool_call",
+            "toolCall": {
+                "id": call.id,
+                "name": call.name,
+                "arguments": call.arguments
+            }
+        }));
+    }
+    chunks.push(json!({ "type": "done" }));
+    json!({
+        "chunks": chunks,
+        "assistantMessage": {
+            "role": "assistant",
+            "content": output.content,
+            "reasoningContent": output.reasoning,
+            "toolCalls": output.tool_calls.into_iter().map(|call| json!({
+                "id": call.id,
+                "name": call.name,
+                "arguments": call.arguments
+            })).collect::<Vec<_>>()
+        }
+    })
+}
+
+fn append_llm_output_events(
+    state: &AppState,
+    session_id: &str,
+    stage: &str,
+    output: &LlmChatOutput,
+) {
+    let mut events = Vec::new();
+    if let Some(reasoning) = output
+        .reasoning
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        events.push(assistant_segment_event(
+            session_id,
+            "reasoning",
+            reasoning,
+            stage,
+        ));
+    }
+    for (kind, content) in parse_tagged_segments(&output.content, fallback_segment_kind(stage)) {
+        if stage != "review" && kind == "final" {
+            events.push(assistant_segment_event(
+                session_id,
+                fallback_segment_kind(stage),
+                &content,
+                stage,
+            ));
+        } else {
+            events.push(assistant_segment_event(session_id, kind, &content, stage));
+        }
+    }
+    let mut parsed_calls = parse_deepcode_action_tool_calls(&output.content);
+    if !parsed_calls.is_empty() {
+        let calls = parsed_calls
+            .drain(..)
+            .map(|call| LlmToolCall {
+                id: call.id.unwrap_or_else(|| format!("tool-{}", now_millis())),
+                name: call.name,
+                arguments: call.arguments,
+            })
+            .collect::<Vec<_>>();
+        let request = AgentRunRequest {
+            content: String::new(),
+            mode: "askBeforeWrite".to_string(),
+            workflow: "planFirst".to_string(),
+            profile_id: None,
+            workflow_config: json!({}),
+            workspace_binding: None,
+            original_body: json!({}),
+        };
+        let _ = execute_stage_tool_calls(state, session_id, &request, calls);
+    }
+    append_session_events(state, session_id, events);
+}
+
+fn assistant_segment_event(session_id: &str, kind: &str, content: &str, stage: &str) -> Value {
+    let channel = match kind {
+        "reasoning" => "reasoning",
+        "observe" => "observation",
+        "final" => "final",
+        _ => "progress",
+    };
+    let label = match kind {
+        "reasoning" => "思考过程",
+        "observe" => "观察",
+        "plan" => "计划",
+        "final" => "Agent",
+        _ => "Agent",
+    };
+    agent_event(
+        session_id,
+        "assistant_msg",
+        json!({
+            "content": content,
+            "label": label,
+            "stage": stage,
+            "phase": stage,
+            "channel": channel,
+            "visibility": if kind == "reasoning" { "trace" } else { "conversation" }
+        }),
+        &now_text(),
+    )
+}
+
+fn parse_tagged_segments(content: &str, fallback: &str) -> Vec<(&'static str, String)> {
+    let tags: [(&str, &'static str); 6] = [
+        ("reasoning", "reasoning"),
+        ("think", "reasoning"),
+        ("say", "say"),
+        ("plan", "plan"),
+        ("observe", "observe"),
+        ("final", "final"),
+    ];
+    let mut result = Vec::new();
+    let mut consumed = vec![false; content.len()];
+    for (tag, kind) in tags {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut offset = 0;
+        while let Some(start) = content[offset..].find(&open) {
+            let open_start = offset + start;
+            let text_start = open_start + open.len();
+            let Some(end_rel) = content[text_start..].find(&close) else {
+                break;
+            };
+            let text_end = text_start + end_rel;
+            let close_end = text_end + close.len();
+            for item in consumed.iter_mut().take(close_end).skip(open_start) {
+                *item = true;
+            }
+            let text = strip_action_blocks(&content[text_start..text_end])
+                .trim()
+                .to_string();
+            if !text.is_empty() {
+                result.push((kind, redact_for_display(&text)));
+            }
+            offset = close_end;
+        }
+    }
+    let remainder = content
+        .char_indices()
+        .filter_map(|(index, ch)| {
+            consumed
+                .get(index)
+                .copied()
+                .is_some_and(|value| !value)
+                .then_some(ch)
+        })
+        .collect::<String>();
+    let clean = strip_action_blocks(&remainder).trim().to_string();
+    if !clean.is_empty() {
+        result.push((fallback_kind_static(fallback), redact_for_display(&clean)));
+    }
+    result
+}
+
+fn fallback_kind_static(value: &str) -> &'static str {
+    match value {
+        "reasoning" => "reasoning",
+        "observe" => "observe",
+        "plan" => "plan",
+        "final" => "final",
+        _ => "say",
+    }
+}
+
+fn fallback_segment_kind(stage: &str) -> &'static str {
+    match stage {
+        "plan" => "plan",
+        "check" => "observe",
+        "review" => "final",
+        _ => "say",
+    }
+}
+
+fn strip_action_blocks(content: &str) -> String {
+    let mut output = String::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("```deepcode-action") {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        if let Some(end) = after_start.find("```") {
+            let after_fence = &after_start[end + 3..];
+            if let Some(second_end) = after_fence.find("```") {
+                rest = &after_fence[second_end + 3..];
+                continue;
+            }
+        }
+        rest = "";
+    }
+    output.push_str(rest);
+    output
+}
+
+fn parse_deepcode_action_tool_calls(content: &str) -> Vec<ToolCallRequest> {
+    let mut calls = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("```deepcode-action") {
+        let after_start = &rest[start..];
+        let Some(first_end) = after_start.find('\n') else {
+            break;
+        };
+        let body_start = first_end + 1;
+        let Some(end) = after_start[body_start..].find("```") else {
+            break;
+        };
+        let raw = after_start[body_start..body_start + end].trim();
+        if let Ok(value) = serde_json::from_str::<Value>(raw) {
+            if let Some(call) = tool_call_from_action_value(&value) {
+                calls.push(call);
+            }
+        }
+        rest = &after_start[body_start + end + 3..];
+    }
+    calls
+}
+
+fn tool_call_from_action_value(value: &Value) -> Option<ToolCallRequest> {
+    let name = value
+        .get("action")
+        .or_else(|| value.get("type"))
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)?
+        .to_string();
+    Some(ToolCallRequest {
+        id: value.get("id").and_then(Value::as_str).map(str::to_string),
+        name,
+        arguments: value
+            .get("input")
+            .or_else(|| value.get("arguments"))
+            .or_else(|| value.get("payload"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    })
+}
+
+fn stage_prompt(stage: &str, mode: &str, workflow: &str, memory: &HostWorkflowMemory) -> String {
+    let stage_instruction = match stage {
+        "plan" => "你是 DeepCode Agent 的规划阶段。只产出计划和完成条件，不直接回答最终身份、结果或总结。",
+        "check" => "你是 DeepCode Agent 的检查阶段。只审查计划风险、路径和权限，不重复最终答案。",
+        "complete" => "你是 DeepCode Agent 的执行阶段。需要本地操作时只使用工具调用或 deepcode-action；不要把自然语言当作本地操作。",
+        "review" => "你是 DeepCode Agent 的复核阶段。只有结构化完成条件满足后才输出最终答案；未完成时说明 blocked/replan。",
+        _ => "你是 DeepCode Agent。",
+    };
+    format!(
+        "{stage_instruction}\n\n\
+        输出语言默认简体中文。工具路径必须是工作区相对路径，禁止 /tmp、绝对路径和 ..。\n\
+        当前会话模式：{mode}。当前 workflow：{workflow}。\n\
+        fs.delete 是隐藏的内核受控能力，不在普通模型工具目录中；临时测试文件清理由 Kernel 受控流程完成。\n\
+        不要重复已经满足的 AnswerObligation。\n\n{}",
+        memory.prompt_text()
+    )
+}
+
+fn model_visible_tools() -> Vec<LlmToolDefinition> {
+    vec![
+        LlmToolDefinition {
+            name: "fs.list".to_string(),
+            description: "List a workspace directory tree with bounded depth.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "folderId": { "type": "string" }
+                }
+            }),
+        },
+        LlmToolDefinition {
+            name: "fs.read".to_string(),
+            description: "Read a text file from the active workspace.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "folderId": { "type": "string" }
+                }
+            }),
+        },
+        LlmToolDefinition {
+            name: "fs.diff".to_string(),
+            description: "Preview a file diff without writing.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["path", "newContent"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "newContent": { "type": "string" },
+                    "folderId": { "type": "string" }
+                }
+            }),
+        },
+        LlmToolDefinition {
+            name: "code.search".to_string(),
+            description: "Search text across the workspace.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string" },
+                    "isRegex": { "type": "boolean" },
+                    "include": { "type": "array", "items": { "type": "string" } },
+                    "folderId": { "type": "string" }
+                }
+            }),
+        },
+        LlmToolDefinition {
+            name: "fs.write".to_string(),
+            description: "Write a text file after explicit permission approval.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["path", "content"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "folderId": { "type": "string" }
+                }
+            }),
+        },
+        LlmToolDefinition {
+            name: "shell.propose".to_string(),
+            description: "Propose a shell command without executing it.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": { "type": "string" },
+                    "reason": { "type": "string" }
+                }
+            }),
+        },
+        LlmToolDefinition {
+            name: "shell.exec".to_string(),
+            description: "Run a command in a Kernel controlled shell after explicit approval."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": { "type": "string" },
+                    "cwd": { "type": "string" },
+                    "timeoutMs": { "type": "number" },
+                    "reason": { "type": "string" }
+                }
+            }),
+        },
+    ]
+}
+
+fn provider_tools_from_values(values: Vec<Value>) -> Vec<LlmToolDefinition> {
+    values
+        .into_iter()
+        .filter_map(|value| {
+            Some(LlmToolDefinition {
+                name: value.get("name").and_then(Value::as_str)?.to_string(),
+                description: value
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("DeepCode tool")
+                    .to_string(),
+                input_schema: value
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "type": "object" })),
+            })
+        })
+        .collect()
+}
+
+impl HostWorkflowMemory {
+    fn from_events(user_content: &str, events: &[Value]) -> Self {
+        let mut memory = Self {
+            identity_required: has_identity_request_text(user_content),
+            tool_summary_required: has_tool_summary_request_text(user_content),
+            temp_lifecycle_required: request_mentions_temp_lifecycle(user_content),
+            ..Self::default()
+        };
+        for event in events {
+            let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+            let payload = event.get("payload").unwrap_or(&Value::Null);
+            match kind {
+                "assistant_msg" => {
+                    let content = payload.get("content").and_then(Value::as_str).unwrap_or("");
+                    let channel = payload.get("channel").and_then(Value::as_str).unwrap_or("");
+                    if content.contains("DeepCode Agent") {
+                        memory.identity_answered = true;
+                    }
+                    if channel == "final" {
+                        memory.final_answered = true;
+                    }
+                }
+                "tool_result" => {
+                    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+                        continue;
+                    }
+                    let name = payload
+                        .get("toolName")
+                        .or_else(|| payload.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let output = payload.get("output").unwrap_or(&Value::Null);
+                    let path = output.get("path").and_then(Value::as_str).unwrap_or("");
+                    match name {
+                        "fs.list" => memory.workspace_listed = true,
+                        "code.search" => memory.search_done = true,
+                        "fs.write" if path.starts_with("_agent_tmp_") => memory.temp_created = true,
+                        "fs.read" if path.starts_with("_agent_tmp_") => memory.temp_read = true,
+                        "fs.delete" if path.starts_with("_agent_tmp_") => {
+                            memory.temp_deleted = true
+                        }
+                        "shell.exec" => {
+                            let command =
+                                output.get("command").and_then(Value::as_str).unwrap_or("");
+                            if command.contains("_agent_tmp_") {
+                                memory.temp_deleted = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        memory
+    }
+
+    fn prompt_text(&self) -> String {
+        let mut lines = vec![
+            "[Structured workflow memory]".to_string(),
+            "Use this structured state instead of repeating prior assistant prose.".to_string(),
+        ];
+        if self.identity_required {
+            lines.push(format!(
+                "- obligation.identity: {}",
+                if self.identity_answered {
+                    "satisfied"
+                } else {
+                    "pending"
+                }
+            ));
+        }
+        if self.tool_summary_required {
+            lines.push("- obligation.toolComponentSummary: pending until final review".to_string());
+        }
+        if self.temp_lifecycle_required {
+            lines.push(format!(
+                "- tempLifecycle: listed={}, search={}, created={}, read={}, cleaned={}",
+                self.workspace_listed,
+                self.search_done,
+                self.temp_created,
+                self.temp_read,
+                self.temp_deleted
+            ));
+        }
+        lines.join("\n")
+    }
+
+    fn temp_lifecycle_complete(&self) -> bool {
+        !self.temp_lifecycle_required
+            || (self.workspace_listed
+                && self.search_done
+                && self.temp_created
+                && self.temp_read
+                && self.temp_deleted)
+    }
+
+    fn can_make_progress(&self) -> bool {
+        self.temp_lifecycle_required && !self.temp_lifecycle_complete()
+    }
+
+    fn final_summary(&self) -> String {
+        let mut lines = Vec::new();
+        if self.identity_required {
+            lines.push("我是 **DeepCode Agent**，一个由 Rust Kernel 管控本地资源、由用户态 Host 展示交互的本地编码代理。");
+        }
+        if self.tool_summary_required {
+            lines.push("本轮已通过 Kernel syscall 验证 `fs.list`、`code.search`、`fs.write`、`fs.read` 和受控 `fs.delete` 清理链路。");
+        }
+        if self.temp_lifecycle_required {
+            lines.push("临时文件生命周期测试已完成：工作区根目录已读取，`_agent_tmp_functional_test.txt` 已创建并读取验证，随后已由隐藏的受控删除能力清理，无测试文件残留。");
+        }
+        if lines.is_empty() {
+            lines.push("任务已完成。");
+        }
+        lines.join("\n\n")
+    }
+
+    fn blocked_summary(&self) -> String {
+        if !self.temp_lifecycle_required {
+            return "当前工作流未满足完成条件，已停止在安全边界内。".to_string();
+        }
+        let mut missing = Vec::new();
+        if !self.workspace_listed {
+            missing.push("列出工作区");
+        }
+        if !self.search_done {
+            missing.push("搜索临时文件残留");
+        }
+        if !self.temp_created {
+            missing.push("创建临时文件");
+        }
+        if !self.temp_read {
+            missing.push("读取验证临时文件");
+        }
+        if !self.temp_deleted {
+            missing.push("清理临时文件");
+        }
+        format!("工作流尚未完成，缺少步骤：{}。", missing.join("、"))
+    }
+}
+
+fn request_mentions_local_workspace(content: &str) -> bool {
+    request_mentions_temp_lifecycle(content)
+        || content.contains("文件")
+        || content.contains("工作区")
+        || content.contains("搜索")
+        || content.to_lowercase().contains("workspace")
+}
+
+fn request_mentions_temp_lifecycle(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    content.contains("临时文件")
+        || content.contains("读写")
+        || content.contains("新建")
+        || lower.contains("temporary file")
+        || lower.contains("temp file")
+}
+
+fn has_identity_request_text(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    content.contains("身份") || content.contains("你是谁") || lower.contains("identity")
+}
+
+fn has_tool_summary_request_text(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    content.contains("功能组件") || content.contains("所有") || lower.contains("tool")
+}
+
+fn effective_workspace_binding(
+    runtime: &SharedRuntime,
+    explicit: Option<WorkspaceBinding>,
+) -> Option<WorkspaceBinding> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let current = current_workspace_json(runtime).ok()?;
+    let workspace = current.get("current")?;
+    if workspace.is_null() {
+        return None;
+    }
+    let open_path = workspace
+        .get("sourcePath")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            workspace
+                .get("folders")
+                .and_then(Value::as_array)
+                .and_then(|folders| folders.first())
+                .and_then(|folder| folder.get("absolutePath"))
+                .and_then(Value::as_str)
+        })?
+        .to_string();
+    Some(WorkspaceBinding {
+        workspace_id: workspace
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        workspace_hash: None,
+        open_path: Some(open_path),
+        active_folder_id: Some("wf-0".to_string()),
+        folder_hash: None,
+    })
+}
+
+fn normalize_openai_base_url(profile: &ResolvedLlmProfile) -> String {
+    let base = profile
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com/v1")
+        .trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/chat/completions")
+    }
+}
+
+fn normalize_anthropic_base_url(profile: &ResolvedLlmProfile) -> String {
+    let base = profile
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.anthropic.com")
+        .trim_end_matches('/');
+    if base.ends_with("/v1/messages") {
+        base.to_string()
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
+fn normalize_ollama_base_url(profile: &ResolvedLlmProfile) -> String {
+    let base = profile
+        .base_url
+        .as_deref()
+        .unwrap_or("http://127.0.0.1:11434")
+        .trim_end_matches('/');
+    if base.ends_with("/api/chat") {
+        base.to_string()
+    } else {
+        format!("{base}/api/chat")
+    }
+}
+
+fn split_system_messages(messages: Vec<Value>) -> (String, Vec<Value>) {
+    let mut system = Vec::new();
+    let mut chat = Vec::new();
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            if let Some(content) = message.get("content").and_then(Value::as_str) {
+                system.push(content.to_string());
+            }
+        } else {
+            chat.push(message);
+        }
+    }
+    (system.join("\n\n"), chat)
+}
+
+fn provider_tool_name(name: &str) -> String {
+    name.replace(
+        |ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'),
+        "_",
+    )
+}
+
+fn internal_tool_name(name: &str) -> String {
+    match name {
+        "fs_read" => "fs.read".to_string(),
+        "fs_list" => "fs.list".to_string(),
+        "fs_diff" => "fs.diff".to_string(),
+        "fs_write" => "fs.write".to_string(),
+        "code_search" => "code.search".to_string(),
+        "shell_propose" => "shell.propose".to_string(),
+        "shell_exec" => "shell.exec".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn token_limit_u32(value: &Value) -> Option<u32> {
+    if let Some(integer) = value.as_u64() {
+        return u32::try_from(integer).ok().filter(|value| *value > 0);
+    }
+    let number = value.as_f64()?;
+    if !number.is_finite() || number <= 0.0 || number.fract() != 0.0 {
+        return None;
+    }
+    if number > u32::MAX as f64 {
+        return None;
+    }
+    Some(number as u32)
+}
+
+fn is_deepseek_profile(profile: &ResolvedLlmProfile) -> bool {
+    profile
+        .base_url
+        .as_deref()
+        .map(|value| value.contains("api.deepseek.com"))
+        .unwrap_or(false)
+        || profile.model.starts_with("deepseek-")
+}
+
+fn should_send_sampling(profile: &ResolvedLlmProfile) -> bool {
+    !(is_deepseek_profile(profile) && profile.thinking.as_deref() == Some("enabled"))
+}
+
+fn llm_mock_enabled() -> bool {
+    std::env::var("DEEPCODE_LLM_MOCK")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn mock_llm_output(prompt: &str) -> LlmChatOutput {
+    if prompt.contains("plan") || prompt.contains("规划") {
+        return LlmChatOutput {
+            content: "<plan>我会先规划测试目标，再通过 Kernel syscall 验证工作区读取、搜索、临时文件写入、读取和清理，最终只在复核阶段回答身份和汇总结果。</plan>".to_string(),
+            ..LlmChatOutput::default()
+        };
+    }
+    if prompt.contains("check") || prompt.contains("检查") {
+        return LlmChatOutput {
+            content: "<observe>计划检查通过：路径使用工作区相对 `_agent_tmp_*`，写入需要权限，清理由 Kernel 隐藏受控能力完成。</observe>".to_string(),
+            ..LlmChatOutput::default()
+        };
+    }
+    if prompt.contains("review") || prompt.contains("复核") {
+        return LlmChatOutput {
+            content: "<final>结构化复核已完成。</final>".to_string(),
+            ..LlmChatOutput::default()
+        };
+    }
+    LlmChatOutput {
+        content: "<say>开始执行工具验证。</say>".to_string(),
+        ..LlmChatOutput::default()
+    }
+}
+
+fn redact_for_display(text: &str) -> String {
+    text.replace("Bearer ", "Bearer [REDACTED] ")
+}
+
+fn limit_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        text.to_string()
+    } else {
+        format!("{}...[truncated]", &text[..limit])
+    }
+}
+
+fn ensure_workspace_binding(
+    runtime: &SharedRuntime,
+    binding: Option<&WorkspaceBinding>,
+) -> Result<(), KernelErrorEnvelope> {
+    let current = current_workspace_json(runtime)?;
+    if current
+        .get("current")
+        .map(|value| !value.is_null())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let Some(open_path) = binding.and_then(|value| value.open_path.as_ref()) else {
+        return Err(KernelErrorEnvelope {
+            code: "no_workspace".to_string(),
+            message:
+                "current workspace is missing and no host workspaceBinding.openPath was provided"
+                    .to_string(),
+            message_key: None,
+            args: None,
+        });
+    };
+    dispatch_workspace(
+        runtime,
+        KernelCommand::WorkspaceOpen {
+            request_id: rid("workspace-restore"),
+            path: open_path.clone(),
+        },
+    )?;
+    Ok(())
+}
+
+fn current_workspace_json(runtime: &SharedRuntime) -> Result<Value, KernelErrorEnvelope> {
+    dispatch_workspace(
+        runtime,
+        KernelCommand::WorkspaceCurrent {
+            request_id: rid("workspace-current"),
+        },
+    )
+}
+
+fn needs_workspace(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "fs.list" | "fs.read" | "fs.write" | "fs.diff" | "fs.delete" | "code.search"
+    )
+}
+
+fn get_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn distribution_root() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn user_config_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("DEEPCODE_CONFIG_DIR") {
+        return PathBuf::from(path);
+    }
+    if cfg!(windows) {
+        if let Some(path) = std::env::var_os("APPDATA") {
+            return PathBuf::from(path).join("DeepCode");
+        }
+    } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(path).join("deepcode");
+    }
+    home_dir()
+        .map(|path| {
+            if cfg!(windows) {
+                path.join("AppData").join("Roaming").join("DeepCode")
+            } else {
+                path.join(".config").join("deepcode")
+            }
+        })
+        .unwrap_or_else(|| distribution_root().join(".deepcode-user"))
+}
+
+struct DriveLocation {
+    display: String,
+    path: PathBuf,
+}
+
+fn platform_id() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "win32",
+        other => other,
+    }
+}
+
+fn drive_locations() -> Vec<DriveLocation> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    ('A'..='Z')
+        .filter_map(|letter| {
+            let display = format!("{letter}:\\");
+            let path = PathBuf::from(&display);
+            path.exists().then_some(DriveLocation { display, path })
+        })
+        .collect()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn normalize_workspace_file_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("workspace file name is required".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed == "." || trimmed == ".." {
+        return Err("workspace file name must not contain path separators".to_string());
+    }
+    let mut file_name = trimmed.to_string();
+    if !file_name.ends_with(".code-workspace") {
+        file_name.push_str(".code-workspace");
+    }
+    Ok(file_name)
+}
+
+fn workspace_file_name_from_label(label: &str) -> String {
+    let sanitized = label
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    normalize_workspace_file_name(&sanitized)
+        .unwrap_or_else(|_| "DeepCode.code-workspace".to_string())
+}
+
+fn sorted_dir_entries(path: &FsPath) -> std::io::Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by(compare_dir_entries);
+    Ok(entries)
+}
+
+fn compare_dir_entries(left: &fs::DirEntry, right: &fs::DirEntry) -> Ordering {
+    let left_name = left.file_name().to_string_lossy().to_string();
+    let right_name = right.file_name().to_string_lossy().to_string();
+    let left_is_dir = left.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+    let right_is_dir = right.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+    (
+        if left_is_dir { 0_u8 } else { 1_u8 },
+        if left_name.starts_with('.') {
+            1_u8
+        } else {
+            0_u8
+        },
+        left_name.to_lowercase(),
+        left_name,
+    )
+        .cmp(&(
+            if right_is_dir { 0_u8 } else { 1_u8 },
+            if right_name.starts_with('.') {
+                1_u8
+            } else {
+                0_u8
+            },
+            right_name.to_lowercase(),
+            right_name,
+        ))
+}
+
+fn read_json_file(path: &PathBuf) -> Option<Value> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn atomic_write_json(path: &PathBuf, value: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let content = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
+    fs::write(&tmp, content).map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|error| format!("rename {}: {error}", path.display()))
+}
+
+fn merge_object(target: &mut Value, patch: &Value) {
+    let Some(target_object) = target.as_object_mut() else {
+        return;
+    };
+    let Some(patch_object) = patch.as_object() else {
+        return;
+    };
+    for (key, value) in patch_object {
+        if value.is_null() {
+            target_object.remove(key);
+        } else {
+            target_object.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn default_user_settings() -> Value {
+    json!({
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.wordWrap": "off",
+        "editor.fontSize": 14,
+        "editor.fontFamily": "Consolas, 'Courier New', monospace",
+        "editor.renderWhitespace": "none",
+        "files.autoSave": "afterDelay",
+        "files.autoSaveDelay": 1000,
+        "files.hotExit": true,
+        "files.encoding": "utf8",
+        "files.eol": "\n",
+        "keyboard.enableBasicShortcuts": true,
+        "explorer.confirmDelete": false,
+        "workbench.colorTheme": "vs-dark",
+        "workbench.language": "zh-CN",
+        "workbench.styleTokenOverrides": "{}",
+        "terminal.integrated.defaultProfile.windows": "wsl",
+        "terminal.integrated.prewarm": "afterStartup",
+        "terminal.integrated.spawnTimeoutMs": 8000,
+        "agent.defaultMode": "plan",
+        "agent.defaultWorkflow": "planFirst",
+        "agent.permissions.allowFileRead": true,
+        "agent.permissions.allowFileWrite": true,
+        "agent.permissions.allowCodeSearch": true,
+        "agent.permissions.allowShellPropose": true,
+        "agent.permissions.allowShellExec": true,
+        "agent.shell.autoExecuteCommands": false,
+        "skills.pythonPath": "python",
+        "skills.autoLoad": true,
+        "skills.mounts": "[]",
+        "prompt.defaultProfileId": "default-agent",
+        "prompt.profiles": "[{\"id\":\"default-agent\",\"name\":\"Default Agent\",\"description\":\"Default coding assistant profile\",\"systemPrompt\":\"You are DeepCode Agent. Work inside the current workspace, explain important risks, and ask for approval before writing files.\",\"enabled\":true}]",
+        "ruler.enabled": true,
+        "ruler.rules": "[{\"id\":\"default-safety\",\"name\":\"Default Safety Boundary\",\"source\":\"system\",\"priority\":100,\"path\":\"<builtin>/default-safety.md\",\"content\":\"Default to plan mode. Read before write. Show diff before saving files. Never run destructive commands without explicit approval.\",\"enabled\":true}]"
+    })
+}
+
+fn default_llm_profiles() -> Value {
+    json!({
+        "profiles": [
+            {
+                "id": "deepseek-v4-flash-openai",
+                "name": "DeepSeek V4 Flash",
+                "kind": "openaiCompatible",
+                "baseUrl": "https://api.deepseek.com",
+                "model": "deepseek-v4-flash",
+                "contextWindowTokens": 1000000,
+                "maxOutputTokens": 384000,
+                "temperature": 0.2,
+                "reasoningEffort": "high",
+                "thinking": "enabled",
+                "enabled": true
+            },
+            {
+                "id": "deepseek-v4-pro-openai",
+                "name": "DeepSeek V4 Pro",
+                "kind": "openaiCompatible",
+                "baseUrl": "https://api.deepseek.com",
+                "model": "deepseek-v4-pro",
+                "contextWindowTokens": 1000000,
+                "maxOutputTokens": 384000,
+                "temperature": 0.2,
+                "reasoningEffort": "max",
+                "thinking": "enabled",
+                "enabled": true
+            }
+        ],
+        "defaultProfileId": "deepseek-v4-pro-openai",
+        "storePath": null
+    })
+}
+
+fn default_workflow_config() -> Value {
+    json!({
+        "plan": {},
+        "check": {},
+        "complete": {},
+        "review": {}
+    })
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn now_text() -> String {
+    now_millis().to_string()
+}
+
+fn has_session(gui: &GuiState, session_id: &str) -> bool {
+    gui.sessions
+        .iter()
+        .any(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+}
+
+fn session_mut<'a>(gui: &'a mut GuiState, session_id: &str) -> Option<&'a mut Value> {
+    gui.sessions
+        .iter_mut()
+        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+}
+
+fn update_session_event_count(gui: &mut GuiState, session_id: &str) {
+    let count = gui
+        .session_events
+        .get(session_id)
+        .map(Vec::len)
+        .unwrap_or_default();
+    if let Some(session) = session_mut(gui, session_id) {
+        session["eventCount"] = json!(count);
+        session["updatedAt"] = json!(now_text());
+    }
+}
+
+fn session_result(gui: &GuiState, session_id: &str) -> Json<ApiResponse> {
+    let Some(session) = gui
+        .sessions
+        .iter()
+        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+    else {
+        return ApiResponse::error("agent_session_not_found", "agent session not found");
+    };
+    ApiResponse::ok(json!({
+        "session": session,
+        "events": gui.session_events.get(session_id).cloned().unwrap_or_default()
+    }))
+}
+
+fn agent_event(session_id: &str, kind: &str, payload: Value, ts: &str) -> Value {
+    json!({
+        "id": format!("evt-{}-{}", kind, now_millis()),
+        "sessionId": session_id,
+        "ts": ts,
+        "kind": kind,
+        "payload": payload
+    })
+}
+
+fn terminal_session_by_id(gui: &GuiState, session_id: &str) -> Json<ApiResponse> {
+    gui.terminals
+        .iter()
+        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+        .cloned()
+        .map(ApiResponse::ok)
+        .unwrap_or_else(|| ApiResponse::error("terminal_not_found", "terminal session not found"))
+}
+
+fn update_browser_action(browser: &mut BrowserState, action: &str, result: &str) {
+    browser.last_action = Some(action.to_string());
+    browser.last_action_at = Some(now_text());
+    browser.last_action_result = Some(result.to_string());
+}
+
+fn browser_status_payload(browser: &BrowserState) -> Value {
+    json!({
+        "status": if browser.current_url.is_some() { "running" } else { "idle" },
+        "inspectState": browser.inspect_state,
+        "currentUrl": browser.current_url,
+        "message": "Packaged browser preview bridge is available; real DOM capture remains reserved.",
+        "snapshot": browser.snapshot,
+        "lastAction": browser.last_action,
+        "lastActionAt": browser.last_action_at,
+        "capabilities": {
+            "status": "available",
+            "openTargetRecording": "available",
+            "reloadRecording": "available",
+            "inspectModeRecording": "available",
+            "domCapture": "reserved",
+            "agentAttachment": "reserved"
+        },
+        "diagnostics": {
+            "currentUrl": browser.current_url,
+            "runtimeStatus": if browser.current_url.is_some() { "running" } else { "idle" },
+            "inspectState": browser.inspect_state,
+            "hasSnapshot": browser.snapshot.is_some(),
+            "attached": browser.attached,
+            "lastAction": browser.last_action,
+            "lastActionAt": browser.last_action_at,
+            "lastActionResult": browser.last_action_result
+        }
+    })
+}
+
+fn default_panel_snapshot(current_url: Option<&str>) -> Value {
+    json!({
+        "id": format!("snapshot-{}", now_millis()),
+        "url": current_url.unwrap_or("http://127.0.0.1:31249/"),
+        "capturedAt": now_text(),
+        "selector": "body",
+        "panelKind": "browser-preview",
+        "panelTitle": "Packaged DeepCode preview",
+        "textContent": "DOM capture is reserved; this diagnostic snapshot proves the GUI Host API is wired.",
+        "sourceHints": ["userspace/gui"],
+        "relatedFiles": ["userspace/gui/src/components/internal-browser/InternalBrowserPanel.tsx"]
+    })
+}
+
+fn rid(value: &str) -> RequestId {
+    RequestId(value.to_string())
+}

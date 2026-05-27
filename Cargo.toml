@@ -9,8 +9,9 @@ members = [
   "crates/deepcode-kernel-skills",
   "crates/deepcode-kernel-workflow",
   "crates/deepcode-kernel-ledger",
+  "crates/deepcode-host-web",
 ]
-exclude = ["tauri/src-tauri"]
+exclude = []
 resolver = "2"
 
 [workspace.package]
@@ -29,6 +30,10 @@ deepcode-kernel-prompt = { path = "crates/deepcode-kernel-prompt" }
 deepcode-kernel-runtime = { path = "crates/deepcode-kernel-runtime" }
 deepcode-kernel-skills = { path = "crates/deepcode-kernel-skills" }
 deepcode-kernel-workflow = { path = "crates/deepcode-kernel-workflow" }
+axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tower-http = { version = "0.5", features = ["fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -72,6 +72,51 @@ impl Kernel {
             KernelCommand::RunResume { request_id, .. } => {
                 self.not_implemented(request_id, "run.resume")
             }
+            KernelCommand::WorkspaceOpen { request_id, .. } => {
+                self.not_implemented(request_id, "workspace.open")
+            }
+            KernelCommand::WorkspaceCurrent { request_id } => {
+                self.not_implemented(request_id, "workspace.current")
+            }
+            KernelCommand::WorkspaceList { request_id, .. } => {
+                self.not_implemented(request_id, "workspace.list")
+            }
+            KernelCommand::WorkspaceRead { request_id, .. } => {
+                self.not_implemented(request_id, "workspace.read")
+            }
+            KernelCommand::WorkspaceWrite { request_id, .. } => {
+                self.not_implemented(request_id, "workspace.write")
+            }
+            KernelCommand::WorkspaceCreate { request_id, .. } => {
+                self.not_implemented(request_id, "workspace.create")
+            }
+            KernelCommand::WorkspaceCreateFolder { request_id, .. } => {
+                self.not_implemented(request_id, "workspace.create_folder")
+            }
+            KernelCommand::WorkspaceRename { request_id, .. } => {
+                self.not_implemented(request_id, "workspace.rename")
+            }
+            KernelCommand::WorkspaceDelete { request_id, .. } => {
+                self.not_implemented(request_id, "workspace.delete")
+            }
+            KernelCommand::WorkspaceSearch { request_id, .. } => {
+                self.not_implemented(request_id, "workspace.search")
+            }
+            KernelCommand::SkillDiscover { request_id } => {
+                self.not_implemented(request_id, "skill.discover")
+            }
+            KernelCommand::SkillInvoke { request_id, .. } => {
+                self.not_implemented(request_id, "skill.invoke")
+            }
+            KernelCommand::ContextAttachReference { request_id, .. } => {
+                self.not_implemented(request_id, "context.attach_reference")
+            }
+            KernelCommand::ContextListReferences { request_id } => {
+                self.not_implemented(request_id, "context.list_references")
+            }
+            KernelCommand::WorkflowObserve { request_id, .. } => {
+                self.not_implemented(request_id, "workflow.observe")
+            }
             KernelCommand::PermissionResolve { request_id, .. } => {
                 self.not_implemented(request_id, "permission.resolve")
             }

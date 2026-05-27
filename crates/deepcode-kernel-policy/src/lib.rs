@@ -24,6 +24,10 @@ impl Capability {
         Self::new("workspace.write")
     }
 
+    pub fn workspace_create() -> Self {
+        Self::new("workspace.create")
+    }
+
     pub fn workspace_delete() -> Self {
         Self::new("workspace.delete")
     }
@@ -74,6 +78,8 @@ impl Capability {
 pub enum CapabilityEffect {
     ReadsWorkspace,
     WritesWorkspace,
+    CreatesWorkspace,
+    DeletesWorkspace,
     RunsProcess,
     UsesNetwork,
     ReadsSecret,
@@ -376,7 +382,12 @@ impl PolicyProfile {
                 })
                 .expect("kernel grant");
         }
-        for capability in [Capability::workspace_write(), Capability::process_exec()] {
+        for capability in [
+            Capability::workspace_write(),
+            Capability::workspace_create(),
+            Capability::workspace_delete(),
+            Capability::process_exec(),
+        ] {
             profile
                 .grant(PolicyGrant {
                     capability,
@@ -449,7 +460,6 @@ impl PolicyProfile {
             Capability::workspace_search(),
             Capability::workspace_preview_diff(),
             Capability::workspace_write(),
-            Capability::workspace_delete(),
             Capability::workspace_rename(),
         ] {
             profile
@@ -458,6 +468,21 @@ impl PolicyProfile {
                     decision: PolicyDecisionKind::Allow,
                     source: PolicySourceTrust::Kernel,
                     reason: Some("trusted profile full ordinary workspace access".to_string()),
+                })
+                .expect("kernel grant");
+        }
+        for capability in [
+            Capability::workspace_create(),
+            Capability::workspace_delete(),
+        ] {
+            profile
+                .grant(PolicyGrant {
+                    capability,
+                    decision: PolicyDecisionKind::Ask,
+                    source: PolicySourceTrust::Kernel,
+                    reason: Some(
+                        "create/delete are isolated higher-risk workspace capabilities".to_string(),
+                    ),
                 })
                 .expect("kernel grant");
         }
@@ -641,6 +666,7 @@ fn matching_temporary_grant<'a>(
 
 fn is_workspace_file_mutation(capability: &Capability) -> bool {
     capability == &Capability::workspace_write()
+        || capability == &Capability::workspace_create()
         || capability == &Capability::workspace_delete()
         || capability == &Capability::workspace_rename()
 }
@@ -750,13 +776,29 @@ mod tests {
         assert_eq!(safe_write.decision, PolicyDecisionKind::Ask);
 
         let trusted = PolicyProfile::trusted_workspace_defaults();
+        let trusted_write = gate
+            .evaluate(
+                &trusted,
+                &request(Capability::workspace_write(), RiskLevel::High),
+            )
+            .unwrap();
+        assert_eq!(trusted_write.decision, PolicyDecisionKind::Allow);
+
+        let trusted_create = gate
+            .evaluate(
+                &trusted,
+                &request(Capability::workspace_create(), RiskLevel::High),
+            )
+            .unwrap();
+        assert_eq!(trusted_create.decision, PolicyDecisionKind::Ask);
+
         let trusted_delete = gate
             .evaluate(
                 &trusted,
                 &request(Capability::workspace_delete(), RiskLevel::High),
             )
             .unwrap();
-        assert_eq!(trusted_delete.decision, PolicyDecisionKind::Allow);
+        assert_eq!(trusted_delete.decision, PolicyDecisionKind::Ask);
 
         let expert = PolicyProfile::expert_defaults();
         let expert_shell = gate

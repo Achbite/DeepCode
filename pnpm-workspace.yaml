@@ -1,7 +1,6 @@
 packages:
-  - "client"
-  - "server"
-  - "tauri"
-  - "packages/*"
+  - "userspace/gui"
+  - "userspace/protocol"
+  - "userspace/session-core"
 allowBuilds:
   esbuild: true

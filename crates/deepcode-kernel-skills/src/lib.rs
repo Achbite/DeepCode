@@ -3,6 +3,9 @@ use deepcode_kernel_policy::{Capability, CapabilityEffect, RiskLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +40,7 @@ pub struct SkillDescriptor {
     pub effects: Vec<CapabilityEffect>,
     pub source: SkillSource,
     pub executor_kind: SkillExecutorKind,
+    pub model_visible: bool,
 }
 
 impl SkillDescriptor {
@@ -65,6 +69,43 @@ pub struct SkillResult {
     pub ok: bool,
     pub output: Value,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalProcessSkillSpec {
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub env_allowlist: Vec<String>,
+    pub timeout_ms: u64,
+    pub stdout_limit_bytes: usize,
+    pub stderr_limit_bytes: usize,
+}
+
+impl ExternalProcessSkillSpec {
+    pub fn python_inline(code: impl Into<String>) -> Self {
+        Self {
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), code.into()],
+            cwd: None,
+            env_allowlist: Vec::new(),
+            timeout_ms: 3_000,
+            stdout_limit_bytes: 16 * 1024,
+            stderr_limit_bytes: 16 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalProcessSkillRuntime {
+    spec: ExternalProcessSkillSpec,
+}
+
+impl ExternalProcessSkillRuntime {
+    pub fn new(spec: ExternalProcessSkillSpec) -> Self {
+        Self { spec }
+    }
 }
 
 pub trait SkillRegistry {
@@ -100,6 +141,7 @@ impl InMemorySkillRegistry {
                 RiskLevel::Low,
                 vec![CapabilityEffect::ReadsWorkspace],
                 vec!["plan", "check", "complete", "review"],
+                true,
             ),
             builtin(
                 "fs.list",
@@ -108,6 +150,7 @@ impl InMemorySkillRegistry {
                 RiskLevel::Low,
                 vec![CapabilityEffect::ReadsWorkspace],
                 vec!["plan", "check", "complete", "review"],
+                true,
             ),
             builtin(
                 "fs.diff",
@@ -116,6 +159,7 @@ impl InMemorySkillRegistry {
                 RiskLevel::Low,
                 vec![CapabilityEffect::ReadsWorkspace],
                 vec!["plan", "check", "complete", "review"],
+                true,
             ),
             builtin(
                 "code.search",
@@ -124,6 +168,7 @@ impl InMemorySkillRegistry {
                 RiskLevel::Low,
                 vec![CapabilityEffect::ReadsWorkspace],
                 vec!["plan", "check", "complete", "review"],
+                true,
             ),
             builtin(
                 "shell.propose",
@@ -132,6 +177,7 @@ impl InMemorySkillRegistry {
                 RiskLevel::Medium,
                 vec![CapabilityEffect::RunsProcess],
                 vec!["plan", "complete"],
+                true,
             ),
             builtin(
                 "fs.write",
@@ -140,6 +186,16 @@ impl InMemorySkillRegistry {
                 RiskLevel::High,
                 vec![CapabilityEffect::WritesWorkspace],
                 vec!["complete"],
+                true,
+            ),
+            builtin(
+                "fs.delete",
+                "skill.fs.delete.description",
+                Capability::workspace_delete(),
+                RiskLevel::Critical,
+                vec![CapabilityEffect::DeletesWorkspace],
+                vec!["complete"],
+                false,
             ),
             builtin(
                 "shell.exec",
@@ -148,6 +204,7 @@ impl InMemorySkillRegistry {
                 RiskLevel::High,
                 vec![CapabilityEffect::RunsProcess],
                 vec!["complete"],
+                true,
             ),
         ])
     }
@@ -187,6 +244,92 @@ impl SkillRuntime for InMemorySkillRegistry {
     }
 }
 
+impl SkillRuntime for ExternalProcessSkillRuntime {
+    fn invoke(&self, invocation: SkillInvocation) -> KernelResult<SkillResult> {
+        let mut args = self.spec.args.clone();
+        if let Some(extra_args) = invocation.input.get("args").and_then(Value::as_array) {
+            for arg in extra_args {
+                let value = arg.as_str().ok_or_else(|| {
+                    KernelError::InvalidCommand(
+                        "external process skill args must be strings".to_string(),
+                    )
+                })?;
+                args.push(value.to_string());
+            }
+        }
+
+        let mut command = Command::new(&self.spec.command);
+        command.args(args);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        command.env_clear();
+        for key in &self.spec.env_allowlist {
+            if let Ok(value) = std::env::var(key) {
+                command.env(key, value);
+            }
+        }
+        if let Some(cwd) = &self.spec.cwd {
+            command.current_dir(cwd);
+        }
+
+        let mut child = command.spawn().map_err(|error| {
+            KernelError::Other(format!(
+                "spawn external skill {}: {error}",
+                self.spec.command
+            ))
+        })?;
+        let deadline = Instant::now() + Duration::from_millis(self.spec.timeout_ms.max(1));
+        let mut timed_out = false;
+
+        loop {
+            if child
+                .try_wait()
+                .map_err(|error| KernelError::Other(format!("poll external skill: {error}")))?
+                .is_some()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                timed_out = true;
+                child
+                    .kill()
+                    .map_err(|error| KernelError::Other(format!("kill external skill: {error}")))?;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let output = child.wait_with_output().map_err(|error| {
+            KernelError::Other(format!("collect external skill output: {error}"))
+        })?;
+        let stdout = truncate_utf8(&output.stdout, self.spec.stdout_limit_bytes);
+        let stderr = truncate_utf8(&output.stderr, self.spec.stderr_limit_bytes);
+        let exit_code = output.status.code();
+        let ok = output.status.success() && !timed_out;
+
+        Ok(SkillResult {
+            invocation_id: invocation.id,
+            ok,
+            output: serde_json::json!({
+                "exitCode": exit_code,
+                "timedOut": timed_out,
+                "stdout": stdout,
+                "stderr": stderr,
+                "stdoutTruncated": output.stdout.len() > self.spec.stdout_limit_bytes,
+                "stderrTruncated": output.stderr.len() > self.spec.stderr_limit_bytes
+            }),
+            error: (!ok).then(|| {
+                if timed_out {
+                    "external process skill timed out".to_string()
+                } else {
+                    format!("external process skill exited with {exit_code:?}")
+                }
+            }),
+        })
+    }
+}
+
 fn builtin(
     id: &str,
     description_key: &str,
@@ -194,6 +337,7 @@ fn builtin(
     risk_level: RiskLevel,
     effects: Vec<CapabilityEffect>,
     allowed_phases: Vec<&str>,
+    model_visible: bool,
 ) -> SkillDescriptor {
     SkillDescriptor {
         id: id.to_string(),
@@ -208,7 +352,13 @@ fn builtin(
         effects,
         source: SkillSource::Builtin,
         executor_kind: SkillExecutorKind::Builtin,
+        model_visible,
     }
+}
+
+fn truncate_utf8(bytes: &[u8], limit: usize) -> String {
+    let limit = limit.min(bytes.len());
+    String::from_utf8_lossy(&bytes[..limit]).to_string()
 }
 
 #[cfg(test)]
@@ -218,13 +368,23 @@ mod tests {
     #[test]
     fn builtin_catalog_contains_expected_tools() {
         let registry = InMemorySkillRegistry::with_builtin_tools();
-        assert_eq!(registry.len(), 7);
+        assert_eq!(registry.len(), 8);
         let write = registry.get("fs.write").unwrap().unwrap();
         assert_eq!(write.risk_level, RiskLevel::High);
         assert_eq!(
             write.primary_capability(),
             Some(Capability::workspace_write())
         );
+        assert!(write.model_visible);
+
+        let delete = registry.get("fs.delete").unwrap().unwrap();
+        assert_eq!(delete.risk_level, RiskLevel::Critical);
+        assert_eq!(
+            delete.primary_capability(),
+            Some(Capability::workspace_delete())
+        );
+        assert!(!delete.model_visible);
+        assert!(delete.effects.contains(&CapabilityEffect::DeletesWorkspace));
     }
 
     #[test]
@@ -259,6 +419,7 @@ mod tests {
                 connector_id: "mcp.github".to_string(),
             },
             executor_kind: SkillExecutorKind::ExternalConnector,
+            model_visible: false,
         }]);
 
         let descriptor = registry.get("mcp.github.search").unwrap().unwrap();
@@ -272,5 +433,66 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error, KernelError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn external_process_skill_runs_python_under_kernel_control() {
+        let runtime = ExternalProcessSkillRuntime::new(ExternalProcessSkillSpec::python_inline(
+            "print('skill-ok')",
+        ));
+
+        let result = runtime
+            .invoke(SkillInvocation {
+                id: "invoke-python".to_string(),
+                skill_id: "external.python.echo".to_string(),
+                phase: Some("complete".to_string()),
+                input: serde_json::json!({}),
+            })
+            .unwrap();
+
+        assert!(result.ok);
+        assert_eq!(result.output["exitCode"], 0);
+        assert_eq!(result.output["stdout"], "skill-ok\n");
+    }
+
+    #[test]
+    fn external_process_skill_times_out_and_reports_exit_context() {
+        let mut spec =
+            ExternalProcessSkillSpec::python_inline("import time; time.sleep(3); print('late')");
+        spec.timeout_ms = 50;
+        let runtime = ExternalProcessSkillRuntime::new(spec);
+
+        let result = runtime
+            .invoke(SkillInvocation {
+                id: "invoke-timeout".to_string(),
+                skill_id: "external.python.timeout".to_string(),
+                phase: Some("complete".to_string()),
+                input: serde_json::json!({}),
+            })
+            .unwrap();
+
+        assert!(!result.ok);
+        assert_eq!(result.output["timedOut"], true);
+        assert!(result.error.unwrap().contains("timed out"));
+    }
+
+    #[test]
+    fn external_process_skill_applies_output_limits() {
+        let mut spec = ExternalProcessSkillSpec::python_inline("print('abcdef')");
+        spec.stdout_limit_bytes = 3;
+        let runtime = ExternalProcessSkillRuntime::new(spec);
+
+        let result = runtime
+            .invoke(SkillInvocation {
+                id: "invoke-limit".to_string(),
+                skill_id: "external.python.limit".to_string(),
+                phase: Some("complete".to_string()),
+                input: serde_json::json!({}),
+            })
+            .unwrap();
+
+        assert!(result.ok);
+        assert_eq!(result.output["stdout"], "abc");
+        assert_eq!(result.output["stdoutTruncated"], true);
     }
 }

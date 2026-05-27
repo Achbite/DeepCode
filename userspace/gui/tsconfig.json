@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "jsx": "react-jsx",
+    "types": ["node", "vite/client"],
+    "baseUrl": ".",
+    "paths": {
+      "@deepcode/protocol": ["../protocol/dist/index.d.ts"],
+      "@deepcode/protocol/*": ["../protocol/dist/*"],
+      "@deepcode/session-core": ["../session-core/dist/index.d.ts"],
+      "@deepcode/session-core/*": ["../session-core/dist/*"]
+    }
+  },
+  "references": [
+    { "path": "../protocol" },
+    { "path": "../session-core" }
+  ],
+  "include": ["src", "vite-env.d.ts"]
+}

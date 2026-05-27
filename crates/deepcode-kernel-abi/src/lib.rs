@@ -22,7 +22,7 @@ pub struct TurnId(pub String);
 #[serde(rename_all = "camelCase")]
 pub struct StageRunId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
@@ -59,6 +59,82 @@ pub enum KernelCommand {
     RunResume {
         request_id: RequestId,
         session_id: SessionId,
+    },
+    WorkspaceOpen {
+        request_id: RequestId,
+        path: String,
+    },
+    WorkspaceCurrent {
+        request_id: RequestId,
+    },
+    WorkspaceList {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: Option<String>,
+        depth: Option<u32>,
+    },
+    WorkspaceRead {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: String,
+    },
+    WorkspaceWrite {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: String,
+        content: String,
+        create: bool,
+    },
+    WorkspaceCreate {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: String,
+        content: Option<String>,
+    },
+    WorkspaceCreateFolder {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: String,
+    },
+    WorkspaceRename {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        old_path: String,
+        new_path: String,
+    },
+    WorkspaceDelete {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: String,
+    },
+    WorkspaceSearch {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        query: String,
+        include: Option<Vec<String>>,
+        is_regex: bool,
+    },
+    SkillDiscover {
+        request_id: RequestId,
+    },
+    SkillInvoke {
+        request_id: RequestId,
+        skill_id: String,
+        input: Value,
+    },
+    ContextAttachReference {
+        request_id: RequestId,
+        source_path: String,
+        import_copy: bool,
+    },
+    ContextListReferences {
+        request_id: RequestId,
+    },
+    WorkflowObserve {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        event: Box<KernelEvent>,
     },
     PermissionResolve {
         request_id: RequestId,
@@ -284,6 +360,41 @@ pub enum KernelEvent {
         phase: String,
         sequence: Option<u64>,
     },
+    #[serde(rename = "workflow.decision_made")]
+    WorkflowDecisionMade {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        decision: WorkflowDecision,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "workspace.result")]
+    WorkspaceResult {
+        request_id: RequestId,
+        operation: String,
+        ok: bool,
+        output: Option<Value>,
+        error: Option<KernelErrorEnvelope>,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "skill.result")]
+    SkillResult {
+        request_id: RequestId,
+        skill_id: Option<String>,
+        ok: bool,
+        output: Option<Value>,
+        error: Option<KernelErrorEnvelope>,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "context.result")]
+    ContextResult {
+        request_id: RequestId,
+        operation: String,
+        ok: bool,
+        output: Option<Value>,
+        error: Option<KernelErrorEnvelope>,
+        sequence: Option<u64>,
+    },
     #[serde(rename = "tempArtifact.created")]
     TempArtifactCreated {
         run_id: RunId,
@@ -416,6 +527,67 @@ pub struct PermissionRequestEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum WorkflowDecisionAction {
+    Continue,
+    AwaitPermission,
+    Replan,
+    Review,
+    Done,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkflowDecisionReason {
+    EventAccepted,
+    AwaitingPermission,
+    PermissionRejected,
+    PendingCriticalSteps,
+    CompletionCriteriaSatisfied,
+    AnswerObligationsSatisfied,
+    ToolFailed,
+    KernelUnableToDecide,
+    FailClosed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnswerObligationId {
+    Identity,
+    ToolComponentSummary,
+    TempFileLifecycleResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnswerObligationStatus {
+    Pending,
+    Satisfied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerObligation {
+    pub id: AnswerObligationId,
+    pub description: String,
+    pub status: AnswerObligationStatus,
+    pub satisfied_by_event: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowDecision {
+    pub action: WorkflowDecisionAction,
+    pub reason: WorkflowDecisionReason,
+    pub phase: Option<String>,
+    pub pending_steps: Vec<String>,
+    pub answer_obligations: Vec<AnswerObligation>,
+    pub summary: Option<String>,
+    pub fail_closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptEnvelopeRef {
     pub id: String,
     pub hash: Option<String>,
@@ -535,6 +707,51 @@ mod tests {
     }
 
     #[test]
+    fn workspace_and_skill_syscalls_round_trip() {
+        let command = KernelCommand::WorkspaceWrite {
+            request_id: RequestId("req-write".to_string()),
+            folder_id: Some("wf-0".to_string()),
+            path: "_agent_tmp_syscall.txt".to_string(),
+            content: "hello".to_string(),
+            create: true,
+        };
+
+        let encoded = serde_json::to_value(&command).expect("serialize workspace write");
+        assert_eq!(encoded["kind"], "workspaceWrite");
+        assert_eq!(encoded["path"], "_agent_tmp_syscall.txt");
+
+        let decoded: KernelCommand =
+            serde_json::from_value(encoded).expect("deserialize workspace write");
+        assert_eq!(decoded, command);
+
+        let command = KernelCommand::SkillInvoke {
+            request_id: RequestId("req-skill".to_string()),
+            skill_id: "external.python.echo".to_string(),
+            input: serde_json::json!({ "text": "ok" }),
+        };
+        let encoded = serde_json::to_value(&command).expect("serialize skill invoke");
+        assert_eq!(encoded["kind"], "skillInvoke");
+        assert_eq!(encoded["skillId"], "external.python.echo");
+    }
+
+    #[test]
+    fn syscall_result_events_are_locale_neutral() {
+        let event = KernelEvent::WorkspaceResult {
+            request_id: RequestId("req-list".to_string()),
+            operation: "workspace.list".to_string(),
+            ok: true,
+            output: Some(serde_json::json!({ "nodes": [] })),
+            error: None,
+            sequence: Some(1),
+        };
+
+        let encoded = serde_json::to_value(&event).expect("serialize workspace result");
+        assert_eq!(encoded["kind"], "workspace.result");
+        assert_eq!(encoded["operation"], "workspace.list");
+        assert_eq!(encoded["ok"], true);
+    }
+
+    #[test]
     fn kernel_event_uses_locale_neutral_dotted_kind() {
         let event = KernelEvent::MessageAppended {
             run_id: Some(RunId("run-1".to_string())),
@@ -588,6 +805,61 @@ mod tests {
         assert_eq!(encoded["kind"], "workflow.checkpointed");
         assert_eq!(encoded["checkpointId"], "checkpoint-1");
         let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize event");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn workflow_observe_and_decision_event_round_trip() {
+        let observed = KernelEvent::ToolCompleted {
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            turn_id: None,
+            tool_call_id: "tool-1".to_string(),
+            tool_name: "fs.list".to_string(),
+            ok: true,
+            output: Some(serde_json::json!({ "path": "." })),
+            error: None,
+            sequence: Some(5),
+        };
+        let command = KernelCommand::WorkflowObserve {
+            request_id: RequestId("req-observe".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            event: Box::new(observed.clone()),
+        };
+        let encoded = serde_json::to_value(&command).expect("serialize observe command");
+        assert_eq!(encoded["kind"], "workflowObserve");
+        assert_eq!(encoded["event"]["kind"], "tool.completed");
+        let decoded: KernelCommand =
+            serde_json::from_value(encoded).expect("deserialize observe command");
+        assert_eq!(decoded, command);
+
+        let event = KernelEvent::WorkflowDecisionMade {
+            request_id: Some(RequestId("req-observe".to_string())),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            decision: WorkflowDecision {
+                action: WorkflowDecisionAction::Continue,
+                reason: WorkflowDecisionReason::PendingCriticalSteps,
+                phase: Some("complete".to_string()),
+                pending_steps: vec!["create temp file".to_string()],
+                answer_obligations: vec![AnswerObligation {
+                    id: AnswerObligationId::Identity,
+                    description: "answer identity once".to_string(),
+                    status: AnswerObligationStatus::Pending,
+                    satisfied_by_event: None,
+                }],
+                summary: Some("Continue until completion criteria are satisfied.".to_string()),
+                fail_closed: false,
+            },
+            sequence: Some(6),
+        };
+        let encoded = serde_json::to_value(&event).expect("serialize decision event");
+        assert_eq!(encoded["kind"], "workflow.decision_made");
+        assert_eq!(encoded["decision"]["action"], "continue");
+        assert_eq!(encoded["decision"]["reason"], "pendingCriticalSteps");
+        let decoded: KernelEvent =
+            serde_json::from_value(encoded).expect("deserialize decision event");
         assert_eq!(decoded, event);
     }
 
