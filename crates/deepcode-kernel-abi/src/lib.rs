@@ -114,6 +114,15 @@ pub enum KernelCommand {
         include: Option<Vec<String>>,
         is_regex: bool,
     },
+    ToolInvoke {
+        request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: Value,
+        workspace_binding: Option<WorkspaceBinding>,
+    },
     SkillDiscover {
         request_id: RequestId,
     },

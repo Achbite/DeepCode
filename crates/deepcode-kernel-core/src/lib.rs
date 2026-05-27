@@ -102,6 +102,9 @@ impl Kernel {
             KernelCommand::WorkspaceSearch { request_id, .. } => {
                 self.not_implemented(request_id, "workspace.search")
             }
+            KernelCommand::ToolInvoke { request_id, .. } => {
+                self.not_implemented(request_id, "tool.invoke")
+            }
             KernelCommand::SkillDiscover { request_id } => {
                 self.not_implemented(request_id, "skill.discover")
             }

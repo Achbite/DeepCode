@@ -26,7 +26,6 @@ export interface ToolExecutionRequest {
   mode: AgentMode;
   toolCall: ToolCall;
   workspaceBinding?: AgentWorkspaceBinding;
-  approved?: boolean;
 }
 
 export interface PermissionEvaluationRequest {

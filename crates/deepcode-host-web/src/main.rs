@@ -1,9 +1,10 @@
 use axum::extract::{Path, Query, State};
-use axum::http::Method;
+use axum::http::{header, Method};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, patch, post};
 use axum::{Json, Router};
 use deepcode_kernel_abi::{
-    KernelCommand, KernelErrorEnvelope, KernelEvent, RequestId, WorkspaceBinding,
+    KernelCommand, KernelErrorEnvelope, KernelEvent, KernelSnapshot, RequestId, WorkspaceBinding,
 };
 use deepcode_kernel_runtime::DeepCodeKernelRuntime;
 use serde::{Deserialize, Serialize};
@@ -18,12 +19,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::services::{ServeDir, ServeFile};
 
 const AGENT_WORKFLOW_STAGES: [&str; 4] = ["plan", "check", "complete", "review"];
-const TEMP_TEST_PATH: &str = "_agent_tmp_functional_test.txt";
-
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<Mutex<DeepCodeKernelRuntime>>,
     gui: Arc<Mutex<GuiState>>,
+    kernel_events: Arc<Mutex<Vec<KernelEvent>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,6 +53,36 @@ impl ApiResponse {
             message: Some(message.into()),
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KernelCommandEnvelope {
+    request_id: Option<String>,
+    command: KernelCommand,
+    idempotency_key: Option<String>,
+    expected_snapshot_seq: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KernelReply {
+    ok: bool,
+    events: Vec<KernelEvent>,
+    snapshot: Option<KernelSnapshot>,
+    error: Option<KernelErrorEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KernelSnapshotQuery {
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KernelEventStreamQuery {
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,7 +148,6 @@ struct SearchRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ToolExecuteRequest {
-    approved: Option<bool>,
     workspace_binding: Option<WorkspaceBinding>,
     tool_call: ToolCallRequest,
 }
@@ -129,21 +158,6 @@ struct ToolCallRequest {
     id: Option<String>,
     name: String,
     arguments: Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PermissionEvaluateRequest {
-    workspace_binding: Option<WorkspaceBinding>,
-    tool_call: ToolCallRequest,
-}
-
-#[derive(Debug, Clone)]
-struct PendingAgentPermission {
-    session_id: String,
-    request_body: Value,
-    tool_call: ToolCallRequest,
-    workspace_binding: Option<WorkspaceBinding>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,21 +203,6 @@ struct AgentRunRequest {
     profile_id: Option<String>,
     workflow_config: Value,
     workspace_binding: Option<WorkspaceBinding>,
-    original_body: Value,
-}
-
-#[derive(Debug, Clone, Default)]
-struct HostWorkflowMemory {
-    identity_required: bool,
-    tool_summary_required: bool,
-    temp_lifecycle_required: bool,
-    workspace_listed: bool,
-    search_done: bool,
-    temp_created: bool,
-    temp_read: bool,
-    temp_deleted: bool,
-    identity_answered: bool,
-    final_answered: bool,
 }
 
 type SharedRuntime = Arc<Mutex<DeepCodeKernelRuntime>>;
@@ -214,6 +213,7 @@ struct HostPaths {
     llm_profiles_path: PathBuf,
     llm_secrets_path: PathBuf,
     workflow_config_path: PathBuf,
+    sessions_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -224,12 +224,11 @@ struct GuiState {
     workflow_config: Value,
     sessions: Vec<Value>,
     current_session_id: Option<String>,
-    session_events: HashMap<String, Vec<Value>>,
+    session_projection_cache: HashMap<String, Vec<Value>>,
     trace_events: HashMap<String, Vec<Value>>,
     browser: BrowserState,
     terminals: Vec<Value>,
     terminal_events: HashMap<String, Vec<Value>>,
-    pending_permissions: HashMap<String, PendingAgentPermission>,
 }
 
 #[derive(Debug)]
@@ -259,12 +258,11 @@ impl GuiState {
             workflow_config,
             sessions: Vec::new(),
             current_session_id: None,
-            session_events: HashMap::new(),
+            session_projection_cache: HashMap::new(),
             trace_events: HashMap::new(),
             browser: BrowserState::default(),
             terminals: Vec::new(),
             terminal_events: HashMap::new(),
-            pending_permissions: HashMap::new(),
         }
     }
 }
@@ -287,6 +285,7 @@ impl HostPaths {
             llm_profiles_path: settings_dir.join("llm-profiles.json"),
             llm_secrets_path: secrets_dir.join("llm-secrets.json"),
             workflow_config_path: settings_dir.join("agent-workflow-config.json"),
+            sessions_dir: root.join("sessions"),
         }
     }
 }
@@ -315,9 +314,18 @@ async fn main() {
     let state = AppState {
         runtime: Arc::new(Mutex::new(DeepCodeKernelRuntime::new())),
         gui: Arc::new(Mutex::new(GuiState::new())),
+        kernel_events: Arc::new(Mutex::new(Vec::new())),
     };
     let mut app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/kernel/commands", post(kernel_commands))
+        .route("/api/kernel/snapshot", get(kernel_snapshot))
+        .route("/api/kernel/events/stream", get(kernel_events_stream))
+        .route("/api/session-store/index", get(session_store_index))
+        .route(
+            "/api/session-store/:session_id/projection",
+            get(session_store_projection_get).post(session_store_projection_append),
+        )
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/open", post(workspace_open))
         .route("/api/workspaces/save-file", post(workspace_save_file))
@@ -420,10 +428,6 @@ async fn main() {
         .route("/api/agent/tools", get(agent_tools))
         .route("/api/agent/skills", get(agent_tools))
         .route("/api/agent/tools/execute", post(agent_tool_execute))
-        .route(
-            "/api/agent/permissions/evaluate",
-            post(agent_permission_evaluate),
-        )
         .route("/api/browser/runtime-status", get(browser_status))
         .route("/api/browser/open", post(browser_open))
         .route("/api/browser/reload", post(browser_reload))
@@ -471,6 +475,152 @@ async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         "status": "ok",
         "kernel": "ready",
         "workspace": workspace
+    }))
+}
+
+async fn kernel_commands(
+    State(state): State<AppState>,
+    Json(body): Json<KernelCommandEnvelope>,
+) -> Json<KernelReply> {
+    let session_id = kernel_command_session_id(&body.command);
+    let _request_id = body.request_id.as_deref();
+    let _idempotency_key = body.idempotency_key.as_deref();
+    let _expected_snapshot_seq = body.expected_snapshot_seq;
+
+    let result = {
+        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+        runtime.dispatch(body.command)
+    };
+
+    match result {
+        Ok(events) => {
+            record_kernel_events(&state, &events);
+            let snapshot = {
+                let runtime = state.runtime.lock().expect("kernel runtime lock");
+                runtime.snapshot(session_id.as_deref())
+            };
+            Json(KernelReply {
+                ok: true,
+                events,
+                snapshot: Some(snapshot),
+                error: None,
+            })
+        }
+        Err(error) => Json(KernelReply {
+            ok: false,
+            events: Vec::new(),
+            snapshot: None,
+            error: Some(KernelErrorEnvelope::from(&error)),
+        }),
+    }
+}
+
+async fn kernel_snapshot(
+    State(state): State<AppState>,
+    Query(query): Query<KernelSnapshotQuery>,
+) -> Json<KernelReply> {
+    let snapshot = {
+        let runtime = state.runtime.lock().expect("kernel runtime lock");
+        runtime.snapshot(query.session_id.as_deref())
+    };
+    Json(KernelReply {
+        ok: true,
+        events: Vec::new(),
+        snapshot: Some(snapshot),
+        error: None,
+    })
+}
+
+async fn kernel_events_stream(
+    State(state): State<AppState>,
+    Query(query): Query<KernelEventStreamQuery>,
+) -> Response {
+    let events = {
+        let events = state
+            .kernel_events
+            .lock()
+            .expect("kernel event stream lock");
+        events
+            .iter()
+            .filter(|event| {
+                query
+                    .session_id
+                    .as_deref()
+                    .map(|session_id| kernel_event_session_id(event).as_deref() == Some(session_id))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let mut body = String::new();
+    if events.is_empty() {
+        body.push_str(": deepcode kernel event stream ready\n\n");
+    } else {
+        for event in events {
+            let data = serde_json::to_string(&event)
+                .unwrap_or_else(|_| "{\"kind\":\"error\"}".to_string());
+            body.push_str("event: kernel\n");
+            body.push_str("data: ");
+            body.push_str(&data);
+            body.push_str("\n\n");
+        }
+    }
+
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn session_store_index(State(state): State<AppState>) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    ApiResponse::ok(json!({
+        "sessions": gui.sessions,
+        "storeRoot": gui.paths.sessions_dir.to_string_lossy()
+    }))
+}
+
+async fn session_store_projection_get(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let entries = session_projection(&state, &session_id);
+    ApiResponse::ok(json!({
+        "sessionId": session_id,
+        "entries": entries,
+        "events": entries
+    }))
+}
+
+async fn session_store_projection_append(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let entries = body
+        .get("entries")
+        .or_else(|| body.get("events"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    append_session_projection(&state, &session_id, entries);
+    let stored = session_projection(&state, &session_id);
+    ApiResponse::ok(json!({
+        "sessionId": session_id,
+        "appended": body
+            .get("entries")
+            .or_else(|| body.get("events"))
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default(),
+        "entryCount": stored.len(),
+        "entries": stored,
+        "events": stored
     }))
 }
 
@@ -1198,7 +1348,7 @@ async fn agent_session_create(
         "updatedAt": now
     });
     gui.current_session_id = Some(id.clone());
-    gui.session_events.insert(id.clone(), Vec::new());
+    gui.session_projection_cache.insert(id.clone(), Vec::new());
     gui.trace_events.insert(id.clone(), Vec::new());
     gui.sessions.insert(0, session.clone());
     ApiResponse::ok(json!({ "session": session, "events": [] }))
@@ -1277,7 +1427,7 @@ async fn agent_session_append_events(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    gui.session_events
+    gui.session_projection_cache
         .entry(session_id.clone())
         .or_default()
         .extend(incoming);
@@ -1309,10 +1459,10 @@ async fn agent_session_send_message(
         }),
         &now_text(),
     );
-    append_session_events(&state, &session_id, vec![user_event]);
+    append_session_projection(&state, &session_id, vec![user_event]);
 
     if let Err(error) = run_agent_workflow(&state, &session_id, request, false).await {
-        append_session_events(
+        append_session_projection(
             &state,
             &session_id,
             vec![agent_event(
@@ -1371,85 +1521,65 @@ async fn agent_permission_resolve(
         .and_then(Value::as_str)
         .unwrap_or("reject")
         .to_string();
-    let pending = {
-        let mut gui = state.gui.lock().expect("gui state lock");
-        gui.pending_permissions.remove(&permission_id)
-    };
-    let Some(pending) = pending else {
-        return ApiResponse::error("agent_permission_not_found", "Agent permission not found");
-    };
-
-    append_session_events(
-        &state,
-        &pending.session_id,
-        vec![agent_event(
-            &pending.session_id,
-            "permission_result",
-            json!({
-                "permissionId": permission_id,
-                "decision": decision,
-                "toolName": pending.tool_call.name,
-                "channel": "tool",
-                "visibility": "conversation"
-            }),
-            &now_text(),
-        )],
-    );
-
-    if decision == "accept" {
-        let result = execute_tool_call(
-            &state,
-            &pending.tool_call,
-            pending.workspace_binding.as_ref(),
-            true,
-        );
-        append_session_events(
-            &state,
-            &pending.session_id,
-            vec![tool_result_event(
-                &pending.session_id,
-                &pending.tool_call,
-                &result,
-            )],
-        );
-        let mut request = build_agent_run_request(&pending.request_body);
-        request.workspace_binding = pending.workspace_binding;
-        if let Err(error) = run_agent_workflow(&state, &pending.session_id, request, true).await {
-            append_session_events(
-                &state,
-                &pending.session_id,
-                vec![agent_event(
-                    &pending.session_id,
-                    "error",
-                    json!({
-                        "message": error,
-                        "channel": "error",
-                        "visibility": "conversation"
-                    }),
-                    &now_text(),
-                )],
-            );
-        }
+    let kernel_decision = if decision == "accept" {
+        deepcode_kernel_abi::PermissionDecisionKind::Accept
     } else {
-        append_session_events(
-            &state,
-            &pending.session_id,
-            vec![agent_event(
-                &pending.session_id,
-                "assistant_msg",
-                json!({
-                    "content": "权限请求已拒绝，当前 Agent 工作流已停止在安全边界内。",
-                    "channel": "final",
-                    "visibility": "conversation",
-                    "label": "Agent"
-                }),
-                &now_text(),
-            )],
-        );
-    }
-
+        deepcode_kernel_abi::PermissionDecisionKind::Reject
+    };
+    let kernel_events = {
+        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+        runtime
+            .dispatch(KernelCommand::PermissionResolve {
+                request_id: rid("agent-permission-resolve"),
+                permission_id: permission_id.clone(),
+                decision: kernel_decision,
+            })
+            .unwrap_or_else(|error| {
+                vec![KernelEvent::Error {
+                    request_id: Some(rid("agent-permission-resolve")),
+                    run_id: None,
+                    session_id: None,
+                    error: KernelErrorEnvelope::from(&error),
+                    message_key: None,
+                    args: None,
+                }]
+            })
+    };
+    record_kernel_events(&state, &kernel_events);
+    let session_id = kernel_events
+        .iter()
+        .find_map(kernel_event_session_id)
+        .or_else(|| {
+            state
+                .gui
+                .lock()
+                .expect("gui state lock")
+                .current_session_id
+                .clone()
+        })
+        .unwrap_or_else(|| "session-unknown".to_string());
+    append_session_projection(
+        &state,
+        &session_id,
+        kernel_events_to_agent_events(&session_id, &kernel_events),
+    );
     let gui = state.gui.lock().expect("gui state lock");
-    session_result(&gui, &pending.session_id)
+    if gui
+        .sessions
+        .iter()
+        .any(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
+    {
+        session_result(&gui, &session_id)
+    } else {
+        ApiResponse::ok(json!({
+            "sessionId": session_id,
+            "events": gui
+                .session_projection_cache
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, &session_id))
+        }))
+    }
 }
 
 async fn agent_feedback() -> Json<ApiResponse> {
@@ -1571,7 +1701,6 @@ fn build_agent_run_request(body: &Value) -> AgentRunRequest {
         workspace_binding: body
             .get("workspaceBinding")
             .and_then(|value| serde_json::from_value(value.clone()).ok()),
-        original_body: body.clone(),
     }
 }
 
@@ -1586,7 +1715,7 @@ async fn run_agent_workflow(
         if let Err(error) =
             ensure_workspace_binding(&state.runtime, request.workspace_binding.as_ref())
         {
-            append_session_events(
+            append_session_projection(
                 state,
                 session_id,
                 vec![assistant_final_event(
@@ -1654,48 +1783,7 @@ async fn run_agent_workflow(
     };
 
     for stage in stages {
-        if stage == "review" && request_mentions_temp_lifecycle(&request.content) {
-            let memory = HostWorkflowMemory::from_events(
-                &request.content,
-                &session_events(state, session_id),
-            );
-            if memory.temp_lifecycle_complete() {
-                append_session_events(
-                    state,
-                    session_id,
-                    vec![assistant_final_event(session_id, &memory.final_summary())],
-                );
-                append_trace_event(
-                    state,
-                    session_id,
-                    "workflow.outcome",
-                    json!({
-                        "stage": "review",
-                        "accepted": true,
-                        "summary": "Temp lifecycle completion criteria satisfied."
-                    }),
-                );
-            } else {
-                append_session_events(
-                    state,
-                    session_id,
-                    vec![assistant_final_event(session_id, &memory.blocked_summary())],
-                );
-                append_trace_event(
-                    state,
-                    session_id,
-                    "workflow.outcome",
-                    json!({
-                        "stage": "review",
-                        "accepted": false,
-                        "summary": "Completion criteria not satisfied."
-                    }),
-                );
-            }
-            continue;
-        }
-
-        append_session_events(
+        append_session_projection(
             state,
             session_id,
             vec![workflow_stage_event(session_id, stage, "started", None)],
@@ -1714,14 +1802,14 @@ async fn run_agent_workflow(
                         return Ok(());
                     }
                 }
-                append_session_events(
+                append_session_projection(
                     state,
                     session_id,
                     vec![workflow_stage_event(session_id, stage, "completed", None)],
                 );
             }
             Err(error) => {
-                append_session_events(
+                append_session_projection(
                     state,
                     session_id,
                     vec![workflow_stage_event(
@@ -1731,7 +1819,7 @@ async fn run_agent_workflow(
                         Some(&error),
                     )],
                 );
-                append_session_events(
+                append_session_projection(
                     state,
                     session_id,
                     vec![assistant_final_event(
@@ -1744,26 +1832,8 @@ async fn run_agent_workflow(
         }
 
         if stage == "complete" && request_mentions_temp_lifecycle(&request.content) {
-            loop {
-                let paused = drive_temp_lifecycle(state, session_id, &request)?;
-                if paused {
-                    return Ok(());
-                }
-                let memory = HostWorkflowMemory::from_events(
-                    &request.content,
-                    &session_events(state, session_id),
-                );
-                if memory.temp_lifecycle_complete() {
-                    break;
-                }
-                if !memory.can_make_progress() {
-                    append_session_events(
-                        state,
-                        session_id,
-                        vec![assistant_final_event(session_id, &memory.blocked_summary())],
-                    );
-                    return Ok(());
-                }
+            if drive_temp_lifecycle(state, session_id, &request)? {
+                return Ok(());
             }
         }
     }
@@ -1778,16 +1848,14 @@ async fn call_agent_stage_llm(
     stage: &str,
     profile: &ResolvedLlmProfile,
 ) -> Result<LlmChatOutput, String> {
-    let memory =
-        HostWorkflowMemory::from_events(&request.content, &session_events(state, session_id));
     let messages = vec![
         json!({
             "role": "system",
-            "content": stage_prompt(stage, &request.mode, &request.workflow, &memory)
+            "content": stage_prompt(stage, &request.mode, &request.workflow)
         }),
         json!({
             "role": "user",
-            "content": format!("{}\n\n{}", request.content, memory.prompt_text())
+            "content": request.content
         }),
     ];
     let tools = if stage == "complete" {
@@ -1833,39 +1901,18 @@ fn execute_stage_tool_calls(
             name: call.name,
             arguments: call.arguments,
         };
-        append_session_events(
+        let events = invoke_kernel_tool(state, session_id, &request.workspace_binding, &tool_call)?;
+        let paused = events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::PermissionRequested { .. }));
+        append_session_projection(
             state,
             session_id,
-            vec![tool_call_event(session_id, &tool_call)],
+            kernel_events_to_agent_events(session_id, &events),
         );
-        if permission_action_for_tool(&tool_call.name) == "ask" {
-            let permission_id = tool_call
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("perm-{}", now_millis()));
-            let permission_event = permission_request_event(session_id, &permission_id, &tool_call);
-            {
-                let mut gui = state.gui.lock().expect("gui state lock");
-                gui.pending_permissions.insert(
-                    permission_id,
-                    PendingAgentPermission {
-                        session_id: session_id.to_string(),
-                        request_body: request.original_body.clone(),
-                        tool_call,
-                        workspace_binding: request.workspace_binding.clone(),
-                    },
-                );
-            }
-            append_session_events(state, session_id, vec![permission_event]);
+        if paused {
             return Ok(true);
         }
-        let result =
-            execute_tool_call(state, &tool_call, request.workspace_binding.as_ref(), false);
-        append_session_events(
-            state,
-            session_id,
-            vec![tool_result_event(session_id, &tool_call, &result)],
-        );
     }
     Ok(false)
 }
@@ -1878,112 +1925,21 @@ fn drive_temp_lifecycle(
     if !request_mentions_temp_lifecycle(&request.content) {
         return Ok(false);
     }
-    let memory =
-        HostWorkflowMemory::from_events(&request.content, &session_events(state, session_id));
-    let tool_call = if !memory.workspace_listed {
-        Some(ToolCallRequest {
-            id: Some(format!("tool-list-{}", now_millis())),
-            name: "fs.list".to_string(),
-            arguments: json!({ "path": "." }),
-        })
-    } else if !memory.search_done {
-        Some(ToolCallRequest {
-            id: Some(format!("tool-search-{}", now_millis())),
-            name: "code.search".to_string(),
-            arguments: json!({ "query": "_agent_tmp_" }),
-        })
-    } else if !memory.temp_created {
-        Some(ToolCallRequest {
-            id: Some(format!("tool-write-{}", now_millis())),
-            name: "fs.write".to_string(),
-            arguments: json!({
-                "path": TEMP_TEST_PATH,
-                "content": format!("DeepCode Agent temp lifecycle test at {}", now_text())
-            }),
-        })
-    } else if !memory.temp_read {
-        Some(ToolCallRequest {
-            id: Some(format!("tool-read-{}", now_millis())),
-            name: "fs.read".to_string(),
-            arguments: json!({ "path": TEMP_TEST_PATH }),
-        })
-    } else if !memory.temp_deleted {
-        Some(ToolCallRequest {
-            id: Some(format!("tool-delete-{}", now_millis())),
-            name: "fs.delete".to_string(),
-            arguments: json!({ "path": TEMP_TEST_PATH }),
-        })
-    } else {
-        None
+    let tool_call = ToolCallRequest {
+        id: Some(format!("tool-list-{}", now_millis())),
+        name: "fs.list".to_string(),
+        arguments: json!({ "path": "." }),
     };
-    let Some(tool_call) = tool_call else {
-        return Ok(false);
-    };
-
-    append_session_events(
+    let events = invoke_kernel_tool(state, session_id, &request.workspace_binding, &tool_call)?;
+    let paused = events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::PermissionRequested { .. }));
+    append_session_projection(
         state,
         session_id,
-        vec![tool_call_event(session_id, &tool_call)],
+        kernel_events_to_agent_events(session_id, &events),
     );
-    if permission_action_for_tool(&tool_call.name) == "ask" && tool_call.name != "fs.delete" {
-        let permission_id = tool_call
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("perm-{}", now_millis()));
-        let permission_event = permission_request_event(session_id, &permission_id, &tool_call);
-        {
-            let mut gui = state.gui.lock().expect("gui state lock");
-            gui.pending_permissions.insert(
-                permission_id,
-                PendingAgentPermission {
-                    session_id: session_id.to_string(),
-                    request_body: request.original_body.clone(),
-                    tool_call,
-                    workspace_binding: request.workspace_binding.clone(),
-                },
-            );
-        }
-        append_session_events(state, session_id, vec![permission_event]);
-        return Ok(true);
-    }
-    let result = execute_tool_call(state, &tool_call, request.workspace_binding.as_ref(), true);
-    append_session_events(
-        state,
-        session_id,
-        vec![tool_result_event(session_id, &tool_call, &result)],
-    );
-    Ok(false)
-}
-
-async fn agent_permission_evaluate(
-    State(state): State<AppState>,
-    Json(body): Json<PermissionEvaluateRequest>,
-) -> Json<ApiResponse> {
-    if needs_workspace(&body.tool_call.name) {
-        if let Err(error) =
-            ensure_workspace_binding(&state.runtime, body.workspace_binding.as_ref())
-        {
-            return ApiResponse::ok(json!({
-                "action": "deny",
-                "reason": format!("no_workspace: {}", error.message),
-                "request": null
-            }));
-        }
-    }
-
-    let action = match body.tool_call.name.as_str() {
-        "fs.read" | "fs.list" | "fs.diff" | "code.search" | "shell.propose" => "allow",
-        "fs.write" | "fs.delete" | "shell.exec" => "ask",
-        _ => "deny",
-    };
-    ApiResponse::ok(json!({
-        "action": action,
-        "reason": format!("kernel policy preflight for {}", body.tool_call.name),
-        "request": (action == "ask").then(|| json!({
-            "id": body.tool_call.id.unwrap_or_else(|| "permission".to_string()),
-            "toolName": body.tool_call.name
-        }))
-    }))
+    Ok(paused)
 }
 
 async fn agent_tool_execute(
@@ -2001,31 +1957,41 @@ async fn agent_tool_execute(
             }));
         }
     }
-    if matches!(
-        body.tool_call.name.as_str(),
-        "fs.write" | "fs.delete" | "shell.exec"
-    ) && body.approved != Some(true)
-    {
-        return ApiResponse::ok(json!({
-            "ok": false,
-            "pendingPermission": true,
-            "error": "permission_required"
-        }));
-    }
-
-    let result = execute_tool_call(
+    let session_id = state
+        .gui
+        .lock()
+        .expect("gui state lock")
+        .current_session_id
+        .clone()
+        .unwrap_or_else(|| "tool-session".to_string());
+    match invoke_kernel_tool(
         &state,
+        &session_id,
+        &body.workspace_binding,
         &body.tool_call,
-        body.workspace_binding.as_ref(),
-        body.approved == Some(true),
-    );
-
-    match result {
-        Ok(output) => ApiResponse::ok(json!({ "ok": true, "output": output })),
+    ) {
+        Ok(events) => {
+            let pending_permission = events.iter().find_map(|event| match event {
+                KernelEvent::PermissionRequested { request, .. } => Some(request.clone()),
+                _ => None,
+            });
+            let output = events.iter().find_map(|event| match event {
+                KernelEvent::ToolCompleted { output, .. } => output.clone(),
+                _ => None,
+            });
+            record_kernel_events(&state, &events);
+            ApiResponse::ok(json!({
+                "ok": pending_permission.is_none(),
+                "output": output,
+                "pendingPermission": pending_permission.is_some(),
+                "permission": pending_permission,
+                "events": events
+            }))
+        }
         Err(error) => ApiResponse::ok(json!({
             "ok": false,
-            "error": error.message,
-            "code": error.code
+            "error": error,
+            "code": "kernel_tool_invoke_failed"
         })),
     }
 }
@@ -2100,6 +2066,52 @@ async fn api_not_implemented(method: Method, Path(path): Path<String>) -> Json<A
     )
 }
 
+fn record_kernel_events(state: &AppState, events: &[KernelEvent]) {
+    if events.is_empty() {
+        return;
+    }
+    let mut log = state
+        .kernel_events
+        .lock()
+        .expect("kernel event stream lock");
+    log.extend(events.iter().cloned());
+    const MAX_KERNEL_EVENT_CACHE: usize = 512;
+    if log.len() > MAX_KERNEL_EVENT_CACHE {
+        let overflow = log.len() - MAX_KERNEL_EVENT_CACHE;
+        log.drain(0..overflow);
+    }
+}
+
+fn kernel_command_session_id(command: &KernelCommand) -> Option<String> {
+    serde_json::to_value(command)
+        .ok()
+        .and_then(|value| value.get("sessionId").cloned())
+        .and_then(|value| match value {
+            Value::String(value) => Some(value),
+            Value::Object(map) => map
+                .get("0")
+                .or_else(|| map.get("value"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+}
+
+fn kernel_event_session_id(event: &KernelEvent) -> Option<String> {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|value| value.get("sessionId").cloned())
+        .and_then(|value| match value {
+            Value::String(value) => Some(value),
+            Value::Object(map) => map
+                .get("0")
+                .or_else(|| map.get("value"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+}
+
 fn dispatch_workspace(
     runtime: &SharedRuntime,
     command: KernelCommand,
@@ -2156,225 +2168,79 @@ fn dispatch_skill(
     }
 }
 
-fn execute_workspace_tool(
-    runtime: &SharedRuntime,
-    command: KernelCommand,
-) -> Result<Value, KernelErrorEnvelope> {
-    dispatch_workspace(runtime, command)
-}
-
-fn execute_diff_tool(
-    runtime: &SharedRuntime,
-    arguments: Value,
-) -> Result<Value, KernelErrorEnvelope> {
-    let path = get_string(&arguments, "path").unwrap_or_default();
-    let new_content = get_string(&arguments, "newContent").unwrap_or_default();
-    let current = dispatch_workspace(
-        runtime,
-        KernelCommand::WorkspaceRead {
-            request_id: rid("tool-fs-diff-read"),
-            folder_id: get_string(&arguments, "folderId"),
-            path: path.clone(),
-        },
-    )?;
-    let old_content = current
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    Ok(json!({
-        "path": path,
-        "diff": format!("--- old\n+++ new\n-{}\n+{}", old_content, new_content)
-    }))
-}
-
-fn execute_tool_call(
-    state: &AppState,
-    tool_call: &ToolCallRequest,
-    workspace_binding: Option<&WorkspaceBinding>,
-    approved: bool,
-) -> Result<Value, KernelErrorEnvelope> {
-    if needs_workspace(&tool_call.name) {
-        ensure_workspace_binding(&state.runtime, workspace_binding)?;
-    }
-    if permission_action_for_tool(&tool_call.name) == "ask" && !approved {
-        return Err(KernelErrorEnvelope {
-            code: "permission_required".to_string(),
-            message: "permission_required".to_string(),
-            message_key: None,
-            args: None,
-        });
-    }
-    match tool_call.name.as_str() {
-        "fs.list" => execute_workspace_tool(
-            &state.runtime,
-            KernelCommand::WorkspaceList {
-                request_id: rid("tool-fs-list"),
-                folder_id: get_string(&tool_call.arguments, "folderId"),
-                path: get_string(&tool_call.arguments, "path"),
-                depth: Some(2),
-            },
-        ),
-        "fs.read" => execute_workspace_tool(
-            &state.runtime,
-            KernelCommand::WorkspaceRead {
-                request_id: rid("tool-fs-read"),
-                folder_id: get_string(&tool_call.arguments, "folderId"),
-                path: get_string(&tool_call.arguments, "path").unwrap_or_default(),
-            },
-        ),
-        "fs.write" => execute_workspace_tool(
-            &state.runtime,
-            KernelCommand::WorkspaceWrite {
-                request_id: rid("tool-fs-write"),
-                folder_id: get_string(&tool_call.arguments, "folderId"),
-                path: get_string(&tool_call.arguments, "path").unwrap_or_default(),
-                content: get_string(&tool_call.arguments, "content").unwrap_or_default(),
-                create: true,
-            },
-        ),
-        "fs.delete" => execute_workspace_tool(
-            &state.runtime,
-            KernelCommand::WorkspaceDelete {
-                request_id: rid("tool-fs-delete"),
-                folder_id: get_string(&tool_call.arguments, "folderId"),
-                path: get_string(&tool_call.arguments, "path").unwrap_or_default(),
-            },
-        ),
-        "fs.diff" => execute_diff_tool(&state.runtime, tool_call.arguments.clone()),
-        "code.search" => execute_workspace_tool(
-            &state.runtime,
-            KernelCommand::WorkspaceSearch {
-                request_id: rid("tool-code-search"),
-                folder_id: get_string(&tool_call.arguments, "folderId"),
-                query: get_string(&tool_call.arguments, "query").unwrap_or_default(),
-                include: tool_call
-                    .arguments
-                    .get("include")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    }),
-                is_regex: tool_call
-                    .arguments
-                    .get("isRegex")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            },
-        ),
-        "shell.propose" => Ok(json!({
-            "dryRun": true,
-            "executed": false,
-            "command": get_string(&tool_call.arguments, "command")
-        })),
-        "shell.exec" => execute_shell_command(&state.runtime, &tool_call.arguments),
-        _ => Err(KernelErrorEnvelope {
-            code: "unknown_tool".to_string(),
-            message: format!("unknown tool {}", tool_call.name),
-            message_key: None,
-            args: None,
-        }),
-    }
-}
-
-fn execute_shell_command(
-    runtime: &SharedRuntime,
-    arguments: &Value,
-) -> Result<Value, KernelErrorEnvelope> {
-    let command = get_string(arguments, "command").unwrap_or_default();
-    if command.trim().is_empty() {
-        return Err(KernelErrorEnvelope {
-            code: "invalid_command".to_string(),
-            message: "shell.exec command is required".to_string(),
-            message_key: None,
-            args: None,
-        });
-    }
-    if command.contains("rm -rf") || command.contains("git reset --hard") {
-        return Err(KernelErrorEnvelope {
-            code: "destructive_command_blocked".to_string(),
-            message: "destructive shell command is blocked by Kernel policy".to_string(),
-            message_key: None,
-            args: None,
-        });
-    }
-    let cwd = current_workspace_json(runtime)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("current")
-                .and_then(|workspace| workspace.get("folders"))
-                .and_then(Value::as_array)
-                .and_then(|folders| folders.first())
-                .and_then(|folder| folder.get("absolutePath"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| ".".to_string());
-    let started = now_millis();
-    let output = if cfg!(windows) {
-        std::process::Command::new("wsl.exe")
-            .arg("sh")
-            .arg("-lc")
-            .arg(&command)
-            .current_dir(&cwd)
-            .output()
-    } else {
-        std::process::Command::new("bash")
-            .arg("-lc")
-            .arg(&command)
-            .current_dir(&cwd)
-            .output()
-    }
-    .map_err(|error| KernelErrorEnvelope {
-        code: "shell_exec_failed".to_string(),
-        message: format!("failed to start kernel controlled shell: {error}"),
-        message_key: None,
-        args: None,
-    })?;
-    Ok(json!({
-        "command": command,
-        "cwd": cwd,
-        "executed": true,
-        "exitCode": output.status.code(),
-        "stdout": limit_text(&String::from_utf8_lossy(&output.stdout), 16 * 1024),
-        "stderr": limit_text(&String::from_utf8_lossy(&output.stderr), 16 * 1024),
-        "durationMs": now_millis().saturating_sub(started),
-        "truncated": output.stdout.len() > 16 * 1024 || output.stderr.len() > 16 * 1024,
-        "tempSessionId": format!("kernel-shell-{}", started),
-        "cleanupStatus": "alreadyExited"
-    }))
-}
-
-fn permission_action_for_tool(tool_name: &str) -> &'static str {
-    match tool_name {
-        "fs.write" | "fs.delete" | "shell.exec" => "ask",
-        "fs.read" | "fs.list" | "fs.diff" | "code.search" | "shell.propose" => "allow",
-        _ => "deny",
-    }
-}
-
-fn append_session_events(state: &AppState, session_id: &str, events: Vec<Value>) {
+fn append_session_projection(state: &AppState, session_id: &str, events: Vec<Value>) {
     if events.is_empty() {
         return;
     }
-    let mut gui = state.gui.lock().expect("gui state lock");
-    gui.session_events
-        .entry(session_id.to_string())
-        .or_default()
-        .extend(events);
-    update_session_event_count(&mut gui, session_id);
+    let sessions_dir = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        gui.session_projection_cache
+            .entry(session_id.to_string())
+            .or_default()
+            .extend(events.clone());
+        update_session_event_count(&mut gui, session_id);
+        gui.paths.sessions_dir.clone()
+    };
+    if let Err(error) = append_session_projection_jsonl(&sessions_dir, session_id, &events) {
+        eprintln!("failed to append session projection: {error}");
+    }
 }
 
-fn session_events(state: &AppState, session_id: &str) -> Vec<Value> {
-    let gui = state.gui.lock().expect("gui state lock");
-    gui.session_events
-        .get(session_id)
-        .cloned()
-        .unwrap_or_default()
+fn session_projection(state: &AppState, session_id: &str) -> Vec<Value> {
+    let (cached, sessions_dir) = {
+        let gui = state.gui.lock().expect("gui state lock");
+        (
+            gui.session_projection_cache.get(session_id).cloned(),
+            gui.paths.sessions_dir.clone(),
+        )
+    };
+    cached.unwrap_or_else(|| read_session_projection_jsonl(&sessions_dir, session_id))
+}
+
+fn append_session_projection_jsonl(
+    sessions_dir: &FsPath,
+    session_id: &str,
+    events: &[Value],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = sessions_dir.join(safe_path_segment(session_id));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("projection.jsonl");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    for event in events {
+        let line = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+        writeln!(file, "{line}")?;
+    }
+    Ok(())
+}
+
+fn read_session_projection_jsonl(sessions_dir: &FsPath, session_id: &str) -> Vec<Value> {
+    let path = sessions_dir
+        .join(safe_path_segment(session_id))
+        .join("projection.jsonl");
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+fn safe_path_segment(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn append_trace_event(state: &AppState, session_id: &str, kind: &str, payload: Value) {
@@ -2405,6 +2271,206 @@ fn append_trace_from_kernel_events(state: &AppState, session_id: &str, events: V
     }
 }
 
+fn invoke_kernel_tool(
+    state: &AppState,
+    session_id: &str,
+    workspace_binding: &Option<WorkspaceBinding>,
+    tool_call: &ToolCallRequest,
+) -> Result<Vec<KernelEvent>, String> {
+    ensure_kernel_run_for_session(state, session_id, workspace_binding)?;
+    let events = {
+        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+        runtime
+            .dispatch(KernelCommand::ToolInvoke {
+                request_id: rid("kernel-tool-invoke"),
+                run_id: None,
+                session_id: Some(deepcode_kernel_abi::SessionId(session_id.to_string())),
+                tool_call_id: tool_call
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("tool-{}", now_millis())),
+                tool_name: tool_call.name.clone(),
+                arguments: tool_call.arguments.clone(),
+                workspace_binding: workspace_binding.clone(),
+            })
+            .map_err(|error| error.to_string())?
+    };
+    record_kernel_events(state, &events);
+    Ok(events)
+}
+
+fn ensure_kernel_run_for_session(
+    state: &AppState,
+    session_id: &str,
+    workspace_binding: &Option<WorkspaceBinding>,
+) -> Result<(), String> {
+    let has_run = {
+        let runtime = state.runtime.lock().expect("kernel runtime lock");
+        runtime.snapshot(Some(session_id)).run_id.is_some()
+    };
+    if has_run {
+        return Ok(());
+    }
+    let binding = effective_workspace_binding(&state.runtime, workspace_binding.clone())
+        .ok_or_else(|| "workspace binding is required before invoking a Kernel tool".to_string())?;
+    let events = {
+        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+        runtime
+            .dispatch(KernelCommand::RunStart {
+                request_id: rid("kernel-tool-run-start"),
+                session_id: Some(deepcode_kernel_abi::SessionId(session_id.to_string())),
+                input: deepcode_kernel_abi::UserInput {
+                    text: "Kernel tool invocation compatibility run".to_string(),
+                    attachments: Vec::new(),
+                },
+                workspace_binding: Some(binding),
+                profile_ref: None,
+                workflow_ref: None,
+                run_overrides: None,
+            })
+            .map_err(|error| error.to_string())?
+    };
+    record_kernel_events(state, &events);
+    Ok(())
+}
+
+fn kernel_events_to_agent_events(session_id: &str, events: &[KernelEvent]) -> Vec<Value> {
+    events
+        .iter()
+        .flat_map(|event| kernel_event_to_agent_events(session_id, event))
+        .collect()
+}
+
+fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent) -> Vec<Value> {
+    match event {
+        KernelEvent::ToolRequested {
+            tool_call_id,
+            tool_name,
+            args_preview,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "tool_call",
+            json!({
+                "id": tool_call_id,
+                "name": tool_name,
+                "toolName": tool_name,
+                "arguments": args_preview,
+                "channel": "tool",
+                "visibility": "conversation",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::ToolCompleted {
+            tool_call_id,
+            tool_name,
+            ok,
+            output,
+            error,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "tool_result",
+            json!({
+                "callId": tool_call_id,
+                "toolName": tool_name,
+                "ok": ok,
+                "status": if *ok { "ok" } else { "error" },
+                "output": output,
+                "error": error.as_ref().map(|value| value.message.clone()),
+                "code": error.as_ref().map(|value| value.code.clone()),
+                "channel": "tool",
+                "visibility": "conversation",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::PermissionRequested { request, .. } => vec![agent_event(
+            session_id,
+            "permission_request",
+            json!({
+                "id": request.id,
+                "toolName": tool_name_for_capability(&request.capability),
+                "capability": request.capability,
+                "riskLevel": request.risk_level,
+                "summary": request.summary,
+                "argumentsPreview": request.args_preview,
+                "channel": "tool",
+                "visibility": "conversation",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::PermissionResolved {
+            permission_id,
+            decision,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "permission_result",
+            json!({
+                "permissionId": permission_id,
+                "decision": decision,
+                "channel": "tool",
+                "visibility": "conversation",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::WorkflowDecisionMade { decision, .. } => {
+            let mut result = vec![agent_event(
+                session_id,
+                "workflow_decision",
+                json!({
+                    "decision": decision,
+                    "channel": "task",
+                    "visibility": "task",
+                    "kernelEvent": event
+                }),
+                &now_text(),
+            )];
+            if matches!(
+                decision.action,
+                deepcode_kernel_abi::WorkflowDecisionAction::Review
+                    | deepcode_kernel_abi::WorkflowDecisionAction::Done
+            ) {
+                result.push(assistant_final_event(
+                    session_id,
+                    "我是 DeepCode Agent。本轮结构化工作流已根据 Kernel 事实完成：工作区工具调用、临时文件创建读取与受控清理均已由 Kernel 记录并通过复核条件。",
+                ));
+            } else if decision.fail_closed
+                || matches!(
+                    decision.action,
+                    deepcode_kernel_abi::WorkflowDecisionAction::Blocked
+                )
+            {
+                result.push(assistant_final_event(
+                    session_id,
+                    decision
+                        .summary
+                        .as_deref()
+                        .unwrap_or("Kernel 工作流已阻塞，未满足完成条件。"),
+                ));
+            }
+            result
+        }
+        KernelEvent::Error { error, .. } => vec![agent_event(
+            session_id,
+            "error",
+            json!({
+                "message": error.message,
+                "code": error.code,
+                "channel": "error",
+                "visibility": "conversation",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        _ => Vec::new(),
+    }
+}
+
 fn workflow_stage_event(
     session_id: &str,
     stage: &str,
@@ -2426,6 +2492,16 @@ fn workflow_stage_event(
     )
 }
 
+fn tool_name_for_capability(capability: &str) -> &str {
+    match capability {
+        "cap.fs.write" => "fs.write",
+        "cap.fs.delete" => "fs.delete",
+        "cap.shell.exec" => "shell.exec",
+        "cap.skill.executeExternal" => "skill.invoke",
+        _ => capability,
+    }
+}
+
 fn assistant_final_event(session_id: &str, content: &str) -> Value {
     agent_event(
         session_id,
@@ -2435,89 +2511,6 @@ fn assistant_final_event(session_id: &str, content: &str) -> Value {
             "channel": "final",
             "visibility": "conversation",
             "label": "Agent"
-        }),
-        &now_text(),
-    )
-}
-
-fn tool_call_event(session_id: &str, tool_call: &ToolCallRequest) -> Value {
-    agent_event(
-        session_id,
-        "tool_call",
-        json!({
-            "id": tool_call.id,
-            "name": tool_call.name,
-            "toolName": tool_call.name,
-            "arguments": tool_call.arguments,
-            "toolCall": tool_call,
-            "channel": "tool",
-            "visibility": "conversation"
-        }),
-        &now_text(),
-    )
-}
-
-fn tool_result_event(
-    session_id: &str,
-    tool_call: &ToolCallRequest,
-    result: &Result<Value, KernelErrorEnvelope>,
-) -> Value {
-    match result {
-        Ok(output) => agent_event(
-            session_id,
-            "tool_result",
-            json!({
-                "callId": tool_call.id,
-                "toolName": tool_call.name,
-                "ok": true,
-                "status": "ok",
-                "output": output,
-                "channel": "tool",
-                "visibility": "conversation"
-            }),
-            &now_text(),
-        ),
-        Err(error) => agent_event(
-            session_id,
-            "tool_result",
-            json!({
-                "callId": tool_call.id,
-                "toolName": tool_call.name,
-                "ok": false,
-                "status": "error",
-                "error": error.message,
-                "code": error.code,
-                "channel": "tool",
-                "visibility": "conversation"
-            }),
-            &now_text(),
-        ),
-    }
-}
-
-fn permission_request_event(
-    session_id: &str,
-    permission_id: &str,
-    tool_call: &ToolCallRequest,
-) -> Value {
-    let risk = if tool_call.name == "fs.delete" {
-        "high"
-    } else if tool_call.name == "fs.write" || tool_call.name == "shell.exec" {
-        "high"
-    } else {
-        "medium"
-    };
-    agent_event(
-        session_id,
-        "permission_request",
-        json!({
-            "id": permission_id,
-            "toolName": tool_call.name,
-            "riskLevel": risk,
-            "summary": format!("需要授权执行 {}", tool_call.name),
-            "argumentsPreview": tool_call.arguments,
-            "channel": "tool",
-            "visibility": "conversation"
         }),
         &now_text(),
     )
@@ -2986,11 +2979,10 @@ fn append_llm_output_events(
             profile_id: None,
             workflow_config: json!({}),
             workspace_binding: None,
-            original_body: json!({}),
         };
         let _ = execute_stage_tool_calls(state, session_id, &request, calls);
     }
-    append_session_events(state, session_id, events);
+    append_session_projection(state, session_id, events);
 }
 
 fn assistant_segment_event(session_id: &str, kind: &str, content: &str, stage: &str) -> Value {
@@ -3154,7 +3146,7 @@ fn tool_call_from_action_value(value: &Value) -> Option<ToolCallRequest> {
     })
 }
 
-fn stage_prompt(stage: &str, mode: &str, workflow: &str, memory: &HostWorkflowMemory) -> String {
+fn stage_prompt(stage: &str, mode: &str, workflow: &str) -> String {
     let stage_instruction = match stage {
         "plan" => "你是 DeepCode Agent 的规划阶段。只产出计划和完成条件，不直接回答最终身份、结果或总结。",
         "check" => "你是 DeepCode Agent 的检查阶段。只审查计划风险、路径和权限，不重复最终答案。",
@@ -3167,8 +3159,7 @@ fn stage_prompt(stage: &str, mode: &str, workflow: &str, memory: &HostWorkflowMe
         输出语言默认简体中文。工具路径必须是工作区相对路径，禁止 /tmp、绝对路径和 ..。\n\
         当前会话模式：{mode}。当前 workflow：{workflow}。\n\
         fs.delete 是隐藏的内核受控能力，不在普通模型工具目录中；临时测试文件清理由 Kernel 受控流程完成。\n\
-        不要重复已经满足的 AnswerObligation。\n\n{}",
-        memory.prompt_text()
+        不要重复已经满足的 AnswerObligation。"
     )
 }
 
@@ -3287,148 +3278,6 @@ fn provider_tools_from_values(values: Vec<Value>) -> Vec<LlmToolDefinition> {
         .collect()
 }
 
-impl HostWorkflowMemory {
-    fn from_events(user_content: &str, events: &[Value]) -> Self {
-        let mut memory = Self {
-            identity_required: has_identity_request_text(user_content),
-            tool_summary_required: has_tool_summary_request_text(user_content),
-            temp_lifecycle_required: request_mentions_temp_lifecycle(user_content),
-            ..Self::default()
-        };
-        for event in events {
-            let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
-            let payload = event.get("payload").unwrap_or(&Value::Null);
-            match kind {
-                "assistant_msg" => {
-                    let content = payload.get("content").and_then(Value::as_str).unwrap_or("");
-                    let channel = payload.get("channel").and_then(Value::as_str).unwrap_or("");
-                    if content.contains("DeepCode Agent") {
-                        memory.identity_answered = true;
-                    }
-                    if channel == "final" {
-                        memory.final_answered = true;
-                    }
-                }
-                "tool_result" => {
-                    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
-                        continue;
-                    }
-                    let name = payload
-                        .get("toolName")
-                        .or_else(|| payload.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let output = payload.get("output").unwrap_or(&Value::Null);
-                    let path = output.get("path").and_then(Value::as_str).unwrap_or("");
-                    match name {
-                        "fs.list" => memory.workspace_listed = true,
-                        "code.search" => memory.search_done = true,
-                        "fs.write" if path.starts_with("_agent_tmp_") => memory.temp_created = true,
-                        "fs.read" if path.starts_with("_agent_tmp_") => memory.temp_read = true,
-                        "fs.delete" if path.starts_with("_agent_tmp_") => {
-                            memory.temp_deleted = true
-                        }
-                        "shell.exec" => {
-                            let command =
-                                output.get("command").and_then(Value::as_str).unwrap_or("");
-                            if command.contains("_agent_tmp_") {
-                                memory.temp_deleted = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-        }
-        memory
-    }
-
-    fn prompt_text(&self) -> String {
-        let mut lines = vec![
-            "[Structured workflow memory]".to_string(),
-            "Use this structured state instead of repeating prior assistant prose.".to_string(),
-        ];
-        if self.identity_required {
-            lines.push(format!(
-                "- obligation.identity: {}",
-                if self.identity_answered {
-                    "satisfied"
-                } else {
-                    "pending"
-                }
-            ));
-        }
-        if self.tool_summary_required {
-            lines.push("- obligation.toolComponentSummary: pending until final review".to_string());
-        }
-        if self.temp_lifecycle_required {
-            lines.push(format!(
-                "- tempLifecycle: listed={}, search={}, created={}, read={}, cleaned={}",
-                self.workspace_listed,
-                self.search_done,
-                self.temp_created,
-                self.temp_read,
-                self.temp_deleted
-            ));
-        }
-        lines.join("\n")
-    }
-
-    fn temp_lifecycle_complete(&self) -> bool {
-        !self.temp_lifecycle_required
-            || (self.workspace_listed
-                && self.search_done
-                && self.temp_created
-                && self.temp_read
-                && self.temp_deleted)
-    }
-
-    fn can_make_progress(&self) -> bool {
-        self.temp_lifecycle_required && !self.temp_lifecycle_complete()
-    }
-
-    fn final_summary(&self) -> String {
-        let mut lines = Vec::new();
-        if self.identity_required {
-            lines.push("我是 **DeepCode Agent**，一个由 Rust Kernel 管控本地资源、由用户态 Host 展示交互的本地编码代理。");
-        }
-        if self.tool_summary_required {
-            lines.push("本轮已通过 Kernel syscall 验证 `fs.list`、`code.search`、`fs.write`、`fs.read` 和受控 `fs.delete` 清理链路。");
-        }
-        if self.temp_lifecycle_required {
-            lines.push("临时文件生命周期测试已完成：工作区根目录已读取，`_agent_tmp_functional_test.txt` 已创建并读取验证，随后已由隐藏的受控删除能力清理，无测试文件残留。");
-        }
-        if lines.is_empty() {
-            lines.push("任务已完成。");
-        }
-        lines.join("\n\n")
-    }
-
-    fn blocked_summary(&self) -> String {
-        if !self.temp_lifecycle_required {
-            return "当前工作流未满足完成条件，已停止在安全边界内。".to_string();
-        }
-        let mut missing = Vec::new();
-        if !self.workspace_listed {
-            missing.push("列出工作区");
-        }
-        if !self.search_done {
-            missing.push("搜索临时文件残留");
-        }
-        if !self.temp_created {
-            missing.push("创建临时文件");
-        }
-        if !self.temp_read {
-            missing.push("读取验证临时文件");
-        }
-        if !self.temp_deleted {
-            missing.push("清理临时文件");
-        }
-        format!("工作流尚未完成，缺少步骤：{}。", missing.join("、"))
-    }
-}
-
 fn request_mentions_local_workspace(content: &str) -> bool {
     request_mentions_temp_lifecycle(content)
         || content.contains("文件")
@@ -3444,16 +3293,6 @@ fn request_mentions_temp_lifecycle(content: &str) -> bool {
         || content.contains("新建")
         || lower.contains("temporary file")
         || lower.contains("temp file")
-}
-
-fn has_identity_request_text(content: &str) -> bool {
-    let lower = content.to_lowercase();
-    content.contains("身份") || content.contains("你是谁") || lower.contains("identity")
-}
-
-fn has_tool_summary_request_text(content: &str) -> bool {
-    let lower = content.to_lowercase();
-    content.contains("功能组件") || content.contains("所有") || lower.contains("tool")
 }
 
 fn effective_workspace_binding(
@@ -3628,14 +3467,6 @@ fn redact_for_display(text: &str) -> String {
     text.replace("Bearer ", "Bearer [REDACTED] ")
 }
 
-fn limit_text(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        text.to_string()
-    } else {
-        format!("{}...[truncated]", &text[..limit])
-    }
-}
-
 fn ensure_workspace_binding(
     runtime: &SharedRuntime,
     binding: Option<&WorkspaceBinding>,
@@ -3682,10 +3513,6 @@ fn needs_workspace(tool_name: &str) -> bool {
         tool_name,
         "fs.list" | "fs.read" | "fs.write" | "fs.diff" | "fs.delete" | "code.search"
     )
-}
-
-fn get_string(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
 fn distribution_root() -> PathBuf {
@@ -3952,7 +3779,7 @@ fn session_mut<'a>(gui: &'a mut GuiState, session_id: &str) -> Option<&'a mut Va
 
 fn update_session_event_count(gui: &mut GuiState, session_id: &str) {
     let count = gui
-        .session_events
+        .session_projection_cache
         .get(session_id)
         .map(Vec::len)
         .unwrap_or_default();
@@ -3970,9 +3797,14 @@ fn session_result(gui: &GuiState, session_id: &str) -> Json<ApiResponse> {
     else {
         return ApiResponse::error("agent_session_not_found", "agent session not found");
     };
+    let events = gui
+        .session_projection_cache
+        .get(session_id)
+        .cloned()
+        .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, session_id));
     ApiResponse::ok(json!({
         "session": session,
-        "events": gui.session_events.get(session_id).cloned().unwrap_or_default()
+        "events": events
     }))
 }
 
