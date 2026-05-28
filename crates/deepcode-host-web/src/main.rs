@@ -314,6 +314,9 @@ async fn main() {
         kernel_events: Arc::new(Mutex::new(Vec::new())),
     };
     let mut app = Router::new()
+        .route("/", get(gui_index))
+        .route("/index.html", get(gui_index))
+        .route("/assets/*asset_path", get(gui_asset))
         .route("/api/health", get(health))
         .route("/api/kernel/commands", post(kernel_commands))
         .route("/api/kernel/snapshot", get(kernel_snapshot))
@@ -477,6 +480,117 @@ async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         "kernel": "ready",
         "workspace": workspace
     }))
+}
+
+async fn gui_index() -> Response {
+    let Some(client_dist) = client_dist_dir() else {
+        return ApiResponse::error(
+            "gui_not_configured",
+            "DEEPCODE_CLIENT_DIST is not configured",
+        )
+        .into_response();
+    };
+    let index_path = client_dist.join("index.html");
+    match fs::read(index_path) {
+        Ok(content) => (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+            ],
+            content,
+        )
+            .into_response(),
+        Err(error) => {
+            ApiResponse::error("gui_index_unavailable", error.to_string()).into_response()
+        }
+    }
+}
+
+async fn gui_asset(Path(asset_path): Path<String>) -> Response {
+    let Some(client_dist) = client_dist_dir() else {
+        return ApiResponse::error(
+            "gui_not_configured",
+            "DEEPCODE_CLIENT_DIST is not configured",
+        )
+        .into_response();
+    };
+    let asset_root = client_dist.join("assets");
+    let Some(relative_path) = safe_asset_path(&asset_path) else {
+        return ApiResponse::error("invalid_asset_path", "Invalid asset path").into_response();
+    };
+    let requested_path = asset_root.join(&relative_path);
+    if requested_path.is_file() {
+        return serve_asset_file(&requested_path, false);
+    }
+    if asset_path.starts_with("heartbeatSocket-") && asset_path.ends_with(".js") {
+        if let Some(current_heartbeat) = find_current_heartbeat_asset(&asset_root) {
+            return serve_asset_file(&current_heartbeat, true);
+        }
+    }
+    ApiResponse::error("asset_not_found", "Asset not found").into_response()
+}
+
+fn safe_asset_path(asset_path: &str) -> Option<PathBuf> {
+    let path = FsPath::new(asset_path);
+    if path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
+}
+
+fn find_current_heartbeat_asset(asset_root: &FsPath) -> Option<PathBuf> {
+    let entries = fs::read_dir(asset_root).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("heartbeatSocket-") && name.ends_with(".js"))
+                .unwrap_or(false)
+        })
+}
+
+fn serve_asset_file(path: &FsPath, disable_cache: bool) -> Response {
+    match fs::read(path) {
+        Ok(content) => (
+            [
+                (header::CONTENT_TYPE, asset_content_type(path)),
+                (
+                    header::CACHE_CONTROL,
+                    if disable_cache {
+                        "no-cache, no-store, must-revalidate"
+                    } else {
+                        "public, max-age=31536000, immutable"
+                    },
+                ),
+            ],
+            content,
+        )
+            .into_response(),
+        Err(error) => ApiResponse::error("asset_unavailable", error.to_string()).into_response(),
+    }
+}
+
+fn asset_content_type(path: &FsPath) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn kernel_commands(
@@ -2617,19 +2731,20 @@ async fn call_llm_profile(
         .map(provider_tools_from_values)
         .unwrap_or_default();
     if llm_mock_enabled() {
-        let mock_prompt = messages
+        let mock_stage_prompt = messages
             .iter()
             .find(|value| value.get("role").and_then(Value::as_str) == Some("system"))
             .and_then(|value| value.get("content"))
             .and_then(Value::as_str)
-            .or_else(|| {
-                messages
-                    .last()
-                    .and_then(|value| value.get("content"))
-                    .and_then(Value::as_str)
-            })
             .unwrap_or_default();
-        return Ok(mock_llm_output(mock_prompt));
+        let mock_user_prompt = messages
+            .iter()
+            .rev()
+            .find(|value| value.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|value| value.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Ok(mock_llm_output(mock_stage_prompt, mock_user_prompt));
     }
     match profile.kind.as_str() {
         "anthropic" => call_anthropic_profile(profile, messages, tools).await,
@@ -3097,20 +3212,27 @@ fn llm_mock_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn mock_llm_output(prompt: &str) -> LlmChatOutput {
-    if prompt.contains("复核阶段") {
+fn mock_llm_output(stage_prompt: &str, user_prompt: &str) -> LlmChatOutput {
+    if stage_prompt.contains("复核阶段") {
+        let content = if request_mentions_temp_lifecycle(user_prompt) {
+            "<final>我是 DeepCode Agent。本轮已根据 Kernel 工具事实完成工作区读取、组件验证、临时文件创建读取与受控清理。</final>"
+        } else if request_mentions_local_workspace(user_prompt) {
+            "<final>我是 DeepCode Agent。本轮已根据 Kernel 工具事实完成工作区读取与组件验证。</final>"
+        } else {
+            "<final>我是 DeepCode Agent。本轮已根据 Kernel 结构化事件完成当前任务。</final>"
+        };
         return LlmChatOutput {
-            content: "<final>我是 DeepCode Agent。本轮已通过 Kernel 事实完成 fs.list、fs.write、fs.read 与受控 fs.delete 临时文件测试，临时文件已清理删除。</final>".to_string(),
+            content: content.to_string(),
             ..LlmChatOutput::default()
         };
     }
-    if prompt.contains("规划阶段") {
+    if stage_prompt.contains("规划阶段") {
         return LlmChatOutput {
             content: "<plan>我会先规划测试目标，再通过 Kernel syscall 验证工作区读取、搜索、临时文件写入、读取和清理，最终只在复核阶段回答身份和汇总结果。</plan>".to_string(),
             ..LlmChatOutput::default()
         };
     }
-    if prompt.contains("检查阶段") {
+    if stage_prompt.contains("检查阶段") {
         return LlmChatOutput {
             content: "<observe>计划检查通过：路径使用工作区相对 `_agent_tmp_*`，写入需要权限，清理由 Kernel 隐藏受控能力完成。</observe>".to_string(),
             ..LlmChatOutput::default()

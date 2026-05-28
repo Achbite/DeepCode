@@ -95,7 +95,12 @@ struct KernelLlmToolCall {
 struct WorkflowDecisionState {
     answer_obligations: Vec<AnswerObligation>,
     temp_lifecycle_required: bool,
+    workspace_summary_required: bool,
+    tool_component_required: bool,
     workspace_listed: bool,
+    workspace_file_read: bool,
+    workspace_search_completed: bool,
+    workspace_summary_file_path: Option<String>,
     temp_created: bool,
     temp_read_back: bool,
     temp_cleanup_requested: bool,
@@ -107,8 +112,11 @@ struct WorkflowDecisionState {
 impl WorkflowDecisionState {
     fn from_user_input(input: &str) -> Self {
         let lower = input.to_lowercase();
+        let tool_component_required = has_tool_component_request(input, &lower);
         let mut state = Self {
             temp_lifecycle_required: has_temp_file_lifecycle_request(input, &lower),
+            workspace_summary_required: has_workspace_summary_request(input, &lower),
+            tool_component_required,
             ..Self::default()
         };
         if has_identity_request(input, &lower) {
@@ -120,7 +128,7 @@ impl WorkflowDecisionState {
                 satisfied_by_event: None,
             });
         }
-        if has_tool_component_request(input, &lower) {
+        if tool_component_required {
             state.answer_obligations.push(AnswerObligation {
                 id: AnswerObligationId::ToolComponentSummary,
                 description: "Summarize tested tool components once in final/review output."
@@ -176,7 +184,13 @@ impl WorkflowDecisionState {
                     return;
                 }
                 match tool_name.as_str() {
-                    "fs.list" => self.workspace_listed = true,
+                    "fs.list" => {
+                        self.workspace_listed = true;
+                        if self.workspace_summary_file_path.is_none() {
+                            self.workspace_summary_file_path =
+                                output.as_ref().and_then(find_workspace_summary_file_path);
+                        }
+                    }
                     "fs.write" => {
                         if output
                             .as_ref()
@@ -187,14 +201,17 @@ impl WorkflowDecisionState {
                         }
                     }
                     "fs.read" => {
-                        if output
+                        let mentions_temp = output
                             .as_ref()
                             .map(output_mentions_temp_file)
-                            .unwrap_or(false)
-                        {
+                            .unwrap_or(false);
+                        if mentions_temp {
                             self.temp_read_back = true;
+                        } else if self.workspace_summary_required {
+                            self.workspace_file_read = true;
                         }
                     }
+                    "code.search" => self.workspace_search_completed = true,
                     "fs.delete" => {
                         if output
                             .as_ref()
@@ -314,12 +331,22 @@ impl WorkflowDecisionState {
     }
 
     fn pending_steps(&self) -> Vec<String> {
-        if !self.temp_lifecycle_required {
-            return Vec::new();
-        }
         let mut steps = Vec::new();
-        if !self.workspace_listed {
+        if (self.workspace_summary_required
+            || self.tool_component_required
+            || self.temp_lifecycle_required)
+            && !self.workspace_listed
+        {
             steps.push("list workspace root".to_string());
+        }
+        if self.workspace_summary_required && !self.workspace_file_read {
+            steps.push("read at least one workspace file before summarizing".to_string());
+        }
+        if self.tool_component_required && !self.workspace_search_completed {
+            steps.push("run workspace search to verify code.search component".to_string());
+        }
+        if !self.temp_lifecycle_required {
+            return steps;
         }
         if !self.temp_created {
             steps.push("create _agent_tmp_* workspace-relative temp file".to_string());
@@ -1878,7 +1905,7 @@ impl DeepCodeKernelRuntime {
         loop {
             let next = {
                 let record = self.record_by_run(run_id)?;
-                next_temp_lifecycle_tool(&record.decision_state)
+                next_kernel_autorun_tool(&record.decision_state)
             };
             let Some((tool_name, arguments)) = next else {
                 break;
@@ -2461,6 +2488,9 @@ fn compile_llm_request_envelope(
         "answerObligations": decision_state.answer_obligations,
         "completionCriteria": {
             "tempLifecycleRequired": decision_state.temp_lifecycle_required,
+            "workspaceSummaryRequired": decision_state.workspace_summary_required,
+            "toolComponentRequired": decision_state.tool_component_required,
+            "workspaceSummaryFilePath": decision_state.workspace_summary_file_path,
             "pendingSteps": decision_state.pending_steps()
         }
     })
@@ -2615,10 +2645,24 @@ fn has_identity_request(input: &str, lower: &str) -> bool {
 
 fn has_tool_component_request(input: &str, lower: &str) -> bool {
     input.contains("功能组件")
+        || input.contains("各组件")
+        || input.contains("所有组件")
         || input.contains("所有的功能")
         || input.contains("工具组件")
+        || input.contains("组件正常")
+        || input.contains("调用各组件")
+        || input.contains("测试agent")
         || lower.contains("action type")
         || lower.contains("tool component")
+}
+
+fn has_workspace_summary_request(input: &str, lower: &str) -> bool {
+    input.contains("读取当前工作区")
+        || (input.contains("工作区") && input.contains("总结"))
+        || (input.contains("当前项目") && input.contains("总结"))
+        || lower.contains("read current workspace")
+        || lower.contains("summarize workspace")
+        || lower.contains("workspace summary")
 }
 
 fn has_temp_file_lifecycle_request(input: &str, lower: &str) -> bool {
@@ -2650,6 +2694,74 @@ fn output_mentions_temp_file(value: &Value) -> bool {
         Value::Object(map) => map.values().any(output_mentions_temp_file),
         _ => false,
     }
+}
+
+fn find_workspace_summary_file_path(value: &Value) -> Option<String> {
+    let mut paths = Vec::new();
+    collect_workspace_file_paths(value, &mut paths);
+    paths.sort_by_key(|path| workspace_summary_path_score(path));
+    paths.into_iter().next()
+}
+
+fn collect_workspace_file_paths(value: &Value, paths: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_workspace_file_paths(item, paths);
+            }
+        }
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("file") {
+                if let Some(path) = map.get("path").and_then(Value::as_str) {
+                    if is_workspace_summary_candidate(path) {
+                        paths.push(path.to_string());
+                    }
+                }
+            }
+            for value in map.values() {
+                collect_workspace_file_paths(value, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_workspace_summary_candidate(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("_agent_tmp_")
+        || lower.ends_with(".exe")
+        || lower.ends_with(".dll")
+        || lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".zip")
+        || lower.ends_with(".7z")
+    {
+        return false;
+    }
+    [
+        ".md", ".txt", ".rs", ".ts", ".tsx", ".js", ".jsx", ".json", ".toml", ".yaml", ".yml",
+        ".cpp", ".h", ".hpp", ".c", ".py",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
+}
+
+fn workspace_summary_path_score(path: &str) -> (u8, usize, String) {
+    let lower = path.to_ascii_lowercase();
+    let priority = if lower.ends_with("readme.md") {
+        0
+    } else if lower.ends_with(".md") {
+        1
+    } else if lower.ends_with(".txt") {
+        2
+    } else if lower.ends_with(".json") || lower.ends_with(".toml") || lower.ends_with(".yaml") {
+        3
+    } else {
+        4
+    };
+    (priority, path.len(), lower)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2706,12 +2818,28 @@ fn redact_tool_arguments(tool_name: &str, arguments: &Value) -> Value {
     arguments.clone()
 }
 
-fn next_temp_lifecycle_tool(state: &WorkflowDecisionState) -> Option<(&'static str, Value)> {
-    if !state.temp_lifecycle_required {
+fn next_kernel_autorun_tool(state: &WorkflowDecisionState) -> Option<(&'static str, Value)> {
+    if !(state.workspace_summary_required
+        || state.tool_component_required
+        || state.temp_lifecycle_required)
+    {
         return None;
     }
     if !state.workspace_listed {
         return Some(("fs.list", serde_json::json!({ "path": "." })));
+    }
+    if state.workspace_summary_required && !state.workspace_file_read {
+        let path = state
+            .workspace_summary_file_path
+            .as_deref()
+            .unwrap_or("README.md");
+        return Some(("fs.read", serde_json::json!({ "path": path })));
+    }
+    if state.tool_component_required && !state.workspace_search_completed {
+        return Some(("code.search", serde_json::json!({ "query": "DeepCode" })));
+    }
+    if !state.temp_lifecycle_required {
+        return None;
     }
     if !state.temp_created {
         return Some((
@@ -3230,6 +3358,21 @@ mod tests {
         }
     }
 
+    fn active_llm_call(events: &[KernelEvent]) -> (RunId, String) {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                KernelEvent::LlmCallRequested {
+                    run_id,
+                    llm_call_id,
+                    ..
+                } => Some((run_id.clone(), llm_call_id.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected active llm call in {events:?}"))
+    }
+
     #[test]
     fn health_check_returns_runtime_ready() {
         let mut runtime = DeepCodeKernelRuntime::new();
@@ -3405,6 +3548,126 @@ mod tests {
                 .as_deref(),
             Some("check")
         );
+    }
+
+    #[test]
+    fn workspace_summary_component_request_requires_kernel_tool_evidence() {
+        let state = WorkflowDecisionState::from_user_input(
+            "读取当前工作区文件并总结输出给我，这是一个测试请求，用于测试agent能否调用各组件正常执行任务，最后返回你的身份信息",
+        );
+
+        let decision = state.decide("plan");
+        assert_eq!(decision.action, WorkflowDecisionAction::Continue);
+        assert_eq!(
+            decision.reason,
+            WorkflowDecisionReason::PendingCriticalSteps
+        );
+        assert!(decision
+            .pending_steps
+            .iter()
+            .any(|step| step.contains("list workspace")));
+        assert!(decision
+            .pending_steps
+            .iter()
+            .any(|step| step.contains("read at least one workspace file")));
+        assert!(decision
+            .pending_steps
+            .iter()
+            .any(|step| step.contains("code.search")));
+    }
+
+    #[test]
+    fn complete_phase_auto_runs_workspace_summary_tools_before_review() {
+        let root = temp_workspace();
+        fs::write(root.join("README.md"), "DeepCode workspace summary smoke").unwrap();
+
+        let mut runtime = DeepCodeKernelRuntime::new();
+        runtime
+            .dispatch(KernelCommand::WorkspaceOpen {
+                request_id: RequestId("req-open".to_string()),
+                path: root.to_string_lossy().to_string(),
+            })
+            .unwrap();
+
+        let started = runtime
+            .dispatch(KernelCommand::RunStart {
+                request_id: RequestId("req-run".to_string()),
+                session_id: Some(SessionId("session-1".to_string())),
+                input: UserInput {
+                    text: "读取当前工作区文件并总结输出给我，这是一个测试请求，用于测试agent能否调用各组件正常执行任务，最后返回你的身份信息".to_string(),
+                    attachments: vec![],
+                },
+                workspace_binding: Some(WorkspaceBinding {
+                    workspace_id: Some("ws-1".to_string()),
+                    workspace_hash: None,
+                    open_path: Some(root.to_string_lossy().to_string()),
+                    active_folder_id: Some("wf-0".to_string()),
+                    folder_hash: None,
+                }),
+                profile_ref: None,
+                workflow_ref: None,
+                run_overrides: None,
+            })
+            .unwrap();
+
+        let (run_id, plan_call_id) = active_llm_call(&started);
+        let plan_events = runtime
+            .dispatch(KernelCommand::LlmResponseSubmit {
+                request_id: RequestId("req-plan".to_string()),
+                run_id: run_id.clone(),
+                session_id: Some(SessionId("session-1".to_string())),
+                llm_call_id: plan_call_id,
+                response_envelope: serde_json::json!({
+                    "assistantMessage": { "content": "<plan>Read workspace and verify components.</plan>", "toolCalls": [] }
+                }),
+            })
+            .unwrap();
+
+        let (_, check_call_id) = active_llm_call(&plan_events);
+        let check_events = runtime
+            .dispatch(KernelCommand::LlmResponseSubmit {
+                request_id: RequestId("req-check".to_string()),
+                run_id: run_id.clone(),
+                session_id: Some(SessionId("session-1".to_string())),
+                llm_call_id: check_call_id,
+                response_envelope: serde_json::json!({
+                    "assistantMessage": { "content": "<observe>Plan is safe.</observe>", "toolCalls": [] }
+                }),
+            })
+            .unwrap();
+
+        let (_, complete_call_id) = active_llm_call(&check_events);
+        let complete_events = runtime
+            .dispatch(KernelCommand::LlmResponseSubmit {
+                request_id: RequestId("req-complete".to_string()),
+                run_id,
+                session_id: Some(SessionId("session-1".to_string())),
+                llm_call_id: complete_call_id,
+                response_envelope: serde_json::json!({
+                    "assistantMessage": { "content": "<say>开始执行工具验证。</say>", "toolCalls": [] }
+                }),
+            })
+            .unwrap();
+
+        assert!(complete_events.iter().any(|event| matches!(
+            event,
+            KernelEvent::ToolCompleted { tool_name, ok: true, .. } if tool_name == "fs.list"
+        )));
+        assert!(complete_events.iter().any(|event| matches!(
+            event,
+            KernelEvent::ToolCompleted { tool_name, ok: true, .. } if tool_name == "fs.read"
+        )));
+        assert!(complete_events.iter().any(|event| matches!(
+            event,
+            KernelEvent::ToolCompleted { tool_name, ok: true, .. } if tool_name == "code.search"
+        )));
+        assert!(complete_events.iter().any(|event| matches!(
+            event,
+            KernelEvent::WorkflowDecisionMade { decision, .. }
+                if decision.action == WorkflowDecisionAction::Review
+        )));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3661,6 +3924,7 @@ mod tests {
             ("req-observe-1", "tool-list", "fs.list"),
             ("req-observe-2", "tool-write", "fs.write"),
             ("req-observe-3", "tool-read", "fs.read"),
+            ("req-observe-4", "tool-search", "code.search"),
         ] {
             observe(
                 &mut runtime,
@@ -3710,6 +3974,7 @@ mod tests {
             ("req-observe-1", "tool-list", "fs.list"),
             ("req-observe-2", "tool-write", "fs.write"),
             ("req-observe-3", "tool-read", "fs.read"),
+            ("req-observe-4", "tool-search", "code.search"),
         ] {
             observe(
                 &mut runtime,
@@ -3729,7 +3994,7 @@ mod tests {
         }
         observe(
             &mut runtime,
-            "req-observe-4",
+            "req-observe-5",
             KernelEvent::ToolRequested {
                 run_id: Some(RunId("run-1".to_string())),
                 session_id: Some(SessionId("session-1".to_string())),
@@ -3742,7 +4007,7 @@ mod tests {
         );
         let review = observe(
             &mut runtime,
-            "req-observe-5",
+            "req-observe-6",
             KernelEvent::ToolCompleted {
                 run_id: Some(RunId("run-1".to_string())),
                 session_id: Some(SessionId("session-1".to_string())),
@@ -3764,7 +4029,7 @@ mod tests {
 
         let done = observe(
             &mut runtime,
-            "req-observe-6",
+            "req-observe-7",
             KernelEvent::MessageAppended {
                 run_id: Some(RunId("run-1".to_string())),
                 session_id: Some(SessionId("session-1".to_string())),
