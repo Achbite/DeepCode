@@ -4,12 +4,17 @@
  */
 import type { HeartbeatServerEvent } from '@deepcode/protocol';
 import useAppStatusStore from '../state/appStatusStore';
+import { getKernelWsBase } from './hostTarget';
 
-const WS_BASE = `ws://${window.location.host}/ws`;
 const HEARTBEAT_INTERVAL_MS = 5000; // 5秒发送一次 ping
+const HEARTBEAT_RECONNECT_FAST_MS = 300;
+const HEARTBEAT_RECONNECT_SLOW_MS = 1500;
 
 let ws: WebSocket | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let shouldReconnect = false;
+let reconnectAttempts = 0;
 
 /**
  * 建立心跳 WebSocket 连接
@@ -17,11 +22,18 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 export function connectHeartbeat(): void {
   const store = useAppStatusStore.getState();
 
+  shouldReconnect = true;
   store.setWsStatus('checking');
+  clearReconnectTimer();
+  if (ws) {
+    ws.close();
+    ws = null;
+  }
 
-  ws = new WebSocket(`${WS_BASE}/heartbeat`);
+  ws = new WebSocket(`${getKernelWsBase()}/heartbeat`);
 
   ws.onopen = () => {
+    reconnectAttempts = 0;
     // 状态将在收到 server.ready 后更新为 connected
   };
 
@@ -66,9 +78,14 @@ export function connectHeartbeat(): void {
   };
 
   ws.onclose = () => {
-    store.setWsStatus('disconnected');
+    ws = null;
     stopHeartbeatLoop();
-    // 首期不自动重连，后续阶段再做
+    if (shouldReconnect) {
+      store.setWsStatus('checking');
+      scheduleReconnect();
+    } else {
+      store.setWsStatus('disconnected');
+    }
   };
 }
 
@@ -76,6 +93,8 @@ export function connectHeartbeat(): void {
  * 断开心跳连接
  */
 export function disconnectHeartbeat(): void {
+  shouldReconnect = false;
+  clearReconnectTimer();
   stopHeartbeatLoop();
   if (ws) {
     ws.close();
@@ -109,4 +128,22 @@ function stopHeartbeatLoop(): void {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;
   }
+}
+
+function clearReconnectTimer(): void {
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function scheduleReconnect(): void {
+  if (reconnectTimer !== null) return;
+  reconnectAttempts += 1;
+  const delay =
+    reconnectAttempts <= 8 ? HEARTBEAT_RECONNECT_FAST_MS : HEARTBEAT_RECONNECT_SLOW_MS;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (shouldReconnect) connectHeartbeat();
+  }, delay);
 }

@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Clone)]
@@ -449,7 +450,7 @@ async fn main() {
         );
         println!("DeepCode GUI assets served from {}", client_dist.display());
     }
-    let app = app.with_state(state);
+    let app = app.with_state(state).layer(localhost_cors_layer());
     let addr: SocketAddr = format!("{host}:{port}").parse().expect("valid host/port");
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -457,6 +458,20 @@ async fn main() {
     println!("DeepCode Rust web host listening on http://{addr}");
     println!("Open DeepCode GUI at http://{addr}/");
     axum::serve(listener, app).await.expect("serve web host");
+}
+
+fn localhost_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::CONTENT_TYPE])
 }
 
 fn client_dist_dir() -> Option<PathBuf> {

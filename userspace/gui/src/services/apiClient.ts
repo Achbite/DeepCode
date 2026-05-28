@@ -69,8 +69,9 @@ import type {
   PanelSnapshotResult,
   AttachPanelSnapshotResult,
 } from '@deepcode/protocol';
+import { getKernelApiBase } from './hostTarget';
 
-const API_BASE = '/api';
+const API_BASE = getKernelApiBase();
 
 interface SendJsonOptions {
   signal?: AbortSignal;

@@ -7,7 +7,7 @@
  *   3. Start heartbeat.
  *   4. Register editor-level shortcuts, auto-save and close guard.
  */
-import React, { Suspense, lazy, useCallback, useEffect, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import useAppStatusStore from '../state/appStatusStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
 import { useSettingsStore } from '../state/settingsStore';
@@ -137,6 +137,7 @@ const App: React.FC = () => {
   );
 
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogData>(CLOSED_CONFIRM_DIALOG);
+  const connectedReloadDoneRef = useRef(false);
 
   const closeConfirmDialog = useCallback(() => {
     setConfirmDialog(CLOSED_CONFIRM_DIALOG);
@@ -203,6 +204,15 @@ const App: React.FC = () => {
       void loadUserSettings().finally(() => markStartup('deepcode:settings-loaded'));
     });
   }, [loadWorkspace, loadUserSettings]);
+
+  // If the desktop shell renders before the background Kernel Host is ready,
+  // the first workspace/settings calls can fail. Retry once when health connects.
+  useEffect(() => {
+    if (apiStatus !== 'connected' || connectedReloadDoneRef.current) return;
+    connectedReloadDoneRef.current = true;
+    void loadWorkspace().finally(() => markStartup('deepcode:workspace-reloaded-after-connect'));
+    void loadUserSettings().finally(() => markStartup('deepcode:settings-reloaded-after-connect'));
+  }, [apiStatus, loadWorkspace, loadUserSettings]);
 
   // ---- 1.1 Workspace settings overlay ----
   useEffect(() => {
