@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DeepCode</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        background: #0a0a0c;
+        color: #f4f7fb;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        overflow: hidden;
+        background:
+          linear-gradient(90deg, rgba(24, 126, 255, 0.16) 0, transparent 1px),
+          linear-gradient(0deg, rgba(24, 126, 255, 0.1) 0, transparent 1px),
+          #0a0a0c;
+        background-size: 24px 24px;
+      }
+
+      .shell {
+        display: grid;
+        grid-template-rows: 38px 1fr 24px;
+        width: 100vw;
+        height: 100vh;
+        border: 1px solid #1c2530;
+      }
+
+      .titlebar,
+      .statusbar {
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        background: #121317;
+        border-bottom: 1px solid #252a31;
+        font-size: 12px;
+      }
+
+      .titlebar {
+        justify-content: space-between;
+        font-weight: 700;
+      }
+
+      .statusbar {
+        justify-content: space-between;
+        border-top: 1px solid #252a31;
+        border-bottom: 0;
+        background: #0d7edc;
+      }
+
+      .main {
+        display: grid;
+        grid-template-columns: 42px 196px minmax(0, 1fr) 320px;
+        min-height: 0;
+      }
+
+      .rail,
+      .sidebar,
+      .agent {
+        border-right: 1px solid #242832;
+        background: rgba(18, 20, 24, 0.88);
+      }
+
+      .rail {
+        display: grid;
+        align-content: start;
+        gap: 10px;
+        padding: 12px 8px;
+      }
+
+      .icon {
+        width: 26px;
+        height: 26px;
+        border-radius: 6px;
+        background: #17202b;
+        border: 1px solid #2c3d51;
+      }
+
+      .sidebar,
+      .agent {
+        padding: 14px;
+      }
+
+      .heading {
+        color: #d7e5f6;
+        font-size: 12px;
+        font-weight: 700;
+        margin-bottom: 14px;
+      }
+
+      .line {
+        height: 12px;
+        margin: 11px 0;
+        border-radius: 4px;
+        background: #20252d;
+      }
+
+      .line.short {
+        width: 64%;
+      }
+
+      .editor {
+        display: grid;
+        place-items: center;
+        min-width: 0;
+        background: rgba(8, 9, 11, 0.72);
+      }
+
+      .boot {
+        width: min(460px, 74vw);
+      }
+
+      .boot h1 {
+        margin: 0 0 10px;
+        font-size: 24px;
+        letter-spacing: 0;
+      }
+
+      .boot p {
+        margin: 0 0 18px;
+        color: #9ba8b8;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .progress {
+        position: relative;
+        height: 4px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: #20252d;
+      }
+
+      .progress::before {
+        position: absolute;
+        inset: 0;
+        width: 42%;
+        content: "";
+        border-radius: inherit;
+        background: #1684ff;
+        animation: slide 1.1s ease-in-out infinite;
+      }
+
+      @keyframes slide {
+        0% {
+          transform: translateX(-110%);
+        }
+        100% {
+          transform: translateX(260%);
+        }
+      }
+
+      .agent {
+        border-right: 0;
+        border-left: 1px solid #242832;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        min-height: 28px;
+        padding: 6px 9px;
+        border-radius: 6px;
+        background: #10243c;
+        color: #cce4ff;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="titlebar">
+        <span>DeepCode</span>
+        <span class="pill" id="boot-status">工作台界面已打开</span>
+      </header>
+      <main class="main">
+        <nav class="rail">
+          <div class="icon"></div>
+          <div class="icon"></div>
+          <div class="icon"></div>
+        </nav>
+        <aside class="sidebar">
+          <div class="heading">资源管理器</div>
+          <div class="line"></div>
+          <div class="line short"></div>
+          <div class="line"></div>
+          <div class="line short"></div>
+        </aside>
+        <section class="editor">
+          <div class="boot">
+            <h1>DeepCode</h1>
+            <p>GUI 壳已先行渲染。Kernel Host 会在后台启动，工作台资源就绪后自动进入完整界面。</p>
+            <div class="progress"></div>
+          </div>
+        </section>
+        <aside class="agent">
+          <div class="heading">Agent</div>
+          <div class="line"></div>
+          <div class="line short"></div>
+          <div class="line"></div>
+        </aside>
+      </main>
+      <footer class="statusbar">
+        <span>Shell ready · Kernel starting in background</span>
+        <span id="boot-target">127.0.0.1:31245</span>
+      </footer>
+    </div>
+    <script>
+      const statusEl = document.getElementById("boot-status");
+      const targetEl = document.getElementById("boot-target");
+
+      let attempts = 0;
+      const startedAt = Date.now();
+
+      function targetFromLocation() {
+        const hash = window.location.hash.startsWith("#")
+          ? window.location.hash.slice(1)
+          : window.location.hash;
+        const params = new URLSearchParams(hash || window.location.search);
+        return {
+          host: params.get("host") || "127.0.0.1",
+          port: params.get("port") || "31245",
+        };
+      }
+
+      async function resolveBootTarget() {
+        const invoke = window.__TAURI__?.core?.invoke;
+        if (invoke) {
+          try {
+            const target = await invoke("deepcode_boot_target");
+            if (target?.host && target?.port) {
+              return target;
+            }
+          } catch {
+            // Fall back to URL/defaults so the page remains useful in a browser.
+          }
+        }
+        return targetFromLocation();
+      }
+
+      async function waitForKernel() {
+        attempts += 1;
+        const baseUrl = window.deepcodeBootBaseUrl || "http://127.0.0.1:31245";
+        try {
+          const response = await fetch(`${baseUrl}/api/health`, { cache: "no-store" });
+          if (response.ok) {
+            statusEl.textContent = "进入工作台";
+            window.location.replace(`${baseUrl}/`);
+            return;
+          }
+        } catch {
+          // Kernel is still starting. The local shell remains responsive.
+        }
+
+        const elapsed = Date.now() - startedAt;
+        if (elapsed > 15000) {
+          statusEl.textContent = "Kernel 后台启动中";
+        } else if (attempts > 2) {
+          statusEl.textContent = "后台加载资源";
+        }
+
+        window.setTimeout(waitForKernel, attempts < 8 ? 160 : 500);
+      }
+
+      resolveBootTarget().then((target) => {
+        window.deepcodeBootBaseUrl = `http://${target.host}:${target.port}`;
+        targetEl.textContent = `${target.host}:${target.port}`;
+        window.setTimeout(waitForKernel, 0);
+      });
+    </script>
+  </body>
+</html>

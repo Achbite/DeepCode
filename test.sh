@@ -473,7 +473,12 @@ test ! -e Dockerfile.tauri
 ! find client server tauri packages -type f 2>/dev/null | grep .
 test -f shells/tauri/src-tauri/Cargo.toml
 test -f shells/tauri/src-tauri/src/main.rs
-! grep -RInE 'Agent|workflow|tool executor|permission evaluator|session truth|KernelCommand|ToolInvoke|child_process|spawn\(|exec\(' shells/tauri/src-tauri/src
+test -f shells/tauri/boot-ui/index.html
+grep -RIn 'index.html#host=' shells/tauri/src-tauri/src/main.rs >/dev/null
+grep -RIn 'local_port_is_available' shells/tauri/src-tauri/src/main.rs >/dev/null
+grep -RIn '工作台界面已打开' shells/tauri/boot-ui/index.html >/dev/null
+! grep -RInE 'Agent|workflow|tool executor|permission evaluator|session truth|KernelCommand|ToolInvoke|fs\.write|fs\.delete|shell\.exec|SkillInvoke|PermissionResolve' shells/tauri/src-tauri/src
+grep -RIn 'deepcode-kernel' shells/tauri/src-tauri/src/main.rs >/dev/null
 bash -n build.sh
 pass "legacy Node server, old TS runtime, Host truth, and thick Tauri gates ok"
 
@@ -700,6 +705,36 @@ curl -fsS -m 3 "http://127.0.0.1:${TEST_PORT}/api/agent/sessions/${SESSION_ID}/t
 curl -fsS -m 3 "$AGENT_WORKFLOW_URL" | jq -e '.ok == true and .data.initialized == true and .data.config.plan != null' >/dev/null
 pass "agent LLM workflow, permission resume, temp lifecycle, and final review are wired"
 
+SESSION_SUMMARY_RESP="$(curl -fsS -m 3 -H 'Content-Type: application/json' -d '{"initialMode":"plan"}' "$AGENT_SESSIONS_URL")"
+SESSION_SUMMARY_ID="$(echo "$SESSION_SUMMARY_RESP" | jq -r '.data.session.id')"
+SUMMARY_MESSAGE_BODY="$(jq -nc --arg openPath "$WORKSPACE_FILE" '{
+  content: "读取当前工作区文件并总结输出给我，这是一个测试请求，用于测试agent能否调用各组件正常执行任务，最后返回你的身份信息",
+  mode: "askBeforeWrite",
+  workflow: "planFirst",
+  profileId: "profile-smoke",
+  workflowConfig: {
+    plan: { profileId: "profile-smoke" },
+    check: { profileId: "profile-smoke" },
+    complete: { profileId: "profile-smoke" },
+    review: { profileId: "profile-smoke" }
+  },
+  workspaceBinding: {
+    workspaceId: "smoke-workspace",
+    workspaceHash: "smoke-hash",
+    openPath: $openPath,
+    activeFolderId: "wf-0"
+  }
+}')"
+SUMMARY_MESSAGE_RESP="$(curl -fsS -m 10 -H 'Content-Type: application/json' \
+  -d "$SUMMARY_MESSAGE_BODY" \
+  "http://127.0.0.1:${TEST_PORT}/api/agent/sessions/${SESSION_SUMMARY_ID}/messages")"
+echo "$SUMMARY_MESSAGE_RESP" | jq -e '.ok == true and (.data.events[] | select(.kind == "tool_result" and .payload.toolName == "fs.list" and .payload.ok == true))' >/dev/null
+echo "$SUMMARY_MESSAGE_RESP" | jq -e '.ok == true and (.data.events[] | select(.kind == "tool_result" and .payload.toolName == "fs.read" and .payload.ok == true))' >/dev/null
+echo "$SUMMARY_MESSAGE_RESP" | jq -e '.ok == true and (.data.events[] | select(.kind == "tool_result" and .payload.toolName == "code.search" and .payload.ok == true))' >/dev/null
+echo "$SUMMARY_MESSAGE_RESP" | jq -e '.ok == true and ([.data.events[] | select(.kind == "assistant_msg" and (.payload.channel == "final") and (.payload.content | contains("DeepCode Agent")))] | length == 1)' >/dev/null
+! echo "$SUMMARY_MESSAGE_RESP" | jq -e '.data.events[] | select(.kind == "assistant_msg" and (.payload.channel == "final") and (.payload.content | contains("临时文件")))' >/dev/null
+pass "workspace summary component test requires real kernel tool evidence before final"
+
 curl -fsS -m 3 "$BROWSER_STATUS_URL" \
   | jq -e '.ok == true and .data.capabilities.status == "available"' >/dev/null
 curl -fsS -m 3 -H 'Content-Type: application/json' \
@@ -747,10 +782,13 @@ test -x "$ROOT_DIR/bin/linux-x64/deepcode-cli"
 test -x "$ROOT_DIR/bin/linux-x64/deepcode-tui"
 test -d "$ROOT_DIR/bin/linux-x64/web"
 test -f "$ROOT_DIR/bin/win64/deepcode-kernel.exe"
-test -f "$ROOT_DIR/bin/win64/deepcode-gui.bat"
+test -f "$ROOT_DIR/bin/win64/DeepCode.exe"
+test -f "$ROOT_DIR/bin/win64/WebView2Loader.dll"
 test -f "$ROOT_DIR/bin/win64/deepcode-cli.bat"
 test -f "$ROOT_DIR/bin/win64/deepcode-tui.bat"
 test -d "$ROOT_DIR/bin/win64/web"
+head -c 2 "$ROOT_DIR/bin/win64/DeepCode.exe" | grep -q 'MZ'
+head -c 2 "$ROOT_DIR/bin/win64/WebView2Loader.dll" | grep -q 'MZ'
 pass "bin/linux-x64 and bin/win64 distributions generated"
 
 DEEPCODE_HOST=127.0.0.1 \
@@ -776,7 +814,10 @@ if [ "$package_ready" -ne 1 ]; then
   exit 6
 fi
 
-curl -fsS -m 3 "$PACKAGE_URL/" | grep -q '<div id="root"'
+curl -fsS -D /tmp/_deepcode_package_headers_$$ -o /tmp/_deepcode_package_index_$$ -m 3 "$PACKAGE_URL/"
+grep -q '<div id="root"' /tmp/_deepcode_package_index_$$
+grep -qi '^cache-control: no-cache, no-store, must-revalidate' /tmp/_deepcode_package_headers_$$
+rm -f /tmp/_deepcode_package_headers_$$ /tmp/_deepcode_package_index_$$
 curl -fsS -m 3 "$PACKAGE_HEALTH_URL" | jq -e '.ok == true and .data.service == "deepcode-host-web"' >/dev/null
 pass "packaged linux GUI is served by Rust host for browser clients"
 

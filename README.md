@@ -55,13 +55,22 @@ Linux:
 Windows:
 
 ```bat
-bin\win64\deepcode-gui.bat
+bin\win64\DeepCode.exe
 ```
 
-然后打开：
+`DeepCode.exe` 会先显示本地 GUI 壳首屏，再启动同目录的 `deepcode-kernel.exe` 并自动进入完整工作台。默认会选择一个空闲本地端口，避免撞上旧预览服务；如果你显式设置 `DEEPCODE_PORT`，则使用该端口。Windows 便携目录必须保留同目录的 `WebView2Loader.dll`；目标系统仍需要安装 Microsoft Edge WebView2 Evergreen Runtime。浏览器调试入口使用脚本默认端口时可以直接打开：
 
 ```text
 http://127.0.0.1:31245/
+```
+
+Codex 内部浏览器常驻预览可使用单独端口，例如：
+
+```bash
+DEEPCODE_PORT=31250 \
+DEEPCODE_CLIENT_DIST="$PWD/bin/linux-x64/web" \
+DEEPCODE_CONFIG_DIR="$PWD/.deepcode-preview-config" \
+./bin/linux-x64/deepcode-kernel
 ```
 
 可通过环境变量调整：
@@ -113,7 +122,7 @@ docker run --rm -t -v "$PWD:/workspace" -w /workspace deepcode-dev ./test.sh
 - Windows 盘符枚举与文件树排序
 - hidden `fs.delete` 受控能力
 - 打包态 Linux GUI 静态资源 smoke
-- Windows GNU 交叉编译产物 smoke
+- Windows GNU `DeepCode.exe` GUI shell 与 Kernel 交叉编译产物 smoke
 - 旧 Node server、pkg、Tauri Agent 后端不进入默认链路
 
 如只需要快速开发检查，可跳过慢速打包 smoke：
@@ -154,7 +163,8 @@ DEEPCODE_SKIP_PACKAGING_SMOKE=1 ./test.sh
 
 - **打包与预览**
   - `./build.sh` 输出 `bin/linux-x64` 和 `bin/win64`。
-  - `bin/<platform>/deepcode-gui*` 启动同一个 Rust Kernel Web Host 并服务 `web/`。
+  - Windows `bin/win64/DeepCode.exe` 是可双击启动的 GUI thin shell，会显示本地首屏并启动同目录 Kernel；默认选择空闲本地端口，`WebView2Loader.dll` 会随分发目录一起输出。
+  - Linux `bin/linux-x64/deepcode-gui` 启动同一个 Rust Kernel Web Host 并服务 `web/`。
   - Codex 内部浏览器、Chrome 或普通浏览器都可以打开 GUI URL。
 
 ### 当前预留
@@ -205,8 +215,9 @@ bin/
 │   ├── packs/
 │   └── README.txt
 └── win64/
+    ├── DeepCode.exe
+    ├── WebView2Loader.dll
     ├── deepcode-kernel.exe
-    ├── deepcode-gui.bat
     ├── deepcode-cli.bat
     ├── deepcode-tui.bat
     ├── web/
