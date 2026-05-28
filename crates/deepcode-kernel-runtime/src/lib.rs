@@ -9,10 +9,11 @@ use deepcode_kernel_config::{
     ConfigTrustLevel, DefaultConfigResolver,
 };
 use deepcode_kernel_ledger::{EventLedger, InMemoryEventLedger, LedgerEvent};
-use deepcode_kernel_policy::PolicyProfile;
+use deepcode_kernel_policy::{AutonomyLevel, PolicyProfile};
 use deepcode_kernel_prompt::LayeredPromptCompiler;
 use deepcode_kernel_skills::{InMemorySkillRegistry, SkillRegistry, SkillRuntime};
 use deepcode_kernel_workflow::{BuiltinWorkflowMachine, WorkflowMachine, WorkflowPhase};
+use serde::Serialize;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -107,6 +108,32 @@ struct WorkflowDecisionState {
     temp_cleaned: bool,
     awaiting_permission: bool,
     blocked_reason: Option<String>,
+    /// Kernel 工具事实证据；review/final 阶段必须以本数组为唯一事实源，不允许从对话历史推断。
+    evidence: Vec<WorkflowEvidence>,
+    /// 当前所处工作流阶段；由 decide() 入口同步，apply_event 据此约束 obligation 满足时机。
+    /// plan/check 阶段即便 channel==final 也不允许 satisfy identity / tool_summary obligation。
+    current_phase: Option<String>,
+}
+
+/// Kernel 工具事实证据。每条记录对应一次 ToolCompleted / PermissionResolved / TempArtifactCleaned 等
+/// 结构化事件；review 阶段 prompt 注入这些字段后，LLM 不再有"自行总结 / 错认工具名"的余地。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowEvidence {
+    /// 真实 Kernel 工具名（如 fs.list / fs.write / fs.read / fs.delete / code.search / shell.exec）。
+    tool_name: String,
+    /// ToolRequested 时分配的 tool_call_id；用于回链到 ledger。
+    tool_call_id: Option<String>,
+    /// 状态：ok / failed / awaiting_permission / permission_rejected。
+    status: String,
+    /// 工具操作目标路径；仅文件类工具填写，shell.exec 类放命令片段。
+    path: Option<String>,
+    /// 权限裁决结果（Accept / Reject / 未涉及）。
+    permission_decision: Option<String>,
+    /// 临时文件清理状态：cleaned / pending / failed / not_applicable。
+    cleanup_status: Option<String>,
+    /// 关联的 KernelEvent 标识，便于 GUI 通过 kernelEventRefs 反查原事件。
+    kernel_event_refs: Vec<String>,
 }
 
 impl WorkflowDecisionState {
@@ -149,7 +176,8 @@ impl WorkflowDecisionState {
         state
     }
 
-    fn apply_event(&mut self, event: &KernelEvent) {
+    fn apply_event(&mut self, event: &KernelEvent, phase: &str) {
+        self.current_phase = Some(phase.to_string());
         match event {
             KernelEvent::ToolRequested {
                 tool_name,
@@ -167,6 +195,7 @@ impl WorkflowDecisionState {
                 }
             }
             KernelEvent::ToolCompleted {
+                tool_call_id,
                 tool_name,
                 ok,
                 output,
@@ -174,6 +203,28 @@ impl WorkflowDecisionState {
                 ..
             } => {
                 self.awaiting_permission = false;
+                let event_id = kernel_event_identity(event);
+                let path = extract_tool_path(tool_name, output, error);
+                let cleanup_status = if tool_name == "fs.delete" {
+                    Some(if *ok { "cleaned" } else { "failed" }.to_string())
+                } else if tool_name == "shell.exec" && self.temp_cleanup_requested {
+                    Some(if *ok { "cleaned" } else { "failed" }.to_string())
+                } else {
+                    None
+                };
+                self.evidence.push(WorkflowEvidence {
+                    tool_name: tool_name.clone(),
+                    tool_call_id: Some(tool_call_id.clone()),
+                    status: if *ok {
+                        "ok".to_string()
+                    } else {
+                        "failed".to_string()
+                    },
+                    path,
+                    permission_decision: None,
+                    cleanup_status,
+                    kernel_event_refs: vec![event_id],
+                });
                 if !ok {
                     self.blocked_reason = Some(
                         error
@@ -233,8 +284,36 @@ impl WorkflowDecisionState {
                 self.awaiting_permission = true;
                 self.blocked_reason = Some(format!("awaiting permission {}", request.id));
             }
-            KernelEvent::PermissionResolved { decision, .. } => {
+            KernelEvent::PermissionResolved {
+                decision,
+                permission_id,
+                ..
+            } => {
                 self.awaiting_permission = false;
+                let event_id = kernel_event_identity(event);
+                let decision_text = match decision {
+                    deepcode_kernel_abi::PermissionDecisionKind::Accept => "Accept",
+                    deepcode_kernel_abi::PermissionDecisionKind::Reject => "Reject",
+                };
+                if let Some(last) = self
+                    .evidence
+                    .iter_mut()
+                    .rev()
+                    .find(|item| item.permission_decision.is_none())
+                {
+                    last.permission_decision = Some(decision_text.to_string());
+                    last.kernel_event_refs.push(event_id.clone());
+                } else {
+                    self.evidence.push(WorkflowEvidence {
+                        tool_name: format!("permission:{permission_id}"),
+                        tool_call_id: None,
+                        status: decision_text.to_lowercase(),
+                        path: None,
+                        permission_decision: Some(decision_text.to_string()),
+                        cleanup_status: None,
+                        kernel_event_refs: vec![event_id],
+                    });
+                }
                 if matches!(
                     decision,
                     deepcode_kernel_abi::PermissionDecisionKind::Reject
@@ -244,19 +323,34 @@ impl WorkflowDecisionState {
                     self.blocked_reason = None;
                 }
             }
-            KernelEvent::MessageAppended { role, content, .. } => {
+            KernelEvent::MessageAppended {
+                role,
+                channel,
+                content,
+                ..
+            } => {
                 if !matches!(role, deepcode_kernel_abi::MessageRole::Agent) {
                     return;
                 }
+                if channel.as_deref() != Some("final") {
+                    return;
+                }
+                // plan / check 阶段即便走 final channel 也不允许满足身份 / 工具汇总 / 临时文件
+                // obligation；只有进入 complete 或 review 阶段后才允许 satisfy，保证身份信息只在
+                // 复核 / final 出现一次。current_phase 由 decide() 入口同步。
+                let in_final_phase = self
+                    .current_phase
+                    .as_deref()
+                    .map(|phase| phase == "review" || phase == "complete")
+                    .unwrap_or(false);
+                if !in_final_phase {
+                    return;
+                }
                 let content = content.as_deref().unwrap_or_default();
-                if content.contains("DeepCode Agent") {
+                if content_satisfies_identity_obligation(content) {
                     self.satisfy_obligation(AnswerObligationId::Identity, event);
                 }
-                if content.contains("fs.read")
-                    || content.contains("fs.list")
-                    || content.contains("fs.write")
-                    || content.contains("shell.exec")
-                {
+                if content_satisfies_tool_summary_obligation(content) {
                     self.satisfy_obligation(AnswerObligationId::ToolComponentSummary, event);
                 }
                 if self.temp_lifecycle_complete()
@@ -312,6 +406,19 @@ impl WorkflowDecisionState {
             .iter()
             .any(|value| value.status == AnswerObligationStatus::Pending)
         {
+            if phase != "complete" && phase != "review" {
+                return WorkflowDecision {
+                    action: WorkflowDecisionAction::Continue,
+                    reason: WorkflowDecisionReason::EventAccepted,
+                    phase: Some(phase.to_string()),
+                    pending_steps,
+                    answer_obligations: self.answer_obligations.clone(),
+                    summary: Some(
+                        "Advance through structured workflow before final obligations.".to_string(),
+                    ),
+                    fail_closed: false,
+                };
+            }
             return self.decision(
                 WorkflowDecisionAction::Review,
                 WorkflowDecisionReason::CompletionCriteriaSatisfied,
@@ -397,6 +504,26 @@ impl WorkflowDecisionState {
             fail_closed,
         }
     }
+}
+
+fn content_satisfies_identity_obligation(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    content.contains("DeepCode Agent")
+        || (content.contains("DeepCode") && (content.contains("我是") || lower.contains("agent")))
+}
+
+fn content_satisfies_tool_summary_obligation(content: &str) -> bool {
+    [
+        "fs.read",
+        "fs.list",
+        "fs.write",
+        "fs.delete",
+        "code.search",
+        "工具",
+        "组件",
+    ]
+    .iter()
+    .any(|needle| content.contains(needle))
 }
 
 impl Default for DeepCodeKernelRuntime {
@@ -1025,7 +1152,8 @@ impl DeepCodeKernelRuntime {
         };
         {
             let record = self.record_by_run_mut(run_id)?;
-            record.decision_state.apply_event(&event);
+            let phase = record.phase.as_str().to_string();
+            record.decision_state.apply_event(&event, &phase);
         }
         self.append_ledger(
             run_id,
@@ -1103,7 +1231,10 @@ impl DeepCodeKernelRuntime {
             };
             {
                 let record = self.record_by_run_mut(run_id)?;
-                record.decision_state.apply_event(&permission);
+                let permission_phase = record.phase.as_str().to_string();
+                record
+                    .decision_state
+                    .apply_event(&permission, &permission_phase);
             }
             self.append_ledger(
                 run_id,
@@ -1209,8 +1340,14 @@ impl DeepCodeKernelRuntime {
 
         let decision = {
             let record = self.record_by_run_mut(&run_id.0)?;
-            record.decision_state.apply_event(&event);
-            record.decision_state.decide(record.phase.as_str())
+            if let KernelEvent::StageChanged { phase, .. } = &event {
+                if let Some(next_phase) = workflow_phase_from_str(phase) {
+                    record.phase = next_phase;
+                }
+            }
+            let event_phase = record.phase.as_str().to_string();
+            record.decision_state.apply_event(&event, &event_phase);
+            record.decision_state.decide(&event_phase)
         };
         let sequence = self.ledger.next_sequence(&run_id.0)?;
         self.append_ledger(
@@ -1340,7 +1477,10 @@ impl DeepCodeKernelRuntime {
                 .records_by_session
                 .get_mut(&session_id)
                 .ok_or_else(|| KernelError::InvalidCommand("missing run record".to_string()))?;
-            record.decision_state.apply_event(&resolved_event);
+            let resolved_phase = record.phase.as_str().to_string();
+            record
+                .decision_state
+                .apply_event(&resolved_event, &resolved_phase);
         }
 
         self.append_ledger(
@@ -1438,17 +1578,43 @@ impl DeepCodeKernelRuntime {
                 "grant": grant
             }),
         )?;
-        Ok(vec![KernelEvent::MessageAppended {
-            run_id: Some(run_id),
-            session_id: Some(SessionId(record.session_id)),
-            turn_id: None,
-            role: deepcode_kernel_abi::MessageRole::System,
-            channel: Some("policy".to_string()),
-            content: None,
-            message_key: Some("permission.temporaryGrant.created".to_string()),
-            args: None,
-            sequence: Some(sequence),
-        }])
+        let autonomy_sequence = self.ledger.next_sequence(&run_id.0)?;
+        self.append_ledger(
+            &run_id.0,
+            &record.session_id,
+            "autonomy.transitioned",
+            autonomy_sequence,
+            serde_json::json!({
+                "summary": "Temporary grant changed the effective capability set for this run.",
+                "fromLevel": autonomy_level_name(&self.policy_profile.autonomy_level),
+                "toLevel": autonomy_level_name(&self.policy_profile.autonomy_level),
+                "capabilitySet": [&grant.capability]
+            }),
+        )?;
+        Ok(vec![
+            KernelEvent::MessageAppended {
+                run_id: Some(run_id),
+                session_id: Some(SessionId(record.session_id.clone())),
+                turn_id: None,
+                role: deepcode_kernel_abi::MessageRole::System,
+                channel: Some("policy".to_string()),
+                content: None,
+                message_key: Some("permission.temporaryGrant.created".to_string()),
+                args: None,
+                sequence: Some(sequence),
+            },
+            KernelEvent::AutonomyTransitioned {
+                run_id: Some(RunId(record.run_id.clone())),
+                session_id: Some(SessionId(record.session_id)),
+                from_level: Some(
+                    autonomy_level_name(&self.policy_profile.autonomy_level).to_string(),
+                ),
+                to_level: autonomy_level_name(&self.policy_profile.autonomy_level).to_string(),
+                capability_set: vec![grant.capability],
+                reason: Some("temporary grant recorded".to_string()),
+                sequence: Some(autonomy_sequence),
+            },
+        ])
     }
 
     fn workspace_open(
@@ -1825,7 +1991,10 @@ impl DeepCodeKernelRuntime {
             };
             {
                 let record = self.record_by_run_mut(&run_id)?;
-                record.decision_state.apply_event(&permission);
+                let permission_phase = record.phase.as_str().to_string();
+                record
+                    .decision_state
+                    .apply_event(&permission, &permission_phase);
             }
             self.append_ledger(
                 &run_id,
@@ -1877,7 +2046,8 @@ impl DeepCodeKernelRuntime {
         };
         {
             let record = self.record_by_run_mut(run_id)?;
-            record.decision_state.apply_event(&event);
+            let phase = record.phase.as_str().to_string();
+            record.decision_state.apply_event(&event, &phase);
         }
         self.append_ledger(
             run_id,
@@ -1967,7 +2137,10 @@ impl DeepCodeKernelRuntime {
                 };
                 {
                     let record = self.record_by_run_mut(run_id)?;
-                    record.decision_state.apply_event(&permission);
+                    let permission_phase = record.phase.as_str().to_string();
+                    record
+                        .decision_state
+                        .apply_event(&permission, &permission_phase);
                 }
                 self.append_ledger(
                     run_id,
@@ -2468,6 +2641,29 @@ fn next_phase_after_llm_response(phase: &str, decision: &WorkflowDecision) -> Ll
     }
 }
 
+fn workflow_phase_from_str(phase: &str) -> Option<WorkflowPhase> {
+    match phase {
+        "plan" => Some(WorkflowPhase::Plan),
+        "check" => Some(WorkflowPhase::Check),
+        "complete" => Some(WorkflowPhase::Complete),
+        "awaitingApproval" => Some(WorkflowPhase::AwaitingApproval),
+        "review" => Some(WorkflowPhase::Review),
+        "done" => Some(WorkflowPhase::Done),
+        "aborted" => Some(WorkflowPhase::Aborted),
+        _ => None,
+    }
+}
+
+fn autonomy_level_name(level: &AutonomyLevel) -> &'static str {
+    match level {
+        AutonomyLevel::Safe => "safe",
+        AutonomyLevel::Developer => "developer",
+        AutonomyLevel::Trusted => "trusted",
+        AutonomyLevel::Expert => "expert",
+        AutonomyLevel::MaintainerRoot => "maintainerRoot",
+    }
+}
+
 fn compile_llm_request_envelope(
     phase: &str,
     input_text: &str,
@@ -2498,22 +2694,35 @@ fn compile_llm_request_envelope(
 
 fn compile_kernel_phase_instruction(phase: &str, decision_state: &WorkflowDecisionState) -> String {
     let stage_instruction = match phase {
-        "plan" => "你是 DeepCode Kernel 调度的规划阶段。只产出计划、范围、禁止项、风险和完成条件，不直接回答最终身份、结果或总结。",
-        "check" => "你是 DeepCode Kernel 调度的检查阶段。只审查计划风险、路径、权限和可执行性，不重复最终答案。",
-        "complete" => "你是 DeepCode Kernel 调度的执行阶段。需要本地操作时只能使用 Kernel 提供的工具调用；不要把自然语言当作本地操作。",
-        "review" => "你是 DeepCode Kernel 调度的复核阶段。只有结构化完成条件满足后才输出最终答案；未完成时说明 blocked/replan。",
+        "plan" => "你是 DeepCode Kernel 调度的规划阶段。只产出计划、范围、禁止项、风险和完成条件；不得回答身份信息、测试结果或最终总结。",
+        "check" => "你是 DeepCode Kernel 调度的检查阶段。只审查计划风险、路径、权限和可执行性；不得写伪工具命令、不得重复计划正文、不得输出最终答案。",
+        "complete" => "你是 DeepCode Kernel 调度的执行阶段。需要本地操作时只能使用 Kernel 提供的工具调用；不要用自然语言声称工具已经执行，不回答身份信息或最终总结。",
+        "review" => "你是 DeepCode Kernel 调度的复核阶段。只能依据 Kernel 工具结果、权限结果和结构化完成条件输出最终答案；未完成时说明 blocked/replan，不得补造工具结果。",
         _ => "你是 DeepCode Kernel 调度的 Agent 阶段。",
     };
-    format!(
+    let mut prompt = format!(
         "{stage_instruction}\n\n\
         输出语言默认简体中文。工具路径必须是工作区相对路径，禁止 /tmp、绝对路径和 ..。\n\
+        DeepCode 允许的工具名仅有：fs.list、fs.read、fs.write、fs.delete、code.search、shell.exec；\n\
+        严禁出现 list_dir、write_file、read_file、delete_file、execute_command、list_files 等非 DeepCode 命名；\n\
+        引用工具时必须使用 fs.list/fs.read/fs.write/fs.delete/code.search/shell.exec 的精确写法，可见工具目录以 requestEnvelope.tools 为准。\n\
         fs.delete 是隐藏的内核受控能力，不在普通模型工具目录中；临时测试文件清理由 Kernel 受控流程完成。\n\
+        规划、检查和执行阶段只能记录进度；身份信息、工具汇总和临时文件结果只允许在复核/final 阶段回答一次。\n\
         不要重复已经满足的 AnswerObligation。\n\
         当前待满足步骤：{}",
         decision_state.pending_steps().join("；")
-    )
+    );
+    // review 阶段把 Kernel 工具事实作为唯一事实源注入 prompt；LLM 只能基于 evidence 字段
+    // 输出最终答案，不允许从对话历史推断"哪个工具失败 / 哪个工具不可用"。
+    if phase == "review" && !decision_state.evidence.is_empty() {
+        let evidence_json = serde_json::to_string_pretty(&decision_state.evidence)
+            .unwrap_or_else(|_| "[]".to_string());
+        prompt.push_str(&format!(
+            "\n\nKernel 工具事实证据（review/final 必须以此为唯一事实源；evidence 中 status=ok 即代表该工具调用成功，不得再说\"无法执行\"或\"工具不可用\"）：\n```json\n{evidence_json}\n```",
+        ));
+    }
+    prompt
 }
-
 fn kernel_visible_tool_schemas() -> Vec<Value> {
     vec![
         serde_json::json!({
@@ -2685,6 +2894,43 @@ fn is_temp_cleanup_command(command: &str) -> bool {
             || lower.starts_with("rm")
             || lower.contains("del ")
             || lower.contains("remove-item"))
+}
+
+/// 从 ToolCompleted 输出 / error 中提取目标路径，仅用于 WorkflowEvidence.path 字段记录。
+/// 文件类工具读 path / file_path / target；shell.exec 读 command 片段；其他类型返回 None。
+fn extract_tool_path(
+    tool_name: &str,
+    output: &Option<Value>,
+    error: &Option<deepcode_kernel_abi::KernelErrorEnvelope>,
+) -> Option<String> {
+    match tool_name {
+        "fs.list" | "fs.read" | "fs.write" | "fs.delete" | "code.search" => output
+            .as_ref()
+            .and_then(|value| {
+                [
+                    "path",
+                    "file_path",
+                    "target",
+                    "filePath",
+                    "targetPath",
+                    "query",
+                ]
+                .iter()
+                .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
+            })
+            .or_else(|| {
+                error
+                    .as_ref()
+                    .and_then(|envelope| envelope.message.split('\'').nth(1).map(str::to_string))
+            }),
+        "shell.exec" => output.as_ref().and_then(|value| {
+            value
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|command| command.chars().take(120).collect::<String>())
+        }),
+        _ => None,
+    }
 }
 
 fn output_mentions_temp_file(value: &Value) -> bool {
@@ -3221,6 +3467,7 @@ fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::ToolCompleted { .. } => "tool.completed",
         KernelEvent::PermissionRequested { .. } => "permission.requested",
         KernelEvent::PermissionResolved { .. } => "permission.resolved",
+        KernelEvent::AutonomyTransitioned { .. } => "autonomy.transitioned",
         KernelEvent::ConfigSnapshotAttached { .. } => "config.snapshot.attached",
         KernelEvent::PlanProposed { .. } => "plan.proposed",
         KernelEvent::PlanAccepted { .. } => "plan.accepted",
@@ -3233,6 +3480,9 @@ fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::ContextResult { .. } => "context.result",
         KernelEvent::TempArtifactCreated { .. } => "tempArtifact.created",
         KernelEvent::TempArtifactCleaned { .. } => "tempArtifact.cleaned",
+        KernelEvent::TempArtifactLeaseGranted { .. } => "tempArtifact.lease_granted",
+        KernelEvent::TempArtifactLeaseReleased { .. } => "tempArtifact.lease_released",
+        KernelEvent::TempArtifactLeasePromoted { .. } => "tempArtifact.lease_promoted",
         KernelEvent::TempCleanupFailed { .. } => "tempCleanup.failed",
         KernelEvent::Error { .. } => "error",
     }
@@ -3249,6 +3499,7 @@ fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::ToolCompleted { sequence, .. }
         | KernelEvent::PermissionRequested { sequence, .. }
         | KernelEvent::PermissionResolved { sequence, .. }
+        | KernelEvent::AutonomyTransitioned { sequence, .. }
         | KernelEvent::ConfigSnapshotAttached { sequence, .. }
         | KernelEvent::PlanProposed { sequence, .. }
         | KernelEvent::PlanAccepted { sequence, .. }
@@ -3261,6 +3512,9 @@ fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::ContextResult { sequence, .. }
         | KernelEvent::TempArtifactCreated { sequence, .. }
         | KernelEvent::TempArtifactCleaned { sequence, .. }
+        | KernelEvent::TempArtifactLeaseGranted { sequence, .. }
+        | KernelEvent::TempArtifactLeaseReleased { sequence, .. }
+        | KernelEvent::TempArtifactLeasePromoted { sequence, .. }
         | KernelEvent::TempCleanupFailed { sequence, .. } => *sequence,
         KernelEvent::HostStatus { .. }
         | KernelEvent::SnapshotReady { .. }
@@ -3866,7 +4120,8 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(grant[0], KernelEvent::MessageAppended { .. }));
-        assert_eq!(runtime.ledger("run-1").unwrap().len(), 7);
+        assert!(matches!(grant[1], KernelEvent::AutonomyTransitioned { .. }));
+        assert_eq!(runtime.ledger("run-1").unwrap().len(), 8);
     }
 
     #[test]
@@ -3969,6 +4224,20 @@ mod tests {
     fn workflow_observe_temp_lifecycle_cleanup_enters_review_then_done() {
         let mut runtime = DeepCodeKernelRuntime::new();
         start_temp_lifecycle_run(&mut runtime);
+        observe(
+            &mut runtime,
+            "req-enter-complete",
+            KernelEvent::StageChanged {
+                run_id: Some(RunId("run-1".to_string())),
+                session_id: Some(SessionId("session-1".to_string())),
+                turn_id: None,
+                stage_run_id: None,
+                phase: "complete".to_string(),
+                status: StageStatus::Running,
+                reason: None,
+                sequence: Some(4),
+            },
+        );
 
         for (request_id, tool_call_id, tool_name) in [
             ("req-observe-1", "tool-list", "fs.list"),
@@ -4048,5 +4317,143 @@ mod tests {
 
         assert_eq!(done.action, WorkflowDecisionAction::Done);
         assert!(done.pending_steps.is_empty());
+    }
+
+    #[test]
+    fn non_final_messages_cannot_satisfy_answer_obligations() {
+        let mut runtime = DeepCodeKernelRuntime::new();
+        start_temp_lifecycle_run(&mut runtime);
+
+        let decision = observe(
+            &mut runtime,
+            "req-non-final",
+            KernelEvent::MessageAppended {
+                run_id: Some(RunId("run-1".to_string())),
+                session_id: Some(SessionId("session-1".to_string())),
+                turn_id: None,
+                role: MessageRole::Agent,
+                channel: Some("plan".to_string()),
+                content: Some(
+                    "我是 DeepCode Agent。fs.read fs.list fs.write fs.delete 都已经完成。"
+                        .to_string(),
+                ),
+                message_key: None,
+                args: None,
+                sequence: Some(10),
+            },
+        );
+
+        assert_ne!(decision.action, WorkflowDecisionAction::Done);
+        assert!(decision
+            .answer_obligations
+            .iter()
+            .all(|obligation| { obligation.status == AnswerObligationStatus::Pending }));
+    }
+
+    #[test]
+    fn check_phase_final_message_cannot_satisfy_identity_obligation() {
+        // 验证 plan/check 阶段即便 channel == final，identity / tool_summary 也不能被满足。
+        // 闭合用户报告的"身份信息在 check 阶段被提前输出"问题。
+        let mut state = WorkflowDecisionState::from_user_input("返回你的身份信息");
+        state.evidence.clear();
+        let event = KernelEvent::MessageAppended {
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            turn_id: None,
+            role: MessageRole::Agent,
+            channel: Some("final".to_string()),
+            content: Some("我是 DeepCode Agent。这是 check 阶段的回答。".to_string()),
+            message_key: None,
+            args: None,
+            sequence: Some(1),
+        };
+        state.apply_event(&event, "check");
+        // check 阶段不允许 satisfy。
+        assert!(state
+            .answer_obligations
+            .iter()
+            .filter(|obligation| obligation.id == AnswerObligationId::Identity)
+            .all(|obligation| obligation.status == AnswerObligationStatus::Pending));
+
+        // review 阶段应允许 satisfy 同样的内容。
+        state.apply_event(&event, "review");
+        assert!(state
+            .answer_obligations
+            .iter()
+            .filter(|obligation| obligation.id == AnswerObligationId::Identity)
+            .all(|obligation| obligation.status == AnswerObligationStatus::Satisfied));
+    }
+
+    #[test]
+    fn evidence_records_tool_completion_status_and_path() {
+        // 验证 ToolCompleted 后 WorkflowEvidence 被累积，包含 toolName/status/path/cleanupStatus。
+        // review 阶段据此构造唯一事实源，杜绝 LLM 自行推断"工具不可用"。
+        let mut state = WorkflowDecisionState::default();
+        let event = KernelEvent::ToolCompleted {
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            turn_id: None,
+            tool_call_id: "call-1".to_string(),
+            tool_name: "fs.delete".to_string(),
+            ok: true,
+            output: Some(serde_json::json!({"path": "_agent_tmp_test.txt"})),
+            error: None,
+            sequence: Some(1),
+        };
+        state.apply_event(&event, "complete");
+        assert_eq!(state.evidence.len(), 1);
+        let evidence = &state.evidence[0];
+        assert_eq!(evidence.tool_name, "fs.delete");
+        assert_eq!(evidence.status, "ok");
+        assert_eq!(evidence.cleanup_status.as_deref(), Some("cleaned"));
+    }
+
+    #[test]
+    fn review_phase_prompt_includes_evidence_json() {
+        // 验证 compile_kernel_phase_instruction 在 review 阶段把 evidence 注入 prompt。
+        // 这是 P0-3 的核心契约：LLM 看到的 prompt 必须包含 Kernel 工具事实。
+        let mut state = WorkflowDecisionState::from_user_input("test workspace tools");
+        state.evidence.push(WorkflowEvidence {
+            tool_name: "fs.delete".to_string(),
+            tool_call_id: Some("call-1".to_string()),
+            status: "ok".to_string(),
+            path: Some("_agent_tmp_test.txt".to_string()),
+            permission_decision: Some("Accept".to_string()),
+            cleanup_status: Some("cleaned".to_string()),
+            kernel_event_refs: vec!["evt-1".to_string()],
+        });
+        let prompt = compile_kernel_phase_instruction("review", &state);
+        assert!(prompt.contains("Kernel 工具事实证据"));
+        assert!(prompt.contains("\"fs.delete\""));
+        assert!(prompt.contains("\"ok\""));
+        assert!(prompt.contains("唯一事实源"));
+
+        // plan 阶段不应注入 evidence JSON。
+        let plan_prompt = compile_kernel_phase_instruction("plan", &state);
+        assert!(!plan_prompt.contains("Kernel 工具事实证据"));
+    }
+
+    #[test]
+    fn phase_prompt_forbids_non_deepcode_tool_names() {
+        // 验证 prompt 显式禁止 list_dir/write_file/read_file/delete_file/execute_command 等
+        // 非 DeepCode 工具名，闭合用户报告的"工具命名混乱"问题。
+        let state = WorkflowDecisionState::default();
+        for phase in ["plan", "check", "complete", "review"] {
+            let prompt = compile_kernel_phase_instruction(phase, &state);
+            assert!(
+                prompt.contains("list_dir")
+                    && prompt.contains("write_file")
+                    && prompt.contains("execute_command"),
+                "phase {phase} prompt must explicitly forbid non-DeepCode tool names"
+            );
+            assert!(
+                prompt.contains("fs.list")
+                    && prompt.contains("fs.read")
+                    && prompt.contains("fs.write")
+                    && prompt.contains("fs.delete")
+                    && prompt.contains("code.search"),
+                "phase {phase} prompt must list allowed DeepCode tool names"
+            );
+        }
     }
 }

@@ -185,6 +185,43 @@ export interface KernelTemporaryGrant {
   reason?: string;
 }
 
+export type KernelEffectSurface =
+  | 'workspace'
+  | 'deepcodeConfig'
+  | 'externalReadOnly'
+  | 'systemPath'
+  | 'process'
+  | 'network'
+  | 'secret'
+  | 'kernel';
+
+export type KernelBatchSize =
+  | 'single'
+  | { bounded: number }
+  | 'unbounded';
+
+export type KernelPersistence = 'ephemeral' | 'run' | 'session' | 'persistent';
+
+export type KernelOutsideWorkspace =
+  | 'forbidden'
+  | 'readOnlyReference'
+  | 'managedCopy'
+  | 'writableOverride';
+
+export type KernelHardFloor =
+  | 'recursiveSystemDelete'
+  | 'outsideWorkspaceWrite'
+  | 'secretExposure'
+  | 'kernelModifyWithoutMaintainer';
+
+export interface KernelPermissionImpact {
+  effectSurface: KernelEffectSurface;
+  batchSize: KernelBatchSize;
+  persistence: KernelPersistence;
+  outsideWorkspace: KernelOutsideWorkspace;
+  hardFloor?: KernelHardFloor;
+}
+
 export type KernelShellRuntimePreference =
   | 'linuxDefault'
   | 'wsl'
@@ -317,6 +354,35 @@ export type KernelTempArtifactEvent =
       runId: string;
       sessionId?: string;
       path: string;
+      sequence?: number;
+    }
+  | {
+      kind: 'tempArtifact.lease_granted';
+      runId: string;
+      sessionId?: string;
+      leaseId: string;
+      artifactId: string;
+      scope: 'run' | 'session' | 'persistent';
+      required: boolean;
+      sequence?: number;
+    }
+  | {
+      kind: 'tempArtifact.lease_released';
+      runId: string;
+      sessionId?: string;
+      leaseId: string;
+      artifactId: string;
+      cleanupOk: boolean;
+      sequence?: number;
+    }
+  | {
+      kind: 'tempArtifact.lease_promoted';
+      runId: string;
+      sessionId?: string;
+      leaseId: string;
+      artifactId: string;
+      fromScope: 'run' | 'session' | 'persistent';
+      toScope: 'run' | 'session' | 'persistent';
       sequence?: number;
     }
   | {

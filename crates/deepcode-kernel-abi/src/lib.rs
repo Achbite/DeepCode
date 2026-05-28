@@ -339,6 +339,16 @@ pub enum KernelEvent {
         reason: Option<String>,
         sequence: Option<u64>,
     },
+    #[serde(rename = "autonomy.transitioned")]
+    AutonomyTransitioned {
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        from_level: Option<String>,
+        to_level: String,
+        capability_set: Vec<String>,
+        reason: Option<String>,
+        sequence: Option<u64>,
+    },
     #[serde(rename = "config.snapshot.attached")]
     ConfigSnapshotAttached {
         run_id: Option<RunId>,
@@ -433,6 +443,35 @@ pub enum KernelEvent {
         run_id: RunId,
         session_id: Option<SessionId>,
         path: String,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "tempArtifact.lease_granted")]
+    TempArtifactLeaseGranted {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        lease_id: String,
+        artifact_id: String,
+        scope: String,
+        required: bool,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "tempArtifact.lease_released")]
+    TempArtifactLeaseReleased {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        lease_id: String,
+        artifact_id: String,
+        cleanup_ok: bool,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "tempArtifact.lease_promoted")]
+    TempArtifactLeasePromoted {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        lease_id: String,
+        artifact_id: String,
+        from_scope: String,
+        to_scope: String,
         sequence: Option<u64>,
     },
     #[serde(rename = "tempCleanup.failed")]

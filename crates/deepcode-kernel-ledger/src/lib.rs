@@ -310,12 +310,86 @@ pub enum TempArtifactKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum TempArtifactScope {
+    Run,
+    Session,
+    Persistent,
+}
+
+impl Default for TempArtifactScope {
+    fn default() -> Self {
+        Self::Run
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TempArtifactLeaseState {
+    Active,
+    Released,
+    Promoted,
+    Orphaned,
+}
+
+impl Default for TempArtifactLeaseState {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempArtifactCondition {
+    pub r#type: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempArtifactLeaseStatus {
+    pub state: TempArtifactLeaseState,
+    pub conditions: Vec<TempArtifactCondition>,
+}
+
+impl Default for TempArtifactLeaseStatus {
+    fn default() -> Self {
+        Self {
+            state: TempArtifactLeaseState::Active,
+            conditions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TempArtifact {
     pub id: String,
     pub run_id: String,
     pub path: String,
     pub kind: TempArtifactKind,
     pub cleaned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    #[serde(default)]
+    pub scope: TempArtifactScope,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub status: TempArtifactLeaseStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempArtifactLease {
+    pub lease_id: String,
+    pub artifact_id: String,
+    pub run_id: String,
+    pub path: String,
+    pub scope: TempArtifactScope,
+    pub required: bool,
+    pub status: TempArtifactLeaseStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,22 +443,155 @@ impl TempArtifactRegistry {
         relative_path: &str,
         kind: TempArtifactKind,
     ) -> KernelResult<TempArtifact> {
+        self.register_path_with_scope(run_id, relative_path, kind, TempArtifactScope::Run, false)
+    }
+
+    pub fn register_path_with_scope(
+        &self,
+        run_id: &str,
+        relative_path: &str,
+        kind: TempArtifactKind,
+        scope: TempArtifactScope,
+        required: bool,
+    ) -> KernelResult<TempArtifact> {
         let full_path = self.safe_join(relative_path)?;
+        let mut artifacts = self.artifacts.lock().expect("temp lock");
+        let next_index = artifacts.len() + 1;
+        let artifact_id = format!("temp-{run_id}-{next_index}");
         let artifact = TempArtifact {
-            id: format!(
-                "temp-{run_id}-{}",
-                self.artifacts.lock().expect("temp lock").len() + 1
-            ),
+            id: artifact_id.clone(),
             run_id: run_id.to_string(),
             path: full_path.to_string_lossy().to_string(),
             kind,
             cleaned: false,
+            lease_id: Some(format!("lease-{artifact_id}")),
+            scope,
+            required,
+            status: TempArtifactLeaseStatus::default(),
         };
-        self.artifacts
+        artifacts.insert(artifact.id.clone(), artifact.clone());
+        Ok(artifact)
+    }
+
+    pub fn acquire_lease(
+        &self,
+        run_id: &str,
+        relative_path: &str,
+        kind: TempArtifactKind,
+        scope: TempArtifactScope,
+        required: bool,
+        content: Option<&[u8]>,
+    ) -> KernelResult<TempArtifactLease> {
+        if let Some(content) = content {
+            let full_path = self.safe_join(relative_path)?;
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    KernelError::Other(format!("create temp artifact directory failed: {error}"))
+                })?;
+            }
+            fs::write(&full_path, content).map_err(|error| {
+                KernelError::Other(format!("write temp artifact failed: {error}"))
+            })?;
+        }
+        let artifact =
+            self.register_path_with_scope(run_id, relative_path, kind, scope, required)?;
+        Ok(lease_from_artifact(&artifact))
+    }
+
+    pub fn release_lease(&self, lease_id: &str) -> KernelResult<TempArtifactCleanupResult> {
+        let artifact_id = self.artifact_id_for_lease(lease_id)?;
+        {
+            let mut artifacts = self.artifacts.lock().expect("temp lock");
+            let artifact = artifacts.get_mut(&artifact_id).ok_or_else(|| {
+                KernelError::PermissionDenied(format!(
+                    "refusing to release unknown temp artifact lease {lease_id}"
+                ))
+            })?;
+            artifact.status.state = TempArtifactLeaseState::Released;
+            artifact.status.conditions.push(TempArtifactCondition {
+                r#type: "Released".to_string(),
+                status: "True".to_string(),
+                reason: Some("LeaseReleaseRequested".to_string()),
+                message: None,
+            });
+        }
+        self.clean_artifact(&artifact_id)
+    }
+
+    pub fn promote_lease(
+        &self,
+        lease_id: &str,
+        new_scope: TempArtifactScope,
+    ) -> KernelResult<TempArtifactLease> {
+        let mut artifacts = self.artifacts.lock().expect("temp lock");
+        let artifact = artifacts
+            .values_mut()
+            .find(|artifact| artifact.lease_id.as_deref() == Some(lease_id))
+            .ok_or_else(|| {
+                KernelError::PermissionDenied(format!(
+                    "refusing to promote unknown temp artifact lease {lease_id}"
+                ))
+            })?;
+        // 单调升级约束：Run→Session→Persistent 允许，逆向降级返回 PermissionDenied。
+        // 等级数值化后比较：Run=0 / Session=1 / Persistent=2。new_scope 必须 >= 当前 scope。
+        let current_rank = scope_rank(&artifact.scope);
+        let new_rank = scope_rank(&new_scope);
+        if new_rank < current_rank {
+            return Err(KernelError::PermissionDenied(format!(
+                "refusing to demote temp artifact lease {lease_id} from {:?} to {new_scope:?}; lease scope can only be monotonically promoted (Run -> Session -> Persistent)",
+                artifact.scope
+            )));
+        }
+        artifact.scope = new_scope;
+        artifact.status.state = TempArtifactLeaseState::Promoted;
+        artifact.status.conditions.push(TempArtifactCondition {
+            r#type: "Promoted".to_string(),
+            status: "True".to_string(),
+            reason: Some("LeasePromoted".to_string()),
+            message: None,
+        });
+        Ok(lease_from_artifact(artifact))
+    }
+
+    pub fn reconcile_orphan_leases(&self) -> KernelResult<Vec<TempArtifactLease>> {
+        let mut artifacts = self.artifacts.lock().expect("temp lock");
+        let mut orphaned = Vec::new();
+        for artifact in artifacts.values_mut() {
+            if artifact.cleaned
+                || artifact.status.state == TempArtifactLeaseState::Released
+                || artifact.scope == TempArtifactScope::Persistent
+            {
+                continue;
+            }
+            artifact.status.state = TempArtifactLeaseState::Orphaned;
+            artifact.status.conditions.push(TempArtifactCondition {
+                r#type: "ReconcileNeeded".to_string(),
+                status: "True".to_string(),
+                reason: Some("RuntimeStartup".to_string()),
+                message: Some(
+                    "Temp artifact lease requires explicit cleanup or promotion.".to_string(),
+                ),
+            });
+            orphaned.push(lease_from_artifact(artifact));
+        }
+        Ok(orphaned)
+    }
+
+    pub fn required_open_leases(&self, run_id: &str) -> KernelResult<Vec<TempArtifactLease>> {
+        Ok(self
+            .artifacts
             .lock()
             .expect("temp lock")
-            .insert(artifact.id.clone(), artifact.clone());
-        Ok(artifact)
+            .values()
+            .filter(|artifact| {
+                artifact.run_id == run_id
+                    && artifact.required
+                    && !artifact.cleaned
+                    && artifact.scope != TempArtifactScope::Persistent
+                    && artifact.status.state != TempArtifactLeaseState::Released
+            })
+            .map(lease_from_artifact)
+            .collect())
     }
 
     pub fn guard<'a>(
@@ -433,6 +640,15 @@ impl TempArtifactRegistry {
         };
         artifact.cleaned = result.cleaned;
         if result.cleaned {
+            artifact.status.state = TempArtifactLeaseState::Released;
+            artifact.status.conditions.push(TempArtifactCondition {
+                r#type: "Cleaned".to_string(),
+                status: "True".to_string(),
+                reason: Some("ArtifactRemoved".to_string()),
+                message: None,
+            });
+        }
+        if result.cleaned {
             artifacts.remove(artifact_id);
         }
         Ok(result)
@@ -444,7 +660,9 @@ impl TempArtifactRegistry {
             .lock()
             .expect("temp lock")
             .values()
-            .filter(|artifact| artifact.run_id == run_id)
+            .filter(|artifact| {
+                artifact.run_id == run_id && artifact.scope == TempArtifactScope::Run
+            })
             .map(|artifact| artifact.id.clone())
             .collect::<Vec<_>>();
         ids.into_iter()
@@ -470,6 +688,45 @@ impl TempArtifactRegistry {
             ));
         }
         Ok(self.root.join(path))
+    }
+
+    fn artifact_id_for_lease(&self, lease_id: &str) -> KernelResult<String> {
+        self.artifacts
+            .lock()
+            .expect("temp lock")
+            .values()
+            .find(|artifact| artifact.lease_id.as_deref() == Some(lease_id))
+            .map(|artifact| artifact.id.clone())
+            .ok_or_else(|| {
+                KernelError::PermissionDenied(format!(
+                    "refusing to access unknown temp artifact lease {lease_id}"
+                ))
+            })
+    }
+}
+
+/// 把 TempArtifactScope 映射为单调升级用的整数等级：Run=0 / Session=1 / Persistent=2。
+/// promote_lease 据此约束 new_scope 必须 >= 当前 scope，禁止逆向降级。
+fn scope_rank(scope: &TempArtifactScope) -> u8 {
+    match scope {
+        TempArtifactScope::Run => 0,
+        TempArtifactScope::Session => 1,
+        TempArtifactScope::Persistent => 2,
+    }
+}
+
+fn lease_from_artifact(artifact: &TempArtifact) -> TempArtifactLease {
+    TempArtifactLease {
+        lease_id: artifact
+            .lease_id
+            .clone()
+            .unwrap_or_else(|| format!("lease-{}", artifact.id)),
+        artifact_id: artifact.id.clone(),
+        run_id: artifact.run_id.clone(),
+        path: artifact.path.clone(),
+        scope: artifact.scope.clone(),
+        required: artifact.required,
+        status: artifact.status.clone(),
     }
 }
 
@@ -555,6 +812,43 @@ impl ReviewGate {
                 .map(|validation| validation.id.clone())
                 .collect(),
         }
+    }
+
+    pub fn evaluate_with_temp_leases(
+        &self,
+        run_id: &str,
+        change_set: Option<&ChangeSet>,
+        validations: &[ValidationResult],
+        evidence_refs: Vec<String>,
+        temp_leases: &[TempArtifactLease],
+    ) -> ReviewGateResult {
+        let open_required_leases = temp_leases
+            .iter()
+            .filter(|lease| {
+                lease.required
+                    && lease.scope != TempArtifactScope::Persistent
+                    && lease.status.state != TempArtifactLeaseState::Released
+            })
+            .collect::<Vec<_>>();
+        if !open_required_leases.is_empty() {
+            return ReviewGateResult {
+                id: format!("review-{run_id}"),
+                run_id: run_id.to_string(),
+                status: ReviewGateStatus::NeedsUserReview,
+                summary: format!(
+                    "{} required temp artifact lease(s) must be released or promoted before review.",
+                    open_required_leases.len()
+                ),
+                evidence_refs,
+                change_set_id: change_set.map(|value| value.id.clone()),
+                validation_result_ids: validations
+                    .iter()
+                    .map(|validation| validation.id.clone())
+                    .collect(),
+            };
+        }
+
+        self.evaluate(run_id, change_set, validations, evidence_refs)
     }
 }
 
@@ -756,6 +1050,147 @@ mod tests {
         assert!(matches!(traversal, KernelError::PermissionDenied(_)));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn temp_artifact_lease_release_promote_and_reconcile_are_explicit() {
+        let root = temp_root("tmp-lease").join(".deepcode/tmp");
+        let registry = TempArtifactRegistry::new(&root);
+        let lease = registry
+            .acquire_lease(
+                "run-1",
+                "runs/run-1/_agent_tmp_lease.txt",
+                TempArtifactKind::AgentTemp,
+                TempArtifactScope::Run,
+                true,
+                Some(b"lease"),
+            )
+            .unwrap();
+        assert!(Path::new(&lease.path).exists());
+        assert!(registry.required_open_leases("run-1").unwrap().len() == 1);
+
+        let promoted = registry
+            .promote_lease(&lease.lease_id, TempArtifactScope::Persistent)
+            .unwrap();
+        assert_eq!(promoted.scope, TempArtifactScope::Persistent);
+        assert!(registry.required_open_leases("run-1").unwrap().is_empty());
+
+        let session_lease = registry
+            .acquire_lease(
+                "run-1",
+                "runs/run-1/_agent_tmp_session.txt",
+                TempArtifactKind::AgentTemp,
+                TempArtifactScope::Session,
+                true,
+                Some(b"session"),
+            )
+            .unwrap();
+        let orphaned = registry.reconcile_orphan_leases().unwrap();
+        assert!(orphaned
+            .iter()
+            .any(|lease| lease.lease_id == session_lease.lease_id
+                && lease.status.state == TempArtifactLeaseState::Orphaned));
+
+        let cleaned = registry.release_lease(&session_lease.lease_id).unwrap();
+        assert!(cleaned.cleaned);
+        assert!(!Path::new(&cleaned.path).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_lease_rejects_monotonic_demotion() {
+        let root = temp_root("tmp-lease-demote").join(".deepcode/tmp");
+        let registry = TempArtifactRegistry::new(&root);
+        let lease = registry
+            .acquire_lease(
+                "run-1",
+                "runs/run-1/_agent_tmp_demote.txt",
+                TempArtifactKind::AgentTemp,
+                TempArtifactScope::Session,
+                false,
+                Some(b"demote"),
+            )
+            .unwrap();
+        // 允许 Session -> Persistent（单调升级）。
+        let promoted = registry
+            .promote_lease(&lease.lease_id, TempArtifactScope::Persistent)
+            .unwrap();
+        assert_eq!(promoted.scope, TempArtifactScope::Persistent);
+        // 禁止 Persistent -> Run（逆向降级）。
+        let demote_err = registry
+            .promote_lease(&lease.lease_id, TempArtifactScope::Run)
+            .unwrap_err();
+        match demote_err {
+            KernelError::PermissionDenied(message) => {
+                assert!(message.contains("monotonically promoted"));
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn review_gate_blocks_required_open_temp_leases() {
+        let gate = ReviewGate;
+        let change_set = ChangeSet::from_operations(
+            "cs-1",
+            "run-1",
+            vec![ChangeOperation {
+                id: "op-1".to_string(),
+                work_unit_id: None,
+                kind: "write".to_string(),
+                file_path: "src/main.rs".to_string(),
+                diff: Some("+change".to_string()),
+            }],
+        );
+        let validation = ValidationResult {
+            id: "val-1".to_string(),
+            run_id: "run-1".to_string(),
+            kind: ValidationKind::Test,
+            passed: true,
+            summary: "tests passed".to_string(),
+            evidence_refs: vec!["evt-1".to_string()],
+        };
+        let lease = TempArtifactLease {
+            lease_id: "lease-1".to_string(),
+            artifact_id: "temp-1".to_string(),
+            run_id: "run-1".to_string(),
+            path: ".deepcode/tmp/runs/run-1/_agent_tmp_test.txt".to_string(),
+            scope: TempArtifactScope::Run,
+            required: true,
+            status: TempArtifactLeaseStatus::default(),
+        };
+
+        let blocked = gate.evaluate_with_temp_leases(
+            "run-1",
+            Some(&change_set),
+            &[validation.clone()],
+            vec!["evt-2".to_string()],
+            &[lease],
+        );
+        assert_eq!(blocked.status, ReviewGateStatus::NeedsUserReview);
+
+        let promoted = TempArtifactLease {
+            lease_id: "lease-2".to_string(),
+            artifact_id: "temp-2".to_string(),
+            run_id: "run-1".to_string(),
+            path: ".deepcode/references/ref.txt".to_string(),
+            scope: TempArtifactScope::Persistent,
+            required: true,
+            status: TempArtifactLeaseStatus {
+                state: TempArtifactLeaseState::Promoted,
+                conditions: Vec::new(),
+            },
+        };
+        let accepted = gate.evaluate_with_temp_leases(
+            "run-1",
+            Some(&change_set),
+            &[validation],
+            vec!["evt-2".to_string()],
+            &[promoted],
+        );
+        assert_eq!(accepted.status, ReviewGateStatus::Accepted);
     }
 
     #[test]

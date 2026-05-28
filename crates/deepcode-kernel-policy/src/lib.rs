@@ -250,6 +250,76 @@ pub struct TemporaryGrant {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum EffectSurface {
+    Workspace,
+    DeepcodeConfig,
+    ExternalReadOnly,
+    SystemPath,
+    Process,
+    Network,
+    Secret,
+    Kernel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BatchSize {
+    Single,
+    Bounded(u32),
+    Unbounded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Persistence {
+    Ephemeral,
+    Run,
+    Session,
+    Persistent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OutsideWorkspace {
+    Forbidden,
+    ReadOnlyReference,
+    ManagedCopy,
+    WritableOverride,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HardFloor {
+    RecursiveSystemDelete,
+    OutsideWorkspaceWrite,
+    SecretExposure,
+    KernelModifyWithoutMaintainer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionImpact {
+    pub effect_surface: EffectSurface,
+    pub batch_size: BatchSize,
+    pub persistence: Persistence,
+    pub outside_workspace: OutsideWorkspace,
+    pub hard_floor: Option<HardFloor>,
+}
+
+impl Default for PermissionImpact {
+    fn default() -> Self {
+        Self {
+            effect_surface: EffectSurface::Workspace,
+            batch_size: BatchSize::Single,
+            persistence: Persistence::Run,
+            outside_workspace: OutsideWorkspace::Forbidden,
+            hard_floor: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ShellRuntimePreference {
     LinuxDefault,
     Wsl,
@@ -559,6 +629,8 @@ pub struct PermissionRequest {
     pub effects: Vec<CapabilityEffect>,
     pub source_trust: Option<PolicySourceTrust>,
     pub resource_scope: Option<ResourceScope>,
+    #[serde(default)]
+    pub impact: PermissionImpact,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -598,6 +670,14 @@ impl PermissionGate for DefaultPermissionGate {
             return Err(KernelError::InvalidCommand(
                 "permission capability is required".to_string(),
             ));
+        }
+
+        if let Some(hard_floor) = detect_hard_floor(profile, request) {
+            return Ok(PolicyDecision {
+                decision: PolicyDecisionKind::Deny,
+                reason: Some(format!("hard floor denied: {hard_floor:?}")),
+                request: None,
+            });
         }
 
         if resource_is_protected_config_asset(request)
@@ -647,6 +727,42 @@ impl PermissionGate for DefaultPermissionGate {
             reason,
         })
     }
+}
+
+fn detect_hard_floor(profile: &PolicyProfile, request: &PermissionRequest) -> Option<HardFloor> {
+    if let Some(hard_floor) = request.impact.hard_floor.clone() {
+        return Some(hard_floor);
+    }
+
+    if request.capability == Capability::kernel_modify()
+        && profile.autonomy_level != AutonomyLevel::MaintainerRoot
+    {
+        return Some(HardFloor::KernelModifyWithoutMaintainer);
+    }
+
+    if request.capability == Capability::secret_read()
+        && request.source_trust == Some(PolicySourceTrust::ExternalConnector)
+    {
+        return Some(HardFloor::SecretExposure);
+    }
+
+    if is_workspace_file_mutation(&request.capability)
+        && matches!(
+            request.impact.outside_workspace,
+            OutsideWorkspace::ReadOnlyReference | OutsideWorkspace::WritableOverride
+        )
+    {
+        return Some(HardFloor::OutsideWorkspaceWrite);
+    }
+
+    if request.capability == Capability::workspace_delete()
+        && (request.impact.effect_surface == EffectSurface::SystemPath
+            || request.impact.batch_size == BatchSize::Unbounded)
+    {
+        return Some(HardFloor::RecursiveSystemDelete);
+    }
+
+    None
 }
 
 fn matching_temporary_grant<'a>(
@@ -707,6 +823,7 @@ mod tests {
             effects: Vec::new(),
             source_trust: None,
             resource_scope: Some(ResourceScope::workspace_file("src/main.rs")),
+            impact: PermissionImpact::default(),
         }
     }
 
@@ -901,6 +1018,119 @@ mod tests {
             )
             .unwrap();
         assert_eq!(different_resource.decision, PolicyDecisionKind::Ask);
+    }
+
+    #[test]
+    fn hard_floor_denies_before_temporary_grant() {
+        let gate = DefaultPermissionGate;
+        let mut profile = PolicyProfile::maintainer_defaults();
+        profile
+            .grant_temporary(TemporaryGrant {
+                id: "grant-delete".to_string(),
+                run_id: "run-1".to_string(),
+                capability: Capability::workspace_delete(),
+                resource_scope: ResourceScope::workspace_file("src"),
+                decision: PolicyDecisionKind::Allow,
+                expires_after_sequence: None,
+                reason: Some("user allowed cleanup".to_string()),
+            })
+            .unwrap();
+
+        let decision = gate
+            .evaluate(
+                &profile,
+                &PermissionRequest {
+                    resource_scope: Some(ResourceScope::workspace_file("src")),
+                    impact: PermissionImpact {
+                        effect_surface: EffectSurface::SystemPath,
+                        batch_size: BatchSize::Unbounded,
+                        persistence: Persistence::Persistent,
+                        outside_workspace: OutsideWorkspace::Forbidden,
+                        hard_floor: None,
+                    },
+                    ..request(Capability::workspace_delete(), RiskLevel::Critical)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
+        assert!(decision
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hard floor"));
+    }
+
+    #[test]
+    fn outside_workspace_write_is_non_overridable() {
+        let gate = DefaultPermissionGate;
+        let profile = PolicyProfile::trusted_workspace_defaults();
+        let decision = gate
+            .evaluate(
+                &profile,
+                &PermissionRequest {
+                    resource_scope: Some(ResourceScope {
+                        kind: ResourceScopeKind::ExternalReadOnlyFile,
+                        path: Some("../research.md".to_string()),
+                        managed_by_kernel: false,
+                    }),
+                    impact: PermissionImpact {
+                        effect_surface: EffectSurface::ExternalReadOnly,
+                        outside_workspace: OutsideWorkspace::ReadOnlyReference,
+                        ..PermissionImpact::default()
+                    },
+                    ..request(Capability::workspace_write(), RiskLevel::Critical)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
+    }
+
+    #[test]
+    fn kernel_modify_requires_maintainer_autonomy_floor() {
+        let gate = DefaultPermissionGate;
+        let trusted = PolicyProfile::trusted_workspace_defaults();
+        let denied = gate
+            .evaluate(
+                &trusted,
+                &PermissionRequest {
+                    resource_scope: Some(ResourceScope {
+                        kind: ResourceScopeKind::Kernel,
+                        path: None,
+                        managed_by_kernel: true,
+                    }),
+                    impact: PermissionImpact {
+                        effect_surface: EffectSurface::Kernel,
+                        persistence: Persistence::Persistent,
+                        ..PermissionImpact::default()
+                    },
+                    ..request(Capability::kernel_modify(), RiskLevel::Critical)
+                },
+            )
+            .unwrap();
+        assert_eq!(denied.decision, PolicyDecisionKind::Deny);
+
+        let maintainer = PolicyProfile::maintainer_defaults();
+        let ask = gate
+            .evaluate(
+                &maintainer,
+                &PermissionRequest {
+                    resource_scope: Some(ResourceScope {
+                        kind: ResourceScopeKind::Kernel,
+                        path: None,
+                        managed_by_kernel: true,
+                    }),
+                    impact: PermissionImpact {
+                        effect_surface: EffectSurface::Kernel,
+                        persistence: Persistence::Persistent,
+                        ..PermissionImpact::default()
+                    },
+                    ..request(Capability::kernel_modify(), RiskLevel::Critical)
+                },
+            )
+            .unwrap();
+        assert_eq!(ask.decision, PolicyDecisionKind::Ask);
     }
 
     #[test]

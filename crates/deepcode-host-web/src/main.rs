@@ -2485,6 +2485,43 @@ fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent) -> Vec<Va
             }),
             &now_text(),
         )],
+        KernelEvent::StageChanged {
+            phase,
+            status,
+            reason,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": phase,
+                "phase": phase,
+                "status": stage_status_for_gui(status),
+                "summary": reason.clone().unwrap_or_else(|| format!("Kernel workflow stage {phase} {:?}.", status)),
+                "channel": "task",
+                "visibility": "task",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::RunCompleted {
+            status, summary, ..
+        } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "workflow",
+                "phase": "workflow",
+                "status": if matches!(status, deepcode_kernel_abi::RunStatus::Completed) { "completed" } else { "error" },
+                "summary": summary.clone().unwrap_or_else(|| "Kernel workflow completed.".to_string()),
+                "channel": "task",
+                "visibility": "task",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
         KernelEvent::ToolRequested {
             tool_call_id,
             tool_name,
@@ -2561,15 +2598,41 @@ fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent) -> Vec<Va
             &now_text(),
         )],
         KernelEvent::WorkflowDecisionMade { decision, .. } => {
+            // 阶段 7/8 review 修复：把 stage / status / summary / details 提升到 payload 根字段，
+            // 让 GUI MessageList 在事件分类与折叠卡标题渲染时能直接读取根字段，
+            // 不再因 payload 只塞 decision 对象而出现"空标题"折叠卡（F4 残留横线根因之一）。
+            let phase_text = decision
+                .phase
+                .clone()
+                .unwrap_or_else(|| "workflow".to_string());
+            let action_text = format!("{:?}", decision.action).to_lowercase();
+            let summary_text = decision
+                .summary
+                .clone()
+                .unwrap_or_else(|| format!("Workflow decision: {action_text}"));
+            let details_text = if decision.pending_steps.is_empty() {
+                None
+            } else {
+                Some(decision.pending_steps.join("\n"))
+            };
+            let mut payload = json!({
+                "stage": phase_text,
+                "phase": phase_text,
+                "status": action_text,
+                "summary": summary_text,
+                "channel": "task",
+                "visibility": "task",
+                "presentation": "stageSummary",
+                "decision": decision,
+                "kernelEvent": event
+            });
+            if let Some(details) = details_text {
+                payload["details"] = json!(details);
+            }
             let mut result = vec![agent_event(
                 session_id,
                 "workflow_decision",
-                json!({
-                    "decision": decision,
-                    "channel": "task",
-                    "visibility": "task",
-                    "kernelEvent": event
-                }),
+                payload,
                 &now_text(),
             )];
             if decision.fail_closed
@@ -2600,7 +2663,81 @@ fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent) -> Vec<Va
             }),
             &now_text(),
         )],
+        // 临时文件生命周期事件投影为 GUI 可见的工具结果条目，确保 fs.write/fs.delete 后产生的
+        // TempArtifactCreated / TempArtifactCleaned 在用户消息流中可见或可折叠查看，
+        // 避免"工作流是否真的执行完"对用户不可信。
+        KernelEvent::TempArtifactCreated { path, .. } => vec![agent_event(
+            session_id,
+            "tool_result",
+            json!({
+                "callId": format!("tempArtifact.created:{path}"),
+                "toolName": "tempArtifact.created",
+                "ok": true,
+                "status": "ok",
+                "output": {
+                    "path": path,
+                },
+                "channel": "tool",
+                "visibility": "conversation",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::TempArtifactCleaned { path, .. } => vec![agent_event(
+            session_id,
+            "tool_result",
+            json!({
+                "callId": format!("tempArtifact.cleaned:{path}"),
+                "toolName": "tempArtifact.cleaned",
+                "ok": true,
+                "status": "ok",
+                "output": {
+                    "path": path,
+                },
+                "channel": "tool",
+                "visibility": "conversation",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::TempCleanupFailed { path, error, .. } => vec![agent_event(
+            session_id,
+            "tool_result",
+            json!({
+                "callId": format!("tempArtifact.cleanup_failed:{path}"),
+                "toolName": "tempArtifact.cleanup_failed",
+                "ok": false,
+                "status": "error",
+                "error": error.message,
+                "code": error.code,
+                "output": {
+                    "path": path,
+                },
+                "channel": "tool",
+                "visibility": "conversation",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        // 阶段 7/8 新增的 4 个 KernelEvent 显式列出 fall through，避免阶段 6 G3
+        // (workflow_decision 静默丢弃) 类问题复发。GUI 是否展示这些事件由阶段 15 收口决定，
+        // 当前阶段 7/8 只保证它们不会被悄无声息吞掉。
+        KernelEvent::AutonomyTransitioned { .. }
+        | KernelEvent::TempArtifactLeaseGranted { .. }
+        | KernelEvent::TempArtifactLeaseReleased { .. }
+        | KernelEvent::TempArtifactLeasePromoted { .. } => Vec::new(),
         _ => Vec::new(),
+    }
+}
+
+fn stage_status_for_gui(status: &deepcode_kernel_abi::StageStatus) -> &'static str {
+    match status {
+        deepcode_kernel_abi::StageStatus::Pending => "updated",
+        deepcode_kernel_abi::StageStatus::Running => "started",
+        deepcode_kernel_abi::StageStatus::Completed => "completed",
+        deepcode_kernel_abi::StageStatus::Blocked | deepcode_kernel_abi::StageStatus::Failed => {
+            "error"
+        }
     }
 }
 
@@ -2746,7 +2883,7 @@ async fn call_llm_profile(
         .map(provider_tools_from_values)
         .unwrap_or_default();
     if llm_mock_enabled() {
-        let mock_stage_prompt = messages
+        let mock_system_instruction = messages
             .iter()
             .find(|value| value.get("role").and_then(Value::as_str) == Some("system"))
             .and_then(|value| value.get("content"))
@@ -2759,7 +2896,7 @@ async fn call_llm_profile(
             .and_then(|value| value.get("content"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        return Ok(mock_llm_output(mock_stage_prompt, mock_user_prompt));
+        return Ok(mock_llm_output(mock_system_instruction, mock_user_prompt));
     }
     match profile.kind.as_str() {
         "anthropic" => call_anthropic_profile(profile, messages, tools).await,
@@ -3233,8 +3370,8 @@ fn llm_mock_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn mock_llm_output(stage_prompt: &str, user_prompt: &str) -> LlmChatOutput {
-    if stage_prompt.contains("复核阶段") {
+fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> LlmChatOutput {
+    if system_instruction.contains("复核阶段") {
         let content = if request_mentions_temp_lifecycle(user_prompt) {
             "<final>我是 DeepCode Agent。本轮已根据 Kernel 工具事实完成工作区读取、组件验证、临时文件创建读取与受控清理。</final>"
         } else if request_mentions_local_workspace(user_prompt) {
@@ -3247,13 +3384,13 @@ fn mock_llm_output(stage_prompt: &str, user_prompt: &str) -> LlmChatOutput {
             ..LlmChatOutput::default()
         };
     }
-    if stage_prompt.contains("规划阶段") {
+    if system_instruction.contains("规划阶段") {
         return LlmChatOutput {
             content: "<plan>我会先规划测试目标，再通过 Kernel syscall 验证工作区读取、搜索、临时文件写入、读取和清理，最终只在复核阶段回答身份和汇总结果。</plan>".to_string(),
             ..LlmChatOutput::default()
         };
     }
-    if stage_prompt.contains("检查阶段") {
+    if system_instruction.contains("检查阶段") {
         return LlmChatOutput {
             content: "<observe>计划检查通过：路径使用工作区相对 `_agent_tmp_*`，写入需要权限，清理由 Kernel 隐藏受控能力完成。</observe>".to_string(),
             ..LlmChatOutput::default()
@@ -3321,9 +3458,31 @@ fn distribution_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 解析布尔型 env 变量；与 Tauri shell main.rs 中同名实现保持一致。
+/// 接受 "1" / "true" / "yes" / "on"（不区分大小写）作为 truthy。
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 fn user_config_root() -> PathBuf {
     if let Some(path) = std::env::var_os("DEEPCODE_CONFIG_DIR") {
         return PathBuf::from(path);
+    }
+    // 阶段 7/8 review 决策（B-α 精化）：DEEPCODE_PORTABLE=1 时启用便携模式，
+    // 让打包发布版（bin/<platform>/DeepCode.exe）的可写配置写到 exe 同目录的
+    // config/user/local/，而不是 %APPDATA%/DeepCode 或 ~/.config/deepcode。
+    // 注意：bin/<platform>/config/global/ 仍是只读分发资源（prompts/ruler/skills），
+    // 不应作为可写路径；secrets/settings 始终走 user/local/ 子目录。
+    if env_truthy("DEEPCODE_PORTABLE") {
+        return distribution_root()
+            .join("config")
+            .join("user")
+            .join("local");
     }
     if cfg!(windows) {
         if let Some(path) = std::env::var_os("APPDATA") {
