@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 # DeepCode stage 5 closeout three-layer Kernel Host smoke test
-#
+# 注意测试环境在docker中运行
 # 默认入口必须是 Rust Kernel Web Host；TS 仅做 protocol/session-core/client。
 # 旧 Node server、pkg 打包链路、TS 工具执行/权限裁决不得进入默认链路。
 # ====================================================================
@@ -45,7 +45,6 @@ PACKAGE_PID_FILE="/tmp/_deepcode_package_host_$$.pid"
 SMOKE_DIR=""
 CONFIG_DIR=""
 PACKAGE_CONFIG_DIR=""
-NODE_SHIM_DIR=""
 JQ_SHIM_DIR=""
 ROOT_CARGO_LOCK_WAS_PRESENT=0
 
@@ -88,9 +87,6 @@ cleanup() {
   if [ -n "$PACKAGE_CONFIG_DIR" ]; then
     rm -rf "$PACKAGE_CONFIG_DIR"
   fi
-  if [ -n "$NODE_SHIM_DIR" ]; then
-    rm -rf "$NODE_SHIM_DIR"
-  fi
   if [ -n "$JQ_SHIM_DIR" ]; then
     rm -rf "$JQ_SHIM_DIR"
   fi
@@ -120,29 +116,9 @@ setup_node_toolchain() {
     return
   fi
 
-  local windows_node="/mnt/c/Users/kkkdiwang/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe"
-  local windows_pnpm_js="/mnt/c/Program Files/nodejs/node_modules/corepack/dist/pnpm.js"
-  if [ ! -x "$windows_node" ] || [ ! -f "$windows_pnpm_js" ]; then
-    return
-  fi
-
-  local windows_pnpm_js_arg
-  windows_pnpm_js_arg="$(wslpath -w "$windows_pnpm_js" 2>/dev/null || true)"
-  if [ -z "$windows_pnpm_js_arg" ]; then
-    return
-  fi
-
-  NODE_SHIM_DIR="$(mktemp -d /tmp/deepcode-node-shim-XXXXXX)"
-  cat >"$NODE_SHIM_DIR/node" <<EOF
-#!/usr/bin/env bash
-exec "$windows_node" "\$@"
-EOF
-  cat >"$NODE_SHIM_DIR/pnpm" <<EOF
-#!/usr/bin/env bash
-exec "$windows_node" "$windows_pnpm_js_arg" "\$@"
-EOF
-  chmod +x "$NODE_SHIM_DIR/node" "$NODE_SHIM_DIR/pnpm"
-  export PATH="$NODE_SHIM_DIR:$PATH"
+  fail "node and pnpm are required in the current Linux/Docker environment"
+  fail "Run this script inside the deepcode-dev Docker image or install Node/pnpm in the Linux toolchain"
+  exit 1
 }
 
 setup_jq_toolchain() {
@@ -488,9 +464,23 @@ grep -RIn 'getKernelApiBase' userspace/gui/src/services/apiClient.ts >/dev/null
 grep -RIn 'getKernelWsBase' userspace/gui/src/services/heartbeatSocket.ts >/dev/null
 ! grep -RIn 'const API_BASE = .*/api' userspace/gui/src/services/apiClient.ts
 ! grep -RIn 'window.location.host}/ws' userspace/gui/src/services/heartbeatSocket.ts
+! grep -RInF -- "'\\n\\n---\\n\\n'" userspace/gui/src/components/agent-panel/MessageList.tsx
+grep -RIn 'hr()' userspace/gui/src/components/agent-panel/MarkdownContent.tsx >/dev/null
 ! grep -RInE 'Agent|workflow|tool executor|permission evaluator|session truth|KernelCommand|ToolInvoke|fs\.write|fs\.delete|shell\.exec|SkillInvoke|PermissionResolve' shells/tauri/src-tauri/src
 grep -RIn 'deepcode-kernel' shells/tauri/src-tauri/src/main.rs >/dev/null
+# 阶段 6/7/8 工具命名一致性门禁：mock LLM 输出 / Kernel stage prompt 不允许出现非 DeepCode 工具名。
+! grep -RInE '"(list_dir|write_file|read_file|delete_file|execute_command|list_files)"' crates/deepcode-host-web/src
+grep -RIn 'list_dir' crates/deepcode-kernel-runtime/src/lib.rs >/dev/null
+grep -RIn 'WorkflowEvidence' crates/deepcode-kernel-runtime/src/lib.rs >/dev/null
+grep -RIn 'Kernel 工具事实证据' crates/deepcode-kernel-runtime/src/lib.rs >/dev/null
+grep -RIn 'monotonically promoted' crates/deepcode-kernel-ledger/src/lib.rs >/dev/null
+# 阶段 7/8 review F4/F5 修复门禁：GUI 投影根字段 + 空容器过滤 + portable 模式不能被回退。
+grep -RIn 'hasMeaningfulContent' userspace/gui/src/components/agent-panel/MessageList.tsx >/dev/null
+grep -RIn 'WorkflowPayloadFields' userspace/protocol/src/agent.ts >/dev/null
+grep -RIn 'DEEPCODE_PORTABLE' crates/deepcode-host-web/src/main.rs >/dev/null
+grep -RIn '"presentation": "stageSummary"' crates/deepcode-host-web/src/main.rs >/dev/null
 bash -n build.sh
+bash -n test.sh
 pass "legacy Node server, old TS runtime, Host truth, and thick Tauri gates ok"
 
 info "[4/6] start Rust Axum host"

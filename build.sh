@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 # DeepCode cross-platform unified build script
+# 注意build环境为docker中
 #
 # 输出统一内核分发目录：
 #   bin/linux-x64/
