@@ -55,6 +55,12 @@ pnpm --filter @deepcode/protocol build
 pnpm --filter @deepcode/session-core build
 pnpm --filter @deepcode/client build
 
+echo "==[build][2b/7]== prepare Tauri embedded GUI dist"
+TAURI_GUI_DIST="$ROOT_DIR/shells/tauri/dist"
+mkdir -p "$TAURI_GUI_DIST"
+find "$TAURI_GUI_DIST" -mindepth 1 -delete 2>/dev/null || true
+cp -r "$CLIENT_DIR/dist/." "$TAURI_GUI_DIST/"
+
 echo "==[build][3/7]== build Rust kernel web host for Linux"
 cargo build --release -p deepcode-host-web
 
@@ -189,11 +195,11 @@ Windows GUI runtime:
   Runtime is still expected to be installed on the target Windows system.
 
 Optional desktop shell:
-  Tauri thin shell source lives in shells/tauri. It shows a bundled local boot
-  shell immediately, starts or connects to the same-dir Kernel Host, and does
-  not contain Agent runtime. Windows distribution includes DeepCode.exe. The
-  desktop shell chooses an available localhost port by default; set
-  DEEPCODE_PORT to force a fixed port such as 31245.
+  Tauri thin shell source lives in shells/tauri. It embeds the same React GUI as
+  the browser host, starts or connects to the same-dir Kernel Host in the
+  background, and does not contain Agent runtime. Windows distribution includes
+  DeepCode.exe. The desktop shell chooses an available localhost port by
+  default; set DEEPCODE_PORT to force a fixed port such as 31245.
 
 Run the Linux GUI launcher or force DEEPCODE_PORT=31245, then open:
   http://127.0.0.1:31245/

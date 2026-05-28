@@ -416,6 +416,10 @@ pnpm --filter @deepcode/session-core build
 pnpm --filter @deepcode/protocol typecheck
 pnpm --filter @deepcode/session-core typecheck
 pnpm --filter @deepcode/client typecheck
+pnpm --filter @deepcode/client build
+mkdir -p shells/tauri/dist
+find shells/tauri/dist -mindepth 1 -delete 2>/dev/null || true
+cp -r userspace/gui/dist/. shells/tauri/dist/
 node --input-type=module <<'NODE'
 import {
   MemoryTranscriptStore,
@@ -474,9 +478,16 @@ test ! -e Dockerfile.tauri
 test -f shells/tauri/src-tauri/Cargo.toml
 test -f shells/tauri/src-tauri/src/main.rs
 test -f shells/tauri/boot-ui/index.html
+test -f shells/tauri/dist/index.html
+grep -RIn '"frontendDist": "../dist"' shells/tauri/src-tauri/tauri.conf.json >/dev/null
+! grep -RIn '"frontendDist": "../boot-ui"' shells/tauri/src-tauri/tauri.conf.json
 grep -RIn 'index.html#host=' shells/tauri/src-tauri/src/main.rs >/dev/null
 grep -RIn 'local_port_is_available' shells/tauri/src-tauri/src/main.rs >/dev/null
 grep -RIn '工作台界面已打开' shells/tauri/boot-ui/index.html >/dev/null
+grep -RIn 'getKernelApiBase' userspace/gui/src/services/apiClient.ts >/dev/null
+grep -RIn 'getKernelWsBase' userspace/gui/src/services/heartbeatSocket.ts >/dev/null
+! grep -RIn 'const API_BASE = .*/api' userspace/gui/src/services/apiClient.ts
+! grep -RIn 'window.location.host}/ws' userspace/gui/src/services/heartbeatSocket.ts
 ! grep -RInE 'Agent|workflow|tool executor|permission evaluator|session truth|KernelCommand|ToolInvoke|fs\.write|fs\.delete|shell\.exec|SkillInvoke|PermissionResolve' shells/tauri/src-tauri/src
 grep -RIn 'deepcode-kernel' shells/tauri/src-tauri/src/main.rs >/dev/null
 bash -n build.sh
