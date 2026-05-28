@@ -1,0 +1,408 @@
+{
+  "name": "DeepCode UI Icon Set",
+  "version": "1.0.0",
+  "style": "D-style layout + C-theme palette",
+  "viewBox": "0 0 24 24",
+  "stroke": {
+    "width": 2,
+    "linecap": "round",
+    "linejoin": "round"
+  },
+  "sizes": [
+    16,
+    20,
+    24,
+    32,
+    64
+  ],
+  "palette": {
+    "bg_primary": "#0B0D10",
+    "surface_1": "#14171C",
+    "surface_2": "#1F2328",
+    "surface_3": "#23272D",
+    "border": "#2B3036",
+    "text_primary": "#E6E8EB",
+    "text_muted": "#8B949E",
+    "text_disabled": "#5C6470",
+    "icon_neutral": "#CBD5E1",
+    "icon_muted": "#64748B",
+    "accent_blue": "#3A82F6",
+    "success": "#22C55E",
+    "warning": "#F59E0B",
+    "error": "#EF4444"
+  },
+  "icons": [
+    {
+      "name": "workspace",
+      "label": "Workspace",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-workspace-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-workspace-24.svg",
+        "png_24": "png/24/icon-workspace-24.png",
+        "sprite_id": "dc-icon-workspace"
+      }
+    },
+    {
+      "name": "folder",
+      "label": "Folder",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-folder-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-folder-24.svg",
+        "png_24": "png/24/icon-folder-24.png",
+        "sprite_id": "dc-icon-folder"
+      }
+    },
+    {
+      "name": "folder-tree",
+      "label": "Folder Tree",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-folder-tree-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-folder-tree-24.svg",
+        "png_24": "png/24/icon-folder-tree-24.png",
+        "sprite_id": "dc-icon-folder-tree"
+      }
+    },
+    {
+      "name": "file",
+      "label": "File",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-file-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-file-24.svg",
+        "png_24": "png/24/icon-file-24.png",
+        "sprite_id": "dc-icon-file"
+      }
+    },
+    {
+      "name": "tabs",
+      "label": "Tabs",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-tabs-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-tabs-24.svg",
+        "png_24": "png/24/icon-tabs-24.png",
+        "sprite_id": "dc-icon-tabs"
+      }
+    },
+    {
+      "name": "code-editor",
+      "label": "Code Editor",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-code-editor-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-code-editor-24.svg",
+        "png_24": "png/24/icon-code-editor-24.png",
+        "sprite_id": "dc-icon-code-editor"
+      }
+    },
+    {
+      "name": "terminal",
+      "label": "Terminal",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-terminal-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-terminal-24.svg",
+        "png_24": "png/24/icon-terminal-24.png",
+        "sprite_id": "dc-icon-terminal"
+      }
+    },
+    {
+      "name": "ai-agent",
+      "label": "AI Agent",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-ai-agent-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-ai-agent-24.svg",
+        "png_24": "png/24/icon-ai-agent-24.png",
+        "sprite_id": "dc-icon-ai-agent"
+      }
+    },
+    {
+      "name": "browser",
+      "label": "Browser",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-browser-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-browser-24.svg",
+        "png_24": "png/24/icon-browser-24.png",
+        "sprite_id": "dc-icon-browser"
+      }
+    },
+    {
+      "name": "settings",
+      "label": "Settings",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-settings-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-settings-24.svg",
+        "png_24": "png/24/icon-settings-24.png",
+        "sprite_id": "dc-icon-settings"
+      }
+    },
+    {
+      "name": "search",
+      "label": "Search",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-search-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-search-24.svg",
+        "png_24": "png/24/icon-search-24.png",
+        "sprite_id": "dc-icon-search"
+      }
+    },
+    {
+      "name": "kernel",
+      "label": "Kernel",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-kernel-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-kernel-24.svg",
+        "png_24": "png/24/icon-kernel-24.png",
+        "sprite_id": "dc-icon-kernel"
+      }
+    },
+    {
+      "name": "workflow-task",
+      "label": "Workflow / Task",
+      "category": "core",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-workflow-task-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-workflow-task-24.svg",
+        "png_24": "png/24/icon-workflow-task-24.png",
+        "sprite_id": "dc-icon-workflow-task"
+      }
+    },
+    {
+      "name": "run",
+      "label": "Run",
+      "category": "action",
+      "color_token": "accent_blue",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-run-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-run-24.svg",
+        "png_24": "png/24/icon-run-24.png",
+        "sprite_id": "dc-icon-run"
+      }
+    },
+    {
+      "name": "stop",
+      "label": "Stop",
+      "category": "action",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-stop-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-stop-24.svg",
+        "png_24": "png/24/icon-stop-24.png",
+        "sprite_id": "dc-icon-stop"
+      }
+    },
+    {
+      "name": "refresh",
+      "label": "Refresh",
+      "category": "action",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-refresh-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-refresh-24.svg",
+        "png_24": "png/24/icon-refresh-24.png",
+        "sprite_id": "dc-icon-refresh"
+      }
+    },
+    {
+      "name": "external-link",
+      "label": "External Link",
+      "category": "action",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-external-link-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-external-link-24.svg",
+        "png_24": "png/24/icon-external-link-24.png",
+        "sprite_id": "dc-icon-external-link"
+      }
+    },
+    {
+      "name": "more-horizontal",
+      "label": "More Horizontal",
+      "category": "action",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-more-horizontal-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-more-horizontal-24.svg",
+        "png_24": "png/24/icon-more-horizontal-24.png",
+        "sprite_id": "dc-icon-more-horizontal"
+      }
+    },
+    {
+      "name": "close",
+      "label": "Close",
+      "category": "action",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-close-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-close-24.svg",
+        "png_24": "png/24/icon-close-24.png",
+        "sprite_id": "dc-icon-close"
+      }
+    },
+    {
+      "name": "chevron-right",
+      "label": "Chevron Right",
+      "category": "action",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-chevron-right-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-chevron-right-24.svg",
+        "png_24": "png/24/icon-chevron-right-24.png",
+        "sprite_id": "dc-icon-chevron-right"
+      }
+    },
+    {
+      "name": "success",
+      "label": "Success",
+      "category": "status",
+      "color_token": "success",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-success-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-success-24.svg",
+        "png_24": "png/24/icon-success-24.png",
+        "sprite_id": "dc-icon-success"
+      }
+    },
+    {
+      "name": "warning",
+      "label": "Warning",
+      "category": "status",
+      "color_token": "warning",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-warning-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-warning-24.svg",
+        "png_24": "png/24/icon-warning-24.png",
+        "sprite_id": "dc-icon-warning"
+      }
+    },
+    {
+      "name": "error",
+      "label": "Error",
+      "category": "status",
+      "color_token": "error",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-error-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-error-24.svg",
+        "png_24": "png/24/icon-error-24.png",
+        "sprite_id": "dc-icon-error"
+      }
+    },
+    {
+      "name": "info",
+      "label": "Info",
+      "category": "status",
+      "color_token": "accent_blue",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-info-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-info-24.svg",
+        "png_24": "png/24/icon-info-24.png",
+        "sprite_id": "dc-icon-info"
+      }
+    },
+    {
+      "name": "in-progress",
+      "label": "In Progress",
+      "category": "status",
+      "color_token": "accent_blue",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-in-progress-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-in-progress-24.svg",
+        "png_24": "png/24/icon-in-progress-24.png",
+        "sprite_id": "dc-icon-in-progress"
+      }
+    },
+    {
+      "name": "blocked",
+      "label": "Blocked",
+      "category": "status",
+      "color_token": "icon_muted",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-blocked-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-blocked-24.svg",
+        "png_24": "png/24/icon-blocked-24.png",
+        "sprite_id": "dc-icon-blocked"
+      }
+    },
+    {
+      "name": "chart-line",
+      "label": "Chart Line",
+      "category": "chart",
+      "color_token": "accent_blue",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-chart-line-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-chart-line-24.svg",
+        "png_24": "png/24/icon-chart-line-24.png",
+        "sprite_id": "dc-icon-chart-line"
+      }
+    },
+    {
+      "name": "chart-bar",
+      "label": "Chart Bar",
+      "category": "chart",
+      "color_token": "accent_blue",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-chart-bar-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-chart-bar-24.svg",
+        "png_24": "png/24/icon-chart-bar-24.png",
+        "sprite_id": "dc-icon-chart-bar"
+      }
+    },
+    {
+      "name": "chart-donut",
+      "label": "Chart Donut",
+      "category": "chart",
+      "color_token": "accent_blue",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-chart-donut-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-chart-donut-24.svg",
+        "png_24": "png/24/icon-chart-donut-24.png",
+        "sprite_id": "dc-icon-chart-donut"
+      }
+    },
+    {
+      "name": "activity-grid",
+      "label": "Activity Grid",
+      "category": "chart",
+      "color_token": "accent_blue",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-activity-grid-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-activity-grid-24.svg",
+        "png_24": "png/24/icon-activity-grid-24.png",
+        "sprite_id": "dc-icon-activity-grid"
+      }
+    },
+    {
+      "name": "kpi-card",
+      "label": "KPI Card",
+      "category": "chart",
+      "color_token": "icon_neutral",
+      "files": {
+        "svg_currentColor_24": "svg/currentColor/24/icon-kpi-card-24.svg",
+        "svg_themed_24": "svg/themed/24/icon-kpi-card-24.svg",
+        "png_24": "png/24/icon-kpi-card-24.png",
+        "sprite_id": "dc-icon-kpi-card"
+      }
+    }
+  ]
+}

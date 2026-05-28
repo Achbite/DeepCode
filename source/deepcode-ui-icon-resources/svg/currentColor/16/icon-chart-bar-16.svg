@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" color="currentColor" role="img" aria-label="Chart Bar icon">
+<title>Chart Bar</title>
+<path d="M4 19V5"/>
+<path d="M4 19h16"/>
+<rect x="7" y="12" width="2.5" height="5" rx=".8"/>
+<rect x="11" y="8" width="2.5" height="9" rx=".8"/>
+<rect x="15" y="10" width="2.5" height="7" rx=".8"/>
+</svg>

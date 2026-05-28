@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" color="currentColor" role="img" aria-label="AI Agent icon">
+<title>AI Agent</title>
+<rect x="5" y="8" width="14" height="10" rx="4"/>
+<path d="M12 5v3"/>
+<path d="M3.5 12v3"/>
+<path d="M20.5 12v3"/>
+<circle cx="9.2" cy="13" r=".75" fill="currentColor" stroke="none"/>
+<circle cx="14.8" cy="13" r=".75" fill="currentColor" stroke="none"/>
+</svg>

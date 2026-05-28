@@ -1,0 +1,25 @@
+:root {
+  --dc-icon-bg-primary: #0B0D10;
+  --dc-icon-surface-1: #14171C;
+  --dc-icon-surface-2: #1F2328;
+  --dc-icon-surface-3: #23272D;
+  --dc-icon-border: #2B3036;
+  --dc-icon-text-primary: #E6E8EB;
+  --dc-icon-text-muted: #8B949E;
+  --dc-icon-neutral: #CBD5E1;
+  --dc-icon-muted: #64748B;
+  --dc-icon-accent: #3A82F6;
+  --dc-icon-success: #22C55E;
+  --dc-icon-warning: #F59E0B;
+  --dc-icon-error: #EF4444;
+}
+.dc-icon { width: 20px; height: 20px; color: var(--dc-icon-neutral); display: inline-block; vertical-align: -0.125em; flex: 0 0 auto; }
+.dc-icon--sm { width: 16px; height: 16px; }
+.dc-icon--md { width: 20px; height: 20px; }
+.dc-icon--lg { width: 24px; height: 24px; }
+.dc-icon--xl { width: 32px; height: 32px; }
+.dc-icon--active { color: var(--dc-icon-accent); }
+.dc-icon--muted { color: var(--dc-icon-muted); }
+.dc-icon--success { color: var(--dc-icon-success); }
+.dc-icon--warning { color: var(--dc-icon-warning); }
+.dc-icon--error { color: var(--dc-icon-error); }

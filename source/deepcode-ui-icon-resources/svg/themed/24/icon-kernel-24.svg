@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" color="#CBD5E1" role="img" aria-label="Kernel icon">
+<title>Kernel</title>
+<rect x="8" y="8" width="8" height="8" rx="1.5"/>
+<path d="M4 9h2.5"/><path d="M4 12h2.5"/><path d="M4 15h2.5"/>
+<path d="M17.5 9H20"/><path d="M17.5 12H20"/><path d="M17.5 15H20"/>
+<path d="M9 4v2.5"/><path d="M12 4v2.5"/><path d="M15 4v2.5"/>
+<path d="M9 17.5V20"/><path d="M12 17.5V20"/><path d="M15 17.5V20"/>
+<rect x="10.5" y="10.5" width="3" height="3" rx=".6"/>
+</svg>

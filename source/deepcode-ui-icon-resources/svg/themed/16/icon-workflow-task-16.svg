@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" color="#CBD5E1" role="img" aria-label="Workflow / Task icon">
+<title>Workflow / Task</title>
+<circle cx="6" cy="6" r="2.2"/>
+<path d="M8.2 6h5.6a4.2 4.2 0 0 1 4.2 4.2V12"/>
+<path d="m16 10 2 2 2-2"/>
+<circle cx="18" cy="18" r="3"/>
+<path d="m16.7 18 .9.9 1.8-2"/>
+<path d="M6 8.2V14a3 3 0 0 0 3 3h4"/>
+<path d="m11.5 15.2 2 1.8-2 1.8"/>
+</svg>

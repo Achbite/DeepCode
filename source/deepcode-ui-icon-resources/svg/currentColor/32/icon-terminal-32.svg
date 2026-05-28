@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" color="currentColor" role="img" aria-label="Terminal icon">
+<title>Terminal</title>
+<rect x="4" y="5" width="16" height="14" rx="2"/>
+<path d="M7.2 8.4h.01"/>
+<path d="M10 8.4h.01"/>
+<path d="M7.5 12.2 10.3 15l-2.8 2.8"/>
+<path d="M13 17.8h4"/>
+</svg>

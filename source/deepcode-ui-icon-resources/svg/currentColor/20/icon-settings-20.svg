@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" color="currentColor" role="img" aria-label="Settings icon">
+<title>Settings</title>
+<path d="M10.2 3.5h3.6l.7 2.4c.5.2 1 .5 1.4.8l2.4-1 1.8 3.1-2.1 1.6c.1.5.1 1.1 0 1.6l2.1 1.6-1.8 3.1-2.4-1c-.4.3-.9.6-1.4.8l-.7 2.4h-3.6l-.7-2.4c-.5-.2-1-.5-1.4-.8l-2.4 1-1.8-3.1L6 12c-.1-.5-.1-1.1 0-1.6L3.9 8.8l1.8-3.1 2.4 1c.4-.3.9-.6 1.4-.8l.7-2.4Z"/>
+<circle cx="12" cy="12" r="3"/>
+</svg>

@@ -1,0 +1,175 @@
+<svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden;">
+<symbol id="dc-icon-workspace" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<rect x="4" y="4" width="6" height="6" rx="1.4"/>
+<rect x="14" y="4" width="6" height="6" rx="1.4"/>
+<rect x="4" y="14" width="6" height="6" rx="1.4"/>
+<rect x="14" y="14" width="6" height="6" rx="1.4"/>
+</symbol>
+<symbol id="dc-icon-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M3.8 7.5A2.5 2.5 0 0 1 6.3 5h4.1l1.9 2h5.4a2.5 2.5 0 0 1 2.5 2.5v7A2.5 2.5 0 0 1 17.7 19H6.3a2.5 2.5 0 0 1-2.5-2.5v-9Z"/>
+<path d="M4 9h16"/>
+</symbol>
+<symbol id="dc-icon-folder-tree" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M4 5.8A1.8 1.8 0 0 1 5.8 4h4.4l1.5 1.7H18a2 2 0 0 1 2 2V11H4V5.8Z"/>
+<path d="M7 11v7"/>
+<path d="M7 15h4"/>
+<rect x="12" y="13.5" width="8" height="5.5" rx="1.4"/>
+<path d="M7 18h4"/>
+<rect x="12" y="17" width="7" height="4" rx="1.2"/>
+</symbol>
+<symbol id="dc-icon-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M7 3.5h7l4 4V20a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 20V5A1.5 1.5 0 0 1 7.5 3.5Z"/>
+<path d="M14 3.5v5h5"/>
+<path d="M9.5 13h5"/>
+<path d="M9.5 17h4"/>
+</symbol>
+<symbol id="dc-icon-tabs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M4 8.2A2.2 2.2 0 0 1 6.2 6h4.4l1.3 2H18a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8.2Z"/>
+<path d="M4 10h16"/>
+<path d="M7.5 8h.01"/>
+<path d="M10.2 8h.01"/>
+</symbol>
+<symbol id="dc-icon-code-editor" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M9 6.5 4.5 12 9 17.5"/>
+<path d="M15 6.5 19.5 12 15 17.5"/>
+<path d="m13 5.5-2 13"/>
+</symbol>
+<symbol id="dc-icon-terminal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<rect x="4" y="5" width="16" height="14" rx="2"/>
+<path d="M7.2 8.4h.01"/>
+<path d="M10 8.4h.01"/>
+<path d="M7.5 12.2 10.3 15l-2.8 2.8"/>
+<path d="M13 17.8h4"/>
+</symbol>
+<symbol id="dc-icon-ai-agent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<rect x="5" y="8" width="14" height="10" rx="4"/>
+<path d="M12 5v3"/>
+<path d="M3.5 12v3"/>
+<path d="M20.5 12v3"/>
+<circle cx="9.2" cy="13" r=".75" fill="currentColor" stroke="none"/>
+<circle cx="14.8" cy="13" r=".75" fill="currentColor" stroke="none"/>
+</symbol>
+<symbol id="dc-icon-browser" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="12" cy="12" r="8"/>
+<path d="M4.5 12h15"/>
+<path d="M12 4a12 12 0 0 1 0 16"/>
+<path d="M12 4a12 12 0 0 0 0 16"/>
+</symbol>
+<symbol id="dc-icon-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M10.2 3.5h3.6l.7 2.4c.5.2 1 .5 1.4.8l2.4-1 1.8 3.1-2.1 1.6c.1.5.1 1.1 0 1.6l2.1 1.6-1.8 3.1-2.4-1c-.4.3-.9.6-1.4.8l-.7 2.4h-3.6l-.7-2.4c-.5-.2-1-.5-1.4-.8l-2.4 1-1.8-3.1L6 12c-.1-.5-.1-1.1 0-1.6L3.9 8.8l1.8-3.1 2.4 1c.4-.3.9-.6 1.4-.8l.7-2.4Z"/>
+<circle cx="12" cy="12" r="3"/>
+</symbol>
+<symbol id="dc-icon-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="10.5" cy="10.5" r="6.5"/>
+<path d="m16 16 4 4"/>
+</symbol>
+<symbol id="dc-icon-kernel" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<rect x="8" y="8" width="8" height="8" rx="1.5"/>
+<path d="M4 9h2.5"/><path d="M4 12h2.5"/><path d="M4 15h2.5"/>
+<path d="M17.5 9H20"/><path d="M17.5 12H20"/><path d="M17.5 15H20"/>
+<path d="M9 4v2.5"/><path d="M12 4v2.5"/><path d="M15 4v2.5"/>
+<path d="M9 17.5V20"/><path d="M12 17.5V20"/><path d="M15 17.5V20"/>
+<rect x="10.5" y="10.5" width="3" height="3" rx=".6"/>
+</symbol>
+<symbol id="dc-icon-workflow-task" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="6" cy="6" r="2.2"/>
+<path d="M8.2 6h5.6a4.2 4.2 0 0 1 4.2 4.2V12"/>
+<path d="m16 10 2 2 2-2"/>
+<circle cx="18" cy="18" r="3"/>
+<path d="m16.7 18 .9.9 1.8-2"/>
+<path d="M6 8.2V14a3 3 0 0 0 3 3h4"/>
+<path d="m11.5 15.2 2 1.8-2 1.8"/>
+</symbol>
+<symbol id="dc-icon-run" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M8 5.5v13l10.5-6.5L8 5.5Z"/>
+</symbol>
+<symbol id="dc-icon-stop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<rect x="7" y="7" width="10" height="10" rx="2"/>
+</symbol>
+<symbol id="dc-icon-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M20 6v5h-5"/>
+<path d="M4 18v-5h5"/>
+<path d="M18.2 10.8A6.5 6.5 0 0 0 7.6 7.2L4 10.5"/>
+<path d="M5.8 13.2a6.5 6.5 0 0 0 10.6 3.6l3.6-3.3"/>
+</symbol>
+<symbol id="dc-icon-external-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M14 4h6v6"/>
+<path d="m20 4-9 9"/>
+<path d="M10 6H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/>
+</symbol>
+<symbol id="dc-icon-more-horizontal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="6" cy="12" r="1.1" fill="currentColor" stroke="none"/>
+<circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/>
+<circle cx="18" cy="12" r="1.1" fill="currentColor" stroke="none"/>
+</symbol>
+<symbol id="dc-icon-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="m6 6 12 12"/>
+<path d="M18 6 6 18"/>
+</symbol>
+<symbol id="dc-icon-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="m9 5 7 7-7 7"/>
+</symbol>
+<symbol id="dc-icon-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="12" cy="12" r="8"/>
+<path d="m8.5 12.5 2.4 2.4 4.9-5.5"/>
+</symbol>
+<symbol id="dc-icon-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M12 4.2 21 20H3L12 4.2Z"/>
+<path d="M12 9.5v5"/>
+<circle cx="12" cy="17.5" r=".8" fill="currentColor" stroke="none"/>
+</symbol>
+<symbol id="dc-icon-error" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="12" cy="12" r="8"/>
+<path d="m9 9 6 6"/>
+<path d="m15 9-6 6"/>
+</symbol>
+<symbol id="dc-icon-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="12" cy="12" r="8"/>
+<path d="M12 11v5"/>
+<circle cx="12" cy="8" r=".8" fill="currentColor" stroke="none"/>
+</symbol>
+<symbol id="dc-icon-in-progress" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M20 12a8 8 0 1 1-2.35-5.65"/>
+<path d="M20 5v6h-6"/>
+<path d="M12 8.5V12l3 2"/>
+</symbol>
+<symbol id="dc-icon-blocked" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="12" cy="12" r="8"/>
+<path d="M6.6 17.4 17.4 6.6"/>
+</symbol>
+<symbol id="dc-icon-chart-line" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M4 19V5"/>
+<path d="M4 19h16"/>
+<path d="m6 15 3.5-4 3 2.5L18 7"/>
+<circle cx="18" cy="7" r="1.2"/>
+</symbol>
+<symbol id="dc-icon-chart-bar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M4 19V5"/>
+<path d="M4 19h16"/>
+<rect x="7" y="12" width="2.5" height="5" rx=".8"/>
+<rect x="11" y="8" width="2.5" height="9" rx=".8"/>
+<rect x="15" y="10" width="2.5" height="7" rx=".8"/>
+</symbol>
+<symbol id="dc-icon-chart-donut" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<circle cx="12" cy="12" r="7"/>
+<path d="M12 5a7 7 0 0 1 6.8 8.6"/>
+<circle cx="12" cy="12" r="3"/>
+</symbol>
+<symbol id="dc-icon-activity-grid" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<rect x="4" y="5" width="3" height="3" rx=".6"/>
+<rect x="9" y="5" width="3" height="3" rx=".6"/>
+<rect x="14" y="5" width="3" height="3" rx=".6"/>
+<rect x="4" y="10.5" width="3" height="3" rx=".6"/>
+<rect x="9" y="10.5" width="3" height="3" rx=".6"/>
+<rect x="14" y="10.5" width="3" height="3" rx=".6"/>
+<rect x="4" y="16" width="3" height="3" rx=".6"/>
+<rect x="9" y="16" width="3" height="3" rx=".6"/>
+<rect x="14" y="16" width="3" height="3" rx=".6"/>
+</symbol>
+<symbol id="dc-icon-kpi-card" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<rect x="4" y="5" width="16" height="14" rx="2"/>
+<path d="M7 9h5"/>
+<path d="M7 13h3"/>
+<path d="m7 17 3-3 2.5 2 3.5-4"/>
+</symbol>
+</svg>
