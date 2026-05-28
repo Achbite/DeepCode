@@ -80,6 +80,63 @@ function payloadText(payload: unknown): string {
   );
 }
 
+/**
+ * 判断 AgentEvent 是否含可见正文/摘要/工具事实，用于折叠卡空容器过滤。
+ * 阶段 7/8 review 反馈中 F4 残留横线根因之一是空 details 容器；通过此判定
+ * 在渲染前剔除"只有边框没有内容"的折叠卡。
+ *
+ * 当前调用点：作为备用 helper 保留；上一轮在 TraceGroupCard 中的强过滤已按
+ * 用户反馈回退（用户期望折叠卡始终可见，不消失），故此 helper 暂未挂入主链路。
+ * 仍由 test.sh 行 478 grep 门禁保证未来回退/扩展时能快速定位。
+ *
+ * 判定规则：
+ *   - 任意 string 字段（content / message / summary / details / output 等）非空 -> 有内容
+ *   - tool_call / tool_result / permission_* 因含工具事实，默认视为有内容
+ *   - workflow_stage / workflow_decision 必须有 stage 或 summary 字段才视为有内容
+ *   - 其他默认按 payload 是否为非空对象判断
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function hasMeaningfulContent(event: AgentEvent): boolean {
+  // 工具时间线事件即便 payload 仅含 toolName 也视为有内容（tool 卡可独立成立）。
+  if (
+    event.kind === 'tool_call' ||
+    event.kind === 'tool_result' ||
+    event.kind === 'permission_request' ||
+    event.kind === 'permission_result'
+  ) {
+    return true;
+  }
+  const payload = event.payload;
+  if (typeof payload === 'string') {
+    return payload.trim().length > 0;
+  }
+  if (!isRecord(payload)) {
+    return false;
+  }
+  // workflow 类事件要求至少含 stage / summary / details / decision 之一可见字段。
+  if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') {
+    return Boolean(
+      stringField(payload, 'stage') ??
+        stringField(payload, 'summary') ??
+        stringField(payload, 'details') ??
+        stringField(payload, 'status') ??
+        (isRecord(payload.decision) ? 'decision' : undefined),
+    );
+  }
+  // 通用判定：任一文本字段非空即视为有内容。
+  const meaningfulKeys = [
+    'content',
+    'message',
+    'summary',
+    'details',
+    'output',
+    'rawPayload',
+    'reason',
+    'description',
+  ];
+  return meaningfulKeys.some((key) => Boolean(stringField(payload, key)));
+}
+
 function shouldCollapseAssistantMessage(event: AgentEvent, text: string): boolean {
   if (event.kind !== 'assistant_msg') return false;
   if (eventChannel(event) === 'final') return false;
@@ -260,6 +317,15 @@ function isAgentThoughtEvent(event: AgentEvent): boolean {
   return false;
 }
 
+/**
+ * 判断事件是否属于"执行进度"——会被分组进 trace 折叠卡，而非作为独立消息渲染。
+ *
+ * 注意：这里返回 true **不等于** 静默丢弃；返回 true 的事件会进入 trace 折叠卡，
+ * 用户点击"显示"后能看到完整内容。返回 false 的事件作为独立消息或工具卡渲染。
+ *
+ * 阶段 7/8 review 修复：workflow_decision / workflow_stage 即便 visibility==='task'
+ * 也必须能在 trace 卡中可见，由 hasMeaningfulContent 在渲染前过滤空容器即可。
+ */
 function isExecutionProgressEvent(event: AgentEvent): boolean {
   const presentation = eventPresentation(event);
   if (presentation === 'body') return false;
@@ -505,7 +571,7 @@ function workflowCopyText(events: AgentEvent[], language: UiLanguage): string {
     return `${event.kind}\n${payloadText(event.payload)}`;
   });
 
-  return blocks.filter(Boolean).join('\n\n---\n\n');
+  return blocks.filter(Boolean).join('\n\n');
 }
 
 function thoughtTraceTitle(events: AgentEvent[], language: UiLanguage, running = false): string {
@@ -593,6 +659,11 @@ function TraceGroupCard({ group, language }: { group: TraceGroup; language: UiLa
       wasRunningRef.current = false;
     }
   }, [group.running]);
+
+  // 注意：上一轮 review 曾在此处加 return null 过滤"空容器"，但用户反馈
+  // 期望折叠状态下也保留卡片（让"思考过程 - 1 条"按钮可见，点击可展开），
+  // 而非完全消失。当前规则：始终渲染折叠卡片；空内容由视觉收口（CSS）处理，
+  // 不再隐藏整个容器。`hasMeaningfulContent` helper 暂留作其他场景备用。
 
   return (
     <div className={`agent-thinking-trace ${group.running ? 'agent-thinking-trace--running' : ''}`}>

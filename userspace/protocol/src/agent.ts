@@ -451,6 +451,29 @@ export interface AgentEvent {
   display?: AgentEventDisplayHint;
 }
 
+/**
+ * 工作流类事件（workflow_decision / workflow_stage 与 RunCompleted 投影）的 payload 根字段契约。
+ *
+ * 阶段 7/8 review 修复（F4 残留横线根因之一）：Host 投影必须把 stage/status/summary/details
+ * 提升到 payload 根字段，让 GUI MessageList 在折叠卡标题渲染、空容器过滤时能直接读取，
+ * 不再因 payload 只塞 decision 子对象而出现"空标题"折叠卡。
+ *
+ * 本 mixin 仅作类型守卫与文档契约；AgentEvent.payload 类型保持 unknown 不变，
+ * 避免破坏既有不带这些字段的事件（如 user_msg / tool_call）。
+ */
+export interface WorkflowPayloadFields {
+  stage?: string;
+  phase?: string;
+  status?: string;
+  summary?: string;
+  details?: string;
+  channel?: AgentEventChannel;
+  visibility?: AgentEventVisibility;
+  presentation?: AgentEventPresentation;
+  decision?: unknown;
+  kernelEvent?: unknown;
+}
+
 export interface CreateAgentSessionRequest {
   initialMode?: AgentMode;
   mode?: AgentMode;

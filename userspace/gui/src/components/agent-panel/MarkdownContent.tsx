@@ -174,6 +174,9 @@ const markdownComponents: Components = {
       </blockquote>
     );
   },
+  hr() {
+    return null;
+  },
   table({ node: _node, children, ...props }) {
     return (
       <div className="agent-markdown__table-wrap">

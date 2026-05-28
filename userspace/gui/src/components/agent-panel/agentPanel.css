@@ -355,6 +355,16 @@
   box-shadow: var(--shadow-sm, 0 1px 2px rgba(0, 0, 0, 0.3));
 }
 
+/* 让 tool bubble 在 hover 时呈现明显卡片感，避免多个 bubble 并列时呈横线状视觉 */
+.agent-tool-bubble {
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.agent-tool-bubble:hover {
+  border-color: rgba(10, 132, 255, 0.35);
+  background: rgba(10, 132, 255, 0.04);
+}
+
 .agent-message--user_msg {
   align-self: flex-end;
   width: fit-content;
@@ -746,55 +756,87 @@
   font-weight: 650;
 }
 
+/* ============================================================
+ * 思考过程折叠选项卡（agent-thinking-trace）
+ * 
+ * 设计目标：每段思考独立成"选项卡"风格折叠卡片，点击展开查看详情。
+ * 视觉规格：
+ *   - 占满消息列容器宽度（align-self: stretch），不再 fit-content
+ *   - 60px 高度，明显的卡片矩形而非细横条
+ *   - 4px 实色左色条作为视觉锚点（区分思考过程与工具批次）
+ *   - 大圆角 8px + box-shadow 让卡片浮起
+ *   - 移除 overflow: hidden 避免内容塌陷
+ *   - hover 时 border 与 background 强化反馈
+ *   - 完成态 dot 用绿色，running 态 dot 用蓝色
+ * ============================================================ */
 .agent-thinking-trace {
+  display: block;
   align-self: stretch;
-  max-width: 100%;
+  width: 100%;
+  margin: 4px 0;
   padding: 0;
-  border-color: var(--line, rgba(255, 255, 255, 0.08));
-  background: var(--bg-panel, #131316);
+  border: 1px solid rgba(10, 132, 255, 0.22);
+  border-left: 4px solid var(--accent, #0a84ff);
+  border-radius: 8px;
+  background: rgba(10, 132, 255, 0.04);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
   color: var(--text-muted, #a1a1aa);
-  font-size: 11px;
-  overflow: hidden;
+  font-size: 12px;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.agent-thinking-trace:hover {
+  border-color: rgba(10, 132, 255, 0.45);
+  background: rgba(10, 132, 255, 0.08);
+  box-shadow: 0 2px 8px rgba(10, 132, 255, 0.2);
 }
 
 .agent-thinking-trace__summary {
   width: 100%;
-  min-height: 32px;
+  min-height: 60px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px;
+  gap: 12px;
   border: 0;
   background: transparent;
-  padding: 0 9px;
+  padding: 16px 18px;
   color: inherit;
   cursor: pointer;
   font: inherit;
   text-align: left;
+  border-radius: 6px;
+}
+
+.agent-thinking-trace__summary:hover .agent-thinking-trace__title {
+  color: var(--text-strong, #fff);
+}
+
+.agent-thinking-trace__left {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.agent-thinking-trace__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ade80;
+  box-shadow: 0 0 6px rgba(74, 222, 128, 0.32);
 }
 
 .agent-thinking-trace__title {
   min-width: 0;
   overflow: hidden;
   color: var(--text-main, #ededed);
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.agent-thinking-trace__left {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: 10px minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
-}
-
-.agent-thinking-trace__dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: rgba(161, 161, 170, 0.8);
+  letter-spacing: 0.2px;
 }
 
 .agent-thinking-trace--running {
@@ -808,7 +850,7 @@
 
 .agent-thinking-trace__hint {
   color: var(--text-muted, #a1a1aa);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 650;
   text-transform: uppercase;
 }
@@ -874,6 +916,39 @@
   cursor: pointer;
   font-size: 11px;
   font-weight: 650;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  display: inline-flex;
+  align-items: center;
+  list-style: none;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.agent-stage-event__details summary::-webkit-details-marker,
+.agent-raw-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-stage-event__details summary::before,
+.agent-raw-details summary::before {
+  content: "▸";
+  margin-right: 4px;
+  font-size: 9px;
+  color: var(--text-muted, #a1a1aa);
+  transition: transform 0.15s ease;
+}
+
+.agent-stage-event__details[open] summary::before,
+.agent-raw-details[open] summary::before {
+  content: "▾";
+}
+
+.agent-stage-event__details summary:hover,
+.agent-raw-details summary:hover {
+  background: rgba(10, 132, 255, 0.08);
+  border-color: rgba(10, 132, 255, 0.25);
 }
 
 .agent-spinner {
@@ -907,24 +982,48 @@
   margin: 0;
 }
 
+/* ============================================================
+ * 工具批次折叠选项卡（agent-tool-batch）
+ * 
+ * 设计目标：每个工具批次独立成"选项卡"风格折叠卡片，与思考过程视觉同档但用绿色色条区分。
+ * 视觉规格：
+ *   - 占满消息列容器宽度（align-self: stretch）
+ *   - 60px 高度，明显的卡片矩形
+ *   - 4px 实色左色条（绿色，区分思考过程的蓝色）
+ *   - 大圆角 8px + box-shadow 让卡片浮起
+ *   - 移除 overflow: hidden 避免嵌套 details 内容塌陷
+ *   - hover 时 border 与 background 强化反馈
+ * ============================================================ */
 .agent-tool-batch {
+  display: block;
   align-self: stretch;
-  max-width: 100%;
-  border: 1px solid rgba(10, 132, 255, 0.22);
-  border-radius: var(--radius-md, 6px);
-  background: rgba(10, 132, 255, 0.06);
-  overflow: hidden;
+  width: 100%;
+  margin: 4px 0;
+  padding: 0;
+  border: 1px solid rgba(48, 209, 88, 0.28);
+  border-left: 4px solid var(--success, #30d158);
+  border-radius: 8px;
+  background: rgba(48, 209, 88, 0.05);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.agent-tool-batch:hover {
+  border-color: rgba(48, 209, 88, 0.5);
+  background: rgba(48, 209, 88, 0.1);
+  box-shadow: 0 2px 8px rgba(48, 209, 88, 0.2);
 }
 
 .agent-tool-batch > summary {
-  min-height: 34px;
+  min-height: 60px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 12px;
   cursor: pointer;
   list-style: none;
-  padding: 0 10px;
+  padding: 16px 18px;
+  border-radius: 6px;
 }
 
 .agent-tool-batch > summary::-webkit-details-marker {
@@ -935,8 +1034,9 @@
   min-width: 0;
   overflow: hidden;
   color: var(--text-main, #ededed);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 650;
+  letter-spacing: 0.2px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -944,42 +1044,49 @@
 .agent-tool-batch__status {
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.07);
-  padding: 1px 6px;
+  padding: 2px 8px;
   color: var(--text-muted, #a1a1aa);
   font-size: 10px;
+  font-weight: 650;
   text-transform: uppercase;
+  letter-spacing: 0.5px;
 }
 
 .agent-tool-batch__status--running {
   color: var(--accent, #0a84ff);
+  background: rgba(10, 132, 255, 0.12);
 }
 
 .agent-tool-batch__status--done {
   color: var(--success, #30d158);
+  background: rgba(48, 209, 88, 0.14);
 }
 
 .agent-tool-batch__status--error {
   color: var(--danger, #ff453a);
+  background: rgba(255, 69, 58, 0.14);
 }
 
 .agent-tool-batch__body {
   display: grid;
-  gap: 7px;
+  gap: 8px;
   max-height: min(34vh, 320px);
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
-  padding: 8px;
+  padding: 12px 14px;
+  border-top: 1px solid rgba(48, 209, 88, 0.18);
 }
 
 .agent-tool-bubble__details > summary {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   cursor: pointer;
   list-style: none;
-  min-height: 24px;
+  min-height: 48px;
+  padding: 10px 14px;
 }
 
 .agent-tool-bubble__details > summary::-webkit-details-marker {
