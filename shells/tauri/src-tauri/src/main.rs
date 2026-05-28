@@ -106,6 +106,10 @@ fn create_main_window(
     Ok(())
 }
 
+// TODO(stage-9): Tauri shell 当前期待启动 `deepcode-kernel.exe` 子进程作为 GUI dist 与 /api/* 提供方；
+// 实际工程里没有 deepcode-kernel binary，dev mode 下 Web Host 由外部脚本启动，binary 缺失时返回 None 走"只连接"模式。
+// 阶段 9 Kernel Daemon 落地后，本函数应迁移为启动 deepcode-kernel-daemon 并通过 IPC 而非 HTTP `/api/*` 提供事实源；
+// 同时 boot-ui/index.html 中 `window.location.replace(${baseUrl}/)` 的 webview 跳转应改为本地静态资源加载或 Tauri Asset 协议。
 fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
     if env_truthy("DEEPCODE_SHELL_CONNECT_ONLY") {
         return None;

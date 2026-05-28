@@ -347,6 +347,7 @@ export type AgentEventKind =
   | 'permission_request'
   | 'permission_result'
   | 'workflow_stage'
+  | 'workflow_decision'
   | 'error';
 
 export type AgentEventChannel =

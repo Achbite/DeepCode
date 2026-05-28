@@ -372,6 +372,9 @@
           const response = await fetch(`${baseUrl}/api/health`, { cache: "no-store" });
           if (response.ok) {
             statusEl.textContent = "进入工作台";
+            // TODO(stage-9): 当前 webview 直接跳转到 Web Host URL，这是 Tauri shell 对 Web Host 的强依赖来源。
+            // 阶段 9 Kernel Daemon 落地后，应改为加载 Tauri 内嵌的 GUI dist 静态资源（asset://），
+            // 通过 IPC 而非 HTTP `/api/*` 与 Kernel daemon 通信；保留此跳转作为 dev mode 兼容入口即可。
             window.location.replace(`${baseUrl}/`);
             return;
           }

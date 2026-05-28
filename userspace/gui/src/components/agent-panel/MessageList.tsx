@@ -264,7 +264,7 @@ function isExecutionProgressEvent(event: AgentEvent): boolean {
   const presentation = eventPresentation(event);
   if (presentation === 'body') return false;
   if (presentation === 'stageSummary' || presentation === 'traceOnly') return true;
-  return event.kind === 'workflow_stage' || eventVisibility(event) === 'task';
+  return event.kind === 'workflow_stage' || event.kind === 'workflow_decision' || eventVisibility(event) === 'task';
 }
 
 function isHiddenConversationEvent(event: AgentEvent): boolean {
@@ -471,6 +471,12 @@ function workflowCopyText(events: AgentEvent[], language: UiLanguage): string {
       const profile = stringField(event.payload, 'profileId');
       return `${t(language, 'agent.copy.stage')} ${localizedStage(stage, language)} - ${localizedStatus(status, language)}${profile ? ` - ${profile}` : ''}`;
     }
+    if (event.kind === 'workflow_decision') {
+      const stage = stringField(event.payload, 'stage') ?? 'workflow';
+      const status = stageStatus(event.payload);
+      const profile = stringField(event.payload, 'profileId');
+      return `${t(language, 'agent.copy.stage')} ${localizedStage(stage, language)} - ${localizedStatus(status, language)}${profile ? ` - ${profile}` : ''}`;
+    }
     if (event.kind === 'tool_call') {
       return [
         `${t(language, 'agent.copy.toolCall')} - ${eventToolName(event)}`,
@@ -556,7 +562,7 @@ function renderError(event: AgentEvent, language: UiLanguage) {
 }
 
 function renderTraceEvent(event: AgentEvent, language: UiLanguage) {
-  if (event.kind === 'workflow_stage') return renderWorkflowStage(event, language);
+  if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') return renderWorkflowStage(event, language);
   if (event.kind === 'assistant_msg') {
     const stage = eventStage(event) ?? 'thought';
     return (
@@ -707,7 +713,7 @@ function TurnActions({
 }
 
 function renderMessage(event: AgentEvent, language: UiLanguage, autoOpen = false) {
-  if (event.kind === 'workflow_stage') return renderWorkflowStage(event, language);
+  if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') return renderWorkflowStage(event, language);
   if (event.kind === 'error') return renderError(event, language);
   if (
     event.kind === 'tool_call' ||

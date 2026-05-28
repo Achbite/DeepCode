@@ -2816,6 +2816,8 @@ async fn call_openai_compatible_profile(
             }))
             .collect::<Vec<_>>());
     }
+    // TODO(stage-9): Move LLM provider transport to Kernel daemon; this Host-side
+    // path is dev-only and not in release builds.
     let response = reqwest::Client::new()
         .post(url)
         .bearer_auth(api_key)
@@ -2869,6 +2871,8 @@ async fn call_anthropic_profile(
             }))
             .collect::<Vec<_>>());
     }
+    // TODO(stage-9): Move LLM provider transport to Kernel daemon; this Host-side
+    // path is dev-only and not in release builds.
     let response = reqwest::Client::new()
         .post(normalize_anthropic_base_url(profile))
         .header("x-api-key", api_key)
@@ -2911,6 +2915,8 @@ async fn call_ollama_profile(
             }))
             .collect::<Vec<_>>());
     }
+    // TODO(stage-9): Move LLM provider transport to Kernel daemon; this Host-side
+    // path is dev-only and not in release builds.
     let response = reqwest::Client::new()
         .post(normalize_ollama_base_url(profile))
         .json(&body)
