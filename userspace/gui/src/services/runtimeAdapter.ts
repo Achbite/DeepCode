@@ -75,6 +75,26 @@ import * as api from './apiClient';
 
 export type RuntimeType = 'web';
 
+type TauriWindowHandle = {
+  minimize: () => Promise<void>;
+  toggleMaximize: () => Promise<void>;
+  close: () => Promise<void>;
+};
+
+type TauriWindowApi = {
+  getCurrentWindow?: () => TauriWindowHandle;
+};
+
+declare global {
+  interface Window {
+    __TAURI__?: {
+      window?: TauriWindowApi;
+    };
+  }
+}
+
+export const APP_CLOSE_REQUEST_EVENT = 'deepcode:app-close-request';
+
 export interface RuntimeStatus {
   runtime: RuntimeType;
   version: string;
@@ -103,11 +123,28 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
   }
 }
 
-export async function minimizeAppWindow(): Promise<void> {}
+function getTauriWindow(): TauriWindowHandle | null {
+  return window.__TAURI__?.window?.getCurrentWindow?.() ?? null;
+}
 
-export async function toggleMaximizeAppWindow(): Promise<void> {}
+export async function minimizeAppWindow(): Promise<void> {
+  await getTauriWindow()?.minimize();
+}
+
+export async function toggleMaximizeAppWindow(): Promise<void> {
+  await getTauriWindow()?.toggleMaximize();
+}
+
+export function requestCloseAppWindow(): void {
+  window.dispatchEvent(new CustomEvent(APP_CLOSE_REQUEST_EVENT));
+}
 
 export async function closeAppWindow(): Promise<void> {
+  const tauriWindow = getTauriWindow();
+  if (tauriWindow) {
+    await tauriWindow.close();
+    return;
+  }
   window.close();
 }
 

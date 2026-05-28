@@ -12,10 +12,13 @@ import useAppStatusStore from '../state/appStatusStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
 import { useSettingsStore } from '../state/settingsStore';
 import {
+  APP_CLOSE_REQUEST_EVENT,
+  closeAppWindow,
   getRuntimeStatus,
   warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
 import { getTabId, useEditorStore } from '../state/editorStore';
+import WindowControls from '../components/window-controls/WindowControls';
 import type { ConfirmDialogAction, ConfirmDialogData } from '../types/ui';
 import { t } from '../i18n';
 import './app.css';
@@ -83,7 +86,10 @@ function scheduleIdle(task: () => void, timeout = 1200): () => void {
 
 const BootShellFallback: React.FC = () => (
   <div className="app-boot-shell" aria-label={t('zh-CN', 'app.startingAria')}>
-    <div className="app-boot-shell__header">DeepCode</div>
+    <div className="app-boot-shell__header" data-tauri-drag-region>
+      <span>DeepCode</span>
+      <WindowControls language="zh-CN" />
+    </div>
     <div className="app-boot-shell__body">
       <div className="app-boot-shell__rail" />
       <div className="app-boot-shell__side" />
@@ -95,7 +101,7 @@ const BootShellFallback: React.FC = () => (
 );
 
 async function destroyCurrentWindow(): Promise<void> {
-  window.close();
+  await closeAppWindow();
 }
 
 const App: React.FC = () => {
@@ -196,6 +202,14 @@ const App: React.FC = () => {
       actions,
     });
   }, [closeConfirmDialog]);
+
+  const requestWindowClose = useCallback(() => {
+    if (useEditorStore.getState().hasAnyDirtyFile()) {
+      showUnsavedCloseDialog();
+      return;
+    }
+    void destroyCurrentWindow();
+  }, [showUnsavedCloseDialog]);
 
   // ---- 1. Load workspace and user settings ----
   useEffect(() => {
@@ -363,6 +377,13 @@ const App: React.FC = () => {
     window.addEventListener('beforeunload', onBeforeUnload);
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
   }, [hotExit]);
+
+  // ---- 6.1 Custom titlebar close guard ----
+  useEffect(() => {
+    const onCloseRequest = () => requestWindowClose();
+    window.addEventListener(APP_CLOSE_REQUEST_EVENT, onCloseRequest);
+    return () => window.removeEventListener(APP_CLOSE_REQUEST_EVENT, onCloseRequest);
+  }, [requestWindowClose]);
 
   return (
     <>

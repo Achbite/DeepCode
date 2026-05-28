@@ -100,7 +100,7 @@ fn create_main_window(
         .min_inner_size(1100.0, 700.0)
         .resizable(true)
         .fullscreen(false)
-        .decorations(true)
+        .decorations(false)
         .background_color(tauri::window::Color(10, 10, 12, 255))
         .build()?;
     Ok(())

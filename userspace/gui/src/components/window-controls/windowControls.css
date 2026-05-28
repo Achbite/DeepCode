@@ -4,6 +4,8 @@
   align-items: center;
   gap: 4px;
   height: 100%;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .window-control {
@@ -15,6 +17,8 @@
   background: transparent;
   color: var(--text-muted, #a1a1aa);
   cursor: pointer;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .window-control:hover {

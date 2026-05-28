@@ -277,7 +277,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         event.preventDefault();
       }}
     >
-      <header className="header">
+      <header className="header" data-tauri-drag-region>
         <div className="header__title">
           <strong>DeepCode</strong>
         </div>

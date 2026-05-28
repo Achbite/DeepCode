@@ -49,6 +49,8 @@
       .titlebar {
         justify-content: space-between;
         font-weight: 700;
+        -webkit-app-region: drag;
+        app-region: drag;
       }
 
       .statusbar {
@@ -175,13 +177,114 @@
         color: #cce4ff;
         font-size: 12px;
       }
+
+      .titlebar__right,
+      .window-controls,
+      .window-control {
+        -webkit-app-region: no-drag;
+        app-region: no-drag;
+      }
+
+      .titlebar__right {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .window-controls {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .window-control {
+        position: relative;
+        width: 30px;
+        height: 28px;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: #9ba8b8;
+        cursor: pointer;
+      }
+
+      .window-control:hover {
+        background: rgba(255, 255, 255, 0.08);
+        color: #f4f7fb;
+      }
+
+      .window-control--close:hover {
+        background: #ff3b30;
+        color: #fff;
+      }
+
+      .window-control::before,
+      .window-control::after {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        content: "";
+        transform: translate(-50%, -50%);
+      }
+
+      .window-control--minimize::before {
+        width: 12px;
+        height: 1px;
+        background: currentColor;
+      }
+
+      .window-control--maximize::before {
+        width: 11px;
+        height: 9px;
+        border: 1px solid currentColor;
+      }
+
+      .window-control--close::before,
+      .window-control--close::after {
+        width: 13px;
+        height: 1px;
+        background: currentColor;
+      }
+
+      .window-control--close::before {
+        transform: translate(-50%, -50%) rotate(45deg);
+      }
+
+      .window-control--close::after {
+        transform: translate(-50%, -50%) rotate(-45deg);
+      }
     </style>
   </head>
   <body>
     <div class="shell">
-      <header class="titlebar">
+      <header class="titlebar" data-tauri-drag-region>
         <span>DeepCode</span>
-        <span class="pill" id="boot-status">工作台界面已打开</span>
+        <span class="titlebar__right">
+          <span class="pill" id="boot-status">工作台界面已打开</span>
+          <span class="window-controls" aria-label="窗口控制">
+            <button
+              id="titlebar-minimize"
+              class="window-control window-control--minimize"
+              type="button"
+              aria-label="最小化"
+              title="最小化"
+            ></button>
+            <button
+              id="titlebar-maximize"
+              class="window-control window-control--maximize"
+              type="button"
+              aria-label="最大化或还原"
+              title="最大化或还原"
+            ></button>
+            <button
+              id="titlebar-close"
+              class="window-control window-control--close"
+              type="button"
+              aria-label="关闭"
+              title="关闭"
+            ></button>
+          </span>
+        </span>
       </header>
       <main class="main">
         <nav class="rail">
@@ -221,6 +324,20 @@
 
       let attempts = 0;
       const startedAt = Date.now();
+
+      function bindWindowControls() {
+        const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
+        if (!appWindow) return;
+        document
+          .getElementById("titlebar-minimize")
+          ?.addEventListener("click", () => appWindow.minimize());
+        document
+          .getElementById("titlebar-maximize")
+          ?.addEventListener("click", () => appWindow.toggleMaximize());
+        document
+          .getElementById("titlebar-close")
+          ?.addEventListener("click", () => appWindow.close());
+      }
 
       function targetFromLocation() {
         const hash = window.location.hash.startsWith("#")
@@ -277,6 +394,8 @@
         targetEl.textContent = `${target.host}:${target.port}`;
         window.setTimeout(waitForKernel, 0);
       });
+
+      bindWindowControls();
     </script>
   </body>
 </html>

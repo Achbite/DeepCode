@@ -16,6 +16,14 @@
   color: #fff;
   font-size: 13px;
   font-weight: 650;
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+.app-boot-shell__header .window-controls,
+.app-boot-shell__header .window-control {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .app-boot-shell__body {
