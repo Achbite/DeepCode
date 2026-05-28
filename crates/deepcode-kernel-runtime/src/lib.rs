@@ -1,7 +1,7 @@
 use deepcode_kernel_abi::{
     AnswerObligation, AnswerObligationId, AnswerObligationStatus, ConfigSnapshotRef, HostStatus,
     KernelCommand, KernelError, KernelErrorEnvelope, KernelEvent, KernelEventSummary, KernelResult,
-    KernelSnapshot, RequestId, RunId, SessionId, StageStatus, WorkflowDecision,
+    KernelSnapshot, ProfileRef, RequestId, RunId, SessionId, StageStatus, WorkflowDecision,
     WorkflowDecisionAction, WorkflowDecisionReason, WorkspaceBinding,
 };
 use deepcode_kernel_config::{
@@ -65,9 +65,13 @@ enum WorkspaceSource {
 struct RuntimeRunRecord {
     session_id: String,
     run_id: String,
+    input_text: String,
     workspace_binding: WorkspaceBinding,
     config_ref: ConfigSnapshotRef,
+    profile_ref: Option<ProfileRef>,
     phase: WorkflowPhase,
+    active_llm_call_id: Option<String>,
+    llm_call_index: u64,
     decision_state: WorkflowDecisionState,
 }
 
@@ -77,6 +81,13 @@ struct PendingKernelTool {
     session_id: String,
     tool_call_id: String,
     tool_name: String,
+    arguments: Value,
+}
+
+#[derive(Debug, Clone)]
+struct KernelLlmToolCall {
+    id: String,
+    name: String,
     arguments: Value,
 }
 
@@ -402,9 +413,22 @@ impl DeepCodeKernelRuntime {
                 session_id,
                 input.text,
                 workspace_binding,
-                profile_ref.map(|value| value.id),
+                profile_ref,
                 workflow_ref.map(|value| value.id),
                 run_overrides,
+            ),
+            KernelCommand::LlmResponseSubmit {
+                request_id,
+                run_id,
+                session_id,
+                llm_call_id,
+                response_envelope,
+            } => self.llm_response_submit(
+                request_id,
+                run_id,
+                session_id,
+                llm_call_id,
+                response_envelope,
             ),
             KernelCommand::SnapshotGet {
                 request_id,
@@ -585,7 +609,7 @@ impl DeepCodeKernelRuntime {
         session_id: Option<SessionId>,
         input_text: String,
         workspace_binding: Option<WorkspaceBinding>,
-        profile_id: Option<String>,
+        profile_ref: Option<ProfileRef>,
         workflow_id: Option<String>,
         run_overrides: Option<Value>,
     ) -> KernelResult<Vec<KernelEvent>> {
@@ -598,7 +622,7 @@ impl DeepCodeKernelRuntime {
 
         let config_snapshot = self.resolve_minimal_config(
             &run_id,
-            profile_id.clone(),
+            profile_ref.as_ref().map(|value| value.id.clone()),
             workflow_id.clone(),
             run_overrides,
         )?;
@@ -620,6 +644,7 @@ impl DeepCodeKernelRuntime {
                 "inputText": input_text,
                 "workspaceBinding": &workspace_binding,
                 "configRef": &config_ref,
+                "profileRef": &profile_ref,
                 "policyProfile": &self.policy_profile.id,
                 "skillCount": self.skills.len(),
                 "promptCompiler": if self.prompt_compiler.require_kernel_safety { "layered" } else { "layered-unchecked" }
@@ -674,12 +699,18 @@ impl DeepCodeKernelRuntime {
             RuntimeRunRecord {
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
+                input_text: input_text.clone(),
                 workspace_binding: workspace_binding.clone(),
                 config_ref: config_ref.clone(),
+                profile_ref: profile_ref.clone(),
                 phase: workflow_state.phase.clone(),
+                active_llm_call_id: None,
+                llm_call_index: 0,
                 decision_state: WorkflowDecisionState::from_user_input(&input_text),
             },
         );
+
+        let llm_call = self.llm_call_requested_event(&run_id, &session_id)?;
 
         Ok(vec![
             KernelEvent::RunStarted {
@@ -712,6 +743,7 @@ impl DeepCodeKernelRuntime {
                 reason: None,
                 sequence: Some(4),
             },
+            llm_call,
         ])
     }
 
@@ -756,6 +788,376 @@ impl DeepCodeKernelRuntime {
                 snapshot: self.snapshot(Some(&record.session_id)),
             },
         ])
+    }
+
+    fn llm_call_requested_event(
+        &mut self,
+        run_id: &str,
+        session_id: &str,
+    ) -> KernelResult<KernelEvent> {
+        let (phase, input_text, profile_ref, decision_state, llm_call_id) = {
+            let record = self.record_by_run_mut(run_id)?;
+            record.llm_call_index += 1;
+            let phase = record.phase.as_str().to_string();
+            let llm_call_id = format!("llm-{run_id}-{phase}-{}", record.llm_call_index);
+            record.active_llm_call_id = Some(llm_call_id.clone());
+            (
+                phase,
+                record.input_text.clone(),
+                record.profile_ref.clone(),
+                record.decision_state.clone(),
+                llm_call_id,
+            )
+        };
+        let request_envelope = compile_llm_request_envelope(&phase, &input_text, &decision_state);
+        let sequence = self.ledger.next_sequence(run_id)?;
+        self.append_ledger(
+            run_id,
+            session_id,
+            "llm.call_requested",
+            sequence,
+            serde_json::json!({
+                "summary": format!("Kernel requested LLM call for {phase}."),
+                "phase": &phase,
+                "llmCallId": &llm_call_id,
+                "profileRef": &profile_ref,
+                "requestEnvelope": &request_envelope
+            }),
+        )?;
+        Ok(KernelEvent::LlmCallRequested {
+            run_id: RunId(run_id.to_string()),
+            session_id: Some(SessionId(session_id.to_string())),
+            phase,
+            llm_call_id,
+            profile_ref,
+            request_envelope,
+            sequence: Some(sequence),
+        })
+    }
+
+    fn llm_response_submit(
+        &mut self,
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        llm_call_id: String,
+        response_envelope: Value,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let record = self.record_by_run(&run_id.0)?;
+        let session_id = session_id
+            .map(|value| value.0)
+            .unwrap_or_else(|| record.session_id.clone());
+        if record.session_id != session_id {
+            return Err(KernelError::InvalidCommand(format!(
+                "run {} is not bound to session {}",
+                run_id.0, session_id
+            )));
+        }
+        if record.active_llm_call_id.as_deref() != Some(llm_call_id.as_str()) {
+            return Err(KernelError::InvalidCommand(format!(
+                "llm call {llm_call_id} is not active for run {}",
+                run_id.0
+            )));
+        }
+
+        let phase = record.phase.as_str().to_string();
+        let mut events = Vec::new();
+        for event in self.message_events_from_llm_response(
+            &request_id,
+            &run_id.0,
+            &session_id,
+            &phase,
+            &response_envelope,
+        )? {
+            events.push(event);
+        }
+
+        if phase == "complete" {
+            let tool_calls = extract_llm_tool_calls(&response_envelope);
+            for call in tool_calls {
+                let mut tool_events = self.invoke_llm_tool_call(&run_id.0, &session_id, call)?;
+                let waiting_for_permission = tool_events
+                    .iter()
+                    .any(|event| matches!(event, KernelEvent::PermissionRequested { .. }));
+                events.append(&mut tool_events);
+                if waiting_for_permission {
+                    events.push(self.workflow_decision_event(
+                        request_id,
+                        &run_id.0,
+                        &session_id,
+                        "permission.requested",
+                    )?);
+                    return Ok(events);
+                }
+            }
+            let mut auto_events = self.auto_continue_after_tool(&run_id.0, &session_id)?;
+            let waiting_for_permission = auto_events
+                .iter()
+                .any(|event| matches!(event, KernelEvent::PermissionRequested { .. }));
+            events.append(&mut auto_events);
+            if waiting_for_permission {
+                events.push(self.workflow_decision_event(
+                    request_id,
+                    &run_id.0,
+                    &session_id,
+                    "permission.requested",
+                )?);
+                return Ok(events);
+            }
+        }
+
+        let decision_event = self.workflow_decision_event(
+            request_id.clone(),
+            &run_id.0,
+            &session_id,
+            "llm.response",
+        )?;
+        let decision = match &decision_event {
+            KernelEvent::WorkflowDecisionMade { decision, .. } => decision.clone(),
+            _ => unreachable!("workflow_decision_event must emit workflow.decision_made"),
+        };
+        events.push(decision_event);
+
+        let next = next_phase_after_llm_response(&phase, &decision);
+        match next {
+            LlmPhaseAdvance::Continue(next_phase) => {
+                events.push(self.enter_phase_event(&run_id.0, &session_id, next_phase)?);
+                events.push(self.llm_call_requested_event(&run_id.0, &session_id)?);
+            }
+            LlmPhaseAdvance::Finish => {
+                events.push(self.complete_run_event(&run_id.0, &session_id)?);
+            }
+            LlmPhaseAdvance::Stop => {}
+        }
+
+        Ok(events)
+    }
+
+    fn message_events_from_llm_response(
+        &mut self,
+        request_id: &RequestId,
+        run_id: &str,
+        session_id: &str,
+        phase: &str,
+        response_envelope: &Value,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let mut events = Vec::new();
+        if let Some(reasoning) = response_envelope
+            .pointer("/assistantMessage/reasoningContent")
+            .or_else(|| response_envelope.get("reasoning"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            let event = self.message_appended_event(
+                request_id,
+                run_id,
+                session_id,
+                "reasoning",
+                Some(reasoning.to_string()),
+            )?;
+            events.push(event);
+        }
+        if let Some(content) = response_envelope
+            .pointer("/assistantMessage/content")
+            .or_else(|| response_envelope.get("content"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            let channel = if phase == "review" { "final" } else { phase };
+            let event = self.message_appended_event(
+                request_id,
+                run_id,
+                session_id,
+                channel,
+                Some(content.to_string()),
+            )?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    fn message_appended_event(
+        &mut self,
+        _request_id: &RequestId,
+        run_id: &str,
+        session_id: &str,
+        channel: &str,
+        content: Option<String>,
+    ) -> KernelResult<KernelEvent> {
+        let sequence = self.ledger.next_sequence(run_id)?;
+        let event = KernelEvent::MessageAppended {
+            run_id: Some(RunId(run_id.to_string())),
+            session_id: Some(SessionId(session_id.to_string())),
+            turn_id: None,
+            role: deepcode_kernel_abi::MessageRole::Agent,
+            channel: Some(channel.to_string()),
+            content: content.clone(),
+            message_key: None,
+            args: None,
+            sequence: Some(sequence),
+        };
+        {
+            let record = self.record_by_run_mut(run_id)?;
+            record.decision_state.apply_event(&event);
+        }
+        self.append_ledger(
+            run_id,
+            session_id,
+            "message.appended",
+            sequence,
+            serde_json::json!({
+                "summary": format!("Agent message appended on {channel}."),
+                "channel": channel,
+                "content": content
+            }),
+        )?;
+        Ok(event)
+    }
+
+    fn invoke_llm_tool_call(
+        &mut self,
+        run_id: &str,
+        session_id: &str,
+        call: KernelLlmToolCall,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        if permission_action_for_kernel_tool(&call.name) == PermissionAction::Deny {
+            return Err(KernelError::PermissionDenied(format!(
+                "tool {} is not allowed",
+                call.name
+            )));
+        }
+        let request_sequence = self.ledger.next_sequence(run_id)?;
+        let requested = KernelEvent::ToolRequested {
+            run_id: Some(RunId(run_id.to_string())),
+            session_id: Some(SessionId(session_id.to_string())),
+            turn_id: None,
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            args_preview: redact_tool_arguments(&call.name, &call.arguments),
+            sequence: Some(request_sequence),
+        };
+        self.append_ledger(
+            run_id,
+            session_id,
+            "tool.requested",
+            request_sequence,
+            serde_json::json!({
+                "summary": format!("LLM requested tool: {}", call.name),
+                "toolCallId": &call.id,
+                "toolName": &call.name,
+                "argsPreview": redact_tool_arguments(&call.name, &call.arguments)
+            }),
+        )?;
+
+        if permission_action_for_kernel_tool(&call.name) == PermissionAction::Ask {
+            let permission_id = call.id.clone();
+            self.state.pending_tools.insert(
+                permission_id.clone(),
+                PendingKernelTool {
+                    run_id: run_id.to_string(),
+                    session_id: session_id.to_string(),
+                    tool_call_id: call.id,
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments,
+                },
+            );
+            let permission_sequence = self.ledger.next_sequence(run_id)?;
+            let permission = KernelEvent::PermissionRequested {
+                run_id: Some(RunId(run_id.to_string())),
+                session_id: SessionId(session_id.to_string()),
+                request: deepcode_kernel_abi::PermissionRequestEnvelope {
+                    id: permission_id.clone(),
+                    capability: capability_for_tool(&call.name).to_string(),
+                    risk_level: risk_for_tool(&call.name).to_string(),
+                    summary: format!("Allow {} to access workspace resources?", call.name),
+                    args_preview: redact_tool_arguments(&call.name, &serde_json::json!({})),
+                },
+                sequence: Some(permission_sequence),
+            };
+            {
+                let record = self.record_by_run_mut(run_id)?;
+                record.decision_state.apply_event(&permission);
+            }
+            self.append_ledger(
+                run_id,
+                session_id,
+                "permission.requested",
+                permission_sequence,
+                serde_json::json!({
+                    "summary": format!("Permission requested for {}.", call.name),
+                    "permissionId": permission_id,
+                    "toolName": call.name
+                }),
+            )?;
+            return Ok(vec![requested, permission]);
+        }
+
+        let completed =
+            self.execute_bound_tool(run_id, session_id, call.id, call.name, call.arguments)?;
+        let mut events = vec![requested, completed];
+        events.extend(self.auto_continue_after_tool(run_id, session_id)?);
+        Ok(events)
+    }
+
+    fn enter_phase_event(
+        &mut self,
+        run_id: &str,
+        session_id: &str,
+        phase: WorkflowPhase,
+    ) -> KernelResult<KernelEvent> {
+        {
+            let record = self.record_by_run_mut(run_id)?;
+            record.phase = phase.clone();
+            record.active_llm_call_id = None;
+        }
+        let sequence = self.ledger.next_sequence(run_id)?;
+        self.append_ledger(
+            run_id,
+            session_id,
+            "stage.changed",
+            sequence,
+            serde_json::json!({
+                "summary": format!("Workflow entered {} stage.", phase.as_str()),
+                "phase": phase.as_str(),
+                "status": "running"
+            }),
+        )?;
+        Ok(KernelEvent::StageChanged {
+            run_id: Some(RunId(run_id.to_string())),
+            session_id: Some(SessionId(session_id.to_string())),
+            turn_id: None,
+            stage_run_id: None,
+            phase: phase.as_str().to_string(),
+            status: StageStatus::Running,
+            reason: None,
+            sequence: Some(sequence),
+        })
+    }
+
+    fn complete_run_event(&mut self, run_id: &str, session_id: &str) -> KernelResult<KernelEvent> {
+        {
+            let record = self.record_by_run_mut(run_id)?;
+            record.phase = WorkflowPhase::Done;
+            record.active_llm_call_id = None;
+        }
+        let sequence = self.ledger.next_sequence(run_id)?;
+        self.append_ledger(
+            run_id,
+            session_id,
+            "run.completed",
+            sequence,
+            serde_json::json!({
+                "summary": "Kernel workflow completed.",
+                "status": "completed"
+            }),
+        )?;
+        Ok(KernelEvent::RunCompleted {
+            run_id: RunId(run_id.to_string()),
+            session_id: Some(SessionId(session_id.to_string())),
+            status: deepcode_kernel_abi::RunStatus::Completed,
+            summary: Some("Kernel workflow completed.".to_string()),
+            sequence: Some(sequence),
+        })
     }
 
     fn workflow_observe(
@@ -968,9 +1370,26 @@ impl DeepCodeKernelRuntime {
             request_id: Some(request_id),
             run_id: RunId(run_id),
             session_id: Some(SessionId(session_id)),
-            decision: workflow_decision,
+            decision: workflow_decision.clone(),
             sequence: Some(workflow_sequence),
         });
+        let run_id = match events.last() {
+            Some(KernelEvent::WorkflowDecisionMade { run_id, .. }) => run_id.0.clone(),
+            _ => unreachable!("last event is workflow decision"),
+        };
+        let session_id = match events.last() {
+            Some(KernelEvent::WorkflowDecisionMade {
+                session_id: Some(session_id),
+                ..
+            }) => session_id.0.clone(),
+            _ => unreachable!("workflow decision has session id"),
+        };
+        if let LlmPhaseAdvance::Continue(next_phase) =
+            next_phase_after_llm_response(&phase, &workflow_decision)
+        {
+            events.push(self.enter_phase_event(&run_id, &session_id, next_phase)?);
+            events.push(self.llm_call_requested_event(&run_id, &session_id)?);
+        }
         Ok(events)
     }
 
@@ -1982,6 +2401,211 @@ impl DeepCodeKernelRuntime {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LlmPhaseAdvance {
+    Continue(WorkflowPhase),
+    Finish,
+    Stop,
+}
+
+fn next_phase_after_llm_response(phase: &str, decision: &WorkflowDecision) -> LlmPhaseAdvance {
+    if decision.fail_closed
+        || matches!(
+            decision.action,
+            WorkflowDecisionAction::AwaitPermission | WorkflowDecisionAction::Blocked
+        )
+    {
+        return LlmPhaseAdvance::Stop;
+    }
+    match phase {
+        "plan" => LlmPhaseAdvance::Continue(WorkflowPhase::Check),
+        "check" => LlmPhaseAdvance::Continue(WorkflowPhase::Complete),
+        "complete" => {
+            if matches!(
+                decision.action,
+                WorkflowDecisionAction::Review | WorkflowDecisionAction::Done
+            ) {
+                LlmPhaseAdvance::Continue(WorkflowPhase::Review)
+            } else {
+                LlmPhaseAdvance::Stop
+            }
+        }
+        "review" => {
+            if matches!(decision.action, WorkflowDecisionAction::Done) {
+                LlmPhaseAdvance::Finish
+            } else {
+                LlmPhaseAdvance::Stop
+            }
+        }
+        _ => LlmPhaseAdvance::Stop,
+    }
+}
+
+fn compile_llm_request_envelope(
+    phase: &str,
+    input_text: &str,
+    decision_state: &WorkflowDecisionState,
+) -> Value {
+    let system = compile_kernel_phase_instruction(phase, decision_state);
+    let tools = if phase == "complete" {
+        kernel_visible_tool_schemas()
+    } else {
+        Vec::new()
+    };
+    serde_json::json!({
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": input_text }
+        ],
+        "tools": tools,
+        "answerObligations": decision_state.answer_obligations,
+        "completionCriteria": {
+            "tempLifecycleRequired": decision_state.temp_lifecycle_required,
+            "pendingSteps": decision_state.pending_steps()
+        }
+    })
+}
+
+fn compile_kernel_phase_instruction(phase: &str, decision_state: &WorkflowDecisionState) -> String {
+    let stage_instruction = match phase {
+        "plan" => "你是 DeepCode Kernel 调度的规划阶段。只产出计划、范围、禁止项、风险和完成条件，不直接回答最终身份、结果或总结。",
+        "check" => "你是 DeepCode Kernel 调度的检查阶段。只审查计划风险、路径、权限和可执行性，不重复最终答案。",
+        "complete" => "你是 DeepCode Kernel 调度的执行阶段。需要本地操作时只能使用 Kernel 提供的工具调用；不要把自然语言当作本地操作。",
+        "review" => "你是 DeepCode Kernel 调度的复核阶段。只有结构化完成条件满足后才输出最终答案；未完成时说明 blocked/replan。",
+        _ => "你是 DeepCode Kernel 调度的 Agent 阶段。",
+    };
+    format!(
+        "{stage_instruction}\n\n\
+        输出语言默认简体中文。工具路径必须是工作区相对路径，禁止 /tmp、绝对路径和 ..。\n\
+        fs.delete 是隐藏的内核受控能力，不在普通模型工具目录中；临时测试文件清理由 Kernel 受控流程完成。\n\
+        不要重复已经满足的 AnswerObligation。\n\
+        当前待满足步骤：{}",
+        decision_state.pending_steps().join("；")
+    )
+}
+
+fn kernel_visible_tool_schemas() -> Vec<Value> {
+    vec![
+        serde_json::json!({
+            "name": "fs.list",
+            "description": "List a workspace directory tree with bounded depth.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "folderId": { "type": "string" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "fs.read",
+            "description": "Read a text file from the active workspace.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "folderId": { "type": "string" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "fs.diff",
+            "description": "Preview a file diff without writing.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "newContent"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "newContent": { "type": "string" },
+                    "folderId": { "type": "string" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "code.search",
+            "description": "Search text across the workspace.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string" },
+                    "isRegex": { "type": "boolean" },
+                    "include": { "type": "array", "items": { "type": "string" } },
+                    "folderId": { "type": "string" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "fs.write",
+            "description": "Write a text file after explicit permission approval.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "content"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "folderId": { "type": "string" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "shell.propose",
+            "description": "Propose a shell command without executing it.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": { "type": "string" },
+                    "reason": { "type": "string" }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "shell.exec",
+            "description": "Run a command in a Kernel controlled shell after explicit approval.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": { "type": "string" },
+                    "cwd": { "type": "string" },
+                    "timeoutMs": { "type": "number" },
+                    "reason": { "type": "string" }
+                }
+            }
+        }),
+    ]
+}
+
+fn extract_llm_tool_calls(response_envelope: &Value) -> Vec<KernelLlmToolCall> {
+    response_envelope
+        .pointer("/assistantMessage/toolCalls")
+        .or_else(|| response_envelope.get("toolCalls"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let name = item.get("name").and_then(Value::as_str)?;
+                    Some(KernelLlmToolCall {
+                        id: item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool-call")
+                            .to_string(),
+                        name: name.to_string(),
+                        arguments: item
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({})),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn has_identity_request(input: &str, lower: &str) -> bool {
     input.contains("身份")
         || input.contains("你是谁")
@@ -2464,6 +3088,7 @@ fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::RunCompleted { .. } => "run.completed",
         KernelEvent::StageChanged { .. } => "stage.changed",
         KernelEvent::MessageAppended { .. } => "message.appended",
+        KernelEvent::LlmCallRequested { .. } => "llm.call_requested",
         KernelEvent::ToolRequested { .. } => "tool.requested",
         KernelEvent::ToolCompleted { .. } => "tool.completed",
         KernelEvent::PermissionRequested { .. } => "permission.requested",
@@ -2491,6 +3116,7 @@ fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::RunCompleted { sequence, .. }
         | KernelEvent::StageChanged { sequence, .. }
         | KernelEvent::MessageAppended { sequence, .. }
+        | KernelEvent::LlmCallRequested { sequence, .. }
         | KernelEvent::ToolRequested { sequence, .. }
         | KernelEvent::ToolCompleted { sequence, .. }
         | KernelEvent::PermissionRequested { sequence, .. }
@@ -2661,7 +3287,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
         assert!(matches!(events[0], KernelEvent::RunStarted { .. }));
         assert!(matches!(
             events[1],
@@ -2678,14 +3304,16 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(events[4], KernelEvent::LlmCallRequested { .. }));
 
         let snapshot = runtime.snapshot(Some("session-1"));
         assert_eq!(snapshot.workflow_phase.as_deref(), Some("plan"));
-        assert_eq!(snapshot.events.len(), 4);
+        assert_eq!(snapshot.events.len(), 5);
 
         let ledger = runtime.ledger("run-1").unwrap();
-        assert_eq!(ledger.len(), 4);
+        assert_eq!(ledger.len(), 5);
         assert_eq!(ledger[0].kind, "run.started");
+        assert_eq!(ledger[4].kind, "llm.call_requested");
     }
 
     #[test]
@@ -2715,7 +3343,68 @@ mod tests {
 
         assert!(matches!(events[0], KernelEvent::WorkflowResumed { .. }));
         assert!(matches!(events[1], KernelEvent::SnapshotReady { .. }));
-        assert_eq!(runtime.ledger("run-1").unwrap().len(), 5);
+        assert_eq!(runtime.ledger("run-1").unwrap().len(), 6);
+    }
+
+    #[test]
+    fn llm_response_submit_advances_workflow_under_kernel_control() {
+        let mut runtime = DeepCodeKernelRuntime::new();
+        let started = runtime
+            .dispatch(KernelCommand::RunStart {
+                request_id: RequestId("req-run".to_string()),
+                session_id: Some(SessionId("session-1".to_string())),
+                input: UserInput {
+                    text: "plan a change".to_string(),
+                    attachments: vec![],
+                },
+                workspace_binding: Some(binding()),
+                profile_ref: None,
+                workflow_ref: None,
+                run_overrides: None,
+            })
+            .unwrap();
+        let (run_id, llm_call_id) = match started.last().unwrap() {
+            KernelEvent::LlmCallRequested {
+                run_id,
+                llm_call_id,
+                ..
+            } => (run_id.clone(), llm_call_id.clone()),
+            other => panic!("expected llm call request, got {other:?}"),
+        };
+
+        let events = runtime
+            .dispatch(KernelCommand::LlmResponseSubmit {
+                request_id: RequestId("req-llm".to_string()),
+                run_id,
+                session_id: Some(SessionId("session-1".to_string())),
+                llm_call_id,
+                response_envelope: serde_json::json!({
+                    "assistantMessage": {
+                        "content": "<plan>Use Kernel managed workflow.</plan>",
+                        "toolCalls": []
+                    }
+                }),
+            })
+            .unwrap();
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::MessageAppended { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            KernelEvent::StageChanged { phase, .. } if phase == "check"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            KernelEvent::LlmCallRequested { phase, .. } if phase == "check"
+        )));
+        assert_eq!(
+            runtime
+                .snapshot(Some("session-1"))
+                .workflow_phase
+                .as_deref(),
+            Some("check")
+        );
     }
 
     #[test]
@@ -2914,7 +3603,7 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(grant[0], KernelEvent::MessageAppended { .. }));
-        assert_eq!(runtime.ledger("run-1").unwrap().len(), 6);
+        assert_eq!(runtime.ledger("run-1").unwrap().len(), 7);
     }
 
     #[test]

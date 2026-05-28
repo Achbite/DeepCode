@@ -464,6 +464,7 @@ info "[3b/6] legacy default-route gates"
 ! grep -RInE 'deepcode-server|pkg@|pkg ' build.sh package.json
 ! grep -RInE 'PermissionGate|ToolRegistry|WorkflowMachine|child_process|spawn\(|exec\(' userspace/session-core/src
 ! grep -RInE 'HostWorkflowMemory|pending_permissions|execute_tool_call|approved: Option|PermissionEvaluateRequest' crates/deepcode-host-web/src crates/deepcode-kernel-runtime/src
+! grep -RInE 'AGENT_WORKFLOW_STAGES|run_agent_workflow|call_agent_stage_llm|execute_stage_tool_calls|drive_temp_lifecycle|stage_prompt|model_visible_tools' crates/deepcode-host-web/src userspace/gui/src userspace/protocol/src
 ! grep -RInE 'executeAgentTool|evaluateAgentPermission|agentRuntime|toolExecutors|permissionGate' userspace/gui/src
 test ! -e userspace/gui/src/services/agentRuntime.ts
 test ! -e userspace/gui/src/services/toolExecutors.ts
@@ -654,9 +655,15 @@ curl -fsS -m 3 -H 'Content-Type: application/json' \
   | jq -e '.ok == true and .data.appended == 1' >/dev/null
 curl -fsS -m 3 "${SESSION_STORE_URL}/${SESSION_ID}/projection" \
   | jq -e '.ok == true and (.data.events | length >= 1)' >/dev/null
+curl -fsS -m 3 -H 'Content-Type: application/json' \
+  -d '{"entry":{"type":"message","uuid":"transcript-smoke","sessionId":"'"$SESSION_ID"'","role":"user","channel":"user","content":"transcript smoke","kernelEventRefs":[],"visible":true,"createdAt":"smoke"}}' \
+  "${SESSION_STORE_URL}/${SESSION_ID}/transcript" \
+  | jq -e '.ok == true and .data.entryCount >= 1' >/dev/null
+curl -fsS -m 3 "${SESSION_STORE_URL}/${SESSION_ID}/transcript" \
+  | jq -e '.ok == true and (.data.entries[] | select(.uuid == "transcript-smoke"))' >/dev/null
 curl -fsS -m 3 "${SESSION_STORE_URL}/index" \
   | jq -e '.ok == true and (.data.sessions | length >= 1)' >/dev/null
-pass "Rust session storage API persists projection events"
+pass "Rust session storage API persists projection and transcript events"
 AGENT_MESSAGE_BODY="$(jq -nc --arg openPath "$WORKSPACE_FILE" '{
   content: "这是一个测试请求，返回你的身份信息，然后测试当前agent所有的功能组件，能否新建临时文件读写这个临时文件然后删除这个临时文件",
   mode: "askBeforeWrite",

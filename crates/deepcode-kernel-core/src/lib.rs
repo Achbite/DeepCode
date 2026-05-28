@@ -66,6 +66,9 @@ impl Kernel {
                 }
                 self.not_implemented(request_id, "run.start")
             }
+            KernelCommand::LlmResponseSubmit { request_id, .. } => {
+                self.not_implemented(request_id, "llm.response_submit")
+            }
             KernelCommand::RunCancel { request_id, .. } => {
                 self.not_implemented(request_id, "run.cancel")
             }

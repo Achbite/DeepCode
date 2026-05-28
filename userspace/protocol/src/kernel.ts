@@ -206,6 +206,47 @@ export interface KernelExecutionEnvironmentPolicy {
   hostShellOverride?: KernelHostShellOverride;
 }
 
+export interface KernelRequestId {
+  value: string;
+}
+
+export interface KernelRunId {
+  value: string;
+}
+
+export interface KernelSessionId {
+  value: string;
+}
+
+export interface KernelProfileRef {
+  id: string;
+  kind?: string;
+  hash?: string;
+}
+
+export interface KernelLlmCallRequestedEvent {
+  kind: 'llm.call_requested';
+  runId: KernelRunId;
+  sessionId?: KernelSessionId;
+  phase: string;
+  llmCallId: string;
+  profileRef?: KernelProfileRef;
+  requestEnvelope: unknown;
+  sequence?: number;
+}
+
+export interface KernelLlmResponseSubmitCommand {
+  kind: 'llmResponseSubmit';
+  requestId: KernelRequestId;
+  runId: KernelRunId;
+  sessionId?: KernelSessionId;
+  llmCallId: string;
+  responseEnvelope: unknown;
+}
+
+export type KernelWorkflowTransportEvent = KernelLlmCallRequestedEvent;
+export type KernelWorkflowTransportCommand = KernelLlmResponseSubmitCommand;
+
 export interface KernelCompletionCriteria {
   id: string;
   description: string;

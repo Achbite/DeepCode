@@ -4,7 +4,6 @@ import type {
   AgentWorkflowStage,
   LlmProviderProfile,
 } from '@deepcode/protocol';
-import { AGENT_WORKFLOW_STAGES } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 
 interface AgentWorkflowSelectorProps {
@@ -23,9 +22,11 @@ const STAGE_LABEL_KEYS: Record<AgentWorkflowStage, string> = {
 };
 
 function emptyConfig(): AgentWorkflowConfig {
-  return Object.fromEntries(
-    AGENT_WORKFLOW_STAGES.map((stage) => [stage, {}])
-  ) as AgentWorkflowConfig;
+  return {} as AgentWorkflowConfig;
+}
+
+function stageLabelKey(stage: AgentWorkflowStage): string {
+  return STAGE_LABEL_KEYS[stage] ?? stage;
 }
 
 function isValidProfile(profile: LlmProviderProfile): boolean {
@@ -43,6 +44,7 @@ const AgentWorkflowSelector: React.FC<AgentWorkflowSelectorProps> = ({
   const rootRef = useRef<HTMLDivElement | null>(null);
   const validProfiles = useMemo(() => profiles.filter(isValidProfile), [profiles]);
   const current = config ?? emptyConfig();
+  const stages = Object.keys(current) as AgentWorkflowStage[];
 
   useEffect(() => {
     if (!open) return;
@@ -83,9 +85,9 @@ const AgentWorkflowSelector: React.FC<AgentWorkflowSelectorProps> = ({
               {t(language, 'agent.workflow.noProfile')}
             </div>
           )}
-          {AGENT_WORKFLOW_STAGES.map((stage) => (
+          {stages.map((stage) => (
             <label key={stage} className="agent-workflow-selector__row">
-              <span>{t(language, STAGE_LABEL_KEYS[stage])}</span>
+              <span>{t(language, stageLabelKey(stage))}</span>
               <select
                 value={current[stage]?.profileId ?? ''}
                 disabled={disabled}

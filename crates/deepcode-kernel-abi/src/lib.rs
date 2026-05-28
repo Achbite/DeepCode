@@ -52,6 +52,13 @@ pub enum KernelCommand {
         workflow_ref: Option<WorkflowRef>,
         run_overrides: Option<Value>,
     },
+    LlmResponseSubmit {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        llm_call_id: String,
+        response_envelope: Value,
+    },
     RunCancel {
         request_id: RequestId,
         run_id: RunId,
@@ -282,6 +289,16 @@ pub enum KernelEvent {
         content: Option<String>,
         message_key: Option<String>,
         args: Option<Value>,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "llm.call_requested")]
+    LlmCallRequested {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        phase: String,
+        llm_call_id: String,
+        profile_ref: Option<ProfileRef>,
+        request_envelope: Value,
         sequence: Option<u64>,
     },
     #[serde(rename = "tool.requested")]

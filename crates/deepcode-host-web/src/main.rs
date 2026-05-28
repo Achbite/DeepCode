@@ -18,7 +18,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::services::{ServeDir, ServeFile};
 
-const AGENT_WORKFLOW_STAGES: [&str; 4] = ["plan", "check", "complete", "review"];
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<Mutex<DeepCodeKernelRuntime>>,
@@ -198,10 +197,8 @@ struct LlmChatOutput {
 #[derive(Debug, Clone)]
 struct AgentRunRequest {
     content: String,
-    mode: String,
     workflow: String,
     profile_id: Option<String>,
-    workflow_config: Value,
     workspace_binding: Option<WorkspaceBinding>,
 }
 
@@ -325,6 +322,10 @@ async fn main() {
         .route(
             "/api/session-store/:session_id/projection",
             get(session_store_projection_get).post(session_store_projection_append),
+        )
+        .route(
+            "/api/session-store/:session_id/transcript",
+            get(session_store_transcript_get).post(session_store_transcript_append),
         )
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/open", post(workspace_open))
@@ -622,6 +623,50 @@ async fn session_store_projection_append(
         "entries": stored,
         "events": stored
     }))
+}
+
+async fn session_store_transcript_get(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let sessions_dir = state
+        .gui
+        .lock()
+        .expect("gui state lock")
+        .paths
+        .sessions_dir
+        .clone();
+    let entries = read_session_jsonl(&sessions_dir, &session_id, "transcript.jsonl");
+    ApiResponse::ok(json!({
+        "sessionId": session_id,
+        "entries": entries
+    }))
+}
+
+async fn session_store_transcript_append(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let entry = body.get("entry").cloned().unwrap_or(body);
+    let sessions_dir = state
+        .gui
+        .lock()
+        .expect("gui state lock")
+        .paths
+        .sessions_dir
+        .clone();
+    match append_session_jsonl(&sessions_dir, &session_id, "transcript.jsonl", &[entry]) {
+        Ok(()) => {
+            let entries = read_session_jsonl(&sessions_dir, &session_id, "transcript.jsonl");
+            ApiResponse::ok(json!({
+                "sessionId": session_id,
+                "entryCount": entries.len(),
+                "entries": entries
+            }))
+        }
+        Err(error) => ApiResponse::error("write_session_transcript_failed", error.to_string()),
+    }
 }
 
 async fn workspace_current(State(state): State<AppState>) -> Json<ApiResponse> {
@@ -1098,8 +1143,10 @@ async fn llm_probe(State(state): State<AppState>, Json(body): Json<Value>) -> Js
     }
     let output = call_llm_profile(
         &profile,
-        vec![json!({ "role": "user", "content": "Reply with OK." })],
-        Vec::new(),
+        json!({
+            "messages": [{ "role": "user", "content": "Reply with OK." }],
+            "tools": []
+        }),
     )
     .await;
     match output {
@@ -1137,13 +1184,11 @@ async fn llm_chat(State(state): State<AppState>, Json(body): Json<Value>) -> Jso
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let tools = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .map(provider_tools_from_values)
-        .unwrap_or_default();
-    match call_llm_profile(&profile, messages, tools).await {
+    let request_envelope = json!({
+        "messages": messages,
+        "tools": body.get("tools").cloned().unwrap_or_else(|| json!([]))
+    });
+    match call_llm_profile(&profile, request_envelope).await {
         Ok(output) => ApiResponse::ok(llm_output_payload(output)),
         Err(error) => ApiResponse::error("llm_chat_failed", error),
     }
@@ -1461,7 +1506,7 @@ async fn agent_session_send_message(
     );
     append_session_projection(&state, &session_id, vec![user_event]);
 
-    if let Err(error) = run_agent_workflow(&state, &session_id, request, false).await {
+    if let Err(error) = start_kernel_agent_run(&state, &session_id, request).await {
         append_session_projection(
             &state,
             &session_id,
@@ -1545,7 +1590,6 @@ async fn agent_permission_resolve(
                 }]
             })
     };
-    record_kernel_events(&state, &kernel_events);
     let session_id = kernel_events
         .iter()
         .find_map(kernel_event_session_id)
@@ -1558,11 +1602,22 @@ async fn agent_permission_resolve(
                 .clone()
         })
         .unwrap_or_else(|| "session-unknown".to_string());
-    append_session_projection(
-        &state,
-        &session_id,
-        kernel_events_to_agent_events(&session_id, &kernel_events),
-    );
+    if let Err(error) = drive_kernel_agent_loop(&state, &session_id, kernel_events).await {
+        append_session_projection(
+            &state,
+            &session_id,
+            vec![agent_event(
+                &session_id,
+                "error",
+                json!({
+                    "message": error,
+                    "channel": "error",
+                    "visibility": "conversation"
+                }),
+                &now_text(),
+            )],
+        );
+    }
     let gui = state.gui.lock().expect("gui state lock");
     if gui
         .sessions
@@ -1680,11 +1735,6 @@ fn build_agent_run_request(body: &Value) -> AgentRunRequest {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        mode: body
-            .get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or("plan")
-            .to_string(),
         workflow: body
             .get("workflow")
             .and_then(Value::as_str)
@@ -1694,21 +1744,16 @@ fn build_agent_run_request(body: &Value) -> AgentRunRequest {
             .get("profileId")
             .and_then(Value::as_str)
             .map(str::to_string),
-        workflow_config: body
-            .get("workflowConfig")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
         workspace_binding: body
             .get("workspaceBinding")
             .and_then(|value| serde_json::from_value(value.clone()).ok()),
     }
 }
 
-async fn run_agent_workflow(
+async fn start_kernel_agent_run(
     state: &AppState,
     session_id: &str,
     request: AgentRunRequest,
-    resume_after_permission: bool,
 ) -> Result<(), String> {
     let needs_workspace = request_mentions_local_workspace(&request.content);
     if needs_workspace {
@@ -1732,214 +1777,145 @@ async fn run_agent_workflow(
         let _ = ensure_workspace_binding(&state.runtime, Some(binding));
     }
 
-    if !resume_after_permission {
-        if let Some(binding) =
-            effective_workspace_binding(&state.runtime, request.workspace_binding.clone())
-        {
-            let kernel_events = {
-                let mut runtime = state.runtime.lock().expect("kernel runtime lock");
-                runtime.dispatch(KernelCommand::RunStart {
-                    request_id: rid("agent-run-start"),
-                    session_id: Some(deepcode_kernel_abi::SessionId(session_id.to_string())),
-                    input: deepcode_kernel_abi::UserInput {
-                        text: request.content.clone(),
-                        attachments: Vec::new(),
-                    },
-                    workspace_binding: Some(binding),
-                    profile_ref: request.profile_id.as_ref().map(|id| {
-                        deepcode_kernel_abi::ProfileRef {
-                            id: id.clone(),
-                            kind: Some("llm".to_string()),
-                            hash: None,
-                        }
-                    }),
-                    workflow_ref: Some(deepcode_kernel_abi::WorkflowRef {
-                        id: request.workflow.clone(),
-                        version: None,
+    let Some(binding) =
+        effective_workspace_binding(&state.runtime, request.workspace_binding.clone())
+    else {
+        append_session_projection(
+            state,
+            session_id,
+            vec![assistant_final_event(
+                session_id,
+                "当前没有可用工作区绑定。请先打开一个文件夹或 .code-workspace 文件，再让 Agent 读取、搜索或修改文件。",
+            )],
+        );
+        return Ok(());
+    };
+
+    let kernel_events = {
+        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+        runtime
+            .dispatch(KernelCommand::RunStart {
+                request_id: rid("agent-run-start"),
+                session_id: Some(deepcode_kernel_abi::SessionId(session_id.to_string())),
+                input: deepcode_kernel_abi::UserInput {
+                    text: request.content.clone(),
+                    attachments: Vec::new(),
+                },
+                workspace_binding: Some(binding),
+                profile_ref: request.profile_id.as_ref().map(|id| {
+                    deepcode_kernel_abi::ProfileRef {
+                        id: id.clone(),
+                        kind: Some("llm".to_string()),
                         hash: None,
-                    }),
-                    run_overrides: None,
-                })
-            };
-            match kernel_events {
-                Ok(events) => append_trace_from_kernel_events(state, session_id, events),
-                Err(error) => append_trace_event(
-                    state,
-                    session_id,
-                    "error",
-                    json!({
-                        "code": "kernel_run_start_failed",
-                        "message": error.to_string()
-                    }),
-                ),
-            }
-        }
-    }
-
-    let stages: Vec<&str> = if resume_after_permission {
-        vec!["complete", "review"]
-    } else {
-        AGENT_WORKFLOW_STAGES.to_vec()
+                    }
+                }),
+                workflow_ref: Some(deepcode_kernel_abi::WorkflowRef {
+                    id: request.workflow.clone(),
+                    version: None,
+                    hash: None,
+                }),
+                run_overrides: None,
+            })
+            .map_err(|error| error.to_string())?
     };
+    drive_kernel_agent_loop(state, session_id, kernel_events).await
+}
 
-    for stage in stages {
+async fn drive_kernel_agent_loop(
+    state: &AppState,
+    session_id: &str,
+    mut kernel_events: Vec<KernelEvent>,
+) -> Result<(), String> {
+    loop {
+        record_kernel_events(state, &kernel_events);
         append_session_projection(
             state,
             session_id,
-            vec![workflow_stage_event(session_id, stage, "started", None)],
+            kernel_events_to_agent_events(session_id, &kernel_events),
         );
-
-        let profile = resolve_stage_profile(state, &request, stage)?;
-        let stage_result = call_agent_stage_llm(state, &request, session_id, stage, &profile).await;
-        match stage_result {
-            Ok(output) => {
-                append_llm_output_events(state, session_id, stage, &output);
-                if stage == "complete" {
-                    if execute_stage_tool_calls(state, session_id, &request, output.tool_calls)? {
-                        return Ok(());
-                    }
-                    if drive_temp_lifecycle(state, session_id, &request)? {
-                        return Ok(());
-                    }
-                }
-                append_session_projection(
-                    state,
-                    session_id,
-                    vec![workflow_stage_event(session_id, stage, "completed", None)],
-                );
-            }
-            Err(error) => {
-                append_session_projection(
-                    state,
-                    session_id,
-                    vec![workflow_stage_event(
-                        session_id,
-                        stage,
-                        "error",
-                        Some(&error),
-                    )],
-                );
-                append_session_projection(
-                    state,
-                    session_id,
-                    vec![assistant_final_event(
-                        session_id,
-                        &format!("LLM 阶段 `{stage}` 调用失败：{error}"),
-                    )],
-                );
-                return Ok(());
-            }
-        }
-
-        if stage == "complete" && request_mentions_temp_lifecycle(&request.content) {
-            if drive_temp_lifecycle(state, session_id, &request)? {
-                return Ok(());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn call_agent_stage_llm(
-    state: &AppState,
-    request: &AgentRunRequest,
-    session_id: &str,
-    stage: &str,
-    profile: &ResolvedLlmProfile,
-) -> Result<LlmChatOutput, String> {
-    let messages = vec![
-        json!({
-            "role": "system",
-            "content": stage_prompt(stage, &request.mode, &request.workflow)
-        }),
-        json!({
-            "role": "user",
-            "content": request.content
-        }),
-    ];
-    let tools = if stage == "complete" {
-        model_visible_tools()
-    } else {
-        Vec::new()
-    };
-    append_trace_event(
-        state,
-        session_id,
-        "llm.requested",
-        json!({
-            "stage": stage,
-            "profileId": profile.id,
-            "model": profile.model,
-            "toolCount": tools.len()
-        }),
-    );
-    let output = call_llm_profile(profile, messages, tools).await?;
-    append_trace_event(
-        state,
-        session_id,
-        "llm.completed",
-        json!({
-            "stage": stage,
-            "profileId": profile.id,
-            "contentBytes": output.content.len(),
-            "toolCallCount": output.tool_calls.len()
-        }),
-    );
-    Ok(output)
-}
-
-fn execute_stage_tool_calls(
-    state: &AppState,
-    session_id: &str,
-    request: &AgentRunRequest,
-    tool_calls: Vec<LlmToolCall>,
-) -> Result<bool, String> {
-    for call in tool_calls {
-        let tool_call = ToolCallRequest {
-            id: Some(call.id),
-            name: call.name,
-            arguments: call.arguments,
-        };
-        let events = invoke_kernel_tool(state, session_id, &request.workspace_binding, &tool_call)?;
-        let paused = events
+        if kernel_events
             .iter()
-            .any(|event| matches!(event, KernelEvent::PermissionRequested { .. }));
-        append_session_projection(
-            state,
-            session_id,
-            kernel_events_to_agent_events(session_id, &events),
-        );
-        if paused {
-            return Ok(true);
+            .any(|event| matches!(event, KernelEvent::PermissionRequested { .. }))
+        {
+            return Ok(());
         }
-    }
-    Ok(false)
-}
+        let llm_requests = kernel_events
+            .iter()
+            .filter_map(|event| match event {
+                KernelEvent::LlmCallRequested {
+                    run_id,
+                    session_id,
+                    phase,
+                    llm_call_id,
+                    profile_ref,
+                    request_envelope,
+                    ..
+                } => Some((
+                    run_id.clone(),
+                    session_id.clone(),
+                    phase.clone(),
+                    llm_call_id.clone(),
+                    profile_ref.clone(),
+                    request_envelope.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if llm_requests.is_empty() {
+            return Ok(());
+        }
 
-fn drive_temp_lifecycle(
-    state: &AppState,
-    session_id: &str,
-    request: &AgentRunRequest,
-) -> Result<bool, String> {
-    if !request_mentions_temp_lifecycle(&request.content) {
-        return Ok(false);
+        let mut next_events = Vec::new();
+        for (run_id, event_session_id, phase, llm_call_id, profile_ref, request_envelope) in
+            llm_requests
+        {
+            let profile = resolve_kernel_llm_profile(state, profile_ref.as_ref())?;
+            append_trace_event(
+                state,
+                session_id,
+                "llm.requested",
+                json!({
+                    "stage": phase,
+                    "llmCallId": llm_call_id,
+                    "profileId": profile.id,
+                    "model": profile.model,
+                    "toolCount": request_envelope
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .map(|items| items.len())
+                        .unwrap_or(0)
+                }),
+            );
+            let output = call_llm_profile(&profile, request_envelope).await?;
+            append_trace_event(
+                state,
+                session_id,
+                "llm.completed",
+                json!({
+                    "stage": phase,
+                    "llmCallId": llm_call_id,
+                    "profileId": profile.id,
+                    "contentBytes": output.content.len(),
+                    "toolCallCount": output.tool_calls.len()
+                }),
+            );
+            let response_envelope = llm_output_payload(output);
+            let submitted = {
+                let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+                runtime
+                    .dispatch(KernelCommand::LlmResponseSubmit {
+                        request_id: rid("llm-response-submit"),
+                        run_id,
+                        session_id: event_session_id,
+                        llm_call_id,
+                        response_envelope,
+                    })
+                    .map_err(|error| error.to_string())?
+            };
+            next_events.extend(submitted);
+        }
+        kernel_events = next_events;
     }
-    let tool_call = ToolCallRequest {
-        id: Some(format!("tool-list-{}", now_millis())),
-        name: "fs.list".to_string(),
-        arguments: json!({ "path": "." }),
-    };
-    let events = invoke_kernel_tool(state, session_id, &request.workspace_binding, &tool_call)?;
-    let paused = events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::PermissionRequested { .. }));
-    append_session_projection(
-        state,
-        session_id,
-        kernel_events_to_agent_events(session_id, &events),
-    );
-    Ok(paused)
 }
 
 async fn agent_tool_execute(
@@ -2202,25 +2178,38 @@ fn append_session_projection_jsonl(
     session_id: &str,
     events: &[Value],
 ) -> std::io::Result<()> {
+    append_session_jsonl(sessions_dir, session_id, "projection.jsonl", events)
+}
+
+fn read_session_projection_jsonl(sessions_dir: &FsPath, session_id: &str) -> Vec<Value> {
+    read_session_jsonl(sessions_dir, session_id, "projection.jsonl")
+}
+
+fn append_session_jsonl(
+    sessions_dir: &FsPath,
+    session_id: &str,
+    file_name: &str,
+    entries: &[Value],
+) -> std::io::Result<()> {
     use std::io::Write;
     let dir = sessions_dir.join(safe_path_segment(session_id));
     fs::create_dir_all(&dir)?;
-    let path = dir.join("projection.jsonl");
+    let path = dir.join(file_name);
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    for event in events {
-        let line = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+    for entry in entries {
+        let line = serde_json::to_string(entry).unwrap_or_else(|_| "{}".to_string());
         writeln!(file, "{line}")?;
     }
     Ok(())
 }
 
-fn read_session_projection_jsonl(sessions_dir: &FsPath, session_id: &str) -> Vec<Value> {
+fn read_session_jsonl(sessions_dir: &FsPath, session_id: &str, file_name: &str) -> Vec<Value> {
     let path = sessions_dir
         .join(safe_path_segment(session_id))
-        .join("projection.jsonl");
+        .join(file_name);
     let Ok(content) = fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -2258,17 +2247,6 @@ fn append_trace_event(state: &AppState, session_id: &str, kind: &str, payload: V
             "summary": payload.get("summary").and_then(Value::as_str).unwrap_or(kind),
             "payload": payload
         }));
-}
-
-fn append_trace_from_kernel_events(state: &AppState, session_id: &str, events: Vec<KernelEvent>) {
-    for event in events {
-        append_trace_event(
-            state,
-            session_id,
-            "kernel.event",
-            serde_json::to_value(event).unwrap_or_else(|_| json!({ "kind": "kernel.event" })),
-        );
-    }
 }
 
 fn invoke_kernel_tool(
@@ -2343,6 +2321,41 @@ fn kernel_events_to_agent_events(session_id: &str, events: &[KernelEvent]) -> Ve
 
 fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent) -> Vec<Value> {
     match event {
+        KernelEvent::MessageAppended {
+            channel, content, ..
+        } => vec![agent_event(
+            session_id,
+            "assistant_msg",
+            json!({
+                "content": content,
+                "kind": channel.as_deref().unwrap_or("progress"),
+                "channel": channel.as_deref().unwrap_or("progress"),
+                "visibility": "conversation",
+                "label": if channel.as_deref() == Some("final") { "Agent" } else { "Agent" },
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::LlmCallRequested {
+            phase,
+            llm_call_id,
+            profile_ref,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": phase,
+                "phase": phase,
+                "status": "llm_requested",
+                "summary": format!("Kernel requested LLM call {llm_call_id}."),
+                "profileId": profile_ref.as_ref().map(|value| value.id.clone()),
+                "channel": "task",
+                "visibility": "task",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
         KernelEvent::ToolRequested {
             tool_call_id,
             tool_name,
@@ -2430,16 +2443,7 @@ fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent) -> Vec<Va
                 }),
                 &now_text(),
             )];
-            if matches!(
-                decision.action,
-                deepcode_kernel_abi::WorkflowDecisionAction::Review
-                    | deepcode_kernel_abi::WorkflowDecisionAction::Done
-            ) {
-                result.push(assistant_final_event(
-                    session_id,
-                    "我是 DeepCode Agent。本轮结构化工作流已根据 Kernel 事实完成：工作区工具调用、临时文件创建读取与受控清理均已由 Kernel 记录并通过复核条件。",
-                ));
-            } else if decision.fail_closed
+            if decision.fail_closed
                 || matches!(
                     decision.action,
                     deepcode_kernel_abi::WorkflowDecisionAction::Blocked
@@ -2471,27 +2475,6 @@ fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent) -> Vec<Va
     }
 }
 
-fn workflow_stage_event(
-    session_id: &str,
-    stage: &str,
-    status: &str,
-    summary: Option<&str>,
-) -> Value {
-    agent_event(
-        session_id,
-        "workflow_stage",
-        json!({
-            "stage": stage,
-            "phase": stage,
-            "status": status,
-            "summary": summary.unwrap_or(status),
-            "channel": "task",
-            "visibility": "task"
-        }),
-        &now_text(),
-    )
-}
-
 fn tool_name_for_capability(capability: &str) -> &str {
     match capability {
         "cap.fs.write" => "fs.write",
@@ -2516,25 +2499,12 @@ fn assistant_final_event(session_id: &str, content: &str) -> Value {
     )
 }
 
-fn resolve_stage_profile(
+fn resolve_kernel_llm_profile(
     state: &AppState,
-    request: &AgentRunRequest,
-    stage: &str,
+    profile_ref: Option<&deepcode_kernel_abi::ProfileRef>,
 ) -> Result<ResolvedLlmProfile, String> {
     let gui = state.gui.lock().expect("gui state lock");
-    let stage_profile = request
-        .workflow_config
-        .get(stage)
-        .and_then(|value| value.get("profileId"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            gui.workflow_config
-                .get(stage)
-                .and_then(|value| value.get("profileId"))
-                .and_then(Value::as_str)
-        })
-        .or(request.profile_id.as_deref());
-    resolve_llm_profile(&gui, stage_profile)
+    resolve_llm_profile(&gui, profile_ref.map(|value| value.id.as_str()))
 }
 
 fn resolve_llm_profile(
@@ -2633,17 +2603,33 @@ fn resolve_llm_profile(
 
 async fn call_llm_profile(
     profile: &ResolvedLlmProfile,
-    messages: Vec<Value>,
-    tools: Vec<LlmToolDefinition>,
+    request_envelope: Value,
 ) -> Result<LlmChatOutput, String> {
+    let messages = request_envelope
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let tools = request_envelope
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .map(provider_tools_from_values)
+        .unwrap_or_default();
     if llm_mock_enabled() {
-        return Ok(mock_llm_output(
-            messages
-                .last()
-                .and_then(|value| value.get("content"))
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        ));
+        let mock_prompt = messages
+            .iter()
+            .find(|value| value.get("role").and_then(Value::as_str) == Some("system"))
+            .and_then(|value| value.get("content"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                messages
+                    .last()
+                    .and_then(|value| value.get("content"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default();
+        return Ok(mock_llm_output(mock_prompt));
     }
     match profile.kind.as_str() {
         "anthropic" => call_anthropic_profile(profile, messages, tools).await,
@@ -2931,333 +2917,6 @@ fn llm_output_payload(output: LlmChatOutput) -> Value {
     })
 }
 
-fn append_llm_output_events(
-    state: &AppState,
-    session_id: &str,
-    stage: &str,
-    output: &LlmChatOutput,
-) {
-    let mut events = Vec::new();
-    if let Some(reasoning) = output
-        .reasoning
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        events.push(assistant_segment_event(
-            session_id,
-            "reasoning",
-            reasoning,
-            stage,
-        ));
-    }
-    for (kind, content) in parse_tagged_segments(&output.content, fallback_segment_kind(stage)) {
-        if stage != "review" && kind == "final" {
-            events.push(assistant_segment_event(
-                session_id,
-                fallback_segment_kind(stage),
-                &content,
-                stage,
-            ));
-        } else {
-            events.push(assistant_segment_event(session_id, kind, &content, stage));
-        }
-    }
-    let mut parsed_calls = parse_deepcode_action_tool_calls(&output.content);
-    if !parsed_calls.is_empty() {
-        let calls = parsed_calls
-            .drain(..)
-            .map(|call| LlmToolCall {
-                id: call.id.unwrap_or_else(|| format!("tool-{}", now_millis())),
-                name: call.name,
-                arguments: call.arguments,
-            })
-            .collect::<Vec<_>>();
-        let request = AgentRunRequest {
-            content: String::new(),
-            mode: "askBeforeWrite".to_string(),
-            workflow: "planFirst".to_string(),
-            profile_id: None,
-            workflow_config: json!({}),
-            workspace_binding: None,
-        };
-        let _ = execute_stage_tool_calls(state, session_id, &request, calls);
-    }
-    append_session_projection(state, session_id, events);
-}
-
-fn assistant_segment_event(session_id: &str, kind: &str, content: &str, stage: &str) -> Value {
-    let channel = match kind {
-        "reasoning" => "reasoning",
-        "observe" => "observation",
-        "final" => "final",
-        _ => "progress",
-    };
-    let label = match kind {
-        "reasoning" => "思考过程",
-        "observe" => "观察",
-        "plan" => "计划",
-        "final" => "Agent",
-        _ => "Agent",
-    };
-    agent_event(
-        session_id,
-        "assistant_msg",
-        json!({
-            "content": content,
-            "label": label,
-            "stage": stage,
-            "phase": stage,
-            "channel": channel,
-            "visibility": if kind == "reasoning" { "trace" } else { "conversation" }
-        }),
-        &now_text(),
-    )
-}
-
-fn parse_tagged_segments(content: &str, fallback: &str) -> Vec<(&'static str, String)> {
-    let tags: [(&str, &'static str); 6] = [
-        ("reasoning", "reasoning"),
-        ("think", "reasoning"),
-        ("say", "say"),
-        ("plan", "plan"),
-        ("observe", "observe"),
-        ("final", "final"),
-    ];
-    let mut result = Vec::new();
-    let mut consumed = vec![false; content.len()];
-    for (tag, kind) in tags {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        let mut offset = 0;
-        while let Some(start) = content[offset..].find(&open) {
-            let open_start = offset + start;
-            let text_start = open_start + open.len();
-            let Some(end_rel) = content[text_start..].find(&close) else {
-                break;
-            };
-            let text_end = text_start + end_rel;
-            let close_end = text_end + close.len();
-            for item in consumed.iter_mut().take(close_end).skip(open_start) {
-                *item = true;
-            }
-            let text = strip_action_blocks(&content[text_start..text_end])
-                .trim()
-                .to_string();
-            if !text.is_empty() {
-                result.push((kind, redact_for_display(&text)));
-            }
-            offset = close_end;
-        }
-    }
-    let remainder = content
-        .char_indices()
-        .filter_map(|(index, ch)| {
-            consumed
-                .get(index)
-                .copied()
-                .is_some_and(|value| !value)
-                .then_some(ch)
-        })
-        .collect::<String>();
-    let clean = strip_action_blocks(&remainder).trim().to_string();
-    if !clean.is_empty() {
-        result.push((fallback_kind_static(fallback), redact_for_display(&clean)));
-    }
-    result
-}
-
-fn fallback_kind_static(value: &str) -> &'static str {
-    match value {
-        "reasoning" => "reasoning",
-        "observe" => "observe",
-        "plan" => "plan",
-        "final" => "final",
-        _ => "say",
-    }
-}
-
-fn fallback_segment_kind(stage: &str) -> &'static str {
-    match stage {
-        "plan" => "plan",
-        "check" => "observe",
-        "review" => "final",
-        _ => "say",
-    }
-}
-
-fn strip_action_blocks(content: &str) -> String {
-    let mut output = String::new();
-    let mut rest = content;
-    while let Some(start) = rest.find("```deepcode-action") {
-        output.push_str(&rest[..start]);
-        let after_start = &rest[start..];
-        if let Some(end) = after_start.find("```") {
-            let after_fence = &after_start[end + 3..];
-            if let Some(second_end) = after_fence.find("```") {
-                rest = &after_fence[second_end + 3..];
-                continue;
-            }
-        }
-        rest = "";
-    }
-    output.push_str(rest);
-    output
-}
-
-fn parse_deepcode_action_tool_calls(content: &str) -> Vec<ToolCallRequest> {
-    let mut calls = Vec::new();
-    let mut rest = content;
-    while let Some(start) = rest.find("```deepcode-action") {
-        let after_start = &rest[start..];
-        let Some(first_end) = after_start.find('\n') else {
-            break;
-        };
-        let body_start = first_end + 1;
-        let Some(end) = after_start[body_start..].find("```") else {
-            break;
-        };
-        let raw = after_start[body_start..body_start + end].trim();
-        if let Ok(value) = serde_json::from_str::<Value>(raw) {
-            if let Some(call) = tool_call_from_action_value(&value) {
-                calls.push(call);
-            }
-        }
-        rest = &after_start[body_start + end + 3..];
-    }
-    calls
-}
-
-fn tool_call_from_action_value(value: &Value) -> Option<ToolCallRequest> {
-    let name = value
-        .get("action")
-        .or_else(|| value.get("type"))
-        .or_else(|| value.get("name"))
-        .and_then(Value::as_str)?
-        .to_string();
-    Some(ToolCallRequest {
-        id: value.get("id").and_then(Value::as_str).map(str::to_string),
-        name,
-        arguments: value
-            .get("input")
-            .or_else(|| value.get("arguments"))
-            .or_else(|| value.get("payload"))
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-    })
-}
-
-fn stage_prompt(stage: &str, mode: &str, workflow: &str) -> String {
-    let stage_instruction = match stage {
-        "plan" => "你是 DeepCode Agent 的规划阶段。只产出计划和完成条件，不直接回答最终身份、结果或总结。",
-        "check" => "你是 DeepCode Agent 的检查阶段。只审查计划风险、路径和权限，不重复最终答案。",
-        "complete" => "你是 DeepCode Agent 的执行阶段。需要本地操作时只使用工具调用或 deepcode-action；不要把自然语言当作本地操作。",
-        "review" => "你是 DeepCode Agent 的复核阶段。只有结构化完成条件满足后才输出最终答案；未完成时说明 blocked/replan。",
-        _ => "你是 DeepCode Agent。",
-    };
-    format!(
-        "{stage_instruction}\n\n\
-        输出语言默认简体中文。工具路径必须是工作区相对路径，禁止 /tmp、绝对路径和 ..。\n\
-        当前会话模式：{mode}。当前 workflow：{workflow}。\n\
-        fs.delete 是隐藏的内核受控能力，不在普通模型工具目录中；临时测试文件清理由 Kernel 受控流程完成。\n\
-        不要重复已经满足的 AnswerObligation。"
-    )
-}
-
-fn model_visible_tools() -> Vec<LlmToolDefinition> {
-    vec![
-        LlmToolDefinition {
-            name: "fs.list".to_string(),
-            description: "List a workspace directory tree with bounded depth.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "folderId": { "type": "string" }
-                }
-            }),
-        },
-        LlmToolDefinition {
-            name: "fs.read".to_string(),
-            description: "Read a text file from the active workspace.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "required": ["path"],
-                "properties": {
-                    "path": { "type": "string" },
-                    "folderId": { "type": "string" }
-                }
-            }),
-        },
-        LlmToolDefinition {
-            name: "fs.diff".to_string(),
-            description: "Preview a file diff without writing.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "required": ["path", "newContent"],
-                "properties": {
-                    "path": { "type": "string" },
-                    "newContent": { "type": "string" },
-                    "folderId": { "type": "string" }
-                }
-            }),
-        },
-        LlmToolDefinition {
-            name: "code.search".to_string(),
-            description: "Search text across the workspace.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "required": ["query"],
-                "properties": {
-                    "query": { "type": "string" },
-                    "isRegex": { "type": "boolean" },
-                    "include": { "type": "array", "items": { "type": "string" } },
-                    "folderId": { "type": "string" }
-                }
-            }),
-        },
-        LlmToolDefinition {
-            name: "fs.write".to_string(),
-            description: "Write a text file after explicit permission approval.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "required": ["path", "content"],
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" },
-                    "folderId": { "type": "string" }
-                }
-            }),
-        },
-        LlmToolDefinition {
-            name: "shell.propose".to_string(),
-            description: "Propose a shell command without executing it.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "required": ["command"],
-                "properties": {
-                    "command": { "type": "string" },
-                    "reason": { "type": "string" }
-                }
-            }),
-        },
-        LlmToolDefinition {
-            name: "shell.exec".to_string(),
-            description: "Run a command in a Kernel controlled shell after explicit approval."
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "required": ["command"],
-                "properties": {
-                    "command": { "type": "string" },
-                    "cwd": { "type": "string" },
-                    "timeoutMs": { "type": "number" },
-                    "reason": { "type": "string" }
-                }
-            }),
-        },
-    ]
-}
-
 fn provider_tools_from_values(values: Vec<Value>) -> Vec<LlmToolDefinition> {
     values
         .into_iter()
@@ -3439,21 +3098,21 @@ fn llm_mock_enabled() -> bool {
 }
 
 fn mock_llm_output(prompt: &str) -> LlmChatOutput {
-    if prompt.contains("plan") || prompt.contains("规划") {
+    if prompt.contains("复核阶段") {
+        return LlmChatOutput {
+            content: "<final>我是 DeepCode Agent。本轮已通过 Kernel 事实完成 fs.list、fs.write、fs.read 与受控 fs.delete 临时文件测试，临时文件已清理删除。</final>".to_string(),
+            ..LlmChatOutput::default()
+        };
+    }
+    if prompt.contains("规划阶段") {
         return LlmChatOutput {
             content: "<plan>我会先规划测试目标，再通过 Kernel syscall 验证工作区读取、搜索、临时文件写入、读取和清理，最终只在复核阶段回答身份和汇总结果。</plan>".to_string(),
             ..LlmChatOutput::default()
         };
     }
-    if prompt.contains("check") || prompt.contains("检查") {
+    if prompt.contains("检查阶段") {
         return LlmChatOutput {
             content: "<observe>计划检查通过：路径使用工作区相对 `_agent_tmp_*`，写入需要权限，清理由 Kernel 隐藏受控能力完成。</observe>".to_string(),
-            ..LlmChatOutput::default()
-        };
-    }
-    if prompt.contains("review") || prompt.contains("复核") {
-        return LlmChatOutput {
-            content: "<final>结构化复核已完成。</final>".to_string(),
             ..LlmChatOutput::default()
         };
     }
@@ -3461,10 +3120,6 @@ fn mock_llm_output(prompt: &str) -> LlmChatOutput {
         content: "<say>开始执行工具验证。</say>".to_string(),
         ..LlmChatOutput::default()
     }
-}
-
-fn redact_for_display(text: &str) -> String {
-    text.replace("Bearer ", "Bearer [REDACTED] ")
 }
 
 fn ensure_workspace_binding(

@@ -11,7 +11,6 @@ import type {
   ListAgentSessionsRequest,
   PermissionRequest,
 } from '@deepcode/protocol';
-import { AGENT_WORKFLOW_STAGES } from '@deepcode/protocol';
 import {
   createWorkspaceBinding,
   createWorkspaceScope,
@@ -98,9 +97,7 @@ type Store = AgentSessionState & AgentSessionActions;
 let activeAgentAbortController: AbortController | null = null;
 
 function emptyWorkflowConfig(): AgentWorkflowConfig {
-  return Object.fromEntries(
-    AGENT_WORKFLOW_STAGES.map((stage) => [stage, {}])
-  ) as AgentWorkflowConfig;
+  return {} as AgentWorkflowConfig;
 }
 
 function settingMode(value: unknown): AgentMode {

@@ -58,13 +58,6 @@ export type AgentReplanReason =
   | 'insufficient_evidence'
   | 'budget_exceeded';
 
-export const AGENT_WORKFLOW_STAGES: AgentWorkflowStage[] = [
-  'plan',
-  'check',
-  'complete',
-  'review',
-];
-
 export interface AgentWorkflowStageConfig {
   profileId?: string;
 }
