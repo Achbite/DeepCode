@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Agent Light IDE</title>
+    <title>DeepCode</title>
     <script>
       if (typeof performance !== "undefined") {
         performance.mark("deepcode:native-shell");
@@ -37,12 +37,74 @@
       .boot-shell__header {
         display: flex;
         align-items: center;
+        justify-content: space-between;
         padding: 0 12px;
         border-bottom: 1px solid rgba(255, 255, 255, 0.08);
         background: #18181b;
         color: #fff;
         font-size: 13px;
         font-weight: 650;
+        -webkit-app-region: drag;
+        app-region: drag;
+      }
+      .window-controls,
+      .window-control {
+        -webkit-app-region: no-drag;
+        app-region: no-drag;
+      }
+      .window-controls {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        height: 100%;
+      }
+      .window-control {
+        position: relative;
+        width: 30px;
+        height: 28px;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: #a1a1aa;
+        cursor: pointer;
+      }
+      .window-control:hover {
+        background: rgba(255, 255, 255, 0.08);
+        color: #fff;
+      }
+      .window-control--close:hover {
+        background: #ff3b30;
+        color: #fff;
+      }
+      .window-control::before,
+      .window-control::after {
+        content: "";
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+      }
+      .window-control--minimize::before {
+        width: 12px;
+        height: 1px;
+        background: currentColor;
+      }
+      .window-control--maximize::before {
+        width: 11px;
+        height: 9px;
+        border: 1px solid currentColor;
+      }
+      .window-control--close::before,
+      .window-control--close::after {
+        width: 13px;
+        height: 1px;
+        background: currentColor;
+      }
+      .window-control--close::before {
+        transform: translate(-50%, -50%) rotate(45deg);
+      }
+      .window-control--close::after {
+        transform: translate(-50%, -50%) rotate(-45deg);
       }
       .boot-shell__body {
         display: grid;
@@ -78,7 +140,32 @@
   <body>
     <div id="root">
       <div class="boot-shell">
-        <div class="boot-shell__header">DeepCode</div>
+        <div class="boot-shell__header" data-tauri-drag-region>
+          <span>DeepCode</span>
+          <span class="window-controls" aria-label="窗口控制">
+            <button
+              id="boot-minimize"
+              class="window-control window-control--minimize"
+              type="button"
+              aria-label="最小化"
+              title="最小化"
+            ></button>
+            <button
+              id="boot-maximize"
+              class="window-control window-control--maximize"
+              type="button"
+              aria-label="最大化或还原"
+              title="最大化或还原"
+            ></button>
+            <button
+              id="boot-close"
+              class="window-control window-control--close"
+              type="button"
+              aria-label="关闭"
+              title="关闭"
+            ></button>
+          </span>
+        </div>
         <div class="boot-shell__body">
           <div class="boot-shell__rail"></div>
           <div class="boot-shell__side"></div>
@@ -88,6 +175,40 @@
         <div class="boot-shell__status"></div>
       </div>
     </div>
+    <script>
+      function runBootWindowCommand(commandName, command) {
+        try {
+          const result = command();
+          if (result && typeof result.catch === "function") {
+            result.catch((err) => console.warn(`[window] ${commandName} failed.`, err));
+          }
+        } catch (err) {
+          console.warn(`[window] ${commandName} failed.`, err);
+        }
+      }
+
+      function bindBootWindowControls() {
+        const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
+        if (!appWindow) return;
+        document
+          .getElementById("boot-minimize")
+          ?.addEventListener("click", () =>
+            runBootWindowCommand("minimize", () => appWindow.minimize())
+          );
+        document
+          .getElementById("boot-maximize")
+          ?.addEventListener("click", () =>
+            runBootWindowCommand("toggleMaximize", () => appWindow.toggleMaximize())
+          );
+        document
+          .getElementById("boot-close")
+          ?.addEventListener("click", () =>
+            runBootWindowCommand("close", () => appWindow.close())
+          );
+      }
+
+      bindBootWindowControls();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

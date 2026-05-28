@@ -127,12 +127,41 @@ function getTauriWindow(): TauriWindowHandle | null {
   return window.__TAURI__?.window?.getCurrentWindow?.() ?? null;
 }
 
+function warnWindowCommand(commandName: string, err: unknown): void {
+  console.warn(`[window] ${commandName} failed.`, err);
+}
+
+async function runWindowCommand(
+  commandName: string,
+  invoke: (tauriWindow: TauriWindowHandle) => Promise<void>,
+  fallback?: () => void | Promise<void>
+): Promise<void> {
+  const tauriWindow = getTauriWindow();
+  if (tauriWindow) {
+    try {
+      await invoke(tauriWindow);
+    } catch (err) {
+      warnWindowCommand(commandName, err);
+    }
+    return;
+  }
+
+  if (!fallback) return;
+  try {
+    await fallback();
+  } catch (err) {
+    warnWindowCommand(commandName, err);
+  }
+}
+
 export async function minimizeAppWindow(): Promise<void> {
-  await getTauriWindow()?.minimize();
+  await runWindowCommand('minimize', (tauriWindow) => tauriWindow.minimize());
 }
 
 export async function toggleMaximizeAppWindow(): Promise<void> {
-  await getTauriWindow()?.toggleMaximize();
+  await runWindowCommand('toggleMaximize', (tauriWindow) =>
+    tauriWindow.toggleMaximize()
+  );
 }
 
 export function requestCloseAppWindow(): void {
@@ -140,12 +169,9 @@ export function requestCloseAppWindow(): void {
 }
 
 export async function closeAppWindow(): Promise<void> {
-  const tauriWindow = getTauriWindow();
-  if (tauriWindow) {
-    await tauriWindow.close();
-    return;
-  }
-  window.close();
+  await runWindowCommand('close', (tauriWindow) => tauriWindow.close(), () => {
+    window.close();
+  });
 }
 
 export function getHealth(): Promise<ApiResponse<HealthStatus>> {

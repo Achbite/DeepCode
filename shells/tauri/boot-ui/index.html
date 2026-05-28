@@ -328,15 +328,33 @@
       function bindWindowControls() {
         const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
         if (!appWindow) return;
+        const runCommand = (commandName, command) => {
+          try {
+            const result = command();
+            if (result && typeof result.catch === "function") {
+              result.catch((err) =>
+                console.warn(`[window] ${commandName} failed.`, err)
+              );
+            }
+          } catch (err) {
+            console.warn(`[window] ${commandName} failed.`, err);
+          }
+        };
         document
           .getElementById("titlebar-minimize")
-          ?.addEventListener("click", () => appWindow.minimize());
+          ?.addEventListener("click", () =>
+            runCommand("minimize", () => appWindow.minimize())
+          );
         document
           .getElementById("titlebar-maximize")
-          ?.addEventListener("click", () => appWindow.toggleMaximize());
+          ?.addEventListener("click", () =>
+            runCommand("toggleMaximize", () => appWindow.toggleMaximize())
+          );
         document
           .getElementById("titlebar-close")
-          ?.addEventListener("click", () => appWindow.close());
+          ?.addEventListener("click", () =>
+            runCommand("close", () => appWindow.close())
+          );
       }
 
       function targetFromLocation() {
