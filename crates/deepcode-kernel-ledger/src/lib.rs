@@ -36,7 +36,9 @@ pub struct RunConfigSnapshot {
 
 pub trait EventLedger: Send + Sync {
     fn append(&self, event: LedgerEvent) -> KernelResult<()>;
+    fn list_all(&self) -> KernelResult<Vec<LedgerEvent>>;
     fn list_by_run(&self, run_id: &str) -> KernelResult<Vec<LedgerEvent>>;
+    fn list_by_session(&self, session_id: &str) -> KernelResult<Vec<LedgerEvent>>;
 
     fn next_sequence(&self, run_id: &str) -> KernelResult<u64> {
         Ok(self
@@ -74,6 +76,10 @@ impl EventLedger for InMemoryEventLedger {
         Ok(())
     }
 
+    fn list_all(&self) -> KernelResult<Vec<LedgerEvent>> {
+        self.all()
+    }
+
     fn list_by_run(&self, run_id: &str) -> KernelResult<Vec<LedgerEvent>> {
         Ok(self
             .events
@@ -81,6 +87,17 @@ impl EventLedger for InMemoryEventLedger {
             .expect("ledger lock")
             .iter()
             .filter(|event| event.run_id.as_deref() == Some(run_id))
+            .cloned()
+            .collect())
+    }
+
+    fn list_by_session(&self, session_id: &str) -> KernelResult<Vec<LedgerEvent>> {
+        Ok(self
+            .events
+            .lock()
+            .expect("ledger lock")
+            .iter()
+            .filter(|event| event.session_id.as_deref() == Some(session_id))
             .cloned()
             .collect())
     }
@@ -150,11 +167,25 @@ impl EventLedger for NdjsonEventLedger {
             .map_err(|error| KernelError::Other(format!("write ledger event failed: {error}")))
     }
 
+    fn list_all(&self) -> KernelResult<Vec<LedgerEvent>> {
+        self.replay_all()
+    }
+
     fn list_by_run(&self, run_id: &str) -> KernelResult<Vec<LedgerEvent>> {
         let mut events = self
             .replay_all()?
             .into_iter()
             .filter(|event| event.run_id.as_deref() == Some(run_id))
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event.sequence.unwrap_or_default());
+        Ok(events)
+    }
+
+    fn list_by_session(&self, session_id: &str) -> KernelResult<Vec<LedgerEvent>> {
+        let mut events = self
+            .replay_all()?
+            .into_iter()
+            .filter(|event| event.session_id.as_deref() == Some(session_id))
             .collect::<Vec<_>>();
         events.sort_by_key(|event| event.sequence.unwrap_or_default());
         Ok(events)
@@ -788,7 +819,7 @@ impl ReviewGate {
         let failed = validations.iter().find(|validation| !validation.passed);
         let status = if failed.is_some() {
             ReviewGateStatus::NeedsReplan
-        } else if change_set.is_none() || evidence_refs.is_empty() {
+        } else if evidence_refs.is_empty() {
             ReviewGateStatus::NeedsUserReview
         } else {
             ReviewGateStatus::Accepted

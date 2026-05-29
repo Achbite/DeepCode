@@ -1,4 +1,5 @@
 use deepcode_kernel_abi::{ConfigSnapshotRef, ProfileRef, WorkspaceBinding};
+use deepcode_kernel_ledger::{ChangeOperation, ValidationResult};
 use deepcode_kernel_workflow::{RunDecisionState, WorkflowPhase};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -11,6 +12,8 @@ pub(crate) struct RuntimeState {
     pub(crate) current_workspace: Option<RuntimeWorkspace>,
     pub(crate) records_by_session: BTreeMap<String, RuntimeRunRecord>,
     pub(crate) pending_tools: BTreeMap<String, PendingKernelTool>,
+    pub(crate) change_operations_by_run: BTreeMap<String, Vec<ChangeOperation>>,
+    pub(crate) validations_by_run: BTreeMap<String, Vec<ValidationResult>>,
 }
 
 #[derive(Debug, Clone)]

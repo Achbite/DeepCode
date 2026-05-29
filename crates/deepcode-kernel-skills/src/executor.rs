@@ -11,9 +11,10 @@ pub struct SkillExecutionContext {
     pub session_id: Option<String>,
     pub trust_mode: SkillTrustMode,
     pub approved_capabilities: Vec<Capability>,
+    pub workspace_root: Option<String>,
 }
 
-pub trait SkillExecutor {
+pub trait SkillExecutor: Send + Sync {
     fn descriptor(&self) -> SkillDescriptor;
     fn invoke(
         &self,
@@ -30,6 +31,14 @@ pub struct SkillExecutorRegistry {
 impl SkillExecutorRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_executors(executors: Vec<Box<dyn SkillExecutor>>) -> Self {
+        let mut registry = Self::new();
+        for executor in executors {
+            registry.register(executor);
+        }
+        registry
     }
 
     pub fn register(&mut self, executor: Box<dyn SkillExecutor>) {

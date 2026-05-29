@@ -178,6 +178,47 @@ wait_http_ok "http://127.0.0.1:${PROXY_PORT}/api/health" "host-web proxy health 
 proxy_health="$(json_get "http://127.0.0.1:${PROXY_PORT}/api/health")"
 assert_json_expr "$proxy_health" 'data["ok"] is True and data["data"]["service"] == "deepcode-kernel-daemon"' "host-web proxies daemon health"
 
+info "[6b/8] Kernel daemon framed IPC smoke"
+ipc_reply="$(
+  printf '%s\n' '{"command":{"kind":"healthCheck","requestId":"req-ipc-health"}}' \
+  | DEEPCODE_DAEMON_IPC_STDIO=1 \
+    DEEPCODE_LEDGER_BACKEND=memory \
+    cargo run -q -p deepcode-kernel-daemon
+)"
+assert_json_expr "$ipc_reply" 'data["ok"] is True and any(event["kind"] == "host.status" for event in data["events"])' "daemon stdio IPC health"
+
+framed_ipc_reply="$(
+  DEEPCODE_DAEMON_IPC_STDIO=1 \
+  DEEPCODE_DAEMON_IPC_FRAMED=1 \
+  DEEPCODE_LEDGER_BACKEND=memory \
+  python3 - <<'PY'
+import json
+import os
+import struct
+import subprocess
+import sys
+
+payload = json.dumps({"command": {"kind": "healthCheck", "requestId": "req-ipc-framed-health"}}).encode("utf-8")
+process = subprocess.Popen(
+    ["cargo", "run", "-q", "-p", "deepcode-kernel-daemon"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=os.environ.copy(),
+)
+stdout, stderr = process.communicate(struct.pack(">I", len(payload)) + payload, timeout=30)
+if process.returncode not in (0, None):
+    sys.stderr.write(stderr.decode("utf-8", errors="replace"))
+    raise SystemExit(process.returncode)
+if len(stdout) < 4:
+    sys.stderr.write(stderr.decode("utf-8", errors="replace"))
+    raise SystemExit("missing framed reply")
+length = struct.unpack(">I", stdout[:4])[0]
+print(stdout[4:4 + length].decode("utf-8"))
+PY
+)"
+assert_json_expr "$framed_ipc_reply" 'data["ok"] is True and any(event["kind"] == "host.status" for event in data["events"])' "daemon length-prefixed IPC health"
+
 info "[7/8] optional packaging smoke"
 if [ "${DEEPCODE_SKIP_PACKAGING_SMOKE:-1}" = "0" ]; then
   ./build.sh

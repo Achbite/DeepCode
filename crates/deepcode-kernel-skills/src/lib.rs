@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod builtin;
 pub mod executor;
 pub mod external;
 pub mod trust_record;
@@ -337,7 +338,7 @@ impl SkillRuntime for ExternalProcessSkillRuntime {
     }
 }
 
-fn builtin(
+pub(crate) fn builtin(
     id: &str,
     description_key: &str,
     capability: Capability,
@@ -551,6 +552,7 @@ mod tests {
                     session_id: Some("session-1".to_string()),
                     trust_mode: SkillTrustMode::DirectHostScript,
                     approved_capabilities: Vec::new(),
+                    workspace_root: None,
                 },
             )
             .unwrap_err();
