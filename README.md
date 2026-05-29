@@ -54,10 +54,34 @@ Linux:
 ./bin/linux-x64/deepcode-gui
 ```
 
+CLI/TUI Host Shell MVP:
+
+```bash
+./bin/linux-x64/deepcode --help
+./bin/linux-x64/deepcode daemon status
+./bin/linux-x64/deepcode-tui --smoke
+./bin/linux-x64/deepcode-tui
+```
+
+`deepcode` 不带参数启动时会进入轻量命令提示，避免双击或手动启动后立即退出。`deepcode-tui` 默认显示命令摘要，并支持：
+
+```text
+/help              显示所有 TUI 命令
+/status            检查 Kernel daemon 连接
+/ask <prompt>      通过 KernelClient 发送一条 prompt
+/audit             显示审计状态占位
+/clear             清空当前可见卡片
+/quit              退出
+```
+
+不带 `/` 的普通文本会按一次 prompt 发送。阶段 10.0 的 TUI 已切换为 Ratatui/Crossterm Host Shell 壳，用于验证 `Event -> CardModel -> Renderer` 边界；完整 Slash Command、文件补全、历史搜索、焦点导航等产品体验仍归阶段 17。
+
 Windows:
 
 ```bat
 bin\win64\DeepCode.exe
+bin\win64\deepcode.cmd --help
+bin\win64\deepcode-tui.bat --smoke
 ```
 
 `DeepCode.exe` 会立即渲染打包内置的完整 React 工作台，同时在后台启动同目录的 `deepcode-kernel.exe`。默认会选择一个空闲本地端口，避免撞上旧预览服务；如果你显式设置 `DEEPCODE_PORT`，则使用该端口。Windows 便携目录必须保留同目录的 `WebView2Loader.dll`；目标系统仍需要安装 Microsoft Edge WebView2 Evergreen Runtime。浏览器调试入口使用脚本默认端口时可以直接打开：
@@ -115,6 +139,8 @@ docker run --rm -t -v "$PWD:/workspace" -w /workspace deepcode-dev ./test.sh
 
 - Rust workspace `cargo fmt/check/test`
 - TS `protocol/session-core/gui` build/typecheck
+- `deepcode-kernel-audit` canonical/hash chain/segment seal/tamper tests
+- CLI/TUI Host Shell smoke：`deepcode --help`、CLI REPL、`deepcode-tui --smoke`
 - Kernel Daemon `/api/health`、`/api/kernel/commands`、`/api/kernel/snapshot`
 - session-core transcript / projection / resume 最小模型
 - Dev Host proxy `/api/*` smoke
@@ -169,12 +195,23 @@ DEEPCODE_SKIP_PACKAGING_SMOKE=1 ./test.sh
   - Windows `bin/win64/DeepCode.exe` 是可双击启动的 GUI thin shell，会直接渲染内置 React 工作台并在后台启动同目录 Kernel；默认选择空闲本地端口，`WebView2Loader.dll` 会随分发目录一起输出。
   - Linux `bin/linux-x64/deepcode-gui` 启动同一个 Rust Kernel Daemon 并服务 `web/`。
   - Codex 内部浏览器、Chrome 或普通浏览器都可以打开 GUI URL。
+- **CLI / TUI Host Shell MVP**
+
+  - `deepcode` / `deepcode-cli` 是阶段 10.0 Host 壳：支持 `--help`、`-p`、`ask`、`daemon status` 和轻量 REPL。
+  - `deepcode-tui` 是 Ratatui/Crossterm Host 壳：提供顶部状态、主卡片区、命令提示区和底部输入栏，并保留 `Event -> CardModel -> Renderer` 投影边界。
+  - CLI/TUI 只通过 `deepcode-kernel-client` 调 daemon，不引用 `DeepCodeKernelRuntime`，不执行工具、不裁决权限、不判定完成。
+- **本地签名审计链 V1**
+
+  - `deepcode-kernel-audit` 已提供 canonical JSON、signed entry、hash chain、segment seal、verify、degraded mode 与 tamper tests。
+  - 当前签名链是开发/便携包 V1，签名算法封装在 audit signer 内；最终企业级签名、OS keychain 和发布防伪策略后置到阶段 21。
 
 ### 当前预留
 
 - **Tauri thin shell**：正式 GUI 壳方向已确定为 Tauri，但只允许承载窗口、文件选择、菜单、快捷键、系统集成和 Kernel daemon bridge，不承载 Agent runtime。
 - **Browser Host**：保留为开发快速验证入口，不作为最终桌面运行模型。
-- **CLI / TUI**：当前分发目录提供轻量入口脚本；完整 CLI/TUI 交互体验仍是后续阶段，且不会重新实现 Agent runtime。
+- **KernelClient 兼容层**：阶段 10.0 CLI/TUI 通过 KernelClient 封装 daemon `/api/agent/*` 兼容投影；后续替换为 IPC / stable KernelClient transport 时，不应影响 CLI/TUI 调用点。
+- **CLI / TUI 正式体验**：当前阶段 10.0 只完成 Host Shell MVP；完整 CLI Host 归阶段 16，完整 TUI Host 归阶段 17，且不会重新实现 Agent runtime。
+- **版本身份 / 发布防伪**：当前发行版本只沿用 Cargo workspace `[workspace.package].version`，不生成 build tag、source hash 或 build metadata 文件；正式源码哈希和签名发布链后置到阶段 21。
 - **MCP adapter**：当前只保留 ExternalConnector / SkillPack 兼容方向，尚未实现完整 MCP client adapter。
 - **Source Control / Git / Validator runtime**：ChangeSet、ReviewGate 和 validation 已有 Kernel 结构基础，真实 Git / lint / test 深度接入仍在后续阶段。
 
@@ -211,6 +248,7 @@ bin/
 ├── linux-x64/
 │   ├── deepcode-kernel
 │   ├── deepcode-gui
+│   ├── deepcode
 │   ├── deepcode-cli
 │   ├── deepcode-tui
 │   ├── web/
@@ -221,6 +259,9 @@ bin/
     ├── DeepCode.exe
     ├── WebView2Loader.dll
     ├── deepcode-kernel.exe
+    ├── deepcode-cli.exe
+    ├── deepcode-tui.exe
+    ├── deepcode.cmd
     ├── deepcode-cli.bat
     ├── deepcode-tui.bat
     ├── web/
@@ -229,7 +270,7 @@ bin/
     └── README.txt
 ```
 
-GUI、CLI、TUI 入口共享同一个 Kernel binary、配置目录、Pack 目录和事件协议。当前 GUI 是可用主入口；CLI/TUI 是同源入口占位，后续继续扩展交互体验。
+GUI、CLI、TUI 入口共享同一个 Kernel daemon、配置目录、Pack 目录和事件协议。当前 GUI 是可用主入口；CLI/TUI 是阶段 10.0 Host Shell MVP，只通过 KernelClient 调 daemon，不拥有 workflow、permission、tool execution 或 review 事实。
 
 ## 当前源码结构
 
@@ -244,6 +285,8 @@ deepagent/
 │   ├── deepcode-kernel-workflow   # WorkflowMachine / WorkUnit / Review 结构
 │   ├── deepcode-kernel-ledger     # EventLedger 与 run snapshot
 │   ├── deepcode-kernel-context    # ContextSnapshot / evidence refs
+│   ├── deepcode-kernel-audit      # 本地签名审计链 canonical/hash/verify
+│   ├── deepcode-kernel-client     # CLI/TUI/Host 共享 KernelClient
 │   ├── deepcode-kernel-daemon     # Kernel Daemon 与 localhost API
 │   ├── deepcode-kernel-config
 │   ├── deepcode-kernel-prompt
@@ -252,6 +295,10 @@ deepagent/
 │   ├── protocol                   # TS 迁移期 DTO 投影
 │   ├── session-core               # TS 用户会话层
 │   └── gui                        # React GUI Host
+├── shells/
+│   ├── cli                        # 阶段 10.0 CLI Host Shell MVP
+│   ├── tui                        # 阶段 10.0 TUI Host Shell MVP
+│   └── tauri                      # GUI thin shell
 ├── fixtures/                      # Agent/workflow/kernel fixture
 └── legacy/                        # 迁移期参考与历史遗留隔离区
 ```
