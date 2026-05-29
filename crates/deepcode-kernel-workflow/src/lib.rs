@@ -2,6 +2,15 @@ use deepcode_kernel_abi::{KernelError, KernelResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod decision_engine;
+pub mod plan_review_engine;
+
+pub use decision_engine::{DecisionEngine, RunDecisionState, WorkflowEvidence};
+pub use plan_review_engine::{
+    DefaultPlanReviewEngine, PlanReviewEngine, PlanReviewFinding, PlanReviewReport,
+    PlanReviewStatus,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WorkflowPhase {

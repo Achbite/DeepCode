@@ -174,6 +174,17 @@ pub enum KernelCommand {
         plan_id: String,
         guidance: String,
     },
+    PlanContractSubmit {
+        request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        contract: Value,
+    },
+    SkillTrustApprove {
+        request_id: RequestId,
+        skill_id: String,
+        decision: Value,
+    },
     PermissionGrantTemporary {
         request_id: RequestId,
         run_id: RunId,
@@ -380,6 +391,14 @@ pub enum KernelEvent {
         reason: Option<String>,
         sequence: Option<u64>,
     },
+    #[serde(rename = "plan.review_report_produced")]
+    PlanReviewReportProduced {
+        request_id: Option<RequestId>,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        report: Value,
+        sequence: Option<u64>,
+    },
     #[serde(rename = "workflow.checkpointed")]
     WorkflowCheckpointed {
         run_id: RunId,
@@ -420,6 +439,21 @@ pub enum KernelEvent {
         ok: bool,
         output: Option<Value>,
         error: Option<KernelErrorEnvelope>,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "skill.trust_requested")]
+    SkillTrustRequested {
+        request_id: Option<RequestId>,
+        skill_id: String,
+        hash: Option<String>,
+        request: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "skill.trust_granted")]
+    SkillTrustGranted {
+        request_id: Option<RequestId>,
+        skill_id: String,
+        trust_record: Value,
         sequence: Option<u64>,
     },
     #[serde(rename = "context.result")]
@@ -870,6 +904,50 @@ mod tests {
         assert_eq!(encoded["kind"], "workflow.checkpointed");
         assert_eq!(encoded["checkpointId"], "checkpoint-1");
         let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize event");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn plan_review_and_skill_trust_placeholders_round_trip() {
+        let command = KernelCommand::PlanContractSubmit {
+            request_id: RequestId("req-plan-contract".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            contract: serde_json::json!({ "id": "plan-1", "status": "draft" }),
+        };
+        let encoded = serde_json::to_value(&command).expect("serialize plan contract command");
+        assert_eq!(encoded["kind"], "planContractSubmit");
+        assert_eq!(encoded["contract"]["id"], "plan-1");
+        let decoded: KernelCommand =
+            serde_json::from_value(encoded).expect("deserialize plan contract command");
+        assert_eq!(decoded, command);
+
+        let event = KernelEvent::PlanReviewReportProduced {
+            request_id: Some(RequestId("req-plan-review".to_string())),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            report: serde_json::json!({ "status": "interfaceOnly" }),
+            sequence: Some(9),
+        };
+        let encoded = serde_json::to_value(&event).expect("serialize plan review event");
+        assert_eq!(encoded["kind"], "plan.review_report_produced");
+        assert_eq!(encoded["report"]["status"], "interfaceOnly");
+        let decoded: KernelEvent =
+            serde_json::from_value(encoded).expect("deserialize plan review event");
+        assert_eq!(decoded, event);
+
+        let event = KernelEvent::SkillTrustRequested {
+            request_id: Some(RequestId("req-skill-trust".to_string())),
+            skill_id: "skill.py".to_string(),
+            hash: Some("sha256:abc".to_string()),
+            request: serde_json::json!({ "trustMode": "brokeredScript" }),
+            sequence: Some(10),
+        };
+        let encoded = serde_json::to_value(&event).expect("serialize skill trust event");
+        assert_eq!(encoded["kind"], "skill.trust_requested");
+        assert_eq!(encoded["hash"], "sha256:abc");
+        let decoded: KernelEvent =
+            serde_json::from_value(encoded).expect("deserialize skill trust event");
         assert_eq!(decoded, event);
     }
 

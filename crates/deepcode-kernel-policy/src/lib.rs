@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub mod workspace_boundary;
+
+pub use workspace_boundary::WorkspaceBoundary;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capability(pub String);
@@ -810,6 +814,7 @@ fn is_deepcode_config_asset(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn request(capability: Capability, risk_level: RiskLevel) -> PermissionRequest {
         PermissionRequest {
@@ -1174,5 +1179,31 @@ mod tests {
         assert!(!decision.prefer_docker);
         assert_eq!(decision.shell, ShellRuntimePreference::Cmd);
         assert!(decision.host_override_recorded);
+    }
+
+    #[test]
+    fn workspace_boundary_rejects_escaped_paths() {
+        let boundary = WorkspaceBoundary::new("/workspace");
+        for path in ["/etc/passwd", "../secret.txt", "C:/Users/test/file.txt"] {
+            assert!(
+                boundary.resolve(path).is_err(),
+                "{path} must not resolve through the workspace boundary"
+            );
+        }
+        assert_eq!(
+            boundary.resolve("src/main.rs").unwrap(),
+            PathBuf::from("/workspace").join("src/main.rs")
+        );
+    }
+
+    #[test]
+    fn workspace_boundary_blocks_protected_config_asset_mutation() {
+        assert!(WorkspaceBoundary::assert_mutable_config_asset("src/lib.rs").is_ok());
+        assert!(
+            WorkspaceBoundary::assert_mutable_config_asset(".deepcode/policy/rules.json").is_err()
+        );
+        assert!(
+            WorkspaceBoundary::assert_mutable_config_asset(".deepcode\\skills\\demo.json").is_err()
+        );
     }
 }

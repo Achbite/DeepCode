@@ -302,6 +302,37 @@ export interface KernelPlanContract {
   requiresUserApproval: boolean;
 }
 
+export type KernelPlanReviewStatus =
+  | 'autoAccepted'
+  | 'awaitingUserApproval'
+  | 'awaitingTemporaryGrant'
+  | 'denied'
+  | 'needsRevision'
+  | 'interfaceOnly';
+
+export interface KernelPlanReviewReport {
+  planId: string;
+  status: KernelPlanReviewStatus;
+  requiredCapabilities: string[];
+  requiredPermissions: string[];
+  hardFloorHits: string[];
+  blockedReasons: string[];
+  findings: unknown[];
+}
+
+export type KernelSkillTrustMode = 'declarative' | 'brokeredScript' | 'directHostScript';
+
+export interface KernelSkillTrustRecord {
+  skillId: string;
+  scriptHash?: string;
+  approvedCapabilities: string[];
+  approvedAt?: string;
+  approvedBy?: string;
+  trustMode: KernelSkillTrustMode;
+  ledgerEventRef?: string;
+  expiresAt?: string;
+}
+
 export type KernelPlanCommand =
   | {
       kind: 'planAccept';
@@ -322,6 +353,19 @@ export type KernelPlanCommand =
       runId: string;
       planId: string;
       guidance: string;
+    }
+  | {
+      kind: 'planContractSubmit';
+      requestId: string;
+      runId?: string;
+      sessionId?: string;
+      contract: unknown;
+    }
+  | {
+      kind: 'skillTrustApprove';
+      requestId: string;
+      skillId: string;
+      decision: unknown;
     }
   | {
       kind: 'permissionGrantTemporary';
@@ -345,6 +389,32 @@ export type KernelWorkflowCheckpointEvent =
       sessionId?: string;
       checkpointId: string;
       phase: string;
+      sequence?: number;
+    };
+
+export type KernelPlanReviewEvent = {
+  kind: 'plan.review_report_produced';
+  requestId?: string;
+  runId?: string;
+  sessionId?: string;
+  report: unknown;
+  sequence?: number;
+};
+
+export type KernelSkillTrustEvent =
+  | {
+      kind: 'skill.trust_requested';
+      requestId?: string;
+      skillId: string;
+      hash?: string;
+      request: unknown;
+      sequence?: number;
+    }
+  | {
+      kind: 'skill.trust_granted';
+      requestId?: string;
+      skillId: string;
+      trustRecord: unknown;
       sequence?: number;
     };
 

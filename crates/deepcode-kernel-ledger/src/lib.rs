@@ -34,9 +34,19 @@ pub struct RunConfigSnapshot {
     pub workspace_binding_hash: Option<String>,
 }
 
-pub trait EventLedger {
+pub trait EventLedger: Send + Sync {
     fn append(&self, event: LedgerEvent) -> KernelResult<()>;
     fn list_by_run(&self, run_id: &str) -> KernelResult<Vec<LedgerEvent>>;
+
+    fn next_sequence(&self, run_id: &str) -> KernelResult<u64> {
+        Ok(self
+            .list_by_run(run_id)?
+            .into_iter()
+            .filter_map(|event| event.sequence)
+            .max()
+            .unwrap_or(0)
+            + 1)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -54,14 +64,7 @@ impl InMemoryEventLedger {
     }
 
     pub fn next_sequence(&self, run_id: &str) -> KernelResult<u64> {
-        let events = self.events.lock().expect("ledger lock");
-        Ok(events
-            .iter()
-            .filter(|event| event.run_id.as_deref() == Some(run_id))
-            .filter_map(|event| event.sequence)
-            .max()
-            .unwrap_or(0)
-            + 1)
+        EventLedger::next_sequence(self, run_id)
     }
 }
 

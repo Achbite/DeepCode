@@ -7,6 +7,13 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod executor;
+pub mod external;
+pub mod trust_record;
+
+pub use executor::{SkillExecutionContext, SkillExecutor, SkillExecutorRegistry};
+pub use trust_record::{SkillTrustMode, SkillTrustRecord};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SkillSource {
@@ -494,5 +501,60 @@ mod tests {
         assert!(result.ok);
         assert_eq!(result.output["stdout"], "abc");
         assert_eq!(result.output["stdoutTruncated"], true);
+    }
+
+    #[derive(Debug)]
+    struct EchoExecutor;
+
+    impl SkillExecutor for EchoExecutor {
+        fn descriptor(&self) -> SkillDescriptor {
+            builtin(
+                "test.echo",
+                "skill.test.echo.description",
+                Capability::workspace_read(),
+                RiskLevel::Low,
+                vec![CapabilityEffect::ReadsWorkspace],
+                vec!["complete"],
+                false,
+            )
+        }
+
+        fn invoke(
+            &self,
+            invocation: SkillInvocation,
+            _context: SkillExecutionContext,
+        ) -> KernelResult<SkillResult> {
+            Ok(SkillResult {
+                invocation_id: invocation.id,
+                ok: true,
+                output: invocation.input,
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn skill_executor_registry_fails_closed_for_direct_host_mode() {
+        let mut registry = SkillExecutorRegistry::new();
+        registry.register(Box::new(EchoExecutor));
+
+        let error = registry
+            .invoke(
+                SkillInvocation {
+                    id: "invoke-direct".to_string(),
+                    skill_id: "test.echo".to_string(),
+                    phase: Some("complete".to_string()),
+                    input: serde_json::json!({}),
+                },
+                SkillExecutionContext {
+                    run_id: Some("run-1".to_string()),
+                    session_id: Some("session-1".to_string()),
+                    trust_mode: SkillTrustMode::DirectHostScript,
+                    approved_capabilities: Vec::new(),
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, KernelError::PermissionDenied(_)));
     }
 }

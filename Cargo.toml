@@ -3,12 +3,14 @@ members = [
   "crates/deepcode-kernel-abi",
   "crates/deepcode-kernel-core",
   "crates/deepcode-kernel-config",
+  "crates/deepcode-kernel-context",
   "crates/deepcode-kernel-policy",
   "crates/deepcode-kernel-prompt",
   "crates/deepcode-kernel-runtime",
   "crates/deepcode-kernel-skills",
   "crates/deepcode-kernel-workflow",
   "crates/deepcode-kernel-ledger",
+  "crates/deepcode-kernel-daemon",
   "crates/deepcode-host-web",
 ]
 exclude = [
@@ -26,12 +28,14 @@ authors = ["DeepCode Team"]
 [workspace.dependencies]
 deepcode-kernel-abi = { path = "crates/deepcode-kernel-abi" }
 deepcode-kernel-config = { path = "crates/deepcode-kernel-config" }
+deepcode-kernel-context = { path = "crates/deepcode-kernel-context" }
 deepcode-kernel-ledger = { path = "crates/deepcode-kernel-ledger" }
 deepcode-kernel-policy = { path = "crates/deepcode-kernel-policy" }
 deepcode-kernel-prompt = { path = "crates/deepcode-kernel-prompt" }
 deepcode-kernel-runtime = { path = "crates/deepcode-kernel-runtime" }
 deepcode-kernel-skills = { path = "crates/deepcode-kernel-skills" }
 deepcode-kernel-workflow = { path = "crates/deepcode-kernel-workflow" }
+deepcode-kernel-daemon = { path = "crates/deepcode-kernel-daemon" }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

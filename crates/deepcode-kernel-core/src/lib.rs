@@ -135,6 +135,12 @@ impl Kernel {
             KernelCommand::PlanRevise { request_id, .. } => {
                 self.not_implemented(request_id, "plan.revise")
             }
+            KernelCommand::PlanContractSubmit { request_id, .. } => {
+                self.not_implemented(request_id, "plan.contract_submit")
+            }
+            KernelCommand::SkillTrustApprove { request_id, .. } => {
+                self.not_implemented(request_id, "skill.trust_approve")
+            }
             KernelCommand::PermissionGrantTemporary { request_id, .. } => {
                 self.not_implemented(request_id, "permission.grant_temporary")
             }

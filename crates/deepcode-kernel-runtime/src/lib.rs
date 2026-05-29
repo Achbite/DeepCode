@@ -1,546 +1,69 @@
 use deepcode_kernel_abi::{
-    AnswerObligation, AnswerObligationId, AnswerObligationStatus, ConfigSnapshotRef, HostStatus,
-    KernelCommand, KernelError, KernelErrorEnvelope, KernelEvent, KernelEventSummary, KernelResult,
-    KernelSnapshot, ProfileRef, RequestId, RunId, SessionId, StageStatus, WorkflowDecision,
-    WorkflowDecisionAction, WorkflowDecisionReason, WorkspaceBinding,
+    ConfigSnapshotRef, HostStatus, KernelCommand, KernelError, KernelErrorEnvelope, KernelEvent,
+    KernelEventSummary, KernelResult, KernelSnapshot, ProfileRef, RequestId, RunId, SessionId,
+    StageStatus, WorkflowDecision, WorkflowDecisionAction, WorkspaceBinding,
 };
 use deepcode_kernel_config::{
     ConfigLayer, ConfigResolver, ConfigResolverInput, ConfigScope, ConfigSource, ConfigSourceKind,
     ConfigTrustLevel, DefaultConfigResolver,
 };
-use deepcode_kernel_ledger::{EventLedger, InMemoryEventLedger, LedgerEvent};
-use deepcode_kernel_policy::{AutonomyLevel, PolicyProfile};
+use deepcode_kernel_context::{ContextCandidatePayload, ContextRuntime};
+use deepcode_kernel_ledger::{EventLedger, InMemoryEventLedger, LedgerEvent, NdjsonEventLedger};
+use deepcode_kernel_policy::{AutonomyLevel, PolicyProfile, WorkspaceBoundary};
 use deepcode_kernel_prompt::LayeredPromptCompiler;
 use deepcode_kernel_skills::{InMemorySkillRegistry, SkillRegistry, SkillRuntime};
-use deepcode_kernel_workflow::{BuiltinWorkflowMachine, WorkflowMachine, WorkflowPhase};
-use serde::Serialize;
+use deepcode_kernel_workflow::{
+    BuiltinWorkflowMachine, RunDecisionState, WorkflowMachine, WorkflowPhase,
+};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug)]
+mod state;
+
+use state::{
+    KernelLlmToolCall, PendingKernelTool, RuntimeRunRecord, RuntimeState, RuntimeWorkspace,
+    WorkspaceSource,
+};
+
 pub struct DeepCodeKernelRuntime {
     config_resolver: DefaultConfigResolver,
     prompt_compiler: LayeredPromptCompiler,
     workflow: BuiltinWorkflowMachine,
     policy_profile: PolicyProfile,
     skills: InMemorySkillRegistry,
-    ledger: InMemoryEventLedger,
+    ledger: Box<dyn EventLedger>,
+    context_runtime: ContextRuntime,
     state: RuntimeState,
-}
-
-#[derive(Debug, Default)]
-struct RuntimeState {
-    next_run_index: u64,
-    next_workspace_index: u64,
-    current_workspace: Option<RuntimeWorkspace>,
-    records_by_session: BTreeMap<String, RuntimeRunRecord>,
-    pending_tools: BTreeMap<String, PendingKernelTool>,
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeWorkspace {
-    id: String,
-    name: String,
-    source: WorkspaceSource,
-    source_path: Option<PathBuf>,
-    root: PathBuf,
-    original_folder_path: String,
-    folder_is_absolute: bool,
-    settings: Value,
-    unsupported_fields: Vec<Value>,
-    opened_at: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkspaceSource {
-    Directory,
-    CodeWorkspace,
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeRunRecord {
-    session_id: String,
-    run_id: String,
-    input_text: String,
-    workspace_binding: WorkspaceBinding,
-    config_ref: ConfigSnapshotRef,
-    profile_ref: Option<ProfileRef>,
-    phase: WorkflowPhase,
-    active_llm_call_id: Option<String>,
-    llm_call_index: u64,
-    decision_state: WorkflowDecisionState,
-}
-
-#[derive(Debug, Clone)]
-struct PendingKernelTool {
-    run_id: String,
-    session_id: String,
-    tool_call_id: String,
-    tool_name: String,
-    arguments: Value,
-}
-
-#[derive(Debug, Clone)]
-struct KernelLlmToolCall {
-    id: String,
-    name: String,
-    arguments: Value,
-}
-
-#[derive(Debug, Clone, Default)]
-struct WorkflowDecisionState {
-    answer_obligations: Vec<AnswerObligation>,
-    temp_lifecycle_required: bool,
-    workspace_summary_required: bool,
-    tool_component_required: bool,
-    workspace_listed: bool,
-    workspace_file_read: bool,
-    workspace_search_completed: bool,
-    workspace_summary_file_path: Option<String>,
-    temp_created: bool,
-    temp_read_back: bool,
-    temp_cleanup_requested: bool,
-    temp_cleaned: bool,
-    awaiting_permission: bool,
-    blocked_reason: Option<String>,
-    /// Kernel 工具事实证据；review/final 阶段必须以本数组为唯一事实源，不允许从对话历史推断。
-    evidence: Vec<WorkflowEvidence>,
-    /// 当前所处工作流阶段；由 decide() 入口同步，apply_event 据此约束 obligation 满足时机。
-    /// plan/check 阶段即便 channel==final 也不允许 satisfy identity / tool_summary obligation。
-    current_phase: Option<String>,
-}
-
-/// Kernel 工具事实证据。每条记录对应一次 ToolCompleted / PermissionResolved / TempArtifactCleaned 等
-/// 结构化事件；review 阶段 prompt 注入这些字段后，LLM 不再有"自行总结 / 错认工具名"的余地。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkflowEvidence {
-    /// 真实 Kernel 工具名（如 fs.list / fs.write / fs.read / fs.delete / code.search / shell.exec）。
-    tool_name: String,
-    /// ToolRequested 时分配的 tool_call_id；用于回链到 ledger。
-    tool_call_id: Option<String>,
-    /// 状态：ok / failed / awaiting_permission / permission_rejected。
-    status: String,
-    /// 工具操作目标路径；仅文件类工具填写，shell.exec 类放命令片段。
-    path: Option<String>,
-    /// 权限裁决结果（Accept / Reject / 未涉及）。
-    permission_decision: Option<String>,
-    /// 临时文件清理状态：cleaned / pending / failed / not_applicable。
-    cleanup_status: Option<String>,
-    /// 关联的 KernelEvent 标识，便于 GUI 通过 kernelEventRefs 反查原事件。
-    kernel_event_refs: Vec<String>,
-}
-
-impl WorkflowDecisionState {
-    fn from_user_input(input: &str) -> Self {
-        let lower = input.to_lowercase();
-        let tool_component_required = has_tool_component_request(input, &lower);
-        let mut state = Self {
-            temp_lifecycle_required: has_temp_file_lifecycle_request(input, &lower),
-            workspace_summary_required: has_workspace_summary_request(input, &lower),
-            tool_component_required,
-            ..Self::default()
-        };
-        if has_identity_request(input, &lower) {
-            state.answer_obligations.push(AnswerObligation {
-                id: AnswerObligationId::Identity,
-                description: "Answer the Agent identity exactly once in final/review output."
-                    .to_string(),
-                status: AnswerObligationStatus::Pending,
-                satisfied_by_event: None,
-            });
-        }
-        if tool_component_required {
-            state.answer_obligations.push(AnswerObligation {
-                id: AnswerObligationId::ToolComponentSummary,
-                description: "Summarize tested tool components once in final/review output."
-                    .to_string(),
-                status: AnswerObligationStatus::Pending,
-                satisfied_by_event: None,
-            });
-        }
-        if state.temp_lifecycle_required {
-            state.answer_obligations.push(AnswerObligation {
-                id: AnswerObligationId::TempFileLifecycleResult,
-                description: "Report temp file create, read verification, and cleanup result once."
-                    .to_string(),
-                status: AnswerObligationStatus::Pending,
-                satisfied_by_event: None,
-            });
-        }
-        state
-    }
-
-    fn apply_event(&mut self, event: &KernelEvent, phase: &str) {
-        self.current_phase = Some(phase.to_string());
-        match event {
-            KernelEvent::ToolRequested {
-                tool_name,
-                args_preview,
-                ..
-            } => {
-                if tool_name == "shell.exec"
-                    && args_preview
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .map(is_temp_cleanup_command)
-                        .unwrap_or(false)
-                {
-                    self.temp_cleanup_requested = true;
-                }
-            }
-            KernelEvent::ToolCompleted {
-                tool_call_id,
-                tool_name,
-                ok,
-                output,
-                error,
-                ..
-            } => {
-                self.awaiting_permission = false;
-                let event_id = kernel_event_identity(event);
-                let path = extract_tool_path(tool_name, output, error);
-                let cleanup_status = if tool_name == "fs.delete" {
-                    Some(if *ok { "cleaned" } else { "failed" }.to_string())
-                } else if tool_name == "shell.exec" && self.temp_cleanup_requested {
-                    Some(if *ok { "cleaned" } else { "failed" }.to_string())
-                } else {
-                    None
-                };
-                self.evidence.push(WorkflowEvidence {
-                    tool_name: tool_name.clone(),
-                    tool_call_id: Some(tool_call_id.clone()),
-                    status: if *ok {
-                        "ok".to_string()
-                    } else {
-                        "failed".to_string()
-                    },
-                    path,
-                    permission_decision: None,
-                    cleanup_status,
-                    kernel_event_refs: vec![event_id],
-                });
-                if !ok {
-                    self.blocked_reason = Some(
-                        error
-                            .as_ref()
-                            .map(|value| value.message.clone())
-                            .unwrap_or_else(|| format!("{tool_name} failed")),
-                    );
-                    return;
-                }
-                match tool_name.as_str() {
-                    "fs.list" => {
-                        self.workspace_listed = true;
-                        if self.workspace_summary_file_path.is_none() {
-                            self.workspace_summary_file_path =
-                                output.as_ref().and_then(find_workspace_summary_file_path);
-                        }
-                    }
-                    "fs.write" => {
-                        if output
-                            .as_ref()
-                            .map(output_mentions_temp_file)
-                            .unwrap_or(false)
-                        {
-                            self.temp_created = true;
-                        }
-                    }
-                    "fs.read" => {
-                        let mentions_temp = output
-                            .as_ref()
-                            .map(output_mentions_temp_file)
-                            .unwrap_or(false);
-                        if mentions_temp {
-                            self.temp_read_back = true;
-                        } else if self.workspace_summary_required {
-                            self.workspace_file_read = true;
-                        }
-                    }
-                    "code.search" => self.workspace_search_completed = true,
-                    "fs.delete" => {
-                        if output
-                            .as_ref()
-                            .map(output_mentions_temp_file)
-                            .unwrap_or(false)
-                        {
-                            self.temp_cleaned = true;
-                        }
-                    }
-                    "shell.exec" => {
-                        if self.temp_cleanup_requested {
-                            self.temp_cleaned = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            KernelEvent::PermissionRequested { request, .. } => {
-                self.awaiting_permission = true;
-                self.blocked_reason = Some(format!("awaiting permission {}", request.id));
-            }
-            KernelEvent::PermissionResolved {
-                decision,
-                permission_id,
-                ..
-            } => {
-                self.awaiting_permission = false;
-                let event_id = kernel_event_identity(event);
-                let decision_text = match decision {
-                    deepcode_kernel_abi::PermissionDecisionKind::Accept => "Accept",
-                    deepcode_kernel_abi::PermissionDecisionKind::Reject => "Reject",
-                };
-                if let Some(last) = self
-                    .evidence
-                    .iter_mut()
-                    .rev()
-                    .find(|item| item.permission_decision.is_none())
-                {
-                    last.permission_decision = Some(decision_text.to_string());
-                    last.kernel_event_refs.push(event_id.clone());
-                } else {
-                    self.evidence.push(WorkflowEvidence {
-                        tool_name: format!("permission:{permission_id}"),
-                        tool_call_id: None,
-                        status: decision_text.to_lowercase(),
-                        path: None,
-                        permission_decision: Some(decision_text.to_string()),
-                        cleanup_status: None,
-                        kernel_event_refs: vec![event_id],
-                    });
-                }
-                if matches!(
-                    decision,
-                    deepcode_kernel_abi::PermissionDecisionKind::Reject
-                ) {
-                    self.blocked_reason = Some("permission rejected".to_string());
-                } else {
-                    self.blocked_reason = None;
-                }
-            }
-            KernelEvent::MessageAppended {
-                role,
-                channel,
-                content,
-                ..
-            } => {
-                if !matches!(role, deepcode_kernel_abi::MessageRole::Agent) {
-                    return;
-                }
-                if channel.as_deref() != Some("final") {
-                    return;
-                }
-                // plan / check 阶段即便走 final channel 也不允许满足身份 / 工具汇总 / 临时文件
-                // obligation；只有进入 complete 或 review 阶段后才允许 satisfy，保证身份信息只在
-                // 复核 / final 出现一次。current_phase 由 decide() 入口同步。
-                let in_final_phase = self
-                    .current_phase
-                    .as_deref()
-                    .map(|phase| phase == "review" || phase == "complete")
-                    .unwrap_or(false);
-                if !in_final_phase {
-                    return;
-                }
-                let content = content.as_deref().unwrap_or_default();
-                if content_satisfies_identity_obligation(content) {
-                    self.satisfy_obligation(AnswerObligationId::Identity, event);
-                }
-                if content_satisfies_tool_summary_obligation(content) {
-                    self.satisfy_obligation(AnswerObligationId::ToolComponentSummary, event);
-                }
-                if self.temp_lifecycle_complete()
-                    && content.contains("临时文件")
-                    && (content.contains("删除") || content.contains("清理"))
-                {
-                    self.satisfy_obligation(AnswerObligationId::TempFileLifecycleResult, event);
-                }
-            }
-            KernelEvent::PlanRejected { reason, .. } => {
-                self.blocked_reason = reason.clone().or_else(|| Some("plan rejected".to_string()));
-            }
-            _ => {}
-        }
-    }
-
-    fn decide(&self, phase: &str) -> WorkflowDecision {
-        if self.awaiting_permission {
-            return self.decision(
-                WorkflowDecisionAction::AwaitPermission,
-                WorkflowDecisionReason::AwaitingPermission,
-                phase,
-                false,
-                self.blocked_reason.clone(),
-            );
-        }
-
-        if let Some(blocked_reason) = &self.blocked_reason {
-            return self.decision(
-                WorkflowDecisionAction::Blocked,
-                WorkflowDecisionReason::ToolFailed,
-                phase,
-                true,
-                Some(blocked_reason.clone()),
-            );
-        }
-
-        let pending_steps = self.pending_steps();
-        if !pending_steps.is_empty() {
-            return WorkflowDecision {
-                action: WorkflowDecisionAction::Continue,
-                reason: WorkflowDecisionReason::PendingCriticalSteps,
-                phase: Some(phase.to_string()),
-                pending_steps,
-                answer_obligations: self.answer_obligations.clone(),
-                summary: Some("Continue until completion criteria are satisfied.".to_string()),
-                fail_closed: false,
-            };
-        }
-
-        if self
-            .answer_obligations
-            .iter()
-            .any(|value| value.status == AnswerObligationStatus::Pending)
-        {
-            if phase != "complete" && phase != "review" {
-                return WorkflowDecision {
-                    action: WorkflowDecisionAction::Continue,
-                    reason: WorkflowDecisionReason::EventAccepted,
-                    phase: Some(phase.to_string()),
-                    pending_steps,
-                    answer_obligations: self.answer_obligations.clone(),
-                    summary: Some(
-                        "Advance through structured workflow before final obligations.".to_string(),
-                    ),
-                    fail_closed: false,
-                };
-            }
-            return self.decision(
-                WorkflowDecisionAction::Review,
-                WorkflowDecisionReason::CompletionCriteriaSatisfied,
-                phase,
-                false,
-                Some("Completion criteria are satisfied; final obligations remain.".to_string()),
-            );
-        }
-
-        self.decision(
-            WorkflowDecisionAction::Done,
-            WorkflowDecisionReason::AnswerObligationsSatisfied,
-            phase,
-            false,
-            Some("Completion criteria and answer obligations are satisfied.".to_string()),
-        )
-    }
-
-    fn pending_steps(&self) -> Vec<String> {
-        let mut steps = Vec::new();
-        if (self.workspace_summary_required
-            || self.tool_component_required
-            || self.temp_lifecycle_required)
-            && !self.workspace_listed
-        {
-            steps.push("list workspace root".to_string());
-        }
-        if self.workspace_summary_required && !self.workspace_file_read {
-            steps.push("read at least one workspace file before summarizing".to_string());
-        }
-        if self.tool_component_required && !self.workspace_search_completed {
-            steps.push("run workspace search to verify code.search component".to_string());
-        }
-        if !self.temp_lifecycle_required {
-            return steps;
-        }
-        if !self.temp_created {
-            steps.push("create _agent_tmp_* workspace-relative temp file".to_string());
-        }
-        if !self.temp_read_back {
-            steps.push("read and verify _agent_tmp_* temp file".to_string());
-        }
-        if !self.temp_cleaned {
-            steps.push("cleanup _agent_tmp_* temp file through controlled path".to_string());
-        }
-        steps
-    }
-
-    fn temp_lifecycle_complete(&self) -> bool {
-        !self.temp_lifecycle_required
-            || (self.workspace_listed
-                && self.temp_created
-                && self.temp_read_back
-                && self.temp_cleaned)
-    }
-
-    fn satisfy_obligation(&mut self, id: AnswerObligationId, event: &KernelEvent) {
-        if let Some(obligation) = self
-            .answer_obligations
-            .iter_mut()
-            .find(|obligation| obligation.id == id)
-        {
-            obligation.status = AnswerObligationStatus::Satisfied;
-            obligation.satisfied_by_event = Some(kernel_event_identity(event));
-        }
-    }
-
-    fn decision(
-        &self,
-        action: WorkflowDecisionAction,
-        reason: WorkflowDecisionReason,
-        phase: &str,
-        fail_closed: bool,
-        summary: Option<String>,
-    ) -> WorkflowDecision {
-        WorkflowDecision {
-            action,
-            reason,
-            phase: Some(phase.to_string()),
-            pending_steps: self.pending_steps(),
-            answer_obligations: self.answer_obligations.clone(),
-            summary,
-            fail_closed,
-        }
-    }
-}
-
-fn content_satisfies_identity_obligation(content: &str) -> bool {
-    let lower = content.to_lowercase();
-    content.contains("DeepCode Agent")
-        || (content.contains("DeepCode") && (content.contains("我是") || lower.contains("agent")))
-}
-
-fn content_satisfies_tool_summary_obligation(content: &str) -> bool {
-    [
-        "fs.read",
-        "fs.list",
-        "fs.write",
-        "fs.delete",
-        "code.search",
-        "工具",
-        "组件",
-    ]
-    .iter()
-    .any(|needle| content.contains(needle))
 }
 
 impl Default for DeepCodeKernelRuntime {
     fn default() -> Self {
+        Self::with_ledger(Box::new(InMemoryEventLedger::new()))
+    }
+}
+
+impl DeepCodeKernelRuntime {
+    pub fn with_ledger(ledger: Box<dyn EventLedger>) -> Self {
         Self {
             config_resolver: DefaultConfigResolver,
             prompt_compiler: LayeredPromptCompiler::default(),
             workflow: BuiltinWorkflowMachine::default(),
             policy_profile: PolicyProfile::developer_defaults(),
             skills: InMemorySkillRegistry::with_builtin_tools(),
-            ledger: InMemoryEventLedger::new(),
+            ledger,
+            context_runtime: ContextRuntime::new(),
             state: RuntimeState::default(),
         }
     }
-}
 
-impl DeepCodeKernelRuntime {
+    pub fn with_ndjson_ledger(path: impl Into<PathBuf>) -> Self {
+        Self::with_ledger(Box::new(NdjsonEventLedger::new(path)))
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -711,6 +234,12 @@ impl DeepCodeKernelRuntime {
                 plan_id,
                 guidance,
             } => self.plan_revise(request_id, run_id, plan_id, guidance),
+            KernelCommand::PlanContractSubmit { request_id, .. } => {
+                self.not_implemented(request_id, "plan.contract_submit")
+            }
+            KernelCommand::SkillTrustApprove { request_id, .. } => {
+                self.not_implemented(request_id, "skill.trust_approve")
+            }
             KernelCommand::PermissionGrantTemporary {
                 request_id,
                 run_id,
@@ -860,7 +389,7 @@ impl DeepCodeKernelRuntime {
                 phase: workflow_state.phase.clone(),
                 active_llm_call_id: None,
                 llm_call_index: 0,
-                decision_state: WorkflowDecisionState::from_user_input(&input_text),
+                decision_state: RunDecisionState::from_user_input(&input_text),
             },
         );
 
@@ -963,7 +492,21 @@ impl DeepCodeKernelRuntime {
                 llm_call_id,
             )
         };
-        let request_envelope = compile_llm_request_envelope(&phase, &input_text, &decision_state);
+        let context_snapshot = self.context_runtime.create_snapshot(
+            vec![ContextCandidatePayload {
+                id: format!("latest-user-input-{run_id}"),
+                kind: "latestUserInput".to_string(),
+                payload: serde_json::json!({ "content": input_text }),
+                source_refs: vec![format!("run:{run_id}")],
+            }],
+            Vec::new(),
+        )?;
+        let request_envelope = compile_llm_request_envelope(
+            &phase,
+            &input_text,
+            &decision_state,
+            Some(&context_snapshot.reference.id),
+        );
         let sequence = self.ledger.next_sequence(run_id)?;
         self.append_ledger(
             run_id,
@@ -975,6 +518,7 @@ impl DeepCodeKernelRuntime {
                 "phase": &phase,
                 "llmCallId": &llm_call_id,
                 "profileRef": &profile_ref,
+                "contextSnapshotId": &context_snapshot.reference.id,
                 "requestEnvelope": &request_envelope
             }),
         )?;
@@ -2199,103 +1743,105 @@ impl DeepCodeKernelRuntime {
     }
 
     fn execute_kernel_tool(&self, tool_name: &str, arguments: &Value) -> KernelResult<Value> {
-        match tool_name {
-            "fs.list" => {
-                let workspace = self.current_workspace()?;
-                let relative = get_string(arguments, "path").unwrap_or_else(|| ".".to_string());
-                let target = self.resolve_workspace_path(&relative)?;
-                Ok(serde_json::json!({
-                    "folderId": "wf-0",
-                    "path": normalize_relative_path(&relative),
-                    "nodes": list_nodes(&target, &workspace.root, 2)?
-                }))
+        if tool_name == "fs.list" {
+            let workspace = self.current_workspace()?;
+            let relative = get_string(arguments, "path").unwrap_or_else(|| ".".to_string());
+            let target = self.resolve_workspace_path(&relative)?;
+            return Ok(serde_json::json!({
+                "folderId": "wf-0",
+                "path": normalize_relative_path(&relative),
+                "nodes": list_nodes(&target, &workspace.root, 2)?
+            }));
+        }
+        if tool_name == "fs.read" {
+            let path = get_string(arguments, "path").unwrap_or_default();
+            let target = self.resolve_workspace_path(&path)?;
+            if !target.is_file() {
+                return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
             }
-            "fs.read" => {
-                let path = get_string(arguments, "path").unwrap_or_default();
-                let target = self.resolve_workspace_path(&path)?;
-                if !target.is_file() {
-                    return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
-                }
-                let content = fs::read_to_string(&target)
-                    .map_err(|error| KernelError::Other(format!("read {path}: {error}")))?;
-                Ok(serde_json::json!({
-                    "folderId": "wf-0",
-                    "path": normalize_relative_path(&path),
-                    "content": content,
-                    "sizeBytes": content.len(),
-                    "binary": false
-                }))
+            let content = fs::read_to_string(&target)
+                .map_err(|error| KernelError::Other(format!("read {path}: {error}")))?;
+            return Ok(serde_json::json!({
+                "folderId": "wf-0",
+                "path": normalize_relative_path(&path),
+                "content": content,
+                "sizeBytes": content.len(),
+                "binary": false
+            }));
+        }
+        if tool_name == "fs.write" {
+            let path = get_string(arguments, "path").unwrap_or_default();
+            deny_protected_deepcode_mutation(&path)?;
+            let target = self.resolve_workspace_path(&path)?;
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| KernelError::Other(format!("create parent: {error}")))?;
             }
-            "fs.write" => {
-                let path = get_string(arguments, "path").unwrap_or_default();
-                deny_protected_deepcode_mutation(&path)?;
-                let target = self.resolve_workspace_path(&path)?;
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|error| KernelError::Other(format!("create parent: {error}")))?;
-                }
-                let content = get_string(arguments, "content").unwrap_or_default();
-                fs::write(&target, content)
-                    .map_err(|error| KernelError::Other(format!("write {path}: {error}")))?;
-                Ok(serde_json::json!({
-                    "folderId": "wf-0",
-                    "path": normalize_relative_path(&path),
-                    "saved": true,
-                    "sizeBytes": fs::metadata(&target).map(|metadata| metadata.len()).unwrap_or(0)
-                }))
+            let content = get_string(arguments, "content").unwrap_or_default();
+            fs::write(&target, content)
+                .map_err(|error| KernelError::Other(format!("write {path}: {error}")))?;
+            return Ok(serde_json::json!({
+                "folderId": "wf-0",
+                "path": normalize_relative_path(&path),
+                "saved": true,
+                "sizeBytes": fs::metadata(&target).map(|metadata| metadata.len()).unwrap_or(0)
+            }));
+        }
+        if tool_name == "fs.delete" {
+            let path = get_string(arguments, "path").unwrap_or_default();
+            deny_protected_deepcode_mutation(&path)?;
+            let target = self.resolve_workspace_path(&path)?;
+            if target.is_dir() {
+                return Err(KernelError::PermissionDenied(
+                    "fs.delete only accepts files".to_string(),
+                ));
             }
-            "fs.delete" => {
-                let path = get_string(arguments, "path").unwrap_or_default();
-                deny_protected_deepcode_mutation(&path)?;
-                let target = self.resolve_workspace_path(&path)?;
-                if target.is_dir() {
-                    return Err(KernelError::PermissionDenied(
-                        "fs.delete only accepts files".to_string(),
-                    ));
-                }
-                fs::remove_file(&target)
-                    .map_err(|error| KernelError::Other(format!("delete {path}: {error}")))?;
-                Ok(serde_json::json!({
-                    "folderId": "wf-0",
-                    "path": normalize_relative_path(&path),
-                    "deleted": true,
-                    "kind": "file"
-                }))
+            fs::remove_file(&target)
+                .map_err(|error| KernelError::Other(format!("delete {path}: {error}")))?;
+            return Ok(serde_json::json!({
+                "folderId": "wf-0",
+                "path": normalize_relative_path(&path),
+                "deleted": true,
+                "kind": "file"
+            }));
+        }
+        if tool_name == "fs.diff" {
+            let path = get_string(arguments, "path").unwrap_or_default();
+            let target = self.resolve_workspace_path(&path)?;
+            let old_content = fs::read_to_string(&target).unwrap_or_default();
+            let new_content = get_string(arguments, "newContent").unwrap_or_default();
+            return Ok(serde_json::json!({
+                "path": path,
+                "diff": format!("--- old\n+++ new\n-{}\n+{}", old_content, new_content)
+            }));
+        }
+        if tool_name == "code.search" {
+            let workspace = self.current_workspace()?;
+            let query = get_string(arguments, "query").unwrap_or_default();
+            if query.trim().is_empty() {
+                return Err(KernelError::InvalidCommand(
+                    "search query is required".to_string(),
+                ));
             }
-            "fs.diff" => {
-                let path = get_string(arguments, "path").unwrap_or_default();
-                let target = self.resolve_workspace_path(&path)?;
-                let old_content = fs::read_to_string(&target).unwrap_or_default();
-                let new_content = get_string(arguments, "newContent").unwrap_or_default();
-                Ok(serde_json::json!({
-                    "path": path,
-                    "diff": format!("--- old\n+++ new\n-{}\n+{}", old_content, new_content)
-                }))
-            }
-            "code.search" => {
-                let workspace = self.current_workspace()?;
-                let query = get_string(arguments, "query").unwrap_or_default();
-                if query.trim().is_empty() {
-                    return Err(KernelError::InvalidCommand(
-                        "search query is required".to_string(),
-                    ));
-                }
-                Ok(serde_json::json!({
-                    "folderId": "wf-0",
-                    "query": query,
-                    "matches": search_workspace(&workspace.root, &query, &[])?
-                }))
-            }
-            "shell.propose" => Ok(serde_json::json!({
+            return Ok(serde_json::json!({
+                "folderId": "wf-0",
+                "query": query,
+                "matches": search_workspace(&workspace.root, &query, &[])?
+            }));
+        }
+        if tool_name == "shell.propose" {
+            return Ok(serde_json::json!({
                 "dryRun": true,
                 "executed": false,
                 "command": get_string(arguments, "command")
-            })),
-            "shell.exec" => self.execute_kernel_shell(arguments),
-            _ => Err(KernelError::InvalidCommand(format!(
-                "unknown tool {tool_name}"
-            ))),
+            }));
         }
+        if tool_name == "shell.exec" {
+            return self.execute_kernel_shell(arguments);
+        }
+        Err(KernelError::InvalidCommand(format!(
+            "unknown tool {tool_name}"
+        )))
     }
 
     fn execute_kernel_shell(&self, arguments: &Value) -> KernelResult<Value> {
@@ -2428,7 +1974,7 @@ impl DeepCodeKernelRuntime {
 
     fn resolve_workspace_path(&self, relative_path: &str) -> KernelResult<PathBuf> {
         let workspace = self.current_workspace()?;
-        resolve_relative_path(&workspace.root, relative_path)
+        WorkspaceBoundary::new(&workspace.root).resolve(relative_path)
     }
 
     fn workspace_result(
@@ -2667,7 +2213,8 @@ fn autonomy_level_name(level: &AutonomyLevel) -> &'static str {
 fn compile_llm_request_envelope(
     phase: &str,
     input_text: &str,
-    decision_state: &WorkflowDecisionState,
+    decision_state: &RunDecisionState,
+    context_snapshot_id: Option<&str>,
 ) -> Value {
     let system = compile_kernel_phase_instruction(phase, decision_state);
     let tools = if phase == "complete" {
@@ -2681,6 +2228,7 @@ fn compile_llm_request_envelope(
             { "role": "user", "content": input_text }
         ],
         "tools": tools,
+        "contextSnapshotId": context_snapshot_id,
         "answerObligations": decision_state.answer_obligations,
         "completionCriteria": {
             "tempLifecycleRequired": decision_state.temp_lifecycle_required,
@@ -2692,7 +2240,7 @@ fn compile_llm_request_envelope(
     })
 }
 
-fn compile_kernel_phase_instruction(phase: &str, decision_state: &WorkflowDecisionState) -> String {
+fn compile_kernel_phase_instruction(phase: &str, decision_state: &RunDecisionState) -> String {
     let stage_instruction = match phase {
         "plan" => "你是 DeepCode Kernel 调度的规划阶段。只产出计划、范围、禁止项、风险和完成条件；不得回答身份信息、测试结果或最终总结。",
         "check" => "你是 DeepCode Kernel 调度的检查阶段。只审查计划风险、路径、权限和可执行性；不得写伪工具命令、不得重复计划正文、不得输出最终答案。",
@@ -2845,171 +2393,6 @@ fn extract_llm_tool_calls(response_envelope: &Value) -> Vec<KernelLlmToolCall> {
         .unwrap_or_default()
 }
 
-fn has_identity_request(input: &str, lower: &str) -> bool {
-    input.contains("身份")
-        || input.contains("你是谁")
-        || lower.contains("identity")
-        || lower.contains("who are you")
-}
-
-fn has_tool_component_request(input: &str, lower: &str) -> bool {
-    input.contains("功能组件")
-        || input.contains("各组件")
-        || input.contains("所有组件")
-        || input.contains("所有的功能")
-        || input.contains("工具组件")
-        || input.contains("组件正常")
-        || input.contains("调用各组件")
-        || input.contains("测试agent")
-        || lower.contains("action type")
-        || lower.contains("tool component")
-}
-
-fn has_workspace_summary_request(input: &str, lower: &str) -> bool {
-    input.contains("读取当前工作区")
-        || (input.contains("工作区") && input.contains("总结"))
-        || (input.contains("当前项目") && input.contains("总结"))
-        || lower.contains("read current workspace")
-        || lower.contains("summarize workspace")
-        || lower.contains("workspace summary")
-}
-
-fn has_temp_file_lifecycle_request(input: &str, lower: &str) -> bool {
-    input.contains("临时文件")
-        || input.contains("读写")
-        || (input.contains("新建") && input.contains("删除"))
-        || lower.contains("temporary file")
-        || lower.contains("temp file")
-}
-
-fn is_temp_file_path(value: &str) -> bool {
-    value.contains("_agent_tmp_")
-}
-
-fn is_temp_cleanup_command(command: &str) -> bool {
-    let lower = command.to_lowercase();
-    is_temp_file_path(command)
-        && (lower.contains("rm ")
-            || lower.contains(" rm")
-            || lower.starts_with("rm")
-            || lower.contains("del ")
-            || lower.contains("remove-item"))
-}
-
-/// 从 ToolCompleted 输出 / error 中提取目标路径，仅用于 WorkflowEvidence.path 字段记录。
-/// 文件类工具读 path / file_path / target；shell.exec 读 command 片段；其他类型返回 None。
-fn extract_tool_path(
-    tool_name: &str,
-    output: &Option<Value>,
-    error: &Option<deepcode_kernel_abi::KernelErrorEnvelope>,
-) -> Option<String> {
-    match tool_name {
-        "fs.list" | "fs.read" | "fs.write" | "fs.delete" | "code.search" => output
-            .as_ref()
-            .and_then(|value| {
-                [
-                    "path",
-                    "file_path",
-                    "target",
-                    "filePath",
-                    "targetPath",
-                    "query",
-                ]
-                .iter()
-                .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
-            })
-            .or_else(|| {
-                error
-                    .as_ref()
-                    .and_then(|envelope| envelope.message.split('\'').nth(1).map(str::to_string))
-            }),
-        "shell.exec" => output.as_ref().and_then(|value| {
-            value
-                .get("command")
-                .and_then(Value::as_str)
-                .map(|command| command.chars().take(120).collect::<String>())
-        }),
-        _ => None,
-    }
-}
-
-fn output_mentions_temp_file(value: &Value) -> bool {
-    match value {
-        Value::String(text) => is_temp_file_path(text),
-        Value::Array(items) => items.iter().any(output_mentions_temp_file),
-        Value::Object(map) => map.values().any(output_mentions_temp_file),
-        _ => false,
-    }
-}
-
-fn find_workspace_summary_file_path(value: &Value) -> Option<String> {
-    let mut paths = Vec::new();
-    collect_workspace_file_paths(value, &mut paths);
-    paths.sort_by_key(|path| workspace_summary_path_score(path));
-    paths.into_iter().next()
-}
-
-fn collect_workspace_file_paths(value: &Value, paths: &mut Vec<String>) {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                collect_workspace_file_paths(item, paths);
-            }
-        }
-        Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("file") {
-                if let Some(path) = map.get("path").and_then(Value::as_str) {
-                    if is_workspace_summary_candidate(path) {
-                        paths.push(path.to_string());
-                    }
-                }
-            }
-            for value in map.values() {
-                collect_workspace_file_paths(value, paths);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn is_workspace_summary_candidate(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    if lower.contains("_agent_tmp_")
-        || lower.ends_with(".exe")
-        || lower.ends_with(".dll")
-        || lower.ends_with(".png")
-        || lower.ends_with(".jpg")
-        || lower.ends_with(".jpeg")
-        || lower.ends_with(".gif")
-        || lower.ends_with(".zip")
-        || lower.ends_with(".7z")
-    {
-        return false;
-    }
-    [
-        ".md", ".txt", ".rs", ".ts", ".tsx", ".js", ".jsx", ".json", ".toml", ".yaml", ".yml",
-        ".cpp", ".h", ".hpp", ".c", ".py",
-    ]
-    .iter()
-    .any(|suffix| lower.ends_with(suffix))
-}
-
-fn workspace_summary_path_score(path: &str) -> (u8, usize, String) {
-    let lower = path.to_ascii_lowercase();
-    let priority = if lower.ends_with("readme.md") {
-        0
-    } else if lower.ends_with(".md") {
-        1
-    } else if lower.ends_with(".txt") {
-        2
-    } else if lower.ends_with(".json") || lower.ends_with(".toml") || lower.ends_with(".yaml") {
-        3
-    } else {
-        4
-    };
-    (priority, path.len(), lower)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionAction {
     Allow,
@@ -3017,8 +2400,8 @@ enum PermissionAction {
     Deny,
 }
 
-fn permission_action_for_kernel_tool(tool_name: &str) -> PermissionAction {
-    match tool_name {
+fn permission_action_for_kernel_tool(tool_id: &str) -> PermissionAction {
+    match tool_id {
         "fs.write" | "shell.exec" => PermissionAction::Ask,
         "fs.delete" => PermissionAction::Ask,
         "fs.read" | "fs.list" | "fs.diff" | "code.search" | "shell.propose" => {
@@ -3035,8 +2418,8 @@ fn needs_workspace_tool(tool_name: &str) -> bool {
     )
 }
 
-fn capability_for_tool(tool_name: &str) -> &'static str {
-    match tool_name {
+fn capability_for_tool(tool_id: &str) -> &'static str {
+    match tool_id {
         "fs.write" => "cap.fs.write",
         "fs.delete" => "cap.fs.delete",
         "shell.exec" => "cap.shell.exec",
@@ -3047,8 +2430,8 @@ fn capability_for_tool(tool_name: &str) -> &'static str {
     }
 }
 
-fn risk_for_tool(tool_name: &str) -> &'static str {
-    match tool_name {
+fn risk_for_tool(tool_id: &str) -> &'static str {
+    match tool_id {
         "fs.delete" | "shell.exec" => "high",
         "fs.write" => "medium",
         _ => "low",
@@ -3064,7 +2447,7 @@ fn redact_tool_arguments(tool_name: &str, arguments: &Value) -> Value {
     arguments.clone()
 }
 
-fn next_kernel_autorun_tool(state: &WorkflowDecisionState) -> Option<(&'static str, Value)> {
+fn next_kernel_autorun_tool(state: &RunDecisionState) -> Option<(&'static str, Value)> {
     if !(state.workspace_summary_required
         || state.tool_component_required
         || state.temp_lifecycle_required)
@@ -3118,6 +2501,10 @@ fn is_kernel_owned_temp_cleanup(tool_name: &str, arguments: &Value) -> bool {
             .and_then(Value::as_str)
             .map(is_temp_file_path)
             .unwrap_or(false)
+}
+
+fn is_temp_file_path(value: &str) -> bool {
+    value.contains("_agent_tmp_")
 }
 
 fn get_string(value: &Value, key: &str) -> Option<String> {
@@ -3269,25 +2656,6 @@ fn validate_folder_id(folder_id: Option<&str>) -> KernelResult<()> {
     Ok(())
 }
 
-fn resolve_relative_path(root: &Path, relative_path: &str) -> KernelResult<PathBuf> {
-    if relative_path.trim().is_empty() {
-        return Err(KernelError::InvalidCommand(
-            "workspace path is required".to_string(),
-        ));
-    }
-    let relative = Path::new(relative_path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-    {
-        return Err(KernelError::PermissionDenied(format!(
-            "workspace syscall requires a workspace-relative path: {relative_path}"
-        )));
-    }
-    Ok(root.join(relative))
-}
-
 fn normalize_relative_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     if normalized.is_empty() {
@@ -3298,22 +2666,7 @@ fn normalize_relative_path(path: &str) -> String {
 }
 
 fn deny_protected_deepcode_mutation(path: &str) -> KernelResult<()> {
-    let normalized = normalize_relative_path(path);
-    let protected = [
-        ".deepcode/prompts/",
-        ".deepcode/skills/",
-        ".deepcode/ruler/",
-        ".deepcode/policy/",
-    ];
-    if protected
-        .iter()
-        .any(|prefix| normalized == prefix.trim_end_matches('/') || normalized.starts_with(prefix))
-    {
-        return Err(KernelError::PermissionDenied(
-            "ordinary workspace mutation cannot modify .deepcode config assets".to_string(),
-        ));
-    }
-    Ok(())
+    WorkspaceBoundary::assert_mutable_config_asset(path)
 }
 
 fn list_nodes(path: &Path, root: &Path, depth: u32) -> KernelResult<Vec<Value>> {
@@ -3444,16 +2797,6 @@ fn skip_directory(path: &Path) -> bool {
     )
 }
 
-fn kernel_event_identity(event: &KernelEvent) -> String {
-    format!(
-        "{}:{}",
-        kernel_event_kind(event),
-        kernel_event_sequence(event)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    )
-}
-
 fn kernel_event_kind(event: &KernelEvent) -> &'static str {
     match event {
         KernelEvent::HostStatus { .. } => "host.status",
@@ -3472,11 +2815,14 @@ fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::PlanProposed { .. } => "plan.proposed",
         KernelEvent::PlanAccepted { .. } => "plan.accepted",
         KernelEvent::PlanRejected { .. } => "plan.rejected",
+        KernelEvent::PlanReviewReportProduced { .. } => "plan.review_report_produced",
         KernelEvent::WorkflowCheckpointed { .. } => "workflow.checkpointed",
         KernelEvent::WorkflowResumed { .. } => "workflow.resumed",
         KernelEvent::WorkflowDecisionMade { .. } => "workflow.decision_made",
         KernelEvent::WorkspaceResult { .. } => "workspace.result",
         KernelEvent::SkillResult { .. } => "skill.result",
+        KernelEvent::SkillTrustRequested { .. } => "skill.trust_requested",
+        KernelEvent::SkillTrustGranted { .. } => "skill.trust_granted",
         KernelEvent::ContextResult { .. } => "context.result",
         KernelEvent::TempArtifactCreated { .. } => "tempArtifact.created",
         KernelEvent::TempArtifactCleaned { .. } => "tempArtifact.cleaned",
@@ -3504,11 +2850,14 @@ fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::PlanProposed { sequence, .. }
         | KernelEvent::PlanAccepted { sequence, .. }
         | KernelEvent::PlanRejected { sequence, .. }
+        | KernelEvent::PlanReviewReportProduced { sequence, .. }
         | KernelEvent::WorkflowCheckpointed { sequence, .. }
         | KernelEvent::WorkflowResumed { sequence, .. }
         | KernelEvent::WorkflowDecisionMade { sequence, .. }
         | KernelEvent::WorkspaceResult { sequence, .. }
         | KernelEvent::SkillResult { sequence, .. }
+        | KernelEvent::SkillTrustRequested { sequence, .. }
+        | KernelEvent::SkillTrustGranted { sequence, .. }
         | KernelEvent::ContextResult { sequence, .. }
         | KernelEvent::TempArtifactCreated { sequence, .. }
         | KernelEvent::TempArtifactCleaned { sequence, .. }
@@ -3525,7 +2874,11 @@ fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deepcode_kernel_abi::{MessageRole, UserInput, WorkspaceBinding};
+    use deepcode_kernel_abi::{
+        AnswerObligationId, AnswerObligationStatus, MessageRole, UserInput, WorkflowDecisionReason,
+        WorkspaceBinding,
+    };
+    use deepcode_kernel_workflow::WorkflowEvidence;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3806,7 +3159,7 @@ mod tests {
 
     #[test]
     fn workspace_summary_component_request_requires_kernel_tool_evidence() {
-        let state = WorkflowDecisionState::from_user_input(
+        let state = RunDecisionState::from_user_input(
             "读取当前工作区文件并总结输出给我，这是一个测试请求，用于测试agent能否调用各组件正常执行任务，最后返回你的身份信息",
         );
 
@@ -4354,7 +3707,7 @@ mod tests {
     fn check_phase_final_message_cannot_satisfy_identity_obligation() {
         // 验证 plan/check 阶段即便 channel == final，identity / tool_summary 也不能被满足。
         // 闭合用户报告的"身份信息在 check 阶段被提前输出"问题。
-        let mut state = WorkflowDecisionState::from_user_input("返回你的身份信息");
+        let mut state = RunDecisionState::from_user_input("返回你的身份信息");
         state.evidence.clear();
         let event = KernelEvent::MessageAppended {
             run_id: Some(RunId("run-1".to_string())),
@@ -4388,7 +3741,7 @@ mod tests {
     fn evidence_records_tool_completion_status_and_path() {
         // 验证 ToolCompleted 后 WorkflowEvidence 被累积，包含 toolName/status/path/cleanupStatus。
         // review 阶段据此构造唯一事实源，杜绝 LLM 自行推断"工具不可用"。
-        let mut state = WorkflowDecisionState::default();
+        let mut state = RunDecisionState::default();
         let event = KernelEvent::ToolCompleted {
             run_id: Some(RunId("run-1".to_string())),
             session_id: Some(SessionId("session-1".to_string())),
@@ -4412,7 +3765,7 @@ mod tests {
     fn review_phase_prompt_includes_evidence_json() {
         // 验证 compile_kernel_phase_instruction 在 review 阶段把 evidence 注入 prompt。
         // 这是 P0-3 的核心契约：LLM 看到的 prompt 必须包含 Kernel 工具事实。
-        let mut state = WorkflowDecisionState::from_user_input("test workspace tools");
+        let mut state = RunDecisionState::from_user_input("test workspace tools");
         state.evidence.push(WorkflowEvidence {
             tool_name: "fs.delete".to_string(),
             tool_call_id: Some("call-1".to_string()),
@@ -4437,7 +3790,7 @@ mod tests {
     fn phase_prompt_forbids_non_deepcode_tool_names() {
         // 验证 prompt 显式禁止 list_dir/write_file/read_file/delete_file/execute_command 等
         // 非 DeepCode 工具名，闭合用户报告的"工具命名混乱"问题。
-        let state = WorkflowDecisionState::default();
+        let state = RunDecisionState::default();
         for phase in ["plan", "check", "complete", "review"] {
             let prompt = compile_kernel_phase_instruction(phase, &state);
             assert!(
