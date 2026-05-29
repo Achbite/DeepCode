@@ -43,6 +43,16 @@ require_tool() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
 }
 
+search() {
+  local pattern="$1"
+  shift
+  if command -v rg >/dev/null 2>&1; then
+    rg -n "$pattern" "$@"
+  else
+    grep -RInE "$pattern" "$@"
+  fi
+}
+
 json_get() {
   python3 - "$@" <<'PY'
 import json
@@ -72,7 +82,8 @@ PY
 wait_http_ok() {
   local url="$1"
   local label="$2"
-  for _ in $(seq 1 80); do
+  local attempts="${DEEPCODE_HTTP_WAIT_ATTEMPTS:-240}"
+  for _ in $(seq 1 "$attempts"); do
     if python3 - "$url" <<'PY' >/dev/null 2>&1
 import sys
 from urllib.request import urlopen
@@ -106,7 +117,7 @@ info "[1/8] tool and shell checks"
 require_tool bash
 require_tool cargo
 require_tool python3
-require_tool rg
+require_tool grep
 bash -n test.sh
 bash -n build.sh
 pass "shell scripts parse"
@@ -134,17 +145,36 @@ else
 fi
 
 info "[4/8] stage 9 boundary grep gates"
-! rg -n "WorkflowDecisionState" crates/deepcode-kernel-runtime/src || fail "runtime must not define WorkflowDecisionState"
-! rg -n "match tool_name" crates/deepcode-kernel-runtime/src || fail "runtime must not use match tool_name dispatch"
-rg -n "struct RuntimeState" crates/deepcode-kernel-runtime/src/state.rs >/dev/null
-rg -n "struct WorkspaceBoundary" crates/deepcode-kernel-policy/src/workspace_boundary.rs >/dev/null
-rg -n "trait SkillExecutor" crates/deepcode-kernel-skills/src/executor.rs >/dev/null
-! rg -n "DeepCodeKernelRuntime|deepcode-kernel-runtime" crates/deepcode-host-web/src crates/deepcode-host-web/Cargo.toml || fail "host-web must not hold Kernel runtime"
-! rg -n "run_agent_workflow|stage_prompt|call_agent_stage_llm|execute_stage_tool_calls|call_llm_profile" crates/deepcode-host-web/src || fail "host-web must not own workflow/provider loop"
-rg -n "deepcode-kernel-daemon" Cargo.toml build.sh test.sh crates/deepcode-kernel-daemon/Cargo.toml >/dev/null
-rg -n "PlanContractSubmit|SkillTrustApprove|PlanReviewReportProduced|SkillTrustRequested|SkillTrustGranted" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
-rg -n "SkillTrustMode|BrokeredScript|DirectHostScript|ScriptBroker" crates/deepcode-kernel-skills/src >/dev/null
-rg -n "PlanReviewEngine|PlanReviewReport" crates/deepcode-kernel-workflow/src >/dev/null
+for runtime_module in \
+  dispatch state workspace tools workflow llm context permissions temp_artifacts obligations
+do
+  test -f "crates/deepcode-kernel-runtime/src/${runtime_module}.rs" \
+    || fail "missing runtime module ${runtime_module}.rs"
+done
+! search "KernelCommand::" crates/deepcode-kernel-runtime/src/lib.rs \
+  || fail "runtime lib.rs must not contain KernelCommand dispatch arms"
+! search "fn (dispatch|workspace_|tool_invoke|execute_bound_tool|llm_response_submit|permission_resolve|run_start|run_resume|context_attach_reference|record_change_operation_for_tool)" crates/deepcode-kernel-runtime/src/lib.rs \
+  || fail "runtime lib.rs must remain facade-only"
+search "pub fn dispatch" crates/deepcode-kernel-runtime/src/dispatch.rs >/dev/null
+search "struct RuntimeState" crates/deepcode-kernel-runtime/src/state.rs >/dev/null
+search "fn workspace_open" crates/deepcode-kernel-runtime/src/workspace.rs >/dev/null
+search "fn tool_invoke" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
+search "fn run_start" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
+search "fn llm_response_submit" crates/deepcode-kernel-runtime/src/llm.rs >/dev/null
+search "fn context_attach_reference" crates/deepcode-kernel-runtime/src/context.rs >/dev/null
+search "fn permission_resolve" crates/deepcode-kernel-runtime/src/permissions.rs >/dev/null
+search "fn is_kernel_owned_temp_cleanup" crates/deepcode-kernel-runtime/src/temp_artifacts.rs >/dev/null
+search "fn record_change_operation_for_tool" crates/deepcode-kernel-runtime/src/obligations.rs >/dev/null
+! search "WorkflowDecisionState" crates/deepcode-kernel-runtime/src || fail "runtime must not define WorkflowDecisionState"
+! search "match tool_name" crates/deepcode-kernel-runtime/src || fail "runtime must not use match tool_name dispatch"
+search "struct WorkspaceBoundary" crates/deepcode-kernel-policy/src/workspace_boundary.rs >/dev/null
+search "trait SkillExecutor" crates/deepcode-kernel-skills/src/executor.rs >/dev/null
+! search "DeepCodeKernelRuntime|deepcode-kernel-runtime" crates/deepcode-host-web/src crates/deepcode-host-web/Cargo.toml || fail "host-web must not hold Kernel runtime"
+! search "run_agent_workflow|stage_prompt|call_agent_stage_llm|execute_stage_tool_calls|call_llm_profile" crates/deepcode-host-web/src || fail "host-web must not own workflow/provider loop"
+search "deepcode-kernel-daemon" Cargo.toml build.sh test.sh crates/deepcode-kernel-daemon/Cargo.toml >/dev/null
+search "PlanContractSubmit|SkillTrustApprove|PlanReviewReportProduced|SkillTrustRequested|SkillTrustGranted" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
+search "SkillTrustMode|BrokeredScript|DirectHostScript|ScriptBroker" crates/deepcode-kernel-skills/src >/dev/null
+search "PlanReviewEngine|PlanReviewReport" crates/deepcode-kernel-workflow/src >/dev/null
 pass "stage 9 grep gates"
 
 info "[5/8] Kernel daemon HTTP smoke"
