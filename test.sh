@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ====================================================================
-# DeepCode stage 9 layered smoke test
+# DeepCode stage 9/10 layered smoke test
 #
 # 默认执行 fast smoke：语法、Rust workspace、TS typecheck/build、阶段 9
-# 边界门禁、Kernel daemon API smoke。packaging/slow 通过环境变量启用。
+# 边界门禁、Kernel daemon API smoke、阶段 10.0 CLI/TUI smoke 和
+# 阶段 10 audit tamper tests。packaging/slow 通过环境变量启用。
 # ====================================================================
 set -euo pipefail
 
@@ -120,11 +121,20 @@ require_tool python3
 require_tool grep
 bash -n test.sh
 bash -n build.sh
+deprecated_build_markers_regex='DEEPCODE_VERSION''_TAG|source''Hash|build-info''\.json|build''Version|release''\.json'
+! search "$deprecated_build_markers_regex" build.sh README.md test.sh /mnt/e/Dev-Agent/技术方案/临时上下文存储.md /mnt/e/Dev-Agent/技术方案/开发规划方案.md >/dev/null \
+  || fail "build version/source hash metadata must stay postponed"
+! search "deepcode\\.exe" build.sh || fail "Windows CLI must not generate deepcode.exe; use DeepCode.exe for GUI and deepcode-cli.exe/deepcode.cmd for CLI"
 pass "shell scripts parse"
 
 info "[2/8] Rust format and tests"
 cargo fmt --check --all
+cargo test -p deepcode-kernel-client -p deepcode-cli -p deepcode-tui -p deepcode-kernel-audit
 cargo test --workspace
+cargo run -q -p deepcode-cli -- --help >/dev/null
+printf '/help\n/quit\n' | cargo run -q -p deepcode-cli >/dev/null
+cargo run -q -p deepcode-tui -- --smoke >/dev/null
+printf '/help\n/quit\n' | cargo run -q -p deepcode-tui >/dev/null
 pass "Rust workspace tests"
 
 info "[3/8] TypeScript protocol/session/gui checks"
@@ -144,7 +154,7 @@ else
   info "TS checks skipped by DEEPCODE_SKIP_TS_CHECKS=1"
 fi
 
-info "[4/8] stage 9 boundary grep gates"
+info "[4/8] stage 9/10 boundary grep gates"
 for runtime_module in \
   dispatch state workspace tools workflow llm context permissions temp_artifacts obligations
 do
@@ -173,9 +183,16 @@ search "trait SkillExecutor" crates/deepcode-kernel-skills/src/executor.rs >/dev
 ! search "run_agent_workflow|stage_prompt|call_agent_stage_llm|execute_stage_tool_calls|call_llm_profile" crates/deepcode-host-web/src || fail "host-web must not own workflow/provider loop"
 search "deepcode-kernel-daemon" Cargo.toml build.sh test.sh crates/deepcode-kernel-daemon/Cargo.toml >/dev/null
 search "PlanContractSubmit|SkillTrustApprove|PlanReviewReportProduced|SkillTrustRequested|SkillTrustGranted" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
+search "AuditVerify|AuditQuery|AuditVerifyCompleted|AuditDegradedEntered|AuditSegmentRotated" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
 search "SkillTrustMode|BrokeredScript|DirectHostScript|ScriptBroker" crates/deepcode-kernel-skills/src >/dev/null
 search "PlanReviewEngine|PlanReviewReport" crates/deepcode-kernel-workflow/src >/dev/null
-pass "stage 9 grep gates"
+search "SignedAuditEntryV1|AuditSegmentSealV1|AuditVerifier" crates/deepcode-kernel-audit/src >/dev/null
+search "struct HttpKernelClient|send_prompt|daemon_status" crates/deepcode-kernel-client/src/lib.rs >/dev/null
+search "enum Command|DaemonStatus|Ask" shells/cli/src/main.rs >/dev/null
+search "run_interactive|/help|/status|/ask <prompt>|/quit" shells/cli/src/main.rs >/dev/null
+search "ratatui|crossterm|CardModel|struct Renderer|audit-status|command_help|/help|/status|/ask <prompt>|/quit" shells/tui/src >/dev/null
+! search "DeepCodeKernelRuntime|deepcode-kernel-runtime" crates/deepcode-kernel-client/src shells/cli/src shells/tui/src || fail "CLI/TUI/client must not reference Kernel runtime"
+pass "stage 9/10 grep gates"
 
 info "[5/8] Kernel daemon HTTP smoke"
 CONFIG_DIR="$(mktemp -d /tmp/deepcode-stage9-config-XXXXXX)"
@@ -189,6 +206,9 @@ wait_http_ok "http://127.0.0.1:${TEST_PORT}/api/health" "daemon health ready"
 
 health="$(json_get "http://127.0.0.1:${TEST_PORT}/api/health")"
 assert_json_expr "$health" 'data["ok"] is True and data["data"]["service"] == "deepcode-kernel-daemon"' "daemon service identity"
+DEEPCODE_API_URL="http://127.0.0.1:${TEST_PORT}" cargo run -q -p deepcode-cli -- daemon status >/dev/null
+DEEPCODE_API_URL="http://127.0.0.1:${TEST_PORT}" cargo run -q -p deepcode-tui -- --smoke >/dev/null
+pass "CLI/TUI Host shell smoke"
 
 reply="$(json_post "http://127.0.0.1:${TEST_PORT}/api/kernel/commands" '{"command":{"kind":"healthCheck","requestId":"req-health"}}')"
 assert_json_expr "$reply" 'data["ok"] is True and any(event["kind"] == "host.status" for event in data["events"]) and data["snapshot"] is not None' "kernel command health"
@@ -253,13 +273,22 @@ info "[7/8] optional packaging smoke"
 if [ "${DEEPCODE_SKIP_PACKAGING_SMOKE:-1}" = "0" ]; then
   ./build.sh
   test -x "$ROOT_DIR/bin/linux-x64/deepcode-kernel"
+  test -x "$ROOT_DIR/bin/linux-x64/deepcode"
+  test -x "$ROOT_DIR/bin/linux-x64/deepcode-cli"
+  test -x "$ROOT_DIR/bin/linux-x64/deepcode-tui"
   test -f "$ROOT_DIR/bin/win64/deepcode-kernel.exe"
+  test -f "$ROOT_DIR/bin/win64/deepcode-cli.exe"
+  test -f "$ROOT_DIR/bin/win64/deepcode-tui.exe"
+  test -f "$ROOT_DIR/bin/win64/deepcode.cmd"
   test -f "$ROOT_DIR/bin/win64/DeepCode.exe"
   test -f "$ROOT_DIR/bin/win64/WebView2Loader.dll"
+  "$ROOT_DIR/bin/linux-x64/deepcode" --help >/dev/null
+  "$ROOT_DIR/bin/linux-x64/deepcode-cli" --help >/dev/null
+  "$ROOT_DIR/bin/linux-x64/deepcode-tui" --smoke >/dev/null
   pass "packaging smoke"
 else
   info "packaging smoke skipped; set DEEPCODE_SKIP_PACKAGING_SMOKE=0 to enable"
 fi
 
 info "[8/8] done"
-pass "DeepCode stage 9 fast smoke passed"
+pass "DeepCode stage 9/10 fast smoke passed"

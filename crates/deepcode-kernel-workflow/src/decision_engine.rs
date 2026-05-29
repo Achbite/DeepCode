@@ -622,6 +622,11 @@ fn event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::SkillTrustRequested { .. } => "skill.trust_requested",
         KernelEvent::SkillTrustGranted { .. } => "skill.trust_granted",
         KernelEvent::ContextResult { .. } => "context.result",
+        KernelEvent::AuditVerifyStarted { .. } => "audit.verify_started",
+        KernelEvent::AuditVerifyCompleted { .. } => "audit.verify_completed",
+        KernelEvent::AuditDegradedEntered { .. } => "audit.degraded_entered",
+        KernelEvent::AuditDegradedExited { .. } => "audit.degraded_exited",
+        KernelEvent::AuditSegmentRotated { .. } => "audit.segment_rotated",
         KernelEvent::TempArtifactCreated { .. } => "tempArtifact.created",
         KernelEvent::TempArtifactCleaned { .. } => "tempArtifact.cleaned",
         KernelEvent::TempArtifactLeaseGranted { .. } => "tempArtifact.lease_granted",
@@ -657,6 +662,11 @@ fn event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::SkillTrustRequested { sequence, .. }
         | KernelEvent::SkillTrustGranted { sequence, .. }
         | KernelEvent::ContextResult { sequence, .. }
+        | KernelEvent::AuditVerifyStarted { sequence, .. }
+        | KernelEvent::AuditVerifyCompleted { sequence, .. }
+        | KernelEvent::AuditDegradedEntered { sequence, .. }
+        | KernelEvent::AuditDegradedExited { sequence, .. }
+        | KernelEvent::AuditSegmentRotated { sequence, .. }
         | KernelEvent::TempArtifactCreated { sequence, .. }
         | KernelEvent::TempArtifactCleaned { sequence, .. }
         | KernelEvent::TempArtifactLeaseGranted { sequence, .. }

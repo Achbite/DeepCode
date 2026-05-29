@@ -7,8 +7,9 @@
 #   bin/linux-x64/
 #     deepcode-kernel        Rust Kernel Daemon + localhost API
 #     deepcode-gui           GUI 入口脚本（共享同一 Kernel）
-#     deepcode-cli           CLI 入口脚本（后续接同一 Kernel）
-#     deepcode-tui           TUI 入口脚本（后续接同一 Kernel）
+#     deepcode               CLI Host Shell 软入口
+#     deepcode-cli           CLI Host Shell MVP
+#     deepcode-tui           TUI Host Shell MVP
 #     web/                   React 静态资源
 #     config/ packs/         默认配置与 Pack 目录
 #
@@ -16,8 +17,9 @@
 #     deepcode-kernel.exe    Windows GNU 交叉编译产物
 #     DeepCode.exe           Windows GUI thin shell（启动同目录 Kernel）
 #     WebView2Loader.dll     Tauri/WebView2 loader，DeepCode.exe 运行必需
-#     deepcode-cli.bat       CLI 入口脚本（后续接同一 Kernel）
-#     deepcode-tui.bat       TUI 入口脚本（后续接同一 Kernel）
+#     deepcode-cli.exe       CLI Host Shell MVP
+#     deepcode-tui.exe       TUI Host Shell MVP
+#     deepcode.cmd           CLI Host Shell 命令入口（避免与 DeepCode.exe 大小写冲突）
 #     web/                   React 静态资源
 #     config/ packs/         默认配置与 Pack 目录
 #
@@ -62,11 +64,11 @@ mkdir -p "$TAURI_GUI_DIST"
 find "$TAURI_GUI_DIST" -mindepth 1 -delete 2>/dev/null || true
 cp -r "$CLIENT_DIR/dist/." "$TAURI_GUI_DIST/"
 
-echo "==[build][3/7]== build Rust kernel daemon for Linux"
-cargo build --release -p deepcode-kernel-daemon
+echo "==[build][3/7]== build Rust daemon/client Host shells for Linux"
+cargo build --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
 
-echo "==[build][4/7]== build Rust kernel daemon for Windows GNU"
-cargo build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon
+echo "==[build][4/7]== build Rust daemon/client Host shells for Windows GNU"
+cargo build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
 
 echo "==[build][5/7]== build Windows DeepCode.exe GUI shell"
 pnpm --filter @deepcode/tauri-shell tauri:build -- --target "$WINDOWS_TARGET"
@@ -95,8 +97,14 @@ prepare_distribution_tree "$WIN_DIR"
 
 cp -v "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$LINUX_DIR/deepcode-kernel"
 chmod +x "$LINUX_DIR/deepcode-kernel"
+cp -v "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode-cli"
+cp -v "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode"
+cp -v "$CARGO_TARGET_ROOT/release/deepcode-tui" "$LINUX_DIR/deepcode-tui"
+chmod +x "$LINUX_DIR/deepcode-cli" "$LINUX_DIR/deepcode" "$LINUX_DIR/deepcode-tui"
 
 cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "$WIN_DIR/deepcode-kernel.exe"
+cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "$WIN_DIR/deepcode-cli.exe"
+cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe" "$WIN_DIR/deepcode-tui.exe"
 cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "$WIN_DIR/DeepCode.exe"
 
 WEBVIEW2_LOADER_DLL="$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/WebView2Loader.dll"
@@ -124,33 +132,13 @@ export DEEPCODE_PORT="${DEEPCODE_PORT:-31245}"
 LAUNCHER
 chmod +x "$LINUX_DIR/deepcode-gui"
 
-cat > "$LINUX_DIR/deepcode-cli" <<'LAUNCHER'
-#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export DEEPCODE_HOST="${DEEPCODE_HOST:-127.0.0.1}"
-export DEEPCODE_PORT="${DEEPCODE_PORT:-31245}"
-exec "$SCRIPT_DIR/deepcode-kernel" "$@"
-LAUNCHER
-chmod +x "$LINUX_DIR/deepcode-cli"
-
-cat > "$LINUX_DIR/deepcode-tui" <<'LAUNCHER'
-#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export DEEPCODE_HOST="${DEEPCODE_HOST:-127.0.0.1}"
-export DEEPCODE_PORT="${DEEPCODE_PORT:-31245}"
-exec "$SCRIPT_DIR/deepcode-kernel" "$@"
-LAUNCHER
-chmod +x "$LINUX_DIR/deepcode-tui"
-
 cat > "$WIN_DIR/deepcode-cli.bat" <<'LAUNCHER'
 @echo off
 setlocal
 set "SCRIPT_DIR=%~dp0"
 if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
 if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
-"%SCRIPT_DIR%deepcode-kernel.exe" %*
+"%SCRIPT_DIR%deepcode-cli.exe" %*
 LAUNCHER
 
 cat > "$WIN_DIR/deepcode-tui.bat" <<'LAUNCHER'
@@ -159,7 +147,16 @@ setlocal
 set "SCRIPT_DIR=%~dp0"
 if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
 if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
-"%SCRIPT_DIR%deepcode-kernel.exe" %*
+"%SCRIPT_DIR%deepcode-tui.exe" %*
+LAUNCHER
+
+cat > "$WIN_DIR/deepcode.cmd" <<'LAUNCHER'
+@echo off
+setlocal
+set "SCRIPT_DIR=%~dp0"
+if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
+if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
+"%SCRIPT_DIR%deepcode-cli.exe" %*
 LAUNCHER
 
 write_readme() {
@@ -187,8 +184,10 @@ Set DEEPCODE_CONFIG_DIR to override the writable configuration root.
 Entries:
   deepcode-kernel       Rust Kernel Daemon + localhost API
   $gui_entry
-  deepcode-cli          CLI host launcher placeholder over the same Kernel
-  deepcode-tui          TUI host launcher placeholder over the same Kernel
+  deepcode              CLI Host Shell MVP over KernelClient (Linux)
+  deepcode-cli          CLI Host Shell MVP over KernelClient
+  deepcode-tui          TUI Host Shell MVP over KernelClient
+  deepcode.cmd          Windows CLI command alias for deepcode-cli.exe
 
 Windows GUI runtime:
   DeepCode.exe requires WebView2Loader.dll next to the executable. The portable

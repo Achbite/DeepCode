@@ -141,6 +141,12 @@ impl Kernel {
             KernelCommand::SkillTrustApprove { request_id, .. } => {
                 self.not_implemented(request_id, "skill.trust_approve")
             }
+            KernelCommand::AuditVerify { request_id, .. } => {
+                self.not_implemented(request_id, "audit.verify")
+            }
+            KernelCommand::AuditQuery { request_id, .. } => {
+                self.not_implemented(request_id, "audit.query")
+            }
             KernelCommand::PermissionGrantTemporary { request_id, .. } => {
                 self.not_implemented(request_id, "permission.grant_temporary")
             }

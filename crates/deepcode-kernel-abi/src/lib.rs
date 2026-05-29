@@ -185,6 +185,15 @@ pub enum KernelCommand {
         skill_id: String,
         decision: Value,
     },
+    AuditVerify {
+        request_id: RequestId,
+        scope: Value,
+    },
+    AuditQuery {
+        request_id: RequestId,
+        filter: Value,
+        projection: Option<String>,
+    },
     PermissionGrantTemporary {
         request_id: RequestId,
         run_id: RunId,
@@ -514,6 +523,38 @@ pub enum KernelEvent {
         session_id: Option<SessionId>,
         path: String,
         error: KernelErrorEnvelope,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "audit.verify_started")]
+    AuditVerifyStarted {
+        request_id: Option<RequestId>,
+        scope: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "audit.verify_completed")]
+    AuditVerifyCompleted {
+        request_id: Option<RequestId>,
+        ok: bool,
+        report: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "audit.degraded_entered")]
+    AuditDegradedEntered {
+        request_id: Option<RequestId>,
+        reason: String,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "audit.degraded_exited")]
+    AuditDegradedExited {
+        request_id: Option<RequestId>,
+        reason: Option<String>,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "audit.segment_rotated")]
+    AuditSegmentRotated {
+        request_id: Option<RequestId>,
+        segment_id: String,
+        seal: Value,
         sequence: Option<u64>,
     },
     #[serde(rename = "error")]
@@ -948,6 +989,44 @@ mod tests {
         assert_eq!(encoded["hash"], "sha256:abc");
         let decoded: KernelEvent =
             serde_json::from_value(encoded).expect("deserialize skill trust event");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn audit_placeholders_round_trip() {
+        let command = KernelCommand::AuditVerify {
+            request_id: RequestId("req-audit-verify".to_string()),
+            scope: serde_json::json!({ "kind": "all" }),
+        };
+        let encoded = serde_json::to_value(&command).expect("serialize audit verify command");
+        assert_eq!(encoded["kind"], "auditVerify");
+        let decoded: KernelCommand =
+            serde_json::from_value(encoded).expect("deserialize audit verify command");
+        assert_eq!(decoded, command);
+
+        let command = KernelCommand::AuditQuery {
+            request_id: RequestId("req-audit-query".to_string()),
+            filter: serde_json::json!({ "runId": "run-1" }),
+            projection: Some("redacted".to_string()),
+        };
+        let encoded = serde_json::to_value(&command).expect("serialize audit query command");
+        assert_eq!(encoded["kind"], "auditQuery");
+        assert_eq!(encoded["projection"], "redacted");
+        let decoded: KernelCommand =
+            serde_json::from_value(encoded).expect("deserialize audit query command");
+        assert_eq!(decoded, command);
+
+        let event = KernelEvent::AuditVerifyCompleted {
+            request_id: Some(RequestId("req-audit-verify".to_string())),
+            ok: true,
+            report: serde_json::json!({ "entriesVerified": 2 }),
+            sequence: Some(11),
+        };
+        let encoded = serde_json::to_value(&event).expect("serialize audit event");
+        assert_eq!(encoded["kind"], "audit.verify_completed");
+        assert_eq!(encoded["report"]["entriesVerified"], 2);
+        let decoded: KernelEvent =
+            serde_json::from_value(encoded).expect("deserialize audit event");
         assert_eq!(decoded, event);
     }
 

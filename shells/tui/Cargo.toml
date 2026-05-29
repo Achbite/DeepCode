@@ -1,0 +1,14 @@
+[package]
+name = "deepcode-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+deepcode-kernel-client.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

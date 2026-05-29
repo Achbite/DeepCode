@@ -1,0 +1,16 @@
+[package]
+name = "deepcode-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "deepcode-cli"
+path = "src/main.rs"
+
+[dependencies]
+deepcode-kernel-client.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
