@@ -54,7 +54,7 @@ Linux:
 ./bin/linux-x64/deepcode-gui
 ```
 
-CLI/TUI Host Shell MVP:
+CLI/TUI 命令入口：
 
 ```bash
 ./bin/linux-x64/deepcode --help
@@ -74,7 +74,7 @@ CLI/TUI Host Shell MVP:
 /quit              退出
 ```
 
-不带 `/` 的普通文本会按一次 prompt 发送。阶段 10.0 的 TUI 已切换为 Ratatui/Crossterm Host Shell 壳，用于验证 `Event -> CardModel -> Renderer` 边界；完整 Slash Command、文件补全、历史搜索、焦点导航等产品体验仍归阶段 17。
+不带 `/` 的普通文本会按一次 prompt 发送。当前 TUI 使用 Ratatui/Crossterm 布局，并保留 `Event -> CardModel -> Renderer` 投影边界；Slash Command 弹窗、文件补全、历史搜索、焦点导航等高级体验仍待完善。
 
 Windows:
 
@@ -135,7 +135,7 @@ docker build -f Dockerfile.dev -t deepcode-dev .
 docker run --rm -t -v "$PWD:/workspace" -w /workspace deepcode-dev ./test.sh
 ```
 
-`./test.sh` 覆盖当前阶段默认门禁：
+`./test.sh` 覆盖当前默认门禁：
 
 - Rust workspace `cargo fmt/check/test`
 - TS `protocol/session-core/gui` build/typecheck
@@ -195,25 +195,25 @@ DEEPCODE_SKIP_PACKAGING_SMOKE=1 ./test.sh
   - Windows `bin/win64/DeepCode.exe` 是可双击启动的 GUI thin shell，会直接渲染内置 React 工作台并在后台启动同目录 Kernel；默认选择空闲本地端口，`WebView2Loader.dll` 会随分发目录一起输出。
   - Linux `bin/linux-x64/deepcode-gui` 启动同一个 Rust Kernel Daemon 并服务 `web/`。
   - Codex 内部浏览器、Chrome 或普通浏览器都可以打开 GUI URL。
-- **CLI / TUI Host Shell MVP**
+- **CLI / TUI 命令入口（待完善）**
 
-  - `deepcode` / `deepcode-cli` 是阶段 10.0 Host 壳：支持 `--help`、`-p`、`ask`、`daemon status` 和轻量 REPL。
+  - `deepcode` / `deepcode-cli` 支持 `--help`、`-p`、`ask`、`daemon status` 和轻量 REPL。
   - `deepcode-tui` 是 Ratatui/Crossterm Host 壳：提供顶部状态、主卡片区、命令提示区和底部输入栏，并保留 `Event -> CardModel -> Renderer` 投影边界。
   - CLI/TUI 只通过 `deepcode-kernel-client` 调 daemon，不引用 `DeepCodeKernelRuntime`，不执行工具、不裁决权限、不判定完成。
 - **本地签名审计链 V1**
 
   - `deepcode-kernel-audit` 已提供 canonical JSON、signed entry、hash chain、segment seal、verify、degraded mode 与 tamper tests。
-  - 当前签名链是开发/便携包 V1，签名算法封装在 audit signer 内；最终企业级签名、OS keychain 和发布防伪策略后置到阶段 21。
+  - 当前签名链是开发/便携包 V1，签名算法封装在 audit signer 内；最终企业级签名、OS keychain 和发布防伪策略仍待完善。
 
 ### 当前预留
 
 - **Tauri thin shell**：正式 GUI 壳方向已确定为 Tauri，但只允许承载窗口、文件选择、菜单、快捷键、系统集成和 Kernel daemon bridge，不承载 Agent runtime。
 - **Browser Host**：保留为开发快速验证入口，不作为最终桌面运行模型。
-- **KernelClient 兼容层**：阶段 10.0 CLI/TUI 通过 KernelClient 封装 daemon `/api/agent/*` 兼容投影；后续替换为 IPC / stable KernelClient transport 时，不应影响 CLI/TUI 调用点。
-- **CLI / TUI 正式体验**：当前阶段 10.0 只完成 Host Shell MVP；完整 CLI Host 归阶段 16，完整 TUI Host 归阶段 17，且不会重新实现 Agent runtime。
-- **版本身份 / 发布防伪**：当前发行版本只沿用 Cargo workspace `[workspace.package].version`，不生成 build tag、source hash 或 build metadata 文件；正式源码哈希和签名发布链后置到阶段 21。
+- **KernelClient 兼容层**：当前 CLI/TUI 通过 KernelClient 封装 daemon `/api/agent/*` 兼容投影；后续替换为 IPC / stable KernelClient transport 时，不应影响 CLI/TUI 调用点。
+- **CLI / TUI 高级体验**：当前只完成基础命令入口和终端面板；完整 stdout/stderr 分流、stdin 管道、权限交互、Slash Command、补全、历史搜索和焦点导航仍待完善，且不会重新实现 Agent runtime。
+- **版本身份 / 发布防伪**：当前发行版本只沿用 Cargo workspace `[workspace.package].version`，不生成 build tag、source hash 或 build metadata 文件；正式源码哈希和签名发布链仍待完善。
 - **MCP adapter**：当前只保留 ExternalConnector / SkillPack 兼容方向，尚未实现完整 MCP client adapter。
-- **Source Control / Git / Validator runtime**：ChangeSet、ReviewGate 和 validation 已有 Kernel 结构基础，真实 Git / lint / test 深度接入仍在后续阶段。
+- **Source Control / Git / Validator runtime**：ChangeSet、ReviewGate 和 validation 已有 Kernel 结构基础，真实 Git / lint / test 深度接入仍待完善。
 
 ## 项目定位与架构
 
@@ -270,7 +270,7 @@ bin/
     └── README.txt
 ```
 
-GUI、CLI、TUI 入口共享同一个 Kernel daemon、配置目录、Pack 目录和事件协议。当前 GUI 是可用主入口；CLI/TUI 是阶段 10.0 Host Shell MVP，只通过 KernelClient 调 daemon，不拥有 workflow、permission、tool execution 或 review 事实。
+GUI、CLI、TUI 入口共享同一个 Kernel daemon、配置目录、Pack 目录和事件协议。当前 GUI 是可用主入口；CLI/TUI 是基础命令入口，只通过 KernelClient 调 daemon，不拥有 workflow、permission、tool execution 或 review 事实。
 
 ## 当前源码结构
 
@@ -296,8 +296,8 @@ deepagent/
 │   ├── session-core               # TS 用户会话层
 │   └── gui                        # React GUI Host
 ├── shells/
-│   ├── cli                        # 阶段 10.0 CLI Host Shell MVP
-│   ├── tui                        # 阶段 10.0 TUI Host Shell MVP
+│   ├── cli                        # CLI Host Shell
+│   ├── tui                        # TUI Host Shell
 │   └── tauri                      # GUI thin shell
 ├── fixtures/                      # Agent/workflow/kernel fixture
 └── legacy/                        # 迁移期参考与历史遗留隔离区
