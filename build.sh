@@ -5,7 +5,7 @@
 #
 # 输出统一内核分发目录：
 #   bin/linux-x64/
-#     deepcode-kernel        Rust Kernel + Web Host
+#     deepcode-kernel        Rust Kernel Daemon + localhost API
 #     deepcode-gui           GUI 入口脚本（共享同一 Kernel）
 #     deepcode-cli           CLI 入口脚本（后续接同一 Kernel）
 #     deepcode-tui           TUI 入口脚本（后续接同一 Kernel）
@@ -62,11 +62,11 @@ mkdir -p "$TAURI_GUI_DIST"
 find "$TAURI_GUI_DIST" -mindepth 1 -delete 2>/dev/null || true
 cp -r "$CLIENT_DIR/dist/." "$TAURI_GUI_DIST/"
 
-echo "==[build][3/7]== build Rust kernel web host for Linux"
-cargo build --release -p deepcode-host-web
+echo "==[build][3/7]== build Rust kernel daemon for Linux"
+cargo build --release -p deepcode-kernel-daemon
 
-echo "==[build][4/7]== build Rust kernel web host for Windows GNU"
-cargo build --release --target "$WINDOWS_TARGET" -p deepcode-host-web
+echo "==[build][4/7]== build Rust kernel daemon for Windows GNU"
+cargo build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon
 
 echo "==[build][5/7]== build Windows DeepCode.exe GUI shell"
 pnpm --filter @deepcode/tauri-shell tauri:build -- --target "$WINDOWS_TARGET"
@@ -93,10 +93,10 @@ prepare_distribution_tree() {
 prepare_distribution_tree "$LINUX_DIR"
 prepare_distribution_tree "$WIN_DIR"
 
-cp -v "$CARGO_TARGET_ROOT/release/deepcode-host-web" "$LINUX_DIR/deepcode-kernel"
+cp -v "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$LINUX_DIR/deepcode-kernel"
 chmod +x "$LINUX_DIR/deepcode-kernel"
 
-cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe" "$WIN_DIR/deepcode-kernel.exe"
+cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "$WIN_DIR/deepcode-kernel.exe"
 cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "$WIN_DIR/DeepCode.exe"
 
 WEBVIEW2_LOADER_DLL="$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/WebView2Loader.dll"
@@ -185,7 +185,7 @@ Writable user settings and LLM profile data are stored outside this distribution
 Set DEEPCODE_CONFIG_DIR to override the writable configuration root.
 
 Entries:
-  deepcode-kernel       Rust Kernel + Web Host
+  deepcode-kernel       Rust Kernel Daemon + localhost API
   $gui_entry
   deepcode-cli          CLI host launcher placeholder over the same Kernel
   deepcode-tui          TUI host launcher placeholder over the same Kernel
@@ -197,7 +197,7 @@ Windows GUI runtime:
 
 Optional desktop shell:
   Tauri thin shell source lives in shells/tauri. It embeds the same React GUI as
-  the browser host, starts or connects to the same-dir Kernel Host in the
+  the browser host, starts or connects to the same-dir Kernel Daemon in the
   background, and does not contain Agent runtime. Windows distribution includes
   DeepCode.exe. The desktop shell chooses an available localhost port by
   default; set DEEPCODE_PORT to force a fixed port such as 31245.
