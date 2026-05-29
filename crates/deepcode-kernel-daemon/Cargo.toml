@@ -1,14 +1,16 @@
 [package]
-name = "deepcode-host-web"
+name = "deepcode-kernel-daemon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "DeepCode Rust Web host adapter backed by the unified Kernel runtime."
+description = "DeepCode Kernel daemon that owns runtime, provider transport, and localhost API."
 
 [dependencies]
 axum.workspace = true
+deepcode-kernel-abi.workspace = true
+deepcode-kernel-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
