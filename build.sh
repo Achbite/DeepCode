@@ -1,29 +1,22 @@
 #!/usr/bin/env bash
 # ====================================================================
 # DeepCode cross-platform unified build script
-# 注意build环境为docker中
+# 注意 build 环境为 Docker 中。
 #
-# 输出统一内核分发目录：
-#   bin/linux-x64/
-#     deepcode-kernel        Rust Kernel Daemon + localhost API
-#     deepcode-gui           GUI 入口脚本（共享同一 Kernel）
-#     deepcode               CLI Host Shell 软入口
-#     deepcode-cli           CLI Host Shell MVP
-#     deepcode-tui           TUI Host Shell MVP
-#     web/                   React 静态资源
-#     config/ packs/         默认配置与 Pack 目录
+# 默认行为：
+#   ./build.sh
+#     完整构建并输出 bin/linux-x64/ 与 bin/win64/。
 #
-#   bin/win64/
-#     deepcode-kernel.exe    Windows GNU 交叉编译产物
-#     DeepCode.exe           Windows GUI thin shell（启动同目录 Kernel）
-#     WebView2Loader.dll     Tauri/WebView2 loader，DeepCode.exe 运行必需
-#     deepcode-cli.exe       CLI Host Shell MVP
-#     deepcode-tui.exe       TUI Host Shell MVP
-#     deepcode.cmd           CLI Host Shell 命令入口（避免与 DeepCode.exe 大小写冲突）
-#     web/                   React 静态资源
-#     config/ packs/         默认配置与 Pack 目录
+# 分阶段入口：
+#   ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
+#   ./build.sh --stage kernel   # Linux/Windows Rust daemon + CLI/TUI
+#   ./build.sh --stage tauri    # Windows DeepCode.exe Tauri thin shell
+#   ./build.sh --stage package  # 复制已有构建产物到 bin/
+#   ./build.sh --stage all      # 等价默认完整构建
 #
-# 旧 Node 服务打包链路不再进入默认构建。
+# 缓存开关：
+#   DEEPCODE_DISABLE_SCCACHE=1  禁用 sccache，回退到普通 cargo。
+#   DEEPCODE_FORCE_BUILD=1      忽略 stage hash，强制执行构建阶段。
 # ====================================================================
 set -euo pipefail
 
@@ -39,44 +32,278 @@ WINDOWS_TARGET="x86_64-pc-windows-gnu"
 CARGO_TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 PNPM_STORE_DIR="${PNPM_STORE_DIR:-$ROOT_DIR/.pnpm-store}"
 BUILD_LINUX_TAURI_SHELL="${DEEPCODE_BUILD_LINUX_TAURI_SHELL:-0}"
+STAGE_STAMP_DIR="$ROOT_DIR/.build-cache/build-stamps"
 
 export CARGO_TARGET_DIR="$CARGO_TARGET_ROOT"
 
 cd "$ROOT_DIR"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./build.sh [--stage all|gui|kernel|tauri|package]...
+  ./build.sh --full
+
+Environment:
+  CARGO_TARGET_DIR                  Override shared Cargo target directory.
+  PNPM_STORE_DIR                    Override pnpm store directory.
+  DEEPCODE_FORCE_BUILD=1            Ignore stage hash stamps and rebuild.
+  DEEPCODE_DISABLE_SCCACHE=1        Disable sccache even when available.
+  SCCACHE_DIR                       Override local sccache cache directory.
+  DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 Build optional Linux Tauri shell.
+USAGE
+}
+
+requested_stages=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --stage)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      IFS=',' read -r -a split_stages <<< "$2"
+      requested_stages+=("${split_stages[@]}")
+      shift 2
+      ;;
+    --stage=*)
+      IFS=',' read -r -a split_stages <<< "${1#--stage=}"
+      requested_stages+=("${split_stages[@]}")
+      shift
+      ;;
+    --full)
+      requested_stages+=("all")
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "==[build][error]== unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "${#requested_stages[@]}" -eq 0 ]; then
+  requested_stages=("all")
+fi
+
+run_deps=0
+run_gui=0
+run_kernel=0
+run_tauri=0
+run_package=0
+
+enable_stage() {
+  case "$1" in
+    all)
+      run_deps=1
+      run_gui=1
+      run_kernel=1
+      run_tauri=1
+      run_package=1
+      ;;
+    deps)
+      run_deps=1
+      ;;
+    gui)
+      run_deps=1
+      run_gui=1
+      ;;
+    kernel)
+      run_kernel=1
+      ;;
+    tauri)
+      run_deps=1
+      run_tauri=1
+      ;;
+    package)
+      run_package=1
+      ;;
+    *)
+      echo "==[build][error]== unsupported stage: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+for stage in "${requested_stages[@]}"; do
+  enable_stage "$stage"
+done
 
 echo "==[build]== DeepCode cross-platform build started at $(date -Is)"
 echo "==[build]== ROOT_DIR=$ROOT_DIR"
 echo "==[build]== CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
 echo "==[build]== DEEPCODE_BUILD_LINUX_TAURI_SHELL=$BUILD_LINUX_TAURI_SHELL"
+echo "==[build]== stages: deps=$run_deps gui=$run_gui kernel=$run_kernel tauri=$run_tauri package=$run_package"
+mkdir -p "$STAGE_STAMP_DIR"
 
-echo "==[build][1/7]== pnpm install"
-pnpm install --no-frozen-lockfile --store-dir "$PNPM_STORE_DIR"
+configure_sccache() {
+  if [ "${DEEPCODE_DISABLE_SCCACHE:-0}" = "1" ]; then
+    unset RUSTC_WRAPPER
+    echo "==[build][cache]== sccache disabled by DEEPCODE_DISABLE_SCCACHE=1"
+    return
+  fi
 
-echo "==[build][2/7]== build TS user/session/UI packages"
-pnpm --filter @deepcode/protocol build
-pnpm --filter @deepcode/session-core build
-pnpm --filter @deepcode/client build
+  if command -v sccache >/dev/null 2>&1; then
+    export SCCACHE_DIR="${SCCACHE_DIR:-$ROOT_DIR/.build-cache/sccache}"
+    mkdir -p "$SCCACHE_DIR"
+    export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
+    echo "==[build][cache]== sccache enabled: RUSTC_WRAPPER=$RUSTC_WRAPPER SCCACHE_DIR=$SCCACHE_DIR"
+  else
+    echo "==[build][cache]== sccache not found; cargo builds continue without RUSTC_WRAPPER"
+  fi
+}
 
-echo "==[build][2b/7]== prepare Tauri embedded GUI dist"
-TAURI_GUI_DIST="$ROOT_DIR/shells/tauri/dist"
-mkdir -p "$TAURI_GUI_DIST"
-find "$TAURI_GUI_DIST" -mindepth 1 -delete 2>/dev/null || true
-cp -r "$CLIENT_DIR/dist/." "$TAURI_GUI_DIST/"
+show_sccache_stats() {
+  if command -v sccache >/dev/null 2>&1 && [ "${DEEPCODE_DISABLE_SCCACHE:-0}" != "1" ]; then
+    echo "==[build][cache]== sccache stats"
+    sccache --show-stats || true
+  fi
+}
 
-echo "==[build][3/7]== build Rust daemon/client Host shells for Linux"
-cargo build --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+tracked_files() {
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git ls-files -- "$@"
+  else
+    find "$@" -type f 2>/dev/null || true
+  fi
+}
 
-echo "==[build][4/7]== build Rust daemon/client Host shells for Windows GNU"
-cargo build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+find_existing_files() {
+  local path
+  for path in "$@"; do
+    if [ -f "$path" ]; then
+      printf '%s\n' "$path"
+    elif [ -d "$path" ]; then
+      find "$path" -type f 2>/dev/null || true
+    fi
+  done
+}
 
-echo "==[build][5/7]== build Windows DeepCode.exe GUI shell"
-pnpm --filter @deepcode/tauri-shell tauri:build -- --target "$WINDOWS_TARGET"
+stage_hash() {
+  local stage="$1"
+  {
+    case "$stage" in
+      gui)
+        tracked_files package.json pnpm-lock.yaml userspace/protocol userspace/session-core userspace/gui \
+          | grep -Ev '(^|/)(dist|node_modules)/' || true
+        ;;
+      kernel)
+        tracked_files Cargo.toml crates shells/cli shells/tui
+        ;;
+      tauri)
+        tracked_files package.json pnpm-lock.yaml shells/tauri
+        find_existing_files "$CLIENT_DIR/dist" "$ROOT_DIR/shells/tauri/dist"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  } \
+    | while IFS= read -r path; do
+        [ -f "$path" ] && printf '%s\n' "$path"
+      done \
+    | LC_ALL=C sort -u \
+    | xargs -r sha256sum \
+    | sha256sum \
+    | awk '{print $1}'
+}
 
-echo "==[build][6/7]== prepare bin/linux-x64 and bin/win64 directories"
-mkdir -p "$LINUX_DIR" "$WIN_DIR"
-find "$LINUX_DIR" -mindepth 1 -delete 2>/dev/null || true
-find "$WIN_DIR" -mindepth 1 -delete 2>/dev/null || true
+stage_should_skip() {
+  local stage="$1"
+  shift
+
+  if [ "${DEEPCODE_FORCE_BUILD:-0}" = "1" ]; then
+    return 1
+  fi
+
+  local artifact
+  for artifact in "$@"; do
+    [ -e "$artifact" ] || return 1
+  done
+
+  local stamp_file="$STAGE_STAMP_DIR/${stage}.sha256"
+  local current_hash
+  current_hash="$(stage_hash "$stage")"
+  if [ -f "$stamp_file" ] && [ "$(cat "$stamp_file")" = "$current_hash" ]; then
+    echo "==[build][$stage]== unchanged; skipping stage (set DEEPCODE_FORCE_BUILD=1 to rebuild)"
+    return 0
+  fi
+  return 1
+}
+
+mark_stage_built() {
+  local stage="$1"
+  stage_hash "$stage" >"$STAGE_STAMP_DIR/${stage}.sha256"
+}
+
+run_pnpm_install() {
+  echo "==[build][deps]== pnpm install"
+  pnpm install --no-frozen-lockfile --store-dir "$PNPM_STORE_DIR"
+}
+
+prepare_tauri_dist() {
+  local tauri_gui_dist="$ROOT_DIR/shells/tauri/dist"
+  test -d "$CLIENT_DIR/dist" || {
+    echo "==[build][error]== userspace/gui/dist missing; run ./build.sh --stage gui first" >&2
+    exit 1
+  }
+  mkdir -p "$tauri_gui_dist"
+  find "$tauri_gui_dist" -mindepth 1 -delete 2>/dev/null || true
+  cp -r "$CLIENT_DIR/dist/." "$tauri_gui_dist/"
+}
+
+build_gui() {
+  if stage_should_skip gui "$CLIENT_DIR/dist/index.html" "$ROOT_DIR/shells/tauri/dist/index.html"; then
+    return
+  fi
+  echo "==[build][gui]== build TS user/session/UI packages"
+  pnpm --filter @deepcode/protocol build
+  pnpm --filter @deepcode/session-core build
+  pnpm --filter @deepcode/client build
+  echo "==[build][gui]== prepare Tauri embedded GUI dist"
+  prepare_tauri_dist
+  mark_stage_built gui
+}
+
+build_kernel() {
+  if stage_should_skip kernel \
+    "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
+    "$CARGO_TARGET_ROOT/release/deepcode-cli" \
+    "$CARGO_TARGET_ROOT/release/deepcode-tui" \
+    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" \
+    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" \
+    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe"; then
+    return
+  fi
+  configure_sccache
+  echo "==[build][kernel]== build Rust daemon/client Host shells for Linux"
+  cargo build --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+  echo "==[build][kernel]== build Rust daemon/client Host shells for Windows GNU"
+  cargo build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+  mark_stage_built kernel
+  show_sccache_stats
+}
+
+build_tauri() {
+  if [ ! -d "$CLIENT_DIR/dist" ]; then
+    echo "==[build][tauri]== GUI dist missing; building GUI first"
+    build_gui
+  else
+    prepare_tauri_dist
+  fi
+  if stage_should_skip tauri "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe"; then
+    return
+  fi
+  configure_sccache
+  echo "==[build][tauri]== build Windows DeepCode.exe GUI shell"
+  pnpm --filter @deepcode/tauri-shell tauri:build -- --target "$WINDOWS_TARGET"
+  mark_stage_built tauri
+  show_sccache_stats
+}
 
 prepare_distribution_tree() {
   local dist_dir="$1"
@@ -92,72 +319,17 @@ prepare_distribution_tree() {
   fi
 }
 
-prepare_distribution_tree "$LINUX_DIR"
-prepare_distribution_tree "$WIN_DIR"
-
-cp -v "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$LINUX_DIR/deepcode-kernel"
-chmod +x "$LINUX_DIR/deepcode-kernel"
-cp -v "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode-cli"
-cp -v "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode"
-cp -v "$CARGO_TARGET_ROOT/release/deepcode-tui" "$LINUX_DIR/deepcode-tui"
-chmod +x "$LINUX_DIR/deepcode-cli" "$LINUX_DIR/deepcode" "$LINUX_DIR/deepcode-tui"
-
-cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "$WIN_DIR/deepcode-kernel.exe"
-cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "$WIN_DIR/deepcode-cli.exe"
-cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe" "$WIN_DIR/deepcode-tui.exe"
-cp -v "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "$WIN_DIR/DeepCode.exe"
-
-WEBVIEW2_LOADER_DLL="$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/WebView2Loader.dll"
-if [ ! -f "$WEBVIEW2_LOADER_DLL" ]; then
-  WEBVIEW2_LOADER_DLL="$(find "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/build" \
-    -path '*/out/x64/WebView2Loader.dll' \
-    -type f \
-    | head -n 1)"
-fi
-if [ ! -f "$WEBVIEW2_LOADER_DLL" ]; then
-  echo "==[build][error]== WebView2Loader.dll was not found in Windows Tauri build output" >&2
-  exit 1
-fi
-cp -v "$WEBVIEW2_LOADER_DLL" "$WIN_DIR/WebView2Loader.dll"
-
-echo "==[build][7/7]== generate host launchers"
-cat > "$LINUX_DIR/deepcode-gui" <<'LAUNCHER'
-#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export DEEPCODE_CLIENT_DIST="${DEEPCODE_CLIENT_DIST:-$SCRIPT_DIR/web}"
-export DEEPCODE_HOST="${DEEPCODE_HOST:-127.0.0.1}"
-export DEEPCODE_PORT="${DEEPCODE_PORT:-31245}"
-"$SCRIPT_DIR/deepcode-kernel" "$@"
-LAUNCHER
-chmod +x "$LINUX_DIR/deepcode-gui"
-
-cat > "$WIN_DIR/deepcode-cli.bat" <<'LAUNCHER'
-@echo off
-setlocal
-set "SCRIPT_DIR=%~dp0"
-if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
-if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
-"%SCRIPT_DIR%deepcode-cli.exe" %*
-LAUNCHER
-
-cat > "$WIN_DIR/deepcode-tui.bat" <<'LAUNCHER'
-@echo off
-setlocal
-set "SCRIPT_DIR=%~dp0"
-if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
-if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
-"%SCRIPT_DIR%deepcode-tui.exe" %*
-LAUNCHER
-
-cat > "$WIN_DIR/deepcode.cmd" <<'LAUNCHER'
-@echo off
-setlocal
-set "SCRIPT_DIR=%~dp0"
-if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
-if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
-"%SCRIPT_DIR%deepcode-cli.exe" %*
-LAUNCHER
+copy_required_file() {
+  local src="$1"
+  local dst="$2"
+  local hint="$3"
+  if [ ! -f "$src" ]; then
+    echo "==[build][error]== missing artifact: $src" >&2
+    echo "==[build][error]== $hint" >&2
+    exit 1
+  fi
+  cp -v "$src" "$dst"
+}
 
 write_readme() {
   local dist_dir="$1"
@@ -212,23 +384,128 @@ Health check:
 README
 }
 
-write_readme "$LINUX_DIR" "linux-x64"
-write_readme "$WIN_DIR" "win64"
+package_distribution() {
+  echo "==[build][package]== prepare bin/linux-x64 and bin/win64 directories"
+  mkdir -p "$LINUX_DIR" "$WIN_DIR"
+  find "$LINUX_DIR" -mindepth 1 -delete 2>/dev/null || true
+  find "$WIN_DIR" -mindepth 1 -delete 2>/dev/null || true
 
-if [ "$BUILD_LINUX_TAURI_SHELL" = "1" ]; then
-  echo "==[build][opt]== build Linux Tauri thin shell"
-  pnpm --filter @deepcode/tauri-shell tauri:build
-  TAURI_RELEASE="$CARGO_TARGET_ROOT/release/DeepCode"
-  if [ -x "$TAURI_RELEASE" ]; then
-    cp -v "$TAURI_RELEASE" "$LINUX_DIR/DeepCode"
-    chmod +x "$LINUX_DIR/DeepCode"
-  else
-    echo "==[build][opt]== Tauri shell build completed, but no Linux release binary was found at $TAURI_RELEASE"
+  prepare_distribution_tree "$LINUX_DIR"
+  prepare_distribution_tree "$WIN_DIR"
+
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$LINUX_DIR/deepcode-kernel" \
+    "run ./build.sh --stage kernel first"
+  chmod +x "$LINUX_DIR/deepcode-kernel"
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode-cli" \
+    "run ./build.sh --stage kernel first"
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode" \
+    "run ./build.sh --stage kernel first"
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "$LINUX_DIR/deepcode-tui" \
+    "run ./build.sh --stage kernel first"
+  chmod +x "$LINUX_DIR/deepcode-cli" "$LINUX_DIR/deepcode" "$LINUX_DIR/deepcode-tui"
+
+  copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "$WIN_DIR/deepcode-kernel.exe" \
+    "run ./build.sh --stage kernel first"
+  copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "$WIN_DIR/deepcode-cli.exe" \
+    "run ./build.sh --stage kernel first"
+  copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe" "$WIN_DIR/deepcode-tui.exe" \
+    "run ./build.sh --stage kernel first"
+  copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "$WIN_DIR/DeepCode.exe" \
+    "run ./build.sh --stage tauri first"
+
+  local webview2_loader_dll="$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/WebView2Loader.dll"
+  if [ ! -f "$webview2_loader_dll" ]; then
+    webview2_loader_dll="$(find "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/build" \
+      -path '*/out/x64/WebView2Loader.dll' \
+      -type f \
+      | head -n 1)"
   fi
-else
-  echo "==[build][opt]== Linux Tauri shell build skipped; set DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 to enable"
+  if [ ! -f "$webview2_loader_dll" ]; then
+    echo "==[build][error]== WebView2Loader.dll was not found in Windows Tauri build output" >&2
+    exit 1
+  fi
+  cp -v "$webview2_loader_dll" "$WIN_DIR/WebView2Loader.dll"
+
+  echo "==[build][package]== generate host launchers"
+  cat > "$LINUX_DIR/deepcode-gui" <<'LAUNCHER'
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export DEEPCODE_CLIENT_DIST="${DEEPCODE_CLIENT_DIST:-$SCRIPT_DIR/web}"
+export DEEPCODE_HOST="${DEEPCODE_HOST:-127.0.0.1}"
+export DEEPCODE_PORT="${DEEPCODE_PORT:-31245}"
+"$SCRIPT_DIR/deepcode-kernel" "$@"
+LAUNCHER
+  chmod +x "$LINUX_DIR/deepcode-gui"
+
+  cat > "$WIN_DIR/deepcode-cli.bat" <<'LAUNCHER'
+@echo off
+setlocal
+set "SCRIPT_DIR=%~dp0"
+if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
+if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
+"%SCRIPT_DIR%deepcode-cli.exe" %*
+LAUNCHER
+
+  cat > "$WIN_DIR/deepcode-tui.bat" <<'LAUNCHER'
+@echo off
+setlocal
+set "SCRIPT_DIR=%~dp0"
+if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
+if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
+"%SCRIPT_DIR%deepcode-tui.exe" %*
+LAUNCHER
+
+  cat > "$WIN_DIR/deepcode.cmd" <<'LAUNCHER'
+@echo off
+setlocal
+set "SCRIPT_DIR=%~dp0"
+if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
+if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
+"%SCRIPT_DIR%deepcode-cli.exe" %*
+LAUNCHER
+
+  write_readme "$LINUX_DIR" "linux-x64"
+  write_readme "$WIN_DIR" "win64"
+
+  if [ "$BUILD_LINUX_TAURI_SHELL" = "1" ]; then
+    echo "==[build][opt]== build Linux Tauri thin shell"
+    configure_sccache
+    pnpm --filter @deepcode/tauri-shell tauri:build
+    local tauri_release="$CARGO_TARGET_ROOT/release/DeepCode"
+    if [ -x "$tauri_release" ]; then
+      cp -v "$tauri_release" "$LINUX_DIR/DeepCode"
+      chmod +x "$LINUX_DIR/DeepCode"
+    else
+      echo "==[build][opt]== Tauri shell build completed, but no Linux release binary was found at $tauri_release"
+    fi
+  else
+    echo "==[build][opt]== Linux Tauri shell build skipped; set DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 to enable"
+  fi
+}
+
+if [ "$run_deps" = "1" ]; then
+  run_pnpm_install
+fi
+
+if [ "$run_gui" = "1" ]; then
+  build_gui
+fi
+
+if [ "$run_kernel" = "1" ]; then
+  build_kernel
+fi
+
+if [ "$run_tauri" = "1" ]; then
+  build_tauri
+fi
+
+if [ "$run_package" = "1" ]; then
+  package_distribution
 fi
 
 echo ""
 echo "==[build]== DONE"
-find "$LINUX_DIR" "$WIN_DIR" -maxdepth 2 -type f | sort
+if [ -d "$LINUX_DIR" ] || [ -d "$WIN_DIR" ]; then
+  find "$LINUX_DIR" "$WIN_DIR" -maxdepth 2 -type f 2>/dev/null | sort || true
+fi

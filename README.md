@@ -48,6 +48,17 @@ pnpm dev:client
 ./build.sh
 ```
 
+`build.sh` 默认完整产出 Linux / Windows 分发目录；开发迭代时可按阶段运行：
+
+```bash
+./build.sh --stage gui
+./build.sh --stage kernel
+./build.sh --stage tauri
+./build.sh --stage package
+```
+
+Rust 构建默认复用统一 `CARGO_TARGET_DIR`，并在环境内存在 `sccache` 时自动使用本地 disk cache。`gui/kernel/tauri` 阶段会用 `.build-cache/build-stamps/` 判断输入是否变化；需要强制重跑时设置 `DEEPCODE_FORCE_BUILD=1`。排查缓存问题时可用 `DEEPCODE_DISABLE_SCCACHE=1 ./build.sh --stage kernel` 临时关闭 sccache。
+
 Linux:
 
 ```bash
@@ -137,8 +148,9 @@ docker run --rm -t -v "$PWD:/workspace" -w /workspace deepcode-dev ./test.sh
 
 `./test.sh` 覆盖当前默认门禁：
 
-- Rust workspace `cargo fmt/check/test`
+- Rust workspace `cargo fmt/test`
 - TS `protocol/session-core/gui` build/typecheck
+- Stage 10.5 构建缓存自检：Cargo incremental、`build.sh --stage`、sccache 开关、Docker BuildKit cache 配置
 - `deepcode-kernel-audit` canonical/hash chain/segment seal/tamper tests
 - CLI/TUI Host Shell smoke：`deepcode --help`、CLI REPL、`deepcode-tui --smoke`
 - Kernel Daemon `/api/health`、`/api/kernel/commands`、`/api/kernel/snapshot`
@@ -158,6 +170,14 @@ docker run --rm -t -v "$PWD:/workspace" -w /workspace deepcode-dev ./test.sh
 ```bash
 DEEPCODE_SKIP_PACKAGING_SMOKE=1 ./test.sh
 ```
+
+需要生成构建基线报告时，仍通过统一测试入口启用：
+
+```bash
+DEEPCODE_RUN_BUILD_BENCH=1 ./test.sh
+```
+
+报告写入被忽略的 `.deepcode/build-baselines/`，用于对比 repeat build、Rust 文件 mtime 变化和 GUI 文件 mtime 变化后的重编范围。
 
 ## 当前能力
 

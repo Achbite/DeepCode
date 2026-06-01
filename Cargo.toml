@@ -29,6 +29,12 @@ rust-version = "1.77"
 license = "MIT"
 authors = ["DeepCode Team"]
 
+[profile.dev]
+incremental = true
+
+[profile.release]
+incremental = true
+
 [workspace.dependencies]
 deepcode-kernel-abi = { path = "crates/deepcode-kernel-abi" }
 deepcode-kernel-config = { path = "crates/deepcode-kernel-config" }

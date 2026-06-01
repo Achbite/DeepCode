@@ -13,6 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PNPM_HOME=/root/.local/share/pnpm \
+    SCCACHE_DIR=/workspace/.build-cache/sccache \
     PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # ---- 1. 系统依赖 ----
@@ -20,20 +21,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # - Windows 交叉编译基础：gcc-mingw-w64-x86-64 + binutils-mingw-w64
 # - 健康检查辅助：iputils-ping / netcat-openbsd / jq
 # - Tauri thin shell 静态检查/打包准备：WebKitGTK、AppIndicator、SVG、patchelf
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# - sccache：由 build.sh 按需启用，DEEPCODE_DISABLE_SCCACHE=1 可关闭
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
         curl wget ca-certificates git \
         build-essential pkg-config make file \
         libssl-dev \
         libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf \
         gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
-        iputils-ping netcat-openbsd jq xz-utils \
-    && rm -rf /var/lib/apt/lists/*
+        iputils-ping netcat-openbsd jq xz-utils sccache
 
 # ---- 2. Node.js 22 LTS ----
 # 官方 NodeSource 安装脚本；本镜像仅用于开发，不追求最小体积
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
- && rm -rf /var/lib/apt/lists/* \
  && node --version && npm --version
 
 # ---- 3. pnpm ----
@@ -43,8 +47,18 @@ RUN corepack enable && corepack prepare pnpm@9.12.0 --activate \
 
 # ---- 4. Rust Windows 交叉目标 ----
 # 让 Rust 支持 x86_64-pc-windows-gnu，配合 mingw-w64 工具链产出 Windows 二进制
-RUN rustup target add x86_64-pc-windows-gnu \
+RUN --mount=type=cache,target=/usr/local/rustup/downloads,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    rustup target add x86_64-pc-windows-gnu \
  && rustup component add rustfmt clippy
+
+# ---- 4b. BuildKit cache anchors ----
+# 运行期仍通过挂载的工作区复用 target；这里声明 target/sccache cache 形态，
+# 让 Docker BuildKit 与 test/build 脚本的缓存目录保持一致。
+RUN --mount=type=cache,target=/workspace/target,sharing=locked \
+    --mount=type=cache,target=/workspace/.build-cache/sccache,sharing=locked \
+    mkdir -p /workspace/target /workspace/.build-cache/sccache
 
 # ---- 5. 入口脚本 ----
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ====================================================================
-# DeepCode stage 9/10 layered smoke test
+# DeepCode stage 9/10/10.5 layered smoke test
 #
 # 默认执行 fast smoke：语法、Rust workspace、TS typecheck/build、阶段 9
-# 边界门禁、Kernel daemon API smoke、阶段 10.0 CLI/TUI smoke 和
-# 阶段 10 audit tamper tests。packaging/slow 通过环境变量启用。
+# 边界门禁、Kernel daemon API smoke、阶段 10.0 CLI/TUI smoke、
+# 阶段 10 audit tamper tests 与阶段 10.5 构建缓存自检。
+# packaging/slow/build baseline probe 通过环境变量启用。
 # ====================================================================
 set -euo pipefail
 
@@ -21,6 +22,20 @@ DAEMON_LOG=""
 DAEMON_PID=""
 PROXY_LOG=""
 PROXY_PID=""
+
+configure_test_sccache() {
+  if [ "${DEEPCODE_DISABLE_SCCACHE:-0}" = "1" ]; then
+    unset RUSTC_WRAPPER
+    return
+  fi
+
+  if command -v sccache >/dev/null 2>&1; then
+    export SCCACHE_DIR="${SCCACHE_DIR:-$ROOT_DIR/.build-cache/sccache}"
+    mkdir -p "$SCCACHE_DIR"
+    export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
+    info "sccache enabled for test cargo commands: SCCACHE_DIR=$SCCACHE_DIR"
+  fi
+}
 
 pass() { echo -e "\033[32m[PASS]\033[0m $*"; }
 fail() { echo -e "\033[31m[FAIL]\033[0m $*"; exit 1; }
@@ -48,9 +63,9 @@ search() {
   local pattern="$1"
   shift
   if command -v rg >/dev/null 2>&1; then
-    rg -n "$pattern" "$@"
+    rg -n -- "$pattern" "$@"
   else
-    grep -RInE "$pattern" "$@"
+    grep -RInE -- "$pattern" "$@"
   fi
 }
 
@@ -114,15 +129,129 @@ PY
   pass "$label"
 }
 
+count_log_pattern() {
+  local pattern="$1"
+  local logfile="$2"
+  grep -E "$pattern" "$logfile" 2>/dev/null | wc -l | tr -d ' '
+}
+
+run_build_baseline_probe() {
+  local stamp out_dir log_dir report
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  out_dir="$ROOT_DIR/.deepcode/build-baselines"
+  log_dir="$out_dir/logs"
+  report="$out_dir/${stamp}-baseline.md"
+  local dirty_detail="$log_dir/${stamp}-dirty-first-20.md"
+  mkdir -p "$log_dir"
+  : >"$dirty_detail"
+
+  cat >"$report" <<REPORT
+# DeepCode Build Baseline ${stamp}
+
+## Environment
+
+- root: \`$ROOT_DIR\`
+- cargo target: \`${CARGO_TARGET_DIR:-$ROOT_DIR/target}\`
+- rustc: \`$(rustc --version 2>/dev/null || echo unavailable)\`
+- cargo: \`$(cargo --version 2>/dev/null || echo unavailable)\`
+- pnpm: \`$(pnpm --version 2>/dev/null || echo unavailable)\`
+- sccache: \`$(sccache --version 2>/dev/null || echo unavailable)\`
+- sccache disabled: \`${DEEPCODE_DISABLE_SCCACHE:-0}\`
+
+## Scenarios
+
+| Scenario | Exit | Seconds | Fresh | Dirty | Compiling | Log |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+REPORT
+
+  run_build_scenario() {
+    local key="$1"
+    local label="$2"
+    shift 2
+    local logfile="$log_dir/${stamp}-${key}.log"
+    local start end status fresh dirty compiling
+
+    info "build bench: $label"
+    start="$(date +%s)"
+    set +e
+    "$@" >"$logfile" 2>&1
+    status="$?"
+    set -e
+    end="$(date +%s)"
+
+    fresh="$(count_log_pattern '^[[:space:]]*Fresh ' "$logfile")"
+    dirty="$(count_log_pattern '^[[:space:]]*Dirty ' "$logfile")"
+    compiling="$(count_log_pattern '^[[:space:]]*Compiling ' "$logfile")"
+
+    printf '| %s | %s | %s | %s | %s | %s | `%s` |\n' \
+      "$label" "$status" "$((end - start))" "$fresh" "$dirty" "$compiling" \
+      "${logfile#$ROOT_DIR/}" >>"$report"
+
+    {
+      printf '### %s\n\n' "$label"
+      grep -E '^[[:space:]]*Dirty ' "$logfile" 2>/dev/null | head -n 20 || true
+      printf '\n'
+    } >>"$dirty_detail"
+  }
+
+  run_build_scenario "cargo-first" "cargo release first" \
+    cargo build -vv --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+
+  run_build_scenario "cargo-repeat" "cargo release repeat" \
+    cargo build -vv --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+
+  touch "$ROOT_DIR/crates/deepcode-kernel-runtime/src/lib.rs"
+  run_build_scenario "cargo-runtime-touch" "cargo release after runtime touch" \
+    cargo build -vv --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+
+  if command -v pnpm >/dev/null 2>&1; then
+    if [ -f "$ROOT_DIR/userspace/gui/src/App.tsx" ]; then
+      touch "$ROOT_DIR/userspace/gui/src/App.tsx"
+    elif [ -f "$ROOT_DIR/userspace/gui/package.json" ]; then
+      touch "$ROOT_DIR/userspace/gui/package.json"
+    fi
+    run_build_scenario "gui-touch" "pnpm gui build after gui touch" \
+      pnpm --filter @deepcode/client build
+  else
+    printf '| pnpm gui build after gui touch | skipped | 0 | 0 | 0 | 0 | `pnpm unavailable` |\n' >>"$report"
+  fi
+
+  cat >>"$report" <<'REPORT'
+
+## Dirty first 20
+
+REPORT
+  cat "$dirty_detail" >>"$report"
+
+  cat >>"$report" <<'REPORT'
+
+## Notes
+
+- `touch` scenarios only update file mtimes; they should not create Git diffs.
+- Cargo counts are parsed from verbose cargo output and are intended for trend comparison, not exact dependency accounting.
+- If `sccache` is available, inspect hit rate with `sccache --show-stats`.
+REPORT
+
+  pass "build baseline report written to ${report#$ROOT_DIR/}"
+}
+
 info "[1/8] tool and shell checks"
 require_tool bash
 require_tool cargo
 require_tool python3
 require_tool grep
+configure_test_sccache
 bash -n test.sh
 bash -n build.sh
 deprecated_build_markers_regex='DEEPCODE_VERSION''_TAG|source''Hash|build-info''\.json|build''Version|release''\.json'
-! search "$deprecated_build_markers_regex" build.sh README.md test.sh /mnt/e/Dev-Agent/技术方案/临时上下文存储.md /mnt/e/Dev-Agent/技术方案/开发规划方案.md >/dev/null \
+version_scan_paths=(build.sh README.md test.sh)
+for optional_doc in \
+  /mnt/e/Dev-Agent/技术方案/临时上下文存储.md \
+  /mnt/e/Dev-Agent/技术方案/开发规划方案.md
+do
+  [ -f "$optional_doc" ] && version_scan_paths+=("$optional_doc")
+done
+! search "$deprecated_build_markers_regex" "${version_scan_paths[@]}" >/dev/null \
   || fail "build version/source hash metadata must stay postponed"
 ! search "deepcode\\.exe" build.sh || fail "Windows CLI must not generate deepcode.exe; use DeepCode.exe for GUI and deepcode-cli.exe/deepcode.cmd for CLI"
 pass "shell scripts parse"
@@ -192,7 +321,15 @@ search "enum Command|DaemonStatus|Ask" shells/cli/src/main.rs >/dev/null
 search "run_interactive|/help|/status|/ask <prompt>|/quit" shells/cli/src/main.rs >/dev/null
 search "ratatui|crossterm|CardModel|struct Renderer|audit-status|command_help|/help|/status|/ask <prompt>|/quit" shells/tui/src >/dev/null
 ! search "DeepCodeKernelRuntime|deepcode-kernel-runtime" crates/deepcode-kernel-client/src shells/cli/src shells/tui/src || fail "CLI/TUI/client must not reference Kernel runtime"
-pass "stage 9/10 grep gates"
+search "\\[profile\\.dev\\]" Cargo.toml >/dev/null
+search "\\[profile\\.release\\]" Cargo.toml >/dev/null
+search "incremental = true" Cargo.toml >/dev/null
+search "DEEPCODE_DISABLE_SCCACHE|RUSTC_WRAPPER|sccache --show-stats|--stage" build.sh >/dev/null
+search "\\.deepcode/build-baselines/" .gitignore >/dev/null
+search "\\.build-cache|\\.deepcode/build-baselines|\\.pnpm-store" .dockerignore >/dev/null
+search "run_build_baseline_probe|cargo release repeat|cargo release after runtime touch|build-baselines" test.sh >/dev/null
+search "--mount=type=cache|sccache|SCCACHE_DIR" Dockerfile.dev >/dev/null
+pass "stage 9/10/10.5 grep gates"
 
 info "[5/8] Kernel daemon HTTP smoke"
 CONFIG_DIR="$(mktemp -d /tmp/deepcode-stage9-config-XXXXXX)"
@@ -290,5 +427,20 @@ else
   info "packaging smoke skipped; set DEEPCODE_SKIP_PACKAGING_SMOKE=0 to enable"
 fi
 
+info "[7b/8] optional build baseline probe"
+if [ "${DEEPCODE_RUN_BUILD_BENCH:-0}" = "1" ]; then
+  run_build_baseline_probe
+  pass "build baseline probe"
+else
+  info "build baseline probe skipped; set DEEPCODE_RUN_BUILD_BENCH=1 to enable"
+fi
+
+if command -v sccache >/dev/null 2>&1 && [ "${DEEPCODE_DISABLE_SCCACHE:-0}" != "1" ]; then
+  info "sccache stats"
+  sccache --show-stats || true
+else
+  info "sccache stats unavailable or disabled"
+fi
+
 info "[8/8] done"
-pass "DeepCode stage 9/10 fast smoke passed"
+pass "DeepCode stage 9/10/10.5 fast smoke passed"
