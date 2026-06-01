@@ -762,8 +762,8 @@
  * 设计目标：每段思考独立成"选项卡"风格折叠卡片，点击展开查看详情。
  * 视觉规格：
  *   - 占满消息列容器宽度（align-self: stretch），不再 fit-content
- *   - 60px 高度，明显的卡片矩形而非细横条
- *   - 4px 实色左色条作为视觉锚点（区分思考过程与工具批次）
+ *   - 34px 高度，保留卡片形态但不挤占消息区
+ *   - 3px 实色左色条作为视觉锚点（区分思考过程与工具批次）
  *   - 大圆角 8px + box-shadow 让卡片浮起
  *   - 移除 overflow: hidden 避免内容塌陷
  *   - hover 时 border 与 background 强化反馈
@@ -773,10 +773,10 @@
   display: block;
   align-self: stretch;
   width: 100%;
-  margin: 4px 0;
+  margin: 2px 0;
   padding: 0;
   border: 1px solid rgba(10, 132, 255, 0.22);
-  border-left: 4px solid var(--accent, #0a84ff);
+  border-left: 3px solid var(--accent, #0a84ff);
   border-radius: 8px;
   background: rgba(10, 132, 255, 0.04);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
@@ -793,14 +793,14 @@
 
 .agent-thinking-trace__summary {
   width: 100%;
-  min-height: 60px;
+  min-height: 34px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   border: 0;
   background: transparent;
-  padding: 16px 18px;
+  padding: 7px 10px;
   color: inherit;
   cursor: pointer;
   font: inherit;
@@ -817,7 +817,7 @@
   display: grid;
   grid-template-columns: 12px minmax(0, 1fr);
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 
 .agent-thinking-trace__dot {

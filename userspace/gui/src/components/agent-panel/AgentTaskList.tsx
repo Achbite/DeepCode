@@ -299,6 +299,10 @@ function hasToolActivity(events: AgentEvent[]): boolean {
   );
 }
 
+function inferAssistantTaskStage(event: AgentEvent, toolActivity: boolean): string {
+  return stringField(event.payload, 'stage') ?? (toolActivity ? 'complete' : 'plan');
+}
+
 function shouldShowWorkflowSummary(stage: string, status: string, toolActivity: boolean): boolean {
   if (status === 'started' || status === 'error') return true;
   if (!toolActivity) return stage === 'complete' || stage === 'review';
@@ -342,16 +346,19 @@ function deriveTasks(events: AgentEvent[], loading: boolean, language: UiLanguag
     }
 
     if (event.kind === 'assistant_msg') {
-      const stage = stringField(event.payload, 'stage');
-      if (!stage) continue;
+      const content = stringField(event.payload, 'content') ?? '';
+      if (!content.trim()) continue;
+      const stage = inferAssistantTaskStage(event, toolActivity);
       if (toolActivity && stage !== 'complete') continue;
       const task = ensureTask(tasks, stage, language);
       focusTaskId = task.id;
+      if (task.status === 'planned') {
+        task.status = loading ? 'running' : 'completed';
+      }
       pushCommand(
         task,
         humanizeAgentOutput(
-          stringField(event.payload, 'content') ??
-            t(language, 'agent.task.assistantOutput'),
+          content || t(language, 'agent.task.assistantOutput'),
           language
         ),
         event.id
@@ -448,6 +455,17 @@ function deriveTasks(events: AgentEvent[], loading: boolean, language: UiLanguag
   };
 }
 
+function isDefaultWaitingState(state: AgentTaskState): boolean {
+  return state.tasks.length === 1 && state.tasks[0]?.id === 'task-waiting';
+}
+
+function isUsableTaskState(state: AgentTaskState): boolean {
+  return state.tasks.some((task) =>
+    task.id !== 'task-waiting' &&
+    (task.hasMeaningfulOutput || task.hasToolActivity || task.status === 'running' || task.status === 'completed' || task.status === 'error')
+  );
+}
+
 interface AgentTaskListProps {
   events: AgentEvent[];
   traceEvents?: AgentTraceEvent[];
@@ -456,13 +474,21 @@ interface AgentTaskListProps {
 }
 
 const AgentTaskList: React.FC<AgentTaskListProps> = ({ events, traceEvents = [], loading, language }) => {
-  const taskEvents = useMemo(
-    () => (traceEvents.length > 0 ? traceEventsToAgentEvents(traceEvents) : events),
-    [events, traceEvents]
-  );
   const taskState = useMemo(
-    () => deriveTasks(taskEvents, loading, language),
-    [language, loading, taskEvents]
+    () => {
+      const eventState = deriveTasks(events, loading, language);
+      if (traceEvents.length === 0) return eventState;
+
+      const traceAgentEvents = traceEventsToAgentEvents(traceEvents);
+      if (traceAgentEvents.length === 0) return eventState;
+
+      const traceState = deriveTasks(traceAgentEvents, loading, language);
+      if (!isUsableTaskState(traceState) && !isDefaultWaitingState(eventState)) {
+        return eventState;
+      }
+      return traceState;
+    },
+    [events, language, loading, traceEvents]
   );
   const tasks = taskState.tasks;
   const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);

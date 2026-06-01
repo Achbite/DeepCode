@@ -307,6 +307,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null } : {}),
       });
       if (wasActive) {
+        const nextSessionId = result.data.currentSessionId;
+        if (nextSessionId && nextSessionId !== sessionId) {
+          await get().activateSession(nextSessionId);
+          return;
+        }
         await get().loadOrCreate();
       }
       return;

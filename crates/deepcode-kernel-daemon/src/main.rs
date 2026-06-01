@@ -1673,7 +1673,8 @@ async fn terminal_events(
 }
 
 async fn agent_sessions_list(State(state): State<AppState>) -> Json<ApiResponse> {
-    let gui = state.gui.lock().expect("gui state lock");
+    let mut gui = state.gui.lock().expect("gui state lock");
+    refresh_pending_session_titles(&mut gui);
     ApiResponse::ok(json!({
         "sessions": gui.sessions,
         "currentSessionId": gui.current_session_id
@@ -1692,18 +1693,17 @@ async fn agent_session_create(
         .or_else(|| body.get("initialMode"))
         .and_then(Value::as_str)
         .unwrap_or("plan");
-    let session = json!({
-        "id": id,
-        "title": body.get("title").and_then(Value::as_str).unwrap_or("New Agent Session"),
-        "mode": mode,
-        "profileId": body.get("profileId").and_then(Value::as_str),
-        "workspaceId": body.get("workspaceId").and_then(Value::as_str),
-        "workspaceHash": body.get("workspaceHash").and_then(Value::as_str),
-        "titleSource": "pending",
-        "eventCount": 0,
-        "createdAt": now,
-        "updatedAt": now
-    });
+    let session = create_agent_session_value(
+        &id,
+        &now,
+        body.get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("New Agent Session"),
+        mode,
+        body.get("profileId").and_then(Value::as_str),
+        body.get("workspaceId").and_then(Value::as_str),
+        body.get("workspaceHash").and_then(Value::as_str),
+    );
     gui.current_session_id = Some(id.clone());
     gui.session_projection_cache.insert(id.clone(), Vec::new());
     gui.trace_events.insert(id.clone(), Vec::new());
@@ -1712,7 +1712,8 @@ async fn agent_session_create(
 }
 
 async fn agent_session_current(State(state): State<AppState>) -> Json<ApiResponse> {
-    let gui = state.gui.lock().expect("gui state lock");
+    let mut gui = state.gui.lock().expect("gui state lock");
+    refresh_pending_session_titles(&mut gui);
     let Some(session_id) = gui.current_session_id.as_ref() else {
         return ApiResponse::ok(Value::Null);
     };
@@ -1726,6 +1727,7 @@ async fn agent_session_activate(
     let mut gui = state.gui.lock().expect("gui state lock");
     if has_session(&gui, &session_id) {
         gui.current_session_id = Some(session_id.clone());
+        refresh_pending_session_titles(&mut gui);
         return session_result(&gui, &session_id);
     }
     ApiResponse::error("agent_session_not_found", "agent session not found")
@@ -1754,18 +1756,39 @@ async fn agent_session_archive(
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
     let mut gui = state.gui.lock().expect("gui state lock");
+    let should_archive = body
+        .get("archived")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let was_current = gui.current_session_id.as_deref() == Some(session_id.as_str());
+    let mut replacement_scope: Option<(Option<String>, Option<String>, Option<String>)> = None;
     if let Some(session) = session_mut(&mut gui, &session_id) {
-        if body
-            .get("archived")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-        {
+        if should_archive {
+            if was_current {
+                replacement_scope = Some((
+                    session
+                        .get("profileId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    session
+                        .get("workspaceId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    session
+                        .get("workspaceHash")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                ));
+            }
             session["archivedAt"] = json!(now_text());
         } else {
             session
                 .as_object_mut()
                 .map(|object| object.remove("archivedAt"));
         }
+    }
+    if should_archive && was_current {
+        ensure_current_agent_session(&mut gui, replacement_scope);
     }
     ApiResponse::ok(json!({
         "sessions": gui.sessions,
@@ -1788,6 +1811,7 @@ async fn agent_session_append_events(
         .entry(session_id.clone())
         .or_default()
         .extend(incoming);
+    refresh_pending_session_titles(&mut gui);
     update_session_event_count(&mut gui, &session_id);
     session_result(&gui, &session_id)
 }
@@ -1797,14 +1821,15 @@ async fn agent_session_send_message(
     Path(session_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
+    let request = build_agent_run_request(&body);
     {
-        let gui = state.gui.lock().expect("gui state lock");
+        let mut gui = state.gui.lock().expect("gui state lock");
         if !has_session(&gui, &session_id) {
             return ApiResponse::error("agent_session_not_found", "agent session not found");
         }
+        maybe_auto_title_session(&mut gui, &session_id, &request.content);
     }
 
-    let request = build_agent_run_request(&body);
     let user_event = agent_event(
         &session_id,
         "user_msg",
@@ -3905,10 +3930,146 @@ fn now_text() -> String {
     now_millis().to_string()
 }
 
-fn has_session(gui: &GuiState, session_id: &str) -> bool {
-    gui.sessions
+fn create_agent_session_value(
+    id: &str,
+    now: &str,
+    title: &str,
+    mode: &str,
+    profile_id: Option<&str>,
+    workspace_id: Option<&str>,
+    workspace_hash: Option<&str>,
+) -> Value {
+    json!({
+        "id": id,
+        "title": title,
+        "mode": mode,
+        "profileId": profile_id,
+        "workspaceId": workspace_id,
+        "workspaceHash": workspace_hash,
+        "titleSource": "pending",
+        "eventCount": 0,
+        "createdAt": now,
+        "updatedAt": now
+    })
+}
+
+fn is_archived_session(session: &Value) -> bool {
+    session.get("archivedAt").and_then(Value::as_str).is_some()
+}
+
+fn ensure_current_agent_session(
+    gui: &mut GuiState,
+    fallback_scope: Option<(Option<String>, Option<String>, Option<String>)>,
+) {
+    if let Some(next_id) = gui
+        .sessions
         .iter()
-        .any(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+        .find(|session| !is_archived_session(session))
+        .and_then(|session| session.get("id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+    {
+        gui.current_session_id = Some(next_id);
+        return;
+    }
+
+    let id = format!("session-{}", now_millis());
+    let now = now_text();
+    let (profile_id, workspace_id, workspace_hash) = fallback_scope.unwrap_or_default();
+    let session = create_agent_session_value(
+        &id,
+        &now,
+        "New Agent Session",
+        "plan",
+        profile_id.as_deref(),
+        workspace_id.as_deref(),
+        workspace_hash.as_deref(),
+    );
+    gui.current_session_id = Some(id.clone());
+    gui.session_projection_cache.insert(id.clone(), Vec::new());
+    gui.trace_events.insert(id.clone(), Vec::new());
+    gui.sessions.insert(0, session);
+}
+
+fn compact_agent_session_title(content: &str) -> Option<String> {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    const TITLE_CHAR_LIMIT: usize = 28;
+    let char_count = normalized.chars().count();
+    if char_count <= TITLE_CHAR_LIMIT {
+        return Some(normalized);
+    }
+    let title = normalized
+        .chars()
+        .take(TITLE_CHAR_LIMIT)
+        .collect::<String>();
+    Some(format!("{title}…"))
+}
+
+fn maybe_auto_title_session(gui: &mut GuiState, session_id: &str, content: &str) {
+    let Some(title) = compact_agent_session_title(content) else {
+        return;
+    };
+    if let Some(session) = session_mut(gui, session_id) {
+        let source = session
+            .get("titleSource")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+        if source == "pending" {
+            session["title"] = json!(title);
+            session["titleSource"] = json!("auto");
+            session["updatedAt"] = json!(now_text());
+        }
+    }
+}
+
+fn first_user_message_content(events: &[Value]) -> Option<String> {
+    events.iter().find_map(|event| {
+        if event.get("kind").and_then(Value::as_str) != Some("user_msg") {
+            return None;
+        }
+        event
+            .get("payload")
+            .and_then(|payload| payload.get("content"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn refresh_pending_session_titles(gui: &mut GuiState) {
+    let sessions_dir = gui.paths.sessions_dir.clone();
+    let pending_ids = gui
+        .sessions
+        .iter()
+        .filter(|session| {
+            session
+                .get("titleSource")
+                .and_then(Value::as_str)
+                .unwrap_or("pending")
+                == "pending"
+        })
+        .filter_map(|session| session.get("id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    for session_id in pending_ids {
+        let events = gui
+            .session_projection_cache
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_else(|| read_session_projection_jsonl(&sessions_dir, &session_id));
+        if let Some(content) = first_user_message_content(&events) {
+            maybe_auto_title_session(gui, &session_id, &content);
+        }
+    }
+}
+
+fn has_session(gui: &GuiState, session_id: &str) -> bool {
+    gui.sessions.iter().any(|session| {
+        session.get("id").and_then(Value::as_str) == Some(session_id)
+            && !is_archived_session(session)
+    })
 }
 
 fn session_mut<'a>(gui: &'a mut GuiState, session_id: &str) -> Option<&'a mut Value> {

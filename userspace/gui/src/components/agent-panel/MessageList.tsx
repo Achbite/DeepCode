@@ -55,11 +55,14 @@ const ASSISTANT_PREVIEW_TEXT_LIMIT = 180;
 const ASSISTANT_COLLAPSE_TEXT_LIMIT = 260;
 const ASSISTANT_COLLAPSE_LINE_LIMIT = 6;
 
-type RenderItem =
+type RenderContentItem =
   | { type: 'event'; event: AgentEvent; autoOpen?: boolean }
   | { type: 'trace'; group: TraceGroup }
-  | { type: 'toolBatch'; group: ToolBatchGroup }
-  | { type: 'turnActions'; id: string; events: AgentEvent[]; targetEvent: AgentEvent };
+  | { type: 'toolBatch'; group: ToolBatchGroup };
+
+type RenderItem =
+  | RenderContentItem
+  | { type: 'turnActions'; id: string; items: RenderContentItem[]; targetEvent: AgentEvent };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -371,7 +374,13 @@ function pickVisibleAssistantEvent(events: AgentEvent[]): AgentEvent | null {
   );
   if (explicitFinal.length > 0) return explicitFinal[explicitFinal.length - 1];
 
-  return null;
+  const visibleAssistant = events.filter((event) =>
+    event.kind === 'assistant_msg' &&
+    eventChannel(event) !== 'reasoning' &&
+    !isHiddenConversationEvent(event) &&
+    payloadText(event.payload).trim().length > 0
+  );
+  return visibleAssistant.length > 0 ? visibleAssistant[visibleAssistant.length - 1] : null;
 }
 
 function hasMatchingStageResult(events: AgentEvent[], source: AgentEvent): boolean {
@@ -406,7 +415,13 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
     const event = events[index];
 
     if (event.kind === 'user_msg') {
-      items.push({ type: 'event', event });
+      const turnItems: RenderContentItem[] = [];
+      const pushTurnItem = (item: RenderContentItem) => {
+        turnItems.push(item);
+        items.push(item);
+      };
+
+      pushTurnItem({ type: 'event', event });
       index += 1;
 
       const turnEvents: AgentEvent[] = [];
@@ -416,6 +431,7 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
       }
 
       const finalAssistant = pickVisibleAssistantEvent(turnEvents);
+      const explicitFinalAssistant = finalAssistant ? eventChannel(finalAssistant) === 'final' : false;
       const renderedEventIds = new Set<string>();
 
       for (let turnIndex = 0; turnIndex < turnEvents.length; turnIndex += 1) {
@@ -428,7 +444,7 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
             turnIndex += 1;
           }
           turnIndex -= 1;
-          items.push({
+          pushTurnItem({
             type: 'trace',
             group: {
               id: `trace-${event.id}-${groupEvents[0]?.id}`,
@@ -449,7 +465,7 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
           renderedEventIds.add(turnEvent.id);
           continue;
         }
-        if (finalAssistant && turnEvent.id === finalAssistant.id) {
+        if (explicitFinalAssistant && finalAssistant && turnEvent.id === finalAssistant.id) {
           continue;
         }
 
@@ -466,7 +482,7 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
             turnIndex += 1;
           }
           turnIndex -= 1;
-          items.push({
+          pushTurnItem({
             type: 'toolBatch',
             group: {
               id: `tool-batch-${event.id}-${batchId ?? batchEvents[0]?.id}`,
@@ -481,7 +497,7 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
         }
 
         renderedEventIds.add(turnEvent.id);
-        items.push({
+        pushTurnItem({
           type: 'event',
           event: turnEvent,
           autoOpen: eventDefaultOpen(turnEvent) ?? (turnEvent.kind === 'tool_call' && !hasLaterResult(turnEvents, turnEvents.indexOf(turnEvent))),
@@ -489,14 +505,14 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
       }
 
       if (finalAssistant && !renderedEventIds.has(finalAssistant.id)) {
-        items.push({ type: 'event', event: finalAssistant });
+        pushTurnItem({ type: 'event', event: finalAssistant });
       }
 
-      if (finalAssistant && !loading && isTurnComplete(turnEvents)) {
+      if (finalAssistant && !loading) {
         items.push({
           type: 'turnActions',
           id: `turn-actions-${event.id}`,
-          events: [event, ...turnEvents],
+          items: turnItems,
           targetEvent: finalAssistant,
         });
       }
@@ -515,63 +531,74 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
   return items;
 }
 
-function workflowCopyText(events: AgentEvent[], language: UiLanguage): string {
-  const blocks = events.map((event) => {
-    if (event.kind === 'user_msg') {
-      return `${t(language, 'agent.copy.user')}\n${payloadText(event.payload)}`;
-    }
-    if (event.kind === 'assistant_msg') {
-      const stage = eventStage(event);
-      const channel = eventChannel(event);
-      const label =
-        channel === 'reasoning'
-          ? `${t(language, 'agent.copy.thinking')}${stage ? ` (${localizedStage(stage, language)})` : ''}`
-          : channel === 'observation'
-            ? `${t(language, 'agent.copy.observation')}${stage ? ` (${localizedStage(stage, language)})` : ''}`
-            : `${stage && channel !== 'final' ? `Agent (${localizedStage(stage, language)})` : 'Agent'}`;
-      return `${label}\n${payloadText(event.payload)}`;
-    }
-    if (event.kind === 'workflow_stage') {
-      const stage = stringField(event.payload, 'stage') ?? 'workflow';
-      const status = stageStatus(event.payload);
-      const profile = stringField(event.payload, 'profileId');
-      return `${t(language, 'agent.copy.stage')} ${localizedStage(stage, language)} - ${localizedStatus(status, language)}${profile ? ` - ${profile}` : ''}`;
-    }
-    if (event.kind === 'workflow_decision') {
-      const stage = stringField(event.payload, 'stage') ?? 'workflow';
-      const status = stageStatus(event.payload);
-      const profile = stringField(event.payload, 'profileId');
-      return `${t(language, 'agent.copy.stage')} ${localizedStage(stage, language)} - ${localizedStatus(status, language)}${profile ? ` - ${profile}` : ''}`;
-    }
-    if (event.kind === 'tool_call') {
-      return [
-        `${t(language, 'agent.copy.toolCall')} - ${eventToolName(event)}`,
-        eventCommand(event) ? `command: ${eventCommand(event)}` : undefined,
-        eventPath(event) ? `path: ${eventPath(event)}` : undefined,
-      ].filter(Boolean).join('\n');
-    }
-    if (event.kind === 'tool_result') {
-      return [
-        `${t(language, 'agent.copy.toolResult')} - ${eventToolName(event)} - ${localizedStatus(eventStatus(event) ?? 'done', language)}`,
-        eventOutput(event),
-      ].filter(Boolean).join('\n');
-    }
-    if (event.kind === 'permission_request') {
-      return [
-        `${t(language, 'agent.copy.permissionRequest')} - ${eventToolName(event)}`,
-        stringField(event.payload, 'summary') ?? eventCommand(event) ?? eventPath(event),
-      ].filter(Boolean).join('\n');
-    }
-    if (event.kind === 'permission_result') {
-      return `${t(language, 'agent.copy.permissionResult')} - ${eventStatus(event) ?? 'resolved'}`;
-    }
-    if (event.kind === 'error') {
-      return `${t(language, 'agent.copy.error')}\n${payloadText(event.payload)}`;
-    }
-    return `${event.kind}\n${payloadText(event.payload)}`;
-  });
+function eventCopyText(event: AgentEvent, language: UiLanguage): string {
+  if (event.kind === 'user_msg') {
+    return `${t(language, 'agent.copy.user')}\n${payloadText(event.payload)}`;
+  }
+  if (event.kind === 'assistant_msg') {
+    const stage = eventStage(event);
+    const channel = eventChannel(event);
+    const label =
+      channel === 'reasoning'
+        ? `${t(language, 'agent.copy.thinking')}${stage ? ` (${localizedStage(stage, language)})` : ''}`
+        : channel === 'observation'
+          ? `${t(language, 'agent.copy.observation')}${stage ? ` (${localizedStage(stage, language)})` : ''}`
+          : `${stage && channel !== 'final' ? `Agent (${localizedStage(stage, language)})` : 'Agent'}`;
+    return `${label}\n${payloadText(event.payload)}`;
+  }
+  if (event.kind === 'workflow_stage') {
+    const stage = stringField(event.payload, 'stage') ?? 'workflow';
+    const status = stageStatus(event.payload);
+    const profile = stringField(event.payload, 'profileId');
+    return `${t(language, 'agent.copy.stage')} ${localizedStage(stage, language)} - ${localizedStatus(status, language)}${profile ? ` - ${profile}` : ''}`;
+  }
+  if (event.kind === 'workflow_decision') {
+    const stage = stringField(event.payload, 'stage') ?? 'workflow';
+    const status = stageStatus(event.payload);
+    const profile = stringField(event.payload, 'profileId');
+    return `${t(language, 'agent.copy.stage')} ${localizedStage(stage, language)} - ${localizedStatus(status, language)}${profile ? ` - ${profile}` : ''}`;
+  }
+  if (event.kind === 'tool_call') {
+    return [
+      `${t(language, 'agent.copy.toolCall')} - ${eventToolName(event)}`,
+      eventCommand(event) ? `command: ${eventCommand(event)}` : undefined,
+      eventPath(event) ? `path: ${eventPath(event)}` : undefined,
+    ].filter(Boolean).join('\n');
+  }
+  if (event.kind === 'tool_result') {
+    return [
+      `${t(language, 'agent.copy.toolResult')} - ${eventToolName(event)} - ${localizedStatus(eventStatus(event) ?? 'done', language)}`,
+      eventOutput(event),
+    ].filter(Boolean).join('\n');
+  }
+  if (event.kind === 'permission_request') {
+    return [
+      `${t(language, 'agent.copy.permissionRequest')} - ${eventToolName(event)}`,
+      stringField(event.payload, 'summary') ?? eventCommand(event) ?? eventPath(event),
+    ].filter(Boolean).join('\n');
+  }
+  if (event.kind === 'permission_result') {
+    return `${t(language, 'agent.copy.permissionResult')} - ${eventStatus(event) ?? 'resolved'}`;
+  }
+  if (event.kind === 'error') {
+    return `${t(language, 'agent.copy.error')}\n${payloadText(event.payload)}`;
+  }
+  return `${event.kind}\n${payloadText(event.payload)}`;
+}
 
-  return blocks.filter(Boolean).join('\n\n');
+function renderItemCopyText(item: RenderContentItem, language: UiLanguage): string {
+  if (item.type === 'event') return eventCopyText(item.event, language);
+  if (item.type === 'trace') {
+    const title = thoughtTraceTitle(item.group.events, language, item.group.running);
+    const body = item.group.events.map((event) => eventCopyText(event, language)).filter(Boolean);
+    return [title, ...body].join('\n\n');
+  }
+  const body = item.group.events.map((event) => eventCopyText(event, language)).filter(Boolean);
+  return [item.group.label, ...body].join('\n\n');
+}
+
+function workflowCopyText(items: RenderContentItem[], language: UiLanguage): string {
+  return items.map((item) => renderItemCopyText(item, language)).filter(Boolean).join('\n\n');
 }
 
 function thoughtTraceTitle(events: AgentEvent[], language: UiLanguage, running = false): string {
@@ -759,15 +786,15 @@ async function copyMessage(text: string): Promise<void> {
 }
 
 function TurnActions({
-  events,
+  items,
   targetEvent,
   language,
 }: {
-  events: AgentEvent[];
+  items: RenderContentItem[];
   targetEvent: AgentEvent;
   language: UiLanguage;
 }) {
-  const text = workflowCopyText(events, language);
+  const text = workflowCopyText(items, language);
   return (
     <div className="agent-turn-actions" aria-label={t(language, 'agent.message.actions')}>
       <button type="button" title={t(language, 'agent.message.copyWorkflowTitle')} onClick={() => { void copyMessage(text); }}>
@@ -865,7 +892,7 @@ const MessageList: React.FC<MessageListProps> = ({ events, loading = false, lang
         return (
           <TurnActions
             key={item.id}
-            events={item.events}
+            items={item.items}
             targetEvent={item.targetEvent}
             language={language}
           />
