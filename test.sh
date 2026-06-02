@@ -363,8 +363,16 @@ search "trait SkillExecutor" crates/deepcode-kernel-skills/src/executor.rs >/dev
 ! search "DeepCodeKernelRuntime|deepcode-kernel-runtime" crates/deepcode-host-web/src crates/deepcode-host-web/Cargo.toml || fail "host-web must not hold Kernel runtime"
 ! search "run_agent_workflow|stage_prompt|call_agent_stage_llm|execute_stage_tool_calls|call_llm_profile" crates/deepcode-host-web/src || fail "host-web must not own workflow/provider loop"
 search "deepcode-kernel-daemon" Cargo.toml build.sh test.sh crates/deepcode-kernel-daemon/Cargo.toml >/dev/null
-search "PlanContractSubmit|SkillTrustApprove|McpRiskAcknowledgmentSubmit|PlanReviewReportProduced|SkillTrustRequested|SkillTrustGranted|McpRiskAcknowledgmentRequired" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
-search "AuditVerify|AuditQuery|AuditVerifyCompleted|AuditDegradedEntered|AuditSegmentRotated" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
+for abi_file in ids error command event run refs config snapshot workspace permissions workflow plan tool skill mcp audit llm context temp_artifact; do
+  test -f "crates/deepcode-kernel-abi/src/${abi_file}.rs" || fail "missing ABI module ${abi_file}.rs"
+done
+test -f crates/deepcode-kernel-abi/src/tests/mod.rs || fail "missing ABI internal test module"
+test -f crates/deepcode-kernel-abi/tests/root_roundtrip.rs || fail "missing ABI crate-root integration test"
+! search "pub enum KernelCommand|pub enum KernelEvent|pub struct KernelSnapshot|pub enum KernelError|pub struct KernelErrorEnvelope" crates/deepcode-kernel-abi/src/lib.rs || fail "ABI lib.rs must remain facade-only"
+search "pub enum KernelCommand|PlanContractSubmit|SkillTrustApprove|McpRiskAcknowledgmentSubmit|AuditVerify|AuditQuery" crates/deepcode-kernel-abi/src/command.rs >/dev/null
+search "pub enum KernelEvent|PlanReviewReportProduced|SkillTrustRequested|SkillTrustGranted|McpRiskAcknowledgmentRequired|AuditVerifyCompleted|AuditDegradedEntered|AuditSegmentRotated" crates/deepcode-kernel-abi/src/event.rs >/dev/null
+search "pub struct KernelSnapshot" crates/deepcode-kernel-abi/src/snapshot.rs >/dev/null
+search "pub enum KernelError|pub struct KernelErrorEnvelope" crates/deepcode-kernel-abi/src/error.rs >/dev/null
 search "SkillTrustMode|BrokeredScript|DirectHostScript|ScriptBroker|ScriptBrokerPolicy|capability_for_broker_method" crates/deepcode-kernel-skills/src >/dev/null
 search "struct SkillManifest|enum InvocationPolicy|enum SkillOutputPolicy|enum SkillManifestKind|fn hash_skill_revision|fn scan_skill_manifest|struct SkillRiskReport|model_visible_skill_descriptors" crates/deepcode-kernel-skills/src >/dev/null
 search "struct PluginBundleManifest|struct PluginBundlePolicy|Plugin enable does not grant" crates/deepcode-kernel-skills/src fixtures/skill-mcp-smoke/README.md >/dev/null

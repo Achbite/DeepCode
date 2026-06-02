@@ -1,0 +1,191 @@
+use crate::{
+    KernelEvent, PermissionDecisionKind, ProfileRef, RequestId, RunId, SessionId,
+    TemporaryGrantEnvelope, UserInput, WorkflowRef, WorkspaceBinding,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum KernelCommand {
+    HealthCheck {
+        request_id: RequestId,
+    },
+    SnapshotGet {
+        request_id: RequestId,
+        session_id: Option<SessionId>,
+    },
+    ConfigGet {
+        request_id: RequestId,
+    },
+    ConfigPatch {
+        request_id: RequestId,
+        patch: Value,
+    },
+    RunStart {
+        request_id: RequestId,
+        session_id: Option<SessionId>,
+        input: UserInput,
+        workspace_binding: Option<WorkspaceBinding>,
+        profile_ref: Option<ProfileRef>,
+        workflow_ref: Option<WorkflowRef>,
+        run_overrides: Option<Value>,
+    },
+    LlmResponseSubmit {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        llm_call_id: String,
+        response_envelope: Value,
+    },
+    RunCancel {
+        request_id: RequestId,
+        run_id: RunId,
+    },
+    RunResume {
+        request_id: RequestId,
+        session_id: SessionId,
+    },
+    WorkspaceOpen {
+        request_id: RequestId,
+        path: String,
+    },
+    WorkspaceCurrent {
+        request_id: RequestId,
+    },
+    WorkspaceList {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: Option<String>,
+        depth: Option<u32>,
+    },
+    WorkspaceRead {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: String,
+    },
+    WorkspaceWrite {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: String,
+        content: String,
+        create: bool,
+    },
+    WorkspaceCreate {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: String,
+        content: Option<String>,
+    },
+    WorkspaceCreateFolder {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: String,
+    },
+    WorkspaceRename {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        old_path: String,
+        new_path: String,
+    },
+    WorkspaceDelete {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        path: String,
+    },
+    WorkspaceSearch {
+        request_id: RequestId,
+        folder_id: Option<String>,
+        query: String,
+        include: Option<Vec<String>>,
+        is_regex: bool,
+    },
+    ToolInvoke {
+        request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: Value,
+        workspace_binding: Option<WorkspaceBinding>,
+    },
+    SkillDiscover {
+        request_id: RequestId,
+    },
+    SkillInvoke {
+        request_id: RequestId,
+        skill_id: String,
+        input: Value,
+    },
+    ContextAttachReference {
+        request_id: RequestId,
+        source_path: String,
+        import_copy: bool,
+    },
+    ContextListReferences {
+        request_id: RequestId,
+    },
+    WorkflowObserve {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        event: Box<KernelEvent>,
+    },
+    PermissionResolve {
+        request_id: RequestId,
+        permission_id: String,
+        decision: PermissionDecisionKind,
+    },
+    PlanAccept {
+        request_id: RequestId,
+        run_id: RunId,
+        plan_id: String,
+    },
+    PlanReject {
+        request_id: RequestId,
+        run_id: RunId,
+        plan_id: String,
+        reason: Option<String>,
+    },
+    PlanRevise {
+        request_id: RequestId,
+        run_id: RunId,
+        plan_id: String,
+        guidance: String,
+    },
+    PlanContractSubmit {
+        request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        contract: Value,
+    },
+    SkillTrustApprove {
+        request_id: RequestId,
+        skill_id: String,
+        decision: Value,
+    },
+    McpRiskAcknowledgmentSubmit {
+        request_id: RequestId,
+        connector_id: String,
+        binding_id: Option<String>,
+        acknowledgment: Value,
+    },
+    AuditVerify {
+        request_id: RequestId,
+        scope: Value,
+    },
+    AuditQuery {
+        request_id: RequestId,
+        filter: Value,
+        projection: Option<String>,
+    },
+    PermissionGrantTemporary {
+        request_id: RequestId,
+        run_id: RunId,
+        grant: TemporaryGrantEnvelope,
+    },
+}
