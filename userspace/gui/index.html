@@ -188,22 +188,24 @@
       }
 
       function bindBootWindowControls() {
-        const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
-        if (!appWindow) return;
+        const invoke = window.__TAURI__?.core?.invoke;
+        if (!invoke) return;
         document
           .getElementById("boot-minimize")
           ?.addEventListener("click", () =>
-            runBootWindowCommand("minimize", () => appWindow.minimize())
+            runBootWindowCommand("minimize", () => invoke("deepcode_window_minimize"))
           );
         document
           .getElementById("boot-maximize")
           ?.addEventListener("click", () =>
-            runBootWindowCommand("toggleMaximize", () => appWindow.toggleMaximize())
+            runBootWindowCommand("toggleMaximize", () =>
+              invoke("deepcode_window_toggle_maximize")
+            )
           );
         document
           .getElementById("boot-close")
           ?.addEventListener("click", () =>
-            runBootWindowCommand("close", () => appWindow.close())
+            runBootWindowCommand("close", () => invoke("deepcode_window_close"))
           );
       }
 

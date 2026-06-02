@@ -388,6 +388,13 @@ search "\\[profile\\.dev\\]" Cargo.toml >/dev/null
 search "\\[profile\\.release\\]" Cargo.toml >/dev/null
 search "incremental = true" Cargo.toml >/dev/null
 search "DEEPCODE_DISABLE_SCCACHE|RUSTC_WRAPPER|sccache --show-stats|--stage" build.sh >/dev/null
+search '"frontendDist": "../dist"' shells/tauri/src-tauri/tauri.conf.json >/dev/null
+search "prepare_tauri_dist|shells/tauri/dist" build.sh shells/tauri/README.md >/dev/null
+! search "waitForKernel|window.location.replace" build.sh shells/tauri/src-tauri/tauri.conf.json shells/tauri/README.md \
+  || fail "Tauri shell must load the full GUI dist directly without boot-page redirect"
+! search "boot-ui" build.sh shells/tauri/src-tauri/tauri.conf.json shells/tauri/README.md \
+  || fail "Tauri shell must not keep boot-ui in its default launch path"
+test ! -e shells/tauri/boot-ui/index.html || fail "Tauri boot-ui intermediate page must be removed"
 search "\\.deepcode/build-baselines/" .gitignore >/dev/null
 search "\\.build-cache|\\.deepcode/build-baselines|\\.pnpm-store" .dockerignore >/dev/null
 search "run_build_baseline_probe|cargo release repeat|cargo release after runtime touch|build-baselines" test.sh >/dev/null

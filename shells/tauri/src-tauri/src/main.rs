@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -42,7 +42,12 @@ impl Drop for KernelProcess {
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![deepcode_boot_target])
+        .invoke_handler(tauri::generate_handler![
+            deepcode_boot_target,
+            deepcode_window_minimize,
+            deepcode_window_toggle_maximize,
+            deepcode_window_close
+        ])
         .setup(|app| {
             let target = resolve_launch_target();
             app.manage(target.clone());
@@ -72,6 +77,25 @@ struct LaunchTarget {
 #[tauri::command]
 fn deepcode_boot_target(target: State<'_, LaunchTarget>) -> LaunchTarget {
     target.inner().clone()
+}
+
+#[tauri::command]
+fn deepcode_window_minimize(window: Window) -> Result<(), String> {
+    window.minimize().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn deepcode_window_toggle_maximize(window: Window) -> Result<(), String> {
+    if window.is_maximized().map_err(|err| err.to_string())? {
+        window.unmaximize().map_err(|err| err.to_string())
+    } else {
+        window.maximize().map_err(|err| err.to_string())
+    }
+}
+
+#[tauri::command]
+fn deepcode_window_close(window: Window) -> Result<(), String> {
+    window.close().map_err(|err| err.to_string())
 }
 
 fn resolve_launch_target() -> LaunchTarget {
@@ -106,10 +130,8 @@ fn create_main_window(
     Ok(())
 }
 
-// TODO(stage-9): Tauri shell 当前期待启动 `deepcode-kernel.exe` 子进程作为 GUI dist 与 /api/* 提供方；
-// 实际工程里没有 deepcode-kernel binary，dev mode 下 Web Host 由外部脚本启动，binary 缺失时返回 None 走"只连接"模式。
-// 阶段 9 Kernel Daemon 落地后，本函数应迁移为启动 deepcode-kernel-daemon 并通过 IPC 而非 HTTP `/api/*` 提供事实源；
-// 同时 boot-ui/index.html 中 `window.location.replace(${baseUrl}/)` 的 webview 跳转应改为本地静态资源加载或 Tauri Asset 协议。
+// 发布包中 `deepcode-kernel.exe` 是同目录 Kernel daemon；开发态或
+// `DEEPCODE_SHELL_CONNECT_ONLY=1` 时可只连接外部已启动 daemon。
 fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
     if env_truthy("DEEPCODE_SHELL_CONNECT_ONLY") {
         return None;

@@ -75,20 +75,14 @@ import * as api from './apiClient';
 
 export type RuntimeType = 'web';
 
-type TauriWindowHandle = {
-  minimize: () => Promise<void>;
-  toggleMaximize: () => Promise<void>;
-  close: () => Promise<void>;
-};
-
-type TauriWindowApi = {
-  getCurrentWindow?: () => TauriWindowHandle;
+type TauriCoreApi = {
+  invoke?: <T = unknown>(command: string, args?: Record<string, unknown>) => Promise<T>;
 };
 
 declare global {
   interface Window {
     __TAURI__?: {
-      window?: TauriWindowApi;
+      core?: TauriCoreApi;
     };
   }
 }
@@ -123,8 +117,16 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
   }
 }
 
-function getTauriWindow(): TauriWindowHandle | null {
-  return window.__TAURI__?.window?.getCurrentWindow?.() ?? null;
+type WindowCommandName = 'minimize' | 'toggleMaximize' | 'close';
+
+const TAURI_WINDOW_COMMANDS: Record<WindowCommandName, string> = {
+  minimize: 'deepcode_window_minimize',
+  toggleMaximize: 'deepcode_window_toggle_maximize',
+  close: 'deepcode_window_close',
+};
+
+function getTauriInvoke(): TauriCoreApi['invoke'] | null {
+  return window.__TAURI__?.core?.invoke ?? null;
 }
 
 function warnWindowCommand(commandName: string, err: unknown): void {
@@ -132,14 +134,13 @@ function warnWindowCommand(commandName: string, err: unknown): void {
 }
 
 async function runWindowCommand(
-  commandName: string,
-  invoke: (tauriWindow: TauriWindowHandle) => Promise<void>,
+  commandName: WindowCommandName,
   fallback?: () => void | Promise<void>
 ): Promise<void> {
-  const tauriWindow = getTauriWindow();
-  if (tauriWindow) {
+  const invoke = getTauriInvoke();
+  if (invoke) {
     try {
-      await invoke(tauriWindow);
+      await invoke(TAURI_WINDOW_COMMANDS[commandName]);
     } catch (err) {
       warnWindowCommand(commandName, err);
     }
@@ -155,13 +156,11 @@ async function runWindowCommand(
 }
 
 export async function minimizeAppWindow(): Promise<void> {
-  await runWindowCommand('minimize', (tauriWindow) => tauriWindow.minimize());
+  await runWindowCommand('minimize');
 }
 
 export async function toggleMaximizeAppWindow(): Promise<void> {
-  await runWindowCommand('toggleMaximize', (tauriWindow) =>
-    tauriWindow.toggleMaximize()
-  );
+  await runWindowCommand('toggleMaximize');
 }
 
 export function requestCloseAppWindow(): void {
@@ -169,7 +168,7 @@ export function requestCloseAppWindow(): void {
 }
 
 export async function closeAppWindow(): Promise<void> {
-  await runWindowCommand('close', (tauriWindow) => tauriWindow.close(), () => {
+  await runWindowCommand('close', () => {
     window.close();
   });
 }
