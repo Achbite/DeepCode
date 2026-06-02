@@ -77,6 +77,34 @@ interface SendJsonOptions {
   signal?: AbortSignal;
 }
 
+export interface SkillScanItem {
+  sourceKind: 'manifest' | 'skillMd' | string;
+  manifestStatus: 'parsed' | 'inferred' | string;
+  sourcePath: string;
+  relativePath: string;
+  skillId: string;
+  version: string;
+  title: string;
+  description: string;
+  entrypointKind: string;
+  trustMode: string;
+  workspaceAccess: string;
+  requestedCapabilities: string[];
+  effects: string[];
+  envAllowlist: string[];
+  modelVisible: boolean;
+  requiresApproval: boolean;
+  v1RuntimeEnabled: boolean;
+  riskLevel: 'low' | 'medium' | 'high' | string;
+}
+
+export interface SkillMountScanResult {
+  mountPath: string;
+  scannedAt: string;
+  skills: SkillScanItem[];
+  warnings: string[];
+}
+
 function isAbortError(err: unknown): boolean {
   return (
     err instanceof DOMException && err.name === 'AbortError'
@@ -210,6 +238,16 @@ export function browsePath(
 ): Promise<ApiResponse<BrowsePathResult>> {
   const qs = buildQuery({ path: absolutePath });
   return getJson<BrowsePathResult>(`${API_BASE}/fs/browse${qs}`);
+}
+
+export function scanSkillMount(
+  path: string
+): Promise<ApiResponse<SkillMountScanResult>> {
+  return sendJson<SkillMountScanResult>(
+    `${API_BASE}/skills/scan-mount`,
+    'POST',
+    { path }
+  );
 }
 
 // ---- 文件 ----

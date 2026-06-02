@@ -206,6 +206,12 @@ export function browsePath(absolutePath?: string): Promise<ApiResponse<BrowsePat
   return api.browsePath(absolutePath);
 }
 
+export function scanSkillMount(
+  path: string
+): Promise<ApiResponse<api.SkillMountScanResult>> {
+  return api.scanSkillMount(path);
+}
+
 export async function pickWorkspacePath(): Promise<ApiResponse<string>> {
   return {
     ok: false,

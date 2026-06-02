@@ -9,12 +9,14 @@ import PromptProfilesSection from './sections/PromptProfilesSection';
 import RuntimeDoctorSection from './sections/RuntimeDoctorSection';
 import RulerRulesSection from './sections/RulerRulesSection';
 import LlmSection from './sections/LlmSection';
+import McpServicesSection from './sections/McpServicesSection';
 
 type SettingsKey =
   | 'workspace'
   | 'common'
   | 'llm'
   | 'skill'
+  | 'mcp'
   | 'prompt'
   | 'doctor'
   | 'ruler';
@@ -46,6 +48,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     { key: 'common', icon: 'CM', label: t(language, 'settings.nav.common') },
     { key: 'llm', icon: 'AI', label: t(language, 'settings.nav.llm') },
     { key: 'skill', icon: 'SK', label: t(language, 'settings.nav.skill') },
+    { key: 'mcp', icon: 'MC', label: t(language, 'settings.nav.mcp') },
     { key: 'prompt', icon: 'PR', label: t(language, 'settings.nav.prompt') },
     { key: 'doctor', icon: 'DR', label: t(language, 'settings.nav.doctor') },
     { key: 'ruler', icon: 'RL', label: t(language, 'settings.nav.ruler') },
@@ -68,6 +71,8 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
         return <LlmSection />;
       case 'skill':
         return <SkillRuntimeSection />;
+      case 'mcp':
+        return <McpServicesSection />;
       case 'prompt':
         return <PromptProfilesSection />;
       case 'doctor':

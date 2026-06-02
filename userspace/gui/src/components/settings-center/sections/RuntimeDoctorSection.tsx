@@ -62,9 +62,11 @@ const RuntimeDoctorSection: React.FC = () => {
 
     const promptProfiles = parseArraySetting(effectiveSettings['prompt.profiles']);
     const skillMounts = parseArraySetting(effectiveSettings['skills.mounts']);
+    const mcpServers = parseArraySetting(effectiveSettings['mcp.servers']);
     const rulerRules = parseArraySetting(effectiveSettings['ruler.rules']);
     const rulerEnabled = Boolean(effectiveSettings['ruler.enabled']);
     const autoLoadSkills = Boolean(effectiveSettings['skills.autoLoad']);
+    const autoLoadMcp = Boolean(effectiveSettings['mcp.autoLoad']);
 
     const nextChecks: DoctorCheck[] = [
       {
@@ -137,6 +139,20 @@ const RuntimeDoctorSection: React.FC = () => {
               })
             : t(language, 'settings.doctor.noSkills', {
                 autoLoad: enabledLabel(autoLoadSkills, language),
+              }),
+      },
+      {
+        id: 'mcp',
+        title: t(language, 'settings.doctor.check.mcp'),
+        status: autoLoadMcp && mcpServers.length === 0 ? 'warn' : 'ok',
+        detail:
+          mcpServers.length > 0
+            ? t(language, 'settings.doctor.detail.mcp', {
+                count: mcpServers.length,
+                autoLoad: enabledLabel(autoLoadMcp, language),
+              })
+            : t(language, 'settings.doctor.noMcp', {
+                autoLoad: enabledLabel(autoLoadMcp, language),
               }),
       },
       {
