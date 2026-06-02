@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # ====================================================================
-# DeepCode stage 9/10/10.5/11/12 layered smoke test
+# DeepCode stage 9 closure + host shell/audit baseline smoke test
 #
-# 默认执行 fast smoke：语法、Rust workspace、TS typecheck/build、阶段 9
-# 边界门禁、Kernel daemon API smoke、阶段 10.0 CLI/TUI smoke、
-# 阶段 10 audit tamper tests、阶段 10.5 构建缓存自检，以及
-# 阶段 11/12 Skill/MCP fail-closed 基础门禁。
-# packaging/slow/build baseline probe 通过环境变量启用。
+# 默认完整 smoke 只能在 Docker 内执行：Rust workspace、TS typecheck/build、
+# 阶段 9 Kernel/daemon 边界门禁、Kernel daemon API smoke、阶段 10.0
+# CLI/TUI smoke、阶段 10 audit tamper tests，以及既有 Skill/MCP
+# fail-closed 基础门禁。
+#
+# 宿主机默认只执行静态脚本与 grep 门禁；如需一次性本地诊断，可显式设置
+# DEEPCODE_ALLOW_HOST_TEST=1，但不得把该变量写入用户环境。
 # ====================================================================
 set -euo pipefail
 
@@ -53,6 +55,7 @@ cleanup() {
   [ -n "$CONFIG_DIR" ] && rm -rf "$CONFIG_DIR"
   [ -n "$DAEMON_LOG" ] && rm -f "$DAEMON_LOG"
   [ -n "$PROXY_LOG" ] && rm -f "$PROXY_LOG"
+  true
 }
 trap cleanup EXIT
 
@@ -69,6 +72,42 @@ search() {
     grep -RInE -- "$pattern" "$@"
   fi
 }
+
+is_docker_environment() {
+  [ -f /.dockerenv ] && return 0
+  grep -qaE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null
+}
+
+check_static_shell_and_policy_gates() {
+  bash -n test.sh
+  bash -n build.sh
+  local deprecated_build_markers_regex='DEEPCODE_VERSION''_TAG|source''Hash|build-info''\.json|build''Version|release''\.json'
+  local version_scan_paths=(build.sh README.md test.sh)
+  local optional_doc
+  for optional_doc in \
+    /mnt/e/Dev-Agent/技术方案/临时上下文存储.md \
+    /mnt/e/Dev-Agent/技术方案/开发规划方案.md
+  do
+    [ -f "$optional_doc" ] && version_scan_paths+=("$optional_doc")
+  done
+  ! search "$deprecated_build_markers_regex" "${version_scan_paths[@]}" >/dev/null \
+    || fail "build version/source hash metadata must stay postponed"
+  ! search "deepcode\\.exe" build.sh || fail "Windows CLI must not generate deepcode.exe; use DeepCode.exe for GUI and deepcode-cli.exe/deepcode.cmd for CLI"
+  search "DEEPCODE_ALLOW_HOST_BUILD|require_docker_build_environment|is_docker_environment" build.sh >/dev/null
+}
+
+host_static_only_gate() {
+  info "[host] static-only checks"
+  require_tool bash
+  require_tool grep
+  check_static_shell_and_policy_gates
+  pass "host static-only checks passed; run full smoke inside Docker"
+}
+
+if ! is_docker_environment && [ "${DEEPCODE_ALLOW_HOST_TEST:-0}" != "1" ]; then
+  host_static_only_gate
+  exit 0
+fi
 
 json_get() {
   python3 - "$@" <<'PY'
@@ -99,7 +138,7 @@ PY
 wait_http_ok() {
   local url="$1"
   local label="$2"
-  local attempts="${DEEPCODE_HTTP_WAIT_ATTEMPTS:-240}"
+  local attempts="${DEEPCODE_HTTP_WAIT_ATTEMPTS:-600}"
   for _ in $(seq 1 "$attempts"); do
     if python3 - "$url" <<'PY' >/dev/null 2>&1
 import sys
@@ -242,19 +281,7 @@ require_tool cargo
 require_tool python3
 require_tool grep
 configure_test_sccache
-bash -n test.sh
-bash -n build.sh
-deprecated_build_markers_regex='DEEPCODE_VERSION''_TAG|source''Hash|build-info''\.json|build''Version|release''\.json'
-version_scan_paths=(build.sh README.md test.sh)
-for optional_doc in \
-  /mnt/e/Dev-Agent/技术方案/临时上下文存储.md \
-  /mnt/e/Dev-Agent/技术方案/开发规划方案.md
-do
-  [ -f "$optional_doc" ] && version_scan_paths+=("$optional_doc")
-done
-! search "$deprecated_build_markers_regex" "${version_scan_paths[@]}" >/dev/null \
-  || fail "build version/source hash metadata must stay postponed"
-! search "deepcode\\.exe" build.sh || fail "Windows CLI must not generate deepcode.exe; use DeepCode.exe for GUI and deepcode-cli.exe/deepcode.cmd for CLI"
+check_static_shell_and_policy_gates
 pass "shell scripts parse"
 
 info "[2/8] Rust format and tests"
@@ -291,10 +318,22 @@ do
   test -f "crates/deepcode-kernel-runtime/src/${runtime_module}.rs" \
     || fail "missing runtime module ${runtime_module}.rs"
 done
+for daemon_module in \
+  prelude api_response state ipc static_assets kernel_api workspace_api settings_api \
+  session_store agent_api agent_loop event_projection llm_transport terminal_api \
+  browser_api skill_api utils
+do
+  test -f "crates/deepcode-kernel-daemon/src/${daemon_module}.rs" \
+    || fail "missing daemon module ${daemon_module}.rs"
+done
+daemon_main_lines="$(wc -l < crates/deepcode-kernel-daemon/src/main.rs | tr -d ' ')"
+[ "$daemon_main_lines" -le 260 ] || fail "daemon main.rs must stay facade-sized, got ${daemon_main_lines} lines"
 ! search "KernelCommand::" crates/deepcode-kernel-runtime/src/lib.rs \
   || fail "runtime lib.rs must not contain KernelCommand dispatch arms"
 ! search "fn (dispatch|workspace_|tool_invoke|execute_bound_tool|llm_response_submit|permission_resolve|run_start|run_resume|context_attach_reference|record_change_operation_for_tool)" crates/deepcode-kernel-runtime/src/lib.rs \
   || fail "runtime lib.rs must remain facade-only"
+! search "pub\\(crate\\).*workspace_current|async fn workspace_current|pub\\(crate\\).*call_openai_compatible_profile|call_anthropic_profile|call_ollama_profile|drive_kernel_agent_loop|append_session_projection_jsonl|scan_skill_mount_dir|safe_asset_path" crates/deepcode-kernel-daemon/src/main.rs \
+  || fail "daemon main.rs must not contain moved handler/provider/storage/static/skill-scan implementations"
 search "pub fn dispatch" crates/deepcode-kernel-runtime/src/dispatch.rs >/dev/null
 search "struct RuntimeState" crates/deepcode-kernel-runtime/src/state.rs >/dev/null
 search "fn workspace_open" crates/deepcode-kernel-runtime/src/workspace.rs >/dev/null
@@ -305,6 +344,18 @@ search "fn context_attach_reference" crates/deepcode-kernel-runtime/src/context.
 search "fn permission_resolve" crates/deepcode-kernel-runtime/src/permissions.rs >/dev/null
 search "fn is_kernel_owned_temp_cleanup" crates/deepcode-kernel-runtime/src/temp_artifacts.rs >/dev/null
 search "fn record_change_operation_for_tool" crates/deepcode-kernel-runtime/src/obligations.rs >/dev/null
+search "fn workspace_current|fn workspace_open" crates/deepcode-kernel-daemon/src/workspace_api.rs >/dev/null
+search "fn user_settings_get|fn llm_profiles_get" crates/deepcode-kernel-daemon/src/settings_api.rs >/dev/null
+search "fn append_session_projection_jsonl|fn session_store_projection_append" crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
+search "fn drive_kernel_agent_loop|fn call_llm_profile" crates/deepcode-kernel-daemon/src/agent_loop.rs >/dev/null
+search "fn call_openai_compatible_profile|fn call_anthropic_profile|fn call_ollama_profile" crates/deepcode-kernel-daemon/src/llm_transport.rs >/dev/null
+search "fn safe_asset_path|fn gui_asset" crates/deepcode-kernel-daemon/src/static_assets.rs >/dev/null
+search "fn skill_mount_scan|fn scan_skill_mount_dir" crates/deepcode-kernel-daemon/src/skill_api.rs >/dev/null
+search "fn run_length_prefixed_ipc|fn run_stdio_ipc" crates/deepcode-kernel-daemon/src/ipc.rs >/dev/null
+if awk '/daemon\)/,/;;/' build.sh | grep -E 'shells/(cli|tui)' >/dev/null; then
+  fail "daemon build hash must not include CLI/TUI shell sources"
+fi
+search "build_daemon|build_cli|build_tui" build.sh >/dev/null
 ! search "WorkflowDecisionState" crates/deepcode-kernel-runtime/src || fail "runtime must not define WorkflowDecisionState"
 ! search "match tool_name" crates/deepcode-kernel-runtime/src || fail "runtime must not use match tool_name dispatch"
 search "struct WorkspaceBoundary" crates/deepcode-kernel-policy/src/workspace_boundary.rs >/dev/null

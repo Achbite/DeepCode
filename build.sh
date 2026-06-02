@@ -9,7 +9,10 @@
 #
 # 分阶段入口：
 #   ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
-#   ./build.sh --stage kernel   # Linux/Windows Rust daemon + CLI/TUI
+#   ./build.sh --stage daemon   # Linux/Windows Rust Kernel daemon
+#   ./build.sh --stage cli      # Linux/Windows CLI Host shell
+#   ./build.sh --stage tui      # Linux/Windows TUI Host shell
+#   ./build.sh --stage kernel   # 兼容入口：daemon + cli + tui
 #   ./build.sh --stage tauri    # Windows DeepCode.exe Tauri thin shell
 #   ./build.sh --stage package  # 复制已有构建产物到 bin/
 #   ./build.sh --stage all      # 等价默认完整构建
@@ -17,6 +20,7 @@
 # 缓存开关：
 #   DEEPCODE_DISABLE_SCCACHE=1  禁用 sccache，回退到普通 cargo。
 #   DEEPCODE_FORCE_BUILD=1      忽略 stage hash，强制执行构建阶段。
+#   DEEPCODE_ALLOW_HOST_BUILD=1 显式允许宿主机直接构建（默认 Docker-only）。
 # ====================================================================
 set -euo pipefail
 
@@ -41,7 +45,7 @@ cd "$ROOT_DIR"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./build.sh [--stage all|gui|kernel|tauri|package]...
+  ./build.sh [--stage all|gui|daemon|cli|tui|kernel|tauri|package]...
   ./build.sh --full
 
 Environment:
@@ -49,6 +53,7 @@ Environment:
   PNPM_STORE_DIR                    Override pnpm store directory.
   DEEPCODE_FORCE_BUILD=1            Ignore stage hash stamps and rebuild.
   DEEPCODE_DISABLE_SCCACHE=1        Disable sccache even when available.
+  DEEPCODE_ALLOW_HOST_BUILD=1       Allow non-Docker host builds explicitly.
   SCCACHE_DIR                       Override local sccache cache directory.
   DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 Build optional Linux Tauri shell.
 USAGE
@@ -90,7 +95,9 @@ fi
 
 run_deps=0
 run_gui=0
-run_kernel=0
+run_daemon=0
+run_cli=0
+run_tui=0
 run_tauri=0
 run_package=0
 
@@ -99,7 +106,9 @@ enable_stage() {
     all)
       run_deps=1
       run_gui=1
-      run_kernel=1
+      run_daemon=1
+      run_cli=1
+      run_tui=1
       run_tauri=1
       run_package=1
       ;;
@@ -111,7 +120,18 @@ enable_stage() {
       run_gui=1
       ;;
     kernel)
-      run_kernel=1
+      run_daemon=1
+      run_cli=1
+      run_tui=1
+      ;;
+    daemon)
+      run_daemon=1
+      ;;
+    cli)
+      run_cli=1
+      ;;
+    tui)
+      run_tui=1
       ;;
     tauri)
       run_deps=1
@@ -137,8 +157,24 @@ echo "==[build]== ROOT_DIR=$ROOT_DIR"
 echo "==[build]== CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
 echo "==[build]== DEEPCODE_BUILD_LINUX_TAURI_SHELL=$BUILD_LINUX_TAURI_SHELL"
-echo "==[build]== stages: deps=$run_deps gui=$run_gui kernel=$run_kernel tauri=$run_tauri package=$run_package"
+echo "==[build]== stages: deps=$run_deps gui=$run_gui daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package"
 mkdir -p "$STAGE_STAMP_DIR"
+
+is_docker_environment() {
+  [ -f /.dockerenv ] && return 0
+  grep -qaE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null
+}
+
+require_docker_build_environment() {
+  if is_docker_environment || [ "${DEEPCODE_ALLOW_HOST_BUILD:-0}" = "1" ]; then
+    return
+  fi
+  echo "==[build][error]== build.sh is Docker-only for build/package stages." >&2
+  echo "==[build][error]== Run inside the deepcode-dev container, or set DEEPCODE_ALLOW_HOST_BUILD=1 for a one-off local diagnostic build." >&2
+  exit 3
+}
+
+require_docker_build_environment
 
 configure_sccache() {
   if [ "${DEEPCODE_DISABLE_SCCACHE:-0}" = "1" ]; then
@@ -192,7 +228,24 @@ stage_hash() {
           | grep -Ev '(^|/)(dist|node_modules)/' || true
         ;;
       kernel)
-        tracked_files Cargo.toml crates shells/cli shells/tui
+        tracked_files Cargo.toml crates/deepcode-kernel-abi crates/deepcode-kernel-core \
+          crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
+          crates/deepcode-kernel-prompt crates/deepcode-kernel-config crates/deepcode-kernel-workflow \
+          crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
+          crates/deepcode-kernel-client crates/deepcode-kernel-daemon shells/cli shells/tui
+        ;;
+      daemon)
+        tracked_files Cargo.toml crates/deepcode-kernel-abi crates/deepcode-kernel-core \
+          crates/deepcode-kernel-runtime crates/deepcode-kernel-policy crates/deepcode-kernel-ledger \
+          crates/deepcode-kernel-prompt crates/deepcode-kernel-config crates/deepcode-kernel-workflow \
+          crates/deepcode-kernel-context crates/deepcode-kernel-skills crates/deepcode-kernel-audit \
+          crates/deepcode-kernel-daemon
+        ;;
+      cli)
+        tracked_files Cargo.toml crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/cli
+        ;;
+      tui)
+        tracked_files Cargo.toml crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/tui
         ;;
       tauri)
         tracked_files package.json pnpm-lock.yaml shells/tauri
@@ -269,23 +322,56 @@ build_gui() {
   mark_stage_built gui
 }
 
-build_kernel() {
-  if stage_should_skip kernel \
+build_daemon() {
+  if stage_should_skip daemon \
     "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
+    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe"; then
+    return
+  fi
+  configure_sccache
+  echo "==[build][daemon]== build Rust Kernel daemon for Linux"
+  cargo build --release -p deepcode-kernel-daemon
+  echo "==[build][daemon]== build Rust Kernel daemon for Windows GNU"
+  cargo build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon
+  mark_stage_built daemon
+  show_sccache_stats
+}
+
+build_cli() {
+  if stage_should_skip cli \
     "$CARGO_TARGET_ROOT/release/deepcode-cli" \
-    "$CARGO_TARGET_ROOT/release/deepcode-tui" \
-    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" \
     "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" \
+    ; then
+    return
+  fi
+  configure_sccache
+  echo "==[build][cli]== build Rust CLI Host shell for Linux"
+  cargo build --release -p deepcode-cli
+  echo "==[build][cli]== build Rust CLI Host shell for Windows GNU"
+  cargo build --release --target "$WINDOWS_TARGET" -p deepcode-cli
+  mark_stage_built cli
+  show_sccache_stats
+}
+
+build_tui() {
+  if stage_should_skip tui \
+    "$CARGO_TARGET_ROOT/release/deepcode-tui" \
     "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe"; then
     return
   fi
   configure_sccache
-  echo "==[build][kernel]== build Rust daemon/client Host shells for Linux"
-  cargo build --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
-  echo "==[build][kernel]== build Rust daemon/client Host shells for Windows GNU"
-  cargo build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
-  mark_stage_built kernel
+  echo "==[build][tui]== build Rust TUI Host shell for Linux"
+  cargo build --release -p deepcode-tui
+  echo "==[build][tui]== build Rust TUI Host shell for Windows GNU"
+  cargo build --release --target "$WINDOWS_TARGET" -p deepcode-tui
+  mark_stage_built tui
   show_sccache_stats
+}
+
+build_kernel() {
+  build_daemon
+  build_cli
+  build_tui
 }
 
 build_tauri() {
@@ -492,8 +578,16 @@ if [ "$run_gui" = "1" ]; then
   build_gui
 fi
 
-if [ "$run_kernel" = "1" ]; then
-  build_kernel
+if [ "$run_daemon" = "1" ]; then
+  build_daemon
+fi
+
+if [ "$run_cli" = "1" ]; then
+  build_cli
+fi
+
+if [ "$run_tui" = "1" ]; then
+  build_tui
 fi
 
 if [ "$run_tauri" = "1" ]; then
