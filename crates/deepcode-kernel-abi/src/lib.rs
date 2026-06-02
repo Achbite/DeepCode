@@ -185,6 +185,12 @@ pub enum KernelCommand {
         skill_id: String,
         decision: Value,
     },
+    McpRiskAcknowledgmentSubmit {
+        request_id: RequestId,
+        connector_id: String,
+        binding_id: Option<String>,
+        acknowledgment: Value,
+    },
     AuditVerify {
         request_id: RequestId,
         scope: Value,
@@ -463,6 +469,14 @@ pub enum KernelEvent {
         request_id: Option<RequestId>,
         skill_id: String,
         trust_record: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "mcp.risk_acknowledgment_required")]
+    McpRiskAcknowledgmentRequired {
+        request_id: Option<RequestId>,
+        connector_id: String,
+        binding_id: Option<String>,
+        risk_report: Value,
         sequence: Option<u64>,
     },
     #[serde(rename = "context.result")]
@@ -989,6 +1003,33 @@ mod tests {
         assert_eq!(encoded["hash"], "sha256:abc");
         let decoded: KernelEvent =
             serde_json::from_value(encoded).expect("deserialize skill trust event");
+        assert_eq!(decoded, event);
+
+        let command = KernelCommand::McpRiskAcknowledgmentSubmit {
+            request_id: RequestId("req-mcp-risk".to_string()),
+            connector_id: "mcp-text-tools".to_string(),
+            binding_id: Some("text.uppercase".to_string()),
+            acknowledgment: serde_json::json!({ "decision": "acknowledge" }),
+        };
+        let encoded = serde_json::to_value(&command).expect("serialize mcp risk command");
+        assert_eq!(encoded["kind"], "mcpRiskAcknowledgmentSubmit");
+        assert_eq!(encoded["connectorId"], "mcp-text-tools");
+        let decoded: KernelCommand =
+            serde_json::from_value(encoded).expect("deserialize mcp risk command");
+        assert_eq!(decoded, command);
+
+        let event = KernelEvent::McpRiskAcknowledgmentRequired {
+            request_id: Some(RequestId("req-mcp-risk".to_string())),
+            connector_id: "mcp-text-tools".to_string(),
+            binding_id: Some("text.uppercase".to_string()),
+            risk_report: serde_json::json!({ "riskLevel": "medium" }),
+            sequence: Some(11),
+        };
+        let encoded = serde_json::to_value(&event).expect("serialize mcp risk event");
+        assert_eq!(encoded["kind"], "mcp.risk_acknowledgment_required");
+        assert_eq!(encoded["riskReport"]["riskLevel"], "medium");
+        let decoded: KernelEvent =
+            serde_json::from_value(encoded).expect("deserialize mcp risk event");
         assert_eq!(decoded, event);
     }
 

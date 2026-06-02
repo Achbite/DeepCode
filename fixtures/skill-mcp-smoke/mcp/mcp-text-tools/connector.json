@@ -1,0 +1,24 @@
+{
+  "connectorId": "fixture.mcp.text-tools",
+  "version": "1",
+  "title": "Fixture MCP Text Tools",
+  "tools": [
+    {
+      "id": "text.reverse",
+      "title": "Reverse text",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string" }
+        },
+        "required": ["text"]
+      },
+      "requiredCapabilities": ["network.egress"],
+      "riskLevel": "high"
+    }
+  ],
+  "resources": [],
+  "prompts": [],
+  "riskLevel": "high",
+  "defaultModelVisible": true
+}

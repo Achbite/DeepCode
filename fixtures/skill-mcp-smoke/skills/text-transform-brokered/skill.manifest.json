@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "skillId": "fixture.text.transform",
+  "version": "1",
+  "title": "Text Transform",
+  "description": "Transforms text through a brokered script fixture.",
+  "entrypoint": {
+    "kind": "script",
+    "command": "python3",
+    "args": ["transform.py"],
+    "scriptPath": "transform.py"
+  },
+  "requestedCapabilities": ["workspace.read"],
+  "effects": ["readsWorkspace"],
+  "envAllowlist": ["DEEPCODE_TEXT_SKILL_MODE"],
+  "workspaceAccess": "readOnly",
+  "timeoutMs": 1000,
+  "modelVisible": true,
+  "requestedTrustMode": "brokeredScript"
+}

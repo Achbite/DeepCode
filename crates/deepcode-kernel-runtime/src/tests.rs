@@ -134,6 +134,74 @@ fn health_check_returns_runtime_ready() {
 }
 
 #[test]
+fn skill_discover_returns_model_visible_catalog_only() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    let events = runtime
+        .dispatch(KernelCommand::SkillDiscover {
+            request_id: RequestId("req-skills".to_string()),
+        })
+        .unwrap();
+
+    let output = match events.into_iter().next().unwrap() {
+        KernelEvent::SkillResult {
+            ok: true,
+            output: Some(output),
+            ..
+        } => output,
+        other => panic!("expected skill result, got {other:?}"),
+    };
+    let skill_ids = output["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|skill| skill.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(skill_ids.contains(&"fs.read"));
+    assert!(skill_ids.contains(&"fs.write"));
+    assert!(!skill_ids.contains(&"fs.delete"));
+}
+
+#[test]
+fn skill_trust_approve_records_brokered_trust_and_rejects_direct_host() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    let events = runtime
+        .dispatch(KernelCommand::SkillTrustApprove {
+            request_id: RequestId("req-trust".to_string()),
+            skill_id: "external.github.search".to_string(),
+            decision: serde_json::json!({
+                "decision": "accept",
+                "trustMode": "brokeredScript",
+                "scriptHash": "sha256:abc",
+                "approvedCapabilities": ["network.egress"],
+                "approvedBy": "user"
+            }),
+        })
+        .unwrap();
+
+    assert!(matches!(
+        events.first(),
+        Some(KernelEvent::SkillTrustGranted { .. })
+    ));
+    assert_eq!(runtime.state.skill_trust_records.len(), 1);
+    assert_eq!(
+        runtime.state.skill_trust_records[0].trust_mode,
+        SkillTrustMode::BrokeredScript
+    );
+
+    let error = runtime
+        .dispatch(KernelCommand::SkillTrustApprove {
+            request_id: RequestId("req-direct".to_string()),
+            skill_id: "external.direct".to_string(),
+            decision: serde_json::json!({
+                "decision": "accept",
+                "trustMode": "directHostScript"
+            }),
+        })
+        .unwrap_err();
+    assert!(matches!(error, KernelError::PermissionDenied(_)));
+}
+
+#[test]
 fn run_start_without_workspace_binding_fails_closed() {
     let mut runtime = DeepCodeKernelRuntime::new();
     let error = runtime

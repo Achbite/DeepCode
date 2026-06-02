@@ -14,6 +14,7 @@ pub(crate) struct RuntimeState {
     pub(crate) pending_tools: BTreeMap<String, PendingKernelTool>,
     pub(crate) change_operations_by_run: BTreeMap<String, Vec<ChangeOperation>>,
     pub(crate) validations_by_run: BTreeMap<String, Vec<ValidationResult>>,
+    pub(crate) skill_trust_records: Vec<SkillTrustRecord>,
 }
 
 #[derive(Debug, Clone)]

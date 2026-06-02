@@ -12,11 +12,12 @@ use deepcode_kernel_ledger::{
     ChangeOperation, ChangeSet, EventLedger, InMemoryEventLedger, LedgerEvent, NdjsonEventLedger,
     ReviewGate, ReviewGateStatus, ValidationKind, ValidationResult,
 };
-use deepcode_kernel_policy::{AutonomyLevel, PolicyProfile, WorkspaceBoundary};
+use deepcode_kernel_policy::{AutonomyLevel, PolicyDecisionKind, PolicyProfile, WorkspaceBoundary};
 use deepcode_kernel_prompt::LayeredPromptCompiler;
 use deepcode_kernel_skills::{
-    builtin::builtin_executors, InMemorySkillRegistry, SkillExecutionContext,
-    SkillExecutorRegistry, SkillInvocation, SkillRegistry, SkillRuntime, SkillTrustMode,
+    builtin::builtin_executors, model_visible_skill_descriptors, InMemorySkillRegistry,
+    SkillExecutionContext, SkillExecutorRegistry, SkillInvocation, SkillRegistry, SkillRuntime,
+    SkillTrustMode, SkillTrustRecord,
 };
 use deepcode_kernel_workflow::{
     BuiltinWorkflowMachine, RunDecisionState, WorkflowMachine, WorkflowPhase,

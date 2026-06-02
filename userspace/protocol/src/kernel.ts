@@ -368,6 +368,13 @@ export type KernelPlanCommand =
       decision: unknown;
     }
   | {
+      kind: 'mcpRiskAcknowledgmentSubmit';
+      requestId: string;
+      connectorId: string;
+      bindingId?: string;
+      acknowledgment: unknown;
+    }
+  | {
       kind: 'permissionGrantTemporary';
       requestId: string;
       runId: string;
@@ -417,6 +424,15 @@ export type KernelSkillTrustEvent =
       trustRecord: unknown;
       sequence?: number;
     };
+
+export type KernelMcpRiskAcknowledgmentEvent = {
+  kind: 'mcp.risk_acknowledgment_required';
+  requestId?: string;
+  connectorId: string;
+  bindingId?: string;
+  riskReport: unknown;
+  sequence?: number;
+};
 
 export type KernelTempArtifactEvent =
   | {

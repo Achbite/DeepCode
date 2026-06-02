@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "skillId": "fixture.text.transform.direct-host",
+  "version": "1",
+  "title": "Text Transform Direct Host Disabled",
+  "description": "Negative fixture proving DirectHostScript remains disabled in V1.",
+  "entrypoint": {
+    "kind": "script",
+    "command": "python3",
+    "args": ["transform.py"],
+    "scriptPath": "transform.py"
+  },
+  "requestedCapabilities": ["workspace.read"],
+  "effects": ["readsWorkspace"],
+  "envAllowlist": [],
+  "workspaceAccess": "readOnly",
+  "timeoutMs": 1000,
+  "modelVisible": true,
+  "requestedTrustMode": "directHostScript"
+}

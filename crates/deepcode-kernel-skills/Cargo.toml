@@ -12,3 +12,4 @@ deepcode-kernel-abi.workspace = true
 deepcode-kernel-policy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true

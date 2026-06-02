@@ -141,6 +141,9 @@ impl Kernel {
             KernelCommand::SkillTrustApprove { request_id, .. } => {
                 self.not_implemented(request_id, "skill.trust_approve")
             }
+            KernelCommand::McpRiskAcknowledgmentSubmit { request_id, .. } => {
+                self.not_implemented(request_id, "mcp.risk_acknowledgment_submit")
+            }
             KernelCommand::AuditVerify { request_id, .. } => {
                 self.not_implemented(request_id, "audit.verify")
             }

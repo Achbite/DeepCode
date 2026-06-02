@@ -1,0 +1,8 @@
+{
+  "connectorId": "fixture.mcp.text-tools",
+  "toolId": "text.reverse",
+  "internalSkillId": "fixture.mcp.text-tools.text.reverse",
+  "approvedCapabilities": ["network.egress"],
+  "riskAcknowledged": true,
+  "revisionHash": "sha256:fixture-acknowledged"
+}

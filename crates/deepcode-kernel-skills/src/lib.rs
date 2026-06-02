@@ -8,11 +8,25 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub mod builtin;
+pub mod catalog;
 pub mod executor;
 pub mod external;
+pub mod hash;
+pub mod manifest;
+pub mod mcp;
+pub mod risk;
+pub mod scanner;
 pub mod trust_record;
 
+pub use catalog::model_visible_skill_descriptors;
 pub use executor::{SkillExecutionContext, SkillExecutor, SkillExecutorRegistry};
+pub use manifest::{SkillEntrypoint, SkillEntrypointKind, SkillManifest, WorkspaceAccess};
+pub use mcp::{
+    model_visible_mcp_tools, McpConnectorDescriptor, McpDescriptorKind, McpPromptDescriptor,
+    McpResourceDescriptor, McpRiskAcknowledgment, McpToolBinding, McpToolDescriptor,
+    McpToolProjection,
+};
+pub use risk::{RiskFindingKind, SkillRiskFinding, SkillRiskReport};
 pub use trust_record::{SkillTrustMode, SkillTrustRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

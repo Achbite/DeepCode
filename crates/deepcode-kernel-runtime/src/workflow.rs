@@ -479,6 +479,7 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::SkillResult { .. } => "skill.result",
         KernelEvent::SkillTrustRequested { .. } => "skill.trust_requested",
         KernelEvent::SkillTrustGranted { .. } => "skill.trust_granted",
+        KernelEvent::McpRiskAcknowledgmentRequired { .. } => "mcp.risk_acknowledgment_required",
         KernelEvent::ContextResult { .. } => "context.result",
         KernelEvent::AuditVerifyStarted { .. } => "audit.verify_started",
         KernelEvent::AuditVerifyCompleted { .. } => "audit.verify_completed",
@@ -519,6 +520,7 @@ pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::SkillResult { sequence, .. }
         | KernelEvent::SkillTrustRequested { sequence, .. }
         | KernelEvent::SkillTrustGranted { sequence, .. }
+        | KernelEvent::McpRiskAcknowledgmentRequired { sequence, .. }
         | KernelEvent::ContextResult { sequence, .. }
         | KernelEvent::AuditVerifyStarted { sequence, .. }
         | KernelEvent::AuditVerifyCompleted { sequence, .. }

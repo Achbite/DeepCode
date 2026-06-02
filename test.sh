@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ====================================================================
-# DeepCode stage 9/10/10.5 layered smoke test
+# DeepCode stage 9/10/10.5/11/12 layered smoke test
 #
 # 默认执行 fast smoke：语法、Rust workspace、TS typecheck/build、阶段 9
 # 边界门禁、Kernel daemon API smoke、阶段 10.0 CLI/TUI smoke、
-# 阶段 10 audit tamper tests 与阶段 10.5 构建缓存自检。
+# 阶段 10 audit tamper tests、阶段 10.5 构建缓存自检，以及
+# 阶段 11/12 Skill/MCP fail-closed 基础门禁。
 # packaging/slow/build baseline probe 通过环境变量启用。
 # ====================================================================
 set -euo pipefail
@@ -311,9 +312,20 @@ search "trait SkillExecutor" crates/deepcode-kernel-skills/src/executor.rs >/dev
 ! search "DeepCodeKernelRuntime|deepcode-kernel-runtime" crates/deepcode-host-web/src crates/deepcode-host-web/Cargo.toml || fail "host-web must not hold Kernel runtime"
 ! search "run_agent_workflow|stage_prompt|call_agent_stage_llm|execute_stage_tool_calls|call_llm_profile" crates/deepcode-host-web/src || fail "host-web must not own workflow/provider loop"
 search "deepcode-kernel-daemon" Cargo.toml build.sh test.sh crates/deepcode-kernel-daemon/Cargo.toml >/dev/null
-search "PlanContractSubmit|SkillTrustApprove|PlanReviewReportProduced|SkillTrustRequested|SkillTrustGranted" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
+search "PlanContractSubmit|SkillTrustApprove|McpRiskAcknowledgmentSubmit|PlanReviewReportProduced|SkillTrustRequested|SkillTrustGranted|McpRiskAcknowledgmentRequired" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
 search "AuditVerify|AuditQuery|AuditVerifyCompleted|AuditDegradedEntered|AuditSegmentRotated" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
-search "SkillTrustMode|BrokeredScript|DirectHostScript|ScriptBroker" crates/deepcode-kernel-skills/src >/dev/null
+search "SkillTrustMode|BrokeredScript|DirectHostScript|ScriptBroker|ScriptBrokerPolicy|capability_for_broker_method" crates/deepcode-kernel-skills/src >/dev/null
+search "struct SkillManifest|enum WorkspaceAccess|fn hash_skill_material|fn scan_skill_manifest|struct SkillRiskReport|model_visible_skill_descriptors" crates/deepcode-kernel-skills/src >/dev/null
+search "struct McpConnectorDescriptor|struct McpToolBinding|struct McpRiskAcknowledgment|fn model_visible_mcp_tools" crates/deepcode-kernel-skills/src >/dev/null
+! search "TODO\\(stage-9\\): Move LLM provider transport" crates/deepcode-kernel-daemon/src/main.rs || fail "daemon LLM transport must not keep stale stage-9 migration TODOs"
+test -f fixtures/skill-mcp-smoke/README.md || fail "missing Skill/MCP smoke fixture README"
+test -f fixtures/skill-mcp-smoke/skills/text-echo-declarative/skill.manifest.json || fail "missing declarative text skill fixture"
+test -f fixtures/skill-mcp-smoke/skills/text-transform-brokered/skill.manifest.json || fail "missing brokered text skill fixture"
+test -f fixtures/skill-mcp-smoke/skills/text-transform-brokered/transform.py || fail "missing brokered text skill script fixture"
+test -f fixtures/skill-mcp-smoke/mcp/mcp-text-tools/connector.json || fail "missing MCP text tools connector fixture"
+test -f fixtures/skill-mcp-smoke/mcp/mcp-text-tools/binding-acknowledged.json || fail "missing MCP acknowledged binding fixture"
+test -f crates/deepcode-kernel-skills/tests/skill_mcp_smoke.rs || fail "missing Skill/MCP smoke integration test"
+search "fn skill_trust_approve|model_visible_skill_descriptors" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
 search "PlanReviewEngine|PlanReviewReport" crates/deepcode-kernel-workflow/src >/dev/null
 search "SignedAuditEntryV1|AuditSegmentSealV1|AuditVerifier" crates/deepcode-kernel-audit/src >/dev/null
 search "struct HttpKernelClient|send_prompt|daemon_status" crates/deepcode-kernel-client/src/lib.rs >/dev/null
@@ -329,7 +341,7 @@ search "\\.deepcode/build-baselines/" .gitignore >/dev/null
 search "\\.build-cache|\\.deepcode/build-baselines|\\.pnpm-store" .dockerignore >/dev/null
 search "run_build_baseline_probe|cargo release repeat|cargo release after runtime touch|build-baselines" test.sh >/dev/null
 search "--mount=type=cache|sccache|SCCACHE_DIR" Dockerfile.dev >/dev/null
-pass "stage 9/10/10.5 grep gates"
+pass "stage 9/10/10.5/11/12 grep gates"
 
 info "[5/8] Kernel daemon HTTP smoke"
 CONFIG_DIR="$(mktemp -d /tmp/deepcode-stage9-config-XXXXXX)"
@@ -443,4 +455,4 @@ else
 fi
 
 info "[8/8] done"
-pass "DeepCode stage 9/10/10.5 fast smoke passed"
+pass "DeepCode stage 9/10/10.5/11/12 fast smoke passed"

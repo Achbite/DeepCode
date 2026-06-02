@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "skillId": "fixture.text.echo",
+  "version": "1",
+  "title": "Text Echo",
+  "description": "Echoes text in a declarative, no-side-effect fixture.",
+  "entrypoint": {
+    "kind": "declarative",
+    "command": null,
+    "args": [],
+    "scriptPath": null
+  },
+  "requestedCapabilities": [],
+  "effects": [],
+  "envAllowlist": [],
+  "workspaceAccess": "none",
+  "timeoutMs": 1000,
+  "modelVisible": true,
+  "requestedTrustMode": "declarative"
+}
