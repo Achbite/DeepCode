@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct SkillRiskReport {
     pub skill_id: String,
+    pub revision_hash: Option<String>,
+    #[serde(default)]
     pub script_hash: Option<String>,
     pub findings: Vec<SkillRiskFinding>,
     pub requires_user_approval: bool,

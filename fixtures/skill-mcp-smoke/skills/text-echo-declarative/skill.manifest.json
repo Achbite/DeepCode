@@ -4,6 +4,7 @@
   "version": "1",
   "title": "Text Echo",
   "description": "Echoes text in a declarative, no-side-effect fixture.",
+  "kind": "text",
   "entrypoint": {
     "kind": "declarative",
     "command": null,
@@ -15,6 +16,10 @@
   "envAllowlist": [],
   "workspaceAccess": "none",
   "timeoutMs": 1000,
-  "modelVisible": true,
-  "requestedTrustMode": "declarative"
+  "requestedModelVisible": true,
+  "requestedTrustMode": "declarative",
+  "sourceScope": "local",
+  "invocationPolicy": "implicitAllowed",
+  "outputPolicy": "textOnly",
+  "resources": []
 }

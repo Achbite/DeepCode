@@ -4,6 +4,7 @@
   "version": "1",
   "title": "Text Transform",
   "description": "Transforms text through a brokered script fixture.",
+  "kind": "brokeredScript",
   "entrypoint": {
     "kind": "script",
     "command": "python3",
@@ -15,6 +16,18 @@
   "envAllowlist": ["DEEPCODE_TEXT_SKILL_MODE"],
   "workspaceAccess": "readOnly",
   "timeoutMs": 1000,
-  "modelVisible": true,
-  "requestedTrustMode": "brokeredScript"
+  "requestedModelVisible": true,
+  "requestedTrustMode": "brokeredScript",
+  "sourceScope": "local",
+  "invocationPolicy": "askBeforeUse",
+  "outputPolicy": "tempOnly",
+  "runtime": {
+    "runtime": "python",
+    "adapter": "broker"
+  },
+  "resources": ["SKILL.md", "skill.toml", "transform.py"],
+  "risk": {
+    "summary": "Brokered fixture only; resource access must go through Kernel broker.",
+    "declaredLevel": "medium"
+  }
 }

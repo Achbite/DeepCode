@@ -112,7 +112,7 @@ mod tests {
     fn trust_record(skill_id: &str, trust_mode: SkillTrustMode) -> SkillTrustRecord {
         SkillTrustRecord {
             skill_id: skill_id.to_string(),
-            script_hash: Some("sha256:abc".to_string()),
+            revision_hash: Some("sha256:abc".to_string()),
             approved_capabilities: vec![Capability::network_egress()],
             approved_at: Some("2026-06-01T00:00:00Z".to_string()),
             approved_by: Some("user".to_string()),

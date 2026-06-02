@@ -1,0 +1,14 @@
+schema_version = 1
+skill_id = "fixture.text.transform"
+kind = "brokeredScript"
+invocation_policy = "askBeforeUse"
+output_policy = "tempOnly"
+requested_model_visible = true
+
+[runtime]
+runtime = "python"
+adapter = "broker"
+
+[risk]
+summary = "Brokered fixture. Resource access must pass through Kernel broker."
+declared_level = "medium"

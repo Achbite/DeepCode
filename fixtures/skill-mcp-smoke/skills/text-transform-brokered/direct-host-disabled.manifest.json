@@ -4,6 +4,7 @@
   "version": "1",
   "title": "Text Transform Direct Host Disabled",
   "description": "Negative fixture proving DirectHostScript remains disabled in V1.",
+  "kind": "directHostScript",
   "entrypoint": {
     "kind": "script",
     "command": "python3",
@@ -15,6 +16,14 @@
   "envAllowlist": [],
   "workspaceAccess": "readOnly",
   "timeoutMs": 1000,
-  "modelVisible": true,
-  "requestedTrustMode": "directHostScript"
+  "requestedModelVisible": true,
+  "requestedTrustMode": "directHostScript",
+  "sourceScope": "local",
+  "invocationPolicy": "disabled",
+  "outputPolicy": "tempOnly",
+  "resources": ["transform.py"],
+  "risk": {
+    "summary": "Negative fixture. DirectHostScript remains disabled in V1.",
+    "declaredLevel": "critical"
+  }
 }

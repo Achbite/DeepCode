@@ -23,7 +23,8 @@ impl SkillTrustMode {
 #[serde(rename_all = "camelCase")]
 pub struct SkillTrustRecord {
     pub skill_id: String,
-    pub script_hash: Option<String>,
+    #[serde(alias = "scriptHash")]
+    pub revision_hash: Option<String>,
     pub approved_capabilities: Vec<Capability>,
     pub approved_at: Option<String>,
     pub approved_by: Option<String>,
@@ -36,7 +37,7 @@ impl SkillTrustRecord {
     pub fn direct_host_placeholder(skill_id: impl Into<String>) -> Self {
         Self {
             skill_id: skill_id.into(),
-            script_hash: None,
+            revision_hash: None,
             approved_capabilities: Vec::new(),
             approved_at: None,
             approved_by: None,

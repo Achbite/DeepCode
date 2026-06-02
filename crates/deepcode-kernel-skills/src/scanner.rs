@@ -1,4 +1,4 @@
-use crate::hash::hash_skill_material;
+use crate::hash::hash_skill_revision;
 use crate::manifest::{SkillManifest, WorkspaceAccess};
 use crate::risk::{RiskFindingKind, SkillRiskFinding, SkillRiskReport};
 use crate::SkillTrustMode;
@@ -74,17 +74,25 @@ pub fn scan_skill_manifest(
         scan_script_content(script_content, &mut findings);
     }
 
+    let revision_hash = script_content.map(|content| {
+        let path = manifest
+            .entrypoint
+            .script_path
+            .as_deref()
+            .unwrap_or("entrypoint-script");
+        hash_skill_revision(manifest, &[(path, content.as_bytes())])
+    });
+
     SkillRiskReport {
-            skill_id: manifest.skill_id.clone(),
-            script_hash: script_content
-                .map(str::as_bytes)
-                .map(|bytes| hash_skill_material(manifest, Some(bytes))),
-            requires_user_approval: manifest.requires_approval() || !findings.is_empty(),
-            static_analysis_boundary:
-                "Static analysis is advisory; Broker, PermissionGate, WorkspaceBoundary and AuditLedger remain the security boundary."
-                    .to_string(),
-            findings,
-        }
+        skill_id: manifest.skill_id.clone(),
+        revision_hash: revision_hash.clone(),
+        script_hash: revision_hash,
+        requires_user_approval: manifest.requires_approval() || !findings.is_empty(),
+        static_analysis_boundary:
+            "Static analysis is advisory; Broker, PermissionGate, WorkspaceBoundary and AuditLedger remain the security boundary."
+                .to_string(),
+        findings,
+    }
 }
 
 fn scan_script_content(script_content: &str, findings: &mut Vec<SkillRiskFinding>) {
@@ -164,7 +172,10 @@ fn scan_script_content(script_content: &str, findings: &mut Vec<SkillRiskFinding
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SkillEntrypoint, SkillEntrypointKind};
+    use crate::{
+        InvocationPolicy, SkillEntrypoint, SkillEntrypointKind, SkillManifestKind,
+        SkillOutputPolicy, SkillSourceScope,
+    };
 
     fn manifest() -> SkillManifest {
         SkillManifest {
@@ -173,6 +184,7 @@ mod tests {
             version: "1".to_string(),
             title: "Scan".to_string(),
             description: None,
+            kind: SkillManifestKind::BrokeredScript,
             entrypoint: SkillEntrypoint {
                 kind: SkillEntrypointKind::Script,
                 command: Some("python3".to_string()),
@@ -184,8 +196,16 @@ mod tests {
             env_allowlist: Vec::new(),
             workspace_access: WorkspaceAccess::ReadOnly,
             timeout_ms: 1_000,
-            model_visible: false,
+            requested_model_visible: false,
             requested_trust_mode: SkillTrustMode::BrokeredScript,
+            source_scope: SkillSourceScope::Local,
+            provenance: None,
+            invocation_policy: InvocationPolicy::AskBeforeUse,
+            output_policy: SkillOutputPolicy::TempOnly,
+            runtime: None,
+            resources: Vec::new(),
+            limits: None,
+            risk: None,
         }
     }
 
@@ -197,6 +217,7 @@ mod tests {
             Some("import subprocess\nsubprocess.run(['curl', '../x'])\nprint('/tmp/x')"),
         );
         assert!(report.requires_user_approval);
+        assert!(report.revision_hash.unwrap().starts_with("sha256:"));
         assert!(report.script_hash.unwrap().starts_with("sha256:"));
         assert!(report
             .findings
