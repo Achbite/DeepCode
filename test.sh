@@ -366,17 +366,24 @@ search "deepcode-kernel-daemon" Cargo.toml build.sh test.sh crates/deepcode-kern
 search "PlanContractSubmit|SkillTrustApprove|McpRiskAcknowledgmentSubmit|PlanReviewReportProduced|SkillTrustRequested|SkillTrustGranted|McpRiskAcknowledgmentRequired" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
 search "AuditVerify|AuditQuery|AuditVerifyCompleted|AuditDegradedEntered|AuditSegmentRotated" crates/deepcode-kernel-abi/src/lib.rs >/dev/null
 search "SkillTrustMode|BrokeredScript|DirectHostScript|ScriptBroker|ScriptBrokerPolicy|capability_for_broker_method" crates/deepcode-kernel-skills/src >/dev/null
-search "struct SkillManifest|enum WorkspaceAccess|fn hash_skill_material|fn scan_skill_manifest|struct SkillRiskReport|model_visible_skill_descriptors" crates/deepcode-kernel-skills/src >/dev/null
-search "struct McpConnectorDescriptor|struct McpToolBinding|struct McpRiskAcknowledgment|fn model_visible_mcp_tools" crates/deepcode-kernel-skills/src >/dev/null
+search "struct SkillManifest|enum InvocationPolicy|enum SkillOutputPolicy|enum SkillManifestKind|fn hash_skill_revision|fn scan_skill_manifest|struct SkillRiskReport|model_visible_skill_descriptors" crates/deepcode-kernel-skills/src >/dev/null
+search "struct PluginBundleManifest|struct PluginBundlePolicy|Plugin enable does not grant" crates/deepcode-kernel-skills/src fixtures/skill-mcp-smoke/README.md >/dev/null
+search "struct McpConnectorDescriptor|struct McpConnectorManifest|struct McpToolBinding|struct McpResourceBinding|struct McpPromptBinding|struct McpRiskAcknowledgmentRecord|fn model_visible_mcp_tools_for_revision|fn model_visible_mcp_resources|fn model_visible_mcp_prompts|fn mcp_tool_projection_to_skill_invocation" crates/deepcode-kernel-skills/src >/dev/null
 ! search "TODO\\(stage-9\\): Move LLM provider transport" crates/deepcode-kernel-daemon/src/main.rs || fail "daemon LLM transport must not keep stale stage-9 migration TODOs"
 test -f fixtures/skill-mcp-smoke/README.md || fail "missing Skill/MCP smoke fixture README"
+test -f fixtures/skill-mcp-smoke/plugin/text-tools.plugin.json || fail "missing PluginBundle fixture"
+test -f fixtures/skill-mcp-smoke/skills/text-echo-declarative/SKILL.md || fail "missing declarative text skill SKILL.md fixture"
+test -f fixtures/skill-mcp-smoke/skills/text-echo-declarative/skill.toml || fail "missing declarative text skill.toml fixture"
 test -f fixtures/skill-mcp-smoke/skills/text-echo-declarative/skill.manifest.json || fail "missing declarative text skill fixture"
+test -f fixtures/skill-mcp-smoke/skills/text-transform-brokered/SKILL.md || fail "missing brokered text skill SKILL.md fixture"
+test -f fixtures/skill-mcp-smoke/skills/text-transform-brokered/skill.toml || fail "missing brokered text skill.toml fixture"
 test -f fixtures/skill-mcp-smoke/skills/text-transform-brokered/skill.manifest.json || fail "missing brokered text skill fixture"
 test -f fixtures/skill-mcp-smoke/skills/text-transform-brokered/transform.py || fail "missing brokered text skill script fixture"
 test -f fixtures/skill-mcp-smoke/mcp/mcp-text-tools/connector.json || fail "missing MCP text tools connector fixture"
+test -f fixtures/skill-mcp-smoke/mcp/mcp-text-tools/mcp.toml || fail "missing MCP text tools mcp.toml fixture"
 test -f fixtures/skill-mcp-smoke/mcp/mcp-text-tools/binding-acknowledged.json || fail "missing MCP acknowledged binding fixture"
 test -f crates/deepcode-kernel-skills/tests/skill_mcp_smoke.rs || fail "missing Skill/MCP smoke integration test"
-search "fn skill_trust_approve|model_visible_skill_descriptors" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
+search "fn skill_trust_approve|fn mcp_risk_acknowledgment_submit|model_visible_skill_descriptors|permissionGranted" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
 search "PlanReviewEngine|PlanReviewReport" crates/deepcode-kernel-workflow/src >/dev/null
 search "SignedAuditEntryV1|AuditSegmentSealV1|AuditVerifier" crates/deepcode-kernel-audit/src >/dev/null
 search "struct HttpKernelClient|send_prompt|daemon_status" crates/deepcode-kernel-client/src/lib.rs >/dev/null

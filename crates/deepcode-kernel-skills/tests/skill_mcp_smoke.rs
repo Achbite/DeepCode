@@ -1,11 +1,12 @@
 use deepcode_kernel_policy::{Capability, CapabilityEffect, RiskLevel};
 use deepcode_kernel_skills::external::broker::{BrokeredScriptRequest, ScriptBrokerPolicy};
-use deepcode_kernel_skills::hash::hash_skill_material;
+use deepcode_kernel_skills::hash::{hash_skill_material, hash_skill_revision};
 use deepcode_kernel_skills::scanner::scan_skill_manifest;
 use deepcode_kernel_skills::{
-    model_visible_mcp_tools, model_visible_skill_descriptors, McpConnectorDescriptor,
-    McpToolBinding, SkillDescriptor, SkillExecutorKind, SkillManifest, SkillSource, SkillTrustMode,
-    SkillTrustRecord,
+    model_visible_mcp_prompts, model_visible_mcp_resources, model_visible_mcp_tools,
+    model_visible_mcp_tools_for_revision, model_visible_skill_descriptors, McpConnectorDescriptor,
+    McpPromptBinding, McpResourceBinding, McpToolBinding, PluginBundleManifest, SkillDescriptor,
+    SkillExecutorKind, SkillManifest, SkillSource, SkillTrustMode, SkillTrustRecord,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -51,14 +52,14 @@ fn descriptor_from_manifest(manifest: &SkillManifest, source: SkillSource) -> Sk
         effects: manifest.effects.clone(),
         source,
         executor_kind: SkillExecutorKind::LocalPack,
-        model_visible: manifest.model_visible,
+        model_visible: manifest.requested_model_visible,
     }
 }
 
 fn trust_record(skill_id: &str, capabilities: Vec<Capability>) -> SkillTrustRecord {
     SkillTrustRecord {
         skill_id: skill_id.to_string(),
-        script_hash: Some("sha256:fixture".to_string()),
+        revision_hash: Some("sha256:fixture".to_string()),
         approved_capabilities: capabilities,
         approved_at: Some("2026-06-01T00:00:00Z".to_string()),
         approved_by: Some("fixture".to_string()),
@@ -90,6 +91,8 @@ fn declarative_text_skill_fixture_is_model_visible_without_trust() {
 fn brokered_text_skill_fixture_hash_scanner_and_catalog_are_stable() {
     let manifest: SkillManifest = read_json("skills/text-transform-brokered/skill.manifest.json");
     let script = read_text("skills/text-transform-brokered/transform.py");
+    let skill_md = read_text("skills/text-transform-brokered/SKILL.md");
+    let skill_toml = read_text("skills/text-transform-brokered/skill.toml");
     assert_eq!(
         manifest.requested_trust_mode,
         SkillTrustMode::BrokeredScript
@@ -102,8 +105,31 @@ fn brokered_text_skill_fixture_hash_scanner_and_catalog_are_stable() {
     assert_eq!(hash, same_hash);
     assert_ne!(hash, changed_hash);
 
+    let revision = hash_skill_revision(
+        &manifest,
+        &[
+            ("SKILL.md", skill_md.as_bytes()),
+            ("skill.toml", skill_toml.as_bytes()),
+            ("scripts/transform.py", script.as_bytes()),
+        ],
+    );
+    let changed_revision = hash_skill_revision(
+        &manifest,
+        &[
+            ("SKILL.md", format!("{skill_md}\n").as_bytes()),
+            ("skill.toml", skill_toml.as_bytes()),
+            ("scripts/transform.py", script.as_bytes()),
+        ],
+    );
+    assert_ne!(revision, changed_revision);
+
     let report = scan_skill_manifest(&manifest, Some(&script));
     assert!(report.requires_user_approval);
+    assert!(report
+        .revision_hash
+        .as_deref()
+        .unwrap()
+        .starts_with("sha256:"));
     assert!(report
         .script_hash
         .as_deref()
@@ -194,6 +220,84 @@ fn mcp_descriptor_fixture_is_default_deny_until_acknowledged_binding() {
         visible[0].internal_skill_id,
         "fixture.mcp.text-tools.text.reverse"
     );
+}
+
+#[test]
+fn mcp_binding_revision_change_requires_new_acknowledgment() {
+    let connector: McpConnectorDescriptor = read_json("mcp/mcp-text-tools/connector.json");
+    let acknowledged: McpToolBinding = read_json("mcp/mcp-text-tools/binding-acknowledged.json");
+
+    assert!(model_visible_mcp_tools_for_revision(
+        &connector,
+        &[acknowledged.clone()],
+        &[Capability::network_egress()],
+        Some("sha256:changed")
+    )
+    .is_empty());
+    assert_eq!(
+        model_visible_mcp_tools_for_revision(
+            &connector,
+            &[acknowledged],
+            &[Capability::network_egress()],
+            Some("sha256:fixture-acknowledged")
+        )
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn mcp_resource_and_prompt_bindings_are_default_deny() {
+    let connector: McpConnectorDescriptor = read_json("mcp/mcp-text-tools/connector.json");
+    let resource_binding = McpResourceBinding {
+        binding_id: Some("fixture-resource-binding".to_string()),
+        connector_id: "fixture.mcp.text-tools".to_string(),
+        resource_id: "text.template".to_string(),
+        internal_context_source_id: "fixture.context.text-template".to_string(),
+        approved_capabilities: vec![Capability::workspace_read()],
+        risk_acknowledged: true,
+        revision_hash: Some("sha256:fixture-resource".to_string()),
+    };
+    let prompt_binding = McpPromptBinding {
+        binding_id: Some("fixture-prompt-binding".to_string()),
+        connector_id: "fixture.mcp.text-tools".to_string(),
+        prompt_id: "text.rewrite.prompt".to_string(),
+        internal_prompt_source_id: "fixture.prompt.text-rewrite".to_string(),
+        approved_capabilities: vec![Capability::network_egress()],
+        risk_acknowledged: true,
+        revision_hash: Some("sha256:fixture-prompt".to_string()),
+    };
+
+    assert!(
+        model_visible_mcp_resources(&connector, &[], &[Capability::workspace_read()]).is_empty()
+    );
+    assert!(model_visible_mcp_prompts(&connector, &[], &[Capability::network_egress()]).is_empty());
+    assert_eq!(
+        model_visible_mcp_resources(
+            &connector,
+            &[resource_binding],
+            &[Capability::workspace_read()]
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        model_visible_mcp_prompts(
+            &connector,
+            &[prompt_binding],
+            &[Capability::network_egress()]
+        )
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn plugin_bundle_fixture_is_distribution_only() {
+    let plugin: PluginBundleManifest = read_json("plugin/text-tools.plugin.json");
+    assert_eq!(plugin.plugin_id, "fixture.plugin.text-tools");
+    assert!(!plugin.grants_capability());
+    assert!(!plugin.enables_runtime_capability());
 }
 
 #[test]
