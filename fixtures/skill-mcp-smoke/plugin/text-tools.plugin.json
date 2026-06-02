@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "fixture.plugin.text-tools",
+  "namespace": "fixture",
+  "name": "Fixture Text Tools Plugin",
+  "version": "1",
+  "revisionHash": "sha256:fixture-plugin",
+  "provenance": "local-fixture",
+  "contents": {
+    "skills": ["fixture.text.echo", "fixture.text.transform"],
+    "mcpConnectors": ["fixture.mcp.text-tools"],
+    "prompts": [],
+    "workflows": []
+  },
+  "policy": {
+    "autoEnableSkills": false,
+    "autoEnableMcp": false,
+    "postinstallAllowed": false
+  },
+  "risk": {
+    "summary": "Fixture only. Plugin enable does not grant skill or MCP capability.",
+    "requiresUserReview": true
+  }
+}

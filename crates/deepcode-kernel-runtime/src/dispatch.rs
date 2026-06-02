@@ -175,9 +175,17 @@ impl DeepCodeKernelRuntime {
                 skill_id,
                 decision,
             } => self.skill_trust_approve(request_id, skill_id, decision),
-            KernelCommand::McpRiskAcknowledgmentSubmit { request_id, .. } => {
-                self.not_implemented(request_id, "mcp.risk_acknowledgment_submit")
-            }
+            KernelCommand::McpRiskAcknowledgmentSubmit {
+                request_id,
+                connector_id,
+                binding_id,
+                acknowledgment,
+            } => self.mcp_risk_acknowledgment_submit(
+                request_id,
+                connector_id,
+                binding_id,
+                acknowledgment,
+            ),
             KernelCommand::AuditVerify { request_id, .. } => {
                 self.not_implemented(request_id, "audit.verify")
             }

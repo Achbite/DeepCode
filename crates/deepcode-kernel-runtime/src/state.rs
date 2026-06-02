@@ -15,6 +15,7 @@ pub(crate) struct RuntimeState {
     pub(crate) change_operations_by_run: BTreeMap<String, Vec<ChangeOperation>>,
     pub(crate) validations_by_run: BTreeMap<String, Vec<ValidationResult>>,
     pub(crate) skill_trust_records: Vec<SkillTrustRecord>,
+    pub(crate) mcp_risk_acknowledgments: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]

@@ -17,8 +17,21 @@
       "riskLevel": "high"
     }
   ],
-  "resources": [],
-  "prompts": [],
+  "resources": [
+    {
+      "id": "text.template",
+      "title": "Text template",
+      "kind": "resource",
+      "requiredCapabilities": ["workspace.read"]
+    }
+  ],
+  "prompts": [
+    {
+      "id": "text.rewrite.prompt",
+      "title": "Rewrite prompt",
+      "requiredCapabilities": ["network.egress"]
+    }
+  ],
   "riskLevel": "high",
   "defaultModelVisible": true
 }

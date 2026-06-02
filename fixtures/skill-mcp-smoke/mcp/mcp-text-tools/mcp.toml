@@ -1,0 +1,18 @@
+schema_version = 1
+connector_id = "fixture.mcp.text-tools"
+version = "1"
+descriptor_snapshot_hash = "sha256:fixture-mcp-descriptor"
+risk_level = "high"
+
+[server]
+name = "Fixture MCP Text Tools"
+vendor = "DeepCode fixture"
+
+[transport]
+kind = "descriptorOnly"
+command = ""
+endpoint = ""
+
+[auth]
+kind = "none"
+secret_ref = ""

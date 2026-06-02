@@ -202,6 +202,43 @@ fn skill_trust_approve_records_brokered_trust_and_rejects_direct_host() {
 }
 
 #[test]
+fn mcp_risk_acknowledgment_records_understanding_without_permission_grant() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    let events = runtime
+        .dispatch(KernelCommand::McpRiskAcknowledgmentSubmit {
+            request_id: RequestId("req-mcp-risk".to_string()),
+            connector_id: "fixture.mcp.text-tools".to_string(),
+            binding_id: Some("text.reverse".to_string()),
+            acknowledgment: serde_json::json!({
+                "decision": "acknowledge",
+                "revisionHash": "sha256:fixture",
+                "acknowledgedBy": "user",
+                "riskLevel": "high"
+            }),
+        })
+        .unwrap();
+
+    let output = match events.into_iter().next().unwrap() {
+        KernelEvent::SkillResult {
+            ok: true,
+            output: Some(output),
+            ..
+        } => output,
+        other => panic!("expected mcp risk acknowledgment skill result, got {other:?}"),
+    };
+    assert_eq!(runtime.state.mcp_risk_acknowledgments.len(), 1);
+    assert_eq!(output["permissionGranted"], false);
+    assert!(output["boundary"]
+        .as_str()
+        .unwrap()
+        .contains("does not grant"));
+    let ledger_events = runtime.ledger.list_all().unwrap();
+    assert!(ledger_events
+        .iter()
+        .any(|event| event.kind == "mcp.risk_acknowledgment_recorded"));
+}
+
+#[test]
 fn run_start_without_workspace_binding_fails_closed() {
     let mut runtime = DeepCodeKernelRuntime::new();
     let error = runtime
