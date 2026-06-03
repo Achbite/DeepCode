@@ -169,9 +169,12 @@ impl DeepCodeKernelRuntime {
                 plan_id,
                 guidance,
             } => self.plan_revise(request_id, run_id, plan_id, guidance),
-            KernelCommand::PlanContractSubmit { request_id, .. } => {
-                self.not_implemented(request_id, "plan.contract_submit")
-            }
+            KernelCommand::PlanContractSubmit {
+                request_id,
+                run_id,
+                session_id,
+                contract,
+            } => self.plan_contract_submit(request_id, run_id, session_id, contract),
             KernelCommand::SkillTrustApprove {
                 request_id,
                 skill_id,

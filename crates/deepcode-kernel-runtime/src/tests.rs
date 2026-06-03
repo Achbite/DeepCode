@@ -3,7 +3,9 @@ use deepcode_kernel_abi::{
     AnswerObligationId, AnswerObligationStatus, MessageRole, UserInput, WorkflowDecisionReason,
     WorkspaceBinding,
 };
-use deepcode_kernel_workflow::WorkflowEvidence;
+use deepcode_kernel_workflow::{
+    ActionBundleDraft, PlanContract, PlannedAction, ValidationExpectation, WorkflowEvidence,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -326,6 +328,120 @@ fn skill_invoke_without_active_run_fails_closed() {
         .unwrap()
         .iter()
         .all(|event| event.kind != "skill.invocation_completed"));
+}
+
+#[test]
+fn plan_contract_submit_produces_review_report_without_entering_complete() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    start_temp_lifecycle_run(&mut runtime);
+    let contract = PlanContract::low_risk_direct("plan-review-1", "read workspace");
+    let events = runtime
+        .dispatch(KernelCommand::PlanContractSubmit {
+            request_id: RequestId("req-plan-review".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            contract: serde_json::to_value(contract).unwrap(),
+        })
+        .unwrap();
+
+    let report = match events.first().unwrap() {
+        KernelEvent::PlanReviewReportProduced {
+            report,
+            run_id,
+            session_id,
+            ..
+        } => {
+            assert_eq!(run_id.as_ref().unwrap().0, "run-1");
+            assert_eq!(session_id.as_ref().unwrap().0, "session-1");
+            report
+        }
+        other => panic!("expected plan review report, got {other:?}"),
+    };
+    assert_eq!(report["status"], "autoAccepted");
+    assert_eq!(
+        report["kernelGeneratedPermissionSummary"],
+        "Kernel preflight: status=autoAccepted; capabilities=workspace.read; permissionGaps=none; hardFloor=none."
+    );
+    assert_eq!(
+        runtime.record_by_run("run-1").unwrap().phase,
+        WorkflowPhase::Plan
+    );
+    let ledger_events = runtime.ledger.list_all().unwrap();
+    assert!(ledger_events
+        .iter()
+        .any(|event| event.kind == "plan.review_report_produced"));
+    assert!(ledger_events
+        .iter()
+        .all(|event| event.kind != "tool.requested"));
+}
+
+#[test]
+fn plan_contract_submit_malformed_contract_returns_denied_report() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    start_temp_lifecycle_run(&mut runtime);
+    let events = runtime
+        .dispatch(KernelCommand::PlanContractSubmit {
+            request_id: RequestId("req-plan-review".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            contract: serde_json::json!({ "not": "a typed plan" }),
+        })
+        .unwrap();
+
+    let report = match events.first().unwrap() {
+        KernelEvent::PlanReviewReportProduced { report, .. } => report,
+        other => panic!("expected plan review report, got {other:?}"),
+    };
+    assert_eq!(report["status"], "denied");
+    assert_eq!(report["planId"], "invalid-contract");
+    assert!(report["deniedReasons"][0]
+        .as_str()
+        .unwrap()
+        .contains("structured PlanContract"));
+}
+
+#[test]
+fn plan_contract_submit_action_bundle_reports_permission_gap() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    start_temp_lifecycle_run(&mut runtime);
+    let bundle = ActionBundleDraft {
+        id: "bundle-write".to_string(),
+        goal: "write file".to_string(),
+        actions: vec![PlannedAction {
+            id: "write-1".to_string(),
+            title: "write generated file".to_string(),
+            capability: "workspace.write".to_string(),
+            resource_scope: vec![".".to_string()],
+            can_parallelize: false,
+            conflict_keys: vec!["out.txt".to_string()],
+            purpose: None,
+        }],
+        validation_expectations: vec![ValidationExpectation {
+            id: "check-1".to_string(),
+            description: "file exists".to_string(),
+            command: None,
+        }],
+        review_expectations: Vec::new(),
+    };
+    let events = runtime
+        .dispatch(KernelCommand::PlanContractSubmit {
+            request_id: RequestId("req-plan-review".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            contract: serde_json::to_value(bundle).unwrap(),
+        })
+        .unwrap();
+
+    let report = match events.first().unwrap() {
+        KernelEvent::PlanReviewReportProduced { report, .. } => report,
+        other => panic!("expected plan review report, got {other:?}"),
+    };
+    assert_eq!(report["status"], "awaitingTemporaryGrant");
+    assert_eq!(report["permissionGaps"][0], "workspace.write");
+    assert_eq!(
+        runtime.record_by_run("run-1").unwrap().phase,
+        WorkflowPhase::Plan
+    );
 }
 
 #[test]

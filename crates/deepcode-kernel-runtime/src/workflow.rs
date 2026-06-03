@@ -311,6 +311,42 @@ impl DeepCodeKernelRuntime {
         self.plan_reject(request_id, run_id, plan_id, Some(guidance))
     }
 
+    pub(crate) fn plan_contract_submit(
+        &mut self,
+        request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        contract: Value,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let (run_id, session_id) = self.resolve_run_session(run_id, session_id)?;
+        let report = match parse_plan_review_input(contract) {
+            Ok(input) => DefaultPlanReviewEngine.review_input(input),
+            Err(reason) => PlanReviewReport::denied("invalid-contract", reason),
+        };
+        let sequence = self.ledger.next_sequence(&run_id)?;
+        let report_value =
+            serde_json::to_value(&report).unwrap_or_else(|_| serde_json::Value::Null);
+        self.append_ledger(
+            &run_id,
+            &session_id,
+            "plan.review_report_produced",
+            sequence,
+            serde_json::json!({
+                "summary": report.kernel_generated_permission_summary,
+                "planId": report.plan_id,
+                "status": plan_review_status_name(&report.status),
+                "report": &report_value
+            }),
+        )?;
+        Ok(vec![KernelEvent::PlanReviewReportProduced {
+            request_id: Some(request_id),
+            run_id: Some(RunId(run_id)),
+            session_id: Some(SessionId(session_id)),
+            report: report_value,
+            sequence: Some(sequence),
+        }])
+    }
+
     pub(crate) fn enter_phase_event(
         &mut self,
         run_id: &str,
@@ -440,6 +476,54 @@ pub(crate) fn workflow_phase_from_str(phase: &str) -> Option<WorkflowPhase> {
         "done" => Some(WorkflowPhase::Done),
         "aborted" => Some(WorkflowPhase::Aborted),
         _ => None,
+    }
+}
+
+fn parse_plan_review_input(contract: Value) -> Result<PlanReviewInput, String> {
+    if let Ok(input) = serde_json::from_value::<PlanReviewInput>(contract.clone()) {
+        return Ok(input);
+    }
+    if let Ok(plan) = serde_json::from_value::<PlanContract>(contract.clone()) {
+        return Ok(PlanReviewInput {
+            plan,
+            action_bundle: None,
+        });
+    }
+    if let Ok(action_bundle) = serde_json::from_value::<ActionBundleDraft>(contract) {
+        let plan = plan_contract_from_action_bundle(&action_bundle);
+        return Ok(PlanReviewInput {
+            plan,
+            action_bundle: Some(action_bundle),
+        });
+    }
+    Err(
+        "contract must be a structured PlanContract, PlanReviewInput, or ActionBundleDraft"
+            .to_string(),
+    )
+}
+
+fn plan_contract_from_action_bundle(bundle: &ActionBundleDraft) -> PlanContract {
+    let mut plan = bundle.to_plan_contract();
+    if plan.completion_criteria.is_empty() {
+        plan.completion_criteria = vec![CompletionCriteria {
+            id: "action-bundle-validation-required".to_string(),
+            description: "Action bundle requires at least one validation or evidence result."
+                .to_string(),
+            evidence_required: Vec::new(),
+            validation_kind: None,
+        }];
+    }
+    plan
+}
+
+fn plan_review_status_name(status: &PlanReviewStatus) -> &'static str {
+    match status {
+        PlanReviewStatus::AutoAccepted => "autoAccepted",
+        PlanReviewStatus::AwaitingUserApproval => "awaitingUserApproval",
+        PlanReviewStatus::AwaitingTemporaryGrant => "awaitingTemporaryGrant",
+        PlanReviewStatus::Denied => "denied",
+        PlanReviewStatus::NeedsRevision => "needsRevision",
+        PlanReviewStatus::InterfaceOnly => "interfaceOnly",
     }
 }
 
