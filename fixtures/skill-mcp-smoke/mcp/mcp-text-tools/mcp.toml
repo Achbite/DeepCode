@@ -9,8 +9,8 @@ name = "Fixture MCP Text Tools"
 vendor = "DeepCode fixture"
 
 [transport]
-kind = "descriptorOnly"
-command = ""
+kind = "stdio"
+command = "python3 server.py"
 endpoint = ""
 
 [auth]

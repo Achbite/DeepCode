@@ -3,6 +3,10 @@ use deepcode_kernel_abi::{
     KernelEventSummary, KernelResult, KernelSnapshot, ProfileRef, RequestId, RunId, SessionId,
     StageStatus, WorkflowDecision, WorkflowDecisionAction, WorkspaceBinding,
 };
+use deepcode_kernel_audit::{
+    AuditActor, AuditBody, AuditCategory, AuditChain, AuditKeyMaterial, AuditRuntimeMode,
+    AuditVerifier, LocalAuditSigner, SignedAuditEntryV1,
+};
 use deepcode_kernel_config::{
     ConfigLayer, ConfigResolver, ConfigResolverInput, ConfigScope, ConfigSource, ConfigSourceKind,
     ConfigTrustLevel, DefaultConfigResolver,

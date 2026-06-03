@@ -72,10 +72,14 @@ fn workspace_and_skill_syscalls_round_trip() {
 
     let command = KernelCommand::SkillInvoke {
         request_id: RequestId("req-skill".to_string()),
+        run_id: Some(RunId("run-1".to_string())),
+        session_id: Some(SessionId("session-1".to_string())),
         skill_id: "external.python.echo".to_string(),
         input: serde_json::json!({ "text": "ok" }),
     };
     let encoded = serde_json::to_value(&command).expect("serialize skill invoke");
     assert_eq!(encoded["kind"], "skillInvoke");
+    assert_eq!(encoded["runId"], "run-1");
+    assert_eq!(encoded["sessionId"], "session-1");
     assert_eq!(encoded["skillId"], "external.python.echo");
 }

@@ -362,6 +362,14 @@ export type KernelPlanCommand =
       contract: unknown;
     }
   | {
+      kind: 'skillInvoke';
+      requestId: string;
+      runId?: string;
+      sessionId?: string;
+      skillId: string;
+      input: unknown;
+    }
+  | {
       kind: 'skillTrustApprove';
       requestId: string;
       skillId: string;

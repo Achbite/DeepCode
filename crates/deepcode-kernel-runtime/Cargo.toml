@@ -9,6 +9,7 @@ description = "DeepCode headless kernel runtime dispatch skeleton."
 
 [dependencies]
 deepcode-kernel-abi.workspace = true
+deepcode-kernel-audit.workspace = true
 deepcode-kernel-config.workspace = true
 deepcode-kernel-context.workspace = true
 deepcode-kernel-ledger.workspace = true

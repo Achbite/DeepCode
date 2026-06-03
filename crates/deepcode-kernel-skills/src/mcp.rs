@@ -1,4 +1,8 @@
+use crate::external::supervisor::{
+    CwdScope, NetworkPolicy, ProcessExecutionPolicy, ProcessInvocation,
+};
 use crate::SkillInvocation;
+use deepcode_kernel_abi::{KernelError, KernelResult};
 use deepcode_kernel_policy::{Capability, RiskLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -180,10 +184,14 @@ pub struct McpPromptProjection {
 pub fn mcp_tool_projection_to_skill_invocation(
     projection: &McpToolProjection,
     invocation_id: impl Into<String>,
+    run_id: Option<String>,
+    session_id: Option<String>,
     input: Value,
 ) -> SkillInvocation {
     SkillInvocation {
         id: invocation_id.into(),
+        run_id,
+        session_id,
         skill_id: projection.internal_skill_id.clone(),
         phase: None,
         input: serde_json::json!({
@@ -192,6 +200,107 @@ pub fn mcp_tool_projection_to_skill_invocation(
             "mcpInput": input,
         }),
     }
+}
+
+pub fn mcp_tool_process_invocation(
+    manifest: &McpConnectorManifest,
+    projection: &McpToolProjection,
+    invocation_id: impl Into<String>,
+    run_id: Option<String>,
+    session_id: Option<String>,
+    input: Value,
+) -> KernelResult<ProcessInvocation> {
+    if manifest.connector_id != projection.connector_id {
+        return Err(KernelError::InvalidCommand(
+            "MCP projection connector does not match connector manifest".to_string(),
+        ));
+    }
+    if manifest.transport.kind != "stdio" && manifest.transport.kind != "process" {
+        return Err(KernelError::PermissionDenied(format!(
+            "MCP transport {} is descriptor-only or unsupported by the stage 13 process adapter",
+            manifest.transport.kind
+        )));
+    }
+    let command = manifest
+        .transport
+        .command
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            KernelError::InvalidCommand("MCP process transport command is required".to_string())
+        })?;
+    let command = command
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let stdin_payload = mcp_stdio_tool_call_payload(projection, input)?;
+    Ok(ProcessInvocation {
+        invocation_id: invocation_id.into(),
+        run_id,
+        session_id,
+        skill_id: Some(projection.internal_skill_id.clone()),
+        connector_id: Some(projection.connector_id.clone()),
+        command,
+        cwd: None,
+        env: Vec::new(),
+        stdin_payload: Some(stdin_payload),
+        policy: ProcessExecutionPolicy {
+            timeout_ms: 3_000,
+            max_stdout_bytes: 16 * 1024,
+            max_stderr_bytes: 16 * 1024,
+            env_allowlist: Vec::new(),
+            cwd_scope: CwdScope::ProcessDefault,
+            network_policy: NetworkPolicy::Deny,
+        },
+    })
+}
+
+pub fn mcp_stdio_tool_call_payload(
+    projection: &McpToolProjection,
+    input: Value,
+) -> KernelResult<String> {
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "clientInfo": {
+                "name": "deepcode-kernel",
+                "version": "0.1.0"
+            },
+            "capabilities": {}
+        }
+    });
+    let tool_call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": projection.tool_id,
+            "arguments": input
+        }
+    });
+    Ok(format!("{initialize}\n{tool_call}\n"))
+}
+
+pub fn parse_mcp_stdio_tool_result(stdout: &str) -> KernelResult<Value> {
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let value = serde_json::from_str::<Value>(line)
+            .map_err(|error| KernelError::Other(format!("decode MCP stdio response: {error}")))?;
+        if value.get("id").and_then(Value::as_u64) != Some(2) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(KernelError::Other(format!("MCP tool call failed: {error}")));
+        }
+        return value.get("result").cloned().ok_or_else(|| {
+            KernelError::Other("MCP stdio tool response is missing result".to_string())
+        });
+    }
+    Err(KernelError::Other(
+        "MCP stdio tool response was not found".to_string(),
+    ))
 }
 
 pub fn model_visible_mcp_tools(
@@ -458,14 +567,105 @@ mod tests {
         let invocation = mcp_tool_projection_to_skill_invocation(
             &projection,
             "invoke-1",
+            Some("run-1".to_string()),
+            Some("session-1".to_string()),
             serde_json::json!({ "query": "DeepCode" }),
         );
 
         assert_eq!(invocation.id, "invoke-1");
+        assert_eq!(invocation.run_id.as_deref(), Some("run-1"));
+        assert_eq!(invocation.session_id.as_deref(), Some("session-1"));
         assert_eq!(invocation.skill_id, "mcp.github.repo.search");
         assert_eq!(invocation.input["connectorId"], "mcp.github");
         assert_eq!(invocation.input["toolId"], "repo.search");
         assert_eq!(invocation.input["mcpInput"]["query"], "DeepCode");
+    }
+
+    #[test]
+    fn mcp_process_invocation_fails_closed_for_descriptor_only_transport() {
+        let manifest = McpConnectorManifest {
+            schema_version: 1,
+            connector_id: "mcp.github".to_string(),
+            version: "1".to_string(),
+            server: McpServerIdentity {
+                name: "GitHub".to_string(),
+                vendor: None,
+            },
+            transport: McpTransportDeclaration {
+                kind: "descriptorOnly".to_string(),
+                command: None,
+                endpoint: None,
+            },
+            auth: McpAuthDeclaration {
+                kind: "none".to_string(),
+                secret_ref: None,
+            },
+            descriptor_snapshot_hash: Some("sha256:abc".to_string()),
+            risk_level: RiskLevel::High,
+        };
+        let projection = model_visible_mcp_tools(
+            &connector(),
+            &[binding(true)],
+            &[Capability::network_egress()],
+        )
+        .pop()
+        .expect("tool projection");
+        let error = mcp_tool_process_invocation(
+            &manifest,
+            &projection,
+            "invoke-mcp",
+            Some("run-1".to_string()),
+            Some("session-1".to_string()),
+            serde_json::json!({ "query": "DeepCode" }),
+        )
+        .unwrap_err();
+        assert!(matches!(error, KernelError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn mcp_process_invocation_uses_projection_and_stdio_command() {
+        let manifest = McpConnectorManifest {
+            schema_version: 1,
+            connector_id: "mcp.github".to_string(),
+            version: "1".to_string(),
+            server: McpServerIdentity {
+                name: "GitHub".to_string(),
+                vendor: None,
+            },
+            transport: McpTransportDeclaration {
+                kind: "stdio".to_string(),
+                command: Some("python3 fixture_server.py".to_string()),
+                endpoint: None,
+            },
+            auth: McpAuthDeclaration {
+                kind: "none".to_string(),
+                secret_ref: None,
+            },
+            descriptor_snapshot_hash: Some("sha256:abc".to_string()),
+            risk_level: RiskLevel::High,
+        };
+        let projection = model_visible_mcp_tools(
+            &connector(),
+            &[binding(true)],
+            &[Capability::network_egress()],
+        )
+        .pop()
+        .expect("tool projection");
+        let invocation = mcp_tool_process_invocation(
+            &manifest,
+            &projection,
+            "invoke-mcp",
+            Some("run-1".to_string()),
+            Some("session-1".to_string()),
+            serde_json::json!({ "query": "DeepCode" }),
+        )
+        .unwrap();
+        assert_eq!(invocation.command, vec!["python3", "fixture_server.py"]);
+        assert_eq!(invocation.run_id.as_deref(), Some("run-1"));
+        assert_eq!(invocation.session_id.as_deref(), Some("session-1"));
+        assert_eq!(invocation.connector_id.as_deref(), Some("mcp.github"));
+        assert!(invocation.stdin_payload.unwrap().contains("repo.search"));
+        assert_eq!(invocation.policy.network_policy, NetworkPolicy::Deny);
     }
 
     #[test]

@@ -390,6 +390,8 @@ impl DeepCodeKernelRuntime {
         let result = self.tool_executors.invoke(
             SkillInvocation {
                 id: format!("tool-{tool_name}"),
+                run_id: None,
+                session_id: None,
                 skill_id: tool_name.to_string(),
                 phase: Some("complete".to_string()),
                 input: arguments.clone(),
@@ -498,20 +500,74 @@ impl DeepCodeKernelRuntime {
     }
 
     pub(crate) fn skill_invoke(
-        &self,
+        &mut self,
         request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
         skill_id: String,
         input: Value,
     ) -> KernelResult<Vec<KernelEvent>> {
+        let (run_id, session_id) = self.resolve_run_session(run_id, session_id)?;
         let result = self
             .skills
             .invoke(deepcode_kernel_skills::SkillInvocation {
                 id: request_id.0.clone(),
+                run_id: Some(run_id.clone()),
+                session_id: Some(session_id.clone()),
                 skill_id: skill_id.clone(),
                 phase: Some("complete".to_string()),
                 input,
             })
             .map(|value| serde_json::to_value(value).unwrap_or(Value::Null));
+        let sequence = self.ledger.list_all()?.len() as u64 + 1;
+        let lifecycle_events = result
+            .as_ref()
+            .ok()
+            .and_then(|output| output.get("output"))
+            .and_then(|output| output.get("lifecycleEvents"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let request_id_value = request_id.0.clone();
+        let audit_projection = serde_json::json!({
+            "eventType": "skill.invocation_completed",
+            "requestId": request_id_value.clone(),
+            "runId": run_id,
+            "sessionId": session_id,
+            "skillId": skill_id.clone(),
+            "ok": result.is_ok(),
+            "error": result.as_ref().err().map(|error| error.to_string()),
+            "lifecycleEvents": lifecycle_events,
+            "redaction": "raw skill output is excluded from audit projection"
+        });
+        self.ledger.append(LedgerEvent {
+            id: format!("evt-skill-invoke-{sequence}"),
+            run_id: Some(run_id.clone()),
+            session_id: Some(session_id.clone()),
+            kind: "skill.invocation_completed".to_string(),
+            sequence: Some(sequence),
+            payload: serde_json::json!({
+                "summary": format!("Skill invocation completed: {}", skill_id),
+                "skillId": skill_id.clone(),
+                "invocationId": request_id_value.clone(),
+                "ok": result.is_ok(),
+                "error": result.as_ref().err().map(|error| error.to_string()),
+                "attribution": {
+                    "requestId": request_id_value,
+                    "runId": run_id,
+                    "sessionId": session_id,
+                    "source": "KernelCommand::SkillInvoke"
+                },
+                "auditProjection": audit_projection
+            }),
+            created_at: None,
+        })?;
+        self.append_signed_audit_entry(
+            &run_id,
+            &session_id,
+            Some(request_id.0.clone()),
+            "skill.invocation_completed",
+            audit_projection,
+        )?;
 
         Ok(vec![KernelEvent::SkillResult {
             request_id,
@@ -521,6 +577,266 @@ impl DeepCodeKernelRuntime {
             error: result.as_ref().err().map(Into::into),
             sequence: None,
         }])
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn brokered_script_dispatch(
+        &mut self,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        request: deepcode_kernel_skills::BrokeredScriptRequest,
+        approved_capabilities: Vec<deepcode_kernel_policy::Capability>,
+    ) -> KernelResult<deepcode_kernel_skills::BrokeredScriptResponse> {
+        let (run_id, session_id) = self.resolve_run_session(run_id, session_id)?;
+        let policy = deepcode_kernel_skills::ScriptBrokerPolicy::new(approved_capabilities);
+        let decision = policy.evaluate(&request);
+        let response = if !decision.authorized {
+            deepcode_kernel_skills::BrokeredScriptResponse {
+                request_id: request.request_id.clone(),
+                ok: false,
+                output: None,
+                error: decision.error.clone(),
+            }
+        } else {
+            self.dispatch_authorized_broker_request(&request)
+        };
+        let sequence = self.ledger.list_all()?.len() as u64 + 1;
+        self.ledger.append(LedgerEvent {
+            id: format!("evt-skill-broker-{sequence}"),
+            run_id: Some(run_id.clone()),
+            session_id: Some(session_id.clone()),
+            kind: "skill.broker_request_completed".to_string(),
+            sequence: Some(sequence),
+            payload: serde_json::json!({
+                "summary": format!("Broker request completed: {}", request.method),
+                "runId": run_id,
+                "sessionId": session_id,
+                "requestId": request.request_id,
+                "invocationId": request.invocation_id,
+                "method": request.method,
+                "ok": response.ok,
+                "error": response.error,
+                "auditProjection": decision.audit_projection()
+            }),
+            created_at: None,
+        })?;
+        self.append_signed_audit_entry(
+            &run_id,
+            &session_id,
+            Some(request.request_id.clone()),
+            "skill.broker_request_completed",
+            serde_json::json!({
+                "requestId": request.request_id,
+                "invocationId": request.invocation_id,
+                "method": request.method,
+                "capability": request.capability.0,
+                "authorized": decision.authorized,
+                "ok": response.ok,
+                "error": response.error
+            }),
+        )?;
+        Ok(response)
+    }
+
+    #[allow(dead_code)]
+    fn dispatch_authorized_broker_request(
+        &self,
+        request: &deepcode_kernel_skills::BrokeredScriptRequest,
+    ) -> deepcode_kernel_skills::BrokeredScriptResponse {
+        let result = match request.method.as_str() {
+            "kernel.fs.read" => {
+                let path = request
+                    .arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        KernelError::InvalidCommand(
+                            "kernel.fs.read broker request requires path".to_string(),
+                        )
+                    });
+                path.and_then(|path| {
+                    self.workspace_read(RequestId(request.request_id.clone()), None, path)
+                        .and_then(broker_workspace_output)
+                })
+            }
+            "kernel.code.search" => {
+                let query = request
+                    .arguments
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        KernelError::InvalidCommand(
+                            "kernel.code.search broker request requires query".to_string(),
+                        )
+                    });
+                query.and_then(|query| {
+                    self.workspace_search(
+                        RequestId(request.request_id.clone()),
+                        None,
+                        query,
+                        None,
+                        false,
+                    )
+                    .and_then(broker_workspace_output)
+                })
+            }
+            "kernel.fs.write"
+            | "kernel.network.fetch"
+            | "kernel.secret.read"
+            | "kernel.shell.exec"
+            | "kernel.temp.create" => Err(KernelError::PermissionDenied(
+                "broker request requires run/session permission continuation and is fail-closed in stage 13"
+                    .to_string(),
+            )),
+            _ => Err(KernelError::PermissionDenied(format!(
+                "unsupported authorized broker method {}",
+                request.method
+            ))),
+        };
+        match result {
+            Ok(output) => deepcode_kernel_skills::BrokeredScriptResponse {
+                request_id: request.request_id.clone(),
+                ok: true,
+                output: Some(output),
+                error: None,
+            },
+            Err(error) => deepcode_kernel_skills::BrokeredScriptResponse {
+                request_id: request.request_id.clone(),
+                ok: false,
+                output: None,
+                error: Some(error.to_string()),
+            },
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_mcp_stdio_tool_call_completed(
+        &mut self,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        invocation_id: String,
+        connector_id: String,
+        tool_id: String,
+        ok: bool,
+        error: Option<String>,
+    ) -> KernelResult<()> {
+        let (run_id, session_id) = self.resolve_run_session(run_id, session_id)?;
+        let sequence = self.ledger.next_sequence(&run_id)?;
+        let redacted_payload = serde_json::json!({
+            "invocationId": invocation_id,
+            "connectorId": connector_id,
+            "toolId": tool_id,
+            "ok": ok,
+            "error": error
+        });
+        self.append_ledger(
+            &run_id,
+            &session_id,
+            "mcp.stdio_tool_call_completed",
+            sequence,
+            serde_json::json!({
+                "summary": "MCP stdio tool call completed",
+                "auditProjection": redacted_payload
+            }),
+        )?;
+        self.append_signed_audit_entry(
+            &run_id,
+            &session_id,
+            None,
+            "mcp.stdio_tool_call_completed",
+            redacted_payload,
+        )?;
+        Ok(())
+    }
+
+    fn append_signed_audit_entry(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        request_id: Option<String>,
+        event_type: &str,
+        redacted_payload: Value,
+    ) -> KernelResult<SignedAuditEntryV1> {
+        let signer = runtime_audit_signer()?;
+        let existing = self.signed_audit_entries()?;
+        let mut chain = AuditChain::from_entries(runtime_audit_segment_id(), signer, existing)
+            .map_err(|error| KernelError::Other(format!("restore audit chain: {error}")))?;
+        let entry = chain
+            .append(
+                now_millis() as i64,
+                AuditBody {
+                    actor: AuditActor::Kernel,
+                    category: AuditCategory::Tool,
+                    event_type: event_type.to_string(),
+                    session_id: Some(session_id.to_string()),
+                    run_id: Some(run_id.to_string()),
+                    request_id,
+                    redacted_payload,
+                },
+            )
+            .map_err(|error| KernelError::Other(format!("append audit entry: {error}")))?;
+        let ledger_sequence = self.ledger.next_sequence(run_id)?;
+        self.append_ledger(
+            run_id,
+            session_id,
+            "audit.signed_entry_created",
+            ledger_sequence,
+            serde_json::json!({
+                "summary": format!("Signed audit entry created: {}", entry.event_type),
+                "signedEntry": &entry
+            }),
+        )?;
+        Ok(entry)
+    }
+
+    fn signed_audit_entries(&self) -> KernelResult<Vec<SignedAuditEntryV1>> {
+        self.ledger
+            .list_all()?
+            .into_iter()
+            .filter(|event| event.kind == "audit.signed_entry_created")
+            .filter_map(|event| event.payload.get("signedEntry").cloned())
+            .map(|value| {
+                serde_json::from_value::<SignedAuditEntryV1>(value).map_err(|error| {
+                    KernelError::Other(format!("decode signed audit entry: {error}"))
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn audit_verify(
+        &self,
+        request_id: RequestId,
+        scope: Value,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let entries = self.signed_audit_entries()?;
+        let verifier = AuditVerifier::new(runtime_audit_signer()?);
+        let (ok, report) = match verifier.verify_entries(&entries) {
+            Ok(report) => (true, serde_json::to_value(report).unwrap_or(Value::Null)),
+            Err(error) => (
+                false,
+                serde_json::json!({
+                    "ok": false,
+                    "entriesVerified": 0,
+                    "message": error.to_string()
+                }),
+            ),
+        };
+        let sequence = self.ledger.list_all()?.len() as u64 + 1;
+        Ok(vec![
+            KernelEvent::AuditVerifyStarted {
+                request_id: Some(request_id.clone()),
+                scope,
+                sequence: Some(sequence),
+            },
+            KernelEvent::AuditVerifyCompleted {
+                request_id: Some(request_id),
+                ok,
+                report,
+                sequence: Some(sequence + 1),
+            },
+        ])
     }
 
     pub(crate) fn mcp_risk_acknowledgment_submit(
@@ -643,6 +959,42 @@ pub(crate) fn needs_workspace_tool(tool_name: &str) -> bool {
         tool_name,
         "fs.read" | "fs.list" | "fs.diff" | "fs.write" | "fs.delete" | "code.search"
     )
+}
+
+#[allow(dead_code)]
+fn broker_workspace_output(events: Vec<KernelEvent>) -> KernelResult<Value> {
+    match events.into_iter().next() {
+        Some(KernelEvent::WorkspaceResult {
+            ok: true,
+            output: Some(output),
+            ..
+        }) => Ok(output),
+        Some(KernelEvent::WorkspaceResult {
+            ok: false,
+            error: Some(error),
+            ..
+        }) => Err(KernelError::Other(error.message)),
+        Some(other) => Err(KernelError::Other(format!(
+            "unexpected broker workspace event {other:?}"
+        ))),
+        None => Err(KernelError::Other(
+            "broker workspace request produced no event".to_string(),
+        )),
+    }
+}
+
+fn runtime_audit_segment_id() -> &'static str {
+    "deepcode-runtime-process-v1"
+}
+
+fn runtime_audit_signer() -> KernelResult<LocalAuditSigner> {
+    let key = AuditKeyMaterial::load_or_degraded(
+        AuditRuntimeMode::Development,
+        "deepcode-runtime-v1",
+        None,
+    )
+    .map_err(|error| KernelError::Other(format!("load runtime audit key: {error}")))?;
+    Ok(LocalAuditSigner::new(key))
 }
 
 pub(crate) fn capability_for_tool(tool_id: &str) -> &'static str {

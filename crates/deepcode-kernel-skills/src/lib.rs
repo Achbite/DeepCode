@@ -3,9 +3,6 @@ use deepcode_kernel_policy::{Capability, CapabilityEffect, RiskLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
 
 pub mod builtin;
 pub mod catalog;
@@ -21,20 +18,31 @@ pub mod trust_record;
 
 pub use catalog::model_visible_skill_descriptors;
 pub use executor::{SkillExecutionContext, SkillExecutor, SkillExecutorRegistry};
+pub use external::broker::{
+    brokered_script_process_invocation, capability_for_broker_method, BrokerRequestDecision,
+    BrokeredScriptRequest, BrokeredScriptResponse, KernelBrokerAdapter, MissingKernelBrokerAdapter,
+    PolicyScriptBroker, ScriptBroker, ScriptBrokerPolicy,
+};
+pub use external::supervisor::{
+    CircuitBreakerPolicy, CwdScope, ExternalProcessSkillRuntime, ExternalProcessSkillSpec,
+    NetworkPolicy, ProcessCircuitBreaker, ProcessExecutionPolicy, ProcessExecutionResult,
+    ProcessInvocation, ProcessLifecycleEvent, ProcessLifecycleEventKind, ProcessSupervisor,
+};
 pub use manifest::{
     InvocationPolicy, SkillEntrypoint, SkillEntrypointKind, SkillLimitDeclaration, SkillManifest,
     SkillManifestKind, SkillOutputPolicy, SkillProvenance, SkillRiskDeclaration,
     SkillRuntimeDeclaration, SkillSourceScope, WorkspaceAccess,
 };
 pub use mcp::{
+    mcp_stdio_tool_call_payload, mcp_tool_process_invocation,
     mcp_tool_projection_to_skill_invocation, model_visible_mcp_prompts,
     model_visible_mcp_prompts_for_revision, model_visible_mcp_resources,
     model_visible_mcp_resources_for_revision, model_visible_mcp_tools,
-    model_visible_mcp_tools_for_revision, McpAuthDeclaration, McpConnectorDescriptor,
-    McpConnectorManifest, McpDescriptorKind, McpPromptBinding, McpPromptDescriptor,
-    McpPromptProjection, McpResourceBinding, McpResourceDescriptor, McpResourceProjection,
-    McpRiskAcknowledgment, McpRiskAcknowledgmentRecord, McpServerIdentity, McpToolBinding,
-    McpToolDescriptor, McpToolProjection, McpTransportDeclaration,
+    model_visible_mcp_tools_for_revision, parse_mcp_stdio_tool_result, McpAuthDeclaration,
+    McpConnectorDescriptor, McpConnectorManifest, McpDescriptorKind, McpPromptBinding,
+    McpPromptDescriptor, McpPromptProjection, McpResourceBinding, McpResourceDescriptor,
+    McpResourceProjection, McpRiskAcknowledgment, McpRiskAcknowledgmentRecord, McpServerIdentity,
+    McpToolBinding, McpToolDescriptor, McpToolProjection, McpTransportDeclaration,
 };
 pub use plugin::{
     PluginBundleContents, PluginBundleManifest, PluginBundlePolicy, PluginRiskSummary,
@@ -92,6 +100,8 @@ impl SkillDescriptor {
 #[serde(rename_all = "camelCase")]
 pub struct SkillInvocation {
     pub id: String,
+    pub run_id: Option<String>,
+    pub session_id: Option<String>,
     pub skill_id: String,
     pub phase: Option<String>,
     pub input: Value,
@@ -104,43 +114,6 @@ pub struct SkillResult {
     pub ok: bool,
     pub output: Value,
     pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalProcessSkillSpec {
-    pub command: String,
-    pub args: Vec<String>,
-    pub cwd: Option<String>,
-    pub env_allowlist: Vec<String>,
-    pub timeout_ms: u64,
-    pub stdout_limit_bytes: usize,
-    pub stderr_limit_bytes: usize,
-}
-
-impl ExternalProcessSkillSpec {
-    pub fn python_inline(code: impl Into<String>) -> Self {
-        Self {
-            command: "python3".to_string(),
-            args: vec!["-c".to_string(), code.into()],
-            cwd: None,
-            env_allowlist: Vec::new(),
-            timeout_ms: 3_000,
-            stdout_limit_bytes: 16 * 1024,
-            stderr_limit_bytes: 16 * 1024,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ExternalProcessSkillRuntime {
-    spec: ExternalProcessSkillSpec,
-}
-
-impl ExternalProcessSkillRuntime {
-    pub fn new(spec: ExternalProcessSkillSpec) -> Self {
-        Self { spec }
-    }
 }
 
 pub trait SkillRegistry {
@@ -279,92 +252,6 @@ impl SkillRuntime for InMemorySkillRegistry {
     }
 }
 
-impl SkillRuntime for ExternalProcessSkillRuntime {
-    fn invoke(&self, invocation: SkillInvocation) -> KernelResult<SkillResult> {
-        let mut args = self.spec.args.clone();
-        if let Some(extra_args) = invocation.input.get("args").and_then(Value::as_array) {
-            for arg in extra_args {
-                let value = arg.as_str().ok_or_else(|| {
-                    KernelError::InvalidCommand(
-                        "external process skill args must be strings".to_string(),
-                    )
-                })?;
-                args.push(value.to_string());
-            }
-        }
-
-        let mut command = Command::new(&self.spec.command);
-        command.args(args);
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.env_clear();
-        for key in &self.spec.env_allowlist {
-            if let Ok(value) = std::env::var(key) {
-                command.env(key, value);
-            }
-        }
-        if let Some(cwd) = &self.spec.cwd {
-            command.current_dir(cwd);
-        }
-
-        let mut child = command.spawn().map_err(|error| {
-            KernelError::Other(format!(
-                "spawn external skill {}: {error}",
-                self.spec.command
-            ))
-        })?;
-        let deadline = Instant::now() + Duration::from_millis(self.spec.timeout_ms.max(1));
-        let mut timed_out = false;
-
-        loop {
-            if child
-                .try_wait()
-                .map_err(|error| KernelError::Other(format!("poll external skill: {error}")))?
-                .is_some()
-            {
-                break;
-            }
-            if Instant::now() >= deadline {
-                timed_out = true;
-                child
-                    .kill()
-                    .map_err(|error| KernelError::Other(format!("kill external skill: {error}")))?;
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        let output = child.wait_with_output().map_err(|error| {
-            KernelError::Other(format!("collect external skill output: {error}"))
-        })?;
-        let stdout = truncate_utf8(&output.stdout, self.spec.stdout_limit_bytes);
-        let stderr = truncate_utf8(&output.stderr, self.spec.stderr_limit_bytes);
-        let exit_code = output.status.code();
-        let ok = output.status.success() && !timed_out;
-
-        Ok(SkillResult {
-            invocation_id: invocation.id,
-            ok,
-            output: serde_json::json!({
-                "exitCode": exit_code,
-                "timedOut": timed_out,
-                "stdout": stdout,
-                "stderr": stderr,
-                "stdoutTruncated": output.stdout.len() > self.spec.stdout_limit_bytes,
-                "stderrTruncated": output.stderr.len() > self.spec.stderr_limit_bytes
-            }),
-            error: (!ok).then(|| {
-                if timed_out {
-                    "external process skill timed out".to_string()
-                } else {
-                    format!("external process skill exited with {exit_code:?}")
-                }
-            }),
-        })
-    }
-}
-
 pub(crate) fn builtin(
     id: &str,
     description_key: &str,
@@ -389,11 +276,6 @@ pub(crate) fn builtin(
         executor_kind: SkillExecutorKind::Builtin,
         model_visible,
     }
-}
-
-fn truncate_utf8(bytes: &[u8], limit: usize) -> String {
-    let limit = limit.min(bytes.len());
-    String::from_utf8_lossy(&bytes[..limit]).to_string()
 }
 
 #[cfg(test)]
@@ -428,6 +310,8 @@ mod tests {
         let error = registry
             .invoke(SkillInvocation {
                 id: "invoke-1".to_string(),
+                run_id: None,
+                session_id: None,
                 skill_id: "missing".to_string(),
                 phase: Some("complete".to_string()),
                 input: serde_json::json!({}),
@@ -462,6 +346,8 @@ mod tests {
         let error = registry
             .invoke(SkillInvocation {
                 id: "invoke-1".to_string(),
+                run_id: None,
+                session_id: None,
                 skill_id: "mcp.github.search".to_string(),
                 phase: Some("complete".to_string()),
                 input: serde_json::json!({}),
@@ -479,6 +365,8 @@ mod tests {
         let result = runtime
             .invoke(SkillInvocation {
                 id: "invoke-python".to_string(),
+                run_id: Some("run-1".to_string()),
+                session_id: Some("session-1".to_string()),
                 skill_id: "external.python.echo".to_string(),
                 phase: Some("complete".to_string()),
                 input: serde_json::json!({}),
@@ -500,6 +388,8 @@ mod tests {
         let result = runtime
             .invoke(SkillInvocation {
                 id: "invoke-timeout".to_string(),
+                run_id: Some("run-1".to_string()),
+                session_id: Some("session-1".to_string()),
                 skill_id: "external.python.timeout".to_string(),
                 phase: Some("complete".to_string()),
                 input: serde_json::json!({}),
@@ -520,6 +410,8 @@ mod tests {
         let result = runtime
             .invoke(SkillInvocation {
                 id: "invoke-limit".to_string(),
+                run_id: Some("run-1".to_string()),
+                session_id: Some("session-1".to_string()),
                 skill_id: "external.python.limit".to_string(),
                 phase: Some("complete".to_string()),
                 input: serde_json::json!({}),
@@ -570,6 +462,8 @@ mod tests {
             .invoke(
                 SkillInvocation {
                     id: "invoke-direct".to_string(),
+                    run_id: Some("run-1".to_string()),
+                    session_id: Some("session-1".to_string()),
                     skill_id: "test.echo".to_string(),
                     phase: Some("complete".to_string()),
                     input: serde_json::json!({}),

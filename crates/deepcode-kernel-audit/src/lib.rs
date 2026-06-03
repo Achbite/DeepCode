@@ -179,6 +179,26 @@ impl AuditChain {
         }
     }
 
+    pub fn from_entries(
+        segment_id: impl Into<String>,
+        signer: LocalAuditSigner,
+        entries: Vec<SignedAuditEntryV1>,
+    ) -> AuditResult<Self> {
+        let segment_id = segment_id.into();
+        if let Some(entry) = entries.iter().find(|entry| entry.segment_id != segment_id) {
+            return verify_error(format!(
+                "segment mismatch at {}: expected {} but got {}",
+                entry.sequence, segment_id, entry.segment_id
+            ));
+        }
+        AuditVerifier::new(signer.clone()).verify_entries(&entries)?;
+        Ok(Self {
+            segment_id,
+            signer,
+            entries,
+        })
+    }
+
     pub fn append(
         &mut self,
         timestamp_ms: i64,
@@ -465,6 +485,25 @@ mod tests {
             .unwrap();
         assert!(report.ok);
         assert_eq!(report.entries_verified, 2);
+    }
+
+    #[test]
+    fn chain_can_resume_from_verified_entries() {
+        let entries = sample_entries();
+        let mut chain =
+            AuditChain::from_entries("segment-1", signer(b"secret"), entries.clone()).unwrap();
+        let entry = chain
+            .append(3, body("permission.rechecked", json!({"ok": true})))
+            .unwrap();
+        assert_eq!(entry.sequence, 3);
+        assert_eq!(entry.prev_hash, entries[1].entry_hash);
+    }
+
+    #[test]
+    fn chain_resume_rejects_tampered_entries() {
+        let mut entries = sample_entries();
+        entries[0].body_redacted = json!({"tampered": true});
+        assert!(AuditChain::from_entries("segment-1", signer(b"secret"), entries).is_err());
     }
 
     #[test]

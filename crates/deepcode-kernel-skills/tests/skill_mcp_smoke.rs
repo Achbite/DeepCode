@@ -1,12 +1,18 @@
 use deepcode_kernel_policy::{Capability, CapabilityEffect, RiskLevel};
-use deepcode_kernel_skills::external::broker::{BrokeredScriptRequest, ScriptBrokerPolicy};
+use deepcode_kernel_skills::external::broker::{
+    brokered_script_process_invocation, BrokeredScriptRequest, MissingKernelBrokerAdapter,
+    PolicyScriptBroker, ScriptBroker, ScriptBrokerPolicy,
+};
 use deepcode_kernel_skills::hash::{hash_skill_material, hash_skill_revision};
 use deepcode_kernel_skills::scanner::scan_skill_manifest;
+use deepcode_kernel_skills::ProcessSupervisor;
 use deepcode_kernel_skills::{
-    model_visible_mcp_prompts, model_visible_mcp_resources, model_visible_mcp_tools,
-    model_visible_mcp_tools_for_revision, model_visible_skill_descriptors, McpConnectorDescriptor,
-    McpPromptBinding, McpResourceBinding, McpToolBinding, PluginBundleManifest, SkillDescriptor,
-    SkillExecutorKind, SkillManifest, SkillSource, SkillTrustMode, SkillTrustRecord,
+    mcp_tool_process_invocation, model_visible_mcp_prompts, model_visible_mcp_resources,
+    model_visible_mcp_tools, model_visible_mcp_tools_for_revision, model_visible_skill_descriptors,
+    parse_mcp_stdio_tool_result, McpAuthDeclaration, McpConnectorDescriptor, McpConnectorManifest,
+    McpPromptBinding, McpResourceBinding, McpServerIdentity, McpToolBinding,
+    McpTransportDeclaration, PluginBundleManifest, SkillDescriptor, SkillExecutorKind,
+    SkillManifest, SkillSource, SkillTrustMode, SkillTrustRecord,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -194,6 +200,51 @@ fn broker_policy_authorizes_fixture_method_without_executing_script() {
 
     let authorization = policy.authorize(&request).unwrap();
     assert_eq!(authorization.capability, Capability::workspace_read());
+    let audit = policy.evaluate(&request).audit_projection();
+    assert_eq!(audit["method"], "kernel.fs.read");
+    assert!(audit.get("arguments").is_none());
+}
+
+#[test]
+fn broker_policy_blocks_fixture_request_before_kernel_adapter() {
+    let broker = PolicyScriptBroker::new(
+        ScriptBrokerPolicy::new(vec![Capability::workspace_read()]),
+        MissingKernelBrokerAdapter,
+    );
+    let response = broker.dispatch(BrokeredScriptRequest {
+        request_id: "fixture-broker-write".to_string(),
+        invocation_id: "fixture-invoke".to_string(),
+        capability: Capability::workspace_write(),
+        method: "kernel.fs.write".to_string(),
+        arguments: serde_json::json!({ "path": "README.md", "content": "x" }),
+    });
+
+    assert!(!response.ok);
+    assert!(response.error.unwrap().contains("unapproved capability"));
+}
+
+#[test]
+fn brokered_text_skill_fixture_runs_under_supervisor() {
+    let manifest: SkillManifest = read_json("skills/text-transform-brokered/skill.manifest.json");
+    let skill_root = fixture_root().join("skills/text-transform-brokered");
+    let invocation = brokered_script_process_invocation(
+        &manifest,
+        "fixture-supervised-transform",
+        Some("run-fixture".to_string()),
+        Some("session-fixture".to_string()),
+        &skill_root,
+        Some(serde_json::json!({ "text": "deepcode" }).to_string()),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(invocation.run_id.as_deref(), Some("run-fixture"));
+    assert_eq!(invocation.session_id.as_deref(), Some("session-fixture"));
+    let mut supervisor = ProcessSupervisor::new();
+    let result = supervisor.invoke(invocation).unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.stdout_preview, "{\"text\": \"DEEPCODE\"}");
+    assert_eq!(result.lifecycle_events.len(), 2);
 }
 
 #[test]
@@ -244,6 +295,58 @@ fn mcp_binding_revision_change_requires_new_acknowledgment() {
         .len(),
         1
     );
+}
+
+#[test]
+fn acknowledged_mcp_stdio_fixture_round_trips_tool_call() {
+    let connector: McpConnectorDescriptor = read_json("mcp/mcp-text-tools/connector.json");
+    let acknowledged: McpToolBinding = read_json("mcp/mcp-text-tools/binding-acknowledged.json");
+    let projection =
+        model_visible_mcp_tools(&connector, &[acknowledged], &[Capability::network_egress()])
+            .pop()
+            .expect("acknowledged mcp projection");
+    let server = fixture_root().join("mcp/mcp-text-tools/server.py");
+    let manifest = McpConnectorManifest {
+        schema_version: 1,
+        connector_id: connector.connector_id.clone(),
+        version: connector.version.clone(),
+        server: McpServerIdentity {
+            name: connector.title.clone(),
+            vendor: Some("DeepCode fixture".to_string()),
+        },
+        transport: McpTransportDeclaration {
+            kind: "stdio".to_string(),
+            command: Some(format!("python3 {}", server.to_string_lossy())),
+            endpoint: None,
+        },
+        auth: McpAuthDeclaration {
+            kind: "none".to_string(),
+            secret_ref: None,
+        },
+        descriptor_snapshot_hash: Some("sha256:fixture-acknowledged".to_string()),
+        risk_level: connector.risk_level.clone(),
+    };
+    let invocation = mcp_tool_process_invocation(
+        &manifest,
+        &projection,
+        "fixture-mcp-stdio",
+        Some("run-fixture".to_string()),
+        Some("session-fixture".to_string()),
+        serde_json::json!({ "text": "deepcode" }),
+    )
+    .unwrap();
+    assert_eq!(invocation.run_id.as_deref(), Some("run-fixture"));
+    assert_eq!(invocation.session_id.as_deref(), Some("session-fixture"));
+    let mut supervisor = ProcessSupervisor::new();
+    let result = supervisor.invoke(invocation).unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(
+        result.lifecycle_events[0].run_id.as_deref(),
+        Some("run-fixture")
+    );
+    let parsed = parse_mcp_stdio_tool_result(&result.stdout_preview).unwrap();
+    assert_eq!(parsed["content"][0]["text"], "edocpeed");
 }
 
 #[test]

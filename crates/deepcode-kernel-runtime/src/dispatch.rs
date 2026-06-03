@@ -128,9 +128,11 @@ impl DeepCodeKernelRuntime {
             KernelCommand::SkillDiscover { request_id } => self.skill_discover(request_id),
             KernelCommand::SkillInvoke {
                 request_id,
+                run_id,
+                session_id,
                 skill_id,
                 input,
-            } => self.skill_invoke(request_id, skill_id, input),
+            } => self.skill_invoke(request_id, run_id, session_id, skill_id, input),
             KernelCommand::ContextAttachReference {
                 request_id,
                 source_path,
@@ -186,8 +188,8 @@ impl DeepCodeKernelRuntime {
                 binding_id,
                 acknowledgment,
             ),
-            KernelCommand::AuditVerify { request_id, .. } => {
-                self.not_implemented(request_id, "audit.verify")
+            KernelCommand::AuditVerify { request_id, scope } => {
+                self.audit_verify(request_id, scope)
             }
             KernelCommand::AuditQuery { request_id, .. } => {
                 self.not_implemented(request_id, "audit.query")

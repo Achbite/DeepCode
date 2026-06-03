@@ -239,6 +239,285 @@ fn mcp_risk_acknowledgment_records_understanding_without_permission_grant() {
 }
 
 #[test]
+fn skill_invoke_records_invocation_lifecycle_in_ledger_even_when_adapter_missing() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    start_temp_lifecycle_run(&mut runtime);
+    let events = runtime
+        .dispatch(KernelCommand::SkillInvoke {
+            request_id: RequestId("req-skill-invoke".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            skill_id: "fs.read".to_string(),
+            input: serde_json::json!({ "path": "README.md" }),
+        })
+        .unwrap();
+
+    assert!(matches!(
+        events.first(),
+        Some(KernelEvent::SkillResult {
+            ok: false,
+            skill_id: Some(skill_id),
+            ..
+        }) if skill_id == "fs.read"
+    ));
+    let ledger_events = runtime.ledger.list_all().unwrap();
+    let event = ledger_events
+        .iter()
+        .find(|event| event.kind == "skill.invocation_completed")
+        .expect("skill invocation ledger event");
+    assert_eq!(event.payload["skillId"], "fs.read");
+    assert_eq!(event.payload["invocationId"], "req-skill-invoke");
+    assert_eq!(event.payload["ok"], false);
+    assert_eq!(
+        event.payload["attribution"]["source"],
+        "KernelCommand::SkillInvoke"
+    );
+    assert_eq!(event.payload["attribution"]["runId"], "run-1");
+    assert_eq!(event.payload["attribution"]["sessionId"], "session-1");
+    assert_eq!(
+        event.payload["auditProjection"]["redaction"],
+        "raw skill output is excluded from audit projection"
+    );
+    assert!(event.payload["auditProjection"].get("output").is_none());
+    let signed = ledger_events
+        .iter()
+        .find(|event| event.kind == "audit.signed_entry_created")
+        .expect("signed audit ledger event");
+    assert_eq!(signed.run_id.as_deref(), Some("run-1"));
+    assert_eq!(signed.session_id.as_deref(), Some("session-1"));
+    assert_eq!(
+        signed.payload["signedEntry"]["event_type"],
+        "skill.invocation_completed"
+    );
+    assert_eq!(signed.payload["signedEntry"]["run_id"], "run-1");
+    assert!(signed.payload["signedEntry"]["body_redacted"]
+        .get("output")
+        .is_none());
+
+    let verify_events = runtime
+        .dispatch(KernelCommand::AuditVerify {
+            request_id: RequestId("req-audit-verify".to_string()),
+            scope: serde_json::json!({ "kind": "all" }),
+        })
+        .unwrap();
+    assert!(matches!(
+        verify_events.last(),
+        Some(KernelEvent::AuditVerifyCompleted { ok: true, .. })
+    ));
+}
+
+#[test]
+fn skill_invoke_without_active_run_fails_closed() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    let error = runtime
+        .dispatch(KernelCommand::SkillInvoke {
+            request_id: RequestId("req-skill-invoke".to_string()),
+            run_id: None,
+            session_id: None,
+            skill_id: "fs.read".to_string(),
+            input: serde_json::json!({ "path": "README.md" }),
+        })
+        .unwrap_err();
+
+    assert!(matches!(error, KernelError::InvalidCommand(_)));
+    assert!(runtime
+        .ledger
+        .list_all()
+        .unwrap()
+        .iter()
+        .all(|event| event.kind != "skill.invocation_completed"));
+}
+
+#[test]
+fn audit_verify_detects_tampered_signed_entry() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    start_temp_lifecycle_run(&mut runtime);
+    runtime
+        .dispatch(KernelCommand::SkillInvoke {
+            request_id: RequestId("req-skill-invoke".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            skill_id: "fs.read".to_string(),
+            input: serde_json::json!({ "path": "README.md" }),
+        })
+        .unwrap();
+    let signed_event = runtime
+        .ledger
+        .list_all()
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "audit.signed_entry_created")
+        .expect("signed audit event");
+    let mut signed_entry: deepcode_kernel_audit::SignedAuditEntryV1 =
+        serde_json::from_value(signed_event.payload["signedEntry"].clone()).unwrap();
+    signed_entry.signature = "tampered".to_string();
+    runtime
+        .ledger
+        .append(LedgerEvent {
+            id: "evt-tampered-audit".to_string(),
+            run_id: Some("run-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            kind: "audit.signed_entry_created".to_string(),
+            sequence: Some(99),
+            payload: serde_json::json!({ "signedEntry": signed_entry }),
+            created_at: None,
+        })
+        .unwrap();
+
+    let verify_events = runtime
+        .dispatch(KernelCommand::AuditVerify {
+            request_id: RequestId("req-audit-verify".to_string()),
+            scope: serde_json::json!({ "kind": "all" }),
+        })
+        .unwrap();
+    assert!(matches!(
+        verify_events.last(),
+        Some(KernelEvent::AuditVerifyCompleted { ok: false, .. })
+    ));
+}
+
+#[test]
+fn brokered_script_dispatch_routes_read_through_workspace_boundary_and_ledger() {
+    let workspace = temp_workspace();
+    fs::write(workspace.join("README.md"), "DeepCode broker read").unwrap();
+    let mut runtime = DeepCodeKernelRuntime::new();
+    runtime
+        .dispatch(KernelCommand::WorkspaceOpen {
+            request_id: RequestId("req-open".to_string()),
+            path: workspace.to_string_lossy().to_string(),
+        })
+        .unwrap();
+    runtime
+        .dispatch(KernelCommand::RunStart {
+            request_id: RequestId("req-run".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            input: UserInput {
+                text: "broker read".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(binding_for_root(&workspace)),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .unwrap();
+
+    let response = runtime
+        .brokered_script_dispatch(
+            Some(RunId("run-1".to_string())),
+            Some(SessionId("session-1".to_string())),
+            deepcode_kernel_skills::BrokeredScriptRequest {
+                request_id: "broker-read".to_string(),
+                invocation_id: "invoke-broker".to_string(),
+                capability: deepcode_kernel_policy::Capability::workspace_read(),
+                method: "kernel.fs.read".to_string(),
+                arguments: serde_json::json!({ "path": "README.md" }),
+            },
+            vec![deepcode_kernel_policy::Capability::workspace_read()],
+        )
+        .unwrap();
+
+    assert!(response.ok);
+    assert_eq!(response.output.unwrap()["content"], "DeepCode broker read");
+    let ledger_events = runtime.ledger.list_all().unwrap();
+    let event = ledger_events
+        .iter()
+        .find(|event| event.kind == "skill.broker_request_completed")
+        .expect("broker request ledger event");
+    assert_eq!(event.run_id.as_deref(), Some("run-1"));
+    assert_eq!(event.session_id.as_deref(), Some("session-1"));
+    assert_eq!(event.payload["method"], "kernel.fs.read");
+    assert_eq!(event.payload["auditProjection"]["authorized"], true);
+    assert!(event.payload["auditProjection"].get("arguments").is_none());
+    assert!(ledger_events
+        .iter()
+        .any(|event| event.kind == "audit.signed_entry_created"
+            && event.payload["signedEntry"]["event_type"] == "skill.broker_request_completed"));
+}
+
+#[test]
+fn brokered_script_dispatch_rejects_write_without_permission_continuation() {
+    let workspace = temp_workspace();
+    let mut runtime = DeepCodeKernelRuntime::new();
+    runtime
+        .dispatch(KernelCommand::WorkspaceOpen {
+            request_id: RequestId("req-open".to_string()),
+            path: workspace.to_string_lossy().to_string(),
+        })
+        .unwrap();
+    runtime
+        .dispatch(KernelCommand::RunStart {
+            request_id: RequestId("req-run".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            input: UserInput {
+                text: "broker write".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(binding_for_root(&workspace)),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .unwrap();
+
+    let response = runtime
+        .brokered_script_dispatch(
+            Some(RunId("run-1".to_string())),
+            Some(SessionId("session-1".to_string())),
+            deepcode_kernel_skills::BrokeredScriptRequest {
+                request_id: "broker-write".to_string(),
+                invocation_id: "invoke-broker".to_string(),
+                capability: deepcode_kernel_policy::Capability::workspace_write(),
+                method: "kernel.fs.write".to_string(),
+                arguments: serde_json::json!({ "path": "out.txt", "content": "x" }),
+            },
+            vec![deepcode_kernel_policy::Capability::workspace_write()],
+        )
+        .unwrap();
+
+    assert!(!response.ok);
+    assert!(response.error.unwrap().contains("permission continuation"));
+    assert!(!workspace.join("out.txt").exists());
+}
+
+#[test]
+fn mcp_stdio_tool_call_completion_writes_signed_audit_entry() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    start_temp_lifecycle_run(&mut runtime);
+    runtime
+        .record_mcp_stdio_tool_call_completed(
+            Some(RunId("run-1".to_string())),
+            Some(SessionId("session-1".to_string())),
+            "mcp-invoke-1".to_string(),
+            "fixture.mcp.text-tools".to_string(),
+            "text.reverse".to_string(),
+            true,
+            None,
+        )
+        .unwrap();
+
+    let ledger_events = runtime.ledger.list_all().unwrap();
+    assert!(ledger_events
+        .iter()
+        .any(|event| event.kind == "mcp.stdio_tool_call_completed"));
+    let signed = ledger_events
+        .iter()
+        .find(|event| {
+            event.kind == "audit.signed_entry_created"
+                && event.payload["signedEntry"]["event_type"] == "mcp.stdio_tool_call_completed"
+        })
+        .expect("mcp stdio signed audit entry");
+    assert_eq!(signed.payload["signedEntry"]["run_id"], "run-1");
+    assert_eq!(
+        signed.payload["signedEntry"]["body_redacted"]["connectorId"],
+        "fixture.mcp.text-tools"
+    );
+    assert!(signed.payload["signedEntry"]["body_redacted"]
+        .get("stdout")
+        .is_none());
+}
+
+#[test]
 fn run_start_without_workspace_binding_fails_closed() {
     let mut runtime = DeepCodeKernelRuntime::new();
     let error = runtime

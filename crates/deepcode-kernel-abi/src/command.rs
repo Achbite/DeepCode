@@ -118,6 +118,8 @@ pub enum KernelCommand {
     },
     SkillInvoke {
         request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
         skill_id: String,
         input: Value,
     },
