@@ -311,7 +311,7 @@ else
   info "TS checks skipped by DEEPCODE_SKIP_TS_CHECKS=1"
 fi
 
-info "[4/8] stage 9/10 boundary grep gates"
+info "[4/8] stage 9/10/10.5/11/12/13 boundary grep gates"
 for runtime_module in \
   dispatch state workspace tools workflow llm context permissions temp_artifacts obligations
 do
@@ -370,13 +370,18 @@ test -f crates/deepcode-kernel-abi/src/tests/mod.rs || fail "missing ABI interna
 test -f crates/deepcode-kernel-abi/tests/root_roundtrip.rs || fail "missing ABI crate-root integration test"
 ! search "pub enum KernelCommand|pub enum KernelEvent|pub struct KernelSnapshot|pub enum KernelError|pub struct KernelErrorEnvelope" crates/deepcode-kernel-abi/src/lib.rs || fail "ABI lib.rs must remain facade-only"
 search "pub enum KernelCommand|PlanContractSubmit|SkillTrustApprove|McpRiskAcknowledgmentSubmit|AuditVerify|AuditQuery" crates/deepcode-kernel-abi/src/command.rs >/dev/null
+search "run_id: Option<RunId>|session_id: Option<SessionId>" crates/deepcode-kernel-abi/src/command.rs >/dev/null
 search "pub enum KernelEvent|PlanReviewReportProduced|SkillTrustRequested|SkillTrustGranted|McpRiskAcknowledgmentRequired|AuditVerifyCompleted|AuditDegradedEntered|AuditSegmentRotated" crates/deepcode-kernel-abi/src/event.rs >/dev/null
 search "pub struct KernelSnapshot" crates/deepcode-kernel-abi/src/snapshot.rs >/dev/null
 search "pub enum KernelError|pub struct KernelErrorEnvelope" crates/deepcode-kernel-abi/src/error.rs >/dev/null
 search "SkillTrustMode|BrokeredScript|DirectHostScript|ScriptBroker|ScriptBrokerPolicy|capability_for_broker_method" crates/deepcode-kernel-skills/src >/dev/null
+search "ProcessSupervisor|ProcessInvocation|ProcessExecutionPolicy|ProcessLifecycleEvent|ProcessCircuitBreaker|CwdScope|NetworkPolicy" crates/deepcode-kernel-skills/src/external/supervisor.rs >/dev/null
+search "run_id: Option<String>|session_id: Option<String>" crates/deepcode-kernel-skills/src/external/supervisor.rs >/dev/null
+search "brokered_script_process_invocation|PolicyScriptBroker|KernelBrokerAdapter|audit_projection|CwdScope::Fixed|NetworkPolicy::Deny" crates/deepcode-kernel-skills/src/external/broker.rs >/dev/null
 search "struct SkillManifest|enum InvocationPolicy|enum SkillOutputPolicy|enum SkillManifestKind|fn hash_skill_revision|fn scan_skill_manifest|struct SkillRiskReport|model_visible_skill_descriptors" crates/deepcode-kernel-skills/src >/dev/null
 search "struct PluginBundleManifest|struct PluginBundlePolicy|Plugin enable does not grant" crates/deepcode-kernel-skills/src fixtures/skill-mcp-smoke/README.md >/dev/null
 search "struct McpConnectorDescriptor|struct McpConnectorManifest|struct McpToolBinding|struct McpResourceBinding|struct McpPromptBinding|struct McpRiskAcknowledgmentRecord|fn model_visible_mcp_tools_for_revision|fn model_visible_mcp_resources|fn model_visible_mcp_prompts|fn mcp_tool_projection_to_skill_invocation" crates/deepcode-kernel-skills/src >/dev/null
+search "fn mcp_tool_process_invocation|fn mcp_stdio_tool_call_payload|fn parse_mcp_stdio_tool_result|descriptor-only or unsupported|MCP process transport command is required|tools/call" crates/deepcode-kernel-skills/src/mcp.rs >/dev/null
 ! search "TODO\\(stage-9\\): Move LLM provider transport" crates/deepcode-kernel-daemon/src/main.rs || fail "daemon LLM transport must not keep stale stage-9 migration TODOs"
 test -f fixtures/skill-mcp-smoke/README.md || fail "missing Skill/MCP smoke fixture README"
 test -f fixtures/skill-mcp-smoke/plugin/text-tools.plugin.json || fail "missing PluginBundle fixture"
@@ -389,9 +394,15 @@ test -f fixtures/skill-mcp-smoke/skills/text-transform-brokered/skill.manifest.j
 test -f fixtures/skill-mcp-smoke/skills/text-transform-brokered/transform.py || fail "missing brokered text skill script fixture"
 test -f fixtures/skill-mcp-smoke/mcp/mcp-text-tools/connector.json || fail "missing MCP text tools connector fixture"
 test -f fixtures/skill-mcp-smoke/mcp/mcp-text-tools/mcp.toml || fail "missing MCP text tools mcp.toml fixture"
+test -f fixtures/skill-mcp-smoke/mcp/mcp-text-tools/server.py || fail "missing MCP stdio fixture server"
 test -f fixtures/skill-mcp-smoke/mcp/mcp-text-tools/binding-acknowledged.json || fail "missing MCP acknowledged binding fixture"
 test -f crates/deepcode-kernel-skills/tests/skill_mcp_smoke.rs || fail "missing Skill/MCP smoke integration test"
-search "fn skill_trust_approve|fn mcp_risk_acknowledgment_submit|model_visible_skill_descriptors|permissionGranted" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
+search "fn skill_trust_approve|fn mcp_risk_acknowledgment_submit|fn brokered_script_dispatch|fn append_signed_audit_entry|fn audit_verify|audit.signed_entry_created|model_visible_skill_descriptors|permissionGranted|skill.invocation_completed|skill.broker_request_completed|mcp.stdio_tool_call_completed|auditProjection|KernelCommand::SkillInvoke" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
+! search "not_implemented\\(request_id, \"audit.verify\"\\)" crates/deepcode-kernel-runtime/src/dispatch.rs || fail "AuditVerify must not remain interface-only in runtime"
+search "brokered_script_dispatch_routes_read_through_workspace_boundary_and_ledger|brokered_script_dispatch_rejects_write_without_permission_continuation|skill_invoke_without_active_run_fails_closed|audit_verify_detects_tampered_signed_entry|mcp_stdio_tool_call_completion_writes_signed_audit_entry" crates/deepcode-kernel-runtime/src/tests.rs >/dev/null
+search "brokered_text_skill_fixture_runs_under_supervisor|broker_policy_blocks_fixture_request_before_kernel_adapter|acknowledged_mcp_stdio_fixture_round_trips_tool_call|parse_mcp_stdio_tool_result|ProcessSupervisor" crates/deepcode-kernel-skills/tests/skill_mcp_smoke.rs >/dev/null
+search "from_entries|chain_can_resume_from_verified_entries|chain_resume_rejects_tampered_entries" crates/deepcode-kernel-audit/src/lib.rs >/dev/null
+search "kind: 'skillInvoke'|runId\\?: string|sessionId\\?: string|skillId: string" userspace/protocol/src/kernel.ts >/dev/null
 search "PlanReviewEngine|PlanReviewReport" crates/deepcode-kernel-workflow/src >/dev/null
 search "SignedAuditEntryV1|AuditSegmentSealV1|AuditVerifier" crates/deepcode-kernel-audit/src >/dev/null
 search "struct HttpKernelClient|send_prompt|daemon_status" crates/deepcode-kernel-client/src/lib.rs >/dev/null
@@ -414,7 +425,7 @@ search "\\.deepcode/build-baselines/" .gitignore >/dev/null
 search "\\.build-cache|\\.deepcode/build-baselines|\\.pnpm-store" .dockerignore >/dev/null
 search "run_build_baseline_probe|cargo release repeat|cargo release after runtime touch|build-baselines" test.sh >/dev/null
 search "--mount=type=cache|sccache|SCCACHE_DIR" Dockerfile.dev >/dev/null
-pass "stage 9/10/10.5/11/12 grep gates"
+pass "stage 9/10/10.5/11/12/13 grep gates"
 
 info "[5/8] Kernel daemon HTTP smoke"
 CONFIG_DIR="$(mktemp -d /tmp/deepcode-stage9-config-XXXXXX)"
@@ -528,4 +539,4 @@ else
 fi
 
 info "[8/8] done"
-pass "DeepCode stage 9/10/10.5/11/12 fast smoke passed"
+pass "DeepCode stage 9/10/10.5/11/12/13 fast smoke passed"
