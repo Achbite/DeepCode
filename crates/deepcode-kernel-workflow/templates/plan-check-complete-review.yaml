@@ -1,0 +1,109 @@
+schema_version: "1.0.0"
+id: plan-check-complete-review
+title: Plan Check Complete Review
+description: Default guarded workflow template.
+initial_state: plan
+max_iterations: 3
+terminal_states:
+  - done
+states:
+  - id: plan
+    kind: llm
+    allowed_capabilities:
+      - workspace.read
+      - workspace.search
+      - web.search
+      - context.assemble
+    allowed_proposals:
+      - RequirementChecklist
+      - ResourceRequest
+      - PlanDraft
+      - AgentPlanDraft
+      - ActionBundleDraft
+    entry_hooks:
+      - prompt.plan.enter
+    exit_predicates:
+      - predicate: proposal.kind.in
+        args:
+          kinds:
+            - PlanDraft
+            - AgentPlanDraft
+            - ActionBundleDraft
+    invalid_proposal_policy: reject_and_reprompt
+  - id: check
+    kind: kernel
+    allowed_capabilities:
+      - plan.review
+      - policy.inspect
+      - evidence.query
+      - permission.preflight
+    allowed_proposals:
+      - PlanReviewReport
+      - PermissionPreflightResult
+    entry_hooks:
+      - kernel.plan_review.preflight
+    exit_predicates:
+      - predicate: plan_review.ready
+    invalid_proposal_policy: reject
+  - id: complete
+    kind: llm_tool
+    allowed_capabilities:
+      - workspace.read
+      - workspace.search
+      - workspace.write
+      - workspace.create
+      - workspace.delete
+      - process.exec
+    allowed_proposals:
+      - ToolActionDraft
+      - PatchDraft
+      - ValidationProposal
+      - RepairProposal
+    exit_predicates:
+      - predicate: validation.succeeded
+      - predicate: temp_lease.all_released
+    invalid_proposal_policy: reject_and_replan
+  - id: review
+    kind: kernel_review
+    allowed_capabilities:
+      - workspace.read
+      - evidence.query
+      - validation.read
+      - reviewgate.evaluate
+    allowed_proposals:
+      - ReviewPacket
+      - ReplanRequest
+      - FinalAnswerDraft
+    exit_predicates:
+      - predicate: review.ready_for_user
+    invalid_proposal_policy: reject
+  - id: done
+    kind: terminal
+    invalid_proposal_policy: reject
+transitions:
+  - from: plan
+    to: check
+    when:
+      - predicate: proposal.kind.in
+        args:
+          kinds:
+            - PlanDraft
+            - AgentPlanDraft
+            - ActionBundleDraft
+  - from: check
+    to: complete
+    when:
+      - predicate: plan_review.ready
+  - from: complete
+    to: review
+    when:
+      - predicate: validation.succeeded
+      - predicate: temp_lease.all_released
+  - from: review
+    to: complete
+    when:
+      - predicate: user.replan_requested
+  - from: review
+    to: done
+    when:
+      - predicate: user.accepted

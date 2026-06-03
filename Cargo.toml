@@ -51,6 +51,7 @@ deepcode-kernel-client = { path = "crates/deepcode-kernel-client" }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 tower-http = { version = "0.5", features = ["fs", "cors"] }
