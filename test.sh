@@ -311,7 +311,7 @@ else
   info "TS checks skipped by DEEPCODE_SKIP_TS_CHECKS=1"
 fi
 
-info "[4/8] stage 9/10/10.5/11/12/13 boundary grep gates"
+info "[4/8] stage 9/10/10.5/11/12/13/14 boundary grep gates"
 for runtime_module in \
   dispatch state workspace tools workflow llm context permissions temp_artifacts obligations
 do
@@ -403,7 +403,26 @@ search "brokered_script_dispatch_routes_read_through_workspace_boundary_and_ledg
 search "brokered_text_skill_fixture_runs_under_supervisor|broker_policy_blocks_fixture_request_before_kernel_adapter|acknowledged_mcp_stdio_fixture_round_trips_tool_call|parse_mcp_stdio_tool_result|ProcessSupervisor" crates/deepcode-kernel-skills/tests/skill_mcp_smoke.rs >/dev/null
 search "from_entries|chain_can_resume_from_verified_entries|chain_resume_rejects_tampered_entries" crates/deepcode-kernel-audit/src/lib.rs >/dev/null
 search "kind: 'skillInvoke'|runId\\?: string|sessionId\\?: string|skillId: string" userspace/protocol/src/kernel.ts >/dev/null
-search "PlanReviewEngine|PlanReviewReport" crates/deepcode-kernel-workflow/src >/dev/null
+search "PlanReviewEngine|PlanReviewReport|PlanReviewInput|kernel_generated_permission_summary|permission_gaps|review_input" crates/deepcode-kernel-workflow/src >/dev/null
+for workflow_module in contract controller descriptor error interpreter machine outcome phase predicate proposal state template validator; do
+  test -f "crates/deepcode-kernel-workflow/src/${workflow_module}.rs" || fail "missing workflow module ${workflow_module}.rs"
+done
+test -f crates/deepcode-kernel-workflow/templates/plan-check-complete-review.yaml || fail "missing default workflow descriptor template"
+test -f crates/deepcode-kernel-workflow/docs/descriptor.md || fail "missing workflow descriptor V1 docs"
+! search "pub enum WorkflowPhase|pub struct WorkflowState|pub trait WorkflowMachine|pub struct WorkflowDescriptor" crates/deepcode-kernel-workflow/src/lib.rs || fail "workflow lib.rs must remain facade-only"
+search "struct ActionBundleDraft|struct PlannedAction|struct ValidationExpectation|struct ReviewExpectation|fn to_plan_contract" crates/deepcode-kernel-workflow/src/contract.rs >/dev/null
+search "struct WorkflowDescriptor|initial_state|allowed_proposals|exit_predicates|invalid_proposal_policy|from_yaml_str|from_json_str" crates/deepcode-kernel-workflow/src/descriptor.rs >/dev/null
+search "enum ProposalKind|AgentPlanDraft|ActionBundleDraft|PatchDraft|ReviewPacket|enum InvalidProposalPolicy|struct ProposalEnvelope" crates/deepcode-kernel-workflow/src/proposal.rs >/dev/null
+search "struct PredicateRegistry|proposal.kind.in|llm_says_done|model_claims_test_passed|assistant_final_answer_exists" crates/deepcode-kernel-workflow/src/predicate.rs >/dev/null
+search "struct DescriptorValidator|unknown_capability|unsafe_hook|forbidden_predicate|unbounded_self_loop|dead_end_state|terminal_unreachable" crates/deepcode-kernel-workflow/src/validator.rs >/dev/null
+search "struct SafeInterpreter|evaluate_transition|validate_proposal|TransitionDecision|ProposalValidationDecision" crates/deepcode-kernel-workflow/src/interpreter.rs >/dev/null
+search "PLAN_CHECK_COMPLETE_REVIEW_TEMPLATE|builtin_plan_check_complete_review|load_builtin_plan_check_complete_review" crates/deepcode-kernel-workflow/src/template.rs >/dev/null
+search "schema_version: \"1.0.0\"|id: plan-check-complete-review|workspace.read|plan.review|permission.preflight|reviewgate.evaluate|ActionBundleDraft" crates/deepcode-kernel-workflow/templates/plan-check-complete-review.yaml >/dev/null
+search "rejects_script_hook|rejects_forbidden_predicate|rejects_unbounded_self_loop|unknown_proposal_kind_fails_to_parse|allows_review_to_complete_user_replan_loop" crates/deepcode-kernel-workflow/src/validator.rs >/dev/null
+search "invalid_proposal_stays_without_transition|plan_draft_advances_to_check|action_bundle_draft_advances_to_check|complete_to_review_requires_all_predicates" crates/deepcode-kernel-workflow/src/interpreter.rs >/dev/null
+! search "PlanContractSubmit \\{ request_id, \\.\\. \\} =>" crates/deepcode-kernel-runtime/src/dispatch.rs || fail "PlanContractSubmit must not remain interface-only"
+search "fn plan_contract_submit|parse_plan_review_input|PlanReviewReportProduced|plan.review_report_produced" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
+search "plan_contract_submit_produces_review_report_without_entering_complete|plan_contract_submit_malformed_contract_returns_denied_report|plan_contract_submit_action_bundle_reports_permission_gap" crates/deepcode-kernel-runtime/src/tests.rs >/dev/null
 search "SignedAuditEntryV1|AuditSegmentSealV1|AuditVerifier" crates/deepcode-kernel-audit/src >/dev/null
 search "struct HttpKernelClient|send_prompt|daemon_status" crates/deepcode-kernel-client/src/lib.rs >/dev/null
 search "enum Command|DaemonStatus|Ask" shells/cli/src/main.rs >/dev/null
@@ -425,7 +444,7 @@ search "\\.deepcode/build-baselines/" .gitignore >/dev/null
 search "\\.build-cache|\\.deepcode/build-baselines|\\.pnpm-store" .dockerignore >/dev/null
 search "run_build_baseline_probe|cargo release repeat|cargo release after runtime touch|build-baselines" test.sh >/dev/null
 search "--mount=type=cache|sccache|SCCACHE_DIR" Dockerfile.dev >/dev/null
-pass "stage 9/10/10.5/11/12/13 grep gates"
+pass "stage 9/10/10.5/11/12/13/14 grep gates"
 
 info "[5/8] Kernel daemon HTTP smoke"
 CONFIG_DIR="$(mktemp -d /tmp/deepcode-stage9-config-XXXXXX)"
@@ -539,4 +558,4 @@ else
 fi
 
 info "[8/8] done"
-pass "DeepCode stage 9/10/10.5/11/12/13 fast smoke passed"
+pass "DeepCode stage 9/10/10.5/11/12/13/14 fast smoke passed"
