@@ -14,6 +14,7 @@ import { useSettingsStore } from '../state/settingsStore';
 import {
   APP_CLOSE_REQUEST_EVENT,
   closeAppWindow,
+  getHealth,
   getRuntimeStatus,
   warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
@@ -238,13 +239,6 @@ const App: React.FC = () => {
     document.documentElement.dataset.theme = colorTheme;
   }, [colorTheme]);
 
-  // ---- 1.3 Communication warmup ----
-  useEffect(() => {
-    return scheduleIdle(() => {
-      void import('../services/apiClient');
-    });
-  }, []);
-
   // ---- 2. Runtime status + API health ----
   useEffect(() => {
     let cancelled = false;
@@ -254,7 +248,6 @@ const App: React.FC = () => {
       const runtimeStatus = await getRuntimeStatus();
       if (cancelled) return;
 
-      const { getHealth } = await import('../services/apiClient');
       const result = await getHealth();
       if (cancelled) return;
       if (result.ok && result.data) {

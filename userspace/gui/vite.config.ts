@@ -5,11 +5,20 @@ export default defineConfig({
   plugins: [react()],
   base: './',
   build: {
+    chunkSizeWarningLimit: 650,
     rollupOptions: {
       output: {
         manualChunks(id) {
           if (id.includes('monaco-editor') || id.includes('@monaco-editor')) {
             return 'monaco';
+          }
+          if (
+            id.includes('react-markdown') ||
+            id.includes('remark-') ||
+            id.includes('rehype-') ||
+            id.includes('katex')
+          ) {
+            return 'markdown-renderer';
           }
           if (id.includes('react') || id.includes('react-dom') || id.includes('zustand')) {
             return 'vendor';
