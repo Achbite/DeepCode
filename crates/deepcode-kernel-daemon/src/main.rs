@@ -87,6 +87,10 @@ async fn main() {
             "/api/session-store/:session_id/archive",
             get(session_store_archive_get),
         )
+        .route(
+            "/api/session-store/:session_id/archive/file",
+            get(session_store_archive_file_get),
+        )
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/open", post(workspace_open))
         .route("/api/workspaces/save-file", post(workspace_save_file))

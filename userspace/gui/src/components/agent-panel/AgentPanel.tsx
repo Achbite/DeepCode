@@ -5,6 +5,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { normalizeUiLanguage } from '../../i18n';
 import AgentComposer from './AgentComposer';
+import AgentArchiveActions from './AgentArchiveActions';
 import AgentSessionSelector from './AgentSessionSelector';
 import AgentTaskList from './AgentTaskList';
 import MessageList from './MessageList';
@@ -74,6 +75,8 @@ const AgentPanel: React.FC = () => {
         onRename={(sessionId, title) => void renameSession(sessionId, title)}
         onArchive={(sessionId) => void archiveSession(sessionId)}
       />
+
+      <AgentArchiveActions sessionId={session?.id} />
 
       <AgentTaskList
         events={events}

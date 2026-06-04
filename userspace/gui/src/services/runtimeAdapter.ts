@@ -409,6 +409,17 @@ export function archiveAgentSession(
   return api.archiveAgentSession(sessionId, request);
 }
 
+export function getConversationArchive(sessionId: string) {
+  return api.getConversationArchive(sessionId);
+}
+
+export function readConversationArchiveFile(
+  sessionId: string,
+  request: { path: string; runId?: string }
+) {
+  return api.readConversationArchiveFile(sessionId, request);
+}
+
 export function appendAgentEvents(
   sessionId: string,
   request: AppendAgentEventsRequest

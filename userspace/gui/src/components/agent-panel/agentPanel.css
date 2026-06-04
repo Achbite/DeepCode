@@ -7,6 +7,42 @@
   color: var(--text-main, #ededed);
 }
 
+.agent-archive-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+}
+
+.agent-archive-actions button {
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: 4px;
+  background: var(--bg-surface, #1c1c20);
+  color: var(--text-muted, #a1a1aa);
+  font-size: 12px;
+}
+
+.agent-archive-actions button:hover:not(:disabled) {
+  color: var(--text-main, #ededed);
+  border-color: var(--accent, #1688ff);
+}
+
+.agent-archive-actions__status {
+  min-width: 0;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-archive-actions__status--error {
+  color: var(--danger, #ef4444);
+}
+
 .agent-session-bar {
   position: relative;
   flex: 0 0 auto;

@@ -44,6 +44,74 @@ pub(crate) async fn session_store_archive_get(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArchiveFileQuery {
+    pub(crate) run_id: Option<String>,
+    pub(crate) path: String,
+}
+
+pub(crate) async fn session_store_archive_file_get(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<ArchiveFileQuery>,
+) -> Json<ApiResponse> {
+    let (archive_root, session) = {
+        let gui = state.gui.lock().expect("gui state lock");
+        (
+            gui.paths.conversation_archives_dir.clone(),
+            session_metadata(&gui.sessions, &session_id),
+        )
+    };
+    let Some(manifest) =
+        select_archive_manifest(&archive_root, &session_id, query.run_id.as_deref())
+    else {
+        return ApiResponse::error(
+            "conversation_archive_not_found",
+            "conversation archive not found",
+        );
+    };
+    let Some(archive_path) = manifest.get("archivePath").and_then(Value::as_str) else {
+        return ApiResponse::error(
+            "conversation_archive_invalid",
+            "conversation archive manifest missing archivePath",
+        );
+    };
+    let archive_dir = PathBuf::from(archive_path);
+    if !archive_dir.starts_with(&archive_root) {
+        return ApiResponse::error(
+            "conversation_archive_invalid",
+            "conversation archive path is outside archive root",
+        );
+    }
+    let Some(relative_path) = safe_archive_relative_path(&query.path) else {
+        return ApiResponse::error(
+            "invalid_archive_path",
+            "archive file path must be relative and safe",
+        );
+    };
+    let file_path = archive_dir.join(&relative_path);
+    if !file_path.starts_with(&archive_dir) {
+        return ApiResponse::error(
+            "invalid_archive_path",
+            "archive file path escapes archive directory",
+        );
+    }
+    let Ok(content) = fs::read_to_string(&file_path) else {
+        return ApiResponse::error(
+            "archive_file_not_found",
+            "archive file not found or not readable as UTF-8",
+        );
+    };
+    ApiResponse::ok(json!({
+        "sessionId": session_id,
+        "workspaceScopeKey": workspace_scope_key(session.as_ref()),
+        "runId": manifest.get("runId").cloned().unwrap_or(Value::Null),
+        "path": relative_path.to_string_lossy(),
+        "content": content
+    }))
+}
+
 pub(crate) async fn session_store_projection_get(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -463,6 +531,50 @@ fn read_conversation_archive_manifests(archive_root: &FsPath, session_id: &str) 
             .reverse()
     });
     manifests
+}
+
+fn select_archive_manifest(
+    archive_root: &FsPath,
+    session_id: &str,
+    run_id: Option<&str>,
+) -> Option<Value> {
+    let mut manifests = read_conversation_archive_manifests(archive_root, session_id);
+    manifests.sort_by(|left, right| {
+        right
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                left.get("updatedAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+    if let Some(run_id) = run_id {
+        manifests
+            .into_iter()
+            .find(|manifest| manifest.get("runId").and_then(Value::as_str) == Some(run_id))
+    } else {
+        manifests.into_iter().next()
+    }
+}
+
+fn safe_archive_relative_path(path: &str) -> Option<PathBuf> {
+    if path.trim().is_empty() || path.starts_with('/') || path.starts_with('\\') {
+        return None;
+    }
+    let candidate = PathBuf::from(path);
+    if candidate.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(candidate)
 }
 
 fn session_metadata(sessions: &[Value], session_id: &str) -> Option<Value> {

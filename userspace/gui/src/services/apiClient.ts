@@ -105,6 +105,37 @@ export interface SkillMountScanResult {
   warnings: string[];
 }
 
+export interface ConversationArchiveFileEntry {
+  path: string;
+  sizeBytes: number;
+}
+
+export interface ConversationArchiveManifest {
+  schemaVersion: string;
+  sessionId: string;
+  workspaceScopeKey: string;
+  runId: string;
+  archivePath: string;
+  createdAt: string;
+  updatedAt: string;
+  files: ConversationArchiveFileEntry[];
+}
+
+export interface ConversationArchiveResult {
+  sessionId: string;
+  conversationArchiveRoot: string;
+  defaultWorkspaceScopeKey: string;
+  archives: ConversationArchiveManifest[];
+}
+
+export interface ConversationArchiveFileResult {
+  sessionId: string;
+  workspaceScopeKey: string;
+  runId: string;
+  path: string;
+  content: string;
+}
+
 function isAbortError(err: unknown): boolean {
   return (
     err instanceof DOMException && err.name === 'AbortError'
@@ -458,6 +489,27 @@ export function archiveAgentSession(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/archive`,
     'POST',
     request
+  );
+}
+
+export function getConversationArchive(
+  sessionId: string
+): Promise<ApiResponse<ConversationArchiveResult>> {
+  return getJson<ConversationArchiveResult>(
+    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/archive`
+  );
+}
+
+export function readConversationArchiveFile(
+  sessionId: string,
+  request: { path: string; runId?: string }
+): Promise<ApiResponse<ConversationArchiveFileResult>> {
+  const qs = buildQuery({
+    path: request.path,
+    runId: request.runId,
+  });
+  return getJson<ConversationArchiveFileResult>(
+    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/archive/file${qs}`
   );
 }
 
