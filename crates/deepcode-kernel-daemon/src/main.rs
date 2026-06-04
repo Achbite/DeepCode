@@ -83,6 +83,10 @@ async fn main() {
             "/api/session-store/:session_id/transcript",
             get(session_store_transcript_get).post(session_store_transcript_append),
         )
+        .route(
+            "/api/session-store/:session_id/archive",
+            get(session_store_archive_get),
+        )
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/open", post(workspace_open))
         .route("/api/workspaces/save-file", post(workspace_save_file))

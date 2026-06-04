@@ -20,6 +20,7 @@ pub(crate) struct HostPaths {
     pub(crate) llm_secrets_path: PathBuf,
     pub(crate) workflow_config_path: PathBuf,
     pub(crate) sessions_dir: PathBuf,
+    pub(crate) conversation_archives_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -92,6 +93,7 @@ impl HostPaths {
             llm_secrets_path: secrets_dir.join("llm-secrets.json"),
             workflow_config_path: settings_dir.join("agent-workflow-config.json"),
             sessions_dir: root.join("sessions"),
+            conversation_archives_dir: root.join("conversation-archives"),
         }
     }
 }

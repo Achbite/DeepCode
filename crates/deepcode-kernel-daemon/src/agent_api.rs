@@ -148,18 +148,14 @@ pub(crate) async fn agent_session_append_events(
     Path(session_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
-    let mut gui = state.gui.lock().expect("gui state lock");
     let incoming = body
         .get("events")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    gui.session_projection_cache
-        .entry(session_id.clone())
-        .or_default()
-        .extend(incoming);
+    append_session_projection(&state, &session_id, incoming);
+    let mut gui = state.gui.lock().expect("gui state lock");
     refresh_pending_session_titles(&mut gui);
-    update_session_event_count(&mut gui, &session_id);
     session_result(&gui, &session_id)
 }
 
