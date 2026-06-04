@@ -1,7 +1,12 @@
 use crate::outcome::{WorkflowError, WorkflowOutcome, WorkflowOutcomeKind};
 use crate::phase::{ReplanReason, WorkflowPhase, WorkflowRunStatus};
+use crate::proposal::{ProposalEnvelope, ProposalKind};
 use crate::state::{WorkflowState, WorkflowTransition, WorkflowTransitionResult};
+use crate::template::builtin_plan_check_complete_review;
+use crate::{SafeInterpreter, TransitionDecision, TransitionInput, WorkflowDescriptor};
 use deepcode_kernel_abi::{KernelError, KernelResult};
+use serde_json::Value;
+use std::collections::BTreeSet;
 
 pub trait WorkflowMachine {
     fn initial_state(&self, session_id: &str, max_iterations: Option<u32>) -> WorkflowState;
@@ -15,12 +20,16 @@ pub trait WorkflowMachine {
 #[derive(Debug, Clone)]
 pub struct BuiltinWorkflowMachine {
     default_max_iterations: u32,
+    descriptor: WorkflowDescriptor,
+    interpreter: SafeInterpreter,
 }
 
 impl Default for BuiltinWorkflowMachine {
     fn default() -> Self {
         Self {
             default_max_iterations: 3,
+            descriptor: builtin_plan_check_complete_review(),
+            interpreter: SafeInterpreter::default(),
         }
     }
 }
@@ -29,6 +38,16 @@ impl BuiltinWorkflowMachine {
     pub fn new(default_max_iterations: u32) -> Self {
         Self {
             default_max_iterations,
+            descriptor: builtin_plan_check_complete_review(),
+            interpreter: SafeInterpreter::default(),
+        }
+    }
+
+    pub fn with_descriptor(default_max_iterations: u32, descriptor: WorkflowDescriptor) -> Self {
+        Self {
+            default_max_iterations,
+            descriptor,
+            interpreter: SafeInterpreter::default(),
         }
     }
 }
@@ -56,10 +75,78 @@ impl WorkflowMachine for BuiltinWorkflowMachine {
         let next = if state.is_terminal() {
             terminal_noop(state, &outcome)
         } else {
+            if let Some(decision) = self.descriptor_transition_decision(&state, &outcome)? {
+                if matches!(decision, TransitionDecision::Stay { .. }) {
+                    let next = abort_for_invalid_transition(state, &outcome);
+                    return Ok(build_transition(previous, next, outcome));
+                }
+            }
             next_state_for_outcome(state, &outcome)
         };
 
         Ok(build_transition(previous, next, outcome))
+    }
+}
+
+impl BuiltinWorkflowMachine {
+    fn descriptor_transition_decision(
+        &self,
+        state: &WorkflowState,
+        outcome: &WorkflowOutcome,
+    ) -> KernelResult<Option<TransitionDecision>> {
+        let Some(input) = transition_input_for_outcome(state, outcome) else {
+            return Ok(None);
+        };
+        self.interpreter
+            .evaluate_transition(&self.descriptor, input)
+            .map(Some)
+            .map_err(|error| {
+                KernelError::InvalidCommand(format!(
+                    "workflow descriptor rejected transition evaluation: {}",
+                    error
+                ))
+            })
+    }
+}
+
+fn transition_input_for_outcome(
+    state: &WorkflowState,
+    outcome: &WorkflowOutcome,
+) -> Option<TransitionInput> {
+    let current_state = state.phase.as_str().to_string();
+    match outcome.kind {
+        WorkflowOutcomeKind::PlanProposed => Some(TransitionInput {
+            current_state,
+            proposal: Some(ProposalEnvelope {
+                kind: ProposalKind::PlanDraft,
+                payload: Value::Null,
+            }),
+            satisfied_predicates: BTreeSet::new(),
+        }),
+        WorkflowOutcomeKind::CheckAccepted => Some(TransitionInput {
+            current_state,
+            proposal: None,
+            satisfied_predicates: BTreeSet::from(["plan_review.ready".to_string()]),
+        }),
+        WorkflowOutcomeKind::CompleteDone => Some(TransitionInput {
+            current_state,
+            proposal: None,
+            satisfied_predicates: BTreeSet::from([
+                "validation.succeeded".to_string(),
+                "temp_lease.all_released".to_string(),
+            ]),
+        }),
+        WorkflowOutcomeKind::ReviewAccepted => Some(TransitionInput {
+            current_state,
+            proposal: None,
+            satisfied_predicates: BTreeSet::from(["user.accepted".to_string()]),
+        }),
+        WorkflowOutcomeKind::ReviewRejected => Some(TransitionInput {
+            current_state,
+            proposal: None,
+            satisfied_predicates: BTreeSet::from(["user.replan_requested".to_string()]),
+        }),
+        _ => None,
     }
 }
 
@@ -517,6 +604,32 @@ mod tests {
 
         assert_eq!(result.state.phase, WorkflowPhase::Aborted);
         assert_eq!(result.state.status, WorkflowRunStatus::Failed);
+        assert_eq!(
+            result.state.last_error.as_ref().unwrap().code,
+            "invalid_workflow_transition"
+        );
+    }
+
+    #[test]
+    fn descriptor_gate_blocks_unlisted_transition() {
+        let mut descriptor = crate::template::builtin_plan_check_complete_review();
+        descriptor
+            .states
+            .iter_mut()
+            .find(|state| state.id == "plan")
+            .unwrap()
+            .allowed_proposals
+            .retain(|proposal| proposal != &crate::ProposalKind::PlanDraft);
+        let machine = BuiltinWorkflowMachine::with_descriptor(3, descriptor);
+        let state = machine.initial_state("session-1", Some(3));
+        let result = machine
+            .transition(
+                state,
+                WorkflowOutcome::new(WorkflowOutcomeKind::PlanProposed),
+            )
+            .unwrap();
+
+        assert_eq!(result.state.phase, WorkflowPhase::Aborted);
         assert_eq!(
             result.state.last_error.as_ref().unwrap().code,
             "invalid_workflow_transition"

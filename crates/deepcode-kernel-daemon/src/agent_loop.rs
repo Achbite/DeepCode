@@ -7,7 +7,7 @@ use crate::*;
 #[derive(Debug, Clone)]
 pub(crate) struct AgentRunRequest {
     pub(crate) content: String,
-    pub(crate) workflow: String,
+    pub(crate) workflow_ref: Option<String>,
     pub(crate) profile_id: Option<String>,
     pub(crate) workspace_binding: Option<WorkspaceBinding>,
 }
@@ -19,11 +19,13 @@ pub(crate) fn build_agent_run_request(body: &Value) -> AgentRunRequest {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        workflow: body
+        workflow_ref: body
             .get("workflow")
+            .or_else(|| body.get("workflowRef"))
             .and_then(Value::as_str)
-            .unwrap_or("planFirst")
-            .to_string(),
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "dynamic")
+            .map(str::to_string),
         profile_id: body
             .get("profileId")
             .and_then(Value::as_str)
@@ -93,10 +95,12 @@ pub(crate) async fn start_kernel_agent_run(
                         hash: None,
                     }
                 }),
-                workflow_ref: Some(deepcode_kernel_abi::WorkflowRef {
-                    id: request.workflow.clone(),
-                    version: None,
-                    hash: None,
+                workflow_ref: request.workflow_ref.as_ref().map(|workflow_ref| {
+                    deepcode_kernel_abi::WorkflowRef {
+                        id: workflow_ref.clone(),
+                        version: None,
+                        hash: None,
+                    }
                 }),
                 run_overrides: None,
             })

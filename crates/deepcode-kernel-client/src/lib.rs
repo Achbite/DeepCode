@@ -109,7 +109,6 @@ impl HttpKernelClient {
             .post(self.url(&format!("/api/agent/sessions/{session_id}/messages")))
             .json(&json!({
                 "content": prompt,
-                "workflow": "plan-check-complete-review",
                 "mode": mode.as_str(),
             }))
             .send()
