@@ -315,9 +315,12 @@ export interface KernelPlanReviewReport {
   status: KernelPlanReviewStatus;
   requiredCapabilities: string[];
   requiredPermissions: string[];
+  permissionGaps?: string[];
   hardFloorHits: string[];
+  deniedReasons?: string[];
   blockedReasons: string[];
   findings: unknown[];
+  kernelGeneratedPermissionSummary?: string;
 }
 
 export type KernelSkillTrustMode = 'declarative' | 'brokeredScript' | 'directHostScript';

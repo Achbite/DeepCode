@@ -1,0 +1,102 @@
+export type AgentPlanTag =
+  | 'USER_PLAN'
+  | 'ACTION_BUNDLE'
+  | 'CODE_BLOCK'
+  | 'EXPECTED_VALIDATION'
+  | 'REVIEW_GUIDE'
+  | 'PERMISSION_HINTS';
+
+export type ActionKind =
+  | 'read'
+  | 'write'
+  | 'delete'
+  | 'command'
+  | 'validation'
+  | 'review'
+  | 'repair';
+
+export interface CodeBlockDraft {
+  id: string;
+  path: string;
+  content: string;
+  language?: string;
+}
+
+export interface PlannedActionDraft {
+  id: string;
+  title: string;
+  capability: string;
+  kind?: ActionKind;
+  resourceScope: string[];
+  canParallelize: boolean;
+  conflictKeys: string[];
+  purpose?: string;
+  sourceBlockId?: string;
+}
+
+export interface ValidationExpectationDraft {
+  id: string;
+  description: string;
+  command?: string;
+}
+
+export interface ReviewExpectationDraft {
+  id: string;
+  description: string;
+}
+
+export interface RepairPolicyDraft {
+  maxRounds: number;
+  allowedFiles: string[];
+  forbidNewFilesAfterApproval: boolean;
+  forbidNewPermissionsAfterApproval: boolean;
+}
+
+export interface ActionBundleDraft {
+  version: '1';
+  id: string;
+  goal: string;
+  requirementId?: string;
+  actions: PlannedActionDraft[];
+  validationExpectations: ValidationExpectationDraft[];
+  reviewExpectations: ReviewExpectationDraft[];
+  repairPolicy?: RepairPolicyDraft;
+}
+
+export interface ExpectedValidation {
+  content: string;
+  expectations: ValidationExpectationDraft[];
+}
+
+export interface ReviewGuide {
+  content: string;
+  expectations: ReviewExpectationDraft[];
+}
+
+export interface PermissionHints {
+  content: string;
+}
+
+export interface AgentPlanParts {
+  userPlan: string;
+  actionBundle: ActionBundleDraft;
+  codeBlocks: CodeBlockDraft[];
+  expectedValidation: ExpectedValidation;
+  reviewGuide: ReviewGuide;
+  permissionHints?: PermissionHints;
+}
+
+export interface AgentPlanParseFailure {
+  code: string;
+  message: string;
+}
+
+export class AgentPlanParseError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string
+  ) {
+    super(message);
+    this.name = 'AgentPlanParseError';
+  }
+}

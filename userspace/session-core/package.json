@@ -20,6 +20,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist",
+    "smoke": "node dist/__tests__/agentPlanSmoke.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
