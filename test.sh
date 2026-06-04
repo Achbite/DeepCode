@@ -299,6 +299,8 @@ if [ "${DEEPCODE_SKIP_TS_CHECKS:-0}" != "1" ]; then
   if command -v node >/dev/null 2>&1 && command -v pnpm >/dev/null 2>&1; then
     pnpm --filter @deepcode/protocol typecheck
     pnpm --filter @deepcode/session-core typecheck
+    pnpm --filter @deepcode/session-core build
+    pnpm --filter @deepcode/session-core smoke
     pnpm --filter @deepcode/client typecheck
     pnpm --filter @deepcode/client build
     pass "TS typecheck and GUI build"
@@ -347,6 +349,11 @@ search "fn record_change_operation_for_tool" crates/deepcode-kernel-runtime/src/
 search "fn workspace_current|fn workspace_open" crates/deepcode-kernel-daemon/src/workspace_api.rs >/dev/null
 search "fn user_settings_get|fn llm_profiles_get" crates/deepcode-kernel-daemon/src/settings_api.rs >/dev/null
 search "fn append_session_projection_jsonl|fn session_store_projection_append" crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
+search "conversation_archives_dir|conversationArchiveRoot|fn session_store_archive_get|fn append_conversation_archive_projection|fn append_conversation_archive_transcript|fn read_conversation_archive_manifests|fn redact_archive_value" crates/deepcode-kernel-daemon/src/state.rs crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
+search "manifest.json|projection.jsonl|transcript.jsonl|exports/complete.md|exports/debug.json|projection-events.jsonl|transcript-events.jsonl|action-bundle-drafts.jsonl|plan-review-reports.jsonl|review-packets.jsonl|permission-tool-facts.jsonl" crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
+search "/api/session-store/:session_id/archive" crates/deepcode-kernel-daemon/src/main.rs >/dev/null
+! search "conversation-archives" userspace/gui/dist shells/tauri/dist shells/tauri/src-tauri/tauri.conf.json 2>/dev/null \
+  || fail "conversation archives must stay in user config data, not GUI/Tauri dist resources"
 search "fn drive_kernel_agent_loop|fn call_llm_profile" crates/deepcode-kernel-daemon/src/agent_loop.rs >/dev/null
 search "fn call_openai_compatible_profile|fn call_anthropic_profile|fn call_ollama_profile" crates/deepcode-kernel-daemon/src/llm_transport.rs >/dev/null
 search "fn safe_asset_path|fn gui_asset" crates/deepcode-kernel-daemon/src/static_assets.rs >/dev/null
@@ -423,6 +430,19 @@ search "invalid_proposal_stays_without_transition|plan_draft_advances_to_check|a
 ! search "PlanContractSubmit \\{ request_id, \\.\\. \\} =>" crates/deepcode-kernel-runtime/src/dispatch.rs || fail "PlanContractSubmit must not remain interface-only"
 search "fn plan_contract_submit|parse_plan_review_input|PlanReviewReportProduced|plan.review_report_produced" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
 search "plan_contract_submit_produces_review_report_without_entering_complete|plan_contract_submit_malformed_contract_returns_denied_report|plan_contract_submit_action_bundle_reports_permission_gap" crates/deepcode-kernel-runtime/src/tests.rs >/dev/null
+search "parseAgentPlan|ACTION_BUNDLE|EXPECTED_VALIDATION|REVIEW_GUIDE|PERMISSION_HINTS" userspace/session-core/src/agent-plan >/dev/null
+search "DraftTaskQueue|ApprovedTaskQueue|createPlanContractSubmitCommand|compileActionBundleToPlanContract" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue >/dev/null
+search "ConversationProjection|buildConversationProjection|exportConversationProjection|为什么这样做|review_summary|check_review" userspace/session-core/src/projection.ts >/dev/null
+search "ReviewSelfCheckInput|buildReviewPacket|permissionDecisions|toolResults|finalSummary|waitingUserReview" userspace/session-core/src/review userspace/session-core/src/projection.ts >/dev/null
+search "DynamicWorkflowPlan|selectDynamicWorkflow|SessionOrchestrationMicroPhase|stateMachineBoundary|kernelOwnedStateMachine|projectionCardKinds|resource_request|resource_packet|repairLoop" userspace/session-core/src/workflow userspace/session-core/src/projection.ts >/dev/null
+search "ResourceManifest|InitialContextPacket|ResourceRequest|ResourcePacket|createResourcePacket|autoRead|askRead|denyRead" userspace/session-core/src/context >/dev/null
+search "PromptEnvelopeParts|StablePrefixRef|DynamicSuffixRef|workflowProjectionSchema|ProviderCacheTelemetry|promptCacheHitTokens|promptCacheMissTokens" userspace/session-core/src/context userspace/session-core/src/cache >/dev/null
+! search "format=\\\"yaml\\\"|YAML ACTION_BUNDLE|strict YAML subset" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue userspace/session-core/src/requirement userspace/session-core/src/cadence userspace/session-core/src/review userspace/session-core/src/context userspace/session-core/src/cache || fail "session-core must not support YAML ACTION_BUNDLE V1"
+! search "PermissionGate|DeepCodeKernelRuntime|workspace\\.write\\(|workspace\\.delete\\(|shell\\.exec\\(|ReviewGate accepted|ValidationResult" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue userspace/session-core/src/requirement userspace/session-core/src/cadence userspace/session-core/src/review userspace/session-core/src/context userspace/session-core/src/cache || fail "session-core must not execute tools or own Kernel decisions"
+test ! -e userspace/gui/src/components/agent-panel/AgentWorkflowSelector.tsx \
+  || fail "GUI composer must not expose fixed workflow selector"
+! search "agent-workflow-selector|plan-check-complete-review" userspace/gui/src/components/agent-panel \
+  || fail "GUI agent panel must not expose fixed plan-check-complete-review selector"
 search "SignedAuditEntryV1|AuditSegmentSealV1|AuditVerifier" crates/deepcode-kernel-audit/src >/dev/null
 search "struct HttpKernelClient|send_prompt|daemon_status" crates/deepcode-kernel-client/src/lib.rs >/dev/null
 search "enum Command|DaemonStatus|Ask" shells/cli/src/main.rs >/dev/null
@@ -467,6 +487,27 @@ assert_json_expr "$reply" 'data["ok"] is True and any(event["kind"] == "host.sta
 
 snapshot="$(json_get "http://127.0.0.1:${TEST_PORT}/api/kernel/snapshot")"
 assert_json_expr "$snapshot" 'data["ok"] is True and data["snapshot"] is not None' "kernel snapshot"
+
+session_store_index="$(json_get "http://127.0.0.1:${TEST_PORT}/api/session-store/index")"
+assert_json_expr "$session_store_index" 'data["ok"] is True and data["data"]["conversationArchiveRoot"].endswith("conversation-archives")' "session store exposes conversation archive root"
+archive_session_create="$(json_post "http://127.0.0.1:${TEST_PORT}/api/agent/sessions" '{"title":"Archive Smoke","workspaceId":"wf-archive","workspaceHash":"hash-archive"}')"
+archive_session_id="$(
+  python3 - "$archive_session_create" <<'PY'
+import json
+import sys
+payload = json.loads(sys.argv[1])
+print(payload["data"]["session"]["id"])
+PY
+)"
+json_post "http://127.0.0.1:${TEST_PORT}/api/agent/sessions/${archive_session_id}/events" '{"events":[{"kind":"user_msg","payload":{"content":"archive smoke","kernelEvent":{"runId":"run-smoke"},"actionBundleDraft":{"version":"1"},"apiToken":"secret-token"}}]}' >/dev/null
+archive_reply="$(json_get "http://127.0.0.1:${TEST_PORT}/api/session-store/${archive_session_id}/archive")"
+assert_json_expr "$archive_reply" 'data["ok"] is True and len(data["data"]["archives"]) >= 1 and any(any(file["path"] == "projection.jsonl" for file in archive["files"]) and any(file["path"] == "exports/complete.md" for file in archive["files"]) for archive in data["data"]["archives"])' "conversation archive manifest exposes projection and exports"
+test -d "$CONFIG_DIR/conversation-archives" || fail "conversation archive root must be created under config dir"
+find "$CONFIG_DIR/conversation-archives" -name projection.jsonl -print -quit | grep -q . \
+  || fail "conversation archive projection.jsonl must be created"
+! grep -R "secret-token" "$CONFIG_DIR/conversation-archives" >/dev/null \
+  || fail "conversation archive must redact sensitive token fields"
+pass "conversation archive session-store smoke"
 
 info "[6/8] Host-web dev proxy smoke"
 PROXY_LOG="/tmp/deepcode-host-web-proxy-test-$$.log"
