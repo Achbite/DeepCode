@@ -1,17 +1,21 @@
 import {
   AgentPlanParseError,
   type ActionBundleDraft,
+  type AgentPlanOutput,
   type AgentPlanParts,
   type AgentPlanTag,
   type CodeBlockDraft,
   type PlannedActionDraft,
   type RepairPolicyDraft,
+  type ResourceRequestDraft,
+  type ResourceRequestDraftItem,
   type ReviewExpectationDraft,
   type ValidationExpectationDraft,
 } from './types.js';
 
 const SINGLETON_TAGS = new Set<AgentPlanTag>([
   'USER_PLAN',
+  'RESOURCE_REQUEST',
   'ACTION_BUNDLE',
   'EXPECTED_VALIDATION',
   'REVIEW_GUIDE',
@@ -30,6 +34,8 @@ const BUNDLE_KEYS = new Set([
   'reviewExpectations',
   'repairPolicy',
 ]);
+const RESOURCE_REQUEST_KEYS = new Set(['version', 'id', 'reason', 'items']);
+const RESOURCE_REQUEST_ITEM_KEYS = new Set(['id', 'manifestEntryId', 'reason']);
 const ACTION_KEYS = new Set([
   'id',
   'title',
@@ -59,6 +65,14 @@ interface ParsedBlock {
 }
 
 export function parseAgentPlan(input: string): AgentPlanParts {
+  const output = parseAgentPlanOutput(input);
+  if (output.kind !== 'actionPlan') {
+    throw new AgentPlanParseError('missing_action_bundle', 'RESOURCE_REQUEST cannot be treated as an executable plan');
+  }
+  return output.parts;
+}
+
+export function parseAgentPlanOutput(input: string): AgentPlanOutput {
   const blocks = extractBlocks(input);
   const singleton = new Map<AgentPlanTag, ParsedBlock>();
   const codeBlocks: CodeBlockDraft[] = [];
@@ -81,32 +95,48 @@ export function parseAgentPlan(input: string): AgentPlanParts {
     singleton.set(block.tag, block);
   }
 
+  const resourceRequestBlock = singleton.get('RESOURCE_REQUEST');
+  const actionBundleBlock = singleton.get('ACTION_BUNDLE');
+  if (resourceRequestBlock && actionBundleBlock) {
+    throw new AgentPlanParseError('resource_request_with_action_bundle', 'RESOURCE_REQUEST and ACTION_BUNDLE cannot appear in the same turn');
+  }
+  if (resourceRequestBlock) {
+    return {
+      kind: 'resourceRequest',
+      userPlan: singleton.get('USER_PLAN')?.content.trim(),
+      resourceRequest: parseResourceRequest(resourceRequestBlock),
+    };
+  }
+
   const userPlan = requireBlock(singleton, 'USER_PLAN').content.trim();
-  const actionBundleBlock = requireBlock(singleton, 'ACTION_BUNDLE');
-  const actionBundle = parseActionBundle(actionBundleBlock, codeBlockIds);
+  const requiredActionBundleBlock = requireBlock(singleton, 'ACTION_BUNDLE');
+  const actionBundle = parseActionBundle(requiredActionBundleBlock, codeBlockIds);
   const expectedValidation = requireBlock(singleton, 'EXPECTED_VALIDATION').content.trim();
   const reviewGuide = requireBlock(singleton, 'REVIEW_GUIDE').content.trim();
   const permissionHints = singleton.get('PERMISSION_HINTS')?.content.trim();
 
   return {
-    userPlan,
-    actionBundle,
-    codeBlocks,
-    expectedValidation: {
-      content: expectedValidation,
-      expectations: actionBundle.validationExpectations,
+    kind: 'actionPlan',
+    parts: {
+      userPlan,
+      actionBundle,
+      codeBlocks,
+      expectedValidation: {
+        content: expectedValidation,
+        expectations: actionBundle.validationExpectations,
+      },
+      reviewGuide: {
+        content: reviewGuide,
+        expectations: actionBundle.reviewExpectations,
+      },
+      permissionHints: permissionHints ? { content: permissionHints } : undefined,
     },
-    reviewGuide: {
-      content: reviewGuide,
-      expectations: actionBundle.reviewExpectations,
-    },
-    permissionHints: permissionHints ? { content: permissionHints } : undefined,
   };
 }
 
 function extractBlocks(input: string): ParsedBlock[] {
   const blockPattern =
-    /<(USER_PLAN|ACTION_BUNDLE|CODE_BLOCK|EXPECTED_VALIDATION|REVIEW_GUIDE|PERMISSION_HINTS)([^>]*)>([\s\S]*?)<\/\1>/g;
+    /<(USER_PLAN|RESOURCE_REQUEST|ACTION_BUNDLE|CODE_BLOCK|EXPECTED_VALIDATION|REVIEW_GUIDE|PERMISSION_HINTS)([^>]*)>([\s\S]*?)<\/\1>/g;
   const blocks: ParsedBlock[] = [];
   let match: RegExpExecArray | null;
   while ((match = blockPattern.exec(input)) !== null) {
@@ -230,17 +260,53 @@ function parseActionBundle(block: ParsedBlock, codeBlockIds: Set<string>): Actio
   };
 }
 
-function parseJsonObject(raw: string): Record<string, unknown> {
+function parseResourceRequest(block: ParsedBlock): ResourceRequestDraft {
+  if (block.attrs.format !== 'json' || block.attrs.version !== '1') {
+    throw new AgentPlanParseError('invalid_resource_request_header', 'RESOURCE_REQUEST must declare format="json" version="1"');
+  }
+  const value = parseJsonObject(block.content, 'RESOURCE_REQUEST');
+  rejectUnknownKeys(value, RESOURCE_REQUEST_KEYS, 'RESOURCE_REQUEST');
+  const version = requireString(value, 'version', 'RESOURCE_REQUEST');
+  if (version !== '1') {
+    throw new AgentPlanParseError('unsupported_resource_request_version', `unsupported RESOURCE_REQUEST version ${version}`);
+  }
+  return {
+    version: '1',
+    id: requireString(value, 'id', 'RESOURCE_REQUEST'),
+    reason: requireString(value, 'reason', 'RESOURCE_REQUEST'),
+    items: requireArray(value, 'items', 'RESOURCE_REQUEST').map((item, index) =>
+      resourceRequestItemFromValue(item, `items[${index}]`)
+    ),
+  };
+}
+
+function parseJsonObject(raw: string, label = 'ACTION_BUNDLE'): Record<string, unknown> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    throw new AgentPlanParseError('invalid_action_bundle_json', error instanceof Error ? error.message : 'invalid JSON');
+    throw new AgentPlanParseError(
+      label === 'ACTION_BUNDLE' ? 'invalid_action_bundle_json' : 'invalid_resource_request_json',
+      error instanceof Error ? error.message : 'invalid JSON'
+    );
   }
   if (!isPlainObject(parsed)) {
-    throw new AgentPlanParseError('invalid_action_bundle_json', 'ACTION_BUNDLE must be a JSON object');
+    throw new AgentPlanParseError(
+      label === 'ACTION_BUNDLE' ? 'invalid_action_bundle_json' : 'invalid_resource_request_json',
+      `${label} must be a JSON object`
+    );
   }
   return parsed;
+}
+
+function resourceRequestItemFromValue(value: unknown, label: string): ResourceRequestDraftItem {
+  const object = requireObject(value, label);
+  rejectUnknownKeys(object, RESOURCE_REQUEST_ITEM_KEYS, label);
+  return {
+    id: requireString(object, 'id', label),
+    manifestEntryId: requireString(object, 'manifestEntryId', label),
+    reason: requireString(object, 'reason', label),
+  };
 }
 
 function plannedActionFromValue(value: unknown, label: string, codeBlockIds: Set<string>): PlannedActionDraft {

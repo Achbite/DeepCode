@@ -1,16 +1,29 @@
 import {
   AgentPlanParseError,
+  LocalL2Cache,
   attachKernelPlanReview,
   buildConversationProjection,
+  buildDynamicWorkflowSession,
+  buildPromptEnvelope,
   buildReviewPacket,
+  canonicalizePrompt,
+  canonicalizeToolSchema,
   compileActionBundleToPlanContract,
+  createProjectIndex,
   createResourcePacket,
   createApprovedTaskQueue,
   createDraftTaskQueue,
+  decidePermissionAutoApproval,
+  decidePlanConfirmation,
+  deriveContextLayering,
   createPlanContractSubmitCommand,
   exportConversationProjection,
+  parseAgentPlanOutput,
   parseAgentPlan,
+  providerTelemetryFromUsage,
   selectDynamicWorkflow,
+  SingleflightDeduper,
+  applyProviderCacheStrategy,
   type AgentPlanParts,
   type PromptEnvelopeParts,
   type ResourceManifest,
@@ -82,7 +95,7 @@ The typecheck command is expected to exit with zero after execution.
 Review the file diff and whether the new value is acceptable.
 </REVIEW_GUIDE>`;
 
-function main(): void {
+async function main(): Promise<void> {
   const parsed = parseAgentPlan(VALID_PLAN);
   assertEqual(parsed.actionBundle.id, 'plan-1', 'valid plan parses action bundle');
   assertEqual(parsed.codeBlocks.length, 1, 'valid plan parses code block');
@@ -147,6 +160,11 @@ function main(): void {
     'duplicate_code_block',
     'duplicate code block ids are rejected'
   );
+  assertParseFails(
+    `${VALID_PLAN}\n<RESOURCE_REQUEST format="json" version="1">{"version":"1","id":"rr-1","reason":"need context","items":[]}</RESOURCE_REQUEST>`,
+    'resource_request_with_action_bundle',
+    'resource request and action bundle cannot appear in the same turn'
+  );
 
   const withHints = parseAgentPlan(
     `${VALID_PLAN}\n<PERMISSION_HINTS>\nModel thinks write access may be needed.\n</PERMISSION_HINTS>`
@@ -159,9 +177,11 @@ function main(): void {
   );
 
   assertNoExecutionFacts(parsed);
+  assertPlanConfirmationPolicies(parsed);
   assertDynamicWorkflowProjection(parsed, preflighted.kernelPlanReview);
   assertResourceRequestLoop();
   assertPromptEnvelopeShape();
+  await assertStage20CacheAndIndex();
 }
 
 function assertConversationProjection(
@@ -492,6 +512,18 @@ function assertResourceRequestLoop(): void {
     'denied',
     'resource packet summarizes strongest read policy outcome'
   );
+
+  const output = parseAgentPlanOutput(`<RESOURCE_REQUEST format="json" version="1">
+{
+  "version": "1",
+  "id": "resource-request-2",
+  "reason": "Need README before planning.",
+  "items": [
+    { "id": "item-1", "manifestEntryId": "file-readme", "reason": "Project overview." }
+  ]
+}
+</RESOURCE_REQUEST>`);
+  assertEqual(output.kind, 'resourceRequest', 'resource request only output is accepted as plan dialogue');
 }
 
 function assertPromptEnvelopeShape(): void {
@@ -516,6 +548,192 @@ function assertPromptEnvelopeShape(): void {
     true,
     'prompt envelope stable prefix carries workflow projection schema'
   );
+
+  const promptEnvelope = buildPromptEnvelope({
+    workflowState: 'plan',
+    allowedProposals: ['RequirementChecklist', 'ResourceRequest', 'ActionBundleDraft'],
+    capabilityCatalogSummary: 'workspace.read is proposal-visible; authorization is separate.',
+    userRequest: 'Update a file after review.',
+  });
+  assertEqual(promptEnvelope.stableLayerNames.join(','), 'baseSystem,workflowState,outputContract,capabilityProjection,memoryContext,userOverlay', 'prompt stable prefix layers are deterministic');
+  assertEqual(promptEnvelope.dynamicLayerNames.join(','), 'currentRequirement,resourceContext', 'prompt dynamic suffix contains current context');
+  assert(promptEnvelope.stablePrefix.includes('Do not output RESOURCE_REQUEST and ACTION_BUNDLE'), 'state prompt enforces exclusive plan outputs');
+}
+
+function assertPlanConfirmationPolicies(parsed: AgentPlanParts): void {
+  const readOnlyBundle = {
+    ...parsed.actionBundle,
+    actions: parsed.actionBundle.actions.filter((action) => action.capability === 'workspace.read'),
+  };
+  const readOnlyDecision = decidePlanConfirmation({
+    actionBundle: readOnlyBundle,
+    kernelPlanReview: {
+      planId: 'plan-read',
+      status: 'autoAccepted',
+      requiredCapabilities: ['workspace.read'],
+      requiredPermissions: [],
+      permissionGaps: [],
+      hardFloorHits: [],
+      deniedReasons: [],
+      blockedReasons: [],
+      findings: [],
+      kernelGeneratedPermissionSummary: 'read only',
+    },
+    policy: {
+      autoConfirmEnabled: true,
+      allowedCapabilityTiers: ['read'],
+    },
+  });
+  assertEqual(readOnlyDecision.decision, 'autoConfirmed', 'read-only plan can auto confirm when user enables read tier');
+
+  const writeDecision = decidePlanConfirmation({
+    actionBundle: parsed.actionBundle,
+    kernelPlanReview: {
+      planId: 'plan-write',
+      status: 'awaitingTemporaryGrant',
+      requiredCapabilities: ['workspace.read', 'workspace.write'],
+      requiredPermissions: [],
+      permissionGaps: ['workspace.write'],
+      hardFloorHits: [],
+      deniedReasons: [],
+      blockedReasons: [],
+      findings: [],
+      kernelGeneratedPermissionSummary: 'write gap',
+    },
+    policy: {
+      autoConfirmEnabled: true,
+      allowedCapabilityTiers: ['read'],
+    },
+  });
+  assertEqual(writeDecision.decision, 'requiresUserConfirmation', 'write plan still requires user confirmation without write auto tier');
+
+  const deletePermission = decidePermissionAutoApproval({
+    capability: 'workspace.delete',
+    resourceScope: 'obsolete.txt',
+    policy: { autoApproveRead: true },
+  });
+  assertEqual(deletePermission.decision, 'requiresUserConfirmation', 'delete requires an explicit auto-delete policy');
+
+  const readPermission = decidePermissionAutoApproval({
+    capability: 'workspace.read',
+    resourceScope: 'README.md',
+    policy: { autoApproveRead: true },
+  });
+  assertEqual(readPermission.decision, 'autoApproved', 'read permission can auto approve when enabled');
+
+  const session = buildDynamicWorkflowSession({
+    sessionId: 'session-1',
+    requirementId: 'req-1',
+    workflowId: 'workflow-read-1',
+    requestKind: 'developmentTask',
+    userRequest: 'Read README.',
+    isReadOnly: true,
+    requiresExecution: false,
+    needsMoreContext: false,
+    hasKernelPlanReview: true,
+    hasPermissionPrompt: false,
+    hasExecutionFacts: false,
+    hasReviewPacket: false,
+    actionBundle: readOnlyBundle,
+    kernelPlanReview: {
+      planId: 'plan-read',
+      status: 'autoAccepted',
+      requiredCapabilities: ['workspace.read'],
+      requiredPermissions: [],
+      permissionGaps: [],
+      hardFloorHits: [],
+      deniedReasons: [],
+      blockedReasons: [],
+      findings: [],
+      kernelGeneratedPermissionSummary: 'read only',
+    },
+    planConfirmationPolicy: {
+      autoConfirmEnabled: true,
+      allowedCapabilityTiers: ['read'],
+    },
+  });
+  assertEqual(session.autoConfirmDecision?.decision, 'autoConfirmed', 'dynamic session records auto confirmation decision');
+  assert(session.approvedQueue, 'auto-confirmed read-only plan can freeze an approved queue');
+}
+
+async function assertStage20CacheAndIndex(): Promise<void> {
+  const projectIndex = createProjectIndex({
+    id: 'project-index-1',
+    workspaceScopeKey: 'workspace-1',
+    generatedAt: '2026-06-04T00:00:00.000Z',
+    entries: [
+      { id: 'b', kind: 'test', path: 'test.sh', summary: 'test entry', tags: ['test'] },
+      { id: 'a', kind: 'manifest', path: 'package.json', summary: 'manifest', tags: ['manifest'] },
+    ],
+  });
+  assertEqual(projectIndex.entries.map((entry) => entry.id).join(','), 'a,b', 'project index entries are sorted');
+  const layering = deriveContextLayering({ projectIndex, initialKinds: ['manifest'], budgetBytes: 1024 });
+  assertEqual(layering.initialPacketEntryIds.join(','), 'a', 'context layering selects initial manifest context');
+
+  const promptA = canonicalizePrompt({
+    provider: 'deepseek',
+    model: 'deepseek-chat',
+    templateVersion: 'prompt-v1',
+    stablePrefix: { b: 2, a: 1 },
+    dynamicSuffix: { request: 'hello' },
+  });
+  const promptB = canonicalizePrompt({
+    provider: 'deepseek',
+    model: 'deepseek-chat',
+    templateVersion: 'prompt-v1',
+    stablePrefix: { a: 1, b: 2 },
+    dynamicSuffix: { request: 'hello' },
+  });
+  assertEqual(promptA.cacheHash, promptB.cacheHash, 'prompt cache hash is stable for key order changes');
+  assertEqual(promptA.auditHash, promptB.auditHash, 'prompt audit hash is stable for key order changes');
+
+  const toolsA = canonicalizeToolSchema([
+    { name: 'z.tool', schema: { enum: ['b', 'a'], type: 'string' } },
+    { name: 'a.tool', schema: { properties: { b: { type: 'string' }, a: { type: 'number' } } } },
+  ]);
+  const toolsB = canonicalizeToolSchema([
+    { name: 'a.tool', schema: { properties: { a: { type: 'number' }, b: { type: 'string' } } } },
+    { name: 'z.tool', schema: { type: 'string', enum: ['a', 'b'] } },
+  ]);
+  assertEqual(toolsA.toolsHash, toolsB.toolsHash, 'tool schema hash is stable across order changes');
+
+  let now = 1000;
+  const cache = new LocalL2Cache<string>(() => now);
+  cache.set({ cacheKey: 'k1', response: 'value', ttlMs: 100, modelId: 'm', templateVersion: 'v1' });
+  assertEqual(cache.get({ cacheKey: 'k1', templateVersion: 'v1' }).hit, true, 'local L2 cache hits before TTL');
+  now = 1200;
+  assertEqual(cache.get({ cacheKey: 'k1', templateVersion: 'v1' }).missReason, 'ttl_expired', 'local L2 cache expires by TTL');
+
+  const strategy = applyProviderCacheStrategy({
+    provider: 'deepseek',
+    model: 'deepseek-chat',
+    prefixHash: promptA.cacheHash,
+    requestBody: { messages: [] },
+  });
+  assertEqual(strategy.semanticMode, 'deepseek-openai', 'DeepSeek strategy uses OpenAI-compatible semantic mode');
+  assertEqual(typeof strategy.requestBody.prompt_cache_key, 'string', 'DeepSeek strategy injects prompt cache key');
+
+  const telemetry = providerTelemetryFromUsage({
+    provider: 'deepseek',
+    usage: { prompt_cache_hit_tokens: 10, prompt_cache_miss_tokens: 2 },
+    cacheHit: true,
+  });
+  assertEqual(telemetry.promptCacheHitTokens, 10, 'DeepSeek cache hit tokens are captured');
+
+  const deduper = new SingleflightDeduper<number>();
+  let calls = 0;
+  const values = await Promise.all([
+    deduper.run('same-key', async () => {
+      calls += 1;
+      return 1;
+    }),
+    deduper.run('same-key', async () => {
+      calls += 1;
+      return 2;
+    }),
+  ]);
+  assertEqual(values.join(','), '1,1', 'singleflight shares the first result');
+  assertEqual(calls, 1, 'singleflight calls factory once');
 }
 
 function assertParseFails(input: string, code: string, label: string): void {
@@ -553,4 +771,4 @@ function assertEqual<T>(actual: T, expected: T, message: string): void {
   }
 }
 
-main();
+await main();

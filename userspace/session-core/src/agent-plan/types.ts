@@ -1,5 +1,6 @@
 export type AgentPlanTag =
   | 'USER_PLAN'
+  | 'RESOURCE_REQUEST'
   | 'ACTION_BUNDLE'
   | 'CODE_BLOCK'
   | 'EXPECTED_VALIDATION'
@@ -77,6 +78,19 @@ export interface PermissionHints {
   content: string;
 }
 
+export interface ResourceRequestDraftItem {
+  id: string;
+  manifestEntryId: string;
+  reason: string;
+}
+
+export interface ResourceRequestDraft {
+  version: '1';
+  id: string;
+  reason: string;
+  items: ResourceRequestDraftItem[];
+}
+
 export interface AgentPlanParts {
   userPlan: string;
   actionBundle: ActionBundleDraft;
@@ -85,6 +99,17 @@ export interface AgentPlanParts {
   reviewGuide: ReviewGuide;
   permissionHints?: PermissionHints;
 }
+
+export type AgentPlanOutput =
+  | {
+      kind: 'actionPlan';
+      parts: AgentPlanParts;
+    }
+  | {
+      kind: 'resourceRequest';
+      userPlan?: string;
+      resourceRequest: ResourceRequestDraft;
+    };
 
 export interface AgentPlanParseFailure {
   code: string;

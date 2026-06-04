@@ -1,5 +1,6 @@
 import type { KernelPlanReviewReport } from '@deepcode/protocol';
 import type { ActionBundleDraft } from '../agent-plan/types.js';
+import type { AutoConfirmDecision } from '../confirmation/types.js';
 import type { ApprovedTaskQueue, DraftTask, DraftTaskQueue, RepairBudget } from './types.js';
 
 export function createDraftTaskQueue(input: { queueId: string; actionBundle: ActionBundleDraft }): DraftTaskQueue {
@@ -32,9 +33,14 @@ export function createApprovedTaskQueue(input: {
   queue: DraftTaskQueue;
   planId: string;
   userConfirmed: boolean;
+  autoConfirmDecision?: AutoConfirmDecision;
 }): ApprovedTaskQueue {
-  if (!input.userConfirmed) {
-    throw new Error('ApprovedTaskQueue requires explicit user confirmation');
+  const autoConfirmed = input.autoConfirmDecision?.decision === 'autoConfirmed';
+  if (!input.userConfirmed && !autoConfirmed) {
+    throw new Error('ApprovedTaskQueue requires user confirmation or an auto-confirmed policy decision');
+  }
+  if (input.autoConfirmDecision?.decision === 'denied') {
+    throw new Error(`ApprovedTaskQueue cannot use denied auto-confirm decision: ${input.autoConfirmDecision.reason}`);
   }
   if (!input.queue.kernelPlanReview) {
     throw new Error('ApprovedTaskQueue requires Kernel PlanReview report');
