@@ -313,7 +313,7 @@ else
   info "TS checks skipped by DEEPCODE_SKIP_TS_CHECKS=1"
 fi
 
-info "[4/8] stage 9/10/10.5/11/12/13/14 boundary grep gates"
+info "[4/8] stage 9/10/10.5/11/12/13/14/19/20 boundary grep gates"
 for runtime_module in \
   dispatch state workspace tools workflow llm context permissions temp_artifacts obligations
 do
@@ -349,9 +349,9 @@ search "fn record_change_operation_for_tool" crates/deepcode-kernel-runtime/src/
 search "fn workspace_current|fn workspace_open" crates/deepcode-kernel-daemon/src/workspace_api.rs >/dev/null
 search "fn user_settings_get|fn llm_profiles_get" crates/deepcode-kernel-daemon/src/settings_api.rs >/dev/null
 search "fn append_session_projection_jsonl|fn session_store_projection_append" crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
-search "conversation_archives_dir|conversationArchiveRoot|fn session_store_archive_get|fn append_conversation_archive_projection|fn append_conversation_archive_transcript|fn read_conversation_archive_manifests|fn redact_archive_value" crates/deepcode-kernel-daemon/src/state.rs crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
+search "conversation_archives_dir|conversationArchiveRoot|fn session_store_archive_get|fn session_store_archive_file_get|ArchiveFileQuery|fn append_conversation_archive_projection|fn append_conversation_archive_transcript|fn read_conversation_archive_manifests|fn safe_archive_relative_path|fn redact_archive_value" crates/deepcode-kernel-daemon/src/state.rs crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
 search "manifest.json|projection.jsonl|transcript.jsonl|exports/complete.md|exports/debug.json|projection-events.jsonl|transcript-events.jsonl|action-bundle-drafts.jsonl|plan-review-reports.jsonl|review-packets.jsonl|permission-tool-facts.jsonl" crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
-search "/api/session-store/:session_id/archive" crates/deepcode-kernel-daemon/src/main.rs >/dev/null
+search "/api/session-store/:session_id/archive|/api/session-store/:session_id/archive/file" crates/deepcode-kernel-daemon/src/main.rs >/dev/null
 ! search "conversation-archives" userspace/gui/dist shells/tauri/dist shells/tauri/src-tauri/tauri.conf.json 2>/dev/null \
   || fail "conversation archives must stay in user config data, not GUI/Tauri dist resources"
 search "fn drive_kernel_agent_loop|fn call_llm_profile" crates/deepcode-kernel-daemon/src/agent_loop.rs >/dev/null
@@ -425,18 +425,28 @@ search "struct DescriptorValidator|unknown_capability|unsafe_hook|forbidden_pred
 search "struct SafeInterpreter|evaluate_transition|validate_proposal|TransitionDecision|ProposalValidationDecision" crates/deepcode-kernel-workflow/src/interpreter.rs >/dev/null
 search "PLAN_CHECK_COMPLETE_REVIEW_TEMPLATE|builtin_plan_check_complete_review|load_builtin_plan_check_complete_review" crates/deepcode-kernel-workflow/src/template.rs >/dev/null
 search "schema_version: \"1.0.0\"|id: plan-check-complete-review|workspace.read|plan.review|permission.preflight|reviewgate.evaluate|ActionBundleDraft" crates/deepcode-kernel-workflow/templates/plan-check-complete-review.yaml >/dev/null
+search "with_descriptor|descriptor_transition_decision|SafeInterpreter|TransitionInput" crates/deepcode-kernel-workflow/src/machine.rs >/dev/null
 search "rejects_script_hook|rejects_forbidden_predicate|rejects_unbounded_self_loop|unknown_proposal_kind_fails_to_parse|allows_review_to_complete_user_replan_loop" crates/deepcode-kernel-workflow/src/validator.rs >/dev/null
 search "invalid_proposal_stays_without_transition|plan_draft_advances_to_check|action_bundle_draft_advances_to_check|complete_to_review_requires_all_predicates" crates/deepcode-kernel-workflow/src/interpreter.rs >/dev/null
+! search "\"workflow\": \"plan-check-complete-review\"|unwrap_or\\(\"planFirst\"\\)" crates/deepcode-kernel-client/src crates/deepcode-kernel-daemon/src/agent_loop.rs \
+  || fail "agent clients must not inject the fixed plan-check-complete-review workflow path"
 ! search "PlanContractSubmit \\{ request_id, \\.\\. \\} =>" crates/deepcode-kernel-runtime/src/dispatch.rs || fail "PlanContractSubmit must not remain interface-only"
 search "fn plan_contract_submit|parse_plan_review_input|PlanReviewReportProduced|plan.review_report_produced" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
 search "plan_contract_submit_produces_review_report_without_entering_complete|plan_contract_submit_malformed_contract_returns_denied_report|plan_contract_submit_action_bundle_reports_permission_gap" crates/deepcode-kernel-runtime/src/tests.rs >/dev/null
 search "parseAgentPlan|ACTION_BUNDLE|EXPECTED_VALIDATION|REVIEW_GUIDE|PERMISSION_HINTS" userspace/session-core/src/agent-plan >/dev/null
+search "RESOURCE_REQUEST|resource_request_with_action_bundle|parseAgentPlanOutput|ResourceRequestDraft|RESOURCE_REQUEST_KEYS" userspace/session-core/src/agent-plan >/dev/null
 search "DraftTaskQueue|ApprovedTaskQueue|createPlanContractSubmitCommand|compileActionBundleToPlanContract" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue >/dev/null
+search "PlanConfirmationPolicy|PermissionAutoApprovalPolicy|AutoConfirmDecision|DEFAULT_PLAN_CONFIRMATION_POLICY|decidePlanConfirmation|decidePermissionAutoApproval|autoApproveDelete" userspace/session-core/src/confirmation userspace/session-core/src/task-queue >/dev/null
 search "ConversationProjection|buildConversationProjection|exportConversationProjection|为什么这样做|review_summary|check_review" userspace/session-core/src/projection.ts >/dev/null
 search "ReviewSelfCheckInput|buildReviewPacket|permissionDecisions|toolResults|finalSummary|waitingUserReview" userspace/session-core/src/review userspace/session-core/src/projection.ts >/dev/null
-search "DynamicWorkflowPlan|selectDynamicWorkflow|SessionOrchestrationMicroPhase|stateMachineBoundary|kernelOwnedStateMachine|projectionCardKinds|resource_request|resource_packet|repairLoop" userspace/session-core/src/workflow userspace/session-core/src/projection.ts >/dev/null
+search "DynamicWorkflowPlan|DynamicWorkflowSession|buildDynamicWorkflowSession|selectDynamicWorkflow|SessionOrchestrationMicroPhase|stateMachineBoundary|kernelOwnedStateMachine|projectionCardKinds|resource_request|resource_packet|repairLoop" userspace/session-core/src/workflow userspace/session-core/src/projection.ts >/dev/null
 search "ResourceManifest|InitialContextPacket|ResourceRequest|ResourcePacket|createResourcePacket|autoRead|askRead|denyRead" userspace/session-core/src/context >/dev/null
+search "ProjectIndex|CheckpointGraph|SymbolHistoryIndex|ContextLayering|createProjectIndex|deriveContextLayering" userspace/session-core/src/context >/dev/null
 search "PromptEnvelopeParts|StablePrefixRef|DynamicSuffixRef|workflowProjectionSchema|ProviderCacheTelemetry|promptCacheHitTokens|promptCacheMissTokens" userspace/session-core/src/context userspace/session-core/src/cache >/dev/null
+search "PromptEnvelopeBuilderInput|PromptSystemLayer|buildPromptEnvelope|baseSystem|workflowState|outputContract|capabilityProjection|memoryContext|userOverlay|currentRequirement|resourceContext" userspace/session-core/src/prompt >/dev/null
+search "canonicalizePrompt|canonicalizeToolSchema|auditHash|cacheHash|LocalL2Cache|SingleflightDeduper|applyProviderCacheStrategy|deepseek-openai|anthropic-native|ollama|providerTelemetryFromUsage" userspace/session-core/src/cache >/dev/null
+search "readConversationArchiveFile|getConversationArchive|AgentArchiveActions|复制完整对话|复制调试包|打开归档目录" userspace/gui/src/services userspace/gui/src/components/agent-panel >/dev/null
+search "manualChunks|markdown-renderer|chunkSizeWarningLimit" userspace/gui/vite.config.ts >/dev/null
 ! search "format=\\\"yaml\\\"|YAML ACTION_BUNDLE|strict YAML subset" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue userspace/session-core/src/requirement userspace/session-core/src/cadence userspace/session-core/src/review userspace/session-core/src/context userspace/session-core/src/cache || fail "session-core must not support YAML ACTION_BUNDLE V1"
 ! search "PermissionGate|DeepCodeKernelRuntime|workspace\\.write\\(|workspace\\.delete\\(|shell\\.exec\\(|ReviewGate accepted|ValidationResult" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue userspace/session-core/src/requirement userspace/session-core/src/cadence userspace/session-core/src/review userspace/session-core/src/context userspace/session-core/src/cache || fail "session-core must not execute tools or own Kernel decisions"
 test ! -e userspace/gui/src/components/agent-panel/AgentWorkflowSelector.tsx \
@@ -464,7 +474,7 @@ search "\\.deepcode/build-baselines/" .gitignore >/dev/null
 search "\\.build-cache|\\.deepcode/build-baselines|\\.pnpm-store" .dockerignore >/dev/null
 search "run_build_baseline_probe|cargo release repeat|cargo release after runtime touch|build-baselines" test.sh >/dev/null
 search "--mount=type=cache|sccache|SCCACHE_DIR" Dockerfile.dev >/dev/null
-pass "stage 9/10/10.5/11/12/13/14 grep gates"
+pass "stage 9/10/10.5/11/12/13/14/19/20 grep gates"
 
 info "[5/8] Kernel daemon HTTP smoke"
 CONFIG_DIR="$(mktemp -d /tmp/deepcode-stage9-config-XXXXXX)"
@@ -599,4 +609,4 @@ else
 fi
 
 info "[8/8] done"
-pass "DeepCode stage 9/10/10.5/11/12/13/14 fast smoke passed"
+pass "DeepCode stage 9/10/10.5/11/12/13/14/19/20 fast smoke passed"
