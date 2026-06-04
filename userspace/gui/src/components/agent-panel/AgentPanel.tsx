@@ -1,5 +1,4 @@
-import React, { useEffect, useState } from 'react';
-import type { LlmProviderProfile } from '@deepcode/protocol';
+import React, { useEffect } from 'react';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -18,7 +17,6 @@ const AgentPanel: React.FC = () => {
   const sessions = useAgentSessionStore((s) => s.sessions);
   const traceEvents = useAgentSessionStore((s) => s.traceEvents);
   const profileId = useAgentSessionStore((s) => s.profileId);
-  const workflowConfig = useAgentSessionStore((s) => s.workflowConfig);
   const loading = useAgentSessionStore((s) => s.loading);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
@@ -31,8 +29,6 @@ const AgentPanel: React.FC = () => {
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const archiveSession = useAgentSessionStore((s) => s.archiveSession);
-  const loadWorkflowConfig = useAgentSessionStore((s) => s.loadWorkflowConfig);
-  const patchWorkflowConfig = useAgentSessionStore((s) => s.patchWorkflowConfig);
   const setProfileId = useAgentSessionStore((s) => s.setProfileId);
   const addAttachment = useAgentSessionStore((s) => s.addAttachment);
   const removeAttachment = useAgentSessionStore((s) => s.removeAttachment);
@@ -45,26 +41,21 @@ const AgentPanel: React.FC = () => {
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
 
-  const [profiles, setProfiles] = useState<LlmProviderProfile[]>([]);
-
   useEffect(() => {
     void loadOrCreate();
     void refreshSessions();
-    void loadWorkflowConfig();
     const loadProfiles = () => getLlmProfiles().then((result) => {
       if (result.ok && result.data) {
-        setProfiles(result.data.profiles);
         setProfileId(profileId ?? result.data.defaultProfileId);
       }
     });
     void loadProfiles();
     const onProfilesUpdated = () => {
       void loadProfiles();
-      void loadWorkflowConfig();
     };
     window.addEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
     return () => window.removeEventListener('deepcode:llm-profiles-updated', onProfilesUpdated);
-  }, [loadOrCreate, loadWorkflowConfig, profileId, refreshSessions, setProfileId]);
+  }, [loadOrCreate, profileId, refreshSessions, setProfileId]);
 
   useEffect(() => {
     void loadOrCreate();
@@ -113,15 +104,12 @@ const AgentPanel: React.FC = () => {
       <AgentComposer
         messageAttachments={messageAttachments}
         sessionAttachments={sessionAttachments}
-        workflowConfig={workflowConfig}
-        profiles={profiles}
         language={language}
         loading={loading}
         onSend={(content) => void sendMessage(content)}
         onStop={() => void cancelCurrentRun()}
         onAddAttachment={addAttachment}
         onRemoveAttachment={removeAttachment}
-        onWorkflowConfigChange={(config) => void patchWorkflowConfig(config)}
       />
     </div>
   );

@@ -1,25 +1,17 @@
 import React, { useMemo, useRef, useState } from 'react';
-import type {
-  AgentContextAttachment,
-  AgentWorkflowConfig,
-  LlmProviderProfile,
-} from '@deepcode/protocol';
+import type { AgentContextAttachment } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import ContextAttachmentPicker from './ContextAttachmentPicker';
-import AgentWorkflowSelector from './AgentWorkflowSelector';
 
 interface AgentComposerProps {
   messageAttachments: AgentContextAttachment[];
   sessionAttachments: AgentContextAttachment[];
-  workflowConfig: AgentWorkflowConfig | null;
-  profiles: LlmProviderProfile[];
   language: UiLanguage;
   loading: boolean;
   onSend: (content: string) => void;
   onStop: () => void;
   onAddAttachment: (attachment: AgentContextAttachment) => void;
   onRemoveAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
-  onWorkflowConfigChange: (config: AgentWorkflowConfig) => void;
 }
 
 interface AgentModifiedFileView {
@@ -42,15 +34,12 @@ function attachmentLabel(attachment: AgentContextAttachment, language: UiLanguag
 const AgentComposer: React.FC<AgentComposerProps> = ({
   messageAttachments,
   sessionAttachments,
-  workflowConfig,
-  profiles,
   language,
   loading,
   onSend,
   onStop,
   onAddAttachment,
   onRemoveAttachment,
-  onWorkflowConfigChange,
 }) => {
   const [value, setValue] = useState('');
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -169,13 +158,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               />
             )}
           </div>
-          <AgentWorkflowSelector
-            profiles={profiles}
-            config={workflowConfig}
-            language={language}
-            disabled={false}
-            onChange={onWorkflowConfigChange}
-          />
         </div>
         <button
           className={loading ? 'agent-composer__send-button--stop' : undefined}
