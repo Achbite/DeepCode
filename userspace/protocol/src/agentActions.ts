@@ -90,3 +90,62 @@ export interface PromptLayerResult {
 export interface SkillReferenceResult {
   skills: SkillReference[];
 }
+
+export type AgentResourceReadPolicy = 'autoRead' | 'askRead' | 'denyRead';
+export type AgentResourceEntryKind = 'file' | 'symbol' | 'search' | 'checkpoint' | 'index' | 'ruler';
+
+export interface AgentResourceManifestEntry {
+  id: string;
+  kind: AgentResourceEntryKind;
+  label: string;
+  resourceRef: string;
+  readPolicy: AgentResourceReadPolicy;
+  reason: string;
+}
+
+export interface AgentResourceManifest {
+  id: string;
+  workspaceScopeKey: string;
+  workspaceId?: string;
+  entries: AgentResourceManifestEntry[];
+  budget: {
+    maxEntries: number;
+    maxBytes: number;
+  };
+  defaultDenyPatterns: string[];
+}
+
+export interface AgentResourceRequestItem {
+  id: string;
+  manifestEntryId: string;
+  reason: string;
+}
+
+export interface AgentResourceRequest {
+  id: string;
+  items: AgentResourceRequestItem[];
+}
+
+export interface ResolveAgentResourcesRequest {
+  workspaceBinding?: unknown;
+  manifest: AgentResourceManifest;
+  request: AgentResourceRequest;
+}
+
+export interface AgentResourcePacketItem {
+  requestItemId: string;
+  manifestEntryId: string;
+  readPolicy: AgentResourceReadPolicy;
+  status: 'provided' | 'needsUserApproval' | 'denied';
+  contentSummary?: string;
+  denialReason?: string;
+  evidenceRefs?: string[];
+  sourceKind?: 'kernelResource' | 'manifestOnly';
+}
+
+export interface AgentResourcePacketResult {
+  id: string;
+  workspaceScopeKey: string;
+  requestId: string;
+  items: AgentResourcePacketItem[];
+}

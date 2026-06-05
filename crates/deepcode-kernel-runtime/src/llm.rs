@@ -331,7 +331,7 @@ pub(crate) fn compile_kernel_phase_instruction(
     };
     let mut prompt = format!(
         "{stage_instruction}\n\n\
-        输出语言默认简体中文。自然语言永远不可执行，权限摘要只能来自 Kernel PlanReview。\n\
+        输出语言根据用户问题决定。自然语言永远不可执行，权限摘要只能来自 Kernel PlanReview。\n\
         plan 阶段输出格式必须是：<USER_PLAN>...</USER_PLAN>、<ACTION_BUNDLE format=\"json\" version=\"1\">{{...}}</ACTION_BUNDLE>、<EXPECTED_VALIDATION>...</EXPECTED_VALIDATION>、<REVIEW_GUIDE>...</REVIEW_GUIDE>。\n\
         ACTION_BUNDLE JSON 必须使用 camelCase 字段：version、id、goal、actions、validationExpectations、reviewExpectations；每个 action 至少包含 id、title、capability、kind、resourceScope。\n\
         工具路径必须是工作区相对路径，禁止 /tmp、绝对路径和 ..。\n\

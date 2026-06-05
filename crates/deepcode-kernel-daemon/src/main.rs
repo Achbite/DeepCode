@@ -194,6 +194,10 @@ async fn main() {
         )
         .route("/api/agent/parse-actions", post(agent_parse_actions))
         .route("/api/agent/fixtures/run", post(agent_fixture_run))
+        .route(
+            "/api/agent/resources/resolve",
+            post(agent_resources_resolve),
+        )
         .route("/api/agent/prompt-layers", get(agent_prompt_layers))
         .route("/api/agent/tools", get(agent_tools))
         .route("/api/agent/skills", get(agent_tools))

@@ -3,6 +3,7 @@
 
 use crate::prelude::*;
 use crate::*;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AgentRunRequest {
@@ -269,6 +270,12 @@ pub(crate) async fn drive_kernel_agent_loop(
                 continue;
             }
             if phase == "review" {
+                record_kernel_events(state, &submitted);
+                append_session_projection(
+                    state,
+                    session_id,
+                    kernel_events_to_agent_events(session_id, &submitted),
+                );
                 append_review_summary_from_response(
                     state,
                     session_id,
@@ -279,6 +286,7 @@ pub(crate) async fn drive_kernel_agent_loop(
                         .and_then(Value::as_str)
                         .unwrap_or_default(),
                 );
+                continue;
             }
             next_events.extend(submitted);
         }
@@ -369,26 +377,23 @@ fn parse_pending_agent_plan(
     run_id: &str,
     content: &str,
 ) -> Result<PendingAgentPlan, String> {
-    let user_plan =
-        tagged_block(content, "USER_PLAN").ok_or_else(|| "missing USER_PLAN block".to_string())?;
-    let action_bundle_raw = tagged_block(content, "ACTION_BUNDLE")
-        .ok_or_else(|| "missing ACTION_BUNDLE block".to_string())?;
-    let expected_validation = tagged_block(content, "EXPECTED_VALIDATION")
-        .ok_or_else(|| "missing EXPECTED_VALIDATION block".to_string())?;
-    let review_guide = tagged_block(content, "REVIEW_GUIDE")
-        .ok_or_else(|| "missing REVIEW_GUIDE block".to_string())?;
-    let action_bundle: Value = serde_json::from_str(action_bundle_raw.trim())
+    let blocks = extract_agent_plan_blocks(content)?;
+    if blocks.contains_key("RESOURCE_REQUEST") && blocks.contains_key("ACTION_BUNDLE") {
+        return Err(
+            "RESOURCE_REQUEST and ACTION_BUNDLE cannot appear in the same turn".to_string(),
+        );
+    }
+    if blocks.contains_key("RESOURCE_REQUEST") {
+        return Err("RESOURCE_REQUEST cannot be treated as an executable plan".to_string());
+    }
+    let user_plan = required_plan_block(&blocks, "USER_PLAN")?;
+    let action_bundle_block = required_plan_block(&blocks, "ACTION_BUNDLE")?;
+    validate_block_header(action_bundle_block, "ACTION_BUNDLE")?;
+    let action_bundle: Value = serde_json::from_str(action_bundle_block.content.trim())
         .map_err(|error| format!("ACTION_BUNDLE must be valid JSON: {error}"))?;
-    if !action_bundle.is_object() {
-        return Err("ACTION_BUNDLE must be a JSON object".to_string());
-    }
-    let version = action_bundle
-        .get("version")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "ACTION_BUNDLE.version is required".to_string())?;
-    if version != "1" {
-        return Err(format!("unsupported ACTION_BUNDLE version {version}"));
-    }
+    validate_action_bundle_json(&action_bundle, &blocks)?;
+    let expected_validation = required_plan_block(&blocks, "EXPECTED_VALIDATION")?;
+    let review_guide = required_plan_block(&blocks, "REVIEW_GUIDE")?;
     let plan_id = action_bundle
         .get("id")
         .and_then(Value::as_str)
@@ -399,22 +404,303 @@ fn parse_pending_agent_plan(
         session_id: session_id.to_string(),
         run_id: run_id.to_string(),
         plan_id,
-        user_plan: user_plan.trim().to_string(),
+        user_plan: user_plan.content.trim().to_string(),
         action_bundle,
-        expected_validation: expected_validation.trim().to_string(),
-        review_guide: review_guide.trim().to_string(),
+        expected_validation: expected_validation.content.trim().to_string(),
+        review_guide: review_guide.content.trim().to_string(),
         plan_review_report: None,
         created_at: now_text(),
     })
 }
 
-fn tagged_block<'a>(content: &'a str, tag: &str) -> Option<&'a str> {
-    let open_start = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let start = content.find(&open_start)?;
-    let after_open = content[start..].find('>')? + start + 1;
-    let end = content[after_open..].find(&close)? + after_open;
-    Some(&content[after_open..end])
+#[derive(Debug, Clone)]
+struct AgentPlanBlock {
+    attrs: BTreeMap<String, String>,
+    content: String,
+}
+
+fn extract_agent_plan_blocks(content: &str) -> Result<BTreeMap<String, AgentPlanBlock>, String> {
+    let mut blocks = BTreeMap::new();
+    let mut index = 0;
+    while let Some(open_offset) = content[index..].find('<') {
+        let open_index = index + open_offset;
+        if content[open_index..].starts_with("</") {
+            return Err("unmatched closing tag".to_string());
+        }
+        let Some(close_angle_offset) = content[open_index..].find('>') else {
+            return Err("unterminated tag".to_string());
+        };
+        let close_angle_index = open_index + close_angle_offset;
+        let header = &content[open_index + 1..close_angle_index];
+        let (tag, attrs) = parse_plan_tag_header(header)?;
+        if !is_known_plan_tag(&tag) {
+            return Err(format!("unknown agent plan tag {tag}"));
+        }
+        if tag != "CODE_BLOCK" && blocks.contains_key(&tag) {
+            return Err(format!("duplicate {tag} block"));
+        }
+        let close_tag = format!("</{tag}>");
+        let content_start = close_angle_index + 1;
+        let Some(close_offset) = content[content_start..].find(&close_tag) else {
+            return Err(format!("missing closing {tag} tag"));
+        };
+        let content_end = content_start + close_offset;
+        let block_content = &content[content_start..content_end];
+        if tag != "CODE_BLOCK" && contains_plan_tag(block_content) {
+            return Err(format!("{tag} contains a nested tag"));
+        }
+        let key = if tag == "CODE_BLOCK" {
+            let Some(id) = attrs.get("id").filter(|value| !value.trim().is_empty()) else {
+                return Err("CODE_BLOCK is missing id".to_string());
+            };
+            let Some(path) = attrs.get("path").filter(|value| !value.trim().is_empty()) else {
+                return Err("CODE_BLOCK is missing path".to_string());
+            };
+            validate_workspace_path(path, "CODE_BLOCK.path")?;
+            format!("CODE_BLOCK:{id}")
+        } else {
+            tag.clone()
+        };
+        if blocks.contains_key(&key) {
+            return Err(format!("duplicate {tag} block"));
+        }
+        blocks.insert(
+            key,
+            AgentPlanBlock {
+                attrs,
+                content: block_content.to_string(),
+            },
+        );
+        index = content_end + close_tag.len();
+    }
+    if content[index..].contains('>') {
+        return Err("unmatched tag text".to_string());
+    }
+    Ok(blocks)
+}
+
+fn parse_plan_tag_header(header: &str) -> Result<(String, BTreeMap<String, String>), String> {
+    let mut parts = header.split_whitespace();
+    let Some(tag) = parts.next() else {
+        return Err("empty tag".to_string());
+    };
+    let mut attrs = BTreeMap::new();
+    for part in parts {
+        let Some((key, raw_value)) = part.split_once('=') else {
+            return Err(format!("{tag} contains invalid attr {part}"));
+        };
+        let value = raw_value.trim_matches('"').trim_matches('\'').to_string();
+        attrs.insert(key.to_string(), value);
+    }
+    Ok((tag.to_string(), attrs))
+}
+
+fn is_known_plan_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "USER_PLAN"
+            | "RESOURCE_REQUEST"
+            | "ACTION_BUNDLE"
+            | "CODE_BLOCK"
+            | "EXPECTED_VALIDATION"
+            | "REVIEW_GUIDE"
+            | "PERMISSION_HINTS"
+    )
+}
+
+fn contains_plan_tag(content: &str) -> bool {
+    [
+        "<USER_PLAN",
+        "<RESOURCE_REQUEST",
+        "<ACTION_BUNDLE",
+        "<CODE_BLOCK",
+        "<EXPECTED_VALIDATION",
+        "<REVIEW_GUIDE",
+        "<PERMISSION_HINTS",
+    ]
+    .iter()
+    .any(|tag| content.contains(tag))
+}
+
+fn required_plan_block<'a>(
+    blocks: &'a BTreeMap<String, AgentPlanBlock>,
+    tag: &str,
+) -> Result<&'a AgentPlanBlock, String> {
+    blocks
+        .get(tag)
+        .ok_or_else(|| format!("missing {tag} block"))
+}
+
+fn validate_block_header(block: &AgentPlanBlock, tag: &str) -> Result<(), String> {
+    if block.attrs.get("format").map(String::as_str) != Some("json")
+        || block.attrs.get("version").map(String::as_str) != Some("1")
+    {
+        return Err(format!("{tag} must declare format=\"json\" version=\"1\""));
+    }
+    Ok(())
+}
+
+fn validate_action_bundle_json(
+    value: &Value,
+    blocks: &BTreeMap<String, AgentPlanBlock>,
+) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Err("ACTION_BUNDLE must be a JSON object".to_string());
+    };
+    reject_unknown_json_fields(
+        object.keys(),
+        &[
+            "version",
+            "id",
+            "goal",
+            "requirementId",
+            "actions",
+            "validationExpectations",
+            "reviewExpectations",
+            "repairPolicy",
+        ],
+        "ACTION_BUNDLE",
+    )?;
+    let version = object
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ACTION_BUNDLE.version is required".to_string())?;
+    if version != "1" {
+        return Err(format!("unsupported ACTION_BUNDLE version {version}"));
+    }
+    let actions = object
+        .get("actions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "ACTION_BUNDLE.actions must be an array".to_string())?;
+    let mut referenced_code_blocks = BTreeSet::new();
+    let code_block_ids = blocks
+        .keys()
+        .filter_map(|key| key.strip_prefix("CODE_BLOCK:"))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    for (index, action) in actions.iter().enumerate() {
+        validate_action_json(action, index, &code_block_ids, &mut referenced_code_blocks)?;
+    }
+    for key in blocks.keys().filter(|key| key.starts_with("CODE_BLOCK:")) {
+        let id = key.trim_start_matches("CODE_BLOCK:");
+        if !referenced_code_blocks.contains(id) {
+            return Err(format!(
+                "CODE_BLOCK {id} is not referenced by ACTION_BUNDLE"
+            ));
+        }
+    }
+    if !object
+        .get("validationExpectations")
+        .map(Value::is_array)
+        .unwrap_or(false)
+    {
+        return Err("ACTION_BUNDLE.validationExpectations must be an array".to_string());
+    }
+    if !object
+        .get("reviewExpectations")
+        .map(Value::is_array)
+        .unwrap_or(false)
+    {
+        return Err("ACTION_BUNDLE.reviewExpectations must be an array".to_string());
+    }
+    Ok(())
+}
+
+fn validate_action_json(
+    value: &Value,
+    index: usize,
+    code_block_ids: &BTreeSet<String>,
+    referenced_code_blocks: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Err(format!("actions[{index}] must be an object"));
+    };
+    reject_unknown_json_fields(
+        object.keys(),
+        &[
+            "id",
+            "title",
+            "capability",
+            "kind",
+            "resourceScope",
+            "canParallelize",
+            "conflictKeys",
+            "purpose",
+            "sourceBlockId",
+        ],
+        &format!("actions[{index}]"),
+    )?;
+    for key in ["id", "title", "capability"] {
+        if object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            return Err(format!("actions[{index}].{key} must be a non-empty string"));
+        }
+    }
+    let resource_scope = object
+        .get("resourceScope")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("actions[{index}].resourceScope must be an array"))?;
+    for resource in resource_scope {
+        let Some(resource) = resource.as_str().filter(|value| !value.trim().is_empty()) else {
+            return Err(format!(
+                "actions[{index}].resourceScope must contain non-empty strings"
+            ));
+        };
+        validate_resource_scope(resource, &format!("actions[{index}].resourceScope"))?;
+    }
+    if let Some(source_block_id) = object.get("sourceBlockId").and_then(Value::as_str) {
+        if !code_block_ids.contains(source_block_id) {
+            return Err(format!(
+                "actions[{index}] references missing CODE_BLOCK {source_block_id}"
+            ));
+        }
+        referenced_code_blocks.insert(source_block_id.to_string());
+    }
+    Ok(())
+}
+
+fn reject_unknown_json_fields<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    allowed: &[&str],
+    label: &str,
+) -> Result<(), String> {
+    for key in keys {
+        if !allowed.iter().any(|allowed_key| *allowed_key == key) {
+            return Err(format!("{label} contains unknown field {key}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_resource_scope(value: &str, label: &str) -> Result<(), String> {
+    if value.contains('*')
+        || value.starts_with("symbol:")
+        || value.starts_with("search:")
+        || value.starts_with("checkpoint:")
+    {
+        return Ok(());
+    }
+    validate_workspace_path(value, label)
+}
+
+fn validate_workspace_path(value: &str, label: &str) -> Result<(), String> {
+    let normalized = value.replace('\\', "/");
+    if normalized.starts_with('/')
+        || normalized.get(1..3) == Some(":/")
+        || normalized == ".."
+        || normalized.starts_with("../")
+        || normalized.contains("/../")
+        || normalized.ends_with("/..")
+    {
+        return Err(format!(
+            "{label} must be workspace-relative and must not contain .."
+        ));
+    }
+    Ok(())
 }
 
 fn plan_card_event(session_id: &str, plan: &PendingAgentPlan) -> Value {

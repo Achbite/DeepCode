@@ -62,6 +62,8 @@ import type {
   AgentActionParseResult,
   AgentFixtureRunRequest,
   AgentFixtureRunResult,
+  ResolveAgentResourcesRequest,
+  AgentResourcePacketResult,
   PromptLayerResult,
   SkillReferenceResult,
   BrowserRuntimeStatusResult,
@@ -719,6 +721,16 @@ export function runAgentFixture(
 ): Promise<ApiResponse<AgentFixtureRunResult>> {
   return sendJson<AgentFixtureRunResult>(
     `${API_BASE}/agent/fixtures/run`,
+    'POST',
+    request
+  );
+}
+
+export function resolveAgentResources(
+  request: ResolveAgentResourcesRequest
+): Promise<ApiResponse<AgentResourcePacketResult>> {
+  return sendJson<AgentResourcePacketResult>(
+    `${API_BASE}/agent/resources/resolve`,
     'POST',
     request
   );

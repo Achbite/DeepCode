@@ -1,6 +1,11 @@
 import type { ResourceManifest, ResourcePacket, ResourcePacketItem, ResourceReadPolicy, ResourceRequest } from './types.js';
 
-export function createResourcePacket(input: { packetId: string; request: ResourceRequest; manifest: ResourceManifest }): ResourcePacket {
+export function createResourcePacket(input: {
+  packetId: string;
+  request: ResourceRequest;
+  manifest: ResourceManifest;
+  kernelEvidence?: Record<string, { contentSummary?: string; evidenceRefs?: string[] }>;
+}): ResourcePacket {
   const entriesById = new Map(input.manifest.entries.map((entry) => [entry.id, entry]));
   const items: ResourcePacketItem[] = [];
   const seen = new Set<string>();
@@ -20,7 +25,7 @@ export function createResourcePacket(input: { packetId: string; request: Resourc
       continue;
     }
 
-    items.push(resourcePacketItem(requestItem.id, entry.id, entry.readPolicy));
+    items.push(resourcePacketItem(requestItem.id, entry.id, entry.readPolicy, input.kernelEvidence?.[entry.id]));
   }
 
   return {
@@ -31,14 +36,21 @@ export function createResourcePacket(input: { packetId: string; request: Resourc
   };
 }
 
-function resourcePacketItem(requestItemId: string, manifestEntryId: string, readPolicy: ResourceReadPolicy): ResourcePacketItem {
+function resourcePacketItem(
+  requestItemId: string,
+  manifestEntryId: string,
+  readPolicy: ResourceReadPolicy,
+  evidence?: { contentSummary?: string; evidenceRefs?: string[] }
+): ResourcePacketItem {
   if (readPolicy === 'autoRead') {
     return {
       requestItemId,
       manifestEntryId,
       readPolicy,
       status: 'provided',
-      contentSummary: 'auto-read resource approved by manifest policy',
+      contentSummary: evidence?.contentSummary ?? 'auto-read resource approved by manifest policy',
+      evidenceRefs: evidence?.evidenceRefs ?? [],
+      sourceKind: evidence ? 'kernelResource' : 'manifestOnly',
     };
   }
   if (readPolicy === 'askRead') {
@@ -48,6 +60,7 @@ function resourcePacketItem(requestItemId: string, manifestEntryId: string, read
       readPolicy,
       status: 'needsUserApproval',
       denialReason: 'resource requires user approval before read',
+      sourceKind: 'manifestOnly',
     };
   }
   return {
@@ -56,5 +69,6 @@ function resourcePacketItem(requestItemId: string, manifestEntryId: string, read
     readPolicy,
     status: 'denied',
     denialReason: 'resource is denied by manifest policy',
+    sourceKind: 'manifestOnly',
   };
 }

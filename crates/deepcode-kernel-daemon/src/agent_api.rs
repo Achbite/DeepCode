@@ -19,6 +19,58 @@ pub(crate) struct ToolCallRequest {
     pub(crate) arguments: Value,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentResourceResolveRequest {
+    pub(crate) workspace_binding: Option<WorkspaceBinding>,
+    pub(crate) manifest: AgentResourceManifest,
+    pub(crate) request: AgentResourceRequest,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentResourceManifest {
+    pub(crate) id: String,
+    pub(crate) workspace_scope_key: String,
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) entries: Vec<AgentResourceManifestEntry>,
+    pub(crate) budget: AgentResourceManifestBudget,
+    pub(crate) default_deny_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentResourceManifestBudget {
+    pub(crate) max_entries: usize,
+    pub(crate) max_bytes: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentResourceManifestEntry {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) label: String,
+    pub(crate) resource_ref: String,
+    pub(crate) read_policy: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentResourceRequest {
+    pub(crate) id: String,
+    pub(crate) items: Vec<AgentResourceRequestItem>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentResourceRequestItem {
+    pub(crate) id: String,
+    pub(crate) manifest_entry_id: String,
+    pub(crate) reason: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentSessionScopeQuery {
@@ -501,15 +553,167 @@ pub(crate) async fn agent_fixture_run() -> Json<ApiResponse> {
     }))
 }
 
+pub(crate) async fn agent_resources_resolve(
+    State(state): State<AppState>,
+    Json(body): Json<AgentResourceResolveRequest>,
+) -> Json<ApiResponse> {
+    let mut items = Vec::new();
+    let entries = body
+        .manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let max_entries = body.manifest.budget.max_entries.max(1);
+    let max_bytes = body.manifest.budget.max_bytes.max(256);
+
+    for request_item in body.request.items.iter().take(max_entries) {
+        let Some(entry) = entries.get(request_item.manifest_entry_id.as_str()) else {
+            items.push(json!({
+                "requestItemId": request_item.id,
+                "manifestEntryId": request_item.manifest_entry_id,
+                "readPolicy": "denyRead",
+                "status": "denied",
+                "denialReason": "resource is not listed in ResourceManifest",
+                "sourceKind": "manifestOnly"
+            }));
+            continue;
+        };
+        match entry.read_policy.as_str() {
+            "denyRead" => items.push(json!({
+                "requestItemId": request_item.id,
+                "manifestEntryId": entry.id,
+                "readPolicy": entry.read_policy,
+                "status": "denied",
+                "denialReason": "resource is denied by manifest policy",
+                "sourceKind": "manifestOnly"
+            })),
+            "askRead" => items.push(json!({
+                "requestItemId": request_item.id,
+                "manifestEntryId": entry.id,
+                "readPolicy": entry.read_policy,
+                "status": "needsUserApproval",
+                "denialReason": "resource requires user approval before read",
+                "sourceKind": "manifestOnly"
+            })),
+            _ => {
+                let resource = resolve_auto_read_resource(
+                    &state,
+                    body.workspace_binding.as_ref(),
+                    entry,
+                    max_bytes,
+                );
+                match resource {
+                    Ok((summary, refs)) => items.push(json!({
+                        "requestItemId": request_item.id,
+                        "manifestEntryId": entry.id,
+                        "readPolicy": "autoRead",
+                        "status": "provided",
+                        "contentSummary": summary,
+                        "evidenceRefs": refs,
+                        "sourceKind": "kernelResource"
+                    })),
+                    Err(error) => items.push(json!({
+                        "requestItemId": request_item.id,
+                        "manifestEntryId": entry.id,
+                        "readPolicy": "autoRead",
+                        "status": "denied",
+                        "denialReason": error,
+                        "sourceKind": "kernelResource"
+                    })),
+                }
+            }
+        }
+    }
+
+    ApiResponse::ok(json!({
+        "id": format!("resource-packet-{}", now_millis()),
+        "workspaceScopeKey": body.manifest.workspace_scope_key,
+        "requestId": body.request.id,
+        "items": items
+    }))
+}
+
+fn resolve_auto_read_resource(
+    state: &AppState,
+    binding: Option<&WorkspaceBinding>,
+    entry: &AgentResourceManifestEntry,
+    max_bytes: usize,
+) -> Result<(String, Vec<String>), String> {
+    ensure_workspace_binding(&state.runtime, binding).map_err(|error| error.message)?;
+    let output = match entry.kind.as_str() {
+        "file" | "ruler" => crate::workspace_api::dispatch_workspace(
+            &state.runtime,
+            KernelCommand::WorkspaceRead {
+                request_id: rid("agent-resource-read"),
+                folder_id: None,
+                path: entry.resource_ref.clone(),
+            },
+        )
+        .map_err(|error| error.message)?,
+        "search" | "symbol" => crate::workspace_api::dispatch_workspace(
+            &state.runtime,
+            KernelCommand::WorkspaceSearch {
+                request_id: rid("agent-resource-search"),
+                folder_id: None,
+                query: entry.resource_ref.clone(),
+                include: None,
+                is_regex: false,
+            },
+        )
+        .map_err(|error| error.message)?,
+        "index" | "checkpoint" => json!({
+            "summary": entry.resource_ref,
+            "reason": entry.reason
+        }),
+        other => {
+            return Err(format!(
+                "resource kind {other} is not supported by Kernel resource resolver"
+            ));
+        }
+    };
+    Ok((
+        summarize_resource_output(&output, max_bytes),
+        vec![format!("kernel-resource:{}:{}", entry.kind, entry.id)],
+    ))
+}
+
+fn summarize_resource_output(output: &Value, max_bytes: usize) -> String {
+    let candidate = output
+        .get("content")
+        .or_else(|| output.get("text"))
+        .or_else(|| output.get("summary"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| serde_json::to_string(output).unwrap_or_else(|_| "{}".to_string()));
+    candidate.chars().take(max_bytes).collect()
+}
+
 pub(crate) async fn agent_prompt_layers() -> Json<ApiResponse> {
     ApiResponse::ok(json!({
-        "layers": [{
-            "id": "builtin-default",
-            "kind": "builtin",
-            "priority": 100,
-            "contentHash": "builtin",
-            "title": "Builtin default prompt"
-        }]
+        "layers": [
+            {
+                "id": "protocol-contract-v1",
+                "kind": "builtin",
+                "priority": 0,
+                "contentHash": "protocol-contract:v1",
+                "title": "Protocol Contract"
+            },
+            {
+                "id": "builtin-system-prompt-v1",
+                "kind": "builtin",
+                "priority": 10,
+                "contentHash": "builtin-system-prompt:v1",
+                "title": "Builtin System Prompt"
+            },
+            {
+                "id": "ruler-context",
+                "kind": "workspace",
+                "priority": 30,
+                "contentHash": "ruler:settings",
+                "title": "Ruler Context"
+            }
+        ]
     }))
 }
 

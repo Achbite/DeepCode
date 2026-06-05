@@ -54,6 +54,8 @@ import type {
   PromptLayerResult,
   RenameAgentSessionRequest,
   RenameEntryResult,
+  ResolveAgentResourcesRequest,
+  AgentResourcePacketResult,
   ResolveAgentPermissionRequest,
   ResolveAgentPlanRequest,
   SaveWorkspaceFileRequest,
@@ -541,6 +543,12 @@ export function runAgentFixture(
   request: AgentFixtureRunRequest
 ): Promise<ApiResponse<AgentFixtureRunResult>> {
   return api.runAgentFixture(request);
+}
+
+export function resolveAgentResources(
+  request: ResolveAgentResourcesRequest
+): Promise<ApiResponse<AgentResourcePacketResult>> {
+  return api.resolveAgentResources(request);
 }
 
 export function getAgentPromptLayers(): Promise<ApiResponse<PromptLayerResult>> {

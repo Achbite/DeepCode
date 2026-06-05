@@ -111,6 +111,7 @@ export function parseAgentPlanOutput(input: string): AgentPlanOutput {
   const userPlan = requireBlock(singleton, 'USER_PLAN').content.trim();
   const requiredActionBundleBlock = requireBlock(singleton, 'ACTION_BUNDLE');
   const actionBundle = parseActionBundle(requiredActionBundleBlock, codeBlockIds);
+  rejectOrphanCodeBlocks(codeBlockIds, actionBundle);
   const expectedValidation = requireBlock(singleton, 'EXPECTED_VALIDATION').content.trim();
   const reviewGuide = requireBlock(singleton, 'REVIEW_GUIDE').content.trim();
   const permissionHints = singleton.get('PERMISSION_HINTS')?.content.trim();
@@ -209,6 +210,7 @@ function requireBlock(blocks: Map<AgentPlanTag, ParsedBlock>, tag: AgentPlanTag)
 function codeBlockFromBlock(block: ParsedBlock): CodeBlockDraft {
   const id = requireAttr(block, 'id');
   const path = requireAttr(block, 'path');
+  rejectUnsafeWorkspacePath(path, `${block.tag}.path`);
   return {
     id,
     path,
@@ -316,17 +318,51 @@ function plannedActionFromValue(value: unknown, label: string, codeBlockIds: Set
   if (sourceBlockId && !codeBlockIds.has(sourceBlockId)) {
     throw new AgentPlanParseError('missing_code_block_ref', `${label} references missing CODE_BLOCK ${sourceBlockId}`);
   }
+  const resourceScope = stringArray(object.resourceScope, `${label}.resourceScope`, true);
+  for (const resource of resourceScope) {
+    rejectUnsafeResourceScope(resource, `${label}.resourceScope`);
+  }
   return {
     id: requireString(object, 'id', label),
     title: requireString(object, 'title', label),
     capability: requireString(object, 'capability', label),
     kind: optionalActionKind(object.kind, label),
-    resourceScope: stringArray(object.resourceScope, `${label}.resourceScope`, true),
+    resourceScope,
     canParallelize: optionalBoolean(object.canParallelize, `${label}.canParallelize`) ?? false,
     conflictKeys: stringArray(object.conflictKeys, `${label}.conflictKeys`, false),
     purpose: optionalString(object, 'purpose', label),
     sourceBlockId,
   };
+}
+
+function rejectOrphanCodeBlocks(codeBlockIds: Set<string>, actionBundle: ActionBundleDraft): void {
+  const referenced = new Set(actionBundle.actions.map((action) => action.sourceBlockId).filter((id): id is string => !!id));
+  for (const id of codeBlockIds) {
+    if (!referenced.has(id)) {
+      throw new AgentPlanParseError('orphan_code_block', `CODE_BLOCK ${id} is not referenced by ACTION_BUNDLE`);
+    }
+  }
+}
+
+function rejectUnsafeResourceScope(value: string, label: string): void {
+  if (value.includes('*') || value.startsWith('symbol:') || value.startsWith('search:') || value.startsWith('checkpoint:')) {
+    return;
+  }
+  rejectUnsafeWorkspacePath(value, label);
+}
+
+function rejectUnsafeWorkspacePath(value: string, label: string): void {
+  const normalized = value.replace(/\\/g, '/');
+  if (
+    normalized.startsWith('/') ||
+    /^[A-Za-z]:\//.test(normalized) ||
+    normalized === '..' ||
+    normalized.startsWith('../') ||
+    normalized.includes('/../') ||
+    normalized.endsWith('/..')
+  ) {
+    throw new AgentPlanParseError('unsafe_workspace_path', `${label} must be workspace-relative and must not contain ..`);
+  }
 }
 
 function validationExpectationFromValue(value: unknown, label: string): ValidationExpectationDraft {

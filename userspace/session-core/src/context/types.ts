@@ -69,6 +69,8 @@ export interface ResourcePacketItem {
   status: 'provided' | 'needsUserApproval' | 'denied';
   contentSummary?: string;
   denialReason?: string;
+  evidenceRefs?: string[];
+  sourceKind?: 'kernelResource' | 'manifestOnly';
 }
 
 export interface ResourcePacket {
@@ -78,21 +80,77 @@ export interface ResourcePacket {
   items: ResourcePacketItem[];
 }
 
+export interface ProtocolContractBlock {
+  protocolContractHash: string;
+  workflowStateContract: string;
+  outputSchemaSummary: string;
+  resourceRequestSchemaSummary: string;
+  actionBundleSchemaSummary: string;
+  failClosedRules: string[];
+  capabilityProjectionSchema: string;
+  workflowProjectionSchema: string;
+}
+
+export interface BuiltinSystemPromptBlock {
+  builtinSystemPromptHash: string;
+  version: string;
+  content: string;
+  editable: false;
+}
+
+export interface RulerBlock {
+  rulerHash: string;
+  constraintSummaries: string[];
+  ignoredClauseCount: number;
+  canGrantPermission: false;
+  canOverrideProtocolContract: false;
+  canOverrideSystemPrompt: true;
+}
+
+export interface CurrentUserOverlayBlock {
+  overlayHash: string;
+  content: string;
+}
+
+export interface AuthoritativeDocExcerptBlock {
+  docExcerptHash: string;
+  excerpts: Array<{
+    docKind: 'humanProjectPlan' | 'humanStageWorkbench';
+    path: string;
+    lineStart: number;
+    lineEnd: number;
+    heading?: string;
+    excerptHash: string;
+  }>;
+}
+
+export interface MemoryHintBlock {
+  memoryHintHashes: string[];
+  summaries: string[];
+}
+
+export interface ResourceContextBlock {
+  initialContextId?: string;
+  resourcePacketHashes: string[];
+  resourcePacketSummaries: string[];
+}
+
+export interface AuditOnlyContextBlock {
+  runId?: string;
+  sessionId?: string;
+  traceId?: string;
+  projectionCardIds?: string[];
+  ledgerRefs?: string[];
+  auditRefs?: string[];
+}
+
 export interface PromptEnvelopeParts {
-  stablePrefix: {
-    systemBoundary: string;
-    outputFormat: string;
-    jsonSchemaSummary: string;
-    parserRules: string;
-    capabilityCatalogSummary: string;
-    workflowProjectionSchema: string;
-  };
-  dynamicSuffix: {
-    userRequest: string;
-    requirement?: unknown;
-    contextCandidates: unknown[];
-    fileSnippets: unknown[];
-    toolEvidence: unknown[];
-    reviewRound?: unknown;
-  };
+  protocolContract: ProtocolContractBlock;
+  builtinSystemPrompt: BuiltinSystemPromptBlock;
+  rulerContext?: RulerBlock;
+  currentUserOverlay?: CurrentUserOverlayBlock;
+  authoritativeDocExcerpts?: AuthoritativeDocExcerptBlock;
+  memoryHints?: MemoryHintBlock;
+  resourceContext?: ResourceContextBlock;
+  auditOnlyContext?: AuditOnlyContextBlock;
 }

@@ -1,7 +1,7 @@
 import type { KernelPlanReviewReport } from '@deepcode/protocol';
 import type { ActionBundleDraft } from '../agent-plan/types.js';
 
-export type DraftTaskQueueStatus = 'draft' | 'kernelPreflighted' | 'userConfirmed' | 'rejected';
+export type DraftTaskQueueStatus = 'draft' | 'kernelPreflighted' | 'userConfirmed' | 'revisionRequested' | 'rejected';
 
 export interface DraftTask {
   id: string;
