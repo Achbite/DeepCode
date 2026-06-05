@@ -157,7 +157,8 @@ docker run --rm -t -v "$PWD:/workspace" -w /workspace deepcode-dev ./test.sh
 - session-core transcript / projection / resume 最小模型
 - Dev Host proxy `/api/*` smoke
 - LLM profile 保存、secretRef、token integer guard
-- Agent workflow permission resume 与临时文件生命周期
+- Agent 动态会话投影、PlanReview / 计划确认、permission resume 与临时文件生命周期
+- Conversation Archive 本地归档、完整对话导出和 debug 包 smoke
 - Workspace 打开、浏览、保存 `.code-workspace`
 - Windows 盘符枚举与文件树排序
 - hidden `fs.delete` 受控能力
@@ -204,11 +205,25 @@ DEEPCODE_RUN_BUILD_BENCH=1 ./test.sh
   - 工作区内路径必须为相对路径；绝对路径、`..` 穿越、Windows 盘符形式的工具路径会被拒绝。
 - **LLM 会话工作流**
 
-  - 恢复非流式 Agent workflow：`plan -> check -> complete -> review`。
+  - 会话层不再把 `plan-check-complete-review` 当作固定 UI 路径；Kernel 仍拥有 workflow/state machine，Session 负责选择 `workflowRef`、解析结构化 proposal、组织投影和用户决策。
+  - LLM 的计划输出采用 tagged Markdown + JSON `ACTION_BUNDLE`；自然语言不会直接变成工具执行、权限授权或完成事实。
+  - 正式 Plan 默认进入 Check / 计划确认卡：Kernel `PlanReview` 生成权限预览，用户可直接同意计划，或在同一个评审输入框提交修改意见；空评审提交视为拒绝计划。
+  - `Permission` 只展示执行前真实授权请求；写入、删除、shell、network、secret 等能力仍由 Kernel PermissionGate 控制。
+  - `Execution` 主视图只展示工具进度、权限结果和执行事实；执行完成后必须生成 `ReviewPacket` 或显示 `Review pending`。
+  - `Review` 合并 Kernel facts 与 LLM review guidance：修改文件、权限使用、工具结果、验证结果来自 Kernel / ledger，模型只给自检摘要、风险和用户审查建议。
   - 支持 OpenAI-compatible、Anthropic、Ollama profile；DeepSeek 按 OpenAI-compatible profile 使用。
   - token 字段有整数 guard，避免 `max_tokens: 384000.0` 这类请求体错误。
   - 写入类工具会生成 permission card；用户接受后 workflow 可从 pending tool 继续执行。
   - “身份 + 临时文件读写删除”fixture 已覆盖：身份只最终回答一次，未清理临时文件不得 review accepted。
+- **Conversation Archive**
+
+  - Daemon session store 会把会话投影、transcript、debug 记录和导出快照持续归档到用户配置目录下的 `conversation-archives/`。
+  - 会话与归档默认按 `workspaceScopeKey/sessionId/runId` 归属；GUI 打开不同工作区时只显示当前 workspace 的 Agent session。Windows `E:\...` 与 WSL `/mnt/e/...` 默认是不同 workspace scope，避免 31245 / 31250 互相串会话。
+  - `/api/agent/sessions?workspaceId&workspaceHash` 与 `/api/agent/sessions/current?workspaceId&workspaceHash` 返回当前 workspace scope 的 session；无 workspace 的 CLI/TUI 旧调用落到 `unbound-workspace`，不复用 GUI 当前工作区会话。
+  - 普通安装默认使用 `%APPDATA%/DeepCode/conversation-archives` 或 `~/.config/deepcode/conversation-archives`；portable / `DEEPCODE_CONFIG_DIR` 模式使用对应可写配置根。
+  - `/api/session-store/index` 返回归档根目录，`/api/session-store/:session_id/archive` 返回单个 session 的 manifest、文件列表和导出路径。
+  - GUI 后续可基于该 manifest 提供“复制完整对话 / 导出调试包 / 打开归档目录”；默认 session selector 不混合跨 workspace 历史，跨 workspace 历史只通过显式 archive/history 入口查看。
+  - 完整 raw event 与 parser/debug 数据保留在归档和调试视图，不进入默认阅读主视图。
 - **打包与预览**
 
   - `./build.sh` 输出 `bin/linux-x64` 和 `bin/win64`。
@@ -353,18 +368,23 @@ TS、GUI、CLI、TUI、MCP server 和 LLM 都不能直接 spawn Skill 进程。
 
 ### LLM Workflow
 
-当前会话工作流按阶段推进：
+DeepCode 当前采用 Kernel-owned workflow / state machine + Session dynamic projection：
 
 ```text
-plan -> check -> complete -> review
+Kernel workflow descriptor / state machine
+  -> Session parses typed proposal and submits PlanContract
+  -> Kernel PlanReview / PermissionGate / execution facts
+  -> Session projects Plan / Check / Permission / Execution / Review cards
 ```
 
-阶段边界：
+边界规则：
 
-- `plan`：产出计划、PlanContract 和待满足 AnswerObligation，不抢答最终业务问题。
-- `check`：审查计划风险、权限和工具目录，不复述完整正文。
-- `complete`：执行下一步工具、处理 permission pending、记录 tool observation。
-- `review`：只在 completion criteria 满足后输出最终答案；未完成时 blocked/replan。
+- `Plan` 是用户可见计划卡，来自 LLM 结构化输出和 Session parser；其中 `ACTION_BUNDLE` 只是草案。
+- `Check` 是 Kernel `PlanReview` + 用户计划评审卡，不再是单独的 LLM 检查阶段文本；用户可同意计划，也可提交评审意见进入 revise。
+- `Permission` 是执行前真实授权请求，权限摘要只来自 Kernel report / PermissionGate。
+- `Execution` 展示工具、权限、文件变更和验证事实；LLM 的执行期开场白不进入主阅读流。
+- `Review` 展示 Kernel facts + LLM guidance，并等待用户最终 review；模型不能替代用户标记 accepted。
+- `Plan / Check / Permission / Execution / Review` 是稳定投影语义，不是所有 workflow 都必须照搬的固定状态序列。
 
 ## Windows / Linux / Docker 策略
 
