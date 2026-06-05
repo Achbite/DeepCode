@@ -1,6 +1,8 @@
 export interface CanonicalPrompt {
   stablePrefix: string;
   dynamicSuffix: string;
+  stablePrefixHash: string;
+  dynamicSuffixHash: string;
   auditHash: string;
   cacheHash: string;
 }
@@ -13,18 +15,29 @@ export interface CanonicalToolSchema {
 export function canonicalizePrompt(input: {
   stablePrefix: unknown;
   dynamicSuffix: unknown;
+  auditOnly?: unknown;
   provider: string;
   model: string;
   templateVersion: string;
 }): CanonicalPrompt {
   const stablePrefix = canonicalJson(input.stablePrefix);
   const dynamicSuffix = canonicalJson(input.dynamicSuffix);
+  const stablePrefixHash = stableHash(
+    canonicalJson({
+      provider: input.provider,
+      model: input.model,
+      templateVersion: input.templateVersion,
+      stablePrefix,
+    })
+  );
+  const dynamicSuffixHash = stableHash(dynamicSuffix);
   const cacheHash = stableHash(
     canonicalJson({
       provider: input.provider,
       model: input.model,
       templateVersion: input.templateVersion,
       stablePrefix,
+      dynamicSuffix,
     })
   );
   const auditHash = stableHash(
@@ -34,9 +47,10 @@ export function canonicalizePrompt(input: {
       templateVersion: input.templateVersion,
       stablePrefix,
       dynamicSuffix,
+      auditOnly: input.auditOnly ?? {},
     })
   );
-  return { stablePrefix, dynamicSuffix, auditHash, cacheHash };
+  return { stablePrefix, dynamicSuffix, stablePrefixHash, dynamicSuffixHash, auditHash, cacheHash };
 }
 
 export function canonicalizeToolSchema(tools: Array<{ name: string; schema: unknown }>): CanonicalToolSchema {

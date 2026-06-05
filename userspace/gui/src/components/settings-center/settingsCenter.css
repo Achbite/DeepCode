@@ -420,7 +420,7 @@
 
 .llm-profile,
 .settings-list-row,
-.prompt-profile-row,
+.prompt-layer-row,
 .ruler-rule-row,
 .doctor-check {
   border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
@@ -429,7 +429,7 @@
 }
 
 .llm-profile,
-.prompt-profile-row,
+.prompt-layer-row,
 .ruler-rule-row,
 .doctor-check {
   padding: 12px;
@@ -459,6 +459,18 @@
 
 .llm-profile__actions {
   margin-top: 10px;
+}
+
+.settings-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-muted, #9aa4b2);
+  font-size: 12px;
 }
 
 .settings-form-grid {
@@ -608,7 +620,7 @@
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
-.prompt-profile-row__meta {
+.prompt-layer-row__meta {
   display: grid;
   grid-template-columns: auto minmax(120px, 180px) minmax(180px, 1fr) auto;
   gap: 8px;
@@ -707,7 +719,7 @@
   .doctor-grid,
   .settings-form-grid,
   .settings-list-row,
-  .prompt-profile-row__meta,
+  .prompt-layer-row__meta,
   .ruler-rule-row__meta {
     grid-template-columns: 1fr;
   }
@@ -727,7 +739,7 @@
   .doctor-grid,
   .settings-form-grid,
   .settings-list-row,
-  .prompt-profile-row__meta,
+  .prompt-layer-row__meta,
   .ruler-rule-row__meta {
     grid-template-columns: 1fr;
   }

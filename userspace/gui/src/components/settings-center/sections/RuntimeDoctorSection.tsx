@@ -3,6 +3,7 @@ import { useSettingsStore } from '../../../state/settingsStore';
 import { useWorkspaceStore } from '../../../state/workspaceStore';
 import { normalizeUiLanguage, t } from '../../../i18n';
 import {
+  getAgentPromptLayers,
   getLlmProfiles,
   getRuntimeStatus,
   listAgentTools,
@@ -59,8 +60,8 @@ const RuntimeDoctorSection: React.FC = () => {
     const nextRuntime = await getRuntimeStatus();
     const llmProfiles = await getLlmProfiles();
     const agentTools = await listAgentTools();
+    const promptLayers = await getAgentPromptLayers();
 
-    const promptProfiles = parseArraySetting(effectiveSettings['prompt.profiles']);
     const skillMounts = parseArraySetting(effectiveSettings['skills.mounts']);
     const mcpServers = parseArraySetting(effectiveSettings['mcp.servers']);
     const rulerRules = parseArraySetting(effectiveSettings['ruler.rules']);
@@ -121,11 +122,11 @@ const RuntimeDoctorSection: React.FC = () => {
       {
         id: 'prompt',
         title: t(language, 'settings.doctor.check.prompt'),
-        status: promptProfiles.length > 0 ? 'ok' : 'warn',
+        status: promptLayers.ok && promptLayers.data && promptLayers.data.layers.length > 0 ? 'ok' : 'warn',
         detail:
-          promptProfiles.length > 0
-            ? t(language, 'settings.doctor.detail.prompt', { count: promptProfiles.length })
-            : t(language, 'settings.doctor.noPrompt'),
+          promptLayers.ok && promptLayers.data && promptLayers.data.layers.length > 0
+            ? t(language, 'settings.doctor.detail.prompt', { count: promptLayers.data.layers.length })
+            : promptLayers.message ?? t(language, 'settings.doctor.noPrompt'),
       },
       {
         id: 'skills',

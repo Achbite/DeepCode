@@ -5,7 +5,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 import WorkspaceSection from './sections/WorkspaceSection';
 import CommonSettingsSection from './sections/CommonSettingsSection';
 import SkillRuntimeSection from './sections/SkillRuntimeSection';
-import PromptProfilesSection from './sections/PromptProfilesSection';
+import PromptInspectorSection from './sections/PromptInspectorSection';
 import RuntimeDoctorSection from './sections/RuntimeDoctorSection';
 import RulerRulesSection from './sections/RulerRulesSection';
 import LlmSection from './sections/LlmSection';
@@ -74,7 +74,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
       case 'mcp':
         return <McpServicesSection />;
       case 'prompt':
-        return <PromptProfilesSection />;
+        return <PromptInspectorSection />;
       case 'doctor':
         return <RuntimeDoctorSection />;
       case 'ruler':

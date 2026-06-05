@@ -40,9 +40,6 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'skills.mounts': '[]',
   'mcp.autoLoad': false,
   'mcp.servers': '[]',
-  'prompt.defaultProfileId': 'default-agent',
-  'prompt.profiles':
-    '[{"id":"default-agent","name":"Default Agent","description":"Default coding assistant profile","systemPrompt":"You are DeepCode Agent. Work inside the current workspace, explain important risks, and ask for approval before writing files.","enabled":true}]',
   'ruler.enabled': true,
   'ruler.rules':
     '[{"id":"default-safety","name":"Default Safety Boundary","source":"system","priority":100,"path":"<builtin>/default-safety.md","content":"Default to plan mode. Read before write. Show diff before saving files. Never run destructive commands without explicit approval.","enabled":true}]',
