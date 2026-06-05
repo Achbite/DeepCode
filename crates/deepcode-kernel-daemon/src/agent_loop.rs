@@ -193,13 +193,93 @@ pub(crate) async fn drive_kernel_agent_loop(
                 runtime
                     .dispatch(KernelCommand::LlmResponseSubmit {
                         request_id: rid("llm-response-submit"),
-                        run_id,
+                        run_id: run_id.clone(),
                         session_id: event_session_id,
                         llm_call_id,
-                        response_envelope,
+                        response_envelope: response_envelope.clone(),
                     })
                     .map_err(|error| error.to_string())?
             };
+            if phase == "plan" {
+                let mut submitted = submitted;
+                match parse_pending_agent_plan(
+                    session_id,
+                    &run_id.0,
+                    response_envelope
+                        .pointer("/assistantMessage/content")
+                        .or_else(|| response_envelope.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ) {
+                    Ok(mut plan) => {
+                        append_session_projection(
+                            state,
+                            session_id,
+                            vec![plan_card_event(session_id, &plan)],
+                        );
+                        let review_events = {
+                            let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+                            runtime
+                                .dispatch(KernelCommand::PlanContractSubmit {
+                                    request_id: rid("agent-plan-review"),
+                                    run_id: Some(run_id.clone()),
+                                    session_id: Some(deepcode_kernel_abi::SessionId(
+                                        session_id.to_string(),
+                                    )),
+                                    contract: plan.action_bundle.clone(),
+                                })
+                                .map_err(|error| error.to_string())?
+                        };
+                        plan.plan_review_report = review_events.iter().find_map(|event| {
+                            if let KernelEvent::PlanReviewReportProduced { report, .. } = event {
+                                Some(report.clone())
+                            } else {
+                                None
+                            }
+                        });
+                        {
+                            let mut gui = state.gui.lock().expect("gui state lock");
+                            gui.pending_plans.insert(plan.plan_id.clone(), plan.clone());
+                        }
+                        submitted.extend(review_events);
+                        if should_auto_accept_plan(state, &plan) {
+                            let accept_events = {
+                                let mut runtime =
+                                    state.runtime.lock().expect("kernel runtime lock");
+                                runtime
+                                    .dispatch(KernelCommand::PlanAccept {
+                                        request_id: rid("agent-plan-auto-accept"),
+                                        run_id: run_id.clone(),
+                                        plan_id: plan.plan_id.clone(),
+                                    })
+                                    .map_err(|error| error.to_string())?
+                            };
+                            submitted.extend(accept_events);
+                        }
+                    }
+                    Err(error) => {
+                        append_session_projection(
+                            state,
+                            session_id,
+                            vec![plan_parse_error_event(session_id, &run_id.0, &error)],
+                        );
+                    }
+                }
+                next_events.extend(submitted);
+                continue;
+            }
+            if phase == "review" {
+                append_review_summary_from_response(
+                    state,
+                    session_id,
+                    &run_id.0,
+                    response_envelope
+                        .pointer("/assistantMessage/content")
+                        .or_else(|| response_envelope.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                );
+            }
             next_events.extend(submitted);
         }
         kernel_events = next_events;
@@ -221,13 +301,20 @@ pub(crate) async fn agent_tool_execute(
             }));
         }
     }
-    let session_id = state
-        .gui
-        .lock()
-        .expect("gui state lock")
-        .current_session_id
-        .clone()
-        .unwrap_or_else(|| "tool-session".to_string());
+    let session_id = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        body.workspace_binding
+            .as_ref()
+            .and_then(|binding| {
+                let scope_key = scope_key_from_parts(
+                    binding.workspace_id.as_deref(),
+                    binding.workspace_hash.as_deref(),
+                );
+                current_agent_session_id_for_scope(&mut gui, &scope_key)
+            })
+            .or_else(|| gui.current_session_id.clone())
+            .unwrap_or_else(|| "tool-session".to_string())
+    };
     match invoke_kernel_tool(
         &state,
         &session_id,
@@ -275,6 +362,254 @@ pub(crate) fn append_trace_event(state: &AppState, session_id: &str, kind: &str,
             "summary": payload.get("summary").and_then(Value::as_str).unwrap_or(kind),
             "payload": payload
         }));
+}
+
+fn parse_pending_agent_plan(
+    session_id: &str,
+    run_id: &str,
+    content: &str,
+) -> Result<PendingAgentPlan, String> {
+    let user_plan =
+        tagged_block(content, "USER_PLAN").ok_or_else(|| "missing USER_PLAN block".to_string())?;
+    let action_bundle_raw = tagged_block(content, "ACTION_BUNDLE")
+        .ok_or_else(|| "missing ACTION_BUNDLE block".to_string())?;
+    let expected_validation = tagged_block(content, "EXPECTED_VALIDATION")
+        .ok_or_else(|| "missing EXPECTED_VALIDATION block".to_string())?;
+    let review_guide = tagged_block(content, "REVIEW_GUIDE")
+        .ok_or_else(|| "missing REVIEW_GUIDE block".to_string())?;
+    let action_bundle: Value = serde_json::from_str(action_bundle_raw.trim())
+        .map_err(|error| format!("ACTION_BUNDLE must be valid JSON: {error}"))?;
+    if !action_bundle.is_object() {
+        return Err("ACTION_BUNDLE must be a JSON object".to_string());
+    }
+    let version = action_bundle
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ACTION_BUNDLE.version is required".to_string())?;
+    if version != "1" {
+        return Err(format!("unsupported ACTION_BUNDLE version {version}"));
+    }
+    let plan_id = action_bundle
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("agent-plan")
+        .to_string();
+    Ok(PendingAgentPlan {
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        plan_id,
+        user_plan: user_plan.trim().to_string(),
+        action_bundle,
+        expected_validation: expected_validation.trim().to_string(),
+        review_guide: review_guide.trim().to_string(),
+        plan_review_report: None,
+        created_at: now_text(),
+    })
+}
+
+fn tagged_block<'a>(content: &'a str, tag: &str) -> Option<&'a str> {
+    let open_start = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let start = content.find(&open_start)?;
+    let after_open = content[start..].find('>')? + start + 1;
+    let end = content[after_open..].find(&close)? + after_open;
+    Some(&content[after_open..end])
+}
+
+fn plan_card_event(session_id: &str, plan: &PendingAgentPlan) -> Value {
+    let actions = plan
+        .action_bundle
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    crate::event_projection::agent_event(
+        session_id,
+        "plan_card",
+        json!({
+            "title": "Plan",
+            "summary": first_non_empty_line(&plan.user_plan),
+            "content": plan.user_plan,
+            "runId": plan.run_id,
+            "planId": plan.plan_id,
+            "actionBundle": plan.action_bundle,
+            "expectedValidation": plan.expected_validation,
+            "reviewGuide": plan.review_guide,
+            "facts": [
+                format!("任务数：{}", actions.len()),
+                "计划确认前不会进入执行。".to_string()
+            ],
+            "channel": "progress",
+            "visibility": "conversation",
+            "presentation": "body"
+        }),
+        &now_text(),
+    )
+}
+
+fn plan_parse_error_event(session_id: &str, run_id: &str, error: &str) -> Value {
+    crate::event_projection::agent_event(
+        session_id,
+        "plan_review",
+        json!({
+            "title": "Check / 计划确认",
+            "summary": format!("计划解析失败，已停止执行：{error}"),
+            "status": "needsRevision",
+            "runId": run_id,
+            "confirmable": false,
+            "facts": [
+                "LLM 输出必须包含 USER_PLAN、JSON ACTION_BUNDLE、EXPECTED_VALIDATION、REVIEW_GUIDE。".to_string(),
+                "解析失败时不能生成 ApprovedTaskQueue，也不能进入执行。".to_string()
+            ],
+            "channel": "progress",
+            "visibility": "conversation",
+            "presentation": "body"
+        }),
+        &now_text(),
+    )
+}
+
+fn first_non_empty_line(content: &str) -> String {
+    content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("计划已生成。")
+        .to_string()
+}
+
+fn should_auto_accept_plan(state: &AppState, plan: &PendingAgentPlan) -> bool {
+    let enabled = {
+        let gui = state.gui.lock().expect("gui state lock");
+        gui.user_settings
+            .get("agent.plan.autoConfirmReadOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    if !enabled {
+        return false;
+    }
+    let Some(report) = plan.plan_review_report.as_ref() else {
+        return false;
+    };
+    if !report_array_empty(report, "permissionGaps")
+        || !report_array_empty(report, "deniedReasons")
+        || !report_array_empty(report, "hardFloorHits")
+    {
+        return false;
+    }
+    let capabilities = report
+        .get("requiredCapabilities")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    !capabilities.is_empty()
+        && capabilities.iter().all(|capability| {
+            matches!(
+                capability.as_str(),
+                Some("workspace.read") | Some("code.search")
+            )
+        })
+}
+
+fn report_array_empty(report: &Value, key: &str) -> bool {
+    report
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| items.is_empty())
+        .unwrap_or(true)
+}
+
+fn append_review_summary_from_response(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    guidance: &str,
+) {
+    let facts = review_facts_for_run(state, run_id);
+    append_session_projection(
+        state,
+        session_id,
+        vec![crate::event_projection::agent_event(
+            session_id,
+            "review_summary",
+            json!({
+                "title": "Review",
+                "summary": first_non_empty_line(guidance),
+                "status": "waitingUserReview",
+                "runId": run_id,
+                "llmGuidance": guidance,
+                "facts": facts,
+                "channel": "final",
+                "visibility": "conversation",
+                "presentation": "body"
+            }),
+            &now_text(),
+        )],
+    );
+}
+
+fn review_facts_for_run(state: &AppState, run_id: &str) -> Vec<String> {
+    let events = state
+        .kernel_events
+        .lock()
+        .expect("kernel event stream lock")
+        .clone();
+    let mut tool_facts = Vec::new();
+    let mut permission_facts = Vec::new();
+    for event in events {
+        if event_run_id(&event).as_deref() != Some(run_id) {
+            continue;
+        }
+        match event {
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok,
+                error,
+                ..
+            } => {
+                tool_facts.push(format!(
+                    "工具结果：{} -> {}{}",
+                    tool_name,
+                    if ok { "ok" } else { "error" },
+                    error
+                        .as_ref()
+                        .map(|value| format!(" ({})", value.message))
+                        .unwrap_or_default()
+                ));
+            }
+            KernelEvent::PermissionResolved {
+                permission_id,
+                decision,
+                ..
+            } => {
+                permission_facts.push(format!("权限决策：{} -> {:?}", permission_id, decision));
+            }
+            _ => {}
+        }
+    }
+    if tool_facts.is_empty() {
+        tool_facts.push("工具结果：无工具执行事实。".to_string());
+    }
+    tool_facts.extend(permission_facts);
+    tool_facts.push("最终验收仍等待用户 review。".to_string());
+    tool_facts
+}
+
+fn event_run_id(event: &KernelEvent) -> Option<String> {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|value| value.get("runId").cloned())
+        .and_then(|value| match value {
+            Value::String(value) => Some(value),
+            Value::Object(map) => map
+                .get("0")
+                .or_else(|| map.get("value"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
 }
 
 pub(crate) fn invoke_kernel_tool(
@@ -501,33 +836,107 @@ pub(crate) fn llm_mock_enabled() -> bool {
 }
 
 pub(crate) fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> LlmChatOutput {
-    if system_instruction.contains("复核阶段") {
+    if system_instruction.contains("Review guidance") || system_instruction.contains("用户审查建议")
+    {
         let content = if request_mentions_temp_lifecycle(user_prompt) {
-            "<final>我是 DeepCode Agent。本轮已根据 Kernel 工具事实完成工作区读取、组件验证、临时文件创建读取与受控清理。</final>"
+            "我是 DeepCode。本轮工具事实显示工作区读取、组件验证、临时文件创建、读取与受控清理均已完成。请用户重点检查工具结果是否都为 ok、临时文件是否无残留、权限请求是否符合预期。"
         } else if request_mentions_local_workspace(user_prompt) {
-            "<final>我是 DeepCode Agent。本轮已根据 Kernel 工具事实完成工作区读取与组件验证。</final>"
+            "我是 DeepCode。本轮工具事实显示工作区读取与组件验证已完成。请用户重点检查读取范围与结果是否符合预期。"
         } else {
-            "<final>我是 DeepCode Agent。本轮已根据 Kernel 结构化事件完成当前任务。</final>"
+            "我是 DeepCode。本轮已根据 Kernel 结构化事件完成当前任务的自检建议，最终验收仍由用户决定。"
         };
         return LlmChatOutput {
             content: content.to_string(),
             ..LlmChatOutput::default()
         };
     }
-    if system_instruction.contains("规划阶段") {
+    if system_instruction.contains("ACTION_BUNDLE") && system_instruction.contains("USER_PLAN") {
         return LlmChatOutput {
-            content: "<plan>我会先规划测试目标，再通过 Kernel syscall 验证工作区读取、搜索、临时文件写入、读取和清理，最终只在复核阶段回答身份和汇总结果。</plan>".to_string(),
-            ..LlmChatOutput::default()
-        };
-    }
-    if system_instruction.contains("检查阶段") {
-        return LlmChatOutput {
-            content: "<observe>计划检查通过：路径使用工作区相对 `_agent_tmp_*`，写入需要权限，清理由 Kernel 隐藏受控能力完成。</observe>".to_string(),
+            content: format!(
+                "<USER_PLAN>\n我是 DeepCode，接下来我将作为你的助手验证当前 Agent 的文件系统、搜索与临时文件生命周期能力。计划会先列出工作区与搜索代码，再创建、读取并清理 `_agent_tmp_functional_test.txt`。\n</USER_PLAN>\n\n\
+                <ACTION_BUNDLE format=\"json\" version=\"1\">\n{}\n</ACTION_BUNDLE>\n\n\
+                <EXPECTED_VALIDATION>\n工具调用应全部返回 ok；临时文件读取内容应与写入内容一致；清理后文件不应残留。\n</EXPECTED_VALIDATION>\n\n\
+                <REVIEW_GUIDE>\n请重点审查工具结果、权限请求和临时文件是否被清理。\n</REVIEW_GUIDE>",
+                serde_json::json!({
+                    "version": "1",
+                    "id": "agent-functional-smoke-plan",
+                    "goal": "验证 Agent 工作区读取、代码搜索和临时文件生命周期能力",
+                    "actions": [
+                        {
+                            "id": "list-workspace-root",
+                            "title": "列出工作区根目录",
+                            "capability": "workspace.read",
+                            "kind": "read",
+                            "resourceScope": ["."]
+                        },
+                        {
+                            "id": "search-workspace",
+                            "title": "验证 code.search",
+                            "capability": "code.search",
+                            "kind": "read",
+                            "resourceScope": ["workspace"]
+                        },
+                        {
+                            "id": "write-temp-file",
+                            "title": "创建临时文件",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["_agent_tmp_functional_test.txt"]
+                        },
+                        {
+                            "id": "read-temp-file",
+                            "title": "读取临时文件",
+                            "capability": "workspace.read",
+                            "kind": "read",
+                            "resourceScope": ["_agent_tmp_functional_test.txt"]
+                        },
+                        {
+                            "id": "delete-temp-file",
+                            "title": "清理临时文件",
+                            "capability": "workspace.delete",
+                            "kind": "delete",
+                            "resourceScope": ["_agent_tmp_functional_test.txt"]
+                        }
+                    ],
+                    "validationExpectations": [
+                        {
+                            "id": "tool-results-ok",
+                            "description": "fs.list、code.search、fs.write、fs.read、fs.delete 均返回 ok"
+                        }
+                    ],
+                    "reviewExpectations": [
+                        {
+                            "id": "user-review-temp-cleanup",
+                            "description": "用户确认临时文件已清理且权限请求符合预期"
+                        }
+                    ]
+                })
+            ),
             ..LlmChatOutput::default()
         };
     }
     LlmChatOutput {
-        content: "<say>开始执行工具验证。</say>".to_string(),
+        content: String::new(),
+        tool_calls: vec![
+            LlmToolCall {
+                id: "mock-fs-list".to_string(),
+                name: "fs.list".to_string(),
+                arguments: json!({ "path": "." }),
+            },
+            LlmToolCall {
+                id: "mock-code-search".to_string(),
+                name: "code.search".to_string(),
+                arguments: json!({ "query": "DeepCode" }),
+            },
+            LlmToolCall {
+                id: "mock-fs-write".to_string(),
+                name: "fs.write".to_string(),
+                arguments: json!({
+                    "path": "_agent_tmp_functional_test.txt",
+                    "content": format!("DeepCode Agent temp lifecycle test at {}", now_millis())
+                }),
+            },
+        ],
         ..LlmChatOutput::default()
     }
 }

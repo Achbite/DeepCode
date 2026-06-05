@@ -183,6 +183,10 @@ async fn main() {
             "/api/agent/permissions/:permission_id/resolve",
             post(agent_permission_resolve),
         )
+        .route(
+            "/api/agent/plans/:run_id/:plan_id/resolve",
+            post(agent_plan_resolve),
+        )
         .route("/api/agent/feedback", post(agent_feedback))
         .route(
             "/api/agent/workflow-config",

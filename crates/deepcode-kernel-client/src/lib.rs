@@ -84,13 +84,32 @@ impl HttpKernelClient {
         prompt: &str,
         mode: PromptMode,
     ) -> KernelClientResult<PromptRunResult> {
+        self.send_prompt_with_workspace_scope(prompt, mode, None)
+            .await
+    }
+
+    pub async fn send_prompt_with_workspace_scope(
+        &self,
+        prompt: &str,
+        mode: PromptMode,
+        workspace_scope: Option<WorkspaceSessionScope>,
+    ) -> KernelClientResult<PromptRunResult> {
+        let mut session_body = json!({
+            "title": "CLI Session",
+            "mode": mode.as_str(),
+        });
+        if let Some(scope) = workspace_scope {
+            if let Some(workspace_id) = scope.workspace_id {
+                session_body["workspaceId"] = json!(workspace_id);
+            }
+            if let Some(workspace_hash) = scope.workspace_hash {
+                session_body["workspaceHash"] = json!(workspace_hash);
+            }
+        }
         let session_response = self
             .http
             .post(self.url("/api/agent/sessions"))
-            .json(&json!({
-                "title": "CLI Session",
-                "mode": mode.as_str(),
-            }))
+            .json(&session_body)
             .send()
             .await?
             .error_for_status()?
@@ -161,6 +180,13 @@ impl HttpKernelClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.config.base_url, path)
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSessionScope {
+    pub workspace_id: Option<String>,
+    pub workspace_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

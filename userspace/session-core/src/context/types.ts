@@ -31,6 +31,7 @@ export interface ResourceManifestBudget {
 
 export interface ResourceManifest {
   id: string;
+  workspaceScopeKey: string;
   workspaceId?: string;
   entries: ResourceManifestEntry[];
   budget: ResourceManifestBudget;
@@ -39,6 +40,7 @@ export interface ResourceManifest {
 
 export interface InitialContextPacket {
   id: string;
+  workspaceScopeKey: string;
   fileTreeSummary?: string;
   projectIndexSummary?: string;
   readmeSummary?: string;
@@ -71,6 +73,7 @@ export interface ResourcePacketItem {
 
 export interface ResourcePacket {
   id: string;
+  workspaceScopeKey: string;
   requestId: string;
   items: ResourcePacketItem[];
 }

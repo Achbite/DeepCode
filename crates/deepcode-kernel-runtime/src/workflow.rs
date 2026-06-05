@@ -244,17 +244,19 @@ impl DeepCodeKernelRuntime {
     }
 
     pub(crate) fn plan_accept(
-        &self,
+        &mut self,
         _request_id: RequestId,
         run_id: RunId,
         plan_id: String,
         auto_accepted: bool,
     ) -> KernelResult<Vec<KernelEvent>> {
-        let record = self.record_by_run(&run_id.0)?;
-        let sequence = self.ledger.next_sequence(&run_id.0)?;
+        let run_id_text = run_id.0.clone();
+        let record = self.record_by_run(&run_id_text)?;
+        let session_id = record.session_id.clone();
+        let sequence = self.ledger.next_sequence(&run_id_text)?;
         self.append_ledger(
-            &run_id.0,
-            &record.session_id,
+            &run_id_text,
+            &session_id,
             "plan.accepted",
             sequence,
             serde_json::json!({
@@ -263,13 +265,16 @@ impl DeepCodeKernelRuntime {
                 "autoAccepted": auto_accepted
             }),
         )?;
-        Ok(vec![KernelEvent::PlanAccepted {
+        let mut events = vec![KernelEvent::PlanAccepted {
             run_id,
-            session_id: Some(SessionId(record.session_id)),
+            session_id: Some(SessionId(session_id.clone())),
             plan_id,
             auto_accepted,
             sequence: Some(sequence),
-        }])
+        }];
+        events.push(self.enter_phase_event(&run_id_text, &session_id, WorkflowPhase::Complete)?);
+        events.push(self.llm_call_requested_event(&run_id_text, &session_id)?);
+        Ok(events)
     }
 
     pub(crate) fn plan_reject(

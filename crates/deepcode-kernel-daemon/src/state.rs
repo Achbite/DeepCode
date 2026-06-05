@@ -31,7 +31,9 @@ pub(crate) struct GuiState {
     pub(crate) workflow_config: Value,
     pub(crate) sessions: Vec<Value>,
     pub(crate) current_session_id: Option<String>,
+    pub(crate) current_session_ids_by_scope: HashMap<String, String>,
     pub(crate) session_projection_cache: HashMap<String, Vec<Value>>,
+    pub(crate) pending_plans: HashMap<String, PendingAgentPlan>,
     pub(crate) trace_events: HashMap<String, Vec<Value>>,
     pub(crate) browser: BrowserState,
     pub(crate) terminals: Vec<Value>,
@@ -65,13 +67,29 @@ impl GuiState {
             workflow_config,
             sessions: Vec::new(),
             current_session_id: None,
+            current_session_ids_by_scope: HashMap::new(),
             session_projection_cache: HashMap::new(),
+            pending_plans: HashMap::new(),
             trace_events: HashMap::new(),
             browser: BrowserState::default(),
             terminals: Vec::new(),
             terminal_events: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PendingAgentPlan {
+    pub(crate) session_id: String,
+    pub(crate) run_id: String,
+    pub(crate) plan_id: String,
+    pub(crate) user_plan: String,
+    pub(crate) action_bundle: Value,
+    pub(crate) expected_validation: String,
+    pub(crate) review_guide: String,
+    pub(crate) plan_review_report: Option<Value>,
+    pub(crate) created_at: String,
 }
 
 impl HostPaths {

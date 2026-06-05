@@ -43,6 +43,89 @@
   color: var(--danger, #ef4444);
 }
 
+.agent-flow-card {
+  margin: 8px 12px;
+  padding: 12px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-lg, 8px);
+  background: var(--bg-surface, #1c1c20);
+  color: var(--text-main, #ededed);
+}
+
+.agent-flow-card__title {
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.agent-flow-card__summary {
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.agent-flow-card__section {
+  margin-top: 10px;
+}
+
+.agent-flow-card__section-title {
+  margin-bottom: 4px;
+  color: var(--accent, #1688ff);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.agent-flow-card__facts {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.agent-flow-card__details {
+  margin-top: 10px;
+}
+
+.agent-plan-review-actions {
+  margin-top: 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.agent-plan-review-actions textarea {
+  min-height: 72px;
+  resize: vertical;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-md, 6px);
+  background: var(--bg-panel, #131316);
+  color: var(--text-main, #ededed);
+  padding: 8px;
+  font: inherit;
+}
+
+.agent-plan-review-actions__buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.agent-plan-review-actions__buttons button {
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-md, 6px);
+  background: var(--bg-panel, #131316);
+  color: var(--text-main, #ededed);
+  padding: 6px 10px;
+  font: inherit;
+}
+
+.agent-plan-review-actions__buttons button:hover:not(:disabled) {
+  border-color: var(--accent, #1688ff);
+}
+
+.agent-plan-review-actions__buttons button:disabled {
+  opacity: 0.5;
+}
+
 .agent-session-bar {
   position: relative;
   flex: 0 0 auto;

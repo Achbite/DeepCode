@@ -10,6 +10,12 @@ interface MessageListProps {
   events: AgentEvent[];
   loading?: boolean;
   language: UiLanguage;
+  onPlanResolve?: (
+    runId: string,
+    planId: string,
+    decision: 'accept' | 'reject' | 'revise',
+    guidance?: string
+  ) => void;
 }
 
 interface TraceGroup {
@@ -349,6 +355,10 @@ function isToolTimelineEvent(event: AgentEvent): boolean {
   );
 }
 
+function isTerminalReviewEvent(event: AgentEvent): boolean {
+  return event.kind === 'review_summary';
+}
+
 function isTurnComplete(events: AgentEvent[]): boolean {
   return !events.some((event, index) => {
     if (event.kind === 'workflow_stage' && stageStatus(event.payload) === 'started') {
@@ -433,6 +443,7 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
       const finalAssistant = pickVisibleAssistantEvent(turnEvents);
       const explicitFinalAssistant = finalAssistant ? eventChannel(finalAssistant) === 'final' : false;
       const renderedEventIds = new Set<string>();
+      const deferredReviewEvents: AgentEvent[] = [];
 
       for (let turnIndex = 0; turnIndex < turnEvents.length; turnIndex += 1) {
         const turnEvent = turnEvents[turnIndex];
@@ -469,6 +480,12 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
           continue;
         }
 
+        if (isTerminalReviewEvent(turnEvent)) {
+          renderedEventIds.add(turnEvent.id);
+          deferredReviewEvents.push(turnEvent);
+          continue;
+        }
+
         if (isToolTimelineEvent(turnEvent)) {
           const batchEvents: AgentEvent[] = [];
           const batchId = eventBatchId(turnEvent);
@@ -502,6 +519,10 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
           event: turnEvent,
           autoOpen: eventDefaultOpen(turnEvent) ?? (turnEvent.kind === 'tool_call' && !hasLaterResult(turnEvents, turnEvents.indexOf(turnEvent))),
         });
+      }
+
+      for (const reviewEvent of deferredReviewEvents) {
+        pushTurnItem({ type: 'event', event: reviewEvent });
       }
 
       if (finalAssistant && !renderedEventIds.has(finalAssistant.id)) {
@@ -651,6 +672,115 @@ function renderError(event: AgentEvent, language: UiLanguage) {
         </details>
       )}
     </div>
+  );
+}
+
+function payloadArray(payload: unknown, key: string): string[] {
+  if (!isRecord(payload)) return [];
+  const value = payload[key];
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === 'string' ? item : JSON.stringify(item)))
+    .filter((item) => item.trim().length > 0);
+}
+
+function renderPlanCard(event: AgentEvent) {
+  const title = stringField(event.payload, 'title') ?? 'Plan';
+  const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
+  const content = stringField(event.payload, 'content');
+  const expectedValidation = stringField(event.payload, 'expectedValidation');
+  const reviewGuide = stringField(event.payload, 'reviewGuide');
+  const facts = payloadArray(event.payload, 'facts');
+  return (
+    <section key={event.id} className="agent-flow-card agent-flow-card--plan">
+      <div className="agent-flow-card__title">{title}</div>
+      <div className="agent-flow-card__summary">{summary}</div>
+      {content && content !== summary && <MarkdownContent content={content} />}
+      {expectedValidation && (
+        <div className="agent-flow-card__section">
+          <div className="agent-flow-card__section-title">Expected Validation</div>
+          <MarkdownContent content={expectedValidation} />
+        </div>
+      )}
+      {reviewGuide && (
+        <div className="agent-flow-card__section">
+          <div className="agent-flow-card__section-title">Review Guide</div>
+          <MarkdownContent content={reviewGuide} />
+        </div>
+      )}
+      {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
+    </section>
+  );
+}
+
+function PlanReviewCard({
+  event,
+  onPlanResolve,
+}: {
+  event: AgentEvent;
+  onPlanResolve?: MessageListProps['onPlanResolve'];
+}) {
+  const [guidance, setGuidance] = React.useState('');
+  const title = stringField(event.payload, 'title') ?? 'Check / 计划确认';
+  const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
+  const status = stringField(event.payload, 'status') ?? 'pending';
+  const runId = stringField(event.payload, 'runId');
+  const planId = stringField(event.payload, 'planId');
+  const facts = payloadArray(event.payload, 'facts');
+  const confirmable =
+    isRecord(event.payload) &&
+    event.payload.confirmable === true &&
+    status !== 'accepted' &&
+    status !== 'rejected' &&
+    Boolean(runId) &&
+    Boolean(planId);
+  const reviewDecision = guidance.trim().length > 0 ? 'revise' : 'reject';
+  return (
+    <section key={event.id} className={`agent-flow-card agent-flow-card--check agent-flow-card--${status}`}>
+      <div className="agent-flow-card__title">{title}</div>
+      <div className="agent-flow-card__summary">{summary}</div>
+      {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
+      {confirmable && (
+        <div className="agent-plan-review-actions">
+          <textarea
+            value={guidance}
+            onChange={(event) => setGuidance(event.target.value)}
+            placeholder="输入计划评审意见或修改要求..."
+          />
+          <div className="agent-plan-review-actions__buttons">
+            <button type="button" onClick={() => onPlanResolve?.(runId!, planId!, 'accept')}>
+              同意计划
+            </button>
+            <button
+              type="button"
+              onClick={() => onPlanResolve?.(runId!, planId!, reviewDecision, guidance.trim() || undefined)}
+            >
+              {guidance.trim().length > 0 ? '提交评审意见' : '拒绝计划'}
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function renderReviewSummaryCard(event: AgentEvent) {
+  const title = stringField(event.payload, 'title') ?? 'Review';
+  const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
+  const guidance = stringField(event.payload, 'llmGuidance');
+  const facts = payloadArray(event.payload, 'facts');
+  return (
+    <section key={event.id} className="agent-flow-card agent-flow-card--review">
+      <div className="agent-flow-card__title">{title}</div>
+      <div className="agent-flow-card__summary">{summary}</div>
+      {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
+      {guidance && guidance !== summary && (
+        <details className="agent-flow-card__details">
+          <summary>LLM 自检建议</summary>
+          <MarkdownContent content={guidance} />
+        </details>
+      )}
+    </section>
   );
 }
 
@@ -810,9 +940,17 @@ function TurnActions({
   );
 }
 
-function renderMessage(event: AgentEvent, language: UiLanguage, autoOpen = false) {
+function renderMessage(
+  event: AgentEvent,
+  language: UiLanguage,
+  autoOpen = false,
+  onPlanResolve?: MessageListProps['onPlanResolve']
+) {
   if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') return renderWorkflowStage(event, language);
   if (event.kind === 'error') return renderError(event, language);
+  if (event.kind === 'plan_card') return renderPlanCard(event);
+  if (event.kind === 'plan_review') return <PlanReviewCard key={event.id} event={event} onPlanResolve={onPlanResolve} />;
+  if (event.kind === 'review_summary') return renderReviewSummaryCard(event);
   if (
     event.kind === 'tool_call' ||
     event.kind === 'tool_result' ||
@@ -872,7 +1010,7 @@ function renderMessage(event: AgentEvent, language: UiLanguage, autoOpen = false
   );
 }
 
-const MessageList: React.FC<MessageListProps> = ({ events, loading = false, language }) => (
+const MessageList: React.FC<MessageListProps> = ({ events, loading = false, language, onPlanResolve }) => (
   <div className="agent-message-list">
     {events.length === 0 && !loading && (
       <div className="agent-empty-state">
@@ -898,7 +1036,7 @@ const MessageList: React.FC<MessageListProps> = ({ events, loading = false, lang
           />
         );
       }
-      return renderMessage(item.event, language, item.autoOpen);
+      return renderMessage(item.event, language, item.autoOpen, onPlanResolve);
     })}
 
     {loading && (

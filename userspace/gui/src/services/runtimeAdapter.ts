@@ -55,6 +55,7 @@ import type {
   RenameAgentSessionRequest,
   RenameEntryResult,
   ResolveAgentPermissionRequest,
+  ResolveAgentPlanRequest,
   SaveWorkspaceFileRequest,
   SaveWorkspaceFileResult,
   SendAgentMessageRequest,
@@ -500,6 +501,14 @@ export function resolveAgentPermission(
   request: ResolveAgentPermissionRequest
 ): Promise<ApiResponse<AgentSessionResult>> {
   return api.resolveAgentPermission(permissionId, request);
+}
+
+export function resolveAgentPlan(
+  runId: string,
+  planId: string,
+  request: ResolveAgentPlanRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return api.resolveAgentPlan(runId, planId, request);
 }
 
 export function submitAgentFeedback(

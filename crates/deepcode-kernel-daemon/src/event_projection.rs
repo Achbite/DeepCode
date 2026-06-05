@@ -120,19 +120,36 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
     match event {
         KernelEvent::MessageAppended {
             channel, content, ..
-        } => vec![agent_event(
-            session_id,
-            "assistant_msg",
-            json!({
-                "content": content,
-                "kind": channel.as_deref().unwrap_or("progress"),
-                "channel": channel.as_deref().unwrap_or("progress"),
-                "visibility": "conversation",
-                "label": if channel.as_deref() == Some("final") { "Agent" } else { "Agent" },
-                "kernelEvent": event
-            }),
-            &now_text(),
-        )],
+        } => match channel.as_deref() {
+            Some("plan") | Some("complete") | Some("review") => Vec::new(),
+            Some("reasoning") => vec![agent_event(
+                session_id,
+                "assistant_msg",
+                json!({
+                    "content": content,
+                    "kind": "reasoning",
+                    "channel": "reasoning",
+                    "visibility": "trace",
+                    "presentation": "traceOnly",
+                    "label": "为什么这样做？",
+                    "kernelEvent": event
+                }),
+                &now_text(),
+            )],
+            _ => vec![agent_event(
+                session_id,
+                "assistant_msg",
+                json!({
+                    "content": content,
+                    "kind": channel.as_deref().unwrap_or("progress"),
+                    "channel": channel.as_deref().unwrap_or("progress"),
+                    "visibility": "conversation",
+                    "label": if channel.as_deref() == Some("final") { "Agent" } else { "Agent" },
+                    "kernelEvent": event
+                }),
+                &now_text(),
+            )],
+        },
         KernelEvent::LlmCallRequested {
             phase,
             llm_call_id,
@@ -261,6 +278,78 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                 "decision": decision,
                 "channel": "tool",
                 "visibility": "conversation",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::PlanReviewReportProduced { report, .. } => vec![agent_event(
+            session_id,
+            "plan_review",
+            json!({
+                "title": "Check / 计划确认",
+                "summary": report
+                    .get("kernelGeneratedPermissionSummary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Kernel PlanReview 已完成，请确认是否同意计划。"),
+                "status": report.get("status").and_then(Value::as_str).unwrap_or("awaitingUserApproval"),
+                "runId": event_run_id(event),
+                "planId": report.get("planId").and_then(Value::as_str).unwrap_or("agent-plan"),
+                "confirmable": true,
+                "report": report,
+                "facts": plan_review_facts(report),
+                "channel": "progress",
+                "visibility": "conversation",
+                "presentation": "body",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::PlanAccepted {
+            run_id,
+            plan_id,
+            auto_accepted,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "plan_review",
+            json!({
+                "title": "Check / 计划确认",
+                "summary": if *auto_accepted { "计划已按只读自动确认策略通过。" } else { "用户已确认计划，准备进入执行。" },
+                "status": "accepted",
+                "runId": run_id.0,
+                "planId": plan_id,
+                "confirmable": false,
+                "facts": [
+                    if *auto_accepted { "确认方式：自动确认" } else { "确认方式：用户确认" }
+                ],
+                "channel": "progress",
+                "visibility": "conversation",
+                "presentation": "body",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::PlanRejected {
+            run_id,
+            plan_id,
+            reason,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "plan_review",
+            json!({
+                "title": "Check / 计划确认",
+                "summary": reason.clone().unwrap_or_else(|| "用户已拒绝计划，未进入执行。".to_string()),
+                "status": "rejected",
+                "runId": run_id.0,
+                "planId": plan_id,
+                "confirmable": false,
+                "facts": [
+                    "计划未获确认，不能生成 ApprovedTaskQueue。"
+                ],
+                "channel": "progress",
+                "visibility": "conversation",
+                "presentation": "body",
                 "kernelEvent": event
             }),
             &now_text(),
@@ -417,6 +506,59 @@ pub(crate) fn tool_name_for_capability(capability: &str) -> &str {
         "cap.skill.executeExternal" => "skill.invoke",
         _ => capability,
     }
+}
+
+fn plan_review_facts(report: &Value) -> Vec<String> {
+    vec![
+        format!(
+            "状态：{}",
+            report
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ),
+        format!(
+            "所需能力：{}",
+            report_array_text(report, "requiredCapabilities")
+        ),
+        format!("权限缺口：{}", report_array_text(report, "permissionGaps")),
+        format!("拒绝原因：{}", report_array_text(report, "deniedReasons")),
+        "用户确认计划后才会进入执行；权限缺口会在执行前由 PermissionGate 请求。".to_string(),
+    ]
+}
+
+fn report_array_text(report: &Value, key: &str) -> String {
+    report
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            let values = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if values.is_empty() {
+                "无".to_string()
+            } else {
+                values.join(", ")
+            }
+        })
+        .unwrap_or_else(|| "无".to_string())
+}
+
+fn event_run_id(event: &KernelEvent) -> Option<String> {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|value| value.get("runId").cloned())
+        .and_then(|value| match value {
+            Value::String(value) => Some(value),
+            Value::Object(map) => map
+                .get("0")
+                .or_else(|| map.get("value"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
 }
 
 pub(crate) fn assistant_final_event(session_id: &str, content: &str) -> Value {

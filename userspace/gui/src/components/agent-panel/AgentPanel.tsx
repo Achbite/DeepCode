@@ -37,6 +37,7 @@ const AgentPanel: React.FC = () => {
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
+  const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
   const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
@@ -85,7 +86,14 @@ const AgentPanel: React.FC = () => {
         language={language}
       />
 
-      <MessageList events={events} loading={loading} language={language} />
+      <MessageList
+        events={events}
+        loading={loading}
+        language={language}
+        onPlanResolve={(runId, planId, decision, guidance) =>
+          void resolvePlan(runId, planId, decision, guidance)
+        }
+      />
 
       {pendingPermission && (
         <PermissionRequestBubble

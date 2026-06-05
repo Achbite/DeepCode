@@ -28,6 +28,7 @@ export interface CheckpointGraphNode {
 
 export interface CheckpointGraph {
   id: string;
+  workspaceScopeKey: string;
   schemaVersion: '1';
   nodes: CheckpointGraphNode[];
   source: 'eventLedgerDerived';
@@ -42,12 +43,14 @@ export interface SymbolHistoryIndexEntry {
 
 export interface SymbolHistoryIndex {
   id: string;
+  workspaceScopeKey: string;
   schemaVersion: '1';
   entries: SymbolHistoryIndexEntry[];
   source: 'checkpointGraphDerived';
 }
 
 export interface ContextLayering {
+  workspaceScopeKey: string;
   initialPacketEntryIds: string[];
   onDemandEntryIds: string[];
   excludedEntryIds: string[];
@@ -80,6 +83,7 @@ export function deriveContextLayering(input: {
   const initial = input.projectIndex.entries.filter((entry) => input.initialKinds.includes(entry.kind)).map((entry) => entry.id);
   const initialSet = new Set(initial);
   return {
+    workspaceScopeKey: input.projectIndex.workspaceScopeKey,
     initialPacketEntryIds: initial,
     onDemandEntryIds: input.projectIndex.entries.filter((entry) => !initialSet.has(entry.id)).map((entry) => entry.id),
     excludedEntryIds: input.projectIndex.stale ? input.projectIndex.entries.map((entry) => entry.id) : [],

@@ -19,12 +19,28 @@ pub(crate) struct ToolCallRequest {
     pub(crate) arguments: Value,
 }
 
-pub(crate) async fn agent_sessions_list(State(state): State<AppState>) -> Json<ApiResponse> {
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentSessionScopeQuery {
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) workspace_hash: Option<String>,
+    pub(crate) include_archived: Option<bool>,
+}
+
+pub(crate) async fn agent_sessions_list(
+    State(state): State<AppState>,
+    Query(query): Query<AgentSessionScopeQuery>,
+) -> Json<ApiResponse> {
     let mut gui = state.gui.lock().expect("gui state lock");
     refresh_pending_session_titles(&mut gui);
+    let scope_key = scope_key_from_query(&query);
+    let include_archived = query.include_archived.unwrap_or(false);
+    let sessions = scoped_sessions(&gui, &scope_key, include_archived);
+    let current_session_id = current_agent_session_id_for_scope(&mut gui, &scope_key);
     ApiResponse::ok(json!({
-        "sessions": gui.sessions,
-        "currentSessionId": gui.current_session_id
+        "sessions": sessions,
+        "currentSessionId": current_session_id,
+        "workspaceScopeKey": scope_key
     }))
 }
 
@@ -40,6 +56,8 @@ pub(crate) async fn agent_session_create(
         .or_else(|| body.get("initialMode"))
         .and_then(Value::as_str)
         .unwrap_or("plan");
+    let workspace_id = body.get("workspaceId").and_then(Value::as_str);
+    let workspace_hash = body.get("workspaceHash").and_then(Value::as_str);
     let session = create_agent_session_value(
         &id,
         &now,
@@ -48,23 +66,30 @@ pub(crate) async fn agent_session_create(
             .unwrap_or("New Agent Session"),
         mode,
         body.get("profileId").and_then(Value::as_str),
-        body.get("workspaceId").and_then(Value::as_str),
-        body.get("workspaceHash").and_then(Value::as_str),
+        workspace_id,
+        workspace_hash,
     );
+    let scope_key = session_scope_key(&session);
     gui.current_session_id = Some(id.clone());
+    gui.current_session_ids_by_scope
+        .insert(scope_key, id.clone());
     gui.session_projection_cache.insert(id.clone(), Vec::new());
     gui.trace_events.insert(id.clone(), Vec::new());
     gui.sessions.insert(0, session.clone());
     ApiResponse::ok(json!({ "session": session, "events": [] }))
 }
 
-pub(crate) async fn agent_session_current(State(state): State<AppState>) -> Json<ApiResponse> {
+pub(crate) async fn agent_session_current(
+    State(state): State<AppState>,
+    Query(query): Query<AgentSessionScopeQuery>,
+) -> Json<ApiResponse> {
     let mut gui = state.gui.lock().expect("gui state lock");
     refresh_pending_session_titles(&mut gui);
-    let Some(session_id) = gui.current_session_id.as_ref() else {
+    let scope_key = scope_key_from_query(&query);
+    let Some(session_id) = current_agent_session_id_for_scope(&mut gui, &scope_key) else {
         return ApiResponse::ok(Value::Null);
     };
-    session_result(&gui, session_id)
+    session_result(&gui, &session_id)
 }
 
 pub(crate) async fn agent_session_activate(
@@ -73,6 +98,10 @@ pub(crate) async fn agent_session_activate(
 ) -> Json<ApiResponse> {
     let mut gui = state.gui.lock().expect("gui state lock");
     if has_session(&gui, &session_id) {
+        if let Some(scope_key) = session_by_id(&gui, &session_id).map(session_scope_key) {
+            gui.current_session_ids_by_scope
+                .insert(scope_key, session_id.clone());
+        }
         gui.current_session_id = Some(session_id.clone());
         refresh_pending_session_titles(&mut gui);
         return session_result(&gui, &session_id);
@@ -107,11 +136,17 @@ pub(crate) async fn agent_session_archive(
         .get("archived")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let was_current = gui.current_session_id.as_deref() == Some(session_id.as_str());
+    let archived_scope_key = session_by_id(&gui, &session_id).map(session_scope_key);
+    let was_global_current = gui.current_session_id.as_deref() == Some(session_id.as_str());
+    let was_scoped_current = archived_scope_key
+        .as_ref()
+        .and_then(|scope| gui.current_session_ids_by_scope.get(scope))
+        .map(|current| current == &session_id)
+        .unwrap_or(false);
     let mut replacement_scope: Option<(Option<String>, Option<String>, Option<String>)> = None;
     if let Some(session) = session_mut(&mut gui, &session_id) {
         if should_archive {
-            if was_current {
+            if was_global_current || was_scoped_current {
                 replacement_scope = Some((
                     session
                         .get("profileId")
@@ -134,12 +169,25 @@ pub(crate) async fn agent_session_archive(
                 .map(|object| object.remove("archivedAt"));
         }
     }
-    if should_archive && was_current {
-        ensure_current_agent_session(&mut gui, replacement_scope);
+    if should_archive {
+        if let Some(scope_key) = archived_scope_key.as_ref() {
+            gui.current_session_ids_by_scope.remove(scope_key);
+        }
+        if was_global_current || was_scoped_current {
+            ensure_current_agent_session_for_scope(
+                &mut gui,
+                archived_scope_key.as_deref().unwrap_or("unbound-workspace"),
+                replacement_scope,
+            );
+        }
     }
+    let response_scope_key = archived_scope_key.unwrap_or_else(|| scope_key_from_parts(None, None));
+    let response_current_id = current_agent_session_id_for_scope(&mut gui, &response_scope_key);
+    let response_sessions = scoped_sessions(&gui, &response_scope_key, false);
     ApiResponse::ok(json!({
-        "sessions": gui.sessions,
-        "currentSessionId": gui.current_session_id
+        "sessions": response_sessions,
+        "currentSessionId": response_current_id,
+        "workspaceScopeKey": response_scope_key
     }))
 }
 
@@ -317,6 +365,98 @@ pub(crate) async fn agent_permission_resolve(
     }
 }
 
+pub(crate) async fn agent_plan_resolve(
+    State(state): State<AppState>,
+    Path((run_id, plan_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let decision = body
+        .get("decision")
+        .and_then(Value::as_str)
+        .unwrap_or("reject");
+    let guidance = body
+        .get("guidance")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let command = match decision {
+        "accept" => KernelCommand::PlanAccept {
+            request_id: rid("agent-plan-resolve"),
+            run_id: deepcode_kernel_abi::RunId(run_id.clone()),
+            plan_id: plan_id.clone(),
+        },
+        "revise" => KernelCommand::PlanRevise {
+            request_id: rid("agent-plan-resolve"),
+            run_id: deepcode_kernel_abi::RunId(run_id.clone()),
+            plan_id: plan_id.clone(),
+            guidance: guidance.unwrap_or_else(|| "用户要求修改计划。".to_string()),
+        },
+        _ => KernelCommand::PlanReject {
+            request_id: rid("agent-plan-resolve"),
+            run_id: deepcode_kernel_abi::RunId(run_id.clone()),
+            plan_id: plan_id.clone(),
+            reason: guidance,
+        },
+    };
+    let kernel_events = {
+        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+        runtime.dispatch(command).unwrap_or_else(|error| {
+            vec![KernelEvent::Error {
+                request_id: Some(rid("agent-plan-resolve")),
+                run_id: Some(deepcode_kernel_abi::RunId(run_id.clone())),
+                session_id: None,
+                error: KernelErrorEnvelope::from(&error),
+                message_key: None,
+                args: None,
+            }]
+        })
+    };
+    let session_id = kernel_events
+        .iter()
+        .find_map(kernel_event_session_id)
+        .or_else(|| {
+            state
+                .gui
+                .lock()
+                .expect("gui state lock")
+                .pending_plans
+                .get(&plan_id)
+                .map(|plan| plan.session_id.clone())
+        })
+        .or_else(|| {
+            state
+                .gui
+                .lock()
+                .expect("gui state lock")
+                .current_session_id
+                .clone()
+        })
+        .unwrap_or_else(|| "session-unknown".to_string());
+    state
+        .gui
+        .lock()
+        .expect("gui state lock")
+        .pending_plans
+        .remove(&plan_id);
+    if let Err(error) = drive_kernel_agent_loop(&state, &session_id, kernel_events).await {
+        append_session_projection(
+            &state,
+            &session_id,
+            vec![agent_event(
+                &session_id,
+                "error",
+                json!({
+                    "message": error,
+                    "channel": "error",
+                    "visibility": "conversation"
+                }),
+                &now_text(),
+            )],
+        );
+    }
+    let gui = state.gui.lock().expect("gui state lock");
+    session_result(&gui, &session_id)
+}
+
 pub(crate) async fn agent_feedback() -> Json<ApiResponse> {
     ApiResponse::ok(json!({
         "accepted": true,
@@ -417,6 +557,7 @@ pub(crate) fn create_agent_session_value(
     workspace_id: Option<&str>,
     workspace_hash: Option<&str>,
 ) -> Value {
+    let workspace_scope_key = scope_key_from_parts(workspace_id, workspace_hash);
     json!({
         "id": id,
         "title": title,
@@ -424,6 +565,7 @@ pub(crate) fn create_agent_session_value(
         "profileId": profile_id,
         "workspaceId": workspace_id,
         "workspaceHash": workspace_hash,
+        "workspaceScopeKey": workspace_scope_key,
         "titleSource": "pending",
         "eventCount": 0,
         "createdAt": now,
@@ -433,6 +575,90 @@ pub(crate) fn create_agent_session_value(
 
 pub(crate) fn is_archived_session(session: &Value) -> bool {
     session.get("archivedAt").and_then(Value::as_str).is_some()
+}
+
+pub(crate) fn scope_key_from_query(query: &AgentSessionScopeQuery) -> String {
+    scope_key_from_parts(
+        query.workspace_id.as_deref(),
+        query.workspace_hash.as_deref(),
+    )
+}
+
+pub(crate) fn scope_key_from_parts(
+    workspace_id: Option<&str>,
+    workspace_hash: Option<&str>,
+) -> String {
+    match (workspace_id, workspace_hash) {
+        (Some(id), Some(hash)) if !id.trim().is_empty() && !hash.trim().is_empty() => {
+            format!(
+                "workspace-{}-{}",
+                safe_path_segment(id),
+                safe_path_segment(hash)
+            )
+        }
+        (Some(id), _) if !id.trim().is_empty() => {
+            format!("workspace-{}", safe_path_segment(id))
+        }
+        _ => "unbound-workspace".to_string(),
+    }
+}
+
+pub(crate) fn session_scope_key(session: &Value) -> String {
+    if let Some(scope_key) = session.get("workspaceScopeKey").and_then(Value::as_str) {
+        if !scope_key.trim().is_empty() {
+            return safe_path_segment(scope_key);
+        }
+    }
+    scope_key_from_parts(
+        session.get("workspaceId").and_then(Value::as_str),
+        session.get("workspaceHash").and_then(Value::as_str),
+    )
+}
+
+pub(crate) fn scoped_sessions(
+    gui: &GuiState,
+    scope_key: &str,
+    include_archived: bool,
+) -> Vec<Value> {
+    gui.sessions
+        .iter()
+        .filter(|session| include_archived || !is_archived_session(session))
+        .filter(|session| session_scope_key(session) == scope_key)
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn session_by_id<'a>(gui: &'a GuiState, session_id: &str) -> Option<&'a Value> {
+    gui.sessions
+        .iter()
+        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+}
+
+pub(crate) fn current_agent_session_id_for_scope(
+    gui: &mut GuiState,
+    scope_key: &str,
+) -> Option<String> {
+    if let Some(current_id) = gui.current_session_ids_by_scope.get(scope_key) {
+        if gui.sessions.iter().any(|session| {
+            session.get("id").and_then(Value::as_str) == Some(current_id.as_str())
+                && !is_archived_session(session)
+                && session_scope_key(session) == scope_key
+        }) {
+            return Some(current_id.clone());
+        }
+    }
+
+    let next_id = gui
+        .sessions
+        .iter()
+        .find(|session| !is_archived_session(session) && session_scope_key(session) == scope_key)
+        .and_then(|session| session.get("id").and_then(Value::as_str))
+        .map(ToOwned::to_owned);
+    if let Some(next_id) = next_id.as_ref() {
+        gui.current_session_ids_by_scope
+            .insert(scope_key.to_string(), next_id.clone());
+    }
+    next_id
 }
 
 pub(crate) fn ensure_current_agent_session(
@@ -463,6 +689,44 @@ pub(crate) fn ensure_current_agent_session(
         workspace_hash.as_deref(),
     );
     gui.current_session_id = Some(id.clone());
+    gui.session_projection_cache.insert(id.clone(), Vec::new());
+    gui.trace_events.insert(id.clone(), Vec::new());
+    gui.sessions.insert(0, session);
+}
+
+pub(crate) fn ensure_current_agent_session_for_scope(
+    gui: &mut GuiState,
+    scope_key: &str,
+    fallback_scope: Option<(Option<String>, Option<String>, Option<String>)>,
+) {
+    if let Some(next_id) = gui
+        .sessions
+        .iter()
+        .find(|session| !is_archived_session(session) && session_scope_key(session) == scope_key)
+        .and_then(|session| session.get("id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+    {
+        gui.current_session_ids_by_scope
+            .insert(scope_key.to_string(), next_id.clone());
+        gui.current_session_id = Some(next_id);
+        return;
+    }
+
+    let id = format!("session-{}", now_millis());
+    let now = now_text();
+    let (profile_id, workspace_id, workspace_hash) = fallback_scope.unwrap_or_default();
+    let session = create_agent_session_value(
+        &id,
+        &now,
+        "New Agent Session",
+        "plan",
+        profile_id.as_deref(),
+        workspace_id.as_deref(),
+        workspace_hash.as_deref(),
+    );
+    gui.current_session_id = Some(id.clone());
+    gui.current_session_ids_by_scope
+        .insert(session_scope_key(&session), id.clone());
     gui.session_projection_cache.insert(id.clone(), Vec::new());
     gui.trace_events.insert(id.clone(), Vec::new());
     gui.sessions.insert(0, session);
@@ -595,4 +859,84 @@ pub(crate) fn agent_event(session_id: &str, kind: &str, payload: Value, ts: &str
         "kind": kind,
         "payload": payload
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_session_list_and_current_are_workspace_owned() {
+        let mut gui = GuiState::new();
+        let now = "2026-06-05T00:00:00Z";
+        let session_a = create_agent_session_value(
+            "session-a",
+            now,
+            "Workspace A",
+            "plan",
+            None,
+            Some("workspace-a"),
+            Some("hash-a"),
+        );
+        let session_b = create_agent_session_value(
+            "session-b",
+            now,
+            "Workspace B",
+            "plan",
+            None,
+            Some("workspace-b"),
+            Some("hash-b"),
+        );
+        let scope_a = session_scope_key(&session_a);
+        let scope_b = session_scope_key(&session_b);
+        gui.sessions = vec![session_b, session_a];
+        gui.current_session_ids_by_scope
+            .insert(scope_a.clone(), "session-a".to_string());
+        gui.current_session_ids_by_scope
+            .insert(scope_b.clone(), "session-b".to_string());
+
+        assert_eq!(
+            scoped_sessions(&gui, &scope_a, false)
+                .iter()
+                .filter_map(|session| session.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["session-a"]
+        );
+        assert_eq!(
+            scoped_sessions(&gui, &scope_b, false)
+                .iter()
+                .filter_map(|session| session.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["session-b"]
+        );
+        assert_eq!(
+            current_agent_session_id_for_scope(&mut gui, &scope_a).as_deref(),
+            Some("session-a")
+        );
+        assert_eq!(
+            current_agent_session_id_for_scope(&mut gui, &scope_b).as_deref(),
+            Some("session-b")
+        );
+
+        session_mut(&mut gui, "session-a").unwrap()["archivedAt"] = json!(now);
+        gui.current_session_ids_by_scope.remove(&scope_a);
+        ensure_current_agent_session_for_scope(
+            &mut gui,
+            &scope_a,
+            Some((
+                None,
+                Some("workspace-a".to_string()),
+                Some("hash-a".to_string()),
+            )),
+        );
+
+        assert_ne!(
+            current_agent_session_id_for_scope(&mut gui, &scope_a).as_deref(),
+            Some("session-b")
+        );
+        assert_eq!(
+            current_agent_session_id_for_scope(&mut gui, &scope_b).as_deref(),
+            Some("session-b")
+        );
+    }
 }

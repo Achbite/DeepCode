@@ -189,7 +189,10 @@ impl DeepCodeKernelRuntime {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
         {
-            let channel = if phase == "review" { "final" } else { phase };
+            if phase == "complete" {
+                return Ok(events);
+            }
+            let channel = if phase == "review" { "review" } else { phase };
             let event = self.message_appended_event(
                 request_id,
                 run_id,
@@ -262,7 +265,7 @@ pub(crate) fn next_phase_after_llm_response(
         return LlmPhaseAdvance::Stop;
     }
     match phase {
-        "plan" => LlmPhaseAdvance::Continue(WorkflowPhase::Check),
+        "plan" => LlmPhaseAdvance::Stop,
         "check" => LlmPhaseAdvance::Continue(WorkflowPhase::Complete),
         "complete" => {
             if matches!(
@@ -320,26 +323,29 @@ pub(crate) fn compile_kernel_phase_instruction(
     decision_state: &RunDecisionState,
 ) -> String {
     let stage_instruction = match phase {
-        "plan" => "你是 DeepCode Kernel 调度的规划阶段。只产出计划、范围、禁止项、风险和完成条件；不得回答身份信息、测试结果或最终总结。",
-        "check" => "你是 DeepCode Kernel 调度的检查阶段。只审查计划风险、路径、权限和可执行性；不得写伪工具命令、不得重复计划正文、不得输出最终答案。",
-        "complete" => "你是 DeepCode Kernel 调度的执行阶段。需要本地操作时只能使用 Kernel 提供的工具调用；不要用自然语言声称工具已经执行，不回答身份信息或最终总结。",
-        "review" => "你是 DeepCode Kernel 调度的复核阶段。只能依据 Kernel 工具结果、权限结果和结构化完成条件输出最终答案；未完成时说明 blocked/replan，不得补造工具结果。",
+        "plan" => "你是 DeepCode 的计划草案生成器。只输出 USER_PLAN、ACTION_BUNDLE、EXPECTED_VALIDATION、REVIEW_GUIDE 四个标签块；ACTION_BUNDLE 必须是 JSON，且只是执行草案，不是授权或执行事实。",
+        "check" => "当前检查由 Kernel PlanReview 自动完成。若收到本阶段请求，只输出一句说明：应返回 PlanReview 等待用户确认，不得输出新的检查报告。",
+        "complete" => "你是 DeepCode 的执行草案到工具调用适配器。需要本地操作时只能发起 Kernel 提供的工具调用；不要输出自然语言开场白，不要声称工具已经执行，不回答身份信息或最终总结。",
+        "review" => "你是 DeepCode 的 Review guidance 生成器。只能根据 Kernel 工具事实、权限结果和验证候选输出用户审查建议与最终摘要；不得补造 Kernel facts，不得替用户接受验收。",
         _ => "你是 DeepCode Kernel 调度的 Agent 阶段。",
     };
     let mut prompt = format!(
         "{stage_instruction}\n\n\
-        输出语言默认简体中文。工具路径必须是工作区相对路径，禁止 /tmp、绝对路径和 ..。\n\
+        输出语言默认简体中文。自然语言永远不可执行，权限摘要只能来自 Kernel PlanReview。\n\
+        plan 阶段输出格式必须是：<USER_PLAN>...</USER_PLAN>、<ACTION_BUNDLE format=\"json\" version=\"1\">{{...}}</ACTION_BUNDLE>、<EXPECTED_VALIDATION>...</EXPECTED_VALIDATION>、<REVIEW_GUIDE>...</REVIEW_GUIDE>。\n\
+        ACTION_BUNDLE JSON 必须使用 camelCase 字段：version、id、goal、actions、validationExpectations、reviewExpectations；每个 action 至少包含 id、title、capability、kind、resourceScope。\n\
+        工具路径必须是工作区相对路径，禁止 /tmp、绝对路径和 ..。\n\
         DeepCode 允许的工具名仅有：fs.list、fs.read、fs.write、fs.delete、code.search、shell.exec；\n\
         严禁出现 list_dir、write_file、read_file、delete_file、execute_command、list_files 等非 DeepCode 命名；\n\
         引用工具时必须使用 fs.list/fs.read/fs.write/fs.delete/code.search/shell.exec 的精确写法，可见工具目录以 requestEnvelope.tools 为准。\n\
         fs.delete 是隐藏的内核受控能力，不在普通模型工具目录中；临时测试文件清理由 Kernel 受控流程完成。\n\
-        规划、检查和执行阶段只能记录进度；身份信息、工具汇总和临时文件结果只允许在复核/final 阶段回答一次。\n\
+        Plan 生成后必须等待 Kernel PlanReview 与用户计划确认；执行后必须进入 Review guidance，不单独输出 final 卡。\n\
         不要重复已经满足的 AnswerObligation。\n\
         当前待满足步骤：{}",
         decision_state.pending_steps().join("；")
     );
-    // review 阶段把 Kernel 工具事实作为唯一事实源注入 prompt；LLM 只能基于 evidence 字段
-    // 输出最终答案，不允许从对话历史推断"哪个工具失败 / 哪个工具不可用"。
+    // review 阶段把 Kernel 工具事实作为唯一事实源注入 prompt；LLM 只能输出 guidance，
+    // 不允许从对话历史推断或补造"哪个工具失败 / 哪个工具不可用"。
     if phase == "review" && !decision_state.evidence.is_empty() {
         let evidence_json = serde_json::to_string_pretty(&decision_state.evidence)
             .unwrap_or_else(|_| "[]".to_string());

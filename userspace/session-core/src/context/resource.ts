@@ -25,6 +25,7 @@ export function createResourcePacket(input: { packetId: string; request: Resourc
 
   return {
     id: input.packetId,
+    workspaceScopeKey: input.manifest.workspaceScopeKey,
     requestId: input.request.id,
     items,
   };

@@ -342,6 +342,9 @@ export interface PatchAgentWorkflowConfigRequest {
 export type AgentEventKind =
   | 'user_msg'
   | 'assistant_msg'
+  | 'plan_card'
+  | 'plan_review'
+  | 'review_summary'
   | 'tool_call'
   | 'tool_result'
   | 'permission_request'
@@ -396,6 +399,7 @@ export interface AgentSession {
   profileId?: string;
   workspaceId?: string;
   workspaceHash?: string;
+  workspaceScopeKey?: string;
   archivedAt?: string;
   lastSummary?: string;
   titleSource?: AgentSessionTitleSource;
@@ -492,6 +496,7 @@ export interface ListAgentSessionsRequest {
 export interface AgentSessionListResult {
   sessions: AgentSession[];
   currentSessionId?: string;
+  workspaceScopeKey?: string;
 }
 
 export interface RenameAgentSessionRequest {
@@ -514,6 +519,11 @@ export interface SendAgentMessageRequest {
 
 export interface ResolveAgentPermissionRequest {
   decision: 'accept' | 'reject';
+}
+
+export interface ResolveAgentPlanRequest {
+  decision: 'accept' | 'reject' | 'revise';
+  guidance?: string;
 }
 
 export type AgentFeedbackRating = 'up' | 'down';

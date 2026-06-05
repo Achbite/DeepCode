@@ -29,6 +29,7 @@ import {
   listAgentSessions,
   patchAgentWorkflowConfig,
   renameAgentSession,
+  resolveAgentPlan,
   resolveAgentPermission,
   sendAgentMessage,
 } from '../services/runtimeAdapter';
@@ -90,6 +91,7 @@ interface AgentSessionActions {
   cancelCurrentRun: () => Promise<void>;
   acceptPermission: () => Promise<void>;
   rejectPermission: () => Promise<void>;
+  resolvePlan: (runId: string, planId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
 }
 
 type Store = AgentSessionState & AgentSessionActions;
@@ -598,6 +600,25 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       void get().refreshTraceEvents(result.data.session.id);
     } else {
       set({ errorMessage: result.message ?? 'Permission resolve failed', resolvingPermission: null, loading: false });
+    }
+  },
+
+  resolvePlan: async (runId, planId, decision, guidance) => {
+    const session = get().session;
+    if (!session || get().loading) return;
+    set({ loading: true, errorMessage: null });
+    const result = await resolveAgentPlan(runId, planId, { decision, guidance });
+    if (result.ok && result.data) {
+      set({
+        session: result.data.session,
+        events: result.data.events,
+        pendingPermission: findLatestPendingPermission(result.data.events),
+        resolvingPermission: null,
+        loading: false,
+      });
+      void get().refreshTraceEvents(result.data.session.id);
+    } else {
+      set({ errorMessage: result.message ?? 'Plan resolve failed', loading: false });
     }
   },
 }));
