@@ -207,10 +207,16 @@ DEEPCODE_RUN_BUILD_BENCH=1 ./test.sh
 
   - 会话层不再把 `plan-check-complete-review` 当作固定 UI 路径；Kernel 仍拥有 workflow/state machine，Session 负责选择 `workflowRef`、解析结构化 proposal、组织投影和用户决策。
   - LLM 的计划输出采用 tagged Markdown + JSON `ACTION_BUNDLE`；自然语言不会直接变成工具执行、权限授权或完成事实。
+  - `RESOURCE_REQUEST` 是 Plan 对话内的只读资源申请，只能从 `ResourceManifest` 选择文件、符号、搜索词、checkpoint 或索引片段；Session 通过 daemon/Kernel 只读 resource API 获取裁剪后的 `ResourcePacket`，不直接运行命令行 grep。
+  - 高权限模式下真实 `grep` / shell 检索只能走受控 `shell.exec` / `process.exec` 权限链路，并进入 PermissionGate、Audit 和 ReviewPacket。
   - 正式 Plan 默认进入 Check / 计划确认卡：Kernel `PlanReview` 生成权限预览，用户可直接同意计划，或在同一个评审输入框提交修改意见；空评审提交视为拒绝计划。
   - `Permission` 只展示执行前真实授权请求；写入、删除、shell、network、secret 等能力仍由 Kernel PermissionGate 控制。
   - `Execution` 主视图只展示工具进度、权限结果和执行事实；执行完成后必须生成 `ReviewPacket` 或显示 `Review pending`。
   - `Review` 合并 Kernel facts 与 LLM review guidance：修改文件、权限使用、工具结果、验证结果来自 Kernel / ledger，模型只给自检摘要、风险和用户审查建议。
+  - 设置中心只暴露 `Ruler Settings` 作为用户可维护约束；`Prompt Inspector` 是只读审计面板，用于查看 `Protocol Contract`、`Builtin System Prompt` 和上下文拼装层。
+  - Ruler 可影响 LLM 风格和偏好，但不能授予权限、覆盖 `Protocol Contract`、绕过 Kernel state contract、PermissionGate、HardFloor、ReviewGate 或 AuditLedger。
+  - Prompt/context cache 拆分 `stablePrefixHash`、`dynamicSuffixHash`、`cacheHash` 和 `auditHash`；run/session/trace/ledger/audit refs 只进入审计 hash，不参与 cache hash。
+  - DeepSeek/OpenAI/Anthropic/Ollama cache telemetry 只用于成本和延迟调优，不参与 PlanReview、PermissionGate、execution、ReviewGate 或 accepted 判定。
   - 支持 OpenAI-compatible、Anthropic、Ollama profile；DeepSeek 按 OpenAI-compatible profile 使用。
   - token 字段有整数 guard，避免 `max_tokens: 384000.0` 这类请求体错误。
   - 写入类工具会生成 permission card；用户接受后 workflow 可从 pending tool 继续执行。
