@@ -732,7 +732,7 @@ fn run_resume_emits_resume_event_and_snapshot() {
 }
 
 #[test]
-fn llm_response_submit_advances_workflow_under_kernel_control() {
+fn llm_response_submit_waits_for_plan_accept_before_execution() {
     let mut runtime = DeepCodeKernelRuntime::new();
     let started = runtime
         .dispatch(KernelCommand::RunStart {
@@ -775,11 +775,11 @@ fn llm_response_submit_advances_workflow_under_kernel_control() {
     assert!(events
         .iter()
         .any(|event| matches!(event, KernelEvent::MessageAppended { .. })));
-    assert!(events.iter().any(|event| matches!(
+    assert!(!events.iter().any(|event| matches!(
         event,
         KernelEvent::StageChanged { phase, .. } if phase == "check"
     )));
-    assert!(events.iter().any(|event| matches!(
+    assert!(!events.iter().any(|event| matches!(
         event,
         KernelEvent::LlmCallRequested { phase, .. } if phase == "check"
     )));
@@ -788,8 +788,27 @@ fn llm_response_submit_advances_workflow_under_kernel_control() {
             .snapshot(Some("session-1"))
             .workflow_phase
             .as_deref(),
-        Some("check")
+        Some("plan")
     );
+
+    let accepted = runtime
+        .dispatch(KernelCommand::PlanAccept {
+            request_id: RequestId("req-plan-accept".to_string()),
+            run_id: RunId("run-1".to_string()),
+            plan_id: "plan-1".to_string(),
+        })
+        .unwrap();
+    assert!(accepted
+        .iter()
+        .any(|event| matches!(event, KernelEvent::PlanAccepted { .. })));
+    assert!(accepted.iter().any(|event| matches!(
+        event,
+        KernelEvent::StageChanged { phase, .. } if phase == "complete"
+    )));
+    assert!(accepted.iter().any(|event| matches!(
+        event,
+        KernelEvent::LlmCallRequested { phase, .. } if phase == "complete"
+    )));
 }
 
 #[test]
@@ -865,20 +884,18 @@ fn complete_phase_auto_runs_workspace_summary_tools_before_review() {
             })
             .unwrap();
 
-    let (_, check_call_id) = active_llm_call(&plan_events);
-    let check_events = runtime
-            .dispatch(KernelCommand::LlmResponseSubmit {
-                request_id: RequestId("req-check".to_string()),
-                run_id: run_id.clone(),
-                session_id: Some(SessionId("session-1".to_string())),
-                llm_call_id: check_call_id,
-                response_envelope: serde_json::json!({
-                    "assistantMessage": { "content": "<observe>Plan is safe.</observe>", "toolCalls": [] }
-                }),
-            })
-            .unwrap();
+    assert!(!plan_events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::LlmCallRequested { .. })));
 
-    let (_, complete_call_id) = active_llm_call(&check_events);
+    let accepted = runtime
+        .dispatch(KernelCommand::PlanAccept {
+            request_id: RequestId("req-plan-accept".to_string()),
+            run_id: run_id.clone(),
+            plan_id: "plan-1".to_string(),
+        })
+        .unwrap();
+    let (_, complete_call_id) = active_llm_call(&accepted);
     let complete_events = runtime
         .dispatch(KernelCommand::LlmResponseSubmit {
             request_id: RequestId("req-complete".to_string()),
@@ -1109,7 +1126,12 @@ fn plan_and_temporary_grant_commands_are_recorded() {
         .unwrap();
     assert!(matches!(grant[0], KernelEvent::MessageAppended { .. }));
     assert!(matches!(grant[1], KernelEvent::AutonomyTransitioned { .. }));
-    assert_eq!(runtime.ledger("run-1").unwrap().len(), 8);
+
+    let ledger = runtime.ledger("run-1").unwrap();
+    assert!(ledger.iter().any(|event| event.kind == "plan.accepted"));
+    assert!(ledger
+        .iter()
+        .any(|event| event.kind == "temporaryGrant.created"));
 }
 
 #[test]

@@ -433,6 +433,7 @@ function assertDynamicWorkflowProjection(
 function assertResourceRequestLoop(): void {
   const manifest: ResourceManifest = {
     id: 'manifest-1',
+    workspaceScopeKey: 'workspace-1',
     workspaceId: 'workspace-1',
     budget: {
       maxEntries: 4,
@@ -476,6 +477,7 @@ function assertResourceRequestLoop(): void {
     ],
   };
   const packet = createResourcePacket({ packetId: 'packet-1', request, manifest });
+  assertEqual(packet.workspaceScopeKey, 'workspace-1', 'resource packets keep workspace ownership');
   assertEqual(packet.items[0]?.status, 'provided', 'auto read resources are provided');
   assertEqual(packet.items[1]?.status, 'needsUserApproval', 'sensitive resources require user approval');
   assertEqual(packet.items[2]?.status, 'denied', 'denied resources stay denied');
@@ -668,6 +670,7 @@ async function assertStage20CacheAndIndex(): Promise<void> {
   });
   assertEqual(projectIndex.entries.map((entry) => entry.id).join(','), 'a,b', 'project index entries are sorted');
   const layering = deriveContextLayering({ projectIndex, initialKinds: ['manifest'], budgetBytes: 1024 });
+  assertEqual(layering.workspaceScopeKey, 'workspace-1', 'context layering keeps workspace ownership');
   assertEqual(layering.initialPacketEntryIds.join(','), 'a', 'context layering selects initial manifest context');
 
   const promptA = canonicalizePrompt({

@@ -164,7 +164,7 @@ import json
 import sys
 data = json.loads(sys.argv[1])
 expr = sys.argv[2]
-assert eval(expr, {"__builtins__": {}, "any": any, "len": len}, {"data": data}), data
+assert eval(expr, {"__builtins__": {}, "all": all, "any": any, "len": len}, {"data": data}), data
 PY
   pass "$label"
 }
@@ -439,6 +439,11 @@ search "DraftTaskQueue|ApprovedTaskQueue|createPlanContractSubmitCommand|compile
 search "PlanConfirmationPolicy|PermissionAutoApprovalPolicy|AutoConfirmDecision|DEFAULT_PLAN_CONFIRMATION_POLICY|decidePlanConfirmation|decidePermissionAutoApproval|autoApproveDelete" userspace/session-core/src/confirmation userspace/session-core/src/task-queue >/dev/null
 search "ConversationProjection|buildConversationProjection|exportConversationProjection|为什么这样做|review_summary|check_review" userspace/session-core/src/projection.ts >/dev/null
 search "ReviewSelfCheckInput|buildReviewPacket|permissionDecisions|toolResults|finalSummary|waitingUserReview" userspace/session-core/src/review userspace/session-core/src/projection.ts >/dev/null
+search "parse_pending_agent_plan|PlanContractSubmit|PlanAccept|agent_plan_resolve|plan_card|plan_review|review_summary|should_auto_accept_plan" crates/deepcode-kernel-daemon/src/agent_loop.rs crates/deepcode-kernel-daemon/src/agent_api.rs crates/deepcode-kernel-daemon/src/event_projection.rs >/dev/null
+search "plan -> check|\"plan\" => LlmPhaseAdvance::Stop|\"review\" \\{ \"review\" \\}|\"complete\" \\{ return Ok\\(events\\);" crates/deepcode-kernel-runtime/src/llm.rs >/dev/null
+search "resolveAgentPlan|ResolveAgentPlanRequest|PlanReviewCard|提交评审意见|拒绝计划|agent-flow-card--check" userspace/protocol/src userspace/gui/src >/dev/null
+! search "DeepCode Kernel 调度的规划阶段|DeepCode Kernel 调度的检查阶段|DeepCode Kernel 调度的执行阶段|DeepCode Kernel 调度的复核阶段|身份信息、工具汇总和临时文件结果只允许" crates/deepcode-kernel-runtime/src/llm.rs crates/deepcode-kernel-daemon/src/agent_loop.rs crates/deepcode-kernel-daemon/src/event_projection.rs userspace/gui/src/components/agent-panel \
+  || fail "old fixed LLM stage prompts must not return to the user-facing agent loop"
 search "DynamicWorkflowPlan|DynamicWorkflowSession|buildDynamicWorkflowSession|selectDynamicWorkflow|SessionOrchestrationMicroPhase|stateMachineBoundary|kernelOwnedStateMachine|projectionCardKinds|resource_request|resource_packet|repairLoop" userspace/session-core/src/workflow userspace/session-core/src/projection.ts >/dev/null
 search "ResourceManifest|InitialContextPacket|ResourceRequest|ResourcePacket|createResourcePacket|autoRead|askRead|denyRead" userspace/session-core/src/context >/dev/null
 search "ProjectIndex|CheckpointGraph|SymbolHistoryIndex|ContextLayering|createProjectIndex|deriveContextLayering" userspace/session-core/src/context >/dev/null
@@ -509,6 +514,32 @@ payload = json.loads(sys.argv[1])
 print(payload["data"]["session"]["id"])
 PY
 )"
+scoped_session_a="$(json_post "http://127.0.0.1:${TEST_PORT}/api/agent/sessions" '{"title":"Workspace A","workspaceId":"wf-a","workspaceHash":"hash-a"}')"
+scoped_session_b="$(json_post "http://127.0.0.1:${TEST_PORT}/api/agent/sessions" '{"title":"Workspace B","workspaceId":"wf-b","workspaceHash":"hash-b"}')"
+scoped_session_a_id="$(
+  python3 - "$scoped_session_a" <<'PY'
+import json
+import sys
+payload = json.loads(sys.argv[1])
+print(payload["data"]["session"]["id"])
+PY
+)"
+scoped_session_b_id="$(
+  python3 - "$scoped_session_b" <<'PY'
+import json
+import sys
+payload = json.loads(sys.argv[1])
+print(payload["data"]["session"]["id"])
+PY
+)"
+scoped_list_a="$(json_get "http://127.0.0.1:${TEST_PORT}/api/agent/sessions?workspaceId=wf-a&workspaceHash=hash-a")"
+assert_json_expr "$scoped_list_a" "data[\"ok\"] is True and data[\"data\"][\"currentSessionId\"] == \"$scoped_session_a_id\" and all(session.get(\"workspaceId\") == \"wf-a\" for session in data[\"data\"][\"sessions\"]) and not any(session.get(\"workspaceId\") == \"wf-b\" for session in data[\"data\"][\"sessions\"])" "agent sessions list is workspace scoped"
+scoped_current_b="$(json_get "http://127.0.0.1:${TEST_PORT}/api/agent/sessions/current?workspaceId=wf-b&workspaceHash=hash-b")"
+assert_json_expr "$scoped_current_b" "data[\"ok\"] is True and data[\"data\"][\"session\"][\"id\"] == \"$scoped_session_b_id\" and data[\"data\"][\"session\"][\"workspaceId\"] == \"wf-b\"" "agent current session is workspace scoped"
+json_post "http://127.0.0.1:${TEST_PORT}/api/agent/sessions/${scoped_session_a_id}/archive" '{"archived":true}' >/dev/null
+scoped_current_b_after_archive="$(json_get "http://127.0.0.1:${TEST_PORT}/api/agent/sessions/current?workspaceId=wf-b&workspaceHash=hash-b")"
+assert_json_expr "$scoped_current_b_after_archive" "data[\"ok\"] is True and data[\"data\"][\"session\"][\"id\"] == \"$scoped_session_b_id\" and data[\"data\"][\"session\"][\"workspaceId\"] == \"wf-b\"" "archiving another workspace does not change scoped current"
+pass "agent session workspace-scope smoke"
 json_post "http://127.0.0.1:${TEST_PORT}/api/agent/sessions/${archive_session_id}/events" '{"events":[{"kind":"user_msg","payload":{"content":"archive smoke","kernelEvent":{"runId":"run-smoke"},"actionBundleDraft":{"version":"1"},"apiToken":"secret-token"}}]}' >/dev/null
 archive_reply="$(json_get "http://127.0.0.1:${TEST_PORT}/api/session-store/${archive_session_id}/archive")"
 assert_json_expr "$archive_reply" 'data["ok"] is True and len(data["data"]["archives"]) >= 1 and any(any(file["path"] == "projection.jsonl" for file in archive["files"]) and any(file["path"] == "exports/complete.md" for file in archive["files"]) for archive in data["data"]["archives"])' "conversation archive manifest exposes projection and exports"
