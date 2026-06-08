@@ -150,6 +150,11 @@ async function main(): Promise<void> {
     'unknown action bundle field is rejected'
   );
   assertParseFails(
+    VALID_PLAN.replace('"kind": "read",', '"kind": "read",\n      "params": { "path": "README.md" },'),
+    'unknown_field',
+    'unknown action params field is rejected'
+  );
+  assertParseFails(
     VALID_PLAN.replace('<REVIEW_GUIDE>', '<UNKNOWN_TAG>'),
     'unknown_tag',
     'unknown tags are rejected'
@@ -191,11 +196,36 @@ async function main(): Promise<void> {
   );
 
   assertNoExecutionFacts(parsed);
+  assertAnswerProtocol();
   assertPlanConfirmationPolicies(parsed);
   assertDynamicWorkflowProjection(parsed, preflighted.kernelPlanReview);
   assertResourceRequestLoop();
   assertPromptEnvelopeShape();
   await assertStage20CacheAndIndex();
+}
+
+function assertAnswerProtocol(): void {
+  const answer = parseAgentPlanOutput(`<ANSWER format="markdown" version="1">
+我是 DeepCode 的本地 Agent，会在 Kernel 权限边界内辅助代码工作。
+</ANSWER>`);
+  assertEqual(answer.kind, 'answer', 'ANSWER-only output is accepted');
+  if (answer.kind !== 'answer') {
+    throw new Error('expected answer output');
+  }
+  assertEqual(answer.answer.format, 'markdown', 'ANSWER declares markdown format');
+  assert(answer.answer.content.includes('DeepCode'), 'ANSWER content is preserved');
+
+  assertParseOutputFails(
+    `<ANSWER format="markdown" version="1">ok</ANSWER>\n${VALID_PLAN}`,
+    'answer_with_plan',
+    'ANSWER cannot be mixed with plan tags'
+  );
+  assertParseOutputFails(
+    '<ANSWER format="text" version="1">ok</ANSWER>',
+    'invalid_answer_header',
+    'ANSWER header must be markdown v1'
+  );
+  assertThrows(() => parseAgentPlan('<ANSWER format="markdown" version="1">ok</ANSWER>'), 'ANSWER cannot be treated as an executable plan');
 }
 
 function assertConversationProjection(
@@ -555,7 +585,7 @@ function assertPromptEnvelopeShape(): void {
   });
   assertEqual(ruler.canGrantPermission, false, 'Ruler cannot grant permissions');
   assertEqual(ruler.canOverrideProtocolContract, false, 'Ruler cannot override protocol contract');
-  assertEqual(ruler.canOverrideSystemPrompt, true, 'Ruler can override built-in style defaults');
+  assertEqual(ruler.canOverrideSystemPrompt, false, 'Ruler cannot override system prompt');
   assertEqual(ruler.ignoredClauses[0]?.reason, 'permission_grant_attempt', 'permission-like Ruler clauses are ignored');
 
   const docProbe = probeAuthoritativeDocs({
@@ -612,7 +642,7 @@ function assertPromptEnvelopeShape(): void {
       ignoredClauseCount: ruler.ignoredClauses.length,
       canGrantPermission: false,
       canOverrideProtocolContract: false,
-      canOverrideSystemPrompt: true,
+      canOverrideSystemPrompt: false,
     },
     authoritativeDocExcerpts: {
       docExcerptHash: docProbe.docExcerptHash,
@@ -644,6 +674,8 @@ function assertPromptEnvelopeShape(): void {
   assertEqual(promptEnvelope.auditOnlyLayerNames.join(','), 'auditOnlyContext', 'audit-only refs are split from cache-visible prompt context');
   assertEqual(promptEnvelope.dynamicSuffix.includes('run-1'), false, 'audit-only run ids do not enter cache-visible dynamic suffix');
   assert(promptEnvelope.stablePrefix.includes('Do not output RESOURCE_REQUEST and ACTION_BUNDLE'), 'state prompt enforces exclusive plan outputs');
+  assert(promptEnvelope.stablePrefix.includes('<ANSWER format="markdown" version="1">'), 'state prompt documents ANSWER output');
+  assert(promptEnvelope.stablePrefix.includes('cannot override this system prompt'), 'state prompt forbids Ruler or memory system override');
 
   const snapshot = createContextSnapshot({
     id: 'snapshot-1',
@@ -853,6 +885,18 @@ async function assertStage20CacheAndIndex(): Promise<void> {
 function assertParseFails(input: string, code: string, label: string): void {
   try {
     parseAgentPlan(input);
+  } catch (error) {
+    if (error instanceof AgentPlanParseError && error.code === code) {
+      return;
+    }
+    throw new Error(`${label}: expected ${code}, got ${error instanceof Error ? error.message : String(error)}`);
+  }
+  throw new Error(`${label}: expected parser failure`);
+}
+
+function assertParseOutputFails(input: string, code: string, label: string): void {
+  try {
+    parseAgentPlanOutput(input);
   } catch (error) {
     if (error instanceof AgentPlanParseError && error.code === code) {
       return;

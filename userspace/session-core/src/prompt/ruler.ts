@@ -35,7 +35,7 @@ export interface CompiledRuler {
   rulerHash: string;
   canGrantPermission: false;
   canOverrideProtocolContract: false;
-  canOverrideSystemPrompt: true;
+  canOverrideSystemPrompt: false;
 }
 
 export function compileRulerDocument(document: RulerDocument): CompiledRuler {
@@ -79,7 +79,7 @@ export function compileRulerDocument(document: RulerDocument): CompiledRuler {
     })),
     canGrantPermission: false,
     canOverrideProtocolContract: false,
-    canOverrideSystemPrompt: true,
+    canOverrideSystemPrompt: false,
   };
 }
 

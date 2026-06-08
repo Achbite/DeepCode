@@ -141,13 +141,14 @@ mod tests {
                 RiskLevel::Critical,
                 vec![CapabilityEffect::DeletesWorkspace],
                 vec!["complete"],
-                false,
+                true,
             ),
         ];
 
         let visible = model_visible_skill_descriptors(&descriptors, &[], &[]);
-        assert_eq!(visible.len(), 1);
+        assert_eq!(visible.len(), 2);
         assert_eq!(visible[0].id, "fs.read");
+        assert_eq!(visible[1].id, "fs.delete");
     }
 
     #[test]

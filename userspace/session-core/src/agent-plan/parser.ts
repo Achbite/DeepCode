@@ -1,6 +1,7 @@
 import {
   AgentPlanParseError,
   type ActionBundleDraft,
+  type AnswerDraft,
   type AgentPlanOutput,
   type AgentPlanParts,
   type AgentPlanTag,
@@ -14,6 +15,7 @@ import {
 } from './types.js';
 
 const SINGLETON_TAGS = new Set<AgentPlanTag>([
+  'ANSWER',
   'USER_PLAN',
   'RESOURCE_REQUEST',
   'ACTION_BUNDLE',
@@ -67,7 +69,10 @@ interface ParsedBlock {
 export function parseAgentPlan(input: string): AgentPlanParts {
   const output = parseAgentPlanOutput(input);
   if (output.kind !== 'actionPlan') {
-    throw new AgentPlanParseError('missing_action_bundle', 'RESOURCE_REQUEST cannot be treated as an executable plan');
+    throw new AgentPlanParseError(
+      'missing_action_bundle',
+      `${output.kind === 'answer' ? 'ANSWER' : 'RESOURCE_REQUEST'} cannot be treated as an executable plan`
+    );
   }
   return output.parts;
 }
@@ -95,8 +100,18 @@ export function parseAgentPlanOutput(input: string): AgentPlanOutput {
     singleton.set(block.tag, block);
   }
 
+  const answerBlock = singleton.get('ANSWER');
   const resourceRequestBlock = singleton.get('RESOURCE_REQUEST');
   const actionBundleBlock = singleton.get('ACTION_BUNDLE');
+  if (answerBlock) {
+    if (singleton.size > 1 || codeBlocks.length > 0) {
+      throw new AgentPlanParseError('answer_with_plan', 'ANSWER cannot appear with plan, resource, permission, or code blocks');
+    }
+    return {
+      kind: 'answer',
+      answer: parseAnswer(answerBlock),
+    };
+  }
   if (resourceRequestBlock && actionBundleBlock) {
     throw new AgentPlanParseError('resource_request_with_action_bundle', 'RESOURCE_REQUEST and ACTION_BUNDLE cannot appear in the same turn');
   }
@@ -137,7 +152,7 @@ export function parseAgentPlanOutput(input: string): AgentPlanOutput {
 
 function extractBlocks(input: string): ParsedBlock[] {
   const blockPattern =
-    /<(USER_PLAN|RESOURCE_REQUEST|ACTION_BUNDLE|CODE_BLOCK|EXPECTED_VALIDATION|REVIEW_GUIDE|PERMISSION_HINTS)([^>]*)>([\s\S]*?)<\/\1>/g;
+    /<(ANSWER|USER_PLAN|RESOURCE_REQUEST|ACTION_BUNDLE|CODE_BLOCK|EXPECTED_VALIDATION|REVIEW_GUIDE|PERMISSION_HINTS)([^>]*)>([\s\S]*?)<\/\1>/g;
   const blocks: ParsedBlock[] = [];
   let match: RegExpExecArray | null;
   while ((match = blockPattern.exec(input)) !== null) {
@@ -259,6 +274,21 @@ function parseActionBundle(block: ParsedBlock, codeBlockIds: Set<string>): Actio
     validationExpectations,
     reviewExpectations,
     repairPolicy: optionalRepairPolicy(value.repairPolicy),
+  };
+}
+
+function parseAnswer(block: ParsedBlock): AnswerDraft {
+  if (block.attrs.format !== 'markdown' || block.attrs.version !== '1') {
+    throw new AgentPlanParseError('invalid_answer_header', 'ANSWER must declare format="markdown" version="1"');
+  }
+  const content = block.content.trim();
+  if (!content) {
+    throw new AgentPlanParseError('empty_answer', 'ANSWER content must be non-empty');
+  }
+  return {
+    format: 'markdown',
+    version: '1',
+    content,
   };
 }
 

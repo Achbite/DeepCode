@@ -203,7 +203,7 @@ impl InMemorySkillRegistry {
                 RiskLevel::Critical,
                 vec![CapabilityEffect::DeletesWorkspace],
                 vec!["complete"],
-                false,
+                true,
             ),
             builtin(
                 "shell.exec",
@@ -300,7 +300,7 @@ mod tests {
             delete.primary_capability(),
             Some(Capability::workspace_delete())
         );
-        assert!(!delete.model_visible);
+        assert!(delete.model_visible);
         assert!(delete.effects.contains(&CapabilityEffect::DeletesWorkspace));
     }
 

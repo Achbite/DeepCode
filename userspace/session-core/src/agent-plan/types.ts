@@ -1,4 +1,5 @@
 export type AgentPlanTag =
+  | 'ANSWER'
   | 'USER_PLAN'
   | 'RESOURCE_REQUEST'
   | 'ACTION_BUNDLE'
@@ -91,6 +92,12 @@ export interface ResourceRequestDraft {
   items: ResourceRequestDraftItem[];
 }
 
+export interface AnswerDraft {
+  format: 'markdown';
+  version: '1';
+  content: string;
+}
+
 export interface AgentPlanParts {
   userPlan: string;
   actionBundle: ActionBundleDraft;
@@ -101,6 +108,10 @@ export interface AgentPlanParts {
 }
 
 export type AgentPlanOutput =
+  | {
+      kind: 'answer';
+      answer: AnswerDraft;
+    }
   | {
       kind: 'actionPlan';
       parts: AgentPlanParts;

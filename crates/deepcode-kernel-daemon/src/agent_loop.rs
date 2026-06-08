@@ -203,7 +203,7 @@ pub(crate) async fn drive_kernel_agent_loop(
             };
             if phase == "plan" {
                 let mut submitted = submitted;
-                match parse_pending_agent_plan(
+                match parse_agent_plan_response(
                     session_id,
                     &run_id.0,
                     response_envelope
@@ -212,7 +212,25 @@ pub(crate) async fn drive_kernel_agent_loop(
                         .and_then(Value::as_str)
                         .unwrap_or_default(),
                 ) {
-                    Ok(mut plan) => {
+                    Ok(AgentPlanResponse::Answer(answer)) => {
+                        append_session_projection(
+                            state,
+                            session_id,
+                            vec![answer_event(session_id, &run_id.0, &answer)],
+                        );
+                    }
+                    Ok(AgentPlanResponse::ResourceRequest(resource_request)) => {
+                        append_session_projection(
+                            state,
+                            session_id,
+                            vec![resource_request_event(
+                                session_id,
+                                &run_id.0,
+                                &resource_request,
+                            )],
+                        );
+                    }
+                    Ok(AgentPlanResponse::ActionPlan(mut plan)) => {
                         append_session_projection(
                             state,
                             session_id,
@@ -372,19 +390,66 @@ pub(crate) fn append_trace_event(state: &AppState, session_id: &str, kind: &str,
         }));
 }
 
-fn parse_pending_agent_plan(
+#[derive(Debug, Clone)]
+struct PendingAgentAnswer {
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAgentResourceRequest {
+    user_plan: Option<String>,
+    request: Value,
+}
+
+#[derive(Debug, Clone)]
+enum AgentPlanResponse {
+    Answer(PendingAgentAnswer),
+    ResourceRequest(PendingAgentResourceRequest),
+    ActionPlan(PendingAgentPlan),
+}
+
+fn parse_agent_plan_response(
     session_id: &str,
     run_id: &str,
     content: &str,
-) -> Result<PendingAgentPlan, String> {
+) -> Result<AgentPlanResponse, String> {
     let blocks = extract_agent_plan_blocks(content)?;
+    if blocks.contains_key("ANSWER") {
+        if blocks.len() != 1 {
+            return Err(
+                "ANSWER cannot appear with plan, resource, permission, or code blocks".to_string(),
+            );
+        }
+        let answer = required_plan_block(&blocks, "ANSWER")?;
+        validate_answer_block_header(answer)?;
+        let content = answer.content.trim();
+        if content.is_empty() {
+            return Err("ANSWER content must be non-empty".to_string());
+        }
+        return Ok(AgentPlanResponse::Answer(PendingAgentAnswer {
+            content: content.to_string(),
+        }));
+    }
     if blocks.contains_key("RESOURCE_REQUEST") && blocks.contains_key("ACTION_BUNDLE") {
         return Err(
             "RESOURCE_REQUEST and ACTION_BUNDLE cannot appear in the same turn".to_string(),
         );
     }
     if blocks.contains_key("RESOURCE_REQUEST") {
-        return Err("RESOURCE_REQUEST cannot be treated as an executable plan".to_string());
+        let block = required_plan_block(&blocks, "RESOURCE_REQUEST")?;
+        validate_block_header(block, "RESOURCE_REQUEST")?;
+        let request: Value = serde_json::from_str(block.content.trim())
+            .map_err(|error| format!("RESOURCE_REQUEST must be valid JSON: {error}"))?;
+        validate_resource_request_json(&request)?;
+        return Ok(AgentPlanResponse::ResourceRequest(
+            PendingAgentResourceRequest {
+                user_plan: blocks
+                    .get("USER_PLAN")
+                    .map(|block| block.content.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                request,
+            },
+        ));
     }
     let user_plan = required_plan_block(&blocks, "USER_PLAN")?;
     let action_bundle_block = required_plan_block(&blocks, "ACTION_BUNDLE")?;
@@ -400,7 +465,7 @@ fn parse_pending_agent_plan(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("agent-plan")
         .to_string();
-    Ok(PendingAgentPlan {
+    Ok(AgentPlanResponse::ActionPlan(PendingAgentPlan {
         session_id: session_id.to_string(),
         run_id: run_id.to_string(),
         plan_id,
@@ -410,7 +475,7 @@ fn parse_pending_agent_plan(
         review_guide: review_guide.content.trim().to_string(),
         plan_review_report: None,
         created_at: now_text(),
-    })
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -498,7 +563,8 @@ fn parse_plan_tag_header(header: &str) -> Result<(String, BTreeMap<String, Strin
 fn is_known_plan_tag(tag: &str) -> bool {
     matches!(
         tag,
-        "USER_PLAN"
+        "ANSWER"
+            | "USER_PLAN"
             | "RESOURCE_REQUEST"
             | "ACTION_BUNDLE"
             | "CODE_BLOCK"
@@ -510,6 +576,7 @@ fn is_known_plan_tag(tag: &str) -> bool {
 
 fn contains_plan_tag(content: &str) -> bool {
     [
+        "<ANSWER",
         "<USER_PLAN",
         "<RESOURCE_REQUEST",
         "<ACTION_BUNDLE",
@@ -536,6 +603,75 @@ fn validate_block_header(block: &AgentPlanBlock, tag: &str) -> Result<(), String
         || block.attrs.get("version").map(String::as_str) != Some("1")
     {
         return Err(format!("{tag} must declare format=\"json\" version=\"1\""));
+    }
+    Ok(())
+}
+
+fn validate_answer_block_header(block: &AgentPlanBlock) -> Result<(), String> {
+    if block.attrs.get("format").map(String::as_str) != Some("markdown")
+        || block.attrs.get("version").map(String::as_str) != Some("1")
+    {
+        return Err("ANSWER must declare format=\"markdown\" version=\"1\"".to_string());
+    }
+    Ok(())
+}
+
+fn validate_resource_request_json(value: &Value) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Err("RESOURCE_REQUEST must be a JSON object".to_string());
+    };
+    reject_unknown_json_fields(
+        object.keys(),
+        &["version", "id", "reason", "items"],
+        "RESOURCE_REQUEST",
+    )?;
+    let version = object
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "RESOURCE_REQUEST.version is required".to_string())?;
+    if version != "1" {
+        return Err(format!("unsupported RESOURCE_REQUEST version {version}"));
+    }
+    for key in ["id", "reason"] {
+        if object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            return Err(format!("RESOURCE_REQUEST.{key} must be a non-empty string"));
+        }
+    }
+    let items = object
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "RESOURCE_REQUEST.items must be an array".to_string())?;
+    for (index, item) in items.iter().enumerate() {
+        validate_resource_request_item_json(item, index)?;
+    }
+    Ok(())
+}
+
+fn validate_resource_request_item_json(value: &Value, index: usize) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Err(format!("RESOURCE_REQUEST.items[{index}] must be an object"));
+    };
+    reject_unknown_json_fields(
+        object.keys(),
+        &["id", "manifestEntryId", "reason"],
+        &format!("RESOURCE_REQUEST.items[{index}]"),
+    )?;
+    for key in ["id", "manifestEntryId", "reason"] {
+        if object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            return Err(format!(
+                "RESOURCE_REQUEST.items[{index}].{key} must be a non-empty string"
+            ));
+        }
     }
     Ok(())
 }
@@ -734,6 +870,60 @@ fn plan_card_event(session_id: &str, plan: &PendingAgentPlan) -> Value {
     )
 }
 
+fn answer_event(session_id: &str, run_id: &str, answer: &PendingAgentAnswer) -> Value {
+    crate::event_projection::agent_event(
+        session_id,
+        "assistant_msg",
+        json!({
+            "content": answer.content.clone(),
+            "channel": "final",
+            "visibility": "conversation",
+            "label": "Agent",
+            "runId": run_id,
+            "kind": "answer",
+            "presentation": "body"
+        }),
+        &now_text(),
+    )
+}
+
+fn resource_request_event(
+    session_id: &str,
+    run_id: &str,
+    resource_request: &PendingAgentResourceRequest,
+) -> Value {
+    let item_count = resource_request
+        .request
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let reason = resource_request
+        .request
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("需要补充上下文。");
+    crate::event_projection::agent_event(
+        session_id,
+        "resource_request",
+        json!({
+            "title": "ResourceRequest",
+            "summary": reason,
+            "runId": run_id,
+            "userPlan": resource_request.user_plan.clone(),
+            "resourceRequest": resource_request.request.clone(),
+            "facts": [
+                format!("资源请求项：{}", item_count),
+                "ResourceRequest 不会直接执行工具；资源补全必须通过 Kernel resource resolver 或权限链路。".to_string()
+            ],
+            "channel": "progress",
+            "visibility": "conversation",
+            "presentation": "body"
+        }),
+        &now_text(),
+    )
+}
+
 fn plan_parse_error_event(session_id: &str, run_id: &str, error: &str) -> Value {
     crate::event_projection::agent_event(
         session_id,
@@ -745,7 +935,7 @@ fn plan_parse_error_event(session_id: &str, run_id: &str, error: &str) -> Value 
             "runId": run_id,
             "confirmable": false,
             "facts": [
-                "LLM 输出必须包含 USER_PLAN、JSON ACTION_BUNDLE、EXPECTED_VALIDATION、REVIEW_GUIDE。".to_string(),
+                "LLM plan 阶段必须输出合法 ANSWER、RESOURCE_REQUEST 或 USER_PLAN + JSON ACTION_BUNDLE + EXPECTED_VALIDATION + REVIEW_GUIDE。".to_string(),
                 "解析失败时不能生成 ApprovedTaskQueue，也不能进入执行。".to_string()
             ],
             "channel": "progress",
@@ -1081,6 +1271,7 @@ pub(crate) fn internal_tool_name(name: &str) -> String {
         "fs_list" => "fs.list".to_string(),
         "fs_diff" => "fs.diff".to_string(),
         "fs_write" => "fs.write".to_string(),
+        "fs_delete" => "fs.delete".to_string(),
         "code_search" => "code.search".to_string(),
         "shell_propose" => "shell.propose".to_string(),
         "shell_exec" => "shell.exec".to_string(),
@@ -1133,6 +1324,15 @@ pub(crate) fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> Ll
         };
         return LlmChatOutput {
             content: content.to_string(),
+            ..LlmChatOutput::default()
+        };
+    }
+    if system_instruction.contains("<ANSWER")
+        && !request_mentions_temp_lifecycle(user_prompt)
+        && !request_mentions_local_workspace(user_prompt)
+    {
+        return LlmChatOutput {
+            content: "<ANSWER format=\"markdown\" version=\"1\">\n我是 DeepCode 的本地 Agent。我的会话协议由 Kernel 约束：纯问答会直接回答，需要上下文时会请求 ResourceRequest，需要执行时会生成可审查的 ACTION_BUNDLE，并由 Kernel 权限系统控制工具执行。\n</ANSWER>".to_string(),
             ..LlmChatOutput::default()
         };
     }
@@ -1224,5 +1424,70 @@ pub(crate) fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> Ll
             },
         ],
         ..LlmChatOutput::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_accepts_answer_only() {
+        let parsed = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            "<ANSWER format=\"markdown\" version=\"1\">\n我是 DeepCode。\n</ANSWER>",
+        )
+        .unwrap();
+        match parsed {
+            AgentPlanResponse::Answer(answer) => {
+                assert!(answer.content.contains("DeepCode"));
+            }
+            other => panic!("expected answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_accepts_resource_request_without_action_bundle() {
+        let parsed = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            "<RESOURCE_REQUEST format=\"json\" version=\"1\">\n{\"version\":\"1\",\"id\":\"rr-1\",\"reason\":\"need context\",\"items\":[{\"id\":\"item-1\",\"manifestEntryId\":\"file-readme\",\"reason\":\"read README\"}]}\n</RESOURCE_REQUEST>",
+        )
+        .unwrap();
+        match parsed {
+            AgentPlanResponse::ResourceRequest(request) => {
+                assert_eq!(request.request["id"], "rr-1");
+            }
+            other => panic!("expected resource request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_rejects_answer_mixed_with_plan() {
+        let error = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            "<ANSWER format=\"markdown\" version=\"1\">ok</ANSWER>\n<USER_PLAN>plan</USER_PLAN>",
+        )
+        .unwrap_err();
+        assert!(error.contains("ANSWER cannot appear"));
+    }
+
+    #[test]
+    fn parser_rejects_action_params_field() {
+        let content = "<USER_PLAN>\nplan\n</USER_PLAN>\n\
+            <ACTION_BUNDLE format=\"json\" version=\"1\">\n\
+            {\"version\":\"1\",\"id\":\"plan-1\",\"goal\":\"test\",\"actions\":[{\"id\":\"a1\",\"title\":\"bad\",\"capability\":\"workspace.read\",\"kind\":\"read\",\"resourceScope\":[\"README.md\"],\"params\":{\"path\":\"README.md\"}}],\"validationExpectations\":[],\"reviewExpectations\":[]}\n\
+            </ACTION_BUNDLE>\n\
+            <EXPECTED_VALIDATION>none</EXPECTED_VALIDATION>\n\
+            <REVIEW_GUIDE>review</REVIEW_GUIDE>";
+        let error = parse_agent_plan_response("session-1", "run-1", content).unwrap_err();
+        assert!(error.contains("unknown field params"));
+    }
+
+    #[test]
+    fn provider_name_roundtrip_includes_delete() {
+        assert_eq!(internal_tool_name("fs_delete"), "fs.delete");
     }
 }

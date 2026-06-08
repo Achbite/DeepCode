@@ -160,7 +160,7 @@ fn skill_discover_returns_model_visible_catalog_only() {
         .collect::<Vec<_>>();
     assert!(skill_ids.contains(&"fs.read"));
     assert!(skill_ids.contains(&"fs.write"));
-    assert!(!skill_ids.contains(&"fs.delete"));
+    assert!(skill_ids.contains(&"fs.delete"));
 }
 
 #[test]
@@ -1631,10 +1631,39 @@ fn phase_prompt_forbids_non_deepcode_tool_names() {
         assert!(
             prompt.contains("fs.list")
                 && prompt.contains("fs.read")
+                && prompt.contains("fs.diff")
                 && prompt.contains("fs.write")
                 && prompt.contains("fs.delete")
-                && prompt.contains("code.search"),
+                && prompt.contains("code.search")
+                && prompt.contains("shell.propose")
+                && prompt.contains("shell.exec"),
             "phase {phase} prompt must list allowed DeepCode tool names"
         );
+        assert!(
+            !prompt.contains("fs.delete 是隐藏"),
+            "phase {phase} prompt must not describe fs.delete as hidden"
+        );
     }
+}
+
+#[test]
+fn plan_envelope_exposes_tool_catalog_without_callable_tools() {
+    let state = RunDecisionState::default();
+    let plan = compile_llm_request_envelope("plan", "你是谁？", &state, Some("ctx-1"));
+    let catalog = plan["toolCatalog"].as_array().unwrap();
+    let callable = plan["tools"].as_array().unwrap();
+    let names = catalog
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"fs.delete"));
+    assert!(names.contains(&"fs.diff"));
+    assert!(names.contains(&"shell.propose"));
+    assert!(callable.is_empty());
+
+    let complete = compile_llm_request_envelope("complete", "执行计划", &state, Some("ctx-2"));
+    assert_eq!(
+        complete["tools"].as_array().unwrap().len(),
+        complete["toolCatalog"].as_array().unwrap().len()
+    );
 }

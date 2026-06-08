@@ -104,7 +104,7 @@ export interface RulerBlock {
   ignoredClauseCount: number;
   canGrantPermission: false;
   canOverrideProtocolContract: false;
-  canOverrideSystemPrompt: true;
+  canOverrideSystemPrompt: false;
 }
 
 export interface CurrentUserOverlayBlock {
