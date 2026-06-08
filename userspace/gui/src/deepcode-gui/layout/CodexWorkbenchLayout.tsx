@@ -448,7 +448,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   }, [activeSession, events.length, knownSessions, sessions]);
   const activeSessionRunning = Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id));
   const projectDraftActive = Boolean(draftProjectId);
-  const isHome = (projectDraftActive && events.length === 0 && !activeSessionRunning)
+  const isHome = projectDraftActive
     || (events.length === 0 && !loadingSession && !activeSessionRunning);
   const visibleSessions = useMemo(
     () => displaySessions.filter((item) => {
@@ -723,12 +723,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                   return (
                     <div
                       key={group.key}
-                      className={
-                        'codex-project-archive-group' +
-                        (group.projectId && group.projectId === activeProjectId
-                          ? ' codex-project-archive-group--active'
-                          : '')
-                      }
+                      className="codex-project-archive-group"
                     >
                       <div
                         className="codex-project-archive-group__title"

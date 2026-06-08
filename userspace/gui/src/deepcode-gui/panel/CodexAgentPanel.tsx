@@ -99,10 +99,11 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = (timeline?.turns.length ?? 0) > 0;
-  const showHome = (forceHome && events.length === 0 && !hasTimelineTurns && !sessionRunning) || (
+  const showHome = forceHome || (
     !sessionRunning && !pendingPermission && !errorMessage && !timelineError
     && events.length === 0 && !hasTimelineTurns
   );
+  const composerRunning = forceHome ? false : sessionRunning;
   const homePrompt = homeProjectTitle
     ? t(language, 'deepcodeGui.home.projectPrompt', { project: homeProjectTitle })
     : t(language, 'deepcodeGui.home.prompt');
@@ -112,7 +113,7 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
       messageAttachments={messageAttachments}
       sessionAttachments={sessionAttachments}
       language={language}
-      loading={sessionRunning}
+      loading={composerRunning}
       onSend={async (content) => {
         await onBeforeSend?.();
         await sendMessage(content);

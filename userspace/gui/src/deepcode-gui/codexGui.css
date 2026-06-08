@@ -1932,13 +1932,11 @@ button {
   text-align: left;
 }
 
-.codex-project-archive-group__title:hover,
-.codex-project-archive-group--active .codex-project-archive-group__title {
+.codex-project-archive-group__title:hover {
   background: #eceeef;
 }
 
-.codex-project-archive-group__title:hover .codex-project-archive-group__select,
-.codex-project-archive-group--active .codex-project-archive-group__select {
+.codex-project-archive-group__title:hover .codex-project-archive-group__select {
   color: #30343a;
 }
 
