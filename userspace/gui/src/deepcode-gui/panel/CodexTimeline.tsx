@@ -69,13 +69,50 @@ const TurnCard: React.FC<{
           <span>{timelineStatusLabel(language, turn.status)}</span>
           {startedAtLabel && <span>{startedAtLabel}</span>}
         </div>
-        {turn.blocks.map((block) => (
+        {orderedTurnBlocks(turn.blocks).map((block) => (
           <TimelineBlock key={block.id} block={block} language={language} onPlanResolve={onPlanResolve} />
         ))}
       </div>
     </section>
   );
 };
+
+function orderedTurnBlocks(blocks: AgentTimelineBlock[]): AgentTimelineBlock[] {
+  return blocks
+    .map((block, index) => ({ block, index }))
+    .sort((left, right) => {
+      const priorityDelta = timelineBlockPriority(left.block.kind) - timelineBlockPriority(right.block.kind);
+      return priorityDelta || left.index - right.index;
+    })
+    .map((entry) => entry.block);
+}
+
+function timelineBlockPriority(kind: AgentTimelineBlock['kind']): number {
+  switch (kind) {
+    case 'user':
+      return 0;
+    case 'thinking':
+      return 1;
+    case 'stage':
+      return 2;
+    case 'toolBatch':
+      return 3;
+    case 'permission':
+      return 4;
+    case 'plan':
+      return 5;
+    case 'review':
+      return 6;
+    case 'error':
+      return 7;
+    case 'turnActions':
+      return 8;
+    case 'assistant':
+      return 9;
+    default:
+      return 10;
+  }
+}
 
 const TimelineBlock: React.FC<{
   block: AgentTimelineBlock;

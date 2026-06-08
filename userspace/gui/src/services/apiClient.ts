@@ -496,6 +496,20 @@ export function archiveAgentSession(
   );
 }
 
+export async function deleteAgentSession(
+  sessionId: string
+): Promise<ApiResponse<AgentSessionListResult>> {
+  const result = await sendJson<AgentSessionListResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}`,
+    'DELETE',
+    {}
+  );
+  if (!result.ok && result.error === 'http_error' && result.message?.includes('405')) {
+    return archiveAgentSession(sessionId, { archived: true });
+  }
+  return result;
+}
+
 export function getConversationArchive(
   sessionId: string
 ): Promise<ApiResponse<ConversationArchiveResult>> {

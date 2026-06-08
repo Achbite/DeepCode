@@ -1,9 +1,9 @@
-import React, { Suspense, lazy, useEffect, useMemo, useState } from 'react';
-import type { AgentEvent } from '@deepcode/protocol';
+import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
+import type { AgentEvent, AgentSession } from '@deepcode/protocol';
 import WindowControls from '../../components/window-controls/WindowControls';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
+import { listAgentSessions } from '../../services/runtimeAdapter';
 import { useSettingsStore } from '../../state/settingsStore';
-import { useUiStore } from '../../state/uiStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import CodexAgentPanel from '../panel/CodexAgentPanel';
@@ -27,6 +27,44 @@ interface CodexTaskItem {
 }
 
 type CodexSidebarIconName = 'compose' | 'folder' | 'plus' | 'settings';
+
+interface CodexProjectArchiveGroup {
+  key: string;
+  title: string;
+  sessions: AgentSession[];
+  projectId?: string;
+}
+
+interface CodexGuiProject {
+  id: string;
+  title: string;
+  sessionIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface CodexSessionContextMenu {
+  session: AgentSession;
+  x: number;
+  y: number;
+}
+
+interface CodexProjectContextMenu {
+  project: CodexGuiProject;
+  x: number;
+  y: number;
+}
+
+interface CodexTextInputDialog {
+  kind: 'project' | 'renameSession' | 'renameProject';
+  title: string;
+  label: string;
+  value: string;
+  session?: AgentSession;
+  project?: CodexGuiProject;
+}
+
+const CODEX_GUI_PROJECTS_STORAGE_KEY = 'deepcode-gui.projects.v1';
 
 const CodexSidebarIcon: React.FC<{ name: CodexSidebarIconName; className?: string }> = ({
   name,
@@ -89,6 +127,21 @@ function statusLabel(language: UiLanguage, value: string): string {
   return translated.startsWith('deepcodeGui.status.') ? value : translated;
 }
 
+async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  document.body.removeChild(textarea);
+}
+
 function displaySessionTitle(language: UiLanguage, title?: string): string {
   const value = title?.trim();
   if (!value || value === 'New Agent Session' || value === '新 Agent 会话') {
@@ -100,6 +153,67 @@ function displaySessionTitle(language: UiLanguage, title?: string): string {
 function hasCustomSessionTitle(title?: string): boolean {
   const value = title?.trim();
   return Boolean(value && value !== 'New Agent Session' && value !== '新 Agent 会话');
+}
+
+function shouldShowSidebarSession(session: AgentSession): boolean {
+  return (session.eventCount ?? 0) > 0 || hasCustomSessionTitle(session.title);
+}
+
+function readGuiProjects(): CodexGuiProject[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(CODEX_GUI_PROJECTS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((item): CodexGuiProject[] => {
+      if (!item || typeof item !== 'object') return [];
+      const record = item as Partial<CodexGuiProject>;
+      if (!record.id || !record.title) return [];
+      return [{
+        id: String(record.id),
+        title: String(record.title),
+        sessionIds: Array.isArray(record.sessionIds)
+          ? record.sessionIds.flatMap((id) => typeof id === 'string' ? [id] : [])
+          : [],
+        createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
+        updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : new Date().toISOString(),
+      }];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function writeGuiProjects(projects: CodexGuiProject[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(CODEX_GUI_PROJECTS_STORAGE_KEY, JSON.stringify(projects));
+  } catch {
+    // localStorage can be unavailable in restricted WebView modes; project grouping stays in memory.
+  }
+}
+
+function deriveProjectArchiveGroups(
+  sessions: AgentSession[],
+  projects: CodexGuiProject[]
+): CodexProjectArchiveGroup[] {
+  const sessionById = new Map(sessions.map((session) => [session.id, session]));
+  return projects.map((project) => {
+    const projectSessions = project.sessionIds
+      .flatMap((sessionId) => {
+        const session = sessionById.get(sessionId);
+        return session ? [session] : [];
+      })
+      .filter(shouldShowSidebarSession)
+      .sort((a, b) => (b.updatedAt || b.createdAt).localeCompare(a.updatedAt || a.createdAt));
+    return {
+      key: project.id,
+      title: project.title,
+      sessions: projectSessions,
+      projectId: project.id,
+    };
+  });
 }
 
 function eventText(event: AgentEvent): string {
@@ -130,19 +244,76 @@ function taskStatus(event: AgentEvent): string {
   return 'completed';
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function stringField(value: unknown, key: string): string | undefined {
+  if (!isRecord(value)) return undefined;
+  const field = value[key];
+  return typeof field === 'string' && field.trim() ? field : undefined;
+}
+
+function latestTurnEvents(events: AgentEvent[]): AgentEvent[] {
+  const lastUserIndex = events.reduce(
+    (last, event, index) => (event.kind === 'user_msg' ? index : last),
+    -1
+  );
+  return lastUserIndex >= 0 ? events.slice(lastUserIndex + 1) : events;
+}
+
+function taskDedupKey(event: AgentEvent): string {
+  const stage = stringField(event.payload, 'stage') ?? stringField(event.payload, 'phase');
+  const runId = stringField(event.payload, 'runId');
+  const planId = stringField(event.payload, 'planId');
+  const callId = stringField(event.payload, 'callId') ?? stringField(event.payload, 'toolCallId');
+  const requestId = stringField(event.payload, 'requestId') ?? stringField(event.payload, 'permissionId');
+  const toolName = stringField(event.payload, 'toolName') ?? stringField(event.payload, 'tool');
+
+  if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') {
+    return `workflow:${stage ?? 'workflow'}:${runId ?? ''}`;
+  }
+  if (event.kind === 'tool_call' || event.kind === 'tool_result') {
+    return `tool:${callId ?? toolName ?? eventText(event)}`;
+  }
+  if (event.kind === 'permission_request' || event.kind === 'permission_result') {
+    return `permission:${requestId ?? toolName ?? eventText(event)}`;
+  }
+  if (event.kind === 'plan_card' || event.kind === 'plan_review') {
+    return `plan:${planId ?? runId ?? eventText(event)}`;
+  }
+  if (event.kind === 'review_summary') {
+    return `review:${runId ?? eventText(event)}`;
+  }
+  if (event.kind === 'error') {
+    return `error:${eventText(event)}`;
+  }
+  return `${event.kind}:${event.id}`;
+}
+
 function deriveTaskItems(events: AgentEvent[], language: UiLanguage, loading: boolean): CodexTaskItem[] {
-  const taskEvents = events
+  const latestEvents = latestTurnEvents(events);
+  const taskEvents = latestEvents
     .filter((event) => event.kind !== 'user_msg' && event.kind !== 'assistant_msg')
-    .slice(-8);
+    .reduce((items, event) => {
+      const key = taskDedupKey(event);
+      const next = {
+        id: key,
+        title: taskTitle(language, event),
+        summary: eventText(event) || event.kind,
+        status: taskStatus(event),
+      };
+      const existingIndex = items.findIndex((item) => item.id === key);
+      if (existingIndex >= 0) {
+        items[existingIndex] = next;
+      } else {
+        items.push(next);
+      }
+      return items;
+    }, [] as CodexTaskItem[])
+    .slice(-6);
 
-  const items = taskEvents.map((event) => ({
-    id: event.id,
-    title: taskTitle(language, event),
-    summary: eventText(event) || event.kind,
-    status: taskStatus(event),
-  }));
-
-  if (loading && items.length === 0) {
+  if (loading && taskEvents.length === 0) {
     return [
       {
         id: 'runtime-preparing',
@@ -153,7 +324,7 @@ function deriveTaskItems(events: AgentEvent[], language: UiLanguage, loading: bo
     ];
   }
 
-  return items;
+  return taskEvents;
 }
 
 const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
@@ -163,18 +334,25 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   lastHeartbeatAt,
 }) => {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [manualSessionIds, setManualSessionIds] = useState<Set<string>>(() => new Set());
+  const [knownSessions, setKnownSessions] = useState<AgentSession[]>([]);
+  const [projectRecords, setProjectRecords] = useState<CodexGuiProject[]>(() => readGuiProjects());
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
+  const [sessionMenu, setSessionMenu] = useState<CodexSessionContextMenu | null>(null);
+  const [projectMenu, setProjectMenu] = useState<CodexProjectContextMenu | null>(null);
+  const [textDialog, setTextDialog] = useState<CodexTextInputDialog | null>(null);
+  const pendingProjectSendRef = useRef<string | null>(null);
   const workspace = useWorkspaceStore((s) => s.current);
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
-  const workspaceLoading = useWorkspaceStore((s) => s.loading);
-  const workspaceError = useWorkspaceStore((s) => s.lastError);
-  const showWorkspaceOpenDialog = useUiStore((s) => s.showWorkspaceOpenDialog);
   const sessions = useAgentSessionStore((s) => s.sessions);
   const activeSession = useAgentSessionStore((s) => s.session);
   const loadingSession = useAgentSessionStore((s) => s.loading);
+  const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const events = useAgentSessionStore((s) => s.events);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
+  const renameSession = useAgentSessionStore((s) => s.renameSession);
+  const deleteSession = useAgentSessionStore((s) => s.deleteSession);
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
@@ -184,37 +362,315 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     performance.mark('deepcode-gui:workbench-ready');
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    const loadKnownSessions = async () => {
+      const result = await listAgentSessions({ includeArchived: true });
+      if (cancelled) return;
+      if (result.ok && result.data) {
+        setKnownSessions(result.data.sessions);
+      }
+    };
+    void loadKnownSessions();
+    const interval = window.setInterval(() => void loadKnownSessions(), 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [sessions.length, activeSession?.id]);
+
+  useEffect(() => {
+    writeGuiProjects(projectRecords);
+  }, [projectRecords]);
+
+  useEffect(() => {
+    if (!sessionMenu && !projectMenu) return undefined;
+    const close = () => {
+      setSessionMenu(null);
+      setProjectMenu(null);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+    window.addEventListener('click', close);
+    window.addEventListener('resize', close);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [sessionMenu, projectMenu]);
+
   const activeFolder = useMemo(() => {
     if (!workspace || workspace.folders.length === 0) return null;
     return workspace.folders.find((folder) => folder.id === activeFolderId) ?? workspace.folders[0];
   }, [activeFolderId, workspace]);
 
-  const workspaceName = basename(activeFolder?.absolutePath ?? workspace?.sourcePath)
-    || t(language, 'deepcodeGui.workspace.none');
+  const workspacePath = activeFolder?.absolutePath ?? workspace?.sourcePath;
+  const workspaceName = workspacePath === '/'
+    ? t(language, 'deepcodeGui.workspace.systemRoot')
+    : basename(workspacePath) || t(language, 'deepcodeGui.workspace.none');
   const lastHeartbeatText = lastHeartbeatAt
     ? new Date(lastHeartbeatAt).toLocaleTimeString()
     : t(language, 'deepcodeGui.status.pending');
   const taskItems = useMemo(
-    () => deriveTaskItems(events, language, loadingSession),
-    [events, language, loadingSession]
+    () => deriveTaskItems(events, language, Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id))),
+    [activeSession?.id, events, language, runningSessionIds]
   );
-  const isHome = events.length === 0 && !loadingSession;
+  const activeProject = useMemo(
+    () => projectRecords.find((project) => project.id === activeProjectId) ?? null,
+    [activeProjectId, projectRecords]
+  );
+  const draftProject = useMemo(
+    () => projectRecords.find((project) => project.id === draftProjectId) ?? null,
+    [draftProjectId, projectRecords]
+  );
+  const assignedProjectSessionIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const project of projectRecords) {
+      for (const sessionId of project.sessionIds) ids.add(sessionId);
+    }
+    return ids;
+  }, [projectRecords]);
+  const displaySessions = useMemo(() => {
+    const byId = new Map<string, AgentSession>();
+    for (const session of knownSessions) byId.set(session.id, session);
+    for (const session of sessions) byId.set(session.id, session);
+    if (activeSession?.id) {
+      byId.set(activeSession.id, {
+        ...byId.get(activeSession.id),
+        ...activeSession,
+        eventCount: Math.max(activeSession.eventCount ?? 0, events.length),
+      });
+    }
+    return Array.from(byId.values());
+  }, [activeSession, events.length, knownSessions, sessions]);
+  const activeSessionRunning = Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id));
+  const projectDraftActive = Boolean(draftProjectId);
+  const isHome = (projectDraftActive && events.length === 0 && !activeSessionRunning)
+    || (events.length === 0 && !loadingSession && !activeSessionRunning);
   const visibleSessions = useMemo(
-    () => sessions.filter((item) =>
-      (item.eventCount ?? 0) > 0 ||
-      manualSessionIds.has(item.id) ||
-      hasCustomSessionTitle(item.title) ||
-      (item.id === activeSession?.id && events.length > 0)
-    ),
-    [activeSession?.id, events.length, manualSessionIds, sessions]
+    () => displaySessions.filter((item) => {
+      if (item.archivedAt) return false;
+      if (assignedProjectSessionIds.has(item.id)) return false;
+      const currentWithEvents = item.id === activeSession?.id && events.length > 0;
+      return shouldShowSidebarSession(item) || currentWithEvents;
+    }),
+    [activeSession?.id, assignedProjectSessionIds, displaySessions, events.length]
+  );
+  const projectArchiveGroups = useMemo(
+    () => deriveProjectArchiveGroups(displaySessions, projectRecords),
+    [displaySessions, projectRecords]
   );
 
-  const handleCreateSession = async () => {
+  const moveSessionToProject = (projectId: string, sessionId: string) => {
+    const now = new Date().toISOString();
+    setProjectRecords((current) => current.map((project) => {
+      const nextSessionIds = project.sessionIds.filter((id) => id !== sessionId);
+      if (project.id !== projectId) {
+        return nextSessionIds.length === project.sessionIds.length
+          ? project
+          : { ...project, sessionIds: nextSessionIds, updatedAt: now };
+      }
+      return {
+        ...project,
+        sessionIds: [sessionId, ...nextSessionIds],
+        updatedAt: now,
+      };
+    }));
+  };
+
+  const handleCreateSession = async (projectId?: string | null) => {
+    const targetProjectId = projectId === undefined ? activeProjectId : projectId;
+    setActiveProjectId(targetProjectId ?? null);
+    setDraftProjectId(targetProjectId ?? null);
+    if (targetProjectId) return;
     await createNewSession();
     const nextSession = useAgentSessionStore.getState().session;
     if (nextSession?.id) {
-      setManualSessionIds((current) => new Set(current).add(nextSession.id));
+      setKnownSessions((current) => [
+        nextSession,
+        ...current.filter((item) => item.id !== nextSession.id),
+      ]);
+      if (targetProjectId) moveSessionToProject(targetProjectId, nextSession.id);
     }
+  };
+
+  const handleSelectProject = (projectId: string) => {
+    setActiveProjectId(projectId);
+    setDraftProjectId(projectId);
+  };
+
+  const prepareProjectDraftSession = async () => {
+    if (!draftProjectId) return;
+    const targetProjectId = draftProjectId;
+    pendingProjectSendRef.current = targetProjectId;
+    setDraftProjectId(null);
+    await createNewSession();
+    const nextSession = useAgentSessionStore.getState().session;
+    if (!nextSession?.id) return;
+    moveSessionToProject(targetProjectId, nextSession.id);
+    setKnownSessions((current) => [
+      nextSession,
+      ...current.filter((item) => item.id !== nextSession.id),
+    ]);
+  };
+
+  const commitDraftProjectSession = async () => {
+    const targetProjectId = pendingProjectSendRef.current;
+    if (!targetProjectId) return;
+    pendingProjectSendRef.current = null;
+    const currentSession = useAgentSessionStore.getState().session;
+    if (!currentSession?.id) {
+      return;
+    }
+    moveSessionToProject(targetProjectId, currentSession.id);
+    setKnownSessions((current) => [
+      currentSession,
+      ...current.filter((item) => item.id !== currentSession.id),
+    ]);
+  };
+
+  const handleCreateProject = () => {
+    const defaultName = t(language, 'deepcodeGui.project.defaultName');
+    setTextDialog({
+      kind: 'project',
+      title: t(language, 'deepcodeGui.project.new'),
+      label: t(language, 'deepcodeGui.project.namePrompt'),
+      value: defaultName,
+    });
+  };
+
+  const commitProjectName = async (title: string) => {
+    if (!title) return;
+    const now = new Date().toISOString();
+    const project: CodexGuiProject = {
+      id: `project-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      title,
+      sessionIds: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    setProjectRecords((current) => [project, ...current]);
+    setActiveProjectId(project.id);
+    setDraftProjectId(project.id);
+  };
+
+  const openSessionContextMenu = (
+    event: React.MouseEvent<HTMLElement>,
+    session: AgentSession
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const width = 190;
+    const height = projectRecords.length > 0 ? Math.min(320, 170 + projectRecords.length * 32) : 136;
+    setSessionMenu({
+      session,
+      x: Math.min(event.clientX, window.innerWidth - width - 8),
+      y: Math.min(event.clientY, window.innerHeight - height - 8),
+    });
+  };
+
+  const openProjectContextMenu = (
+    event: React.MouseEvent<HTMLElement>,
+    project: CodexGuiProject
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const width = 190;
+    const height = 112;
+    setProjectMenu({
+      project,
+      x: Math.min(event.clientX, window.innerWidth - width - 8),
+      y: Math.min(event.clientY, window.innerHeight - height - 8),
+    });
+  };
+
+  const handleRenameSession = (session: AgentSession) => {
+    setSessionMenu(null);
+    setTextDialog({
+      kind: 'renameSession',
+      title: t(language, 'agent.session.rename'),
+      label: t(language, 'agent.session.titleLabel'),
+      value: displaySessionTitle(language, session.title),
+      session,
+    });
+  };
+
+  const handleRenameProject = (project: CodexGuiProject) => {
+    setProjectMenu(null);
+    setTextDialog({
+      kind: 'renameProject',
+      title: t(language, 'deepcodeGui.project.rename'),
+      label: t(language, 'deepcodeGui.project.namePrompt'),
+      value: project.title,
+      project,
+    });
+  };
+
+  const commitSessionRename = async (session: AgentSession, nextTitle: string) => {
+    if (!nextTitle) return;
+    await renameSession(session.id, nextTitle);
+    setKnownSessions((current) => current.map((item) =>
+      item.id === session.id ? { ...item, title: nextTitle } : item
+    ));
+  };
+
+  const commitProjectRename = (project: CodexGuiProject, nextTitle: string) => {
+    if (!nextTitle) return;
+    const now = new Date().toISOString();
+    setProjectRecords((current) => current.map((item) =>
+      item.id === project.id ? { ...item, title: nextTitle, updatedAt: now } : item
+    ));
+  };
+
+  const handleTextDialogSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!textDialog) return;
+    const value = textDialog.value.trim();
+    if (!value) return;
+    setTextDialog(null);
+    if (textDialog.kind === 'project') {
+      await commitProjectName(value);
+      return;
+    }
+    if (textDialog.kind === 'renameProject' && textDialog.project) {
+      commitProjectRename(textDialog.project, value);
+      return;
+    }
+    if (textDialog.kind === 'renameSession' && textDialog.session) {
+      await commitSessionRename(textDialog.session, value);
+    }
+  };
+
+  const handleDeleteSession = async (session: AgentSession) => {
+    setSessionMenu(null);
+    await deleteSession(session.id);
+    setKnownSessions((current) => current.filter((item) => item.id !== session.id));
+    setProjectRecords((current) => current.map((project) => ({
+      ...project,
+      sessionIds: project.sessionIds.filter((id) => id !== session.id),
+    })));
+  };
+
+  const handleCopySessionId = async (session: AgentSession) => {
+    setSessionMenu(null);
+    await copyText(session.id);
+  };
+
+  const handleMoveSessionToProject = (session: AgentSession, projectId: string) => {
+    setSessionMenu(null);
+    moveSessionToProject(projectId, session.id);
+    setActiveProjectId(projectId);
+    setDraftProjectId(null);
+  };
+
+  const handleDeleteProject = (project: CodexGuiProject) => {
+    setProjectMenu(null);
+    setProjectRecords((current) => current.filter((item) => item.id !== project.id));
+    if (activeProjectId === project.id) setActiveProjectId(null);
+    if (draftProjectId === project.id) setDraftProjectId(null);
   };
 
   return (
@@ -236,7 +692,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
             <button
               type="button"
               className="codex-sidebar-action codex-sidebar-action--primary"
-              onClick={() => void handleCreateSession()}
+              onClick={() => void handleCreateSession(null)}
               disabled={loadingSession}
             >
               <CodexSidebarIcon name="compose" className="codex-sidebar-icon" />
@@ -245,21 +701,101 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
           </div>
 
           <section className="codex-sidebar-section">
-            <div className="codex-sidebar-section__label">{t(language, 'deepcodeGui.sidebar.project')}</div>
-            <button
-              type="button"
-              className="codex-project-row"
-              onClick={showWorkspaceOpenDialog}
-              disabled={workspaceLoading}
-              title={activeFolder?.absolutePath ?? workspace?.sourcePath ?? undefined}
-            >
-              <CodexSidebarIcon name="folder" className="codex-sidebar-icon" />
-              <span className="codex-project-row__body">
-                <span>{workspaceName}</span>
-                <small>{workspaceLoading ? statusLabel(language, 'running') : t(language, 'deepcodeGui.workspace.open')}</small>
-              </span>
-            </button>
-            {workspaceError && <div className="codex-sidebar-error">{workspaceError}</div>}
+            <div className="codex-sidebar-section__heading codex-sidebar-section__heading--project">
+              <div className="codex-sidebar-section__label">{t(language, 'deepcodeGui.sidebar.project')}</div>
+              <button
+                type="button"
+                className="codex-sidebar-text-action"
+                onClick={() => void handleCreateProject()}
+                disabled={loadingSession}
+              >
+                {t(language, 'deepcodeGui.project.new')}
+              </button>
+            </div>
+            {projectArchiveGroups.length === 0 ? (
+              <div className="codex-sidebar-empty">{t(language, 'deepcodeGui.project.empty')}</div>
+            ) : (
+              <div className="codex-project-archive-list">
+                {projectArchiveGroups.slice(0, 6).map((group, groupIndex) => {
+                  const projectRecord = group.projectId
+                    ? projectRecords.find((project) => project.id === group.projectId) ?? null
+                    : null;
+                  return (
+                    <div
+                      key={group.key}
+                      className={
+                        'codex-project-archive-group' +
+                        (group.projectId && group.projectId === activeProjectId
+                          ? ' codex-project-archive-group--active'
+                          : '')
+                      }
+                    >
+                      <div
+                        className="codex-project-archive-group__title"
+                        onContextMenu={(event) => {
+                          if (projectRecord) openProjectContextMenu(event, projectRecord);
+                        }}
+                      >
+                      <button
+                        type="button"
+                        className="codex-project-archive-group__select"
+                        onClick={() => group.projectId && handleSelectProject(group.projectId)}
+                        onContextMenu={(event) => {
+                          if (projectRecord) openProjectContextMenu(event, projectRecord);
+                        }}
+                        disabled={!group.projectId}
+                      >
+                        <CodexSidebarIcon name="folder" className="codex-sidebar-icon" />
+                        <span>{group.title}</span>
+                      </button>
+                      {group.projectId && (
+                        <div className="codex-project-archive-group__actions" aria-hidden={false}>
+                          <button
+                            type="button"
+                            className="codex-project-archive-group__compose"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void handleCreateSession(group.projectId);
+                            }}
+                            disabled={loadingSession}
+                            aria-label={t(language, 'deepcodeGui.project.newChat')}
+                            title={t(language, 'deepcodeGui.project.newChat')}
+                          >
+                            <CodexSidebarIcon name="compose" />
+                          </button>
+                        </div>
+                      )}
+                      </div>
+                      <div className="codex-project-archive-group__sessions">
+                        {group.sessions.slice(0, 4).map((item, itemIndex) => {
+                          const shortcutIndex = groupIndex + itemIndex + 1;
+                          return (
+                            <button
+                              key={item.id}
+                              type="button"
+                              className={item.id === activeSession?.id ? 'active' : ''}
+                              onClick={() => {
+                                setActiveProjectId(group.projectId ?? null);
+                                setDraftProjectId(null);
+                                void activateSession(item.id);
+                              }}
+                              onContextMenu={(event) => openSessionContextMenu(event, item)}
+                              disabled={loadingSession}
+                              title={item.title || item.id}
+                            >
+                              <span>{displaySessionTitle(language, item.title)}</span>
+                              {shortcutIndex <= 9 && (
+                                <kbd>⌘{shortcutIndex}</kbd>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
 
             <div className="codex-sidebar-section__heading">
               <div className="codex-sidebar-section__label codex-sidebar-section__label--nested">
@@ -268,12 +804,12 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
               <button
                 type="button"
                 className="codex-sidebar-new-chat"
-                onClick={() => void handleCreateSession()}
+                onClick={() => void handleCreateSession(null)}
                 disabled={loadingSession}
                 aria-label={t(language, 'deepcodeGui.nav.newChat')}
                 title={t(language, 'deepcodeGui.nav.newChat')}
               >
-                <CodexSidebarIcon name="plus" />
+                <CodexSidebarIcon name="compose" />
               </button>
             </div>
             {visibleSessions.length > 0 && (
@@ -283,7 +819,12 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                     key={item.id}
                     type="button"
                     className={item.id === activeSession?.id ? 'active' : ''}
-                    onClick={() => void activateSession(item.id)}
+                    onClick={() => {
+                      setActiveProjectId(null);
+                      setDraftProjectId(null);
+                      void activateSession(item.id);
+                    }}
+                    onContextMenu={(event) => openSessionContextMenu(event, item)}
                     disabled={loadingSession}
                     title={item.title || item.id}
                   >
@@ -308,7 +849,13 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
         </aside>
 
         <main className="codex-session-main">
-          <CodexAgentPanel language={language} />
+          <CodexAgentPanel
+            language={language}
+            forceHome={projectDraftActive}
+            homeProjectTitle={draftProject?.title ?? activeProject?.title ?? null}
+            onBeforeSend={prepareProjectDraftSession}
+            onAfterSend={commitDraftProjectSession}
+          />
         </main>
 
         <aside className="codex-context-panel">
@@ -333,6 +880,131 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
           </section>
         </aside>
       </div>
+
+      {sessionMenu && (
+        <div
+          className="codex-session-context-menu"
+          style={{ left: sessionMenu.x, top: sessionMenu.y }}
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+          role="menu"
+        >
+          <div className="codex-session-context-menu__title">
+            {displaySessionTitle(language, sessionMenu.session.title)}
+          </div>
+          <button type="button" role="menuitem" onClick={() => handleRenameSession(sessionMenu.session)}>
+            {t(language, 'agent.session.rename')}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="codex-session-context-menu__danger"
+            onClick={() => void handleDeleteSession(sessionMenu.session)}
+          >
+            {t(language, 'agent.session.delete')}
+          </button>
+          {projectRecords.length > 0 && (
+            <div className="codex-session-context-menu__section">
+              <div className="codex-session-context-menu__section-title">
+                {t(language, 'deepcodeGui.session.addToProject')}
+              </div>
+              {projectRecords.slice(0, 8).map((project) => (
+                <button
+                  key={project.id}
+                  type="button"
+                  role="menuitem"
+                  onClick={() => handleMoveSessionToProject(sessionMenu.session, project.id)}
+                >
+                  {project.title}
+                </button>
+              ))}
+            </div>
+          )}
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => void handleCopySessionId(sessionMenu.session)}
+          >
+            {t(language, 'deepcodeGui.session.copyId')}
+          </button>
+        </div>
+      )}
+
+      {projectMenu && (
+        <div
+          className="codex-session-context-menu"
+          style={{ left: projectMenu.x, top: projectMenu.y }}
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+          role="menu"
+        >
+          <div className="codex-session-context-menu__title">
+            {projectMenu.project.title}
+          </div>
+          <button type="button" role="menuitem" onClick={() => handleRenameProject(projectMenu.project)}>
+            {t(language, 'deepcodeGui.project.rename')}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="codex-session-context-menu__danger"
+            onClick={() => handleDeleteProject(projectMenu.project)}
+          >
+            {t(language, 'deepcodeGui.project.delete')}
+          </button>
+        </div>
+      )}
+
+      {textDialog && (
+        <div
+          className="codex-text-dialog-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label={textDialog.title}
+          onMouseDown={() => setTextDialog(null)}
+        >
+          <form
+            className="codex-text-dialog"
+            onSubmit={(event) => void handleTextDialogSubmit(event)}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header>
+              <h2>{textDialog.title}</h2>
+              <button
+                type="button"
+                aria-label={t(language, 'agent.session.cancel')}
+                onClick={() => setTextDialog(null)}
+              >
+                x
+              </button>
+            </header>
+            <label>
+              <span>{textDialog.label}</span>
+              <input
+                autoFocus
+                value={textDialog.value}
+                onChange={(event) => setTextDialog((current) =>
+                  current ? { ...current, value: event.target.value } : current
+                )}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape') {
+                    event.preventDefault();
+                    setTextDialog(null);
+                  }
+                }}
+              />
+            </label>
+            <footer>
+              <button type="button" onClick={() => setTextDialog(null)}>
+                {t(language, 'agent.session.cancel')}
+              </button>
+              <button type="submit" disabled={!textDialog.value.trim()}>
+                {t(language, 'agent.session.save')}
+              </button>
+            </footer>
+          </form>
+        </div>
+      )}
 
       <Suspense fallback={null}>
         {settingsOpen && (

@@ -183,7 +183,7 @@ async fn main() {
         )
         .route(
             "/api/agent/sessions/:session_id",
-            patch(agent_session_rename),
+            patch(agent_session_rename).delete(agent_session_delete),
         )
         .route(
             "/api/agent/permissions/:permission_id/resolve",

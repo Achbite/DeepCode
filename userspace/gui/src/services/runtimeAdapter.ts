@@ -412,6 +412,12 @@ export function archiveAgentSession(
   return api.archiveAgentSession(sessionId, request);
 }
 
+export function deleteAgentSession(
+  sessionId: string
+): Promise<ApiResponse<AgentSessionListResult>> {
+  return api.deleteAgentSession(sessionId);
+}
+
 export function getConversationArchive(sessionId: string) {
   return api.getConversationArchive(sessionId);
 }

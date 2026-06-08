@@ -21,6 +21,7 @@ import {
 import {
   activateAgentSession,
   archiveAgentSession,
+  deleteAgentSession,
   cancelAgentRun,
   createAgentSession,
   getAgentWorkflowConfig,
@@ -63,6 +64,7 @@ interface AgentSessionState {
   workflowConfigStorePath?: string;
   profileId?: string;
   loading: boolean;
+  runningSessionIds: string[];
   errorMessage: string | null;
   messageAttachments: AgentContextAttachment[];
   sessionAttachments: AgentContextAttachment[];
@@ -78,6 +80,7 @@ interface AgentSessionActions {
   activateSession: (sessionId: string) => Promise<void>;
   renameSession: (sessionId: string, title: string) => Promise<void>;
   archiveSession: (sessionId: string) => Promise<void>;
+  deleteSession: (sessionId: string) => Promise<void>;
   refreshTraceEvents: (sessionId?: string) => Promise<void>;
   loadWorkflowConfig: () => Promise<void>;
   patchWorkflowConfig: (config: AgentWorkflowConfig) => Promise<void>;
@@ -96,7 +99,7 @@ interface AgentSessionActions {
 
 type Store = AgentSessionState & AgentSessionActions;
 
-let activeAgentAbortController: AbortController | null = null;
+const activeAgentAbortControllers = new Map<string, AbortController>();
 
 function emptyWorkflowConfig(): AgentWorkflowConfig {
   return {} as AgentWorkflowConfig;
@@ -155,6 +158,14 @@ function isEmptyAgentSession(session: AgentSession | null | undefined): boolean 
   return Boolean(session) && (session?.eventCount ?? 0) === 0;
 }
 
+function addRunningSessionId(ids: string[], sessionId: string): string[] {
+  return ids.includes(sessionId) ? ids : [...ids, sessionId];
+}
+
+function removeRunningSessionId(ids: string[], sessionId: string): string[] {
+  return ids.filter((id) => id !== sessionId);
+}
+
 export const useAgentSessionStore = create<Store>((set, get) => ({
   session: null,
   sessions: [],
@@ -166,6 +177,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   workflow: 'planFirst',
   workflowConfig: null,
   loading: false,
+  runningSessionIds: [],
   errorMessage: null,
   messageAttachments: [],
   sessionAttachments: [],
@@ -321,6 +333,26 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set({ errorMessage: result.message ?? 'Agent session archive failed' });
   },
 
+  deleteSession: async (sessionId) => {
+    const result = await deleteAgentSession(sessionId);
+    if (result.ok && result.data) {
+      const wasActive = get().session?.id === sessionId;
+      set({
+        sessions: result.data.sessions,
+        currentSessionId: result.data.currentSessionId,
+        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null } : {}),
+      });
+      if (wasActive) {
+        const nextSessionId = result.data.currentSessionId;
+        if (nextSessionId && nextSessionId !== sessionId) {
+          await get().activateSession(nextSessionId);
+        }
+      }
+      return;
+    }
+    set({ errorMessage: result.message ?? 'Agent session delete failed' });
+  },
+
   refreshTraceEvents: async (sessionId) => {
     const id = sessionId ?? get().session?.id;
     if (!id) return;
@@ -391,7 +423,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!session) return;
 
     const attachments = readMessageAttachments(get(), attachmentsOverride);
-    if (get().loading) {
+    if (get().runningSessionIds.includes(session.id)) {
       const queuedEvent = createLocalEvent(session.id, 'user_msg', {
         content: trimmed,
         attachments,
@@ -415,7 +447,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set((state) => ({
       events: [...state.events, localUserEvent],
       messageAttachments: [],
-      loading: true,
+      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
     }));
 
@@ -439,7 +471,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     void refreshProgress();
 
     const abortController = new AbortController();
-    activeAgentAbortController = abortController;
+    activeAgentAbortControllers.set(session.id, abortController);
     let wasAborted = false;
 
     try {
@@ -461,14 +493,20 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const data = result.data;
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      set({
-        session: data.session,
-        sessions: [data.session, ...get().sessions.filter((item) => item.id !== data.session.id)],
-        currentSessionId: data.session.id,
-        events: data.events,
-        pendingPermission: findLatestPendingPermission(data.events),
-        resolvingPermission: null,
-        loading: false,
+      const isActiveSession = get().session?.id === data.session.id;
+      set((state) => {
+        const nextState: Partial<Store> = {
+          sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
+          resolvingPermission: null,
+        };
+        if (isActiveSession) {
+          nextState.session = data.session;
+          nextState.currentSessionId = data.session.id;
+          nextState.events = data.events;
+          nextState.pendingPermission = findLatestPendingPermission(data.events);
+        }
+        return nextState;
       });
       void get().refreshTraceEvents(data.session.id);
     } catch (err) {
@@ -477,24 +515,26 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const message = err instanceof Error ? err.message : String(err);
       wasAborted = abortController.signal.aborted || message === 'request_aborted';
       if (wasAborted) {
-        set({
-          loading: false,
+        set((state) => ({
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
           errorMessage: null,
           queuedMessages: [],
-        });
+        }));
       } else {
         set((state) => ({
-          events: [
-            ...state.events,
-            createLocalEvent(session.id, 'error', { message }),
-          ],
-          errorMessage: message,
-          loading: false,
+          events: state.session?.id === session.id
+            ? [
+                ...state.events,
+                createLocalEvent(session.id, 'error', { message }),
+              ]
+            : state.events,
+          errorMessage: state.session?.id === session.id ? message : state.errorMessage,
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
         }));
       }
     } finally {
-      if (activeAgentAbortController === abortController) {
-        activeAgentAbortController = null;
+      if (activeAgentAbortControllers.get(session.id) === abortController) {
+        activeAgentAbortControllers.delete(session.id);
       }
     }
 
@@ -514,14 +554,14 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   cancelCurrentRun: async () => {
     const session = get().session;
     if (!session) return;
-    activeAgentAbortController?.abort();
-    set({
-      loading: false,
+    activeAgentAbortControllers.get(session.id)?.abort();
+    set((state) => ({
+      runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       queuedMessages: [],
       pendingPermission: null,
       resolvingPermission: null,
       errorMessage: null,
-    });
+    }));
 
     const result = await cancelAgentRun(session.id);
     if (result.ok && result.data) {

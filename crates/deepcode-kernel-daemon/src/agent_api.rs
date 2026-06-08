@@ -178,6 +178,64 @@ pub(crate) async fn agent_session_rename(
     ApiResponse::error("agent_session_not_found", "agent session not found")
 }
 
+pub(crate) async fn agent_session_delete(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let safe_session_id = safe_path_segment(&session_id);
+    let (
+        sessions_dir,
+        archive_root,
+        response_scope_key,
+        response_current_id,
+        response_sessions,
+    ) = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        let Some(position) = gui
+            .sessions
+            .iter()
+            .position(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
+        else {
+            return ApiResponse::error("agent_session_not_found", "agent session not found");
+        };
+
+        let scope_key = session_scope_key(&gui.sessions[position]);
+        gui.sessions.remove(position);
+        gui.session_projection_cache.remove(&session_id);
+        gui.pending_plans
+            .retain(|_, plan| plan.session_id != session_id);
+        gui.trace_events.remove(&session_id);
+        gui.current_session_ids_by_scope
+            .retain(|_, current_id| current_id != &session_id);
+        if gui.current_session_id.as_deref() == Some(session_id.as_str()) {
+            gui.current_session_id = gui
+                .sessions
+                .iter()
+                .find(|session| !is_archived_session(session))
+                .and_then(|session| session.get("id").and_then(Value::as_str))
+                .map(ToOwned::to_owned);
+        }
+        let response_current_id = current_agent_session_id_for_scope(&mut gui, &scope_key);
+        let response_sessions = scoped_sessions(&gui, &scope_key, false);
+        (
+            gui.paths.sessions_dir.clone(),
+            gui.paths.conversation_archives_dir.clone(),
+            scope_key,
+            response_current_id,
+            response_sessions,
+        )
+    };
+
+    remove_session_storage_dir(&sessions_dir, &safe_session_id);
+    remove_conversation_archive_dirs(&archive_root, &safe_session_id);
+
+    ApiResponse::ok(json!({
+        "sessions": response_sessions,
+        "currentSessionId": response_current_id,
+        "workspaceScopeKey": response_scope_key
+    }))
+}
+
 pub(crate) async fn agent_session_archive(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -779,6 +837,25 @@ pub(crate) fn create_agent_session_value(
 
 pub(crate) fn is_archived_session(session: &Value) -> bool {
     session.get("archivedAt").and_then(Value::as_str).is_some()
+}
+
+pub(crate) fn remove_session_storage_dir(sessions_dir: &FsPath, safe_session_id: &str) {
+    let path = sessions_dir.join(safe_session_id);
+    if path.starts_with(sessions_dir) {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
+pub(crate) fn remove_conversation_archive_dirs(archive_root: &FsPath, safe_session_id: &str) {
+    let Ok(workspaces) = fs::read_dir(archive_root) else {
+        return;
+    };
+    for workspace in workspaces.filter_map(Result::ok) {
+        let session_dir = workspace.path().join(safe_session_id);
+        if session_dir.starts_with(archive_root) {
+            let _ = fs::remove_dir_all(session_dir);
+        }
+    }
 }
 
 pub(crate) fn scope_key_from_query(query: &AgentSessionScopeQuery) -> String {

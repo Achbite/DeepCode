@@ -10,6 +10,10 @@ import CodexTimeline from './CodexTimeline';
 
 interface CodexAgentPanelProps {
   language: UiLanguage;
+  forceHome?: boolean;
+  homeProjectTitle?: string | null;
+  onBeforeSend?: () => Promise<void> | void;
+  onAfterSend?: () => Promise<void> | void;
 }
 
 function displaySessionTitle(language: UiLanguage, title?: string): string {
@@ -20,11 +24,17 @@ function displaySessionTitle(language: UiLanguage, title?: string): string {
   return value;
 }
 
-const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({ language }) => {
+const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
+  language,
+  forceHome = false,
+  homeProjectTitle,
+  onBeforeSend,
+  onAfterSend,
+}) => {
   const events = useAgentSessionStore((s) => s.events);
   const session = useAgentSessionStore((s) => s.session);
   const profileId = useAgentSessionStore((s) => s.profileId);
-  const loading = useAgentSessionStore((s) => s.loading);
+  const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
@@ -43,6 +53,7 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({ language }) => {
   const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
   const [timeline, setTimeline] = useState<AgentTimelineResult | null>(null);
   const [timelineError, setTimelineError] = useState<string | null>(null);
+  const sessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
 
   useEffect(() => {
     void loadOrCreate();
@@ -79,25 +90,34 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({ language }) => {
       }
     };
     void loadTimeline();
-    const interval = loading ? window.setInterval(() => void loadTimeline(), 1000) : null;
+    const interval = sessionRunning ? window.setInterval(() => void loadTimeline(), 1000) : null;
     return () => {
       cancelled = true;
       if (interval !== null) window.clearInterval(interval);
     };
-  }, [events.length, loading, session?.id]);
+  }, [events.length, session?.id, sessionRunning]);
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = (timeline?.turns.length ?? 0) > 0;
-  const showHome = !loading && !pendingPermission && !errorMessage && !timelineError
-    && events.length === 0 && !hasTimelineTurns;
+  const showHome = (forceHome && events.length === 0 && !hasTimelineTurns && !sessionRunning) || (
+    !sessionRunning && !pendingPermission && !errorMessage && !timelineError
+    && events.length === 0 && !hasTimelineTurns
+  );
+  const homePrompt = homeProjectTitle
+    ? t(language, 'deepcodeGui.home.projectPrompt', { project: homeProjectTitle })
+    : t(language, 'deepcodeGui.home.prompt');
 
   const composer = (
     <AgentComposer
       messageAttachments={messageAttachments}
       sessionAttachments={sessionAttachments}
       language={language}
-      loading={loading}
-      onSend={(content) => void sendMessage(content)}
+      loading={sessionRunning}
+      onSend={async (content) => {
+        await onBeforeSend?.();
+        await sendMessage(content);
+        await onAfterSend?.();
+      }}
       onStop={() => void cancelCurrentRun()}
       onAddAttachment={addAttachment}
       onRemoveAttachment={removeAttachment}
@@ -108,7 +128,7 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({ language }) => {
     return (
       <div className="codex-agent-panel codex-agent-panel--home">
         <div className="codex-home-panel">
-          <h1>{t(language, 'deepcodeGui.home.prompt')}</h1>
+          <h1>{homePrompt}</h1>
           {composer}
         </div>
       </div>
@@ -128,7 +148,7 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({ language }) => {
       <CodexTimeline
         timeline={timeline}
         fallbackEvents={events}
-        loading={loading}
+        loading={sessionRunning}
         language={language}
         onPlanResolve={(runId, planId, decision, guidance) =>
           void resolvePlan(runId, planId, decision, guidance)

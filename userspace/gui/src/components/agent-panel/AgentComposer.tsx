@@ -10,7 +10,7 @@ interface AgentComposerProps {
   sessionAttachments: AgentContextAttachment[];
   language: UiLanguage;
   loading: boolean;
-  onSend: (content: string) => void;
+  onSend: (content: string) => void | Promise<void>;
   onStop: () => void;
   onAddAttachment: (attachment: AgentContextAttachment) => void;
   onRemoveAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
@@ -83,9 +83,10 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   }, [value]);
 
   const send = () => {
-    if (!value.trim()) return;
-    onSend(value);
+    const nextValue = value;
+    if (!nextValue.trim()) return;
     setValue('');
+    void onSend(nextValue);
   };
 
   useEffect(() => {

@@ -39,6 +39,14 @@ function isEditableTarget(target: EventTarget | null): boolean {
 }
 
 const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
+const DEEPCODE_GUI_DEFAULT_WORKSPACE_ROOT = '/';
+
+function needsDefaultGuiWorkspace(): boolean {
+  const { current, fallbackUsed } = useWorkspaceStore.getState();
+  if (!current) return true;
+  if (fallbackUsed || current.source === 'fallback') return true;
+  return current.folders.length === 0;
+}
 
 const BootFallback: React.FC = () => (
   <div className="codex-boot-shell">
@@ -63,6 +71,7 @@ const DeepCodeGuiApp: React.FC = () => {
   const syncWorkspaceSettings = useSettingsStore((s) => s.syncWorkspaceSettings);
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const connectedReloadDoneRef = useRef(false);
+  const defaultWorkspaceAttemptedRef = useRef(false);
   const dirtySignature = useEditorStore((s) =>
     s.tabs
       .flatMap((tab) =>
@@ -78,6 +87,18 @@ const DeepCodeGuiApp: React.FC = () => {
     return saveFile(getTabId(activeTab));
   }, []);
 
+  const ensureDefaultGuiWorkspace = useCallback(async () => {
+    await loadWorkspace();
+    if (defaultWorkspaceAttemptedRef.current || !needsDefaultGuiWorkspace()) return;
+    defaultWorkspaceAttemptedRef.current = true;
+    const result = await useWorkspaceStore
+      .getState()
+      .openWorkspace(DEEPCODE_GUI_DEFAULT_WORKSPACE_ROOT);
+    if (!result.ok) {
+      setErrorMessage(result.message ?? 'Failed to open DeepCode-GUI default workspace');
+    }
+  }, [loadWorkspace, setErrorMessage]);
+
   useEffect(() => {
     document.documentElement.dataset.product = 'deepcode-gui';
     return afterFirstPaint(() => {
@@ -89,9 +110,9 @@ const DeepCodeGuiApp: React.FC = () => {
   useEffect(() => {
     if (apiStatus !== 'connected' || connectedReloadDoneRef.current) return;
     connectedReloadDoneRef.current = true;
-    void loadWorkspace();
+    void ensureDefaultGuiWorkspace();
     void loadUserSettings();
-  }, [apiStatus, loadWorkspace, loadUserSettings]);
+  }, [apiStatus, ensureDefaultGuiWorkspace, loadUserSettings]);
 
   useEffect(() => {
     syncWorkspaceSettings(workspaceSettings);
