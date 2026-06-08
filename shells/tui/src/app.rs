@@ -146,11 +146,16 @@ impl TuiApp {
                 self.status = format!("session={} | run=completed", result.session_id);
                 self.cards
                     .push(CardModel::stage("session", result.session_id.clone()));
-                for event in result.events {
-                    self.cards.push(CardModel::from_event(&event));
-                }
-                if let Some(answer) = result.final_answer {
-                    self.cards.push(CardModel::final_answer(answer));
+                match self.client.agent_timeline(&result.session_id).await {
+                    Ok(timeline) => self.cards.extend(CardModel::from_timeline(&timeline)),
+                    Err(_) => {
+                        for event in result.events {
+                            self.cards.push(CardModel::from_event(&event));
+                        }
+                        if let Some(answer) = result.final_answer {
+                            self.cards.push(CardModel::final_answer(answer));
+                        }
+                    }
                 }
             }
             Err(error) => {

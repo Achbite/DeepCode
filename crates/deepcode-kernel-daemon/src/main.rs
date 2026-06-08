@@ -1,5 +1,6 @@
 mod agent_api;
 mod agent_loop;
+mod agent_timeline;
 mod api_response;
 mod browser_api;
 mod event_projection;
@@ -20,6 +21,7 @@ use crate::prelude::*;
 
 pub(crate) use agent_api::*;
 pub(crate) use agent_loop::*;
+pub(crate) use agent_timeline::*;
 pub(crate) use api_response::*;
 pub(crate) use browser_api::*;
 pub(crate) use event_projection::*;
@@ -174,6 +176,10 @@ async fn main() {
         .route(
             "/api/agent/sessions/:session_id/trace",
             get(agent_session_trace),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/timeline",
+            get(agent_session_timeline),
         )
         .route(
             "/api/agent/sessions/:session_id",

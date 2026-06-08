@@ -4,10 +4,13 @@ use serde_json::Value;
 pub enum CardKind {
     User,
     Assistant,
+    Thinking,
     CommandHelp,
     Stage,
     Tool,
     Permission,
+    Plan,
+    Review,
     Error,
     Final,
     AuditStatus,
@@ -47,6 +50,57 @@ impl CardModel {
 
     pub fn audit_status(title: impl Into<String>, body: impl Into<String>) -> Self {
         Self::new(CardKind::AuditStatus, title, body)
+    }
+
+    pub fn from_timeline(timeline: &Value) -> Vec<Self> {
+        let turns = timeline
+            .get("turns")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut cards = Vec::new();
+        for turn in turns {
+            let status = turn.get_str("status").unwrap_or("unknown");
+            cards.push(Self::new(
+                CardKind::Stage,
+                "turn",
+                format!("timeline turn status: {status}"),
+            ));
+            let blocks = turn
+                .get("blocks")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for block in blocks {
+                if block.get_str("kind") == Some("user") {
+                    continue;
+                }
+                cards.push(Self::from_timeline_block(&block));
+            }
+        }
+        cards
+    }
+
+    fn from_timeline_block(block: &Value) -> Self {
+        let kind = block.get_str("kind").unwrap_or("stage");
+        let status = block.get_str("status").unwrap_or("completed");
+        let title = block.get_str("title").unwrap_or(kind);
+        let summary = block.get_str("summary").unwrap_or("");
+        let body = block
+            .get_str("bodyMarkdown")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(summary);
+        let card_kind = match kind {
+            "assistant" => CardKind::Final,
+            "thinking" => CardKind::Thinking,
+            "toolBatch" => CardKind::Tool,
+            "permission" => CardKind::Permission,
+            "plan" => CardKind::Plan,
+            "review" => CardKind::Review,
+            "error" => CardKind::Error,
+            _ => CardKind::Stage,
+        };
+        Self::new(card_kind, format!("{title} · {status}"), body)
     }
 
     pub fn from_event(event: &Value) -> Self {

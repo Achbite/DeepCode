@@ -79,6 +79,18 @@ impl HttpKernelClient {
         self.health().await
     }
 
+    pub async fn agent_timeline(&self, session_id: &str) -> KernelClientResult<Value> {
+        let value = self
+            .http
+            .get(self.url(&format!("/api/agent/sessions/{session_id}/timeline")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        api_data(value)
+    }
+
     pub async fn send_prompt(
         &self,
         prompt: &str,
