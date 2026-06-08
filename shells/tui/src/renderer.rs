@@ -4,10 +4,10 @@ use crate::{
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    prelude::Frame,
+    prelude::{Alignment, Frame},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
 };
 
 #[derive(Clone)]
@@ -18,17 +18,19 @@ pub struct Theme {
     pub danger: Color,
     pub dim: Color,
     pub border: Color,
+    pub user_bg: Color,
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            accent: Color::Blue,
+            accent: Color::Cyan,
             success: Color::Green,
             warning: Color::Yellow,
             danger: Color::Red,
             dim: Color::DarkGray,
-            border: Color::DarkGray,
+            border: Color::Rgb(210, 214, 220),
+            user_bg: Color::Rgb(235, 238, 242),
         }
     }
 }
@@ -41,35 +43,40 @@ pub struct Renderer {
 impl Renderer {
     pub fn draw(&self, frame: &mut Frame<'_>, app: &TuiApp) {
         let area = frame.area();
+        let composer_height = if app.input().chars().count() > usize::from(area.width / 2) {
+            5
+        } else {
+            4
+        };
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
-                Constraint::Min(10),
-                Constraint::Length(8),
-                Constraint::Length(3),
+                Constraint::Length(2),
+                Constraint::Min(8),
+                Constraint::Length(composer_height),
                 Constraint::Length(1),
             ])
             .split(area);
 
         self.draw_header(frame, vertical[0]);
-        self.draw_body(frame, vertical[1], app.cards());
-        self.draw_command_panel(frame, vertical[2]);
-        self.draw_input(frame, vertical[3], app.input());
-        self.draw_status(frame, vertical[4], app.status());
+        self.draw_timeline(frame, vertical[1], app.cards());
+        self.draw_composer(frame, vertical[2], app.input());
+        self.draw_footer(frame, vertical[3], app.status());
     }
 
     pub fn render_plain(&self, cards: &[CardModel]) -> String {
         let mut output = String::new();
-        output.push_str("╭ DeepCode TUI ─────────────────────────────────────────────────────╮\n");
-        output.push_str("│ KernelClient Host Shell | stage 10.0 | type /help for commands    │\n");
-        output.push_str("╰───────────────────────────────────────────────────────────────────╯\n");
-        output.push_str("── Conversation ─────────────────────────────────────────────────────\n");
-        for card in cards {
-            output.push_str(&self.render_plain_card(card));
+        output.push_str("DeepCode TUI · pi-style session shell\n");
+        output.push_str("────────────────────────────────────────\n");
+        if cards.is_empty() {
+            output.push_str("我们应该在 DeepCode 中做些什么？\n\n");
+        } else {
+            for card in cards {
+                output.push_str(&self.render_plain_card(card));
+            }
         }
-        output.push_str("── Input ────────────────────────────────────────────────────────────\n");
-        output.push_str("Type a message, or use /help /status /ask <prompt> /audit /clear /quit\n");
+        output.push_str("────────────────────────────────────────\n");
+        output.push_str("输入消息，或使用 /help /status /audit /clear /quit\n");
         output
     }
 
@@ -82,180 +89,192 @@ impl Renderer {
                         .fg(self.theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  TUI Host Shell MVP"),
+                Span::raw(" TUI"),
+                Span::styled("  ·  ", Style::default().fg(self.theme.dim)),
+                Span::styled("Agent Session", Style::default().fg(Color::Gray)),
             ]),
             Line::from(vec![Span::styled(
-                "KernelClient only · no runtime ownership · stage 10.0",
+                "KernelClient Host Shell · timeline display only",
                 Style::default().fg(self.theme.dim),
             )]),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(self.border_style()),
-        );
+        ]);
         frame.render_widget(header, area);
     }
 
-    fn draw_body(&self, frame: &mut Frame<'_>, area: Rect, cards: &[CardModel]) {
-        let body = if area.width >= 96 {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
-                .split(area)
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(100), Constraint::Length(0)])
-                .split(area)
-        };
+    fn draw_timeline(&self, frame: &mut Frame<'_>, area: Rect, cards: &[CardModel]) {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(20),
+                Constraint::Length(2),
+            ])
+            .split(area);
+        let area = columns[1];
 
+        if cards.is_empty() {
+            let empty = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "我们应该在 DeepCode 中做些什么？",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "输入消息后会生成 timeline；TUI 只负责显示，不接管会话编排。",
+                    Style::default().fg(self.theme.dim),
+                )),
+            ])
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+            frame.render_widget(empty, area);
+            return;
+        }
+
+        let visible_cards = usize::from(area.height.saturating_sub(1)).max(1);
+        let content_width = usize::from(area.width.saturating_sub(4));
         let items = cards
             .iter()
             .rev()
-            .take(18)
+            .take(visible_cards)
             .rev()
-            .map(|card| ListItem::new(self.card_lines(card)).style(self.card_style(card)))
+            .map(|card| ListItem::new(self.card_lines(card, content_width)))
             .collect::<Vec<_>>();
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .title("Conversation")
-                    .borders(Borders::ALL)
-                    .border_style(self.border_style()),
-            )
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-        frame.render_widget(list, body[0]);
+        let list = List::new(items).block(Block::default().borders(Borders::NONE));
+        frame.render_widget(list, area);
+    }
 
-        if body.len() > 1 && body[1].height > 0 {
-            let side = Paragraph::new(vec![
-                Line::from(Span::styled(
-                    "Stage 10.0 boundaries",
-                    Style::default().fg(self.theme.accent),
-                )),
-                Line::from(""),
-                Line::from("• Host shell only"),
-                Line::from("• KernelClient HTTP adapter"),
-                Line::from("• No workflow ownership"),
-                Line::from("• No tool execution"),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Full TUI stays stage 17",
-                    Style::default().fg(self.theme.warning),
-                )),
+    fn draw_composer(&self, frame: &mut Frame<'_>, area: Rect, input: &str) {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(18),
+                Constraint::Percentage(64),
+                Constraint::Percentage(18),
             ])
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .title("Guide")
-                    .borders(Borders::ALL)
-                    .border_style(self.border_style()),
-            );
-            frame.render_widget(side, body[1]);
-        }
-    }
-
-    fn draw_command_panel(&self, frame: &mut Frame<'_>, area: Rect) {
-        let commands = Paragraph::new(vec![
+            .split(area);
+        let content = if input.is_empty() {
+            Line::from(Span::styled(
+                "询问 DeepCode Agent...",
+                Style::default().fg(self.theme.dim),
+            ))
+        } else {
             Line::from(vec![
-                Span::styled("/help", Style::default().fg(self.theme.accent)),
-                Span::raw(" commands  "),
-                Span::styled("/status", Style::default().fg(self.theme.success)),
-                Span::raw(" daemon  "),
-                Span::styled("/ask <prompt>", Style::default().fg(self.theme.accent)),
-                Span::raw(" prompt"),
-            ]),
-            Line::from(vec![
-                Span::styled("/audit", Style::default().fg(self.theme.warning)),
-                Span::raw(" audit placeholder  "),
-                Span::styled("/clear", Style::default().fg(self.theme.dim)),
-                Span::raw(" clear cards  "),
-                Span::styled("/quit", Style::default().fg(self.theme.danger)),
-                Span::raw(" exit"),
-            ]),
-            Line::from(""),
-            Line::from("Plain text is sent as one prompt through KernelClient."),
-        ])
-        .wrap(Wrap { trim: true })
-        .block(
+                Span::styled("> ", Style::default().fg(self.theme.accent)),
+                Span::raw(input.to_string()),
+            ])
+        };
+        let composer = Paragraph::new(content).wrap(Wrap { trim: true }).block(
             Block::default()
-                .title("Commands")
                 .borders(Borders::ALL)
-                .border_style(self.border_style()),
+                .border_type(BorderType::Rounded)
+                .border_style(self.border_style())
+                .title(" 消息 "),
         );
-        frame.render_widget(commands, area);
+        frame.render_widget(composer, columns[1]);
     }
 
-    fn draw_input(&self, frame: &mut Frame<'_>, area: Rect, input: &str) {
-        let input = Paragraph::new(Line::from(vec![
-            Span::styled("> ", Style::default().fg(self.theme.accent)),
-            Span::raw(input),
-        ]))
-        .block(
-            Block::default()
-                .title("Input")
-                .borders(Borders::ALL)
-                .border_style(self.border_style()),
-        );
-        frame.render_widget(input, area);
-    }
-
-    fn draw_status(&self, frame: &mut Frame<'_>, area: Rect, status: &str) {
-        let status = Paragraph::new(Line::from(vec![
-            Span::styled("status ", Style::default().fg(self.theme.dim)),
-            Span::raw(status),
+    fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect, status: &str) {
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled(status.to_string(), Style::default().fg(self.theme.dim)),
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().fg(self.theme.accent)),
+            Span::raw(" 发送 · "),
+            Span::styled("Esc", Style::default().fg(self.theme.accent)),
+            Span::raw(" 清空输入 · "),
+            Span::styled("^C", Style::default().fg(self.theme.danger)),
+            Span::raw(" 退出"),
         ]));
-        frame.render_widget(status, area);
+        frame.render_widget(footer, area);
     }
 
-    fn card_lines(&self, card: &CardModel) -> Vec<Line<'static>> {
-        let mut lines = vec![Line::from(vec![
-            Span::styled("┃ ", Style::default().fg(self.card_color(card))),
+    fn card_lines(&self, card: &CardModel, width: usize) -> Vec<Line<'static>> {
+        if matches!(card.kind, CardKind::User) {
+            return self.user_card_lines(card, width);
+        }
+
+        let mut header = vec![
+            Span::styled(
+                format!("{} ", icon(card)),
+                Style::default().fg(self.card_color(card)),
+            ),
             Span::styled(
                 label(card),
                 Style::default()
                     .fg(self.card_color(card))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled(card.title.clone(), Style::default().fg(Color::White)),
-        ])];
-        for source_line in card.body.lines() {
-            lines.push(Line::from(vec![
-                Span::styled("┃ ", Style::default().fg(self.card_color(card))),
-                Span::raw(source_line.to_string()),
-            ]));
+        ];
+        if card.title != label(card) {
+            header.push(Span::styled("  ", Style::default().fg(self.theme.dim)));
+            header.push(Span::styled(
+                card.title.clone(),
+                Style::default().fg(self.theme.dim),
+            ));
         }
-        if card.body.is_empty() {
+        let mut lines = vec![Line::from(header)];
+
+        let body = if card.body.trim().is_empty() {
+            "(empty)".to_string()
+        } else {
+            card.body.clone()
+        };
+        for source_line in body.lines() {
             lines.push(Line::from(vec![
-                Span::styled("┃ ", Style::default().fg(self.card_color(card))),
-                Span::styled("(empty)", Style::default().fg(self.theme.dim)),
+                Span::raw("  "),
+                Span::styled(
+                    source_line.to_string(),
+                    Style::default().fg(self.body_color(card)),
+                ),
             ]));
         }
         lines.push(Line::from(""));
         lines
     }
 
+    fn user_card_lines(&self, card: &CardModel, width: usize) -> Vec<Line<'static>> {
+        let max_width = width.saturating_sub(8).clamp(12, 72);
+        let mut lines = Vec::new();
+        for source_line in card.body.lines() {
+            let text = compact_line(source_line, max_width);
+            lines.push(
+                Line::from(Span::styled(
+                    format!(" {text} "),
+                    Style::default().fg(Color::Black).bg(self.theme.user_bg),
+                ))
+                .alignment(Alignment::Right),
+            );
+        }
+        if lines.is_empty() {
+            lines.push(
+                Line::from(Span::styled(
+                    " (empty) ",
+                    Style::default().fg(Color::Black).bg(self.theme.user_bg),
+                ))
+                .alignment(Alignment::Right),
+            );
+        }
+        lines.push(Line::from(""));
+        lines
+    }
+
     fn render_plain_card(&self, card: &CardModel) -> String {
-        let mut out = format!("┃ {} · {}\n", label(card), card.title);
+        let mut out = if card.title == label(card) {
+            format!("{} {}\n", icon(card), label(card))
+        } else {
+            format!("{} {} · {}\n", icon(card), label(card), card.title)
+        };
         if card.body.is_empty() {
-            out.push_str("┃ (empty)\n");
+            out.push_str("  (empty)\n");
         } else {
             for line in card.body.lines() {
-                out.push_str(&format!("┃ {line}\n"));
+                out.push_str(&format!("  {line}\n"));
             }
         }
         out.push('\n');
         out
-    }
-
-    fn card_style(&self, card: &CardModel) -> Style {
-        Style::default().fg(match card.kind {
-            CardKind::Error => self.theme.danger,
-            CardKind::AuditStatus => self.theme.warning,
-            CardKind::Final => self.theme.success,
-            _ => Color::Gray,
-        })
     }
 
     fn card_color(&self, card: &CardModel) -> Color {
@@ -275,24 +294,60 @@ impl Renderer {
         }
     }
 
+    fn body_color(&self, card: &CardModel) -> Color {
+        match card.kind {
+            CardKind::Error => self.theme.danger,
+            CardKind::Thinking | CardKind::Stage | CardKind::AuditStatus => Color::Gray,
+            _ => Color::White,
+        }
+    }
+
     fn border_style(&self) -> Style {
         Style::default().fg(self.theme.border)
     }
 }
 
+fn icon(card: &CardModel) -> &'static str {
+    match card.kind {
+        CardKind::User => "›",
+        CardKind::Assistant | CardKind::Final => "◆",
+        CardKind::Thinking => "·",
+        CardKind::CommandHelp => "?",
+        CardKind::Stage => "•",
+        CardKind::Tool => "⌁",
+        CardKind::Permission => "!",
+        CardKind::Plan => "◇",
+        CardKind::Review => "✓",
+        CardKind::Error => "×",
+        CardKind::AuditStatus => "◌",
+    }
+}
+
 fn label(card: &CardModel) -> &'static str {
     match card.kind {
-        CardKind::User => "USER",
-        CardKind::Assistant => "ASSISTANT",
-        CardKind::Thinking => "THINKING",
-        CardKind::CommandHelp => "COMMANDS",
-        CardKind::Stage => "STAGE",
-        CardKind::Tool => "TOOL",
-        CardKind::Permission => "PERMISSION",
-        CardKind::Plan => "PLAN",
-        CardKind::Review => "REVIEW",
-        CardKind::Error => "ERROR",
-        CardKind::Final => "FINAL",
-        CardKind::AuditStatus => "AUDIT",
+        CardKind::User => "你",
+        CardKind::Assistant => "DeepCode",
+        CardKind::Thinking => "思考",
+        CardKind::CommandHelp => "命令",
+        CardKind::Stage => "状态",
+        CardKind::Tool => "工具",
+        CardKind::Permission => "权限",
+        CardKind::Plan => "计划",
+        CardKind::Review => "审查",
+        CardKind::Error => "错误",
+        CardKind::Final => "DeepCode",
+        CardKind::AuditStatus => "审计",
     }
+}
+
+fn compact_line(input: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    for (index, ch) in input.chars().enumerate() {
+        if index >= max_width {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }

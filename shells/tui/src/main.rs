@@ -147,7 +147,7 @@ impl Drop for TerminalGuard {
 
 fn print_help() {
     println!(
-        r#"DeepCode TUI Host Shell MVP
+        r#"DeepCode TUI
 
 Usage:
   deepcode-tui
@@ -155,16 +155,16 @@ Usage:
   deepcode-tui --api <url>
 
 Interactive commands:
-  /help              Show all TUI commands
-  /status            Check Kernel daemon connection
-  /ask <prompt>      Send one prompt through KernelClient
-  /audit             Show audit verify placeholder
-  /clear             Clear the visible card buffer
-  /quit              Exit TUI
+  /help              显示 TUI 命令
+  /status            检查 Kernel daemon 连接
+  /ask <prompt>      通过 KernelClient 发送一条 prompt
+  /audit             显示审计占位状态
+  /clear             清理当前可见卡片
+  /quit              退出 TUI
 
-Plain text without a slash is sent as a prompt.
+不带斜杠的文本会直接作为 prompt 发送。
 
-This is the stage-10.0 Ratatui/Crossterm Host shell. Full TUI product behavior
-remains stage 17."#
+该终端界面参考 pi/Claude Code 的会话优先形态封装；TUI 只负责展示、
+输入和命令入口，不持有 workflow、permission 或 tool execution 事实。"#
     );
 }

@@ -25,15 +25,11 @@ pub struct CardModel {
 
 impl CardModel {
     pub fn user(body: impl Into<String>) -> Self {
-        Self::new(CardKind::User, "user", body)
-    }
-
-    pub fn assistant(body: impl Into<String>) -> Self {
-        Self::new(CardKind::Assistant, "assistant", body)
+        Self::new(CardKind::User, "你", body)
     }
 
     pub fn command_help() -> Self {
-        Self::new(CardKind::CommandHelp, "commands", command_help())
+        Self::new(CardKind::CommandHelp, "帮助", command_help())
     }
 
     pub fn stage(title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -41,11 +37,11 @@ impl CardModel {
     }
 
     pub fn error(body: impl Into<String>) -> Self {
-        Self::new(CardKind::Error, "error", body)
+        Self::new(CardKind::Error, "错误", body)
     }
 
     pub fn final_answer(body: impl Into<String>) -> Self {
-        Self::new(CardKind::Final, "final", body)
+        Self::new(CardKind::Final, "最终回答", body)
     }
 
     pub fn audit_status(title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -61,11 +57,13 @@ impl CardModel {
         let mut cards = Vec::new();
         for turn in turns {
             let status = turn.get_str("status").unwrap_or("unknown");
-            cards.push(Self::new(
-                CardKind::Stage,
-                "turn",
-                format!("timeline turn status: {status}"),
-            ));
+            if !matches!(status, "completed" | "done") {
+                cards.push(Self::new(
+                    CardKind::Stage,
+                    "回合状态",
+                    format!("timeline turn status: {status}"),
+                ));
+            }
             let blocks = turn
                 .get("blocks")
                 .and_then(Value::as_array)
@@ -84,7 +82,10 @@ impl CardModel {
     fn from_timeline_block(block: &Value) -> Self {
         let kind = block.get_str("kind").unwrap_or("stage");
         let status = block.get_str("status").unwrap_or("completed");
-        let title = block.get_str("title").unwrap_or(kind);
+        let title = block
+            .get_str("title")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| timeline_kind_title(kind));
         let summary = block.get_str("summary").unwrap_or("");
         let body = block
             .get_str("bodyMarkdown")
@@ -100,7 +101,11 @@ impl CardModel {
             "error" => CardKind::Error,
             _ => CardKind::Stage,
         };
-        Self::new(card_kind, format!("{title} · {status}"), body)
+        Self::new(
+            card_kind,
+            format!("{title} · {}", status_label(status)),
+            body,
+        )
     }
 
     pub fn from_event(event: &Value) -> Self {
@@ -134,27 +139,44 @@ impl CardModel {
     }
 }
 
-pub fn command_summary() -> &'static str {
-    "Welcome to DeepCode TUI Host Shell MVP.\n\
-This terminal layout follows the Claude/pi/claw style: status header, conversation cards, command guide, and input footer.\n\
-Type /help to list commands, /status to check daemon, /ask <prompt> to run one prompt, or /quit to exit."
+pub fn command_help() -> &'static str {
+    "可用命令：\n\
+/help          显示命令列表\n\
+/status        检查 Kernel daemon 连接\n\
+/ask <prompt>  发送一条 prompt\n\
+/audit         显示审计占位状态\n\
+/clear         清理当前可见卡片\n\
+/quit          退出 TUI\n\
+\n\
+不带斜杠的文本会按 /ask <prompt> 发送。\n\
+\n\
+边界：TUI 只负责展示和输入，workflow、permission、tool execution 仍由 DeepCode Kernel/daemon 持有。"
 }
 
-pub fn command_help() -> &'static str {
-    "Available commands:\n\
-/help          Show this command list\n\
-/status        Check Kernel daemon connection and base URL\n\
-/ask <prompt>  Send one prompt through KernelClient\n\
-/audit         Show audit verify status placeholder\n\
-/clear         Clear the visible card buffer\n\
-/quit          Exit the TUI\n\
-\n\
-Plain text without a slash is treated like /ask <prompt>.\n\
-\n\
-Current limitations:\n\
-- Stage 10.0 is a Host Shell MVP, not the full stage 17 TUI product.\n\
-- KernelClient still wraps daemon HTTP compatibility routes.\n\
-- Full Slash Command popup, file picker, focus navigation, and history stay in stage 17."
+fn timeline_kind_title(kind: &str) -> &'static str {
+    match kind {
+        "assistant" => "DeepCode",
+        "thinking" => "思考",
+        "stage" => "阶段",
+        "toolBatch" => "工具",
+        "permission" => "权限",
+        "plan" => "计划",
+        "review" => "审查",
+        "error" => "错误",
+        "turnActions" => "操作",
+        _ => "事件",
+    }
+}
+
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "running" => "运行中",
+        "blocked" => "等待确认",
+        "failed" => "失败",
+        "completed" | "done" => "完成",
+        "pending" => "等待中",
+        _ => "未知",
+    }
 }
 
 pub trait ValueExt {

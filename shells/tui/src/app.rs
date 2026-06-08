@@ -1,4 +1,4 @@
-use crate::model::{command_summary, CardModel};
+use crate::model::CardModel;
 use crate::renderer::Renderer;
 use deepcode_kernel_client::{HttpKernelClient, PromptMode};
 
@@ -12,7 +12,7 @@ pub struct TuiApp {
 
 impl TuiApp {
     pub fn new(client: HttpKernelClient, renderer: Renderer) -> Self {
-        let status = format!("api={} | stage=10.0 | renderer=ratatui", client.base_url());
+        let status = format!("API {} · 等待连接", client.base_url());
         Self {
             client,
             renderer,
@@ -23,9 +23,6 @@ impl TuiApp {
     }
 
     pub async fn bootstrap(&mut self) {
-        self.cards
-            .push(CardModel::audit_status("audit-status", "reserved"));
-        self.cards.push(CardModel::assistant(command_summary()));
         self.refresh_daemon_status().await;
     }
 
@@ -74,7 +71,10 @@ impl TuiApp {
             "/audit" | "audit" => self.refresh_audit_status().await,
             "/clear" | "clear" => {
                 self.cards.clear();
-                self.cards.push(CardModel::assistant(command_summary()));
+                self.cards.push(CardModel::stage(
+                    "显示已清理",
+                    "只清理当前 TUI 视图，不修改会话事实。",
+                ));
             }
             "/quit" | "/exit" | "quit" | "exit" | "q" => return false,
             command if command.starts_with("/ask ") => {
@@ -86,7 +86,7 @@ impl TuiApp {
                     .await;
             }
             command if command.starts_with('/') => self.cards.push(CardModel::error(format!(
-                "unknown command: {command}\nType /help to list available commands."
+                "未知命令：{command}\n输入 /help 查看可用命令。"
             ))),
             prompt => self.send_prompt(prompt).await,
         }
@@ -97,25 +97,29 @@ impl TuiApp {
         match self.client.daemon_status().await {
             Ok(status) => {
                 self.status = format!(
-                    "api={} | daemon={} | status={}",
+                    "API {} · {} · {}",
                     self.client.base_url(),
                     status.service,
-                    if status.ok { "ok" } else { "degraded" }
+                    if status.ok { "已连接" } else { "降级" }
                 );
                 self.cards.push(CardModel::stage(
-                    "connected",
+                    "API 已连接",
                     format!(
-                        "{} at {}\nstatus: {}",
+                        "{}\n{}\n{}",
                         status.service,
                         self.client.base_url(),
-                        if status.ok { "ok" } else { "degraded" }
+                        if status.ok {
+                            "状态正常"
+                        } else {
+                            "状态降级"
+                        }
                     ),
                 ));
             }
             Err(error) => {
-                self.status = format!("api={} | daemon=unavailable", self.client.base_url());
+                self.status = format!("API {} · 不可用", self.client.base_url());
                 self.cards.push(CardModel::error(format!(
-                    "daemon unavailable: {error}\nUse /status to retry after starting the Kernel daemon."
+                    "Kernel daemon 不可用：{error}\n启动 daemon 后输入 /status 重试。"
                 )));
             }
         }
@@ -129,23 +133,23 @@ impl TuiApp {
             )),
             Err(error) => self
                 .cards
-                .push(CardModel::error(format!("audit verify failed: {error}"))),
+                .push(CardModel::error(format!("审计检查失败：{error}"))),
         }
     }
 
     async fn send_prompt(&mut self, prompt: &str) {
         if prompt.trim().is_empty() {
             self.cards
-                .push(CardModel::error("prompt is empty; type /help for usage"));
+                .push(CardModel::error("输入为空；可输入 /help 查看用法。"));
             return;
         }
         self.cards.push(CardModel::user(prompt));
-        self.status = "run=pending | waiting for daemon response".to_string();
+        self.status = "运行中 · 等待 daemon 响应".to_string();
         match self.client.send_prompt(prompt, PromptMode::Ask).await {
             Ok(result) => {
-                self.status = format!("session={} | run=completed", result.session_id);
+                self.status = format!("会话 {} · 已完成", result.session_id);
                 self.cards
-                    .push(CardModel::stage("session", result.session_id.clone()));
+                    .push(CardModel::stage("会话", result.session_id.clone()));
                 match self.client.agent_timeline(&result.session_id).await {
                     Ok(timeline) => self.cards.extend(CardModel::from_timeline(&timeline)),
                     Err(_) => {
@@ -159,9 +163,9 @@ impl TuiApp {
                 }
             }
             Err(error) => {
-                self.status = "run=failed".to_string();
+                self.status = "运行失败".to_string();
                 self.cards
-                    .push(CardModel::error(format!("run failed: {error}")));
+                    .push(CardModel::error(format!("运行失败：{error}")));
             }
         }
     }
