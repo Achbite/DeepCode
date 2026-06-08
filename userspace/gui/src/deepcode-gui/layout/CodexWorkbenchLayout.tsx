@@ -449,6 +449,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   }, [activeSession, events.length, knownSessions, sessions]);
   const activeSessionRunning = Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id));
   const projectDraftActive = Boolean(draftProjectId);
+  const highlightedSessionId = projectDraftActive ? null : activeSession?.id ?? null;
   const isHome = projectDraftActive
     || (events.length === 0 && !loadingSession && !activeSessionRunning);
   const visibleSessions = useMemo(
@@ -782,7 +783,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                               <button
                                 key={item.id}
                                 type="button"
-                                className={item.id === activeSession?.id ? 'active' : ''}
+                                className={item.id === highlightedSessionId ? 'active' : ''}
                                 onClick={() => {
                                   setActiveProjectId(group.projectId ?? null);
                                   setDraftProjectId(null);
@@ -828,7 +829,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                   <button
                     key={item.id}
                     type="button"
-                    className={item.id === activeSession?.id ? 'active' : ''}
+                    className={item.id === highlightedSessionId ? 'active' : ''}
                     onClick={() => {
                       setActiveProjectId(null);
                       setDraftProjectId(null);
