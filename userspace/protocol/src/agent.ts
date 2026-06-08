@@ -455,6 +455,53 @@ export interface AgentEvent {
   display?: AgentEventDisplayHint;
 }
 
+export type AgentTimelineBlockKind =
+  | 'user'
+  | 'assistant'
+  | 'thinking'
+  | 'stage'
+  | 'toolBatch'
+  | 'permission'
+  | 'plan'
+  | 'review'
+  | 'error'
+  | 'turnActions';
+
+export type AgentTimelineStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting'
+  | 'blocked'
+  | 'completed'
+  | 'failed';
+
+export interface AgentTimelineBlock {
+  id: string;
+  kind: AgentTimelineBlockKind;
+  title: string;
+  summary: string;
+  status: AgentTimelineStatus;
+  defaultCollapsed: boolean;
+  bodyMarkdown?: string;
+  events: AgentEvent[];
+}
+
+export interface AgentTimelineTurn {
+  id: string;
+  sessionId: string;
+  status: AgentTimelineStatus;
+  startedAt?: string;
+  completedAt?: string;
+  blocks: AgentTimelineBlock[];
+}
+
+export interface AgentTimelineResult {
+  sessionId: string;
+  generatedAt: string;
+  turns: AgentTimelineTurn[];
+  eventCount: number;
+}
+
 /**
  * 工作流类事件（workflow_decision / workflow_stage 与 RunCompleted 投影）的 payload 根字段契约。
  *

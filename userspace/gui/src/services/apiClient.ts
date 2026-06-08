@@ -44,6 +44,7 @@ import type {
   ResolveAgentPlanRequest,
   AgentFeedbackRequest,
   AgentFeedbackResult,
+  AgentTimelineResult,
   GetAgentEventSnapshotResult,
   GetAgentWorkflowConfigResult,
   PatchAgentWorkflowConfigRequest,
@@ -555,6 +556,14 @@ export function getAgentEventSnapshot(
 ): Promise<ApiResponse<GetAgentEventSnapshotResult>> {
   return getJson<GetAgentEventSnapshotResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/trace`
+  );
+}
+
+export function getAgentTimeline(
+  sessionId: string
+): Promise<ApiResponse<AgentTimelineResult>> {
+  return getJson<AgentTimelineResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/timeline`
   );
 }
 

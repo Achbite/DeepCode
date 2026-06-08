@@ -448,6 +448,10 @@ export function getAgentEventSnapshot(
   return api.getAgentEventSnapshot(sessionId);
 }
 
+export function getAgentTimeline(sessionId: string) {
+  return api.getAgentTimeline(sessionId);
+}
+
 const agentEventSubscriptions = new Map<string, number>();
 
 export function subscribeAgentEvents(
