@@ -9,6 +9,8 @@
 #
 # 分阶段入口：
 #   ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
+#   ./build.sh --stage deepcode-gui # pnpm + Codex 风 DeepCode-GUI dist
+#   ./build.sh --stage macos-deepcode-gui # Docker 前端构建 + macOS DeepCode-GUI.app
 #   ./build.sh --stage daemon   # Linux/Windows Rust Kernel daemon
 #   ./build.sh --stage cli      # Linux/Windows CLI Host shell
 #   ./build.sh --stage tui      # Linux/Windows TUI Host shell
@@ -45,7 +47,7 @@ cd "$ROOT_DIR"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./build.sh [--stage all|gui|daemon|cli|tui|kernel|tauri|package]...
+  ./build.sh [--stage all|gui|deepcode-gui|macos-deepcode-gui|daemon|cli|tui|kernel|tauri|package]...
   ./build.sh --full
 
 Environment:
@@ -56,6 +58,7 @@ Environment:
   DEEPCODE_ALLOW_HOST_BUILD=1       Allow non-Docker host builds explicitly.
   SCCACHE_DIR                       Override local sccache cache directory.
   DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 Build optional Linux Tauri shell.
+  DEEPCODE_MACOS_PRODUCT=DeepCode-GUI Package the Codex-style macOS GUI app.
 USAGE
 }
 
@@ -95,6 +98,8 @@ fi
 
 run_deps=0
 run_gui=0
+run_deepcode_gui=0
+run_macos_deepcode_gui=0
 run_daemon=0
 run_cli=0
 run_tui=0
@@ -118,6 +123,13 @@ enable_stage() {
     gui)
       run_deps=1
       run_gui=1
+      ;;
+    deepcode-gui)
+      run_deps=1
+      run_deepcode_gui=1
+      ;;
+    macos-deepcode-gui)
+      run_macos_deepcode_gui=1
       ;;
     kernel)
       run_daemon=1
@@ -152,12 +164,20 @@ for stage in "${requested_stages[@]}"; do
   enable_stage "$stage"
 done
 
-echo "==[build]== DeepCode cross-platform build started at $(date -Is)"
+build_started_at() {
+  if date -Is >/dev/null 2>&1; then
+    date -Is
+  else
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+  fi
+}
+
+echo "==[build]== DeepCode cross-platform build started at $(build_started_at)"
 echo "==[build]== ROOT_DIR=$ROOT_DIR"
 echo "==[build]== CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
 echo "==[build]== DEEPCODE_BUILD_LINUX_TAURI_SHELL=$BUILD_LINUX_TAURI_SHELL"
-echo "==[build]== stages: deps=$run_deps gui=$run_gui daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package"
+echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui macos-deepcode-gui=$run_macos_deepcode_gui daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package"
 mkdir -p "$STAGE_STAMP_DIR"
 
 is_docker_environment() {
@@ -173,6 +193,36 @@ require_docker_build_environment() {
   echo "==[build][error]== Run inside the deepcode-dev container, or set DEEPCODE_ALLOW_HOST_BUILD=1 for a one-off local diagnostic build." >&2
   exit 3
 }
+
+run_macos_deepcode_gui_package_from_host() {
+  if is_docker_environment; then
+    echo "==[build][error]== macos-deepcode-gui must run on the macOS host, not inside Docker." >&2
+    exit 3
+  fi
+  if [ "$(uname -s)" != "Darwin" ]; then
+    echo "==[build][error]== macos-deepcode-gui requires a macOS host." >&2
+    exit 3
+  fi
+
+  echo "==[build][macos-deepcode-gui]== build Docker-managed DeepCode-GUI frontend dist"
+  make build-deepcode-gui
+  echo "==[build][macos-deepcode-gui]== package DeepCode-GUI.app on macOS host"
+  DEEPCODE_MACOS_PRODUCT=DeepCode-GUI bash ./scripts/package-macos.sh
+}
+
+if [ "$run_macos_deepcode_gui" = "1" ]; then
+  if [ "$run_deps" = "1" ] || [ "$run_gui" = "1" ] || [ "$run_deepcode_gui" = "1" ] || \
+    [ "$run_daemon" = "1" ] || [ "$run_cli" = "1" ] || [ "$run_tui" = "1" ] || \
+    [ "$run_tauri" = "1" ] || [ "$run_package" = "1" ]; then
+    echo "==[build][error]== macos-deepcode-gui is a host orchestration stage; run it by itself." >&2
+    exit 2
+  fi
+  run_macos_deepcode_gui_package_from_host
+  echo ""
+  echo "==[build]== DONE"
+  echo "$BIN_ROOT/macos-arm64/DeepCode-GUI.app"
+  exit 0
+fi
 
 require_docker_build_environment
 
@@ -226,6 +276,16 @@ stage_hash() {
       gui)
         tracked_files package.json pnpm-lock.yaml userspace/protocol userspace/session-core userspace/gui \
           | grep -Ev '(^|/)(dist|node_modules)/' || true
+        ;;
+      deepcode-gui)
+        tracked_files package.json pnpm-lock.yaml userspace/protocol userspace/session-core userspace/gui shells/deepcode-gui \
+          | grep -Ev '(^|/)(dist|dist-deepcode-gui|node_modules)/' || true
+        find_existing_files \
+          userspace/gui/deepcode-gui.html \
+          userspace/gui/vite.deepcode-gui.config.ts \
+          userspace/gui/src/deepcode-gui \
+          shells/deepcode-gui \
+          | grep -Ev '(^|/)(dist|dist-deepcode-gui|node_modules|target)/' || true
         ;;
       kernel)
         tracked_files Cargo.toml crates/deepcode-kernel-abi crates/deepcode-kernel-core \
@@ -309,6 +369,26 @@ prepare_tauri_dist() {
   cp -r "$CLIENT_DIR/dist/." "$tauri_gui_dist/"
 }
 
+prepare_deepcode_gui_tauri_dist() {
+  local deepcode_gui_dist="$CLIENT_DIR/dist-deepcode-gui"
+  local tauri_gui_dist="$ROOT_DIR/shells/deepcode-gui/dist"
+  normalize_deepcode_gui_dist
+  test -d "$deepcode_gui_dist" || {
+    echo "==[build][error]== userspace/gui/dist-deepcode-gui missing; run ./build.sh --stage deepcode-gui first" >&2
+    exit 1
+  }
+  mkdir -p "$tauri_gui_dist"
+  find "$tauri_gui_dist" -mindepth 1 -delete 2>/dev/null || true
+  cp -r "$deepcode_gui_dist/." "$tauri_gui_dist/"
+}
+
+normalize_deepcode_gui_dist() {
+  local deepcode_gui_dist="$CLIENT_DIR/dist-deepcode-gui"
+  if [ -f "$deepcode_gui_dist/deepcode-gui.html" ]; then
+    cp "$deepcode_gui_dist/deepcode-gui.html" "$deepcode_gui_dist/index.html"
+  fi
+}
+
 build_gui() {
   if stage_should_skip gui "$CLIENT_DIR/dist/index.html" "$ROOT_DIR/shells/tauri/dist/index.html"; then
     return
@@ -320,6 +400,20 @@ build_gui() {
   echo "==[build][gui]== prepare Tauri embedded GUI dist"
   prepare_tauri_dist
   mark_stage_built gui
+}
+
+build_deepcode_gui() {
+  if stage_should_skip deepcode-gui "$CLIENT_DIR/dist-deepcode-gui/index.html" "$ROOT_DIR/shells/deepcode-gui/dist/index.html"; then
+    return
+  fi
+  echo "==[build][deepcode-gui]== build TS protocol/session-core/Codex GUI packages"
+  pnpm --filter @deepcode/protocol build
+  pnpm --filter @deepcode/session-core build
+  pnpm --filter @deepcode/client build:deepcode-gui
+  normalize_deepcode_gui_dist
+  echo "==[build][deepcode-gui]== prepare DeepCode-GUI Tauri embedded dist"
+  prepare_deepcode_gui_tauri_dist
+  mark_stage_built deepcode-gui
 }
 
 build_daemon() {
@@ -576,6 +670,10 @@ fi
 
 if [ "$run_gui" = "1" ]; then
   build_gui
+fi
+
+if [ "$run_deepcode_gui" = "1" ]; then
+  build_deepcode_gui
 fi
 
 if [ "$run_daemon" = "1" ]; then

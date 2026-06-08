@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DeepCode-GUI",
+  "version": "0.1.0",
+  "identifier": "com.achbite.deepcode",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:31246",
+    "beforeBuildCommand": ""
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": [
+      "../../tauri/src-tauri/icons/icon.png"
+    ]
+  }
+}

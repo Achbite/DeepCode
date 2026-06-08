@@ -11,7 +11,7 @@ use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEven
 use std::os::windows::process::CommandExt;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: &str = "31245";
+const DEFAULT_PORT: &str = "31246";
 
 struct KernelProcess {
     child: Mutex<Option<Child>>,
@@ -64,7 +64,7 @@ fn main() {
             _ => {}
         })
         .run(tauri::generate_context!())
-        .expect("failed to run DeepCode Tauri shell");
+        .expect("failed to run DeepCode-GUI Tauri shell");
 }
 
 #[derive(Clone, Serialize)]
@@ -118,21 +118,31 @@ fn create_main_window(
     target: &LaunchTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let boot_url = format!("index.html#host={}&port={}", target.host, target.port);
-    WebviewWindowBuilder::new(app, "main", WebviewUrl::App(boot_url.into()))
-        .title("DeepCode")
-        .inner_size(1500.0, 900.0)
-        .min_inner_size(1100.0, 700.0)
+    let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App(boot_url.into()))
+        .title("DeepCode-GUI")
+        .inner_size(1500.0, 920.0)
+        .min_inner_size(1120.0, 720.0)
         .resizable(true)
-        .fullscreen(false)
+        .fullscreen(false);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .decorations(true)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .traffic_light_position(tauri::LogicalPosition::new(-120.0, -120.0))
+        .hidden_title(true)
+        .shadow(true)
+        .background_color(tauri::window::Color(245, 246, 247, 255));
+
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder
         .decorations(false)
-        .background_color(tauri::window::Color(10, 10, 12, 255))
-        .build()?;
+        .background_color(tauri::window::Color(245, 246, 247, 255));
+
+    builder.build()?;
     Ok(())
 }
 
-// 发布包中 `deepcode-kernel(.exe)` 是同目录 Kernel daemon；macOS .app
-// 同样优先查找 Contents/MacOS，并为后续资源式布局保留 Contents/Resources
-// 兜底。开发态或 `DEEPCODE_SHELL_CONNECT_ONLY=1` 时可只连接外部已启动 daemon。
 fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
     if env_truthy("DEEPCODE_SHELL_CONNECT_ONLY") {
         return None;
@@ -145,7 +155,7 @@ fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
     let web_dir = std::env::var("DEEPCODE_CLIENT_DIST")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            find_bundled_dir(&exe_dir, "web").unwrap_or_else(|| kernel_dir.join("web"))
+            find_bundled_dir(&exe_dir, "web-deepcode-gui").unwrap_or_else(|| kernel_dir.join("web-deepcode-gui"))
         });
 
     let mut command = Command::new(kernel_path);

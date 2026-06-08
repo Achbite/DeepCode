@@ -1,0 +1,17 @@
+{
+  "name": "@deepcode/deepcode-gui-shell",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare:dist": "mkdir -p dist && find dist -mindepth 1 -delete 2>/dev/null || true; cp -R ../../userspace/gui/dist-deepcode-gui/. dist/",
+    "tauri:info": "tauri info",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "typecheck": "tauri info"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.2"
+  }
+}

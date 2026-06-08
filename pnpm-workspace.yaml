@@ -3,5 +3,6 @@ packages:
   - "userspace/protocol"
   - "userspace/session-core"
   - "shells/tauri"
+  - "shells/deepcode-gui"
 allowBuilds:
   esbuild: true
