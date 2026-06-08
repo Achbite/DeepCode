@@ -1226,11 +1226,14 @@ function TurnActions({
 
   return (
     <div className="agent-turn-actions" aria-label={t(language, 'agent.message.actions')}>
-      <details className="agent-copy-menu" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <details className="agent-turn-action-menu" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
         <summary title={t(language, 'agent.message.copyMenuTitle')}>
           {t(language, 'agent.message.copyMenu')}
         </summary>
-        <div className="agent-copy-menu__popover">
+        <div className="agent-turn-action-menu__popover">
+          <div className="agent-turn-action-menu__group-label">
+            {t(language, 'agent.message.copyGroup')}
+          </div>
           <button
             type="button"
             disabled={status === 'working'}
@@ -1252,7 +1255,10 @@ function TurnActions({
           >
             {t(language, 'agent.message.copyDebugPackage')}
           </button>
-          <div className="agent-copy-menu__separator" />
+          <div className="agent-turn-action-menu__separator" />
+          <div className="agent-turn-action-menu__group-label">
+            {t(language, 'agent.message.feedbackGroup')}
+          </div>
           <button type="button" onClick={() => runFeedbackAction('up')}>
             {t(language, 'agent.message.feedbackUp')}
           </button>
