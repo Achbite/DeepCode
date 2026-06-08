@@ -1,6 +1,8 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { AgentContextAttachment } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
+import { useSettingsStore } from '../../state/settingsStore';
+import { useWorkspaceStore } from '../../state/workspaceStore';
 import ContextAttachmentPicker from './ContextAttachmentPicker';
 
 interface AgentComposerProps {
@@ -31,6 +33,30 @@ function attachmentLabel(attachment: AgentContextAttachment, language: UiLanguag
   return `${t(language, 'agent.composer.file')} ${attachment.path || '.'}`;
 }
 
+function joinWorkspacePath(root: string, filePath: string): string | null {
+  const normalizedRoot = root.replace(/\\/g, '/').replace(/\/+$/, '');
+  const normalizedPath = filePath.replace(/\\/g, '/');
+  if (!normalizedPath.trim()) return null;
+  if (normalizedPath.startsWith('/')) {
+    return normalizedPath.startsWith(`${normalizedRoot}/`) || normalizedPath === normalizedRoot
+      ? normalizedPath
+      : null;
+  }
+  const parts: string[] = [];
+  for (const part of normalizedPath.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') return null;
+    parts.push(part);
+  }
+  return `${normalizedRoot}/${parts.join('/')}`;
+}
+
+function openVscodeFile(absolutePath: string): void {
+  const normalized = absolutePath.replace(/\\/g, '/');
+  const urlPath = normalized.startsWith('/') ? normalized : `/${normalized}`;
+  window.location.href = `vscode://file${encodeURI(urlPath)}`;
+}
+
 const AgentComposer: React.FC<AgentComposerProps> = ({
   messageAttachments,
   sessionAttachments,
@@ -45,6 +71,10 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [changesOpen, setChangesOpen] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const activeFolder = useWorkspaceStore((s) => s.getActiveFolder());
+  const previewEditor = String(
+    useSettingsStore((s) => s.effectiveSettings['workbench.previewEditor'] ?? 'vscode')
+  );
 
   const mention = useMemo(() => {
     const match = value.match(/@([^@\s]*)$/);
@@ -58,6 +88,13 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     setValue('');
   };
 
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = '34px';
+    textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 34), 150)}px`;
+  }, [value]);
+
   const pickAttachment = (attachment: AgentContextAttachment) => {
     onAddAttachment(attachment);
     if (mention) {
@@ -67,9 +104,20 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   };
 
   const chips = [...sessionAttachments, ...messageAttachments];
+  const composerExpanded = Boolean(value.trim() || chips.length > 0 || pickerOpen || mention);
+
+  const openModifiedFile = (file: AgentModifiedFileView) => {
+    const absolutePath = activeFolder?.absolutePath
+      ? joinWorkspacePath(activeFolder.absolutePath, file.path)
+      : null;
+    if (!absolutePath) return;
+    if (previewEditor === 'vscode') {
+      openVscodeFile(absolutePath);
+    }
+  };
 
   return (
-    <div className="agent-composer">
+    <div className={`agent-composer ${composerExpanded ? 'agent-composer--expanded' : ''}`}>
       {chips.length > 0 && (
         <div className="agent-attachment-chips">
           {chips.map((attachment) => (
@@ -86,33 +134,65 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           ))}
         </div>
       )}
-      <div className={`agent-change-set ${changesOpen ? 'agent-change-set--open' : ''}`}>
-        <button
-          className="agent-change-set__header"
-          type="button"
-          onClick={() => setChangesOpen((open) => !open)}
-        >
-          <span>{t(language, 'agent.composer.modifiedFiles')}</span>
-          <span>{MODIFIED_FILES.length}</span>
-        </button>
-        {changesOpen && MODIFIED_FILES.length > 0 && (
-          <div className="agent-change-set__body">
-            {MODIFIED_FILES.map((file) => (
-              <div key={file.path} className="agent-change-file">
-                <span className="agent-change-file__path" title={file.path}>
-                  {file.path}
-                </span>
-                <span className="agent-change-file__savepoint">{file.savepoint}</span>
-                <div className="agent-change-file__actions">
-                  <button type="button" title={t(language, 'agent.composer.openDiff')}>diff</button>
-                  <button type="button" title={t(language, 'agent.composer.rejectChanges')}>X</button>
-                  <button type="button" title={t(language, 'agent.composer.acceptChanges')}>OK</button>
+      {MODIFIED_FILES.length > 0 && (
+        <div className={`agent-change-set ${changesOpen ? 'agent-change-set--open' : ''}`}>
+          <button
+            className="agent-change-set__header"
+            type="button"
+            onClick={() => setChangesOpen((open) => !open)}
+          >
+            <span>{t(language, 'agent.composer.modifiedFiles')}</span>
+            <span>{MODIFIED_FILES.length}</span>
+          </button>
+          {changesOpen && (
+            <div className="agent-change-set__body">
+              {MODIFIED_FILES.map((file) => (
+                <div
+                  key={file.path}
+                  className="agent-change-file"
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => openModifiedFile(file)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      openModifiedFile(file);
+                    }
+                  }}
+                >
+                  <span className="agent-change-file__path" title={file.path}>
+                    {file.path}
+                  </span>
+                  <span className="agent-change-file__savepoint">{file.savepoint}</span>
+                  <div className="agent-change-file__actions">
+                    <button
+                      type="button"
+                      title={t(language, 'agent.composer.openDiff')}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      diff
+                    </button>
+                    <button
+                      type="button"
+                      title={t(language, 'agent.composer.rejectChanges')}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      X
+                    </button>
+                    <button
+                      type="button"
+                      title={t(language, 'agent.composer.acceptChanges')}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      OK
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       <div className="agent-composer__input-wrap">
         <textarea
           ref={textareaRef}
@@ -146,6 +226,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               type="button"
               title={t(language, 'agent.composer.addFile')}
               aria-label={t(language, 'agent.composer.addFile')}
+              aria-expanded={pickerOpen}
               onClick={() => setPickerOpen((open) => !open)}
             >
               +

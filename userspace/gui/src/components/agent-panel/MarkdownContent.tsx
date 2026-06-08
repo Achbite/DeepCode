@@ -174,8 +174,8 @@ const markdownComponents: Components = {
       </blockquote>
     );
   },
-  hr() {
-    return null;
+  hr({ node: _node, ...props }) {
+    return <hr {...props} className="agent-markdown__hr" />;
   },
   table({ node: _node, children, ...props }) {
     return (
@@ -187,7 +187,8 @@ const markdownComponents: Components = {
     );
   },
   pre({ node: _node, children, ...props }) {
-    const child = React.Children.only(children);
+    const childArray = React.Children.toArray(children);
+    const child = childArray.length === 1 ? childArray[0] : null;
     if (React.isValidElement<CodeElementProps>(child)) {
       const className = child.props.className ?? '';
       const language = /language-([^\s]+)/.exec(className)?.[1] ?? '';
@@ -211,7 +212,7 @@ const markdownComponents: Components = {
   },
   code({ node: _node, className, children, ...props }) {
     return (
-      <code {...props} className={className}>
+      <code {...props} className={className ? `${className} agent-markdown__code` : 'agent-markdown__inline-code'}>
         {children}
       </code>
     );

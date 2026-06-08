@@ -87,6 +87,16 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     control: 'text',
   },
   {
+    key: 'workbench.previewEditor',
+    label: 'Preview Editor',
+    description: 'External editor used when opening changed files from Agent UI.',
+    group: 'workbench',
+    control: 'select',
+    options: [
+      { label: 'VSCode', value: 'vscode' },
+    ],
+  },
+  {
     key: 'editor.tabSize',
     label: 'Tab Size',
     description: 'Editor indentation width.',

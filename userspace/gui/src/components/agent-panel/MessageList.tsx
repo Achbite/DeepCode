@@ -4,7 +4,11 @@ import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
 import { compactDisplayText, sanitizeDisplayText } from './displayText';
-import { submitAgentFeedback } from '../../services/runtimeAdapter';
+import {
+  getConversationArchive,
+  readConversationArchiveFile,
+  submitAgentFeedback,
+} from '../../services/runtimeAdapter';
 
 interface MessageListProps {
   events: AgentEvent[];
@@ -69,6 +73,20 @@ type RenderContentItem =
 type RenderItem =
   | RenderContentItem
   | { type: 'turnActions'; id: string; items: RenderContentItem[]; targetEvent: AgentEvent };
+
+interface PlanConfirmationState {
+  acceptedKeys: Set<string>;
+  planCardKeys: Set<string>;
+}
+
+interface ArchiveDebugExport {
+  schemaVersion?: string;
+  sessionId?: string;
+  runId?: string;
+  generatedAt?: string;
+  projection?: unknown[];
+  transcript?: unknown[];
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -291,6 +309,44 @@ function eventStatus(event: AgentEvent): string | undefined {
   if (!isRecord(event.payload)) return undefined;
   if (typeof event.payload.ok === 'boolean') return event.payload.ok ? 'ok' : 'error';
   return stringField(event.payload, 'status') ?? stringField(event.payload, 'decision');
+}
+
+function eventRunId(event: AgentEvent): string | undefined {
+  return stringField(event.payload, 'runId');
+}
+
+function eventPlanId(event: AgentEvent): string | undefined {
+  return stringField(event.payload, 'planId');
+}
+
+function planKey(event: AgentEvent): string | undefined {
+  const runId = eventRunId(event);
+  const planId = eventPlanId(event);
+  if (!runId || !planId) return undefined;
+  return `${runId}::${planId}`;
+}
+
+function buildPlanConfirmationState(events: AgentEvent[]): PlanConfirmationState {
+  const acceptedKeys = new Set<string>();
+  const planCardKeys = new Set<string>();
+
+  for (const event of events) {
+    const key = planKey(event);
+    if (!key) continue;
+    if (event.kind === 'plan_card') {
+      planCardKeys.add(key);
+    }
+    if (event.kind === 'plan_review' && eventStatus(event) === 'accepted') {
+      acceptedKeys.add(key);
+    }
+  }
+
+  return { acceptedKeys, planCardKeys };
+}
+
+function shouldHideAcceptedPlanReview(event: AgentEvent, planState: PlanConfirmationState): boolean {
+  const key = planKey(event);
+  return Boolean(key && eventStatus(event) === 'accepted' && planState.planCardKeys.has(key));
 }
 
 function eventOutput(event: AgentEvent): string | undefined {
@@ -622,6 +678,146 @@ function workflowCopyText(items: RenderContentItem[], language: UiLanguage): str
   return items.map((item) => renderItemCopyText(item, language)).filter(Boolean).join('\n\n');
 }
 
+function agentOutputCopyText(items: RenderContentItem[], language: UiLanguage): string {
+  return items
+    .flatMap((item) => {
+      if (item.type !== 'event') return [];
+      if (item.event.kind === 'user_msg') return [];
+      return [eventCopyText(item.event, language)];
+    })
+    .filter((line) => line.trim().length > 0)
+    .join('\n\n');
+}
+
+function archiveRecordText(record: Record<string, unknown>): string {
+  const directText =
+    stringField(record, 'content') ??
+    stringField(record, 'summary') ??
+    stringField(record, 'message');
+  if (directText) return sanitizeDisplayText(directText);
+
+  const payload = isRecord(record.payload) ? record.payload : undefined;
+  const payloadTextValue =
+    payload &&
+    (stringField(payload, 'content') ??
+      stringField(payload, 'summary') ??
+      stringField(payload, 'message'));
+  if (payloadTextValue) return sanitizeDisplayText(payloadTextValue);
+
+  return JSON.stringify(record, null, 2);
+}
+
+function archiveTimestamp(record: Record<string, unknown>): string | undefined {
+  return (
+    stringField(record, 'ts') ??
+    stringField(record, 'createdAt') ??
+    stringField(record, 'updatedAt')
+  );
+}
+
+function archiveProjectionTitle(kind: string): string {
+  switch (kind) {
+    case 'user_msg':
+      return '用户';
+    case 'assistant_msg':
+      return 'Agent';
+    case 'plan_card':
+      return 'Plan';
+    case 'plan_review':
+      return 'Plan Review';
+    case 'review_summary':
+      return 'Review';
+    case 'tool_call':
+      return '工具调用';
+    case 'tool_result':
+      return '工具结果';
+    case 'permission_request':
+      return '权限请求';
+    case 'permission_result':
+      return '权限结果';
+    case 'workflow_stage':
+      return 'Workflow Stage';
+    case 'workflow_decision':
+      return 'Workflow Decision';
+    case 'error':
+      return '错误';
+    default:
+      return kind || 'Projection';
+  }
+}
+
+function buildChronologicalArchiveMarkdown(debugExport: ArchiveDebugExport): string {
+  const projection = Array.isArray(debugExport.projection) ? debugExport.projection : [];
+  const transcript = Array.isArray(debugExport.transcript) ? debugExport.transcript : [];
+  const entries = [
+    ...projection
+      .filter(isRecord)
+      .map((entry, index) => {
+        const kind = stringField(entry, 'kind') ?? 'event';
+        return {
+          order: index,
+          timestamp: archiveTimestamp(entry) ?? '',
+          heading: `Projection / ${archiveProjectionTitle(kind)}`,
+          body: archiveRecordText(entry),
+        };
+      }),
+    ...transcript
+      .filter(isRecord)
+      .map((entry, index) => {
+        const role = stringField(entry, 'role') ?? 'entry';
+        const channel = stringField(entry, 'channel') ?? 'unknown';
+        return {
+          order: projection.length + index,
+          timestamp: archiveTimestamp(entry) ?? '',
+          heading: `Transcript / ${role} / ${channel}`,
+          body: archiveRecordText(entry),
+        };
+      }),
+  ].sort((left, right) => {
+    if (left.timestamp && right.timestamp && left.timestamp !== right.timestamp) {
+      return left.timestamp.localeCompare(right.timestamp);
+    }
+    return left.order - right.order;
+  });
+
+  const lines = [
+    '# DeepCode Chronological Conversation',
+    '',
+    debugExport.sessionId ? `- Session: \`${debugExport.sessionId}\`` : undefined,
+    debugExport.runId ? `- Run: \`${debugExport.runId}\`` : undefined,
+    debugExport.generatedAt ? `- Archive generated: \`${debugExport.generatedAt}\`` : undefined,
+    '',
+  ].filter((line): line is string => typeof line === 'string');
+
+  if (entries.length === 0) {
+    lines.push('- No archived conversation entries.');
+    return lines.join('\n');
+  }
+
+  for (const entry of entries) {
+    const suffix = entry.timestamp ? ` · ${entry.timestamp}` : '';
+    lines.push(`## ${entry.heading}${suffix}`, '', entry.body, '');
+  }
+
+  return lines.join('\n').trimEnd();
+}
+
+async function readLatestArchiveFile(sessionId: string, path: string): Promise<string> {
+  const archive = await getConversationArchive(sessionId);
+  const runId = archive.data?.archives[0]?.runId;
+  const result = await readConversationArchiveFile(sessionId, { path, runId });
+  if (!archive.ok || !result.ok || !result.data) {
+    throw new Error(result.message ?? result.error ?? archive.message ?? archive.error ?? 'archive export unavailable');
+  }
+  return result.data.content;
+}
+
+async function readChronologicalArchiveMarkdown(sessionId: string): Promise<string> {
+  const content = await readLatestArchiveFile(sessionId, 'exports/debug.json');
+  const parsed = JSON.parse(content) as ArchiveDebugExport;
+  return buildChronologicalArchiveMarkdown(parsed);
+}
+
 function thoughtTraceTitle(events: AgentEvent[], language: UiLanguage, running = false): string {
   const stages = Array.from(
     new Set(events.map((event) => eventStage(event)).filter((stage): stage is string => Boolean(stage)))
@@ -684,13 +880,72 @@ function payloadArray(payload: unknown, key: string): string[] {
     .filter((item) => item.trim().length > 0);
 }
 
-function renderPlanCard(event: AgentEvent) {
+function PlanCard({
+  event,
+  confirmed,
+  language,
+}: {
+  event: AgentEvent;
+  confirmed: boolean;
+  language: UiLanguage;
+}) {
+  const [expanded, setExpanded] = React.useState(false);
   const title = stringField(event.payload, 'title') ?? 'Plan';
   const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
   const content = stringField(event.payload, 'content');
   const expectedValidation = stringField(event.payload, 'expectedValidation');
   const reviewGuide = stringField(event.payload, 'reviewGuide');
   const facts = payloadArray(event.payload, 'facts');
+
+  if (confirmed) {
+    return (
+      <div key={event.id} className="agent-thinking-trace agent-thinking-trace--plan-confirmed">
+        <button
+          type="button"
+          className="agent-thinking-trace__summary"
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <span className="agent-thinking-trace__left">
+            <span className="agent-thinking-trace__dot" />
+            <span className="agent-thinking-trace__title">
+              {t(language, 'agent.plan.confirmedTitle')} - {summary}
+            </span>
+          </span>
+          <span className="agent-thinking-trace__hint">
+            {expanded ? t(language, 'agent.ui.hide') : t(language, 'agent.ui.show')}
+          </span>
+        </button>
+        {expanded && (
+          <div className="agent-thinking-trace__body agent-plan-confirmed__body">
+            <div className="agent-flow-card__summary">{summary}</div>
+            {content && content !== summary && <MarkdownContent content={content} />}
+            {expectedValidation && (
+              <div className="agent-flow-card__section">
+                <div className="agent-flow-card__section-title">
+                  {t(language, 'agent.plan.expectedValidation')}
+                </div>
+                <MarkdownContent content={expectedValidation} />
+              </div>
+            )}
+            {reviewGuide && (
+              <div className="agent-flow-card__section">
+                <div className="agent-flow-card__section-title">
+                  {t(language, 'agent.plan.reviewGuide')}
+                </div>
+                <MarkdownContent content={reviewGuide} />
+              </div>
+            )}
+            {facts.length > 0 && (
+              <ul className="agent-flow-card__facts">
+                {facts.map((fact) => <li key={fact}>{fact}</li>)}
+              </ul>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <section key={event.id} className="agent-flow-card agent-flow-card--plan">
       <div className="agent-flow-card__title">{title}</div>
@@ -698,13 +953,17 @@ function renderPlanCard(event: AgentEvent) {
       {content && content !== summary && <MarkdownContent content={content} />}
       {expectedValidation && (
         <div className="agent-flow-card__section">
-          <div className="agent-flow-card__section-title">Expected Validation</div>
+          <div className="agent-flow-card__section-title">
+            {t(language, 'agent.plan.expectedValidation')}
+          </div>
           <MarkdownContent content={expectedValidation} />
         </div>
       )}
       {reviewGuide && (
         <div className="agent-flow-card__section">
-          <div className="agent-flow-card__section-title">Review Guide</div>
+          <div className="agent-flow-card__section-title">
+            {t(language, 'agent.plan.reviewGuide')}
+          </div>
           <MarkdownContent content={reviewGuide} />
         </div>
       )}
@@ -716,12 +975,14 @@ function renderPlanCard(event: AgentEvent) {
 function PlanReviewCard({
   event,
   onPlanResolve,
+  language,
 }: {
   event: AgentEvent;
   onPlanResolve?: MessageListProps['onPlanResolve'];
+  language: UiLanguage;
 }) {
   const [guidance, setGuidance] = React.useState('');
-  const title = stringField(event.payload, 'title') ?? 'Check / 计划确认';
+  const title = stringField(event.payload, 'title') ?? t(language, 'agent.plan.reviewTitle');
   const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
   const status = stringField(event.payload, 'status') ?? 'pending';
   const runId = stringField(event.payload, 'runId');
@@ -745,17 +1006,19 @@ function PlanReviewCard({
           <textarea
             value={guidance}
             onChange={(event) => setGuidance(event.target.value)}
-            placeholder="输入计划评审意见或修改要求..."
+            placeholder={t(language, 'agent.plan.reviewPlaceholder')}
           />
           <div className="agent-plan-review-actions__buttons">
             <button type="button" onClick={() => onPlanResolve?.(runId!, planId!, 'accept')}>
-              同意计划
+              {t(language, 'agent.plan.accept')}
             </button>
             <button
               type="button"
               onClick={() => onPlanResolve?.(runId!, planId!, reviewDecision, guidance.trim() || undefined)}
             >
-              {guidance.trim().length > 0 ? '提交评审意见' : '拒绝计划'}
+              {guidance.trim().length > 0
+                ? t(language, 'agent.plan.submitReview')
+                : t(language, 'agent.plan.reject')}
             </button>
           </div>
         </div>
@@ -924,18 +1187,89 @@ function TurnActions({
   targetEvent: AgentEvent;
   language: UiLanguage;
 }) {
-  const text = workflowCopyText(items, language);
+  const [status, setStatus] = React.useState<'idle' | 'working' | 'done' | 'error'>('idle');
+  const [message, setMessage] = React.useState('');
+  const [open, setOpen] = React.useState(false);
+  const agentText = agentOutputCopyText(items, language) || workflowCopyText(items, language);
+  const sessionId = targetEvent.sessionId;
+
+  const requireSessionId = (): string => {
+    if (!sessionId) throw new Error(t(language, 'agent.message.archiveNoSession'));
+    return sessionId;
+  };
+
+  const runCopyAction = async (label: string, action: () => Promise<string>) => {
+    try {
+      setStatus('working');
+      setMessage('');
+      const text = await action();
+      await copyMessage(text);
+      setStatus('done');
+      setMessage(label);
+      setOpen(false);
+    } catch (error) {
+      setStatus('error');
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const runFeedbackAction = (rating: 'up' | 'down') => {
+    feedback(targetEvent, rating);
+    setStatus('done');
+    setMessage(
+      rating === 'up'
+        ? t(language, 'agent.message.feedbackUp')
+        : t(language, 'agent.message.feedbackDown')
+    );
+    setOpen(false);
+  };
+
   return (
     <div className="agent-turn-actions" aria-label={t(language, 'agent.message.actions')}>
-      <button type="button" title={t(language, 'agent.message.copyWorkflowTitle')} onClick={() => { void copyMessage(text); }}>
-        {t(language, 'agent.message.copyWorkflow')}
-      </button>
-      <button type="button" title={t(language, 'agent.message.feedbackUpTitle')} onClick={() => feedback(targetEvent, 'up')}>
-        {t(language, 'agent.message.feedbackUp')}
-      </button>
-      <button type="button" title={t(language, 'agent.message.feedbackDownTitle')} onClick={() => feedback(targetEvent, 'down')}>
-        {t(language, 'agent.message.feedbackDown')}
-      </button>
+      <details className="agent-copy-menu" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+        <summary title={t(language, 'agent.message.copyMenuTitle')}>
+          {t(language, 'agent.message.copyMenu')}
+        </summary>
+        <div className="agent-copy-menu__popover">
+          <button
+            type="button"
+            disabled={status === 'working'}
+            onClick={() => void runCopyAction(t(language, 'agent.message.copyAgentOutput'), async () => agentText)}
+          >
+            {t(language, 'agent.message.copyAgentOutput')}
+          </button>
+          <button
+            type="button"
+            disabled={status === 'working' || !sessionId}
+            onClick={() => void runCopyAction(t(language, 'agent.message.copyChronological'), () => readChronologicalArchiveMarkdown(requireSessionId()))}
+          >
+            {t(language, 'agent.message.copyChronological')}
+          </button>
+          <button
+            type="button"
+            disabled={status === 'working' || !sessionId}
+            onClick={() => void runCopyAction(t(language, 'agent.message.copyDebugPackage'), () => readLatestArchiveFile(requireSessionId(), 'exports/debug.json'))}
+          >
+            {t(language, 'agent.message.copyDebugPackage')}
+          </button>
+          <div className="agent-copy-menu__separator" />
+          <button type="button" onClick={() => runFeedbackAction('up')}>
+            {t(language, 'agent.message.feedbackUp')}
+          </button>
+          <button type="button" onClick={() => runFeedbackAction('down')}>
+            {t(language, 'agent.message.feedbackDown')}
+          </button>
+        </div>
+      </details>
+      {status !== 'idle' && (
+        <span className={`agent-turn-actions__status agent-turn-actions__status--${status}`}>
+          {status === 'working'
+            ? t(language, 'agent.message.copyWorking')
+            : status === 'done'
+              ? t(language, 'agent.message.copyDone', { label: message })
+              : message}
+        </span>
+      )}
     </div>
   );
 }
@@ -944,12 +1278,26 @@ function renderMessage(
   event: AgentEvent,
   language: UiLanguage,
   autoOpen = false,
-  onPlanResolve?: MessageListProps['onPlanResolve']
+  onPlanResolve?: MessageListProps['onPlanResolve'],
+  planState: PlanConfirmationState = { acceptedKeys: new Set(), planCardKeys: new Set() }
 ) {
   if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') return renderWorkflowStage(event, language);
   if (event.kind === 'error') return renderError(event, language);
-  if (event.kind === 'plan_card') return renderPlanCard(event);
-  if (event.kind === 'plan_review') return <PlanReviewCard key={event.id} event={event} onPlanResolve={onPlanResolve} />;
+  if (event.kind === 'plan_card') {
+    const key = planKey(event);
+    return (
+      <PlanCard
+        key={event.id}
+        event={event}
+        confirmed={Boolean(key && planState.acceptedKeys.has(key))}
+        language={language}
+      />
+    );
+  }
+  if (event.kind === 'plan_review') {
+    if (shouldHideAcceptedPlanReview(event, planState)) return null;
+    return <PlanReviewCard key={event.id} event={event} language={language} onPlanResolve={onPlanResolve} />;
+  }
   if (event.kind === 'review_summary') return renderReviewSummaryCard(event);
   if (
     event.kind === 'tool_call' ||
@@ -1010,42 +1358,47 @@ function renderMessage(
   );
 }
 
-const MessageList: React.FC<MessageListProps> = ({ events, loading = false, language, onPlanResolve }) => (
-  <div className="agent-message-list">
-    {events.length === 0 && !loading && (
-      <div className="agent-empty-state">
-        <div className="agent-empty-state__title">
-          {t(language, 'agent.message.readyTitle')}
-        </div>
-        <div className="agent-empty-state__subtle">
-          {t(language, 'agent.message.readyBody')}
-        </div>
-      </div>
-    )}
+const MessageList: React.FC<MessageListProps> = ({ events, loading = false, language, onPlanResolve }) => {
+  const planState = React.useMemo(() => buildPlanConfirmationState(events), [events]);
+  const renderItems = React.useMemo(() => createRenderItems(events, loading), [events, loading]);
 
-    {createRenderItems(events, loading).map((item) => {
-      if (item.type === 'trace') return <TraceGroupCard key={item.group.id} group={item.group} language={language} />;
-      if (item.type === 'toolBatch') return renderToolBatch(item.group, language);
-      if (item.type === 'turnActions') {
-        return (
-          <TurnActions
-            key={item.id}
-            items={item.items}
-            targetEvent={item.targetEvent}
-            language={language}
-          />
-        );
-      }
-      return renderMessage(item.event, language, item.autoOpen, onPlanResolve);
-    })}
+  return (
+    <div className="agent-message-list">
+      {events.length === 0 && !loading && (
+        <div className="agent-empty-state">
+          <div className="agent-empty-state__title">
+            {t(language, 'agent.message.readyTitle')}
+          </div>
+          <div className="agent-empty-state__subtle">
+            {t(language, 'agent.message.readyBody')}
+          </div>
+        </div>
+      )}
 
-    {loading && (
-      <div className="agent-thinking">
-        <span className="agent-spinner" />
-        <span>{t(language, 'agent.message.thinking')}</span>
-      </div>
-    )}
-  </div>
-);
+      {renderItems.map((item) => {
+        if (item.type === 'trace') return <TraceGroupCard key={item.group.id} group={item.group} language={language} />;
+        if (item.type === 'toolBatch') return renderToolBatch(item.group, language);
+        if (item.type === 'turnActions') {
+          return (
+            <TurnActions
+              key={item.id}
+              items={item.items}
+              targetEvent={item.targetEvent}
+              language={language}
+            />
+          );
+        }
+        return renderMessage(item.event, language, item.autoOpen, onPlanResolve, planState);
+      })}
+
+      {loading && (
+        <div className="agent-thinking">
+          <span className="agent-spinner" />
+          <span>{t(language, 'agent.message.thinking')}</span>
+        </div>
+      )}
+    </div>
+  );
+};
 
 export default MessageList;

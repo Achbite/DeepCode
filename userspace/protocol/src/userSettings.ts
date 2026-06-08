@@ -22,6 +22,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'workbench.colorTheme': 'vs-dark',
   'workbench.language': 'zh-CN',
   'workbench.styleTokenOverrides': '{}',
+  'workbench.previewEditor': 'vscode',
   'terminal.integrated.defaultProfile.windows': 'wsl',
   'terminal.integrated.prewarm': 'afterStartup',
   'terminal.integrated.spawnTimeoutMs': 8000,
