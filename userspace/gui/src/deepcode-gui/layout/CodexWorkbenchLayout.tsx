@@ -338,6 +338,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   const [projectRecords, setProjectRecords] = useState<CodexGuiProject[]>(() => readGuiProjects());
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
+  const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
   const [sessionMenu, setSessionMenu] = useState<CodexSessionContextMenu | null>(null);
   const [projectMenu, setProjectMenu] = useState<CodexProjectContextMenu | null>(null);
   const [textDialog, setTextDialog] = useState<CodexTextInputDialog | null>(null);
@@ -463,6 +464,10 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     () => deriveProjectArchiveGroups(displaySessions, projectRecords),
     [displaySessions, projectRecords]
   );
+  const collapsedProjectIdSet = useMemo(
+    () => new Set(collapsedProjectIds),
+    [collapsedProjectIds]
+  );
 
   const moveSessionToProject = (projectId: string, sessionId: string) => {
     const now = new Date().toISOString();
@@ -497,9 +502,12 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     }
   };
 
-  const handleSelectProject = (projectId: string) => {
-    setActiveProjectId(projectId);
-    setDraftProjectId(projectId);
+  const toggleProjectExpanded = (projectId: string) => {
+    setCollapsedProjectIds((current) =>
+      current.includes(projectId)
+        ? current.filter((id) => id !== projectId)
+        : [...current, projectId]
+    );
   };
 
   const prepareProjectDraftSession = async () => {
@@ -669,6 +677,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   const handleDeleteProject = (project: CodexGuiProject) => {
     setProjectMenu(null);
     setProjectRecords((current) => current.filter((item) => item.id !== project.id));
+    setCollapsedProjectIds((current) => current.filter((id) => id !== project.id));
     if (activeProjectId === project.id) setActiveProjectId(null);
     if (draftProjectId === project.id) setDraftProjectId(null);
   };
@@ -720,6 +729,9 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                   const projectRecord = group.projectId
                     ? projectRecords.find((project) => project.id === group.projectId) ?? null
                     : null;
+                  const projectCollapsed = Boolean(
+                    group.projectId && collapsedProjectIdSet.has(group.projectId)
+                  );
                   return (
                     <div
                       key={group.key}
@@ -734,11 +746,12 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                       <button
                         type="button"
                         className="codex-project-archive-group__select"
-                        onClick={() => group.projectId && handleSelectProject(group.projectId)}
+                        onClick={() => group.projectId && toggleProjectExpanded(group.projectId)}
                         onContextMenu={(event) => {
                           if (projectRecord) openProjectContextMenu(event, projectRecord);
                         }}
                         disabled={!group.projectId}
+                        aria-expanded={!projectCollapsed}
                       >
                         <CodexSidebarIcon name="folder" className="codex-sidebar-icon" />
                         <span>{group.title}</span>
@@ -761,31 +774,33 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                         </div>
                       )}
                       </div>
-                      <div className="codex-project-archive-group__sessions">
-                        {group.sessions.slice(0, 4).map((item, itemIndex) => {
-                          const shortcutIndex = groupIndex + itemIndex + 1;
-                          return (
-                            <button
-                              key={item.id}
-                              type="button"
-                              className={item.id === activeSession?.id ? 'active' : ''}
-                              onClick={() => {
-                                setActiveProjectId(group.projectId ?? null);
-                                setDraftProjectId(null);
-                                void activateSession(item.id);
-                              }}
-                              onContextMenu={(event) => openSessionContextMenu(event, item)}
-                              disabled={loadingSession}
-                              title={item.title || item.id}
-                            >
-                              <span>{displaySessionTitle(language, item.title)}</span>
-                              {shortcutIndex <= 9 && (
-                                <kbd>⌘{shortcutIndex}</kbd>
-                              )}
-                            </button>
-                          );
-                        })}
-                      </div>
+                      {!projectCollapsed && (
+                        <div className="codex-project-archive-group__sessions">
+                          {group.sessions.slice(0, 4).map((item, itemIndex) => {
+                            const shortcutIndex = groupIndex + itemIndex + 1;
+                            return (
+                              <button
+                                key={item.id}
+                                type="button"
+                                className={item.id === activeSession?.id ? 'active' : ''}
+                                onClick={() => {
+                                  setActiveProjectId(group.projectId ?? null);
+                                  setDraftProjectId(null);
+                                  void activateSession(item.id);
+                                }}
+                                onContextMenu={(event) => openSessionContextMenu(event, item)}
+                                disabled={loadingSession}
+                                title={item.title || item.id}
+                              >
+                                <span>{displaySessionTitle(language, item.title)}</span>
+                                {shortcutIndex <= 9 && (
+                                  <kbd>⌘{shortcutIndex}</kbd>
+                                )}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
