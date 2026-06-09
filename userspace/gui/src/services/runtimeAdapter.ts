@@ -99,16 +99,6 @@ export interface RuntimeStatus {
   arch?: string;
 }
 
-export interface PickedUserAttachment {
-  kind: 'file' | 'directory';
-  absolutePath: string;
-}
-
-export interface PickUserAttachmentOptions {
-  initialDirectory?: string | null;
-  directoriesOnly?: boolean;
-}
-
 export function getRuntimeType(): RuntimeType {
   return 'web';
 }
@@ -184,32 +174,6 @@ export async function closeAppWindow(): Promise<void> {
   await runWindowCommand('close', () => {
     window.close();
   });
-}
-
-export async function pickUserAttachment(
-  options: PickUserAttachmentOptions = {}
-): Promise<ApiResponse<PickedUserAttachment | null>> {
-  const invoke = getTauriInvoke();
-  if (!invoke) {
-    return {
-      ok: false,
-      error: 'not_supported',
-      message: '当前预览模式不支持系统文件选择器。',
-    };
-  }
-  try {
-    const picked = await invoke<PickedUserAttachment | null>('deepcode_pick_user_attachment', {
-      initialDirectory: options.initialDirectory ?? null,
-      directoriesOnly: Boolean(options.directoriesOnly),
-    });
-    return { ok: true, data: picked ?? null };
-  } catch (err) {
-    return {
-      ok: false,
-      error: 'picker_failed',
-      message: err instanceof Error ? err.message : String(err),
-    };
-  }
 }
 
 export async function getDefaultWorkspacePath(): Promise<ApiResponse<string | null>> {

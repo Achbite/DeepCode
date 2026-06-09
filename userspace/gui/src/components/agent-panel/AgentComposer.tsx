@@ -1,17 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { AgentContextAttachment } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import { pickUserAttachment } from '../../services/runtimeAdapter';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import ContextAttachmentPicker from './ContextAttachmentPicker';
+import UserAttachmentDialog, { type PickedUserAttachment } from './UserAttachmentDialog';
 
 interface AgentComposerProps {
   messageAttachments: AgentContextAttachment[];
   sessionAttachments: AgentContextAttachment[];
   language: UiLanguage;
   loading: boolean;
-  initialAttachmentDirectory?: string | null;
   onSend: (content: string) => void | Promise<void>;
   onStop: () => void;
   onAddAttachment: (attachment: AgentContextAttachment) => void;
@@ -77,14 +76,13 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   sessionAttachments,
   language,
   loading,
-  initialAttachmentDirectory,
   onSend,
   onStop,
   onAddAttachment,
   onRemoveAttachment,
 }) => {
   const [value, setValue] = useState('');
-  const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
+  const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
   const [changesOpen, setChangesOpen] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const activeFolder = useWorkspaceStore((s) => s.getActiveFolder());
@@ -120,7 +118,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   };
 
   const chips = [...sessionAttachments, ...messageAttachments];
-  const composerExpanded = Boolean(value.trim() || chips.length > 0 || attachmentNotice || mention);
+  const composerExpanded = Boolean(value.trim() || chips.length > 0 || attachmentDialogOpen || mention);
 
   const openModifiedFile = (file: AgentModifiedFileView) => {
     const absolutePath = activeFolder?.absolutePath
@@ -132,22 +130,13 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     }
   };
 
-  const pickUserSelectedAttachment = async () => {
-    setAttachmentNotice(null);
-    const result = await pickUserAttachment({
-      initialDirectory: initialAttachmentDirectory ?? activeFolder?.absolutePath ?? null,
-    });
-    if (!result.ok) {
-      setAttachmentNotice(result.message ?? t(language, 'agent.composer.nativePickerUnsupported'));
-      return;
-    }
-    if (!result.data) return;
-    const absolutePath = selectedAttachmentPath(result.data.absolutePath);
+  const pickUserSelectedAttachment = (picked: PickedUserAttachment) => {
+    const absolutePath = selectedAttachmentPath(picked.absolutePath);
     const workspacePath = activeFolder?.absolutePath
       ? relativeToWorkspacePath(activeFolder.absolutePath, absolutePath)
       : null;
     onAddAttachment({
-      kind: result.data.kind,
+      kind: picked.kind,
       path: workspacePath ?? absolutePath,
       absolutePath,
       folderId: workspacePath && activeFolder ? activeFolder.id : undefined,
@@ -258,11 +247,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           />
         )}
       </div>
-      {attachmentNotice && (
-        <div className="agent-composer__notice" role="status">
-          {attachmentNotice}
-        </div>
-      )}
       <div className="agent-composer__footer">
         <div className="agent-composer__footer-left">
           <div className="agent-composer__attach-wrap">
@@ -271,9 +255,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               type="button"
               title={t(language, 'agent.composer.addFile')}
               aria-label={t(language, 'agent.composer.addFile')}
-              onClick={() => {
-                void pickUserSelectedAttachment();
-              }}
+              onClick={() => setAttachmentDialogOpen(true)}
             >
               +
             </button>
@@ -291,6 +273,13 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           {loading ? t(language, 'agent.composer.stop') : t(language, 'agent.composer.send')}
         </button>
       </div>
+      <UserAttachmentDialog
+        visible={attachmentDialogOpen}
+        initialDirectory={activeFolder?.absolutePath ?? null}
+        language={language}
+        onClose={() => setAttachmentDialogOpen(false)}
+        onPick={pickUserSelectedAttachment}
+      />
     </div>
   );
 };

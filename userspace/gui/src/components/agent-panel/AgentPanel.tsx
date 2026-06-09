@@ -37,7 +37,6 @@ const AgentPanel: React.FC = () => {
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
-  const activeFolder = useWorkspaceStore((s) => s.getActiveFolder());
   const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
@@ -115,7 +114,6 @@ const AgentPanel: React.FC = () => {
         sessionAttachments={sessionAttachments}
         language={language}
         loading={loading}
-        initialAttachmentDirectory={activeFolder?.absolutePath ?? null}
         onSend={(content) => void sendMessage(content)}
         onStop={() => void cancelCurrentRun()}
         onAddAttachment={addAttachment}

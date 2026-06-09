@@ -2185,56 +2185,6 @@ button {
   box-shadow: 0 0 0 3px rgba(64, 121, 88, 0.12);
 }
 
-.codex-text-dialog__directory {
-  display: grid;
-  gap: 8px;
-  border: 1px solid #ebe7de;
-  border-radius: 13px;
-  background: #fbfaf7;
-  padding: 10px;
-}
-
-.codex-text-dialog__directory > div {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.codex-text-dialog__directory span {
-  color: #777f88;
-  font-size: 12px;
-  font-weight: 560;
-}
-
-.codex-text-dialog__directory strong {
-  min-width: 0;
-  color: #30343a;
-  font-size: 13px;
-  font-weight: 560;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.codex-text-dialog__directory button {
-  min-height: 30px;
-  border: 1px solid #e4e1d8;
-  border-radius: 10px;
-  background: #ffffff;
-  color: #30343a;
-  font-size: 13px;
-  font-weight: 540;
-}
-
-.codex-text-dialog__directory p {
-  margin: 0;
-  color: #b45309;
-  font-size: 12px;
-  line-height: 1.4;
-}
-
 .codex-session-list {
   min-height: 0;
   overflow: auto;

@@ -12,7 +12,6 @@ interface CodexAgentPanelProps {
   language: UiLanguage;
   forceHome?: boolean;
   homeProjectTitle?: string | null;
-  initialAttachmentDirectory?: string | null;
   onBeforeSend?: () => Promise<boolean | void> | boolean | void;
   onAfterSend?: () => Promise<void> | void;
 }
@@ -29,7 +28,6 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
   language,
   forceHome = false,
   homeProjectTitle,
-  initialAttachmentDirectory,
   onBeforeSend,
   onAfterSend,
 }) => {
@@ -116,7 +114,6 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
       sessionAttachments={sessionAttachments}
       language={language}
       loading={composerRunning}
-      initialAttachmentDirectory={initialAttachmentDirectory}
       onSend={async (content) => {
         const shouldContinue = await onBeforeSend?.();
         if (shouldContinue === false) return;

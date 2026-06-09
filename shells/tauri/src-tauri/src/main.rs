@@ -44,7 +44,6 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             deepcode_boot_target,
-            deepcode_pick_user_attachment,
             deepcode_window_minimize,
             deepcode_window_toggle_maximize,
             deepcode_window_close
@@ -75,24 +74,9 @@ struct LaunchTarget {
     port: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PickedUserAttachment {
-    kind: String,
-    absolute_path: String,
-}
-
 #[tauri::command]
 fn deepcode_boot_target(target: State<'_, LaunchTarget>) -> LaunchTarget {
     target.inner().clone()
-}
-
-#[tauri::command]
-fn deepcode_pick_user_attachment(
-    initial_directory: Option<String>,
-    directories_only: Option<bool>,
-) -> Result<Option<PickedUserAttachment>, String> {
-    pick_user_attachment(initial_directory, directories_only.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -232,95 +216,6 @@ fn kernel_binary_name() -> &'static str {
     } else {
         "deepcode-kernel"
     }
-}
-
-fn pick_user_attachment(
-    initial_directory: Option<String>,
-    directories_only: bool,
-) -> Result<Option<PickedUserAttachment>, String> {
-    let initial_directory = initial_directory.filter(|path| Path::new(path).is_dir());
-
-    #[cfg(target_os = "macos")]
-    {
-        return pick_user_attachment_macos(initial_directory.as_deref(), directories_only);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("system file picker is not implemented for this platform".to_string())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn pick_user_attachment_macos(
-    initial_directory: Option<&str>,
-    directories_only: bool,
-) -> Result<Option<PickedUserAttachment>, String> {
-    let initial_directory = initial_directory
-        .map(js_string_literal)
-        .unwrap_or_else(|| "null".to_string());
-    let directories_only = if directories_only { "true" } else { "false" };
-    let script = format!(r#"
-ObjC.import('AppKit');
-const panel = $.NSOpenPanel.openPanel;
-panel.title = '添加文件或目录';
-panel.prompt = '添加';
-panel.canChooseFiles = !{directories_only};
-panel.canChooseDirectories = true;
-panel.allowsMultipleSelection = false;
-panel.resolvesAliases = true;
-const initialDirectory = {initial_directory};
-if (initialDirectory) {{
-  panel.directoryURL = $.NSURL.fileURLWithPath(initialDirectory);
-}}
-const response = panel.runModal();
-if (response == $.NSModalResponseOK) {{
-  ObjC.unwrap(panel.URLs.objectAtIndex(0).path);
-}} else {{
-  '';
-}}
-"#);
-    let output = Command::new("osascript")
-        .arg("-l")
-        .arg("JavaScript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| format!("open file picker: {error}"))?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if message.is_empty() {
-            "file picker failed".to_string()
-        } else {
-            message
-        });
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return Ok(None);
-    }
-    let path_buf = PathBuf::from(&path);
-    let kind = if path_buf.is_dir() { "directory" } else { "file" }.to_string();
-    Ok(Some(PickedUserAttachment {
-        kind,
-        absolute_path: path,
-    }))
-}
-
-#[cfg(target_os = "macos")]
-fn js_string_literal(value: &str) -> String {
-    let mut output = String::from("'");
-    for ch in value.chars() {
-        match ch {
-            '\\' => output.push_str("\\\\"),
-            '\'' => output.push_str("\\'"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            _ => output.push(ch),
-        }
-    }
-    output.push('\'');
-    output
 }
 
 fn env_truthy(name: &str) -> bool {
