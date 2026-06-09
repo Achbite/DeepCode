@@ -99,6 +99,11 @@ export interface RuntimeStatus {
   arch?: string;
 }
 
+export interface PickedUserAttachment {
+  kind: 'file' | 'directory';
+  absolutePath: string;
+}
+
 export function getRuntimeType(): RuntimeType {
   return 'web';
 }
@@ -174,6 +179,51 @@ export async function closeAppWindow(): Promise<void> {
   await runWindowCommand('close', () => {
     window.close();
   });
+}
+
+export async function pickUserAttachment(): Promise<ApiResponse<PickedUserAttachment | null>> {
+  const invoke = getTauriInvoke();
+  if (!invoke) {
+    return {
+      ok: false,
+      error: 'not_supported',
+      message: '当前预览模式不支持系统文件选择器。',
+    };
+  }
+  try {
+    const picked = await invoke<PickedUserAttachment | null>('deepcode_pick_user_attachment');
+    return { ok: true, data: picked ?? null };
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'picker_failed',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export async function getDefaultWorkspacePath(): Promise<ApiResponse<string | null>> {
+  if (document.documentElement.dataset.product !== 'deepcode-gui') {
+    return { ok: true, data: null };
+  }
+  const invoke = getTauriInvoke();
+  if (!invoke) {
+    const result = await api.getDefaultWorkspacePath();
+    if (result.ok && result.data) {
+      return { ok: true, data: result.data.path };
+    }
+    return { ok: true, data: null };
+  }
+  try {
+    const path = await invoke<string | null>('deepcode_default_workspace_path');
+    return { ok: true, data: path ?? null };
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'default_workspace_failed',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 export function getHealth(): Promise<ApiResponse<HealthStatus>> {

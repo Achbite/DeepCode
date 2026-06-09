@@ -44,6 +44,8 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             deepcode_boot_target,
+            deepcode_default_workspace_path,
+            deepcode_pick_user_attachment,
             deepcode_window_minimize,
             deepcode_window_toggle_maximize,
             deepcode_window_close
@@ -74,9 +76,26 @@ struct LaunchTarget {
     port: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PickedUserAttachment {
+    kind: String,
+    absolute_path: String,
+}
+
 #[tauri::command]
 fn deepcode_boot_target(target: State<'_, LaunchTarget>) -> LaunchTarget {
     target.inner().clone()
+}
+
+#[tauri::command]
+fn deepcode_default_workspace_path() -> Option<String> {
+    default_workspace_path().map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn deepcode_pick_user_attachment() -> Result<Option<PickedUserAttachment>, String> {
+    pick_user_attachment()
 }
 
 #[tauri::command]
@@ -226,6 +245,90 @@ fn kernel_binary_name() -> &'static str {
     } else {
         "deepcode-kernel"
     }
+}
+
+fn default_workspace_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("DEEPCODE_DEFAULT_WORKSPACE").map(PathBuf::from) {
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+
+    platform_desktop_dir()
+        .filter(|path| path.is_dir())
+        .or_else(|| user_home_dir().filter(|path| path.is_dir()))
+}
+
+fn platform_desktop_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "linux") {
+        if let Some(path) = std::env::var_os("XDG_DESKTOP_DIR").map(PathBuf::from) {
+            return Some(path);
+        }
+    }
+    user_home_dir().map(|home| home.join("Desktop"))
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn pick_user_attachment() -> Result<Option<PickedUserAttachment>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return pick_user_attachment_macos();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("system file picker is not implemented for this platform".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pick_user_attachment_macos() -> Result<Option<PickedUserAttachment>, String> {
+    let script = r#"
+ObjC.import('AppKit');
+const panel = $.NSOpenPanel.openPanel;
+panel.title = '添加文件或目录';
+panel.prompt = '添加';
+panel.canChooseFiles = true;
+panel.canChooseDirectories = true;
+panel.allowsMultipleSelection = false;
+panel.resolvesAliases = true;
+const response = panel.runModal();
+if (response == $.NSModalResponseOK) {
+  ObjC.unwrap(panel.URLs.objectAtIndex(0).path);
+} else {
+  '';
+}
+"#;
+    let output = Command::new("osascript")
+        .arg("-l")
+        .arg("JavaScript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| format!("open file picker: {error}"))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if message.is_empty() {
+            "file picker failed".to_string()
+        } else {
+            message
+        });
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let path_buf = PathBuf::from(&path);
+    let kind = if path_buf.is_dir() { "directory" } else { "file" }.to_string();
+    Ok(Some(PickedUserAttachment {
+        kind,
+        absolute_path: path,
+    }))
 }
 
 fn env_truthy(name: &str) -> bool {

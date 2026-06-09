@@ -9,6 +9,7 @@
  */
 import { create } from 'zustand';
 import {
+  getDefaultWorkspacePath,
   getCurrentWorkspace,
   openWorkspace as runtimeOpenWorkspace,
   saveWorkspaceFile as runtimeSaveWorkspaceFile,
@@ -82,6 +83,29 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const result = await getCurrentWorkspace();
     if (result.ok && result.data) {
       const ws = result.data.current;
+      if (!ws) {
+        const defaultWorkspace = await getDefaultWorkspacePath();
+        if (defaultWorkspace.ok && defaultWorkspace.data) {
+          const opened = await runtimeOpenWorkspace(defaultWorkspace.data);
+          if (opened.ok && opened.data) {
+            const openedWorkspace = opened.data.workspace;
+            set((state) => ({
+              current: openedWorkspace,
+              fallbackUsed: false,
+              lastError: null,
+              activeFolderId: openedWorkspace.folders[0]?.id ?? null,
+              loading: false,
+              treeRevision: state.treeRevision + 1,
+            }));
+            return;
+          }
+          set({
+            lastError: opened.message ?? '默认工作区打开失败',
+            loading: false,
+          });
+          return;
+        }
+      }
       set((state) => ({
         current: ws,
         fallbackUsed: result.data!.fallbackUsed,

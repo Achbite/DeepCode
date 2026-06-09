@@ -94,6 +94,7 @@ async fn main() {
             get(session_store_archive_file_get),
         )
         .route("/api/workspaces/current", get(workspace_current))
+        .route("/api/workspaces/default-path", get(workspace_default_path))
         .route("/api/workspaces/open", post(workspace_open))
         .route("/api/workspaces/save-file", post(workspace_save_file))
         .route(

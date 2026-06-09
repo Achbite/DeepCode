@@ -76,6 +76,14 @@ pub(crate) async fn workspace_current(State(state): State<AppState>) -> Json<Api
     }
 }
 
+pub(crate) async fn workspace_default_path() -> Json<ApiResponse> {
+    let path = std::env::var_os("DEEPCODE_DEFAULT_WORKSPACE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .map(|path| path.to_string_lossy().to_string());
+    ApiResponse::ok(json!({ "path": path }))
+}
+
 pub(crate) async fn workspace_open(
     State(state): State<AppState>,
     Json(body): Json<OpenWorkspaceRequest>,

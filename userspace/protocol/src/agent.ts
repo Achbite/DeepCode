@@ -411,8 +411,9 @@ export interface AgentSession {
 export interface AgentContextAttachment {
   kind: 'file' | 'directory' | 'panelSnapshot';
   path: string;
+  absolutePath?: string;
   folderId?: string;
-  source: 'mention' | 'contextMenu' | 'browser';
+  source: 'mention' | 'contextMenu' | 'browser' | 'userSelected';
   scope: 'message' | 'session';
   snapshot?: PanelSemanticSnapshot;
 }

@@ -4,10 +4,12 @@
 use crate::prelude::*;
 use crate::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AgentRunRequest {
     pub(crate) content: String,
+    pub(crate) attachments: Vec<Value>,
     pub(crate) workflow_ref: Option<String>,
     pub(crate) profile_id: Option<String>,
     pub(crate) workspace_binding: Option<WorkspaceBinding>,
@@ -20,6 +22,11 @@ pub(crate) fn build_agent_run_request(body: &Value) -> AgentRunRequest {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        attachments: body
+            .get("attachments")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
         workflow_ref: body
             .get("workflow")
             .or_else(|| body.get("workflowRef"))
@@ -37,11 +44,140 @@ pub(crate) fn build_agent_run_request(body: &Value) -> AgentRunRequest {
     }
 }
 
+const USER_ATTACHMENT_MAX_CONTEXT_CHARS: usize = 40_000;
+const USER_ATTACHMENT_MAX_FILE_CHARS: usize = 12_000;
+const USER_ATTACHMENT_MAX_DIR_ENTRIES: usize = 300;
+const USER_ATTACHMENT_MAX_DIR_DEPTH: usize = 2;
+
+pub(crate) fn user_input_with_selected_attachment_context(request: &AgentRunRequest) -> String {
+    let context = build_user_selected_attachment_context(&request.attachments);
+    if context.trim().is_empty() {
+        return request.content.clone();
+    }
+    format!(
+        "{}\n\n## 用户主动添加的上下文\n{}",
+        request.content.trim_end(),
+        context
+    )
+}
+
+fn build_user_selected_attachment_context(attachments: &[Value]) -> String {
+    let mut parts = Vec::new();
+    let mut total_chars = 0_usize;
+    for attachment in attachments {
+        if attachment.get("source").and_then(Value::as_str) != Some("userSelected") {
+            continue;
+        }
+        let Some(path) = attachment
+            .get("absolutePath")
+            .or_else(|| attachment.get("path"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let kind = attachment
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("file");
+        let rendered = if kind == "directory" {
+            render_user_selected_directory(path)
+        } else {
+            render_user_selected_file(path)
+        };
+        let remaining = USER_ATTACHMENT_MAX_CONTEXT_CHARS.saturating_sub(total_chars);
+        if remaining == 0 {
+            break;
+        }
+        let rendered = clip_chars(&rendered, remaining);
+        total_chars += rendered.chars().count();
+        parts.push(rendered);
+    }
+    parts.join("\n\n")
+}
+
+fn render_user_selected_file(path: &str) -> String {
+    let path_buf = PathBuf::from(path);
+    if !path_buf.is_file() {
+        return format!("### file:{path}\n读取失败: 用户选择的路径不是文件。");
+    }
+    match std::fs::read_to_string(&path_buf) {
+        Ok(content) => {
+            let clipped = clip_chars(&content, USER_ATTACHMENT_MAX_FILE_CHARS);
+            format!("### file:{path}\n```text\n{clipped}\n```")
+        }
+        Err(error) => format!("### file:{path}\n读取失败: {error}"),
+    }
+}
+
+fn render_user_selected_directory(path: &str) -> String {
+    let path_buf = PathBuf::from(path);
+    if !path_buf.is_dir() {
+        return format!("### directory:{path}\n读取失败: 用户选择的路径不是目录。");
+    }
+    let mut lines = Vec::new();
+    collect_user_selected_directory_entries(&path_buf, &path_buf, 0, &mut lines);
+    format!("### directory:{path}\n```text\n{}\n```", lines.join("\n"))
+}
+
+fn collect_user_selected_directory_entries(
+    root: &Path,
+    current: &Path,
+    depth: usize,
+    lines: &mut Vec<String>,
+) {
+    if depth >= USER_ATTACHMENT_MAX_DIR_DEPTH || lines.len() >= USER_ATTACHMENT_MAX_DIR_ENTRIES {
+        return;
+    }
+    let Ok(entries) = sorted_dir_entries(current) else {
+        return;
+    };
+    for entry in entries {
+        if lines.len() >= USER_ATTACHMENT_MAX_DIR_ENTRIES {
+            break;
+        }
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let kind = if path.is_dir() { "[dir]" } else { "[file]" };
+        lines.push(format!(
+            "{}- {} {}",
+            "  ".repeat(depth),
+            kind,
+            relative.to_string_lossy()
+        ));
+        if path.is_dir() {
+            collect_user_selected_directory_entries(root, &path, depth + 1, lines);
+        }
+    }
+}
+
+fn clip_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let head_chars = max_chars.saturating_mul(65) / 100;
+    let tail_chars = max_chars.saturating_mul(25) / 100;
+    let head = text.chars().take(head_chars).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head}\n\n[... truncated ...]\n\n{tail}")
+}
+
 pub(crate) async fn start_kernel_agent_run(
     state: &AppState,
     session_id: &str,
     request: AgentRunRequest,
 ) -> Result<(), String> {
+    let run_input_text = user_input_with_selected_attachment_context(&request);
     let needs_workspace = request_mentions_local_workspace(&request.content);
     if needs_workspace {
         if let Err(error) =
@@ -85,8 +221,8 @@ pub(crate) async fn start_kernel_agent_run(
                 request_id: rid("agent-run-start"),
                 session_id: Some(deepcode_kernel_abi::SessionId(session_id.to_string())),
                 input: deepcode_kernel_abi::UserInput {
-                    text: request.content.clone(),
-                    attachments: Vec::new(),
+                    text: run_input_text,
+                    attachments: request.attachments.clone(),
                 },
                 workspace_binding: Some(binding),
                 profile_ref: request.profile_id.as_ref().map(|id| {

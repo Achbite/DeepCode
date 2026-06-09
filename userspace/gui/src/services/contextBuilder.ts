@@ -12,7 +12,7 @@ function dedupeAttachments(
 ): AgentContextAttachment[] {
   const byKey = new Map<string, AgentContextAttachment>();
   for (const attachment of attachments) {
-    const key = `${attachment.folderId ?? ''}:${attachment.path}`;
+    const key = `${attachment.folderId ?? ''}:${attachment.absolutePath ?? attachment.path}`;
     const existing = byKey.get(key);
     if (!existing || attachment.scope === 'session') {
       byKey.set(key, attachment);

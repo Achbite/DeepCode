@@ -2425,6 +2425,51 @@ button {
   letter-spacing: 0.02em;
 }
 
+.codex-turn-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  min-height: 26px;
+  margin-top: 2px;
+  padding-left: 0;
+  color: #8e949a;
+}
+
+.codex-turn-actions__button {
+  width: 22px;
+  height: 22px;
+  display: inline-grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #8e949a;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.codex-turn-actions__button:hover:not(:disabled) {
+  background: #f0f1f2;
+  color: #4f555c;
+}
+
+.codex-turn-actions__button:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+
+.codex-turn-actions__status {
+  min-width: 0;
+  color: #9aa0a6;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.codex-turn-actions__status--error {
+  color: #c2413a;
+}
+
 .codex-context-panel {
   position: relative;
   display: flex;

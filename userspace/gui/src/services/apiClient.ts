@@ -140,6 +140,10 @@ export interface ConversationArchiveFileResult {
   content: string;
 }
 
+export interface DefaultWorkspacePathResult {
+  path: string | null;
+}
+
 function isAbortError(err: unknown): boolean {
   return (
     err instanceof DOMException && err.name === 'AbortError'
@@ -230,6 +234,10 @@ export function getHealth(): Promise<ApiResponse<HealthStatus>> {
 
 export function getCurrentWorkspace(): Promise<ApiResponse<WorkspaceState>> {
   return getJson<WorkspaceState>(`${API_BASE}/workspaces/current`);
+}
+
+export function getDefaultWorkspacePath(): Promise<ApiResponse<DefaultWorkspacePathResult>> {
+  return getJson<DefaultWorkspacePathResult>(`${API_BASE}/workspaces/default-path`);
 }
 
 export function openWorkspace(

@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { AgentContextAttachment } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
+import { pickUserAttachment } from '../../services/runtimeAdapter';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import ContextAttachmentPicker from './ContextAttachmentPicker';
@@ -55,6 +56,19 @@ function openVscodeFile(absolutePath: string): void {
   const normalized = absolutePath.replace(/\\/g, '/');
   const urlPath = normalized.startsWith('/') ? normalized : `/${normalized}`;
   window.location.href = `vscode://file${encodeURI(urlPath)}`;
+}
+
+function relativeToWorkspacePath(root: string, absolutePath: string): string | null {
+  const normalizedRoot = root.replace(/\\/g, '/').replace(/\/+$/, '');
+  const normalizedPath = absolutePath.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (normalizedPath === normalizedRoot) return '.';
+  const prefix = `${normalizedRoot}/`;
+  if (!normalizedPath.startsWith(prefix)) return null;
+  return normalizedPath.slice(prefix.length) || '.';
+}
+
+function selectedAttachmentPath(absolutePath: string): string {
+  return absolutePath.replace(/\\/g, '/');
 }
 
 const AgentComposer: React.FC<AgentComposerProps> = ({
@@ -115,6 +129,28 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     if (previewEditor === 'vscode') {
       openVscodeFile(absolutePath);
     }
+  };
+
+  const pickUserSelectedAttachment = async () => {
+    const result = await pickUserAttachment();
+    if (!result.ok) {
+      setPickerOpen((open) => !open);
+      return;
+    }
+    if (!result.data) return;
+    const absolutePath = selectedAttachmentPath(result.data.absolutePath);
+    const workspacePath = activeFolder?.absolutePath
+      ? relativeToWorkspacePath(activeFolder.absolutePath, absolutePath)
+      : null;
+    onAddAttachment({
+      kind: result.data.kind,
+      path: workspacePath ?? absolutePath,
+      absolutePath,
+      folderId: workspacePath && activeFolder ? activeFolder.id : undefined,
+      source: 'userSelected',
+      scope: 'message',
+    });
+    setPickerOpen(false);
   };
 
   return (
@@ -228,7 +264,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               title={t(language, 'agent.composer.addFile')}
               aria-label={t(language, 'agent.composer.addFile')}
               aria-expanded={pickerOpen}
-              onClick={() => setPickerOpen((open) => !open)}
+              onClick={() => {
+                void pickUserSelectedAttachment();
+              }}
             >
               +
             </button>

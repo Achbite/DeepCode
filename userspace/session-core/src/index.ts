@@ -23,8 +23,10 @@ export function mergeContextAttachment(
   list: AgentContextAttachment[],
   next: AgentContextAttachment
 ): AgentContextAttachment[] {
-  const key = `${next.folderId ?? ''}:${next.path}`;
-  const filtered = list.filter((item) => `${item.folderId ?? ''}:${item.path}` !== key);
+  const attachmentKey = (item: AgentContextAttachment) =>
+    `${item.folderId ?? ''}:${item.absolutePath ?? item.path}`;
+  const key = attachmentKey(next);
+  const filtered = list.filter((item) => attachmentKey(item) !== key);
   return [...filtered, next];
 }
 
