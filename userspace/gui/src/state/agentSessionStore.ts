@@ -51,6 +51,10 @@ interface QueuedAgentMessage {
   attachments: AgentContextAttachment[];
 }
 
+interface CreateAgentSessionOptions {
+  reuseEmpty?: boolean;
+}
+
 interface AgentSessionState {
   session: AgentSession | null;
   sessions: AgentSession[];
@@ -76,7 +80,7 @@ interface AgentSessionState {
 interface AgentSessionActions {
   loadOrCreate: () => Promise<void>;
   refreshSessions: () => Promise<void>;
-  createNewSession: () => Promise<void>;
+  createNewSession: (options?: CreateAgentSessionOptions) => Promise<AgentSession | null>;
   activateSession: (sessionId: string) => Promise<void>;
   renameSession: (sessionId: string, title: string) => Promise<void>;
   archiveSession: (sessionId: string) => Promise<void>;
@@ -247,10 +251,11 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
   },
 
-  createNewSession: async () => {
-    if (isEmptyAgentSession(get().session)) {
+  createNewSession: async (options = {}) => {
+    const currentSession = get().session;
+    if (options.reuseEmpty !== false && isEmptyAgentSession(currentSession)) {
       set({ errorMessage: null });
-      return;
+      return currentSession ?? null;
     }
     const settings = useSettingsStore.getState().effectiveSettings;
     const initialMode = settingMode(settings['agent.defaultMode']);
@@ -270,9 +275,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         errorMessage: null,
       });
       void get().refreshSessions();
-      return;
+      return result.data.session;
     }
     set({ errorMessage: result.message ?? 'Agent session create failed' });
+    return null;
   },
 
   activateSession: async (sessionId) => {

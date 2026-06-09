@@ -104,6 +104,11 @@ export interface PickedUserAttachment {
   absolutePath: string;
 }
 
+export interface PickUserAttachmentOptions {
+  initialDirectory?: string | null;
+  directoriesOnly?: boolean;
+}
+
 export function getRuntimeType(): RuntimeType {
   return 'web';
 }
@@ -181,7 +186,9 @@ export async function closeAppWindow(): Promise<void> {
   });
 }
 
-export async function pickUserAttachment(): Promise<ApiResponse<PickedUserAttachment | null>> {
+export async function pickUserAttachment(
+  options: PickUserAttachmentOptions = {}
+): Promise<ApiResponse<PickedUserAttachment | null>> {
   const invoke = getTauriInvoke();
   if (!invoke) {
     return {
@@ -191,7 +198,10 @@ export async function pickUserAttachment(): Promise<ApiResponse<PickedUserAttach
     };
   }
   try {
-    const picked = await invoke<PickedUserAttachment | null>('deepcode_pick_user_attachment');
+    const picked = await invoke<PickedUserAttachment | null>('deepcode_pick_user_attachment', {
+      initialDirectory: options.initialDirectory ?? null,
+      directoriesOnly: Boolean(options.directoriesOnly),
+    });
     return { ok: true, data: picked ?? null };
   } catch (err) {
     return {

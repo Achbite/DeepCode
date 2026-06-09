@@ -94,8 +94,11 @@ fn deepcode_default_workspace_path() -> Option<String> {
 }
 
 #[tauri::command]
-fn deepcode_pick_user_attachment() -> Result<Option<PickedUserAttachment>, String> {
-    pick_user_attachment()
+fn deepcode_pick_user_attachment(
+    initial_directory: Option<String>,
+    directories_only: Option<bool>,
+) -> Result<Option<PickedUserAttachment>, String> {
+    pick_user_attachment(initial_directory, directories_only.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -274,10 +277,15 @@ fn user_home_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
-fn pick_user_attachment() -> Result<Option<PickedUserAttachment>, String> {
+fn pick_user_attachment(
+    initial_directory: Option<String>,
+    directories_only: bool,
+) -> Result<Option<PickedUserAttachment>, String> {
+    let initial_directory = initial_directory.filter(|path| Path::new(path).is_dir());
+
     #[cfg(target_os = "macos")]
     {
-        return pick_user_attachment_macos();
+        return pick_user_attachment_macos(initial_directory.as_deref(), directories_only);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -287,23 +295,34 @@ fn pick_user_attachment() -> Result<Option<PickedUserAttachment>, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn pick_user_attachment_macos() -> Result<Option<PickedUserAttachment>, String> {
-    let script = r#"
+fn pick_user_attachment_macos(
+    initial_directory: Option<&str>,
+    directories_only: bool,
+) -> Result<Option<PickedUserAttachment>, String> {
+    let initial_directory = initial_directory
+        .map(js_string_literal)
+        .unwrap_or_else(|| "null".to_string());
+    let directories_only = if directories_only { "true" } else { "false" };
+    let script = format!(r#"
 ObjC.import('AppKit');
 const panel = $.NSOpenPanel.openPanel;
 panel.title = '添加文件或目录';
 panel.prompt = '添加';
-panel.canChooseFiles = true;
+panel.canChooseFiles = !{directories_only};
 panel.canChooseDirectories = true;
 panel.allowsMultipleSelection = false;
 panel.resolvesAliases = true;
+const initialDirectory = {initial_directory};
+if (initialDirectory) {{
+  panel.directoryURL = $.NSURL.fileURLWithPath(initialDirectory);
+}}
 const response = panel.runModal();
-if (response == $.NSModalResponseOK) {
+if (response == $.NSModalResponseOK) {{
   ObjC.unwrap(panel.URLs.objectAtIndex(0).path);
-} else {
+}} else {{
   '';
-}
-"#;
+}}
+"#);
     let output = Command::new("osascript")
         .arg("-l")
         .arg("JavaScript")
@@ -329,6 +348,22 @@ if (response == $.NSModalResponseOK) {
         kind,
         absolute_path: path,
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn js_string_literal(value: &str) -> String {
+    let mut output = String::from("'");
+    for ch in value.chars() {
+        match ch {
+            '\\' => output.push_str("\\\\"),
+            '\'' => output.push_str("\\'"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            _ => output.push(ch),
+        }
+    }
+    output.push('\'');
+    output
 }
 
 fn env_truthy(name: &str) -> bool {

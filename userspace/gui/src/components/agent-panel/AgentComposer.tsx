@@ -11,6 +11,7 @@ interface AgentComposerProps {
   sessionAttachments: AgentContextAttachment[];
   language: UiLanguage;
   loading: boolean;
+  initialAttachmentDirectory?: string | null;
   onSend: (content: string) => void | Promise<void>;
   onStop: () => void;
   onAddAttachment: (attachment: AgentContextAttachment) => void;
@@ -76,13 +77,14 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   sessionAttachments,
   language,
   loading,
+  initialAttachmentDirectory,
   onSend,
   onStop,
   onAddAttachment,
   onRemoveAttachment,
 }) => {
   const [value, setValue] = useState('');
-  const [pickerOpen, setPickerOpen] = useState(false);
+  const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
   const [changesOpen, setChangesOpen] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const activeFolder = useWorkspaceStore((s) => s.getActiveFolder());
@@ -115,11 +117,10 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     if (mention) {
       setValue(`${value.slice(0, mention.start)}${value.slice(mention.start + mention.query.length + 1)}`);
     }
-    setPickerOpen(false);
   };
 
   const chips = [...sessionAttachments, ...messageAttachments];
-  const composerExpanded = Boolean(value.trim() || chips.length > 0 || pickerOpen || mention);
+  const composerExpanded = Boolean(value.trim() || chips.length > 0 || attachmentNotice || mention);
 
   const openModifiedFile = (file: AgentModifiedFileView) => {
     const absolutePath = activeFolder?.absolutePath
@@ -132,9 +133,12 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   };
 
   const pickUserSelectedAttachment = async () => {
-    const result = await pickUserAttachment();
+    setAttachmentNotice(null);
+    const result = await pickUserAttachment({
+      initialDirectory: initialAttachmentDirectory ?? activeFolder?.absolutePath ?? null,
+    });
     if (!result.ok) {
-      setPickerOpen((open) => !open);
+      setAttachmentNotice(result.message ?? t(language, 'agent.composer.nativePickerUnsupported'));
       return;
     }
     if (!result.data) return;
@@ -150,7 +154,6 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       source: 'userSelected',
       scope: 'message',
     });
-    setPickerOpen(false);
   };
 
   return (
@@ -255,6 +258,11 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           />
         )}
       </div>
+      {attachmentNotice && (
+        <div className="agent-composer__notice" role="status">
+          {attachmentNotice}
+        </div>
+      )}
       <div className="agent-composer__footer">
         <div className="agent-composer__footer-left">
           <div className="agent-composer__attach-wrap">
@@ -263,20 +271,12 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
               type="button"
               title={t(language, 'agent.composer.addFile')}
               aria-label={t(language, 'agent.composer.addFile')}
-              aria-expanded={pickerOpen}
               onClick={() => {
                 void pickUserSelectedAttachment();
               }}
             >
               +
             </button>
-            {pickerOpen && (
-              <ContextAttachmentPicker
-                query=""
-                language={language}
-                onPick={pickAttachment}
-              />
-            )}
           </div>
         </div>
         <button

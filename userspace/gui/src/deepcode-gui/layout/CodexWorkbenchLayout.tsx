@@ -1,8 +1,8 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
-import type { AgentEvent, AgentSession } from '@deepcode/protocol';
+import type { AgentContextAttachment, AgentEvent, AgentSession } from '@deepcode/protocol';
 import WindowControls from '../../components/window-controls/WindowControls';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
-import { listAgentSessions } from '../../services/runtimeAdapter';
+import { listAgentSessions, pickUserAttachment } from '../../services/runtimeAdapter';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
@@ -39,6 +39,8 @@ interface CodexGuiProject {
   id: string;
   title: string;
   sessionIds: string[];
+  defaultWorkspacePath?: string;
+  defaultWorkspaceName?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -60,8 +62,15 @@ interface CodexTextInputDialog {
   title: string;
   label: string;
   value: string;
+  projectDirectory?: string | null;
+  projectDirectoryError?: string | null;
   session?: AgentSession;
   project?: CodexGuiProject;
+}
+
+interface PendingProjectSession {
+  projectId: string;
+  sessionId: string;
 }
 
 const CODEX_GUI_PROJECTS_STORAGE_KEY = 'deepcode-gui.projects.v1';
@@ -142,6 +151,18 @@ async function copyText(text: string): Promise<void> {
   document.body.removeChild(textarea);
 }
 
+function projectDefaultDirectoryAttachment(project: CodexGuiProject): AgentContextAttachment | null {
+  const absolutePath = project.defaultWorkspacePath?.trim();
+  if (!absolutePath) return null;
+  return {
+    kind: 'directory',
+    path: absolutePath.replace(/\\/g, '/'),
+    absolutePath,
+    source: 'userSelected',
+    scope: 'message',
+  };
+}
+
 function displaySessionTitle(language: UiLanguage, title?: string): string {
   const value = title?.trim();
   if (!value || value === 'New Agent Session' || value === '新 Agent 会话') {
@@ -176,6 +197,12 @@ function readGuiProjects(): CodexGuiProject[] {
         sessionIds: Array.isArray(record.sessionIds)
           ? record.sessionIds.flatMap((id) => typeof id === 'string' ? [id] : [])
           : [],
+        defaultWorkspacePath: typeof record.defaultWorkspacePath === 'string'
+          ? record.defaultWorkspacePath
+          : undefined,
+        defaultWorkspaceName: typeof record.defaultWorkspaceName === 'string'
+          ? record.defaultWorkspaceName
+          : undefined,
         createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
         updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : new Date().toISOString(),
       }];
@@ -342,7 +369,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   const [sessionMenu, setSessionMenu] = useState<CodexSessionContextMenu | null>(null);
   const [projectMenu, setProjectMenu] = useState<CodexProjectContextMenu | null>(null);
   const [textDialog, setTextDialog] = useState<CodexTextInputDialog | null>(null);
-  const pendingProjectSendRef = useRef<string | null>(null);
+  const pendingProjectSendRef = useRef<PendingProjectSession | null>(null);
   const workspace = useWorkspaceStore((s) => s.current);
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
   const sessions = useAgentSessionStore((s) => s.sessions);
@@ -427,6 +454,11 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     () => projectRecords.find((project) => project.id === draftProjectId) ?? null,
     [draftProjectId, projectRecords]
   );
+  const projectAttachmentDirectory = draftProject?.defaultWorkspacePath
+    ?? activeProject?.defaultWorkspacePath
+    ?? activeFolder?.absolutePath
+    ?? workspacePath
+    ?? null;
   const assignedProjectSessionIds = useMemo(() => {
     const ids = new Set<string>();
     for (const project of projectRecords) {
@@ -487,19 +519,21 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     }));
   };
 
+  const upsertKnownSession = (session: AgentSession) => {
+    setKnownSessions((current) => [
+      session,
+      ...current.filter((item) => item.id !== session.id),
+    ]);
+  };
+
   const handleCreateSession = async (projectId?: string | null) => {
     const targetProjectId = projectId === undefined ? activeProjectId : projectId;
     setActiveProjectId(targetProjectId ?? null);
     setDraftProjectId(targetProjectId ?? null);
     if (targetProjectId) return;
-    await createNewSession();
-    const nextSession = useAgentSessionStore.getState().session;
+    const nextSession = await createNewSession();
     if (nextSession?.id) {
-      setKnownSessions((current) => [
-        nextSession,
-        ...current.filter((item) => item.id !== nextSession.id),
-      ]);
-      if (targetProjectId) moveSessionToProject(targetProjectId, nextSession.id);
+      upsertKnownSession(nextSession);
     }
   };
 
@@ -512,33 +546,44 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   };
 
   const prepareProjectDraftSession = async () => {
-    if (!draftProjectId) return;
+    if (!draftProjectId) return true;
     const targetProjectId = draftProjectId;
-    pendingProjectSendRef.current = targetProjectId;
+    const targetProject = projectRecords.find((project) => project.id === targetProjectId) ?? null;
+    pendingProjectSendRef.current = null;
+    setActiveProjectId(targetProjectId);
     setDraftProjectId(null);
-    await createNewSession();
-    const nextSession = useAgentSessionStore.getState().session;
-    if (!nextSession?.id) return;
+    const nextSession = await createNewSession({ reuseEmpty: false });
+    if (!nextSession?.id) {
+      setDraftProjectId(targetProjectId);
+      return false;
+    }
+    pendingProjectSendRef.current = {
+      projectId: targetProjectId,
+      sessionId: nextSession.id,
+    };
     moveSessionToProject(targetProjectId, nextSession.id);
-    setKnownSessions((current) => [
-      nextSession,
-      ...current.filter((item) => item.id !== nextSession.id),
-    ]);
+    upsertKnownSession(nextSession);
+    const defaultDirectoryAttachment = targetProject
+      ? projectDefaultDirectoryAttachment(targetProject)
+      : null;
+    if (defaultDirectoryAttachment) {
+      useAgentSessionStore.getState().addAttachment(defaultDirectoryAttachment);
+    }
+    return true;
   };
 
   const commitDraftProjectSession = async () => {
-    const targetProjectId = pendingProjectSendRef.current;
-    if (!targetProjectId) return;
+    const pending = pendingProjectSendRef.current;
+    if (!pending) return;
     pendingProjectSendRef.current = null;
-    const currentSession = useAgentSessionStore.getState().session;
-    if (!currentSession?.id) {
-      return;
+    const state = useAgentSessionStore.getState();
+    const updatedSession = state.session?.id === pending.sessionId
+      ? state.session
+      : state.sessions.find((item) => item.id === pending.sessionId);
+    moveSessionToProject(pending.projectId, pending.sessionId);
+    if (updatedSession) {
+      upsertKnownSession(updatedSession);
     }
-    moveSessionToProject(targetProjectId, currentSession.id);
-    setKnownSessions((current) => [
-      currentSession,
-      ...current.filter((item) => item.id !== currentSession.id),
-    ]);
   };
 
   const handleCreateProject = () => {
@@ -548,16 +593,54 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
       title: t(language, 'deepcodeGui.project.new'),
       label: t(language, 'deepcodeGui.project.namePrompt'),
       value: defaultName,
+      projectDirectory: null,
+      projectDirectoryError: null,
     });
   };
 
-  const commitProjectName = async (title: string) => {
+  const handlePickProjectDirectory = async () => {
+    if (!textDialog || textDialog.kind !== 'project') return;
+    const result = await pickUserAttachment({
+      directoriesOnly: true,
+      initialDirectory: textDialog.projectDirectory ?? activeFolder?.absolutePath ?? workspacePath ?? null,
+    });
+    if (!result.ok) {
+      setTextDialog((current) =>
+        current && current.kind === 'project'
+          ? {
+              ...current,
+              projectDirectoryError: result.message ?? t(language, 'agent.composer.nativePickerUnsupported'),
+            }
+          : current
+      );
+      return;
+    }
+    if (!result.data) return;
+    const directoryPath = result.data.absolutePath;
+    const defaultName = t(language, 'deepcodeGui.project.defaultName');
+    setTextDialog((current) => {
+      if (!current || current.kind !== 'project') return current;
+      const currentValue = current.value.trim();
+      const shouldUseFolderName = !currentValue || currentValue === defaultName;
+      return {
+        ...current,
+        value: shouldUseFolderName ? (basename(directoryPath) || current.value) : current.value,
+        projectDirectory: directoryPath,
+        projectDirectoryError: null,
+      };
+    });
+  };
+
+  const commitProjectName = async (title: string, defaultWorkspacePath?: string | null) => {
     if (!title) return;
     const now = new Date().toISOString();
+    const normalizedDefaultPath = defaultWorkspacePath?.trim() || undefined;
     const project: CodexGuiProject = {
       id: `project-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
       title,
       sessionIds: [],
+      defaultWorkspacePath: normalizedDefaultPath,
+      defaultWorkspaceName: normalizedDefaultPath ? basename(normalizedDefaultPath) : undefined,
       createdAt: now,
       updatedAt: now,
     };
@@ -641,7 +724,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     if (!value) return;
     setTextDialog(null);
     if (textDialog.kind === 'project') {
-      await commitProjectName(value);
+      await commitProjectName(value, textDialog.projectDirectory);
       return;
     }
     if (textDialog.kind === 'renameProject' && textDialog.project) {
@@ -864,6 +947,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
             language={language}
             forceHome={projectDraftActive}
             homeProjectTitle={draftProject?.title ?? activeProject?.title ?? null}
+            initialAttachmentDirectory={projectAttachmentDirectory}
             onBeforeSend={prepareProjectDraftSession}
             onAfterSend={commitDraftProjectSession}
           />
@@ -1005,6 +1089,27 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                 }}
               />
             </label>
+            {textDialog.kind === 'project' && (
+              <div className="codex-text-dialog__directory">
+                <div>
+                  <span>{t(language, 'deepcodeGui.project.defaultDirectory')}</span>
+                  <strong title={textDialog.projectDirectory ?? undefined}>
+                    {textDialog.projectDirectory
+                      ? basename(textDialog.projectDirectory)
+                      : t(language, 'deepcodeGui.project.noDefaultDirectory')}
+                  </strong>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void handlePickProjectDirectory()}
+                >
+                  {t(language, 'deepcodeGui.project.chooseDirectory')}
+                </button>
+                {textDialog.projectDirectoryError && (
+                  <p>{textDialog.projectDirectoryError}</p>
+                )}
+              </div>
+            )}
             <footer>
               <button type="button" onClick={() => setTextDialog(null)}>
                 {t(language, 'agent.session.cancel')}

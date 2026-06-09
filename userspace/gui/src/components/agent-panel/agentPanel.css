@@ -1513,6 +1513,17 @@
   position: relative;
 }
 
+.agent-composer__notice {
+  margin-top: 6px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-md, 6px);
+  background: rgba(255, 204, 0, 0.08);
+  color: var(--text-muted, #a1a1aa);
+  padding: 7px 9px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .agent-change-set {
   margin-bottom: 6px;
   border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
