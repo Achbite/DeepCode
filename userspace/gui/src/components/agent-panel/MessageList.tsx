@@ -449,6 +449,16 @@ function pickVisibleAssistantEvent(events: AgentEvent[]): AgentEvent | null {
   return visibleAssistant.length > 0 ? visibleAssistant[visibleAssistant.length - 1] : null;
 }
 
+function pickTurnActionTarget(events: AgentEvent[], finalAssistant: AgentEvent | null): AgentEvent | null {
+  if (finalAssistant) return finalAssistant;
+  const candidates = events.filter((event) => {
+    if (event.kind === 'user_msg') return false;
+    if (isRecord(event.payload) && event.payload.pending === true) return false;
+    return !isHiddenConversationEvent(event) || isToolTimelineEvent(event) || event.kind === 'error';
+  });
+  return candidates.length > 0 ? candidates[candidates.length - 1] : null;
+}
+
 function hasMatchingStageResult(events: AgentEvent[], source: AgentEvent): boolean {
   const stageRunId = eventStageRunId(source);
   const stage = eventStage(source);
@@ -585,12 +595,13 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
         pushTurnItem({ type: 'event', event: finalAssistant });
       }
 
-      if (finalAssistant && !loading) {
+      const turnActionTarget = pickTurnActionTarget(turnEvents, finalAssistant);
+      if (turnActionTarget && !loading) {
         items.push({
           type: 'turnActions',
           id: `turn-actions-${event.id}`,
           items: turnItems,
-          targetEvent: finalAssistant,
+          targetEvent: turnActionTarget,
         });
       }
       continue;

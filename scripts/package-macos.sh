@@ -326,6 +326,123 @@ copy_web_dist() {
   cp -R "$CLIENT_DIST_DIR/." "$dst/"
 }
 
+write_file_if_missing() {
+  local dst="$1"
+  [ ! -f "$dst" ] || return 0
+  mkdir -p "$(dirname "$dst")"
+  cat > "$dst"
+}
+
+prepare_portable_config_root() {
+  log "prepare portable config/session/cache root"
+  mkdir -p \
+    "$BIN_DIR/config/user/local/settings" \
+    "$BIN_DIR/config/user/local/secrets" \
+    "$BIN_DIR/sessions" \
+    "$BIN_DIR/conversation-archives" \
+    "$BIN_DIR/kernel"
+
+  write_file_if_missing "$BIN_DIR/config/user/local/settings/user-settings.json" <<'JSON'
+{
+  "editor.tabSize": 4,
+  "editor.insertSpaces": true,
+  "editor.wordWrap": "off",
+  "editor.fontSize": 14,
+  "editor.fontFamily": "Consolas, 'Courier New', monospace",
+  "editor.renderWhitespace": "none",
+  "files.autoSave": "afterDelay",
+  "files.autoSaveDelay": 1000,
+  "files.hotExit": true,
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+  "keyboard.enableBasicShortcuts": true,
+  "explorer.confirmDelete": false,
+  "workbench.colorTheme": "vs-dark",
+  "workbench.language": "zh-CN",
+  "workbench.styleTokenOverrides": "{}",
+  "terminal.integrated.defaultProfile.windows": "wsl",
+  "terminal.integrated.prewarm": "afterStartup",
+  "terminal.integrated.spawnTimeoutMs": 8000,
+  "agent.defaultMode": "plan",
+  "agent.defaultWorkflow": "planFirst",
+  "agent.permissions.allowFileRead": true,
+  "agent.permissions.allowFileWrite": true,
+  "agent.permissions.allowCodeSearch": true,
+  "agent.permissions.allowShellPropose": true,
+  "agent.permissions.allowShellExec": true,
+  "agent.shell.autoExecuteCommands": false,
+  "skills.pythonPath": "python",
+  "skills.autoLoad": true,
+  "skills.mounts": "[]",
+  "mcp.autoLoad": false,
+  "mcp.servers": "[]",
+  "ruler.enabled": true,
+  "ruler.rules": "[{\"id\":\"default-safety\",\"name\":\"Default Safety Boundary\",\"source\":\"system\",\"priority\":100,\"path\":\"<builtin>/default-safety.md\",\"content\":\"Default to plan mode. Read before write. Show diff before saving files. Never run destructive commands without explicit approval.\",\"enabled\":true}]"
+}
+JSON
+
+  write_file_if_missing "$BIN_DIR/config/user/local/settings/llm-profiles.json" <<'JSON'
+{
+  "profiles": [
+    {
+      "id": "deepseek-v4-flash-openai",
+      "name": "DeepSeek V4 Flash",
+      "kind": "openaiCompatible",
+      "baseUrl": "https://api.deepseek.com",
+      "model": "deepseek-v4-flash",
+      "contextWindowTokens": 1000000,
+      "maxOutputTokens": 384000,
+      "temperature": 0.2,
+      "reasoningEffort": "high",
+      "thinking": "enabled",
+      "enabled": true
+    },
+    {
+      "id": "deepseek-v4-pro-openai",
+      "name": "DeepSeek V4 Pro",
+      "kind": "openaiCompatible",
+      "baseUrl": "https://api.deepseek.com",
+      "model": "deepseek-v4-pro",
+      "contextWindowTokens": 1000000,
+      "maxOutputTokens": 384000,
+      "temperature": 0.2,
+      "reasoningEffort": "max",
+      "thinking": "enabled",
+      "enabled": true
+    }
+  ],
+  "defaultProfileId": "deepseek-v4-pro-openai",
+  "storePath": null
+}
+JSON
+
+  write_file_if_missing "$BIN_DIR/config/user/local/settings/agent-workflow-config.json" <<'JSON'
+{
+  "plan": {},
+  "check": {},
+  "complete": {},
+  "review": {}
+}
+JSON
+
+  write_file_if_missing "$BIN_DIR/config/README.txt" <<README
+DeepCode writable portable configuration
+========================================
+
+This directory is used by the macOS local package when launched through
+$APP_NAME.app or package launcher scripts.
+
+Writable runtime data:
+  config/user/local/settings/     User settings, profiles, workflow config.
+  config/user/local/secrets/      Local secret references. Do not share.
+  sessions/                       Session projection and transcript cache.
+  conversation-archives/          Conversation archive exports and debug packages.
+  kernel/                         Kernel ledger and runtime records.
+
+Set DEEPCODE_CONFIG_DIR to override this package-local root.
+README
+}
+
 write_tui_launcher() {
   [ "$WRITE_TUI_LAUNCHER" = "1" ] || return 0
   cat > "$BIN_DIR/$TUI_COMMAND_NAME" <<LAUNCHER
@@ -337,7 +454,8 @@ HOST="\${DEEPCODE_HOST:-127.0.0.1}"
 KERNEL_BIN="\$SCRIPT_DIR/deepcode-kernel"
 TUI_BIN="\$SCRIPT_DIR/deepcode-tui"
 WEB_DIR="\$SCRIPT_DIR/$WEB_DIR_NAME"
-LOG_DIR="\${DEEPCODE_LOG_DIR:-\$HOME/Library/Logs/DeepCode}"
+CONFIG_ROOT="\${DEEPCODE_CONFIG_DIR:-\$SCRIPT_DIR}"
+LOG_DIR="\${DEEPCODE_LOG_DIR:-\$CONFIG_ROOT/logs}"
 mkdir -p "\$LOG_DIR"
 
 fail() {
@@ -406,6 +524,7 @@ trap cleanup EXIT INT TERM
 if ! health_ok "\$API_URL"; then
   DEEPCODE_HOST="\$HOST" \
   DEEPCODE_PORT="\$PORT" \
+  DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT" \
   DEEPCODE_CLIENT_DIST="\$WEB_DIR" \
     "\$KERNEL_BIN" >>"\$LOG_DIR/deepcode-kernel.log" 2>&1 &
   KERNEL_PID="\$!"
@@ -418,6 +537,7 @@ fi
 
 export DEEPCODE_HOST="\$HOST"
 export DEEPCODE_PORT="\$PORT"
+export DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT"
 export DEEPCODE_API_URL="\$API_URL"
 "\$TUI_BIN" --api "\$API_URL"
 LAUNCHER
@@ -490,7 +610,13 @@ write_readme() {
 
   notes="  bin/macos-arm64 is the shared macOS distribution directory for DeepCode and
   DeepCode-GUI. Both GUI variants use the same kernel/session/user settings
-  model unless DEEPCODE_CONFIG_DIR is explicitly overridden."
+  model unless DEEPCODE_CONFIG_DIR is explicitly overridden.
+  By default, this local package stores writable user data under:
+    config/user/local/settings/
+    config/user/local/secrets/
+    sessions/
+    conversation-archives/
+    kernel/"
 
   cat > "$BIN_DIR/README.txt" <<README
 $PRODUCT macOS arm64 Distribution
@@ -507,6 +633,10 @@ Files:
   deepcode-cli              Darwin arm64 CLI host.
   deepcode-tui              Darwin arm64 Ratatui/Crossterm TUI host.
 $root_web_entry
+  config/                  Package-local writable user config root.
+  sessions/                Package-local session projection/transcript cache.
+  conversation-archives/   Package-local conversation exports and debug packages.
+  kernel/                  Package-local Kernel ledger/runtime records.
 
 Notes:
 $notes
@@ -532,6 +662,7 @@ package_distribution() {
   local app_macos_dir="$BIN_DIR/$APP_NAME.app/Contents/MacOS"
   local app_resources_dir="$BIN_DIR/$APP_NAME.app/Contents/Resources"
   mkdir -p "$app_macos_dir" "$app_resources_dir"
+  prepare_portable_config_root
   write_app_info_plist "$BIN_DIR/$APP_NAME.app/Contents/Info.plist"
 
   log "copy Tauri shell into app bundle"

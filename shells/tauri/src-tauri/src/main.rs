@@ -141,6 +141,9 @@ fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
     let exe_dir = current_exe_dir()?;
     let kernel_path = find_bundled_file(&exe_dir, kernel_binary_name())?;
     let kernel_dir = parent_dir(&kernel_path).unwrap_or_else(|| exe_dir.clone());
+    let config_root = std::env::var_os("DEEPCODE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| package_root(&exe_dir).unwrap_or_else(|| kernel_dir.clone()));
 
     let web_dir = std::env::var("DEEPCODE_CLIENT_DIST")
         .map(PathBuf::from)
@@ -153,6 +156,7 @@ fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
         .current_dir(&kernel_dir)
         .env("DEEPCODE_HOST", host)
         .env("DEEPCODE_PORT", port)
+        .env("DEEPCODE_CONFIG_DIR", config_root)
         .env("DEEPCODE_CLIENT_DIST", web_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -208,6 +212,17 @@ fn bundled_candidates(exe_dir: &Path, name: &str) -> Vec<PathBuf> {
         }
     }
     candidates
+}
+
+fn package_root(exe_dir: &Path) -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return exe_dir
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+    }
+    Some(exe_dir.to_path_buf())
 }
 
 fn kernel_binary_name() -> &'static str {

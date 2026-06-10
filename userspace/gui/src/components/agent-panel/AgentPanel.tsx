@@ -18,6 +18,7 @@ const AgentPanel: React.FC = () => {
   const traceEvents = useAgentSessionStore((s) => s.traceEvents);
   const profileId = useAgentSessionStore((s) => s.profileId);
   const loading = useAgentSessionStore((s) => s.loading);
+  const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const errorMessage = useAgentSessionStore((s) => s.errorMessage);
   const messageAttachments = useAgentSessionStore((s) => s.messageAttachments);
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
@@ -41,6 +42,8 @@ const AgentPanel: React.FC = () => {
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
+  const activeSessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
+  const agentBusy = loading || activeSessionRunning;
 
   useEffect(() => {
     void loadOrCreate();
@@ -79,13 +82,13 @@ const AgentPanel: React.FC = () => {
       <AgentTaskList
         events={events}
         traceEvents={traceEvents}
-        loading={loading}
+        loading={agentBusy}
         language={language}
       />
 
       <MessageList
         events={events}
-        loading={loading}
+        loading={agentBusy}
         language={language}
         onPlanResolve={(runId, planId, decision, guidance) =>
           void resolvePlan(runId, planId, decision, guidance)
@@ -113,7 +116,7 @@ const AgentPanel: React.FC = () => {
         messageAttachments={messageAttachments}
         sessionAttachments={sessionAttachments}
         language={language}
-        loading={loading}
+        loading={agentBusy}
         onSend={(content) => void sendMessage(content)}
         onStop={() => void cancelCurrentRun()}
         onAddAttachment={addAttachment}
