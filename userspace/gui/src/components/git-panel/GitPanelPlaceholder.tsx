@@ -4,11 +4,20 @@
  */
 import React, { useEffect, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
+import { getGitStatus } from '../../services/runtimeAdapter';
 import './gitPanel.css';
 
 interface GitContextMenuState {
   x: number;
   y: number;
+}
+
+interface GitChangeItem {
+  path: string;
+  index: string;
+  worktree: string;
+  group: string;
+  raw: string;
 }
 
 const RESERVED_ACTION_KEYS = [
@@ -24,6 +33,22 @@ interface GitPanelPlaceholderProps {
 
 const GitPanelPlaceholder: React.FC<GitPanelPlaceholderProps> = ({ language }) => {
   const [contextMenu, setContextMenu] = useState<GitContextMenuState | null>(null);
+  const [changes, setChanges] = useState<GitChangeItem[]>([]);
+  const [root, setRoot] = useState<string>('');
+  const [message, setMessage] = useState<string>('');
+
+  const refresh = async () => {
+    const response = await getGitStatus();
+    if (response.ok && response.data) {
+      setChanges(response.data.changes);
+      setRoot(response.data.root);
+      setMessage('');
+    } else {
+      setChanges([]);
+      setRoot('');
+      setMessage(response.message ?? response.error ?? t(language, 'git.statusUnavailable'));
+    }
+  };
 
   useEffect(() => {
     const close = () => setContextMenu(null);
@@ -41,6 +66,12 @@ const GitPanelPlaceholder: React.FC<GitPanelPlaceholderProps> = ({ language }) =
     };
   }, []);
 
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  const grouped = groupChanges(changes);
+
   return (
     <div
       className="git-panel-placeholder"
@@ -50,10 +81,44 @@ const GitPanelPlaceholder: React.FC<GitPanelPlaceholderProps> = ({ language }) =
         setContextMenu({ x: event.clientX, y: event.clientY });
       }}
     >
-      <div className="placeholder-content">
-        {t(language, 'git.placeholder')}
-        <div className="stage-hint">{t(language, 'git.stageHint')}</div>
+      <div className="git-panel-toolbar">
+        <div>
+          <strong>{t(language, 'workbench.sourceControl')}</strong>
+          <span>{root || t(language, 'git.noRepository')}</span>
+        </div>
+        <button type="button" onClick={() => void refresh()} title={t(language, 'git.refresh')}>
+          ↻
+        </button>
       </div>
+
+      {message ? (
+        <div className="placeholder-content">
+          {message}
+          <div className="stage-hint">{t(language, 'git.stageHint')}</div>
+        </div>
+      ) : changes.length === 0 ? (
+        <div className="placeholder-content">
+          {t(language, 'git.clean')}
+          <div className="stage-hint">{t(language, 'git.stageHint')}</div>
+        </div>
+      ) : (
+        <div className="git-change-tree">
+          {(['staged', 'changed', 'untracked'] as const).map((group) => (
+            <section key={group} className="git-change-group">
+              <header>
+                <span>{t(language, `git.group.${group}`)}</span>
+                <strong>{grouped[group].length}</strong>
+              </header>
+              {grouped[group].map((change) => (
+                <button key={`${change.group}:${change.path}:${change.raw}`} type="button">
+                  <span className="git-change-status">{change.index}{change.worktree}</span>
+                  <span className="git-change-path">{change.path}</span>
+                </button>
+              ))}
+            </section>
+          ))}
+        </div>
+      )}
 
       {contextMenu && (
         <div
@@ -72,5 +137,13 @@ const GitPanelPlaceholder: React.FC<GitPanelPlaceholderProps> = ({ language }) =
     </div>
   );
 };
+
+function groupChanges(changes: GitChangeItem[]): Record<'staged' | 'changed' | 'untracked', GitChangeItem[]> {
+  return {
+    staged: changes.filter((change) => change.group === 'staged'),
+    changed: changes.filter((change) => change.group === 'changed'),
+    untracked: changes.filter((change) => change.group === 'untracked'),
+  };
+}
 
 export default GitPanelPlaceholder;

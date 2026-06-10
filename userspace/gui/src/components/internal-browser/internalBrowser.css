@@ -111,6 +111,13 @@
   background-size: 28px 28px;
 }
 
+.internal-browser-panel__frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #fff;
+}
+
 .internal-browser-panel__placeholder {
   width: min(520px, calc(100% - 40px));
   display: flex;

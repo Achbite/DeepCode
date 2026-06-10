@@ -112,6 +112,7 @@ const InternalBrowserPanel: React.FC = () => {
 
   const inspectState: BrowserInspectState = runtime?.inspectState ?? 'off';
   const busy = activeAction !== 'idle';
+  const previewUrl = runtime?.currentUrl || url;
 
   return (
     <div className="internal-browser-panel">
@@ -217,11 +218,21 @@ const InternalBrowserPanel: React.FC = () => {
 
       <div className="internal-browser-panel__body">
         <section className="internal-browser-panel__preview">
-          <div className="internal-browser-panel__placeholder">
-            <strong>{t(language, 'browser.skeletonTitle')}</strong>
-            <span>{busy ? t(language, 'browser.processing') : message}</span>
-            <small>{t(language, 'browser.skeletonHint')}</small>
-          </div>
+          {previewUrl ? (
+            <iframe
+              key={previewUrl}
+              className="internal-browser-panel__frame"
+              title="DeepCode internal browser"
+              src={previewUrl}
+              sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts"
+            />
+          ) : (
+            <div className="internal-browser-panel__placeholder">
+              <strong>{t(language, 'browser.skeletonTitle')}</strong>
+              <span>{busy ? t(language, 'browser.processing') : message}</span>
+              <small>{t(language, 'browser.skeletonHint')}</small>
+            </div>
+          )}
         </section>
         <aside className="internal-browser-panel__inspector">
           <div className="internal-browser-panel__meta">

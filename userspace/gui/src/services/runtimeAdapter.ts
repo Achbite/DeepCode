@@ -593,6 +593,17 @@ export function getAgentSkills(): Promise<ApiResponse<SkillReferenceResult>> {
   return api.getAgentSkills();
 }
 
+export function getGitStatus(): Promise<ApiResponse<api.GitStatusResult>> {
+  return api.getGitStatus();
+}
+
+export function getGitDiff(
+  path?: string,
+  staged?: boolean
+): Promise<ApiResponse<api.GitDiffResult>> {
+  return api.getGitDiff(path, staged);
+}
+
 export function getBrowserRuntimeStatus(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
   return api.getBrowserRuntimeStatus();
 }

@@ -1,6 +1,103 @@
 .git-panel-placeholder {
   position: relative;
   min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  color: var(--text-main);
+}
+
+.git-panel-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.git-panel-toolbar div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.git-panel-toolbar strong {
+  color: var(--text-strong);
+  font-size: 12px;
+}
+
+.git-panel-toolbar span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-panel-toolbar button {
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-main);
+  cursor: pointer;
+}
+
+.git-change-tree {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+}
+
+.git-change-group {
+  margin-bottom: 10px;
+}
+
+.git-change-group header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 2px 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.git-change-group button {
+  width: 100%;
+  min-height: 28px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 6px;
+  align-items: center;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-main);
+  cursor: default;
+  text-align: left;
+}
+
+.git-change-group button:hover {
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.git-change-status {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: center;
+}
+
+.git-change-path {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .git-panel-context-menu {

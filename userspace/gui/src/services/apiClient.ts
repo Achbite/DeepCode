@@ -775,6 +775,39 @@ export function getAgentSkills(): Promise<ApiResponse<SkillReferenceResult>> {
   return getJson<SkillReferenceResult>(`${API_BASE}/agent/skills`);
 }
 
+export interface GitChangeItem {
+  path: string;
+  index: string;
+  worktree: string;
+  group: 'staged' | 'changed' | 'untracked' | string;
+  raw: string;
+}
+
+export interface GitStatusResult {
+  root: string;
+  changes: GitChangeItem[];
+  raw: string;
+}
+
+export interface GitDiffResult {
+  root: string;
+  path?: string | null;
+  staged: boolean;
+  diff: string;
+}
+
+export function getGitStatus(): Promise<ApiResponse<GitStatusResult>> {
+  return getJson<GitStatusResult>(`${API_BASE}/git/status`);
+}
+
+export function getGitDiff(path?: string, staged?: boolean): Promise<ApiResponse<GitDiffResult>> {
+  const qs = buildQuery({
+    path,
+    staged: staged === undefined ? undefined : String(staged),
+  });
+  return getJson<GitDiffResult>(`${API_BASE}/git/diff${qs}`);
+}
+
 export function getBrowserRuntimeStatus(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
   return getJson<BrowserRuntimeStatusResult>(`${API_BASE}/browser/runtime-status`);
 }
