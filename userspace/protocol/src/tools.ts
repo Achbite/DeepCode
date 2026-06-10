@@ -49,6 +49,12 @@ export interface FsWriteInput {
   folderId?: string;
 }
 
+export interface FsDeleteInput {
+  path: string;
+  folderId?: string;
+  reason?: string;
+}
+
 export interface FsListInput {
   path: string;
   folderId?: string;
@@ -78,6 +84,54 @@ export interface ShellExecInput {
   cwd?: string;
   timeoutMs?: number;
   reason?: string;
+}
+
+export interface WebSearchInput {
+  query: string;
+  limit?: number;
+}
+
+export interface WebFetchInput {
+  url: string;
+  maxBytes?: number;
+}
+
+export interface GitDiffInput {
+  path?: string;
+  staged?: boolean;
+}
+
+export interface GitPathInput {
+  path?: string;
+  paths?: string[];
+}
+
+export interface GitCommitInput {
+  message: string;
+}
+
+export interface BrowserOpenInput {
+  url: string;
+}
+
+export interface BrowserSnapshotInput {
+  selector?: string;
+}
+
+export interface BrowserInspectInput {
+  inspectState?: string;
+}
+
+export interface BrowserSelectorInput {
+  selector: string;
+}
+
+export interface BrowserTypeInput extends BrowserSelectorInput {
+  text: string;
+}
+
+export interface BrowserScrollInput {
+  deltaY?: number;
 }
 
 export interface ShellExecResult {

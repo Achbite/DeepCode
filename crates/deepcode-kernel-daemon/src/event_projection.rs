@@ -500,9 +500,12 @@ pub(crate) fn stage_status_for_gui(status: &deepcode_kernel_abi::StageStatus) ->
 
 pub(crate) fn tool_name_for_capability(capability: &str) -> &str {
     match capability {
-        "cap.fs.write" => "fs.write",
-        "cap.fs.delete" => "fs.delete",
-        "cap.shell.exec" => "shell.exec",
+        "workspace.write" | "cap.fs.write" => "fs.write",
+        "workspace.delete" | "cap.fs.delete" => "fs.delete",
+        "process.exec" | "cap.shell.exec" => "shell.exec",
+        "network.egress" => "web.fetch",
+        "git.write" => "git.commit",
+        "browser.control" => "browser.snapshot",
         "cap.skill.executeExternal" => "skill.invoke",
         _ => capability,
     }

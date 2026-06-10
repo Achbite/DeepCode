@@ -31,6 +31,8 @@ impl DeepCodeKernelRuntime {
         }
 
         let (run_id, session_id) = self.resolve_run_session(run_id, session_id)?;
+        let permission_action =
+            self.effective_permission_action_for_tool(&run_id, &tool_name, &arguments)?;
         let request_sequence = self.ledger.next_sequence(&run_id)?;
         let requested = KernelEvent::ToolRequested {
             run_id: Some(RunId(run_id.clone())),
@@ -54,7 +56,7 @@ impl DeepCodeKernelRuntime {
             }),
         )?;
 
-        if permission_action_for_kernel_tool(&tool_name) == PermissionAction::Ask {
+        if permission_action == PermissionAction::Ask {
             let permission_id = tool_call_id.clone();
             let pending_tool_call_id = tool_call_id.clone();
             let pending_arguments = arguments.clone();
@@ -77,7 +79,7 @@ impl DeepCodeKernelRuntime {
                     capability: capability_for_tool(&tool_name).to_string(),
                     risk_level: risk_for_tool(&tool_name).to_string(),
                     summary: format!("Allow {tool_name} to access workspace resources?"),
-                    args_preview: redact_tool_arguments(&tool_name, &serde_json::json!({})),
+                    args_preview: redact_tool_arguments(&tool_name, &pending_arguments),
                 },
                 sequence: Some(permission_sequence),
             };
@@ -100,8 +102,12 @@ impl DeepCodeKernelRuntime {
                     "toolName": tool_name,
                     "capability": capability_for_tool(&tool_name),
                     "riskLevel": risk_for_tool(&tool_name),
-                    "argsPreview": redact_tool_arguments(&tool_name, &serde_json::json!({})),
-                    "arguments": pending_arguments
+                    "argsPreview": redact_tool_arguments(&tool_name, &pending_arguments),
+                    "argumentsRef": {
+                        "storage": "runtime.pendingTools",
+                        "permissionId": permission_id,
+                        "redaction": "raw arguments are kept in memory only and are not persisted to permission ledger"
+                    }
                 }),
             )?;
             return Ok(vec![requested, permission]);
@@ -185,6 +191,8 @@ impl DeepCodeKernelRuntime {
                 call.name
             )));
         }
+        let permission_action =
+            self.effective_permission_action_for_tool(run_id, &call.name, &call.arguments)?;
         let request_sequence = self.ledger.next_sequence(run_id)?;
         let requested = KernelEvent::ToolRequested {
             run_id: Some(RunId(run_id.to_string())),
@@ -208,7 +216,7 @@ impl DeepCodeKernelRuntime {
             }),
         )?;
 
-        if permission_action_for_kernel_tool(&call.name) == PermissionAction::Ask {
+        if permission_action == PermissionAction::Ask {
             let permission_id = call.id.clone();
             let pending_tool_call_id = call.id.clone();
             let pending_arguments = call.arguments.clone();
@@ -231,7 +239,7 @@ impl DeepCodeKernelRuntime {
                     capability: capability_for_tool(&call.name).to_string(),
                     risk_level: risk_for_tool(&call.name).to_string(),
                     summary: format!("Allow {} to access workspace resources?", call.name),
-                    args_preview: redact_tool_arguments(&call.name, &serde_json::json!({})),
+                    args_preview: redact_tool_arguments(&call.name, &pending_arguments),
                 },
                 sequence: Some(permission_sequence),
             };
@@ -254,8 +262,12 @@ impl DeepCodeKernelRuntime {
                     "toolName": call.name,
                     "capability": capability_for_tool(&call.name),
                     "riskLevel": risk_for_tool(&call.name),
-                    "argsPreview": redact_tool_arguments(&call.name, &serde_json::json!({})),
-                    "arguments": pending_arguments
+                    "argsPreview": redact_tool_arguments(&call.name, &pending_arguments),
+                    "argumentsRef": {
+                        "storage": "runtime.pendingTools",
+                        "permissionId": permission_id,
+                        "redaction": "raw arguments are kept in memory only and are not persisted to permission ledger"
+                    }
                 }),
             )?;
             return Ok(vec![requested, permission]);
@@ -310,7 +322,9 @@ impl DeepCodeKernelRuntime {
                 }),
             )?;
             events.push(requested);
-            if permission_action_for_kernel_tool(tool_name) == PermissionAction::Ask
+            let permission_action =
+                self.effective_permission_action_for_tool(run_id, tool_name, &arguments)?;
+            if permission_action == PermissionAction::Ask
                 && !is_kernel_owned_temp_cleanup(tool_name, &arguments)
             {
                 let permission_id = tool_call_id.clone();
@@ -335,7 +349,7 @@ impl DeepCodeKernelRuntime {
                         capability: capability_for_tool(tool_name).to_string(),
                         risk_level: risk_for_tool(tool_name).to_string(),
                         summary: format!("Allow {tool_name} to access workspace resources?"),
-                        args_preview: redact_tool_arguments(tool_name, &serde_json::json!({})),
+                        args_preview: redact_tool_arguments(tool_name, &pending_arguments),
                     },
                     sequence: Some(permission_sequence),
                 };
@@ -358,8 +372,12 @@ impl DeepCodeKernelRuntime {
                         "toolName": tool_name,
                         "capability": capability_for_tool(tool_name),
                         "riskLevel": risk_for_tool(tool_name),
-                        "argsPreview": redact_tool_arguments(tool_name, &serde_json::json!({})),
-                        "arguments": pending_arguments
+                        "argsPreview": redact_tool_arguments(tool_name, &pending_arguments),
+                        "argumentsRef": {
+                            "storage": "runtime.pendingTools",
+                            "permissionId": permission_id,
+                            "redaction": "raw arguments are kept in memory only and are not persisted to permission ledger"
+                        }
                     }),
                 )?;
                 events.push(permission);
@@ -945,11 +963,13 @@ pub(crate) enum PermissionAction {
 
 pub(crate) fn permission_action_for_kernel_tool(tool_id: &str) -> PermissionAction {
     match tool_id {
-        "fs.write" | "shell.exec" => PermissionAction::Ask,
-        "fs.delete" => PermissionAction::Ask,
-        "fs.read" | "fs.list" | "fs.diff" | "code.search" | "shell.propose" => {
-            PermissionAction::Allow
+        "fs.write" | "fs.delete" | "shell.exec" | "web.search" | "web.fetch" | "git.stage"
+        | "git.unstage" | "git.commit" | "browser.open" | "browser.reload" | "browser.snapshot"
+        | "browser.inspect" | "browser.click" | "browser.type" | "browser.scroll" => {
+            PermissionAction::Ask
         }
+        "fs.read" | "fs.list" | "fs.diff" | "code.search" | "shell.propose" | "git.status"
+        | "git.diff" => PermissionAction::Allow,
         _ => PermissionAction::Deny,
     }
 }
@@ -957,7 +977,17 @@ pub(crate) fn permission_action_for_kernel_tool(tool_id: &str) -> PermissionActi
 pub(crate) fn needs_workspace_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "fs.read" | "fs.list" | "fs.diff" | "fs.write" | "fs.delete" | "code.search"
+        "fs.read"
+            | "fs.list"
+            | "fs.diff"
+            | "fs.write"
+            | "fs.delete"
+            | "code.search"
+            | "git.status"
+            | "git.diff"
+            | "git.stage"
+            | "git.unstage"
+            | "git.commit"
     )
 }
 
@@ -999,31 +1029,78 @@ fn runtime_audit_signer() -> KernelResult<LocalAuditSigner> {
 
 pub(crate) fn capability_for_tool(tool_id: &str) -> &'static str {
     match tool_id {
-        "fs.write" => "cap.fs.write",
-        "fs.delete" => "cap.fs.delete",
-        "shell.exec" => "cap.shell.exec",
-        "fs.read" | "fs.list" | "fs.diff" => "cap.fs.read",
-        "code.search" => "cap.code.search",
-        "shell.propose" => "cap.shell.propose",
-        _ => "cap.unknown",
+        "fs.write" => "workspace.write",
+        "fs.delete" => "workspace.delete",
+        "shell.exec" => "process.exec",
+        "web.search" | "web.fetch" => "network.egress",
+        "git.stage" | "git.unstage" | "git.commit" => "git.write",
+        "browser.open" | "browser.reload" | "browser.snapshot" | "browser.inspect"
+        | "browser.click" | "browser.type" | "browser.scroll" => "browser.control",
+        "fs.read" | "fs.list" => "workspace.read",
+        "fs.diff" => "workspace.preview_diff",
+        "code.search" => "workspace.search",
+        "shell.propose" => "process.propose",
+        "git.status" | "git.diff" => "git.read",
+        _ => "unknown",
     }
 }
 
 pub(crate) fn risk_for_tool(tool_id: &str) -> &'static str {
     match tool_id {
-        "fs.delete" | "shell.exec" => "high",
+        "fs.delete" | "shell.exec" | "web.search" | "web.fetch" | "git.stage" | "git.unstage"
+        | "git.commit" | "browser.open" | "browser.reload" | "browser.snapshot"
+        | "browser.inspect" | "browser.click" | "browser.type" | "browser.scroll" => "high",
         "fs.write" => "medium",
         _ => "low",
     }
 }
 
 pub(crate) fn redact_tool_arguments(tool_name: &str, arguments: &Value) -> Value {
-    if tool_name == "shell.exec" {
-        return serde_json::json!({
-            "command": arguments.get("command").and_then(Value::as_str).unwrap_or_default()
-        });
+    match tool_name {
+        "shell.exec" | "shell.propose" => {
+            let command = arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            serde_json::json!({
+                "commandPreview": limit_preview(command, 160),
+                "commandBytes": command.len(),
+                "commandHash": deepcode_kernel_skills::hash::hash_bytes(command.as_bytes())
+            })
+        }
+        "fs.write" | "fs.diff" => {
+            let content = arguments
+                .get("content")
+                .or_else(|| arguments.get("newContent"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            serde_json::json!({
+                "path": arguments.get("path").cloned().unwrap_or(Value::Null),
+                "contentBytes": content.len(),
+                "contentHash": deepcode_kernel_skills::hash::hash_bytes(content.as_bytes())
+            })
+        }
+        "browser.type" => {
+            let text = arguments
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            serde_json::json!({
+                "selector": arguments.get("selector").cloned().unwrap_or(Value::Null),
+                "textPreview": limit_preview(text, 80),
+                "textBytes": text.len(),
+                "textHash": deepcode_kernel_skills::hash::hash_bytes(text.as_bytes())
+            })
+        }
+        _ => arguments.clone(),
     }
-    arguments.clone()
+}
+
+fn limit_preview(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    format!("{}…", value.chars().take(max_chars).collect::<String>())
 }
 
 pub(crate) fn next_kernel_autorun_tool(state: &RunDecisionState) -> Option<(&'static str, Value)> {

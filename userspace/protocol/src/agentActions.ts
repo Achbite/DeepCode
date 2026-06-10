@@ -9,6 +9,21 @@ export type ParsedAgentActionType =
   | 'fs.diff'
   | 'shell.propose'
   | 'shell.exec'
+  | 'fs.delete'
+  | 'web.search'
+  | 'web.fetch'
+  | 'git.status'
+  | 'git.diff'
+  | 'git.stage'
+  | 'git.unstage'
+  | 'git.commit'
+  | 'browser.open'
+  | 'browser.reload'
+  | 'browser.snapshot'
+  | 'browser.inspect'
+  | 'browser.click'
+  | 'browser.type'
+  | 'browser.scroll'
   | 'final';
 
 export interface ParsedAgentActionError {

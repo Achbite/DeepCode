@@ -214,6 +214,132 @@ impl InMemorySkillRegistry {
                 vec!["complete"],
                 true,
             ),
+            builtin(
+                "web.search",
+                "skill.web.search.description",
+                Capability::network_egress(),
+                RiskLevel::High,
+                vec![CapabilityEffect::UsesNetwork],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "web.fetch",
+                "skill.web.fetch.description",
+                Capability::network_egress(),
+                RiskLevel::High,
+                vec![CapabilityEffect::UsesNetwork],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "git.status",
+                "skill.git.status.description",
+                Capability::git_read(),
+                RiskLevel::Low,
+                vec![CapabilityEffect::ReadsGit],
+                vec!["plan", "check", "complete", "review"],
+                true,
+            ),
+            builtin(
+                "git.diff",
+                "skill.git.diff.description",
+                Capability::git_read(),
+                RiskLevel::Low,
+                vec![CapabilityEffect::ReadsGit],
+                vec!["plan", "check", "complete", "review"],
+                true,
+            ),
+            builtin(
+                "git.stage",
+                "skill.git.stage.description",
+                Capability::git_write(),
+                RiskLevel::High,
+                vec![CapabilityEffect::ModifiesGit],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "git.unstage",
+                "skill.git.unstage.description",
+                Capability::git_write(),
+                RiskLevel::High,
+                vec![CapabilityEffect::ModifiesGit],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "git.commit",
+                "skill.git.commit.description",
+                Capability::git_write(),
+                RiskLevel::High,
+                vec![CapabilityEffect::ModifiesGit],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "browser.open",
+                "skill.browser.open.description",
+                Capability::browser_control(),
+                RiskLevel::High,
+                vec![CapabilityEffect::ControlsBrowser],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "browser.reload",
+                "skill.browser.reload.description",
+                Capability::browser_control(),
+                RiskLevel::High,
+                vec![CapabilityEffect::ControlsBrowser],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "browser.snapshot",
+                "skill.browser.snapshot.description",
+                Capability::browser_control(),
+                RiskLevel::High,
+                vec![CapabilityEffect::ControlsBrowser],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "browser.inspect",
+                "skill.browser.inspect.description",
+                Capability::browser_control(),
+                RiskLevel::High,
+                vec![CapabilityEffect::ControlsBrowser],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "browser.click",
+                "skill.browser.click.description",
+                Capability::browser_control(),
+                RiskLevel::High,
+                vec![CapabilityEffect::ControlsBrowser],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "browser.type",
+                "skill.browser.type.description",
+                Capability::browser_control(),
+                RiskLevel::High,
+                vec![CapabilityEffect::ControlsBrowser],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
+                "browser.scroll",
+                "skill.browser.scroll.description",
+                Capability::browser_control(),
+                RiskLevel::High,
+                vec![CapabilityEffect::ControlsBrowser],
+                vec!["complete"],
+                true,
+            ),
         ])
     }
 
@@ -285,7 +411,7 @@ mod tests {
     #[test]
     fn builtin_catalog_contains_expected_tools() {
         let registry = InMemorySkillRegistry::with_builtin_tools();
-        assert_eq!(registry.len(), 8);
+        assert_eq!(registry.len(), 22);
         let write = registry.get("fs.write").unwrap().unwrap();
         assert_eq!(write.risk_level, RiskLevel::High);
         assert_eq!(
@@ -302,6 +428,29 @@ mod tests {
         );
         assert!(delete.model_visible);
         assert!(delete.effects.contains(&CapabilityEffect::DeletesWorkspace));
+
+        let web_fetch = registry.get("web.fetch").unwrap().unwrap();
+        assert_eq!(
+            web_fetch.primary_capability(),
+            Some(Capability::network_egress())
+        );
+        assert!(web_fetch.effects.contains(&CapabilityEffect::UsesNetwork));
+
+        let git_status = registry.get("git.status").unwrap().unwrap();
+        assert_eq!(
+            git_status.primary_capability(),
+            Some(Capability::git_read())
+        );
+        assert!(git_status.effects.contains(&CapabilityEffect::ReadsGit));
+
+        let browser_click = registry.get("browser.click").unwrap().unwrap();
+        assert_eq!(
+            browser_click.primary_capability(),
+            Some(Capability::browser_control())
+        );
+        assert!(browser_click
+            .effects
+            .contains(&CapabilityEffect::ControlsBrowser));
     }
 
     #[test]

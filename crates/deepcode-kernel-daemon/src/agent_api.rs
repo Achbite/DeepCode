@@ -183,19 +183,11 @@ pub(crate) async fn agent_session_delete(
     Path(session_id): Path<String>,
 ) -> Json<ApiResponse> {
     let safe_session_id = safe_path_segment(&session_id);
-    let (
-        sessions_dir,
-        archive_root,
-        response_scope_key,
-        response_current_id,
-        response_sessions,
-    ) = {
+    let (sessions_dir, archive_root, response_scope_key, response_current_id, response_sessions) = {
         let mut gui = state.gui.lock().expect("gui state lock");
-        let Some(position) = gui
-            .sessions
-            .iter()
-            .position(|session| session.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
-        else {
+        let Some(position) = gui.sessions.iter().position(|session| {
+            session.get("id").and_then(Value::as_str) == Some(session_id.as_str())
+        }) else {
             return ApiResponse::error("agent_session_not_found", "agent session not found");
         };
 
@@ -509,16 +501,56 @@ pub(crate) async fn agent_plan_resolve(
     };
     let kernel_events = {
         let mut runtime = state.runtime.lock().expect("kernel runtime lock");
-        runtime.dispatch(command).unwrap_or_else(|error| {
-            vec![KernelEvent::Error {
-                request_id: Some(rid("agent-plan-resolve")),
-                run_id: Some(deepcode_kernel_abi::RunId(run_id.clone())),
-                session_id: None,
-                error: KernelErrorEnvelope::from(&error),
-                message_key: None,
-                args: None,
-            }]
-        })
+        let mut events = Vec::new();
+        let mut grant_failed = false;
+        if decision == "accept" {
+            let grants = {
+                let gui = state.gui.lock().expect("gui state lock");
+                gui.pending_plans
+                    .get(&plan_id)
+                    .map(temporary_grants_for_pending_plan)
+                    .unwrap_or_default()
+            };
+            for grant in grants {
+                match runtime.dispatch(KernelCommand::PermissionGrantTemporary {
+                    request_id: rid("agent-plan-temp-grant"),
+                    run_id: deepcode_kernel_abi::RunId(run_id.clone()),
+                    grant,
+                }) {
+                    Ok(mut grant_events) => events.append(&mut grant_events),
+                    Err(error) => {
+                        events.push(KernelEvent::Error {
+                            request_id: Some(rid("agent-plan-temp-grant")),
+                            run_id: Some(deepcode_kernel_abi::RunId(run_id.clone())),
+                            session_id: None,
+                            error: KernelErrorEnvelope::from(&error),
+                            message_key: None,
+                            args: None,
+                        });
+                        grant_failed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if grant_failed {
+            events
+        } else {
+            match runtime.dispatch(command) {
+                Ok(mut command_events) => {
+                    events.append(&mut command_events);
+                    events
+                }
+                Err(error) => vec![KernelEvent::Error {
+                    request_id: Some(rid("agent-plan-resolve")),
+                    run_id: Some(deepcode_kernel_abi::RunId(run_id.clone())),
+                    session_id: None,
+                    error: KernelErrorEnvelope::from(&error),
+                    message_key: None,
+                    args: None,
+                }],
+            }
+        }
     };
     let session_id = kernel_events
         .iter()
@@ -565,6 +597,105 @@ pub(crate) async fn agent_plan_resolve(
     }
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)
+}
+
+fn temporary_grants_for_pending_plan(
+    plan: &PendingAgentPlan,
+) -> Vec<deepcode_kernel_abi::TemporaryGrantEnvelope> {
+    let gaps = plan
+        .plan_review_report
+        .as_ref()
+        .and_then(|report| report.get("permissionGaps"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let actions = plan
+        .action_bundle
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut grants = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for gap in gaps {
+        let Some(capability) = gap.as_str().filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        let scopes = resource_scopes_for_capability(&actions, capability);
+        if scopes.is_empty() {
+            let key = format!("{capability}:*");
+            if seen.insert(key) {
+                grants.push(temporary_grant(plan, capability, None));
+            }
+            continue;
+        }
+        for scope in scopes {
+            let key = format!("{capability}:{scope}");
+            if seen.insert(key) {
+                grants.push(temporary_grant(plan, capability, Some(scope)));
+            }
+        }
+    }
+    grants
+}
+
+fn resource_scopes_for_capability(actions: &[Value], capability: &str) -> Vec<String> {
+    actions
+        .iter()
+        .filter(|action| action.get("capability").and_then(Value::as_str) == Some(capability))
+        .flat_map(|action| {
+            action
+                .get("resourceScope")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|scope| scope.as_str().map(str::to_string))
+        .filter(|scope| {
+            !scope.trim().is_empty()
+                && scope != "workspace"
+                && !scope.contains('*')
+                && !scope.starts_with("search:")
+                && !scope.starts_with("symbol:")
+        })
+        .collect()
+}
+
+fn temporary_grant(
+    plan: &PendingAgentPlan,
+    capability: &str,
+    resource_path: Option<String>,
+) -> deepcode_kernel_abi::TemporaryGrantEnvelope {
+    deepcode_kernel_abi::TemporaryGrantEnvelope {
+        id: format!(
+            "grant-{}-{}-{}",
+            safe_path_segment(&plan.plan_id),
+            safe_path_segment(capability),
+            resource_path
+                .as_deref()
+                .map(safe_path_segment)
+                .unwrap_or_else(|| "run".to_string())
+        ),
+        capability: capability.to_string(),
+        resource_kind: resource_kind_for_capability(capability).to_string(),
+        resource_path,
+        expires_after_sequence: None,
+        reason: Some(format!("Plan {} accepted by user", plan.plan_id)),
+    }
+}
+
+fn resource_kind_for_capability(capability: &str) -> &'static str {
+    match capability {
+        "workspace.write" | "workspace.delete" | "workspace.rename" | "workspace.create" => {
+            "workspaceFile"
+        }
+        "git.write" => "git",
+        "process.exec" => "process",
+        "network.egress" => "network",
+        "browser.control" => "browser",
+        "secret.read" => "secret",
+        _ => "capability",
+    }
 }
 
 pub(crate) async fn agent_feedback() -> Json<ApiResponse> {

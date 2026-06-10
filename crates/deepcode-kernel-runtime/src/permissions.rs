@@ -149,8 +149,7 @@ impl DeepCodeKernelRuntime {
                     .payload
                     .get("arguments")
                     .cloned()
-                    .or_else(|| event.payload.get("args").cloned())
-                    .unwrap_or(Value::Null);
+                    .or_else(|| event.payload.get("args").cloned())?;
                 Some((
                     permission_id,
                     PendingKernelTool {
@@ -287,16 +286,23 @@ impl DeepCodeKernelRuntime {
     }
 
     pub(crate) fn permission_grant_temporary(
-        &self,
+        &mut self,
         _request_id: RequestId,
         run_id: RunId,
         grant: deepcode_kernel_abi::TemporaryGrantEnvelope,
     ) -> KernelResult<Vec<KernelEvent>> {
         let record = self.record_by_run(&run_id.0)?;
+        let record_run_id = record.run_id.clone();
+        let session_id = record.session_id.clone();
+        self.state
+            .temporary_grants_by_run
+            .entry(run_id.0.clone())
+            .or_default()
+            .push(grant.clone());
         let sequence = self.ledger.next_sequence(&run_id.0)?;
         self.append_ledger(
             &run_id.0,
-            &record.session_id,
+            &session_id,
             "temporaryGrant.created",
             sequence,
             serde_json::json!({
@@ -307,7 +313,7 @@ impl DeepCodeKernelRuntime {
         let autonomy_sequence = self.ledger.next_sequence(&run_id.0)?;
         self.append_ledger(
             &run_id.0,
-            &record.session_id,
+            &session_id,
             "autonomy.transitioned",
             autonomy_sequence,
             serde_json::json!({
@@ -320,7 +326,7 @@ impl DeepCodeKernelRuntime {
         Ok(vec![
             KernelEvent::MessageAppended {
                 run_id: Some(run_id),
-                session_id: Some(SessionId(record.session_id.clone())),
+                session_id: Some(SessionId(session_id.clone())),
                 turn_id: None,
                 role: deepcode_kernel_abi::MessageRole::System,
                 channel: Some("policy".to_string()),
@@ -330,8 +336,8 @@ impl DeepCodeKernelRuntime {
                 sequence: Some(sequence),
             },
             KernelEvent::AutonomyTransitioned {
-                run_id: Some(RunId(record.run_id.clone())),
-                session_id: Some(SessionId(record.session_id)),
+                run_id: Some(RunId(record_run_id)),
+                session_id: Some(SessionId(session_id)),
                 from_level: Some(
                     autonomy_level_name(&self.policy_profile.autonomy_level).to_string(),
                 ),
@@ -341,6 +347,52 @@ impl DeepCodeKernelRuntime {
                 sequence: Some(autonomy_sequence),
             },
         ])
+    }
+
+    pub(crate) fn effective_permission_action_for_tool(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> KernelResult<PermissionAction> {
+        let base = permission_action_for_kernel_tool(tool_name);
+        if base != PermissionAction::Ask {
+            return Ok(base);
+        }
+        if self.temporary_grant_allows(run_id, tool_name, arguments)? {
+            return Ok(PermissionAction::Allow);
+        }
+        Ok(base)
+    }
+
+    fn temporary_grant_allows(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> KernelResult<bool> {
+        let Some(grants) = self.state.temporary_grants_by_run.get(run_id) else {
+            return Ok(false);
+        };
+        let capability = capability_for_tool(tool_name);
+        let next_sequence = self.ledger.next_sequence(run_id).unwrap_or(u64::MAX);
+        Ok(grants.iter().any(|grant| {
+            if grant.capability != capability {
+                return false;
+            }
+            if grant
+                .expires_after_sequence
+                .map(|expires| next_sequence > expires)
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            grant
+                .resource_path
+                .as_deref()
+                .map(|path| argument_resource_matches(tool_name, arguments, path))
+                .unwrap_or(true)
+        }))
     }
 }
 
@@ -355,4 +407,24 @@ pub(crate) fn permission_envelope_from_pending(
         summary: format!("Allow {} to access workspace resources?", pending.tool_name),
         args_preview: redact_tool_arguments(&pending.tool_name, &pending.arguments),
     }
+}
+
+fn argument_resource_matches(tool_name: &str, arguments: &Value, path: &str) -> bool {
+    let direct = arguments
+        .get("path")
+        .or_else(|| arguments.get("url"))
+        .and_then(Value::as_str)
+        .map(|value| value == path)
+        .unwrap_or(false);
+    if direct {
+        return true;
+    }
+    if matches!(tool_name, "git.stage" | "git.unstage") {
+        return arguments
+            .get("paths")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().any(|item| item.as_str() == Some(path)))
+            .unwrap_or(false);
+    }
+    false
 }

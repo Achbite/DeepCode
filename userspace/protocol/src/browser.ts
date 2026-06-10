@@ -9,7 +9,10 @@ export type BrowserRuntimeAction =
   | 'reload'
   | 'inspect'
   | 'snapshot'
-  | 'attach';
+  | 'attach'
+  | 'click'
+  | 'type'
+  | 'scroll';
 
 export type BrowserRuntimeCapability =
   | 'status'

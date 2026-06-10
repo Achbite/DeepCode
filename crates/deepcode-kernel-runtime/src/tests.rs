@@ -1135,6 +1135,81 @@ fn plan_and_temporary_grant_commands_are_recorded() {
 }
 
 #[test]
+fn temporary_grant_allows_matching_tool_without_permission_prompt() {
+    let root = temp_workspace();
+    let workspace_binding = binding_for_root(&root);
+    let mut runtime = DeepCodeKernelRuntime::new();
+    runtime
+        .dispatch(KernelCommand::RunStart {
+            request_id: RequestId("req-run".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            input: UserInput {
+                text: "write granted file".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(workspace_binding.clone()),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .unwrap();
+
+    runtime
+        .dispatch(KernelCommand::PermissionGrantTemporary {
+            request_id: RequestId("req-grant".to_string()),
+            run_id: RunId("run-1".to_string()),
+            grant: deepcode_kernel_abi::TemporaryGrantEnvelope {
+                id: "grant-write".to_string(),
+                capability: "workspace.write".to_string(),
+                resource_kind: "workspaceFile".to_string(),
+                resource_path: Some("granted.txt".to_string()),
+                expires_after_sequence: Some(10),
+                reason: Some("plan accepted".to_string()),
+            },
+        })
+        .unwrap();
+
+    let events = runtime
+        .dispatch(KernelCommand::ToolInvoke {
+            request_id: RequestId("req-write".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            tool_call_id: "tool-write-granted".to_string(),
+            tool_name: "fs.write".to_string(),
+            arguments: serde_json::json!({
+                "path": "granted.txt",
+                "content": "granted write"
+            }),
+            workspace_binding: Some(workspace_binding),
+        })
+        .unwrap();
+
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::PermissionRequested { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::ToolCompleted { ok: true, .. })));
+    assert_eq!(
+        fs::read_to_string(root.join("granted.txt")).unwrap(),
+        "granted write"
+    );
+
+    let ledger = runtime.ledger("run-1").unwrap();
+    assert!(ledger
+        .iter()
+        .any(|event| event.kind == "temporaryGrant.created"));
+    assert!(ledger
+        .iter()
+        .any(|event| event.kind == "change.operation_recorded"));
+    assert!(ledger
+        .iter()
+        .all(|event| event.kind != "permission.requested"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn ndjson_ledger_restores_pending_permission_and_continues_tool() {
     let root = temp_workspace();
     let workspace = root.join("workspace");
@@ -1191,28 +1266,26 @@ fn ndjson_ledger_restores_pending_permission_and_continues_tool() {
         Some("tool-write-replay")
     );
 
-    let resolved = restored
+    let resolve_error = restored
         .dispatch(KernelCommand::PermissionResolve {
             request_id: RequestId("req-resolve".to_string()),
             permission_id: "tool-write-replay".to_string(),
             decision: deepcode_kernel_abi::PermissionDecisionKind::Accept,
         })
-        .unwrap();
-    assert!(resolved.iter().any(|event| matches!(
-        event,
-        KernelEvent::ToolCompleted { tool_name, ok: true, .. } if tool_name == "fs.write"
-    )));
-    assert_eq!(
-        fs::read_to_string(workspace.join("_agent_tmp_replay.txt")).unwrap(),
-        "restored write"
-    );
+        .unwrap_err();
+    assert!(resolve_error
+        .to_string()
+        .contains("unknown permission tool-write-replay"));
     let ledger = restored.ledger("run-1").unwrap();
+    let permission_requested = ledger
+        .iter()
+        .find(|event| event.kind == "permission.requested")
+        .expect("permission request recorded");
+    assert!(permission_requested.payload.get("arguments").is_none());
+    assert!(permission_requested.payload.get("argumentsRef").is_some());
     assert!(ledger
         .iter()
-        .any(|event| event.kind == "permission.resolved"));
-    assert!(ledger
-        .iter()
-        .any(|event| event.kind == "change.operation_recorded"));
+        .all(|event| event.kind != "change.operation_recorded"));
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -1605,14 +1678,14 @@ fn review_phase_prompt_includes_evidence_json() {
         kernel_event_refs: vec!["evt-1".to_string()],
     });
     let prompt = compile_kernel_phase_instruction("review", &state);
-    assert!(prompt.contains("Kernel 工具事实证据"));
+    assert!(prompt.contains("Kernel tool-fact evidence"));
     assert!(prompt.contains("\"fs.delete\""));
     assert!(prompt.contains("\"ok\""));
-    assert!(prompt.contains("唯一事实源"));
+    assert!(prompt.contains("only fact source"));
 
     // plan 阶段不应注入 evidence JSON。
     let plan_prompt = compile_kernel_phase_instruction("plan", &state);
-    assert!(!plan_prompt.contains("Kernel 工具事实证据"));
+    assert!(!plan_prompt.contains("Kernel tool-fact evidence"));
 }
 
 #[test]

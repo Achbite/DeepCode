@@ -492,6 +492,16 @@ pub(crate) fn current_workspace_json(
 pub(crate) fn needs_workspace(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "fs.list" | "fs.read" | "fs.write" | "fs.diff" | "fs.delete" | "code.search"
+        "fs.list"
+            | "fs.read"
+            | "fs.write"
+            | "fs.diff"
+            | "fs.delete"
+            | "code.search"
+            | "git.status"
+            | "git.diff"
+            | "git.stage"
+            | "git.unstage"
+            | "git.commit"
     )
 }

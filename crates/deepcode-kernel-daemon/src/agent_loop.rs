@@ -311,7 +311,7 @@ pub(crate) async fn drive_kernel_agent_loop(
                         .unwrap_or(0)
                 }),
             );
-            let output = call_llm_profile(&profile, request_envelope).await?;
+            let output = call_llm_profile(&profile, request_envelope.clone()).await?;
             append_trace_event(
                 state,
                 session_id,
@@ -339,15 +339,21 @@ pub(crate) async fn drive_kernel_agent_loop(
             };
             if phase == "plan" {
                 let mut submitted = submitted;
-                match parse_agent_plan_response(
+                let original_content = response_envelope
+                    .pointer("/assistantMessage/content")
+                    .or_else(|| response_envelope.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let parsed_plan = parse_or_repair_agent_plan_response(
+                    state,
                     session_id,
                     &run_id.0,
-                    response_envelope
-                        .pointer("/assistantMessage/content")
-                        .or_else(|| response_envelope.get("content"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                ) {
+                    &profile,
+                    &request_envelope,
+                    original_content,
+                )
+                .await;
+                match parsed_plan {
                     Ok(AgentPlanResponse::Answer(answer)) => {
                         append_session_projection(
                             state,
@@ -524,6 +530,121 @@ pub(crate) fn append_trace_event(state: &AppState, session_id: &str, kind: &str,
             "summary": payload.get("summary").and_then(Value::as_str).unwrap_or(kind),
             "payload": payload
         }));
+}
+
+async fn parse_or_repair_agent_plan_response(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    profile: &ResolvedLlmProfile,
+    original_request_envelope: &Value,
+    original_content: &str,
+) -> Result<AgentPlanResponse, String> {
+    match parse_agent_plan_response(session_id, run_id, original_content) {
+        Ok(parsed) => return Ok(parsed),
+        Err(first_error) => {
+            append_trace_event(
+                state,
+                session_id,
+                "llm.plan_parse_failed",
+                json!({
+                    "runId": run_id,
+                    "error": first_error,
+                    "repairPolicy": "single_llm_repair"
+                }),
+            );
+            let repair_request = build_plan_repair_request(
+                original_request_envelope,
+                original_content,
+                &first_error,
+            );
+            append_trace_event(
+                state,
+                session_id,
+                "llm.repair_requested",
+                json!({
+                    "runId": run_id,
+                    "profileId": profile.id,
+                    "model": profile.model,
+                    "reason": first_error
+                }),
+            );
+            let repair_output = match call_llm_profile(profile, repair_request).await {
+                Ok(output) => output,
+                Err(error) => {
+                    append_trace_event(
+                        state,
+                        session_id,
+                        "llm.repair_failed",
+                        json!({
+                            "runId": run_id,
+                            "error": error
+                        }),
+                    );
+                    return Err(format!("{first_error}; repair call failed: {error}"));
+                }
+            };
+            let repair_content = repair_output.content.clone();
+            append_trace_event(
+                state,
+                session_id,
+                "llm.repair_completed",
+                json!({
+                    "runId": run_id,
+                    "profileId": profile.id,
+                    "contentBytes": repair_content.len(),
+                    "toolCallCount": repair_output.tool_calls.len(),
+                    "repairedResponse": llm_output_payload(repair_output)
+                }),
+            );
+            parse_agent_plan_response(session_id, run_id, &repair_content).map_err(|repair_error| {
+                append_trace_event(
+                    state,
+                    session_id,
+                    "llm.repair_parse_failed",
+                    json!({
+                        "runId": run_id,
+                        "originalError": first_error,
+                        "repairError": repair_error
+                    }),
+                );
+                format!("{first_error}; repair failed: {repair_error}")
+            })
+        }
+    }
+}
+
+fn build_plan_repair_request(
+    original_request_envelope: &Value,
+    original_content: &str,
+    parser_error: &str,
+) -> Value {
+    let tool_catalog = original_request_envelope
+        .get("toolCatalog")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    json!({
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are DeepCode plan protocol repair. Return only one valid DeepCode plan response. Keep strict fail-closed semantics: do not invent execution facts, do not add direct params/input/command/script/path/content fields inside ACTION_BUNDLE actions, and do not combine RESOURCE_REQUEST with ACTION_BUNDLE. ACTION_BUNDLE tag must be format=\"json\" version=\"1\"; JSON version must be string \"1\"; resourceScope must be a string array. Use capability namespace in ACTION_BUNDLE: workspace.read, workspace.search, workspace.write, workspace.delete, process.exec, network.egress, git.read, git.write, browser.control. Executor tool names such as fs.write/fs.delete/web.search/git.status/browser.open are only for complete-stage tool calls. File content drafts must be emitted as CODE_BLOCK id/path, and write actions must reference sourceBlockId. If the user requested write then review then delete, include only the current write/review batch; deletion must wait for the next user-confirmed turn."
+            },
+            {
+                "role": "user",
+                "content": format!(
+                    "Parser error:\\n{}\\n\\nCanonical minimal write example:\\n<CODE_BLOCK id=\"write-test-md\" path=\"test.md\">测试请求写入操作</CODE_BLOCK>\\n<USER_PLAN>创建 test.md 并等待用户 review。</USER_PLAN>\\n<ACTION_BUNDLE format=\"json\" version=\"1\">{{\"version\":\"1\",\"id\":\"write-test-md-plan\",\"goal\":\"创建 test.md 并等待 review\",\"actions\":[{{\"id\":\"write-test-md\",\"title\":\"写入 test.md\",\"capability\":\"workspace.write\",\"kind\":\"write\",\"resourceScope\":[\"test.md\"],\"sourceBlockId\":\"write-test-md\"}}],\"validationExpectations\":[{{\"id\":\"file-written\",\"description\":\"test.md 已由 Kernel fs.write 写入\"}}],\"reviewExpectations\":[{{\"id\":\"user-review\",\"description\":\"用户 review 后再决定是否删除\"}}]}}</ACTION_BUNDLE>\\n<EXPECTED_VALIDATION>Kernel fs.write 返回 ok。</EXPECTED_VALIDATION>\\n<REVIEW_GUIDE>请用户检查 test.md 内容，确认后下一轮再删除。</REVIEW_GUIDE>\\n\\nOriginal invalid output:\\n{}",
+                    parser_error,
+                    clip_chars(original_content, 48_000)
+                )
+            }
+        ],
+        "toolCatalog": tool_catalog,
+        "tools": [],
+        "repairPolicy": {
+            "maxAttempts": 1,
+            "parser": "strict"
+        }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -912,6 +1033,11 @@ fn validate_action_json(
             return Err(format!("actions[{index}].{key} must be a non-empty string"));
         }
     }
+    let capability = object
+        .get("capability")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    validate_plan_capability(capability, &format!("actions[{index}].capability"))?;
     let resource_scope = object
         .get("resourceScope")
         .and_then(Value::as_array)
@@ -931,8 +1057,39 @@ fn validate_action_json(
             ));
         }
         referenced_code_blocks.insert(source_block_id.to_string());
+    } else if capability == "workspace.write"
+        && object.get("kind").and_then(Value::as_str) == Some("write")
+    {
+        return Err(format!(
+            "actions[{index}] workspace.write must reference a CODE_BLOCK via sourceBlockId"
+        ));
     }
     Ok(())
+}
+
+fn validate_plan_capability(value: &str, label: &str) -> Result<(), String> {
+    if matches!(
+        value,
+        "workspace.read"
+            | "workspace.search"
+            | "workspace.preview_diff"
+            | "workspace.write"
+            | "workspace.delete"
+            | "process.propose"
+            | "process.exec"
+            | "network.egress"
+            | "git.read"
+            | "git.write"
+            | "browser.control"
+    ) {
+        return Ok(());
+    }
+    if value.contains('.') {
+        return Err(format!(
+            "{label} must use capability namespace, not executor tool name {value}"
+        ));
+    }
+    Err(format!("{label} is not a known capability"))
 }
 
 fn reject_unknown_json_fields<'a>(
@@ -1411,6 +1568,20 @@ pub(crate) fn internal_tool_name(name: &str) -> String {
         "code_search" => "code.search".to_string(),
         "shell_propose" => "shell.propose".to_string(),
         "shell_exec" => "shell.exec".to_string(),
+        "web_search" => "web.search".to_string(),
+        "web_fetch" => "web.fetch".to_string(),
+        "git_status" => "git.status".to_string(),
+        "git_diff" => "git.diff".to_string(),
+        "git_stage" => "git.stage".to_string(),
+        "git_unstage" => "git.unstage".to_string(),
+        "git_commit" => "git.commit".to_string(),
+        "browser_open" => "browser.open".to_string(),
+        "browser_reload" => "browser.reload".to_string(),
+        "browser_snapshot" => "browser.snapshot".to_string(),
+        "browser_inspect" => "browser.inspect".to_string(),
+        "browser_click" => "browser.click".to_string(),
+        "browser_type" => "browser.type".to_string(),
+        "browser_scroll" => "browser.scroll".to_string(),
         other => other.to_string(),
     }
 }
@@ -1475,14 +1646,16 @@ pub(crate) fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> Ll
     if system_instruction.contains("ACTION_BUNDLE") && system_instruction.contains("USER_PLAN") {
         return LlmChatOutput {
             content: format!(
-                "<USER_PLAN>\n我是 DeepCode，接下来我将作为你的助手验证当前 Agent 的文件系统、搜索与临时文件生命周期能力。计划会先列出工作区与搜索代码，再创建、读取并清理 `_agent_tmp_functional_test.txt`。\n</USER_PLAN>\n\n\
+                "<CODE_BLOCK id=\"write-agent-functional-smoke\" path=\"_agent_tmp_functional_test.txt\">\nDeepCode Agent temp lifecycle test at {}\n</CODE_BLOCK>\n\n\
+                <USER_PLAN>\n我是 DeepCode，接下来我将作为你的助手验证当前 Agent 的文件系统、搜索与临时文件生命周期能力。计划会先列出工作区与搜索代码，再创建并读取 `_agent_tmp_functional_test.txt`，随后等待用户 review 后再进入删除计划。\n</USER_PLAN>\n\n\
                 <ACTION_BUNDLE format=\"json\" version=\"1\">\n{}\n</ACTION_BUNDLE>\n\n\
-                <EXPECTED_VALIDATION>\n工具调用应全部返回 ok；临时文件读取内容应与写入内容一致；清理后文件不应残留。\n</EXPECTED_VALIDATION>\n\n\
-                <REVIEW_GUIDE>\n请重点审查工具结果、权限请求和临时文件是否被清理。\n</REVIEW_GUIDE>",
+                <EXPECTED_VALIDATION>\n工具调用应全部返回 ok；临时文件读取内容应与写入内容一致；删除动作必须等待用户 review 后由下一轮计划触发。\n</EXPECTED_VALIDATION>\n\n\
+                <REVIEW_GUIDE>\n请重点审查工具结果、权限请求和临时文件内容；如确认通过，下一轮再生成删除计划。\n</REVIEW_GUIDE>",
+                now_millis(),
                 serde_json::json!({
                     "version": "1",
                     "id": "agent-functional-smoke-plan",
-                    "goal": "验证 Agent 工作区读取、代码搜索和临时文件生命周期能力",
+                    "goal": "验证 Agent 工作区读取、代码搜索和临时文件写入 review 能力",
                     "actions": [
                         {
                             "id": "list-workspace-root",
@@ -1494,7 +1667,7 @@ pub(crate) fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> Ll
                         {
                             "id": "search-workspace",
                             "title": "验证 code.search",
-                            "capability": "code.search",
+                            "capability": "workspace.search",
                             "kind": "read",
                             "resourceScope": ["workspace"]
                         },
@@ -1503,7 +1676,8 @@ pub(crate) fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> Ll
                             "title": "创建临时文件",
                             "capability": "workspace.write",
                             "kind": "write",
-                            "resourceScope": ["_agent_tmp_functional_test.txt"]
+                            "resourceScope": ["_agent_tmp_functional_test.txt"],
+                            "sourceBlockId": "write-agent-functional-smoke"
                         },
                         {
                             "id": "read-temp-file",
@@ -1511,25 +1685,18 @@ pub(crate) fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> Ll
                             "capability": "workspace.read",
                             "kind": "read",
                             "resourceScope": ["_agent_tmp_functional_test.txt"]
-                        },
-                        {
-                            "id": "delete-temp-file",
-                            "title": "清理临时文件",
-                            "capability": "workspace.delete",
-                            "kind": "delete",
-                            "resourceScope": ["_agent_tmp_functional_test.txt"]
                         }
                     ],
                     "validationExpectations": [
                         {
                             "id": "tool-results-ok",
-                            "description": "fs.list、code.search、fs.write、fs.read、fs.delete 均返回 ok"
+                            "description": "fs.list、code.search、fs.write、fs.read 均返回 ok"
                         }
                     ],
                     "reviewExpectations": [
                         {
                             "id": "user-review-temp-cleanup",
-                            "description": "用户确认临时文件已清理且权限请求符合预期"
+                            "description": "用户确认临时文件内容后再决定是否删除"
                         }
                     ]
                 })
@@ -1620,6 +1787,55 @@ mod tests {
             <REVIEW_GUIDE>review</REVIEW_GUIDE>";
         let error = parse_agent_plan_response("session-1", "run-1", content).unwrap_err();
         assert!(error.contains("unknown field params"));
+    }
+
+    #[test]
+    fn parser_rejects_action_bundle_missing_json_version() {
+        let content = "<USER_PLAN>\nplan\n</USER_PLAN>\n\
+            <ACTION_BUNDLE format=\"json\" version=\"1\">\n\
+            {\"id\":\"plan-1\",\"goal\":\"test\",\"actions\":[],\"validationExpectations\":[],\"reviewExpectations\":[]}\n\
+            </ACTION_BUNDLE>\n\
+            <EXPECTED_VALIDATION>none</EXPECTED_VALIDATION>\n\
+            <REVIEW_GUIDE>review</REVIEW_GUIDE>";
+        let error = parse_agent_plan_response("session-1", "run-1", content).unwrap_err();
+        assert!(error.contains("ACTION_BUNDLE.version is required"));
+    }
+
+    #[test]
+    fn parser_rejects_scalar_resource_scope() {
+        let content = "<USER_PLAN>\nplan\n</USER_PLAN>\n\
+            <ACTION_BUNDLE format=\"json\" version=\"1\">\n\
+            {\"version\":\"1\",\"id\":\"plan-1\",\"goal\":\"test\",\"actions\":[{\"id\":\"a1\",\"title\":\"bad\",\"capability\":\"workspace.read\",\"kind\":\"read\",\"resourceScope\":\"README.md\"}],\"validationExpectations\":[],\"reviewExpectations\":[]}\n\
+            </ACTION_BUNDLE>\n\
+            <EXPECTED_VALIDATION>none</EXPECTED_VALIDATION>\n\
+            <REVIEW_GUIDE>review</REVIEW_GUIDE>";
+        let error = parse_agent_plan_response("session-1", "run-1", content).unwrap_err();
+        assert!(error.contains("resourceScope must be an array"));
+    }
+
+    #[test]
+    fn parser_rejects_executor_tool_name_as_plan_capability() {
+        let content = "<USER_PLAN>\nplan\n</USER_PLAN>\n\
+            <ACTION_BUNDLE format=\"json\" version=\"1\">\n\
+            {\"version\":\"1\",\"id\":\"plan-1\",\"goal\":\"test\",\"actions\":[{\"id\":\"a1\",\"title\":\"bad\",\"capability\":\"fs.write\",\"kind\":\"write\",\"resourceScope\":[\"test.md\"]}],\"validationExpectations\":[],\"reviewExpectations\":[]}\n\
+            </ACTION_BUNDLE>\n\
+            <EXPECTED_VALIDATION>none</EXPECTED_VALIDATION>\n\
+            <REVIEW_GUIDE>review</REVIEW_GUIDE>";
+        let error = parse_agent_plan_response("session-1", "run-1", content).unwrap_err();
+        assert!(error.contains("must use capability namespace"));
+    }
+
+    #[test]
+    fn parser_accepts_source_block_write_plan() {
+        let content = "<CODE_BLOCK id=\"write-test\" path=\"test.md\">\nhello\n</CODE_BLOCK>\n\
+            <USER_PLAN>\nplan\n</USER_PLAN>\n\
+            <ACTION_BUNDLE format=\"json\" version=\"1\">\n\
+            {\"version\":\"1\",\"id\":\"plan-1\",\"goal\":\"test\",\"actions\":[{\"id\":\"a1\",\"title\":\"write\",\"capability\":\"workspace.write\",\"kind\":\"write\",\"resourceScope\":[\"test.md\"],\"sourceBlockId\":\"write-test\"}],\"validationExpectations\":[],\"reviewExpectations\":[]}\n\
+            </ACTION_BUNDLE>\n\
+            <EXPECTED_VALIDATION>Kernel fs.write succeeds.</EXPECTED_VALIDATION>\n\
+            <REVIEW_GUIDE>Review test.md.</REVIEW_GUIDE>";
+        let parsed = parse_agent_plan_response("session-1", "run-1", content).unwrap();
+        assert!(matches!(parsed, AgentPlanResponse::ActionPlan(_)));
     }
 
     #[test]

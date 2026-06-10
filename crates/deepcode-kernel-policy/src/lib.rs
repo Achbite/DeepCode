@@ -48,6 +48,10 @@ impl Capability {
         Self::new("workspace.search")
     }
 
+    pub fn git_read() -> Self {
+        Self::new("git.read")
+    }
+
     pub fn git_write() -> Self {
         Self::new("git.write")
     }
@@ -62,6 +66,10 @@ impl Capability {
 
     pub fn network_egress() -> Self {
         Self::new("network.egress")
+    }
+
+    pub fn browser_control() -> Self {
+        Self::new("browser.control")
     }
 
     pub fn secret_read() -> Self {
@@ -84,10 +92,12 @@ pub enum CapabilityEffect {
     WritesWorkspace,
     CreatesWorkspace,
     DeletesWorkspace,
+    ReadsGit,
     RunsProcess,
     UsesNetwork,
     ReadsSecret,
     ModifiesGit,
+    ControlsBrowser,
     ModifiesKernel,
     ModifiesConfig,
 }

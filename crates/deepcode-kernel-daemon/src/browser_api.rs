@@ -75,7 +75,7 @@ pub(crate) fn browser_status_payload(browser: &BrowserState) -> Value {
         "status": if browser.current_url.is_some() { "running" } else { "idle" },
         "inspectState": browser.inspect_state,
         "currentUrl": browser.current_url,
-        "message": "Packaged browser preview bridge is available; real DOM capture remains reserved.",
+        "message": "Editor internal browser render bridge is available; DOM capture remains reserved.",
         "snapshot": browser.snapshot,
         "lastAction": browser.last_action,
         "lastActionAt": browser.last_action_at,
@@ -85,7 +85,7 @@ pub(crate) fn browser_status_payload(browser: &BrowserState) -> Value {
             "reloadRecording": "available",
             "inspectModeRecording": "available",
             "domCapture": "reserved",
-            "agentAttachment": "reserved"
+            "agentAttachment": "available"
         },
         "diagnostics": {
             "currentUrl": browser.current_url,

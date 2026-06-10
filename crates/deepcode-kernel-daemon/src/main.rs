@@ -4,6 +4,7 @@ mod agent_timeline;
 mod api_response;
 mod browser_api;
 mod event_projection;
+mod git_api;
 mod ipc;
 mod kernel_api;
 mod llm_transport;
@@ -25,6 +26,7 @@ pub(crate) use agent_timeline::*;
 pub(crate) use api_response::*;
 pub(crate) use browser_api::*;
 pub(crate) use event_projection::*;
+pub(crate) use git_api::*;
 pub(crate) use ipc::*;
 pub(crate) use kernel_api::*;
 pub(crate) use llm_transport::*;
@@ -122,6 +124,8 @@ async fn main() {
         .route("/api/llm/probe", post(llm_probe))
         .route("/api/llm/chat", post(llm_chat))
         .route("/api/code/search", post(code_search))
+        .route("/api/git/status", get(git_status))
+        .route("/api/git/diff", get(git_diff))
         .route("/api/runtime/shell", get(runtime_shell))
         .route("/api/terminal/capabilities", get(terminal_capabilities))
         .route(
