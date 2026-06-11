@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use DeepCode in research, prototypes, or technical writing, please cite it using this metadata."
+title: "DeepCode"
+type: software
+authors:
+  - name: "DeepCode Team"
+year: 2026
+license: MIT
+repository-code: "https://github.com/Achbite/DeepCode"
+abstract: "DeepCode is a local-first AI coding workbench experiment focused on Kernel/session architecture, tool execution, permission audit, context compression, and multi-shell packaging."
+keywords:
+  - ai-coding-agent
+  - kernel-session-architecture
+  - local-first
+  - developer-tooling
+  - rust
+  - typescript
