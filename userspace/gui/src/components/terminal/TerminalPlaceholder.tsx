@@ -6,6 +6,7 @@ import {
   getTerminalEvents,
   listTerminalSessions,
   restartTerminalSession,
+  resizeTerminalSession,
   sendTerminalInput,
   updateTerminalSession,
 } from '../../services/runtimeAdapter';
@@ -44,6 +45,8 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
   const lastSequenceRef = useRef<Record<string, number>>({});
   const sessionsRef = useRef<TerminalSession[]>([]);
   const activeIdRef = useRef<string | null>(null);
+  const screenRef = useRef<HTMLDivElement | null>(null);
+  const lastTerminalSizeRef = useRef<Record<string, string>>({});
 
   const active = sessions.find((session) => session.id === activeId) ?? sessions[0];
   const activeOutput = active ? outputBySession[active.id] ?? '' : '';
@@ -215,6 +218,32 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
     return () => window.clearInterval(timer);
   }, [active?.id, describeFailure, refreshSessions]);
 
+  useEffect(() => {
+    if (!active?.id || !screenRef.current || typeof ResizeObserver === 'undefined') return;
+    const sessionId = active.id;
+    const node = screenRef.current;
+    let frame = 0;
+    const observer = new ResizeObserver(([entry]) => {
+      if (!entry) return;
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const width = Math.max(1, entry.contentRect.width);
+        const height = Math.max(1, entry.contentRect.height - 28);
+        const cols = Math.max(20, Math.floor(width / 8));
+        const rows = Math.max(4, Math.floor(height / 18));
+        const key = `${cols}x${rows}`;
+        if (lastTerminalSizeRef.current[sessionId] === key) return;
+        lastTerminalSizeRef.current[sessionId] = key;
+        void resizeTerminalSession(sessionId, { cols, rows });
+      });
+    });
+    observer.observe(node);
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [active?.id]);
+
   const moveSession = useCallback((sourceId: string, targetId: string) => {
     if (sourceId === targetId) return;
     setSessions((prev) => {
@@ -354,10 +383,6 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
     event.preventDefault();
     if (!active || command.trim() === '') return;
     const line = `${command}\n`;
-    setOutputBySession((prev) => ({
-      ...prev,
-      [active.id]: `${prev[active.id] ?? ''}${active.shellKind} $ ${command}\n`,
-    }));
     setCommand('');
     const result = await sendTerminalInput(active.id, { data: line });
     if (!result.ok) {
@@ -367,10 +392,24 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
     }
   };
 
+  const handleCommandKeyDown = async (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (!active || active.status !== 'running') return;
+    if (event.ctrlKey && event.key.toLowerCase() === 'c') {
+      event.preventDefault();
+      setCommand('');
+      const result = await sendTerminalInput(active.id, { data: '\u0003' });
+      if (!result.ok) {
+        setTerminalError(describeFailure(result));
+      } else {
+        setTerminalError(null);
+      }
+    }
+  };
+
   return (
     <div className="terminal-panel">
       <div className="terminal-panel__body">
-        <div className="terminal-panel__screen">
+        <div className="terminal-panel__screen" ref={screenRef}>
           {terminalError && (
             <div className="terminal-panel__error" role="status">
               {terminalError}
@@ -385,6 +424,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
               className="terminal-panel__command-input"
               value={command}
               onChange={(event) => setCommand(event.target.value)}
+              onKeyDown={(event) => void handleCommandKeyDown(event)}
               disabled={!active || active.status !== 'running'}
               aria-label={t(language, 'terminal.input')}
             />

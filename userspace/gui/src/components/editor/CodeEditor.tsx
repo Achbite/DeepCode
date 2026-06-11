@@ -96,7 +96,7 @@ const EXT_TO_LANGUAGE: Record<string, string> = {
 
 function inferLanguageId(filePath: string | null): string {
   if (!filePath) return 'plaintext';
-  // .code-workspace（VSCode 工作区文件）：阶段 4 / S4-3 起允许在 Monaco 中编辑保存，
+  // .code-workspace（VS Code-style 工作区文件）：阶段 4 / S4-3 起允许在 Monaco 中编辑保存，
   // 实际文件内容是允许注释的 JSON（jsonc），与 .vscode/settings.json 同语言。
   if (/\.code-workspace$/i.test(filePath)) return 'jsonc';
   const ext = filePath.split('.').pop()?.toLowerCase() ?? '';

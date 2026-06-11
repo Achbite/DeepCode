@@ -24,6 +24,7 @@ const AgentPanel: React.FC = () => {
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const pendingPermission = useAgentSessionStore((s) => s.pendingPermission);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
+  const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
@@ -90,6 +91,7 @@ const AgentPanel: React.FC = () => {
         events={events}
         loading={agentBusy}
         language={language}
+        resolvingPlan={resolvingPlan}
         onPlanResolve={(runId, planId, decision, guidance) =>
           void resolvePlan(runId, planId, decision, guidance)
         }

@@ -1,4 +1,4 @@
-/* DeepCode-GUI light workbench theme inspired by DeepSeek-GUI (MIT) and Codex-style coding agent surfaces. */
+/* DeepCode-GUI light conversational workbench theme. Public coding-agent UIs are UX references only. */
 
 html,
 body,
@@ -911,7 +911,7 @@ button {
   font-size: 11px;
 }
 
-/* Light Codex/DeepSeek-GUI workbench surface. */
+/* Light conversational workbench surface. */
 :root[data-product='deepcode-gui'] {
   --bg-app: #f6f5f1;
   --bg-panel: #ffffff;
@@ -1639,7 +1639,7 @@ button {
   }
 }
 
-/* Screenshot-aligned Codex/DeepSeek-GUI layout: conversation first, tools as projection only. */
+/* Screenshot-aligned conversational layout: conversation first, tools as projection only. */
 .codex-workbench {
   grid-template-rows: 38px minmax(0, 1fr);
   background: #f5f6f7;

@@ -1,7 +1,7 @@
 /**
  * FileTree Codicons 图标集合（阶段 4 / S4-1）
  *
- * 来源：VSCode 官方 Codicons 图标集（MIT 协议，github.com/microsoft/vscode-codicons）。
+ * 来源：VS Code Codicons 图标集（MIT 协议，github.com/microsoft/vscode-codicons）。
  * 设计要求：
  *   - 仅 inline SVG，不引入字体文件或外部资源；
  *   - 颜色统一使用 currentColor，由 CSS 主题变量驱动；

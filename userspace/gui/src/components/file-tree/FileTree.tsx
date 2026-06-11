@@ -1,7 +1,7 @@
 /**
  * 文件树组件
  *
- * VSCode 风格资源管理器基础交互：
+ * VS Code-style 资源管理器基础交互：
  *   - 当前焦点目录决定 toolbar 新建文件 / 文件夹落点；
  *   - 右键菜单按资源类型显示 Explorer 操作；
  *   - 文件 / 文件夹均支持 inline rename；
@@ -94,8 +94,34 @@ function replacePathPrefix(path: string, oldPath: string, newPath: string): stri
   return path;
 }
 
+function absolutePathForTarget(rootPath: string, relativePath: string): string {
+  const root = rootPath.replace(/\/+$/g, '');
+  const relative = relativePath.replace(/^\/+/g, '');
+  return relative ? `${root}/${relative}` : rootPath;
+}
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textArea = document.createElement('textarea');
+  textArea.value = text;
+  textArea.setAttribute('readonly', 'true');
+  textArea.style.position = 'fixed';
+  textArea.style.left = '-9999px';
+  document.body.appendChild(textArea);
+  textArea.select();
+  const copied = document.execCommand('copy');
+  document.body.removeChild(textArea);
+  if (!copied) {
+    throw new Error('clipboard copy failed');
+  }
+}
+
 const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, language }) => {
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
+  const currentWorkspace = useWorkspaceStore((s) => s.current);
   const treeRevision = useWorkspaceStore((s) => s.treeRevision);
   const bumpTreeRevision = useWorkspaceStore((s) => s.bumpTreeRevision);
   const getActiveFolder = useWorkspaceStore((s) => s.getActiveFolder);
@@ -112,8 +138,10 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
   const [pendingCreate, setPendingCreate] = useState<PendingCreate | null>(null);
   const [pendingRename, setPendingRename] = useState<PendingRename | null>(null);
   const [pendingError, setPendingError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [selectedResource, setSelectedResource] = useState<ResourceTarget | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
 
   const rootTarget: ResourceTarget | null = activeFolderId
     ? {
@@ -162,8 +190,19 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
       window.removeEventListener('click', close);
       window.removeEventListener('blur', close);
       window.removeEventListener('keydown', onKeyDown);
+      if (noticeTimerRef.current) {
+        window.clearTimeout(noticeTimerRef.current);
+      }
     };
   }, []);
+
+  const showNotice = (message: string) => {
+    setNotice(message);
+    if (noticeTimerRef.current) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
+    noticeTimerRef.current = window.setTimeout(() => setNotice(null), 1800);
+  };
 
   const getCreateParentPath = (): string => {
     if (!selectedResource) return '';
@@ -362,6 +401,35 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
     setContextMenu(null);
   };
 
+  const copyRelativePath = async (target: ResourceTarget) => {
+    const path = target.path || '.';
+    try {
+      await copyTextToClipboard(path);
+      showNotice(t(language, 'explorer.copy.relativeDone'));
+    } catch {
+      showNotice(t(language, 'explorer.copy.failed'));
+    }
+    setContextMenu(null);
+  };
+
+  const copyAbsolutePath = async (target: ResourceTarget) => {
+    const folder =
+      currentWorkspace?.folders.find((candidate) => candidate.id === target.folderId) ??
+      getActiveFolder();
+    if (!folder) {
+      showNotice(t(language, 'explorer.copy.failed'));
+      setContextMenu(null);
+      return;
+    }
+    try {
+      await copyTextToClipboard(absolutePathForTarget(folder.absolutePath, target.path));
+      showNotice(t(language, 'explorer.copy.absoluteDone'));
+    } catch {
+      showNotice(t(language, 'explorer.copy.failed'));
+    }
+    setContextMenu(null);
+  };
+
   const isSelected = (target: ResourceTarget, activeFileSelected = false) => {
     if (selectedResource) {
       return (
@@ -556,6 +624,9 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
           {pendingError && (
             <div className="file-tree__new-error">{pendingError}</div>
           )}
+          {notice && (
+            <div className="file-tree__notice" role="status">{notice}</div>
+          )}
           {tree.map((node) => renderNode(node))}
         </div>
       )}
@@ -577,6 +648,8 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
           }}
           onRename={() => startRename(contextMenu.target)}
           onDelete={() => void submitDelete(contextMenu.target)}
+          onCopyRelativePath={() => void copyRelativePath(contextMenu.target)}
+          onCopyAbsolutePath={() => void copyAbsolutePath(contextMenu.target)}
           onAddToAgent={() => addToAgent(contextMenu.target, 'message')}
           onAddToAgentSession={() => addToAgent(contextMenu.target, 'session')}
           language={language}
@@ -643,6 +716,8 @@ interface ExplorerContextMenuProps {
   onNewFolder: () => void;
   onRename: () => void;
   onDelete: () => void;
+  onCopyRelativePath: () => void;
+  onCopyAbsolutePath: () => void;
   onAddToAgent: () => void;
   onAddToAgentSession: () => void;
   language: UiLanguage;
@@ -654,6 +729,8 @@ const ExplorerContextMenu: React.FC<ExplorerContextMenuProps> = ({
   onNewFolder,
   onRename,
   onDelete,
+  onCopyRelativePath,
+  onCopyAbsolutePath,
   onAddToAgent,
   onAddToAgentSession,
   language,
@@ -674,6 +751,9 @@ const ExplorerContextMenu: React.FC<ExplorerContextMenuProps> = ({
         {t(language, 'explorer.delete')}
       </button>
     )}
+    <div className="file-tree__context-separator" />
+    <button onClick={onCopyRelativePath}>{t(language, 'explorer.copyRelativePath')}</button>
+    <button onClick={onCopyAbsolutePath}>{t(language, 'explorer.copyAbsolutePath')}</button>
     <div className="file-tree__context-separator" />
     <button onClick={onAddToAgent}>{t(language, 'explorer.addToAgentMessage')}</button>
     <button onClick={onAddToAgentSession}>{t(language, 'explorer.pinToAgentSession')}</button>

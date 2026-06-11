@@ -46,6 +46,12 @@ type PermissionResolution = {
   decision: 'accept' | 'reject';
 };
 
+type PlanResolution = {
+  runId: string;
+  planId: string;
+  decision: 'accept' | 'reject' | 'revise';
+};
+
 interface QueuedAgentMessage {
   content: string;
   attachments: AgentContextAttachment[];
@@ -74,6 +80,7 @@ interface AgentSessionState {
   sessionAttachments: AgentContextAttachment[];
   pendingPermission: PendingPermission | null;
   resolvingPermission: PermissionResolution | null;
+  resolvingPlan: PlanResolution | null;
   queuedMessages: QueuedAgentMessage[];
 }
 
@@ -104,6 +111,7 @@ interface AgentSessionActions {
 type Store = AgentSessionState & AgentSessionActions;
 
 const activeAgentAbortControllers = new Map<string, AbortController>();
+const workspaceTreeRefreshEventIds = new Set<string>();
 
 function emptyWorkflowConfig(): AgentWorkflowConfig {
   return {} as AgentWorkflowConfig;
@@ -170,6 +178,34 @@ function removeRunningSessionId(ids: string[], sessionId: string): string[] {
   return ids.filter((id) => id !== sessionId);
 }
 
+function eventToolName(event: AgentEvent): string | undefined {
+  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
+    return undefined;
+  }
+  const payload = event.payload as Record<string, unknown>;
+  const value = payload.toolName ?? payload.name;
+  return typeof value === 'string' ? value : undefined;
+}
+
+function shouldRefreshWorkspaceTree(events: AgentEvent[]): boolean {
+  let shouldRefresh = false;
+  for (const event of events) {
+    if (event.kind !== 'tool_result') continue;
+    const toolName = eventToolName(event);
+    if (toolName !== 'fs.write' && toolName !== 'fs.delete') continue;
+    if (workspaceTreeRefreshEventIds.has(event.id)) continue;
+    workspaceTreeRefreshEventIds.add(event.id);
+    shouldRefresh = true;
+  }
+  return shouldRefresh;
+}
+
+function refreshWorkspaceTreeForToolFacts(events: AgentEvent[]) {
+  if (shouldRefreshWorkspaceTree(events)) {
+    useWorkspaceStore.getState().bumpTreeRevision();
+  }
+}
+
 export const useAgentSessionStore = create<Store>((set, get) => ({
   session: null,
   sessions: [],
@@ -187,6 +223,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   sessionAttachments: [],
   pendingPermission: null,
   resolvingPermission: null,
+  resolvingPlan: null,
   queuedMessages: [],
 
   loadOrCreate: async () => {
@@ -209,6 +246,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
     const current = await getCurrentAgentSession(scope);
     if (current.ok && current.data) {
+      refreshWorkspaceTreeForToolFacts(current.data.events);
       set({
         session: current.data.session,
         workspaceScopeKey: nextScopeKey,
@@ -222,6 +260,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
     const created = await createAgentSession({ initialMode, ...scope });
     if (created.ok && created.data) {
+      refreshWorkspaceTreeForToolFacts(created.data.events);
       set({
         session: created.data.session,
         workspaceScopeKey: nextScopeKey,
@@ -261,6 +300,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const initialMode = settingMode(settings['agent.defaultMode']);
     const result = await createAgentSession({ initialMode, ...currentWorkspaceScope() });
     if (result.ok && result.data) {
+      refreshWorkspaceTreeForToolFacts(result.data.events);
       set({
         session: result.data.session,
         workspaceScopeKey: currentWorkspaceScopeKey(),
@@ -272,6 +312,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         profileId: result.data.session.profileId,
         pendingPermission: null,
         resolvingPermission: null,
+        resolvingPlan: null,
         errorMessage: null,
       });
       void get().refreshSessions();
@@ -296,6 +337,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         profileId: result.data.session.profileId,
         pendingPermission: findLatestPendingPermission(result.data.events),
         resolvingPermission: null,
+        resolvingPlan: null,
         loading: false,
       });
       void get().refreshTraceEvents(result.data.session.id);
@@ -324,7 +366,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       set({
         sessions: result.data.sessions,
         currentSessionId: result.data.currentSessionId,
-        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null } : {}),
+        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null, resolvingPlan: null } : {}),
       });
       if (wasActive) {
         const nextSessionId = result.data.currentSessionId;
@@ -346,7 +388,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       set({
         sessions: result.data.sessions,
         currentSessionId: result.data.currentSessionId,
-        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null } : {}),
+        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null, resolvingPlan: null } : {}),
       });
       if (wasActive) {
         const nextSessionId = result.data.currentSessionId;
@@ -463,6 +505,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       if (pollingStopped) return;
       const current = await getCurrentAgentSession(currentWorkspaceScope());
       if (current.ok && current.data?.session.id === session.id) {
+        refreshWorkspaceTreeForToolFacts(current.data.events);
         set({
           session: current.data.session,
           events: current.data.events,
@@ -497,6 +540,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         throw new Error(result.message ?? 'Agent message failed');
       }
       const data = result.data;
+      refreshWorkspaceTreeForToolFacts(data.events);
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       const isActiveSession = get().session?.id === data.session.id;
@@ -505,6 +549,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           sessions: [data.session, ...state.sessions.filter((item) => item.id !== data.session.id)],
           runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
           resolvingPermission: null,
+          resolvingPlan: null,
         };
         if (isActiveSession) {
           nextState.session = data.session;
@@ -566,11 +611,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       queuedMessages: [],
       pendingPermission: null,
       resolvingPermission: null,
+      resolvingPlan: null,
       errorMessage: null,
     }));
 
     const result = await cancelAgentRun(session.id);
     if (result.ok && result.data) {
+      refreshWorkspaceTreeForToolFacts(result.data.events);
       set({
         session: result.data.session,
         sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
@@ -578,6 +625,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         events: result.data.events,
         pendingPermission: findLatestPendingPermission(result.data.events),
         resolvingPermission: null,
+        resolvingPlan: null,
         loading: false,
         errorMessage: null,
       });
@@ -605,23 +653,60 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const pending = get().pendingPermission;
     const session = get().session;
     if (!pending || !session || get().resolvingPermission) return;
-    set({
-      loading: true,
+    set((state) => ({
       resolvingPermission: { id: pending.request.id, decision: 'accept' },
+      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
-    });
-    const result = await resolveAgentPermission(pending.request.id, { decision: 'accept' });
-    if (result.ok && result.data) {
-      set({
-        session: result.data.session,
-        events: result.data.events,
-        pendingPermission: findLatestPendingPermission(result.data.events),
+    }));
+    let progressTimer: number | undefined;
+    let pollingStopped = false;
+    const refreshProgress = async () => {
+      if (pollingStopped) return;
+      const current = await getCurrentAgentSession(currentWorkspaceScope());
+      if (current.ok && current.data?.session.id === session.id) {
+        refreshWorkspaceTreeForToolFacts(current.data.events);
+        set({
+          session: current.data.session,
+          events: current.data.events,
+          pendingPermission: findLatestPendingPermission(current.data.events),
+        });
+        await get().refreshTraceEvents(session.id);
+      }
+    };
+    progressTimer = window.setInterval(() => {
+      void refreshProgress();
+    }, 300);
+    void refreshProgress();
+    try {
+      const result = await resolveAgentPermission(pending.request.id, { decision: 'accept' });
+      pollingStopped = true;
+      if (progressTimer !== undefined) window.clearInterval(progressTimer);
+      if (result.ok && result.data) {
+        refreshWorkspaceTreeForToolFacts(result.data.events);
+        set((state) => ({
+          session: result.data!.session,
+          events: result.data!.events,
+          pendingPermission: findLatestPendingPermission(result.data!.events),
+          resolvingPermission: null,
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, result.data!.session.id),
+        }));
+        void get().refreshTraceEvents(result.data.session.id);
+      } else {
+        set((state) => ({
+          errorMessage: result.message ?? 'Permission resolve failed',
+          resolvingPermission: null,
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+        }));
+      }
+    } catch (err) {
+      pollingStopped = true;
+      if (progressTimer !== undefined) window.clearInterval(progressTimer);
+      const message = err instanceof Error ? err.message : String(err);
+      set((state) => ({
+        errorMessage: message,
         resolvingPermission: null,
-        loading: false,
-      });
-      void get().refreshTraceEvents(result.data.session.id);
-    } else {
-      set({ errorMessage: result.message ?? 'Permission resolve failed', resolvingPermission: null, loading: false });
+        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+      }));
     }
   },
 
@@ -629,42 +714,121 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const pending = get().pendingPermission;
     const session = get().session;
     if (!pending || !session || get().resolvingPermission) return;
-    set({
-      loading: true,
+    set((state) => ({
       resolvingPermission: { id: pending.request.id, decision: 'reject' },
+      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
       errorMessage: null,
-    });
-    const result = await resolveAgentPermission(pending.request.id, { decision: 'reject' });
-    if (result.ok && result.data) {
-      set({
-        session: result.data.session,
-        events: result.data.events,
-        pendingPermission: findLatestPendingPermission(result.data.events),
+    }));
+    let progressTimer: number | undefined;
+    let pollingStopped = false;
+    const refreshProgress = async () => {
+      if (pollingStopped) return;
+      const current = await getCurrentAgentSession(currentWorkspaceScope());
+      if (current.ok && current.data?.session.id === session.id) {
+        refreshWorkspaceTreeForToolFacts(current.data.events);
+        set({
+          session: current.data.session,
+          events: current.data.events,
+          pendingPermission: findLatestPendingPermission(current.data.events),
+        });
+        await get().refreshTraceEvents(session.id);
+      }
+    };
+    progressTimer = window.setInterval(() => {
+      void refreshProgress();
+    }, 300);
+    void refreshProgress();
+    try {
+      const result = await resolveAgentPermission(pending.request.id, { decision: 'reject' });
+      pollingStopped = true;
+      if (progressTimer !== undefined) window.clearInterval(progressTimer);
+      if (result.ok && result.data) {
+        refreshWorkspaceTreeForToolFacts(result.data.events);
+        set((state) => ({
+          session: result.data!.session,
+          events: result.data!.events,
+          pendingPermission: findLatestPendingPermission(result.data!.events),
+          resolvingPermission: null,
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, result.data!.session.id),
+        }));
+        void get().refreshTraceEvents(result.data.session.id);
+      } else {
+        set((state) => ({
+          errorMessage: result.message ?? 'Permission resolve failed',
+          resolvingPermission: null,
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+        }));
+      }
+    } catch (err) {
+      pollingStopped = true;
+      if (progressTimer !== undefined) window.clearInterval(progressTimer);
+      const message = err instanceof Error ? err.message : String(err);
+      set((state) => ({
+        errorMessage: message,
         resolvingPermission: null,
-        loading: false,
-      });
-      void get().refreshTraceEvents(result.data.session.id);
-    } else {
-      set({ errorMessage: result.message ?? 'Permission resolve failed', resolvingPermission: null, loading: false });
+        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+      }));
     }
   },
 
   resolvePlan: async (runId, planId, decision, guidance) => {
     const session = get().session;
-    if (!session || get().loading) return;
-    set({ loading: true, errorMessage: null });
-    const result = await resolveAgentPlan(runId, planId, { decision, guidance });
-    if (result.ok && result.data) {
-      set({
-        session: result.data.session,
-        events: result.data.events,
-        pendingPermission: findLatestPendingPermission(result.data.events),
-        resolvingPermission: null,
-        loading: false,
-      });
-      void get().refreshTraceEvents(result.data.session.id);
-    } else {
-      set({ errorMessage: result.message ?? 'Plan resolve failed', loading: false });
+    if (!session || get().resolvingPlan) return;
+    set((state) => ({
+      resolvingPlan: { runId, planId, decision },
+      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
+      errorMessage: null,
+    }));
+    let progressTimer: number | undefined;
+    let pollingStopped = false;
+    const refreshProgress = async () => {
+      if (pollingStopped) return;
+      const current = await getCurrentAgentSession(currentWorkspaceScope());
+      if (current.ok && current.data?.session.id === session.id) {
+        refreshWorkspaceTreeForToolFacts(current.data.events);
+        set({
+          session: current.data.session,
+          events: current.data.events,
+          pendingPermission: findLatestPendingPermission(current.data.events),
+        });
+        await get().refreshTraceEvents(session.id);
+      }
+    };
+    progressTimer = window.setInterval(() => {
+      void refreshProgress();
+    }, 300);
+    void refreshProgress();
+    try {
+      const result = await resolveAgentPlan(runId, planId, { decision, guidance });
+      pollingStopped = true;
+      if (progressTimer !== undefined) window.clearInterval(progressTimer);
+      if (result.ok && result.data) {
+        refreshWorkspaceTreeForToolFacts(result.data.events);
+        set((state) => ({
+          session: result.data!.session,
+          events: result.data!.events,
+          pendingPermission: findLatestPendingPermission(result.data!.events),
+          resolvingPermission: null,
+          resolvingPlan: null,
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, result.data!.session.id),
+        }));
+        void get().refreshTraceEvents(result.data.session.id);
+      } else {
+        set((state) => ({
+          errorMessage: result.message ?? 'Plan resolve failed',
+          resolvingPlan: null,
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+        }));
+      }
+    } catch (err) {
+      pollingStopped = true;
+      if (progressTimer !== undefined) window.clearInterval(progressTimer);
+      const message = err instanceof Error ? err.message : String(err);
+      set((state) => ({
+        errorMessage: message,
+        resolvingPlan: null,
+        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+      }));
     }
   },
 }));

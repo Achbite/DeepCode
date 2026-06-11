@@ -62,7 +62,7 @@ const CodeWorkspaceChoiceDialog: React.FC = () => {
         <div className="cwc-dialog__body">
           <p className="cwc-dialog__file">{fileName}</p>
           <p className="cwc-dialog__hint">
-            该文件是 VSCode 工作区描述文件。你希望如何处理它？
+            该文件是 VS Code-style 工作区描述文件。你希望如何处理它？
           </p>
         </div>
         <div className="cwc-dialog__actions">

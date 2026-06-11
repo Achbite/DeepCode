@@ -16,6 +16,7 @@ import {
   closeAppWindow,
   getHealth,
   getRuntimeStatus,
+  healthVersion,
   warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
 import { getTabId, useEditorStore } from '../state/editorStore';
@@ -252,7 +253,7 @@ const App: React.FC = () => {
       if (cancelled) return;
       if (result.ok && result.data) {
         setApiStatus('connected');
-        setServerVersion(result.data.version);
+        setServerVersion(healthVersion(result.data));
       } else {
         setApiStatus('error');
         setErrorMessage(result.message || 'API unavailable');

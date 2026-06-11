@@ -99,6 +99,10 @@ export interface RuntimeStatus {
   arch?: string;
 }
 
+export function healthVersion(health?: HealthStatus): string {
+  return health?.version || health?.buildCommit || 'unknown';
+}
+
 export function getRuntimeType(): RuntimeType {
   return 'web';
 }
@@ -108,7 +112,7 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
     const health = await api.getHealth();
     return {
       runtime: 'web',
-      version: health.ok && health.data ? health.data.version : 'unknown',
+      version: health.ok ? healthVersion(health.data) : 'unknown',
       platform: navigator.platform,
     };
   } catch {

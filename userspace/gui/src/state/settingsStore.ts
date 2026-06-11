@@ -93,7 +93,7 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     group: 'workbench',
     control: 'select',
     options: [
-      { label: 'VSCode', value: 'vscode' },
+      { label: 'VS Code', value: 'vscode' },
     ],
   },
   {

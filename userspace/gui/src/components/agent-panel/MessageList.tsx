@@ -14,6 +14,11 @@ interface MessageListProps {
   events: AgentEvent[];
   loading?: boolean;
   language: UiLanguage;
+  resolvingPlan?: {
+    runId: string;
+    planId: string;
+    decision: 'accept' | 'reject' | 'revise';
+  } | null;
   onPlanResolve?: (
     runId: string,
     planId: string,
@@ -326,7 +331,10 @@ function planKey(event: AgentEvent): string | undefined {
   return `${runId}::${planId}`;
 }
 
-function buildPlanConfirmationState(events: AgentEvent[]): PlanConfirmationState {
+function buildPlanConfirmationState(
+  events: AgentEvent[],
+  resolvingPlan?: MessageListProps['resolvingPlan']
+): PlanConfirmationState {
   const acceptedKeys = new Set<string>();
   const planCardKeys = new Set<string>();
 
@@ -341,12 +349,16 @@ function buildPlanConfirmationState(events: AgentEvent[]): PlanConfirmationState
     }
   }
 
+  if (resolvingPlan?.decision === 'accept') {
+    acceptedKeys.add(`${resolvingPlan.runId}::${resolvingPlan.planId}`);
+  }
+
   return { acceptedKeys, planCardKeys };
 }
 
-function shouldHideAcceptedPlanReview(event: AgentEvent, planState: PlanConfirmationState): boolean {
+function shouldHidePlanReviewForConfirmedPlan(event: AgentEvent, planState: PlanConfirmationState): boolean {
   const key = planKey(event);
-  return Boolean(key && eventStatus(event) === 'accepted' && planState.planCardKeys.has(key));
+  return Boolean(key && planState.acceptedKeys.has(key) && planState.planCardKeys.has(key));
 }
 
 function eventOutput(event: AgentEvent): string | undefined {
@@ -823,10 +835,31 @@ async function readLatestArchiveFile(sessionId: string, path: string): Promise<s
   return result.data.content;
 }
 
+async function readSessionArchiveFile(sessionId: string, path: string): Promise<string> {
+  const archive = await getConversationArchive(sessionId);
+  const result = await readConversationArchiveFile(sessionId, { path, runId: 'session' });
+  if (!archive.ok || !result.ok || !result.data) {
+    throw new Error(result.message ?? result.error ?? archive.message ?? archive.error ?? 'archive export unavailable');
+  }
+  return result.data.content;
+}
+
 async function readChronologicalArchiveMarkdown(sessionId: string): Promise<string> {
-  const content = await readLatestArchiveFile(sessionId, 'exports/debug.json');
-  const parsed = JSON.parse(content) as ArchiveDebugExport;
-  return buildChronologicalArchiveMarkdown(parsed);
+  try {
+    return await readSessionArchiveFile(sessionId, 'exports/chronological.md');
+  } catch {
+    const content = await readLatestArchiveFile(sessionId, 'exports/debug.json');
+    const parsed = JSON.parse(content) as ArchiveDebugExport;
+    return buildChronologicalArchiveMarkdown(parsed);
+  }
+}
+
+async function readChronologicalDebugPackage(sessionId: string): Promise<string> {
+  try {
+    return await readSessionArchiveFile(sessionId, 'exports/chronological-debug.json');
+  } catch {
+    return readLatestArchiveFile(sessionId, 'exports/debug.json');
+  }
 }
 
 function thoughtTraceTitle(events: AgentEvent[], language: UiLanguage, running = false): string {
@@ -1262,7 +1295,7 @@ function TurnActions({
           <button
             type="button"
             disabled={status === 'working' || !sessionId}
-            onClick={() => void runCopyAction(t(language, 'agent.message.copyDebugPackage'), () => readLatestArchiveFile(requireSessionId(), 'exports/debug.json'))}
+            onClick={() => void runCopyAction(t(language, 'agent.message.copyDebugPackage'), () => readChronologicalDebugPackage(requireSessionId()))}
           >
             {t(language, 'agent.message.copyDebugPackage')}
           </button>
@@ -1312,7 +1345,7 @@ function renderMessage(
     );
   }
   if (event.kind === 'plan_review') {
-    if (shouldHideAcceptedPlanReview(event, planState)) return null;
+    if (shouldHidePlanReviewForConfirmedPlan(event, planState)) return null;
     return <PlanReviewCard key={event.id} event={event} language={language} onPlanResolve={onPlanResolve} />;
   }
   if (event.kind === 'review_summary') return renderReviewSummaryCard(event);
@@ -1375,8 +1408,17 @@ function renderMessage(
   );
 }
 
-const MessageList: React.FC<MessageListProps> = ({ events, loading = false, language, onPlanResolve }) => {
-  const planState = React.useMemo(() => buildPlanConfirmationState(events), [events]);
+const MessageList: React.FC<MessageListProps> = ({
+  events,
+  loading = false,
+  language,
+  resolvingPlan,
+  onPlanResolve,
+}) => {
+  const planState = React.useMemo(
+    () => buildPlanConfirmationState(events, resolvingPlan),
+    [events, resolvingPlan]
+  );
   const renderItems = React.useMemo(() => createRenderItems(events, loading), [events, loading]);
 
   return (
