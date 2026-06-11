@@ -81,7 +81,7 @@ is_docker_environment() {
 check_static_shell_and_policy_gates() {
   bash -n test.sh
   bash -n build.sh
-  local deprecated_build_markers_regex='DEEPCODE_VERSION''_TAG|source''Hash|build-info''\.json|build''Version|release''\.json'
+  local deprecated_build_markers_regex='DEEPCODE_VERSION''_TAG|source''Hash|build''Version|release''\.json'
   local version_scan_paths=(build.sh README.md test.sh)
   local optional_doc
   for optional_doc in \
@@ -297,7 +297,12 @@ pass "Rust workspace tests"
 info "[3/8] TypeScript protocol/session/gui checks"
 if [ "${DEEPCODE_SKIP_TS_CHECKS:-0}" != "1" ]; then
   if command -v node >/dev/null 2>&1 && command -v pnpm >/dev/null 2>&1; then
+    rm -f \
+      userspace/protocol/tsconfig.tsbuildinfo \
+      userspace/session-core/tsconfig.tsbuildinfo \
+      userspace/gui/tsconfig.tsbuildinfo
     pnpm --filter @deepcode/protocol typecheck
+    pnpm --filter @deepcode/protocol build
     pnpm --filter @deepcode/session-core typecheck
     pnpm --filter @deepcode/session-core build
     pnpm --filter @deepcode/session-core smoke
@@ -350,12 +355,14 @@ search "fn workspace_current|fn workspace_open" crates/deepcode-kernel-daemon/sr
 search "fn user_settings_get|fn llm_profiles_get" crates/deepcode-kernel-daemon/src/settings_api.rs >/dev/null
 search "fn append_session_projection_jsonl|fn session_store_projection_append" crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
 search "conversation_archives_dir|conversationArchiveRoot|fn session_store_archive_get|fn session_store_archive_file_get|ArchiveFileQuery|fn append_conversation_archive_projection|fn append_conversation_archive_transcript|fn read_conversation_archive_manifests|fn safe_archive_relative_path|fn redact_archive_value" crates/deepcode-kernel-daemon/src/state.rs crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
-search "manifest.json|projection.jsonl|transcript.jsonl|exports/complete.md|exports/debug.json|projection-events.jsonl|transcript-events.jsonl|action-bundle-drafts.jsonl|plan-review-reports.jsonl|review-packets.jsonl|permission-tool-facts.jsonl" crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
+search "manifest.json|projection.jsonl|transcript.jsonl|exports/complete.md|exports/debug.json|projection-events.jsonl|transcript-events.jsonl|action-bundle-drafts.jsonl|plan-review-reports.jsonl|review-packets.jsonl|permission-tool-facts.jsonl|llm-provider-errors.jsonl" crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
 search "/api/session-store/:session_id/archive|/api/session-store/:session_id/archive/file" crates/deepcode-kernel-daemon/src/main.rs >/dev/null
 ! search "conversation-archives" userspace/gui/dist shells/tauri/dist shells/tauri/src-tauri/tauri.conf.json 2>/dev/null \
   || fail "conversation archives must stay in user config data, not GUI/Tauri dist resources"
 search "fn drive_kernel_agent_loop|fn call_llm_profile" crates/deepcode-kernel-daemon/src/agent_loop.rs >/dev/null
 search "fn call_openai_compatible_profile|fn call_anthropic_profile|fn call_ollama_profile" crates/deepcode-kernel-daemon/src/llm_transport.rs >/dev/null
+search "LlmProviderDiagnostic|LlmProviderErrorLayer|ProviderJsonDecodeFailed|expected_schema|body_preview" crates/deepcode-kernel-abi/src/llm.rs crates/deepcode-kernel-abi/src/event.rs crates/deepcode-kernel-daemon/src/llm_transport.rs crates/deepcode-kernel-daemon/src/event_projection.rs >/dev/null
+search "llm.provider_error|LlmProviderError" crates/deepcode-kernel-abi/src/event.rs crates/deepcode-kernel-daemon/src/event_projection.rs crates/deepcode-kernel-daemon/src/agent_loop.rs >/dev/null
 search "fn safe_asset_path|fn gui_asset" crates/deepcode-kernel-daemon/src/static_assets.rs >/dev/null
 search "fn skill_mount_scan|fn scan_skill_mount_dir" crates/deepcode-kernel-daemon/src/skill_api.rs >/dev/null
 search "fn run_length_prefixed_ipc|fn run_stdio_ipc" crates/deepcode-kernel-daemon/src/ipc.rs >/dev/null
@@ -433,7 +440,7 @@ search "invalid_proposal_stays_without_transition|plan_draft_advances_to_check|a
 ! search "PlanContractSubmit \\{ request_id, \\.\\. \\} =>" crates/deepcode-kernel-runtime/src/dispatch.rs || fail "PlanContractSubmit must not remain interface-only"
 search "fn plan_contract_submit|parse_plan_review_input|PlanReviewReportProduced|plan.review_report_produced" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
 search "plan_contract_submit_produces_review_report_without_entering_complete|plan_contract_submit_malformed_contract_returns_denied_report|plan_contract_submit_action_bundle_reports_permission_gap" crates/deepcode-kernel-runtime/src/tests.rs >/dev/null
-search "parseAgentPlan|ACTION_BUNDLE|EXPECTED_VALIDATION|REVIEW_GUIDE|PERMISSION_HINTS" userspace/session-core/src/agent-plan >/dev/null
+search "parseAgentPlan|actionBundle|expectedValidation|reviewGuide" userspace/session-core/src/agent-plan >/dev/null
 search "RESOURCE_REQUEST|resource_request_with_action_bundle|parseAgentPlanOutput|ResourceRequestDraft|RESOURCE_REQUEST_KEYS" userspace/session-core/src/agent-plan >/dev/null
 search "DraftTaskQueue|ApprovedTaskQueue|createPlanContractSubmitCommand|compileActionBundleToPlanContract" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue >/dev/null
 search "PlanConfirmationPolicy|PermissionAutoApprovalPolicy|AutoConfirmDecision|DEFAULT_PLAN_CONFIRMATION_POLICY|decidePlanConfirmation|decidePermissionAutoApproval|autoApproveDelete" userspace/session-core/src/confirmation userspace/session-core/src/task-queue >/dev/null

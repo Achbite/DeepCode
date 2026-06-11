@@ -10,7 +10,9 @@
 # 分阶段入口：
 #   ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
 #   ./build.sh --stage deepcode-gui # pnpm + Codex 风 DeepCode-GUI dist
-#   ./build.sh --stage macos-deepcode-gui # Docker 前端构建 + macOS DeepCode-GUI.app
+#   ./build.sh --stage package-macos # macOS host: build DeepCode.app package
+#   ./build.sh --stage package-macos-deepcode-gui # macOS host: build DeepCode-GUI.app package
+#   ./build.sh --stage macos-deepcode-gui # compat alias for package-macos-deepcode-gui
 #   ./build.sh --stage daemon   # Linux/Windows Rust Kernel daemon
 #   ./build.sh --stage cli      # Linux/Windows CLI Host shell
 #   ./build.sh --stage tui      # Linux/Windows TUI Host shell
@@ -23,6 +25,7 @@
 #   DEEPCODE_DISABLE_SCCACHE=1  禁用 sccache，回退到普通 cargo。
 #   DEEPCODE_FORCE_BUILD=1      忽略 stage hash，强制执行构建阶段。
 #   DEEPCODE_ALLOW_HOST_BUILD=1 显式允许宿主机直接构建（默认 Docker-only）。
+#   --clean-cache               清理 macOS 打包缓存后重新打包；保留用户配置和会话数据。
 # ====================================================================
 set -euo pipefail
 
@@ -47,8 +50,9 @@ cd "$ROOT_DIR"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./build.sh [--stage all|gui|deepcode-gui|macos-deepcode-gui|daemon|cli|tui|kernel|tauri|package]...
+  ./build.sh [--stage all|gui|deepcode-gui|package-macos|package-macos-deepcode-gui|macos-deepcode-gui|daemon|cli|tui|kernel|tauri|package]...
   ./build.sh --full
+  ./build.sh --stage package-macos --clean-cache
 
 Environment:
   CARGO_TARGET_DIR                  Override shared Cargo target directory.
@@ -59,10 +63,12 @@ Environment:
   SCCACHE_DIR                       Override local sccache cache directory.
   DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 Build optional Linux Tauri shell.
   DEEPCODE_MACOS_PRODUCT=DeepCode-GUI Package the Codex-style macOS GUI app.
+  --clean-cache                     Clean macOS package build artifacts without deleting config/sessions/archives/kernel data.
 USAGE
 }
 
 requested_stages=()
+clean_cache=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --stage)
@@ -78,6 +84,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --full)
       requested_stages+=("all")
+      shift
+      ;;
+    --clean-cache)
+      clean_cache=1
       shift
       ;;
     -h|--help)
@@ -99,7 +109,8 @@ fi
 run_deps=0
 run_gui=0
 run_deepcode_gui=0
-run_macos_deepcode_gui=0
+run_package_macos=0
+run_package_macos_deepcode_gui=0
 run_daemon=0
 run_cli=0
 run_tui=0
@@ -128,8 +139,14 @@ enable_stage() {
       run_deps=1
       run_deepcode_gui=1
       ;;
+    package-macos)
+      run_package_macos=1
+      ;;
+    package-macos-deepcode-gui)
+      run_package_macos_deepcode_gui=1
+      ;;
     macos-deepcode-gui)
-      run_macos_deepcode_gui=1
+      run_package_macos_deepcode_gui=1
       ;;
     kernel)
       run_daemon=1
@@ -177,7 +194,8 @@ echo "==[build]== ROOT_DIR=$ROOT_DIR"
 echo "==[build]== CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
 echo "==[build]== DEEPCODE_BUILD_LINUX_TAURI_SHELL=$BUILD_LINUX_TAURI_SHELL"
-echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui macos-deepcode-gui=$run_macos_deepcode_gui daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package"
+echo "==[build]== clean-cache=$clean_cache"
+echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui package-macos=$run_package_macos package-macos-deepcode-gui=$run_package_macos_deepcode_gui daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package"
 mkdir -p "$STAGE_STAMP_DIR"
 
 is_docker_environment() {
@@ -194,34 +212,57 @@ require_docker_build_environment() {
   exit 3
 }
 
-run_macos_deepcode_gui_package_from_host() {
+run_macos_package_from_host() {
+  local product="$1"
+  local output_app="$2"
   if is_docker_environment; then
-    echo "==[build][error]== macos-deepcode-gui must run on the macOS host, not inside Docker." >&2
+    echo "==[build][error]== macOS package stages must run on the macOS host, not inside Docker." >&2
     exit 3
   fi
   if [ "$(uname -s)" != "Darwin" ]; then
-    echo "==[build][error]== macos-deepcode-gui requires a macOS host." >&2
+    echo "==[build][error]== macOS package stages require a macOS host." >&2
     exit 3
   fi
 
-  echo "==[build][macos-deepcode-gui]== build Docker-managed DeepCode-GUI frontend dist"
-  make build-deepcode-gui
-  echo "==[build][macos-deepcode-gui]== package DeepCode-GUI.app on macOS host"
-  DEEPCODE_MACOS_PRODUCT=DeepCode-GUI bash ./scripts/package-macos.sh
+  if [ "$product" = "DeepCode-GUI" ]; then
+    echo "==[build][package-macos-deepcode-gui]== build Docker-managed DeepCode-GUI frontend dist"
+    make build-deepcode-gui
+  fi
+
+  echo "==[build][package-macos]== package $product.app on macOS host"
+  if [ "$clean_cache" = "1" ]; then
+    env DEEPCODE_MACOS_CLEAN=1 DEEPCODE_MACOS_REFRESH_GUI_DIST=1 DEEPCODE_MACOS_PRODUCT="$product" bash ./scripts/package-macos.sh
+  else
+    env DEEPCODE_MACOS_PRODUCT="$product" bash ./scripts/package-macos.sh
+  fi
+  echo ""
+  echo "==[build]== DONE"
+  echo "$BIN_ROOT/macos-arm64/$output_app"
 }
 
-if [ "$run_macos_deepcode_gui" = "1" ]; then
+host_macos_stage_count=$((run_package_macos + run_package_macos_deepcode_gui))
+if [ "$host_macos_stage_count" -gt 0 ]; then
+  if [ "$host_macos_stage_count" -ne 1 ]; then
+    echo "==[build][error]== run exactly one macOS package stage at a time." >&2
+    exit 2
+  fi
   if [ "$run_deps" = "1" ] || [ "$run_gui" = "1" ] || [ "$run_deepcode_gui" = "1" ] || \
     [ "$run_daemon" = "1" ] || [ "$run_cli" = "1" ] || [ "$run_tui" = "1" ] || \
     [ "$run_tauri" = "1" ] || [ "$run_package" = "1" ]; then
-    echo "==[build][error]== macos-deepcode-gui is a host orchestration stage; run it by itself." >&2
+    echo "==[build][error]== macOS package stages are host orchestration stages; run them by themselves." >&2
     exit 2
   fi
-  run_macos_deepcode_gui_package_from_host
-  echo ""
-  echo "==[build]== DONE"
-  echo "$BIN_ROOT/macos-arm64/DeepCode-GUI.app"
+  if [ "$run_package_macos" = "1" ]; then
+    run_macos_package_from_host "DeepCode" "DeepCode.app"
+  else
+    run_macos_package_from_host "DeepCode-GUI" "DeepCode-GUI.app"
+  fi
   exit 0
+fi
+
+if [ "$clean_cache" = "1" ]; then
+  echo "==[build][error]== --clean-cache is only supported with --stage package-macos or --stage package-macos-deepcode-gui." >&2
+  exit 2
 fi
 
 require_docker_build_environment
@@ -364,6 +405,7 @@ prepare_tauri_dist() {
     echo "==[build][error]== userspace/gui/dist missing; run ./build.sh --stage gui first" >&2
     exit 1
   }
+  validate_frontend_dist "$CLIENT_DIR/dist" "DeepCode" "gui"
   mkdir -p "$tauri_gui_dist"
   find "$tauri_gui_dist" -mindepth 1 -delete 2>/dev/null || true
   cp -r "$CLIENT_DIR/dist/." "$tauri_gui_dist/"
@@ -377,9 +419,27 @@ prepare_deepcode_gui_tauri_dist() {
     echo "==[build][error]== userspace/gui/dist-deepcode-gui missing; run ./build.sh --stage deepcode-gui first" >&2
     exit 1
   }
+  validate_frontend_dist "$deepcode_gui_dist" "DeepCode-GUI" "deepcode-gui"
   mkdir -p "$tauri_gui_dist"
   find "$tauri_gui_dist" -mindepth 1 -delete 2>/dev/null || true
   cp -r "$deepcode_gui_dist/." "$tauri_gui_dist/"
+}
+
+validate_frontend_dist() {
+  local dist_dir="$1"
+  local label="$2"
+  local stage="$3"
+  local index_file="$dist_dir/index.html"
+
+  if [ ! -f "$index_file" ]; then
+    echo "==[build][error]== $label frontend dist missing index.html at $index_file" >&2
+    exit 1
+  fi
+  if ! grep -q '<script[^>]*type="module"[^>]*assets/' "$index_file"; then
+    echo "==[build][error]== $label frontend dist index.html has no production module entry." >&2
+    echo "==[build][error]== Rebuild the dist with DEEPCODE_FORCE_BUILD=1 bash ./build.sh --stage $stage" >&2
+    exit 1
+  fi
 }
 
 normalize_deepcode_gui_dist() {

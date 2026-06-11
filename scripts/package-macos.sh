@@ -8,6 +8,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
+BUILD_COMMIT="${DEEPCODE_BUILD_COMMIT:-$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || printf 'unknown')}"
 PRODUCT="${DEEPCODE_MACOS_PRODUCT:-DeepCode}"
 case "$PRODUCT" in
   DeepCode)
@@ -26,7 +27,7 @@ case "$PRODUCT" in
     ;;
   DeepCode-GUI)
     APP_NAME="DeepCode-GUI"
-    BUNDLE_ID="com.achbite.deepcode"
+    BUNDLE_ID="com.achbite.deepcode.gui"
     TAURI_DIR="$ROOT_DIR/shells/deepcode-gui"
     TAURI_BIN_NAME="DeepCode-GUI"
     CLIENT_DIST_DIR="$CLIENT_DIR/dist-deepcode-gui"
@@ -55,8 +56,50 @@ REFRESH_GUI_DIST="${DEEPCODE_MACOS_REFRESH_GUI_DIST:-0}"
 SEED_CARGO_REGISTRY="${DEEPCODE_MACOS_SEED_CARGO_REGISTRY:-1}"
 CARGO_OFFLINE="${DEEPCODE_MACOS_CARGO_OFFLINE:-1}"
 TAURI_NETWORK_FALLBACK="${DEEPCODE_MACOS_TAURI_NETWORK_FALLBACK:-1}"
+CLEAN_PACKAGE_CACHE="${DEEPCODE_MACOS_CLEAN:-0}"
 
 export CARGO_TARGET_DIR="$CARGO_TARGET_ROOT"
+
+usage() {
+  cat <<USAGE
+Usage:
+  scripts/package-macos.sh [--clean]
+
+Environment:
+  DEEPCODE_MACOS_PRODUCT=DeepCode|DeepCode-GUI
+  DEEPCODE_MACOS_CLEAN=1        Clean macOS package build artifacts before rebuilding.
+  DEEPCODE_MACOS_REFRESH_GUI_DIST=1
+                                Rebuild GUI dist through the Docker dev container when available.
+
+Clean keeps package-local user data:
+  bin/macos-arm64/config
+  bin/macos-arm64/sessions
+  bin/macos-arm64/conversation-archives
+  bin/macos-arm64/kernel
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --clean)
+      CLEAN_PACKAGE_CACHE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf '==[macos-package][error]== unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "$CLEAN_PACKAGE_CACHE" = "1" ]; then
+  REFRESH_GUI_DIST=1
+fi
 
 log() {
   printf '==[macos-package]== %s\n' "$*"
@@ -65,6 +108,60 @@ log() {
 fail() {
   printf '==[macos-package][error]== %s\n' "$*" >&2
   exit 1
+}
+
+running_processes_for_path() {
+  local target="$1"
+  ps -axo pid=,command= | DEEPCODE_PROCESS_TARGET="$target" awk 'index($0, ENVIRON["DEEPCODE_PROCESS_TARGET"]) > 0 { print }'
+}
+
+fail_if_target_app_is_running() {
+  local app_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/$TAURI_BIN_NAME"
+  local kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
+  local matches=""
+
+  if [ -e "$app_bin" ]; then
+    matches="$(running_processes_for_path "$app_bin" || true)"
+  fi
+  if [ -e "$kernel_bin" ]; then
+    local kernel_matches
+    kernel_matches="$(running_processes_for_path "$kernel_bin" || true)"
+    if [ -n "$kernel_matches" ]; then
+      if [ -n "$matches" ]; then
+        matches="$matches
+$kernel_matches"
+      else
+        matches="$kernel_matches"
+      fi
+    fi
+  fi
+
+  if [ -n "$matches" ]; then
+    printf '%s\n' "$matches" >&2
+    fail "$APP_NAME.app is still running from $BIN_DIR. Quit it before packaging so the new Kernel is used."
+  fi
+}
+
+clean_macos_package_cache() {
+  log "clean macOS package build artifacts for $PRODUCT"
+  log "preserve package-local user data: config/, sessions/, conversation-archives/, kernel/"
+
+  rm -rf "$BIN_DIR/$APP_NAME.app" "$BIN_DIR/$WEB_DIR_NAME" "$TAURI_DIR/dist"
+  if [ -n "$TUI_COMMAND_NAME" ]; then
+    rm -f "$BIN_DIR/$TUI_COMMAND_NAME"
+  fi
+  rm -f \
+    "$BIN_DIR/deepcode-kernel" \
+    "$BIN_DIR/deepcode-cli" \
+    "$BIN_DIR/deepcode-tui" \
+    "$BIN_DIR/README.txt" \
+    "$BIN_DIR/build-info.json"
+
+  rm -f \
+    "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
+    "$CARGO_TARGET_ROOT/release/deepcode-cli" \
+    "$CARGO_TARGET_ROOT/release/deepcode-tui" \
+    "$CARGO_TARGET_ROOT/release/$TAURI_BIN_NAME"
 }
 
 ensure_macos_arm64() {
@@ -227,17 +324,28 @@ install_dependencies() {
 
 prepare_tauri_dist() {
   [ -f "$CLIENT_DIST_DIR/index.html" ] || fail "GUI dist missing at $CLIENT_DIST_DIR"
+  validate_frontend_dist "$CLIENT_DIST_DIR" "$PRODUCT"
   log "prepare Tauri embedded dist"
   rm -rf "$TAURI_DIR/dist"
   mkdir -p "$TAURI_DIR/dist"
   cp -R "$CLIENT_DIST_DIR/." "$TAURI_DIR/dist/"
 }
 
+validate_frontend_dist() {
+  local dist_dir="$1"
+  local label="$2"
+  local index_file="$dist_dir/index.html"
+  [ -f "$index_file" ] || fail "$label frontend dist missing index.html at $index_file"
+  if ! grep -q '<script[^>]*type="module"[^>]*assets/' "$index_file"; then
+    fail "$label frontend dist index.html has no production module entry; rebuild the GUI dist with DEEPCODE_FORCE_BUILD=1."
+  fi
+}
+
 refresh_gui_dist_with_docker() {
   command -v docker >/dev/null 2>&1 || return 1
   docker container inspect deepcode-dev >/dev/null 2>&1 || return 1
   log "refresh $PRODUCT GUI dist in deepcode-dev Docker container"
-  docker exec deepcode-dev bash -lc "bash ./build.sh --stage $DOCKER_GUI_STAGE"
+  docker exec deepcode-dev bash -lc "DEEPCODE_FORCE_BUILD=1 bash ./build.sh --stage $DOCKER_GUI_STAGE"
 }
 
 ensure_gui_dist() {
@@ -292,18 +400,18 @@ build_gui_dist() {
 
 build_rust_bins() {
   log "build Darwin Kernel/CLI/TUI release binaries"
-  cargo build --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+  DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --release -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
 }
 
 build_tauri_app() {
   log "build macOS $PRODUCT Tauri shell binary"
-  if (cd "$TAURI_SRC_DIR" && cargo build --release --bin "$TAURI_BIN_NAME"); then
+  if (cd "$TAURI_SRC_DIR" && DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --release --bin "$TAURI_BIN_NAME"); then
     return
   fi
 
   if [ "$CARGO_OFFLINE" = "1" ] && [ "$TAURI_NETWORK_FALLBACK" = "1" ]; then
     log "retry Tauri shell build with Cargo network enabled"
-    (cd "$TAURI_SRC_DIR" && CARGO_NET_OFFLINE=false cargo build --release --bin "$TAURI_BIN_NAME")
+    (cd "$TAURI_SRC_DIR" && CARGO_NET_OFFLINE=false DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --release --bin "$TAURI_BIN_NAME")
     return
   fi
 
@@ -321,6 +429,7 @@ copy_required_file() {
 copy_web_dist() {
   local dst="$1"
   [ -f "$CLIENT_DIST_DIR/index.html" ] || fail "GUI dist missing at $CLIENT_DIST_DIR"
+  validate_frontend_dist "$CLIENT_DIST_DIR" "$PRODUCT"
   rm -rf "$dst"
   mkdir -p "$dst"
   cp -R "$CLIENT_DIST_DIR/." "$dst/"
@@ -590,6 +699,12 @@ sign_app_bundle() {
   }
 }
 
+sync_signed_kernel_sidecar_to_root() {
+  local app_kernel="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
+  [ -x "$app_kernel" ] || fail "missing bundled Kernel sidecar: $app_kernel"
+  install -m 755 "$app_kernel" "$BIN_DIR/deepcode-kernel"
+}
+
 write_readme() {
   local tui_section root_web_entry notes
   if [ "$WRITE_TUI_LAUNCHER" = "1" ]; then
@@ -605,7 +720,7 @@ write_readme() {
     root_web_entry="  $WEB_DIR_NAME/             React GUI static assets served by the Kernel daemon."
   else
     root_web_entry="  $APP_NAME.app/Contents/MacOS/$WEB_DIR_NAME/
-                         Bundled Codex-style GUI assets; the shared root web/ is not replaced."
+                         Bundled conversational GUI assets; the shared root web/ is not replaced."
   fi
 
   notes="  bin/macos-arm64 is the shared macOS distribution directory for DeepCode and
@@ -646,6 +761,19 @@ $notes
 README
 }
 
+write_build_info() {
+  local dst="$1"
+  local product="${2:-$PRODUCT}"
+  cat > "$dst" <<JSON
+{
+  "buildCommit": "$BUILD_COMMIT",
+  "protocolVersion": "deepcode.agent.protocol.v2",
+  "toolCatalogVersion": "deepcode.tool_catalog.k7-k9.v1",
+  "product": "$product"
+}
+JSON
+}
+
 package_distribution() {
   log "prepare $BIN_DIR"
   mkdir -p "$BIN_DIR"
@@ -674,6 +802,8 @@ package_distribution() {
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$BIN_DIR/deepcode-kernel" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$BIN_DIR/deepcode-cli" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "$BIN_DIR/deepcode-tui" 755
+  write_build_info "$BIN_DIR/build-info.json" "macos-arm64"
+  write_build_info "$app_macos_dir/build-info.json"
 
   copy_web_dist "$app_macos_dir/$WEB_DIR_NAME"
   if [ "$COPY_ROOT_WEB_DIST" = "1" ]; then
@@ -682,6 +812,49 @@ package_distribution() {
   write_tui_launcher
   write_readme
   sign_app_bundle "$BIN_DIR/$APP_NAME.app"
+  sync_signed_kernel_sidecar_to_root
+}
+
+verify_packaged_kernel_markers() {
+  local kernel_bin="$BIN_DIR/deepcode-kernel"
+  local app_kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
+  local root_hash app_hash
+  [ -x "$kernel_bin" ] || fail "missing packaged Kernel binary: $kernel_bin"
+  [ -x "$app_kernel_bin" ] || fail "missing bundled Kernel binary: $app_kernel_bin"
+
+  root_hash="$(shasum -a 256 "$kernel_bin" | awk '{print $1}')"
+  app_hash="$(shasum -a 256 "$app_kernel_bin" | awk '{print $1}')"
+  [ "$root_hash" = "$app_hash" ] || fail "root deepcode-kernel and bundled app Kernel differ"
+
+  [ -f "$BIN_DIR/build-info.json" ] || fail "missing root build-info.json"
+  [ -f "$BIN_DIR/$APP_NAME.app/Contents/MacOS/build-info.json" ] || fail "missing bundled build-info.json"
+
+  for candidate in "$kernel_bin" "$app_kernel_bin"; do
+    local strings_file
+    strings_file="$(mktemp "${TMPDIR:-/tmp}/deepcode-kernel-strings.XXXXXX")"
+    strings "$candidate" >"$strings_file"
+    if ! grep -Fq 'deepcode.agent.protocol.v2' "$strings_file"; then
+      rm -f "$strings_file"
+      fail "$candidate is missing deepcode.agent.protocol.v2 marker"
+    fi
+    if ! grep -Fq 'deepcode.tool_catalog.k7-k9.v1' "$strings_file"; then
+      rm -f "$strings_file"
+      fail "$candidate is missing tool catalog version marker"
+    fi
+    if ! grep -Fq 'web.search' "$strings_file"; then
+      rm -f "$strings_file"
+      fail "$candidate tool catalog is missing web.search"
+    fi
+    if ! grep -Fq 'git.status' "$strings_file"; then
+      rm -f "$strings_file"
+      fail "$candidate tool catalog is missing git.status"
+    fi
+    if ! grep -Fq 'browser.snapshot' "$strings_file"; then
+      rm -f "$strings_file"
+      fail "$candidate tool catalog is missing browser.snapshot"
+    fi
+    rm -f "$strings_file"
+  done
 }
 
 main() {
@@ -693,6 +866,10 @@ main() {
 
   ensure_macos_arm64
   ensure_xcode_tools
+  fail_if_target_app_is_running
+  if [ "$CLEAN_PACKAGE_CACHE" = "1" ]; then
+    clean_macos_package_cache
+  fi
   ensure_rust
   seed_cargo_cache_from_docker
   configure_cargo_network_mode
@@ -700,6 +877,7 @@ main() {
   build_rust_bins
   build_tauri_app
   package_distribution
+  verify_packaged_kernel_markers
 
   log "done: $BIN_DIR"
   log "GUI: open $BIN_DIR/$APP_NAME.app"

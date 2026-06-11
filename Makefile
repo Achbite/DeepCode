@@ -6,6 +6,7 @@
 #   make dev-deepcode-gui   -> 在 Docker 内启动 31246 DeepCode-GUI 调试服务
 #   make clean          -> 全量清理（容器 + 镜像 + named volumes），下次 shell 全量重建
 #   make package-macos  -> 在 macOS 宿主机上生成 Darwin GUI/TUI 本机包
+#   make package-macos-clean -> 清理打包缓存后重新生成 Darwin GUI/TUI 本机包
 #   make package-macos-deepcode-gui -> 在 macOS 宿主机上生成 bin/macos-arm64/DeepCode-GUI.app
 #
 # 适用环境：Linux / macOS / WSL（必须能直连 Docker daemon）
@@ -45,7 +46,7 @@ RUN_ARGS := \
 	-e PNPM_HOME=/root/.local/share/pnpm \
 	-e PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-.PHONY: help shell build-deepcode-gui dev-deepcode-gui clean package-macos package-macos-deepcode-gui _ensure_image _ensure_container
+.PHONY: help shell build-deepcode-gui dev-deepcode-gui clean package-macos package-macos-clean package-macos-deepcode-gui _ensure_image _ensure_container
 
 # ---- help：默认目标，列出可用入口 ----
 help:
@@ -56,6 +57,7 @@ help:
 	@echo "  make dev-deepcode-gui    在 Docker 内启动 DeepCode-GUI 调试服务：127.0.0.1:31246"
 	@echo "  make clean          全量清理（容器 + 镜像 + 4 个 named volumes），下次 shell 全量重建"
 	@echo "  make package-macos  在 macOS 宿主机上生成 bin/macos-arm64 GUI/TUI 本机包"
+	@echo "  make package-macos-clean  清理打包缓存后重新生成 macOS 本机包（保留 config/sessions/archives/kernel）"
 	@echo "  make package-macos-deepcode-gui  在 macOS 宿主机上生成 bin/macos-arm64/DeepCode-GUI.app"
 	@echo ""
 	@echo "进入容器后可手动执行："
@@ -63,10 +65,13 @@ help:
 	@echo "  ./test.sh    运行链路 ping 与环境检查"
 
 package-macos:
-	@bash ./scripts/package-macos.sh
+	@bash ./build.sh --stage package-macos
 
-package-macos-deepcode-gui: build-deepcode-gui
-	@DEEPCODE_MACOS_PRODUCT=DeepCode-GUI bash ./scripts/package-macos.sh
+package-macos-clean:
+	@bash ./build.sh --stage package-macos --clean-cache
+
+package-macos-deepcode-gui:
+	@bash ./build.sh --stage package-macos-deepcode-gui
 
 # ---- _ensure_image：镜像不存在则构建 ----
 _ensure_image:

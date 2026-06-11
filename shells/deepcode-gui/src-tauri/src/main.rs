@@ -1,10 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::Serialize;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
+use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
 
 #[cfg(windows)]
@@ -12,6 +14,8 @@ use std::os::windows::process::CommandExt;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: &str = "31246";
+const APP_ASSET_SCHEME: &str = "deepcode-gui";
+const APP_ASSET_DIR: &str = "web-deepcode-gui";
 
 struct KernelProcess {
     child: Mutex<Option<Child>>,
@@ -42,6 +46,9 @@ impl Drop for KernelProcess {
 
 fn main() {
     tauri::Builder::default()
+        .register_uri_scheme_protocol(APP_ASSET_SCHEME, |_ctx, request| {
+            serve_bundled_asset(APP_ASSET_DIR, request)
+        })
         .invoke_handler(tauri::generate_handler![
             deepcode_boot_target,
             deepcode_default_workspace_path,
@@ -52,9 +59,10 @@ fn main() {
         .setup(|app| {
             let target = resolve_launch_target();
             app.manage(target.clone());
-            create_main_window(app, &target)?;
             let child = spawn_kernel_if_available(&target.host, &target.port);
             app.manage(KernelProcess::new(child));
+            wait_for_kernel_port(&target.host, &target.port);
+            create_main_window(app, &target)?;
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -123,8 +131,11 @@ fn create_main_window(
     app: &tauri::App,
     target: &LaunchTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let boot_url = format!("index.html#host={}&port={}", target.host, target.port);
-    let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App(boot_url.into()))
+    let boot_url = format!(
+        "{APP_ASSET_SCHEME}://localhost/index.html#host={}&port={}",
+        target.host, target.port
+    );
+    let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(boot_url.parse()?))
         .title("DeepCode-GUI")
         .inner_size(1500.0, 920.0)
         .min_inner_size(1120.0, 720.0)
@@ -149,6 +160,102 @@ fn create_main_window(
     Ok(())
 }
 
+fn connect_kernel_api(endpoint: &str) -> std::io::Result<TcpStream> {
+    let mut last_error = None;
+    for _ in 0..40 {
+        match TcpStream::connect(endpoint) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                last_error = Some(err);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "kernel api connect timed out")
+    }))
+}
+
+fn wait_for_kernel_port(host: &str, port: &str) {
+    let endpoint = format!("{host}:{port}");
+    let _ = connect_kernel_api(&endpoint);
+}
+
+fn serve_bundled_asset(web_dir_name: &str, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+    match resolve_asset_path(web_dir_name, request.uri().path()) {
+        Ok(path) => match std::fs::read(&path) {
+            Ok(bytes) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type_for_path(&path))
+                .body(bytes)
+                .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR)),
+            Err(_) => text_response(StatusCode::NOT_FOUND, "asset not found"),
+        },
+        Err(message) => text_response(StatusCode::BAD_REQUEST, &message),
+    }
+}
+
+fn resolve_asset_path(web_dir_name: &str, uri_path: &str) -> Result<PathBuf, String> {
+    let exe_dir =
+        current_exe_dir().ok_or_else(|| "failed to resolve executable directory".to_string())?;
+    let web_root =
+        find_bundled_dir(&exe_dir, web_dir_name).unwrap_or_else(|| exe_dir.join(web_dir_name));
+    let requested = uri_path.trim_start_matches('/');
+    let relative = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    let relative_path = Path::new(relative);
+
+    if relative_path
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("invalid asset path".to_string());
+    }
+
+    Ok(web_root.join(relative_path))
+}
+
+fn text_response(status: StatusCode, body: &str) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(body.as_bytes().to_vec())
+        .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn empty_response(status: StatusCode) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(status)
+        .body(Vec::new())
+        .expect("empty response should be valid")
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+    {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
+    }
+}
+
 fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
     if env_truthy("DEEPCODE_SHELL_CONNECT_ONLY") {
         return None;
@@ -164,7 +271,8 @@ fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
     let web_dir = std::env::var("DEEPCODE_CLIENT_DIST")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            find_bundled_dir(&exe_dir, "web-deepcode-gui").unwrap_or_else(|| kernel_dir.join("web-deepcode-gui"))
+            find_bundled_dir(&exe_dir, "web-deepcode-gui")
+                .unwrap_or_else(|| kernel_dir.join("web-deepcode-gui"))
         });
 
     let mut command = Command::new(kernel_path);
