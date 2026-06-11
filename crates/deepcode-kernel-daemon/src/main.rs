@@ -188,6 +188,10 @@ async fn main() {
             get(agent_session_timeline),
         )
         .route(
+            "/api/agent/sessions/:session_id/runs/:run_id/review",
+            post(agent_review_resolve),
+        )
+        .route(
             "/api/agent/sessions/:session_id",
             patch(agent_session_rename).delete(agent_session_delete),
         )

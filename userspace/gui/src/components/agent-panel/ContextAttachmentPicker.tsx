@@ -40,6 +40,7 @@ const ContextAttachmentPicker: React.FC<ContextAttachmentPickerProps> = ({
   onPick,
 }) => {
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
+  const workspace = useWorkspaceStore((s) => s.current);
   const [items, setItems] = useState<PickerItem[]>([]);
 
   useEffect(() => {
@@ -64,6 +65,14 @@ const ContextAttachmentPicker: React.FC<ContextAttachmentPickerProps> = ({
       .slice(0, 40);
   }, [items, query]);
 
+  const absolutePathForItem = (item: PickerItem): string | undefined => {
+    const folder = workspace?.folders.find((candidate) => candidate.id === item.folderId);
+    if (!folder) return undefined;
+    const root = folder.absolutePath.replace(/\/+$/g, '');
+    const relative = item.path.replace(/^\/+/g, '');
+    return relative ? `${root}/${relative}` : folder.absolutePath;
+  };
+
   return (
     <div className="agent-attachment-picker">
       {filtered.map((item) => (
@@ -74,6 +83,7 @@ const ContextAttachmentPicker: React.FC<ContextAttachmentPickerProps> = ({
             onPick({
               kind: item.kind,
               path: item.path,
+              absolutePath: absolutePathForItem(item),
               folderId: item.folderId,
               source: 'mention',
               scope: 'message',

@@ -25,6 +25,7 @@ const AgentPanel: React.FC = () => {
   const pendingPermission = useAgentSessionStore((s) => s.pendingPermission);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
+  const resolvingReview = useAgentSessionStore((s) => s.resolvingReview);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
@@ -39,6 +40,7 @@ const AgentPanel: React.FC = () => {
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
+  const resolveReview = useAgentSessionStore((s) => s.resolveReview);
   const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
@@ -92,8 +94,12 @@ const AgentPanel: React.FC = () => {
         loading={agentBusy}
         language={language}
         resolvingPlan={resolvingPlan}
+        resolvingReview={resolvingReview}
         onPlanResolve={(runId, planId, decision, guidance) =>
           void resolvePlan(runId, planId, decision, guidance)
+        }
+        onReviewResolve={(runId, decision, guidance) =>
+          void resolveReview(runId, decision, guidance)
         }
       />
 

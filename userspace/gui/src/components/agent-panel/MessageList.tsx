@@ -19,10 +19,19 @@ interface MessageListProps {
     planId: string;
     decision: 'accept' | 'reject' | 'revise';
   } | null;
+  resolvingReview?: {
+    runId: string;
+    decision: 'accept' | 'revise';
+  } | null;
   onPlanResolve?: (
     runId: string,
     planId: string,
     decision: 'accept' | 'reject' | 'revise',
+    guidance?: string
+  ) => void;
+  onReviewResolve?: (
+    runId: string,
+    decision: 'accept' | 'revise',
     guidance?: string
   ) => void;
 }
@@ -82,6 +91,8 @@ type RenderItem =
 interface PlanConfirmationState {
   acceptedKeys: Set<string>;
   planCardKeys: Set<string>;
+  acceptedRunIds: Set<string>;
+  planCardRunIds: Set<string>;
 }
 
 interface ArchiveDebugExport {
@@ -337,28 +348,46 @@ function buildPlanConfirmationState(
 ): PlanConfirmationState {
   const acceptedKeys = new Set<string>();
   const planCardKeys = new Set<string>();
+  const acceptedRunIds = new Set<string>();
+  const planCardRunIds = new Set<string>();
 
   for (const event of events) {
     const key = planKey(event);
-    if (!key) continue;
+    const runId = eventRunId(event);
     if (event.kind === 'plan_card') {
-      planCardKeys.add(key);
+      if (key) planCardKeys.add(key);
+      if (runId) planCardRunIds.add(runId);
     }
     if (event.kind === 'plan_review' && eventStatus(event) === 'accepted') {
-      acceptedKeys.add(key);
+      if (key) acceptedKeys.add(key);
+      if (runId) acceptedRunIds.add(runId);
     }
   }
 
   if (resolvingPlan?.decision === 'accept') {
     acceptedKeys.add(`${resolvingPlan.runId}::${resolvingPlan.planId}`);
+    acceptedRunIds.add(resolvingPlan.runId);
   }
 
-  return { acceptedKeys, planCardKeys };
+  return { acceptedKeys, planCardKeys, acceptedRunIds, planCardRunIds };
 }
 
 function shouldHidePlanReviewForConfirmedPlan(event: AgentEvent, planState: PlanConfirmationState): boolean {
   const key = planKey(event);
-  return Boolean(key && planState.acceptedKeys.has(key) && planState.planCardKeys.has(key));
+  const runId = eventRunId(event);
+  return Boolean(
+    (key && planState.acceptedKeys.has(key)) ||
+    (runId && planState.acceptedRunIds.has(runId) && planState.planCardRunIds.has(runId))
+  );
+}
+
+function isPlanConfirmed(event: AgentEvent, planState: PlanConfirmationState): boolean {
+  const key = planKey(event);
+  const runId = eventRunId(event);
+  return Boolean(
+    (key && planState.acceptedKeys.has(key)) ||
+    (runId && planState.acceptedRunIds.has(runId))
+  );
 }
 
 function eventOutput(event: AgentEvent): string | undefined {
@@ -1071,21 +1100,84 @@ function PlanReviewCard({
   );
 }
 
-function renderReviewSummaryCard(event: AgentEvent) {
-  const title = stringField(event.payload, 'title') ?? 'Review';
+function ReviewSummaryCard({
+  event,
+  language,
+  resolvingReview,
+  onReviewResolve,
+}: {
+  event: AgentEvent;
+  language: UiLanguage;
+  resolvingReview?: MessageListProps['resolvingReview'];
+  onReviewResolve?: MessageListProps['onReviewResolve'];
+}) {
+  const [guidance, setGuidance] = React.useState('');
+  const title = stringField(event.payload, 'title') ?? t(language, 'agent.review.title');
   const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
-  const guidance = stringField(event.payload, 'llmGuidance');
+  const llmGuidance = stringField(event.payload, 'llmGuidance');
+  const status = stringField(event.payload, 'status') ?? 'waitingUserReview';
+  const runId = stringField(event.payload, 'runId');
+  const confirmable =
+    isRecord(event.payload) &&
+    event.payload.confirmable === true &&
+    status === 'waitingUserReview' &&
+    Boolean(runId);
+  const resolving = Boolean(runId && resolvingReview?.runId === runId);
   const facts = payloadArray(event.payload, 'facts');
+  const continuationCount =
+    isRecord(event.payload) && typeof event.payload.continuationCount === 'number'
+      ? event.payload.continuationCount
+      : 0;
   return (
-    <section key={event.id} className="agent-flow-card agent-flow-card--review">
+    <section key={event.id} className={`agent-flow-card agent-flow-card--review agent-flow-card--${status}`}>
       <div className="agent-flow-card__title">{title}</div>
       <div className="agent-flow-card__summary">{summary}</div>
+      {continuationCount > 0 && (
+        <div className="agent-flow-card__section">
+          <div className="agent-flow-card__section-title">
+            {t(language, 'agent.review.continuationTitle')}
+          </div>
+          <div className="agent-flow-card__summary">
+            {t(language, 'agent.review.continuationCount', { count: String(continuationCount) })}
+          </div>
+        </div>
+      )}
       {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
-      {guidance && guidance !== summary && (
+      {llmGuidance && llmGuidance !== summary && (
         <details className="agent-flow-card__details">
-          <summary>LLM 自检建议</summary>
-          <MarkdownContent content={guidance} />
+          <summary>{t(language, 'agent.review.llmGuidance')}</summary>
+          <MarkdownContent content={llmGuidance} />
         </details>
+      )}
+      {confirmable && (
+        <div className="agent-plan-review-actions">
+          <textarea
+            value={guidance}
+            onChange={(event) => setGuidance(event.target.value)}
+            placeholder={t(language, 'agent.review.placeholder')}
+            disabled={resolving}
+          />
+          <div className="agent-plan-review-actions__buttons">
+            <button
+              type="button"
+              disabled={resolving}
+              onClick={() => onReviewResolve?.(runId!, 'accept')}
+            >
+              {resolving && resolvingReview?.decision === 'accept'
+                ? t(language, 'agent.review.accepting')
+                : t(language, 'agent.review.acceptContinue')}
+            </button>
+            <button
+              type="button"
+              disabled={resolving}
+              onClick={() => onReviewResolve?.(runId!, 'revise', guidance.trim() || undefined)}
+            >
+              {resolving && resolvingReview?.decision === 'revise'
+                ? t(language, 'agent.review.submitting')
+                : t(language, 'agent.review.submitRevision')}
+            </button>
+          </div>
+        </div>
       )}
     </section>
   );
@@ -1329,17 +1421,23 @@ function renderMessage(
   language: UiLanguage,
   autoOpen = false,
   onPlanResolve?: MessageListProps['onPlanResolve'],
-  planState: PlanConfirmationState = { acceptedKeys: new Set(), planCardKeys: new Set() }
+  onReviewResolve?: MessageListProps['onReviewResolve'],
+  resolvingReview?: MessageListProps['resolvingReview'],
+  planState: PlanConfirmationState = {
+    acceptedKeys: new Set(),
+    planCardKeys: new Set(),
+    acceptedRunIds: new Set(),
+    planCardRunIds: new Set(),
+  }
 ) {
   if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') return renderWorkflowStage(event, language);
   if (event.kind === 'error') return renderError(event, language);
   if (event.kind === 'plan_card') {
-    const key = planKey(event);
     return (
       <PlanCard
         key={event.id}
         event={event}
-        confirmed={Boolean(key && planState.acceptedKeys.has(key))}
+        confirmed={isPlanConfirmed(event, planState)}
         language={language}
       />
     );
@@ -1348,7 +1446,17 @@ function renderMessage(
     if (shouldHidePlanReviewForConfirmedPlan(event, planState)) return null;
     return <PlanReviewCard key={event.id} event={event} language={language} onPlanResolve={onPlanResolve} />;
   }
-  if (event.kind === 'review_summary') return renderReviewSummaryCard(event);
+  if (event.kind === 'review_summary') {
+    return (
+      <ReviewSummaryCard
+        key={event.id}
+        event={event}
+        language={language}
+        resolvingReview={resolvingReview}
+        onReviewResolve={onReviewResolve}
+      />
+    );
+  }
   if (
     event.kind === 'tool_call' ||
     event.kind === 'tool_result' ||
@@ -1413,7 +1521,9 @@ const MessageList: React.FC<MessageListProps> = ({
   loading = false,
   language,
   resolvingPlan,
+  resolvingReview,
   onPlanResolve,
+  onReviewResolve,
 }) => {
   const planState = React.useMemo(
     () => buildPlanConfirmationState(events, resolvingPlan),
@@ -1447,7 +1557,15 @@ const MessageList: React.FC<MessageListProps> = ({
             />
           );
         }
-        return renderMessage(item.event, language, item.autoOpen, onPlanResolve, planState);
+        return renderMessage(
+          item.event,
+          language,
+          item.autoOpen,
+          onPlanResolve,
+          onReviewResolve,
+          resolvingReview,
+          planState
+        );
       })}
 
       {loading && (

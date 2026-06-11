@@ -258,9 +258,17 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
 
   const addFileTabToAgentContext = async (tab: Extract<(typeof tabs)[number], { kind: 'file' }>) => {
     const { useAgentSessionStore } = await import('../../state/agentSessionStore');
+    const { useWorkspaceStore } = await import('../../state/workspaceStore');
+    const folder = useWorkspaceStore
+      .getState()
+      .current
+      ?.folders.find((candidate) => candidate.id === tab.folderId);
+    const root = folder?.absolutePath.replace(/\/+$/g, '');
+    const relative = tab.path.replace(/^\/+/g, '');
     useAgentSessionStore.getState().addAttachment({
       kind: 'file',
       path: tab.path,
+      absolutePath: root ? `${root}/${relative}` : undefined,
       folderId: tab.folderId,
       source: 'contextMenu',
       scope: 'message',

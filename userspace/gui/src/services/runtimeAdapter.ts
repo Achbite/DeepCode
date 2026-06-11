@@ -58,6 +58,7 @@ import type {
   AgentResourcePacketResult,
   ResolveAgentPermissionRequest,
   ResolveAgentPlanRequest,
+  ResolveAgentReviewRequest,
   SaveWorkspaceFileRequest,
   SaveWorkspaceFileResult,
   SendAgentMessageRequest,
@@ -549,6 +550,14 @@ export function resolveAgentPlan(
   request: ResolveAgentPlanRequest
 ): Promise<ApiResponse<AgentSessionResult>> {
   return api.resolveAgentPlan(runId, planId, request);
+}
+
+export function resolveAgentReview(
+  sessionId: string,
+  runId: string,
+  request: ResolveAgentReviewRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return api.resolveAgentReview(sessionId, runId, request);
 }
 
 export function submitAgentFeedback(

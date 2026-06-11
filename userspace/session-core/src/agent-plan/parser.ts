@@ -19,6 +19,7 @@ const BUNDLE_KEYS = new Set([
   'goal',
   'requirementId',
   'actions',
+  'continuationExpectations',
   'validationExpectations',
   'reviewExpectations',
   'repairPolicy',
@@ -213,6 +214,11 @@ function actionBundleFromObject(value: Record<string, unknown>, codeBlockIds: Se
   const actions = requireArray(value, 'actions', label).map((item, index) =>
     plannedActionFromValue(item, `actions[${index}]`, codeBlockIds)
   );
+  const continuationExpectations = value.continuationExpectations === undefined
+    ? undefined
+    : requireArray(value, 'continuationExpectations', label).map((item, index) =>
+        plannedActionFromValue(item, `continuationExpectations[${index}]`, codeBlockIds)
+      );
   const validationExpectations = requireArray(value, 'validationExpectations', label).map((item, index) =>
     validationExpectationFromValue(item, `validationExpectations[${index}]`)
   );
@@ -226,6 +232,7 @@ function actionBundleFromObject(value: Record<string, unknown>, codeBlockIds: Se
     goal: requireString(value, 'goal', label),
     requirementId: optionalString(value, 'requirementId', label),
     actions,
+    continuationExpectations,
     validationExpectations,
     reviewExpectations,
     repairPolicy: optionalRepairPolicy(value.repairPolicy),
@@ -316,7 +323,14 @@ function validatePlanCapability(value: string, label: string): void {
 }
 
 function rejectOrphanCodeBlocks(codeBlockIds: Set<string>, actionBundle: ActionBundleDraft): void {
-  const referenced = new Set(actionBundle.actions.map((action) => action.sourceBlockId).filter((id): id is string => !!id));
+  const referenced = new Set(
+    [
+      ...actionBundle.actions,
+      ...(actionBundle.continuationExpectations ?? []),
+    ]
+      .map((action) => action.sourceBlockId)
+      .filter((id): id is string => !!id)
+  );
   for (const id of codeBlockIds) {
     if (!referenced.has(id)) {
       throw new AgentPlanParseError('orphan_code_block', `CODE_BLOCK ${id} is not referenced by ACTION_BUNDLE`);

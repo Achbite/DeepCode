@@ -35,6 +35,7 @@ pub(crate) struct GuiState {
     pub(crate) current_session_ids_by_scope: HashMap<String, String>,
     pub(crate) session_projection_cache: HashMap<String, Vec<Value>>,
     pub(crate) pending_plans: HashMap<String, PendingAgentPlan>,
+    pub(crate) pending_reviews: HashMap<String, PendingAgentReview>,
     pub(crate) trace_events: HashMap<String, Vec<Value>>,
     pub(crate) browser: BrowserState,
 }
@@ -69,6 +70,7 @@ impl GuiState {
             current_session_ids_by_scope: HashMap::new(),
             session_projection_cache: HashMap::new(),
             pending_plans: HashMap::new(),
+            pending_reviews: HashMap::new(),
             trace_events: HashMap::new(),
             browser: BrowserState::default(),
         }
@@ -88,6 +90,21 @@ pub(crate) struct PendingAgentPlan {
     pub(crate) expected_validation: String,
     pub(crate) review_guide: String,
     pub(crate) plan_review_report: Option<Value>,
+    pub(crate) created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PendingAgentReview {
+    pub(crate) session_id: String,
+    pub(crate) run_id: String,
+    pub(crate) source_plan_id: String,
+    #[serde(default)]
+    pub(crate) continuations: Vec<Value>,
+    #[serde(default)]
+    pub(crate) code_blocks: Vec<Value>,
+    #[serde(default)]
+    pub(crate) review_expectations: Vec<Value>,
     pub(crate) created_at: String,
 }
 

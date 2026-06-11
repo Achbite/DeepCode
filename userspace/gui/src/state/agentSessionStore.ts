@@ -31,6 +31,7 @@ import {
   patchAgentWorkflowConfig,
   renameAgentSession,
   resolveAgentPlan,
+  resolveAgentReview,
   resolveAgentPermission,
   sendAgentMessage,
 } from '../services/runtimeAdapter';
@@ -50,6 +51,11 @@ type PlanResolution = {
   runId: string;
   planId: string;
   decision: 'accept' | 'reject' | 'revise';
+};
+
+type ReviewResolution = {
+  runId: string;
+  decision: 'accept' | 'revise';
 };
 
 interface QueuedAgentMessage {
@@ -81,6 +87,7 @@ interface AgentSessionState {
   pendingPermission: PendingPermission | null;
   resolvingPermission: PermissionResolution | null;
   resolvingPlan: PlanResolution | null;
+  resolvingReview: ReviewResolution | null;
   queuedMessages: QueuedAgentMessage[];
 }
 
@@ -106,6 +113,7 @@ interface AgentSessionActions {
   acceptPermission: () => Promise<void>;
   rejectPermission: () => Promise<void>;
   resolvePlan: (runId: string, planId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
+  resolveReview: (runId: string, decision: 'accept' | 'revise', guidance?: string) => Promise<void>;
 }
 
 type Store = AgentSessionState & AgentSessionActions;
@@ -224,6 +232,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   pendingPermission: null,
   resolvingPermission: null,
   resolvingPlan: null,
+  resolvingReview: null,
   queuedMessages: [],
 
   loadOrCreate: async () => {
@@ -313,6 +322,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         pendingPermission: null,
         resolvingPermission: null,
         resolvingPlan: null,
+        resolvingReview: null,
         errorMessage: null,
       });
       void get().refreshSessions();
@@ -338,6 +348,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         pendingPermission: findLatestPendingPermission(result.data.events),
         resolvingPermission: null,
         resolvingPlan: null,
+        resolvingReview: null,
         loading: false,
       });
       void get().refreshTraceEvents(result.data.session.id);
@@ -366,7 +377,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       set({
         sessions: result.data.sessions,
         currentSessionId: result.data.currentSessionId,
-        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null, resolvingPlan: null } : {}),
+        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null, resolvingPlan: null, resolvingReview: null } : {}),
       });
       if (wasActive) {
         const nextSessionId = result.data.currentSessionId;
@@ -388,7 +399,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       set({
         sessions: result.data.sessions,
         currentSessionId: result.data.currentSessionId,
-        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null, resolvingPlan: null } : {}),
+        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null, resolvingPlan: null, resolvingReview: null } : {}),
       });
       if (wasActive) {
         const nextSessionId = result.data.currentSessionId;
@@ -612,6 +623,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       pendingPermission: null,
       resolvingPermission: null,
       resolvingPlan: null,
+      resolvingReview: null,
       errorMessage: null,
     }));
 
@@ -626,6 +638,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         pendingPermission: findLatestPendingPermission(result.data.events),
         resolvingPermission: null,
         resolvingPlan: null,
+        resolvingReview: null,
         loading: false,
         errorMessage: null,
       });
@@ -810,6 +823,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           pendingPermission: findLatestPendingPermission(result.data!.events),
           resolvingPermission: null,
           resolvingPlan: null,
+          resolvingReview: null,
           runningSessionIds: removeRunningSessionId(state.runningSessionIds, result.data!.session.id),
         }));
         void get().refreshTraceEvents(result.data.session.id);
@@ -827,6 +841,68 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       set((state) => ({
         errorMessage: message,
         resolvingPlan: null,
+        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+      }));
+    }
+  },
+
+  resolveReview: async (runId, decision, guidance) => {
+    const session = get().session;
+    if (!session || get().resolvingReview) return;
+    set((state) => ({
+      resolvingReview: { runId, decision },
+      runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
+      errorMessage: null,
+    }));
+    let progressTimer: number | undefined;
+    let pollingStopped = false;
+    const refreshProgress = async () => {
+      if (pollingStopped) return;
+      const current = await getCurrentAgentSession(currentWorkspaceScope());
+      if (current.ok && current.data?.session.id === session.id) {
+        refreshWorkspaceTreeForToolFacts(current.data.events);
+        set({
+          session: current.data.session,
+          events: current.data.events,
+          pendingPermission: findLatestPendingPermission(current.data.events),
+        });
+        await get().refreshTraceEvents(session.id);
+      }
+    };
+    progressTimer = window.setInterval(() => {
+      void refreshProgress();
+    }, 300);
+    void refreshProgress();
+    try {
+      const result = await resolveAgentReview(session.id, runId, { decision, guidance });
+      pollingStopped = true;
+      if (progressTimer !== undefined) window.clearInterval(progressTimer);
+      if (result.ok && result.data) {
+        refreshWorkspaceTreeForToolFacts(result.data.events);
+        set((state) => ({
+          session: result.data!.session,
+          events: result.data!.events,
+          pendingPermission: findLatestPendingPermission(result.data!.events),
+          resolvingPermission: null,
+          resolvingPlan: null,
+          resolvingReview: null,
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, result.data!.session.id),
+        }));
+        void get().refreshTraceEvents(result.data.session.id);
+      } else {
+        set((state) => ({
+          errorMessage: result.message ?? 'Review resolve failed',
+          resolvingReview: null,
+          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+        }));
+      }
+    } catch (err) {
+      pollingStopped = true;
+      if (progressTimer !== undefined) window.clearInterval(progressTimer);
+      const message = err instanceof Error ? err.message : String(err);
+      set((state) => ({
+        errorMessage: message,
+        resolvingReview: null,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       }));
     }

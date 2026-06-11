@@ -52,7 +52,7 @@ const USER_ATTACHMENT_MAX_DIR_DEPTH: usize = 2;
 const AGENT_PROTOCOL_SCHEMA_VERSION: &str = "deepcode.agent.protocol.v2";
 
 pub(crate) fn user_input_with_selected_attachment_context(request: &AgentRunRequest) -> String {
-    let context = build_user_selected_attachment_context(&request.attachments);
+    let context = build_explicit_attachment_context(&request.attachments, None);
     if context.trim().is_empty() {
         return request.content.clone();
     }
@@ -63,30 +63,75 @@ pub(crate) fn user_input_with_selected_attachment_context(request: &AgentRunRequ
     )
 }
 
-fn build_user_selected_attachment_context(attachments: &[Value]) -> String {
+pub(crate) fn user_input_with_explicit_attachment_context(
+    request: &AgentRunRequest,
+    workspace: Option<&Value>,
+) -> String {
+    let context = build_explicit_attachment_context(&request.attachments, workspace);
+    if context.trim().is_empty() {
+        return request.content.clone();
+    }
+    format!(
+        "{}\n\n## User-selected context\n{}",
+        request.content.trim_end(),
+        context
+    )
+}
+
+fn build_explicit_attachment_context(attachments: &[Value], workspace: Option<&Value>) -> String {
     let mut parts = Vec::new();
     let mut total_chars = 0_usize;
+    let mut manifest_entries = Vec::new();
     for attachment in attachments {
-        if attachment.get("source").and_then(Value::as_str) != Some("userSelected") {
+        let source = attachment
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(source, "userSelected" | "contextMenu" | "mention") {
             continue;
         }
-        let Some(path) = attachment
-            .get("absolutePath")
-            .or_else(|| attachment.get("path"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
         let kind = attachment
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("file");
+        let folder_id = attachment
+            .get("folderId")
+            .and_then(Value::as_str)
+            .unwrap_or("wf-0");
+        let relative_path = attachment
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let absolute_path = attachment
+            .get("absolutePath")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                relative_path.and_then(|path| {
+                    resolve_attachment_path_from_workspace(workspace, folder_id, path)
+                })
+            });
+        let Some(path_buf) = absolute_path else {
+            continue;
+        };
+        let display_path = relative_path
+            .map(str::to_string)
+            .unwrap_or_else(|| path_buf.to_string_lossy().to_string());
+        let absolute_display = path_buf.to_string_lossy().to_string();
+        manifest_entries.push(json!({
+            "kind": kind,
+            "source": source,
+            "folderId": folder_id,
+            "path": display_path,
+            "absolutePath": absolute_display,
+        }));
         let rendered = if kind == "directory" {
-            render_user_selected_directory(path)
+            render_user_selected_directory(&display_path, &path_buf)
         } else {
-            render_user_selected_file(path)
+            render_user_selected_file(&display_path, &path_buf)
         };
         let remaining = USER_ATTACHMENT_MAX_CONTEXT_CHARS.saturating_sub(total_chars);
         if remaining == 0 {
@@ -96,33 +141,70 @@ fn build_user_selected_attachment_context(attachments: &[Value]) -> String {
         total_chars += rendered.chars().count();
         parts.push(rendered);
     }
+    if !manifest_entries.is_empty() {
+        let manifest =
+            serde_json::to_string_pretty(&manifest_entries).unwrap_or_else(|_| "[]".to_string());
+        parts.insert(
+            0,
+            format!(
+                "### ATTACHMENTS manifest\n```json\n{manifest}\n```\nUse these explicit user attachments before guessing references such as \"this file\"."
+            ),
+        );
+    }
     parts.join("\n\n")
 }
 
-fn render_user_selected_file(path: &str) -> String {
-    let path_buf = PathBuf::from(path);
-    if !path_buf.is_file() {
-        return format!("### file:{path}\nRead failed: the user-selected path is not a file.");
+fn resolve_attachment_path_from_workspace(
+    workspace: Option<&Value>,
+    folder_id: &str,
+    relative_path: &str,
+) -> Option<PathBuf> {
+    validate_workspace_path(relative_path, "attachment.path").ok()?;
+    let workspace = workspace?.get("current")?;
+    if workspace.is_null() {
+        return None;
     }
-    match std::fs::read_to_string(&path_buf) {
+    let folders = workspace.get("folders")?.as_array()?;
+    let folder = folders
+        .iter()
+        .find(|folder| folder.get("id").and_then(Value::as_str) == Some(folder_id))
+        .or_else(|| folders.first())?;
+    let root = PathBuf::from(folder.get("absolutePath")?.as_str()?);
+    let candidate = root.join(relative_path);
+    let normalized = candidate.components().collect::<PathBuf>();
+    if !normalized.starts_with(&root) {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn render_user_selected_file(display_path: &str, path_buf: &Path) -> String {
+    if !path_buf.is_file() {
+        return format!(
+            "### file:{display_path}\nRead failed: the user-selected path is not a file."
+        );
+    }
+    match std::fs::read_to_string(path_buf) {
         Ok(content) => {
             let clipped = clip_chars(&content, USER_ATTACHMENT_MAX_FILE_CHARS);
-            format!("### file:{path}\n```text\n{clipped}\n```")
+            format!("### file:{display_path}\n```text\n{clipped}\n```")
         }
-        Err(error) => format!("### file:{path}\nRead failed: {error}"),
+        Err(error) => format!("### file:{display_path}\nRead failed: {error}"),
     }
 }
 
-fn render_user_selected_directory(path: &str) -> String {
-    let path_buf = PathBuf::from(path);
+fn render_user_selected_directory(display_path: &str, path_buf: &Path) -> String {
     if !path_buf.is_dir() {
         return format!(
-            "### directory:{path}\nRead failed: the user-selected path is not a directory."
+            "### directory:{display_path}\nRead failed: the user-selected path is not a directory."
         );
     }
     let mut lines = Vec::new();
-    collect_user_selected_directory_entries(&path_buf, &path_buf, 0, &mut lines);
-    format!("### directory:{path}\n```text\n{}\n```", lines.join("\n"))
+    collect_user_selected_directory_entries(path_buf, path_buf, 0, &mut lines);
+    format!(
+        "### directory:{display_path}\n```text\n{}\n```",
+        lines.join("\n")
+    )
 }
 
 fn collect_user_selected_directory_entries(
@@ -181,7 +263,6 @@ pub(crate) async fn start_kernel_agent_run(
     session_id: &str,
     request: AgentRunRequest,
 ) -> Result<(), String> {
-    let run_input_text = user_input_with_selected_attachment_context(&request);
     let prefers_chinese = user_prompt_prefers_chinese(&request.content);
     let needs_workspace = request_mentions_local_workspace(&request.content);
     if needs_workspace {
@@ -225,6 +306,9 @@ pub(crate) async fn start_kernel_agent_run(
         );
         return Ok(());
     };
+    let workspace_snapshot = current_workspace_json(&state.runtime).ok();
+    let run_input_text =
+        user_input_with_explicit_attachment_context(&request, workspace_snapshot.as_ref());
 
     let kernel_events = {
         let mut runtime = state.runtime.lock().expect("kernel runtime lock");
@@ -673,12 +757,12 @@ fn build_plan_repair_request(
         "messages": [
             {
                 "role": "system",
-                "content": "You are DeepCode plan protocol repair. Return only one valid JSON object using schemaVersion \"deepcode.agent.protocol.v2\". Keep strict fail-closed semantics: do not invent execution facts, do not add direct params/input/command/script/path/content fields inside actionBundle.actions, and do not combine resourceRequest with actionBundle. actionBundle.version must be string \"1\"; action.resourceScope must be a string array. Use capability namespace in actionBundle: workspace.read, workspace.search, workspace.write, workspace.delete, process.exec, network.egress, git.read, git.write, browser.control. Executor tool names such as fs.write/fs.delete/web.search/git.status/browser.open are only for complete-stage tool calls. File content drafts must be emitted as top-level codeBlocks, and write actions must reference sourceBlockId. If the user requested write then review then delete, include only the current write/review batch; deletion must wait for the next user-confirmed turn."
+                "content": "You are DeepCode plan protocol repair. Return only one valid JSON object using schemaVersion \"deepcode.agent.protocol.v2\". Keep strict fail-closed semantics: do not invent execution facts, do not add direct params/input/command/script/path/content fields inside actionBundle.actions or continuationExpectations, and do not combine resourceRequest with actionBundle. resourceRequest must be under the top-level key \"resourceRequest\"; never use a top-level \"request\" key. actionBundle.version must be string \"1\"; action.resourceScope must be a string array. Use capability namespace in actionBundle: workspace.read, workspace.search, workspace.write, workspace.delete, process.exec, network.egress, git.read, git.write, browser.control. Executor tool names such as fs.write/fs.delete/web.search/git.status/browser.open are only for complete-stage tool calls. File content drafts must be emitted as top-level codeBlocks, and write actions must reference sourceBlockId. If the user requested write then review then delete, current actions include only the write/review batch and the post-review delete intent goes in actionBundle.continuationExpectations."
             },
             {
                 "role": "user",
                 "content": format!(
-                    "Parser error:\\n{}\\n\\nCanonical minimal JSON Envelope v2 write example:\\n{{\"schemaVersion\":\"deepcode.agent.protocol.v2\",\"kind\":\"actionBundle\",\"outputLanguage\":\"en-US\",\"userPlan\":\"Create test.md and wait for user review.\",\"codeBlocks\":[{{\"id\":\"write-test-md\",\"path\":\"test.md\",\"content\":\"test write content\"}}],\"actionBundle\":{{\"version\":\"1\",\"id\":\"write-test-md-plan\",\"goal\":\"Create test.md and wait for review\",\"actions\":[{{\"id\":\"write-test-md\",\"title\":\"Write test.md\",\"capability\":\"workspace.write\",\"kind\":\"write\",\"resourceScope\":[\"test.md\"],\"sourceBlockId\":\"write-test-md\"}}],\"validationExpectations\":[{{\"id\":\"file-written\",\"description\":\"Kernel fs.write returns ok\"}}],\"reviewExpectations\":[{{\"id\":\"user-review\",\"description\":\"User reviews before deletion\"}}]}},\"expectedValidation\":\"Kernel fs.write returns ok.\",\"reviewGuide\":\"Ask the user to review test.md before deletion is planned in a later turn.\"}}\\n\\nOriginal invalid output:\\n{}",
+                    "Parser error:\\n{}\\n\\nCanonical minimal JSON Envelope v2 resourceRequest example:\\n{{\"schemaVersion\":\"deepcode.agent.protocol.v2\",\"kind\":\"resourceRequest\",\"outputLanguage\":\"en-US\",\"resourceRequest\":{{\"version\":\"1\",\"id\":\"need-target\",\"reason\":\"Need a concrete target resource.\",\"items\":[{{\"id\":\"target-file\",\"manifestEntryId\":\"current-selection\",\"reason\":\"Resolve the user-selected file.\"}}]}}}}\\n\\nCanonical minimal JSON Envelope v2 write/review/continuation example:\\n{{\"schemaVersion\":\"deepcode.agent.protocol.v2\",\"kind\":\"actionBundle\",\"outputLanguage\":\"en-US\",\"userPlan\":\"Create test.md and wait for user review.\",\"codeBlocks\":[{{\"id\":\"write-test-md\",\"path\":\"test.md\",\"content\":\"test write content\"}}],\"actionBundle\":{{\"version\":\"1\",\"id\":\"write-test-md-plan\",\"goal\":\"Create test.md and wait for review\",\"actions\":[{{\"id\":\"write-test-md\",\"title\":\"Write test.md\",\"capability\":\"workspace.write\",\"kind\":\"write\",\"resourceScope\":[\"test.md\"],\"sourceBlockId\":\"write-test-md\"}}],\"continuationExpectations\":[{{\"id\":\"delete-test-md-after-review\",\"title\":\"Delete test.md after user review is accepted\",\"capability\":\"workspace.delete\",\"kind\":\"delete\",\"resourceScope\":[\"test.md\"]}}],\"validationExpectations\":[{{\"id\":\"file-written\",\"description\":\"Kernel fs.write returns ok\"}}],\"reviewExpectations\":[{{\"id\":\"user-review\",\"description\":\"User reviews before deletion\"}}]}},\"expectedValidation\":\"Kernel fs.write returns ok.\",\"reviewGuide\":\"Ask the user to review test.md. If accepted, Kernel continues to the scoped delete continuation.\"}}\\n\\nOriginal invalid output:\\n{}",
                     parser_error,
                     clip_chars(original_content, 48_000)
                 )
@@ -1022,6 +1106,7 @@ fn validate_action_bundle_json(
             "goal",
             "requirementId",
             "actions",
+            "continuationExpectations",
             "validationExpectations",
             "reviewExpectations",
             "repairPolicy",
@@ -1041,7 +1126,25 @@ fn validate_action_bundle_json(
         .ok_or_else(|| "ACTION_BUNDLE.actions must be an array".to_string())?;
     let mut referenced_code_blocks = BTreeSet::new();
     for (index, action) in actions.iter().enumerate() {
-        validate_action_json(action, index, code_block_ids, &mut referenced_code_blocks)?;
+        validate_action_json(
+            action,
+            &format!("actions[{index}]"),
+            code_block_ids,
+            &mut referenced_code_blocks,
+        )?;
+    }
+    let continuations = object
+        .get("continuationExpectations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for (index, action) in continuations.iter().enumerate() {
+        validate_action_json(
+            action,
+            &format!("continuationExpectations[{index}]"),
+            code_block_ids,
+            &mut referenced_code_blocks,
+        )?;
     }
     for id in code_block_ids {
         if !referenced_code_blocks.contains(id) {
@@ -1069,12 +1172,12 @@ fn validate_action_bundle_json(
 
 fn validate_action_json(
     value: &Value,
-    index: usize,
+    label: &str,
     code_block_ids: &BTreeSet<String>,
     referenced_code_blocks: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     let Some(object) = value.as_object() else {
-        return Err(format!("actions[{index}] must be an object"));
+        return Err(format!("{label} must be an object"));
     };
     reject_unknown_json_fields(
         object.keys(),
@@ -1089,7 +1192,7 @@ fn validate_action_json(
             "purpose",
             "sourceBlockId",
         ],
-        &format!("actions[{index}]"),
+        label,
     )?;
     for key in ["id", "title", "capability"] {
         if object
@@ -1098,30 +1201,30 @@ fn validate_action_json(
             .filter(|value| !value.trim().is_empty())
             .is_none()
         {
-            return Err(format!("actions[{index}].{key} must be a non-empty string"));
+            return Err(format!("{label}.{key} must be a non-empty string"));
         }
     }
     let capability = object
         .get("capability")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    validate_plan_capability(capability, &format!("actions[{index}].capability"))?;
+    validate_plan_capability(capability, &format!("{label}.capability"))?;
     let resource_scope = object
         .get("resourceScope")
         .and_then(Value::as_array)
-        .ok_or_else(|| format!("actions[{index}].resourceScope must be an array"))?;
+        .ok_or_else(|| format!("{label}.resourceScope must be an array"))?;
     for resource in resource_scope {
         let Some(resource) = resource.as_str().filter(|value| !value.trim().is_empty()) else {
             return Err(format!(
-                "actions[{index}].resourceScope must contain non-empty strings"
+                "{label}.resourceScope must contain non-empty strings"
             ));
         };
-        validate_resource_scope(resource, &format!("actions[{index}].resourceScope"))?;
+        validate_resource_scope(resource, &format!("{label}.resourceScope"))?;
     }
     if let Some(source_block_id) = object.get("sourceBlockId").and_then(Value::as_str) {
         if !code_block_ids.contains(source_block_id) {
             return Err(format!(
-                "actions[{index}] references missing CODE_BLOCK {source_block_id}"
+                "{label} references missing CODE_BLOCK {source_block_id}"
             ));
         }
         referenced_code_blocks.insert(source_block_id.to_string());
@@ -1129,7 +1232,7 @@ fn validate_action_json(
         && object.get("kind").and_then(Value::as_str) == Some("write")
     {
         return Err(format!(
-            "actions[{index}] workspace.write must reference a CODE_BLOCK via sourceBlockId"
+            "{label} workspace.write must reference a CODE_BLOCK via sourceBlockId"
         ));
     }
     Ok(())
@@ -1200,7 +1303,7 @@ fn validate_workspace_path(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn plan_card_event(session_id: &str, plan: &PendingAgentPlan) -> Value {
+pub(crate) fn plan_card_event(session_id: &str, plan: &PendingAgentPlan) -> Value {
     let actions = plan
         .action_bundle
         .get("actions")
@@ -1370,6 +1473,18 @@ fn append_review_summary_from_response(
     guidance: &str,
 ) {
     let facts = review_facts_for_run(state, run_id);
+    let pending_review = state
+        .gui
+        .lock()
+        .expect("gui state lock")
+        .pending_reviews
+        .get(run_id)
+        .cloned();
+    let confirmable = pending_review.is_some();
+    let continuation_count = pending_review
+        .as_ref()
+        .map(|review| review.continuations.len())
+        .unwrap_or(0);
     append_session_projection(
         state,
         session_id,
@@ -1381,6 +1496,12 @@ fn append_review_summary_from_response(
                 "summary": first_non_empty_line(guidance),
                 "status": "waitingUserReview",
                 "runId": run_id,
+                "reviewId": run_id,
+                "confirmable": confirmable,
+                "continuationCount": continuation_count,
+                "sourcePlanId": pending_review.as_ref().map(|review| review.source_plan_id.clone()),
+                "reviewExpectations": pending_review.as_ref().map(|review| review.review_expectations.clone()).unwrap_or_default(),
+                "continuationExpectations": pending_review.as_ref().map(|review| review.continuations.clone()).unwrap_or_default(),
                 "llmGuidance": guidance,
                 "facts": facts,
                 "channel": "final",

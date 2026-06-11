@@ -50,6 +50,7 @@ export interface ActionBundleDraft {
   goal: string;
   requirementId?: string;
   actions: PlannedActionDraft[];
+  continuationExpectations?: PlannedActionDraft[];
   validationExpectations: ValidationExpectationDraft[];
   reviewExpectations: ReviewExpectationDraft[];
   repairPolicy?: RepairPolicyDraft;

@@ -196,6 +196,8 @@ pub(crate) async fn agent_session_delete(
         gui.session_projection_cache.remove(&session_id);
         gui.pending_plans
             .retain(|_, plan| plan.session_id != session_id);
+        gui.pending_reviews
+            .retain(|_, review| review.session_id != session_id);
         gui.trace_events.remove(&session_id);
         gui.current_session_ids_by_scope
             .retain(|_, current_id| current_id != &session_id);
@@ -504,18 +506,27 @@ pub(crate) async fn agent_plan_resolve(
         let mut events = Vec::new();
         let mut grant_failed = false;
         if decision == "accept" {
-            let (grants, approved_tools) = {
+            let (grants, approved_tools, pending_review) = {
                 let gui = state.gui.lock().expect("gui state lock");
                 gui.pending_plans.get(&plan_id).map_or_else(
-                    || (Vec::new(), Vec::new()),
+                    || (Vec::new(), Vec::new(), None),
                     |plan| {
                         (
                             temporary_grants_for_pending_plan(plan),
                             approved_tool_calls_for_pending_plan(plan),
+                            pending_review_for_plan(plan),
                         )
                     },
                 )
             };
+            if let Some(review) = pending_review {
+                state
+                    .gui
+                    .lock()
+                    .expect("gui state lock")
+                    .pending_reviews
+                    .insert(run_id.clone(), review);
+            }
             for grant in grants {
                 match runtime.dispatch(KernelCommand::PermissionGrantTemporary {
                     request_id: rid("agent-plan-temp-grant"),
@@ -615,6 +626,171 @@ pub(crate) async fn agent_plan_resolve(
     }
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)
+}
+
+pub(crate) async fn agent_review_resolve(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let decision = body
+        .get("decision")
+        .and_then(Value::as_str)
+        .unwrap_or("revise");
+    let guidance = body
+        .get("guidance")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let pending = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        if !has_session(&gui, &session_id) {
+            return ApiResponse::error("agent_session_not_found", "agent session not found");
+        }
+        gui.pending_reviews.remove(&run_id)
+    };
+    let Some(review) = pending else {
+        return ApiResponse::error("agent_review_not_found", "agent review not found");
+    };
+
+    if decision != "accept" {
+        append_session_projection(
+            &state,
+            &session_id,
+            vec![agent_event(
+                &session_id,
+                "review_summary",
+                json!({
+                    "title": "Review",
+                    "summary": guidance.clone().unwrap_or_else(|| "用户要求补充或修改。".to_string()),
+                    "status": "needsRevision",
+                    "runId": run_id.clone(),
+                    "reviewId": run_id.clone(),
+                    "confirmable": false,
+                    "guidance": guidance,
+                    "channel": "final",
+                    "visibility": "conversation",
+                    "presentation": "body"
+                }),
+                &now_text(),
+            )],
+        );
+        let gui = state.gui.lock().expect("gui state lock");
+        return session_result(&gui, &session_id);
+    }
+
+    append_session_projection(
+        &state,
+        &session_id,
+        vec![agent_event(
+            &session_id,
+            "review_summary",
+            json!({
+                "title": "Review",
+                "summary": "用户已通过 Review，准备继续后续任务。",
+                "status": "accepted",
+                "runId": run_id.clone(),
+                "reviewId": run_id.clone(),
+                "confirmable": false,
+                "continuationCount": review.continuations.len(),
+                "channel": "progress",
+                "visibility": "conversation",
+                "presentation": "body"
+            }),
+            &now_text(),
+        )],
+    );
+
+    if review.continuations.is_empty() {
+        let gui = state.gui.lock().expect("gui state lock");
+        return session_result(&gui, &session_id);
+    }
+
+    let plan = continuation_plan_from_review(&review);
+    let mut review_events = {
+        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+        match runtime.dispatch(KernelCommand::PlanContractSubmit {
+            request_id: rid("agent-review-continuation-plan"),
+            run_id: Some(deepcode_kernel_abi::RunId(plan.run_id.clone())),
+            session_id: Some(deepcode_kernel_abi::SessionId(session_id.clone())),
+            contract: plan.action_bundle.clone(),
+        }) {
+            Ok(events) => events,
+            Err(error) => vec![KernelEvent::Error {
+                request_id: Some(rid("agent-review-continuation-plan")),
+                run_id: Some(deepcode_kernel_abi::RunId(plan.run_id.clone())),
+                session_id: Some(deepcode_kernel_abi::SessionId(session_id.clone())),
+                error: KernelErrorEnvelope::from(&error),
+                message_key: None,
+                args: None,
+            }],
+        }
+    };
+    let mut plan = plan;
+    plan.plan_review_report = review_events.iter().find_map(|event| {
+        if let KernelEvent::PlanReviewReportProduced { report, .. } = event {
+            Some(report.clone())
+        } else {
+            None
+        }
+    });
+    {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        gui.pending_plans.insert(plan.plan_id.clone(), plan.clone());
+    }
+    record_kernel_events(&state, &review_events);
+    let mut projection = vec![plan_card_event(&session_id, &plan)];
+    projection.extend(kernel_events_to_agent_events(&session_id, &review_events));
+    append_session_projection(&state, &session_id, projection);
+    review_events.clear();
+    let gui = state.gui.lock().expect("gui state lock");
+    session_result(&gui, &session_id)
+}
+
+fn continuation_plan_from_review(review: &PendingAgentReview) -> PendingAgentPlan {
+    let plan_id = format!(
+        "{}-continuation-{}",
+        safe_path_segment(&review.source_plan_id),
+        now_millis()
+    );
+    let actions = review.continuations.clone();
+    let action_bundle = json!({
+        "version": "1",
+        "id": plan_id,
+        "goal": format!("Continue after user review for {}", review.source_plan_id),
+        "actions": actions,
+        "validationExpectations": [
+            {
+                "id": "continuation-tool-validation",
+                "description": "Kernel tool facts and post-tool validation must confirm the continuation."
+            }
+        ],
+        "reviewExpectations": []
+    });
+    let summary = actions
+        .first()
+        .and_then(|action| action.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("Continue after user review.")
+        .to_string();
+    PendingAgentPlan {
+        session_id: review.session_id.clone(),
+        run_id: review.run_id.clone(),
+        plan_id: action_bundle
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("review-continuation")
+            .to_string(),
+        user_plan: summary,
+        action_bundle,
+        code_blocks: review.code_blocks.clone(),
+        expected_validation:
+            "Kernel executes the scoped continuation and records tool validation facts.".to_string(),
+        review_guide: "Review the continuation plan before execution.".to_string(),
+        plan_review_report: None,
+        created_at: now_text(),
+    }
 }
 
 fn approved_tool_calls_for_pending_plan(plan: &PendingAgentPlan) -> Vec<(String, String, Value)> {
@@ -735,6 +911,33 @@ fn temporary_grants_for_pending_plan(
         }
     }
     grants
+}
+
+fn pending_review_for_plan(plan: &PendingAgentPlan) -> Option<PendingAgentReview> {
+    let continuations = plan
+        .action_bundle
+        .get("continuationExpectations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let review_expectations = plan
+        .action_bundle
+        .get("reviewExpectations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if continuations.is_empty() && review_expectations.is_empty() {
+        return None;
+    }
+    Some(PendingAgentReview {
+        session_id: plan.session_id.clone(),
+        run_id: plan.run_id.clone(),
+        source_plan_id: plan.plan_id.clone(),
+        continuations,
+        code_blocks: plan.code_blocks.clone(),
+        review_expectations,
+        created_at: now_text(),
+    })
 }
 
 fn resource_scopes_for_capability(actions: &[Value], capability: &str) -> Vec<String> {

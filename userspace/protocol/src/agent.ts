@@ -574,6 +574,11 @@ export interface ResolveAgentPlanRequest {
   guidance?: string;
 }
 
+export interface ResolveAgentReviewRequest {
+  decision: 'accept' | 'revise';
+  guidance?: string;
+}
+
 export type AgentFeedbackRating = 'up' | 'down';
 
 export interface AgentFeedbackRequest {

@@ -42,6 +42,7 @@ import type {
   SendAgentMessageRequest,
   ResolveAgentPermissionRequest,
   ResolveAgentPlanRequest,
+  ResolveAgentReviewRequest,
   AgentFeedbackRequest,
   AgentFeedbackResult,
   AgentTimelineResult,
@@ -607,6 +608,18 @@ export function resolveAgentPlan(
 ): Promise<ApiResponse<AgentSessionResult>> {
   return sendJson<AgentSessionResult>(
     `${API_BASE}/agent/plans/${encodeURIComponent(runId)}/${encodeURIComponent(planId)}/resolve`,
+    'POST',
+    request
+  );
+}
+
+export function resolveAgentReview(
+  sessionId: string,
+  runId: string,
+  request: ResolveAgentReviewRequest
+): Promise<ApiResponse<AgentSessionResult>> {
+  return sendJson<AgentSessionResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/review`,
     'POST',
     request
   );
