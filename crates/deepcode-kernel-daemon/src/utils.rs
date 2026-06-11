@@ -221,15 +221,6 @@ pub(crate) fn now_text() -> String {
     now_millis().to_string()
 }
 
-pub(crate) fn terminal_session_by_id(gui: &GuiState, session_id: &str) -> Json<ApiResponse> {
-    gui.terminals
-        .iter()
-        .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
-        .cloned()
-        .map(ApiResponse::ok)
-        .unwrap_or_else(|| ApiResponse::error("terminal_not_found", "terminal session not found"))
-}
-
 pub(crate) fn update_browser_action(browser: &mut BrowserState, action: &str, result: &str) {
     browser.last_action = Some(action.to_string());
     browser.last_action_at = Some(now_text());

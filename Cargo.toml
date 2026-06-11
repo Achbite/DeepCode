@@ -59,3 +59,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 ratatui = "0.29"
 crossterm = "0.28"
+portable-pty = "0.8"

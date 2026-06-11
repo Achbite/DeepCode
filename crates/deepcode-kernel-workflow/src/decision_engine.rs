@@ -604,6 +604,7 @@ fn event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::StageChanged { .. } => "stage.changed",
         KernelEvent::MessageAppended { .. } => "message.appended",
         KernelEvent::LlmCallRequested { .. } => "llm.call_requested",
+        KernelEvent::LlmProviderError { .. } => "llm.provider_error",
         KernelEvent::ToolRequested { .. } => "tool.requested",
         KernelEvent::ToolCompleted { .. } => "tool.completed",
         KernelEvent::PermissionRequested { .. } => "permission.requested",
@@ -645,6 +646,7 @@ fn event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::StageChanged { sequence, .. }
         | KernelEvent::MessageAppended { sequence, .. }
         | KernelEvent::LlmCallRequested { sequence, .. }
+        | KernelEvent::LlmProviderError { sequence, .. }
         | KernelEvent::ToolRequested { sequence, .. }
         | KernelEvent::ToolCompleted { sequence, .. }
         | KernelEvent::PermissionRequested { sequence, .. }

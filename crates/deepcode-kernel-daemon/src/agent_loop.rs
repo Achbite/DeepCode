@@ -3,7 +3,8 @@
 
 use crate::prelude::*;
 use crate::*;
-use std::collections::{BTreeMap, BTreeSet};
+use deepcode_kernel_abi::LlmProviderDiagnostic;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,7 @@ const USER_ATTACHMENT_MAX_CONTEXT_CHARS: usize = 40_000;
 const USER_ATTACHMENT_MAX_FILE_CHARS: usize = 12_000;
 const USER_ATTACHMENT_MAX_DIR_ENTRIES: usize = 300;
 const USER_ATTACHMENT_MAX_DIR_DEPTH: usize = 2;
+const AGENT_PROTOCOL_SCHEMA_VERSION: &str = "deepcode.agent.protocol.v2";
 
 pub(crate) fn user_input_with_selected_attachment_context(request: &AgentRunRequest) -> String {
     let context = build_user_selected_attachment_context(&request.attachments);
@@ -55,7 +57,7 @@ pub(crate) fn user_input_with_selected_attachment_context(request: &AgentRunRequ
         return request.content.clone();
     }
     format!(
-        "{}\n\n## 用户主动添加的上下文\n{}",
+        "{}\n\n## User-selected context\n{}",
         request.content.trim_end(),
         context
     )
@@ -100,21 +102,23 @@ fn build_user_selected_attachment_context(attachments: &[Value]) -> String {
 fn render_user_selected_file(path: &str) -> String {
     let path_buf = PathBuf::from(path);
     if !path_buf.is_file() {
-        return format!("### file:{path}\n读取失败: 用户选择的路径不是文件。");
+        return format!("### file:{path}\nRead failed: the user-selected path is not a file.");
     }
     match std::fs::read_to_string(&path_buf) {
         Ok(content) => {
             let clipped = clip_chars(&content, USER_ATTACHMENT_MAX_FILE_CHARS);
             format!("### file:{path}\n```text\n{clipped}\n```")
         }
-        Err(error) => format!("### file:{path}\n读取失败: {error}"),
+        Err(error) => format!("### file:{path}\nRead failed: {error}"),
     }
 }
 
 fn render_user_selected_directory(path: &str) -> String {
     let path_buf = PathBuf::from(path);
     if !path_buf.is_dir() {
-        return format!("### directory:{path}\n读取失败: 用户选择的路径不是目录。");
+        return format!(
+            "### directory:{path}\nRead failed: the user-selected path is not a directory."
+        );
     }
     let mut lines = Vec::new();
     collect_user_selected_directory_entries(&path_buf, &path_buf, 0, &mut lines);
@@ -178,21 +182,27 @@ pub(crate) async fn start_kernel_agent_run(
     request: AgentRunRequest,
 ) -> Result<(), String> {
     let run_input_text = user_input_with_selected_attachment_context(&request);
+    let prefers_chinese = user_prompt_prefers_chinese(&request.content);
     let needs_workspace = request_mentions_local_workspace(&request.content);
     if needs_workspace {
         if let Err(error) =
             ensure_workspace_binding(&state.runtime, request.workspace_binding.as_ref())
         {
+            let message = if prefers_chinese {
+                format!(
+                    "当前没有可用工作区绑定：{}。请先打开一个文件夹或 .code-workspace 文件，再让 Agent 读取、搜索或修改文件。",
+                    error.message
+                )
+            } else {
+                format!(
+                    "No workspace binding is available: {}. Open a folder or .code-workspace file before asking the Agent to read, search, or modify files.",
+                    error.message
+                )
+            };
             append_session_projection(
                 state,
                 session_id,
-                vec![assistant_final_event(
-                    session_id,
-                    &format!(
-                        "当前没有可用工作区绑定：{}。请先打开一个文件夹或 .code-workspace 文件，再让 Agent 读取、搜索或修改文件。",
-                        error.message
-                    ),
-                )],
+                vec![assistant_final_event(session_id, &message)],
             );
             return Ok(());
         }
@@ -203,13 +213,15 @@ pub(crate) async fn start_kernel_agent_run(
     let Some(binding) =
         effective_workspace_binding(&state.runtime, request.workspace_binding.clone())
     else {
+        let message = if prefers_chinese {
+            "当前没有可用工作区绑定。请先打开一个文件夹或 .code-workspace 文件，再让 Agent 读取、搜索或修改文件。"
+        } else {
+            "No workspace binding is available. Open a folder or .code-workspace file before asking the Agent to read, search, or modify files."
+        };
         append_session_projection(
             state,
             session_id,
-            vec![assistant_final_event(
-                session_id,
-                "当前没有可用工作区绑定。请先打开一个文件夹或 .code-workspace 文件，再让 Agent 读取、搜索或修改文件。",
-            )],
+            vec![assistant_final_event(session_id, message)],
         );
         return Ok(());
     };
@@ -311,7 +323,41 @@ pub(crate) async fn drive_kernel_agent_loop(
                         .unwrap_or(0)
                 }),
             );
-            let output = call_llm_profile(&profile, request_envelope.clone()).await?;
+            let output = match call_llm_profile(&profile, request_envelope.clone()).await {
+                Ok(output) => output,
+                Err(error) => {
+                    let provider_event = KernelEvent::LlmProviderError {
+                        run_id: run_id.clone(),
+                        session_id: event_session_id.clone().or_else(|| {
+                            Some(deepcode_kernel_abi::SessionId(session_id.to_string()))
+                        }),
+                        phase: phase.clone(),
+                        llm_call_id: llm_call_id.clone(),
+                        diagnostic: error.clone(),
+                        sequence: None,
+                    };
+                    record_kernel_events(state, &[provider_event.clone()]);
+                    append_trace_event(
+                        state,
+                        session_id,
+                        "llm.provider_error",
+                        json!({
+                            "runId": run_id.0.clone(),
+                            "phase": phase.clone(),
+                            "llmCallId": llm_call_id.clone(),
+                            "profileId": profile.id.clone(),
+                            "model": profile.model.clone(),
+                            "providerError": provider_error_value(&error)
+                        }),
+                    );
+                    append_session_projection(
+                        state,
+                        session_id,
+                        kernel_events_to_agent_events(session_id, &[provider_event]),
+                    );
+                    continue;
+                }
+            };
             append_trace_event(
                 state,
                 session_id,
@@ -578,7 +624,7 @@ async fn parse_or_repair_agent_plan_response(
                         "llm.repair_failed",
                         json!({
                             "runId": run_id,
-                            "error": error
+                            "providerError": provider_error_value(&error)
                         }),
                     );
                     return Err(format!("{first_error}; repair call failed: {error}"));
@@ -627,12 +673,12 @@ fn build_plan_repair_request(
         "messages": [
             {
                 "role": "system",
-                "content": "You are DeepCode plan protocol repair. Return only one valid DeepCode plan response. Keep strict fail-closed semantics: do not invent execution facts, do not add direct params/input/command/script/path/content fields inside ACTION_BUNDLE actions, and do not combine RESOURCE_REQUEST with ACTION_BUNDLE. ACTION_BUNDLE tag must be format=\"json\" version=\"1\"; JSON version must be string \"1\"; resourceScope must be a string array. Use capability namespace in ACTION_BUNDLE: workspace.read, workspace.search, workspace.write, workspace.delete, process.exec, network.egress, git.read, git.write, browser.control. Executor tool names such as fs.write/fs.delete/web.search/git.status/browser.open are only for complete-stage tool calls. File content drafts must be emitted as CODE_BLOCK id/path, and write actions must reference sourceBlockId. If the user requested write then review then delete, include only the current write/review batch; deletion must wait for the next user-confirmed turn."
+                "content": "You are DeepCode plan protocol repair. Return only one valid JSON object using schemaVersion \"deepcode.agent.protocol.v2\". Keep strict fail-closed semantics: do not invent execution facts, do not add direct params/input/command/script/path/content fields inside actionBundle.actions, and do not combine resourceRequest with actionBundle. actionBundle.version must be string \"1\"; action.resourceScope must be a string array. Use capability namespace in actionBundle: workspace.read, workspace.search, workspace.write, workspace.delete, process.exec, network.egress, git.read, git.write, browser.control. Executor tool names such as fs.write/fs.delete/web.search/git.status/browser.open are only for complete-stage tool calls. File content drafts must be emitted as top-level codeBlocks, and write actions must reference sourceBlockId. If the user requested write then review then delete, include only the current write/review batch; deletion must wait for the next user-confirmed turn."
             },
             {
                 "role": "user",
                 "content": format!(
-                    "Parser error:\\n{}\\n\\nCanonical minimal write example:\\n<CODE_BLOCK id=\"write-test-md\" path=\"test.md\">测试请求写入操作</CODE_BLOCK>\\n<USER_PLAN>创建 test.md 并等待用户 review。</USER_PLAN>\\n<ACTION_BUNDLE format=\"json\" version=\"1\">{{\"version\":\"1\",\"id\":\"write-test-md-plan\",\"goal\":\"创建 test.md 并等待 review\",\"actions\":[{{\"id\":\"write-test-md\",\"title\":\"写入 test.md\",\"capability\":\"workspace.write\",\"kind\":\"write\",\"resourceScope\":[\"test.md\"],\"sourceBlockId\":\"write-test-md\"}}],\"validationExpectations\":[{{\"id\":\"file-written\",\"description\":\"test.md 已由 Kernel fs.write 写入\"}}],\"reviewExpectations\":[{{\"id\":\"user-review\",\"description\":\"用户 review 后再决定是否删除\"}}]}}</ACTION_BUNDLE>\\n<EXPECTED_VALIDATION>Kernel fs.write 返回 ok。</EXPECTED_VALIDATION>\\n<REVIEW_GUIDE>请用户检查 test.md 内容，确认后下一轮再删除。</REVIEW_GUIDE>\\n\\nOriginal invalid output:\\n{}",
+                    "Parser error:\\n{}\\n\\nCanonical minimal JSON Envelope v2 write example:\\n{{\"schemaVersion\":\"deepcode.agent.protocol.v2\",\"kind\":\"actionBundle\",\"outputLanguage\":\"en-US\",\"userPlan\":\"Create test.md and wait for user review.\",\"codeBlocks\":[{{\"id\":\"write-test-md\",\"path\":\"test.md\",\"content\":\"test write content\"}}],\"actionBundle\":{{\"version\":\"1\",\"id\":\"write-test-md-plan\",\"goal\":\"Create test.md and wait for review\",\"actions\":[{{\"id\":\"write-test-md\",\"title\":\"Write test.md\",\"capability\":\"workspace.write\",\"kind\":\"write\",\"resourceScope\":[\"test.md\"],\"sourceBlockId\":\"write-test-md\"}}],\"validationExpectations\":[{{\"id\":\"file-written\",\"description\":\"Kernel fs.write returns ok\"}}],\"reviewExpectations\":[{{\"id\":\"user-review\",\"description\":\"User reviews before deletion\"}}]}},\"expectedValidation\":\"Kernel fs.write returns ok.\",\"reviewGuide\":\"Ask the user to review test.md before deletion is planned in a later turn.\"}}\\n\\nOriginal invalid output:\\n{}",
                     parser_error,
                     clip_chars(original_content, 48_000)
                 )
@@ -670,52 +716,140 @@ fn parse_agent_plan_response(
     run_id: &str,
     content: &str,
 ) -> Result<AgentPlanResponse, String> {
-    let blocks = extract_agent_plan_blocks(content)?;
-    if blocks.contains_key("ANSWER") {
-        if blocks.len() != 1 {
-            return Err(
-                "ANSWER cannot appear with plan, resource, permission, or code blocks".to_string(),
-            );
-        }
-        let answer = required_plan_block(&blocks, "ANSWER")?;
-        validate_answer_block_header(answer)?;
-        let content = answer.content.trim();
-        if content.is_empty() {
-            return Err("ANSWER content must be non-empty".to_string());
-        }
-        return Ok(AgentPlanResponse::Answer(PendingAgentAnswer {
-            content: content.to_string(),
-        }));
+    let trimmed = content.trim();
+    if !trimmed.starts_with('{') {
+        return Err("LLM plan output must be one JSON Envelope v2 object".to_string());
     }
-    if blocks.contains_key("RESOURCE_REQUEST") && blocks.contains_key("ACTION_BUNDLE") {
-        return Err(
-            "RESOURCE_REQUEST and ACTION_BUNDLE cannot appear in the same turn".to_string(),
-        );
-    }
-    if blocks.contains_key("RESOURCE_REQUEST") {
-        let block = required_plan_block(&blocks, "RESOURCE_REQUEST")?;
-        validate_block_header(block, "RESOURCE_REQUEST")?;
-        let request: Value = serde_json::from_str(block.content.trim())
-            .map_err(|error| format!("RESOURCE_REQUEST must be valid JSON: {error}"))?;
-        validate_resource_request_json(&request)?;
-        return Ok(AgentPlanResponse::ResourceRequest(
-            PendingAgentResourceRequest {
-                user_plan: blocks
-                    .get("USER_PLAN")
-                    .map(|block| block.content.trim().to_string())
-                    .filter(|value| !value.is_empty()),
-                request,
-            },
+    parse_agent_protocol_envelope_v2(session_id, run_id, trimmed)
+}
+
+fn parse_agent_protocol_envelope_v2(
+    session_id: &str,
+    run_id: &str,
+    content: &str,
+) -> Result<AgentPlanResponse, String> {
+    let envelope: Value = serde_json::from_str(content)
+        .map_err(|error| format!("JSON Envelope v2 must be valid JSON object: {error}"))?;
+    let Some(object) = envelope.as_object() else {
+        return Err("JSON Envelope v2 must be a JSON object".to_string());
+    };
+    reject_unknown_json_fields(
+        object.keys(),
+        &[
+            "schemaVersion",
+            "kind",
+            "outputLanguage",
+            "answer",
+            "resourceRequest",
+            "userPlan",
+            "actionBundle",
+            "codeBlocks",
+            "expectedValidation",
+            "reviewGuide",
+        ],
+        "JSON Envelope v2",
+    )?;
+    let schema_version = required_json_string(&envelope, "schemaVersion", "JSON Envelope v2")?;
+    if schema_version != AGENT_PROTOCOL_SCHEMA_VERSION {
+        return Err(format!(
+            "JSON Envelope schemaVersion must be {AGENT_PROTOCOL_SCHEMA_VERSION}"
         ));
     }
-    let user_plan = required_plan_block(&blocks, "USER_PLAN")?;
-    let action_bundle_block = required_plan_block(&blocks, "ACTION_BUNDLE")?;
-    validate_block_header(action_bundle_block, "ACTION_BUNDLE")?;
-    let action_bundle: Value = serde_json::from_str(action_bundle_block.content.trim())
-        .map_err(|error| format!("ACTION_BUNDLE must be valid JSON: {error}"))?;
-    validate_action_bundle_json(&action_bundle, &blocks)?;
-    let expected_validation = required_plan_block(&blocks, "EXPECTED_VALIDATION")?;
-    let review_guide = required_plan_block(&blocks, "REVIEW_GUIDE")?;
+    let kind = required_json_string(&envelope, "kind", "JSON Envelope v2")?;
+    let output_language = required_json_string(&envelope, "outputLanguage", "JSON Envelope v2")?;
+    if output_language.trim().is_empty() {
+        return Err("JSON Envelope v2.outputLanguage must be non-empty".to_string());
+    }
+    match kind.as_str() {
+        "answer" => parse_json_envelope_answer(&envelope),
+        "resourceRequest" => parse_json_envelope_resource_request(&envelope),
+        "actionBundle" => parse_json_envelope_action_bundle(session_id, run_id, &envelope),
+        other => Err(format!("JSON Envelope v2.kind is unsupported: {other}")),
+    }
+}
+
+fn parse_json_envelope_answer(envelope: &Value) -> Result<AgentPlanResponse, String> {
+    reject_branch_payloads(
+        envelope,
+        "answer",
+        &[
+            "resourceRequest",
+            "userPlan",
+            "actionBundle",
+            "codeBlocks",
+            "expectedValidation",
+            "reviewGuide",
+        ],
+    )?;
+    let answer = envelope
+        .get("answer")
+        .ok_or_else(|| "JSON Envelope v2.answer is required".to_string())?;
+    let Some(object) = answer.as_object() else {
+        return Err("JSON Envelope v2.answer must be an object".to_string());
+    };
+    reject_unknown_json_fields(
+        object.keys(),
+        &["format", "content"],
+        "JSON Envelope v2.answer",
+    )?;
+    let format = required_json_string(answer, "format", "JSON Envelope v2.answer")?;
+    if format != "markdown" {
+        return Err("JSON Envelope v2.answer.format must be markdown".to_string());
+    }
+    let content = required_json_string(answer, "content", "JSON Envelope v2.answer")?;
+    Ok(AgentPlanResponse::Answer(PendingAgentAnswer { content }))
+}
+
+fn parse_json_envelope_resource_request(envelope: &Value) -> Result<AgentPlanResponse, String> {
+    reject_branch_payloads(
+        envelope,
+        "resourceRequest",
+        &[
+            "answer",
+            "actionBundle",
+            "codeBlocks",
+            "expectedValidation",
+            "reviewGuide",
+        ],
+    )?;
+    let request = envelope
+        .get("resourceRequest")
+        .cloned()
+        .ok_or_else(|| "JSON Envelope v2.resourceRequest is required".to_string())?;
+    validate_resource_request_json(&request)?;
+    Ok(AgentPlanResponse::ResourceRequest(
+        PendingAgentResourceRequest {
+            user_plan: envelope
+                .get("userPlan")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            request,
+        },
+    ))
+}
+
+fn parse_json_envelope_action_bundle(
+    session_id: &str,
+    run_id: &str,
+    envelope: &Value,
+) -> Result<AgentPlanResponse, String> {
+    reject_branch_payloads(envelope, "actionBundle", &["answer", "resourceRequest"])?;
+    let user_plan = required_json_string(envelope, "userPlan", "JSON Envelope v2")?;
+    let action_bundle = envelope
+        .get("actionBundle")
+        .cloned()
+        .ok_or_else(|| "JSON Envelope v2.actionBundle is required".to_string())?;
+    let code_blocks = json_envelope_code_blocks(envelope)?;
+    let code_block_ids = code_blocks
+        .iter()
+        .filter_map(|block| block.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect::<BTreeSet<_>>();
+    validate_action_bundle_json(&action_bundle, &code_block_ids)?;
+    let expected_validation =
+        required_json_string(envelope, "expectedValidation", "JSON Envelope v2")?;
+    let review_guide = required_json_string(envelope, "reviewGuide", "JSON Envelope v2")?;
     let plan_id = action_bundle
         .get("id")
         .and_then(Value::as_str)
@@ -726,151 +860,91 @@ fn parse_agent_plan_response(
         session_id: session_id.to_string(),
         run_id: run_id.to_string(),
         plan_id,
-        user_plan: user_plan.content.trim().to_string(),
+        user_plan,
         action_bundle,
-        expected_validation: expected_validation.content.trim().to_string(),
-        review_guide: review_guide.content.trim().to_string(),
+        code_blocks,
+        expected_validation,
+        review_guide,
         plan_review_report: None,
         created_at: now_text(),
     }))
 }
 
-#[derive(Debug, Clone)]
-struct AgentPlanBlock {
-    attrs: BTreeMap<String, String>,
-    content: String,
-}
-
-fn extract_agent_plan_blocks(content: &str) -> Result<BTreeMap<String, AgentPlanBlock>, String> {
-    let mut blocks = BTreeMap::new();
-    let mut index = 0;
-    while let Some(open_offset) = content[index..].find('<') {
-        let open_index = index + open_offset;
-        if content[open_index..].starts_with("</") {
-            return Err("unmatched closing tag".to_string());
-        }
-        let Some(close_angle_offset) = content[open_index..].find('>') else {
-            return Err("unterminated tag".to_string());
-        };
-        let close_angle_index = open_index + close_angle_offset;
-        let header = &content[open_index + 1..close_angle_index];
-        let (tag, attrs) = parse_plan_tag_header(header)?;
-        if !is_known_plan_tag(&tag) {
-            return Err(format!("unknown agent plan tag {tag}"));
-        }
-        if tag != "CODE_BLOCK" && blocks.contains_key(&tag) {
-            return Err(format!("duplicate {tag} block"));
-        }
-        let close_tag = format!("</{tag}>");
-        let content_start = close_angle_index + 1;
-        let Some(close_offset) = content[content_start..].find(&close_tag) else {
-            return Err(format!("missing closing {tag} tag"));
-        };
-        let content_end = content_start + close_offset;
-        let block_content = &content[content_start..content_end];
-        if tag != "CODE_BLOCK" && contains_plan_tag(block_content) {
-            return Err(format!("{tag} contains a nested tag"));
-        }
-        let key = if tag == "CODE_BLOCK" {
-            let Some(id) = attrs.get("id").filter(|value| !value.trim().is_empty()) else {
-                return Err("CODE_BLOCK is missing id".to_string());
-            };
-            let Some(path) = attrs.get("path").filter(|value| !value.trim().is_empty()) else {
-                return Err("CODE_BLOCK is missing path".to_string());
-            };
-            validate_workspace_path(path, "CODE_BLOCK.path")?;
-            format!("CODE_BLOCK:{id}")
-        } else {
-            tag.clone()
-        };
-        if blocks.contains_key(&key) {
-            return Err(format!("duplicate {tag} block"));
-        }
-        blocks.insert(
-            key,
-            AgentPlanBlock {
-                attrs,
-                content: block_content.to_string(),
-            },
-        );
-        index = content_end + close_tag.len();
-    }
-    if content[index..].contains('>') {
-        return Err("unmatched tag text".to_string());
-    }
-    Ok(blocks)
-}
-
-fn parse_plan_tag_header(header: &str) -> Result<(String, BTreeMap<String, String>), String> {
-    let mut parts = header.split_whitespace();
-    let Some(tag) = parts.next() else {
-        return Err("empty tag".to_string());
+fn json_envelope_code_blocks(envelope: &Value) -> Result<Vec<Value>, String> {
+    let Some(blocks) = envelope.get("codeBlocks") else {
+        return Ok(Vec::new());
     };
-    let mut attrs = BTreeMap::new();
-    for part in parts {
-        let Some((key, raw_value)) = part.split_once('=') else {
-            return Err(format!("{tag} contains invalid attr {part}"));
+    let Some(items) = blocks.as_array() else {
+        return Err("JSON Envelope v2.codeBlocks must be an array".to_string());
+    };
+    let mut ids = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for (index, block) in items.iter().enumerate() {
+        let Some(object) = block.as_object() else {
+            return Err(format!(
+                "JSON Envelope v2.codeBlocks[{index}] must be an object"
+            ));
         };
-        let value = raw_value.trim_matches('"').trim_matches('\'').to_string();
-        attrs.insert(key.to_string(), value);
+        reject_unknown_json_fields(
+            object.keys(),
+            &["id", "path", "language", "content"],
+            &format!("JSON Envelope v2.codeBlocks[{index}]"),
+        )?;
+        let id = required_json_string(
+            block,
+            "id",
+            &format!("JSON Envelope v2.codeBlocks[{index}]"),
+        )?;
+        if !ids.insert(id.clone()) {
+            return Err(format!("duplicate codeBlocks id {id}"));
+        }
+        let path = required_json_string(
+            block,
+            "path",
+            &format!("JSON Envelope v2.codeBlocks[{index}]"),
+        )?;
+        validate_workspace_path(&path, &format!("JSON Envelope v2.codeBlocks[{index}].path"))?;
+        let content = required_json_string(
+            block,
+            "content",
+            &format!("JSON Envelope v2.codeBlocks[{index}]"),
+        )?;
+        let mut next = json!({
+            "id": id,
+            "path": path,
+            "content": content
+        });
+        if let Some(language) = block.get("language").and_then(Value::as_str) {
+            next["language"] = json!(language);
+        }
+        normalized.push(next);
     }
-    Ok((tag.to_string(), attrs))
+    Ok(normalized)
 }
 
-fn is_known_plan_tag(tag: &str) -> bool {
-    matches!(
-        tag,
-        "ANSWER"
-            | "USER_PLAN"
-            | "RESOURCE_REQUEST"
-            | "ACTION_BUNDLE"
-            | "CODE_BLOCK"
-            | "EXPECTED_VALIDATION"
-            | "REVIEW_GUIDE"
-            | "PERMISSION_HINTS"
-    )
-}
-
-fn contains_plan_tag(content: &str) -> bool {
-    [
-        "<ANSWER",
-        "<USER_PLAN",
-        "<RESOURCE_REQUEST",
-        "<ACTION_BUNDLE",
-        "<CODE_BLOCK",
-        "<EXPECTED_VALIDATION",
-        "<REVIEW_GUIDE",
-        "<PERMISSION_HINTS",
-    ]
-    .iter()
-    .any(|tag| content.contains(tag))
-}
-
-fn required_plan_block<'a>(
-    blocks: &'a BTreeMap<String, AgentPlanBlock>,
-    tag: &str,
-) -> Result<&'a AgentPlanBlock, String> {
-    blocks
-        .get(tag)
-        .ok_or_else(|| format!("missing {tag} block"))
-}
-
-fn validate_block_header(block: &AgentPlanBlock, tag: &str) -> Result<(), String> {
-    if block.attrs.get("format").map(String::as_str) != Some("json")
-        || block.attrs.get("version").map(String::as_str) != Some("1")
-    {
-        return Err(format!("{tag} must declare format=\"json\" version=\"1\""));
-    }
-    Ok(())
-}
-
-fn validate_answer_block_header(block: &AgentPlanBlock) -> Result<(), String> {
-    if block.attrs.get("format").map(String::as_str) != Some("markdown")
-        || block.attrs.get("version").map(String::as_str) != Some("1")
-    {
-        return Err("ANSWER must declare format=\"markdown\" version=\"1\"".to_string());
+fn reject_branch_payloads(
+    envelope: &Value,
+    branch: &str,
+    forbidden: &[&str],
+) -> Result<(), String> {
+    for key in forbidden {
+        if envelope.get(*key).is_some() {
+            return Err(format!(
+                "JSON Envelope v2 kind {branch} cannot include branch payload {key}"
+            ));
+        }
     }
     Ok(())
+}
+
+fn required_json_string(value: &Value, key: &str, label: &str) -> Result<String, String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{label}.{key} must be a non-empty string"))
 }
 
 fn validate_resource_request_json(value: &Value) -> Result<(), String> {
@@ -935,7 +1009,7 @@ fn validate_resource_request_item_json(value: &Value, index: usize) -> Result<()
 
 fn validate_action_bundle_json(
     value: &Value,
-    blocks: &BTreeMap<String, AgentPlanBlock>,
+    code_block_ids: &BTreeSet<String>,
 ) -> Result<(), String> {
     let Some(object) = value.as_object() else {
         return Err("ACTION_BUNDLE must be a JSON object".to_string());
@@ -966,16 +1040,10 @@ fn validate_action_bundle_json(
         .and_then(Value::as_array)
         .ok_or_else(|| "ACTION_BUNDLE.actions must be an array".to_string())?;
     let mut referenced_code_blocks = BTreeSet::new();
-    let code_block_ids = blocks
-        .keys()
-        .filter_map(|key| key.strip_prefix("CODE_BLOCK:"))
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
     for (index, action) in actions.iter().enumerate() {
-        validate_action_json(action, index, &code_block_ids, &mut referenced_code_blocks)?;
+        validate_action_json(action, index, code_block_ids, &mut referenced_code_blocks)?;
     }
-    for key in blocks.keys().filter(|key| key.starts_with("CODE_BLOCK:")) {
-        let id = key.trim_start_matches("CODE_BLOCK:");
+    for id in code_block_ids {
         if !referenced_code_blocks.contains(id) {
             return Err(format!(
                 "CODE_BLOCK {id} is not referenced by ACTION_BUNDLE"
@@ -1149,6 +1217,7 @@ fn plan_card_event(session_id: &str, plan: &PendingAgentPlan) -> Value {
             "runId": plan.run_id,
             "planId": plan.plan_id,
             "actionBundle": plan.action_bundle,
+            "codeBlocks": plan.code_blocks,
             "expectedValidation": plan.expected_validation,
             "reviewGuide": plan.review_guide,
             "facts": [
@@ -1228,7 +1297,7 @@ fn plan_parse_error_event(session_id: &str, run_id: &str, error: &str) -> Value 
             "runId": run_id,
             "confirmable": false,
             "facts": [
-                "LLM plan 阶段必须输出合法 ANSWER、RESOURCE_REQUEST 或 USER_PLAN + JSON ACTION_BUNDLE + EXPECTED_VALIDATION + REVIEW_GUIDE。".to_string(),
+                "LLM plan 阶段必须输出合法 deepcode.agent.protocol.v2 JSON Envelope；tagged Markdown 协议已移除。".to_string(),
                 "解析失败时不能生成 ApprovedTaskQueue，也不能进入执行。".to_string()
             ],
             "channel": "progress",
@@ -1239,12 +1308,16 @@ fn plan_parse_error_event(session_id: &str, run_id: &str, error: &str) -> Value 
     )
 }
 
+fn provider_error_value(error: &LlmProviderDiagnostic) -> Value {
+    serde_json::to_value(error).unwrap_or_else(|_| json!({ "message": error.to_string() }))
+}
+
 fn first_non_empty_line(content: &str) -> String {
     content
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .unwrap_or("计划已生成。")
+        .unwrap_or("Plan generated.")
         .to_string()
 }
 
@@ -1339,7 +1412,7 @@ fn review_facts_for_run(state: &AppState, run_id: &str) -> Vec<String> {
                 ..
             } => {
                 tool_facts.push(format!(
-                    "工具结果：{} -> {}{}",
+                    "Tool result: {} -> {}{}",
                     tool_name,
                     if ok { "ok" } else { "error" },
                     error
@@ -1353,16 +1426,19 @@ fn review_facts_for_run(state: &AppState, run_id: &str) -> Vec<String> {
                 decision,
                 ..
             } => {
-                permission_facts.push(format!("权限决策：{} -> {:?}", permission_id, decision));
+                permission_facts.push(format!(
+                    "Permission decision: {} -> {:?}",
+                    permission_id, decision
+                ));
             }
             _ => {}
         }
     }
     if tool_facts.is_empty() {
-        tool_facts.push("工具结果：无工具执行事实。".to_string());
+        tool_facts.push("Tool result: no tool execution facts.".to_string());
     }
     tool_facts.extend(permission_facts);
-    tool_facts.push("最终验收仍等待用户 review。".to_string());
+    tool_facts.push("Final acceptance still waits for user review.".to_string());
     tool_facts
 }
 
@@ -1620,87 +1696,138 @@ pub(crate) fn llm_mock_enabled() -> bool {
 }
 
 pub(crate) fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> LlmChatOutput {
-    if system_instruction.contains("Review guidance") || system_instruction.contains("用户审查建议")
+    let prefers_chinese = user_prompt_prefers_chinese(user_prompt);
+    let output_language = if prefers_chinese { "zh-CN" } else { "en-US" };
+    if system_instruction.contains("review-guidance generator")
+        || system_instruction.contains("Kernel tool-fact evidence")
     {
         let content = if request_mentions_temp_lifecycle(user_prompt) {
-            "我是 DeepCode。本轮工具事实显示工作区读取、组件验证、临时文件创建、读取与受控清理均已完成。请用户重点检查工具结果是否都为 ok、临时文件是否无残留、权限请求是否符合预期。"
+            if prefers_chinese {
+                "我是 DeepCode。本轮工具事实显示工作区读取、组件验证、临时文件创建、读取与受控清理均已完成。请用户重点检查工具结果是否都为 ok、临时文件是否无残留、权限请求是否符合预期。"
+            } else {
+                "I am DeepCode. Kernel tool facts show that workspace reading, component verification, temp file creation, readback, and controlled cleanup completed. Please review whether tool results are ok, temp files have no residue, and permission requests match expectations."
+            }
         } else if request_mentions_local_workspace(user_prompt) {
-            "我是 DeepCode。本轮工具事实显示工作区读取与组件验证已完成。请用户重点检查读取范围与结果是否符合预期。"
-        } else {
+            if prefers_chinese {
+                "我是 DeepCode。本轮工具事实显示工作区读取与组件验证已完成。请用户重点检查读取范围与结果是否符合预期。"
+            } else {
+                "I am DeepCode. Kernel tool facts show that workspace reading and component verification completed. Please review whether the read scope and results match the request."
+            }
+        } else if prefers_chinese {
             "我是 DeepCode。本轮已根据 Kernel 结构化事件完成当前任务的自检建议，最终验收仍由用户决定。"
+        } else {
+            "I am DeepCode. This review guidance is based on Kernel structured events. Final acceptance remains the user's decision."
         };
         return LlmChatOutput {
             content: content.to_string(),
             ..LlmChatOutput::default()
         };
     }
-    if system_instruction.contains("<ANSWER")
+    if system_instruction.contains(AGENT_PROTOCOL_SCHEMA_VERSION)
         && !request_mentions_temp_lifecycle(user_prompt)
         && !request_mentions_local_workspace(user_prompt)
     {
+        let answer_content = if prefers_chinese {
+            "我是 DeepCode 的本地 Agent。我的会话协议由 Kernel 约束：纯问答会直接回答，需要上下文时会请求 resourceRequest，需要执行时会生成可审查的 actionBundle，并由 Kernel 权限系统控制工具执行。"
+        } else {
+            "I am the local DeepCode Agent. My session protocol is constrained by the Kernel: read-only questions are answered directly, missing context uses resourceRequest, and executable work uses reviewable actionBundle drafts controlled by Kernel permissions."
+        };
         return LlmChatOutput {
-            content: "<ANSWER format=\"markdown\" version=\"1\">\n我是 DeepCode 的本地 Agent。我的会话协议由 Kernel 约束：纯问答会直接回答，需要上下文时会请求 ResourceRequest，需要执行时会生成可审查的 ACTION_BUNDLE，并由 Kernel 权限系统控制工具执行。\n</ANSWER>".to_string(),
+            content: serde_json::json!({
+                "schemaVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+                "kind": "answer",
+                "outputLanguage": output_language,
+                "answer": {
+                    "format": "markdown",
+                    "content": answer_content
+                }
+            })
+            .to_string(),
             ..LlmChatOutput::default()
         };
     }
-    if system_instruction.contains("ACTION_BUNDLE") && system_instruction.contains("USER_PLAN") {
+    if system_instruction.contains(AGENT_PROTOCOL_SCHEMA_VERSION) {
+        let user_plan = if prefers_chinese {
+            "我是 DeepCode，接下来我将作为你的助手验证当前 Agent 的文件系统、搜索与临时文件生命周期能力。计划会先列出工作区与搜索代码，再创建并读取 `_agent_tmp_functional_test.txt`，随后等待用户 review 后再进入删除计划。"
+        } else {
+            "I will verify the current Agent file-system, search, and temporary-file lifecycle capabilities. The plan lists the workspace, runs code search, creates and reads `_agent_tmp_functional_test.txt`, then waits for user review before a later deletion plan."
+        };
+        let expected_validation = if prefers_chinese {
+            "工具调用应全部返回 ok；临时文件读取内容应与写入内容一致；删除动作必须等待用户 review 后由下一轮计划触发。"
+        } else {
+            "All tool calls should return ok; the temp file read should match the written content; deletion must wait for user review and be planned in a later turn."
+        };
+        let review_guide = if prefers_chinese {
+            "请重点审查工具结果、权限请求和临时文件内容；如确认通过，下一轮再生成删除计划。"
+        } else {
+            "Review tool results, permission requests, and temp file content. If accepted, deletion should be planned in the next turn."
+        };
+        let content = serde_json::json!({
+            "schemaVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+            "kind": "actionBundle",
+            "outputLanguage": output_language,
+            "userPlan": user_plan,
+            "codeBlocks": [
+                {
+                    "id": "write-agent-functional-smoke",
+                    "path": "_agent_tmp_functional_test.txt",
+                    "content": format!("DeepCode Agent temp lifecycle test at {}", now_millis())
+                }
+            ],
+            "actionBundle": {
+                "version": "1",
+                "id": "agent-functional-smoke-plan",
+                "goal": "Verify Agent workspace read, code search, and temp write review flow",
+                "actions": [
+                    {
+                        "id": "list-workspace-root",
+                        "title": "List workspace root",
+                        "capability": "workspace.read",
+                        "kind": "read",
+                        "resourceScope": ["."]
+                    },
+                    {
+                        "id": "search-workspace",
+                        "title": "Verify code.search",
+                        "capability": "workspace.search",
+                        "kind": "read",
+                        "resourceScope": ["workspace"]
+                    },
+                    {
+                        "id": "write-temp-file",
+                        "title": "Create temp file",
+                        "capability": "workspace.write",
+                        "kind": "write",
+                        "resourceScope": ["_agent_tmp_functional_test.txt"],
+                        "sourceBlockId": "write-agent-functional-smoke"
+                    },
+                    {
+                        "id": "read-temp-file",
+                        "title": "Read temp file",
+                        "capability": "workspace.read",
+                        "kind": "read",
+                        "resourceScope": ["_agent_tmp_functional_test.txt"]
+                    }
+                ],
+                "validationExpectations": [
+                    {
+                        "id": "tool-results-ok",
+                        "description": "Kernel tool results return ok for fs.list, code.search, fs.write, and fs.read"
+                    }
+                ],
+                "reviewExpectations": [
+                    {
+                        "id": "user-review-temp-cleanup",
+                        "description": "User reviews temp file content before deletion is planned"
+                    }
+                ]
+            },
+            "expectedValidation": expected_validation,
+            "reviewGuide": review_guide
+        })
+        .to_string();
         return LlmChatOutput {
-            content: format!(
-                "<CODE_BLOCK id=\"write-agent-functional-smoke\" path=\"_agent_tmp_functional_test.txt\">\nDeepCode Agent temp lifecycle test at {}\n</CODE_BLOCK>\n\n\
-                <USER_PLAN>\n我是 DeepCode，接下来我将作为你的助手验证当前 Agent 的文件系统、搜索与临时文件生命周期能力。计划会先列出工作区与搜索代码，再创建并读取 `_agent_tmp_functional_test.txt`，随后等待用户 review 后再进入删除计划。\n</USER_PLAN>\n\n\
-                <ACTION_BUNDLE format=\"json\" version=\"1\">\n{}\n</ACTION_BUNDLE>\n\n\
-                <EXPECTED_VALIDATION>\n工具调用应全部返回 ok；临时文件读取内容应与写入内容一致；删除动作必须等待用户 review 后由下一轮计划触发。\n</EXPECTED_VALIDATION>\n\n\
-                <REVIEW_GUIDE>\n请重点审查工具结果、权限请求和临时文件内容；如确认通过，下一轮再生成删除计划。\n</REVIEW_GUIDE>",
-                now_millis(),
-                serde_json::json!({
-                    "version": "1",
-                    "id": "agent-functional-smoke-plan",
-                    "goal": "验证 Agent 工作区读取、代码搜索和临时文件写入 review 能力",
-                    "actions": [
-                        {
-                            "id": "list-workspace-root",
-                            "title": "列出工作区根目录",
-                            "capability": "workspace.read",
-                            "kind": "read",
-                            "resourceScope": ["."]
-                        },
-                        {
-                            "id": "search-workspace",
-                            "title": "验证 code.search",
-                            "capability": "workspace.search",
-                            "kind": "read",
-                            "resourceScope": ["workspace"]
-                        },
-                        {
-                            "id": "write-temp-file",
-                            "title": "创建临时文件",
-                            "capability": "workspace.write",
-                            "kind": "write",
-                            "resourceScope": ["_agent_tmp_functional_test.txt"],
-                            "sourceBlockId": "write-agent-functional-smoke"
-                        },
-                        {
-                            "id": "read-temp-file",
-                            "title": "读取临时文件",
-                            "capability": "workspace.read",
-                            "kind": "read",
-                            "resourceScope": ["_agent_tmp_functional_test.txt"]
-                        }
-                    ],
-                    "validationExpectations": [
-                        {
-                            "id": "tool-results-ok",
-                            "description": "fs.list、code.search、fs.write、fs.read 均返回 ok"
-                        }
-                    ],
-                    "reviewExpectations": [
-                        {
-                            "id": "user-review-temp-cleanup",
-                            "description": "用户确认临时文件内容后再决定是否删除"
-                        }
-                    ]
-                })
-            ),
+            content,
             ..LlmChatOutput::default()
         };
     }
@@ -1730,16 +1857,172 @@ pub(crate) fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> Ll
     }
 }
 
+fn user_prompt_prefers_chinese(user_prompt: &str) -> bool {
+    user_prompt
+        .chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parser_accepts_json_envelope_answer() {
+        let parsed = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "answer",
+                "outputLanguage": "zh-CN",
+                "answer": {
+                    "format": "markdown",
+                    "content": "我是 DeepCode。"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        match parsed {
+            AgentPlanResponse::Answer(answer) => {
+                assert!(answer.content.contains("DeepCode"));
+            }
+            other => panic!("expected answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_accepts_json_envelope_action_bundle() {
+        let parsed = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "actionBundle",
+                "outputLanguage": "zh-CN",
+                "userPlan": "Create test.md and wait for review.",
+                "codeBlocks": [
+                    {
+                        "id": "write-test",
+                        "path": "test.md",
+                        "content": "hello"
+                    }
+                ],
+                "actionBundle": {
+                    "version": "1",
+                    "id": "plan-1",
+                    "goal": "Create test.md and wait for review",
+                    "actions": [
+                        {
+                            "id": "a1",
+                            "title": "Write test.md",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["test.md"],
+                            "sourceBlockId": "write-test"
+                        }
+                    ],
+                    "validationExpectations": [],
+                    "reviewExpectations": []
+                },
+                "expectedValidation": "Kernel fs.write succeeds.",
+                "reviewGuide": "Review test.md."
+            })
+            .to_string(),
+        )
+        .unwrap();
+        match parsed {
+            AgentPlanResponse::ActionPlan(plan) => {
+                assert_eq!(plan.code_blocks.len(), 1);
+                assert_eq!(plan.plan_id, "plan-1");
+            }
+            other => panic!("expected action plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_rejects_json_envelope_answer_with_action_bundle() {
+        let error = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "answer",
+                "outputLanguage": "en-US",
+                "answer": {
+                    "format": "markdown",
+                    "content": "ok"
+                },
+                "actionBundle": {}
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot include branch payload actionBundle"));
+    }
+
+    #[test]
+    fn parser_rejects_json_envelope_executor_capability() {
+        let error = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "actionBundle",
+                "outputLanguage": "en-US",
+                "userPlan": "Bad plan.",
+                "actionBundle": {
+                    "version": "1",
+                    "id": "plan-1",
+                    "goal": "bad",
+                    "actions": [
+                        {
+                            "id": "a1",
+                            "title": "bad",
+                            "capability": "fs.write",
+                            "kind": "write",
+                            "resourceScope": ["test.md"]
+                        }
+                    ],
+                    "validationExpectations": [],
+                    "reviewExpectations": []
+                },
+                "expectedValidation": "none",
+                "reviewGuide": "review"
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("must use capability namespace"));
+    }
+
+    #[test]
+    fn parser_rejects_tagged_answer_protocol() {
+        let error = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            "<ANSWER format=\"markdown\" version=\"1\">\n我是 DeepCode。\n</ANSWER>",
+        )
+        .unwrap_err();
+        assert!(error.contains("must be one JSON Envelope v2 object"));
+    }
 
     #[test]
     fn parser_accepts_answer_only() {
         let parsed = parse_agent_plan_response(
             "session-1",
             "run-1",
-            "<ANSWER format=\"markdown\" version=\"1\">\n我是 DeepCode。\n</ANSWER>",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "answer",
+                "outputLanguage": "zh-CN",
+                "answer": {
+                    "format": "markdown",
+                    "content": "我是 DeepCode。"
+                }
+            })
+            .to_string(),
         )
         .unwrap();
         match parsed {
@@ -1755,7 +2038,24 @@ mod tests {
         let parsed = parse_agent_plan_response(
             "session-1",
             "run-1",
-            "<RESOURCE_REQUEST format=\"json\" version=\"1\">\n{\"version\":\"1\",\"id\":\"rr-1\",\"reason\":\"need context\",\"items\":[{\"id\":\"item-1\",\"manifestEntryId\":\"file-readme\",\"reason\":\"read README\"}]}\n</RESOURCE_REQUEST>",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "resourceRequest",
+                "outputLanguage": "en-US",
+                "resourceRequest": {
+                    "version": "1",
+                    "id": "rr-1",
+                    "reason": "need context",
+                    "items": [
+                        {
+                            "id": "item-1",
+                            "manifestEntryId": "file-readme",
+                            "reason": "read README"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
         )
         .unwrap();
         match parsed {
@@ -1771,70 +2071,174 @@ mod tests {
         let error = parse_agent_plan_response(
             "session-1",
             "run-1",
-            "<ANSWER format=\"markdown\" version=\"1\">ok</ANSWER>\n<USER_PLAN>plan</USER_PLAN>",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "answer",
+                "outputLanguage": "en-US",
+                "answer": {
+                    "format": "markdown",
+                    "content": "ok"
+                },
+                "actionBundle": {}
+            })
+            .to_string(),
         )
         .unwrap_err();
-        assert!(error.contains("ANSWER cannot appear"));
+        assert!(error.contains("cannot include branch payload actionBundle"));
     }
 
     #[test]
     fn parser_rejects_action_params_field() {
-        let content = "<USER_PLAN>\nplan\n</USER_PLAN>\n\
-            <ACTION_BUNDLE format=\"json\" version=\"1\">\n\
-            {\"version\":\"1\",\"id\":\"plan-1\",\"goal\":\"test\",\"actions\":[{\"id\":\"a1\",\"title\":\"bad\",\"capability\":\"workspace.read\",\"kind\":\"read\",\"resourceScope\":[\"README.md\"],\"params\":{\"path\":\"README.md\"}}],\"validationExpectations\":[],\"reviewExpectations\":[]}\n\
-            </ACTION_BUNDLE>\n\
-            <EXPECTED_VALIDATION>none</EXPECTED_VALIDATION>\n\
-            <REVIEW_GUIDE>review</REVIEW_GUIDE>";
-        let error = parse_agent_plan_response("session-1", "run-1", content).unwrap_err();
+        let content = serde_json::json!({
+            "schemaVersion": "deepcode.agent.protocol.v2",
+            "kind": "actionBundle",
+            "outputLanguage": "en-US",
+            "userPlan": "plan",
+            "actionBundle": {
+                "version": "1",
+                "id": "plan-1",
+                "goal": "test",
+                "actions": [
+                    {
+                        "id": "a1",
+                        "title": "bad",
+                        "capability": "workspace.read",
+                        "kind": "read",
+                        "resourceScope": ["README.md"],
+                        "params": { "path": "README.md" }
+                    }
+                ],
+                "validationExpectations": [],
+                "reviewExpectations": []
+            },
+            "expectedValidation": "none",
+            "reviewGuide": "review"
+        })
+        .to_string();
+        let error = parse_agent_plan_response("session-1", "run-1", &content).unwrap_err();
         assert!(error.contains("unknown field params"));
     }
 
     #[test]
     fn parser_rejects_action_bundle_missing_json_version() {
-        let content = "<USER_PLAN>\nplan\n</USER_PLAN>\n\
-            <ACTION_BUNDLE format=\"json\" version=\"1\">\n\
-            {\"id\":\"plan-1\",\"goal\":\"test\",\"actions\":[],\"validationExpectations\":[],\"reviewExpectations\":[]}\n\
-            </ACTION_BUNDLE>\n\
-            <EXPECTED_VALIDATION>none</EXPECTED_VALIDATION>\n\
-            <REVIEW_GUIDE>review</REVIEW_GUIDE>";
-        let error = parse_agent_plan_response("session-1", "run-1", content).unwrap_err();
+        let content = serde_json::json!({
+            "schemaVersion": "deepcode.agent.protocol.v2",
+            "kind": "actionBundle",
+            "outputLanguage": "en-US",
+            "userPlan": "plan",
+            "actionBundle": {
+                "id": "plan-1",
+                "goal": "test",
+                "actions": [],
+                "validationExpectations": [],
+                "reviewExpectations": []
+            },
+            "expectedValidation": "none",
+            "reviewGuide": "review"
+        })
+        .to_string();
+        let error = parse_agent_plan_response("session-1", "run-1", &content).unwrap_err();
         assert!(error.contains("ACTION_BUNDLE.version is required"));
     }
 
     #[test]
     fn parser_rejects_scalar_resource_scope() {
-        let content = "<USER_PLAN>\nplan\n</USER_PLAN>\n\
-            <ACTION_BUNDLE format=\"json\" version=\"1\">\n\
-            {\"version\":\"1\",\"id\":\"plan-1\",\"goal\":\"test\",\"actions\":[{\"id\":\"a1\",\"title\":\"bad\",\"capability\":\"workspace.read\",\"kind\":\"read\",\"resourceScope\":\"README.md\"}],\"validationExpectations\":[],\"reviewExpectations\":[]}\n\
-            </ACTION_BUNDLE>\n\
-            <EXPECTED_VALIDATION>none</EXPECTED_VALIDATION>\n\
-            <REVIEW_GUIDE>review</REVIEW_GUIDE>";
-        let error = parse_agent_plan_response("session-1", "run-1", content).unwrap_err();
+        let content = serde_json::json!({
+            "schemaVersion": "deepcode.agent.protocol.v2",
+            "kind": "actionBundle",
+            "outputLanguage": "en-US",
+            "userPlan": "plan",
+            "actionBundle": {
+                "version": "1",
+                "id": "plan-1",
+                "goal": "test",
+                "actions": [
+                    {
+                        "id": "a1",
+                        "title": "bad",
+                        "capability": "workspace.read",
+                        "kind": "read",
+                        "resourceScope": "README.md"
+                    }
+                ],
+                "validationExpectations": [],
+                "reviewExpectations": []
+            },
+            "expectedValidation": "none",
+            "reviewGuide": "review"
+        })
+        .to_string();
+        let error = parse_agent_plan_response("session-1", "run-1", &content).unwrap_err();
         assert!(error.contains("resourceScope must be an array"));
     }
 
     #[test]
     fn parser_rejects_executor_tool_name_as_plan_capability() {
-        let content = "<USER_PLAN>\nplan\n</USER_PLAN>\n\
-            <ACTION_BUNDLE format=\"json\" version=\"1\">\n\
-            {\"version\":\"1\",\"id\":\"plan-1\",\"goal\":\"test\",\"actions\":[{\"id\":\"a1\",\"title\":\"bad\",\"capability\":\"fs.write\",\"kind\":\"write\",\"resourceScope\":[\"test.md\"]}],\"validationExpectations\":[],\"reviewExpectations\":[]}\n\
-            </ACTION_BUNDLE>\n\
-            <EXPECTED_VALIDATION>none</EXPECTED_VALIDATION>\n\
-            <REVIEW_GUIDE>review</REVIEW_GUIDE>";
-        let error = parse_agent_plan_response("session-1", "run-1", content).unwrap_err();
+        let content = serde_json::json!({
+            "schemaVersion": "deepcode.agent.protocol.v2",
+            "kind": "actionBundle",
+            "outputLanguage": "en-US",
+            "userPlan": "plan",
+            "actionBundle": {
+                "version": "1",
+                "id": "plan-1",
+                "goal": "test",
+                "actions": [
+                    {
+                        "id": "a1",
+                        "title": "bad",
+                        "capability": "fs.write",
+                        "kind": "write",
+                        "resourceScope": ["test.md"]
+                    }
+                ],
+                "validationExpectations": [],
+                "reviewExpectations": []
+            },
+            "expectedValidation": "none",
+            "reviewGuide": "review"
+        })
+        .to_string();
+        let error = parse_agent_plan_response("session-1", "run-1", &content).unwrap_err();
         assert!(error.contains("must use capability namespace"));
     }
 
     #[test]
     fn parser_accepts_source_block_write_plan() {
-        let content = "<CODE_BLOCK id=\"write-test\" path=\"test.md\">\nhello\n</CODE_BLOCK>\n\
-            <USER_PLAN>\nplan\n</USER_PLAN>\n\
-            <ACTION_BUNDLE format=\"json\" version=\"1\">\n\
-            {\"version\":\"1\",\"id\":\"plan-1\",\"goal\":\"test\",\"actions\":[{\"id\":\"a1\",\"title\":\"write\",\"capability\":\"workspace.write\",\"kind\":\"write\",\"resourceScope\":[\"test.md\"],\"sourceBlockId\":\"write-test\"}],\"validationExpectations\":[],\"reviewExpectations\":[]}\n\
-            </ACTION_BUNDLE>\n\
-            <EXPECTED_VALIDATION>Kernel fs.write succeeds.</EXPECTED_VALIDATION>\n\
-            <REVIEW_GUIDE>Review test.md.</REVIEW_GUIDE>";
-        let parsed = parse_agent_plan_response("session-1", "run-1", content).unwrap();
+        let content = serde_json::json!({
+            "schemaVersion": "deepcode.agent.protocol.v2",
+            "kind": "actionBundle",
+            "outputLanguage": "en-US",
+            "userPlan": "plan",
+            "codeBlocks": [
+                {
+                    "id": "write-test",
+                    "path": "test.md",
+                    "content": "hello"
+                }
+            ],
+            "actionBundle": {
+                "version": "1",
+                "id": "plan-1",
+                "goal": "test",
+                "actions": [
+                    {
+                        "id": "a1",
+                        "title": "write",
+                        "capability": "workspace.write",
+                        "kind": "write",
+                        "resourceScope": ["test.md"],
+                        "sourceBlockId": "write-test"
+                    }
+                ],
+                "validationExpectations": [],
+                "reviewExpectations": []
+            },
+            "expectedValidation": "Kernel fs.write succeeds.",
+            "reviewGuide": "Review test.md."
+        })
+        .to_string();
+        let parsed = parse_agent_plan_response("session-1", "run-1", &content).unwrap();
         assert!(matches!(parsed, AgentPlanResponse::ActionPlan(_)));
     }
 

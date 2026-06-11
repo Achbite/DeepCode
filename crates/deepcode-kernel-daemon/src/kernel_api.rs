@@ -10,8 +10,39 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         "service": "deepcode-kernel-daemon",
         "status": "ok",
         "kernel": "ready",
+        "buildCommit": build_commit(),
+        "protocolVersion": deepcode_kernel_runtime::llm::AGENT_PROTOCOL_VERSION,
+        "toolCatalogVersion": deepcode_kernel_runtime::llm::TOOL_CATALOG_VERSION,
+        "toolCatalogCount": deepcode_kernel_runtime::llm::kernel_visible_tool_catalog_count(),
         "workspace": workspace
     }))
+}
+
+fn build_commit() -> String {
+    std::env::var("DEEPCODE_BUILD_COMMIT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| option_env!("DEEPCODE_BUILD_COMMIT").map(str::to_string))
+        .or_else(read_packaged_build_commit)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn read_packaged_build_commit() -> Option<String> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))?;
+    for path in [
+        exe_dir.join("build-info.json"),
+        exe_dir.join("..").join("build-info.json"),
+    ] {
+        let value = read_json_file(&path)?;
+        if let Some(commit) = value.get("buildCommit").and_then(Value::as_str) {
+            if !commit.trim().is_empty() {
+                return Some(commit.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub(crate) async fn kernel_commands(

@@ -1,7 +1,7 @@
 use crate::{
-    ConfigSnapshotRef, HostStatus, KernelErrorEnvelope, KernelSnapshot, MessageRole,
-    PermissionDecisionKind, PermissionRequestEnvelope, ProfileRef, RequestId, RunId, RunStatus,
-    SessionId, StageRunId, StageStatus, TurnId, WorkflowDecision, WorkspaceBinding,
+    ConfigSnapshotRef, HostStatus, KernelErrorEnvelope, KernelSnapshot, LlmProviderDiagnostic,
+    MessageRole, PermissionDecisionKind, PermissionRequestEnvelope, ProfileRef, RequestId, RunId,
+    RunStatus, SessionId, StageRunId, StageStatus, TurnId, WorkflowDecision, WorkspaceBinding,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,6 +73,15 @@ pub enum KernelEvent {
         llm_call_id: String,
         profile_ref: Option<ProfileRef>,
         request_envelope: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "llm.provider_error")]
+    LlmProviderError {
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        phase: String,
+        llm_call_id: String,
+        diagnostic: LlmProviderDiagnostic,
         sequence: Option<u64>,
     },
     #[serde(rename = "tool.requested")]

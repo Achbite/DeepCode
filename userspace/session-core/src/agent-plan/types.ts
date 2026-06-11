@@ -1,13 +1,3 @@
-export type AgentPlanTag =
-  | 'ANSWER'
-  | 'USER_PLAN'
-  | 'RESOURCE_REQUEST'
-  | 'ACTION_BUNDLE'
-  | 'CODE_BLOCK'
-  | 'EXPECTED_VALIDATION'
-  | 'REVIEW_GUIDE'
-  | 'PERMISSION_HINTS';
-
 export type ActionKind =
   | 'read'
   | 'write'
@@ -75,10 +65,6 @@ export interface ReviewGuide {
   expectations: ReviewExpectationDraft[];
 }
 
-export interface PermissionHints {
-  content: string;
-}
-
 export interface ResourceRequestDraftItem {
   id: string;
   manifestEntryId: string;
@@ -104,7 +90,6 @@ export interface AgentPlanParts {
   codeBlocks: CodeBlockDraft[];
   expectedValidation: ExpectedValidation;
   reviewGuide: ReviewGuide;
-  permissionHints?: PermissionHints;
 }
 
 export type AgentPlanOutput =

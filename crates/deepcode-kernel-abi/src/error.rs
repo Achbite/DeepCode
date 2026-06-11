@@ -19,6 +19,8 @@ pub enum KernelError {
     InvalidCommand(String),
     #[error("workspace binding is required")]
     MissingWorkspaceBinding,
+    #[error("pending permission is unavailable: {0}")]
+    PendingPermissionUnavailable(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
     #[error("kernel error: {0}")]
@@ -33,6 +35,7 @@ impl From<&KernelError> for KernelErrorEnvelope {
             KernelError::NotImplemented(_) => "not_implemented",
             KernelError::InvalidCommand(_) => "invalid_command",
             KernelError::MissingWorkspaceBinding => "workspace_binding_required",
+            KernelError::PendingPermissionUnavailable(_) => "pending_permission_unavailable",
             KernelError::PermissionDenied(_) => "permission_denied",
             KernelError::Other(_) => "kernel_error",
         };

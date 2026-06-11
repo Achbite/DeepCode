@@ -19,10 +19,15 @@ import type { WorkspaceSummary } from './workspace.js';
  * 旧 Node server 不再作为默认 API 事实源。
  */
 export interface HealthStatus {
-  service: 'deepcode-host-web';
+  service: 'deepcode-host-web' | 'deepcode-kernel-daemon' | string;
   status: 'ok';
-  version: string;
-  timestamp: string;
+  version?: string;
+  timestamp?: string;
+  buildCommit?: string;
+  protocolVersion?: string;
+  toolCatalogVersion?: string;
+  toolCatalogCount?: number;
+  kernel?: string;
   /** 当前活动工作区摘要；无工作区时 available=false */
   workspace: WorkspaceSummary;
 }

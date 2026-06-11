@@ -273,7 +273,23 @@ impl DeepCodeKernelRuntime {
             sequence: Some(sequence),
         }];
         events.push(self.enter_phase_event(&run_id_text, &session_id, WorkflowPhase::Complete)?);
-        events.push(self.llm_call_requested_event(&run_id_text, &session_id)?);
+        if self
+            .state
+            .approved_tools_by_run
+            .get(&run_id_text)
+            .map(|queue| !queue.is_empty())
+            .unwrap_or(false)
+        {
+            events.extend(self.auto_continue_after_tool(&run_id_text, &session_id)?);
+            events.push(self.workflow_decision_event(
+                RequestId("agent-plan-approved-tools".to_string()),
+                &run_id_text,
+                &session_id,
+                "approved_tools.completed",
+            )?);
+        } else {
+            events.push(self.llm_call_requested_event(&run_id_text, &session_id)?);
+        }
         Ok(events)
     }
 
@@ -415,6 +431,7 @@ impl DeepCodeKernelRuntime {
                 review_result.summary
             )));
         }
+        self.release_workflow_resources(run_id, session_id)?;
         {
             let record = self.record_by_run_mut(run_id)?;
             record.phase = WorkflowPhase::Done;
@@ -438,6 +455,34 @@ impl DeepCodeKernelRuntime {
             summary: Some("Kernel workflow completed.".to_string()),
             sequence: Some(sequence),
         })
+    }
+
+    fn release_workflow_resources(&mut self, run_id: &str, session_id: &str) -> KernelResult<()> {
+        let owner = KernelResourceOwner::agent_workflow(None::<String>, run_id.to_string());
+        let resources = self.state.resource_registry.active_by_owner(&owner);
+        for resource in resources {
+            let cleanup = cleanup_workflow_resource(&resource);
+            let release = self.state.resource_registry.release(&resource.resource_id);
+            let sequence = self.ledger.next_sequence(run_id)?;
+            self.append_ledger(
+                run_id,
+                session_id,
+                "resource.released",
+                sequence,
+                serde_json::json!({
+                    "summary": format!("Kernel released workflow resource: {}", resource.resource_id),
+                    "resourceId": &resource.resource_id,
+                    "kind": &resource.kind,
+                    "owner": &resource.owner,
+                    "scope": &resource.scope,
+                    "cleanupPolicy": &resource.cleanup_policy,
+                    "cleanup": cleanup,
+                    "released": release.released,
+                    "error": release.error
+                }),
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn workflow_decision_event(
@@ -468,6 +513,55 @@ impl DeepCodeKernelRuntime {
             decision,
             sequence: Some(sequence),
         })
+    }
+}
+
+fn cleanup_workflow_resource(resource: &KernelResource) -> Value {
+    if resource.cleanup_policy != KernelResourceCleanupPolicy::OnWorkflowEnd {
+        return serde_json::json!({
+            "attempted": false,
+            "reason": "cleanup policy is not OnWorkflowEnd"
+        });
+    }
+    if !matches!(
+        resource.kind,
+        KernelResourceKind::TempArtifact
+            | KernelResourceKind::RedirectOutput
+            | KernelResourceKind::CacheFile
+    ) {
+        return serde_json::json!({
+            "attempted": false,
+            "reason": "resource kind has no file cleanup handler"
+        });
+    }
+    let Some(absolute_path) = resource
+        .metadata
+        .get("absolutePath")
+        .and_then(Value::as_str)
+    else {
+        return serde_json::json!({
+            "attempted": false,
+            "reason": "resource has no absolutePath metadata"
+        });
+    };
+    match fs::remove_file(absolute_path) {
+        Ok(()) => serde_json::json!({
+            "attempted": true,
+            "removed": true,
+            "absolutePath": absolute_path
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({
+            "attempted": true,
+            "removed": true,
+            "absolutePath": absolute_path,
+            "alreadyMissing": true
+        }),
+        Err(error) => serde_json::json!({
+            "attempted": true,
+            "removed": false,
+            "absolutePath": absolute_path,
+            "error": error.to_string()
+        }),
     }
 }
 
@@ -551,6 +645,7 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::StageChanged { .. } => "stage.changed",
         KernelEvent::MessageAppended { .. } => "message.appended",
         KernelEvent::LlmCallRequested { .. } => "llm.call_requested",
+        KernelEvent::LlmProviderError { .. } => "llm.provider_error",
         KernelEvent::ToolRequested { .. } => "tool.requested",
         KernelEvent::ToolCompleted { .. } => "tool.completed",
         KernelEvent::PermissionRequested { .. } => "permission.requested",
@@ -592,6 +687,7 @@ pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::StageChanged { sequence, .. }
         | KernelEvent::MessageAppended { sequence, .. }
         | KernelEvent::LlmCallRequested { sequence, .. }
+        | KernelEvent::LlmProviderError { sequence, .. }
         | KernelEvent::ToolRequested { sequence, .. }
         | KernelEvent::ToolCompleted { sequence, .. }
         | KernelEvent::PermissionRequested { sequence, .. }

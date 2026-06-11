@@ -78,6 +78,8 @@ export interface CreateTerminalSessionRequest {
   name?: string;
   shellKind?: ShellRuntimeKind;
   cwd?: string;
+  cols?: number;
+  rows?: number;
 }
 
 export interface TerminalInputRequest {

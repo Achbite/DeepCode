@@ -66,6 +66,42 @@ impl DeepCodeKernelRuntime {
         tool_name: &str,
         output: &Value,
     ) -> KernelResult<()> {
+        if let Some(validation_payload) = output.get("validation") {
+            let passed = validation_payload
+                .get("passed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let validation = ValidationResult {
+                id: format!("validation-{run_id}-{tool_call_id}"),
+                run_id: run_id.to_string(),
+                kind: ValidationKind::ManualReview,
+                passed,
+                summary: if passed {
+                    format!("Tool effect verified for {tool_name}.")
+                } else {
+                    format!("Tool effect verification failed for {tool_name}.")
+                },
+                evidence_refs: vec![format!("tool.completed:{tool_call_id}")],
+            };
+            self.state
+                .validations_by_run
+                .entry(run_id.to_string())
+                .or_default()
+                .push(validation.clone());
+            let sequence = self.ledger.next_sequence(run_id)?;
+            self.append_ledger(
+                run_id,
+                session_id,
+                "validation.result",
+                sequence,
+                serde_json::json!({
+                    "summary": &validation.summary,
+                    "validation": &validation,
+                    "toolValidation": validation_payload
+                }),
+            )?;
+            return Ok(());
+        }
         if tool_name != "shell.exec" {
             return Ok(());
         }

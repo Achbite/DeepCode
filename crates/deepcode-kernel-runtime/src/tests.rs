@@ -1190,6 +1190,26 @@ fn temporary_grant_allows_matching_tool_without_permission_prompt() {
     assert!(events
         .iter()
         .any(|event| matches!(event, KernelEvent::ToolCompleted { ok: true, .. })));
+    let write_output = events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ToolCompleted {
+                tool_name, output, ..
+            } if tool_name == "fs.write" => output.as_ref(),
+            _ => None,
+        })
+        .expect("fs.write output");
+    assert_eq!(write_output["validation"]["kind"], "readBack");
+    assert_eq!(write_output["validation"]["passed"], true);
+    assert_eq!(
+        write_output["workspaceRoot"].as_str(),
+        Some(root.to_string_lossy().as_ref())
+    );
+    let granted_path = root.join("granted.txt");
+    assert_eq!(
+        write_output["absolutePath"].as_str(),
+        Some(granted_path.to_string_lossy().as_ref())
+    );
     assert_eq!(
         fs::read_to_string(root.join("granted.txt")).unwrap(),
         "granted write"
@@ -1205,6 +1225,77 @@ fn temporary_grant_allows_matching_tool_without_permission_prompt() {
     assert!(ledger
         .iter()
         .all(|event| event.kind != "permission.requested"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn temporary_grant_delete_executes_and_validates_missing_file() {
+    let root = temp_workspace();
+    let workspace_binding = binding_for_root(&root);
+    fs::write(root.join("delete-me.txt"), "temporary").unwrap();
+    let mut runtime = DeepCodeKernelRuntime::new();
+    runtime
+        .dispatch(KernelCommand::RunStart {
+            request_id: RequestId("req-run".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            input: UserInput {
+                text: "delete granted file".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(workspace_binding.clone()),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .unwrap();
+
+    runtime
+        .dispatch(KernelCommand::PermissionGrantTemporary {
+            request_id: RequestId("req-grant-delete".to_string()),
+            run_id: RunId("run-1".to_string()),
+            grant: deepcode_kernel_abi::TemporaryGrantEnvelope {
+                id: "grant-delete".to_string(),
+                capability: "workspace.delete".to_string(),
+                resource_kind: "workspaceFile".to_string(),
+                resource_path: Some("delete-me.txt".to_string()),
+                expires_after_sequence: Some(10),
+                reason: Some("review accepted".to_string()),
+            },
+        })
+        .unwrap();
+
+    let events = runtime
+        .dispatch(KernelCommand::ToolInvoke {
+            request_id: RequestId("req-delete".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-1".to_string())),
+            tool_call_id: "tool-delete-granted".to_string(),
+            tool_name: "fs.delete".to_string(),
+            arguments: serde_json::json!({
+                "path": "delete-me.txt",
+                "reason": "review accepted"
+            }),
+            workspace_binding: Some(workspace_binding),
+        })
+        .unwrap();
+
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::PermissionRequested { .. })));
+    let delete_output = events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ToolCompleted {
+                tool_name, output, ..
+            } if tool_name == "fs.delete" => output.as_ref(),
+            _ => None,
+        })
+        .expect("fs.delete output");
+    assert_eq!(delete_output["validation"]["kind"], "deleteVerified");
+    assert_eq!(delete_output["validation"]["passed"], true);
+    assert_eq!(delete_output["validation"]["exists"], false);
+    assert!(!root.join("delete-me.txt").exists());
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -1273,9 +1364,13 @@ fn ndjson_ledger_restores_pending_permission_and_continues_tool() {
             decision: deepcode_kernel_abi::PermissionDecisionKind::Accept,
         })
         .unwrap_err();
+    assert!(matches!(
+        resolve_error,
+        KernelError::PendingPermissionUnavailable(_)
+    ));
     assert!(resolve_error
         .to_string()
-        .contains("unknown permission tool-write-replay"));
+        .contains("permission tool-write-replay has no live pending tool arguments"));
     let ledger = restored.ledger("run-1").unwrap();
     let permission_requested = ledger
         .iter()
@@ -1376,8 +1471,44 @@ fn tool_execution_records_changes_validations_and_review_gate_evidence() {
         runtime.evidence_refs_for_run("run-1").unwrap(),
     );
     assert_eq!(review_result.status, ReviewGateStatus::Accepted);
+    runtime
+        .complete_run_event("run-1", "session-1")
+        .expect("complete run");
+    assert!(!root.join("_agent_tmp_change.txt").exists());
+    assert!(runtime
+        .ledger("run-1")
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "resource.released"));
 
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn kernel_command_gate_rejects_terminal_escape_background_rm_and_redirect() {
+    for (command, category) in [
+        ("open -a Terminal", "nestedTerminal"),
+        ("nohup sleep 60", "backgroundEscape"),
+        ("tmux new-session", "terminalReuseEscape"),
+        ("rm _agent_tmp_test.txt", "deleteBypass"),
+        ("printf hello > _agent_tmp_out.txt", "unmanagedRedirect"),
+    ] {
+        let denial = deny_kernel_shell_command(
+            "shell.exec",
+            &serde_json::json!({
+                "command": command
+            }),
+        )
+        .expect("command denied");
+        assert_eq!(denial.category, category);
+    }
+    assert!(deny_kernel_shell_command(
+        "shell.exec",
+        &serde_json::json!({
+            "command": "printf test"
+        })
+    )
+    .is_none());
 }
 
 #[test]

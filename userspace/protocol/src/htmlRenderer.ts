@@ -2,7 +2,7 @@
  * HTML 渲染器协议契约（阶段 4 / S4-5 预留；阶段 7 落地）
  *
  * 背景：未来阶段 7 解决"Agent 生成的 HTML 方案需要复制到外部浏览器审查"工作流痛点。
- * 让前端就地用 `<iframe sandbox>` 渲染 Agent 输出，对齐 VSCode WebView Panel 体验。
+ * 让前端就地用 `<iframe sandbox>` 渲染 Agent 输出，对齐 VS Code-style WebView Panel 体验。
  *
  * 本阶段只定义 DTO，**不实装**：
  *   - 前端：HtmlPreviewPane 容器（阶段 7）

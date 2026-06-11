@@ -8,6 +8,7 @@ use crate::*;
 pub(crate) struct AppState {
     pub(crate) runtime: Arc<Mutex<DeepCodeKernelRuntime>>,
     pub(crate) gui: Arc<Mutex<GuiState>>,
+    pub(crate) terminal_runtime: Arc<Mutex<crate::terminal_api::TerminalRuntime>>,
     pub(crate) kernel_events: Arc<Mutex<Vec<KernelEvent>>>,
 }
 
@@ -36,8 +37,6 @@ pub(crate) struct GuiState {
     pub(crate) pending_plans: HashMap<String, PendingAgentPlan>,
     pub(crate) trace_events: HashMap<String, Vec<Value>>,
     pub(crate) browser: BrowserState,
-    pub(crate) terminals: Vec<Value>,
-    pub(crate) terminal_events: HashMap<String, Vec<Value>>,
 }
 
 #[derive(Debug)]
@@ -72,8 +71,6 @@ impl GuiState {
             pending_plans: HashMap::new(),
             trace_events: HashMap::new(),
             browser: BrowserState::default(),
-            terminals: Vec::new(),
-            terminal_events: HashMap::new(),
         }
     }
 }
@@ -86,6 +83,8 @@ pub(crate) struct PendingAgentPlan {
     pub(crate) plan_id: String,
     pub(crate) user_plan: String,
     pub(crate) action_bundle: Value,
+    #[serde(default)]
+    pub(crate) code_blocks: Vec<Value>,
     pub(crate) expected_validation: String,
     pub(crate) review_guide: String,
     pub(crate) plan_review_report: Option<Value>,

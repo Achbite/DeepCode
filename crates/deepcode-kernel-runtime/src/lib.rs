@@ -13,8 +13,9 @@ use deepcode_kernel_config::{
 };
 use deepcode_kernel_context::{ContextCandidatePayload, ContextRuntime};
 use deepcode_kernel_ledger::{
-    ChangeOperation, ChangeSet, EventLedger, InMemoryEventLedger, LedgerEvent, NdjsonEventLedger,
-    ReviewGate, ReviewGateStatus, ValidationKind, ValidationResult,
+    ChangeOperation, ChangeSet, EventLedger, InMemoryEventLedger, KernelResource,
+    KernelResourceCleanupPolicy, KernelResourceKind, KernelResourceOwner, KernelResourceScope,
+    LedgerEvent, NdjsonEventLedger, ReviewGate, ReviewGateStatus, ValidationKind, ValidationResult,
 };
 use deepcode_kernel_policy::{AutonomyLevel, PolicyDecisionKind, PolicyProfile, WorkspaceBoundary};
 use deepcode_kernel_prompt::LayeredPromptCompiler;

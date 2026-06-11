@@ -435,10 +435,273 @@ pub struct TempArtifactCleanupResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelResourceKind {
+    TerminalSession,
+    TempArtifact,
+    RedirectOutput,
+    CacheFile,
+    ProcessHandle,
+    GitHandle,
+    BrowserHandle,
+    NetworkHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelResourceOwnerKind {
+    UserSession,
+    AgentWorkflow,
+    KernelInternal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelResourceOwner {
+    pub kind: KernelResourceOwnerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+impl KernelResourceOwner {
+    pub fn user_session(session_id: impl Into<String>) -> Self {
+        Self {
+            kind: KernelResourceOwnerKind::UserSession,
+            session_id: Some(session_id.into()),
+            workflow_id: None,
+            run_id: None,
+        }
+    }
+
+    pub fn agent_workflow(
+        session_id: Option<impl Into<String>>,
+        workflow_id: impl Into<String>,
+    ) -> Self {
+        let workflow_id = workflow_id.into();
+        Self {
+            kind: KernelResourceOwnerKind::AgentWorkflow,
+            session_id: session_id.map(Into::into),
+            workflow_id: Some(workflow_id.clone()),
+            run_id: Some(workflow_id),
+        }
+    }
+
+    pub fn kernel_internal(run_id: Option<impl Into<String>>) -> Self {
+        Self {
+            kind: KernelResourceOwnerKind::KernelInternal,
+            session_id: None,
+            workflow_id: None,
+            run_id: run_id.map(Into::into),
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && optional_match(self.session_id.as_deref(), other.session_id.as_deref())
+            && optional_match(self.workflow_id.as_deref(), other.workflow_id.as_deref())
+            && optional_match(self.run_id.as_deref(), other.run_id.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelResourceScope {
+    Workflow,
+    Session,
+    Persistent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelResourceState {
+    Active,
+    Released,
+    Orphaned,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelResourceCleanupPolicy {
+    OnWorkflowEnd,
+    OnSessionEnd,
+    OnRuntimeDrop,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelResource {
+    pub resource_id: String,
+    pub kind: KernelResourceKind,
+    pub owner: KernelResourceOwner,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub scope: KernelResourceScope,
+    pub state: KernelResourceState,
+    pub cleanup_policy: KernelResourceCleanupPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+impl KernelResource {
+    pub fn active(
+        resource_id: impl Into<String>,
+        kind: KernelResourceKind,
+        owner: KernelResourceOwner,
+        scope: KernelResourceScope,
+        cleanup_policy: KernelResourceCleanupPolicy,
+        metadata: Value,
+    ) -> Self {
+        let session_id = owner.session_id.clone();
+        let workflow_id = owner.workflow_id.clone();
+        let run_id = owner.run_id.clone();
+        Self {
+            resource_id: resource_id.into(),
+            kind,
+            owner,
+            session_id,
+            workflow_id,
+            run_id,
+            scope,
+            state: KernelResourceState::Active,
+            cleanup_policy,
+            created_at: None,
+            released_at: None,
+            metadata,
+        }
+    }
+
+    pub fn denied(
+        resource_id: impl Into<String>,
+        kind: KernelResourceKind,
+        owner: KernelResourceOwner,
+        scope: KernelResourceScope,
+        cleanup_policy: KernelResourceCleanupPolicy,
+        metadata: Value,
+    ) -> Self {
+        let mut resource = Self::active(resource_id, kind, owner, scope, cleanup_policy, metadata);
+        resource.state = KernelResourceState::Denied;
+        resource
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelResourceReleaseResult {
+    pub resource_id: String,
+    pub released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct KernelResourceRegistry {
+    resources: Mutex<BTreeMap<String, KernelResource>>,
+}
+
+impl KernelResourceRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, resource: KernelResource) -> KernelResult<KernelResource> {
+        let mut resources = self.resources.lock().expect("resource registry lock");
+        resources.insert(resource.resource_id.clone(), resource.clone());
+        Ok(resource)
+    }
+
+    pub fn deny(&self, resource: KernelResource) -> KernelResult<KernelResource> {
+        let mut denied = resource;
+        denied.state = KernelResourceState::Denied;
+        self.register(denied)
+    }
+
+    pub fn get(&self, resource_id: &str) -> Option<KernelResource> {
+        self.resources
+            .lock()
+            .expect("resource registry lock")
+            .get(resource_id)
+            .cloned()
+    }
+
+    pub fn list(&self) -> Vec<KernelResource> {
+        self.resources
+            .lock()
+            .expect("resource registry lock")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn active_by_owner(&self, owner: &KernelResourceOwner) -> Vec<KernelResource> {
+        self.resources
+            .lock()
+            .expect("resource registry lock")
+            .values()
+            .filter(|resource| {
+                resource.state == KernelResourceState::Active && resource.owner.matches(owner)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn release(&self, resource_id: &str) -> KernelResourceReleaseResult {
+        let mut resources = self.resources.lock().expect("resource registry lock");
+        let Some(resource) = resources.get_mut(resource_id) else {
+            return KernelResourceReleaseResult {
+                resource_id: resource_id.to_string(),
+                released: false,
+                error: Some("resource not found".to_string()),
+            };
+        };
+        if resource.state == KernelResourceState::Released {
+            return KernelResourceReleaseResult {
+                resource_id: resource_id.to_string(),
+                released: true,
+                error: None,
+            };
+        }
+        resource.state = KernelResourceState::Released;
+        resource.released_at = Some("released".to_string());
+        KernelResourceReleaseResult {
+            resource_id: resource_id.to_string(),
+            released: true,
+            error: None,
+        }
+    }
+
+    pub fn release_by_owner(
+        &self,
+        owner: &KernelResourceOwner,
+    ) -> Vec<KernelResourceReleaseResult> {
+        let ids = self
+            .active_by_owner(owner)
+            .into_iter()
+            .map(|resource| resource.resource_id)
+            .collect::<Vec<_>>();
+        ids.into_iter().map(|id| self.release(&id)).collect()
+    }
+}
+
 #[derive(Debug)]
 pub struct TempArtifactRegistry {
     root: PathBuf,
     artifacts: Mutex<BTreeMap<String, TempArtifact>>,
+    resources: KernelResourceRegistry,
 }
 
 impl TempArtifactRegistry {
@@ -446,11 +709,16 @@ impl TempArtifactRegistry {
         Self {
             root: root.into(),
             artifacts: Mutex::new(BTreeMap::new()),
+            resources: KernelResourceRegistry::new(),
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn resource_registry(&self) -> &KernelResourceRegistry {
+        &self.resources
     }
 
     pub fn create_file(
@@ -504,6 +772,18 @@ impl TempArtifactRegistry {
             status: TempArtifactLeaseStatus::default(),
         };
         artifacts.insert(artifact.id.clone(), artifact.clone());
+        self.resources.register(KernelResource::active(
+            artifact.id.clone(),
+            resource_kind_for_temp_artifact(&artifact.kind),
+            KernelResourceOwner::agent_workflow(None::<String>, run_id.to_string()),
+            resource_scope_for_temp_artifact(&artifact.scope),
+            cleanup_policy_for_temp_artifact(&artifact.scope),
+            serde_json::json!({
+                "path": &artifact.path,
+                "leaseId": &artifact.lease_id,
+                "required": artifact.required
+            }),
+        ))?;
         Ok(artifact)
     }
 
@@ -683,6 +963,7 @@ impl TempArtifactRegistry {
             });
         }
         if result.cleaned {
+            let _ = self.resources.release(artifact_id);
             artifacts.remove(artifact_id);
         }
         Ok(result)
@@ -741,6 +1022,38 @@ impl TempArtifactRegistry {
 
 /// 把 TempArtifactScope 映射为单调升级用的整数等级：Run=0 / Session=1 / Persistent=2。
 /// promote_lease 据此约束 new_scope 必须 >= 当前 scope，禁止逆向降级。
+fn optional_match(actual: Option<&str>, expected: Option<&str>) -> bool {
+    expected
+        .map(|expected| Some(expected) == actual)
+        .unwrap_or(true)
+}
+
+fn resource_kind_for_temp_artifact(kind: &TempArtifactKind) -> KernelResourceKind {
+    match kind {
+        TempArtifactKind::CheckOutput | TempArtifactKind::AgentTemp => {
+            KernelResourceKind::TempArtifact
+        }
+        TempArtifactKind::TerminalOutput => KernelResourceKind::RedirectOutput,
+        TempArtifactKind::ManagedReferenceCopy => KernelResourceKind::CacheFile,
+    }
+}
+
+fn resource_scope_for_temp_artifact(scope: &TempArtifactScope) -> KernelResourceScope {
+    match scope {
+        TempArtifactScope::Run => KernelResourceScope::Workflow,
+        TempArtifactScope::Session => KernelResourceScope::Session,
+        TempArtifactScope::Persistent => KernelResourceScope::Persistent,
+    }
+}
+
+fn cleanup_policy_for_temp_artifact(scope: &TempArtifactScope) -> KernelResourceCleanupPolicy {
+    match scope {
+        TempArtifactScope::Run => KernelResourceCleanupPolicy::OnWorkflowEnd,
+        TempArtifactScope::Session => KernelResourceCleanupPolicy::OnSessionEnd,
+        TempArtifactScope::Persistent => KernelResourceCleanupPolicy::Manual,
+    }
+}
+
 fn scope_rank(scope: &TempArtifactScope) -> u8 {
     match scope {
         TempArtifactScope::Run => 0,
@@ -909,6 +1222,82 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!("deepcode-{name}-{nonce}"))
+    }
+
+    #[test]
+    fn kernel_resource_registry_releases_only_matching_agent_owner() {
+        let registry = KernelResourceRegistry::new();
+        let agent_owner =
+            KernelResourceOwner::agent_workflow(Some("session-1".to_string()), "run-1");
+        registry
+            .register(KernelResource::active(
+                "res-agent",
+                KernelResourceKind::TempArtifact,
+                agent_owner.clone(),
+                KernelResourceScope::Workflow,
+                KernelResourceCleanupPolicy::OnWorkflowEnd,
+                serde_json::json!({ "path": "tmp.txt" }),
+            ))
+            .unwrap();
+        registry
+            .register(KernelResource::active(
+                "res-user",
+                KernelResourceKind::TerminalSession,
+                KernelResourceOwner::user_session("session-1"),
+                KernelResourceScope::Session,
+                KernelResourceCleanupPolicy::OnSessionEnd,
+                serde_json::json!({ "terminalId": "term-1" }),
+            ))
+            .unwrap();
+
+        let released = registry.release_by_owner(&agent_owner);
+
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            registry.get("res-agent").unwrap().state,
+            KernelResourceState::Released
+        );
+        assert_eq!(
+            registry.get("res-user").unwrap().state,
+            KernelResourceState::Active
+        );
+    }
+
+    #[test]
+    fn temp_artifact_registers_kernel_resource_and_clean_run_releases_it() {
+        let root = temp_root("resource-registry");
+        let registry = TempArtifactRegistry::new(&root);
+        let artifact = registry
+            .create_file(
+                "run-1",
+                "cache/output.txt",
+                TempArtifactKind::AgentTemp,
+                b"temporary output",
+            )
+            .unwrap();
+
+        let resource = registry
+            .resource_registry()
+            .get(&artifact.id)
+            .expect("kernel resource");
+        assert_eq!(resource.kind, KernelResourceKind::TempArtifact);
+        assert_eq!(resource.owner.kind, KernelResourceOwnerKind::AgentWorkflow);
+        assert_eq!(resource.scope, KernelResourceScope::Workflow);
+        assert_eq!(resource.state, KernelResourceState::Active);
+
+        let cleaned = registry.clean_run("run-1").unwrap();
+
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(
+            registry
+                .resource_registry()
+                .get(&artifact.id)
+                .unwrap()
+                .state,
+            KernelResourceState::Released
+        );
+        assert!(!Path::new(&artifact.path).exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -34,76 +34,82 @@ import {
   type ResourceRequest,
 } from '../index.js';
 
-const VALID_PLAN = `<USER_PLAN>
-Plan: update one file after review.
-</USER_PLAN>
+type MutableJson = Record<string, any>;
 
-<ACTION_BUNDLE format="json" version="1">
-{
-  "version": "1",
-  "id": "plan-1",
-  "goal": "Update a small workspace file.",
-  "requirementId": "req-1",
-  "actions": [
+const VALID_ENVELOPE = JSON.stringify({
+  schemaVersion: 'deepcode.agent.protocol.v2',
+  kind: 'actionBundle',
+  outputLanguage: 'en-US',
+  userPlan: 'Plan: update one file after review.',
+  codeBlocks: [
     {
-      "id": "read-readme",
-      "title": "Read README",
-      "kind": "read",
-      "capability": "workspace.read",
-      "resourceScope": ["README.md"],
-      "canParallelize": true,
-      "conflictKeys": []
+      id: 'CODE_BLOCK_example',
+      path: 'src/example.ts',
+      content: 'export const value = 1;\n',
     },
-    {
-      "id": "write-file",
-      "title": "Write file",
-      "kind": "write",
-      "capability": "workspace.write",
-      "resourceScope": ["src/example.ts"],
-      "canParallelize": false,
-      "conflictKeys": ["src/example.ts"],
-      "sourceBlockId": "CODE_BLOCK_example"
-    }
   ],
-  "validationExpectations": [
-    {
-      "id": "validation-1",
-      "description": "TypeScript typecheck should pass.",
-      "command": "pnpm --filter @deepcode/session-core typecheck"
-    }
-  ],
-  "reviewExpectations": [
-    {
-      "id": "review-1",
-      "description": "User reviews whether the change matches the request."
-    }
-  ],
-  "repairPolicy": {
-    "maxRounds": 2,
-    "allowedFiles": ["src/example.ts"],
-    "forbidNewFilesAfterApproval": true,
-    "forbidNewPermissionsAfterApproval": true
-  }
+  actionBundle: {
+    version: '1',
+    id: 'plan-1',
+    goal: 'Update a small workspace file.',
+    requirementId: 'req-1',
+    actions: [
+      {
+        id: 'read-readme',
+        title: 'Read README',
+        kind: 'read',
+        capability: 'workspace.read',
+        resourceScope: ['README.md'],
+        canParallelize: true,
+        conflictKeys: [],
+      },
+      {
+        id: 'write-file',
+        title: 'Write file',
+        kind: 'write',
+        capability: 'workspace.write',
+        resourceScope: ['src/example.ts'],
+        canParallelize: false,
+        conflictKeys: ['src/example.ts'],
+        sourceBlockId: 'CODE_BLOCK_example',
+      },
+    ],
+    validationExpectations: [
+      {
+        id: 'validation-1',
+        description: 'TypeScript typecheck should pass.',
+        command: 'pnpm --filter @deepcode/session-core typecheck',
+      },
+    ],
+    reviewExpectations: [
+      {
+        id: 'review-1',
+        description: 'User reviews whether the change matches the request.',
+      },
+    ],
+    repairPolicy: {
+      maxRounds: 2,
+      allowedFiles: ['src/example.ts'],
+      forbidNewFilesAfterApproval: true,
+      forbidNewPermissionsAfterApproval: true,
+    },
+  },
+  expectedValidation: 'The typecheck command is expected to exit with zero after execution.',
+  reviewGuide: 'Review the file diff and whether the new value is acceptable.',
+}, null, 2);
+
+function cloneValidEnvelope(): MutableJson {
+  return JSON.parse(VALID_ENVELOPE) as MutableJson;
 }
-</ACTION_BUNDLE>
 
-<CODE_BLOCK id="CODE_BLOCK_example" path="src/example.ts">
-export const value = 1;
-</CODE_BLOCK>
-
-<EXPECTED_VALIDATION>
-The typecheck command is expected to exit with zero after execution.
-</EXPECTED_VALIDATION>
-
-<REVIEW_GUIDE>
-Review the file diff and whether the new value is acceptable.
-</REVIEW_GUIDE>`;
+function actionAt(envelope: MutableJson, index: number): MutableJson {
+  return ((envelope.actionBundle as MutableJson).actions as MutableJson[])[index];
+}
 
 async function main(): Promise<void> {
-  const parsed = parseAgentPlan(VALID_PLAN);
+  const parsed = parseAgentPlan(VALID_ENVELOPE);
   assertEqual(parsed.actionBundle.id, 'plan-1', 'valid plan parses action bundle');
   assertEqual(parsed.codeBlocks.length, 1, 'valid plan parses code block');
-  assert(!parsed.permissionHints, 'valid plan does not produce permission hints by default');
 
   const contract = compileActionBundleToPlanContract(parsed.actionBundle);
   assertEqual(contract.requiredCapabilities.join(','), 'workspace.read,workspace.write', 'contract capabilities are sorted');
@@ -139,60 +145,86 @@ async function main(): Promise<void> {
   assertEqual(approved.approvedScope.capabilities.join(','), 'workspace.read,workspace.write', 'approved scope is frozen');
   assertConversationProjection(parsed, preflighted.kernelPlanReview);
 
-  assertParseFails(
-    VALID_PLAN.replace('format="json"', 'format="yaml"'),
-    'invalid_action_bundle_header',
-    'YAML action bundle is rejected'
+  assertParseFails('<USER_PLAN>legacy plan</USER_PLAN>', 'invalid_json_envelope', 'tagged plan protocol is rejected');
+  assertParseOutputFails(
+    '<ANSWER format="markdown" version="1">legacy answer</ANSWER>',
+    'invalid_json_envelope',
+    'tagged answer protocol is rejected'
   );
+
+  const unknownFieldEnvelope = cloneValidEnvelope();
+  (unknownFieldEnvelope.actionBundle as MutableJson).unknownField = true;
   assertParseFails(
-    VALID_PLAN.replace('"actions": [', '"unknownField": true, "actions": ['),
+    JSON.stringify(unknownFieldEnvelope),
     'unknown_field',
     'unknown action bundle field is rejected'
   );
+
+  const actionParamsEnvelope = cloneValidEnvelope();
+  actionAt(actionParamsEnvelope, 0).params = { path: 'README.md' };
   assertParseFails(
-    VALID_PLAN.replace('"kind": "read",', '"kind": "read",\n      "params": { "path": "README.md" },'),
+    JSON.stringify(actionParamsEnvelope),
     'unknown_field',
     'unknown action params field is rejected'
   );
+
+  const missingCodeBlockEnvelope = cloneValidEnvelope();
+  actionAt(missingCodeBlockEnvelope, 1).sourceBlockId = 'missing';
   assertParseFails(
-    VALID_PLAN.replace('<REVIEW_GUIDE>', '<UNKNOWN_TAG>'),
-    'unknown_tag',
-    'unknown tags are rejected'
-  );
-  assertParseFails(
-    VALID_PLAN.replace('"sourceBlockId": "CODE_BLOCK_example"', '"sourceBlockId": "missing"'),
+    JSON.stringify(missingCodeBlockEnvelope),
     'missing_code_block_ref',
     'missing code block reference is rejected'
   );
+
+  const duplicateCodeBlockEnvelope = cloneValidEnvelope();
+  duplicateCodeBlockEnvelope.codeBlocks = [
+    ...(duplicateCodeBlockEnvelope.codeBlocks as MutableJson[]),
+    { id: 'CODE_BLOCK_example', path: 'src/duplicate.ts', content: 'duplicate' },
+  ];
   assertParseFails(
-    `${VALID_PLAN}\n<CODE_BLOCK id="CODE_BLOCK_example" path="src/other.ts">duplicate</CODE_BLOCK>`,
+    JSON.stringify(duplicateCodeBlockEnvelope),
     'duplicate_code_block',
     'duplicate code block ids are rejected'
   );
+
+  const orphanCodeBlockEnvelope = cloneValidEnvelope();
+  orphanCodeBlockEnvelope.codeBlocks = [
+    ...(orphanCodeBlockEnvelope.codeBlocks as MutableJson[]),
+    { id: 'CODE_BLOCK_orphan', path: 'src/orphan.ts', content: 'orphan' },
+  ];
   assertParseFails(
-    `${VALID_PLAN}\n<CODE_BLOCK id="CODE_BLOCK_orphan" path="src/orphan.ts">orphan</CODE_BLOCK>`,
+    JSON.stringify(orphanCodeBlockEnvelope),
     'orphan_code_block',
     'orphan code blocks are rejected'
   );
+
+  const unsafePathEnvelope = cloneValidEnvelope();
+  actionAt(unsafePathEnvelope, 1).resourceScope = ['../src/example.ts'];
   assertParseFails(
-    VALID_PLAN.replace('"resourceScope": ["src/example.ts"]', '"resourceScope": ["../src/example.ts"]'),
+    JSON.stringify(unsafePathEnvelope),
     'unsafe_workspace_path',
     'unsafe workspace paths are rejected'
   );
+
+  const executorCapabilityEnvelope = cloneValidEnvelope();
+  actionAt(executorCapabilityEnvelope, 1).capability = 'fs.write';
   assertParseFails(
-    `${VALID_PLAN}\n<RESOURCE_REQUEST format="json" version="1">{"version":"1","id":"rr-1","reason":"need context","items":[]}</RESOURCE_REQUEST>`,
-    'resource_request_with_action_bundle',
-    'resource request and action bundle cannot appear in the same turn'
+    JSON.stringify(executorCapabilityEnvelope),
+    'invalid_capability_namespace',
+    'executor tool names are rejected in v2 capability fields'
   );
 
-  const withHints = parseAgentPlan(
-    `${VALID_PLAN}\n<PERMISSION_HINTS>\nModel thinks write access may be needed.\n</PERMISSION_HINTS>`
-  );
-  assertEqual(withHints.permissionHints?.content.includes('write access'), true, 'permission hints remain advisory');
-  assertEqual(
-    compileActionBundleToPlanContract(withHints.actionBundle).requiredCapabilities.includes('Model thinks write access may be needed.'),
-    false,
-    'permission hints do not enter required capabilities'
+  const mixedBranchEnvelope = {
+    schemaVersion: 'deepcode.agent.protocol.v2',
+    kind: 'resourceRequest',
+    outputLanguage: 'en-US',
+    resourceRequest: { version: '1', id: 'rr-1', reason: 'need context', items: [] },
+    actionBundle: (cloneValidEnvelope().actionBundle as MutableJson),
+  };
+  assertParseOutputFails(
+    JSON.stringify(mixedBranchEnvelope),
+    'branch_payload_conflict',
+    'resource request and action bundle cannot appear in the same turn'
   );
 
   assertNoExecutionFacts(parsed);
@@ -205,9 +237,15 @@ async function main(): Promise<void> {
 }
 
 function assertAnswerProtocol(): void {
-  const answer = parseAgentPlanOutput(`<ANSWER format="markdown" version="1">
-我是 DeepCode 的本地 Agent，会在 Kernel 权限边界内辅助代码工作。
-</ANSWER>`);
+  const answer = parseAgentPlanOutput(JSON.stringify({
+    schemaVersion: 'deepcode.agent.protocol.v2',
+    kind: 'answer',
+    outputLanguage: 'zh-CN',
+    answer: {
+      format: 'markdown',
+      content: '我是 DeepCode 的本地 Agent，会在 Kernel 权限边界内辅助代码工作。',
+    },
+  }));
   assertEqual(answer.kind, 'answer', 'ANSWER-only output is accepted');
   if (answer.kind !== 'answer') {
     throw new Error('expected answer output');
@@ -216,16 +254,32 @@ function assertAnswerProtocol(): void {
   assert(answer.answer.content.includes('DeepCode'), 'ANSWER content is preserved');
 
   assertParseOutputFails(
-    `<ANSWER format="markdown" version="1">ok</ANSWER>\n${VALID_PLAN}`,
-    'answer_with_plan',
-    'ANSWER cannot be mixed with plan tags'
+    JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v2',
+      kind: 'answer',
+      outputLanguage: 'en-US',
+      answer: { format: 'markdown', content: 'ok' },
+      actionBundle: {},
+    }),
+    'branch_payload_conflict',
+    'ANSWER cannot be mixed with plan branch payload'
   );
   assertParseOutputFails(
-    '<ANSWER format="text" version="1">ok</ANSWER>',
-    'invalid_answer_header',
-    'ANSWER header must be markdown v1'
+    JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v2',
+      kind: 'answer',
+      outputLanguage: 'en-US',
+      answer: { format: 'text', content: 'ok' },
+    }),
+    'invalid_answer_format',
+    'ANSWER format must be markdown'
   );
-  assertThrows(() => parseAgentPlan('<ANSWER format="markdown" version="1">ok</ANSWER>'), 'ANSWER cannot be treated as an executable plan');
+  assertThrows(() => parseAgentPlan(JSON.stringify({
+    schemaVersion: 'deepcode.agent.protocol.v2',
+    kind: 'answer',
+    outputLanguage: 'en-US',
+    answer: { format: 'markdown', content: 'ok' },
+  })), 'ANSWER cannot be treated as an executable plan');
 }
 
 function assertConversationProjection(
@@ -559,16 +613,19 @@ function assertResourceRequestLoop(): void {
     'resource packet summarizes strongest read policy outcome'
   );
 
-  const output = parseAgentPlanOutput(`<RESOURCE_REQUEST format="json" version="1">
-{
-  "version": "1",
-  "id": "resource-request-2",
-  "reason": "Need README before planning.",
-  "items": [
-    { "id": "item-1", "manifestEntryId": "file-readme", "reason": "Project overview." }
-  ]
-}
-</RESOURCE_REQUEST>`);
+  const output = parseAgentPlanOutput(JSON.stringify({
+    schemaVersion: 'deepcode.agent.protocol.v2',
+    kind: 'resourceRequest',
+    outputLanguage: 'en-US',
+    resourceRequest: {
+      version: '1',
+      id: 'resource-request-2',
+      reason: 'Need README before planning.',
+      items: [
+        { id: 'item-1', manifestEntryId: 'file-readme', reason: 'Project overview.' },
+      ],
+    },
+  }));
   assertEqual(output.kind, 'resourceRequest', 'resource request only output is accepted as plan dialogue');
 }
 
@@ -623,10 +680,10 @@ function assertPromptEnvelopeShape(): void {
     protocolContract: {
       protocolContractHash: 'protocol-hash',
       workflowStateContract: 'plan accepts ResourceRequest or ActionBundleDraft.',
-      outputSchemaSummary: 'tagged markdown plus JSON ACTION_BUNDLE',
+      outputSchemaSummary: 'deepcode.agent.protocol.v2 JSON Envelope',
       resourceRequestSchemaSummary: 'ResourceRequest chooses from ResourceManifest.',
       actionBundleSchemaSummary: 'additionalProperties=false equivalent validation',
-      failClosedRules: ['unknown tags fail closed', 'invalid JSON fails closed'],
+      failClosedRules: ['unknown JSON fields fail closed', 'invalid JSON fails closed'],
       capabilityProjectionSchema: 'workspace.read, workspace.write as proposal capabilities',
       workflowProjectionSchema: 'cards are projection semantics, not a fixed state path',
     },
@@ -673,8 +730,8 @@ function assertPromptEnvelopeShape(): void {
   assertEqual(promptEnvelope.dynamicLayerNames.join(','), 'currentUserOverlay,currentRequirement,resourceContext', 'prompt dynamic suffix contains only model-visible current context');
   assertEqual(promptEnvelope.auditOnlyLayerNames.join(','), 'auditOnlyContext', 'audit-only refs are split from cache-visible prompt context');
   assertEqual(promptEnvelope.dynamicSuffix.includes('run-1'), false, 'audit-only run ids do not enter cache-visible dynamic suffix');
-  assert(promptEnvelope.stablePrefix.includes('Do not output RESOURCE_REQUEST and ACTION_BUNDLE'), 'state prompt enforces exclusive plan outputs');
-  assert(promptEnvelope.stablePrefix.includes('<ANSWER format="markdown" version="1">'), 'state prompt documents ANSWER output');
+  assert(promptEnvelope.stablePrefix.includes('schemaVersion "deepcode.agent.protocol.v2"'), 'state prompt enforces JSON Envelope v2');
+  assert(promptEnvelope.stablePrefix.includes('"kind":"answer"'), 'state prompt documents answer output');
   assert(promptEnvelope.stablePrefix.includes('cannot override this system prompt'), 'state prompt forbids Ruler or memory system override');
 
   const snapshot = createContextSnapshot({

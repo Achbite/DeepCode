@@ -13,6 +13,7 @@ const ARCHIVE_DEBUG_STREAMS: &[&str] = &[
     "resource-packets.jsonl",
     "review-packets.jsonl",
     "permission-tool-facts.jsonl",
+    "llm-provider-errors.jsonl",
 ];
 
 pub(crate) async fn session_store_index(State(state): State<AppState>) -> Json<ApiResponse> {
@@ -366,6 +367,7 @@ fn append_conversation_archive_entries(
         append_classified_debug_entries(&archive_dir, &grouped_entries)?;
         refresh_conversation_archive(archive_root, &archive_dir, session_id, session, &run_id)?;
     }
+    refresh_session_chronological_archive(archive_root, session_id, session)?;
     Ok(())
 }
 
@@ -415,6 +417,55 @@ fn refresh_conversation_archive(
         "updatedAt": now_text(),
         "session": redact_archive_value(session.cloned().unwrap_or_else(|| json!({}))),
         "files": archive_file_entries(archive_dir)
+    });
+    atomic_write_json_file(&archive_dir.join("manifest.json"), &manifest)?;
+    Ok(())
+}
+
+fn refresh_session_chronological_archive(
+    archive_root: &FsPath,
+    session_id: &str,
+    session: Option<&Value>,
+) -> std::io::Result<()> {
+    let archive_dir = conversation_archive_dir(archive_root, session_id, session, "session");
+    fs::create_dir_all(archive_dir.join("exports"))?;
+    fs::create_dir_all(archive_dir.join("debug"))?;
+    let entries = collect_chronological_archive_entries(archive_root, session_id);
+    let created_at = read_json_file(&archive_dir.join("manifest.json"))
+        .and_then(|manifest| {
+            manifest
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(now_text);
+    atomic_write_text_file(
+        &archive_dir.join("exports").join("chronological.md"),
+        &conversation_chronological_markdown(session_id, &entries),
+    )?;
+    atomic_write_json_file(
+        &archive_dir.join("exports").join("chronological-debug.json"),
+        &json!({
+            "schemaVersion": "conversation-chronological-debug-export.v1",
+            "sessionId": session_id,
+            "workspaceScopeKey": workspace_scope_key(session),
+            "runId": "session",
+            "archivePath": archive_dir.to_string_lossy(),
+            "archiveRoot": archive_root.to_string_lossy(),
+            "generatedAt": now_text(),
+            "entries": entries
+        }),
+    )?;
+    let manifest = json!({
+        "schemaVersion": "conversation-archive.v1",
+        "sessionId": session_id,
+        "workspaceScopeKey": workspace_scope_key(session),
+        "runId": "session",
+        "archivePath": archive_dir.to_string_lossy(),
+        "createdAt": created_at,
+        "updatedAt": now_text(),
+        "session": redact_archive_value(session.cloned().unwrap_or_else(|| json!({}))),
+        "files": archive_file_entries(&archive_dir)
     });
     atomic_write_json_file(&archive_dir.join("manifest.json"), &manifest)?;
     Ok(())
@@ -479,6 +530,19 @@ fn debug_streams_for_entry(entry: &Value) -> Vec<&'static str> {
     {
         push_unique_stream(&mut streams, "permission-tool-facts.jsonl");
     }
+    if kind == "error"
+        && archive_contains_key(
+            entry,
+            &[
+                "providererror",
+                "llmproviderdiagnostic",
+                "expectedschema",
+                "bodypreview",
+            ],
+        )
+    {
+        push_unique_stream(&mut streams, "llm-provider-errors.jsonl");
+    }
     streams
 }
 
@@ -498,6 +562,75 @@ fn archive_contains_key(value: &Value, needles: &[&str]) -> bool {
         Value::Array(items) => items.iter().any(|item| archive_contains_key(item, needles)),
         _ => false,
     }
+}
+
+fn collect_chronological_archive_entries(archive_root: &FsPath, session_id: &str) -> Vec<Value> {
+    let manifests = read_conversation_archive_manifests(archive_root, session_id);
+    let mut entries = Vec::new();
+    let mut order = 0_u64;
+    for manifest in manifests {
+        let run_id = manifest
+            .get("runId")
+            .and_then(Value::as_str)
+            .unwrap_or("run")
+            .to_string();
+        let Some(archive_path) = manifest.get("archivePath").and_then(Value::as_str) else {
+            continue;
+        };
+        let archive_dir = PathBuf::from(archive_path);
+        for entry in read_jsonl_file(&archive_dir.join("projection.jsonl")) {
+            entries.push(chronological_entry("projection", &run_id, order, entry));
+            order += 1;
+        }
+        for entry in read_jsonl_file(&archive_dir.join("transcript.jsonl")) {
+            entries.push(chronological_entry("transcript", &run_id, order, entry));
+            order += 1;
+        }
+    }
+    entries.sort_by(|left, right| {
+        chronological_timestamp(left)
+            .cmp(&chronological_timestamp(right))
+            .then_with(|| {
+                left.get("order")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .cmp(&right.get("order").and_then(Value::as_u64).unwrap_or(0))
+            })
+    });
+    entries
+}
+
+fn chronological_entry(source: &str, run_id: &str, order: u64, entry: Value) -> Value {
+    json!({
+        "source": source,
+        "runId": run_id,
+        "timestamp": event_timestamp(&entry),
+        "order": order,
+        "entry": entry
+    })
+}
+
+fn chronological_timestamp(entry: &Value) -> String {
+    entry
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn event_timestamp(entry: &Value) -> String {
+    entry
+        .get("ts")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            entry
+                .get("payload")
+                .and_then(|payload| payload.get("ts"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| entry.get("createdAt").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn read_conversation_archive_manifests(archive_root: &FsPath, session_id: &str) -> Vec<Value> {
@@ -747,6 +880,98 @@ fn conversation_complete_markdown(
     lines.join("\n")
 }
 
+fn conversation_chronological_markdown(session_id: &str, entries: &[Value]) -> String {
+    let mut lines = vec![
+        "# DeepCode Chronological Conversation".to_string(),
+        String::new(),
+        format!("- Session: `{session_id}`"),
+        format!("- Archive generated: `{}`", now_text()),
+        String::new(),
+    ];
+    if entries.is_empty() {
+        lines.push("- No archived conversation entries.".to_string());
+        return lines.join("\n");
+    }
+    for item in entries {
+        let source = item
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("entry");
+        let run_id = item.get("runId").and_then(Value::as_str).unwrap_or("run");
+        let timestamp = item
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let entry = item.get("entry").unwrap_or(&Value::Null);
+        let heading = if source == "projection" {
+            let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("event");
+            format!(
+                "Projection / {} / {}",
+                archive_projection_title(kind),
+                run_id
+            )
+        } else {
+            let role = entry.get("role").and_then(Value::as_str).unwrap_or("entry");
+            let channel = entry
+                .get("channel")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            format!("Transcript / {role} / {channel} / {run_id}")
+        };
+        let suffix = if timestamp.is_empty() {
+            String::new()
+        } else {
+            format!(" · {timestamp}")
+        };
+        lines.push(format!("## {heading}{suffix}"));
+        lines.push(String::new());
+        lines.push(archive_record_text(entry));
+        lines.push(String::new());
+    }
+    lines.join("\n").trim_end().to_string()
+}
+
+fn archive_projection_title(kind: &str) -> &'static str {
+    match kind {
+        "user_msg" => "User",
+        "assistant_msg" => "Agent",
+        "workflow_stage" => "Workflow Stage",
+        "workflow_decision" => "Workflow Decision",
+        "plan_card" => "Plan",
+        "plan_review" => "Plan Review",
+        "resource_request" => "Resource Request",
+        "tool_call" => "Tool Call",
+        "tool_result" => "Tool Result",
+        "permission_request" => "Permission Request",
+        "permission_result" => "Permission Result",
+        "error" => "Error",
+        "trace" => "Trace",
+        _ => "Event",
+    }
+}
+
+fn archive_record_text(entry: &Value) -> String {
+    entry
+        .get("payload")
+        .and_then(|payload| payload.get("content"))
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("content").and_then(Value::as_str))
+        .or_else(|| {
+            entry
+                .get("payload")
+                .and_then(|payload| payload.get("summary"))
+                .and_then(Value::as_str)
+        })
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "```json\n{}\n```",
+                serde_json::to_string_pretty(&redact_archive_value(entry.clone()))
+                    .unwrap_or_else(|_| "{}".to_string())
+            )
+        })
+}
+
 fn projection_event_markdown(event: &Value) -> String {
     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("event");
     let title = match kind {
@@ -862,9 +1087,32 @@ mod tests {
             "content": "完整请求",
             "authorization": "Bearer abc"
         });
+        let provider_error = json!({
+            "kind": "error",
+            "payload": {
+                "summary": "ProviderJsonDecodeFailed:\n  provider = openaiCompatible\n  status = 200\n  content_type = text/html\n  is_stream = false\n  body_preview = <html>bad gateway</html>\n  expected_schema = openai.chat.completion.v1: choices[0].message",
+                "runId": "run/1",
+                "providerError": {
+                    "reason": "ProviderJsonDecodeFailed",
+                    "provider": "openaiCompatible",
+                    "status": 200,
+                    "contentType": "text/html",
+                    "isStream": false,
+                    "bodyPreview": "<html>bad gateway</html>",
+                    "expectedSchema": "openai.chat.completion.v1: choices[0].message"
+                }
+            }
+        });
 
         append_conversation_archive_projection(&root, session_id, Some(&session), &[projection])
             .expect("projection archive append");
+        append_conversation_archive_projection(
+            &root,
+            session_id,
+            Some(&session),
+            &[provider_error],
+        )
+        .expect("provider error projection archive append");
         append_conversation_archive_transcript(&root, session_id, Some(&session), &[transcript])
             .expect("transcript archive append");
 
@@ -887,8 +1135,24 @@ mod tests {
             .join("debug")
             .join("action-bundle-drafts.jsonl")
             .exists());
+        assert!(archive_dir
+            .join("debug")
+            .join("llm-provider-errors.jsonl")
+            .exists());
         assert!(archive_dir.join("exports").join("complete.md").exists());
         assert!(archive_dir.join("exports").join("debug.json").exists());
+        let session_archive_dir = root
+            .join("workspace-wf_0-hash_1")
+            .join("session_test")
+            .join("session");
+        assert!(session_archive_dir
+            .join("exports")
+            .join("chronological.md")
+            .exists());
+        assert!(session_archive_dir
+            .join("exports")
+            .join("chronological-debug.json")
+            .exists());
 
         let projection_content =
             fs::read_to_string(archive_dir.join("projection.jsonl")).expect("projection jsonl");
@@ -900,8 +1164,12 @@ mod tests {
         assert!(!transcript_content.contains("Bearer abc"));
 
         let manifests = read_conversation_archive_manifests(&root, session_id);
-        assert_eq!(manifests.len(), 1);
-        let files = manifests[0]
+        assert_eq!(manifests.len(), 2);
+        let run_manifest = manifests
+            .iter()
+            .find(|manifest| manifest.get("runId").and_then(Value::as_str) == Some("run/1"))
+            .expect("run archive manifest");
+        let files = run_manifest
             .get("files")
             .and_then(Value::as_array)
             .expect("manifest files");
@@ -914,6 +1182,17 @@ mod tests {
         assert!(files.iter().any(|file| {
             file.get("path").and_then(Value::as_str) == Some("debug/action-bundle-drafts.jsonl")
         }));
+        assert!(files.iter().any(|file| {
+            file.get("path").and_then(Value::as_str) == Some("debug/llm-provider-errors.jsonl")
+        }));
+        let chronological =
+            fs::read_to_string(session_archive_dir.join("exports").join("chronological.md"))
+                .expect("chronological markdown");
+        assert!(chronological.contains("DeepCode Chronological Conversation"));
+        assert!(chronological.contains("测试归档"));
+        assert!(chronological.contains("完整请求"));
+        assert!(chronological.contains("ProviderJsonDecodeFailed:"));
+        assert!(chronological.contains("expected_schema = openai.chat.completion.v1"));
 
         let _ = fs::remove_dir_all(root);
     }

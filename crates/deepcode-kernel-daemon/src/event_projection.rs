@@ -119,9 +119,34 @@ pub(crate) fn kernel_events_to_agent_events(
 pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent) -> Vec<Value> {
     match event {
         KernelEvent::MessageAppended {
-            channel, content, ..
+            channel,
+            content,
+            role,
+            message_key,
+            ..
         } => match channel.as_deref() {
             Some("plan") | Some("complete") | Some("review") => Vec::new(),
+            Some("policy")
+                if matches!(role, deepcode_kernel_abi::MessageRole::System)
+                    && content.is_none()
+                    && message_key.as_deref() == Some("permission.temporaryGrant.created") =>
+            {
+                vec![agent_event(
+                    session_id,
+                    "workflow_stage",
+                    json!({
+                        "stage": "permission",
+                        "phase": "permission",
+                        "status": "completed",
+                        "summary": "Temporary permission grant recorded.",
+                        "channel": "task",
+                        "visibility": "task",
+                        "presentation": "stageSummary",
+                        "kernelEvent": event
+                    }),
+                    &now_text(),
+                )]
+            }
             Some("reasoning") => vec![agent_event(
                 session_id,
                 "assistant_msg",
@@ -166,6 +191,32 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                 "profileId": profile_ref.as_ref().map(|value| value.id.clone()),
                 "channel": "task",
                 "visibility": "task",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::LlmProviderError {
+            run_id,
+            phase,
+            llm_call_id,
+            diagnostic,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "error",
+            json!({
+                "message": diagnostic.to_string(),
+                "summary": diagnostic.archive_text(),
+                "code": "llm_provider_error",
+                "providerError": diagnostic,
+                "runId": run_id.0,
+                "phase": phase,
+                "llmCallId": llm_call_id,
+                "profileId": diagnostic.profile_id.clone(),
+                "model": diagnostic.model.clone(),
+                "channel": "error",
+                "visibility": "conversation",
+                "presentation": "body",
                 "kernelEvent": event
             }),
             &now_text(),

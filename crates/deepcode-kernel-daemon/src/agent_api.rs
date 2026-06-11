@@ -504,12 +504,17 @@ pub(crate) async fn agent_plan_resolve(
         let mut events = Vec::new();
         let mut grant_failed = false;
         if decision == "accept" {
-            let grants = {
+            let (grants, approved_tools) = {
                 let gui = state.gui.lock().expect("gui state lock");
-                gui.pending_plans
-                    .get(&plan_id)
-                    .map(temporary_grants_for_pending_plan)
-                    .unwrap_or_default()
+                gui.pending_plans.get(&plan_id).map_or_else(
+                    || (Vec::new(), Vec::new()),
+                    |plan| {
+                        (
+                            temporary_grants_for_pending_plan(plan),
+                            approved_tool_calls_for_pending_plan(plan),
+                        )
+                    },
+                )
             };
             for grant in grants {
                 match runtime.dispatch(KernelCommand::PermissionGrantTemporary {
@@ -530,6 +535,19 @@ pub(crate) async fn agent_plan_resolve(
                         grant_failed = true;
                         break;
                     }
+                }
+            }
+            if !grant_failed {
+                if let Err(error) = runtime.enqueue_approved_tool_calls(&run_id, approved_tools) {
+                    events.push(KernelEvent::Error {
+                        request_id: Some(rid("agent-plan-approved-tools")),
+                        run_id: Some(deepcode_kernel_abi::RunId(run_id.clone())),
+                        session_id: None,
+                        error: KernelErrorEnvelope::from(&error),
+                        message_key: None,
+                        args: None,
+                    });
+                    grant_failed = true;
                 }
             }
         }
@@ -597,6 +615,86 @@ pub(crate) async fn agent_plan_resolve(
     }
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)
+}
+
+fn approved_tool_calls_for_pending_plan(plan: &PendingAgentPlan) -> Vec<(String, String, Value)> {
+    let code_blocks = plan
+        .code_blocks
+        .iter()
+        .filter_map(|block| {
+            let id = block.get("id")?.as_str()?.to_string();
+            Some((id, block.clone()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let actions = plan
+        .action_bundle
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    actions
+        .iter()
+        .filter_map(|action| approved_tool_call_for_action(plan, action, &code_blocks))
+        .collect()
+}
+
+fn approved_tool_call_for_action(
+    plan: &PendingAgentPlan,
+    action: &Value,
+    code_blocks: &std::collections::BTreeMap<String, Value>,
+) -> Option<(String, String, Value)> {
+    let action_id = action.get("id")?.as_str()?.trim();
+    let capability = action.get("capability")?.as_str()?.trim();
+    let kind = action
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let resource_scope = action
+        .get("resourceScope")
+        .and_then(Value::as_array)
+        .and_then(|items| items.iter().find_map(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let tool_call_id = format!(
+        "approved-{}-{}",
+        safe_path_segment(&plan.plan_id),
+        safe_path_segment(action_id)
+    );
+    match capability {
+        "workspace.write" if kind == "write" => {
+            let source_block_id = action.get("sourceBlockId")?.as_str()?.trim();
+            let block = code_blocks.get(source_block_id)?;
+            let path = block.get("path")?.as_str()?.trim();
+            let content = block.get("content")?.as_str()?;
+            Some((
+                tool_call_id,
+                "fs.write".to_string(),
+                json!({
+                    "path": path,
+                    "content": content
+                }),
+            ))
+        }
+        "workspace.delete" => Some((
+            tool_call_id,
+            "fs.delete".to_string(),
+            json!({
+                "path": resource_scope,
+                "reason": format!("Approved plan {} action {}", plan.plan_id, action_id)
+            }),
+        )),
+        "workspace.read" if resource_scope == "." || kind == "list" => Some((
+            tool_call_id,
+            "fs.list".to_string(),
+            json!({ "path": resource_scope }),
+        )),
+        "workspace.read" => Some((
+            tool_call_id,
+            "fs.read".to_string(),
+            json!({ "path": resource_scope }),
+        )),
+        _ => None,
+    }
 }
 
 fn temporary_grants_for_pending_plan(

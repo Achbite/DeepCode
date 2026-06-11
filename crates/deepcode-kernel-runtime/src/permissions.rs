@@ -176,7 +176,9 @@ impl DeepCodeKernelRuntime {
             .pending_tools
             .remove(&permission_id)
             .ok_or_else(|| {
-                KernelError::InvalidCommand(format!("unknown permission {permission_id}"))
+                KernelError::PendingPermissionUnavailable(format!(
+                    "permission {permission_id} has no live pending tool arguments; the request may have expired or the Kernel process may have restarted"
+                ))
             })?;
         let session_id = pending.session_id.clone();
         let run_id = pending.run_id.clone();

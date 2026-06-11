@@ -5,7 +5,7 @@
  *
  * 设计要点：
  *   1. WorkspaceSpec 是当前活动工作区的事实源，包含 source、folders[]、settings 与不支持字段；
- *   2. 兼容 VSCode 风格的 .code-workspace 文件（仅 folders + settings 子集）；
+ *   2. 兼容 VS Code-style .code-workspace 文件（仅 folders + settings 子集）；
  *   3. 路径安全：每个 WorkspaceFolder 解析后得到独立 rootId，所有文件读写必须绑定到某个 folderId；
  *   4. 不含历史兼容字段，命名直接采用最新方案。
  */
@@ -13,7 +13,7 @@
 /**
  * 工作区来源类型。
  *   - directory       ：用户打开的是单个目录
- *   - code-workspace  ：用户打开的是 VSCode 兼容 .code-workspace 文件
+ *   - code-workspace  ：用户打开的是 VS Code-style .code-workspace 文件
  *   - fallback        ：无任何用户选择时使用的默认工作区（仓库内 ./workspace）
  */
 export type WorkspaceSourceKind = 'directory' | 'code-workspace' | 'fallback';
@@ -132,7 +132,7 @@ export interface SaveWorkspaceFileResult {
 export interface PatchWorkspaceSettingsRequest {
   /**
    * 仅允许 DeepCode 命名空间下的键（前缀 'deepcode.'）；
-   * 后端会拒绝其他键，避免误写入 VSCode 通用配置。
+   * 后端会拒绝其他键，避免误写入通用 VS Code 配置。
    */
   settings: Record<string, unknown>;
 }

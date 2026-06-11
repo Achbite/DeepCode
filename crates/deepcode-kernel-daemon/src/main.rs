@@ -54,6 +54,7 @@ async fn main() {
     let state = AppState {
         runtime: Arc::new(Mutex::new(runtime)),
         gui: Arc::new(Mutex::new(GuiState::new())),
+        terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
         kernel_events: Arc::new(Mutex::new(Vec::new())),
     };
     if std::env::var("DEEPCODE_DAEMON_IPC_STDIO")

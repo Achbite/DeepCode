@@ -4,7 +4,6 @@ import {
   type AnswerDraft,
   type AgentPlanOutput,
   type AgentPlanParts,
-  type AgentPlanTag,
   type CodeBlockDraft,
   type PlannedActionDraft,
   type RepairPolicyDraft,
@@ -13,18 +12,6 @@ import {
   type ReviewExpectationDraft,
   type ValidationExpectationDraft,
 } from './types.js';
-
-const SINGLETON_TAGS = new Set<AgentPlanTag>([
-  'ANSWER',
-  'USER_PLAN',
-  'RESOURCE_REQUEST',
-  'ACTION_BUNDLE',
-  'EXPECTED_VALIDATION',
-  'REVIEW_GUIDE',
-  'PERMISSION_HINTS',
-]);
-
-const KNOWN_TAGS = new Set<AgentPlanTag>([...SINGLETON_TAGS, 'CODE_BLOCK']);
 
 const BUNDLE_KEYS = new Set([
   'version',
@@ -57,14 +44,34 @@ const REPAIR_KEYS = new Set([
   'forbidNewFilesAfterApproval',
   'forbidNewPermissionsAfterApproval',
 ]);
-
-interface ParsedBlock {
-  tag: AgentPlanTag;
-  attrs: Record<string, string>;
-  content: string;
-  start: number;
-  end: number;
-}
+const AGENT_PROTOCOL_SCHEMA_VERSION = 'deepcode.agent.protocol.v2';
+const ENVELOPE_KEYS = new Set([
+  'schemaVersion',
+  'kind',
+  'outputLanguage',
+  'answer',
+  'resourceRequest',
+  'userPlan',
+  'actionBundle',
+  'codeBlocks',
+  'expectedValidation',
+  'reviewGuide',
+]);
+const ANSWER_KEYS = new Set(['format', 'content']);
+const CODE_BLOCK_KEYS = new Set(['id', 'path', 'language', 'content']);
+const PLAN_CAPABILITIES = new Set([
+  'workspace.read',
+  'workspace.search',
+  'workspace.preview_diff',
+  'workspace.write',
+  'workspace.delete',
+  'process.propose',
+  'process.exec',
+  'network.egress',
+  'git.read',
+  'git.write',
+  'browser.control',
+]);
 
 export function parseAgentPlan(input: string): AgentPlanParts {
   const output = parseAgentPlanOutput(input);
@@ -78,198 +85,146 @@ export function parseAgentPlan(input: string): AgentPlanParts {
 }
 
 export function parseAgentPlanOutput(input: string): AgentPlanOutput {
-  const blocks = extractBlocks(input);
-  const singleton = new Map<AgentPlanTag, ParsedBlock>();
-  const codeBlocks: CodeBlockDraft[] = [];
-  const codeBlockIds = new Set<string>();
-
-  for (const block of blocks) {
-    rejectNestedTags(block);
-    if (block.tag === 'CODE_BLOCK') {
-      const codeBlock = codeBlockFromBlock(block);
-      if (codeBlockIds.has(codeBlock.id)) {
-        throw new AgentPlanParseError('duplicate_code_block', `duplicate CODE_BLOCK id ${codeBlock.id}`);
-      }
-      codeBlockIds.add(codeBlock.id);
-      codeBlocks.push(codeBlock);
-      continue;
-    }
-    if (singleton.has(block.tag)) {
-      throw new AgentPlanParseError('duplicate_tag', `duplicate ${block.tag} block`);
-    }
-    singleton.set(block.tag, block);
+  if (!input.trim().startsWith('{')) {
+    throw new AgentPlanParseError('invalid_json_envelope', 'agent plan output must be one JSON Envelope v2 object');
   }
+  return parseJsonEnvelopeOutput(input);
+}
 
-  const answerBlock = singleton.get('ANSWER');
-  const resourceRequestBlock = singleton.get('RESOURCE_REQUEST');
-  const actionBundleBlock = singleton.get('ACTION_BUNDLE');
-  if (answerBlock) {
-    if (singleton.size > 1 || codeBlocks.length > 0) {
-      throw new AgentPlanParseError('answer_with_plan', 'ANSWER cannot appear with plan, resource, permission, or code blocks');
-    }
+function parseJsonEnvelopeOutput(input: string): AgentPlanOutput {
+  const envelope = parseJsonObject(input, 'JSON Envelope v2');
+  rejectUnknownKeys(envelope, ENVELOPE_KEYS, 'JSON Envelope v2');
+  const schemaVersion = requireString(envelope, 'schemaVersion', 'JSON Envelope v2');
+  if (schemaVersion !== AGENT_PROTOCOL_SCHEMA_VERSION) {
+    throw new AgentPlanParseError(
+      'unsupported_protocol_schema',
+      `JSON Envelope v2.schemaVersion must be ${AGENT_PROTOCOL_SCHEMA_VERSION}`
+    );
+  }
+  requireString(envelope, 'outputLanguage', 'JSON Envelope v2');
+  const kind = requireString(envelope, 'kind', 'JSON Envelope v2');
+  if (kind === 'answer') {
+    rejectBranchPayloads(envelope, 'answer', [
+      'resourceRequest',
+      'userPlan',
+      'actionBundle',
+      'codeBlocks',
+      'expectedValidation',
+      'reviewGuide',
+    ]);
     return {
       kind: 'answer',
-      answer: parseAnswer(answerBlock),
+      answer: answerFromEnvelope(envelope.answer),
     };
   }
-  if (resourceRequestBlock && actionBundleBlock) {
-    throw new AgentPlanParseError('resource_request_with_action_bundle', 'RESOURCE_REQUEST and ACTION_BUNDLE cannot appear in the same turn');
-  }
-  if (resourceRequestBlock) {
+  if (kind === 'resourceRequest') {
+    rejectBranchPayloads(envelope, 'resourceRequest', ['answer', 'actionBundle', 'codeBlocks', 'expectedValidation', 'reviewGuide']);
     return {
       kind: 'resourceRequest',
-      userPlan: singleton.get('USER_PLAN')?.content.trim(),
-      resourceRequest: parseResourceRequest(resourceRequestBlock),
+      userPlan: optionalString(envelope, 'userPlan', 'JSON Envelope v2'),
+      resourceRequest: resourceRequestFromObject(requireObject(envelope.resourceRequest, 'JSON Envelope v2.resourceRequest'), 'JSON Envelope v2.resourceRequest'),
     };
   }
+  if (kind === 'actionBundle') {
+    rejectBranchPayloads(envelope, 'actionBundle', ['answer', 'resourceRequest']);
+    const codeBlocks = codeBlocksFromEnvelope(envelope.codeBlocks);
+    const codeBlockIds = new Set(codeBlocks.map((block) => block.id));
+    const actionBundle = actionBundleFromObject(
+      requireObject(envelope.actionBundle, 'JSON Envelope v2.actionBundle'),
+      codeBlockIds,
+      'JSON Envelope v2.actionBundle'
+    );
+    rejectOrphanCodeBlocks(codeBlockIds, actionBundle);
+    return {
+      kind: 'actionPlan',
+      parts: {
+        userPlan: requireString(envelope, 'userPlan', 'JSON Envelope v2'),
+        actionBundle,
+        codeBlocks,
+        expectedValidation: {
+          content: requireString(envelope, 'expectedValidation', 'JSON Envelope v2'),
+          expectations: actionBundle.validationExpectations,
+        },
+        reviewGuide: {
+          content: requireString(envelope, 'reviewGuide', 'JSON Envelope v2'),
+          expectations: actionBundle.reviewExpectations,
+        },
+      },
+    };
+  }
+  throw new AgentPlanParseError('unsupported_protocol_kind', `JSON Envelope v2.kind is unsupported: ${kind}`);
+}
 
-  const userPlan = requireBlock(singleton, 'USER_PLAN').content.trim();
-  const requiredActionBundleBlock = requireBlock(singleton, 'ACTION_BUNDLE');
-  const actionBundle = parseActionBundle(requiredActionBundleBlock, codeBlockIds);
-  rejectOrphanCodeBlocks(codeBlockIds, actionBundle);
-  const expectedValidation = requireBlock(singleton, 'EXPECTED_VALIDATION').content.trim();
-  const reviewGuide = requireBlock(singleton, 'REVIEW_GUIDE').content.trim();
-  const permissionHints = singleton.get('PERMISSION_HINTS')?.content.trim();
+function rejectBranchPayloads(envelope: Record<string, unknown>, branch: string, forbidden: string[]): void {
+  for (const key of forbidden) {
+    if (envelope[key] !== undefined) {
+      throw new AgentPlanParseError('branch_payload_conflict', `JSON Envelope v2 kind ${branch} cannot include branch payload ${key}`);
+    }
+  }
+}
 
+function answerFromEnvelope(value: unknown): AnswerDraft {
+  const object = requireObject(value, 'JSON Envelope v2.answer');
+  rejectUnknownKeys(object, ANSWER_KEYS, 'JSON Envelope v2.answer');
+  const format = requireString(object, 'format', 'JSON Envelope v2.answer');
+  if (format !== 'markdown') {
+    throw new AgentPlanParseError('invalid_answer_format', 'JSON Envelope v2.answer.format must be markdown');
+  }
   return {
-    kind: 'actionPlan',
-    parts: {
-      userPlan,
-      actionBundle,
-      codeBlocks,
-      expectedValidation: {
-        content: expectedValidation,
-        expectations: actionBundle.validationExpectations,
-      },
-      reviewGuide: {
-        content: reviewGuide,
-        expectations: actionBundle.reviewExpectations,
-      },
-      permissionHints: permissionHints ? { content: permissionHints } : undefined,
-    },
+    format: 'markdown',
+    version: '1',
+    content: requireString(object, 'content', 'JSON Envelope v2.answer'),
   };
 }
 
-function extractBlocks(input: string): ParsedBlock[] {
-  const blockPattern =
-    /<(ANSWER|USER_PLAN|RESOURCE_REQUEST|ACTION_BUNDLE|CODE_BLOCK|EXPECTED_VALIDATION|REVIEW_GUIDE|PERMISSION_HINTS)([^>]*)>([\s\S]*?)<\/\1>/g;
-  const blocks: ParsedBlock[] = [];
-  let match: RegExpExecArray | null;
-  while ((match = blockPattern.exec(input)) !== null) {
-    const tag = asKnownTag(match[1]);
-    blocks.push({
-      tag,
-      attrs: parseAttrs(match[2] ?? ''),
-      content: match[3] ?? '',
-      start: match.index,
-      end: match.index + match[0].length,
-    });
+function codeBlocksFromEnvelope(value: unknown): CodeBlockDraft[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new AgentPlanParseError('invalid_code_blocks', 'JSON Envelope v2.codeBlocks must be an array');
   }
-  rejectUnknownOrStrayTags(input, blocks);
-  return blocks;
-}
-
-function rejectUnknownOrStrayTags(input: string, blocks: ParsedBlock[]): void {
-  const tokenPattern = /<\/?([A-Z_]+)(?:\s[^>]*)?>/g;
-  let match: RegExpExecArray | null;
-  while ((match = tokenPattern.exec(input)) !== null) {
-    const tag = match[1];
-    const owner = blocks.find((block) => match && match.index >= block.start && match.index < block.end);
-    if (!owner) {
-      asKnownTag(tag);
-      throw new AgentPlanParseError('unmatched_tag', `unmatched ${tag} tag`);
+  const seen = new Set<string>();
+  return value.map((item, index) => {
+    const label = `JSON Envelope v2.codeBlocks[${index}]`;
+    const object = requireObject(item, label);
+    rejectUnknownKeys(object, CODE_BLOCK_KEYS, label);
+    const id = requireString(object, 'id', label);
+    if (seen.has(id)) {
+      throw new AgentPlanParseError('duplicate_code_block', `duplicate codeBlocks id ${id}`);
     }
-    if (owner.tag === 'CODE_BLOCK') {
-      continue;
-    }
-    if (match.index !== owner.start && match.index + match[0].length !== owner.end) {
-      asKnownTag(tag);
-      throw new AgentPlanParseError('nested_tag', `${owner.tag} contains a nested tag`);
-    }
-  }
+    seen.add(id);
+    const path = requireString(object, 'path', label);
+    rejectUnsafeWorkspacePath(path, `${label}.path`);
+    return {
+      id,
+      path,
+      language: optionalString(object, 'language', label),
+      content: requireString(object, 'content', label),
+    };
+  });
 }
 
-function rejectNestedTags(block: ParsedBlock): void {
-  if (block.tag === 'CODE_BLOCK') return;
-  const nestedPattern = /<\/?([A-Z_]+)(?:\s[^>]*)?>/;
-  if (nestedPattern.test(block.content)) {
-    throw new AgentPlanParseError('nested_tag', `${block.tag} contains a nested tag`);
-  }
-}
-
-function asKnownTag(tag: string): AgentPlanTag {
-  if (!KNOWN_TAGS.has(tag as AgentPlanTag)) {
-    throw new AgentPlanParseError('unknown_tag', `unknown agent plan tag ${tag}`);
-  }
-  return tag as AgentPlanTag;
-}
-
-function parseAttrs(raw: string): Record<string, string> {
-  const attrs: Record<string, string> = {};
-  const attrPattern = /([a-zA-Z][a-zA-Z0-9_-]*)=("([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
-  let match: RegExpExecArray | null;
-  while ((match = attrPattern.exec(raw)) !== null) {
-    attrs[match[1]] = match[3] ?? match[4] ?? match[5] ?? '';
-  }
-  return attrs;
-}
-
-function requireBlock(blocks: Map<AgentPlanTag, ParsedBlock>, tag: AgentPlanTag): ParsedBlock {
-  const block = blocks.get(tag);
-  if (!block) {
-    throw new AgentPlanParseError('missing_tag', `missing ${tag} block`);
-  }
-  return block;
-}
-
-function codeBlockFromBlock(block: ParsedBlock): CodeBlockDraft {
-  const id = requireAttr(block, 'id');
-  const path = requireAttr(block, 'path');
-  rejectUnsafeWorkspacePath(path, `${block.tag}.path`);
-  return {
-    id,
-    path,
-    language: block.attrs.language,
-    content: block.content,
-  };
-}
-
-function requireAttr(block: ParsedBlock, attr: string): string {
-  const value = block.attrs[attr]?.trim();
-  if (!value) {
-    throw new AgentPlanParseError('missing_attr', `${block.tag} is missing ${attr}`);
-  }
-  return value;
-}
-
-function parseActionBundle(block: ParsedBlock, codeBlockIds: Set<string>): ActionBundleDraft {
-  if (block.attrs.format !== 'json' || block.attrs.version !== '1') {
-    throw new AgentPlanParseError('invalid_action_bundle_header', 'ACTION_BUNDLE must declare format="json" version="1"');
-  }
-
-  const value = parseJsonObject(block.content);
-  rejectUnknownKeys(value, BUNDLE_KEYS, 'ACTION_BUNDLE');
-
+function actionBundleFromObject(value: Record<string, unknown>, codeBlockIds: Set<string>, label: string): ActionBundleDraft {
+  rejectUnknownKeys(value, BUNDLE_KEYS, label);
   const version = requireString(value, 'version', 'ACTION_BUNDLE');
   if (version !== '1') {
     throw new AgentPlanParseError('unsupported_action_bundle_version', `unsupported ACTION_BUNDLE version ${version}`);
   }
 
-  const actions = requireArray(value, 'actions', 'ACTION_BUNDLE').map((item, index) =>
+  const actions = requireArray(value, 'actions', label).map((item, index) =>
     plannedActionFromValue(item, `actions[${index}]`, codeBlockIds)
   );
-  const validationExpectations = requireArray(value, 'validationExpectations', 'ACTION_BUNDLE').map((item, index) =>
+  const validationExpectations = requireArray(value, 'validationExpectations', label).map((item, index) =>
     validationExpectationFromValue(item, `validationExpectations[${index}]`)
   );
-  const reviewExpectations = requireArray(value, 'reviewExpectations', 'ACTION_BUNDLE').map((item, index) =>
+  const reviewExpectations = requireArray(value, 'reviewExpectations', label).map((item, index) =>
     reviewExpectationFromValue(item, `reviewExpectations[${index}]`)
   );
 
   return {
     version: '1',
-    id: requireString(value, 'id', 'ACTION_BUNDLE'),
-    goal: requireString(value, 'goal', 'ACTION_BUNDLE'),
-    requirementId: optionalString(value, 'requirementId', 'ACTION_BUNDLE'),
+    id: requireString(value, 'id', label),
+    goal: requireString(value, 'goal', label),
+    requirementId: optionalString(value, 'requirementId', label),
     actions,
     validationExpectations,
     reviewExpectations,
@@ -277,36 +232,17 @@ function parseActionBundle(block: ParsedBlock, codeBlockIds: Set<string>): Actio
   };
 }
 
-function parseAnswer(block: ParsedBlock): AnswerDraft {
-  if (block.attrs.format !== 'markdown' || block.attrs.version !== '1') {
-    throw new AgentPlanParseError('invalid_answer_header', 'ANSWER must declare format="markdown" version="1"');
-  }
-  const content = block.content.trim();
-  if (!content) {
-    throw new AgentPlanParseError('empty_answer', 'ANSWER content must be non-empty');
-  }
-  return {
-    format: 'markdown',
-    version: '1',
-    content,
-  };
-}
-
-function parseResourceRequest(block: ParsedBlock): ResourceRequestDraft {
-  if (block.attrs.format !== 'json' || block.attrs.version !== '1') {
-    throw new AgentPlanParseError('invalid_resource_request_header', 'RESOURCE_REQUEST must declare format="json" version="1"');
-  }
-  const value = parseJsonObject(block.content, 'RESOURCE_REQUEST');
-  rejectUnknownKeys(value, RESOURCE_REQUEST_KEYS, 'RESOURCE_REQUEST');
-  const version = requireString(value, 'version', 'RESOURCE_REQUEST');
+function resourceRequestFromObject(value: Record<string, unknown>, label: string): ResourceRequestDraft {
+  rejectUnknownKeys(value, RESOURCE_REQUEST_KEYS, label);
+  const version = requireString(value, 'version', label);
   if (version !== '1') {
     throw new AgentPlanParseError('unsupported_resource_request_version', `unsupported RESOURCE_REQUEST version ${version}`);
   }
   return {
     version: '1',
-    id: requireString(value, 'id', 'RESOURCE_REQUEST'),
-    reason: requireString(value, 'reason', 'RESOURCE_REQUEST'),
-    items: requireArray(value, 'items', 'RESOURCE_REQUEST').map((item, index) =>
+    id: requireString(value, 'id', label),
+    reason: requireString(value, 'reason', label),
+    items: requireArray(value, 'items', label).map((item, index) =>
       resourceRequestItemFromValue(item, `items[${index}]`)
     ),
   };
@@ -318,13 +254,13 @@ function parseJsonObject(raw: string, label = 'ACTION_BUNDLE'): Record<string, u
     parsed = JSON.parse(raw);
   } catch (error) {
     throw new AgentPlanParseError(
-      label === 'ACTION_BUNDLE' ? 'invalid_action_bundle_json' : 'invalid_resource_request_json',
+      label === 'JSON Envelope v2' ? 'invalid_json_envelope' : 'invalid_json_object',
       error instanceof Error ? error.message : 'invalid JSON'
     );
   }
   if (!isPlainObject(parsed)) {
     throw new AgentPlanParseError(
-      label === 'ACTION_BUNDLE' ? 'invalid_action_bundle_json' : 'invalid_resource_request_json',
+      label === 'JSON Envelope v2' ? 'invalid_json_envelope' : 'invalid_json_object',
       `${label} must be a JSON object`
     );
   }
@@ -348,6 +284,12 @@ function plannedActionFromValue(value: unknown, label: string, codeBlockIds: Set
   if (sourceBlockId && !codeBlockIds.has(sourceBlockId)) {
     throw new AgentPlanParseError('missing_code_block_ref', `${label} references missing CODE_BLOCK ${sourceBlockId}`);
   }
+  const capability = requireString(object, 'capability', label);
+  validatePlanCapability(capability, `${label}.capability`);
+  const kind = optionalActionKind(object.kind, label);
+  if (!sourceBlockId && capability === 'workspace.write' && kind === 'write') {
+    throw new AgentPlanParseError('missing_code_block_ref', `${label} workspace.write must reference codeBlocks via sourceBlockId`);
+  }
   const resourceScope = stringArray(object.resourceScope, `${label}.resourceScope`, true);
   for (const resource of resourceScope) {
     rejectUnsafeResourceScope(resource, `${label}.resourceScope`);
@@ -355,14 +297,22 @@ function plannedActionFromValue(value: unknown, label: string, codeBlockIds: Set
   return {
     id: requireString(object, 'id', label),
     title: requireString(object, 'title', label),
-    capability: requireString(object, 'capability', label),
-    kind: optionalActionKind(object.kind, label),
+    capability,
+    kind,
     resourceScope,
     canParallelize: optionalBoolean(object.canParallelize, `${label}.canParallelize`) ?? false,
     conflictKeys: stringArray(object.conflictKeys, `${label}.conflictKeys`, false),
     purpose: optionalString(object, 'purpose', label),
     sourceBlockId,
   };
+}
+
+function validatePlanCapability(value: string, label: string): void {
+  if (PLAN_CAPABILITIES.has(value)) return;
+  if (value.includes('.')) {
+    throw new AgentPlanParseError('invalid_capability_namespace', `${label} must use capability namespace, not executor tool name ${value}`);
+  }
+  throw new AgentPlanParseError('unknown_capability', `${label} is not a known capability`);
 }
 
 function rejectOrphanCodeBlocks(codeBlockIds: Set<string>, actionBundle: ActionBundleDraft): void {

@@ -1,6 +1,45 @@
 use super::*;
 
 impl DeepCodeKernelRuntime {
+    pub fn enqueue_approved_tool_calls(
+        &mut self,
+        run_id: &str,
+        calls: Vec<(String, String, Value)>,
+    ) -> KernelResult<()> {
+        self.record_by_run(run_id)?;
+        if calls.is_empty() {
+            return Ok(());
+        }
+        let queue = self
+            .state
+            .approved_tools_by_run
+            .entry(run_id.to_string())
+            .or_default();
+        queue.extend(
+            calls
+                .into_iter()
+                .map(|(id, name, arguments)| KernelLlmToolCall {
+                    id,
+                    name,
+                    arguments,
+                }),
+        );
+        let record = self.record_by_run_mut(run_id)?;
+        record.decision_state.tool_component_required = false;
+        record.decision_state.temp_lifecycle_required = false;
+        record
+            .decision_state
+            .answer_obligations
+            .retain(|obligation| {
+                !matches!(
+                    obligation.id,
+                    deepcode_kernel_abi::AnswerObligationId::ToolComponentSummary
+                        | deepcode_kernel_abi::AnswerObligationId::TempFileLifecycleResult
+                )
+            });
+        Ok(())
+    }
+
     pub(crate) fn tool_invoke(
         &mut self,
         request_id: RequestId,
@@ -134,7 +173,25 @@ impl DeepCodeKernelRuntime {
         tool_name: String,
         arguments: Value,
     ) -> KernelResult<KernelEvent> {
-        let result = self.execute_kernel_tool(&tool_name, &arguments);
+        if let Some(denial) = deny_kernel_shell_command(&tool_name, &arguments) {
+            return self.command_denied_tool_completed_event(
+                run_id,
+                session_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+                denial,
+            );
+        }
+        let result = self
+            .execute_kernel_tool(&tool_name, &arguments)
+            .and_then(|mut output| {
+                self.attach_workspace_tool_diagnostics(&tool_name, &arguments, &mut output)?;
+                self.record_kernel_resource_effects(
+                    run_id, session_id, &tool_name, &arguments, &output,
+                )?;
+                Ok(output)
+            });
         let sequence = self.ledger.next_sequence(run_id)?;
         let event = KernelEvent::ToolCompleted {
             run_id: Some(RunId(run_id.to_string())),
@@ -177,6 +234,185 @@ impl DeepCodeKernelRuntime {
             self.record_validation_for_tool(run_id, session_id, &tool_call_id, &tool_name, output)?;
         }
         Ok(event)
+    }
+
+    fn command_denied_tool_completed_event(
+        &mut self,
+        run_id: &str,
+        session_id: &str,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: Value,
+        denial: KernelCommandDeny,
+    ) -> KernelResult<KernelEvent> {
+        let deny_sequence = self.ledger.next_sequence(run_id)?;
+        let command = arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let denied_resource_id = format!("denied-command-{run_id}-{deny_sequence}");
+        self.state.resource_registry.deny(KernelResource::denied(
+            denied_resource_id.clone(),
+            KernelResourceKind::ProcessHandle,
+            KernelResourceOwner::agent_workflow(Some(session_id.to_string()), run_id.to_string()),
+            KernelResourceScope::Workflow,
+            KernelResourceCleanupPolicy::OnWorkflowEnd,
+            serde_json::json!({
+                "toolName": &tool_name,
+                "reason": &denial.reason,
+                "category": denial.category,
+                "commandPreview": limit_preview(command, 160),
+                "commandBytes": command.len(),
+                "commandHash": deepcode_kernel_skills::hash::hash_bytes(command.as_bytes())
+            }),
+        ))?;
+        self.append_ledger(
+            run_id,
+            session_id,
+            "resource.denied",
+            deny_sequence,
+            serde_json::json!({
+                "summary": format!("Kernel denied resource request: {}", denial.reason),
+                "resourceId": denied_resource_id,
+                "kind": "processHandle",
+                "owner": "agentWorkflow",
+                "scope": "workflow",
+                "reason": &denial.reason,
+                "category": denial.category,
+                "event": "resource.denied"
+            }),
+        )?;
+        let command_sequence = self.ledger.next_sequence(run_id)?;
+        self.append_ledger(
+            run_id,
+            session_id,
+            "command.denied",
+            command_sequence,
+            serde_json::json!({
+                "summary": format!("Kernel command gate denied {tool_name}: {}", denial.reason),
+                "toolCallId": &tool_call_id,
+                "toolName": &tool_name,
+                "reason": &denial.reason,
+                "category": denial.category,
+                "argsPreview": redact_tool_arguments(&tool_name, &arguments),
+                "event": "command.denied"
+            }),
+        )?;
+
+        let error = KernelError::PermissionDenied(format!(
+            "command denied by Kernel command gate: {}",
+            denial.reason
+        ));
+        let sequence = self.ledger.next_sequence(run_id)?;
+        let event = KernelEvent::ToolCompleted {
+            run_id: Some(RunId(run_id.to_string())),
+            session_id: Some(SessionId(session_id.to_string())),
+            turn_id: None,
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            ok: false,
+            output: None,
+            error: Some(KernelErrorEnvelope::from(&error)),
+            sequence: Some(sequence),
+        };
+        {
+            let record = self.record_by_run_mut(run_id)?;
+            let phase = record.phase.as_str().to_string();
+            record.decision_state.apply_event(&event, &phase);
+        }
+        self.append_ledger(
+            run_id,
+            session_id,
+            "tool.completed",
+            sequence,
+            serde_json::json!({
+                "summary": format!("Tool completed: {tool_name}"),
+                "toolCallId": tool_call_id,
+                "toolName": tool_name,
+                "ok": false,
+                "error": KernelErrorEnvelope::from(&error)
+            }),
+        )?;
+        Ok(event)
+    }
+
+    fn record_kernel_resource_effects(
+        &mut self,
+        run_id: &str,
+        session_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+        output: &Value,
+    ) -> KernelResult<()> {
+        let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if !is_temp_file_path(path) {
+            return Ok(());
+        }
+
+        if tool_name == "fs.write" {
+            let absolute_path = output
+                .get("absolutePath")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    self.resolve_workspace_path(path)
+                        .ok()
+                        .map(|path| path.to_string_lossy().to_string())
+                });
+            let resource_id = workflow_temp_resource_id(run_id, path);
+            self.state
+                .resource_registry
+                .register(KernelResource::active(
+                    resource_id.clone(),
+                    KernelResourceKind::TempArtifact,
+                    KernelResourceOwner::agent_workflow(
+                        Some(session_id.to_string()),
+                        run_id.to_string(),
+                    ),
+                    KernelResourceScope::Workflow,
+                    KernelResourceCleanupPolicy::OnWorkflowEnd,
+                    serde_json::json!({
+                        "path": path,
+                        "absolutePath": absolute_path,
+                        "sourceTool": tool_name,
+                        "managedBy": "kernel.resourceRegistry"
+                    }),
+                ))?;
+            let sequence = self.ledger.next_sequence(run_id)?;
+            self.append_ledger(
+                run_id,
+                session_id,
+                "resource.registered",
+                sequence,
+                serde_json::json!({
+                    "summary": format!("Kernel registered workflow temp resource: {path}"),
+                    "resourceId": resource_id,
+                    "kind": "tempArtifact",
+                    "owner": "agentWorkflow",
+                    "scope": "workflow",
+                    "path": path
+                }),
+            )?;
+        } else if tool_name == "fs.delete" {
+            let resource_id = workflow_temp_resource_id(run_id, path);
+            let release = self.state.resource_registry.release(&resource_id);
+            let sequence = self.ledger.next_sequence(run_id)?;
+            self.append_ledger(
+                run_id,
+                session_id,
+                "resource.released",
+                sequence,
+                serde_json::json!({
+                    "summary": format!("Kernel released workflow temp resource: {path}"),
+                    "resourceId": resource_id,
+                    "released": release.released,
+                    "error": release.error
+                }),
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn invoke_llm_tool_call(
@@ -287,26 +523,34 @@ impl DeepCodeKernelRuntime {
     ) -> KernelResult<Vec<KernelEvent>> {
         let mut events = Vec::new();
         loop {
-            let next = {
-                let record = self.record_by_run(run_id)?;
-                next_kernel_autorun_tool(&record.decision_state)
-            };
-            let Some((tool_name, arguments)) = next else {
+            let next = self.pop_approved_tool_call(run_id).or_else(|| {
+                let record = self.record_by_run(run_id).ok()?;
+                next_kernel_autorun_tool(&record.decision_state).map(|(tool_name, arguments)| {
+                    KernelLlmToolCall {
+                        id: format!(
+                            "kernel-auto-{}-{}",
+                            tool_name.replace('.', "-"),
+                            now_millis()
+                        ),
+                        name: tool_name.to_string(),
+                        arguments,
+                    }
+                })
+            });
+            let Some(call) = next else {
                 break;
             };
-            let tool_call_id = format!(
-                "kernel-auto-{}-{}",
-                tool_name.replace('.', "-"),
-                now_millis()
-            );
+            let tool_call_id = call.id;
+            let tool_name = call.name;
+            let arguments = call.arguments;
             let request_sequence = self.ledger.next_sequence(run_id)?;
             let requested = KernelEvent::ToolRequested {
                 run_id: Some(RunId(run_id.to_string())),
                 session_id: Some(SessionId(session_id.to_string())),
                 turn_id: None,
                 tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.to_string(),
-                args_preview: redact_tool_arguments(tool_name, &arguments),
+                tool_name: tool_name.clone(),
+                args_preview: redact_tool_arguments(&tool_name, &arguments),
                 sequence: Some(request_sequence),
             };
             self.append_ledger(
@@ -317,15 +561,15 @@ impl DeepCodeKernelRuntime {
                 serde_json::json!({
                     "summary": format!("Kernel auto requested: {tool_name}"),
                     "toolCallId": &tool_call_id,
-                    "toolName": tool_name,
-                    "argsPreview": redact_tool_arguments(tool_name, &arguments)
+                    "toolName": &tool_name,
+                    "argsPreview": redact_tool_arguments(&tool_name, &arguments)
                 }),
             )?;
             events.push(requested);
             let permission_action =
-                self.effective_permission_action_for_tool(run_id, tool_name, &arguments)?;
+                self.effective_permission_action_for_tool(run_id, &tool_name, &arguments)?;
             if permission_action == PermissionAction::Ask
-                && !is_kernel_owned_temp_cleanup(tool_name, &arguments)
+                && !is_kernel_owned_temp_cleanup(&tool_name, &arguments)
             {
                 let permission_id = tool_call_id.clone();
                 let pending_tool_call_id = tool_call_id.clone();
@@ -336,7 +580,7 @@ impl DeepCodeKernelRuntime {
                         run_id: run_id.to_string(),
                         session_id: session_id.to_string(),
                         tool_call_id: pending_tool_call_id.clone(),
-                        tool_name: tool_name.to_string(),
+                        tool_name: tool_name.clone(),
                         arguments: pending_arguments.clone(),
                     },
                 );
@@ -346,10 +590,10 @@ impl DeepCodeKernelRuntime {
                     session_id: SessionId(session_id.to_string()),
                     request: deepcode_kernel_abi::PermissionRequestEnvelope {
                         id: permission_id.clone(),
-                        capability: capability_for_tool(tool_name).to_string(),
-                        risk_level: risk_for_tool(tool_name).to_string(),
+                        capability: capability_for_tool(&tool_name).to_string(),
+                        risk_level: risk_for_tool(&tool_name).to_string(),
                         summary: format!("Allow {tool_name} to access workspace resources?"),
-                        args_preview: redact_tool_arguments(tool_name, &pending_arguments),
+                        args_preview: redact_tool_arguments(&tool_name, &pending_arguments),
                     },
                     sequence: Some(permission_sequence),
                 };
@@ -369,10 +613,10 @@ impl DeepCodeKernelRuntime {
                         "summary": format!("Permission requested for {tool_name}."),
                         "permissionId": permission_id,
                         "toolCallId": pending_tool_call_id,
-                        "toolName": tool_name,
-                        "capability": capability_for_tool(tool_name),
-                        "riskLevel": risk_for_tool(tool_name),
-                        "argsPreview": redact_tool_arguments(tool_name, &pending_arguments),
+                        "toolName": &tool_name,
+                        "capability": capability_for_tool(&tool_name),
+                        "riskLevel": risk_for_tool(&tool_name),
+                        "argsPreview": redact_tool_arguments(&tool_name, &pending_arguments),
                         "argumentsRef": {
                             "storage": "runtime.pendingTools",
                             "permissionId": permission_id,
@@ -383,13 +627,8 @@ impl DeepCodeKernelRuntime {
                 events.push(permission);
                 break;
             }
-            let completed = self.execute_bound_tool(
-                run_id,
-                session_id,
-                tool_call_id,
-                tool_name.to_string(),
-                arguments,
-            )?;
+            let completed =
+                self.execute_bound_tool(run_id, session_id, tool_call_id, tool_name, arguments)?;
             events.push(completed);
         }
         Ok(events)
@@ -431,6 +670,72 @@ impl DeepCodeKernelRuntime {
                     .unwrap_or_else(|| format!("tool {tool_name} failed")),
             ))
         }
+    }
+
+    fn attach_workspace_tool_diagnostics(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        output: &mut Value,
+    ) -> KernelResult<()> {
+        if !matches!(
+            tool_name,
+            "fs.write" | "fs.delete" | "fs.read" | "fs.list" | "code.search"
+        ) {
+            return Ok(());
+        }
+        let Some(workspace) = self.state.current_workspace.as_ref() else {
+            return Ok(());
+        };
+        if let Some(object) = output.as_object_mut() {
+            object.insert(
+                "workspaceRoot".to_string(),
+                Value::String(workspace.root.to_string_lossy().to_string()),
+            );
+            if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                if let Ok(target) = self.resolve_workspace_path(path) {
+                    object.insert(
+                        "absolutePath".to_string(),
+                        Value::String(target.to_string_lossy().to_string()),
+                    );
+                    if tool_name == "fs.write" {
+                        let expected = arguments
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let actual = fs::read(&target).map_err(|error| {
+                            KernelError::Other(format!("read back {path}: {error}"))
+                        })?;
+                        let expected_hash =
+                            deepcode_kernel_skills::hash::hash_bytes(expected.as_bytes());
+                        let actual_hash = deepcode_kernel_skills::hash::hash_bytes(&actual);
+                        object.insert(
+                            "validation".to_string(),
+                            serde_json::json!({
+                                "kind": "readBack",
+                                "passed": actual == expected.as_bytes(),
+                                "path": path,
+                                "contentBytes": actual.len(),
+                                "contentHash": actual_hash,
+                                "expectedContentBytes": expected.len(),
+                                "expectedContentHash": expected_hash
+                            }),
+                        );
+                    } else if tool_name == "fs.delete" {
+                        object.insert(
+                            "validation".to_string(),
+                            serde_json::json!({
+                                "kind": "deleteVerified",
+                                "passed": !target.exists(),
+                                "path": path,
+                                "exists": target.exists()
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn skill_discover(&self, request_id: RequestId) -> KernelResult<Vec<KernelEvent>> {
@@ -904,6 +1209,20 @@ impl DeepCodeKernelRuntime {
     }
 }
 
+impl DeepCodeKernelRuntime {
+    fn pop_approved_tool_call(&mut self, run_id: &str) -> Option<KernelLlmToolCall> {
+        let queue = self.state.approved_tools_by_run.get_mut(run_id)?;
+        if queue.is_empty() {
+            return None;
+        }
+        let call = queue.remove(0);
+        if queue.is_empty() {
+            self.state.approved_tools_by_run.remove(run_id);
+        }
+        Some(call)
+    }
+}
+
 #[derive(Debug)]
 struct SkillTrustApprovalDecision {
     decision: Option<String>,
@@ -991,6 +1310,97 @@ pub(crate) fn needs_workspace_tool(tool_name: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KernelCommandDeny {
+    pub(crate) category: &'static str,
+    pub(crate) reason: String,
+}
+
+pub(crate) fn deny_kernel_shell_command(
+    tool_name: &str,
+    arguments: &Value,
+) -> Option<KernelCommandDeny> {
+    if !matches!(tool_name, "shell.exec" | "shell.propose") {
+        return None;
+    }
+    let command = arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if command.is_empty() {
+        return None;
+    }
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("open -a terminal")
+        || (lower.contains("osascript") && lower.contains("terminal"))
+        || contains_shell_word(&lower, "gnome-terminal")
+        || contains_shell_word(&lower, "xterm")
+        || contains_shell_word(&lower, "konsole")
+        || contains_shell_word(&lower, "alacritty")
+        || contains_shell_word(&lower, "wezterm")
+        || contains_shell_word(&lower, "wt.exe")
+        || lower.contains("cmd.exe /c start")
+        || lower.contains("powershell start-process")
+        || lower.contains("pwsh -c start-process")
+    {
+        return Some(KernelCommandDeny {
+            category: "nestedTerminal",
+            reason: "starting nested terminal/session managers is denied".to_string(),
+        });
+    }
+    if contains_shell_word(&lower, "nohup")
+        || contains_shell_word(&lower, "disown")
+        || contains_shell_word(&lower, "setsid")
+        || lower.ends_with('&')
+        || lower.contains(" & ")
+    {
+        return Some(KernelCommandDeny {
+            category: "backgroundEscape",
+            reason: "background or detached processes must be modeled as Kernel resources"
+                .to_string(),
+        });
+    }
+    if contains_shell_word(&lower, "tmux")
+        || contains_shell_word(&lower, "screen")
+        || contains_shell_word(&lower, "script")
+    {
+        return Some(KernelCommandDeny {
+            category: "terminalReuseEscape",
+            reason: "terminal multiplexer/session capture commands are denied".to_string(),
+        });
+    }
+    if contains_shell_word(&lower, "rm") {
+        return Some(KernelCommandDeny {
+            category: "deleteBypass",
+            reason: "delete operations must use fs.delete or Kernel cleanup".to_string(),
+        });
+    }
+    if contains_unmanaged_shell_redirection(&lower) {
+        return Some(KernelCommandDeny {
+            category: "unmanagedRedirect",
+            reason: "shell redirection must target a Kernel-allocated redirect/cache resource"
+                .to_string(),
+        });
+    }
+    None
+}
+
+fn contains_shell_word(command: &str, word: &str) -> bool {
+    command
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+        .any(|part| part == word)
+}
+
+fn contains_unmanaged_shell_redirection(command: &str) -> bool {
+    command.contains(">>")
+        || command.contains("&>")
+        || command.contains("2>")
+        || command.contains(">")
+        || command.contains("| tee ")
+        || command.starts_with("tee ")
+}
+
 #[allow(dead_code)]
 fn broker_workspace_output(events: Vec<KernelEvent>) -> KernelResult<Value> {
     match events.into_iter().next() {
@@ -1055,8 +1465,8 @@ pub(crate) fn risk_for_tool(tool_id: &str) -> &'static str {
     }
 }
 
-pub(crate) fn redact_tool_arguments(tool_name: &str, arguments: &Value) -> Value {
-    match tool_name {
+pub(crate) fn redact_tool_arguments(tool_id: &str, arguments: &Value) -> Value {
+    match tool_id {
         "shell.exec" | "shell.propose" => {
             let command = arguments
                 .get("command")
@@ -1101,6 +1511,14 @@ fn limit_preview(value: &str, max_chars: usize) -> String {
         return value.to_string();
     }
     format!("{}…", value.chars().take(max_chars).collect::<String>())
+}
+
+fn workflow_temp_resource_id(run_id: &str, path: &str) -> String {
+    let normalized = path
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    format!("agent-temp-{run_id}-{normalized}")
 }
 
 pub(crate) fn next_kernel_autorun_tool(state: &RunDecisionState) -> Option<(&'static str, Value)> {

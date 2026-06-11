@@ -3,6 +3,9 @@
 
 use crate::prelude::*;
 use crate::*;
+use deepcode_kernel_abi::{LlmProviderDiagnostic, LlmProviderErrorLayer};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedLlmProfile {
@@ -144,7 +147,7 @@ pub(crate) fn resolve_llm_profile(
 pub(crate) async fn call_llm_profile(
     profile: &ResolvedLlmProfile,
     request_envelope: Value,
-) -> Result<LlmChatOutput, String> {
+) -> Result<LlmChatOutput, LlmProviderDiagnostic> {
     let messages = request_envelope
         .get("messages")
         .and_then(Value::as_array)
@@ -178,7 +181,13 @@ pub(crate) async fn call_llm_profile(
         "openaiCompatible" | "codex" => {
             call_openai_compatible_profile(profile, messages, tools).await
         }
-        other => Err(format!("Unsupported LLM provider kind: {other}")),
+        other => Err(provider_local_error(
+            profile,
+            other,
+            "ProviderUnsupportedKind",
+            LlmProviderErrorLayer::Transport,
+            format!("Unsupported LLM provider kind: {other}"),
+        )),
     }
 }
 
@@ -186,11 +195,16 @@ pub(crate) async fn call_openai_compatible_profile(
     profile: &ResolvedLlmProfile,
     messages: Vec<Value>,
     tools: Vec<LlmToolDefinition>,
-) -> Result<LlmChatOutput, String> {
-    let api_key = profile
-        .api_key
-        .as_deref()
-        .ok_or_else(|| format!("LLM profile `{}` has no API key", profile.name))?;
+) -> Result<LlmChatOutput, LlmProviderDiagnostic> {
+    let api_key = profile.api_key.as_deref().ok_or_else(|| {
+        provider_local_error(
+            profile,
+            "openaiCompatible",
+            "ProviderProfileMissingApiKey",
+            LlmProviderErrorLayer::Transport,
+            format!("LLM profile `{}` has no API key", profile.name),
+        )
+    })?;
     let url = normalize_openai_base_url(profile);
     let mut body = json!({
         "model": profile.model,
@@ -233,34 +247,40 @@ pub(crate) async fn call_openai_compatible_profile(
         .json(&body)
         .send()
         .await
-        .map_err(|error| format!("LLM request failed: {error}"))?;
-    let status = response.status();
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("LLM response JSON parse failed: {error}"))?;
-    if !status.is_success() {
-        return Err(format!("LLM HTTP {}: {}", status.as_u16(), value));
-    }
-    let choice = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    Ok(parse_openai_message(&choice))
+        .map_err(|error| {
+            provider_transport_error(
+                profile,
+                "openaiCompatible",
+                "request_failed",
+                error.to_string(),
+            )
+        })?;
+    let response = read_provider_json_response(
+        profile,
+        "openaiCompatible",
+        response,
+        "openai.chat.completion.v1: choices[0].message",
+        false,
+    )
+    .await?;
+    let choice = require_openai_message(profile, "openaiCompatible", &response)?;
+    Ok(parse_openai_message(choice))
 }
 
 pub(crate) async fn call_anthropic_profile(
     profile: &ResolvedLlmProfile,
     messages: Vec<Value>,
     tools: Vec<LlmToolDefinition>,
-) -> Result<LlmChatOutput, String> {
-    let api_key = profile
-        .api_key
-        .as_deref()
-        .ok_or_else(|| format!("LLM profile `{}` has no API key", profile.name))?;
+) -> Result<LlmChatOutput, LlmProviderDiagnostic> {
+    let api_key = profile.api_key.as_deref().ok_or_else(|| {
+        provider_local_error(
+            profile,
+            "anthropic",
+            "ProviderProfileMissingApiKey",
+            LlmProviderErrorLayer::Transport,
+            format!("LLM profile `{}` has no API key", profile.name),
+        )
+    })?;
     let (system, chat_messages) = split_system_messages(messages);
     let mut body = json!({
         "model": profile.model,
@@ -287,23 +307,26 @@ pub(crate) async fn call_anthropic_profile(
         .json(&body)
         .send()
         .await
-        .map_err(|error| format!("LLM request failed: {error}"))?;
-    let status = response.status();
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("LLM response JSON parse failed: {error}"))?;
-    if !status.is_success() {
-        return Err(format!("LLM HTTP {}: {}", status.as_u16(), value));
-    }
-    Ok(parse_anthropic_message(&value))
+        .map_err(|error| {
+            provider_transport_error(profile, "anthropic", "request_failed", error.to_string())
+        })?;
+    let response = read_provider_json_response(
+        profile,
+        "anthropic",
+        response,
+        "anthropic.messages.v1: content[]",
+        false,
+    )
+    .await?;
+    require_anthropic_message(profile, "anthropic", &response)?;
+    Ok(parse_anthropic_message(&response.value))
 }
 
 pub(crate) async fn call_ollama_profile(
     profile: &ResolvedLlmProfile,
     messages: Vec<Value>,
     tools: Vec<LlmToolDefinition>,
-) -> Result<LlmChatOutput, String> {
+) -> Result<LlmChatOutput, LlmProviderDiagnostic> {
     let mut body = json!({
         "model": profile.model,
         "messages": messages,
@@ -327,18 +350,322 @@ pub(crate) async fn call_ollama_profile(
         .json(&body)
         .send()
         .await
-        .map_err(|error| format!("LLM request failed: {error}"))?;
+        .map_err(|error| {
+            provider_transport_error(profile, "ollama", "request_failed", error.to_string())
+        })?;
+    let response = read_provider_json_response(
+        profile,
+        "ollama",
+        response,
+        "ollama.chat.v1: message",
+        false,
+    )
+    .await?;
+    let message = require_ollama_message(profile, "ollama", &response)?;
+    Ok(parse_openai_message(message))
+}
+
+#[derive(Debug, Clone)]
+struct ProviderJsonResponse {
+    value: Value,
+    status: Option<u16>,
+    content_type: String,
+    body: String,
+    body_hash: String,
+    is_stream: bool,
+    expected_schema: String,
+}
+
+async fn read_provider_json_response(
+    profile: &ResolvedLlmProfile,
+    provider: &str,
+    response: reqwest::Response,
+    expected_schema: &str,
+    is_stream: bool,
+) -> Result<ProviderJsonResponse, LlmProviderDiagnostic> {
     let status = response.status();
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("LLM response JSON parse failed: {error}"))?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let body = response.text().await.map_err(|error| {
+        provider_response_diagnostic(
+            profile,
+            provider,
+            "ProviderResponseReadFailed",
+            LlmProviderErrorLayer::Transport,
+            None,
+            Some(&content_type),
+            "",
+            None,
+            is_stream,
+            expected_schema,
+            error.to_string(),
+        )
+    })?;
+    let body_hash = provider_body_hash(&body);
     if !status.is_success() {
-        return Err(format!("LLM HTTP {}: {}", status.as_u16(), value));
+        return Err(provider_response_diagnostic(
+            profile,
+            provider,
+            "ProviderHttpStatusFailed",
+            LlmProviderErrorLayer::HttpStatus,
+            Some(status.as_u16()),
+            Some(&content_type),
+            &body,
+            Some(body_hash.as_str()),
+            is_stream,
+            expected_schema,
+            format!("LLM provider returned HTTP {}", status.as_u16()),
+        ));
     }
-    Ok(parse_openai_message(
-        value.get("message").unwrap_or(&Value::Null),
-    ))
+    let value = serde_json::from_str::<Value>(&body).map_err(|error| {
+        provider_response_error(
+            profile,
+            provider,
+            "ProviderJsonDecodeFailed",
+            LlmProviderErrorLayer::JsonDecode,
+            Some(status.as_u16()),
+            Some(&content_type),
+            &body,
+            Some(body_hash.as_str()),
+            is_stream,
+            expected_schema,
+            error.to_string(),
+        )
+    })?;
+    Ok(ProviderJsonResponse {
+        value,
+        status: Some(status.as_u16()),
+        content_type,
+        body,
+        body_hash,
+        is_stream,
+        expected_schema: expected_schema.to_string(),
+    })
+}
+
+fn provider_transport_error(
+    profile: &ResolvedLlmProfile,
+    provider: &str,
+    reason: &str,
+    message: String,
+) -> LlmProviderDiagnostic {
+    let reason = match reason {
+        "request_failed" => "ProviderTransportFailed",
+        "response_read_failed" => "ProviderResponseReadFailed",
+        other => other,
+    };
+    provider_response_diagnostic(
+        profile,
+        provider,
+        reason,
+        LlmProviderErrorLayer::Transport,
+        None,
+        None,
+        "",
+        None,
+        false,
+        "provider.transport",
+        message,
+    )
+}
+
+fn provider_response_error(
+    profile: &ResolvedLlmProfile,
+    provider: &str,
+    reason: &str,
+    error_layer: LlmProviderErrorLayer,
+    status: Option<u16>,
+    content_type: Option<&str>,
+    body: &str,
+    body_hash: Option<&str>,
+    is_stream: bool,
+    expected_schema: &str,
+    message: String,
+) -> LlmProviderDiagnostic {
+    provider_response_diagnostic(
+        profile,
+        provider,
+        reason,
+        error_layer,
+        status,
+        content_type,
+        body,
+        body_hash,
+        is_stream,
+        expected_schema,
+        message,
+    )
+}
+
+fn provider_response_diagnostic(
+    profile: &ResolvedLlmProfile,
+    provider: &str,
+    reason: &str,
+    error_layer: LlmProviderErrorLayer,
+    status: Option<u16>,
+    content_type: Option<&str>,
+    body: &str,
+    body_hash: Option<&str>,
+    is_stream: bool,
+    expected_schema: &str,
+    message: String,
+) -> LlmProviderDiagnostic {
+    LlmProviderDiagnostic {
+        reason: reason.to_string(),
+        error_layer,
+        message,
+        provider: provider.to_string(),
+        profile_id: profile.id.clone(),
+        profile_name: profile.name.clone(),
+        model: profile.model.clone(),
+        status,
+        content_type: content_type.unwrap_or("unknown").to_string(),
+        is_stream,
+        body_preview: provider_body_preview(body),
+        body_hash: body_hash.map(str::to_string),
+        expected_schema: expected_schema.to_string(),
+    }
+}
+
+fn provider_local_error(
+    profile: &ResolvedLlmProfile,
+    provider: &str,
+    reason: &str,
+    error_layer: LlmProviderErrorLayer,
+    message: String,
+) -> LlmProviderDiagnostic {
+    provider_response_diagnostic(
+        profile,
+        provider,
+        reason,
+        error_layer,
+        None,
+        None,
+        "",
+        None,
+        false,
+        "provider.local.config",
+        message,
+    )
+}
+
+fn provider_body_hash(body: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn provider_body_preview(body: &str) -> String {
+    let mut preview = String::new();
+    for line in body.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("authorization")
+            || lower.contains("api_key")
+            || lower.contains("apikey")
+            || lower.contains("secret")
+            || lower.contains("password")
+            || lower.contains("token")
+        {
+            preview.push_str("[redacted-provider-error-line]\n");
+        } else {
+            preview.push_str(line);
+            preview.push('\n');
+        }
+        if preview.chars().count() >= 1600 {
+            break;
+        }
+    }
+    if preview.is_empty() {
+        return String::new();
+    }
+    let clipped = preview.chars().take(1600).collect::<String>();
+    clipped.trim_end().to_string()
+}
+
+fn require_openai_message<'a>(
+    profile: &ResolvedLlmProfile,
+    provider: &str,
+    response: &'a ProviderJsonResponse,
+) -> Result<&'a Value, LlmProviderDiagnostic> {
+    response
+        .value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .filter(|message| message.is_object())
+        .ok_or_else(|| {
+            provider_schema_error(
+                profile,
+                provider,
+                response,
+                "OpenAI-compatible response must contain choices[0].message object",
+            )
+        })
+}
+
+fn require_anthropic_message(
+    profile: &ResolvedLlmProfile,
+    provider: &str,
+    response: &ProviderJsonResponse,
+) -> Result<(), LlmProviderDiagnostic> {
+    response
+        .value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|_| ())
+        .ok_or_else(|| {
+            provider_schema_error(
+                profile,
+                provider,
+                response,
+                "Anthropic response must contain content array",
+            )
+        })
+}
+
+fn require_ollama_message<'a>(
+    profile: &ResolvedLlmProfile,
+    provider: &str,
+    response: &'a ProviderJsonResponse,
+) -> Result<&'a Value, LlmProviderDiagnostic> {
+    response
+        .value
+        .get("message")
+        .filter(|message| message.is_object())
+        .ok_or_else(|| {
+            provider_schema_error(
+                profile,
+                provider,
+                response,
+                "Ollama response must contain message object",
+            )
+        })
+}
+
+fn provider_schema_error(
+    profile: &ResolvedLlmProfile,
+    provider: &str,
+    response: &ProviderJsonResponse,
+    message: &str,
+) -> LlmProviderDiagnostic {
+    provider_response_error(
+        profile,
+        provider,
+        "ProviderSchemaDecodeFailed",
+        LlmProviderErrorLayer::SchemaDecode,
+        response.status,
+        Some(&response.content_type),
+        &response.body,
+        Some(&response.body_hash),
+        response.is_stream,
+        &response.expected_schema,
+        message.to_string(),
+    )
 }
 
 pub(crate) fn parse_openai_message(message: &Value) -> LlmChatOutput {
@@ -476,4 +803,58 @@ pub(crate) fn provider_tools_from_values(values: Vec<Value>) -> Vec<LlmToolDefin
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_profile() -> ResolvedLlmProfile {
+        ResolvedLlmProfile {
+            id: "profile-1".to_string(),
+            name: "DeepSeek V4 Pro".to_string(),
+            kind: "openaiCompatible".to_string(),
+            base_url: Some("https://api.example.test/v1".to_string()),
+            model: "deepseek-v4-pro".to_string(),
+            max_output_tokens: Some(1024),
+            temperature: None,
+            reasoning_effort: None,
+            thinking: None,
+            api_key: Some("secret".to_string()),
+        }
+    }
+
+    #[test]
+    fn provider_json_decode_diagnostic_keeps_raw_response_context() {
+        let diagnostic = provider_response_error(
+            &test_profile(),
+            "openaiCompatible",
+            "ProviderJsonDecodeFailed",
+            LlmProviderErrorLayer::JsonDecode,
+            Some(200),
+            Some("text/html"),
+            "token: should-not-leak\n<html>bad gateway</html>",
+            Some("abc123"),
+            false,
+            "openai.chat.completion.v1: choices[0].message",
+            "expected value at line 1 column 1".to_string(),
+        );
+
+        assert_eq!(diagnostic.reason, "ProviderJsonDecodeFailed");
+        assert_eq!(diagnostic.status, Some(200));
+        assert_eq!(diagnostic.content_type, "text/html");
+        assert!(!diagnostic.is_stream);
+        assert_eq!(
+            diagnostic.expected_schema,
+            "openai.chat.completion.v1: choices[0].message"
+        );
+        assert!(diagnostic
+            .body_preview
+            .contains("[redacted-provider-error-line]"));
+        assert!(!diagnostic.body_preview.contains("should-not-leak"));
+        let archive_text = diagnostic.archive_text();
+        assert!(archive_text.contains("ProviderJsonDecodeFailed:"));
+        assert!(archive_text.contains("content_type = text/html"));
+        assert!(archive_text.contains("expected_schema = openai.chat.completion.v1"));
+    }
 }

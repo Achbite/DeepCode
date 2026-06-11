@@ -153,7 +153,8 @@ pub(crate) async fn llm_probe(
             "provider": profile.kind,
             "model": profile.model,
             "latencyMs": now_millis().saturating_sub(started),
-            "error": error
+            "error": error.to_string(),
+            "providerError": error
         })),
     }
 }
@@ -185,7 +186,12 @@ pub(crate) async fn llm_chat(
     });
     match call_llm_profile(&profile, request_envelope).await {
         Ok(output) => ApiResponse::ok(llm_output_payload(output)),
-        Err(error) => ApiResponse::error("llm_chat_failed", error),
+        Err(error) => Json(ApiResponse {
+            ok: false,
+            data: Some(json!({ "providerError": error })),
+            error: Some("llm_chat_failed".to_string()),
+            message: Some(error.to_string()),
+        }),
     }
 }
 

@@ -10,9 +10,11 @@ description = "DeepCode Kernel daemon that owns runtime, provider transport, and
 [dependencies]
 axum.workspace = true
 deepcode-kernel-abi.workspace = true
+deepcode-kernel-ledger.workspace = true
 deepcode-kernel-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 reqwest.workspace = true
+portable-pty.workspace = true
