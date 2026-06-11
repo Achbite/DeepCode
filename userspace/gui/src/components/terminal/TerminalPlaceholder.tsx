@@ -1,5 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { TerminalSession } from '@deepcode/protocol';
+import { FitAddon } from '@xterm/addon-fit';
+import { Terminal as XTerm } from '@xterm/xterm';
+import '@xterm/xterm/css/xterm.css';
 import {
   createTerminalSession,
   deleteTerminalSession,
@@ -34,7 +37,6 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [outputBySession, setOutputBySession] = useState<Record<string, string>>({});
-  const [command, setCommand] = useState('');
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<TerminalContextMenu | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -43,13 +45,18 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const dragStateRef = useRef<TerminalDragState | null>(null);
   const lastSequenceRef = useRef<Record<string, number>>({});
+  const seenEventKeysRef = useRef<Set<string>>(new Set());
   const sessionsRef = useRef<TerminalSession[]>([]);
   const activeIdRef = useRef<string | null>(null);
   const screenRef = useRef<HTMLDivElement | null>(null);
+  const terminalHostRef = useRef<HTMLDivElement | null>(null);
+  const xtermRef = useRef<XTerm | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const terminalSessionIdRef = useRef<string | null>(null);
+  const outputBySessionRef = useRef<Record<string, string>>({});
   const lastTerminalSizeRef = useRef<Record<string, string>>({});
 
   const active = sessions.find((session) => session.id === activeId) ?? sessions[0];
-  const activeOutput = active ? outputBySession[active.id] ?? '' : '';
 
   const describeFailure = useCallback(
     (result: { error?: string; message?: string }) =>
@@ -84,6 +91,10 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
     activeIdRef.current = activeId;
   }, [activeId]);
 
+  useEffect(() => {
+    outputBySessionRef.current = outputBySession;
+  }, [outputBySession]);
+
   const applySessions = useCallback(
     (nextSessions: TerminalSession[], preferredActiveId?: string) => {
       const sorted = [...nextSessions].sort((a, b) => a.order - b.order);
@@ -110,6 +121,14 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
     setTerminalError(null);
     applySessions(result.data.sessions, preferredActiveId);
   }, [applySessions, describeFailure]);
+
+  const clearSeenEventsForSession = useCallback((sessionId: string) => {
+    for (const key of Array.from(seenEventKeysRef.current)) {
+      if (key.startsWith(`${sessionId}:`)) {
+        seenEventKeysRef.current.delete(key);
+      }
+    }
+  }, []);
 
   const createTerminal = useCallback(async () => {
     const currentSessions = sessionsRef.current;
@@ -162,11 +181,12 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
       return next;
     });
     lastSequenceRef.current[sessionId] = 0;
+    clearSeenEventsForSession(sessionId);
     applySessions(nextSessions, fallbackActive);
     setContextMenu(null);
     setRenamingId(null);
     void refreshSessions(fallbackActive);
-  }, [applySessions, refreshSessions, describeFailure]);
+  }, [applySessions, refreshSessions, describeFailure, clearSeenEventsForSession]);
 
   useEffect(() => {
     let cancelled = false;
@@ -201,6 +221,9 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
           if (event.sequence > (lastSequenceRef.current[event.sessionId] ?? 0)) {
             lastSequenceRef.current[event.sessionId] = event.sequence;
           }
+          const eventKey = `${event.sessionId}:${event.sequence}`;
+          if (seenEventKeysRef.current.has(eventKey)) return '';
+          seenEventKeysRef.current.add(eventKey);
           if (event.type === 'exit') return `\n[process exited ${event.exitCode ?? ''}]\n`;
           if (event.type === 'error') return `\n[error] ${event.data ?? ''}\n`;
           if (event.type === 'ready') return '';
@@ -213,36 +236,94 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
         ...prev,
         [active.id]: `${prev[active.id] ?? ''}${text}`,
       }));
+      if (terminalSessionIdRef.current === active.id) {
+        xtermRef.current?.write(text);
+      }
       void refreshSessions();
     }, 600);
     return () => window.clearInterval(timer);
   }, [active?.id, describeFailure, refreshSessions]);
 
   useEffect(() => {
-    if (!active?.id || !screenRef.current || typeof ResizeObserver === 'undefined') return;
+    if (!active?.id || !terminalHostRef.current) {
+      xtermRef.current?.dispose();
+      xtermRef.current = null;
+      fitAddonRef.current = null;
+      terminalSessionIdRef.current = null;
+      return;
+    }
     const sessionId = active.id;
-    const node = screenRef.current;
-    let frame = 0;
-    const observer = new ResizeObserver(([entry]) => {
-      if (!entry) return;
-      if (frame) window.cancelAnimationFrame(frame);
-      frame = window.requestAnimationFrame(() => {
-        const width = Math.max(1, entry.contentRect.width);
-        const height = Math.max(1, entry.contentRect.height - 28);
-        const cols = Math.max(20, Math.floor(width / 8));
-        const rows = Math.max(4, Math.floor(height / 18));
-        const key = `${cols}x${rows}`;
-        if (lastTerminalSizeRef.current[sessionId] === key) return;
-        lastTerminalSizeRef.current[sessionId] = key;
-        void resizeTerminalSession(sessionId, { cols, rows });
+    const terminal = new XTerm({
+      convertEol: true,
+      cursorBlink: true,
+      cursorStyle: 'block',
+      disableStdin: active.status !== 'running',
+      fontFamily: '"Cascadia Code", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+      fontSize: 12,
+      lineHeight: 1.2,
+      scrollback: 5000,
+      theme: {
+        background: '#050506',
+        foreground: '#d4d4d4',
+        cursor: '#d4d4d4',
+        selectionBackground: '#264f78',
+      },
+    });
+    const fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.open(terminalHostRef.current);
+    terminal.write(outputBySessionRef.current[sessionId] ?? '');
+    terminalSessionIdRef.current = sessionId;
+    xtermRef.current = terminal;
+    fitAddonRef.current = fitAddon;
+
+    const inputDisposable = terminal.onData((data) => {
+      if (activeIdRef.current !== sessionId) return;
+      void sendTerminalInput(sessionId, { data }).then((result) => {
+        if (!result.ok) {
+          setTerminalError(describeFailure(result));
+        } else {
+          setTerminalError(null);
+        }
       });
     });
-    observer.observe(node);
+
+    let frame = 0;
+    const resize = () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        try {
+          fitAddon.fit();
+        } catch (error) {
+          console.warn('Terminal fit failed.', error);
+          return;
+        }
+        const key = `${terminal.cols}x${terminal.rows}`;
+        if (lastTerminalSizeRef.current[sessionId] === key) return;
+        lastTerminalSizeRef.current[sessionId] = key;
+        void resizeTerminalSession(sessionId, { cols: terminal.cols, rows: terminal.rows });
+      });
+    };
+    resize();
+    terminal.focus();
+    const observer =
+      typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(() => resize());
+    if (observer) observer.observe(terminalHostRef.current);
+
     return () => {
       if (frame) window.cancelAnimationFrame(frame);
-      observer.disconnect();
+      observer?.disconnect();
+      inputDisposable.dispose();
+      terminal.dispose();
+      if (terminalSessionIdRef.current === sessionId) {
+        terminalSessionIdRef.current = null;
+        xtermRef.current = null;
+        fitAddonRef.current = null;
+      }
     };
-  }, [active?.id]);
+  }, [active?.id, active?.status, describeFailure]);
 
   const moveSession = useCallback((sourceId: string, targetId: string) => {
     if (sourceId === targetId) return;
@@ -372,38 +453,15 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
         prev.map((session) => (session.id === sessionId ? result.data! : session))
       );
       setActiveId(result.data.id);
+      clearSeenEventsForSession(result.data.id);
+      if (terminalSessionIdRef.current === result.data.id) {
+        xtermRef.current?.clear();
+      }
       setOutputBySession((prev) => ({ ...prev, [result.data!.id]: '' }));
     } else if (!result.ok) {
       setTerminalError(describeFailure(result));
     }
     setContextMenu(null);
-  };
-
-  const submitCommand = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!active || command.trim() === '') return;
-    const line = `${command}\n`;
-    setCommand('');
-    const result = await sendTerminalInput(active.id, { data: line });
-    if (!result.ok) {
-      setTerminalError(describeFailure(result));
-    } else {
-      setTerminalError(null);
-    }
-  };
-
-  const handleCommandKeyDown = async (event: React.KeyboardEvent<HTMLInputElement>) => {
-    if (!active || active.status !== 'running') return;
-    if (event.ctrlKey && event.key.toLowerCase() === 'c') {
-      event.preventDefault();
-      setCommand('');
-      const result = await sendTerminalInput(active.id, { data: '\u0003' });
-      if (!result.ok) {
-        setTerminalError(describeFailure(result));
-      } else {
-        setTerminalError(null);
-      }
-    }
   };
 
   return (
@@ -415,21 +473,13 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
               {terminalError}
             </div>
           )}
-          <pre className="terminal-panel__output">
-            {activeOutput || defaultOutput()}
-          </pre>
-          <form className="terminal-panel__prompt" onSubmit={submitCommand}>
-            <span>{active?.shellKind ?? 'shell'}</span>
-            <input
-              className="terminal-panel__command-input"
-              value={command}
-              onChange={(event) => setCommand(event.target.value)}
-              onKeyDown={(event) => void handleCommandKeyDown(event)}
-              disabled={!active || active.status !== 'running'}
-              aria-label={t(language, 'terminal.input')}
-            />
-            <span className="terminal-panel__cursor">_</span>
-          </form>
+          {!active && <div className="terminal-panel__empty">{defaultOutput()}</div>}
+          {active?.status === 'starting' && (
+            <div className="terminal-panel__empty terminal-panel__empty--overlay">
+              {defaultOutput()}
+            </div>
+          )}
+          <div className="terminal-panel__xterm" ref={terminalHostRef} />
         </div>
 
         <aside className="terminal-panel__sidebar" aria-label={t(language, 'terminal.sessions')}>
