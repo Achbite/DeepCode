@@ -26,9 +26,9 @@ DeepCode 当前区分四套正式 UI 封装：
 
 UI shell 不拥有第二套 Kernel、Session truth、tool execution、permission 或用户偏好存储。功能组件、权限、工具调用和 session 编排由 Kernel/session 提供，UI 只负责展示、输入和交互差异。
 
-## 开发环境
+## 构建与发布模式
 
-常规开发和验证优先在 Docker/Colima 环境内完成：
+常规开发、Linux/Windows 打包优先在 Docker/Colima 环境内完成：
 
 ```bash
 make shell
@@ -36,7 +36,45 @@ bash ./build.sh
 bash ./test.sh
 ```
 
-macOS `.app` 和 Darwin 可执行文件需要在 macOS 主机侧最终打包，这是 macOS 原生 app bundle 的显式例外：
+默认构建目标是完整的本地分发闭环。在容器内，`bash ./build.sh` 会构建共享
+GUI assets、DeepCode-GUI assets、Linux/Windows Rust 二进制、可选 Linux Tauri
+shell，以及 portable package layout。macOS 环境下，它随后可以向宿主机打包服务
+提交请求，补齐 Darwin 原生发布产物。
+
+macOS 原生发布是 Docker-only 构建规则的显式例外。Editor app、DeepCode-GUI
+app、CLI、TUI、TUI launcher 和 Darwin Kernel 都是 macOS native artifact，必须
+由 macOS 宿主机打包步骤产出，不能用 Linux 容器内二进制替代。
+
+先在 macOS 宿主机启动一次打包服务：
+
+```bash
+make macos-package-service
+```
+
+然后进入开发容器执行常规构建：
+
+```bash
+bash ./build.sh
+```
+
+默认 Docker-side 构建使用 `DEEPCODE_MACOS_PACKAGE_MODE=auto`：如果宿主机打包
+服务正在运行，构建会自动提交 macOS 打包请求；如果服务未运行，Docker package
+仍会完成，macOS 打包会带明确日志跳过。需要发布验收时让 macOS 打包缺失直接失败，
+使用：
+
+```bash
+DEEPCODE_MACOS_PACKAGE_MODE=require bash ./build.sh
+```
+
+macOS product set 默认是 `DeepCode-GUI,DeepCode`。这个顺序是有意的：
+先打包 DeepCode-GUI，再由 Editor package 刷新共享根目录 sidecar 和 `web/`，
+同时保留 `DeepCode-GUI.app`。只在定向重打包时覆盖：
+
+```bash
+DEEPCODE_MACOS_PRODUCTS=DeepCode bash ./build.sh --stage package-macos
+```
+
+也可以直接在 macOS 宿主机生成完整 macOS 包：
 
 ```bash
 make package-macos
@@ -50,7 +88,8 @@ make package-macos-clean
 
 `make package-macos-clean` 会在重新构建前删除 product `.app`、根目录 sidecar binaries、打包 web assets、Tauri dist 和 macOS target release 二进制等构建/打包产物。它会保留 package-local 运行数据：`config/`、`sessions/`、`conversation-archives/` 和 `kernel/`。
 
-`make package-macos` 会调用 `scripts/package-macos.sh`，输出：
+`make package-macos` 会调用 `scripts/package-macos.sh`，输出完整 macOS arm64
+发布包：
 
 ```text
 bin/macos-arm64/
@@ -61,10 +100,12 @@ bin/macos-arm64/
   deepcode-tui
   DeepCode-TUI.command
   web/
+  DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui/
   config/
   sessions/
   conversation-archives/
   kernel/
+  build-info.json
   README.txt
 ```
 

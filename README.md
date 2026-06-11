@@ -26,9 +26,9 @@ DeepCode currently has four formal UI package forms:
 
 UI shells do not own a second Kernel, session truth, tool execution path, permission model, or user-preference store. Functional components, permissions, tool calls, and session orchestration are provided by Kernel/session. UI layers only own rendering, input, and interaction differences.
 
-## Development Environment
+## Build And Release Mode
 
-Regular development and verification should run inside Docker/Colima:
+Regular development and Linux/Windows packaging run inside Docker/Colima:
 
 ```bash
 make shell
@@ -36,7 +36,49 @@ bash ./build.sh
 bash ./test.sh
 ```
 
-macOS `.app` bundles and Darwin executables require a macOS host-side final packaging step. This is the explicit exception for native macOS app bundles:
+The default build target is the complete local distribution flow. Inside the
+container, `bash ./build.sh` builds the shared GUI assets, DeepCode-GUI assets,
+Linux/Windows Rust binaries, optional Linux Tauri shell, and the portable
+package layout. On macOS, it can then submit a host-side packaging request for
+the native Darwin release outputs.
+
+Native macOS publishing is the explicit exception to the Docker-only build rule.
+The Editor app, DeepCode-GUI app, CLI, TUI, TUI launcher, and Darwin Kernel are
+macOS-native artifacts and must be produced by the macOS host package step. They
+are not substituted by Linux container binaries.
+
+Start the host package service once from the macOS host:
+
+```bash
+make macos-package-service
+```
+
+Then run the normal build inside the dev container:
+
+```bash
+bash ./build.sh
+```
+
+By default, Docker-side builds use `DEEPCODE_MACOS_PACKAGE_MODE=auto`: if the
+host package service is running, the build queues the macOS packaging requests;
+if it is not running, the Docker package still completes and macOS packaging is
+skipped with a clear log message. For release verification that must fail when
+macOS packaging is unavailable, use:
+
+```bash
+DEEPCODE_MACOS_PACKAGE_MODE=require bash ./build.sh
+```
+
+The macOS product set defaults to `DeepCode-GUI,DeepCode`. This order is
+intentional: DeepCode-GUI is packaged first, then the Editor package refreshes
+the shared root sidecars and `web/` directory while preserving
+`DeepCode-GUI.app`. Override it only for targeted rebuilds:
+
+```bash
+DEEPCODE_MACOS_PRODUCTS=DeepCode bash ./build.sh --stage package-macos
+```
+
+The same complete macOS package can be built directly on the macOS host:
 
 ```bash
 make package-macos
@@ -50,7 +92,8 @@ make package-macos-clean
 
 `make package-macos-clean` removes build/package artifacts such as the product `.app`, root sidecar binaries, packaged web assets, Tauri dist, and macOS target release binaries before rebuilding. It preserves package-local runtime data: `config/`, `sessions/`, `conversation-archives/`, and `kernel/`.
 
-`make package-macos` calls `scripts/package-macos.sh` and writes:
+`make package-macos` calls `scripts/package-macos.sh` and writes the complete
+macOS arm64 release package:
 
 ```text
 bin/macos-arm64/
@@ -61,10 +104,12 @@ bin/macos-arm64/
   deepcode-tui
   DeepCode-TUI.command
   web/
+  DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui/
   config/
   sessions/
   conversation-archives/
   kernel/
+  build-info.json
   README.txt
 ```
 
