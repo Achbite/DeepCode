@@ -5,7 +5,8 @@
 #   make build-deepcode-gui -> 在 Docker 内构建 Codex 风 DeepCode-GUI dist
 #   make dev-deepcode-gui   -> 在 Docker 内启动 31246 DeepCode-GUI 调试服务
 #   make clean          -> 全量清理（容器 + 镜像 + named volumes），下次 shell 全量重建
-#   make package-macos  -> 在 macOS 宿主机上生成 Darwin GUI/TUI 本机包
+#   make macos-package-service -> 在 macOS 宿主机启动 Docker 可请求的打包服务
+#   make package-macos  -> 生成完整 macOS 发布包：DeepCode.app + DeepCode-GUI.app + CLI/TUI
 #   make package-macos-clean -> 清理打包缓存后重新生成 Darwin GUI/TUI 本机包
 #   make package-macos-deepcode-gui -> 在 macOS 宿主机上生成 bin/macos-arm64/DeepCode-GUI.app
 #
@@ -20,6 +21,21 @@ IMAGE            := $(IMAGE_NAME):$(IMAGE_TAG)
 CONTAINER_NAME   := deepcode-dev
 DOCKERFILE       := Dockerfile.dev
 WORKDIR_IN_CTNR  := /workspace
+DEEPCODE_APT_MIRROR ?= https://mirrors.tuna.tsinghua.edu.cn/debian
+DEEPCODE_APT_SECURITY_MIRROR ?= https://mirrors.tuna.tsinghua.edu.cn/debian-security
+DEEPCODE_NODE_VERSION ?= 22.22.3
+DEEPCODE_NODE_DIST_BASE ?= https://npmmirror.com/mirrors/node
+DEEPCODE_NPM_REGISTRY ?= https://registry.npmmirror.com
+DEEPCODE_RUSTUP_DIST_SERVER ?= https://mirrors.ustc.edu.cn/rust-static
+DEEPCODE_RUSTUP_UPDATE_ROOT ?= https://mirrors.ustc.edu.cn/rust-static/rustup
+BUILD_ARGS := \
+	--build-arg DEEPCODE_APT_MIRROR=$(DEEPCODE_APT_MIRROR) \
+	--build-arg DEEPCODE_APT_SECURITY_MIRROR=$(DEEPCODE_APT_SECURITY_MIRROR) \
+	--build-arg DEEPCODE_NODE_VERSION=$(DEEPCODE_NODE_VERSION) \
+	--build-arg DEEPCODE_NODE_DIST_BASE=$(DEEPCODE_NODE_DIST_BASE) \
+	--build-arg DEEPCODE_NPM_REGISTRY=$(DEEPCODE_NPM_REGISTRY) \
+	--build-arg DEEPCODE_RUSTUP_DIST_SERVER=$(DEEPCODE_RUSTUP_DIST_SERVER) \
+	--build-arg DEEPCODE_RUSTUP_UPDATE_ROOT=$(DEEPCODE_RUSTUP_UPDATE_ROOT)
 
 # ---- 持久化卷（只有 make clean 才会清空，避免每次 shell 重装依赖）----
 VOL_PNPM_STORE        := deepcode-pnpm-store
@@ -46,7 +62,7 @@ RUN_ARGS := \
 	-e PNPM_HOME=/root/.local/share/pnpm \
 	-e PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-.PHONY: help shell build-deepcode-gui dev-deepcode-gui clean package-macos package-macos-clean package-macos-deepcode-gui _ensure_image _ensure_container
+.PHONY: help shell build-deepcode-gui dev-deepcode-gui clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _ensure_image _ensure_container
 
 # ---- help：默认目标，列出可用入口 ----
 help:
@@ -56,13 +72,23 @@ help:
 	@echo "  make build-deepcode-gui  在 Docker 内构建 Codex 风 DeepCode-GUI dist"
 	@echo "  make dev-deepcode-gui    在 Docker 内启动 DeepCode-GUI 调试服务：127.0.0.1:31246"
 	@echo "  make clean          全量清理（容器 + 镜像 + 4 个 named volumes），下次 shell 全量重建"
-	@echo "  make package-macos  在 macOS 宿主机上生成 bin/macos-arm64 GUI/TUI 本机包"
+	@echo "  make macos-package-service  在 macOS 宿主机启动 Docker 打包请求服务"
+	@echo "  make package-macos  生成完整 macOS 发布包：DeepCode.app + DeepCode-GUI.app + CLI/TUI"
 	@echo "  make package-macos-clean  清理打包缓存后重新生成 macOS 本机包（保留 config/sessions/archives/kernel）"
 	@echo "  make package-macos-deepcode-gui  在 macOS 宿主机上生成 bin/macos-arm64/DeepCode-GUI.app"
 	@echo ""
 	@echo "进入容器后可手动执行："
 	@echo "  ./build.sh   编译并输出统一分发目录到 bin/deepcode/"
 	@echo "  ./test.sh    运行链路 ping 与环境检查"
+
+macos-package-service:
+	@bash ./build.sh --stage macos-package-service
+
+macos-package-service-status:
+	@bash ./scripts/macos-package-service.sh status
+
+macos-package-service-stop:
+	@bash ./scripts/macos-package-service.sh stop
 
 package-macos:
 	@bash ./build.sh --stage package-macos
@@ -77,7 +103,7 @@ package-macos-deepcode-gui:
 _ensure_image:
 	@if ! docker image inspect $(IMAGE) >/dev/null 2>&1; then \
 		echo "[make] 镜像 $(IMAGE) 不存在，开始构建..."; \
-		docker build -f $(DOCKERFILE) -t $(IMAGE) . ; \
+		docker build $(BUILD_ARGS) -f $(DOCKERFILE) -t $(IMAGE) . ; \
 	else \
 		echo "[make] 镜像 $(IMAGE) 已存在，跳过构建"; \
 	fi

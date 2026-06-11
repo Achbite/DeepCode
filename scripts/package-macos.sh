@@ -706,7 +706,7 @@ sync_signed_kernel_sidecar_to_root() {
 }
 
 write_readme() {
-  local tui_section root_web_entry notes
+  local tui_section root_web_entry asset_entries notes app_entries gui_section note_assets
   if [ "$WRITE_TUI_LAUNCHER" = "1" ]; then
     tui_section="TUI:
   open $TUI_COMMAND_NAME
@@ -720,34 +720,63 @@ write_readme() {
     root_web_entry="  $WEB_DIR_NAME/             React GUI static assets served by the Kernel daemon."
   else
     root_web_entry="  $APP_NAME.app/Contents/MacOS/$WEB_DIR_NAME/
-                         Bundled conversational GUI assets; the shared root web/ is not replaced."
+	                         Bundled conversational GUI assets; the shared root web/ is not replaced."
   fi
+  asset_entries="$root_web_entry"
 
   notes="  bin/macos-arm64 is the shared macOS distribution directory for DeepCode and
   DeepCode-GUI. Both GUI variants use the same kernel/session/user settings
   model unless DEEPCODE_CONFIG_DIR is explicitly overridden.
-  By default, this local package stores writable user data under:
-    config/user/local/settings/
-    config/user/local/secrets/
-    sessions/
-    conversation-archives/
-    kernel/"
+	  By default, this local package stores writable user data under:
+	    config/user/local/settings/
+	    config/user/local/secrets/
+	    sessions/
+	    conversation-archives/
+	    kernel/"
+
+  app_entries=""
+  gui_section=""
+  note_assets=""
+  if [ "$PRODUCT" = "DeepCode" ] || [ -d "$BIN_DIR/DeepCode.app" ]; then
+    app_entries="  DeepCode.app              Native macOS Editor shell. Starts its bundled Kernel."
+    gui_section="  open DeepCode.app"
+    note_assets="  DeepCode.app contains deepcode-kernel and web/ under Contents/MacOS."
+  fi
+  if [ "$PRODUCT" = "DeepCode-GUI" ] || [ -d "$BIN_DIR/DeepCode-GUI.app" ]; then
+    if [ "$WEB_DIR_NAME" != "web-deepcode-gui" ]; then
+      asset_entries="$asset_entries
+  DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui/
+                         Bundled conversational GUI assets."
+    fi
+    if [ -n "$app_entries" ]; then
+      app_entries="$app_entries
+  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel."
+      gui_section="$gui_section
+  open DeepCode-GUI.app"
+      note_assets="$note_assets
+  DeepCode-GUI.app contains deepcode-kernel and web-deepcode-gui/ under Contents/MacOS."
+    else
+      app_entries="  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel."
+      gui_section="  open DeepCode-GUI.app"
+      note_assets="  DeepCode-GUI.app contains deepcode-kernel and web-deepcode-gui/ under Contents/MacOS."
+    fi
+  fi
 
   cat > "$BIN_DIR/README.txt" <<README
-$PRODUCT macOS arm64 Distribution
+DeepCode macOS arm64 Distribution
 =================================
 
 GUI:
-  open $APP_NAME.app
+$gui_section
 
 $tui_section
 
 Files:
-  $APP_NAME.app              Native macOS GUI shell. Starts its bundled Kernel.
+$app_entries
   deepcode-kernel           Darwin arm64 Kernel daemon.
   deepcode-cli              Darwin arm64 CLI host.
   deepcode-tui              Darwin arm64 Ratatui/Crossterm TUI host.
-$root_web_entry
+$asset_entries
   config/                  Package-local writable user config root.
   sessions/                Package-local session projection/transcript cache.
   conversation-archives/   Package-local conversation exports and debug packages.
@@ -757,7 +786,7 @@ Notes:
 $notes
   This is a local runnable package. It is ad-hoc signed for local execution,
   but it is not Developer ID signed, notarized, or wrapped in a DMG.
-  The GUI app also contains deepcode-kernel and $WEB_DIR_NAME/ under Contents/MacOS.
+$note_assets
 README
 }
 
@@ -828,6 +857,11 @@ verify_packaged_kernel_markers() {
 
   [ -f "$BIN_DIR/build-info.json" ] || fail "missing root build-info.json"
   [ -f "$BIN_DIR/$APP_NAME.app/Contents/MacOS/build-info.json" ] || fail "missing bundled build-info.json"
+  for build_info in "$BIN_DIR/build-info.json" "$BIN_DIR/$APP_NAME.app/Contents/MacOS/build-info.json"; do
+    local build_info_commit
+    build_info_commit="$(awk -F '"' '/"buildCommit"/ { print $4; exit }' "$build_info")"
+    [ "$build_info_commit" = "$BUILD_COMMIT" ] || fail "$build_info buildCommit=$build_info_commit does not match current build commit $BUILD_COMMIT"
+  done
 
   for candidate in "$kernel_bin" "$app_kernel_bin"; do
     local strings_file
@@ -852,6 +886,18 @@ verify_packaged_kernel_markers() {
     if ! grep -Fq 'browser.snapshot' "$strings_file"; then
       rm -f "$strings_file"
       fail "$candidate tool catalog is missing browser.snapshot"
+    fi
+    if grep -Fq 'Kernel terminal placeholder ready' "$strings_file"; then
+      rm -f "$strings_file"
+      fail "$candidate still contains old placeholder terminal runtime"
+    fi
+    if grep -Fq 'terminal runtime reserved' "$strings_file"; then
+      rm -f "$strings_file"
+      fail "$candidate still contains reserved terminal placeholder output"
+    fi
+    if ! grep -Fq 'Kernel PTY terminal runtime is ready.' "$strings_file"; then
+      rm -f "$strings_file"
+      fail "$candidate is missing PTY terminal runtime marker"
     fi
     rm -f "$strings_file"
   done

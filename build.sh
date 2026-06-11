@@ -10,7 +10,8 @@
 # 分阶段入口：
 #   ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
 #   ./build.sh --stage deepcode-gui # pnpm + Codex 风 DeepCode-GUI dist
-#   ./build.sh --stage package-macos # macOS host: build DeepCode.app package
+#   ./build.sh --stage macos-package-service # macOS host: start package worker
+#   ./build.sh --stage package-macos # macOS host/Docker request: build complete macOS app set
 #   ./build.sh --stage package-macos-deepcode-gui # macOS host: build DeepCode-GUI.app package
 #   ./build.sh --stage macos-deepcode-gui # compat alias for package-macos-deepcode-gui
 #   ./build.sh --stage daemon   # Linux/Windows Rust Kernel daemon
@@ -40,6 +41,12 @@ CLIENT_DIR="$ROOT_DIR/userspace/gui"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
 CARGO_TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 PNPM_STORE_DIR="${PNPM_STORE_DIR:-$ROOT_DIR/.pnpm-store}"
+PNPM_REGISTRY="${DEEPCODE_PNPM_REGISTRY:-https://registry.yarnpkg.com}"
+PNPM_NETWORK_CONCURRENCY="${DEEPCODE_PNPM_NETWORK_CONCURRENCY:-4}"
+PNPM_FETCH_RETRIES="${DEEPCODE_PNPM_FETCH_RETRIES:-2}"
+PNPM_FETCH_RETRY_MINTIMEOUT_MS="${DEEPCODE_PNPM_FETCH_RETRY_MINTIMEOUT_MS:-5000}"
+PNPM_FETCH_RETRY_MAXTIMEOUT_MS="${DEEPCODE_PNPM_FETCH_RETRY_MAXTIMEOUT_MS:-15000}"
+PNPM_FETCH_TIMEOUT_MS="${DEEPCODE_PNPM_FETCH_TIMEOUT_MS:-30000}"
 BUILD_LINUX_TAURI_SHELL="${DEEPCODE_BUILD_LINUX_TAURI_SHELL:-0}"
 STAGE_STAMP_DIR="$ROOT_DIR/.build-cache/build-stamps"
 
@@ -50,19 +57,30 @@ cd "$ROOT_DIR"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./build.sh [--stage all|gui|deepcode-gui|package-macos|package-macos-deepcode-gui|macos-deepcode-gui|daemon|cli|tui|kernel|tauri|package]...
+  ./build.sh [--stage all|gui|deepcode-gui|macos-package-service|package-macos|package-macos-deepcode-gui|macos-deepcode-gui|daemon|cli|tui|kernel|tauri|package]...
+  ./build.sh --stage macos-package-service
   ./build.sh --full
   ./build.sh --stage package-macos --clean-cache
 
 Environment:
   CARGO_TARGET_DIR                  Override shared Cargo target directory.
   PNPM_STORE_DIR                    Override pnpm store directory.
+  DEEPCODE_PNPM_REGISTRY            Override pnpm registry used by dependency install.
+  DEEPCODE_PNPM_NETWORK_CONCURRENCY Override pnpm network concurrency.
+  DEEPCODE_PNPM_FETCH_TIMEOUT_MS    Override pnpm fetch timeout in milliseconds.
   DEEPCODE_FORCE_BUILD=1            Ignore stage hash stamps and rebuild.
   DEEPCODE_DISABLE_SCCACHE=1        Disable sccache even when available.
   DEEPCODE_ALLOW_HOST_BUILD=1       Allow non-Docker host builds explicitly.
   SCCACHE_DIR                       Override local sccache cache directory.
   DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 Build optional Linux Tauri shell.
-  DEEPCODE_MACOS_PRODUCT=DeepCode-GUI Package the Codex-style macOS GUI app.
+  DEEPCODE_MACOS_PACKAGE_MODE=auto|off|require
+                                      From Docker, submit a macOS package request after full package stage.
+  DEEPCODE_MACOS_PACKAGE_WAIT=1       Wait for the host package service request to finish.
+  DEEPCODE_MACOS_PACKAGE_TIMEOUT_SECONDS
+                                      Timeout for macOS package service requests.
+  DEEPCODE_MACOS_PRODUCTS=DeepCode-GUI,DeepCode
+                                      Comma/space separated macOS app set for package-macos.
+  DEEPCODE_MACOS_PRODUCT=DeepCode-GUI Compatibility alias for a single macOS product.
   --clean-cache                     Clean macOS package build artifacts without deleting config/sessions/archives/kernel data.
 USAGE
 }
@@ -111,6 +129,7 @@ run_gui=0
 run_deepcode_gui=0
 run_package_macos=0
 run_package_macos_deepcode_gui=0
+run_macos_package_service=0
 run_daemon=0
 run_cli=0
 run_tui=0
@@ -122,11 +141,15 @@ enable_stage() {
     all)
       run_deps=1
       run_gui=1
+      run_deepcode_gui=1
       run_daemon=1
       run_cli=1
       run_tui=1
       run_tauri=1
       run_package=1
+      ;;
+    macos-package-service)
+      run_macos_package_service=1
       ;;
     deps)
       run_deps=1
@@ -193,9 +216,10 @@ echo "==[build]== DeepCode cross-platform build started at $(build_started_at)"
 echo "==[build]== ROOT_DIR=$ROOT_DIR"
 echo "==[build]== CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
+echo "==[build]== PNPM_REGISTRY=$PNPM_REGISTRY"
 echo "==[build]== DEEPCODE_BUILD_LINUX_TAURI_SHELL=$BUILD_LINUX_TAURI_SHELL"
 echo "==[build]== clean-cache=$clean_cache"
-echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui package-macos=$run_package_macos package-macos-deepcode-gui=$run_package_macos_deepcode_gui daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package"
+echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui package-macos=$run_package_macos package-macos-deepcode-gui=$run_package_macos_deepcode_gui macos-package-service=$run_macos_package_service daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package"
 mkdir -p "$STAGE_STAMP_DIR"
 
 is_docker_environment() {
@@ -240,7 +264,138 @@ run_macos_package_from_host() {
   echo "$BIN_ROOT/macos-arm64/$output_app"
 }
 
+resolved_macos_products=()
+
+add_macos_product() {
+  local product="$1"
+  local existing
+  case "$product" in
+    DeepCode|DeepCode-GUI) ;;
+    *) echo "==[build][error]== unsupported macOS product: $product" >&2; exit 2 ;;
+  esac
+  for existing in "${resolved_macos_products[@]}"; do
+    [ "$existing" != "$product" ] || return 0
+  done
+  resolved_macos_products+=("$product")
+}
+
+resolve_macos_products() {
+  resolved_macos_products=()
+  local raw="${DEEPCODE_MACOS_PRODUCTS:-}"
+  if [ -z "$raw" ]; then
+    raw="${DEEPCODE_MACOS_PRODUCT:-DeepCode-GUI,DeepCode}"
+  fi
+  raw="${raw//,/ }"
+
+  local product
+  for product in $raw; do
+    case "$product" in
+      all|complete|both)
+        add_macos_product "DeepCode-GUI"
+        add_macos_product "DeepCode"
+        ;;
+      *)
+        add_macos_product "$product"
+        ;;
+    esac
+  done
+  if [ "${#resolved_macos_products[@]}" -eq 0 ]; then
+    echo "==[build][error]== empty macOS product list" >&2
+    exit 2
+  fi
+}
+
+run_macos_package_products_from_host() {
+  local product
+  for product in "$@"; do
+    case "$product" in
+      DeepCode) run_macos_package_from_host "DeepCode" "DeepCode.app" ;;
+      DeepCode-GUI) run_macos_package_from_host "DeepCode-GUI" "DeepCode-GUI.app" ;;
+      *) echo "==[build][error]== unsupported macOS product: $product" >&2; exit 2 ;;
+    esac
+  done
+}
+
+start_macos_package_service_from_host() {
+  if is_docker_environment; then
+    echo "==[build][error]== macOS package service must be started on the macOS host, not inside Docker." >&2
+    echo "==[build][error]== Run on the host: bash ./build.sh --stage macos-package-service" >&2
+    exit 3
+  fi
+  if [ "$(uname -s)" != "Darwin" ]; then
+    echo "==[build][error]== macOS package service requires a macOS host." >&2
+    exit 3
+  fi
+  bash ./scripts/macos-package-service.sh start
+  bash ./scripts/macos-package-service.sh status
+}
+
+macos_package_service_is_running() {
+  bash ./scripts/macos-package-service.sh status --quiet >/dev/null 2>&1
+}
+
+submit_macos_package_request() {
+  local product="$1"
+  local required="${2:-1}"
+  local wait="${DEEPCODE_MACOS_PACKAGE_WAIT:-1}"
+  local timeout="${DEEPCODE_MACOS_PACKAGE_TIMEOUT_SECONDS:-3600}"
+  local args=(submit --product "$product" --timeout-seconds "$timeout")
+
+  if [ "$clean_cache" = "1" ]; then
+    args+=(--clean --refresh-gui-dist)
+  fi
+  if [ "$wait" = "1" ]; then
+    args+=(--wait)
+  fi
+
+  if ! macos_package_service_is_running; then
+    if [ "$required" = "1" ]; then
+      echo "==[build][error]== macOS package service is not running." >&2
+      echo "==[build][error]== Run on the macOS host first: bash ./build.sh --stage macos-package-service" >&2
+      exit 3
+    fi
+    echo "==[build][package-macos]== macOS package service not running; skip auto package request"
+    echo "==[build][package-macos]== Start it on host with: bash ./build.sh --stage macos-package-service"
+    return 0
+  fi
+
+  echo "==[build][package-macos]== submit $product request to macOS package service"
+  bash ./scripts/macos-package-service.sh "${args[@]}"
+}
+
+submit_macos_package_requests() {
+  local required="$1"
+  shift
+  local product
+  for product in "$@"; do
+    submit_macos_package_request "$product" "$required"
+  done
+}
+
+auto_submit_macos_package_request() {
+  [ "${DEEPCODE_MACOS_PACKAGE_MODE:-auto}" != "off" ] || return
+  is_docker_environment || return
+
+  local required=0
+  if [ "${DEEPCODE_MACOS_PACKAGE_MODE:-auto}" = "require" ]; then
+    required=1
+  fi
+  resolve_macos_products
+  submit_macos_package_requests "$required" "${resolved_macos_products[@]}"
+}
+
 host_macos_stage_count=$((run_package_macos + run_package_macos_deepcode_gui))
+if [ "$run_macos_package_service" = "1" ]; then
+  if [ "$host_macos_stage_count" -gt 0 ] || [ "$run_deps" = "1" ] || [ "$run_gui" = "1" ] || \
+    [ "$run_deepcode_gui" = "1" ] || [ "$run_daemon" = "1" ] || [ "$run_cli" = "1" ] || \
+    [ "$run_tui" = "1" ] || [ "$run_tauri" = "1" ] || [ "$run_package" = "1" ]; then
+    echo "==[build][error]== macos-package-service must run by itself." >&2
+    exit 2
+  fi
+  start_macos_package_service_from_host
+  exit 0
+fi
+
 if [ "$host_macos_stage_count" -gt 0 ]; then
   if [ "$host_macos_stage_count" -ne 1 ]; then
     echo "==[build][error]== run exactly one macOS package stage at a time." >&2
@@ -253,9 +408,18 @@ if [ "$host_macos_stage_count" -gt 0 ]; then
     exit 2
   fi
   if [ "$run_package_macos" = "1" ]; then
-    run_macos_package_from_host "DeepCode" "DeepCode.app"
+    resolve_macos_products
+    if is_docker_environment; then
+      submit_macos_package_requests 1 "${resolved_macos_products[@]}"
+    else
+      run_macos_package_products_from_host "${resolved_macos_products[@]}"
+    fi
   else
-    run_macos_package_from_host "DeepCode-GUI" "DeepCode-GUI.app"
+    if is_docker_environment; then
+      submit_macos_package_request "DeepCode-GUI" 1
+    else
+      run_macos_package_from_host "DeepCode-GUI" "DeepCode-GUI.app"
+    fi
   fi
   exit 0
 fi
@@ -396,7 +560,14 @@ mark_stage_built() {
 
 run_pnpm_install() {
   echo "==[build][deps]== pnpm install"
-  pnpm install --no-frozen-lockfile --store-dir "$PNPM_STORE_DIR"
+  pnpm install --no-frozen-lockfile \
+    --store-dir "$PNPM_STORE_DIR" \
+    --registry "$PNPM_REGISTRY" \
+    --network-concurrency "$PNPM_NETWORK_CONCURRENCY" \
+    --fetch-retries "$PNPM_FETCH_RETRIES" \
+    --fetch-retry-mintimeout "$PNPM_FETCH_RETRY_MINTIMEOUT_MS" \
+    --fetch-retry-maxtimeout "$PNPM_FETCH_RETRY_MAXTIMEOUT_MS" \
+    --fetch-timeout "$PNPM_FETCH_TIMEOUT_MS"
 }
 
 prepare_tauri_dist() {
@@ -754,6 +925,7 @@ fi
 
 if [ "$run_package" = "1" ]; then
   package_distribution
+  auto_submit_macos_package_request
 fi
 
 echo ""
