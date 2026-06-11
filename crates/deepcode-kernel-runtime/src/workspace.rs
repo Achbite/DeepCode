@@ -246,18 +246,35 @@ impl DeepCodeKernelRuntime {
         path: String,
     ) -> KernelResult<Vec<KernelEvent>> {
         let result = (|| {
-            let _workspace = self.current_workspace()?;
+            let workspace = self.current_workspace()?;
             validate_folder_id(folder_id.as_deref())?;
-            deny_protected_deepcode_mutation(&path)?;
-            let target = self.resolve_workspace_path(&path)?;
-            let kind = if target.is_dir() { "directory" } else { "file" };
-            if target.is_dir() {
+            if normalize_relative_path(&path) == "." {
                 return Err(KernelError::PermissionDenied(
-                    "workspace.delete only accepts files in this kernel stage".to_string(),
+                    "workspace.delete cannot remove the workspace root".to_string(),
                 ));
             }
-            fs::remove_file(&target)
-                .map_err(|error| KernelError::Other(format!("delete {path}: {error}")))?;
+            deny_protected_deepcode_mutation(&path)?;
+            let target = self.resolve_workspace_path(&path)?;
+            if target == workspace.root {
+                return Err(KernelError::PermissionDenied(
+                    "workspace.delete cannot remove the workspace root".to_string(),
+                ));
+            }
+            let metadata = fs::symlink_metadata(&target)
+                .map_err(|error| KernelError::Other(format!("stat {path}: {error}")))?;
+            let kind = if metadata.file_type().is_dir() {
+                "directory"
+            } else {
+                "file"
+            };
+            if metadata.file_type().is_dir() {
+                fs::remove_dir_all(&target).map_err(|error| {
+                    KernelError::Other(format!("delete directory {path}: {error}"))
+                })?;
+            } else {
+                fs::remove_file(&target)
+                    .map_err(|error| KernelError::Other(format!("delete file {path}: {error}")))?;
+            }
             Ok(serde_json::json!({
                 "folderId": "wf-0",
                 "path": normalize_relative_path(&path),
@@ -464,7 +481,27 @@ pub(crate) fn normalize_relative_path(path: &str) -> String {
 }
 
 pub(crate) fn deny_protected_deepcode_mutation(path: &str) -> KernelResult<()> {
-    WorkspaceBoundary::assert_mutable_config_asset(path)
+    WorkspaceBoundary::assert_mutable_config_asset(path)?;
+    let normalized = path.replace('\\', "/").trim_matches('/').to_string();
+    if normalized.is_empty() || normalized == "." {
+        return Ok(());
+    }
+    let protected_prefixes = [
+        "bin/macos-arm64/config",
+        "bin/macos-arm64/sessions",
+        "bin/macos-arm64/conversation-archives",
+        "bin/macos-arm64/kernel",
+    ];
+    if protected_prefixes.iter().any(|prefix| {
+        normalized == *prefix
+            || normalized.starts_with(&format!("{prefix}/"))
+            || prefix.starts_with(&format!("{normalized}/"))
+    }) {
+        return Err(KernelError::PermissionDenied(
+            "workspace mutation cannot modify package-local DeepCode runtime data".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn list_nodes(path: &Path, root: &Path, depth: u32) -> KernelResult<Vec<Value>> {

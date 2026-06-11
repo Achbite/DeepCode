@@ -1031,6 +1031,117 @@ fn workspace_syscalls_manage_files_under_current_workspace() {
 }
 
 #[test]
+fn workspace_delete_recursively_removes_directories() {
+    let root = temp_workspace();
+    fs::create_dir_all(root.join("tmp-dir/nested")).unwrap();
+    fs::write(root.join("tmp-dir/nested/file.txt"), "delete me").unwrap();
+
+    let mut runtime = DeepCodeKernelRuntime::new();
+    workspace_output(
+        runtime
+            .dispatch(KernelCommand::WorkspaceOpen {
+                request_id: RequestId("req-open".to_string()),
+                path: root.to_string_lossy().to_string(),
+            })
+            .unwrap(),
+    );
+
+    let deleted = workspace_output(
+        runtime
+            .dispatch(KernelCommand::WorkspaceDelete {
+                request_id: RequestId("req-delete-dir".to_string()),
+                folder_id: Some("wf-0".to_string()),
+                path: "tmp-dir".to_string(),
+            })
+            .unwrap(),
+    );
+    assert_eq!(deleted["kind"], "directory");
+    assert!(!root.join("tmp-dir").exists());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn workspace_delete_removes_hidden_files() {
+    let root = temp_workspace();
+    fs::write(root.join(".DS_Store"), "finder metadata").unwrap();
+
+    let mut runtime = DeepCodeKernelRuntime::new();
+    workspace_output(
+        runtime
+            .dispatch(KernelCommand::WorkspaceOpen {
+                request_id: RequestId("req-open".to_string()),
+                path: root.to_string_lossy().to_string(),
+            })
+            .unwrap(),
+    );
+
+    let deleted = workspace_output(
+        runtime
+            .dispatch(KernelCommand::WorkspaceDelete {
+                request_id: RequestId("req-delete-hidden".to_string()),
+                folder_id: Some("wf-0".to_string()),
+                path: ".DS_Store".to_string(),
+            })
+            .unwrap(),
+    );
+    assert_eq!(deleted["kind"], "file");
+    assert_eq!(deleted["path"], ".DS_Store");
+    assert!(!root.join(".DS_Store").exists());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn workspace_delete_rejects_root_and_package_runtime_data() {
+    let root = temp_workspace();
+    fs::create_dir_all(root.join("bin/macos-arm64/sessions/session-1")).unwrap();
+    fs::write(
+        root.join("bin/macos-arm64/sessions/session-1/projection.jsonl"),
+        "{}\n",
+    )
+    .unwrap();
+
+    let mut runtime = DeepCodeKernelRuntime::new();
+    workspace_output(
+        runtime
+            .dispatch(KernelCommand::WorkspaceOpen {
+                request_id: RequestId("req-open".to_string()),
+                path: root.to_string_lossy().to_string(),
+            })
+            .unwrap(),
+    );
+
+    let root_error = workspace_error(
+        runtime
+            .dispatch(KernelCommand::WorkspaceDelete {
+                request_id: RequestId("req-delete-root".to_string()),
+                folder_id: Some("wf-0".to_string()),
+                path: ".".to_string(),
+            })
+            .unwrap(),
+    );
+    assert_eq!(root_error, "permission_denied");
+    assert!(root.exists());
+
+    let protected_error = workspace_error(
+        runtime
+            .dispatch(KernelCommand::WorkspaceDelete {
+                request_id: RequestId("req-delete-protected".to_string()),
+                folder_id: Some("wf-0".to_string()),
+                path: "bin/macos-arm64/sessions".to_string(),
+            })
+            .unwrap(),
+    );
+    assert_eq!(protected_error, "permission_denied");
+    assert!(root
+        .join("bin/macos-arm64/sessions/session-1/projection.jsonl")
+        .exists());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn workspace_syscalls_fail_closed_without_workspace_or_for_unsafe_paths() {
     let mut runtime = DeepCodeKernelRuntime::new();
     let error = workspace_error(
