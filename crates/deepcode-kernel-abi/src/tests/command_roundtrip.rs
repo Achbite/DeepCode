@@ -25,7 +25,7 @@ fn run_start_carries_workspace_binding_and_refs() {
         workspace_binding: Some(WorkspaceBinding {
             workspace_id: Some("ws-1".to_string()),
             workspace_hash: Some("hash-1".to_string()),
-            open_path: Some("/workspace/project.code-workspace".to_string()),
+            open_path: Some("workspace-binding".to_string()),
             active_folder_id: Some("wf-0".to_string()),
             folder_hash: Some("folder-hash".to_string()),
         }),
@@ -57,14 +57,14 @@ fn workspace_and_skill_syscalls_round_trip() {
     let command = KernelCommand::WorkspaceWrite {
         request_id: RequestId("req-write".to_string()),
         folder_id: Some("wf-0".to_string()),
-        path: "_agent_tmp_syscall.txt".to_string(),
+        path: "managed-syscall-resource".to_string(),
         content: "hello".to_string(),
         create: true,
     };
 
     let encoded = serde_json::to_value(&command).expect("serialize workspace write");
     assert_eq!(encoded["kind"], "workspaceWrite");
-    assert_eq!(encoded["path"], "_agent_tmp_syscall.txt");
+    assert_eq!(encoded["path"], "managed-syscall-resource");
 
     let decoded: KernelCommand =
         serde_json::from_value(encoded).expect("deserialize workspace write");

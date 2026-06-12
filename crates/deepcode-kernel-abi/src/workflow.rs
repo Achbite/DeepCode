@@ -29,8 +29,6 @@ pub enum WorkflowDecisionReason {
 #[serde(rename_all = "camelCase")]
 pub enum AnswerObligationId {
     Identity,
-    ToolComponentSummary,
-    TempFileLifecycleResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

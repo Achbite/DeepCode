@@ -60,14 +60,21 @@ impl GuiState {
             read_json_file(&paths.llm_profiles_path).unwrap_or_else(default_llm_profiles);
         let workflow_config =
             read_json_file(&paths.workflow_config_path).unwrap_or_else(default_workflow_config);
+        let sessions = restore_session_index(&paths);
+        let current_session_id = sessions
+            .iter()
+            .find(|session| !is_archived_session(session))
+            .and_then(|session| session.get("id").and_then(Value::as_str))
+            .map(ToOwned::to_owned);
+        let current_session_ids_by_scope = restored_current_session_ids_by_scope(&sessions);
         Self {
             paths,
             user_settings,
             llm_profiles,
             workflow_config,
-            sessions: Vec::new(),
-            current_session_id: None,
-            current_session_ids_by_scope: HashMap::new(),
+            sessions,
+            current_session_id,
+            current_session_ids_by_scope,
             session_projection_cache: HashMap::new(),
             pending_plans: HashMap::new(),
             pending_reviews: HashMap::new(),

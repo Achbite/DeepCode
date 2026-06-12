@@ -4,7 +4,7 @@
 use crate::prelude::*;
 use crate::*;
 use deepcode_kernel_abi::LlmProviderDiagnostic;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -49,7 +49,24 @@ const USER_ATTACHMENT_MAX_CONTEXT_CHARS: usize = 40_000;
 const USER_ATTACHMENT_MAX_FILE_CHARS: usize = 12_000;
 const USER_ATTACHMENT_MAX_DIR_ENTRIES: usize = 300;
 const USER_ATTACHMENT_MAX_DIR_DEPTH: usize = 2;
+const SESSION_SHORT_MEMORY_MAX_CHARS: usize = 12_000;
+const SESSION_SHORT_MEMORY_MAX_USER_TURNS: usize = 6;
+const SESSION_SHORT_MEMORY_MAX_ASSISTANT_SUMMARIES: usize = 4;
+const SESSION_SHORT_MEMORY_MAX_ATTACHMENTS: usize = 12;
+const SESSION_SHORT_MEMORY_MAX_TEXT_CHARS: usize = 700;
+const SESSION_RESOURCE_CONTEXT_MAX_CHARS: usize = 28_000;
+const SESSION_RESOURCE_CONTEXT_MAX_ITEMS: usize = 12;
+const SESSION_RESOURCE_CONTEXT_MAX_OUTPUT_CHARS: usize = 8_000;
+const INTERNAL_READ_ONLY_MAX_ADVANCES: usize = 6;
 const AGENT_PROTOCOL_SCHEMA_VERSION: &str = "deepcode.agent.protocol.v2";
+const READ_ONLY_DUPLICATE_RESOURCE_MESSAGE: &str = "当前只读探索计划只请求了本轮已经读取或搜索过的资源，Agent 已停止继续重复读取。请补充新的目录、文件、搜索词，或缩小需要分析的问题范围。";
+
+#[derive(Debug, Clone)]
+struct ReadOnlyContinuationSeed {
+    profile: ResolvedLlmProfile,
+    request_envelope: Value,
+    event_session_id: Option<deepcode_kernel_abi::SessionId>,
+}
 
 pub(crate) fn user_input_with_selected_attachment_context(request: &AgentRunRequest) -> String {
     let context = build_explicit_attachment_context(&request.attachments, None);
@@ -147,11 +164,867 @@ fn build_explicit_attachment_context(attachments: &[Value], workspace: Option<&V
         parts.insert(
             0,
             format!(
-                "### ATTACHMENTS manifest\n```json\n{manifest}\n```\nUse these explicit user attachments before guessing references such as \"this file\"."
+                "### ATTACHMENTS manifest\n```json\n{manifest}\n```\nUse these explicit user attachments before guessing unresolved file or directory references."
             ),
         );
     }
     parts.join("\n\n")
+}
+
+fn request_envelope_with_session_short_memory(
+    state: &AppState,
+    session_id: &str,
+    phase: &str,
+    request_envelope: &Value,
+) -> Value {
+    if phase != "plan" {
+        return request_envelope.clone();
+    }
+    let memory = build_session_short_memory_context(&session_projection(state, session_id));
+    if memory.trim().is_empty() {
+        return request_envelope.clone();
+    }
+
+    let mut next = request_envelope.clone();
+    let Some(messages) = next.get_mut("messages").and_then(Value::as_array_mut) else {
+        return request_envelope.clone();
+    };
+    let Some(user_message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return request_envelope.clone();
+    };
+    let Some(content) = user_message.get("content").and_then(Value::as_str) else {
+        return request_envelope.clone();
+    };
+    user_message["content"] = json!(format!(
+        "{}\n\n## Session short-term memory\n{}",
+        content.trim_end(),
+        memory
+    ));
+    next
+}
+
+fn request_envelope_with_session_memory_block(
+    state: &AppState,
+    session_id: &str,
+    request_envelope: &Value,
+) -> Value {
+    let memory = build_session_short_memory_context(&session_projection(state, session_id));
+    if memory.trim().is_empty() {
+        return request_envelope.clone();
+    }
+    append_user_context_block(request_envelope, "Session short-term memory", &memory)
+}
+
+fn read_only_analysis_request_envelope(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    request_envelope: &Value,
+) -> Value {
+    let mut next = request_envelope_with_session_memory_block(state, session_id, request_envelope);
+    let system_prompt = read_only_analysis_system_prompt();
+    set_system_message(&mut next, &system_prompt);
+    let coverage = collect_read_only_coverage(state, run_id);
+    if let Some(object) = next.as_object_mut() {
+        object.insert("tools".to_string(), json!([]));
+        object.insert(
+            "readOnlyAnalysisLoop".to_string(),
+            json!({
+                "runId": run_id,
+                "toolResultSource": "Kernel ToolCompleted events",
+                "allowedPlanCapabilities": ["workspace.read", "workspace.search"],
+                "coveredResources": coverage.as_json()
+            }),
+        );
+    }
+    let resource_context = build_session_resource_context(state, run_id);
+    if resource_context.trim().is_empty() {
+        return append_user_context_block(
+            &next,
+            "Read-only exploration state",
+            "No Kernel read-only tool output has been collected yet. If more context is needed, request a bounded read-only actionBundle; otherwise answer from the available user message and memory.",
+        );
+    }
+    append_user_context_block(&next, "Session resource context", &resource_context)
+}
+
+fn read_only_analysis_system_prompt() -> String {
+    format!(
+        "Return exactly one JSON object using schemaVersion \"{AGENT_PROTOCOL_SCHEMA_VERSION}\". Choose exactly one kind: \"answer\", \"resourceRequest\", or \"actionBundle\".\n\
+kind=\"answer\" requires top-level answer={{\"format\":\"markdown\",\"content\":\"...\"}}.\n\
+kind=\"resourceRequest\" requires top-level resourceRequest with version=\"1\", non-empty id/reason, and items[].id/items[].manifestEntryId/items[].reason.\n\
+kind=\"actionBundle\" is allowed only for bounded read-only workspace context. actionBundle.version must be string \"1\". actionBundle.actions must be an array. actionBundle.validationExpectations and actionBundle.reviewExpectations must both be arrays, even when empty. Each action must include non-empty id/title/capability/kind and resourceScope as a string array.\n\
+Allowed read-only action pairs: capability=\"workspace.read\" with kind=\"list\" or kind=\"read\"; capability=\"workspace.search\" with kind=\"search\". Kernel execution maps those pairs to fs.list, fs.read, and code.search. Do not use executor tool names as capabilities.\n\
+Do not write, delete, execute processes, use network, mutate Git, or control the browser in this read-only loop. Do not put actions at the top level. Do not add params/input/command/script/path/content fields inside actions.\n\
+Do not repeat a path, directory, or search query already listed in coveredResources or Session resource context. If no new read-only resource is needed, return kind=\"answer\". Output only the JSON object; do not include Markdown wrappers, code fences, or explanatory preambles."
+    )
+}
+
+fn read_only_action_bundle_example() -> &'static str {
+    "{\"schemaVersion\":\"deepcode.agent.protocol.v2\",\"kind\":\"actionBundle\",\"outputLanguage\":\"en-US\",\"userPlan\":\"Collect bounded read-only workspace context.\",\"actionBundle\":{\"version\":\"1\",\"id\":\"read-only-context\",\"goal\":\"Collect read-only context\",\"actions\":[{\"id\":\"list-scope\",\"title\":\"List workspace scope\",\"capability\":\"workspace.read\",\"kind\":\"list\",\"resourceScope\":[\".\"]},{\"id\":\"read-scope\",\"title\":\"Read workspace resource\",\"capability\":\"workspace.read\",\"kind\":\"read\",\"resourceScope\":[\".\"]},{\"id\":\"search-scope\",\"title\":\"Search workspace text\",\"capability\":\"workspace.search\",\"kind\":\"search\",\"resourceScope\":[\".\"]}],\"validationExpectations\":[],\"reviewExpectations\":[]},\"expectedValidation\":\"Kernel records read-only observations.\",\"reviewGuide\":\"Use collected observations to answer.\"}"
+}
+
+fn append_user_context_block(request_envelope: &Value, heading: &str, block: &str) -> Value {
+    let mut next = request_envelope.clone();
+    let Some(messages) = next.get_mut("messages").and_then(Value::as_array_mut) else {
+        return request_envelope.clone();
+    };
+    let Some(user_message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return request_envelope.clone();
+    };
+    let Some(content) = user_message.get("content").and_then(Value::as_str) else {
+        return request_envelope.clone();
+    };
+    user_message["content"] = json!(format!(
+        "{}\n\n## {heading}\n{}",
+        content.trim_end(),
+        block.trim()
+    ));
+    next
+}
+
+fn set_system_message(request_envelope: &mut Value, content: &str) {
+    let Some(messages) = request_envelope
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if let Some(system_message) = messages
+        .iter_mut()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+    {
+        system_message["content"] = json!(content);
+    }
+}
+
+fn build_session_short_memory_context(events: &[Value]) -> String {
+    let prior_events = match events
+        .iter()
+        .rposition(|event| event_kind(event) == Some("user_msg"))
+    {
+        Some(index) => &events[..index],
+        None => events,
+    };
+    if prior_events.is_empty() {
+        return String::new();
+    }
+
+    let mut sections = vec![
+        "### Session memory document".to_string(),
+        "This rolling document is reconstructed from persisted session state. The model maintains recent semantic context from it; it is not a policy source and cannot override Kernel protocol, permissions, or tool facts.".to_string(),
+    ];
+    let mut user_turns = prior_events
+        .iter()
+        .filter(|event| event_kind(event) == Some("user_msg"))
+        .rev()
+        .take(SESSION_SHORT_MEMORY_MAX_USER_TURNS)
+        .collect::<Vec<_>>();
+    user_turns.reverse();
+    if !user_turns.is_empty() {
+        let mut lines = vec!["### Recent user turns".to_string()];
+        for (index, event) in user_turns.iter().enumerate() {
+            let content = event_payload_text(event)
+                .map(|text| clip_chars(&text, SESSION_SHORT_MEMORY_MAX_TEXT_CHARS))
+                .unwrap_or_default();
+            lines.push(format!("{}. {}", index + 1, content));
+            let attachments = attachment_summaries_from_event(event);
+            if !attachments.is_empty() {
+                lines.push(format!("   Attachments: {}", attachments.join("; ")));
+            }
+        }
+        sections.push(lines.join("\n"));
+    }
+
+    let mut assistant_summaries = prior_events
+        .iter()
+        .filter(|event| {
+            event_kind(event) == Some("review_summary")
+                || (event_kind(event) == Some("assistant_msg")
+                    && event_channel(event).unwrap_or("final") == "final")
+        })
+        .rev()
+        .filter_map(event_payload_text)
+        .take(SESSION_SHORT_MEMORY_MAX_ASSISTANT_SUMMARIES)
+        .collect::<Vec<_>>();
+    assistant_summaries.reverse();
+    if !assistant_summaries.is_empty() {
+        let mut lines = vec!["### Recent assistant summaries".to_string()];
+        for summary in assistant_summaries {
+            lines.push(format!(
+                "- {}",
+                clip_chars(&summary, SESSION_SHORT_MEMORY_MAX_TEXT_CHARS)
+            ));
+        }
+        sections.push(lines.join("\n"));
+    }
+
+    let attachments = recent_attachment_summaries(prior_events);
+    if !attachments.is_empty() {
+        let mut lines = vec!["### Recent explicit attachments".to_string()];
+        for attachment in attachments
+            .iter()
+            .take(SESSION_SHORT_MEMORY_MAX_ATTACHMENTS)
+        {
+            lines.push(format!("- {}", attachment.summary));
+        }
+        sections.push(lines.join("\n"));
+    }
+
+    clip_chars_hard(&sections.join("\n\n"), SESSION_SHORT_MEMORY_MAX_CHARS)
+}
+
+#[derive(Debug, Clone)]
+struct RecentAttachmentSummary {
+    summary: String,
+}
+
+fn recent_attachment_summaries(events: &[Value]) -> Vec<RecentAttachmentSummary> {
+    let mut seen = BTreeSet::new();
+    let mut attachments = Vec::new();
+    for event in events.iter().rev() {
+        if event_kind(event) != Some("user_msg") {
+            continue;
+        }
+        for attachment in event_payload_attachments(event).into_iter().rev() {
+            let kind = attachment
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("file")
+                .to_string();
+            let path = attachment_display_path(&attachment);
+            let absolute_path = attachment
+                .get("absolutePath")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let key = format!("{kind}\u{1f}{path}\u{1f}{absolute_path}");
+            if !seen.insert(key) {
+                continue;
+            }
+            let source = attachment
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let scope = attachment
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("message");
+            let summary = if absolute_path.is_empty() {
+                format!("{kind} {path} [source={source}, scope={scope}]")
+            } else {
+                format!(
+                    "{kind} {path} [absolutePath={absolute_path}, source={source}, scope={scope}]"
+                )
+            };
+            attachments.push(RecentAttachmentSummary { summary });
+            if attachments.len() >= SESSION_SHORT_MEMORY_MAX_ATTACHMENTS {
+                return attachments;
+            }
+        }
+    }
+    attachments
+}
+
+fn attachment_summaries_from_event(event: &Value) -> Vec<String> {
+    event_payload_attachments(event)
+        .into_iter()
+        .map(|attachment| {
+            let kind = attachment
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            format!("{kind} {}", attachment_display_path(&attachment))
+        })
+        .collect()
+}
+
+fn event_payload_attachments(event: &Value) -> Vec<Value> {
+    event
+        .get("payload")
+        .and_then(|payload| payload.get("attachments"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn attachment_display_path(attachment: &Value) -> String {
+    attachment
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .or_else(|| attachment.get("absolutePath").and_then(Value::as_str))
+        .unwrap_or(".")
+        .to_string()
+}
+
+fn clip_chars_hard(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let marker = "\n\n[... truncated ...]";
+    let marker_chars = marker.chars().count();
+    let keep = max_chars.saturating_sub(marker_chars);
+    format!("{}{}", text.chars().take(keep).collect::<String>(), marker)
+}
+
+fn event_payload_text(event: &Value) -> Option<String> {
+    let payload = event.get("payload")?;
+    ["content", "summary", "message"].iter().find_map(|key| {
+        payload
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn event_kind(event: &Value) -> Option<&str> {
+    event.get("kind").and_then(Value::as_str)
+}
+
+fn event_channel(event: &Value) -> Option<&str> {
+    event
+        .get("payload")
+        .and_then(|payload| payload.get("channel"))
+        .and_then(Value::as_str)
+}
+
+fn is_review_channel_assistant_event(event: &Value) -> bool {
+    event_kind(event) == Some("assistant_msg") && event_channel(event) == Some("review")
+}
+
+fn resource_request_key(resource_request: &PendingAgentResourceRequest) -> String {
+    let request = &resource_request.request;
+    let version = request
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("1");
+    let reason = request
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(normalize_resource_request_text)
+        .unwrap_or_default();
+    let mut items = request
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    let manifest_entry_id = item
+                        .get("manifestEntryId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let item_reason = item
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(normalize_resource_request_text)
+                        .unwrap_or_default();
+                    format!("{manifest_entry_id}:{item_reason}")
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    items.sort();
+    format!("{version}|{reason}|{}", items.join("|"))
+}
+
+fn read_only_plan_key(plan: &PendingAgentPlan) -> String {
+    let actions = plan
+        .action_bundle
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut parts = actions
+        .iter()
+        .map(|action| {
+            let capability = action
+                .get("capability")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let kind = action
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let scope = action
+                .get("resourceScope")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    let mut values = items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(normalize_resource_request_text)
+                        .collect::<Vec<_>>();
+                    values.sort();
+                    values.join(",")
+                })
+                .unwrap_or_default();
+            format!("{capability}:{kind}:{scope}")
+        })
+        .collect::<Vec<_>>();
+    parts.sort();
+    parts.join("|")
+}
+
+fn read_only_plan_covered_by_context(plan: &PendingAgentPlan, coverage: &ReadOnlyCoverage) -> bool {
+    let keys = read_only_plan_resource_keys(plan);
+    !keys.is_empty() && keys.iter().all(|key| coverage.contains_key(key))
+}
+
+fn read_only_plan_resource_keys(plan: &PendingAgentPlan) -> BTreeSet<String> {
+    let actions = plan
+        .action_bundle
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut keys = BTreeSet::new();
+    for action in actions {
+        let capability = action
+            .get("capability")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let kind = action
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let scopes = action
+            .get("resourceScope")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for scope in scopes.iter().filter_map(Value::as_str) {
+            let scope = scope.trim();
+            if scope.is_empty() {
+                continue;
+            }
+            match capability {
+                "workspace.read" => {
+                    let path = normalize_coverage_value(scope);
+                    let tool = if kind == "list" { "fs.list" } else { "fs.read" };
+                    keys.insert(format!("{tool}:{path}"));
+                }
+                "workspace.search" | "code.search" => {
+                    let query = normalize_search_scope(scope);
+                    if !query.is_empty() {
+                        keys.insert(format!("code.search:{query}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    keys
+}
+
+fn normalize_resource_request_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_session_resource_context(state: &AppState, run_id: &str) -> String {
+    let events = state
+        .kernel_events
+        .lock()
+        .expect("kernel event stream lock")
+        .clone();
+    let coverage = collect_read_only_coverage_from_events(&events, run_id);
+    let mut requested_args = BTreeMap::<String, Value>::new();
+    for event in &events {
+        if event_run_id(event).as_deref() != Some(run_id) {
+            continue;
+        }
+        if let KernelEvent::ToolRequested {
+            tool_call_id,
+            tool_name,
+            args_preview,
+            ..
+        } = event
+        {
+            if read_only_context_tool(tool_name) {
+                requested_args.insert(tool_call_id.clone(), args_preview.clone());
+            }
+        }
+    }
+
+    let mut blocks = vec![
+        "### ResourcePacket from Kernel read-only tool output".to_string(),
+        "Use these observations as concrete workspace facts. Each item is clipped and may need follow-up reads if more detail is required.".to_string(),
+    ];
+    if !coverage.is_empty() {
+        blocks.push(coverage.render_markdown());
+    }
+    let mut count = 0_usize;
+    for event in events {
+        if count >= SESSION_RESOURCE_CONTEXT_MAX_ITEMS {
+            blocks.push(format!(
+                "[truncated: more than {SESSION_RESOURCE_CONTEXT_MAX_ITEMS} read-only observations]"
+            ));
+            break;
+        }
+        if event_run_id(&event).as_deref() != Some(run_id) {
+            continue;
+        }
+        let KernelEvent::ToolCompleted {
+            tool_call_id,
+            tool_name,
+            ok,
+            output,
+            error,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if !read_only_context_tool(&tool_name) {
+            continue;
+        }
+        count += 1;
+        let args = requested_args
+            .get(&tool_call_id)
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        blocks.push(render_resource_observation(
+            count,
+            &tool_call_id,
+            &tool_name,
+            ok,
+            &args,
+            output.as_ref(),
+            error.as_ref().map(|value| value.message.as_str()),
+        ));
+    }
+    if count == 0 {
+        return String::new();
+    }
+    clip_chars_hard(&blocks.join("\n\n"), SESSION_RESOURCE_CONTEXT_MAX_CHARS)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReadOnlyCoverage {
+    listed_paths: BTreeSet<String>,
+    read_paths: BTreeSet<String>,
+    searched_queries: BTreeSet<String>,
+}
+
+impl ReadOnlyCoverage {
+    fn is_empty(&self) -> bool {
+        self.listed_paths.is_empty()
+            && self.read_paths.is_empty()
+            && self.searched_queries.is_empty()
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        let Some((tool, value)) = key.split_once(':') else {
+            return false;
+        };
+        match tool {
+            "fs.list" => self.listed_paths.contains(value),
+            "fs.read" => self.read_paths.contains(value),
+            "code.search" => self.searched_queries.contains(value),
+            _ => false,
+        }
+    }
+
+    fn as_json(&self) -> Value {
+        json!({
+            "fs.list": self.listed_paths.iter().cloned().collect::<Vec<_>>(),
+            "fs.read": self.read_paths.iter().cloned().collect::<Vec<_>>(),
+            "code.search": self.searched_queries.iter().cloned().collect::<Vec<_>>()
+        })
+    }
+
+    fn render_markdown(&self) -> String {
+        let mut lines = vec!["### Covered read-only resources".to_string()];
+        if !self.listed_paths.is_empty() {
+            lines.push(format!(
+                "- fs.list: {}",
+                self.listed_paths
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.read_paths.is_empty() {
+            lines.push(format!(
+                "- fs.read: {}",
+                self.read_paths
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.searched_queries.is_empty() {
+            lines.push(format!(
+                "- code.search: {}",
+                self.searched_queries
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+fn collect_read_only_coverage(state: &AppState, run_id: &str) -> ReadOnlyCoverage {
+    let events = state
+        .kernel_events
+        .lock()
+        .expect("kernel event stream lock")
+        .clone();
+    collect_read_only_coverage_from_events(&events, run_id)
+}
+
+fn collect_read_only_coverage_from_events(
+    events: &[KernelEvent],
+    run_id: &str,
+) -> ReadOnlyCoverage {
+    let mut requested_args = BTreeMap::<String, Value>::new();
+    for event in events {
+        if event_run_id(event).as_deref() != Some(run_id) {
+            continue;
+        }
+        if let KernelEvent::ToolRequested {
+            tool_call_id,
+            tool_name,
+            args_preview,
+            ..
+        } = event
+        {
+            if read_only_context_tool(tool_name) {
+                requested_args.insert(tool_call_id.clone(), args_preview.clone());
+            }
+        }
+    }
+
+    let mut coverage = ReadOnlyCoverage::default();
+    for event in events {
+        if event_run_id(event).as_deref() != Some(run_id) {
+            continue;
+        }
+        let KernelEvent::ToolCompleted {
+            tool_call_id,
+            tool_name,
+            ok,
+            output,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if !ok || !read_only_context_tool(tool_name) {
+            continue;
+        }
+        let args = requested_args.get(tool_call_id);
+        match tool_name.as_str() {
+            "fs.list" => {
+                if let Some(path) = output
+                    .as_ref()
+                    .and_then(|value| value.get("path"))
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        args.and_then(|value| value.get("path"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(normalize_coverage_value)
+                    .filter(|value| !value.is_empty())
+                {
+                    coverage.listed_paths.insert(path);
+                }
+            }
+            "fs.read" => {
+                if let Some(path) = output
+                    .as_ref()
+                    .and_then(|value| value.get("path"))
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        args.and_then(|value| value.get("path"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(normalize_coverage_value)
+                    .filter(|value| !value.is_empty())
+                {
+                    coverage.read_paths.insert(path);
+                }
+            }
+            "code.search" => {
+                if let Some(query) = output
+                    .as_ref()
+                    .and_then(|value| value.get("query"))
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        args.and_then(|value| value.get("query"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(normalize_search_scope)
+                    .filter(|value| !value.is_empty())
+                {
+                    coverage.searched_queries.insert(query);
+                }
+            }
+            _ => {}
+        }
+    }
+    coverage
+}
+
+fn normalize_coverage_value(value: &str) -> String {
+    let mut normalized = value.trim().replace('\\', "/");
+    while normalized.starts_with("./") {
+        normalized = normalized[2..].to_string();
+    }
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn normalize_search_scope(value: &str) -> String {
+    normalize_resource_request_text(
+        value
+            .trim()
+            .strip_prefix("search:")
+            .or_else(|| value.trim().strip_prefix("symbol:"))
+            .unwrap_or_else(|| value.trim()),
+    )
+}
+
+fn render_resource_observation(
+    index: usize,
+    tool_call_id: &str,
+    tool_name: &str,
+    ok: bool,
+    args: &Value,
+    output: Option<&Value>,
+    error: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        format!("#### Observation {index}: {tool_name}"),
+        format!("- toolCallId: {tool_call_id}"),
+        format!("- status: {}", if ok { "ok" } else { "error" }),
+    ];
+    if !args.is_null() {
+        lines.push(format!("- arguments: {}", compact_json(args)));
+    }
+    if let Some(error) = error {
+        lines.push(format!("- error: {}", clip_chars(error, 600)));
+    }
+    if let Some(output) = output {
+        if let Some(path) = output.get("path").and_then(Value::as_str) {
+            lines.push(format!("- path: {path}"));
+        }
+        if let Some(query) = output.get("query").and_then(Value::as_str) {
+            lines.push(format!("- query: {query}"));
+        }
+        let (kind, content) = resource_observation_content(tool_name, output);
+        lines.push(format!("- contentKind: {kind}"));
+        lines.push(format!(
+            "```text\n{}\n```",
+            clip_chars(&content, SESSION_RESOURCE_CONTEXT_MAX_OUTPUT_CHARS)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn resource_observation_content(tool_name: &str, output: &Value) -> (&'static str, String) {
+    match tool_name {
+        "fs.read" => (
+            "fileText",
+            output
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        "fs.list" => (
+            "directoryTree",
+            output
+                .get("nodes")
+                .map(pretty_json)
+                .unwrap_or_else(|| pretty_json(output)),
+        ),
+        "code.search" => (
+            "searchResults",
+            output
+                .get("matches")
+                .map(pretty_json)
+                .unwrap_or_else(|| pretty_json(output)),
+        ),
+        _ => ("json", pretty_json(output)),
+    }
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn read_only_context_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "fs.list" | "fs.read" | "code.search")
+}
+
+fn visible_kernel_events_for_session(
+    events: &[KernelEvent],
+    internal_read_only_runs: &BTreeSet<String>,
+) -> Vec<KernelEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            let internal_read_only = event_run_id(event)
+                .as_deref()
+                .map(|run_id| internal_read_only_runs.contains(run_id))
+                .unwrap_or(false);
+            if !internal_read_only {
+                return true;
+            }
+            !matches!(
+                event,
+                KernelEvent::PlanReviewReportProduced { .. }
+                    | KernelEvent::PlanAccepted { .. }
+                    | KernelEvent::PlanRejected { .. }
+                    | KernelEvent::WorkflowDecisionMade { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn internal_read_only_observation_run(
+    events: &[KernelEvent],
+    internal_read_only_runs: &BTreeSet<String>,
+) -> Option<String> {
+    events.iter().find_map(|event| {
+        let KernelEvent::ToolCompleted {
+            run_id: Some(run_id),
+            tool_name,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        if internal_read_only_runs.contains(&run_id.0) && read_only_context_tool(tool_name) {
+            Some(run_id.0.clone())
+        } else {
+            None
+        }
+    })
 }
 
 fn resolve_attachment_path_from_workspace(
@@ -347,12 +1220,19 @@ pub(crate) async fn drive_kernel_agent_loop(
     session_id: &str,
     mut kernel_events: Vec<KernelEvent>,
 ) -> Result<(), String> {
+    let mut seen_resource_requests = BTreeSet::new();
+    let mut internal_read_only_runs = BTreeSet::new();
+    let mut seen_internal_read_only_plan_keys = BTreeSet::new();
+    let mut read_only_continuation_seeds = BTreeMap::<String, ReadOnlyContinuationSeed>::new();
+    let mut internal_read_only_advances = 0_usize;
     loop {
         record_kernel_events(state, &kernel_events);
+        let visible_kernel_events =
+            visible_kernel_events_for_session(&kernel_events, &internal_read_only_runs);
         append_session_projection(
             state,
             session_id,
-            kernel_events_to_agent_events(session_id, &kernel_events),
+            kernel_events_to_agent_events(session_id, &visible_kernel_events),
         );
         if kernel_events
             .iter()
@@ -383,6 +1263,28 @@ pub(crate) async fn drive_kernel_agent_loop(
             })
             .collect::<Vec<_>>();
         if llm_requests.is_empty() {
+            if let Some(run_id) =
+                internal_read_only_observation_run(&kernel_events, &internal_read_only_runs)
+            {
+                if let Some(seed) = read_only_continuation_seeds.get(&run_id).cloned() {
+                    let continuation_events = continue_read_only_analysis_loop(
+                        state,
+                        session_id,
+                        &run_id,
+                        seed,
+                        &mut seen_resource_requests,
+                        &mut seen_internal_read_only_plan_keys,
+                        &mut internal_read_only_runs,
+                        &mut read_only_continuation_seeds,
+                        &mut internal_read_only_advances,
+                    )
+                    .await?;
+                    if !continuation_events.is_empty() {
+                        kernel_events = continuation_events;
+                        continue;
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -390,7 +1292,21 @@ pub(crate) async fn drive_kernel_agent_loop(
         for (run_id, event_session_id, phase, llm_call_id, profile_ref, request_envelope) in
             llm_requests
         {
+            let raw_request_envelope = request_envelope.clone();
             let profile = resolve_kernel_llm_profile(state, profile_ref.as_ref())?;
+            let read_only_analysis_mode = phase == "review"
+                && internal_read_only_runs.contains(&run_id.0)
+                && !has_pending_review_for_run(state, &run_id.0);
+            let request_envelope = if read_only_analysis_mode {
+                read_only_analysis_request_envelope(state, session_id, &run_id.0, &request_envelope)
+            } else {
+                request_envelope_with_session_short_memory(
+                    state,
+                    session_id,
+                    &phase,
+                    &request_envelope,
+                )
+            };
             append_trace_event(
                 state,
                 session_id,
@@ -404,7 +1320,8 @@ pub(crate) async fn drive_kernel_agent_loop(
                         .get("tools")
                         .and_then(Value::as_array)
                         .map(|items| items.len())
-                        .unwrap_or(0)
+                        .unwrap_or(0),
+                    "requestEnvelope": request_envelope.clone()
                 }),
             );
             let output = match call_llm_profile(&profile, request_envelope.clone()).await {
@@ -442,6 +1359,7 @@ pub(crate) async fn drive_kernel_agent_loop(
                     continue;
                 }
             };
+            let response_envelope = llm_output_payload(output);
             append_trace_event(
                 state,
                 session_id,
@@ -450,18 +1368,212 @@ pub(crate) async fn drive_kernel_agent_loop(
                     "stage": phase,
                     "llmCallId": llm_call_id,
                     "profileId": profile.id,
-                    "contentBytes": output.content.len(),
-                    "toolCallCount": output.tool_calls.len()
+                    "contentBytes": response_envelope
+                        .pointer("/assistantMessage/content")
+                        .or_else(|| response_envelope.get("content"))
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0),
+                    "toolCallCount": response_envelope
+                        .get("toolCalls")
+                        .and_then(Value::as_array)
+                        .map(|items| items.len())
+                        .unwrap_or(0),
+                    "responseEnvelope": response_envelope.clone()
                 }),
             );
-            let response_envelope = llm_output_payload(output);
+            if read_only_analysis_mode {
+                let original_content = response_envelope
+                    .pointer("/assistantMessage/content")
+                    .or_else(|| response_envelope.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let parsed_plan = parse_or_repair_agent_plan_response(
+                    state,
+                    session_id,
+                    &run_id.0,
+                    &profile,
+                    &request_envelope,
+                    original_content,
+                )
+                .await;
+                match parsed_plan {
+                    Ok(AgentPlanResponse::Answer(answer)) => {
+                        let submitted = {
+                            let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+                            runtime
+                                .dispatch(KernelCommand::LlmResponseSubmit {
+                                    request_id: rid("llm-read-only-analysis-submit"),
+                                    run_id: run_id.clone(),
+                                    session_id: event_session_id.clone(),
+                                    llm_call_id,
+                                    response_envelope: response_envelope.clone(),
+                                })
+                                .map_err(|error| error.to_string())?
+                        };
+                        record_kernel_events(state, &submitted);
+                        let mut projection = kernel_events_to_agent_events(session_id, &submitted);
+                        projection.retain(|event| !is_review_channel_assistant_event(event));
+                        append_session_projection(state, session_id, projection);
+                        append_session_projection(
+                            state,
+                            session_id,
+                            vec![answer_event(session_id, &run_id.0, &answer)],
+                        );
+                    }
+                    Ok(AgentPlanResponse::ResourceRequest(resource_request)) => {
+                        let key = resource_request_key(&resource_request);
+                        let event = if seen_resource_requests.insert(key) {
+                            resource_request_event(session_id, &run_id.0, &resource_request)
+                        } else {
+                            assistant_final_event(
+                                session_id,
+                                "当前资源请求与本轮前一次请求重复，Agent 已停止继续重复请求。请补充一个更明确的文件、目录或操作目标。",
+                            )
+                        };
+                        append_session_projection(state, session_id, vec![event]);
+                    }
+                    Ok(AgentPlanResponse::ActionPlan(mut plan)) => {
+                        let review_events = {
+                            let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+                            runtime
+                                .dispatch(KernelCommand::PlanContractSubmit {
+                                    request_id: rid("agent-read-only-analysis-plan-review"),
+                                    run_id: Some(run_id.clone()),
+                                    session_id: Some(deepcode_kernel_abi::SessionId(
+                                        session_id.to_string(),
+                                    )),
+                                    contract: plan.action_bundle.clone(),
+                                })
+                                .map_err(|error| error.to_string())?
+                        };
+                        plan.plan_review_report = review_events.iter().find_map(|event| {
+                            if let KernelEvent::PlanReviewReportProduced { report, .. } = event {
+                                Some(report.clone())
+                            } else {
+                                None
+                            }
+                        });
+                        if should_internally_advance_read_only_plan(&plan) {
+                            let coverage = collect_read_only_coverage(state, &run_id.0);
+                            if read_only_plan_covered_by_context(&plan, &coverage) {
+                                append_session_projection(
+                                    state,
+                                    session_id,
+                                    vec![assistant_final_event(
+                                        session_id,
+                                        READ_ONLY_DUPLICATE_RESOURCE_MESSAGE,
+                                    )],
+                                );
+                                continue;
+                            }
+                            let key = read_only_plan_key(&plan);
+                            if !seen_internal_read_only_plan_keys.insert(key) {
+                                append_session_projection(
+                                    state,
+                                    session_id,
+                                    vec![assistant_final_event(
+                                        session_id,
+                                        "当前只读探索计划与本轮前一次计划重复，Agent 已停止继续重复读取。请补充更明确的分析目标或资源范围。",
+                                    )],
+                                );
+                                continue;
+                            }
+                            if internal_read_only_advances >= INTERNAL_READ_ONLY_MAX_ADVANCES {
+                                append_session_projection(
+                                    state,
+                                    session_id,
+                                    vec![assistant_final_event(
+                                        session_id,
+                                        "只读探索已达到本轮上下文预算上限，Agent 已停止继续读取。请缩小问题范围或指定需要分析的模块。",
+                                    )],
+                                );
+                                continue;
+                            }
+                            internal_read_only_advances += 1;
+                            record_kernel_events(state, &review_events);
+                            append_trace_event(
+                                state,
+                                session_id,
+                                "agent.read_only_plan.internal_accept",
+                                json!({
+                                    "runId": &plan.run_id,
+                                    "planId": &plan.plan_id,
+                                    "capabilities": plan_review_required_capabilities(&plan),
+                                    "advanceCount": internal_read_only_advances
+                                }),
+                            );
+                            internal_read_only_runs.insert(plan.run_id.clone());
+                            read_only_continuation_seeds.insert(
+                                plan.run_id.clone(),
+                                ReadOnlyContinuationSeed {
+                                    profile: profile.clone(),
+                                    request_envelope: raw_request_envelope.clone(),
+                                    event_session_id: event_session_id.clone(),
+                                },
+                            );
+                            let approved_tools = approved_tool_calls_for_pending_plan(&plan);
+                            if approved_tools.is_empty() {
+                                append_session_projection(
+                                    state,
+                                    session_id,
+                                    vec![assistant_final_event(
+                                        session_id,
+                                        "只读探索计划未能映射为 Kernel 只读工具调用，Agent 已停止执行该计划。",
+                                    )],
+                                );
+                                continue;
+                            }
+                            let accept_events = {
+                                let mut runtime =
+                                    state.runtime.lock().expect("kernel runtime lock");
+                                runtime
+                                    .enqueue_approved_tool_calls(&plan.run_id, approved_tools)
+                                    .map_err(|error| error.to_string())?;
+                                runtime
+                                    .dispatch(KernelCommand::PlanAccept {
+                                        request_id: rid("agent-read-only-analysis-auto-accept"),
+                                        run_id: run_id.clone(),
+                                        plan_id: plan.plan_id.clone(),
+                                    })
+                                    .map_err(|error| error.to_string())?
+                            };
+                            next_events.extend(accept_events);
+                        } else {
+                            record_kernel_events(state, &review_events);
+                            append_session_projection(
+                                state,
+                                session_id,
+                                kernel_events_to_agent_events(session_id, &review_events),
+                            );
+                            append_session_projection(
+                                state,
+                                session_id,
+                                vec![plan_card_event(session_id, &plan)],
+                            );
+                            {
+                                let mut gui = state.gui.lock().expect("gui state lock");
+                                gui.pending_plans.insert(plan.plan_id.clone(), plan.clone());
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        append_session_projection(
+                            state,
+                            session_id,
+                            vec![plan_parse_error_event(session_id, &run_id.0, &error)],
+                        );
+                    }
+                }
+                continue;
+            }
             let submitted = {
                 let mut runtime = state.runtime.lock().expect("kernel runtime lock");
                 runtime
                     .dispatch(KernelCommand::LlmResponseSubmit {
                         request_id: rid("llm-response-submit"),
                         run_id: run_id.clone(),
-                        session_id: event_session_id,
+                        session_id: event_session_id.clone(),
                         llm_call_id,
                         response_envelope: response_envelope.clone(),
                     })
@@ -469,6 +1581,7 @@ pub(crate) async fn drive_kernel_agent_loop(
             };
             if phase == "plan" {
                 let mut submitted = submitted;
+                let mut internally_advanced_read_only_plan = false;
                 let original_content = response_envelope
                     .pointer("/assistantMessage/content")
                     .or_else(|| response_envelope.get("content"))
@@ -492,22 +1605,18 @@ pub(crate) async fn drive_kernel_agent_loop(
                         );
                     }
                     Ok(AgentPlanResponse::ResourceRequest(resource_request)) => {
-                        append_session_projection(
-                            state,
-                            session_id,
-                            vec![resource_request_event(
+                        let key = resource_request_key(&resource_request);
+                        let event = if seen_resource_requests.insert(key) {
+                            resource_request_event(session_id, &run_id.0, &resource_request)
+                        } else {
+                            assistant_final_event(
                                 session_id,
-                                &run_id.0,
-                                &resource_request,
-                            )],
-                        );
+                                "当前资源请求与本轮前一次请求重复，Agent 已停止继续重复请求。请补充一个更明确的文件、目录或操作目标。",
+                            )
+                        };
+                        append_session_projection(state, session_id, vec![event]);
                     }
                     Ok(AgentPlanResponse::ActionPlan(mut plan)) => {
-                        append_session_projection(
-                            state,
-                            session_id,
-                            vec![plan_card_event(session_id, &plan)],
-                        );
                         let review_events = {
                             let mut runtime = state.runtime.lock().expect("kernel runtime lock");
                             runtime
@@ -528,15 +1637,83 @@ pub(crate) async fn drive_kernel_agent_loop(
                                 None
                             }
                         });
-                        {
-                            let mut gui = state.gui.lock().expect("gui state lock");
-                            gui.pending_plans.insert(plan.plan_id.clone(), plan.clone());
-                        }
-                        submitted.extend(review_events);
-                        if should_auto_accept_plan(state, &plan) {
+                        if should_internally_advance_read_only_plan(&plan) {
+                            let coverage = collect_read_only_coverage(state, &run_id.0);
+                            if read_only_plan_covered_by_context(&plan, &coverage) {
+                                append_session_projection(
+                                    state,
+                                    session_id,
+                                    vec![assistant_final_event(
+                                        session_id,
+                                        READ_ONLY_DUPLICATE_RESOURCE_MESSAGE,
+                                    )],
+                                );
+                                continue;
+                            }
+                            let key = read_only_plan_key(&plan);
+                            if !seen_internal_read_only_plan_keys.insert(key) {
+                                append_session_projection(
+                                    state,
+                                    session_id,
+                                    vec![assistant_final_event(
+                                        session_id,
+                                        "当前只读探索计划与本轮前一次计划重复，Agent 已停止继续重复读取。请补充更明确的分析目标或资源范围。",
+                                    )],
+                                );
+                                continue;
+                            }
+                            if internal_read_only_advances >= INTERNAL_READ_ONLY_MAX_ADVANCES {
+                                append_session_projection(
+                                    state,
+                                    session_id,
+                                    vec![assistant_final_event(
+                                        session_id,
+                                        "只读探索已达到本轮上下文预算上限，Agent 已停止继续读取。请缩小问题范围或指定需要分析的模块。",
+                                    )],
+                                );
+                                continue;
+                            }
+                            internal_read_only_advances += 1;
+                            record_kernel_events(state, &submitted);
+                            record_kernel_events(state, &review_events);
+                            append_trace_event(
+                                state,
+                                session_id,
+                                "agent.read_only_plan.internal_accept",
+                                json!({
+                                    "runId": &plan.run_id,
+                                    "planId": &plan.plan_id,
+                                    "capabilities": plan_review_required_capabilities(&plan),
+                                    "advanceCount": internal_read_only_advances
+                                }),
+                            );
+                            internal_read_only_runs.insert(plan.run_id.clone());
+                            read_only_continuation_seeds.insert(
+                                plan.run_id.clone(),
+                                ReadOnlyContinuationSeed {
+                                    profile: profile.clone(),
+                                    request_envelope: raw_request_envelope.clone(),
+                                    event_session_id: event_session_id.clone(),
+                                },
+                            );
+                            let approved_tools = approved_tool_calls_for_pending_plan(&plan);
+                            if approved_tools.is_empty() {
+                                append_session_projection(
+                                    state,
+                                    session_id,
+                                    vec![assistant_final_event(
+                                        session_id,
+                                        "只读探索计划未能映射为 Kernel 只读工具调用，Agent 已停止执行该计划。",
+                                    )],
+                                );
+                                continue;
+                            }
                             let accept_events = {
                                 let mut runtime =
                                     state.runtime.lock().expect("kernel runtime lock");
+                                runtime
+                                    .enqueue_approved_tool_calls(&plan.run_id, approved_tools)
+                                    .map_err(|error| error.to_string())?;
                                 runtime
                                     .dispatch(KernelCommand::PlanAccept {
                                         request_id: rid("agent-plan-auto-accept"),
@@ -545,7 +1722,33 @@ pub(crate) async fn drive_kernel_agent_loop(
                                     })
                                     .map_err(|error| error.to_string())?
                             };
-                            submitted.extend(accept_events);
+                            next_events.extend(accept_events);
+                            internally_advanced_read_only_plan = true;
+                        } else {
+                            append_session_projection(
+                                state,
+                                session_id,
+                                vec![plan_card_event(session_id, &plan)],
+                            );
+                            {
+                                let mut gui = state.gui.lock().expect("gui state lock");
+                                gui.pending_plans.insert(plan.plan_id.clone(), plan.clone());
+                            }
+                            submitted.extend(review_events);
+                            if should_auto_accept_plan(state, &plan) {
+                                let accept_events = {
+                                    let mut runtime =
+                                        state.runtime.lock().expect("kernel runtime lock");
+                                    runtime
+                                        .dispatch(KernelCommand::PlanAccept {
+                                            request_id: rid("agent-plan-auto-accept"),
+                                            run_id: run_id.clone(),
+                                            plan_id: plan.plan_id.clone(),
+                                        })
+                                        .map_err(|error| error.to_string())?
+                                };
+                                submitted.extend(accept_events);
+                            }
                         }
                     }
                     Err(error) => {
@@ -556,16 +1759,19 @@ pub(crate) async fn drive_kernel_agent_loop(
                         );
                     }
                 }
-                next_events.extend(submitted);
+                if !internally_advanced_read_only_plan {
+                    next_events.extend(submitted);
+                }
                 continue;
             }
             if phase == "review" {
                 record_kernel_events(state, &submitted);
-                append_session_projection(
-                    state,
-                    session_id,
-                    kernel_events_to_agent_events(session_id, &submitted),
-                );
+                let has_pending_review = has_pending_review_for_run(state, &run_id.0);
+                let mut projection = kernel_events_to_agent_events(session_id, &submitted);
+                if !has_pending_review {
+                    projection.retain(|event| !is_review_channel_assistant_event(event));
+                }
+                append_session_projection(state, session_id, projection);
                 append_review_summary_from_response(
                     state,
                     session_id,
@@ -581,6 +1787,291 @@ pub(crate) async fn drive_kernel_agent_loop(
             next_events.extend(submitted);
         }
         kernel_events = next_events;
+    }
+}
+
+async fn continue_read_only_analysis_loop(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    seed: ReadOnlyContinuationSeed,
+    seen_resource_requests: &mut BTreeSet<String>,
+    seen_internal_read_only_plan_keys: &mut BTreeSet<String>,
+    internal_read_only_runs: &mut BTreeSet<String>,
+    read_only_continuation_seeds: &mut BTreeMap<String, ReadOnlyContinuationSeed>,
+    internal_read_only_advances: &mut usize,
+) -> Result<Vec<KernelEvent>, String> {
+    let request_envelope =
+        read_only_analysis_request_envelope(state, session_id, run_id, &seed.request_envelope);
+    let llm_call_id = format!("llm-{run_id}-read-only-{}", now_millis());
+    append_trace_event(
+        state,
+        session_id,
+        "llm.requested",
+        json!({
+            "stage": "read_only_analysis",
+            "llmCallId": llm_call_id,
+            "profileId": seed.profile.id,
+            "model": seed.profile.model,
+            "toolCount": request_envelope
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0),
+            "requestEnvelope": request_envelope.clone()
+        }),
+    );
+    let output = match call_llm_profile(&seed.profile, request_envelope.clone()).await {
+        Ok(output) => output,
+        Err(error) => {
+            append_trace_event(
+                state,
+                session_id,
+                "llm.provider_error",
+                json!({
+                    "runId": run_id,
+                    "phase": "read_only_analysis",
+                    "llmCallId": llm_call_id,
+                    "profileId": seed.profile.id,
+                    "model": seed.profile.model,
+                    "providerError": provider_error_value(&error)
+                }),
+            );
+            append_session_projection(
+                state,
+                session_id,
+                vec![assistant_final_event(
+                    session_id,
+                    "只读上下文已经读取，但继续分析时 LLM Provider 调用失败。请稍后重试，或缩小分析范围后再次发送。",
+                )],
+            );
+            return Ok(Vec::new());
+        }
+    };
+    let response_envelope = llm_output_payload(output);
+    append_trace_event(
+        state,
+        session_id,
+        "llm.completed",
+        json!({
+            "stage": "read_only_analysis",
+            "llmCallId": llm_call_id,
+            "profileId": seed.profile.id,
+            "contentBytes": response_envelope
+                .pointer("/assistantMessage/content")
+                .or_else(|| response_envelope.get("content"))
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or(0),
+            "toolCallCount": response_envelope
+                .get("toolCalls")
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0),
+            "responseEnvelope": response_envelope.clone()
+        }),
+    );
+    handle_read_only_analysis_response(
+        state,
+        session_id,
+        run_id,
+        seed.event_session_id,
+        &seed.profile,
+        &seed.request_envelope,
+        &request_envelope,
+        response_envelope,
+        seen_resource_requests,
+        seen_internal_read_only_plan_keys,
+        internal_read_only_runs,
+        read_only_continuation_seeds,
+        internal_read_only_advances,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_read_only_analysis_response(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    event_session_id: Option<deepcode_kernel_abi::SessionId>,
+    profile: &ResolvedLlmProfile,
+    base_request_envelope: &Value,
+    request_envelope: &Value,
+    response_envelope: Value,
+    seen_resource_requests: &mut BTreeSet<String>,
+    seen_internal_read_only_plan_keys: &mut BTreeSet<String>,
+    internal_read_only_runs: &mut BTreeSet<String>,
+    read_only_continuation_seeds: &mut BTreeMap<String, ReadOnlyContinuationSeed>,
+    internal_read_only_advances: &mut usize,
+) -> Result<Vec<KernelEvent>, String> {
+    let original_content = response_envelope
+        .pointer("/assistantMessage/content")
+        .or_else(|| response_envelope.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let parsed_plan = parse_or_repair_agent_plan_response(
+        state,
+        session_id,
+        run_id,
+        profile,
+        request_envelope,
+        original_content,
+    )
+    .await;
+    match parsed_plan {
+        Ok(AgentPlanResponse::Answer(answer)) => {
+            append_session_projection(
+                state,
+                session_id,
+                vec![answer_event(session_id, run_id, &answer)],
+            );
+            Ok(Vec::new())
+        }
+        Ok(AgentPlanResponse::ResourceRequest(resource_request)) => {
+            let key = resource_request_key(&resource_request);
+            let event = if seen_resource_requests.insert(key) {
+                resource_request_event(session_id, run_id, &resource_request)
+            } else {
+                assistant_final_event(
+                    session_id,
+                    "当前资源请求与本轮前一次请求重复，Agent 已停止继续重复请求。请补充一个更明确的文件、目录或操作目标。",
+                )
+            };
+            append_session_projection(state, session_id, vec![event]);
+            Ok(Vec::new())
+        }
+        Ok(AgentPlanResponse::ActionPlan(mut plan)) => {
+            let run = deepcode_kernel_abi::RunId(run_id.to_string());
+            let review_events = {
+                let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+                runtime
+                    .dispatch(KernelCommand::PlanContractSubmit {
+                        request_id: rid("agent-read-only-analysis-plan-review"),
+                        run_id: Some(run.clone()),
+                        session_id: Some(deepcode_kernel_abi::SessionId(session_id.to_string())),
+                        contract: plan.action_bundle.clone(),
+                    })
+                    .map_err(|error| error.to_string())?
+            };
+            plan.plan_review_report = review_events.iter().find_map(|event| {
+                if let KernelEvent::PlanReviewReportProduced { report, .. } = event {
+                    Some(report.clone())
+                } else {
+                    None
+                }
+            });
+            if should_internally_advance_read_only_plan(&plan) {
+                let coverage = collect_read_only_coverage(state, run_id);
+                if read_only_plan_covered_by_context(&plan, &coverage) {
+                    append_session_projection(
+                        state,
+                        session_id,
+                        vec![assistant_final_event(
+                            session_id,
+                            READ_ONLY_DUPLICATE_RESOURCE_MESSAGE,
+                        )],
+                    );
+                    return Ok(Vec::new());
+                }
+                let key = read_only_plan_key(&plan);
+                if !seen_internal_read_only_plan_keys.insert(key) {
+                    append_session_projection(
+                        state,
+                        session_id,
+                        vec![assistant_final_event(
+                            session_id,
+                            "当前只读探索计划与本轮前一次计划重复，Agent 已停止继续重复读取。请补充更明确的分析目标或资源范围。",
+                        )],
+                    );
+                    return Ok(Vec::new());
+                }
+                if *internal_read_only_advances >= INTERNAL_READ_ONLY_MAX_ADVANCES {
+                    append_session_projection(
+                        state,
+                        session_id,
+                        vec![assistant_final_event(
+                            session_id,
+                            "只读探索已达到本轮上下文预算上限，Agent 已停止继续读取。请缩小问题范围或指定需要分析的模块。",
+                        )],
+                    );
+                    return Ok(Vec::new());
+                }
+                *internal_read_only_advances += 1;
+                record_kernel_events(state, &review_events);
+                append_trace_event(
+                    state,
+                    session_id,
+                    "agent.read_only_plan.internal_accept",
+                    json!({
+                        "runId": &plan.run_id,
+                        "planId": &plan.plan_id,
+                        "capabilities": plan_review_required_capabilities(&plan),
+                        "advanceCount": *internal_read_only_advances
+                    }),
+                );
+                internal_read_only_runs.insert(plan.run_id.clone());
+                read_only_continuation_seeds.insert(
+                    plan.run_id.clone(),
+                    ReadOnlyContinuationSeed {
+                        profile: profile.clone(),
+                        request_envelope: base_request_envelope.clone(),
+                        event_session_id: event_session_id.clone(),
+                    },
+                );
+                let approved_tools = approved_tool_calls_for_pending_plan(&plan);
+                if approved_tools.is_empty() {
+                    append_session_projection(
+                        state,
+                        session_id,
+                        vec![assistant_final_event(
+                            session_id,
+                            "只读探索计划未能映射为 Kernel 只读工具调用，Agent 已停止执行该计划。",
+                        )],
+                    );
+                    return Ok(Vec::new());
+                }
+                let accept_events = {
+                    let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+                    runtime
+                        .enqueue_approved_tool_calls(&plan.run_id, approved_tools)
+                        .map_err(|error| error.to_string())?;
+                    runtime
+                        .dispatch(KernelCommand::PlanAccept {
+                            request_id: rid("agent-read-only-analysis-auto-accept"),
+                            run_id: run,
+                            plan_id: plan.plan_id.clone(),
+                        })
+                        .map_err(|error| error.to_string())?
+                };
+                Ok(accept_events)
+            } else {
+                record_kernel_events(state, &review_events);
+                append_session_projection(
+                    state,
+                    session_id,
+                    kernel_events_to_agent_events(session_id, &review_events),
+                );
+                append_session_projection(
+                    state,
+                    session_id,
+                    vec![plan_card_event(session_id, &plan)],
+                );
+                {
+                    let mut gui = state.gui.lock().expect("gui state lock");
+                    gui.pending_plans.insert(plan.plan_id.clone(), plan);
+                }
+                Ok(Vec::new())
+            }
+        }
+        Err(error) => {
+            append_session_projection(
+                state,
+                session_id,
+                vec![plan_parse_error_event(session_id, run_id, &error)],
+            );
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -753,18 +2244,22 @@ fn build_plan_repair_request(
         .get("toolCatalog")
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let original_request_context = serde_json::to_string_pretty(original_request_envelope)
+        .unwrap_or_else(|_| original_request_envelope.to_string());
     json!({
         "messages": [
             {
                 "role": "system",
-                "content": "You are DeepCode plan protocol repair. Return only one valid JSON object using schemaVersion \"deepcode.agent.protocol.v2\". Keep strict fail-closed semantics: do not invent execution facts, do not add direct params/input/command/script/path/content fields inside actionBundle.actions or continuationExpectations, and do not combine resourceRequest with actionBundle. resourceRequest must be under the top-level key \"resourceRequest\"; never use a top-level \"request\" key. actionBundle.version must be string \"1\"; action.resourceScope must be a string array. Use capability namespace in actionBundle: workspace.read, workspace.search, workspace.write, workspace.delete, process.exec, network.egress, git.read, git.write, browser.control. Executor tool names such as fs.write/fs.delete/web.search/git.status/browser.open are only for complete-stage tool calls. File content drafts must be emitted as top-level codeBlocks, and write actions must reference sourceBlockId. If the user requested write then review then delete, current actions include only the write/review batch and the post-review delete intent goes in actionBundle.continuationExpectations."
+                "content": "You are DeepCode plan protocol repair. Return only one valid JSON object using schemaVersion \"deepcode.agent.protocol.v2\". Keep strict fail-closed semantics: do not invent execution facts, do not add direct params/input/command/script/path/content fields inside actionBundle.actions or continuationExpectations, and do not combine resourceRequest with actionBundle. resourceRequest must be under the top-level key \"resourceRequest\"; never use a top-level \"request\" key. actionBundle.version must be string \"1\"; actionBundle.actions must be an array; actionBundle.validationExpectations and actionBundle.reviewExpectations must both be arrays, even when empty; action.resourceScope must be a string array. If the invalid output has top-level actions, move them under actionBundle.actions and populate the required actionBundle wrapper fields. Use capability namespace in actionBundle: workspace.read, workspace.search, workspace.write, workspace.delete, process.exec, network.egress, git.read, git.write, browser.control. Executor tool names such as fs.write/fs.delete/code.search/web.search/git.status/browser.open are only for complete-stage tool calls. File content drafts must be emitted as top-level codeBlocks, and write actions must reference sourceBlockId. If the user requested write then review then delete, current actions include only the write/review batch and the post-review delete intent goes in actionBundle.continuationExpectations."
             },
             {
                 "role": "user",
                 "content": format!(
-                    "Parser error:\\n{}\\n\\nCanonical minimal JSON Envelope v2 resourceRequest example:\\n{{\"schemaVersion\":\"deepcode.agent.protocol.v2\",\"kind\":\"resourceRequest\",\"outputLanguage\":\"en-US\",\"resourceRequest\":{{\"version\":\"1\",\"id\":\"need-target\",\"reason\":\"Need a concrete target resource.\",\"items\":[{{\"id\":\"target-file\",\"manifestEntryId\":\"current-selection\",\"reason\":\"Resolve the user-selected file.\"}}]}}}}\\n\\nCanonical minimal JSON Envelope v2 write/review/continuation example:\\n{{\"schemaVersion\":\"deepcode.agent.protocol.v2\",\"kind\":\"actionBundle\",\"outputLanguage\":\"en-US\",\"userPlan\":\"Create test.md and wait for user review.\",\"codeBlocks\":[{{\"id\":\"write-test-md\",\"path\":\"test.md\",\"content\":\"test write content\"}}],\"actionBundle\":{{\"version\":\"1\",\"id\":\"write-test-md-plan\",\"goal\":\"Create test.md and wait for review\",\"actions\":[{{\"id\":\"write-test-md\",\"title\":\"Write test.md\",\"capability\":\"workspace.write\",\"kind\":\"write\",\"resourceScope\":[\"test.md\"],\"sourceBlockId\":\"write-test-md\"}}],\"continuationExpectations\":[{{\"id\":\"delete-test-md-after-review\",\"title\":\"Delete test.md after user review is accepted\",\"capability\":\"workspace.delete\",\"kind\":\"delete\",\"resourceScope\":[\"test.md\"]}}],\"validationExpectations\":[{{\"id\":\"file-written\",\"description\":\"Kernel fs.write returns ok\"}}],\"reviewExpectations\":[{{\"id\":\"user-review\",\"description\":\"User reviews before deletion\"}}]}},\"expectedValidation\":\"Kernel fs.write returns ok.\",\"reviewGuide\":\"Ask the user to review test.md. If accepted, Kernel continues to the scoped delete continuation.\"}}\\n\\nOriginal invalid output:\\n{}",
+                    "Original request envelope context:\\n{}\\n\\nParser error:\\n{}\\n\\nCanonical minimal JSON Envelope v2 answer example:\\n{{\"schemaVersion\":\"deepcode.agent.protocol.v2\",\"kind\":\"answer\",\"outputLanguage\":\"en-US\",\"answer\":{{\"format\":\"markdown\",\"content\":\"Final user-facing answer.\"}}}}\\n\\nCanonical minimal JSON Envelope v2 resourceRequest example:\\n{{\"schemaVersion\":\"deepcode.agent.protocol.v2\",\"kind\":\"resourceRequest\",\"outputLanguage\":\"en-US\",\"resourceRequest\":{{\"version\":\"1\",\"id\":\"need-target\",\"reason\":\"Need a concrete target resource.\",\"items\":[{{\"id\":\"target-entry\",\"manifestEntryId\":\"current-selection\",\"reason\":\"Resolve a manifest entry.\"}}]}}}}\\n\\nCanonical minimal JSON Envelope v2 read-only actionBundle example:\\n{}\\n\\nCanonical minimal JSON Envelope v2 write/review/continuation example:\\n{{\"schemaVersion\":\"deepcode.agent.protocol.v2\",\"kind\":\"actionBundle\",\"outputLanguage\":\"en-US\",\"userPlan\":\"Create the referenced workspace resource and wait for user review.\",\"codeBlocks\":[{{\"id\":\"write-resource\",\"path\":\"<workspace-resource>\",\"content\":\"example content\"}}],\"actionBundle\":{{\"version\":\"1\",\"id\":\"write-resource-plan\",\"goal\":\"Create the referenced workspace resource and wait for review\",\"actions\":[{{\"id\":\"write-resource\",\"title\":\"Write referenced workspace resource\",\"capability\":\"workspace.write\",\"kind\":\"write\",\"resourceScope\":[\"<workspace-resource>\"],\"sourceBlockId\":\"write-resource\"}}],\"continuationExpectations\":[{{\"id\":\"delete-resource-after-review\",\"title\":\"Delete referenced workspace resource after user review is accepted\",\"capability\":\"workspace.delete\",\"kind\":\"delete\",\"resourceScope\":[\"<workspace-resource>\"]}}],\"validationExpectations\":[{{\"id\":\"file-written\",\"description\":\"Kernel fs.write returns ok\"}}],\"reviewExpectations\":[{{\"id\":\"user-review\",\"description\":\"User reviews before deletion\"}}]}},\"expectedValidation\":\"Kernel fs.write returns ok.\",\"reviewGuide\":\"Ask the user to review the referenced workspace resource. If accepted, Kernel continues to the scoped delete continuation.\"}}\\n\\nOriginal invalid model output:\\n{}",
+                    clip_chars(&original_request_context, 24_000),
                     parser_error,
-                    clip_chars(original_content, 48_000)
+                    read_only_action_bundle_example(),
+                    clip_chars(original_content, 24_000)
                 )
             }
         ],
@@ -1194,7 +2689,7 @@ fn validate_action_json(
         ],
         label,
     )?;
-    for key in ["id", "title", "capability"] {
+    for key in ["id", "title", "capability", "kind"] {
         if object
             .get(key)
             .and_then(Value::as_str)
@@ -1209,6 +2704,11 @@ fn validate_action_json(
         .and_then(Value::as_str)
         .unwrap_or_default();
     validate_plan_capability(capability, &format!("{label}.capability"))?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    validate_action_kind(capability, kind, label)?;
     let resource_scope = object
         .get("resourceScope")
         .and_then(Value::as_array)
@@ -1236,6 +2736,27 @@ fn validate_action_json(
         ));
     }
     Ok(())
+}
+
+fn validate_action_kind(capability: &str, kind: &str, label: &str) -> Result<(), String> {
+    let allowed = match capability {
+        "workspace.read" => &["list", "read"][..],
+        "workspace.search" => &["search"][..],
+        "workspace.write" => &["write"][..],
+        "workspace.delete" => &["delete"][..],
+        _ => return Ok(()),
+    };
+    if allowed.contains(&kind) {
+        return Ok(());
+    }
+    Err(format!(
+        "{label}.kind must be one of [{}] for capability {capability}",
+        allowed
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 fn validate_plan_capability(value: &str, label: &str) -> Result<(), String> {
@@ -1435,6 +2956,14 @@ fn should_auto_accept_plan(state: &AppState, plan: &PendingAgentPlan) -> bool {
     if !enabled {
         return false;
     }
+    plan_review_allows_read_only_execution(plan)
+}
+
+fn should_internally_advance_read_only_plan(plan: &PendingAgentPlan) -> bool {
+    plan_review_allows_read_only_execution(plan)
+}
+
+fn plan_review_allows_read_only_execution(plan: &PendingAgentPlan) -> bool {
     let Some(report) = plan.plan_review_report.as_ref() else {
         return false;
     };
@@ -1444,18 +2973,30 @@ fn should_auto_accept_plan(state: &AppState, plan: &PendingAgentPlan) -> bool {
     {
         return false;
     }
-    let capabilities = report
-        .get("requiredCapabilities")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let capabilities = plan_review_required_capabilities(plan);
     !capabilities.is_empty()
-        && capabilities.iter().all(|capability| {
-            matches!(
-                capability.as_str(),
-                Some("workspace.read") | Some("code.search")
-            )
+        && capabilities
+            .iter()
+            .all(|capability| read_only_context_capability(capability))
+}
+
+fn plan_review_required_capabilities(plan: &PendingAgentPlan) -> Vec<String> {
+    plan.plan_review_report
+        .as_ref()
+        .and_then(|report| report.get("requiredCapabilities"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
         })
+        .unwrap_or_default()
+}
+
+fn read_only_context_capability(capability: &str) -> bool {
+    matches!(capability, "workspace.read" | "workspace.search")
 }
 
 fn report_array_empty(report: &Value, key: &str) -> bool {
@@ -1480,6 +3021,18 @@ fn append_review_summary_from_response(
         .pending_reviews
         .get(run_id)
         .cloned();
+    if pending_review.is_none() {
+        let visible = visible_review_guidance(guidance);
+        let content = visible.trim();
+        if !content.is_empty() {
+            append_session_projection(
+                state,
+                session_id,
+                vec![assistant_final_event(session_id, content)],
+            );
+        }
+        return;
+    }
     let confirmable = pending_review.is_some();
     let continuation_count = pending_review
         .as_ref()
@@ -1491,7 +3044,7 @@ fn append_review_summary_from_response(
         vec![crate::event_projection::agent_event(
             session_id,
             "review_summary",
-            json!({
+            serde_json::json!({
                 "title": "Review",
                 "summary": first_non_empty_line(guidance),
                 "status": "waitingUserReview",
@@ -1511,6 +3064,35 @@ fn append_review_summary_from_response(
             &now_text(),
         )],
     );
+}
+
+fn visible_review_guidance(guidance: &str) -> String {
+    let trimmed = guidance.trim();
+    match parse_agent_plan_response("review-session", "review-run", trimmed) {
+        Ok(AgentPlanResponse::Answer(answer)) => answer.content,
+        Ok(_) => String::new(),
+        Err(_) if looks_like_protocol_debug_text(trimmed) => String::new(),
+        Err(_) => guidance.to_string(),
+    }
+}
+
+fn looks_like_protocol_debug_text(value: &str) -> bool {
+    let trimmed = value.trim_start();
+    trimmed.starts_with('{')
+        || trimmed.contains(AGENT_PROTOCOL_SCHEMA_VERSION)
+        || trimmed.contains("JSON Envelope v2")
+        || trimmed.contains("Parser error:")
+        || trimmed.contains("Original invalid model output:")
+        || trimmed.contains("ACTION_BUNDLE.")
+}
+
+fn has_pending_review_for_run(state: &AppState, run_id: &str) -> bool {
+    state
+        .gui
+        .lock()
+        .expect("gui state lock")
+        .pending_reviews
+        .contains_key(run_id)
 }
 
 fn review_facts_for_run(state: &AppState, run_id: &str) -> Vec<String> {
@@ -1642,20 +3224,12 @@ pub(crate) fn ensure_kernel_run_for_session(
 }
 
 pub(crate) fn request_mentions_local_workspace(content: &str) -> bool {
-    request_mentions_temp_lifecycle(content)
-        || content.contains("文件")
+    content.contains("文件")
         || content.contains("工作区")
         || content.contains("搜索")
+        || content.contains("读取")
+        || content.contains("修改")
         || content.to_lowercase().contains("workspace")
-}
-
-pub(crate) fn request_mentions_temp_lifecycle(content: &str) -> bool {
-    let lower = content.to_lowercase();
-    content.contains("临时文件")
-        || content.contains("读写")
-        || content.contains("新建")
-        || lower.contains("temporary file")
-        || lower.contains("temp file")
 }
 
 pub(crate) fn effective_workspace_binding(
@@ -1810,174 +3384,6 @@ pub(crate) fn should_send_sampling(profile: &ResolvedLlmProfile) -> bool {
     !(is_deepseek_profile(profile) && profile.thinking.as_deref() == Some("enabled"))
 }
 
-pub(crate) fn llm_mock_enabled() -> bool {
-    std::env::var("DEEPCODE_LLM_MOCK")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-pub(crate) fn mock_llm_output(system_instruction: &str, user_prompt: &str) -> LlmChatOutput {
-    let prefers_chinese = user_prompt_prefers_chinese(user_prompt);
-    let output_language = if prefers_chinese { "zh-CN" } else { "en-US" };
-    if system_instruction.contains("review-guidance generator")
-        || system_instruction.contains("Kernel tool-fact evidence")
-    {
-        let content = if request_mentions_temp_lifecycle(user_prompt) {
-            if prefers_chinese {
-                "我是 DeepCode。本轮工具事实显示工作区读取、组件验证、临时文件创建、读取与受控清理均已完成。请用户重点检查工具结果是否都为 ok、临时文件是否无残留、权限请求是否符合预期。"
-            } else {
-                "I am DeepCode. Kernel tool facts show that workspace reading, component verification, temp file creation, readback, and controlled cleanup completed. Please review whether tool results are ok, temp files have no residue, and permission requests match expectations."
-            }
-        } else if request_mentions_local_workspace(user_prompt) {
-            if prefers_chinese {
-                "我是 DeepCode。本轮工具事实显示工作区读取与组件验证已完成。请用户重点检查读取范围与结果是否符合预期。"
-            } else {
-                "I am DeepCode. Kernel tool facts show that workspace reading and component verification completed. Please review whether the read scope and results match the request."
-            }
-        } else if prefers_chinese {
-            "我是 DeepCode。本轮已根据 Kernel 结构化事件完成当前任务的自检建议，最终验收仍由用户决定。"
-        } else {
-            "I am DeepCode. This review guidance is based on Kernel structured events. Final acceptance remains the user's decision."
-        };
-        return LlmChatOutput {
-            content: content.to_string(),
-            ..LlmChatOutput::default()
-        };
-    }
-    if system_instruction.contains(AGENT_PROTOCOL_SCHEMA_VERSION)
-        && !request_mentions_temp_lifecycle(user_prompt)
-        && !request_mentions_local_workspace(user_prompt)
-    {
-        let answer_content = if prefers_chinese {
-            "我是 DeepCode 的本地 Agent。我的会话协议由 Kernel 约束：纯问答会直接回答，需要上下文时会请求 resourceRequest，需要执行时会生成可审查的 actionBundle，并由 Kernel 权限系统控制工具执行。"
-        } else {
-            "I am the local DeepCode Agent. My session protocol is constrained by the Kernel: read-only questions are answered directly, missing context uses resourceRequest, and executable work uses reviewable actionBundle drafts controlled by Kernel permissions."
-        };
-        return LlmChatOutput {
-            content: serde_json::json!({
-                "schemaVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
-                "kind": "answer",
-                "outputLanguage": output_language,
-                "answer": {
-                    "format": "markdown",
-                    "content": answer_content
-                }
-            })
-            .to_string(),
-            ..LlmChatOutput::default()
-        };
-    }
-    if system_instruction.contains(AGENT_PROTOCOL_SCHEMA_VERSION) {
-        let user_plan = if prefers_chinese {
-            "我是 DeepCode，接下来我将作为你的助手验证当前 Agent 的文件系统、搜索与临时文件生命周期能力。计划会先列出工作区与搜索代码，再创建并读取 `_agent_tmp_functional_test.txt`，随后等待用户 review 后再进入删除计划。"
-        } else {
-            "I will verify the current Agent file-system, search, and temporary-file lifecycle capabilities. The plan lists the workspace, runs code search, creates and reads `_agent_tmp_functional_test.txt`, then waits for user review before a later deletion plan."
-        };
-        let expected_validation = if prefers_chinese {
-            "工具调用应全部返回 ok；临时文件读取内容应与写入内容一致；删除动作必须等待用户 review 后由下一轮计划触发。"
-        } else {
-            "All tool calls should return ok; the temp file read should match the written content; deletion must wait for user review and be planned in a later turn."
-        };
-        let review_guide = if prefers_chinese {
-            "请重点审查工具结果、权限请求和临时文件内容；如确认通过，下一轮再生成删除计划。"
-        } else {
-            "Review tool results, permission requests, and temp file content. If accepted, deletion should be planned in the next turn."
-        };
-        let content = serde_json::json!({
-            "schemaVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
-            "kind": "actionBundle",
-            "outputLanguage": output_language,
-            "userPlan": user_plan,
-            "codeBlocks": [
-                {
-                    "id": "write-agent-functional-smoke",
-                    "path": "_agent_tmp_functional_test.txt",
-                    "content": format!("DeepCode Agent temp lifecycle test at {}", now_millis())
-                }
-            ],
-            "actionBundle": {
-                "version": "1",
-                "id": "agent-functional-smoke-plan",
-                "goal": "Verify Agent workspace read, code search, and temp write review flow",
-                "actions": [
-                    {
-                        "id": "list-workspace-root",
-                        "title": "List workspace root",
-                        "capability": "workspace.read",
-                        "kind": "read",
-                        "resourceScope": ["."]
-                    },
-                    {
-                        "id": "search-workspace",
-                        "title": "Verify code.search",
-                        "capability": "workspace.search",
-                        "kind": "read",
-                        "resourceScope": ["workspace"]
-                    },
-                    {
-                        "id": "write-temp-file",
-                        "title": "Create temp file",
-                        "capability": "workspace.write",
-                        "kind": "write",
-                        "resourceScope": ["_agent_tmp_functional_test.txt"],
-                        "sourceBlockId": "write-agent-functional-smoke"
-                    },
-                    {
-                        "id": "read-temp-file",
-                        "title": "Read temp file",
-                        "capability": "workspace.read",
-                        "kind": "read",
-                        "resourceScope": ["_agent_tmp_functional_test.txt"]
-                    }
-                ],
-                "validationExpectations": [
-                    {
-                        "id": "tool-results-ok",
-                        "description": "Kernel tool results return ok for fs.list, code.search, fs.write, and fs.read"
-                    }
-                ],
-                "reviewExpectations": [
-                    {
-                        "id": "user-review-temp-cleanup",
-                        "description": "User reviews temp file content before deletion is planned"
-                    }
-                ]
-            },
-            "expectedValidation": expected_validation,
-            "reviewGuide": review_guide
-        })
-        .to_string();
-        return LlmChatOutput {
-            content,
-            ..LlmChatOutput::default()
-        };
-    }
-    LlmChatOutput {
-        content: String::new(),
-        tool_calls: vec![
-            LlmToolCall {
-                id: "mock-fs-list".to_string(),
-                name: "fs.list".to_string(),
-                arguments: json!({ "path": "." }),
-            },
-            LlmToolCall {
-                id: "mock-code-search".to_string(),
-                name: "code.search".to_string(),
-                arguments: json!({ "query": "DeepCode" }),
-            },
-            LlmToolCall {
-                id: "mock-fs-write".to_string(),
-                name: "fs.write".to_string(),
-                arguments: json!({
-                    "path": "_agent_tmp_functional_test.txt",
-                    "content": format!("DeepCode Agent temp lifecycle test at {}", now_millis())
-                }),
-            },
-        ],
-        ..LlmChatOutput::default()
-    }
-}
-
 fn user_prompt_prefers_chinese(user_prompt: &str) -> bool {
     user_prompt
         .chars()
@@ -1987,6 +3393,11 @@ fn user_prompt_prefers_chinese(user_prompt: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn neutral_resource() -> String {
+        ["res", "ource"].concat()
+    }
 
     #[test]
     fn parser_accepts_json_envelope_answer() {
@@ -2015,6 +3426,7 @@ mod tests {
 
     #[test]
     fn parser_accepts_json_envelope_action_bundle() {
+        let resource = neutral_resource();
         let parsed = parse_agent_plan_response(
             "session-1",
             "run-1",
@@ -2022,25 +3434,25 @@ mod tests {
                 "schemaVersion": "deepcode.agent.protocol.v2",
                 "kind": "actionBundle",
                 "outputLanguage": "zh-CN",
-                "userPlan": "Create test.md and wait for review.",
+                "userPlan": "Create referenced resource and wait for review.",
                 "codeBlocks": [
                     {
                         "id": "write-test",
-                        "path": "test.md",
+                        "path": resource.clone(),
                         "content": "hello"
                     }
                 ],
                 "actionBundle": {
                     "version": "1",
                     "id": "plan-1",
-                    "goal": "Create test.md and wait for review",
+                    "goal": "Create referenced resource and wait for review",
                     "actions": [
                         {
                             "id": "a1",
-                            "title": "Write test.md",
+                            "title": "Write referenced resource",
                             "capability": "workspace.write",
                             "kind": "write",
-                            "resourceScope": ["test.md"],
+                            "resourceScope": [resource.clone()],
                             "sourceBlockId": "write-test"
                         }
                     ],
@@ -2048,7 +3460,7 @@ mod tests {
                     "reviewExpectations": []
                 },
                 "expectedValidation": "Kernel fs.write succeeds.",
-                "reviewGuide": "Review test.md."
+                "reviewGuide": "Review referenced resource."
             })
             .to_string(),
         )
@@ -2085,6 +3497,7 @@ mod tests {
 
     #[test]
     fn parser_rejects_json_envelope_executor_capability() {
+        let resource = neutral_resource();
         let error = parse_agent_plan_response(
             "session-1",
             "run-1",
@@ -2103,7 +3516,7 @@ mod tests {
                             "title": "bad",
                             "capability": "fs.write",
                             "kind": "write",
-                            "resourceScope": ["test.md"]
+                            "resourceScope": [resource.clone()]
                         }
                     ],
                     "validationExpectations": [],
@@ -2185,6 +3598,63 @@ mod tests {
             }
             other => panic!("expected resource request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resource_request_key_ignores_generated_ids() {
+        let first = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "resourceRequest",
+                "outputLanguage": "en-US",
+                "resourceRequest": {
+                    "version": "1",
+                    "id": "rr-1",
+                    "reason": "need  current context",
+                    "items": [
+                        {
+                            "id": "item-1",
+                            "manifestEntryId": "current-selection",
+                            "reason": "Resolve manifest entry"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let second = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "resourceRequest",
+                "outputLanguage": "en-US",
+                "resourceRequest": {
+                    "version": "1",
+                    "id": "rr-2",
+                    "reason": "need current context",
+                    "items": [
+                        {
+                            "id": "item-2",
+                            "manifestEntryId": "current-selection",
+                            "reason": "Resolve manifest entry"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let AgentPlanResponse::ResourceRequest(first) = first else {
+            panic!("expected first resource request");
+        };
+        let AgentPlanResponse::ResourceRequest(second) = second else {
+            panic!("expected second resource request");
+        };
+        assert_eq!(resource_request_key(&first), resource_request_key(&second));
     }
 
     #[test]
@@ -2294,7 +3764,72 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_action_missing_kind() {
+        let resource = neutral_resource();
+        let content = serde_json::json!({
+            "schemaVersion": "deepcode.agent.protocol.v2",
+            "kind": "actionBundle",
+            "outputLanguage": "en-US",
+            "userPlan": "plan",
+            "actionBundle": {
+                "version": "1",
+                "id": "plan-1",
+                "goal": "test",
+                "actions": [
+                    {
+                        "id": "a1",
+                        "title": "read",
+                        "capability": "workspace.read",
+                        "resourceScope": [resource.clone()]
+                    }
+                ],
+                "validationExpectations": [],
+                "reviewExpectations": []
+            },
+            "expectedValidation": "none",
+            "reviewGuide": "review"
+        })
+        .to_string();
+        let error = parse_agent_plan_response("session-1", "run-1", &content).unwrap_err();
+        assert!(error.contains("actions[0].kind must be a non-empty string"));
+    }
+
+    #[test]
+    fn parser_rejects_read_action_with_invalid_kind() {
+        let resource = neutral_resource();
+        let content = serde_json::json!({
+            "schemaVersion": "deepcode.agent.protocol.v2",
+            "kind": "actionBundle",
+            "outputLanguage": "en-US",
+            "userPlan": "plan",
+            "actionBundle": {
+                "version": "1",
+                "id": "plan-1",
+                "goal": "test",
+                "actions": [
+                    {
+                        "id": "a1",
+                        "title": "bad",
+                        "capability": "workspace.read",
+                        "kind": "scan",
+                        "resourceScope": [resource.clone()]
+                    }
+                ],
+                "validationExpectations": [],
+                "reviewExpectations": []
+            },
+            "expectedValidation": "none",
+            "reviewGuide": "review"
+        })
+        .to_string();
+        let error = parse_agent_plan_response("session-1", "run-1", &content).unwrap_err();
+        assert!(error.contains("kind must be one of"));
+        assert!(error.contains("workspace.read"));
+    }
+
+    #[test]
     fn parser_rejects_executor_tool_name_as_plan_capability() {
+        let resource = neutral_resource();
         let content = serde_json::json!({
             "schemaVersion": "deepcode.agent.protocol.v2",
             "kind": "actionBundle",
@@ -2310,7 +3845,7 @@ mod tests {
                         "title": "bad",
                         "capability": "fs.write",
                         "kind": "write",
-                        "resourceScope": ["test.md"]
+                            "resourceScope": [resource.clone()]
                     }
                 ],
                 "validationExpectations": [],
@@ -2326,6 +3861,7 @@ mod tests {
 
     #[test]
     fn parser_accepts_source_block_write_plan() {
+        let resource = neutral_resource();
         let content = serde_json::json!({
             "schemaVersion": "deepcode.agent.protocol.v2",
             "kind": "actionBundle",
@@ -2334,7 +3870,7 @@ mod tests {
             "codeBlocks": [
                 {
                     "id": "write-test",
-                    "path": "test.md",
+                    "path": resource.clone(),
                     "content": "hello"
                 }
             ],
@@ -2348,7 +3884,7 @@ mod tests {
                         "title": "write",
                         "capability": "workspace.write",
                         "kind": "write",
-                        "resourceScope": ["test.md"],
+                        "resourceScope": [resource.clone()],
                         "sourceBlockId": "write-test"
                     }
                 ],
@@ -2356,11 +3892,621 @@ mod tests {
                 "reviewExpectations": []
             },
             "expectedValidation": "Kernel fs.write succeeds.",
-            "reviewGuide": "Review test.md."
+            "reviewGuide": "Review referenced resource."
         })
         .to_string();
         let parsed = parse_agent_plan_response("session-1", "run-1", &content).unwrap();
         assert!(matches!(parsed, AgentPlanResponse::ActionPlan(_)));
+    }
+
+    #[test]
+    fn read_only_plan_review_can_advance_internally() {
+        let plan = test_plan_with_review_capabilities(
+            vec!["workspace.read", "workspace.search"],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        assert!(should_internally_advance_read_only_plan(&plan));
+    }
+
+    #[test]
+    fn write_plan_review_cannot_advance_internally() {
+        let plan = test_plan_with_review_capabilities(
+            vec!["workspace.read", "workspace.write"],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        assert!(!should_internally_advance_read_only_plan(&plan));
+    }
+
+    #[test]
+    fn read_only_plan_with_permission_gap_cannot_advance_internally() {
+        let plan = test_plan_with_review_capabilities(
+            vec!["workspace.read"],
+            vec!["workspace.read"],
+            vec![],
+            vec![],
+        );
+
+        assert!(!should_internally_advance_read_only_plan(&plan));
+    }
+
+    #[test]
+    fn internal_read_only_projection_hides_plan_confirmation_events() {
+        let mut internal_runs = BTreeSet::new();
+        internal_runs.insert("run-read".to_string());
+        let events = vec![
+            KernelEvent::PlanReviewReportProduced {
+                request_id: None,
+                run_id: Some(deepcode_kernel_abi::RunId("run-read".to_string())),
+                session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                report: serde_json::json!({}),
+                sequence: Some(1),
+            },
+            KernelEvent::PlanAccepted {
+                run_id: deepcode_kernel_abi::RunId("run-read".to_string()),
+                session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                plan_id: "plan-read".to_string(),
+                auto_accepted: false,
+                sequence: Some(2),
+            },
+            KernelEvent::WorkflowDecisionMade {
+                request_id: None,
+                run_id: deepcode_kernel_abi::RunId("run-read".to_string()),
+                session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                decision: deepcode_kernel_abi::WorkflowDecision {
+                    action: deepcode_kernel_abi::WorkflowDecisionAction::Blocked,
+                    reason: deepcode_kernel_abi::WorkflowDecisionReason::ToolFailed,
+                    phase: Some("complete".to_string()),
+                    pending_steps: Vec::new(),
+                    answer_obligations: Vec::new(),
+                    summary: Some("read-only observation failed".to_string()),
+                    fail_closed: true,
+                },
+                sequence: Some(3),
+            },
+            KernelEvent::PlanAccepted {
+                run_id: deepcode_kernel_abi::RunId("run-write".to_string()),
+                session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                plan_id: "plan-write".to_string(),
+                auto_accepted: false,
+                sequence: Some(4),
+            },
+        ];
+
+        let visible = visible_kernel_events_for_session(&events, &internal_runs);
+        assert_eq!(visible.len(), 1);
+        assert!(matches!(
+            &visible[0],
+            KernelEvent::PlanAccepted { run_id, .. } if run_id.0 == "run-write"
+        ));
+    }
+
+    #[test]
+    fn session_resource_context_renders_read_only_tool_outputs() {
+        let state = AppState {
+            runtime: Arc::new(Mutex::new(DeepCodeKernelRuntime::new())),
+            gui: Arc::new(Mutex::new(GuiState::new())),
+            terminal_runtime: Arc::new(Mutex::new(crate::terminal_api::TerminalRuntime::new())),
+            kernel_events: Arc::new(Mutex::new(vec![
+                KernelEvent::ToolRequested {
+                    run_id: Some(deepcode_kernel_abi::RunId("run-read".to_string())),
+                    session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                    turn_id: None,
+                    tool_call_id: "call-list".to_string(),
+                    tool_name: "fs.list".to_string(),
+                    args_preview: serde_json::json!({ "path": "src" }),
+                    sequence: Some(1),
+                },
+                KernelEvent::ToolCompleted {
+                    run_id: Some(deepcode_kernel_abi::RunId("run-read".to_string())),
+                    session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                    turn_id: None,
+                    tool_call_id: "call-list".to_string(),
+                    tool_name: "fs.list".to_string(),
+                    ok: true,
+                    output: Some(serde_json::json!({
+                        "path": "src",
+                        "nodes": [
+                            { "path": "src/lib.rs", "kind": "file" }
+                        ]
+                    })),
+                    error: None,
+                    sequence: Some(2),
+                },
+                KernelEvent::ToolRequested {
+                    run_id: Some(deepcode_kernel_abi::RunId("run-read".to_string())),
+                    session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                    turn_id: None,
+                    tool_call_id: "call-read".to_string(),
+                    tool_name: "fs.read".to_string(),
+                    args_preview: serde_json::json!({ "path": "src/lib.rs" }),
+                    sequence: Some(3),
+                },
+                KernelEvent::ToolCompleted {
+                    run_id: Some(deepcode_kernel_abi::RunId("run-read".to_string())),
+                    session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                    turn_id: None,
+                    tool_call_id: "call-read".to_string(),
+                    tool_name: "fs.read".to_string(),
+                    ok: true,
+                    output: Some(serde_json::json!({
+                        "path": "src/lib.rs",
+                        "content": "pub fn entry_point() {}"
+                    })),
+                    error: None,
+                    sequence: Some(4),
+                },
+                KernelEvent::ToolRequested {
+                    run_id: Some(deepcode_kernel_abi::RunId("run-read".to_string())),
+                    session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                    turn_id: None,
+                    tool_call_id: "call-search".to_string(),
+                    tool_name: "code.search".to_string(),
+                    args_preview: serde_json::json!({ "query": "entry_point" }),
+                    sequence: Some(5),
+                },
+                KernelEvent::ToolCompleted {
+                    run_id: Some(deepcode_kernel_abi::RunId("run-read".to_string())),
+                    session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                    turn_id: None,
+                    tool_call_id: "call-search".to_string(),
+                    tool_name: "code.search".to_string(),
+                    ok: true,
+                    output: Some(serde_json::json!({
+                        "query": "entry_point",
+                        "matches": [
+                            { "path": "src/lib.rs", "line": 1, "text": "pub fn entry_point() {}" }
+                        ]
+                    })),
+                    error: None,
+                    sequence: Some(6),
+                },
+            ])),
+        };
+
+        let context = build_session_resource_context(&state, "run-read");
+        assert!(context.contains("ResourcePacket from Kernel read-only tool output"));
+        assert!(context.contains("contentKind: directoryTree"));
+        assert!(context.contains("contentKind: fileText"));
+        assert!(context.contains("contentKind: searchResults"));
+        assert!(context.contains("pub fn entry_point()"));
+    }
+
+    #[test]
+    fn session_resource_context_renders_read_only_tool_errors() {
+        let state = AppState {
+            runtime: Arc::new(Mutex::new(DeepCodeKernelRuntime::new())),
+            gui: Arc::new(Mutex::new(GuiState::new())),
+            terminal_runtime: Arc::new(Mutex::new(crate::terminal_api::TerminalRuntime::new())),
+            kernel_events: Arc::new(Mutex::new(vec![
+                KernelEvent::ToolRequested {
+                    run_id: Some(deepcode_kernel_abi::RunId("run-read".to_string())),
+                    session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                    turn_id: None,
+                    tool_call_id: "call-read".to_string(),
+                    tool_name: "fs.read".to_string(),
+                    args_preview: serde_json::json!({ "path": "module" }),
+                    sequence: Some(1),
+                },
+                KernelEvent::ToolCompleted {
+                    run_id: Some(deepcode_kernel_abi::RunId("run-read".to_string())),
+                    session_id: Some(deepcode_kernel_abi::SessionId("session-1".to_string())),
+                    turn_id: None,
+                    tool_call_id: "call-read".to_string(),
+                    tool_name: "fs.read".to_string(),
+                    ok: false,
+                    output: None,
+                    error: Some(deepcode_kernel_abi::KernelErrorEnvelope {
+                        code: "invalid_command".to_string(),
+                        message: "module is not a file".to_string(),
+                        message_key: None,
+                        args: None,
+                    }),
+                    sequence: Some(2),
+                },
+            ])),
+        };
+
+        let context = build_session_resource_context(&state, "run-read");
+        assert!(context.contains("status: error"));
+        assert!(context.contains("module is not a file"));
+        assert!(context.contains("\"path\":\"module\""));
+    }
+
+    #[test]
+    fn review_guidance_json_answer_renders_only_answer_content() {
+        let visible = visible_review_guidance(
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "answer",
+                "outputLanguage": "zh-CN",
+                "answer": {
+                    "format": "markdown",
+                    "content": "这是最终正文。"
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(visible, "这是最终正文。");
+    }
+
+    #[test]
+    fn review_guidance_filters_protocol_debug_text() {
+        let visible = visible_review_guidance(
+            r#"{"schemaVersion":"deepcode.agent.protocol.v2","kind":"actionBundle","actions":[]}"#,
+        );
+        assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn read_only_analysis_prompt_contains_full_envelope_contract() {
+        let prompt = read_only_analysis_system_prompt();
+        assert!(prompt.contains("kind=\"answer\""));
+        assert!(prompt.contains("kind=\"resourceRequest\""));
+        assert!(prompt.contains("kind=\"actionBundle\""));
+        assert!(prompt.contains("validationExpectations"));
+        assert!(prompt.contains("reviewExpectations"));
+        assert!(prompt.contains("Do not put actions at the top level"));
+        assert!(prompt.contains("workspace.search"));
+        assert!(!prompt.contains(&["plan", "ner"].concat()));
+    }
+
+    #[test]
+    fn repair_request_contains_parser_error_invalid_output_and_read_only_example() {
+        let request = build_plan_repair_request(
+            &serde_json::json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Read context and answer."
+                    }
+                ]
+            }),
+            r#"{"actions":[]}"#,
+            "JSON Envelope v2 contains unknown field actions",
+        );
+        let content = request["messages"][1]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(content.contains("JSON Envelope v2 contains unknown field actions"));
+        assert!(content.contains(r#"{"actions":[]}"#));
+        assert!(
+            content.contains("Canonical minimal JSON Envelope v2 read-only actionBundle example")
+        );
+        assert!(content.contains("\"validationExpectations\":[]"));
+        assert!(content.contains("\"reviewExpectations\":[]"));
+    }
+
+    #[test]
+    fn read_only_plan_key_deduplicates_same_scopes() {
+        let first =
+            test_plan_with_review_capabilities(vec!["workspace.read"], vec![], vec![], vec![]);
+        let mut second = first.clone();
+        second.plan_id = "plan-2".to_string();
+        assert_eq!(read_only_plan_key(&first), read_only_plan_key(&second));
+    }
+
+    #[test]
+    fn read_only_plan_coverage_detects_repeated_resources() {
+        let plan = test_plan_with_actions(serde_json::json!([
+            {
+                "id": "list-src",
+                "title": "List source",
+                "capability": "workspace.read",
+                "kind": "list",
+                "resourceScope": ["src"]
+            },
+            {
+                "id": "read-lib",
+                "title": "Read entry file",
+                "capability": "workspace.read",
+                "kind": "read",
+                "resourceScope": ["src/lib.rs"]
+            },
+            {
+                "id": "search-entry",
+                "title": "Search entry symbol",
+                "capability": "workspace.search",
+                "kind": "search",
+                "resourceScope": ["search:entry_point"]
+            }
+        ]));
+        let mut coverage = ReadOnlyCoverage::default();
+        coverage.listed_paths.insert("src".to_string());
+        coverage.read_paths.insert("src/lib.rs".to_string());
+        coverage.searched_queries.insert("entry_point".to_string());
+
+        assert!(read_only_plan_covered_by_context(&plan, &coverage));
+    }
+
+    #[test]
+    fn workspace_search_plan_maps_to_code_search_tool() {
+        let plan = test_plan_with_actions(serde_json::json!([
+            {
+                "id": "search-entry",
+                "title": "Search entry symbol",
+                "capability": "workspace.search",
+                "kind": "search",
+                "resourceScope": ["search:entry_point"]
+            }
+        ]));
+        let calls = approved_tool_calls_for_pending_plan(&plan);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "code.search");
+        assert_eq!(calls[0].2["query"], "entry_point");
+    }
+
+    #[test]
+    fn workspace_read_kind_selects_read_tool_even_for_root_scope() {
+        let plan = test_plan_with_actions(serde_json::json!([
+            {
+                "id": "read-root",
+                "title": "Read scope",
+                "capability": "workspace.read",
+                "kind": "read",
+                "resourceScope": ["."]
+            }
+        ]));
+        let calls = approved_tool_calls_for_pending_plan(&plan);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "fs.read");
+        assert_eq!(calls[0].2["path"], ".");
+    }
+
+    fn test_plan_with_review_capabilities(
+        capabilities: Vec<&str>,
+        permission_gaps: Vec<&str>,
+        denied_reasons: Vec<&str>,
+        hard_floor_hits: Vec<&str>,
+    ) -> PendingAgentPlan {
+        PendingAgentPlan {
+            session_id: "session-1".to_string(),
+            run_id: "run-1".to_string(),
+            plan_id: "plan-1".to_string(),
+            user_plan: "Read-only context plan.".to_string(),
+            action_bundle: serde_json::json!({
+                "version": "1",
+                "id": "plan-1",
+                "goal": "Read context",
+                "actions": [],
+                "validationExpectations": [],
+                "reviewExpectations": []
+            }),
+            code_blocks: Vec::new(),
+            expected_validation: "Read-only evidence is available.".to_string(),
+            review_guide: "Summarize read-only evidence.".to_string(),
+            plan_review_report: Some(serde_json::json!({
+                "requiredCapabilities": capabilities,
+                "permissionGaps": permission_gaps,
+                "deniedReasons": denied_reasons,
+                "hardFloorHits": hard_floor_hits
+            })),
+            created_at: now_text(),
+        }
+    }
+
+    fn test_plan_with_actions(actions: Value) -> PendingAgentPlan {
+        PendingAgentPlan {
+            session_id: "session-1".to_string(),
+            run_id: "run-1".to_string(),
+            plan_id: "plan-1".to_string(),
+            user_plan: "Read bounded workspace context.".to_string(),
+            action_bundle: serde_json::json!({
+                "version": "1",
+                "id": "plan-1",
+                "goal": "Read bounded workspace context",
+                "actions": actions,
+                "validationExpectations": [],
+                "reviewExpectations": []
+            }),
+            code_blocks: Vec::new(),
+            expected_validation: "Kernel read-only tools return observations.".to_string(),
+            review_guide: "Answer from read-only evidence.".to_string(),
+            plan_review_report: Some(serde_json::json!({
+                "requiredCapabilities": ["workspace.read", "workspace.search"],
+                "permissionGaps": [],
+                "deniedReasons": [],
+                "hardFloorHits": []
+            })),
+            created_at: now_text(),
+        }
+    }
+
+    #[test]
+    fn session_short_memory_includes_recent_file_attachment() {
+        let resource = neutral_resource();
+        let events = vec![
+            serde_json::json!({
+                "kind": "user_msg",
+                "payload": {
+                    "content": "读取分析附加文件",
+                    "attachments": [
+                        {
+                            "kind": "file",
+                            "path": resource.clone(),
+                            "source": "userSelected",
+                            "scope": "message"
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "kind": "assistant_msg",
+                "payload": {
+                    "content": "文件分析完成：附加文件包含一个可读入口段落。",
+                    "channel": "final"
+                }
+            }),
+            serde_json::json!({
+                "kind": "user_msg",
+                "payload": {
+                    "content": "删除最近分析的文件",
+                    "attachments": []
+                }
+            }),
+        ];
+
+        let memory = build_session_short_memory_context(&events);
+        assert!(memory.contains("Session memory document"));
+        assert!(memory.contains("Recent explicit attachments"));
+        assert!(memory.contains(&resource));
+        assert!(!memory.contains("删除最近分析的文件"));
+    }
+
+    #[test]
+    fn session_short_memory_includes_multiple_recent_attachments() {
+        let resource_a = format!("{}-a", neutral_resource());
+        let resource_b = format!("{}-b", neutral_resource());
+        let events = vec![
+            serde_json::json!({
+                "kind": "user_msg",
+                "payload": {
+                    "content": "分析这些文件",
+                    "attachments": [
+                        { "kind": "file", "path": resource_a.clone(), "source": "userSelected", "scope": "message" },
+                        { "kind": "file", "path": resource_b.clone(), "source": "userSelected", "scope": "message" }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "kind": "user_msg",
+                "payload": {
+                    "content": "删除最近提到的文件",
+                    "attachments": []
+                }
+            }),
+        ];
+
+        let memory = build_session_short_memory_context(&events);
+        assert!(memory.contains("Recent explicit attachments"));
+        assert!(memory.contains(&resource_a));
+        assert!(memory.contains(&resource_b));
+        assert!(!memory.contains("删除最近提到的文件"));
+    }
+
+    #[test]
+    fn session_short_memory_includes_recent_directory_attachment() {
+        let resource_group = format!("{}-group", neutral_resource());
+        let events = vec![
+            serde_json::json!({
+                "kind": "user_msg",
+                "payload": {
+                    "content": "分析附加目录的项目结构",
+                    "attachments": [
+                        {
+                            "kind": "directory",
+                            "path": resource_group.clone(),
+                            "source": "userSelected",
+                            "scope": "message"
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "kind": "assistant_msg",
+                "payload": {
+                    "content": "目录分析完成，包含若干源码和配置文件。",
+                    "channel": "final"
+                }
+            }),
+            serde_json::json!({
+                "kind": "user_msg",
+                "payload": {
+                    "content": "继续看一下里面的源代码",
+                    "attachments": []
+                }
+            }),
+        ];
+
+        let memory = build_session_short_memory_context(&events);
+        assert!(memory.contains("Recent explicit attachments"));
+        assert!(memory.contains(&format!("directory {resource_group}")));
+        assert!(!memory.contains("继续看一下里面的源代码"));
+    }
+
+    #[test]
+    fn session_short_memory_is_bounded() {
+        let resource = format!("{}-large", neutral_resource());
+        let large_text = "很长的历史内容".repeat(5_000);
+        let events = vec![
+            serde_json::json!({
+                "kind": "user_msg",
+                "payload": {
+                    "content": large_text,
+                    "attachments": [
+                        { "kind": "file", "path": resource.clone(), "source": "userSelected", "scope": "message" }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "kind": "assistant_msg",
+                "payload": {
+                    "content": "分析完成。".repeat(5_000),
+                    "channel": "final"
+                }
+            }),
+            serde_json::json!({
+                "kind": "user_msg",
+                "payload": { "content": "继续", "attachments": [] }
+            }),
+        ];
+
+        let memory = build_session_short_memory_context(&events);
+        assert!(memory.chars().count() <= SESSION_SHORT_MEMORY_MAX_CHARS);
+        assert!(memory.contains(&resource));
+    }
+
+    #[test]
+    fn production_context_paths_do_not_contain_scenario_hardcoding() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = crate_root
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("repo root");
+        let files = [
+            crate_root.join("src/agent_loop.rs"),
+            crate_root.join("src/llm_transport.rs"),
+            crate_root.join("src/settings_api.rs"),
+            repo_root.join("crates/deepcode-kernel-runtime/src/llm.rs"),
+            repo_root.join("crates/deepcode-kernel-runtime/src/tools.rs"),
+            repo_root.join("crates/deepcode-kernel-runtime/src/workflow.rs"),
+            repo_root.join("crates/deepcode-kernel-workflow/src/decision_engine.rs"),
+        ];
+        let banned = [
+            ["RL", "-Local", "Server"].concat(),
+            ["Project", "/", "Test"].concat(),
+            ["Test", ".", "cpp"].concat(),
+            ["Project", "/", "Sample", "App"].concat(),
+            ["其中", "的 cpp"].concat(),
+            ["告诉我", "其中"].concat(),
+            ["gRPC ", "服务入口"].concat(),
+            ["_agent", "_tmp", "_functional", "_test"].concat(),
+            ["_agent", "_tmp", "_fixture", "_lifecycle"].concat(),
+            ["test", ".", "md"].concat(),
+            ["next", "_kernel", "_autorun", "_tool"].concat(),
+            ["agent", "Fixture"].concat(),
+            ["from", "_", "leg", "acy", "_fixture"].concat(),
+            ["DEEPCODE", "_LLM", "_MOCK"].concat(),
+            ["mock", "_llm", "_output"].concat(),
+            ["llm", "_mock", "_enabled"].concat(),
+        ];
+        for file in files {
+            let content = std::fs::read_to_string(&file)
+                .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+            for needle in &banned {
+                assert!(
+                    !content.contains(needle),
+                    "{} contains banned scenario hardcoding: {}",
+                    file.display(),
+                    needle
+                );
+            }
+        }
     }
 
     #[test]

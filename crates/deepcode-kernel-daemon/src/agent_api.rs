@@ -295,6 +295,14 @@ pub(crate) async fn agent_session_archive(
     }))
 }
 
+pub(crate) async fn agent_session_events(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    session_result(&gui, &session_id)
+}
+
 pub(crate) async fn agent_session_append_events(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -793,7 +801,9 @@ fn continuation_plan_from_review(review: &PendingAgentReview) -> PendingAgentPla
     }
 }
 
-fn approved_tool_calls_for_pending_plan(plan: &PendingAgentPlan) -> Vec<(String, String, Value)> {
+pub(crate) fn approved_tool_calls_for_pending_plan(
+    plan: &PendingAgentPlan,
+) -> Vec<(String, String, Value)> {
     let code_blocks = plan
         .code_blocks
         .iter()
@@ -859,18 +869,32 @@ fn approved_tool_call_for_action(
                 "reason": format!("Approved plan {} action {}", plan.plan_id, action_id)
             }),
         )),
-        "workspace.read" if resource_scope == "." || kind == "list" => Some((
+        "workspace.read" if kind == "list" => Some((
             tool_call_id,
             "fs.list".to_string(),
             json!({ "path": resource_scope }),
         )),
-        "workspace.read" => Some((
+        "workspace.read" if kind == "read" => Some((
             tool_call_id,
             "fs.read".to_string(),
             json!({ "path": resource_scope }),
         )),
+        "workspace.search" if kind == "search" => Some((
+            tool_call_id,
+            "code.search".to_string(),
+            json!({ "query": search_query_from_scope(resource_scope) }),
+        )),
         _ => None,
     }
+}
+
+fn search_query_from_scope(scope: &str) -> String {
+    scope
+        .strip_prefix("search:")
+        .or_else(|| scope.strip_prefix("symbol:"))
+        .unwrap_or(scope)
+        .trim()
+        .to_string()
 }
 
 fn temporary_grants_for_pending_plan(
@@ -1094,12 +1118,16 @@ pub(crate) async fn agent_resources_resolve(
                     max_bytes,
                 );
                 match resource {
-                    Ok((summary, refs)) => items.push(json!({
+                    Ok((content, refs)) => items.push(json!({
                         "requestItemId": request_item.id,
                         "manifestEntryId": entry.id,
                         "readPolicy": "autoRead",
                         "status": "provided",
-                        "contentSummary": summary,
+                        "contentSummary": content.content_summary,
+                        "promptContent": content.prompt_content,
+                        "contentKind": content.content_kind,
+                        "truncated": content.truncated,
+                        "originalBytes": content.original_bytes,
                         "evidenceRefs": refs,
                         "sourceKind": "kernelResource"
                     })),
@@ -1129,7 +1157,7 @@ fn resolve_auto_read_resource(
     binding: Option<&WorkspaceBinding>,
     entry: &AgentResourceManifestEntry,
     max_bytes: usize,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<(ResolvedResourceContent, Vec<String>), String> {
     ensure_workspace_binding(&state.runtime, binding).map_err(|error| error.message)?;
     let output = match entry.kind.as_str() {
         "file" | "ruler" => crate::workspace_api::dispatch_workspace(
@@ -1168,15 +1196,50 @@ fn resolve_auto_read_resource(
     ))
 }
 
-fn summarize_resource_output(output: &Value, max_bytes: usize) -> String {
-    let candidate = output
-        .get("content")
-        .or_else(|| output.get("text"))
-        .or_else(|| output.get("summary"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| serde_json::to_string(output).unwrap_or_else(|_| "{}".to_string()));
-    candidate.chars().take(max_bytes).collect()
+struct ResolvedResourceContent {
+    content_summary: String,
+    prompt_content: String,
+    content_kind: &'static str,
+    truncated: bool,
+    original_bytes: usize,
+}
+
+fn summarize_resource_output(output: &Value, max_bytes: usize) -> ResolvedResourceContent {
+    let (content_kind, candidate) =
+        if let Some(content) = output.get("content").and_then(Value::as_str) {
+            ("fileText", content.to_string())
+        } else if let Some(text) = output.get("text").and_then(Value::as_str) {
+            ("text", text.to_string())
+        } else if let Some(nodes) = output.get("nodes") {
+            (
+                "directoryTree",
+                serde_json::to_string_pretty(nodes).unwrap_or_else(|_| nodes.to_string()),
+            )
+        } else if let Some(matches) = output.get("matches") {
+            (
+                "searchResults",
+                serde_json::to_string_pretty(matches).unwrap_or_else(|_| matches.to_string()),
+            )
+        } else if let Some(summary) = output.get("summary").and_then(Value::as_str) {
+            ("summary", summary.to_string())
+        } else {
+            (
+                "json",
+                serde_json::to_string_pretty(output).unwrap_or_else(|_| "{}".to_string()),
+            )
+        };
+    let original_bytes = candidate.len();
+    let max_chars = max_bytes.max(256);
+    let prompt_content = candidate.chars().take(max_chars).collect::<String>();
+    let truncated = prompt_content.len() < candidate.len();
+    let content_summary = prompt_content.chars().take(1200).collect::<String>();
+    ResolvedResourceContent {
+        content_summary,
+        prompt_content,
+        content_kind,
+        truncated,
+        original_bytes,
+    }
 }
 
 pub(crate) async fn agent_prompt_layers() -> Json<ApiResponse> {

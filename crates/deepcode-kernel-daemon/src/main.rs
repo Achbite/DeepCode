@@ -169,7 +169,7 @@ async fn main() {
         )
         .route(
             "/api/agent/sessions/:session_id/events",
-            post(agent_session_append_events),
+            get(agent_session_events).post(agent_session_append_events),
         )
         .route(
             "/api/agent/sessions/:session_id/messages",

@@ -351,3 +351,38 @@ fn trim_text(value: &str, max_chars: usize) -> String {
     output.push_str("...");
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_message_renders_as_thinking_block() {
+        let timeline = build_agent_timeline(
+            "session-1",
+            vec![
+                json!({
+                    "id": "user-1",
+                    "kind": "user_msg",
+                    "ts": "2026-01-01T00:00:00Z",
+                    "payload": { "content": "hello" }
+                }),
+                json!({
+                    "id": "reasoning-1",
+                    "kind": "assistant_msg",
+                    "ts": "2026-01-01T00:00:01Z",
+                    "payload": {
+                        "channel": "reasoning",
+                        "content": "internal reasoning"
+                    }
+                }),
+            ],
+        );
+        let blocks = timeline["turns"][0]["blocks"].as_array().unwrap();
+        let thinking = blocks
+            .iter()
+            .find(|block| block.get("kind").and_then(Value::as_str) == Some("thinking"))
+            .expect("thinking block must be retained");
+        assert_eq!(thinking["bodyMarkdown"], "internal reasoning");
+    }
+}

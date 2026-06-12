@@ -24,19 +24,6 @@ impl DeepCodeKernelRuntime {
                     arguments,
                 }),
         );
-        let record = self.record_by_run_mut(run_id)?;
-        record.decision_state.tool_component_required = false;
-        record.decision_state.temp_lifecycle_required = false;
-        record
-            .decision_state
-            .answer_obligations
-            .retain(|obligation| {
-                !matches!(
-                    obligation.id,
-                    deepcode_kernel_abi::AnswerObligationId::ToolComponentSummary
-                        | deepcode_kernel_abi::AnswerObligationId::TempFileLifecycleResult
-                )
-            });
         Ok(())
     }
 
@@ -523,21 +510,7 @@ impl DeepCodeKernelRuntime {
     ) -> KernelResult<Vec<KernelEvent>> {
         let mut events = Vec::new();
         loop {
-            let next = self.pop_approved_tool_call(run_id).or_else(|| {
-                let record = self.record_by_run(run_id).ok()?;
-                next_kernel_autorun_tool(&record.decision_state).map(|(tool_name, arguments)| {
-                    KernelLlmToolCall {
-                        id: format!(
-                            "kernel-auto-{}-{}",
-                            tool_name.replace('.', "-"),
-                            now_millis()
-                        ),
-                        name: tool_name.to_string(),
-                        arguments,
-                    }
-                })
-            });
-            let Some(call) = next else {
+            let Some(call) = self.pop_approved_tool_call(run_id) else {
                 break;
             };
             let tool_call_id = call.id;
@@ -559,7 +532,7 @@ impl DeepCodeKernelRuntime {
                 "tool.requested",
                 request_sequence,
                 serde_json::json!({
-                    "summary": format!("Kernel auto requested: {tool_name}"),
+                    "summary": format!("Kernel requested approved tool: {tool_name}"),
                     "toolCallId": &tool_call_id,
                     "toolName": &tool_name,
                     "argsPreview": redact_tool_arguments(&tool_name, &arguments)
@@ -1519,53 +1492,6 @@ fn workflow_temp_resource_id(run_id: &str, path: &str) -> String {
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect::<String>();
     format!("agent-temp-{run_id}-{normalized}")
-}
-
-pub(crate) fn next_kernel_autorun_tool(state: &RunDecisionState) -> Option<(&'static str, Value)> {
-    if !(state.workspace_summary_required
-        || state.tool_component_required
-        || state.temp_lifecycle_required)
-    {
-        return None;
-    }
-    if !state.workspace_listed {
-        return Some(("fs.list", serde_json::json!({ "path": "." })));
-    }
-    if state.workspace_summary_required && !state.workspace_file_read {
-        let path = state
-            .workspace_summary_file_path
-            .as_deref()
-            .unwrap_or("README.md");
-        return Some(("fs.read", serde_json::json!({ "path": path })));
-    }
-    if state.tool_component_required && !state.workspace_search_completed {
-        return Some(("code.search", serde_json::json!({ "query": "DeepCode" })));
-    }
-    if !state.temp_lifecycle_required {
-        return None;
-    }
-    if !state.temp_created {
-        return Some((
-            "fs.write",
-            serde_json::json!({
-                "path": "_agent_tmp_functional_test.txt",
-                "content": format!("DeepCode Agent temp lifecycle test at {}", now_millis())
-            }),
-        ));
-    }
-    if !state.temp_read_back {
-        return Some((
-            "fs.read",
-            serde_json::json!({ "path": "_agent_tmp_functional_test.txt" }),
-        ));
-    }
-    if !state.temp_cleaned {
-        return Some((
-            "fs.delete",
-            serde_json::json!({ "path": "_agent_tmp_functional_test.txt" }),
-        ));
-    }
-    None
 }
 
 pub(crate) fn get_string(value: &Value, key: &str) -> Option<String> {

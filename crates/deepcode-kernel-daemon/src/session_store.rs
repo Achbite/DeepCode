@@ -16,6 +16,82 @@ const ARCHIVE_DEBUG_STREAMS: &[&str] = &[
     "llm-provider-errors.jsonl",
 ];
 
+#[derive(Default)]
+struct ProjectionSummary {
+    event_count: usize,
+    first_timestamp: Option<String>,
+    last_timestamp: Option<String>,
+    first_user_content: Option<String>,
+}
+
+pub(crate) fn restore_session_index(paths: &HostPaths) -> Vec<Value> {
+    let mut sessions_by_id: HashMap<String, Value> = HashMap::new();
+
+    for session in read_archived_session_metadata(&paths.conversation_archives_dir) {
+        let Some(session_id) = session
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        sessions_by_id
+            .entry(session_id)
+            .and_modify(|existing| {
+                if session_sort_key(&session) > session_sort_key(existing) {
+                    *existing = session.clone();
+                }
+            })
+            .or_insert(session);
+    }
+
+    for session_id in projection_session_ids(&paths.sessions_dir) {
+        sessions_by_id.entry(session_id.clone()).or_insert_with(|| {
+            let created_at = timestamp_from_session_id(&session_id).unwrap_or_else(now_text);
+            create_agent_session_value(
+                &session_id,
+                &created_at,
+                "New Agent Session",
+                "plan",
+                None,
+                None,
+                None,
+            )
+        });
+    }
+
+    let session_ids = sessions_by_id.keys().cloned().collect::<Vec<_>>();
+    for session_id in session_ids {
+        if let Some(session) = sessions_by_id.get_mut(&session_id) {
+            normalize_restored_session(session, &session_id, &paths.sessions_dir);
+        }
+    }
+
+    let mut sessions = sessions_by_id
+        .into_values()
+        .filter(|session| session.get("id").and_then(Value::as_str).is_some())
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| session_sort_key(right).cmp(&session_sort_key(left)));
+    sessions
+}
+
+pub(crate) fn restored_current_session_ids_by_scope(sessions: &[Value]) -> HashMap<String, String> {
+    let mut current = HashMap::new();
+    for session in sessions {
+        if is_archived_session(session) {
+            continue;
+        }
+        let Some(session_id) = session.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        current
+            .entry(session_scope_key(session))
+            .or_insert_with(|| session_id.to_string());
+    }
+    current
+}
+
 pub(crate) async fn session_store_index(State(state): State<AppState>) -> Json<ApiResponse> {
     let gui = state.gui.lock().expect("gui state lock");
     ApiResponse::ok(json!({
@@ -209,15 +285,26 @@ pub(crate) fn append_session_projection(state: &AppState, session_id: &str, even
     if events.is_empty() {
         return;
     }
-    let (sessions_dir, archive_root, session) = {
+    let (sessions_dir, needs_cache_hydration) = {
+        let gui = state.gui.lock().expect("gui state lock");
+        (
+            gui.paths.sessions_dir.clone(),
+            !gui.session_projection_cache.contains_key(session_id),
+        )
+    };
+    let existing_events = if needs_cache_hydration {
+        read_session_projection_jsonl(&sessions_dir, session_id)
+    } else {
+        Vec::new()
+    };
+    let (archive_root, session) = {
         let mut gui = state.gui.lock().expect("gui state lock");
         gui.session_projection_cache
             .entry(session_id.to_string())
-            .or_default()
+            .or_insert_with(|| existing_events)
             .extend(events.clone());
         update_session_event_count(&mut gui, session_id);
         (
-            gui.paths.sessions_dir.clone(),
             gui.paths.conversation_archives_dir.clone(),
             session_metadata(&gui.sessions, session_id),
         )
@@ -291,6 +378,216 @@ pub(crate) fn read_session_jsonl(
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect()
+}
+
+fn read_archived_session_metadata(archive_root: &FsPath) -> Vec<Value> {
+    let Ok(workspaces) = fs::read_dir(archive_root) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    for workspace in workspaces.filter_map(Result::ok) {
+        let Ok(session_dirs) = fs::read_dir(workspace.path()) else {
+            continue;
+        };
+        for session_dir in session_dirs.filter_map(Result::ok) {
+            let manifest_path = session_dir.path().join("session").join("manifest.json");
+            let Some(manifest) = read_json_file(&manifest_path) else {
+                continue;
+            };
+            let mut session = manifest
+                .get("session")
+                .cloned()
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            let session_id = session
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    manifest
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .map(ToOwned::to_owned)
+                });
+            let Some(session_id) = session_id else {
+                continue;
+            };
+            session["id"] = json!(session_id);
+            if session
+                .get("workspaceScopeKey")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                if let Some(scope) = manifest.get("workspaceScopeKey").and_then(Value::as_str) {
+                    session["workspaceScopeKey"] = json!(scope);
+                }
+            }
+            sessions.push(session);
+        }
+    }
+    sessions
+}
+
+fn projection_session_ids(sessions_dir: &FsPath) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(sessions_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.join("projection.jsonl").is_file() {
+                return None;
+            }
+            entry.file_name().to_str().map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+fn normalize_restored_session(session: &mut Value, session_id: &str, sessions_dir: &FsPath) {
+    let summary = summarize_session_projection(sessions_dir, session_id);
+    let fallback_created_at = timestamp_from_session_id(session_id).unwrap_or_else(now_text);
+    let created_at = string_field(session, "createdAt")
+        .or(summary.first_timestamp.clone())
+        .unwrap_or(fallback_created_at);
+    let updated_at = summary
+        .last_timestamp
+        .clone()
+        .or_else(|| string_field(session, "updatedAt"))
+        .unwrap_or_else(|| created_at.clone());
+
+    session["id"] = json!(session_id);
+    session["createdAt"] = json!(created_at);
+    session["updatedAt"] = json!(updated_at);
+    session["eventCount"] = json!(summary.event_count);
+
+    if session
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        session["mode"] = json!("plan");
+    }
+    if !session.get("profileId").is_some() {
+        session["profileId"] = Value::Null;
+    }
+    if !session.get("workspaceId").is_some() {
+        session["workspaceId"] = Value::Null;
+    }
+    if !session.get("workspaceHash").is_some() {
+        session["workspaceHash"] = Value::Null;
+    }
+
+    let mut title = string_field(session, "title").unwrap_or_default();
+    let title_source =
+        string_field(session, "titleSource").unwrap_or_else(|| "pending".to_string());
+    if is_default_session_title(&title) {
+        if let Some(user_content) = summary.first_user_content.as_deref() {
+            if let Some(compact) = compact_agent_session_title(user_content) {
+                title = compact;
+                session["titleSource"] = json!("auto");
+            }
+        }
+    }
+    if title.trim().is_empty() {
+        title = "New Agent Session".to_string();
+    }
+    session["title"] = json!(title);
+    if session
+        .get("titleSource")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        session["titleSource"] = json!(title_source);
+    }
+    if session
+        .get("workspaceScopeKey")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        session["workspaceScopeKey"] = json!(scope_key_from_parts(
+            session.get("workspaceId").and_then(Value::as_str),
+            session.get("workspaceHash").and_then(Value::as_str),
+        ));
+    }
+}
+
+fn summarize_session_projection(sessions_dir: &FsPath, session_id: &str) -> ProjectionSummary {
+    use std::io::BufRead as _;
+
+    let path = sessions_dir
+        .join(safe_path_segment(session_id))
+        .join("projection.jsonl");
+    let Ok(file) = fs::File::open(path) else {
+        return ProjectionSummary::default();
+    };
+    let mut summary = ProjectionSummary::default();
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        summary.event_count += 1;
+        let timestamp = event_timestamp(&event);
+        if !timestamp.is_empty() {
+            if summary.first_timestamp.is_none() {
+                summary.first_timestamp = Some(timestamp.clone());
+            }
+            summary.last_timestamp = Some(timestamp);
+        }
+        if summary.first_user_content.is_none()
+            && event.get("kind").and_then(Value::as_str) == Some("user_msg")
+        {
+            summary.first_user_content = event
+                .get("payload")
+                .and_then(|payload| payload.get("content"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+    }
+    summary
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|item| !item.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn is_default_session_title(title: &str) -> bool {
+    let normalized = title.trim();
+    normalized.is_empty() || normalized == "New Agent Session" || normalized == "新 Agent 会话"
+}
+
+fn timestamp_from_session_id(session_id: &str) -> Option<String> {
+    session_id
+        .strip_prefix("session-")
+        .filter(|value| value.chars().all(|ch| ch.is_ascii_digit()))
+        .map(ToOwned::to_owned)
+}
+
+fn session_sort_key(session: &Value) -> String {
+    string_field(session, "updatedAt")
+        .or_else(|| string_field(session, "createdAt"))
+        .or_else(|| {
+            session
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(timestamp_from_session_id)
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn safe_path_segment(input: &str) -> String {
@@ -1216,6 +1513,197 @@ mod tests {
             .join("session_without_metadata")
             .join("run_alpha");
         assert!(archive_dir.join("manifest.json").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_session_index_uses_archive_manifest_and_projection_fallback() {
+        let root = archive_test_root("session-restore");
+        let sessions_dir = root.join("sessions");
+        let archive_root = root.join("conversation-archives");
+        let paths = HostPaths {
+            settings_path: root.join("settings.json"),
+            llm_profiles_path: root.join("profiles.json"),
+            llm_secrets_path: root.join("secrets.json"),
+            workflow_config_path: root.join("workflow.json"),
+            sessions_dir: sessions_dir.clone(),
+            conversation_archives_dir: archive_root.clone(),
+        };
+
+        let archived_session_id = "session-12345";
+        let archived_session = create_agent_session_value(
+            archived_session_id,
+            "12345",
+            "New Agent Session",
+            "plan",
+            None,
+            Some("ws/1"),
+            Some("hash/1"),
+        );
+        let archived_user = json!({
+            "id": "evt-user-1",
+            "sessionId": archived_session_id,
+            "ts": "12346",
+            "kind": "user_msg",
+            "payload": { "content": "恢复历史对话标题", "runId": "run-1" }
+        });
+        let archived_answer = json!({
+            "id": "evt-assistant-1",
+            "sessionId": archived_session_id,
+            "ts": "12347",
+            "kind": "assistant_msg",
+            "payload": { "content": "ok", "runId": "run-1" }
+        });
+        append_session_projection_jsonl(
+            &sessions_dir,
+            archived_session_id,
+            &[archived_user.clone(), archived_answer],
+        )
+        .expect("archived projection jsonl");
+        append_conversation_archive_projection(
+            &archive_root,
+            archived_session_id,
+            Some(&archived_session),
+            &[archived_user],
+        )
+        .expect("archived conversation manifest");
+
+        let fallback_session_id = "session-99999";
+        append_session_projection_jsonl(
+            &sessions_dir,
+            fallback_session_id,
+            &[json!({
+                "id": "evt-user-2",
+                "sessionId": fallback_session_id,
+                "ts": "99999",
+                "kind": "user_msg",
+                "payload": { "content": "只有 projection 的会话" }
+            })],
+        )
+        .expect("fallback projection jsonl");
+
+        let restored = restore_session_index(&paths);
+        assert_eq!(restored.len(), 2);
+        let archived = restored
+            .iter()
+            .find(|session| session.get("id").and_then(Value::as_str) == Some(archived_session_id))
+            .expect("archived session restored");
+        assert_eq!(archived.get("eventCount").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            archived.get("title").and_then(Value::as_str),
+            Some("恢复历史对话标题")
+        );
+        assert_eq!(
+            archived.get("workspaceScopeKey").and_then(Value::as_str),
+            Some("workspace-ws_1-hash_1")
+        );
+
+        let fallback = restored
+            .iter()
+            .find(|session| session.get("id").and_then(Value::as_str) == Some(fallback_session_id))
+            .expect("projection-only session restored");
+        assert_eq!(fallback.get("eventCount").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            fallback.get("title").and_then(Value::as_str),
+            Some("只有 projection 的会话")
+        );
+        assert_eq!(
+            fallback.get("workspaceScopeKey").and_then(Value::as_str),
+            Some("unbound-workspace")
+        );
+
+        let current_by_scope = restored_current_session_ids_by_scope(&restored);
+        assert_eq!(
+            current_by_scope
+                .get("workspace-ws_1-hash_1")
+                .map(String::as_str),
+            Some(archived_session_id)
+        );
+        assert_eq!(
+            current_by_scope
+                .get("unbound-workspace")
+                .map(String::as_str),
+            Some(fallback_session_id)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn append_session_projection_hydrates_restored_history_before_append() {
+        let root = archive_test_root("projection-hydrate");
+        let sessions_dir = root.join("sessions");
+        let archive_root = root.join("conversation-archives");
+        let session_id = "session-123456";
+        let paths = HostPaths {
+            settings_path: root.join("settings.json"),
+            llm_profiles_path: root.join("profiles.json"),
+            llm_secrets_path: root.join("secrets.json"),
+            workflow_config_path: root.join("workflow.json"),
+            sessions_dir: sessions_dir.clone(),
+            conversation_archives_dir: archive_root,
+        };
+        let historical_event = json!({
+            "id": "evt-history",
+            "sessionId": session_id,
+            "ts": "1",
+            "kind": "user_msg",
+            "payload": { "content": "历史问题" }
+        });
+        let appended_event = json!({
+            "id": "evt-next",
+            "sessionId": session_id,
+            "ts": "2",
+            "kind": "user_msg",
+            "payload": { "content": "继续追问" }
+        });
+        append_session_projection_jsonl(&sessions_dir, session_id, &[historical_event.clone()])
+            .expect("historical projection");
+
+        let session = create_agent_session_value(
+            session_id,
+            "1",
+            "历史问题",
+            "plan",
+            None,
+            Some("ws"),
+            Some("hash"),
+        );
+        let state = AppState {
+            runtime: Arc::new(Mutex::new(DeepCodeKernelRuntime::new())),
+            gui: Arc::new(Mutex::new(GuiState {
+                paths,
+                user_settings: json!({}),
+                llm_profiles: json!({}),
+                workflow_config: json!({}),
+                sessions: vec![session],
+                current_session_id: Some(session_id.to_string()),
+                current_session_ids_by_scope: HashMap::new(),
+                session_projection_cache: HashMap::new(),
+                pending_plans: HashMap::new(),
+                pending_reviews: HashMap::new(),
+                trace_events: HashMap::new(),
+                browser: BrowserState::default(),
+            })),
+            terminal_runtime: Arc::new(Mutex::new(crate::terminal_api::TerminalRuntime::new())),
+            kernel_events: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        append_session_projection(&state, session_id, vec![appended_event.clone()]);
+        let stored = session_projection(&state, session_id);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0], historical_event);
+        assert_eq!(stored[1], appended_event);
+        let event_count = state
+            .gui
+            .lock()
+            .expect("gui lock")
+            .sessions
+            .first()
+            .and_then(|session| session.get("eventCount"))
+            .and_then(Value::as_u64);
+        assert_eq!(event_count, Some(2));
 
         let _ = fs::remove_dir_all(root);
     }

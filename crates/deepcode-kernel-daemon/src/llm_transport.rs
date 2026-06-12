@@ -159,22 +159,6 @@ pub(crate) async fn call_llm_profile(
         .cloned()
         .map(provider_tools_from_values)
         .unwrap_or_default();
-    if llm_mock_enabled() {
-        let mock_system_instruction = messages
-            .iter()
-            .find(|value| value.get("role").and_then(Value::as_str) == Some("system"))
-            .and_then(|value| value.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let mock_user_prompt = messages
-            .iter()
-            .rev()
-            .find(|value| value.get("role").and_then(Value::as_str) == Some("user"))
-            .and_then(|value| value.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        return Ok(mock_llm_output(mock_system_instruction, mock_user_prompt));
-    }
     match profile.kind.as_str() {
         "anthropic" => call_anthropic_profile(profile, messages, tools).await,
         "ollama" => call_ollama_profile(profile, messages, tools).await,

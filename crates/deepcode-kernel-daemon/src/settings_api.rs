@@ -125,14 +125,6 @@ pub(crate) async fn llm_probe(
             }));
         }
     };
-    if llm_mock_enabled() {
-        return ApiResponse::ok(json!({
-            "ok": true,
-            "provider": profile.kind,
-            "model": profile.model,
-            "latencyMs": now_millis().saturating_sub(started)
-        }));
-    }
     let output = call_llm_profile(
         &profile,
         json!({
