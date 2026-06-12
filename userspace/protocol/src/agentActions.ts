@@ -152,7 +152,11 @@ export interface AgentResourcePacketItem {
   manifestEntryId: string;
   readPolicy: AgentResourceReadPolicy;
   status: 'provided' | 'needsUserApproval' | 'denied';
+  contentKind?: 'directoryTree' | 'fileText' | 'searchResults' | 'summary' | 'text' | 'json';
   contentSummary?: string;
+  promptContent?: string;
+  truncated?: boolean;
+  originalBytes?: number;
   denialReason?: string;
   evidenceRefs?: string[];
   sourceKind?: 'kernelResource' | 'manifestOnly';

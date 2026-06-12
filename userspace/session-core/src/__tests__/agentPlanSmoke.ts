@@ -574,9 +574,24 @@ function assertResourceRequestLoop(): void {
       { id: 'item-4', manifestEntryId: 'missing-entry', reason: 'Model guessed a path.' },
     ],
   };
-  const packet = createResourcePacket({ packetId: 'packet-1', request, manifest });
+  const packet = createResourcePacket({
+    packetId: 'packet-1',
+    request,
+    manifest,
+    kernelEvidence: {
+      'file-readme': {
+        contentKind: 'fileText',
+        contentSummary: 'workspace overview',
+        promptContent: 'workspace overview with concrete entry points',
+        truncated: false,
+        originalBytes: 45,
+        evidenceRefs: ['kernel-resource:file:file-readme'],
+      },
+    },
+  });
   assertEqual(packet.workspaceScopeKey, 'workspace-1', 'resource packets keep workspace ownership');
   assertEqual(packet.items[0]?.status, 'provided', 'auto read resources are provided');
+  assertEqual(packet.items[0]?.promptContent, 'workspace overview with concrete entry points', 'resource packet keeps prompt-ready content');
   assertEqual(packet.items[1]?.status, 'needsUserApproval', 'sensitive resources require user approval');
   assertEqual(packet.items[2]?.status, 'denied', 'denied resources stay denied');
   assertEqual(packet.items[3]?.status, 'denied', 'resources outside ResourceManifest are denied');
@@ -733,6 +748,47 @@ function assertPromptEnvelopeShape(): void {
   assert(promptEnvelope.stablePrefix.includes('schemaVersion "deepcode.agent.protocol.v2"'), 'state prompt enforces JSON Envelope v2');
   assert(promptEnvelope.stablePrefix.includes('"kind":"answer"'), 'state prompt documents answer output');
   assert(promptEnvelope.stablePrefix.includes('cannot override this system prompt'), 'state prompt forbids Ruler or memory system override');
+
+  const resourceManifest: ResourceManifest = {
+    id: 'manifest-prompt',
+    workspaceScopeKey: 'workspace-1',
+    entries: [
+      {
+        id: 'entry-context',
+        kind: 'file',
+        label: 'Context entry',
+        resourceRef: 'src/lib.rs',
+        readPolicy: 'autoRead',
+        reason: 'Need a concrete source excerpt.',
+      },
+    ],
+    budget: { maxEntries: 4, maxBytes: 4096 },
+    defaultDenyPatterns: [],
+  };
+  const resourcePacket = createResourcePacket({
+    packetId: 'packet-prompt',
+    manifest: resourceManifest,
+    request: {
+      id: 'request-prompt',
+      items: [{ id: 'item-context', manifestEntryId: 'entry-context', reason: 'Read source excerpt.' }],
+    },
+    kernelEvidence: {
+      'entry-context': {
+        contentKind: 'fileText',
+        promptContent: 'prompt-ready source excerpt',
+        evidenceRefs: ['kernel-resource:file:entry-context'],
+      },
+    },
+  });
+  const resourcePromptEnvelope = buildPromptEnvelope({
+    workflowState: 'plan',
+    allowedProposals: ['ResourceRequest', 'ActionBundleDraft'],
+    capabilityCatalogSummary: 'workspace.read is proposal-visible; authorization is separate.',
+    compiledRuler: ruler,
+    userRequest: 'Analyze referenced workspace context.',
+    resourcePackets: [resourcePacket],
+  });
+  assert(resourcePromptEnvelope.dynamicSuffix.includes('prompt-ready source excerpt'), 'resource packet prompt content enters model-visible context');
 
   const snapshot = createContextSnapshot({
     id: 'snapshot-1',

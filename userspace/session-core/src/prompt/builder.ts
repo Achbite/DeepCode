@@ -47,8 +47,8 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       name: 'capabilityProjection',
       content: [
         'JSON Envelope v2 answer shape: {"schemaVersion":"deepcode.agent.protocol.v2","kind":"answer","outputLanguage":"zh-CN","answer":{"format":"markdown","content":"..."}}',
-        'JSON Envelope v2 resource request shape: {"schemaVersion":"deepcode.agent.protocol.v2","kind":"resourceRequest","outputLanguage":"zh-CN","resourceRequest":{"version":"1","id":"need-target","reason":"Need a concrete target resource.","items":[{"id":"target-file","manifestEntryId":"current-selection","reason":"Resolve the user-selected file."}]}}',
-        'JSON Envelope v2 action bundle shape: {"schemaVersion":"deepcode.agent.protocol.v2","kind":"actionBundle","outputLanguage":"zh-CN","userPlan":"...","codeBlocks":[{"id":"...","path":"...","content":"..."}],"actionBundle":{"version":"1","id":"...","goal":"...","actions":[{"id":"...","title":"...","capability":"workspace.write","kind":"write","resourceScope":["test.md"],"sourceBlockId":"..."}],"continuationExpectations":[{"id":"delete-after-review","title":"Delete test.md after user review is accepted","capability":"workspace.delete","kind":"delete","resourceScope":["test.md"]}],"validationExpectations":[],"reviewExpectations":[]},"expectedValidation":"...","reviewGuide":"..."}',
+        'JSON Envelope v2 resource request shape: {"schemaVersion":"deepcode.agent.protocol.v2","kind":"resourceRequest","outputLanguage":"zh-CN","resourceRequest":{"version":"1","id":"need-target","reason":"Need a concrete target resource.","items":[{"id":"target-entry","manifestEntryId":"current-selection","reason":"Resolve a manifest entry."}]}}',
+        'JSON Envelope v2 action bundle shape: {"schemaVersion":"deepcode.agent.protocol.v2","kind":"actionBundle","outputLanguage":"zh-CN","userPlan":"...","codeBlocks":[{"id":"...","path":"<workspace-resource>","content":"..."}],"actionBundle":{"version":"1","id":"...","goal":"...","actions":[{"id":"...","title":"...","capability":"workspace.write","kind":"write","resourceScope":["<workspace-resource>"],"sourceBlockId":"..."}],"continuationExpectations":[{"id":"delete-after-review","title":"Delete referenced workspace resource after user review is accepted","capability":"workspace.delete","kind":"delete","resourceScope":["<workspace-resource>"]}],"validationExpectations":[],"reviewExpectations":[]},"expectedValidation":"...","reviewGuide":"..."}',
         'Natural language is never executable. Tagged Markdown protocol output is not accepted; live plan output must use JSON Envelope v2.',
         `Capabilities visible as proposals only, not authorization:\n${input.capabilityCatalogSummary}`,
       ].join('\n'),
@@ -126,8 +126,33 @@ function resourceContextSummary(input: PromptEnvelopeBuilderInput): string {
   }
   for (const packet of input.resourcePackets ?? []) {
     lines.push(`ResourcePacket: ${packet.id} request=${packet.requestId} items=${packet.items.length}`);
+    for (const item of packet.items) {
+      lines.push(`- item=${item.requestItemId} manifestEntry=${item.manifestEntryId} status=${item.status} policy=${item.readPolicy} source=${item.sourceKind ?? 'unknown'}`);
+      if (item.contentKind) lines.push(`  contentKind=${item.contentKind}`);
+      if (typeof item.originalBytes === 'number') lines.push(`  originalBytes=${item.originalBytes}`);
+      if (item.truncated) lines.push('  truncated=true');
+      if (item.evidenceRefs?.length) lines.push(`  evidenceRefs=${item.evidenceRefs.join(',')}`);
+      if (item.denialReason) lines.push(`  denialReason=${item.denialReason}`);
+      const content = item.promptContent ?? item.contentSummary;
+      if (content) {
+        lines.push('  content:');
+        lines.push(fencedText(clipResourceContext(content)));
+      }
+    }
   }
   return lines.length > 0 ? lines.join('\n') : 'ResourceContext: empty';
+}
+
+function clipResourceContext(content: string): string {
+  const maxChars = 8000;
+  if (content.length <= maxChars) return content;
+  const head = content.slice(0, Math.floor(maxChars * 0.7));
+  const tail = content.slice(content.length - Math.floor(maxChars * 0.2));
+  return `${head}\n\n[... truncated ...]\n\n${tail}`;
+}
+
+function fencedText(content: string): string {
+  return `\`\`\`text\n${content}\n\`\`\``;
 }
 
 function rulerContextSummary(input: PromptEnvelopeBuilderInput): string {

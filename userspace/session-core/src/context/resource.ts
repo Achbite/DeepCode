@@ -1,10 +1,19 @@
 import type { ResourceManifest, ResourcePacket, ResourcePacketItem, ResourceReadPolicy, ResourceRequest } from './types.js';
 
+type KernelResourceEvidence = {
+  contentKind?: ResourcePacketItem['contentKind'];
+  contentSummary?: string;
+  promptContent?: string;
+  truncated?: boolean;
+  originalBytes?: number;
+  evidenceRefs?: string[];
+};
+
 export function createResourcePacket(input: {
   packetId: string;
   request: ResourceRequest;
   manifest: ResourceManifest;
-  kernelEvidence?: Record<string, { contentSummary?: string; evidenceRefs?: string[] }>;
+  kernelEvidence?: Record<string, KernelResourceEvidence>;
 }): ResourcePacket {
   const entriesById = new Map(input.manifest.entries.map((entry) => [entry.id, entry]));
   const items: ResourcePacketItem[] = [];
@@ -40,7 +49,7 @@ function resourcePacketItem(
   requestItemId: string,
   manifestEntryId: string,
   readPolicy: ResourceReadPolicy,
-  evidence?: { contentSummary?: string; evidenceRefs?: string[] }
+  evidence?: KernelResourceEvidence
 ): ResourcePacketItem {
   if (readPolicy === 'autoRead') {
     return {
@@ -48,7 +57,11 @@ function resourcePacketItem(
       manifestEntryId,
       readPolicy,
       status: 'provided',
+      contentKind: evidence?.contentKind,
       contentSummary: evidence?.contentSummary ?? 'auto-read resource approved by manifest policy',
+      promptContent: evidence?.promptContent,
+      truncated: evidence?.truncated,
+      originalBytes: evidence?.originalBytes,
       evidenceRefs: evidence?.evidenceRefs ?? [],
       sourceKind: evidence ? 'kernelResource' : 'manifestOnly',
     };
