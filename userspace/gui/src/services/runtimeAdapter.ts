@@ -465,6 +465,10 @@ export function appendAgentEvents(
   return api.appendAgentEvents(sessionId, request);
 }
 
+export function getAgentSession(sessionId: string): Promise<ApiResponse<AgentSessionResult>> {
+  return api.getAgentSession(sessionId);
+}
+
 export function sendAgentMessage(
   sessionId: string,
   request: SendAgentMessageRequest,

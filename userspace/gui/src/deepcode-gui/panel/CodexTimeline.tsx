@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
+  AgentContextAttachment,
   AgentEvent,
   AgentTimelineBlock,
   AgentTimelineResult,
@@ -34,16 +35,85 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
     [fallbackEvents]
   );
   const view = timeline ?? fallbackTimeline;
+  const timelineRef = useRef<HTMLDivElement | null>(null);
+  const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const scrollContainerRef = useRef<HTMLElement | null>(null);
+  const shouldFollowRef = useRef(true);
+  const previousLoadingRef = useRef(false);
+  const suppressScrollEventsUntilRef = useRef(0);
+  const scrollSignature = useMemo(
+    () => timelineScrollSignature(view, loading),
+    [view, loading]
+  );
+  const typewriterBlockIds = useAssistantTypewriterBlockIds(view, loading);
+
+  const resolveScrollContainer = useCallback(() => {
+    const cached = scrollContainerRef.current;
+    if (cached && document.contains(cached)) return cached;
+    const container = findTimelineScrollContainer(timelineRef.current);
+    scrollContainerRef.current = container;
+    return container;
+  }, []);
+
+  const scrollToTimelineEnd = useCallback(() => {
+    const container = resolveScrollContainer();
+    if (!container) return;
+
+    suppressScrollEventsUntilRef.current = window.performance.now() + 160;
+    container.scrollTop = container.scrollHeight;
+    timelineEndRef.current?.scrollIntoView({
+      block: 'end',
+      behavior: 'auto',
+    });
+    window.requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight;
+      timelineEndRef.current?.scrollIntoView({
+        block: 'end',
+        behavior: 'auto',
+      });
+    });
+  }, [resolveScrollContainer]);
+
+  useEffect(() => {
+    const scrollContainer = resolveScrollContainer();
+    if (!scrollContainer) return undefined;
+
+    const updateShouldFollow = () => {
+      if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
+      const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+      const distanceFromBottom = maxScrollTop - scrollContainer.scrollTop;
+      shouldFollowRef.current = distanceFromBottom < 180;
+    };
+
+    updateShouldFollow();
+    scrollContainer.addEventListener('scroll', updateShouldFollow, { passive: true });
+    return () => scrollContainer.removeEventListener('scroll', updateShouldFollow);
+  }, [resolveScrollContainer]);
+
+  useLayoutEffect(() => {
+    const startedRunning = loading && !previousLoadingRef.current;
+    previousLoadingRef.current = loading;
+    if (startedRunning) shouldFollowRef.current = true;
+    if (!startedRunning && !shouldFollowRef.current) return;
+
+    scrollToTimelineEnd();
+  }, [loading, scrollSignature, scrollToTimelineEnd]);
 
   return (
-    <div className="codex-timeline">
+    <div className="codex-timeline" ref={timelineRef}>
       {view.turns.length === 0 && !loading && (
         <div className="codex-empty">
           <div className="codex-empty__title">{t(language, 'deepcodeGui.status.ready')}</div>
         </div>
       )}
       {view.turns.map((turn) => (
-        <TurnCard key={turn.id} turn={turn} language={language} onPlanResolve={onPlanResolve} />
+        <TurnCard
+          key={turn.id}
+          turn={turn}
+          language={language}
+          typewriterBlockIds={typewriterBlockIds}
+          onPlanResolve={onPlanResolve}
+        />
       ))}
       {loading && (
         <div className="codex-live-indicator">
@@ -51,15 +121,98 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
           {t(language, 'deepcodeGui.status.running')}
         </div>
       )}
+      <div ref={timelineEndRef} className="codex-timeline__end" aria-hidden="true" />
     </div>
   );
 };
 
+function findTimelineScrollContainer(timelineElement: HTMLElement | null): HTMLElement | null {
+  let element = timelineElement;
+  let firstScrollableStyleElement: HTMLElement | null = null;
+
+  while (element) {
+    const style = window.getComputedStyle(element);
+    const hasScrollableStyle = style.overflowY === 'auto'
+      || style.overflowY === 'scroll'
+      || style.overflowY === 'overlay';
+
+    if (hasScrollableStyle && !firstScrollableStyleElement) {
+      firstScrollableStyleElement = element;
+    }
+    if (hasScrollableStyle && element.scrollHeight > element.clientHeight + 1) {
+      return element;
+    }
+    element = element.parentElement;
+  }
+
+  return firstScrollableStyleElement ?? timelineElement;
+}
+
+function timelineScrollSignature(view: AgentTimelineResult, loading: boolean): string {
+  const lastTurn = view.turns[view.turns.length - 1];
+  if (!lastTurn) return `empty:${loading ? 'running' : 'idle'}`;
+  const blockSignature = lastTurn.blocks
+    .map((block) => {
+      const eventCount = block.events?.length ?? 0;
+      const bodyLength = block.bodyMarkdown?.length ?? 0;
+      return `${block.id}:${block.kind}:${block.status}:${eventCount}:${bodyLength}`;
+    })
+    .join('|');
+  return `${lastTurn.id}:${lastTurn.status}:${loading ? 'running' : 'idle'}:${blockSignature}`;
+}
+
+function useAssistantTypewriterBlockIds(
+  view: AgentTimelineResult,
+  loading: boolean
+): Set<string> {
+  const activeSessionIdRef = useRef<string | null>(null);
+  const seenAssistantBlockIdsRef = useRef<Set<string>>(new Set());
+  const typewriterBlockIdsRef = useRef<Set<string>>(new Set());
+  const liveSessionIdRef = useRef<string | null>(null);
+
+  return useMemo(() => {
+    const sessionId = view.sessionId;
+    const assistantIds = collectAssistantBlockIds(view);
+
+    if (activeSessionIdRef.current !== sessionId) {
+      activeSessionIdRef.current = sessionId;
+      seenAssistantBlockIdsRef.current = new Set(assistantIds);
+      typewriterBlockIdsRef.current = new Set();
+      liveSessionIdRef.current = loading ? sessionId : null;
+      return new Set<string>();
+    }
+
+    if (loading) {
+      liveSessionIdRef.current = sessionId;
+    }
+    const shouldAnimateNewAssistant = liveSessionIdRef.current === sessionId;
+    for (const blockId of assistantIds) {
+      if (seenAssistantBlockIdsRef.current.has(blockId)) continue;
+      seenAssistantBlockIdsRef.current.add(blockId);
+      if (shouldAnimateNewAssistant) {
+        typewriterBlockIdsRef.current.add(blockId);
+      }
+    }
+
+    return new Set(typewriterBlockIdsRef.current);
+  }, [loading, view]);
+}
+
+function collectAssistantBlockIds(view: AgentTimelineResult): string[] {
+  return view.turns.flatMap((turn) =>
+    turn.blocks
+      .filter((block) => block.kind === 'assistant')
+      .filter((block) => (block.bodyMarkdown ?? block.summary ?? '').trim().length > 0)
+      .map((block) => block.id)
+  );
+}
+
 const TurnCard: React.FC<{
   turn: AgentTimelineTurn;
   language: UiLanguage;
+  typewriterBlockIds: Set<string>;
   onPlanResolve?: CodexTimelineProps['onPlanResolve'];
-}> = ({ turn, language, onPlanResolve }) => {
+}> = ({ turn, language, typewriterBlockIds, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
   const blocks = orderedTurnBlocks(turn.blocks);
 
@@ -72,7 +225,13 @@ const TurnCard: React.FC<{
           {startedAtLabel && <span>{startedAtLabel}</span>}
         </div>
         {blocks.map((block) => (
-          <TimelineBlock key={block.id} block={block} language={language} onPlanResolve={onPlanResolve} />
+          <TimelineBlock
+            key={block.id}
+            block={block}
+            language={language}
+            animateAssistant={typewriterBlockIds.has(block.id)}
+            onPlanResolve={onPlanResolve}
+          />
         ))}
         <TurnActionBar turn={turn} blocks={blocks} language={language} />
       </div>
@@ -201,6 +360,31 @@ const CodexTurnActionIcon: React.FC<{ name: 'copy' | 'up' | 'down' }> = ({ name 
   );
 };
 
+const CodexAttachmentChips: React.FC<{
+  attachments: AgentContextAttachment[];
+  language: UiLanguage;
+}> = ({ attachments, language }) => {
+  if (attachments.length === 0) return null;
+  return (
+    <div className="agent-message-attachments" aria-label={t(language, 'agent.message.attachments')}>
+      {attachments.map((attachment, index) => (
+        <span
+          key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${index}`}
+          className={`agent-message-attachment agent-message-attachment--${attachment.scope}`}
+          title={attachment.absolutePath ?? attachment.path}
+        >
+          <span className="agent-message-attachment__kind">
+            {attachmentKindLabel(attachment, language)}
+          </span>
+          <span className="agent-message-attachment__path">
+            {attachmentDisplayPath(attachment)}
+          </span>
+        </span>
+      ))}
+    </div>
+  );
+};
+
 function orderedTurnBlocks(blocks: AgentTimelineBlock[]): AgentTimelineBlock[] {
   return blocks
     .map((block, index) => ({ block, index }))
@@ -241,12 +425,15 @@ function timelineBlockPriority(kind: AgentTimelineBlock['kind']): number {
 const TimelineBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
+  animateAssistant?: boolean;
   onPlanResolve?: CodexTimelineProps['onPlanResolve'];
-}> = ({ block, language, onPlanResolve }) => {
+}> = ({ block, language, animateAssistant = false, onPlanResolve }) => {
   if (block.kind === 'user') {
+    const attachments = blockAttachments(block);
     return (
       <article className="codex-block codex-block--user">
         <div className="codex-block__label">{t(language, 'agent.message.user')}</div>
+        <CodexAttachmentChips attachments={attachments} language={language} />
         <MarkdownContent content={block.bodyMarkdown ?? block.summary} />
       </article>
     );
@@ -256,7 +443,7 @@ const TimelineBlock: React.FC<{
     return (
       <article className="codex-block codex-block--assistant">
         <div className="codex-block__label">DeepCode</div>
-        <TypewriterMarkdown content={block.bodyMarkdown ?? block.summary} />
+        <TypewriterMarkdown content={block.bodyMarkdown ?? block.summary} animate={animateAssistant} />
       </article>
     );
   }
@@ -332,10 +519,14 @@ const PlanBlock: React.FC<{
   );
 };
 
-const TypewriterMarkdown: React.FC<{ content: string }> = ({ content }) => {
-  const [visible, setVisible] = useState('');
+const TypewriterMarkdown: React.FC<{ content: string; animate: boolean }> = ({ content, animate }) => {
+  const [visible, setVisible] = useState(() => (animate ? '' : content));
 
   useEffect(() => {
+    if (!animate) {
+      setVisible(content);
+      return undefined;
+    }
     setVisible('');
     if (!content) return;
     let index = 0;
@@ -347,9 +538,9 @@ const TypewriterMarkdown: React.FC<{ content: string }> = ({ content }) => {
       }
     }, 12);
     return () => window.clearInterval(id);
-  }, [content]);
+  }, [animate, content]);
 
-  return <MarkdownContent content={visible || content} />;
+  return <MarkdownContent content={animate ? visible : content} />;
 };
 
 const EventList: React.FC<{ events: AgentEvent[]; compact?: boolean }> = ({ events, compact }) => (
@@ -449,9 +640,15 @@ function blockCopyText(block: AgentTimelineBlock, language: UiLanguage): string[
   if (block.kind === 'turnActions') return [];
   const title = blockCopyTitle(block, language);
   const body = (block.bodyMarkdown ?? block.summary ?? '').trim();
-  if (body) return [`${title}\n${body}`];
+  const attachmentText = block.kind === 'user'
+    ? attachmentCopyText(blockAttachments(block), language)
+    : '';
+  if (body) return [[`${title}\n${body}`, attachmentText].filter(Boolean).join('\n\n')];
   const eventLines = block.events.map(eventSummary).filter(Boolean);
-  return eventLines.length > 0 ? [`${title}\n${eventLines.join('\n')}`] : [];
+  if (eventLines.length > 0) {
+    return [[`${title}\n${eventLines.join('\n')}`, attachmentText].filter(Boolean).join('\n\n')];
+  }
+  return attachmentText ? [attachmentText] : [];
 }
 
 function blockCopyTitle(block: AgentTimelineBlock, language: UiLanguage): string {
@@ -491,6 +688,41 @@ function stringField(payload: Record<string, unknown>, key: string): string | un
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function payloadAttachments(payload: unknown): AgentContextAttachment[] {
+  if (!isRecord(payload) || !Array.isArray(payload.attachments)) return [];
+  return payload.attachments.filter((item): item is AgentContextAttachment =>
+    isRecord(item) &&
+    typeof item.path === 'string' &&
+    (item.kind === 'file' || item.kind === 'directory' || item.kind === 'panelSnapshot') &&
+    (item.scope === 'message' || item.scope === 'session')
+  );
+}
+
+function blockAttachments(block: AgentTimelineBlock): AgentContextAttachment[] {
+  if (block.kind !== 'user') return [];
+  return block.events.flatMap((event) => payloadAttachments(event.payload));
+}
+
+function attachmentKindLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
+  if (attachment.kind === 'directory') return t(language, 'agent.composer.dir');
+  if (attachment.kind === 'panelSnapshot') return t(language, 'agent.composer.panel');
+  return t(language, 'agent.composer.file');
+}
+
+function attachmentDisplayPath(attachment: AgentContextAttachment): string {
+  return attachment.path || attachment.absolutePath || '.';
+}
+
+function attachmentCopyText(attachments: AgentContextAttachment[], language: UiLanguage): string {
+  if (attachments.length === 0) return '';
+  return [
+    t(language, 'agent.message.attachments'),
+    ...attachments.map((attachment) =>
+      `- ${attachmentKindLabel(attachment, language)} ${attachmentDisplayPath(attachment)} (${attachment.scope})`
+    ),
+  ].join('\n');
 }
 
 function timelineStatusLabel(language: UiLanguage, status: string): string {

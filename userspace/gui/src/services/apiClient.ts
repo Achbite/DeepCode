@@ -551,6 +551,14 @@ export function appendAgentEvents(
   );
 }
 
+export function getAgentSession(
+  sessionId: string
+): Promise<ApiResponse<AgentSessionResult>> {
+  return getJson<AgentSessionResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`
+  );
+}
+
 export function sendAgentMessage(
   sessionId: string,
   request: SendAgentMessageRequest,

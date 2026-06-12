@@ -1,5 +1,10 @@
 import React from 'react';
-import type { AgentDisplayPolicy, AgentEvent, AgentEventPresentation } from '@deepcode/protocol';
+import type {
+  AgentContextAttachment,
+  AgentDisplayPolicy,
+  AgentEvent,
+  AgentEventPresentation,
+} from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
@@ -120,6 +125,66 @@ function payloadText(payload: unknown): string {
     stringField(payload, 'message') ??
     stringField(payload, 'summary') ??
     (typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2) ?? 'No details')
+  );
+}
+
+function payloadAttachments(payload: unknown): AgentContextAttachment[] {
+  if (!isRecord(payload) || !Array.isArray(payload.attachments)) return [];
+  return payload.attachments.filter((item): item is AgentContextAttachment =>
+    isRecord(item) &&
+    typeof item.path === 'string' &&
+    (item.kind === 'file' || item.kind === 'directory' || item.kind === 'panelSnapshot') &&
+    (item.scope === 'message' || item.scope === 'session')
+  );
+}
+
+function attachmentKindLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
+  if (attachment.kind === 'directory') return t(language, 'agent.composer.dir');
+  if (attachment.kind === 'panelSnapshot') return t(language, 'agent.composer.panel');
+  return t(language, 'agent.composer.file');
+}
+
+function attachmentDisplayPath(attachment: AgentContextAttachment): string {
+  return attachment.path || attachment.absolutePath || '.';
+}
+
+function attachmentCopyText(attachments: AgentContextAttachment[], language: UiLanguage): string {
+  if (attachments.length === 0) return '';
+  return [
+    t(language, 'agent.message.attachments'),
+    ...attachments.map((attachment) =>
+      `- ${attachmentKindLabel(attachment, language)} ${attachmentDisplayPath(attachment)} (${attachment.scope})`
+    ),
+  ].join('\n');
+}
+
+function AttachmentChips({
+  attachments,
+  language,
+  className = 'agent-message-attachments',
+}: {
+  attachments: AgentContextAttachment[];
+  language: UiLanguage;
+  className?: string;
+}) {
+  if (attachments.length === 0) return null;
+  return (
+    <div className={className} aria-label={t(language, 'agent.message.attachments')}>
+      {attachments.map((attachment, index) => (
+        <span
+          key={`${attachment.scope}:${attachment.folderId ?? ''}:${attachment.path}:${index}`}
+          className={`agent-message-attachment agent-message-attachment--${attachment.scope}`}
+          title={attachment.absolutePath ?? attachment.path}
+        >
+          <span className="agent-message-attachment__kind">
+            {attachmentKindLabel(attachment, language)}
+          </span>
+          <span className="agent-message-attachment__path">
+            {attachmentDisplayPath(attachment)}
+          </span>
+        </span>
+      ))}
+    </div>
   );
 }
 
@@ -662,7 +727,11 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
 
 function eventCopyText(event: AgentEvent, language: UiLanguage): string {
   if (event.kind === 'user_msg') {
-    return `${t(language, 'agent.copy.user')}\n${payloadText(event.payload)}`;
+    const attachments = payloadAttachments(event.payload);
+    return [
+      `${t(language, 'agent.copy.user')}\n${payloadText(event.payload)}`,
+      attachmentCopyText(attachments, language),
+    ].filter(Boolean).join('\n\n');
   }
   if (event.kind === 'assistant_msg') {
     const stage = eventStage(event);
@@ -1472,6 +1541,7 @@ function renderMessage(
   const text = payloadText(event.payload);
   const renderMarkdown = event.kind === 'assistant_msg' || event.kind === 'user_msg';
   const shouldCollapse = shouldCollapseAssistantMessage(event, text);
+  const attachments = event.kind === 'user_msg' ? payloadAttachments(event.payload) : [];
 
   if (shouldCollapse) {
     return (
@@ -1509,6 +1579,12 @@ function renderMessage(
           </span>
         )}
       </div>
+      {attachments.length > 0 && (
+        <AttachmentChips
+          attachments={attachments}
+          language={language}
+        />
+      )}
       <div className={`agent-message__body ${renderMarkdown ? 'agent-message__body--markdown' : 'agent-message__body--plain'}`}>
         {renderMarkdown ? <MarkdownContent content={text} /> : text}
       </div>

@@ -22,6 +22,7 @@ interface UserAttachmentDialogProps {
   language: UiLanguage;
   onClose: () => void;
   onPick: (attachment: PickedUserAttachment) => void;
+  onDirectoryChange?: (absolutePath: string) => void;
 }
 
 const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
@@ -30,6 +31,7 @@ const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
   language,
   onClose,
   onPick,
+  onDirectoryChange,
 }) => {
   const [locations, setLocations] = useState<InitialLocation[]>([]);
   const [browseResult, setBrowseResult] = useState<BrowsePathResult | null>(null);
@@ -47,6 +49,7 @@ const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
     if (result.ok && result.data) {
       setBrowseResult(result.data);
       setAddressInput(result.data.absolutePath);
+      onDirectoryChange?.(normalizePath(result.data.absolutePath));
     } else {
       setError(result.message ?? t(language, 'workspaceDialog.error.browse'));
     }
@@ -107,6 +110,7 @@ const UserAttachmentDialog: React.FC<UserAttachmentDialogProps> = ({
   const normalizePath = (path: string): string => path.replace(/\\/g, '/');
 
   const pickPath = (kind: 'file' | 'directory', absolutePath: string) => {
+    onDirectoryChange?.(normalizePath(kind === 'directory' ? absolutePath : browseResult?.absolutePath ?? absolutePath));
     onPick({
       kind,
       absolutePath: normalizePath(absolutePath),

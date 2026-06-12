@@ -24,6 +24,7 @@ import {
   deleteAgentSession,
   cancelAgentRun,
   createAgentSession,
+  getAgentSession,
   getAgentWorkflowConfig,
   getAgentEventSnapshot,
   getCurrentAgentSession,
@@ -514,14 +515,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     let pollingStopped = false;
     const refreshProgress = async () => {
       if (pollingStopped) return;
-      const current = await getCurrentAgentSession(currentWorkspaceScope());
-      if (current.ok && current.data?.session.id === session.id) {
+      const current = await getAgentSession(session.id);
+      if (current.ok && current.data) {
         refreshWorkspaceTreeForToolFacts(current.data.events);
-        set({
-          session: current.data.session,
-          events: current.data.events,
-          pendingPermission: findLatestPendingPermission(current.data.events),
-        });
+        if (get().session?.id === session.id) {
+          set({
+            session: current.data.session,
+            events: current.data.events,
+            pendingPermission: findLatestPendingPermission(current.data.events),
+          });
+        }
         await get().refreshTraceEvents(session.id);
       }
     };
@@ -675,14 +678,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     let pollingStopped = false;
     const refreshProgress = async () => {
       if (pollingStopped) return;
-      const current = await getCurrentAgentSession(currentWorkspaceScope());
-      if (current.ok && current.data?.session.id === session.id) {
+      const current = await getAgentSession(session.id);
+      if (current.ok && current.data) {
         refreshWorkspaceTreeForToolFacts(current.data.events);
-        set({
-          session: current.data.session,
-          events: current.data.events,
-          pendingPermission: findLatestPendingPermission(current.data.events),
-        });
+        if (get().session?.id === session.id) {
+          set({
+            session: current.data.session,
+            events: current.data.events,
+            pendingPermission: findLatestPendingPermission(current.data.events),
+          });
+        }
         await get().refreshTraceEvents(session.id);
       }
     };
@@ -736,14 +741,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     let pollingStopped = false;
     const refreshProgress = async () => {
       if (pollingStopped) return;
-      const current = await getCurrentAgentSession(currentWorkspaceScope());
-      if (current.ok && current.data?.session.id === session.id) {
+      const current = await getAgentSession(session.id);
+      if (current.ok && current.data) {
         refreshWorkspaceTreeForToolFacts(current.data.events);
-        set({
-          session: current.data.session,
-          events: current.data.events,
-          pendingPermission: findLatestPendingPermission(current.data.events),
-        });
+        if (get().session?.id === session.id) {
+          set({
+            session: current.data.session,
+            events: current.data.events,
+            pendingPermission: findLatestPendingPermission(current.data.events),
+          });
+        }
         await get().refreshTraceEvents(session.id);
       }
     };
@@ -796,14 +803,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     let pollingStopped = false;
     const refreshProgress = async () => {
       if (pollingStopped) return;
-      const current = await getCurrentAgentSession(currentWorkspaceScope());
-      if (current.ok && current.data?.session.id === session.id) {
+      const current = await getAgentSession(session.id);
+      if (current.ok && current.data) {
         refreshWorkspaceTreeForToolFacts(current.data.events);
-        set({
-          session: current.data.session,
-          events: current.data.events,
-          pendingPermission: findLatestPendingPermission(current.data.events),
-        });
+        if (get().session?.id === session.id) {
+          set({
+            session: current.data.session,
+            events: current.data.events,
+            pendingPermission: findLatestPendingPermission(current.data.events),
+          });
+        }
         await get().refreshTraceEvents(session.id);
       }
     };
@@ -858,14 +867,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     let pollingStopped = false;
     const refreshProgress = async () => {
       if (pollingStopped) return;
-      const current = await getCurrentAgentSession(currentWorkspaceScope());
-      if (current.ok && current.data?.session.id === session.id) {
+      const current = await getAgentSession(session.id);
+      if (current.ok && current.data) {
         refreshWorkspaceTreeForToolFacts(current.data.events);
-        set({
-          session: current.data.session,
-          events: current.data.events,
-          pendingPermission: findLatestPendingPermission(current.data.events),
-        });
+        if (get().session?.id === session.id) {
+          set({
+            session: current.data.session,
+            events: current.data.events,
+            pendingPermission: findLatestPendingPermission(current.data.events),
+          });
+        }
         await get().refreshTraceEvents(session.id);
       }
     };

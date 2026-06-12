@@ -23,6 +23,7 @@ interface AgentModifiedFileView {
 }
 
 const MODIFIED_FILES: AgentModifiedFileView[] = [];
+const LAST_ATTACHMENT_DIRECTORY_KEY_PREFIX = 'deepcode.agent.lastAttachmentDirectory';
 
 function attachmentLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
   if (attachment.kind === 'directory') {
@@ -71,6 +72,46 @@ function selectedAttachmentPath(absolutePath: string): string {
   return absolutePath.replace(/\\/g, '/');
 }
 
+function storageAvailable(): boolean {
+  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
+}
+
+function lastAttachmentDirectoryKey(workspaceRoot?: string): string {
+  const scope = workspaceRoot?.replace(/\\/g, '/').replace(/\/+$/, '') || 'no-workspace';
+  return `${LAST_ATTACHMENT_DIRECTORY_KEY_PREFIX}:${scope}`;
+}
+
+function readLastAttachmentDirectory(workspaceRoot?: string): string | null {
+  if (!storageAvailable()) return null;
+  try {
+    return window.localStorage.getItem(lastAttachmentDirectoryKey(workspaceRoot));
+  } catch {
+    return null;
+  }
+}
+
+function writeLastAttachmentDirectory(workspaceRoot: string | undefined, absolutePath: string): void {
+  if (!storageAvailable()) return;
+  const normalized = selectedAttachmentPath(absolutePath).replace(/\/+$/, '');
+  if (!normalized) return;
+  try {
+    window.localStorage.setItem(lastAttachmentDirectoryKey(workspaceRoot), normalized);
+  } catch {
+    // localStorage can be unavailable in restricted WebView modes.
+  }
+}
+
+function isImeComposing(event: React.KeyboardEvent<HTMLTextAreaElement>): boolean {
+  const syntheticEvent = event as React.KeyboardEvent<HTMLTextAreaElement> & { isComposing?: boolean };
+  const nativeEvent = event.nativeEvent as KeyboardEvent & { isComposing?: boolean; keyCode?: number };
+  return Boolean(
+    syntheticEvent.isComposing ||
+    nativeEvent.isComposing ||
+    nativeEvent.keyCode === 229 ||
+    event.keyCode === 229
+  );
+}
+
 const AgentComposer: React.FC<AgentComposerProps> = ({
   messageAttachments,
   sessionAttachments,
@@ -84,8 +125,12 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   const [value, setValue] = useState('');
   const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
   const [changesOpen, setChangesOpen] = useState(true);
+  const [lastAttachmentDirectory, setLastAttachmentDirectory] = useState<string | null>(() =>
+    readLastAttachmentDirectory()
+  );
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const activeFolder = useWorkspaceStore((s) => s.getActiveFolder());
+  const activeWorkspaceRoot = activeFolder?.absolutePath;
   const previewEditor = String(
     useSettingsStore((s) => s.effectiveSettings['workbench.previewEditor'] ?? 'vscode')
   );
@@ -109,6 +154,10 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     textarea.style.height = '34px';
     textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 34), 150)}px`;
   }, [value]);
+
+  useEffect(() => {
+    setLastAttachmentDirectory(readLastAttachmentDirectory(activeWorkspaceRoot));
+  }, [activeWorkspaceRoot]);
 
   const pickAttachment = (attachment: AgentContextAttachment) => {
     onAddAttachment(attachment);
@@ -144,6 +193,14 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       scope: 'message',
     });
   };
+
+  const updateLastAttachmentDirectory = (absolutePath: string) => {
+    const normalized = selectedAttachmentPath(absolutePath);
+    setLastAttachmentDirectory(normalized);
+    writeLastAttachmentDirectory(activeWorkspaceRoot, normalized);
+  };
+
+  const dialogInitialDirectory = lastAttachmentDirectory ?? activeFolder?.absolutePath ?? null;
 
   return (
     <div className={`agent-composer ${composerExpanded ? 'agent-composer--expanded' : ''}`}>
@@ -229,6 +286,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           onChange={(event) => setValue(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
+              if (isImeComposing(event)) return;
               event.preventDefault();
               send();
             }
@@ -275,10 +333,11 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       </div>
       <UserAttachmentDialog
         visible={attachmentDialogOpen}
-        initialDirectory={activeFolder?.absolutePath ?? null}
+        initialDirectory={dialogInitialDirectory}
         language={language}
         onClose={() => setAttachmentDialogOpen(false)}
         onPick={pickUserSelectedAttachment}
+        onDirectoryChange={updateLastAttachmentDirectory}
       />
     </div>
   );
