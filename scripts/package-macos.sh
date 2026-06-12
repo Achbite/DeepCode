@@ -52,7 +52,8 @@ NODE_HOME="${DEEPCODE_MACOS_NODE_HOME:-$HOME/.local/deepcode-node}"
 PNPM_VERSION="${DEEPCODE_MACOS_PNPM_VERSION:-9.15.9}"
 BOOTSTRAP="${DEEPCODE_MACOS_BOOTSTRAP:-1}"
 BUILD_GUI_ON_HOST="${DEEPCODE_MACOS_BUILD_GUI_ON_HOST:-0}"
-REFRESH_GUI_DIST="${DEEPCODE_MACOS_REFRESH_GUI_DIST:-0}"
+REFRESH_GUI_DIST="${DEEPCODE_MACOS_REFRESH_GUI_DIST:-1}"
+KILL_RUNNING="${DEEPCODE_MACOS_KILL_RUNNING:-1}"
 SEED_CARGO_REGISTRY="${DEEPCODE_MACOS_SEED_CARGO_REGISTRY:-1}"
 CARGO_OFFLINE="${DEEPCODE_MACOS_CARGO_OFFLINE:-1}"
 TAURI_NETWORK_FALLBACK="${DEEPCODE_MACOS_TAURI_NETWORK_FALLBACK:-1}"
@@ -63,13 +64,14 @@ export CARGO_TARGET_DIR="$CARGO_TARGET_ROOT"
 usage() {
   cat <<USAGE
 Usage:
-  scripts/package-macos.sh [--clean]
+  scripts/package-macos.sh [--clean] [--no-kill-running]
 
 Environment:
   DEEPCODE_MACOS_PRODUCT=DeepCode|DeepCode-GUI
   DEEPCODE_MACOS_CLEAN=1        Clean macOS package build artifacts before rebuilding.
   DEEPCODE_MACOS_REFRESH_GUI_DIST=1
-                                Rebuild GUI dist through the Docker dev container when available.
+                                Rebuild GUI dist through the Docker dev container. Defaults to 1 for package builds.
+  DEEPCODE_MACOS_KILL_RUNNING=1 Automatically stop processes occupying the target .app bundle. Defaults to 1.
 
 Clean keeps package-local user data:
   bin/macos-arm64/config
@@ -83,6 +85,14 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --clean)
       CLEAN_PACKAGE_CACHE=1
+      shift
+      ;;
+    --kill-running)
+      KILL_RUNNING=1
+      shift
+      ;;
+    --no-kill-running)
+      KILL_RUNNING=0
       shift
       ;;
     -h|--help)
@@ -100,6 +110,13 @@ done
 if [ "$CLEAN_PACKAGE_CACHE" = "1" ]; then
   REFRESH_GUI_DIST=1
 fi
+case "$KILL_RUNNING" in
+  0|1) ;;
+  *)
+    printf '==[macos-package][error]== invalid DEEPCODE_MACOS_KILL_RUNNING: %s\n' "$KILL_RUNNING" >&2
+    exit 2
+    ;;
+esac
 
 log() {
   printf '==[macos-package]== %s\n' "$*"
@@ -115,30 +132,86 @@ running_processes_for_path() {
   ps -axo pid=,command= | DEEPCODE_PROCESS_TARGET="$target" awk 'index($0, ENVIRON["DEEPCODE_PROCESS_TARGET"]) > 0 { print }'
 }
 
-fail_if_target_app_is_running() {
+running_process_ids_for_path() {
+  local target="$1"
+  ps -axo pid=,command= | DEEPCODE_PROCESS_TARGET="$target" awk 'index($0, ENVIRON["DEEPCODE_PROCESS_TARGET"]) > 0 { print $1 }'
+}
+
+target_app_process_ids() {
   local app_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/$TAURI_BIN_NAME"
   local kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
-  local matches=""
+  local app_macos_dir="$BIN_DIR/$APP_NAME.app/Contents/MacOS"
 
   if [ -e "$app_bin" ]; then
-    matches="$(running_processes_for_path "$app_bin" || true)"
+    running_process_ids_for_path "$app_bin" || true
   fi
   if [ -e "$kernel_bin" ]; then
-    local kernel_matches
-    kernel_matches="$(running_processes_for_path "$kernel_bin" || true)"
-    if [ -n "$kernel_matches" ]; then
-      if [ -n "$matches" ]; then
-        matches="$matches
-$kernel_matches"
-      else
-        matches="$kernel_matches"
-      fi
+    running_process_ids_for_path "$kernel_bin" || true
+  fi
+  if [ -d "$app_macos_dir" ] && command -v lsof >/dev/null 2>&1; then
+    lsof +D "$app_macos_dir" 2>/dev/null | awk 'NR > 1 && $2 ~ /^[0-9]+$/ { print $2 }' || true
+  fi
+}
+
+describe_process_ids() {
+  local pid
+  for pid in "$@"; do
+    [ -n "$pid" ] || continue
+    ps -p "$pid" -o pid=,command= 2>/dev/null || true
+  done
+}
+
+current_target_app_process_ids() {
+  target_app_process_ids | awk 'NF > 0 { print $1 }' | sort -u
+}
+
+wait_for_target_app_release() {
+  local timeout_seconds="$1"
+  local deadline
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  while true; do
+    if [ -z "$(current_target_app_process_ids)" ]; then
+      return 0
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
+release_or_fail_if_target_app_is_running() {
+  local pids=""
+  local remaining=""
+  pids="$(current_target_app_process_ids || true)"
+
+  if [ -z "$pids" ]; then
+    return 0
+  fi
+
+  describe_process_ids $pids >&2
+  if [ "$KILL_RUNNING" != "1" ]; then
+    fail "$APP_NAME.app is still running from $BIN_DIR. Re-run without --no-kill-running, or quit it before packaging."
+  fi
+
+  log "stop running $APP_NAME.app processes before packaging"
+  local pid
+  for pid in $pids; do
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+  done
+  if ! wait_for_target_app_release 8; then
+    remaining="$(current_target_app_process_ids || true)"
+    if [ -n "$remaining" ]; then
+      log "force stop stubborn $APP_NAME.app processes"
+      describe_process_ids $remaining >&2
+      for pid in $remaining; do
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+      done
     fi
   fi
 
-  if [ -n "$matches" ]; then
-    printf '%s\n' "$matches" >&2
-    fail "$APP_NAME.app is still running from $BIN_DIR. Quit it before packaging so the new Kernel is used."
+  if ! wait_for_target_app_release 5; then
+    remaining="$(current_target_app_process_ids || true)"
+    describe_process_ids $remaining >&2
+    fail "$APP_NAME.app is still occupying $BIN_DIR after stop attempts."
   fi
 }
 
@@ -341,6 +414,21 @@ validate_frontend_dist() {
   fi
 }
 
+frontend_asset_manifest() {
+  local index_file="$1"
+  grep -Eo 'assets/[^"<>[:space:]]+\.(js|css)' "$index_file" | LC_ALL=C sort -u || true
+}
+
+frontend_asset_summary() {
+  local index_file="$1"
+  frontend_asset_manifest "$index_file" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+clean_frontend_package_dist() {
+  log "clean $PRODUCT frontend package dist"
+  rm -rf "$CLIENT_DIST_DIR" "$TAURI_DIR/dist"
+}
+
 refresh_gui_dist_with_docker() {
   command -v docker >/dev/null 2>&1 || return 1
   docker container inspect deepcode-dev >/dev/null 2>&1 || return 1
@@ -350,6 +438,7 @@ refresh_gui_dist_with_docker() {
 
 ensure_gui_dist() {
   if [ "$REFRESH_GUI_DIST" = "1" ]; then
+    clean_frontend_package_dist
     if ! refresh_gui_dist_with_docker; then
       if [ "$BUILD_GUI_ON_HOST" != "1" ]; then
         fail "DEEPCODE_MACOS_REFRESH_GUI_DIST=1 was requested, but Docker refresh failed. Set DEEPCODE_MACOS_BUILD_GUI_ON_HOST=1 to build GUI on host."
@@ -433,6 +522,35 @@ copy_web_dist() {
   rm -rf "$dst"
   mkdir -p "$dst"
   cp -R "$CLIENT_DIST_DIR/." "$dst/"
+}
+
+verify_copied_web_dist() {
+  local dst="$1"
+  local source_index="$CLIENT_DIST_DIR/index.html"
+  local copied_index="$dst/index.html"
+  local source_assets copied_assets asset source_hash copied_hash
+
+  [ -f "$copied_index" ] || fail "$PRODUCT bundled frontend dist missing index.html at $copied_index"
+  source_assets="$(frontend_asset_manifest "$source_index")"
+  copied_assets="$(frontend_asset_manifest "$copied_index")"
+  [ -n "$source_assets" ] || fail "$PRODUCT source frontend dist has no css/js assets at $source_index"
+  [ "$source_assets" = "$copied_assets" ] || {
+    printf '==[macos-package][error]== source assets:\n%s\n' "$source_assets" >&2
+    printf '==[macos-package][error]== bundled assets:\n%s\n' "$copied_assets" >&2
+    fail "$PRODUCT bundled frontend asset manifest does not match source dist."
+  }
+
+  while IFS= read -r asset; do
+    [ -f "$CLIENT_DIST_DIR/$asset" ] || fail "$PRODUCT source frontend asset missing: $asset"
+    [ -f "$dst/$asset" ] || fail "$PRODUCT bundled frontend asset missing: $asset"
+    source_hash="$(shasum -a 256 "$CLIENT_DIST_DIR/$asset" | awk '{ print $1 }')"
+    copied_hash="$(shasum -a 256 "$dst/$asset" | awk '{ print $1 }')"
+    [ "$source_hash" = "$copied_hash" ] || fail "$PRODUCT bundled frontend asset hash mismatch: $asset"
+  done <<ASSETS
+$source_assets
+ASSETS
+
+  log "$PRODUCT bundled frontend assets: $(frontend_asset_summary "$copied_index")"
 }
 
 write_file_if_missing() {
@@ -835,8 +953,10 @@ package_distribution() {
   write_build_info "$app_macos_dir/build-info.json"
 
   copy_web_dist "$app_macos_dir/$WEB_DIR_NAME"
+  verify_copied_web_dist "$app_macos_dir/$WEB_DIR_NAME"
   if [ "$COPY_ROOT_WEB_DIST" = "1" ]; then
     copy_web_dist "$BIN_DIR/$WEB_DIR_NAME"
+    verify_copied_web_dist "$BIN_DIR/$WEB_DIR_NAME"
   fi
   write_tui_launcher
   write_readme
@@ -912,7 +1032,7 @@ main() {
 
   ensure_macos_arm64
   ensure_xcode_tools
-  fail_if_target_app_is_running
+  release_or_fail_if_target_app_is_running
   if [ "$CLEAN_PACKAGE_CACHE" = "1" ]; then
     clean_macos_package_cache
   fi

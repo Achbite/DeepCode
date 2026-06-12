@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ====================================================================
 # DeepCode cross-platform unified build script
-# 注意 build 环境为 Docker 中。
+# 常规 Linux/Windows 构建在 Docker 中执行；macOS .app 打包入口在 macOS 宿主机执行。
 #
 # 默认行为：
 #   ./build.sh
-#     完整构建并输出 bin/linux-x64/ 与 bin/win64/。
+#     macOS 宿主机：强制刷新前端并打包最新 DeepCode.app / DeepCode-GUI.app。
+#     Docker/Linux：完整构建并输出 bin/linux-x64/ 与 bin/win64/，可自动请求 macOS 打包服务。
 #
 # 分阶段入口：
 #   ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
@@ -27,6 +28,7 @@
 #   DEEPCODE_FORCE_BUILD=1      忽略 stage hash，强制执行构建阶段。
 #   DEEPCODE_ALLOW_HOST_BUILD=1 显式允许宿主机直接构建（默认 Docker-only）。
 #   --clean-cache               清理 macOS 打包缓存后重新打包；保留用户配置和会话数据。
+#   --no-kill-running           macOS 打包时不自动结束旧 .app 占用进程。
 # ====================================================================
 set -euo pipefail
 
@@ -62,6 +64,10 @@ Usage:
   ./build.sh --full
   ./build.sh --stage package-macos --clean-cache
 
+Default:
+  macOS host: package latest DeepCode.app and DeepCode-GUI.app.
+  Docker/Linux: build regular Linux/Windows distribution artifacts.
+
 Environment:
   CARGO_TARGET_DIR                  Override shared Cargo target directory.
   PNPM_STORE_DIR                    Override pnpm store directory.
@@ -82,11 +88,13 @@ Environment:
                                       Comma/space separated macOS app set for package-macos.
   DEEPCODE_MACOS_PRODUCT=DeepCode-GUI Compatibility alias for a single macOS product.
   --clean-cache                     Clean macOS package build artifacts without deleting config/sessions/archives/kernel data.
+  --no-kill-running                 Do not stop processes occupying the target macOS .app bundle before packaging.
 USAGE
 }
 
 requested_stages=()
 clean_cache=0
+kill_running="${DEEPCODE_MACOS_KILL_RUNNING:-1}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --stage)
@@ -108,6 +116,14 @@ while [ "$#" -gt 0 ]; do
       clean_cache=1
       shift
       ;;
+    --kill-running)
+      kill_running=1
+      shift
+      ;;
+    --no-kill-running)
+      kill_running=0
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -120,8 +136,20 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+case "$kill_running" in
+  0|1) ;;
+  *)
+    echo "==[build][error]== invalid DEEPCODE_MACOS_KILL_RUNNING: $kill_running" >&2
+    exit 2
+    ;;
+esac
+
 if [ "${#requested_stages[@]}" -eq 0 ]; then
-  requested_stages=("all")
+  if [ "$(uname -s)" = "Darwin" ] && [ ! -f /.dockerenv ]; then
+    requested_stages=("package-macos")
+  else
+    requested_stages=("all")
+  fi
 fi
 
 run_deps=0
@@ -248,16 +276,11 @@ run_macos_package_from_host() {
     exit 3
   fi
 
-  if [ "$product" = "DeepCode-GUI" ]; then
-    echo "==[build][package-macos-deepcode-gui]== build Docker-managed DeepCode-GUI frontend dist"
-    make build-deepcode-gui
-  fi
-
   echo "==[build][package-macos]== package $product.app on macOS host"
   if [ "$clean_cache" = "1" ]; then
-    env DEEPCODE_MACOS_CLEAN=1 DEEPCODE_MACOS_REFRESH_GUI_DIST=1 DEEPCODE_MACOS_PRODUCT="$product" bash ./scripts/package-macos.sh
+    env DEEPCODE_MACOS_CLEAN=1 DEEPCODE_MACOS_REFRESH_GUI_DIST=1 DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCT="$product" bash ./scripts/package-macos.sh
   else
-    env DEEPCODE_MACOS_PRODUCT="$product" bash ./scripts/package-macos.sh
+    env DEEPCODE_MACOS_REFRESH_GUI_DIST=1 DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCT="$product" bash ./scripts/package-macos.sh
   fi
   echo ""
   echo "==[build]== DONE"
@@ -341,8 +364,12 @@ submit_macos_package_request() {
   local timeout="${DEEPCODE_MACOS_PACKAGE_TIMEOUT_SECONDS:-3600}"
   local args=(submit --product "$product" --timeout-seconds "$timeout")
 
+  args+=(--refresh-gui-dist)
   if [ "$clean_cache" = "1" ]; then
-    args+=(--clean --refresh-gui-dist)
+    args+=(--clean)
+  fi
+  if [ "$kill_running" = "0" ]; then
+    args+=(--no-kill-running)
   fi
   if [ "$wait" = "1" ]; then
     args+=(--wait)
