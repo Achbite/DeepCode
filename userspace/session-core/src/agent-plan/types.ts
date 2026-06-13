@@ -113,6 +113,29 @@ export interface AgentPlanParseFailure {
   message: string;
 }
 
+export type ProposalEnvelopeSource = 'llm' | 'user' | 'system' | 'cache';
+
+export type ProposalEnvelopeKind =
+  | 'answer'
+  | 'resourceRequest'
+  | 'requirementDraft'
+  | 'actionBundle'
+  | 'repairProposal'
+  | 'reviewPacketDraft';
+
+export interface ProposalEnvelope {
+  schemaVersion: 'deepcode.agent.protocol.v3';
+  proposalId: string;
+  runId: string;
+  sessionId?: string;
+  source: ProposalEnvelopeSource;
+  kind: ProposalEnvelopeKind;
+  payload: unknown;
+  referencedResourcePacketRefs: string[];
+  referencedEvidenceRefs: string[];
+  parserDiagnostics?: unknown;
+}
+
 export class AgentPlanParseError extends Error {
   constructor(
     public readonly code: string,

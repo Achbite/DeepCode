@@ -4,6 +4,7 @@ export * from './cadence/index.js';
 export * from './confirmation/index.js';
 export * from './context/index.js';
 export * from './controller.js';
+export * from './driver/index.js';
 export * from './projection.js';
 export * from './prompt/index.js';
 export * from './promptHistory.js';

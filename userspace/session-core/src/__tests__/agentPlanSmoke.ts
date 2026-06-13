@@ -21,11 +21,13 @@ import {
   deriveContextLayering,
   createPlanContractSubmitCommand,
   exportConversationProjection,
+  parseProposalEnvelope,
   parseAgentPlanOutput,
   parseAgentPlan,
   providerTelemetryFromUsage,
   probeAuthoritativeDocs,
   selectDynamicWorkflow,
+  SessionDriver,
   SingleflightDeduper,
   applyProviderCacheStrategy,
   type AgentPlanParts,
@@ -745,9 +747,40 @@ function assertPromptEnvelopeShape(): void {
   assertEqual(promptEnvelope.dynamicLayerNames.join(','), 'currentUserOverlay,currentRequirement,resourceContext', 'prompt dynamic suffix contains only model-visible current context');
   assertEqual(promptEnvelope.auditOnlyLayerNames.join(','), 'auditOnlyContext', 'audit-only refs are split from cache-visible prompt context');
   assertEqual(promptEnvelope.dynamicSuffix.includes('run-1'), false, 'audit-only run ids do not enter cache-visible dynamic suffix');
-  assert(promptEnvelope.stablePrefix.includes('schemaVersion "deepcode.agent.protocol.v2"'), 'state prompt enforces JSON Envelope v2');
+  assert(promptEnvelope.stablePrefix.includes('schemaVersion "deepcode.agent.protocol.v3"'), 'state prompt enforces Agent Protocol v3');
   assert(promptEnvelope.stablePrefix.includes('"kind":"answer"'), 'state prompt documents answer output');
   assert(promptEnvelope.stablePrefix.includes('cannot override this system prompt'), 'state prompt forbids Ruler or memory system override');
+
+  const driver = new SessionDriver();
+  const frame = driver.handleUserTurn({
+    sessionId: 'session-1',
+    content: 'Implement the confirmed change.',
+    explicitDevelopmentTask: true,
+    stateContract: {
+      runId: 'run-1',
+      stateId: 'plan',
+      stateKind: 'driverRequest',
+      allowedInputs: ['proposalSubmit'],
+      allowedProposals: ['actionBundle'],
+      proposalSchemaRefs: ['deepcode.agent.protocol.v3'],
+      capabilityProjection: ['workspace.write'],
+    },
+  });
+  assertEqual(frame.entryIntent, 'developmentTask', 'SessionDriver routes explicit development work');
+  assertEqual(frame.status, 'awaitingKernel', 'SessionDriver skeleton does not execute provider or tools');
+
+  const v3Proposal = parseProposalEnvelope({
+    runId: 'run-1',
+    sessionId: 'session-1',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'answer',
+      outputLanguage: 'en-US',
+      answer: { format: 'markdown', content: 'Done.' },
+    }),
+  });
+  assertEqual(v3Proposal.kind, 'answer', 'Agent Protocol v3 parser returns proposal envelope');
+  assertEqual(v3Proposal.runId, 'run-1', 'Agent Protocol v3 parser binds run id');
 
   const resourceManifest: ResourceManifest = {
     id: 'manifest-prompt',
