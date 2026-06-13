@@ -171,7 +171,7 @@ impl DeepCodeKernelRuntime {
             );
         }
         let result = self
-            .execute_kernel_tool(&tool_name, &arguments)
+            .execute_kernel_tool(run_id, &tool_name, &arguments)
             .and_then(|mut output| {
                 self.attach_workspace_tool_diagnostics(&tool_name, &arguments, &mut output)?;
                 self.record_kernel_resource_effects(
@@ -514,8 +514,11 @@ impl DeepCodeKernelRuntime {
                 break;
             };
             let tool_call_id = call.id;
-            let tool_name = call.name;
+            let mut tool_name = call.name;
             let arguments = call.arguments;
+            if tool_name == "fs.read" && self.read_tool_target_is_directory(run_id, &arguments) {
+                tool_name = "fs.list".to_string();
+            }
             let request_sequence = self.ledger.next_sequence(run_id)?;
             let requested = KernelEvent::ToolRequested {
                 run_id: Some(RunId(run_id.to_string())),
@@ -607,16 +610,31 @@ impl DeepCodeKernelRuntime {
         Ok(events)
     }
 
+    fn read_tool_target_is_directory(&self, run_id: &str, arguments: &Value) -> bool {
+        let Some(root) = self
+            .tool_workspace_root(run_id, "fs.read", arguments)
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        WorkspaceBoundary::new(PathBuf::from(root))
+            .resolve(path)
+            .map(|target| target.is_dir())
+            .unwrap_or(false)
+    }
+
     pub(crate) fn execute_kernel_tool(
         &self,
+        run_id: &str,
         tool_name: &str,
         arguments: &Value,
     ) -> KernelResult<Value> {
-        let workspace_root = self
-            .state
-            .current_workspace
-            .as_ref()
-            .map(|workspace| workspace.root.to_string_lossy().to_string());
+        let workspace_root = self.tool_workspace_root(run_id, tool_name, arguments)?;
         let result = self.tool_executors.invoke(
             SkillInvocation {
                 id: format!("tool-{tool_name}"),
@@ -645,6 +663,63 @@ impl DeepCodeKernelRuntime {
         }
     }
 
+    fn tool_workspace_root(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> KernelResult<Option<String>> {
+        if let Some(root) = arguments
+            .get("attachmentRoot")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            self.validate_attachment_tool_root(run_id, tool_name, root, arguments)?;
+            return Ok(Some(root.to_string()));
+        }
+        Ok(self
+            .state
+            .current_workspace
+            .as_ref()
+            .map(|workspace| workspace.root.to_string_lossy().to_string()))
+    }
+
+    fn validate_attachment_tool_root(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        root: &str,
+        arguments: &Value,
+    ) -> KernelResult<()> {
+        if !matches!(tool_name, "fs.read" | "fs.list" | "code.search") {
+            return Err(KernelError::PermissionDenied(
+                "attachmentRoot is only allowed for read-only workspace tools".to_string(),
+            ));
+        }
+        let record = self.record_by_run(run_id)?;
+        let root = PathBuf::from(root)
+            .canonicalize()
+            .map_err(|error| KernelError::InvalidCommand(format!("attachmentRoot: {error}")))?;
+        let relative = arguments
+            .get("path")
+            .or_else(|| arguments.get("include"))
+            .and_then(Value::as_str)
+            .unwrap_or(".");
+        let target = WorkspaceBoundary::new(&root).resolve(relative)?;
+        let target = target.canonicalize().unwrap_or(target);
+        let allowed = record
+            .attachments
+            .iter()
+            .any(|attachment| explicit_attachment_allows_target(attachment, &root, &target));
+        if !allowed {
+            return Err(KernelError::PermissionDenied(
+                "attachmentRoot must match an explicit user attachment".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn attach_workspace_tool_diagnostics(
         &self,
         tool_name: &str,
@@ -657,16 +732,26 @@ impl DeepCodeKernelRuntime {
         ) {
             return Ok(());
         }
-        let Some(workspace) = self.state.current_workspace.as_ref() else {
+        let diagnostic_root = arguments
+            .get("attachmentRoot")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.state
+                    .current_workspace
+                    .as_ref()
+                    .map(|workspace| workspace.root.clone())
+            });
+        let Some(diagnostic_root) = diagnostic_root else {
             return Ok(());
         };
         if let Some(object) = output.as_object_mut() {
             object.insert(
                 "workspaceRoot".to_string(),
-                Value::String(workspace.root.to_string_lossy().to_string()),
+                Value::String(diagnostic_root.to_string_lossy().to_string()),
             );
             if let Some(path) = arguments.get("path").and_then(Value::as_str) {
-                if let Ok(target) = self.resolve_workspace_path(path) {
+                if let Ok(target) = WorkspaceBoundary::new(&diagnostic_root).resolve(path) {
                     object.insert(
                         "absolutePath".to_string(),
                         Value::String(target.to_string_lossy().to_string()),
@@ -1281,6 +1366,39 @@ pub(crate) fn needs_workspace_tool(tool_name: &str) -> bool {
             | "git.unstage"
             | "git.commit"
     )
+}
+
+fn explicit_attachment_allows_target(attachment: &Value, root: &Path, target: &Path) -> bool {
+    let source = attachment
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(source, "userSelected" | "contextMenu" | "mention") {
+        return false;
+    }
+    let Some(absolute_path) = attachment
+        .get("absolutePath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Ok(attachment_path) = PathBuf::from(absolute_path).canonicalize() else {
+        return false;
+    };
+    let kind = attachment
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("file");
+    if kind == "directory" {
+        root == attachment_path && target.starts_with(&attachment_path)
+    } else {
+        attachment_path
+            .parent()
+            .map(|parent| parent == root && target == attachment_path)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

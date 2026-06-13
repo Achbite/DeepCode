@@ -1,5 +1,7 @@
 use super::*;
 
+// Legacy RunStart path. New provider-facing protocol/prompt ownership belongs
+// to userspace/session-core and submits ProposalEnvelope v3 back to Kernel.
 pub const AGENT_PROTOCOL_VERSION: &str = "deepcode.agent.protocol.v2";
 pub const TOOL_CATALOG_VERSION: &str = "deepcode.tool_catalog.k7-k9.v1";
 

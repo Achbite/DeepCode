@@ -21,12 +21,61 @@ impl DeepCodeKernelRuntime {
             } => self.run_start(
                 request_id,
                 session_id,
-                input.text,
+                input,
                 workspace_binding,
                 profile_ref,
                 workflow_ref.map(|value| value.id),
                 run_overrides,
             ),
+            KernelCommand::RunCreate {
+                request_id,
+                session_id,
+                input,
+                workspace_binding,
+                profile_ref,
+                workflow_ref,
+                run_overrides,
+            } => self.run_create(
+                request_id,
+                session_id,
+                input,
+                workspace_binding,
+                profile_ref,
+                workflow_ref,
+                run_overrides,
+            ),
+            KernelCommand::StateContractGet {
+                request_id,
+                run_id,
+                session_id,
+            } => self.state_contract_get(request_id, run_id, session_id),
+            KernelCommand::ProposalSubmit {
+                request_id,
+                run_id,
+                session_id,
+                proposal,
+            } => self.proposal_submit(request_id, run_id, session_id, proposal),
+            KernelCommand::UserDecisionSubmit {
+                request_id,
+                run_id,
+                session_id,
+                decision,
+            } => self.user_decision_submit(request_id, run_id, session_id, decision),
+            KernelCommand::ResourceResolve {
+                request_id,
+                run_id,
+                session_id,
+                request,
+            } => self.resource_resolve(request_id, run_id, session_id, request),
+            KernelCommand::ActionBatchSubmit { request_id, .. } => {
+                self.not_implemented(request_id, "action_batch.submit")
+            }
+            KernelCommand::ReviewFactsGet { request_id, .. } => {
+                self.not_implemented(request_id, "review_facts.get")
+            }
+            KernelCommand::ReviewGateEvaluate { request_id, .. } => {
+                self.not_implemented(request_id, "review_gate.evaluate")
+            }
             KernelCommand::LlmResponseSubmit {
                 request_id,
                 run_id,

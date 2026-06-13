@@ -1,7 +1,8 @@
 use crate::{
-    ConfigSnapshotRef, HostStatus, KernelErrorEnvelope, KernelSnapshot, LlmProviderDiagnostic,
-    MessageRole, PermissionDecisionKind, PermissionRequestEnvelope, ProfileRef, RequestId, RunId,
-    RunStatus, SessionId, StageRunId, StageStatus, TurnId, WorkflowDecision, WorkspaceBinding,
+    ConfigSnapshotRef, DriverRequest, HostStatus, KernelErrorEnvelope, KernelSnapshot,
+    KernelStateContract, LlmProviderDiagnostic, MessageRole, PermissionDecisionKind,
+    PermissionRequestEnvelope, ProfileRef, ProposalEnvelope, RequestId, RunId, RunStatus,
+    SessionId, StageRunId, StageStatus, TurnId, WorkflowDecision, WorkspaceBinding,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -32,6 +33,115 @@ pub enum KernelEvent {
         run_id: RunId,
         session_id: Option<SessionId>,
         workspace_binding: WorkspaceBinding,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "state.entered")]
+    StateEntered {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        state_contract: KernelStateContract,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "driver.request_produced")]
+    DriverRequestProduced {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        driver_request: DriverRequest,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "proposal.accepted")]
+    ProposalAccepted {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        proposal: ProposalEnvelope,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "proposal.rejected")]
+    ProposalRejected {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        proposal_id: Option<String>,
+        reason: String,
+        diagnostics: Option<Value>,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "resource.packet_produced")]
+    ResourcePacketProduced {
+        request_id: Option<RequestId>,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        packet: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "action_batch.accepted")]
+    ActionBatchAccepted {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        batch: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "work_unit.queued")]
+    WorkUnitQueued {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        work_unit: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "work_unit.started")]
+    WorkUnitStarted {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        work_unit_id: String,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "work_unit.completed")]
+    WorkUnitCompleted {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        work_unit_id: String,
+        output: Option<Value>,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "work_unit.failed")]
+    WorkUnitFailed {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        work_unit_id: String,
+        error: KernelErrorEnvelope,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "work_unit.blocked")]
+    WorkUnitBlocked {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        work_unit_id: String,
+        reason: String,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "review.facts_produced")]
+    ReviewFactsProduced {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        facts: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "review_gate.evaluated")]
+    ReviewGateEvaluated {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        result: Value,
         sequence: Option<u64>,
     },
     #[serde(rename = "run.completed")]

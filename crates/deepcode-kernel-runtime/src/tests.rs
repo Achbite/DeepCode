@@ -1,6 +1,7 @@
 use super::*;
 use deepcode_kernel_abi::{
-    AnswerObligationId, AnswerObligationStatus, MessageRole, UserInput, WorkspaceBinding,
+    AnswerObligationId, AnswerObligationStatus, MessageRole, ProposalEnvelopeSource, UserInput,
+    WorkspaceBinding,
 };
 use deepcode_kernel_workflow::{
     ActionBundleDraft, PlanContract, PlannedAction, ValidationExpectation, WorkflowEvidence,
@@ -617,12 +618,12 @@ fn mcp_stdio_tool_call_completion_writes_signed_audit_entry() {
 }
 
 #[test]
-fn run_start_without_workspace_binding_fails_closed() {
+fn run_start_without_workspace_binding_allows_llm_only_conversation() {
     let mut runtime = DeepCodeKernelRuntime::new();
-    let error = runtime
+    let events = runtime
         .dispatch(KernelCommand::RunStart {
             request_id: RequestId("req-run".to_string()),
-            session_id: None,
+            session_id: Some(SessionId("session-1".to_string())),
             input: UserInput {
                 text: "hello".to_string(),
                 attachments: vec![],
@@ -632,9 +633,26 @@ fn run_start_without_workspace_binding_fails_closed() {
             workflow_ref: None,
             run_overrides: None,
         })
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(error, KernelError::MissingWorkspaceBinding));
+    assert!(matches!(events[0], KernelEvent::RunStarted { .. }));
+    assert!(matches!(events[4], KernelEvent::LlmCallRequested { .. }));
+    assert!(runtime
+        .snapshot(Some("session-1"))
+        .workspace_binding
+        .is_some());
+    assert_eq!(
+        workspace_error(
+            runtime
+                .dispatch(KernelCommand::WorkspaceRead {
+                    request_id: RequestId("read-without-workspace".to_string()),
+                    folder_id: None,
+                    path: "README.md".to_string(),
+                })
+                .unwrap()
+        ),
+        "workspace_binding_required"
+    );
 }
 
 #[test]
@@ -682,6 +700,232 @@ fn run_start_creates_headless_skeleton_events_and_ledger() {
     assert_eq!(ledger.len(), 5);
     assert_eq!(ledger[0].kind, "run.started");
     assert_eq!(ledger[4].kind, "llm.call_requested");
+}
+
+#[test]
+fn run_create_produces_driver_request_without_llm_call() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    let events = runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-driver".to_string())),
+            input: UserInput {
+                text: "plan through session driver".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(binding()),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .unwrap();
+
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[0], KernelEvent::StateEntered { .. }));
+    assert!(matches!(
+        events[1],
+        KernelEvent::DriverRequestProduced { .. }
+    ));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::LlmCallRequested { .. })));
+
+    let ledger = runtime.ledger("run-1").unwrap();
+    assert!(ledger.iter().any(|event| event.kind == "state.entered"));
+    assert!(ledger
+        .iter()
+        .any(|event| event.kind == "driver.request_produced"));
+    assert!(!ledger
+        .iter()
+        .any(|event| event.kind == "llm.call_requested"));
+}
+
+#[test]
+fn proposal_submit_accepts_v3_and_resource_resolve_produces_packet() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    let root = temp_workspace();
+    fs::write(root.join("entry.txt"), "prompt-ready source excerpt").unwrap();
+    fs::create_dir_all(root.join("module")).unwrap();
+    fs::write(root.join("module").join("index.txt"), "module summary").unwrap();
+    runtime
+        .dispatch(KernelCommand::WorkspaceOpen {
+            request_id: RequestId("req-workspace-open".to_string()),
+            path: root.to_string_lossy().to_string(),
+        })
+        .unwrap();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-driver".to_string())),
+            input: UserInput {
+                text: "answer through session driver".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(binding_for_root(&root)),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .unwrap();
+
+    let events = runtime
+        .dispatch(KernelCommand::ProposalSubmit {
+            request_id: RequestId("req-proposal".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-driver".to_string())),
+            proposal: ProposalEnvelope {
+                schema_version: "deepcode.agent.protocol.v3".to_string(),
+                proposal_id: "proposal-answer".to_string(),
+                run_id: RunId("run-1".to_string()),
+                session_id: Some(SessionId("session-driver".to_string())),
+                source: ProposalEnvelopeSource::Llm,
+                kind: ProposalEnvelopeKind::Answer,
+                payload: serde_json::json!({
+                    "format": "markdown",
+                    "content": "ok"
+                }),
+                referenced_resource_packet_refs: vec![],
+                referenced_evidence_refs: vec![],
+                parser_diagnostics: None,
+            },
+        })
+        .unwrap();
+    assert!(matches!(events[0], KernelEvent::ProposalAccepted { .. }));
+
+    let events = runtime
+        .dispatch(KernelCommand::ResourceResolve {
+            request_id: RequestId("req-resource".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-driver".to_string())),
+            request: ResourceResolveRequest {
+                manifest: serde_json::json!({
+                    "id": "manifest-1",
+                    "entries": [
+                        { "id": "entry-file", "kind": "file", "path": "entry.txt", "summary": "source ref" },
+                        { "id": "entry-dir", "kind": "directory", "absolutePath": root.join("module").to_string_lossy() },
+                        { "id": "entry-not-file", "kind": "file", "path": "." }
+                    ]
+                }),
+            },
+        })
+        .unwrap();
+    match &events[0] {
+        KernelEvent::ResourcePacketProduced { packet, .. } => {
+            assert_eq!(packet["manifestId"], "manifest-1");
+            assert_eq!(packet["items"][0]["manifestEntryId"], "entry-file");
+            assert_eq!(packet["items"][0]["status"], "resolved");
+            assert_eq!(packet["items"][0]["resolvedKind"], "file");
+            assert!(packet["items"][0]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("prompt-ready source excerpt"));
+            assert_eq!(packet["items"][1]["manifestEntryId"], "entry-dir");
+            assert_eq!(packet["items"][1]["resolvedKind"], "directory");
+            assert_eq!(packet["items"][2]["status"], "error");
+            assert_eq!(packet["items"][2]["reason"], "not_file");
+        }
+        other => panic!("expected ResourcePacketProduced, got {other:?}"),
+    }
+
+    let error = workspace_error(
+        runtime
+            .dispatch(KernelCommand::WorkspaceRead {
+                request_id: RequestId("req-read-absolute".to_string()),
+                folder_id: None,
+                path: root.join("entry.txt").to_string_lossy().to_string(),
+            })
+            .unwrap(),
+    );
+    assert_eq!(error, "permission_denied");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn read_only_tool_root_override_requires_explicit_attachment() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    let workspace = temp_workspace();
+    let attachment_root = temp_workspace();
+    fs::write(attachment_root.join("note.txt"), "attachment text").unwrap();
+    runtime
+        .dispatch(KernelCommand::WorkspaceOpen {
+            request_id: RequestId("req-workspace-open".to_string()),
+            path: workspace.to_string_lossy().to_string(),
+        })
+        .unwrap();
+    runtime
+        .dispatch(KernelCommand::RunStart {
+            request_id: RequestId("req-run".to_string()),
+            session_id: Some(SessionId("session-attachment".to_string())),
+            input: UserInput {
+                text: "read explicit attachment".to_string(),
+                attachments: vec![serde_json::json!({
+                    "kind": "directory",
+                    "absolutePath": attachment_root.to_string_lossy(),
+                    "source": "userSelected"
+                })],
+            },
+            workspace_binding: Some(binding_for_root(&workspace)),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .unwrap();
+
+    runtime
+        .enqueue_approved_tool_calls(
+            "run-1",
+            vec![(
+                "approved-read-attachment".to_string(),
+                "fs.read".to_string(),
+                serde_json::json!({
+                    "path": "note.txt",
+                    "attachmentRoot": attachment_root.to_string_lossy()
+                }),
+            )],
+        )
+        .unwrap();
+    let events = runtime
+        .auto_continue_after_tool("run-1", "session-attachment")
+        .unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KernelEvent::ToolCompleted {
+            ok: true,
+            output: Some(output),
+            ..
+        } if output.get("content").and_then(Value::as_str) == Some("attachment text")
+    )));
+
+    let denied_root = temp_workspace();
+    fs::write(denied_root.join("note.txt"), "denied").unwrap();
+    runtime
+        .enqueue_approved_tool_calls(
+            "run-1",
+            vec![(
+                "approved-read-denied".to_string(),
+                "fs.read".to_string(),
+                serde_json::json!({
+                    "path": "note.txt",
+                    "attachmentRoot": denied_root.to_string_lossy()
+                }),
+            )],
+        )
+        .unwrap();
+    let events = runtime
+        .auto_continue_after_tool("run-1", "session-attachment")
+        .unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KernelEvent::ToolCompleted {
+            ok: false,
+            error: Some(error),
+            ..
+        } if error.code == "permission_denied"
+    )));
+
+    fs::remove_dir_all(workspace).unwrap();
+    fs::remove_dir_all(attachment_root).unwrap();
+    fs::remove_dir_all(denied_root).unwrap();
 }
 
 #[test]

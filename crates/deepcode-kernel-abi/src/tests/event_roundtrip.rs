@@ -41,6 +41,64 @@ fn kernel_event_uses_locale_neutral_dotted_kind() {
 }
 
 #[test]
+fn driver_loop_v3_events_round_trip() {
+    let contract = KernelStateContract {
+        run_id: RunId("run-1".to_string()),
+        workflow_ref: Some(WorkflowRef {
+            id: "builtin.plan-first".to_string(),
+            version: None,
+            hash: None,
+        }),
+        state_id: "plan".to_string(),
+        state_kind: "driverRequest".to_string(),
+        allowed_inputs: vec!["proposalSubmit".to_string()],
+        allowed_proposals: vec!["answer".to_string()],
+        proposal_schema_refs: vec!["deepcode.agent.protocol.v3".to_string()],
+        required_user_decision: None,
+        capability_projection: vec!["workspace.read".to_string()],
+        tool_catalog_ref: Some("catalog-v1".to_string()),
+        transition_predicates: vec![],
+        fail_closed_rules: vec![],
+    };
+    let event = KernelEvent::StateEntered {
+        request_id: Some(RequestId("req-state".to_string())),
+        run_id: RunId("run-1".to_string()),
+        session_id: Some(SessionId("session-1".to_string())),
+        state_contract: contract.clone(),
+        sequence: Some(1),
+    };
+    let encoded = serde_json::to_value(&event).expect("serialize state event");
+    assert_eq!(encoded["kind"], "state.entered");
+    assert_eq!(
+        encoded["stateContract"]["proposalSchemaRefs"][0],
+        "deepcode.agent.protocol.v3"
+    );
+    let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize state event");
+    assert_eq!(decoded, event);
+
+    let event = KernelEvent::DriverRequestProduced {
+        request_id: Some(RequestId("req-driver".to_string())),
+        run_id: RunId("run-1".to_string()),
+        session_id: Some(SessionId("session-1".to_string())),
+        driver_request: DriverRequest {
+            id: "driver-run-1-need-proposal".to_string(),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            kind: DriverRequestKind::NeedProposal,
+            reason: "Need proposal".to_string(),
+            state_contract: contract,
+        },
+        sequence: Some(2),
+    };
+    let encoded = serde_json::to_value(&event).expect("serialize driver request event");
+    assert_eq!(encoded["kind"], "driver.request_produced");
+    assert_eq!(encoded["driverRequest"]["kind"], "needProposal");
+    let decoded: KernelEvent =
+        serde_json::from_value(encoded).expect("deserialize driver request event");
+    assert_eq!(decoded, event);
+}
+
+#[test]
 fn llm_provider_error_event_round_trips_with_raw_response_diagnostic() {
     let event = KernelEvent::LlmProviderError {
         run_id: RunId("run-1".to_string()),

@@ -48,6 +48,7 @@ pub(crate) struct RuntimeRunRecord {
     pub(crate) session_id: String,
     pub(crate) run_id: String,
     pub(crate) input_text: String,
+    pub(crate) attachments: Vec<Value>,
     pub(crate) workspace_binding: WorkspaceBinding,
     pub(crate) config_ref: ConfigSnapshotRef,
     pub(crate) profile_ref: Option<ProfileRef>,
@@ -224,6 +225,12 @@ impl DeepCodeKernelRuntime {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            attachments: started
+                .payload
+                .get("attachments")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
             workspace_binding,
             config_ref,
             profile_ref,

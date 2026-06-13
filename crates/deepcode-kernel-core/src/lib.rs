@@ -66,6 +66,30 @@ impl Kernel {
                 }
                 self.not_implemented(request_id, "run.start")
             }
+            KernelCommand::RunCreate { request_id, .. } => {
+                self.not_implemented(request_id, "run.create")
+            }
+            KernelCommand::StateContractGet { request_id, .. } => {
+                self.not_implemented(request_id, "state_contract.get")
+            }
+            KernelCommand::ProposalSubmit { request_id, .. } => {
+                self.not_implemented(request_id, "proposal.submit")
+            }
+            KernelCommand::UserDecisionSubmit { request_id, .. } => {
+                self.not_implemented(request_id, "user_decision.submit")
+            }
+            KernelCommand::ResourceResolve { request_id, .. } => {
+                self.not_implemented(request_id, "resource.resolve")
+            }
+            KernelCommand::ActionBatchSubmit { request_id, .. } => {
+                self.not_implemented(request_id, "action_batch.submit")
+            }
+            KernelCommand::ReviewFactsGet { request_id, .. } => {
+                self.not_implemented(request_id, "review_facts.get")
+            }
+            KernelCommand::ReviewGateEvaluate { request_id, .. } => {
+                self.not_implemented(request_id, "review_gate.evaluate")
+            }
             KernelCommand::LlmResponseSubmit { request_id, .. } => {
                 self.not_implemented(request_id, "llm.response_submit")
             }

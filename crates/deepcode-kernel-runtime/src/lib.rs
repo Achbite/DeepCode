@@ -1,7 +1,9 @@
 use deepcode_kernel_abi::{
-    ConfigSnapshotRef, HostStatus, KernelCommand, KernelError, KernelErrorEnvelope, KernelEvent,
-    KernelEventSummary, KernelResult, KernelSnapshot, ProfileRef, RequestId, RunId, SessionId,
-    StageStatus, WorkflowDecision, WorkflowDecisionAction, WorkspaceBinding,
+    ConfigSnapshotRef, DriverRequest, DriverRequestKind, HostStatus, KernelCommand, KernelError,
+    KernelErrorEnvelope, KernelEvent, KernelEventSummary, KernelResult, KernelSnapshot,
+    KernelStateContract, ProfileRef, ProposalEnvelope, ProposalEnvelopeKind, RequestId,
+    ResourceResolveRequest, RunId, SessionId, StageStatus, UserDecisionSubmit, UserInput,
+    WorkflowDecision, WorkflowDecisionAction, WorkflowRef, WorkspaceBinding,
 };
 use deepcode_kernel_audit::{
     AuditActor, AuditBody, AuditCategory, AuditChain, AuditKeyMaterial, AuditRuntimeMode,

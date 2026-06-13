@@ -1,6 +1,7 @@
 use crate::{
-    KernelEvent, PermissionDecisionKind, ProfileRef, RequestId, RunId, SessionId,
-    TemporaryGrantEnvelope, UserInput, WorkflowRef, WorkspaceBinding,
+    KernelEvent, PermissionDecisionKind, ProfileRef, ProposalEnvelope, RequestId,
+    ResourceResolveRequest, RunId, SessionId, TemporaryGrantEnvelope, UserDecisionSubmit,
+    UserInput, WorkflowRef, WorkspaceBinding,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +35,55 @@ pub enum KernelCommand {
         profile_ref: Option<ProfileRef>,
         workflow_ref: Option<WorkflowRef>,
         run_overrides: Option<Value>,
+    },
+    RunCreate {
+        request_id: RequestId,
+        session_id: Option<SessionId>,
+        input: UserInput,
+        workspace_binding: Option<WorkspaceBinding>,
+        profile_ref: Option<ProfileRef>,
+        workflow_ref: Option<WorkflowRef>,
+        run_overrides: Option<Value>,
+    },
+    StateContractGet {
+        request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+    },
+    ProposalSubmit {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        proposal: ProposalEnvelope,
+    },
+    UserDecisionSubmit {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        decision: UserDecisionSubmit,
+    },
+    ResourceResolve {
+        request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        request: ResourceResolveRequest,
+    },
+    ActionBatchSubmit {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        batch: Value,
+    },
+    ReviewFactsGet {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+    },
+    ReviewGateEvaluate {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        decision: Value,
     },
     LlmResponseSubmit {
         request_id: RequestId,

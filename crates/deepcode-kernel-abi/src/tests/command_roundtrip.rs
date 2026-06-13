@@ -53,6 +53,72 @@ fn run_start_carries_workspace_binding_and_refs() {
 }
 
 #[test]
+fn driver_loop_v3_commands_round_trip() {
+    let proposal = ProposalEnvelope {
+        schema_version: "deepcode.agent.protocol.v3".to_string(),
+        proposal_id: "proposal-1".to_string(),
+        run_id: RunId("run-1".to_string()),
+        session_id: Some(SessionId("session-1".to_string())),
+        source: ProposalEnvelopeSource::Llm,
+        kind: ProposalEnvelopeKind::Answer,
+        payload: serde_json::json!({ "answer": { "format": "markdown", "content": "ok" } }),
+        referenced_resource_packet_refs: vec![],
+        referenced_evidence_refs: vec![],
+        parser_diagnostics: None,
+    };
+    let command = KernelCommand::ProposalSubmit {
+        request_id: RequestId("req-proposal".to_string()),
+        run_id: RunId("run-1".to_string()),
+        session_id: Some(SessionId("session-1".to_string())),
+        proposal: proposal.clone(),
+    };
+    let encoded = serde_json::to_value(&command).expect("serialize proposal submit");
+    assert_eq!(encoded["kind"], "proposalSubmit");
+    assert_eq!(
+        encoded["proposal"]["schemaVersion"],
+        "deepcode.agent.protocol.v3"
+    );
+    let decoded: KernelCommand =
+        serde_json::from_value(encoded).expect("deserialize proposal submit");
+    assert_eq!(decoded, command);
+
+    let command = KernelCommand::ResourceResolve {
+        request_id: RequestId("req-resource".to_string()),
+        run_id: Some(RunId("run-1".to_string())),
+        session_id: Some(SessionId("session-1".to_string())),
+        request: ResourceResolveRequest {
+            manifest: serde_json::json!({
+                "id": "manifest-1",
+                "entries": [{ "id": "entry-1", "kind": "file" }]
+            }),
+        },
+    };
+    let encoded = serde_json::to_value(&command).expect("serialize resource resolve");
+    assert_eq!(encoded["kind"], "resourceResolve");
+    assert_eq!(encoded["request"]["manifest"]["id"], "manifest-1");
+    let decoded: KernelCommand =
+        serde_json::from_value(encoded).expect("deserialize resource resolve");
+    assert_eq!(decoded, command);
+
+    let command = KernelCommand::UserDecisionSubmit {
+        request_id: RequestId("req-decision".to_string()),
+        run_id: RunId("run-1".to_string()),
+        session_id: Some(SessionId("session-1".to_string())),
+        decision: UserDecisionSubmit {
+            decision_id: "decision-1".to_string(),
+            decision_kind: "accepted".to_string(),
+            target_id: Some(proposal.proposal_id),
+            payload: serde_json::json!({}),
+        },
+    };
+    let encoded = serde_json::to_value(&command).expect("serialize user decision");
+    assert_eq!(encoded["kind"], "userDecisionSubmit");
+    let decoded: KernelCommand =
+        serde_json::from_value(encoded).expect("deserialize user decision");
+    assert_eq!(decoded, command);
+}
+
+#[test]
 fn workspace_and_skill_syscalls_round_trip() {
     let command = KernelCommand::WorkspaceWrite {
         request_id: RequestId("req-write".to_string()),

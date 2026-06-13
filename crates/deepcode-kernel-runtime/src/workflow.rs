@@ -5,13 +5,15 @@ impl DeepCodeKernelRuntime {
         &mut self,
         request_id: RequestId,
         session_id: Option<SessionId>,
-        input_text: String,
+        input: UserInput,
         workspace_binding: Option<WorkspaceBinding>,
         profile_ref: Option<ProfileRef>,
         workflow_id: Option<String>,
         run_overrides: Option<Value>,
     ) -> KernelResult<Vec<KernelEvent>> {
-        let workspace_binding = workspace_binding.ok_or(KernelError::MissingWorkspaceBinding)?;
+        let input_text = input.text.clone();
+        let attachments = input.attachments;
+        let workspace_binding = workspace_binding.unwrap_or_else(empty_workspace_binding);
         self.state.next_run_index += 1;
         let run_id = format!("run-{}", self.state.next_run_index);
         let session_id = session_id
@@ -39,7 +41,8 @@ impl DeepCodeKernelRuntime {
             sequence,
             serde_json::json!({
                 "summary": "Headless kernel run skeleton started.",
-                "inputText": input_text,
+                "inputText": &input_text,
+                "attachments": &attachments,
                 "workspaceBinding": &workspace_binding,
                 "configRef": &config_ref,
                 "profileRef": &profile_ref,
@@ -98,6 +101,7 @@ impl DeepCodeKernelRuntime {
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
                 input_text: input_text.clone(),
+                attachments,
                 workspace_binding: workspace_binding.clone(),
                 config_ref: config_ref.clone(),
                 profile_ref: profile_ref.clone(),
@@ -143,6 +147,333 @@ impl DeepCodeKernelRuntime {
             },
             llm_call,
         ])
+    }
+
+    pub(crate) fn run_create(
+        &mut self,
+        request_id: RequestId,
+        session_id: Option<SessionId>,
+        input: UserInput,
+        workspace_binding: Option<WorkspaceBinding>,
+        profile_ref: Option<ProfileRef>,
+        workflow_ref: Option<WorkflowRef>,
+        run_overrides: Option<Value>,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let workspace_binding = workspace_binding.unwrap_or_else(empty_workspace_binding);
+        self.state.next_run_index += 1;
+        let run_id = format!("run-{}", self.state.next_run_index);
+        let session_id = session_id
+            .map(|value| value.0)
+            .unwrap_or_else(|| format!("session-{}", self.state.next_run_index));
+        let workflow_id = workflow_ref.as_ref().map(|value| value.id.clone());
+        let config_snapshot = self.resolve_minimal_config(
+            &run_id,
+            profile_ref.as_ref().map(|value| value.id.clone()),
+            workflow_id,
+            run_overrides,
+        )?;
+        let config_ref = ConfigSnapshotRef {
+            snapshot_id: config_snapshot.snapshot_id.clone(),
+            hash: config_snapshot.hash.clone(),
+        };
+        let workflow_state = self.workflow.initial_state(&session_id, Some(3));
+        let mut sequence = 0_u64;
+
+        sequence += 1;
+        self.append_ledger(
+            &run_id,
+            &session_id,
+            "run.started",
+            sequence,
+            serde_json::json!({
+                "summary": "Kernel driver run created.",
+                "inputText": &input.text,
+                "attachmentCount": input.attachments.len(),
+                "workspaceBinding": &workspace_binding,
+                "configRef": &config_ref,
+                "profileRef": &profile_ref,
+                "policyProfile": &self.policy_profile.id,
+                "driverLoop": "session"
+            }),
+        )?;
+
+        sequence += 1;
+        self.append_ledger(
+            &run_id,
+            &session_id,
+            "config.snapshot.attached",
+            sequence,
+            serde_json::json!({
+                "summary": "Config snapshot attached.",
+                "snapshotRef": &config_ref,
+                "sources": &config_snapshot.source_refs
+            }),
+        )?;
+
+        sequence += 1;
+        self.append_ledger(
+            &run_id,
+            &session_id,
+            "workflow.checkpointed",
+            sequence,
+            serde_json::json!({
+                "summary": "Workflow checkpoint created for Session DriverLoop.",
+                "runId": &run_id,
+                "sessionId": &session_id,
+                "phase": workflow_state.phase.as_str(),
+                "sequence": sequence,
+                "pendingPermissionId": null,
+                "activeWorkUnitIds": []
+            }),
+        )?;
+
+        self.state.records_by_session.insert(
+            session_id.clone(),
+            RuntimeRunRecord {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                input_text: input.text.clone(),
+                attachments: input.attachments.clone(),
+                workspace_binding,
+                config_ref,
+                profile_ref,
+                phase: workflow_state.phase.clone(),
+                active_llm_call_id: None,
+                llm_call_index: 0,
+                decision_state: RunDecisionState::from_user_input(&input.text),
+            },
+        );
+
+        let record = self.record_by_run(&run_id)?;
+        let contract = self.state_contract_for_record(&record);
+        sequence += 1;
+        self.append_ledger(
+            &run_id,
+            &session_id,
+            "state.entered",
+            sequence,
+            serde_json::json!({
+                "summary": "Kernel state contract produced.",
+                "stateContract": &contract
+            }),
+        )?;
+        let state_event = KernelEvent::StateEntered {
+            request_id: Some(request_id.clone()),
+            run_id: RunId(run_id.clone()),
+            session_id: Some(SessionId(session_id.clone())),
+            state_contract: contract.clone(),
+            sequence: Some(sequence),
+        };
+
+        let driver_request = self.driver_request_for_contract(
+            &contract,
+            Some(SessionId(session_id.clone())),
+            DriverRequestKind::NeedProposal,
+            "Session should assemble context and submit a v3 proposal.",
+        );
+        sequence += 1;
+        self.append_ledger(
+            &run_id,
+            &session_id,
+            "driver.request_produced",
+            sequence,
+            serde_json::json!({
+                "summary": "DriverRequest produced for Session DriverLoop.",
+                "driverRequest": &driver_request
+            }),
+        )?;
+        let driver_event = KernelEvent::DriverRequestProduced {
+            request_id: Some(request_id),
+            run_id: RunId(run_id),
+            session_id: Some(SessionId(session_id)),
+            driver_request,
+            sequence: Some(sequence),
+        };
+
+        Ok(vec![state_event, driver_event])
+    }
+
+    pub(crate) fn state_contract_get(
+        &mut self,
+        request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let (run_id, session_id) = self.resolve_run_session(run_id, session_id)?;
+        let record = self.record_by_run(&run_id)?;
+        let contract = self.state_contract_for_record(&record);
+        let sequence = self.ledger.next_sequence(&run_id)?;
+        self.append_ledger(
+            &run_id,
+            &session_id,
+            "state.entered",
+            sequence,
+            serde_json::json!({
+                "summary": "Kernel state contract read.",
+                "stateContract": &contract
+            }),
+        )?;
+        Ok(vec![KernelEvent::StateEntered {
+            request_id: Some(request_id),
+            run_id: RunId(run_id),
+            session_id: Some(SessionId(session_id)),
+            state_contract: contract,
+            sequence: Some(sequence),
+        }])
+    }
+
+    pub(crate) fn proposal_submit(
+        &mut self,
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        proposal: ProposalEnvelope,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let record = self.record_by_run(&run_id.0)?;
+        let session_id = session_id
+            .map(|value| value.0)
+            .unwrap_or_else(|| record.session_id.clone());
+        let sequence = self.ledger.next_sequence(&run_id.0)?;
+        if proposal.schema_version != "deepcode.agent.protocol.v3" || proposal.run_id != run_id {
+            let reason = if proposal.schema_version != "deepcode.agent.protocol.v3" {
+                "ProposalEnvelope schemaVersion must be deepcode.agent.protocol.v3"
+            } else {
+                "ProposalEnvelope runId must match command runId"
+            };
+            self.append_ledger(
+                &run_id.0,
+                &session_id,
+                "proposal.rejected",
+                sequence,
+                serde_json::json!({
+                    "summary": reason,
+                    "proposalId": &proposal.proposal_id,
+                    "proposalKind": proposal_kind_name(&proposal.kind),
+                    "schemaVersion": &proposal.schema_version
+                }),
+            )?;
+            return Ok(vec![KernelEvent::ProposalRejected {
+                request_id: Some(request_id),
+                run_id,
+                session_id: Some(SessionId(session_id)),
+                proposal_id: Some(proposal.proposal_id),
+                reason: reason.to_string(),
+                diagnostics: None,
+                sequence: Some(sequence),
+            }]);
+        }
+
+        self.append_ledger(
+            &run_id.0,
+            &session_id,
+            "proposal.accepted",
+            sequence,
+            serde_json::json!({
+                "summary": "ProposalEnvelope accepted by Kernel structural validator.",
+                "proposalId": &proposal.proposal_id,
+                "proposalKind": proposal_kind_name(&proposal.kind),
+                "schemaVersion": &proposal.schema_version
+            }),
+        )?;
+        Ok(vec![KernelEvent::ProposalAccepted {
+            request_id: Some(request_id),
+            run_id,
+            session_id: Some(SessionId(session_id)),
+            proposal,
+            sequence: Some(sequence),
+        }])
+    }
+
+    pub(crate) fn user_decision_submit(
+        &mut self,
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        decision: UserDecisionSubmit,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let record = self.record_by_run(&run_id.0)?;
+        let session_id = session_id
+            .map(|value| value.0)
+            .unwrap_or_else(|| record.session_id.clone());
+        let sequence = self.ledger.next_sequence(&run_id.0)?;
+        self.append_ledger(
+            &run_id.0,
+            &session_id,
+            "user_decision.submitted",
+            sequence,
+            serde_json::json!({
+                "summary": "User decision recorded for DriverLoop.",
+                "decision": &decision
+            }),
+        )?;
+        let contract = self.state_contract_for_record(&record);
+        let driver_request = self.driver_request_for_contract(
+            &contract,
+            Some(SessionId(session_id.clone())),
+            DriverRequestKind::NeedProposal,
+            "Session should continue after the recorded user decision.",
+        );
+        let driver_sequence = self.ledger.next_sequence(&run_id.0)?;
+        self.append_ledger(
+            &run_id.0,
+            &session_id,
+            "driver.request_produced",
+            driver_sequence,
+            serde_json::json!({
+                "summary": "DriverRequest produced after user decision.",
+                "driverRequest": &driver_request
+            }),
+        )?;
+        Ok(vec![KernelEvent::DriverRequestProduced {
+            request_id: Some(request_id),
+            run_id,
+            session_id: Some(SessionId(session_id)),
+            driver_request,
+            sequence: Some(driver_sequence),
+        }])
+    }
+
+    pub(crate) fn resource_resolve(
+        &mut self,
+        request_id: RequestId,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+        request: ResourceResolveRequest,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let resolved = self.resolve_run_session(run_id, session_id).ok();
+        let sequence = resolved
+            .as_ref()
+            .map(|(run_id, _)| self.ledger.next_sequence(run_id))
+            .transpose()?;
+        let packet = resource_packet_from_manifest(
+            &request_id,
+            &request.manifest,
+            self.state
+                .current_workspace
+                .as_ref()
+                .map(|workspace| workspace.root.as_path()),
+        );
+        if let (Some((run_id, session_id)), Some(sequence)) = (resolved.as_ref(), sequence) {
+            self.append_ledger(
+                run_id,
+                session_id,
+                "resource.packet_produced",
+                sequence,
+                serde_json::json!({
+                    "summary": "ResourcePacket skeleton produced by Kernel ResourceResolve.",
+                    "packet": &packet
+                }),
+            )?;
+        }
+        Ok(vec![KernelEvent::ResourcePacketProduced {
+            request_id: Some(request_id),
+            run_id: resolved.as_ref().map(|(run_id, _)| RunId(run_id.clone())),
+            session_id: resolved
+                .as_ref()
+                .map(|(_, session_id)| SessionId(session_id.clone())),
+            packet,
+            sequence,
+        }])
     }
 
     pub(crate) fn run_resume(
@@ -516,6 +847,354 @@ impl DeepCodeKernelRuntime {
     }
 }
 
+fn empty_workspace_binding() -> WorkspaceBinding {
+    WorkspaceBinding {
+        workspace_id: None,
+        workspace_hash: None,
+        open_path: None,
+        active_folder_id: None,
+        folder_hash: None,
+    }
+}
+
+impl DeepCodeKernelRuntime {
+    fn state_contract_for_record(&self, record: &RuntimeRunRecord) -> KernelStateContract {
+        KernelStateContract {
+            run_id: RunId(record.run_id.clone()),
+            workflow_ref: Some(WorkflowRef {
+                id: "builtin.plan-first".to_string(),
+                version: None,
+                hash: None,
+            }),
+            state_id: record.phase.as_str().to_string(),
+            state_kind: "driverRequest".to_string(),
+            allowed_inputs: vec![
+                "proposalSubmit".to_string(),
+                "userDecisionSubmit".to_string(),
+                "resourceResolve".to_string(),
+            ],
+            allowed_proposals: vec![
+                "answer".to_string(),
+                "resourceRequest".to_string(),
+                "requirementDraft".to_string(),
+                "actionBundle".to_string(),
+                "repairProposal".to_string(),
+                "reviewPacketDraft".to_string(),
+            ],
+            proposal_schema_refs: vec!["deepcode.agent.protocol.v3".to_string()],
+            required_user_decision: None,
+            capability_projection: vec![
+                "workspace.read".to_string(),
+                "workspace.search".to_string(),
+                "workspace.write".to_string(),
+                "workspace.delete".to_string(),
+                "process.exec".to_string(),
+                "network.egress".to_string(),
+                "git.read".to_string(),
+                "git.write".to_string(),
+                "browser.control".to_string(),
+            ],
+            tool_catalog_ref: Some(TOOL_CATALOG_VERSION.to_string()),
+            transition_predicates: vec![
+                "proposal must match allowed proposals".to_string(),
+                "side effects require Kernel permission gates".to_string(),
+            ],
+            fail_closed_rules: vec![
+                "unknown proposal schema is rejected".to_string(),
+                "Session cannot advance Kernel state directly".to_string(),
+            ],
+        }
+    }
+
+    fn driver_request_for_contract(
+        &self,
+        contract: &KernelStateContract,
+        session_id: Option<SessionId>,
+        kind: DriverRequestKind,
+        reason: &str,
+    ) -> DriverRequest {
+        DriverRequest {
+            id: format!(
+                "driver-{}-{}",
+                contract.run_id.0,
+                driver_request_kind_name(&kind)
+            ),
+            run_id: contract.run_id.clone(),
+            session_id,
+            kind,
+            reason: reason.to_string(),
+            state_contract: contract.clone(),
+        }
+    }
+}
+
+fn driver_request_kind_name(kind: &DriverRequestKind) -> &'static str {
+    match kind {
+        DriverRequestKind::NeedRequirementDraft => "need-requirement-draft",
+        DriverRequestKind::NeedRequirementDecision => "need-requirement-decision",
+        DriverRequestKind::NeedResourcePacket => "need-resource-packet",
+        DriverRequestKind::NeedProposal => "need-proposal",
+        DriverRequestKind::NeedUserPlanDecision => "need-user-plan-decision",
+        DriverRequestKind::NeedUserPermissionDecision => "need-user-permission-decision",
+        DriverRequestKind::NeedRepairProposal => "need-repair-proposal",
+        DriverRequestKind::NeedReviewPacket => "need-review-packet",
+        DriverRequestKind::NeedUserReviewDecision => "need-user-review-decision",
+        DriverRequestKind::WaitKernelExecution => "wait-kernel-execution",
+        DriverRequestKind::Terminal => "terminal",
+    }
+}
+
+fn proposal_kind_name(kind: &ProposalEnvelopeKind) -> &'static str {
+    match kind {
+        ProposalEnvelopeKind::Answer => "answer",
+        ProposalEnvelopeKind::ResourceRequest => "resourceRequest",
+        ProposalEnvelopeKind::RequirementDraft => "requirementDraft",
+        ProposalEnvelopeKind::ActionBundle => "actionBundle",
+        ProposalEnvelopeKind::RepairProposal => "repairProposal",
+        ProposalEnvelopeKind::ReviewPacketDraft => "reviewPacketDraft",
+    }
+}
+
+const RESOURCE_PACKET_MAX_FILE_CHARS: usize = 12_000;
+const RESOURCE_PACKET_MAX_DIR_DEPTH: u32 = 2;
+
+fn resource_packet_from_manifest(
+    request_id: &RequestId,
+    manifest: &Value,
+    workspace_root: Option<&Path>,
+) -> Value {
+    let manifest_id = manifest
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("resource-manifest");
+    let entries = manifest
+        .get("entries")
+        .or_else(|| manifest.get("items"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let items = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            resolve_resource_manifest_entry(request_id, index, entry, workspace_root)
+        })
+        .collect::<Vec<_>>();
+    let evidence_refs = items
+        .iter()
+        .filter_map(|item| {
+            item.get("evidenceRef")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "id": format!("resource-packet-{}", request_id.0),
+        "requestId": request_id.0,
+        "manifestId": manifest_id,
+        "items": items,
+        "evidenceRefs": evidence_refs,
+        "summary": "Kernel ResourceResolve produced a ResourcePacket from explicit manifest entries."
+    })
+}
+
+fn resolve_resource_manifest_entry(
+    request_id: &RequestId,
+    index: usize,
+    entry: &Value,
+    workspace_root: Option<&Path>,
+) -> Value {
+    let manifest_entry_id = entry
+        .get("id")
+        .or_else(|| entry.get("manifestEntryId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("entry-{index}"));
+    let source_kind = entry
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("resource");
+    let request_item_id = format!("item-{index}");
+    let evidence_ref = format!("evidence-{}-{index}", request_id.0);
+    let Some(path) = resource_entry_path(entry, workspace_root) else {
+        return resource_packet_error_item(
+            &request_item_id,
+            &manifest_entry_id,
+            source_kind,
+            "outside_manifest_scope",
+            "manifest entry did not provide a resolvable explicit path",
+        );
+    };
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return resource_packet_error_item(
+                &request_item_id,
+                &manifest_entry_id,
+                source_kind,
+                "not_found",
+                &format!("stat {}: {error}", path.display()),
+            );
+        }
+    };
+    let actual_kind = if metadata.is_dir() {
+        "directory"
+    } else if metadata.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    if source_kind == "file" && !metadata.is_file() {
+        return resource_packet_error_item(
+            &request_item_id,
+            &manifest_entry_id,
+            source_kind,
+            "not_file",
+            &format!("{} is {actual_kind}, not file", path.display()),
+        );
+    }
+    if source_kind == "directory" && !metadata.is_dir() {
+        return resource_packet_error_item(
+            &request_item_id,
+            &manifest_entry_id,
+            source_kind,
+            "not_directory",
+            &format!("{} is {actual_kind}, not directory", path.display()),
+        );
+    }
+
+    if metadata.is_dir() {
+        let nodes =
+            list_nodes(&path, &path, RESOURCE_PACKET_MAX_DIR_DEPTH).unwrap_or_else(|error| {
+                vec![serde_json::json!({
+                    "type": "error",
+                    "message": error.to_string()
+                })]
+            });
+        return serde_json::json!({
+            "requestItemId": request_item_id,
+            "manifestEntryId": manifest_entry_id,
+            "status": "resolved",
+            "readPolicy": "explicit-manifest-readonly",
+            "sourceKind": source_kind,
+            "resolvedKind": "directory",
+            "path": resource_entry_display_path(entry, &path),
+            "absolutePath": path.to_string_lossy(),
+            "contentKind": "directoryTree",
+            "nodes": nodes,
+            "contentSummary": entry.get("summary").and_then(Value::as_str).unwrap_or("Directory tree resolved by Kernel ResourceResolve."),
+            "evidenceRef": evidence_ref,
+            "evidenceRefs": [evidence_ref]
+        });
+    }
+
+    if metadata.is_file() {
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                let clipped = clip_resource_text(&content, RESOURCE_PACKET_MAX_FILE_CHARS);
+                return serde_json::json!({
+                    "requestItemId": request_item_id,
+                    "manifestEntryId": manifest_entry_id,
+                    "status": "resolved",
+                    "readPolicy": "explicit-manifest-readonly",
+                    "sourceKind": source_kind,
+                    "resolvedKind": "file",
+                    "path": resource_entry_display_path(entry, &path),
+                    "absolutePath": path.to_string_lossy(),
+                    "contentKind": "fileText",
+                    "content": clipped,
+                    "sizeBytes": content.len(),
+                    "truncated": content.chars().count() > RESOURCE_PACKET_MAX_FILE_CHARS,
+                    "contentSummary": entry.get("summary").and_then(Value::as_str).unwrap_or("File text resolved by Kernel ResourceResolve."),
+                    "evidenceRef": evidence_ref,
+                    "evidenceRefs": [evidence_ref]
+                });
+            }
+            Err(error) => {
+                return resource_packet_error_item(
+                    &request_item_id,
+                    &manifest_entry_id,
+                    source_kind,
+                    "read_failed",
+                    &format!("read {}: {error}", path.display()),
+                );
+            }
+        }
+    }
+
+    resource_packet_error_item(
+        &request_item_id,
+        &manifest_entry_id,
+        source_kind,
+        "unsupported_resource_kind",
+        &format!("{} is not a file or directory", path.display()),
+    )
+}
+
+fn resource_entry_path(entry: &Value, workspace_root: Option<&Path>) -> Option<PathBuf> {
+    let raw = entry
+        .get("absolutePath")
+        .or_else(|| entry.get("resourceRef"))
+        .or_else(|| entry.get("resource_ref"))
+        .or_else(|| entry.get("path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Some(path.components().collect::<PathBuf>());
+    }
+    let root = workspace_root?;
+    WorkspaceBoundary::new(root).resolve(raw).ok()
+}
+
+fn resource_entry_display_path(entry: &Value, path: &Path) -> String {
+    entry
+        .get("path")
+        .or_else(|| entry.get("resourceRef"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+fn resource_packet_error_item(
+    request_item_id: &str,
+    manifest_entry_id: &str,
+    source_kind: &str,
+    reason: &str,
+    message: &str,
+) -> Value {
+    serde_json::json!({
+        "requestItemId": request_item_id,
+        "manifestEntryId": manifest_entry_id,
+        "status": "error",
+        "readPolicy": "explicit-manifest-readonly",
+        "sourceKind": source_kind,
+        "reason": reason,
+        "message": message,
+        "evidenceRefs": []
+    })
+}
+
+fn clip_resource_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let head_len = max_chars / 2;
+    let tail_len = max_chars.saturating_sub(head_len + 24);
+    let head = text.chars().take(head_len).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head}\n\n[... truncated ...]\n\n{tail}")
+}
+
 fn cleanup_workflow_resource(resource: &KernelResource) -> Value {
     if resource.cleanup_policy != KernelResourceCleanupPolicy::OnWorkflowEnd {
         return serde_json::json!({
@@ -641,6 +1320,19 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::HostStatus { .. } => "host.status",
         KernelEvent::SnapshotReady { .. } => "snapshot.ready",
         KernelEvent::RunStarted { .. } => "run.started",
+        KernelEvent::StateEntered { .. } => "state.entered",
+        KernelEvent::DriverRequestProduced { .. } => "driver.request_produced",
+        KernelEvent::ProposalAccepted { .. } => "proposal.accepted",
+        KernelEvent::ProposalRejected { .. } => "proposal.rejected",
+        KernelEvent::ResourcePacketProduced { .. } => "resource.packet_produced",
+        KernelEvent::ActionBatchAccepted { .. } => "action_batch.accepted",
+        KernelEvent::WorkUnitQueued { .. } => "work_unit.queued",
+        KernelEvent::WorkUnitStarted { .. } => "work_unit.started",
+        KernelEvent::WorkUnitCompleted { .. } => "work_unit.completed",
+        KernelEvent::WorkUnitFailed { .. } => "work_unit.failed",
+        KernelEvent::WorkUnitBlocked { .. } => "work_unit.blocked",
+        KernelEvent::ReviewFactsProduced { .. } => "review.facts_produced",
+        KernelEvent::ReviewGateEvaluated { .. } => "review_gate.evaluated",
         KernelEvent::RunCompleted { .. } => "run.completed",
         KernelEvent::StageChanged { .. } => "stage.changed",
         KernelEvent::MessageAppended { .. } => "message.appended",
@@ -683,6 +1375,19 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
 pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
     match event {
         KernelEvent::RunStarted { sequence, .. }
+        | KernelEvent::StateEntered { sequence, .. }
+        | KernelEvent::DriverRequestProduced { sequence, .. }
+        | KernelEvent::ProposalAccepted { sequence, .. }
+        | KernelEvent::ProposalRejected { sequence, .. }
+        | KernelEvent::ResourcePacketProduced { sequence, .. }
+        | KernelEvent::ActionBatchAccepted { sequence, .. }
+        | KernelEvent::WorkUnitQueued { sequence, .. }
+        | KernelEvent::WorkUnitStarted { sequence, .. }
+        | KernelEvent::WorkUnitCompleted { sequence, .. }
+        | KernelEvent::WorkUnitFailed { sequence, .. }
+        | KernelEvent::WorkUnitBlocked { sequence, .. }
+        | KernelEvent::ReviewFactsProduced { sequence, .. }
+        | KernelEvent::ReviewGateEvaluated { sequence, .. }
         | KernelEvent::RunCompleted { sequence, .. }
         | KernelEvent::StageChanged { sequence, .. }
         | KernelEvent::MessageAppended { sequence, .. }

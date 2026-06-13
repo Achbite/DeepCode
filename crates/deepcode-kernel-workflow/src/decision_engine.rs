@@ -326,6 +326,19 @@ fn event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::HostStatus { .. } => "host.status",
         KernelEvent::SnapshotReady { .. } => "snapshot.ready",
         KernelEvent::RunStarted { .. } => "run.started",
+        KernelEvent::StateEntered { .. } => "state.entered",
+        KernelEvent::DriverRequestProduced { .. } => "driver.request_produced",
+        KernelEvent::ProposalAccepted { .. } => "proposal.accepted",
+        KernelEvent::ProposalRejected { .. } => "proposal.rejected",
+        KernelEvent::ResourcePacketProduced { .. } => "resource.packet_produced",
+        KernelEvent::ActionBatchAccepted { .. } => "action_batch.accepted",
+        KernelEvent::WorkUnitQueued { .. } => "work_unit.queued",
+        KernelEvent::WorkUnitStarted { .. } => "work_unit.started",
+        KernelEvent::WorkUnitCompleted { .. } => "work_unit.completed",
+        KernelEvent::WorkUnitFailed { .. } => "work_unit.failed",
+        KernelEvent::WorkUnitBlocked { .. } => "work_unit.blocked",
+        KernelEvent::ReviewFactsProduced { .. } => "review.facts_produced",
+        KernelEvent::ReviewGateEvaluated { .. } => "review_gate.evaluated",
         KernelEvent::RunCompleted { .. } => "run.completed",
         KernelEvent::StageChanged { .. } => "stage.changed",
         KernelEvent::MessageAppended { .. } => "message.appended",
@@ -368,6 +381,19 @@ fn event_kind(event: &KernelEvent) -> &'static str {
 fn event_sequence(event: &KernelEvent) -> Option<u64> {
     match event {
         KernelEvent::RunStarted { sequence, .. }
+        | KernelEvent::StateEntered { sequence, .. }
+        | KernelEvent::DriverRequestProduced { sequence, .. }
+        | KernelEvent::ProposalAccepted { sequence, .. }
+        | KernelEvent::ProposalRejected { sequence, .. }
+        | KernelEvent::ResourcePacketProduced { sequence, .. }
+        | KernelEvent::ActionBatchAccepted { sequence, .. }
+        | KernelEvent::WorkUnitQueued { sequence, .. }
+        | KernelEvent::WorkUnitStarted { sequence, .. }
+        | KernelEvent::WorkUnitCompleted { sequence, .. }
+        | KernelEvent::WorkUnitFailed { sequence, .. }
+        | KernelEvent::WorkUnitBlocked { sequence, .. }
+        | KernelEvent::ReviewFactsProduced { sequence, .. }
+        | KernelEvent::ReviewGateEvaluated { sequence, .. }
         | KernelEvent::RunCompleted { sequence, .. }
         | KernelEvent::StageChanged { sequence, .. }
         | KernelEvent::MessageAppended { sequence, .. }

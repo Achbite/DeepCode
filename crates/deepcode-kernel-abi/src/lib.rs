@@ -2,6 +2,7 @@ mod audit;
 mod command;
 mod config;
 mod context;
+mod driver;
 mod error;
 mod event;
 mod ids;
@@ -24,6 +25,7 @@ pub use command::*;
 pub use config::*;
 #[allow(unused_imports)]
 pub use context::*;
+pub use driver::*;
 pub use error::*;
 pub use event::*;
 pub use ids::*;
