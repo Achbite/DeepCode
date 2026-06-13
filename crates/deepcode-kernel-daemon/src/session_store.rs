@@ -6,6 +6,8 @@ use crate::*;
 
 const ARCHIVE_DEBUG_STREAMS: &[&str] = &[
     "parser-results.jsonl",
+    "trace-events.jsonl",
+    "llm-exchanges.jsonl",
     "agent-plan-parts.jsonl",
     "action-bundle-drafts.jsonl",
     "draft-task-queues.jsonl",
@@ -796,6 +798,20 @@ fn ensure_debug_stream_files(archive_dir: &FsPath) -> std::io::Result<()> {
 
 fn debug_streams_for_entry(entry: &Value) -> Vec<&'static str> {
     let mut streams = Vec::new();
+    if archive_contains_key(entry, &["tracekind"]) {
+        push_unique_stream(&mut streams, "trace-events.jsonl");
+    }
+    if archive_contains_key(
+        entry,
+        &[
+            "llmcallid",
+            "requestenvelope",
+            "responseenvelope",
+            "parserrepairrequest",
+        ],
+    ) {
+        push_unique_stream(&mut streams, "llm-exchanges.jsonl");
+    }
     if archive_contains_key(entry, &["parserresult", "parsererror"]) {
         push_unique_stream(&mut streams, "parser-results.jsonl");
     }
@@ -1007,7 +1023,7 @@ fn safe_archive_relative_path(path: &str) -> Option<PathBuf> {
     Some(candidate)
 }
 
-fn session_metadata(sessions: &[Value], session_id: &str) -> Option<Value> {
+pub(crate) fn session_metadata(sessions: &[Value], session_id: &str) -> Option<Value> {
     sessions
         .iter()
         .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
@@ -1201,10 +1217,9 @@ fn conversation_chronological_markdown(session_id: &str, entries: &[Value]) -> S
             .unwrap_or_default();
         let entry = item.get("entry").unwrap_or(&Value::Null);
         let heading = if source == "projection" {
-            let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("event");
             format!(
                 "Projection / {} / {}",
-                archive_projection_title(kind),
+                archive_projection_entry_title(entry),
                 run_id
             )
         } else {
@@ -1226,6 +1241,25 @@ fn conversation_chronological_markdown(session_id: &str, entries: &[Value]) -> S
         lines.push(String::new());
     }
     lines.join("\n").trim_end().to_string()
+}
+
+fn archive_projection_entry_title(entry: &Value) -> &'static str {
+    let payload = entry.get("payload").unwrap_or(&Value::Null);
+    if payload.get("traceKind").and_then(Value::as_str).is_some()
+        || payload.get("visibility").and_then(Value::as_str) == Some("trace")
+    {
+        return "Trace";
+    }
+    let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("event");
+    if kind == "assistant_msg"
+        && matches!(
+            payload.get("channel").and_then(Value::as_str),
+            Some("reasoning" | "thinking" | "trace")
+        )
+    {
+        return "Thinking";
+    }
+    archive_projection_title(kind)
 }
 
 fn archive_projection_title(kind: &str) -> &'static str {
@@ -1400,6 +1434,31 @@ mod tests {
                 }
             }
         });
+        let reasoning = json!({
+            "kind": "assistant_msg",
+            "payload": {
+                "channel": "reasoning",
+                "content": "内部推理摘要",
+                "runId": "run/1"
+            }
+        });
+        let llm_trace = json!({
+            "kind": "llm.requested",
+            "payload": {
+                "traceKind": "llm.requested",
+                "visibility": "trace",
+                "runId": "run/1",
+                "llmCallId": "llm-run-1",
+                "requestEnvelope": {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "读取上下文"
+                        }
+                    ]
+                }
+            }
+        });
 
         append_conversation_archive_projection(&root, session_id, Some(&session), &[projection])
             .expect("projection archive append");
@@ -1407,7 +1466,7 @@ mod tests {
             &root,
             session_id,
             Some(&session),
-            &[provider_error],
+            &[provider_error, reasoning, llm_trace],
         )
         .expect("provider error projection archive append");
         append_conversation_archive_transcript(&root, session_id, Some(&session), &[transcript])
@@ -1435,6 +1494,14 @@ mod tests {
         assert!(archive_dir
             .join("debug")
             .join("llm-provider-errors.jsonl")
+            .exists());
+        assert!(archive_dir
+            .join("debug")
+            .join("trace-events.jsonl")
+            .exists());
+        assert!(archive_dir
+            .join("debug")
+            .join("llm-exchanges.jsonl")
             .exists());
         assert!(archive_dir.join("exports").join("complete.md").exists());
         assert!(archive_dir.join("exports").join("debug.json").exists());
@@ -1490,6 +1557,8 @@ mod tests {
         assert!(chronological.contains("完整请求"));
         assert!(chronological.contains("ProviderJsonDecodeFailed:"));
         assert!(chronological.contains("expected_schema = openai.chat.completion.v1"));
+        assert!(chronological.contains("Projection / Thinking / run/1"));
+        assert!(chronological.contains("Projection / Trace / run/1"));
 
         let _ = fs::remove_dir_all(root);
     }

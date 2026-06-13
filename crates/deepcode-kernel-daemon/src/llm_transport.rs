@@ -42,6 +42,8 @@ pub(crate) struct LlmChatOutput {
     pub(crate) tool_calls: Vec<LlmToolCall>,
 }
 
+const OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP: u32 = 16_384;
+
 pub(crate) fn resolve_kernel_llm_profile(
     state: &AppState,
     profile_ref: Option<&deepcode_kernel_abi::ProfileRef>,
@@ -190,12 +192,44 @@ pub(crate) async fn call_openai_compatible_profile(
         )
     })?;
     let url = normalize_openai_base_url(profile);
+    let body = openai_compatible_request_body(profile, messages, &tools);
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| {
+            provider_transport_error(
+                profile,
+                "openaiCompatible",
+                "request_failed",
+                error.to_string(),
+            )
+        })?;
+    let response = read_provider_json_response(
+        profile,
+        "openaiCompatible",
+        response,
+        "openai.chat.completion.v1: choices[0].message",
+        false,
+    )
+    .await?;
+    let choice = require_openai_message(profile, "openaiCompatible", &response)?;
+    Ok(parse_openai_message(choice))
+}
+
+fn openai_compatible_request_body(
+    profile: &ResolvedLlmProfile,
+    messages: Vec<Value>,
+    tools: &[LlmToolDefinition],
+) -> Value {
     let mut body = json!({
         "model": profile.model,
         "messages": messages,
         "stream": false
     });
-    if let Some(tokens) = profile.max_output_tokens {
+    if let Some(tokens) = effective_openai_compatible_max_tokens(profile) {
         body["max_tokens"] = json!(tokens);
     }
     if should_send_sampling(profile) {
@@ -225,30 +259,14 @@ pub(crate) async fn call_openai_compatible_profile(
             }))
             .collect::<Vec<_>>());
     }
-    let response = reqwest::Client::new()
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| {
-            provider_transport_error(
-                profile,
-                "openaiCompatible",
-                "request_failed",
-                error.to_string(),
-            )
-        })?;
-    let response = read_provider_json_response(
-        profile,
-        "openaiCompatible",
-        response,
-        "openai.chat.completion.v1: choices[0].message",
-        false,
-    )
-    .await?;
-    let choice = require_openai_message(profile, "openaiCompatible", &response)?;
-    Ok(parse_openai_message(choice))
+    body
+}
+
+pub(crate) fn effective_openai_compatible_max_tokens(profile: &ResolvedLlmProfile) -> Option<u32> {
+    profile
+        .max_output_tokens
+        .filter(|tokens| *tokens > 0)
+        .map(|tokens| tokens.min(OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP))
 }
 
 pub(crate) async fn call_anthropic_profile(
@@ -840,5 +858,36 @@ mod tests {
         assert!(archive_text.contains("ProviderJsonDecodeFailed:"));
         assert!(archive_text.contains("content_type = text/html"));
         assert!(archive_text.contains("expected_schema = openai.chat.completion.v1"));
+    }
+
+    #[test]
+    fn openai_request_body_clamps_excessive_max_tokens() {
+        let mut profile = test_profile();
+        profile.max_output_tokens = Some(384_000);
+
+        let body = openai_compatible_request_body(
+            &profile,
+            vec![json!({ "role": "user", "content": "hello" })],
+            &[],
+        );
+
+        assert_eq!(
+            body["max_tokens"].as_u64(),
+            Some(OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP as u64)
+        );
+    }
+
+    #[test]
+    fn openai_request_body_keeps_configured_max_tokens_under_cap() {
+        let mut profile = test_profile();
+        profile.max_output_tokens = Some(2048);
+
+        let body = openai_compatible_request_body(
+            &profile,
+            vec![json!({ "role": "user", "content": "hello" })],
+            &[],
+        );
+
+        assert_eq!(body["max_tokens"].as_u64(), Some(2048));
     }
 }

@@ -58,6 +58,8 @@ const SESSION_RESOURCE_CONTEXT_MAX_CHARS: usize = 28_000;
 const SESSION_RESOURCE_CONTEXT_MAX_ITEMS: usize = 12;
 const SESSION_RESOURCE_CONTEXT_MAX_OUTPUT_CHARS: usize = 8_000;
 const INTERNAL_READ_ONLY_MAX_ADVANCES: usize = 6;
+// Legacy compatibility path only. New DriverLoop work must keep provider-facing
+// prompt, repair, and AgentProtocolParser authority in userspace/session-core.
 const AGENT_PROTOCOL_SCHEMA_VERSION: &str = "deepcode.agent.protocol.v2";
 const READ_ONLY_DUPLICATE_RESOURCE_MESSAGE: &str = "当前只读探索计划只请求了本轮已经读取或搜索过的资源，Agent 已停止继续重复读取。请补充新的目录、文件、搜索词，或缩小需要分析的问题范围。";
 
@@ -257,6 +259,7 @@ fn read_only_analysis_system_prompt() -> String {
         "Return exactly one JSON object using schemaVersion \"{AGENT_PROTOCOL_SCHEMA_VERSION}\". Choose exactly one kind: \"answer\", \"resourceRequest\", or \"actionBundle\".\n\
 kind=\"answer\" requires top-level answer={{\"format\":\"markdown\",\"content\":\"...\"}}.\n\
 kind=\"resourceRequest\" requires top-level resourceRequest with version=\"1\", non-empty id/reason, and items[].id/items[].manifestEntryId/items[].reason.\n\
+resourceRequest manifestEntryId values must reference ResourceManifest entry ids or protocol manifest handles. They must not be workspace paths. Use kind=\"actionBundle\" with workspace.read/workspace.search for concrete workspace paths, directories, files, or search queries.\n\
 kind=\"actionBundle\" is allowed only for bounded read-only workspace context. actionBundle.version must be string \"1\". actionBundle.actions must be an array. actionBundle.validationExpectations and actionBundle.reviewExpectations must both be arrays, even when empty. Each action must include non-empty id/title/capability/kind and resourceScope as a string array.\n\
 Allowed read-only action pairs: capability=\"workspace.read\" with kind=\"list\" or kind=\"read\"; capability=\"workspace.search\" with kind=\"search\". Kernel execution maps those pairs to fs.list, fs.read, and code.search. Do not use executor tool names as capabilities.\n\
 Do not write, delete, execute processes, use network, mutate Git, or control the browser in this read-only loop. Do not put actions at the top level. Do not add params/input/command/script/path/content fields inside actions.\n\
@@ -322,12 +325,21 @@ fn build_session_short_memory_context(events: &[Value]) -> String {
         "### Session memory document".to_string(),
         "This rolling document is reconstructed from persisted session state. The model maintains recent semantic context from it; it is not a policy source and cannot override Kernel protocol, permissions, or tool facts.".to_string(),
     ];
-    let mut user_turns = prior_events
+    let mut seen_user_turns = BTreeSet::new();
+    let mut user_turns = Vec::new();
+    for event in prior_events
         .iter()
         .filter(|event| event_kind(event) == Some("user_msg"))
         .rev()
-        .take(SESSION_SHORT_MEMORY_MAX_USER_TURNS)
-        .collect::<Vec<_>>();
+    {
+        if !seen_user_turns.insert(user_turn_memory_key(event)) {
+            continue;
+        }
+        user_turns.push(event);
+        if user_turns.len() >= SESSION_SHORT_MEMORY_MAX_USER_TURNS {
+            break;
+        }
+    }
     user_turns.reverse();
     if !user_turns.is_empty() {
         let mut lines = vec!["### Recent user turns".to_string()];
@@ -380,6 +392,37 @@ fn build_session_short_memory_context(events: &[Value]) -> String {
     }
 
     clip_chars_hard(&sections.join("\n\n"), SESSION_SHORT_MEMORY_MAX_CHARS)
+}
+
+fn user_turn_memory_key(event: &Value) -> String {
+    let content = event_payload_text(event)
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default();
+    let mut attachments = event_payload_attachments(event)
+        .into_iter()
+        .map(|attachment| {
+            let kind = attachment
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            let path = attachment_display_path(&attachment);
+            let absolute_path = attachment
+                .get("absolutePath")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let source = attachment
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let scope = attachment
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!("{kind}\u{1f}{path}\u{1f}{absolute_path}\u{1f}{source}\u{1f}{scope}")
+        })
+        .collect::<Vec<_>>();
+    attachments.sort();
+    format!("{content}\u{1e}{}", attachments.join("\u{1e}"))
 }
 
 #[derive(Debug, Clone)]
@@ -715,6 +758,7 @@ struct ReadOnlyCoverage {
     listed_paths: BTreeSet<String>,
     read_paths: BTreeSet<String>,
     searched_queries: BTreeSet<String>,
+    failed_keys: BTreeSet<String>,
 }
 
 impl ReadOnlyCoverage {
@@ -722,25 +766,28 @@ impl ReadOnlyCoverage {
         self.listed_paths.is_empty()
             && self.read_paths.is_empty()
             && self.searched_queries.is_empty()
+            && self.failed_keys.is_empty()
     }
 
     fn contains_key(&self, key: &str) -> bool {
         let Some((tool, value)) = key.split_once(':') else {
             return false;
         };
-        match tool {
+        let covered = match tool {
             "fs.list" => self.listed_paths.contains(value),
             "fs.read" => self.read_paths.contains(value),
             "code.search" => self.searched_queries.contains(value),
             _ => false,
-        }
+        };
+        covered || self.failed_keys.contains(key)
     }
 
     fn as_json(&self) -> Value {
         json!({
             "fs.list": self.listed_paths.iter().cloned().collect::<Vec<_>>(),
             "fs.read": self.read_paths.iter().cloned().collect::<Vec<_>>(),
-            "code.search": self.searched_queries.iter().cloned().collect::<Vec<_>>()
+            "code.search": self.searched_queries.iter().cloned().collect::<Vec<_>>(),
+            "failed": self.failed_keys.iter().cloned().collect::<Vec<_>>()
         })
     }
 
@@ -770,6 +817,16 @@ impl ReadOnlyCoverage {
             lines.push(format!(
                 "- code.search: {}",
                 self.searched_queries
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.failed_keys.is_empty() {
+            lines.push(format!(
+                "- failed: {}",
+                self.failed_keys
                     .iter()
                     .cloned()
                     .collect::<Vec<_>>()
@@ -826,10 +883,16 @@ fn collect_read_only_coverage_from_events(
         else {
             continue;
         };
-        if !ok || !read_only_context_tool(tool_name) {
+        if !read_only_context_tool(tool_name) {
             continue;
         }
         let args = requested_args.get(tool_call_id);
+        if !ok {
+            if let Some(key) = read_only_tool_coverage_key(tool_name, output.as_ref(), args) {
+                coverage.failed_keys.insert(key);
+            }
+            continue;
+        }
         match tool_name.as_str() {
             "fs.list" => {
                 if let Some(path) = output
@@ -880,6 +943,36 @@ fn collect_read_only_coverage_from_events(
         }
     }
     coverage
+}
+
+fn read_only_tool_coverage_key(
+    tool_name: &str,
+    output: Option<&Value>,
+    args: Option<&Value>,
+) -> Option<String> {
+    match tool_name {
+        "fs.list" | "fs.read" => output
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                args.and_then(|value| value.get("path"))
+                    .and_then(Value::as_str)
+            })
+            .map(normalize_coverage_value)
+            .filter(|value| !value.is_empty())
+            .map(|path| format!("{tool_name}:{path}")),
+        "code.search" => output
+            .and_then(|value| value.get("query"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                args.and_then(|value| value.get("query"))
+                    .and_then(Value::as_str)
+            })
+            .map(normalize_search_scope)
+            .filter(|value| !value.is_empty())
+            .map(|query| format!("code.search:{query}")),
+        _ => None,
+    }
 }
 
 fn normalize_coverage_value(value: &str) -> String {
@@ -1136,49 +1229,11 @@ pub(crate) async fn start_kernel_agent_run(
     session_id: &str,
     request: AgentRunRequest,
 ) -> Result<(), String> {
-    let prefers_chinese = user_prompt_prefers_chinese(&request.content);
-    let needs_workspace = request_mentions_local_workspace(&request.content);
-    if needs_workspace {
-        if let Err(error) =
-            ensure_workspace_binding(&state.runtime, request.workspace_binding.as_ref())
-        {
-            let message = if prefers_chinese {
-                format!(
-                    "当前没有可用工作区绑定：{}。请先打开一个文件夹或 .code-workspace 文件，再让 Agent 读取、搜索或修改文件。",
-                    error.message
-                )
-            } else {
-                format!(
-                    "No workspace binding is available: {}. Open a folder or .code-workspace file before asking the Agent to read, search, or modify files.",
-                    error.message
-                )
-            };
-            append_session_projection(
-                state,
-                session_id,
-                vec![assistant_final_event(session_id, &message)],
-            );
-            return Ok(());
-        }
-    } else if let Some(binding) = request.workspace_binding.as_ref() {
+    if let Some(binding) = request.workspace_binding.as_ref() {
         let _ = ensure_workspace_binding(&state.runtime, Some(binding));
     }
 
-    let Some(binding) =
-        effective_workspace_binding(&state.runtime, request.workspace_binding.clone())
-    else {
-        let message = if prefers_chinese {
-            "当前没有可用工作区绑定。请先打开一个文件夹或 .code-workspace 文件，再让 Agent 读取、搜索或修改文件。"
-        } else {
-            "No workspace binding is available. Open a folder or .code-workspace file before asking the Agent to read, search, or modify files."
-        };
-        append_session_projection(
-            state,
-            session_id,
-            vec![assistant_final_event(session_id, message)],
-        );
-        return Ok(());
-    };
+    let binding = effective_workspace_binding(&state.runtime, request.workspace_binding.clone());
     let workspace_snapshot = current_workspace_json(&state.runtime).ok();
     let run_input_text =
         user_input_with_explicit_attachment_context(&request, workspace_snapshot.as_ref());
@@ -1193,7 +1248,7 @@ pub(crate) async fn start_kernel_agent_run(
                     text: run_input_text,
                     attachments: request.attachments.clone(),
                 },
-                workspace_binding: Some(binding),
+                workspace_binding: binding,
                 profile_ref: request.profile_id.as_ref().map(|id| {
                     deepcode_kernel_abi::ProfileRef {
                         id: id.clone(),
@@ -1220,6 +1275,8 @@ pub(crate) async fn drive_kernel_agent_loop(
     session_id: &str,
     mut kernel_events: Vec<KernelEvent>,
 ) -> Result<(), String> {
+    // Legacy agent brain retained until the Session DriverLoop v3 path can run
+    // end-to-end. Do not add new prompt/parser/plan authority here.
     let mut seen_resource_requests = BTreeSet::new();
     let mut internal_read_only_runs = BTreeSet::new();
     let mut seen_internal_read_only_plan_keys = BTreeSet::new();
@@ -1316,6 +1373,7 @@ pub(crate) async fn drive_kernel_agent_loop(
                     "llmCallId": llm_call_id,
                     "profileId": profile.id,
                     "model": profile.model,
+                    "effectiveMaxOutputTokens": effective_profile_max_output_tokens_for_trace(&profile),
                     "toolCount": request_envelope
                         .get("tools")
                         .and_then(Value::as_array)
@@ -1512,7 +1570,13 @@ pub(crate) async fn drive_kernel_agent_loop(
                                     event_session_id: event_session_id.clone(),
                                 },
                             );
-                            let approved_tools = approved_tool_calls_for_pending_plan(&plan);
+                            let attachments =
+                                latest_user_attachments_for_session(state, session_id);
+                            let approved_tools =
+                                approved_tool_calls_for_pending_plan_with_attachments(
+                                    &plan,
+                                    &attachments,
+                                );
                             if approved_tools.is_empty() {
                                 append_session_projection(
                                     state,
@@ -1696,7 +1760,13 @@ pub(crate) async fn drive_kernel_agent_loop(
                                     event_session_id: event_session_id.clone(),
                                 },
                             );
-                            let approved_tools = approved_tool_calls_for_pending_plan(&plan);
+                            let attachments =
+                                latest_user_attachments_for_session(state, session_id);
+                            let approved_tools =
+                                approved_tool_calls_for_pending_plan_with_attachments(
+                                    &plan,
+                                    &attachments,
+                                );
                             if approved_tools.is_empty() {
                                 append_session_projection(
                                     state,
@@ -1813,6 +1883,7 @@ async fn continue_read_only_analysis_loop(
             "llmCallId": llm_call_id,
             "profileId": seed.profile.id,
             "model": seed.profile.model,
+            "effectiveMaxOutputTokens": effective_profile_max_output_tokens_for_trace(&seed.profile),
             "toolCount": request_envelope
                 .get("tools")
                 .and_then(Value::as_array)
@@ -2019,7 +2090,9 @@ async fn handle_read_only_analysis_response(
                         event_session_id: event_session_id.clone(),
                     },
                 );
-                let approved_tools = approved_tool_calls_for_pending_plan(&plan);
+                let attachments = latest_user_attachments_for_session(state, session_id);
+                let approved_tools =
+                    approved_tool_calls_for_pending_plan_with_attachments(&plan, &attachments);
                 if approved_tools.is_empty() {
                     append_session_projection(
                         state,
@@ -2137,20 +2210,56 @@ pub(crate) async fn agent_tool_execute(
 }
 
 pub(crate) fn append_trace_event(state: &AppState, session_id: &str, kind: &str, payload: Value) {
-    let mut gui = state.gui.lock().expect("gui state lock");
-    gui.trace_events
-        .entry(session_id.to_string())
-        .or_default()
-        .push(json!({
-            "id": format!("trace-{}", now_millis()),
-            "sessionId": session_id,
-            "ts": now_text(),
-            "kind": kind,
-            "source": "runtime",
-            "level": if kind == "error" { "error" } else { "info" },
-            "summary": payload.get("summary").and_then(Value::as_str).unwrap_or(kind),
-            "payload": payload
-        }));
+    let mut trace_payload = match payload {
+        Value::Object(_) => payload,
+        value => json!({ "details": value }),
+    };
+    if let Some(object) = trace_payload.as_object_mut() {
+        object
+            .entry("traceKind".to_string())
+            .or_insert_with(|| json!(kind));
+        object
+            .entry("channel".to_string())
+            .or_insert_with(|| json!("trace"));
+        object
+            .entry("visibility".to_string())
+            .or_insert_with(|| json!("trace"));
+        object
+            .entry("presentation".to_string())
+            .or_insert_with(|| json!("debug"));
+    }
+    let event = json!({
+        "id": format!("trace-{}", now_millis()),
+        "sessionId": session_id,
+        "ts": now_text(),
+        "kind": kind,
+        "source": "runtime",
+        "level": if kind == "error" { "error" } else { "info" },
+        "summary": trace_payload
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or(kind),
+        "payload": trace_payload
+    });
+    let (archive_root, session) = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        gui.trace_events
+            .entry(session_id.to_string())
+            .or_default()
+            .push(event.clone());
+        (
+            gui.paths.conversation_archives_dir.clone(),
+            session_metadata(&gui.sessions, session_id),
+        )
+    };
+    if let Err(error) = append_conversation_archive_projection(
+        &archive_root,
+        session_id,
+        session.as_ref(),
+        &[event],
+    ) {
+        eprintln!("failed to append trace conversation archive: {error}");
+    }
 }
 
 async fn parse_or_repair_agent_plan_response(
@@ -2187,6 +2296,7 @@ async fn parse_or_repair_agent_plan_response(
                     "runId": run_id,
                     "profileId": profile.id,
                     "model": profile.model,
+                    "effectiveMaxOutputTokens": effective_profile_max_output_tokens_for_trace(profile),
                     "reason": first_error
                 }),
             );
@@ -2250,7 +2360,7 @@ fn build_plan_repair_request(
         "messages": [
             {
                 "role": "system",
-                "content": "You are DeepCode plan protocol repair. Return only one valid JSON object using schemaVersion \"deepcode.agent.protocol.v2\". Keep strict fail-closed semantics: do not invent execution facts, do not add direct params/input/command/script/path/content fields inside actionBundle.actions or continuationExpectations, and do not combine resourceRequest with actionBundle. resourceRequest must be under the top-level key \"resourceRequest\"; never use a top-level \"request\" key. actionBundle.version must be string \"1\"; actionBundle.actions must be an array; actionBundle.validationExpectations and actionBundle.reviewExpectations must both be arrays, even when empty; action.resourceScope must be a string array. If the invalid output has top-level actions, move them under actionBundle.actions and populate the required actionBundle wrapper fields. Use capability namespace in actionBundle: workspace.read, workspace.search, workspace.write, workspace.delete, process.exec, network.egress, git.read, git.write, browser.control. Executor tool names such as fs.write/fs.delete/code.search/web.search/git.status/browser.open are only for complete-stage tool calls. File content drafts must be emitted as top-level codeBlocks, and write actions must reference sourceBlockId. If the user requested write then review then delete, current actions include only the write/review batch and the post-review delete intent goes in actionBundle.continuationExpectations."
+                "content": "You are DeepCode plan protocol repair. Return only one valid JSON object using schemaVersion \"deepcode.agent.protocol.v2\". Keep strict fail-closed semantics: do not invent execution facts, do not add direct params/input/command/script/path/content fields inside actionBundle.actions or continuationExpectations, and do not combine resourceRequest with actionBundle. resourceRequest must be under the top-level key \"resourceRequest\"; never use a top-level \"request\" key. resourceRequest manifestEntryId values must reference ResourceManifest entry ids or protocol manifest handles, not workspace paths; convert concrete workspace path, directory, file, or search needs into an actionBundle with workspace.read/workspace.search. actionBundle.version must be string \"1\"; actionBundle.actions must be an array; actionBundle.validationExpectations and actionBundle.reviewExpectations must both be arrays, even when empty; action.resourceScope must be a string array. If the invalid output has top-level actions, move them under actionBundle.actions and populate the required actionBundle wrapper fields. Use capability namespace in actionBundle: workspace.read, workspace.search, workspace.write, workspace.delete, process.exec, network.egress, git.read, git.write, browser.control. Executor tool names such as fs.write/fs.delete/code.search/web.search/git.status/browser.open are only for complete-stage tool calls. File content drafts must be emitted as top-level codeBlocks, and write actions must reference sourceBlockId. If the user requested write then review then delete, current actions include only the write/review batch and the post-review delete intent goes in actionBundle.continuationExpectations."
             },
             {
                 "role": "user",
@@ -2583,7 +2693,34 @@ fn validate_resource_request_item_json(value: &Value, index: usize) -> Result<()
             ));
         }
     }
+    let manifest_entry_id = object
+        .get("manifestEntryId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    validate_manifest_entry_id(
+        manifest_entry_id,
+        &format!("RESOURCE_REQUEST.items[{index}].manifestEntryId"),
+    )?;
     Ok(())
+}
+
+fn validate_manifest_entry_id(value: &str, label: &str) -> Result<(), String> {
+    let value = value.trim();
+    let is_path_like = value == "."
+        || value == ".."
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('/')
+        || value.starts_with('~')
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains("://");
+    if !is_path_like {
+        return Ok(());
+    }
+    Err(format!(
+        "{label} must reference a ResourceManifest entry id, not a workspace path; use an actionBundle with workspace.read or workspace.search for concrete workspace resources"
+    ))
 }
 
 fn validate_action_bundle_json(
@@ -3223,15 +3360,6 @@ pub(crate) fn ensure_kernel_run_for_session(
     Ok(())
 }
 
-pub(crate) fn request_mentions_local_workspace(content: &str) -> bool {
-    content.contains("文件")
-        || content.contains("工作区")
-        || content.contains("搜索")
-        || content.contains("读取")
-        || content.contains("修改")
-        || content.to_lowercase().contains("workspace")
-}
-
 pub(crate) fn effective_workspace_binding(
     runtime: &SharedRuntime,
     explicit: Option<WorkspaceBinding>,
@@ -3384,10 +3512,12 @@ pub(crate) fn should_send_sampling(profile: &ResolvedLlmProfile) -> bool {
     !(is_deepseek_profile(profile) && profile.thinking.as_deref() == Some("enabled"))
 }
 
-fn user_prompt_prefers_chinese(user_prompt: &str) -> bool {
-    user_prompt
-        .chars()
-        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
+fn effective_profile_max_output_tokens_for_trace(profile: &ResolvedLlmProfile) -> Option<u32> {
+    match profile.kind.as_str() {
+        "openaiCompatible" | "codex" => effective_openai_compatible_max_tokens(profile),
+        "anthropic" => Some(profile.max_output_tokens.unwrap_or(4096)),
+        _ => profile.max_output_tokens,
+    }
 }
 
 #[cfg(test)]
@@ -3598,6 +3728,72 @@ mod tests {
             }
             other => panic!("expected resource request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_accepts_protocol_manifest_resource_request() {
+        let parsed = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "resourceRequest",
+                "outputLanguage": "en-US",
+                "resourceRequest": {
+                    "version": "1",
+                    "id": "rr-current",
+                    "reason": "need current manifest entry",
+                    "items": [
+                        {
+                            "id": "target",
+                            "manifestEntryId": "current-selection",
+                            "reason": "resolve the active manifest entry"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        match parsed {
+            AgentPlanResponse::ResourceRequest(request) => {
+                assert_eq!(
+                    request.request["items"][0]["manifestEntryId"],
+                    "current-selection"
+                );
+            }
+            other => panic!("expected resource request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_rejects_path_like_resource_request_manifest_entry_id() {
+        let error = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v2",
+                "kind": "resourceRequest",
+                "outputLanguage": "en-US",
+                "resourceRequest": {
+                    "version": "1",
+                    "id": "rr-path",
+                    "reason": "need concrete workspace resource",
+                    "items": [
+                        {
+                            "id": "target",
+                            "manifestEntryId": "scope/resource.ext",
+                            "reason": "read the concrete resource"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("workspace path"));
+        assert!(error.contains("actionBundle"));
+        assert!(error.contains("workspace.read"));
     }
 
     #[test]
@@ -4178,6 +4374,9 @@ mod tests {
         assert!(
             content.contains("Canonical minimal JSON Envelope v2 read-only actionBundle example")
         );
+        assert!(content.contains("manifestEntryId"));
+        assert!(content.contains("workspace.read"));
+        assert!(content.contains("workspace.search"));
         assert!(content.contains("\"validationExpectations\":[]"));
         assert!(content.contains("\"reviewExpectations\":[]"));
     }
@@ -4242,7 +4441,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_read_kind_selects_read_tool_even_for_root_scope() {
+    fn workspace_read_kind_selects_list_tool_for_root_scope() {
         let plan = test_plan_with_actions(serde_json::json!([
             {
                 "id": "read-root",
@@ -4254,8 +4453,67 @@ mod tests {
         ]));
         let calls = approved_tool_calls_for_pending_plan(&plan);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1, "fs.read");
+        assert_eq!(calls[0].1, "fs.list");
         assert_eq!(calls[0].2["path"], ".");
+    }
+
+    #[test]
+    fn workspace_read_kind_anchors_relative_scope_to_directory_attachment() {
+        let root = std::env::temp_dir().join(format!(
+            "deepcode-daemon-attachment-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("note.txt"), "content").unwrap();
+
+        let attachment = serde_json::json!({
+            "id": "attachment-dir",
+            "kind": "directory",
+            "path": "attached",
+            "absolutePath": root.to_string_lossy(),
+            "source": "userSelected",
+            "scope": "message"
+        });
+        let read_file_plan = test_plan_with_actions(serde_json::json!([
+            {
+                "id": "read-note",
+                "title": "Read note",
+                "capability": "workspace.read",
+                "kind": "read",
+                "resourceScope": ["note.txt"]
+            }
+        ]));
+        let calls = approved_tool_calls_for_pending_plan_with_attachments(
+            &read_file_plan,
+            &[attachment.clone()],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "fs.read");
+        assert_eq!(calls[0].2["path"], "note.txt");
+        assert_eq!(calls[0].2["attachmentManifestEntryId"], "attachment-dir");
+        let canonical_root = root.canonicalize().unwrap();
+        assert_eq!(
+            calls[0].2["attachmentRoot"].as_str(),
+            Some(canonical_root.to_string_lossy().as_ref())
+        );
+
+        let read_dir_plan = test_plan_with_actions(serde_json::json!([
+            {
+                "id": "read-nested",
+                "title": "Read nested",
+                "capability": "workspace.read",
+                "kind": "read",
+                "resourceScope": ["nested"]
+            }
+        ]));
+        let calls =
+            approved_tool_calls_for_pending_plan_with_attachments(&read_dir_plan, &[attachment]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "fs.list");
+        assert_eq!(calls[0].2["path"], "nested");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn test_plan_with_review_capabilities(
@@ -4427,6 +4685,38 @@ mod tests {
         assert!(memory.contains("Recent explicit attachments"));
         assert!(memory.contains(&format!("directory {resource_group}")));
         assert!(!memory.contains("继续看一下里面的源代码"));
+    }
+
+    #[test]
+    fn session_short_memory_deduplicates_repeated_user_turns_with_same_attachments() {
+        let resource_group = format!("{}-group", neutral_resource());
+        let repeated_turn = serde_json::json!({
+            "kind": "user_msg",
+            "payload": {
+                "content": "分析附加资源",
+                "attachments": [
+                    {
+                        "kind": "directory",
+                        "path": resource_group.clone(),
+                        "source": "userSelected",
+                        "scope": "message"
+                    }
+                ]
+            }
+        });
+        let events = vec![
+            repeated_turn.clone(),
+            repeated_turn,
+            serde_json::json!({
+                "kind": "user_msg",
+                "payload": { "content": "继续", "attachments": [] }
+            }),
+        ];
+
+        let memory = build_session_short_memory_context(&events);
+        assert_eq!(memory.matches("分析附加资源").count(), 1);
+        assert!(memory.contains(&resource_group));
+        assert!(!memory.contains("继续"));
     }
 
     #[test]

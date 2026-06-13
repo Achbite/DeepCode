@@ -3,6 +3,7 @@
 
 use crate::prelude::*;
 use crate::*;
+use std::path::{Path as StdPath, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -514,19 +515,24 @@ pub(crate) async fn agent_plan_resolve(
         let mut events = Vec::new();
         let mut grant_failed = false;
         if decision == "accept" {
-            let (grants, approved_tools, pending_review) = {
+            let pending_plan = {
                 let gui = state.gui.lock().expect("gui state lock");
-                gui.pending_plans.get(&plan_id).map_or_else(
-                    || (Vec::new(), Vec::new(), None),
-                    |plan| {
-                        (
-                            temporary_grants_for_pending_plan(plan),
-                            approved_tool_calls_for_pending_plan(plan),
-                            pending_review_for_plan(plan),
-                        )
-                    },
-                )
+                gui.pending_plans.get(&plan_id).cloned()
             };
+            let attachments = pending_plan
+                .as_ref()
+                .map(|plan| latest_user_attachments_for_session(&state, &plan.session_id))
+                .unwrap_or_default();
+            let (grants, approved_tools, pending_review) = pending_plan.as_ref().map_or_else(
+                || (Vec::new(), Vec::new(), None),
+                |plan| {
+                    (
+                        temporary_grants_for_pending_plan(plan),
+                        approved_tool_calls_for_pending_plan_with_attachments(plan, &attachments),
+                        pending_review_for_plan(plan),
+                    )
+                },
+            );
             if let Some(review) = pending_review {
                 state
                     .gui
@@ -634,6 +640,32 @@ pub(crate) async fn agent_plan_resolve(
     }
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)
+}
+
+pub(crate) fn latest_user_attachments_for_session(
+    state: &AppState,
+    session_id: &str,
+) -> Vec<Value> {
+    session_projection(state, session_id)
+        .into_iter()
+        .rev()
+        .find_map(|event| {
+            if event.get("kind").and_then(Value::as_str) != Some("user_msg") {
+                return None;
+            }
+            let attachments = event
+                .get("payload")
+                .and_then(|payload| payload.get("attachments"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if attachments.is_empty() {
+                None
+            } else {
+                Some(attachments)
+            }
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) async fn agent_review_resolve(
@@ -804,6 +836,13 @@ fn continuation_plan_from_review(review: &PendingAgentReview) -> PendingAgentPla
 pub(crate) fn approved_tool_calls_for_pending_plan(
     plan: &PendingAgentPlan,
 ) -> Vec<(String, String, Value)> {
+    approved_tool_calls_for_pending_plan_with_attachments(plan, &[])
+}
+
+pub(crate) fn approved_tool_calls_for_pending_plan_with_attachments(
+    plan: &PendingAgentPlan,
+    attachments: &[Value],
+) -> Vec<(String, String, Value)> {
     let code_blocks = plan
         .code_blocks
         .iter()
@@ -820,7 +859,7 @@ pub(crate) fn approved_tool_calls_for_pending_plan(
         .unwrap_or_default();
     actions
         .iter()
-        .filter_map(|action| approved_tool_call_for_action(plan, action, &code_blocks))
+        .filter_map(|action| approved_tool_call_for_action(plan, action, &code_blocks, attachments))
         .collect()
 }
 
@@ -828,6 +867,7 @@ fn approved_tool_call_for_action(
     plan: &PendingAgentPlan,
     action: &Value,
     code_blocks: &std::collections::BTreeMap<String, Value>,
+    attachments: &[Value],
 ) -> Option<(String, String, Value)> {
     let action_id = action.get("id")?.as_str()?.trim();
     let capability = action.get("capability")?.as_str()?.trim();
@@ -872,13 +912,12 @@ fn approved_tool_call_for_action(
         "workspace.read" if kind == "list" => Some((
             tool_call_id,
             "fs.list".to_string(),
-            json!({ "path": resource_scope }),
+            read_only_tool_arguments(resource_scope, attachments),
         )),
-        "workspace.read" if kind == "read" => Some((
-            tool_call_id,
-            "fs.read".to_string(),
-            json!({ "path": resource_scope }),
-        )),
+        "workspace.read" if kind == "read" => {
+            let (tool_name, arguments) = read_tool_for_scope(resource_scope, attachments);
+            Some((tool_call_id, tool_name, arguments))
+        }
         "workspace.search" if kind == "search" => Some((
             tool_call_id,
             "code.search".to_string(),
@@ -886,6 +925,199 @@ fn approved_tool_call_for_action(
         )),
         _ => None,
     }
+}
+
+fn read_tool_for_scope(scope: &str, attachments: &[Value]) -> (String, Value) {
+    if let Some(resolved) = resolve_scope_against_attachments(scope, attachments) {
+        let tool = if resolved.target_is_dir {
+            "fs.list"
+        } else {
+            "fs.read"
+        };
+        return (tool.to_string(), resolved.arguments);
+    }
+    if scope.trim() == "." || scope.trim().ends_with('/') {
+        return ("fs.list".to_string(), json!({ "path": scope }));
+    }
+    ("fs.read".to_string(), json!({ "path": scope }))
+}
+
+fn read_only_tool_arguments(scope: &str, attachments: &[Value]) -> Value {
+    resolve_scope_against_attachments(scope, attachments)
+        .map(|resolved| resolved.arguments)
+        .unwrap_or_else(|| json!({ "path": scope }))
+}
+
+struct ResolvedAttachmentScope {
+    arguments: Value,
+    target_is_dir: bool,
+}
+
+fn resolve_scope_against_attachments(
+    scope: &str,
+    attachments: &[Value],
+) -> Option<ResolvedAttachmentScope> {
+    let scope = scope.trim();
+    if scope.is_empty() {
+        return None;
+    }
+    attachments
+        .iter()
+        .find_map(|attachment| resolve_scope_against_attachment(scope, attachment))
+}
+
+fn resolve_scope_against_attachment(
+    scope: &str,
+    attachment: &Value,
+) -> Option<ResolvedAttachmentScope> {
+    let source = attachment
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(source, "userSelected" | "contextMenu" | "mention") {
+        return None;
+    }
+    let kind = attachment
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("file");
+    let absolute_path = attachment
+        .get("absolutePath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let attachment_path = PathBuf::from(absolute_path).canonicalize().ok()?;
+    if kind == "directory" {
+        resolve_scope_against_directory_attachment(scope, attachment, &attachment_path)
+    } else {
+        resolve_scope_against_file_attachment(scope, attachment, &attachment_path)
+    }
+}
+
+fn resolve_scope_against_directory_attachment(
+    scope: &str,
+    attachment: &Value,
+    root: &StdPath,
+) -> Option<ResolvedAttachmentScope> {
+    let relative = attachment_relative_scope(scope, attachment, root)?;
+    let target = root.join(&relative);
+    if !target.exists() {
+        return None;
+    }
+    let target_is_dir = target.is_dir();
+    Some(ResolvedAttachmentScope {
+        arguments: json!({
+            "path": path_for_tool_argument(&relative),
+            "attachmentRoot": root.to_string_lossy(),
+            "attachmentManifestEntryId": attachment_manifest_entry_id(attachment)
+        }),
+        target_is_dir,
+    })
+}
+
+fn resolve_scope_against_file_attachment(
+    scope: &str,
+    attachment: &Value,
+    file_path: &StdPath,
+) -> Option<ResolvedAttachmentScope> {
+    if !file_path.is_file() {
+        return None;
+    }
+    let file_name = file_path.file_name()?.to_string_lossy().to_string();
+    let display_path = attachment
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let scope_path = StdPath::new(scope);
+    let matches_scope = scope == display_path
+        || scope == file_name
+        || scope_path
+            .file_name()
+            .map(|value| value.to_string_lossy() == file_name)
+            .unwrap_or(false)
+        || scope_path
+            .canonicalize()
+            .ok()
+            .map(|value| value == file_path)
+            .unwrap_or(false);
+    if !matches_scope {
+        return None;
+    }
+    let root = file_path.parent()?;
+    Some(ResolvedAttachmentScope {
+        arguments: json!({
+            "path": file_name,
+            "attachmentRoot": root.to_string_lossy(),
+            "attachmentManifestEntryId": attachment_manifest_entry_id(attachment)
+        }),
+        target_is_dir: false,
+    })
+}
+
+fn attachment_relative_scope(scope: &str, attachment: &Value, root: &StdPath) -> Option<PathBuf> {
+    if scope == "." {
+        return Some(PathBuf::from("."));
+    }
+    let scope_path = StdPath::new(scope);
+    if scope_path.is_absolute() {
+        let absolute = scope_path.canonicalize().ok()?;
+        return absolute.strip_prefix(root).ok().map(PathBuf::from);
+    }
+    let display_path = attachment
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('/');
+    let normalized_scope = scope.replace('\\', "/");
+    let normalized_scope = normalized_scope.trim_matches('/');
+    if !display_path.is_empty() && normalized_scope == display_path {
+        return Some(PathBuf::from("."));
+    }
+    if !display_path.is_empty() {
+        if let Some(stripped) = normalized_scope.strip_prefix(&format!("{display_path}/")) {
+            return safe_relative_path(stripped);
+        }
+    }
+    safe_relative_path(normalized_scope)
+}
+
+fn safe_relative_path(value: &str) -> Option<PathBuf> {
+    let path = StdPath::new(value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    Some(if value.is_empty() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from(value)
+    })
+}
+
+fn path_for_tool_argument(path: &StdPath) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if value.is_empty() {
+        ".".to_string()
+    } else {
+        value
+    }
+}
+
+fn attachment_manifest_entry_id(attachment: &Value) -> String {
+    attachment
+        .get("id")
+        .or_else(|| attachment.get("manifestEntryId"))
+        .and_then(Value::as_str)
+        .or_else(|| attachment.get("path").and_then(Value::as_str))
+        .unwrap_or("explicit-attachment")
+        .to_string()
 }
 
 fn search_query_from_scope(scope: &str) -> String {

@@ -221,6 +221,75 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             }),
             &now_text(),
         )],
+        KernelEvent::StateEntered { state_contract, .. } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "state_contract",
+                "phase": state_contract.state_id,
+                "status": "contract_ready",
+                "summary": format!("Kernel state contract ready for {}.", state_contract.state_id),
+                "channel": "task",
+                "visibility": "task",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::DriverRequestProduced { driver_request, .. } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "driver_request",
+                "phase": driver_request.kind,
+                "status": "requested",
+                "summary": driver_request.reason,
+                "channel": "task",
+                "visibility": "task",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::ProposalAccepted { proposal, .. } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "proposal",
+                "phase": proposal.kind,
+                "status": "accepted",
+                "summary": format!("Proposal {} accepted.", proposal.proposal_id),
+                "channel": "task",
+                "visibility": "task",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::ProposalRejected { reason, .. } => vec![agent_event(
+            session_id,
+            "error",
+            json!({
+                "message": reason,
+                "summary": reason,
+                "code": "proposal_rejected",
+                "channel": "error",
+                "visibility": "conversation",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::ResourcePacketProduced { packet, .. } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "resource_resolve",
+                "phase": "resource",
+                "status": "packet_produced",
+                "summary": packet.get("summary").and_then(Value::as_str).unwrap_or("ResourcePacket produced."),
+                "channel": "task",
+                "visibility": "task",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
         KernelEvent::StageChanged {
             phase,
             status,
