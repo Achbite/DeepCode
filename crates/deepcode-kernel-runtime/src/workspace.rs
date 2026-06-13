@@ -7,6 +7,7 @@ impl DeepCodeKernelRuntime {
         path: String,
     ) -> KernelResult<Vec<KernelEvent>> {
         let resolved = resolve_workspace_root(&path).map_err(KernelError::InvalidCommand)?;
+        preflight_workspace_root_readable(&resolved.root)?;
         self.state.next_workspace_index += 1;
         let id = format!("ws-{}", self.state.next_workspace_index);
         let name = resolved
@@ -502,6 +503,15 @@ pub(crate) fn deny_protected_deepcode_mutation(path: &str) -> KernelResult<()> {
         ));
     }
     Ok(())
+}
+
+fn preflight_workspace_root_readable(root: &Path) -> KernelResult<()> {
+    list_nodes(root, root, 1).map(|_| ()).map_err(|error| {
+        KernelError::WorkspaceRootUnreadable(format!(
+            "{} cannot be listed for read-only workspace access: {error}",
+            root.display()
+        ))
+    })
 }
 
 pub(crate) fn list_nodes(path: &Path, root: &Path, depth: u32) -> KernelResult<Vec<Value>> {

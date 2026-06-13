@@ -355,7 +355,8 @@ pub(crate) async fn agent_session_send_message(
                 &session_id,
                 "error",
                 json!({
-                    "message": error,
+                    "code": error.code,
+                    "message": error.message,
                     "channel": "error",
                     "visibility": "conversation"
                 }),
@@ -523,6 +524,10 @@ pub(crate) async fn agent_plan_resolve(
                 .as_ref()
                 .map(|plan| latest_user_attachments_for_session(&state, &plan.session_id))
                 .unwrap_or_default();
+            let plan_run_id = pending_plan
+                .as_ref()
+                .map(|plan| plan.run_id.clone())
+                .unwrap_or_else(|| run_id.clone());
             let (grants, approved_tools, pending_review) = pending_plan.as_ref().map_or_else(
                 || (Vec::new(), Vec::new(), None),
                 |plan| {
@@ -563,10 +568,27 @@ pub(crate) async fn agent_plan_resolve(
                 }
             }
             if !grant_failed {
-                if let Err(error) = runtime.enqueue_approved_tool_calls(&run_id, approved_tools) {
+                if let Err(error) =
+                    runtime.grant_explicit_attachments_for_run(&plan_run_id, &attachments)
+                {
+                    events.push(KernelEvent::Error {
+                        request_id: Some(rid("agent-plan-attachment-grants")),
+                        run_id: Some(deepcode_kernel_abi::RunId(plan_run_id.clone())),
+                        session_id: None,
+                        error: KernelErrorEnvelope::from(&error),
+                        message_key: None,
+                        args: None,
+                    });
+                    grant_failed = true;
+                }
+            }
+            if !grant_failed {
+                if let Err(error) =
+                    runtime.enqueue_approved_tool_calls(&plan_run_id, approved_tools)
+                {
                     events.push(KernelEvent::Error {
                         request_id: Some(rid("agent-plan-approved-tools")),
-                        run_id: Some(deepcode_kernel_abi::RunId(run_id.clone())),
+                        run_id: Some(deepcode_kernel_abi::RunId(plan_run_id.clone())),
                         session_id: None,
                         error: KernelErrorEnvelope::from(&error),
                         message_key: None,

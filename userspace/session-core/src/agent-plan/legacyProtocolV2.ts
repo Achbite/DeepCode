@@ -13,6 +13,8 @@ import {
   type ValidationExpectationDraft,
 } from './types.js';
 
+// Legacy JSON Envelope v2 compatibility parser. Agent Protocol v3 DriverLoop
+// output must use protocolV3.ts and parseProposalEnvelope instead.
 const BUNDLE_KEYS = new Set([
   'version',
   'id',

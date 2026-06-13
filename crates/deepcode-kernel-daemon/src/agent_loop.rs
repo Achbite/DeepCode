@@ -16,6 +16,39 @@ pub(crate) struct AgentRunRequest {
     pub(crate) workspace_binding: Option<WorkspaceBinding>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AgentRunError {
+    pub(crate) code: String,
+    pub(crate) message: String,
+}
+
+impl AgentRunError {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentRunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl From<String> for AgentRunError {
+    fn from(message: String) -> Self {
+        Self::new("kernel_error", message)
+    }
+}
+
+impl From<KernelErrorEnvelope> for AgentRunError {
+    fn from(error: KernelErrorEnvelope) -> Self {
+        Self::new(error.code, error.message)
+    }
+}
+
 pub(crate) fn build_agent_run_request(body: &Value) -> AgentRunRequest {
     AgentRunRequest {
         content: body
@@ -61,6 +94,8 @@ const INTERNAL_READ_ONLY_MAX_ADVANCES: usize = 6;
 // Legacy compatibility path only. New DriverLoop work must keep provider-facing
 // prompt, repair, and AgentProtocolParser authority in userspace/session-core.
 const AGENT_PROTOCOL_SCHEMA_VERSION: &str = "deepcode.agent.protocol.v2";
+const LEGACY_DRIVER_PATH: &str = "legacy-v2";
+const LEGACY_PARSER_VERSION: &str = "legacy-json-envelope-v2";
 const READ_ONLY_DUPLICATE_RESOURCE_MESSAGE: &str = "当前只读探索计划只请求了本轮已经读取或搜索过的资源，Agent 已停止继续重复读取。请补充新的目录、文件、搜索词，或缩小需要分析的问题范围。";
 
 #[derive(Debug, Clone)]
@@ -237,6 +272,9 @@ fn read_only_analysis_request_envelope(
             "readOnlyAnalysisLoop".to_string(),
             json!({
                 "runId": run_id,
+                "driverPath": LEGACY_DRIVER_PATH,
+                "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+                "parserVersion": LEGACY_PARSER_VERSION,
                 "toolResultSource": "Kernel ToolCompleted events",
                 "allowedPlanCapabilities": ["workspace.read", "workspace.search"],
                 "coveredResources": coverage.as_json()
@@ -1224,14 +1262,167 @@ fn clip_chars(text: &str, max_chars: usize) -> String {
     format!("{head}\n\n[... truncated ...]\n\n{tail}")
 }
 
+fn is_explicit_user_attachment(attachment: &Value) -> bool {
+    let source = attachment
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    matches!(source, "userSelected" | "contextMenu" | "mention")
+}
+
+fn explicit_attachment_manifest_entry_id(attachment: &Value, fallback: String) -> String {
+    attachment
+        .get("id")
+        .or_else(|| attachment.get("manifestEntryId"))
+        .and_then(Value::as_str)
+        .or_else(|| attachment.get("path").and_then(Value::as_str))
+        .unwrap_or(&fallback)
+        .to_string()
+}
+
+fn agent_attachment_preflight_entries(attachments: &[Value]) -> Vec<Value> {
+    attachments
+        .iter()
+        .enumerate()
+        .filter(|(_, attachment)| is_explicit_user_attachment(attachment))
+        .filter_map(|(index, attachment)| {
+            let kind = attachment
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            if !matches!(kind, "file" | "directory") {
+                return None;
+            }
+            let path = attachment
+                .get("absolutePath")
+                .or_else(|| attachment.get("path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let mut entry = json!({
+                "id": explicit_attachment_manifest_entry_id(
+                    attachment,
+                    format!("attachment-{index}")
+                ),
+                "kind": kind,
+                "path": attachment
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or(path),
+                "summary": "Explicit user attachment preflight"
+            });
+            if let Some(absolute_path) = attachment.get("absolutePath").and_then(Value::as_str) {
+                entry["absolutePath"] = json!(absolute_path);
+            }
+            Some(entry)
+        })
+        .collect()
+}
+
+fn preflight_agent_read_access(
+    state: &AppState,
+    session_id: &str,
+    workspace_binding: Option<&WorkspaceBinding>,
+    attachments: &[Value],
+) -> Result<(), AgentRunError> {
+    if let Some(binding) = workspace_binding {
+        ensure_workspace_binding(&state.runtime, Some(binding)).map_err(AgentRunError::from)?;
+    }
+
+    let current = current_workspace_json(&state.runtime).ok();
+    let has_workspace = current
+        .as_ref()
+        .and_then(|value| value.get("current"))
+        .map(|value| !value.is_null())
+        .unwrap_or(false);
+    if has_workspace {
+        crate::workspace_api::dispatch_workspace(
+            &state.runtime,
+            KernelCommand::WorkspaceList {
+                request_id: rid("agent-workspace-read-preflight"),
+                folder_id: None,
+                path: Some(".".to_string()),
+                depth: Some(1),
+            },
+        )
+        .map_err(|error| {
+            AgentRunError::new(
+                "workspace_root_unreadable",
+                format!(
+                    "当前工作区无法读取，请在 macOS 系统权限中允许 DeepCode 访问该目录，重新打开工作区后重试：{}",
+                    error.message
+                ),
+            )
+        })?;
+    }
+
+    let entries = agent_attachment_preflight_entries(attachments);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let events = {
+        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+        runtime
+            .dispatch(KernelCommand::ResourceResolve {
+                request_id: rid("agent-attachment-read-preflight"),
+                run_id: None,
+                session_id: Some(deepcode_kernel_abi::SessionId(session_id.to_string())),
+                request: deepcode_kernel_abi::ResourceResolveRequest {
+                    manifest: json!({
+                        "id": "agent-attachment-read-preflight",
+                        "entries": entries
+                    }),
+                },
+            })
+            .map_err(|error| AgentRunError::from(KernelErrorEnvelope::from(&error)))?
+    };
+    let Some(KernelEvent::ResourcePacketProduced { packet, .. }) = events.first() else {
+        return Err(AgentRunError::new(
+            "attachment_access_denied",
+            "显式附件读取权限检查未返回 ResourcePacket，请重新选择附件后重试。",
+        ));
+    };
+    let failed = packet
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("status").and_then(Value::as_str) == Some("error")
+                    || item.get("status").and_then(Value::as_str) == Some("denied")
+            })
+        });
+    if let Some(item) = failed {
+        let reason = item
+            .get("reason")
+            .or_else(|| item.get("denialReason"))
+            .and_then(Value::as_str)
+            .unwrap_or("read_failed");
+        let message = item
+            .get("message")
+            .or_else(|| item.get("denialReason"))
+            .and_then(Value::as_str)
+            .unwrap_or("attachment cannot be resolved");
+        return Err(AgentRunError::new(
+            "attachment_access_denied",
+            format!(
+                "显式附件无法读取，请确认 macOS 文件权限或重新选择附件后重试：{reason}: {message}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn start_kernel_agent_run(
     state: &AppState,
     session_id: &str,
     request: AgentRunRequest,
-) -> Result<(), String> {
-    if let Some(binding) = request.workspace_binding.as_ref() {
-        let _ = ensure_workspace_binding(&state.runtime, Some(binding));
-    }
+) -> Result<(), AgentRunError> {
+    preflight_agent_read_access(
+        state,
+        session_id,
+        request.workspace_binding.as_ref(),
+        &request.attachments,
+    )?;
 
     let binding = effective_workspace_binding(&state.runtime, request.workspace_binding.clone());
     let workspace_snapshot = current_workspace_json(&state.runtime).ok();
@@ -1265,9 +1456,11 @@ pub(crate) async fn start_kernel_agent_run(
                 }),
                 run_overrides: None,
             })
-            .map_err(|error| error.to_string())?
+            .map_err(|error| AgentRunError::from(error.to_string()))?
     };
-    drive_kernel_agent_loop(state, session_id, kernel_events).await
+    drive_kernel_agent_loop(state, session_id, kernel_events)
+        .await
+        .map_err(AgentRunError::from)
 }
 
 pub(crate) async fn drive_kernel_agent_loop(
@@ -1370,6 +1563,9 @@ pub(crate) async fn drive_kernel_agent_loop(
                 "llm.requested",
                 json!({
                     "stage": phase,
+                    "driverPath": LEGACY_DRIVER_PATH,
+                    "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+                    "parserVersion": LEGACY_PARSER_VERSION,
                     "llmCallId": llm_call_id,
                     "profileId": profile.id,
                     "model": profile.model,
@@ -1424,6 +1620,9 @@ pub(crate) async fn drive_kernel_agent_loop(
                 "llm.completed",
                 json!({
                     "stage": phase,
+                    "driverPath": LEGACY_DRIVER_PATH,
+                    "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+                    "parserVersion": LEGACY_PARSER_VERSION,
                     "llmCallId": llm_call_id,
                     "profileId": profile.id,
                     "contentBytes": response_envelope
@@ -1453,6 +1652,7 @@ pub(crate) async fn drive_kernel_agent_loop(
                     &profile,
                     &request_envelope,
                     original_content,
+                    AgentProtocolRepairStage::ReadOnlyAnalysis,
                 )
                 .await;
                 match parsed_plan {
@@ -1558,7 +1758,8 @@ pub(crate) async fn drive_kernel_agent_loop(
                                     "runId": &plan.run_id,
                                     "planId": &plan.plan_id,
                                     "capabilities": plan_review_required_capabilities(&plan),
-                                    "advanceCount": internal_read_only_advances
+                                    "advanceCount": internal_read_only_advances,
+                                    "driverPath": LEGACY_DRIVER_PATH
                                 }),
                             );
                             internal_read_only_runs.insert(plan.run_id.clone());
@@ -1588,20 +1789,35 @@ pub(crate) async fn drive_kernel_agent_loop(
                                 );
                                 continue;
                             }
-                            let accept_events = {
+                            let (attachment_grants, accept_events) = {
                                 let mut runtime =
                                     state.runtime.lock().expect("kernel runtime lock");
+                                let attachment_grants = runtime
+                                    .grant_explicit_attachments_for_run(&plan.run_id, &attachments)
+                                    .map_err(|error| error.to_string())?;
                                 runtime
                                     .enqueue_approved_tool_calls(&plan.run_id, approved_tools)
                                     .map_err(|error| error.to_string())?;
-                                runtime
+                                let accept_events = runtime
                                     .dispatch(KernelCommand::PlanAccept {
                                         request_id: rid("agent-read-only-analysis-auto-accept"),
                                         run_id: run_id.clone(),
                                         plan_id: plan.plan_id.clone(),
                                     })
-                                    .map_err(|error| error.to_string())?
+                                    .map_err(|error| error.to_string())?;
+                                (attachment_grants, accept_events)
                             };
+                            append_trace_event(
+                                state,
+                                session_id,
+                                "agent.read_only_plan.attachment_grants_bound",
+                                json!({
+                                    "runId": &plan.run_id,
+                                    "planId": &plan.plan_id,
+                                    "driverPath": LEGACY_DRIVER_PATH,
+                                    "grantCount": attachment_grants
+                                }),
+                            );
                             next_events.extend(accept_events);
                         } else {
                             record_kernel_events(state, &review_events);
@@ -1625,7 +1841,9 @@ pub(crate) async fn drive_kernel_agent_loop(
                         append_session_projection(
                             state,
                             session_id,
-                            vec![plan_parse_error_event(session_id, &run_id.0, &error)],
+                            vec![read_only_analysis_parse_error_event(
+                                session_id, &run_id.0, &error,
+                            )],
                         );
                     }
                 }
@@ -1658,6 +1876,7 @@ pub(crate) async fn drive_kernel_agent_loop(
                     &profile,
                     &request_envelope,
                     original_content,
+                    AgentProtocolRepairStage::Plan,
                 )
                 .await;
                 match parsed_plan {
@@ -1748,7 +1967,8 @@ pub(crate) async fn drive_kernel_agent_loop(
                                     "runId": &plan.run_id,
                                     "planId": &plan.plan_id,
                                     "capabilities": plan_review_required_capabilities(&plan),
-                                    "advanceCount": internal_read_only_advances
+                                    "advanceCount": internal_read_only_advances,
+                                    "driverPath": LEGACY_DRIVER_PATH
                                 }),
                             );
                             internal_read_only_runs.insert(plan.run_id.clone());
@@ -1778,20 +1998,35 @@ pub(crate) async fn drive_kernel_agent_loop(
                                 );
                                 continue;
                             }
-                            let accept_events = {
+                            let (attachment_grants, accept_events) = {
                                 let mut runtime =
                                     state.runtime.lock().expect("kernel runtime lock");
+                                let attachment_grants = runtime
+                                    .grant_explicit_attachments_for_run(&plan.run_id, &attachments)
+                                    .map_err(|error| error.to_string())?;
                                 runtime
                                     .enqueue_approved_tool_calls(&plan.run_id, approved_tools)
                                     .map_err(|error| error.to_string())?;
-                                runtime
+                                let accept_events = runtime
                                     .dispatch(KernelCommand::PlanAccept {
                                         request_id: rid("agent-plan-auto-accept"),
                                         run_id: run_id.clone(),
                                         plan_id: plan.plan_id.clone(),
                                     })
-                                    .map_err(|error| error.to_string())?
+                                    .map_err(|error| error.to_string())?;
+                                (attachment_grants, accept_events)
                             };
+                            append_trace_event(
+                                state,
+                                session_id,
+                                "agent.read_only_plan.attachment_grants_bound",
+                                json!({
+                                    "runId": &plan.run_id,
+                                    "planId": &plan.plan_id,
+                                    "driverPath": LEGACY_DRIVER_PATH,
+                                    "grantCount": attachment_grants
+                                }),
+                            );
                             next_events.extend(accept_events);
                             internally_advanced_read_only_plan = true;
                         } else {
@@ -1822,10 +2057,11 @@ pub(crate) async fn drive_kernel_agent_loop(
                         }
                     }
                     Err(error) => {
+                        let message = error.to_string();
                         append_session_projection(
                             state,
                             session_id,
-                            vec![plan_parse_error_event(session_id, &run_id.0, &error)],
+                            vec![plan_parse_error_event(session_id, &run_id.0, &message)],
                         );
                     }
                 }
@@ -1880,6 +2116,9 @@ async fn continue_read_only_analysis_loop(
         "llm.requested",
         json!({
             "stage": "read_only_analysis",
+            "driverPath": LEGACY_DRIVER_PATH,
+            "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+            "parserVersion": LEGACY_PARSER_VERSION,
             "llmCallId": llm_call_id,
             "profileId": seed.profile.id,
             "model": seed.profile.model,
@@ -1926,6 +2165,9 @@ async fn continue_read_only_analysis_loop(
         "llm.completed",
         json!({
             "stage": "read_only_analysis",
+            "driverPath": LEGACY_DRIVER_PATH,
+            "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+            "parserVersion": LEGACY_PARSER_VERSION,
             "llmCallId": llm_call_id,
             "profileId": seed.profile.id,
             "contentBytes": response_envelope
@@ -1988,6 +2230,7 @@ async fn handle_read_only_analysis_response(
         profile,
         request_envelope,
         original_content,
+        AgentProtocolRepairStage::ReadOnlyAnalysis,
     )
     .await;
     match parsed_plan {
@@ -2078,7 +2321,8 @@ async fn handle_read_only_analysis_response(
                         "runId": &plan.run_id,
                         "planId": &plan.plan_id,
                         "capabilities": plan_review_required_capabilities(&plan),
-                        "advanceCount": *internal_read_only_advances
+                        "advanceCount": *internal_read_only_advances,
+                        "driverPath": LEGACY_DRIVER_PATH
                     }),
                 );
                 internal_read_only_runs.insert(plan.run_id.clone());
@@ -2104,19 +2348,34 @@ async fn handle_read_only_analysis_response(
                     );
                     return Ok(Vec::new());
                 }
-                let accept_events = {
+                let (attachment_grants, accept_events) = {
                     let mut runtime = state.runtime.lock().expect("kernel runtime lock");
+                    let attachment_grants = runtime
+                        .grant_explicit_attachments_for_run(&plan.run_id, &attachments)
+                        .map_err(|error| error.to_string())?;
                     runtime
                         .enqueue_approved_tool_calls(&plan.run_id, approved_tools)
                         .map_err(|error| error.to_string())?;
-                    runtime
+                    let accept_events = runtime
                         .dispatch(KernelCommand::PlanAccept {
                             request_id: rid("agent-read-only-analysis-auto-accept"),
                             run_id: run,
                             plan_id: plan.plan_id.clone(),
                         })
-                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())?;
+                    (attachment_grants, accept_events)
                 };
+                append_trace_event(
+                    state,
+                    session_id,
+                    "agent.read_only_plan.attachment_grants_bound",
+                    json!({
+                        "runId": &plan.run_id,
+                        "planId": &plan.plan_id,
+                        "driverPath": LEGACY_DRIVER_PATH,
+                        "grantCount": attachment_grants
+                    }),
+                );
                 Ok(accept_events)
             } else {
                 record_kernel_events(state, &review_events);
@@ -2141,7 +2400,9 @@ async fn handle_read_only_analysis_response(
             append_session_projection(
                 state,
                 session_id,
-                vec![plan_parse_error_event(session_id, run_id, &error)],
+                vec![read_only_analysis_parse_error_event(
+                    session_id, run_id, &error,
+                )],
             );
             Ok(Vec::new())
         }
@@ -2269,16 +2530,21 @@ async fn parse_or_repair_agent_plan_response(
     profile: &ResolvedLlmProfile,
     original_request_envelope: &Value,
     original_content: &str,
-) -> Result<AgentPlanResponse, String> {
+    stage: AgentProtocolRepairStage,
+) -> Result<AgentPlanResponse, AgentProtocolFailure> {
     match parse_agent_plan_response(session_id, run_id, original_content) {
         Ok(parsed) => return Ok(parsed),
         Err(first_error) => {
             append_trace_event(
                 state,
                 session_id,
-                "llm.plan_parse_failed",
+                stage.parse_failed_event_name(),
                 json!({
                     "runId": run_id,
+                    "code": "agent_protocol_parse_failed",
+                    "driverPath": LEGACY_DRIVER_PATH,
+                    "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+                    "parserVersion": LEGACY_PARSER_VERSION,
                     "error": first_error,
                     "repairPolicy": "single_llm_repair"
                 }),
@@ -2291,9 +2557,13 @@ async fn parse_or_repair_agent_plan_response(
             append_trace_event(
                 state,
                 session_id,
-                "llm.repair_requested",
+                stage.repair_requested_event_name(),
                 json!({
                     "runId": run_id,
+                    "driverPath": LEGACY_DRIVER_PATH,
+                    "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+                    "parserVersion": LEGACY_PARSER_VERSION,
+                    "repairProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
                     "profileId": profile.id,
                     "model": profile.model,
                     "effectiveMaxOutputTokens": effective_profile_max_output_tokens_for_trace(profile),
@@ -2306,22 +2576,34 @@ async fn parse_or_repair_agent_plan_response(
                     append_trace_event(
                         state,
                         session_id,
-                        "llm.repair_failed",
+                        stage.repair_failed_event_name(),
                         json!({
                             "runId": run_id,
+                            "code": "agent_protocol_repair_failed",
+                            "driverPath": LEGACY_DRIVER_PATH,
+                            "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+                            "parserVersion": LEGACY_PARSER_VERSION,
+                            "repairProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
                             "providerError": provider_error_value(&error)
                         }),
                     );
-                    return Err(format!("{first_error}; repair call failed: {error}"));
+                    return Err(AgentProtocolFailure::new(
+                        "agent_protocol_repair_failed",
+                        format!("{first_error}; repair call failed: {error}"),
+                    ));
                 }
             };
             let repair_content = repair_output.content.clone();
             append_trace_event(
                 state,
                 session_id,
-                "llm.repair_completed",
+                stage.repair_completed_event_name(),
                 json!({
                     "runId": run_id,
+                    "driverPath": LEGACY_DRIVER_PATH,
+                    "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+                    "parserVersion": LEGACY_PARSER_VERSION,
+                    "repairProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
                     "profileId": profile.id,
                     "contentBytes": repair_content.len(),
                     "toolCallCount": repair_output.tool_calls.len(),
@@ -2332,16 +2614,88 @@ async fn parse_or_repair_agent_plan_response(
                 append_trace_event(
                     state,
                     session_id,
-                    "llm.repair_parse_failed",
+                    stage.repair_parse_failed_event_name(),
                     json!({
                         "runId": run_id,
+                        "code": "agent_protocol_repair_failed",
+                        "driverPath": LEGACY_DRIVER_PATH,
+                        "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+                        "parserVersion": LEGACY_PARSER_VERSION,
+                        "repairProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
                         "originalError": first_error,
                         "repairError": repair_error
                     }),
                 );
-                format!("{first_error}; repair failed: {repair_error}")
+                AgentProtocolFailure::new(
+                    "agent_protocol_repair_failed",
+                    format!("{first_error}; repair failed: {repair_error}"),
+                )
             })
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AgentProtocolRepairStage {
+    Plan,
+    ReadOnlyAnalysis,
+}
+
+impl AgentProtocolRepairStage {
+    fn parse_failed_event_name(self) -> &'static str {
+        match self {
+            Self::Plan => "llm.plan_parse_failed",
+            Self::ReadOnlyAnalysis => "llm.read_only_analysis_parse_failed",
+        }
+    }
+
+    fn repair_requested_event_name(self) -> &'static str {
+        match self {
+            Self::Plan => "llm.repair_requested",
+            Self::ReadOnlyAnalysis => "llm.read_only_analysis_repair_requested",
+        }
+    }
+
+    fn repair_failed_event_name(self) -> &'static str {
+        match self {
+            Self::Plan => "llm.repair_failed",
+            Self::ReadOnlyAnalysis => "llm.read_only_analysis_repair_failed",
+        }
+    }
+
+    fn repair_completed_event_name(self) -> &'static str {
+        match self {
+            Self::Plan => "llm.repair_completed",
+            Self::ReadOnlyAnalysis => "llm.read_only_analysis_repair_completed",
+        }
+    }
+
+    fn repair_parse_failed_event_name(self) -> &'static str {
+        match self {
+            Self::Plan => "llm.repair_parse_failed",
+            Self::ReadOnlyAnalysis => "llm.read_only_analysis_repair_parse_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AgentProtocolFailure {
+    code: &'static str,
+    message: String,
+}
+
+impl AgentProtocolFailure {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentProtocolFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
     }
 }
 
@@ -2375,6 +2729,10 @@ fn build_plan_repair_request(
         ],
         "toolCatalog": tool_catalog,
         "tools": [],
+        "driverPath": LEGACY_DRIVER_PATH,
+        "expectedProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
+        "parserVersion": LEGACY_PARSER_VERSION,
+        "repairProtocolVersion": AGENT_PROTOCOL_SCHEMA_VERSION,
         "repairPolicy": {
             "maxAttempts": 1,
             "parser": "strict"
@@ -2441,7 +2799,7 @@ fn parse_agent_protocol_envelope_v2(
     let schema_version = required_json_string(&envelope, "schemaVersion", "JSON Envelope v2")?;
     if schema_version != AGENT_PROTOCOL_SCHEMA_VERSION {
         return Err(format!(
-            "JSON Envelope schemaVersion must be {AGENT_PROTOCOL_SCHEMA_VERSION}"
+            "protocol_version_mismatch: expected {AGENT_PROTOCOL_SCHEMA_VERSION} for {LEGACY_DRIVER_PATH}/{LEGACY_PARSER_VERSION}, got {schema_version}"
         ));
     }
     let kind = required_json_string(&envelope, "kind", "JSON Envelope v2")?;
@@ -3069,6 +3427,39 @@ fn plan_parse_error_event(session_id: &str, run_id: &str, error: &str) -> Value 
     )
 }
 
+fn read_only_analysis_parse_error_event(
+    session_id: &str,
+    run_id: &str,
+    error: &AgentProtocolFailure,
+) -> Value {
+    let content = if error.code == "agent_protocol_repair_failed" {
+        format!(
+            "只读上下文已经读取，但 Agent 输出协议修复失败，无法安全生成最终回答。\n\n错误：{}",
+            error.message
+        )
+    } else {
+        format!(
+            "只读上下文已经读取，但 Agent 输出不是合法的协议 JSON，已停止本轮分析。\n\n错误：{}",
+            error.message
+        )
+    };
+    crate::event_projection::agent_event(
+        session_id,
+        "assistant_msg",
+        json!({
+            "content": content,
+            "channel": "final",
+            "visibility": "conversation",
+            "label": "Agent",
+            "runId": run_id,
+            "kind": "read_only_analysis_parse_failed",
+            "code": error.code,
+            "presentation": "body"
+        }),
+        &now_text(),
+    )
+}
+
 fn provider_error_value(error: &LlmProviderDiagnostic) -> Value {
     serde_json::to_value(error).unwrap_or_else(|_| json!({ "message": error.to_string() }))
 }
@@ -3670,6 +4061,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("must be one JSON Envelope v2 object"));
+    }
+
+    #[test]
+    fn legacy_parser_rejects_v3_schema_as_protocol_mismatch() {
+        let error = parse_agent_plan_response(
+            "session-1",
+            "run-1",
+            &serde_json::json!({
+                "schemaVersion": "deepcode.agent.protocol.v3",
+                "kind": "answer",
+                "outputLanguage": "zh-CN",
+                "answer": {
+                    "format": "markdown",
+                    "content": "ok"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("protocol_version_mismatch"));
+        assert!(error.contains("legacy-v2"));
+        assert!(error.contains("legacy-json-envelope-v2"));
+        assert!(error.contains("deepcode.agent.protocol.v3"));
     }
 
     #[test]
@@ -4379,6 +4793,59 @@ mod tests {
         assert!(content.contains("workspace.search"));
         assert!(content.contains("\"validationExpectations\":[]"));
         assert!(content.contains("\"reviewExpectations\":[]"));
+        assert_eq!(request["driverPath"], "legacy-v2");
+        assert_eq!(
+            request["expectedProtocolVersion"],
+            "deepcode.agent.protocol.v2"
+        );
+        assert_eq!(request["parserVersion"], "legacy-json-envelope-v2");
+        assert_eq!(
+            request["repairProtocolVersion"],
+            "deepcode.agent.protocol.v2"
+        );
+    }
+
+    #[test]
+    fn agent_read_preflight_rejects_unresolved_explicit_attachment() {
+        let state = AppState {
+            runtime: Arc::new(Mutex::new(DeepCodeKernelRuntime::new())),
+            gui: Arc::new(Mutex::new(GuiState::new())),
+            terminal_runtime: Arc::new(Mutex::new(crate::terminal_api::TerminalRuntime::new())),
+            kernel_events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let missing = std::env::temp_dir().join(format!(
+            "deepcode-daemon-missing-attachment-{}",
+            std::process::id()
+        ));
+        let error = preflight_agent_read_access(
+            &state,
+            "session-preflight",
+            None,
+            &[serde_json::json!({
+                "kind": "file",
+                "path": "missing-resource.txt",
+                "absolutePath": missing.to_string_lossy(),
+                "source": "userSelected",
+                "scope": "message"
+            })],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "attachment_access_denied");
+        assert!(error.message.contains("显式附件无法读取"));
+    }
+
+    #[test]
+    fn read_only_analysis_parse_failure_renders_final_assistant_event() {
+        let event = read_only_analysis_parse_error_event(
+            "session-1",
+            "run-1",
+            &AgentProtocolFailure::new("agent_protocol_repair_failed", "repair transport failed"),
+        );
+        assert_eq!(event["kind"], "assistant_msg");
+        assert_eq!(event["payload"]["channel"], "final");
+        assert_eq!(event["payload"]["code"], "agent_protocol_repair_failed");
+        assert_eq!(event["payload"]["kind"], "read_only_analysis_parse_failed");
+        assert_ne!(event["kind"], "plan_review");
     }
 
     #[test]

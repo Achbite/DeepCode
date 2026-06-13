@@ -82,6 +82,68 @@ fn start_identity_run(runtime: &mut DeepCodeKernelRuntime) {
         .unwrap();
 }
 
+#[test]
+#[cfg(unix)]
+fn workspace_open_rejects_unreadable_root_without_replacing_current_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let readable = temp_workspace();
+    let blocked = temp_workspace();
+    fs::write(readable.join("entry.txt"), "ok").unwrap();
+
+    let mut runtime = DeepCodeKernelRuntime::new();
+    runtime
+        .dispatch(KernelCommand::WorkspaceOpen {
+            request_id: RequestId("req-open-readable".to_string()),
+            path: readable.to_string_lossy().to_string(),
+        })
+        .unwrap();
+
+    let original_mode = fs::metadata(&blocked).unwrap().permissions().mode();
+    let mut permissions = fs::metadata(&blocked).unwrap().permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&blocked, permissions).unwrap();
+
+    if fs::read_dir(&blocked).is_ok() {
+        let mut restore = fs::metadata(&blocked).unwrap().permissions();
+        restore.set_mode(original_mode);
+        fs::set_permissions(&blocked, restore).unwrap();
+        fs::remove_dir_all(readable).unwrap();
+        fs::remove_dir_all(blocked).unwrap();
+        return;
+    }
+
+    let error = runtime
+        .dispatch(KernelCommand::WorkspaceOpen {
+            request_id: RequestId("req-open-blocked".to_string()),
+            path: blocked.to_string_lossy().to_string(),
+        })
+        .unwrap_err();
+    assert!(matches!(error, KernelError::WorkspaceRootUnreadable(_)));
+
+    let current = workspace_output(
+        runtime
+            .dispatch(KernelCommand::WorkspaceCurrent {
+                request_id: RequestId("req-current".to_string()),
+            })
+            .unwrap(),
+    );
+    assert_eq!(
+        current["current"]["folders"][0]["absolutePath"],
+        readable
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()
+    );
+
+    let mut restore = fs::metadata(&blocked).unwrap().permissions();
+    restore.set_mode(original_mode);
+    fs::set_permissions(&blocked, restore).unwrap();
+    fs::remove_dir_all(readable).unwrap();
+    fs::remove_dir_all(blocked).unwrap();
+}
+
 fn observe(
     runtime: &mut DeepCodeKernelRuntime,
     request_id: &str,
@@ -926,6 +988,86 @@ fn read_only_tool_root_override_requires_explicit_attachment() {
     fs::remove_dir_all(workspace).unwrap();
     fs::remove_dir_all(attachment_root).unwrap();
     fs::remove_dir_all(denied_root).unwrap();
+}
+
+#[test]
+fn grant_explicit_attachments_for_run_allows_historical_attachment_root() {
+    let mut runtime = DeepCodeKernelRuntime::new();
+    let attachment_root = temp_workspace();
+    fs::write(
+        attachment_root.join("note.txt"),
+        "historical attachment text",
+    )
+    .unwrap();
+    runtime
+        .dispatch(KernelCommand::RunStart {
+            request_id: RequestId("req-run".to_string()),
+            session_id: Some(SessionId("session-historical-attachment".to_string())),
+            input: UserInput {
+                text: "continue from prior attachment".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(binding()),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .unwrap();
+
+    let denied = runtime
+        .execute_kernel_tool(
+            "run-1",
+            "fs.read",
+            &serde_json::json!({
+                "path": "note.txt",
+                "attachmentRoot": attachment_root.to_string_lossy()
+            }),
+        )
+        .unwrap_err();
+    assert!(matches!(denied, KernelError::PermissionDenied(_)));
+
+    let added = runtime
+        .grant_explicit_attachments_for_run(
+            "run-1",
+            &[serde_json::json!({
+                "kind": "directory",
+                "path": "attached",
+                "absolutePath": attachment_root.to_string_lossy(),
+                "source": "userSelected",
+                "scope": "message"
+            })],
+        )
+        .unwrap();
+    assert_eq!(added, 1);
+
+    let output = runtime
+        .execute_kernel_tool(
+            "run-1",
+            "fs.read",
+            &serde_json::json!({
+                "path": "note.txt",
+                "attachmentRoot": attachment_root.to_string_lossy()
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        output.get("content").and_then(Value::as_str),
+        Some("historical attachment text")
+    );
+
+    let duplicate_added = runtime
+        .grant_explicit_attachments_for_run(
+            "run-1",
+            &[serde_json::json!({
+                "kind": "directory",
+                "absolutePath": attachment_root.to_string_lossy(),
+                "source": "userSelected"
+            })],
+        )
+        .unwrap();
+    assert_eq!(duplicate_added, 0);
+
+    fs::remove_dir_all(attachment_root).unwrap();
 }
 
 #[test]

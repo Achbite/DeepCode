@@ -4,7 +4,7 @@ use deepcode_kernel_abi::{
 use deepcode_kernel_ledger::{ChangeOperation, KernelResourceRegistry, ValidationResult};
 use deepcode_kernel_workflow::{RunDecisionState, WorkflowPhase};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Default)]
@@ -331,6 +331,38 @@ impl DeepCodeKernelRuntime {
             .ok_or_else(|| KernelError::InvalidCommand(format!("run {run_id} is not active")))
     }
 
+    pub fn grant_explicit_attachments_for_run(
+        &mut self,
+        run_id: &str,
+        attachments: &[Value],
+    ) -> KernelResult<usize> {
+        let grants = attachments
+            .iter()
+            .filter_map(normalized_explicit_attachment_grant)
+            .collect::<Vec<_>>();
+        if grants.is_empty() {
+            return Ok(0);
+        }
+
+        let record = self.record_by_run_mut(run_id)?;
+        let mut existing = record
+            .attachments
+            .iter()
+            .filter_map(explicit_attachment_grant_key)
+            .collect::<BTreeSet<_>>();
+        let mut added = 0_usize;
+        for grant in grants {
+            let Some(key) = explicit_attachment_grant_key(&grant) else {
+                continue;
+            };
+            if existing.insert(key) {
+                record.attachments.push(grant);
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
     pub(crate) fn resolve_run_session(
         &self,
         run_id: Option<RunId>,
@@ -431,6 +463,53 @@ impl DeepCodeKernelRuntime {
             created_at: None,
         })
     }
+}
+
+fn normalized_explicit_attachment_grant(attachment: &Value) -> Option<Value> {
+    let source = attachment
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(source, "userSelected" | "contextMenu" | "mention") {
+        return None;
+    }
+    let kind = attachment
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("file");
+    if !matches!(kind, "file" | "directory") {
+        return None;
+    }
+    let absolute_path = attachment
+        .get("absolutePath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let canonical_path = PathBuf::from(absolute_path).canonicalize().ok()?;
+    let metadata = std::fs::metadata(&canonical_path).ok()?;
+    if kind == "file" && !metadata.is_file() {
+        return None;
+    }
+    if kind == "directory" && !metadata.is_dir() {
+        return None;
+    }
+
+    let mut grant = attachment.clone();
+    let object = grant.as_object_mut()?;
+    object.insert("kind".to_string(), Value::String(kind.to_string()));
+    object.insert("source".to_string(), Value::String(source.to_string()));
+    object.insert(
+        "absolutePath".to_string(),
+        Value::String(canonical_path.to_string_lossy().to_string()),
+    );
+    Some(grant)
+}
+
+fn explicit_attachment_grant_key(attachment: &Value) -> Option<String> {
+    let source = attachment.get("source").and_then(Value::as_str)?;
+    let kind = attachment.get("kind").and_then(Value::as_str)?;
+    let absolute_path = attachment.get("absolutePath").and_then(Value::as_str)?;
+    Some(format!("{source}\u{1f}{kind}\u{1f}{absolute_path}"))
 }
 
 pub(crate) fn run_index_from_id(run_id: &str) -> Option<u64> {

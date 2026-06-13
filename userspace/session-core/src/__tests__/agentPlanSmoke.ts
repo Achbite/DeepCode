@@ -781,6 +781,16 @@ function assertPromptEnvelopeShape(): void {
   });
   assertEqual(v3Proposal.kind, 'answer', 'Agent Protocol v3 parser returns proposal envelope');
   assertEqual(v3Proposal.runId, 'run-1', 'Agent Protocol v3 parser binds run id');
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-1',
+    sessionId: 'session-1',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v2',
+      kind: 'answer',
+      outputLanguage: 'en-US',
+      answer: { format: 'markdown', content: 'Legacy answer.' },
+    }),
+  }), 'Agent Protocol v3.schemaVersion must be deepcode.agent.protocol.v3');
 
   const resourceManifest: ResourceManifest = {
     id: 'manifest-prompt',
