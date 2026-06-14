@@ -366,6 +366,10 @@ pub(crate) async fn agent_plan_resolve(
     Path((run_id, plan_id)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
+    return ApiResponse::error(
+        "session_decision_owned_by_session",
+        "Plan decisions are owned by userspace Session DecisionResolver. Daemon no longer resolves or executes plans.",
+    );
     let decision = body
         .get("decision")
         .and_then(Value::as_str)
@@ -374,6 +378,63 @@ pub(crate) async fn agent_plan_resolve(
         .get("guidance")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let pending_plan = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        let mut pending = find_pending_plan_by_alias(&gui, &plan_id);
+        if pending.is_none() {
+            if let Some(session_id) = gui.current_session_id.clone() {
+                let events = gui
+                    .session_projection_cache
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, &session_id));
+                for event in events.iter().rev() {
+                    let Some(plan) = pending_plan_from_plan_card_event(&session_id, event) else {
+                        continue;
+                    };
+                    if pending_plan_aliases(&plan).contains(&plan_id) {
+                        insert_pending_plan_aliases(&mut gui, plan.clone());
+                        pending = Some(plan);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(plan) = pending.as_ref() {
+            remove_pending_plan_aliases(&mut gui, plan);
+        }
+        pending
+    };
+    if pending_plan.is_none() {
+        let session_id = state
+            .gui
+            .lock()
+            .expect("gui state lock")
+            .current_session_id
+            .clone()
+            .unwrap_or_else(|| "session-unknown".to_string());
+        append_session_projection(
+            &state,
+            &session_id,
+            vec![agent_event(
+                &session_id,
+                "trace/plan_accept_noop",
+                json!({
+                    "title": "Plan accept no-op",
+                    "summary": "该计划已处理或已过期，没有再次提交执行。",
+                    "runId": run_id.clone(),
+                    "planId": plan_id.clone(),
+                    "decision": decision,
+                    "channel": "progress",
+                    "visibility": "conversation",
+                    "presentation": "body"
+                }),
+                &now_text(),
+            )],
+        );
+        let gui = state.gui.lock().expect("gui state lock");
+        return session_result(&gui, &session_id);
+    }
     let command = match decision {
         "accept" => KernelCommand::PlanAccept {
             request_id: rid("agent-plan-resolve"),
@@ -393,40 +454,29 @@ pub(crate) async fn agent_plan_resolve(
             reason: guidance,
         },
     };
+    let pending_review = if decision == "accept" {
+        pending_plan.as_ref().map(pending_review_for_plan)
+    } else {
+        None
+    };
+    let mut post_projection = Vec::new();
     let kernel_events = {
         let mut runtime = state.runtime.lock().expect("kernel runtime lock");
         let mut events = Vec::new();
         let mut grant_failed = false;
         if decision == "accept" {
-            let pending_plan = {
-                let gui = state.gui.lock().expect("gui state lock");
-                gui.pending_plans.get(&plan_id).cloned()
-            };
             let plan_run_id = pending_plan
                 .as_ref()
                 .map(|plan| plan.run_id.clone())
                 .unwrap_or_else(|| run_id.clone());
-            let (grants, pending_review) = pending_plan.as_ref().map_or_else(
-                || (Vec::new(), None),
-                |plan| {
-                    (
-                        temporary_grants_for_pending_plan(plan),
-                        pending_review_for_plan(plan),
-                    )
-                },
-            );
-            if let Some(review) = pending_review {
-                state
-                    .gui
-                    .lock()
-                    .expect("gui state lock")
-                    .pending_reviews
-                    .insert(run_id.clone(), review);
-            }
+            let grants = pending_plan
+                .as_ref()
+                .map(temporary_grants_for_pending_plan)
+                .unwrap_or_default();
             for grant in grants {
                 match runtime.dispatch(KernelCommand::PermissionGrantTemporary {
                     request_id: rid("agent-plan-temp-grant"),
-                    run_id: deepcode_kernel_abi::RunId(run_id.clone()),
+                    run_id: deepcode_kernel_abi::RunId(plan_run_id.clone()),
                     grant,
                 }) {
                     Ok(mut grant_events) => events.append(&mut grant_events),
@@ -444,7 +494,6 @@ pub(crate) async fn agent_plan_resolve(
                     }
                 }
             }
-            let _ = plan_run_id;
         }
         if grant_failed {
             events
@@ -452,6 +501,34 @@ pub(crate) async fn agent_plan_resolve(
             match runtime.dispatch(command) {
                 Ok(mut command_events) => {
                     events.append(&mut command_events);
+                    if decision == "accept" {
+                        if let Some(plan) = pending_plan.as_ref() {
+                            match runtime.dispatch(KernelCommand::ActionBatchSubmit {
+                                request_id: rid("agent-action-batch-submit"),
+                                run_id: deepcode_kernel_abi::RunId(plan.run_id.clone()),
+                                session_id: Some(deepcode_kernel_abi::SessionId(
+                                    plan.session_id.clone(),
+                                )),
+                                batch: json!({
+                                    "planId": plan.plan_id,
+                                    "actionBundle": plan.action_bundle,
+                                    "codeBlocks": plan.code_blocks
+                                }),
+                            }) {
+                                Ok(mut batch_events) => events.append(&mut batch_events),
+                                Err(error) => events.push(KernelEvent::Error {
+                                    request_id: Some(rid("agent-action-batch-submit")),
+                                    run_id: Some(deepcode_kernel_abi::RunId(plan.run_id.clone())),
+                                    session_id: Some(deepcode_kernel_abi::SessionId(
+                                        plan.session_id.clone(),
+                                    )),
+                                    error: KernelErrorEnvelope::from(&error),
+                                    message_key: None,
+                                    args: None,
+                                }),
+                            }
+                        }
+                    }
                     events
                 }
                 Err(error) => vec![KernelEvent::Error {
@@ -465,9 +542,10 @@ pub(crate) async fn agent_plan_resolve(
             }
         }
     };
-    let session_id = kernel_events
-        .iter()
-        .find_map(kernel_event_session_id)
+    let session_id = pending_plan
+        .as_ref()
+        .map(|plan| plan.session_id.clone())
+        .or_else(|| kernel_events.iter().find_map(kernel_event_session_id))
         .or_else(|| {
             state
                 .gui
@@ -486,17 +564,42 @@ pub(crate) async fn agent_plan_resolve(
                 .clone()
         })
         .unwrap_or_else(|| "session-unknown".to_string());
-    state
-        .gui
-        .lock()
-        .expect("gui state lock")
-        .pending_plans
-        .remove(&plan_id);
+    if let Some(review) =
+        pending_review.filter(|_| kernel_events_have_action_progress(&kernel_events))
+    {
+        state
+            .gui
+            .lock()
+            .expect("gui state lock")
+            .pending_reviews
+            .insert(review.run_id.clone(), review.clone());
+        post_projection.push(review_summary_waiting_event(
+            &session_id,
+            &review,
+            &kernel_events,
+        ));
+    }
     record_kernel_events(&state, &kernel_events);
-    let projection = kernel_events_to_agent_events(&session_id, &kernel_events);
+    let mut projection = kernel_events_to_agent_events(&session_id, &kernel_events);
+    projection.append(&mut post_projection);
     append_session_projection(&state, &session_id, projection);
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)
+}
+
+fn kernel_events_have_action_progress(events: &[KernelEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ActionBatchAccepted { .. }
+                | KernelEvent::WorkUnitQueued { .. }
+                | KernelEvent::WorkUnitStarted { .. }
+                | KernelEvent::WorkUnitCompleted { .. }
+                | KernelEvent::WorkUnitFailed { .. }
+                | KernelEvent::WorkUnitBlocked { .. }
+                | KernelEvent::ToolCompleted { .. }
+        )
+    })
 }
 
 pub(crate) fn latest_user_attachments_for_session(
@@ -530,6 +633,10 @@ pub(crate) async fn agent_review_resolve(
     Path((session_id, run_id)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
+    return ApiResponse::error(
+        "session_decision_owned_by_session",
+        "Review decisions are owned by userspace Session DecisionResolver. Daemon no longer resolves reviews or generates continuation plans.",
+    );
     let decision = body
         .get("decision")
         .and_then(Value::as_str)
@@ -548,7 +655,27 @@ pub(crate) async fn agent_review_resolve(
         gui.pending_reviews.remove(&run_id)
     };
     let Some(review) = pending else {
-        return ApiResponse::error("agent_review_not_found", "agent review not found");
+        append_session_projection(
+            &state,
+            &session_id,
+            vec![agent_event(
+                &session_id,
+                "trace/review_accept_noop",
+                json!({
+                    "title": "Review",
+                    "summary": "该 Review 已处理或已过期，没有重复推进任务。",
+                    "status": "noop",
+                    "runId": run_id.clone(),
+                    "decision": decision,
+                    "channel": "progress",
+                    "visibility": "conversation",
+                    "presentation": "collapsible"
+                }),
+                &now_text(),
+            )],
+        );
+        let gui = state.gui.lock().expect("gui state lock");
+        return session_result(&gui, &session_id);
     };
 
     if decision != "accept" {
@@ -561,11 +688,14 @@ pub(crate) async fn agent_review_resolve(
                 json!({
                     "title": "Review",
                     "summary": guidance.clone().unwrap_or_else(|| "用户要求补充或修改。".to_string()),
+                    "content": guidance.clone().unwrap_or_else(|| "用户要求补充或修改。".to_string()),
                     "status": "needsRevision",
                     "runId": run_id.clone(),
                     "reviewId": run_id.clone(),
+                    "sourcePlanId": review.source_plan_id,
                     "confirmable": false,
                     "guidance": guidance,
+                    "continuationRequested": false,
                     "channel": "final",
                     "visibility": "conversation",
                     "presentation": "body"
@@ -586,11 +716,15 @@ pub(crate) async fn agent_review_resolve(
             json!({
                 "title": "Review",
                 "summary": "用户已通过 Review，准备继续后续任务。",
+                "content": accepted_review_content(&review),
                 "status": "accepted",
                 "runId": run_id.clone(),
                 "reviewId": run_id.clone(),
+                "sourcePlanId": review.source_plan_id.clone(),
                 "confirmable": false,
+                "continuationRequested": !review.continuations.is_empty(),
                 "continuationCount": review.continuations.len(),
+                "continuations": review.continuations.clone(),
                 "channel": "progress",
                 "visibility": "conversation",
                 "presentation": "body"
@@ -599,95 +733,8 @@ pub(crate) async fn agent_review_resolve(
         )],
     );
 
-    if review.continuations.is_empty() {
-        let gui = state.gui.lock().expect("gui state lock");
-        return session_result(&gui, &session_id);
-    }
-
-    let plan = continuation_plan_from_review(&review);
-    let mut review_events = {
-        let mut runtime = state.runtime.lock().expect("kernel runtime lock");
-        match runtime.dispatch(KernelCommand::PlanContractSubmit {
-            request_id: rid("agent-review-continuation-plan"),
-            run_id: Some(deepcode_kernel_abi::RunId(plan.run_id.clone())),
-            session_id: Some(deepcode_kernel_abi::SessionId(session_id.clone())),
-            contract: plan.action_bundle.clone(),
-        }) {
-            Ok(events) => events,
-            Err(error) => vec![KernelEvent::Error {
-                request_id: Some(rid("agent-review-continuation-plan")),
-                run_id: Some(deepcode_kernel_abi::RunId(plan.run_id.clone())),
-                session_id: Some(deepcode_kernel_abi::SessionId(session_id.clone())),
-                error: KernelErrorEnvelope::from(&error),
-                message_key: None,
-                args: None,
-            }],
-        }
-    };
-    let mut plan = plan;
-    plan.plan_review_report = review_events.iter().find_map(|event| {
-        if let KernelEvent::PlanReviewReportProduced { report, .. } = event {
-            Some(report.clone())
-        } else {
-            None
-        }
-    });
-    {
-        let mut gui = state.gui.lock().expect("gui state lock");
-        gui.pending_plans.insert(plan.plan_id.clone(), plan.clone());
-    }
-    record_kernel_events(&state, &review_events);
-    let mut projection = vec![plan_card_event(&session_id, &plan)];
-    projection.extend(kernel_events_to_agent_events(&session_id, &review_events));
-    append_session_projection(&state, &session_id, projection);
-    review_events.clear();
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)
-}
-
-fn continuation_plan_from_review(review: &PendingAgentReview) -> PendingAgentPlan {
-    let plan_id = format!(
-        "{}-continuation-{}",
-        safe_path_segment(&review.source_plan_id),
-        now_millis()
-    );
-    let actions = review.continuations.clone();
-    let action_bundle = json!({
-        "version": "1",
-        "id": plan_id,
-        "goal": format!("Continue after user review for {}", review.source_plan_id),
-        "actions": actions,
-        "validationExpectations": [
-            {
-                "id": "continuation-tool-validation",
-                "description": "Kernel tool facts and post-tool validation must confirm the continuation."
-            }
-        ],
-        "reviewExpectations": []
-    });
-    let summary = actions
-        .first()
-        .and_then(|action| action.get("title"))
-        .and_then(Value::as_str)
-        .unwrap_or("Continue after user review.")
-        .to_string();
-    PendingAgentPlan {
-        session_id: review.session_id.clone(),
-        run_id: review.run_id.clone(),
-        plan_id: action_bundle
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("review-continuation")
-            .to_string(),
-        user_plan: summary,
-        action_bundle,
-        code_blocks: review.code_blocks.clone(),
-        expected_validation:
-            "Kernel executes the scoped continuation and records tool validation facts.".to_string(),
-        review_guide: "Review the continuation plan before execution.".to_string(),
-        plan_review_report: None,
-        created_at: now_text(),
-    }
 }
 
 fn plan_card_event(session_id: &str, plan: &PendingAgentPlan) -> Value {
@@ -711,6 +758,319 @@ fn plan_card_event(session_id: &str, plan: &PendingAgentPlan) -> Value {
         }),
         &now_text(),
     )
+}
+
+fn review_summary_waiting_event(
+    session_id: &str,
+    review: &PendingAgentReview,
+    kernel_events: &[KernelEvent],
+) -> Value {
+    let completed = kernel_events
+        .iter()
+        .filter(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. }))
+        .count();
+    let failed = kernel_events
+        .iter()
+        .filter(|event| matches!(event, KernelEvent::WorkUnitFailed { .. }))
+        .count();
+    let blocked = kernel_events
+        .iter()
+        .filter(|event| matches!(event, KernelEvent::WorkUnitBlocked { .. }))
+        .count();
+    let tool_results = kernel_events
+        .iter()
+        .filter(|event| matches!(event, KernelEvent::ToolCompleted { .. }))
+        .count();
+    let summary = if failed > 0 || blocked > 0 {
+        "当前批次已推进，但存在失败或阻塞项，请审查 Kernel facts 后决定是否修订。"
+    } else {
+        "当前批次已执行，请审查 Kernel tool facts 与验证结果。"
+    };
+    let facts = review_fact_lines(kernel_events)
+        .into_iter()
+        .map(|line| line.trim_start_matches("- ").to_string())
+        .collect::<Vec<_>>();
+    let content = waiting_review_content(review, kernel_events, summary, completed, failed, blocked, tool_results);
+    agent_event(
+        session_id,
+        "review_summary",
+        json!({
+            "title": "Review",
+            "summary": summary,
+            "content": content,
+            "status": "waitingUserReview",
+            "runId": review.run_id.clone(),
+            "reviewId": review.run_id.clone(),
+            "sourcePlanId": review.source_plan_id.clone(),
+            "confirmable": true,
+            "continuationCount": review.continuations.len(),
+            "continuationRequested": false,
+            "continuations": review.continuations.clone(),
+            "reviewExpectations": review.review_expectations.clone(),
+            "facts": facts,
+            "factCounts": {
+                "workUnitsCompleted": completed,
+                "workUnitsFailed": failed,
+                "workUnitsBlocked": blocked,
+                "toolResults": tool_results
+            },
+            "channel": "review",
+            "visibility": "conversation",
+            "presentation": "body"
+        }),
+        &now_text(),
+    )
+}
+
+fn accepted_review_content(review: &PendingAgentReview) -> String {
+    let mut lines = vec![
+        "## Review 已通过".to_string(),
+        String::new(),
+        "用户已通过当前批次 Review；Kernel facts 已作为本批次事实源保留。".to_string(),
+        String::new(),
+        "### 后续任务".to_string(),
+    ];
+    if review.continuations.is_empty() {
+        lines.push("- 当前计划没有登记后续批次。".to_string());
+    } else {
+        lines.push(format!(
+            "- 当前计划登记了 {} 个后续意图。后续批次必须由 Session 重新组装上下文并调用模型生成新的详细 Plan；这些意图不会由 daemon 直接执行。",
+            review.continuations.len()
+        ));
+        for continuation in review.continuations.iter().take(6) {
+            lines.push(format!("- {}", continuation_summary(continuation)));
+        }
+    }
+    lines.push(String::new());
+    lines.push("### 决策边界".to_string());
+    lines.push("- Review 通过只关闭当前批次。".to_string());
+    lines.push("- 后续批次仍需生成新的 Plan，并等待用户确认后才能执行。".to_string());
+    lines.join("\n")
+}
+
+fn waiting_review_content(
+    review: &PendingAgentReview,
+    kernel_events: &[KernelEvent],
+    summary: &str,
+    completed: usize,
+    failed: usize,
+    blocked: usize,
+    tool_results: usize,
+) -> String {
+    let mut lines = vec![
+        "## Review".to_string(),
+        String::new(),
+        summary.to_string(),
+        String::new(),
+        "### 执行结果".to_string(),
+        format!("- WorkUnit 完成：{completed}"),
+        format!("- WorkUnit 失败：{failed}"),
+        format!("- WorkUnit 阻塞：{blocked}"),
+        format!("- Tool facts：{tool_results}"),
+        String::new(),
+    ];
+
+    let completed_units = work_unit_completed_lines(kernel_events);
+    lines.push("### 完成项".to_string());
+    if completed_units.is_empty() {
+        lines.push("- 暂无已完成 WorkUnit。".to_string());
+    } else {
+        lines.extend(completed_units);
+    }
+    lines.push(String::new());
+
+    let failed_units = work_unit_failed_lines(kernel_events);
+    let blocked_units = work_unit_blocked_lines(kernel_events);
+    lines.push("### 失败 / 阻塞项".to_string());
+    if failed_units.is_empty() && blocked_units.is_empty() {
+        lines.push("- 暂无失败或阻塞项。".to_string());
+    } else {
+        lines.extend(failed_units);
+        lines.extend(blocked_units);
+    }
+    lines.push(String::new());
+
+    let tool_lines = tool_fact_lines(kernel_events);
+    lines.push("### 文件与工具事实".to_string());
+    if tool_lines.is_empty() {
+        lines.push("- 当前批次没有可展示的 ToolCompleted 事实。".to_string());
+    } else {
+        lines.extend(tool_lines);
+    }
+    lines.push(String::new());
+
+    if !review.user_plan.trim().is_empty() {
+        lines.push("### 原计划摘要".to_string());
+        lines.push(clip_chars(review.user_plan.trim(), 1200));
+        lines.push(String::new());
+    }
+
+    lines.push("### 验证与启动建议".to_string());
+    let review_expectations = review_expectation_lines(review);
+    if review_expectations.is_empty() {
+        lines.push("- 当前计划未提供可执行验证命令，需要下一轮补充。".to_string());
+    } else {
+        lines.extend(review_expectations);
+    }
+    lines.push(String::new());
+
+    lines.push("### 后续决策".to_string());
+    if failed > 0 || blocked > 0 {
+        lines.push("- 如需修复，请在输入框输入 Review 修改意见；空输入通过会关闭当前 Review，但不会自动执行失败项。".to_string());
+    } else {
+        lines.push("- 空输入通过 Review；输入文字会作为 Review 修订意见。".to_string());
+    }
+    if review.continuations.is_empty() {
+        lines.push("- 当前计划没有登记后续批次。".to_string());
+    } else {
+        lines.push(format!(
+            "- 当前计划登记了 {} 个后续意图；Review 通过后由 Session 重新生成下一批详细 Plan，再等待用户确认。",
+            review.continuations.len()
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn review_fact_lines(kernel_events: &[KernelEvent]) -> Vec<String> {
+    let mut facts = Vec::new();
+    facts.extend(work_unit_completed_lines(kernel_events));
+    facts.extend(work_unit_failed_lines(kernel_events));
+    facts.extend(work_unit_blocked_lines(kernel_events));
+    facts.extend(tool_fact_lines(kernel_events));
+    facts
+}
+
+fn work_unit_completed_lines(kernel_events: &[KernelEvent]) -> Vec<String> {
+    kernel_events
+        .iter()
+        .filter_map(|event| match event {
+            KernelEvent::WorkUnitCompleted {
+                work_unit_id,
+                output,
+                ..
+            } => Some(format!(
+                "- `{}` completed{}",
+                work_unit_id,
+                output
+                    .as_ref()
+                    .map(|value| format!("：{}", clipped_json(value, 180)))
+                    .unwrap_or_default()
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn work_unit_failed_lines(kernel_events: &[KernelEvent]) -> Vec<String> {
+    kernel_events
+        .iter()
+        .filter_map(|event| match event {
+            KernelEvent::WorkUnitFailed {
+                work_unit_id,
+                error,
+                ..
+            } => Some(format!("- `{}` failed：{}", work_unit_id, error.message)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn work_unit_blocked_lines(kernel_events: &[KernelEvent]) -> Vec<String> {
+    kernel_events
+        .iter()
+        .filter_map(|event| match event {
+            KernelEvent::WorkUnitBlocked {
+                work_unit_id,
+                reason,
+                ..
+            } => Some(format!("- `{}` blocked：{}", work_unit_id, reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_fact_lines(kernel_events: &[KernelEvent]) -> Vec<String> {
+    kernel_events
+        .iter()
+        .filter_map(|event| match event {
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok,
+                output,
+                error,
+                ..
+            } => {
+                let status = if *ok { "ok" } else { "error" };
+                let detail = error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .or_else(|| output.as_ref().map(|value| clipped_json(value, 180)))
+                    .unwrap_or_else(|| "no output".to_string());
+                Some(format!("- `{}` {}：{}", tool_name, status, detail))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn review_expectation_lines(review: &PendingAgentReview) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !review.expected_validation.trim().is_empty() {
+        lines.push(format!(
+            "- 验证要求：{}",
+            review.expected_validation.trim()
+        ));
+    }
+    if !review.review_guide.trim().is_empty() {
+        lines.push(format!("- Review 指引：{}", review.review_guide.trim()));
+    }
+    lines.extend(review
+        .review_expectations
+        .iter()
+        .filter_map(|expectation| {
+            expectation
+                .get("description")
+                .and_then(Value::as_str)
+                .or_else(|| expectation.get("summary").and_then(Value::as_str))
+                .or_else(|| expectation.get("command").and_then(Value::as_str))
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("- {}", value.trim()))
+        .collect::<Vec<_>>());
+    lines
+}
+
+fn continuation_summary(value: &Value) -> String {
+    value
+        .get("title")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("description").and_then(Value::as_str))
+        .or_else(|| value.get("id").and_then(Value::as_str))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| clipped_json(value, 160))
+}
+
+fn clipped_json(value: &Value, max_chars: usize) -> String {
+    let text = if let Some(value) = value.as_str() {
+        value.to_string()
+    } else {
+        serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
+    };
+    clip_chars(&text, max_chars)
+}
+
+fn clip_chars(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            output.push('…');
+            return output;
+        }
+        output.push(ch);
+    }
+    output
 }
 
 fn temporary_grants_for_pending_plan(
@@ -753,7 +1113,7 @@ fn temporary_grants_for_pending_plan(
     grants
 }
 
-fn pending_review_for_plan(plan: &PendingAgentPlan) -> Option<PendingAgentReview> {
+fn pending_review_for_plan(plan: &PendingAgentPlan) -> PendingAgentReview {
     let continuations = plan
         .action_bundle
         .get("continuationExpectations")
@@ -766,18 +1126,18 @@ fn pending_review_for_plan(plan: &PendingAgentPlan) -> Option<PendingAgentReview
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if continuations.is_empty() && review_expectations.is_empty() {
-        return None;
-    }
-    Some(PendingAgentReview {
+    PendingAgentReview {
         session_id: plan.session_id.clone(),
         run_id: plan.run_id.clone(),
         source_plan_id: plan.plan_id.clone(),
+        user_plan: plan.user_plan.clone(),
         continuations,
         code_blocks: plan.code_blocks.clone(),
         review_expectations,
+        expected_validation: plan.expected_validation.clone(),
+        review_guide: plan.review_guide.clone(),
         created_at: now_text(),
-    })
+    }
 }
 
 fn resource_scopes_for_capability(actions: &[Value], capability: &str) -> Vec<String> {
@@ -800,6 +1160,91 @@ fn resource_scopes_for_capability(actions: &[Value], capability: &str) -> Vec<St
                 && !scope.starts_with("symbol:")
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review_fixture() -> PendingAgentReview {
+        PendingAgentReview {
+            session_id: "session-generic".to_string(),
+            run_id: "run-generic".to_string(),
+            source_plan_id: "plan-generic".to_string(),
+            user_plan: "# Plan\n\n## Test Plan\n- Run the validation command from the plan.".to_string(),
+            continuations: vec![json!({
+                "id": "next-batch",
+                "title": "Generate the next reviewable implementation batch"
+            })],
+            code_blocks: Vec::new(),
+            review_expectations: vec![json!({
+                "id": "manual-review",
+                "description": "Inspect written files and run the project validation commands from the plan."
+            })],
+            expected_validation: "Kernel records concrete write facts for every planned file.".to_string(),
+            review_guide: "Review generated files before accepting the batch.".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn review_summary_waiting_event_contains_detailed_failure_content() {
+        let review = review_fixture();
+        let events = vec![
+            KernelEvent::WorkUnitFailed {
+                request_id: None,
+                run_id: deepcode_kernel_abi::RunId("run-generic".to_string()),
+                session_id: Some(deepcode_kernel_abi::SessionId("session-generic".to_string())),
+                work_unit_id: "work-unit-generic".to_string(),
+                error: KernelErrorEnvelope {
+                    code: "invalid_command".to_string(),
+                    message: "invalid command: workspace.write action requires sourceBlockId".to_string(),
+                    message_key: None,
+                    args: None,
+                },
+                sequence: Some(1),
+            },
+            KernelEvent::ToolCompleted {
+                run_id: Some(deepcode_kernel_abi::RunId("run-generic".to_string())),
+                session_id: Some(deepcode_kernel_abi::SessionId("session-generic".to_string())),
+                turn_id: None,
+                tool_call_id: "tool-generic".to_string(),
+                tool_name: "fs.write".to_string(),
+                ok: false,
+                output: None,
+                error: Some(KernelErrorEnvelope {
+                    code: "invalid_command".to_string(),
+                    message: "invalid command: workspace.write action requires sourceBlockId".to_string(),
+                    message_key: None,
+                    args: None,
+                }),
+                sequence: Some(2),
+            },
+        ];
+
+        let event = review_summary_waiting_event("session-generic", &review, &events);
+        let payload = event.get("payload").and_then(Value::as_object).unwrap();
+        let content = payload.get("content").and_then(Value::as_str).unwrap();
+
+        assert!(content.contains("失败 / 阻塞项"));
+        assert!(content.contains("workspace.write action requires sourceBlockId"));
+        assert_eq!(
+            payload
+                .get("continuationRequested")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(payload.get("facts").and_then(Value::as_array).unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn accepted_review_content_marks_continuations_as_session_planning_input() {
+        let review = review_fixture();
+        let content = accepted_review_content(&review);
+
+        assert!(content.contains("后续批次必须由 Session 重新组装上下文"));
+        assert!(content.contains("不会由 daemon 直接执行"));
+    }
 }
 
 fn temporary_grant(
@@ -870,34 +1315,6 @@ pub(crate) async fn agent_workflow_config_patch(
         })),
         Err(error) => ApiResponse::error("write_workflow_config_failed", error),
     }
-}
-
-pub(crate) async fn agent_prompt_layers() -> Json<ApiResponse> {
-    ApiResponse::ok(json!({
-        "layers": [
-            {
-                "id": "protocol-contract-v1",
-                "kind": "builtin",
-                "priority": 0,
-                "contentHash": "protocol-contract:v1",
-                "title": "Protocol Contract"
-            },
-            {
-                "id": "builtin-system-prompt-v1",
-                "kind": "builtin",
-                "priority": 10,
-                "contentHash": "builtin-system-prompt:v1",
-                "title": "Builtin System Prompt"
-            },
-            {
-                "id": "ruler-context",
-                "kind": "workspace",
-                "priority": 30,
-                "contentHash": "ruler:settings",
-                "title": "Ruler Context"
-            }
-        ]
-    }))
 }
 
 pub(crate) async fn agent_tools(State(state): State<AppState>) -> Json<ApiResponse> {

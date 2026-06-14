@@ -342,6 +342,8 @@ export interface PatchAgentWorkflowConfigRequest {
 export type AgentEventKind =
   | 'user_msg'
   | 'assistant_msg'
+  | 'requirement_confirmation'
+  | 'requirement_decision'
   | 'plan_card'
   | 'plan_review'
   | 'review_summary'
@@ -351,6 +353,9 @@ export type AgentEventKind =
   | 'permission_result'
   | 'workflow_stage'
   | 'workflow_decision'
+  | 'trace/requirement_decision_noop'
+  | 'trace/plan_accept_noop'
+  | 'trace/review_accept_noop'
   | 'error';
 
 export type AgentEventChannel =

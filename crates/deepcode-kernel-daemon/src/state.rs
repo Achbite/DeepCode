@@ -90,6 +90,8 @@ pub(crate) struct PendingAgentPlan {
     pub(crate) session_id: String,
     pub(crate) run_id: String,
     pub(crate) plan_id: String,
+    #[serde(default)]
+    pub(crate) proposal_id: Option<String>,
     pub(crate) user_plan: String,
     pub(crate) action_bundle: Value,
     #[serde(default)]
@@ -107,11 +109,17 @@ pub(crate) struct PendingAgentReview {
     pub(crate) run_id: String,
     pub(crate) source_plan_id: String,
     #[serde(default)]
+    pub(crate) user_plan: String,
+    #[serde(default)]
     pub(crate) continuations: Vec<Value>,
     #[serde(default)]
     pub(crate) code_blocks: Vec<Value>,
     #[serde(default)]
     pub(crate) review_expectations: Vec<Value>,
+    #[serde(default)]
+    pub(crate) expected_validation: String,
+    #[serde(default)]
+    pub(crate) review_guide: String,
     pub(crate) created_at: String,
 }
 

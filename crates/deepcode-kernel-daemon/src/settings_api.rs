@@ -172,10 +172,16 @@ pub(crate) async fn llm_chat(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let request_envelope = json!({
+    let mut request_envelope = json!({
         "messages": messages,
         "tools": body.get("tools").cloned().unwrap_or_else(|| json!([]))
     });
+    if let Some(response_format) = body
+        .get("responseFormat")
+        .or_else(|| body.get("response_format"))
+    {
+        request_envelope["responseFormat"] = response_format.clone();
+    }
     match call_llm_profile(&profile, request_envelope).await {
         Ok(output) => ApiResponse::ok(llm_output_payload(output)),
         Err(error) => Json(ApiResponse {

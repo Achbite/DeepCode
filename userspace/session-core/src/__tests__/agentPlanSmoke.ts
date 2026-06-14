@@ -18,6 +18,7 @@ import {
   SessionDriverLoop,
   type ActionBundleDraft,
   type ResourceManifest,
+  type TranscriptEntry,
 } from '../index.js';
 
 async function main(): Promise<void> {
@@ -29,6 +30,58 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopPathResourceRequest();
   await assertSessionDriverLoopRejectsOutsidePath();
   await assertSessionDriverLoopUsesRecentAttachmentRoot();
+  await assertSessionDriverLoopRequestsRequirementConfirmationForSideEffectTask();
+  await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
+  await assertSessionDriverLoopRepairsOversizedActionBundle();
+  await assertSessionDriverLoopRepairsEmptyActionBundleResponse();
+}
+
+async function assertSessionDriverLoopRequestsRequirementConfirmationForSideEffectTask(): Promise<void> {
+  const events: AgentEvent[] = [];
+  let llmCalls = 0;
+  const session: AgentSession = {
+    id: 'session-requirement-auto',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'requirementDraft',
+        outputLanguage: 'en-US',
+        requirementDraft: {
+          version: '1',
+          requirementId: 'req-generic-auto',
+          summary: 'Confirm a generic side-effect task before planning.',
+          goal: 'Prepare a scoped implementation requirement.',
+          scope: ['Create one reviewable implementation batch after confirmation.'],
+          outOfScope: ['Do not execute unsupported capabilities.'],
+          constraints: ['Keep the batch small and reviewable.'],
+          risks: ['Scope can expand if the target root is ambiguous.'],
+          acceptanceCriteria: ['User confirms the requirement before plan generation.'],
+          openQuestions: [],
+        },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-requirement-auto',
+    content: 'Create a generic workspace change.',
+  });
+  assertEqual(llmCalls, 1, 'auto requirement confirmation calls provider once for requirement draft');
+  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), true, 'auto mode emits requirement confirmation');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'auto mode does not generate a plan before requirement confirmation');
 }
 
 function assertV3Parser(): void {
@@ -158,6 +211,7 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('manifestEntry id=attachment-0-generic-file'), 'prompt exposes manifest entry ids');
   assert(prompt.dynamicSuffix.includes('Conversation roots'), 'prompt exposes conversation roots');
   assert(prompt.stablePrefix.includes('"path":"relative/path.ext"'), 'prompt documents path-based resourceRequest');
+  assert(prompt.stablePrefix.includes('Implementation batch budget'), 'prompt documents incremental implementation budget');
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
   assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
 }
@@ -551,6 +605,310 @@ async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> 
   assertEqual(result.events.some((event) => event.kind === 'assistant_msg'), true, 'recent root path request reaches final answer');
   assertEqual(resourceResolveManifests.length, 1, 'recent attachment root is not auto-read before the model requests a path');
   assertEqual(resourceResolveManifests[0].entries[0].resourceRef, '/tmp/previous-generic-project/README.txt', 'recent root resolves path under the previous attachment');
+}
+
+async function assertSessionDriverLoopRepairsSideEffectBundleEvidence(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const transcript: TranscriptEntry[] = [];
+  let llmCalls = 0;
+  const submittedPlans: Array<Record<string, any>> = [];
+  const session: AgentSession = {
+    id: 'session-plan-repair',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    appendTranscript: async (_sessionId, entry) => {
+      transcript.push(entry);
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'runCreate') return fakeKernel(request);
+      if (command.kind === 'proposalSubmit') {
+        return {
+          ok: true,
+          events: [{
+            kind: 'proposal.accepted',
+            runId: 'run-generic',
+            sessionId: 'session-plan-repair',
+            proposal: command.proposal,
+          }],
+        };
+      }
+      if (command.kind === 'planContractSubmit') {
+        submittedPlans.push(command.contract);
+        return {
+          ok: true,
+          events: [{
+            kind: 'plan.review_report_produced',
+            runId: 'run-generic',
+            sessionId: 'session-plan-repair',
+            report: {
+              planId: command.contract.id,
+              status: 'awaitingUserApproval',
+              requiredCapabilities: command.contract.requiredCapabilities,
+              requiredPermissions: ['temporaryGrant:workspace.write'],
+              permissionGaps: ['workspace.write'],
+              hardFloorHits: [],
+              deniedReasons: [],
+              blockedReasons: [],
+              findings: [],
+              kernelGeneratedPermissionSummary: 'Kernel preflight: status=awaitingUserApproval; capabilities=workspace.write; permissionGaps=workspace.write; hardFloor=none.',
+            },
+          }],
+        };
+      }
+      return { ok: true, events: [] };
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      const bundle = genericWriteProposal(llmCalls === 1);
+      return {
+        ok: true,
+        data: {
+          chunks: [{ type: 'reasoning_delta', content: `generic reasoning ${llmCalls}` }, { type: 'done' }],
+          assistantMessage: {
+            role: 'assistant',
+            reasoningContent: `generic reasoning ${llmCalls}`,
+            content: JSON.stringify(bundle),
+          },
+        },
+      };
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + transcript.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-plan-repair',
+    content: 'Create a generic scaffold.',
+    requirementConfirmationMode: 'off',
+  });
+  assertEqual(llmCalls, 2, 'side-effect actionBundle missing evidence triggers one protocol repair');
+  assertEqual(submittedPlans.length, 1, 'repaired actionBundle reaches Kernel plan contract submit once');
+  assertEqual((submittedPlans[0].completionCriteria ?? []).length, 1, 'repaired plan contains completion criteria');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired plan renders a plan card');
+  assertEqual(result.events.some((event) => event.kind === 'plan_review'), true, 'repaired plan renders a plan review card');
+  assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any).channel === 'reasoning'), true, 'provider reasoning is visible');
+  assertEqual(transcript.some((entry) => entry.type === 'metadata' && entry.kind === 'provider_trace'), true, 'provider trace is archived');
+}
+
+async function assertSessionDriverLoopRepairsOversizedActionBundle(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const submittedPlans: Array<Record<string, any>> = [];
+  const repairRequests: LlmChatRequest[] = [];
+  let llmCalls = 0;
+  const session: AgentSession = {
+    id: 'session-budget-repair',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-budget-repair', submittedPlans),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls > 1) repairRequests.push(request);
+      const bundle = llmCalls === 1 ? oversizedGenericWriteProposal() : genericWriteProposal(false);
+      return jsonLlmResponse(bundle);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + repairRequests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-budget-repair',
+    content: 'Create a generic workspace change in reviewable batches.',
+    requirementConfirmationMode: 'off',
+  });
+  assertEqual(llmCalls, 2, 'oversized actionBundle triggers one implementation batch repair');
+  assert(repairRequests.some((request) => request.messages.some((message) => message.content.includes('next small reviewable implementation batch'))), 'repair prompt requests a smaller implementation batch');
+  assertEqual(submittedPlans.length, 1, 'repaired oversized actionBundle reaches Kernel plan review once');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired oversized plan renders a plan card');
+  const planCard = result.events.find((event) => event.kind === 'plan_card');
+  assertEqual(Boolean((planCard?.payload as any)?.implementationBatch), true, 'plan card carries implementation batch context');
+}
+
+async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const submittedPlans: Array<Record<string, any>> = [];
+  let llmCalls = 0;
+  const session: AgentSession = {
+    id: 'session-empty-repair',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-empty-repair', submittedPlans),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls === 1) {
+        return {
+          ok: true,
+          data: {
+            chunks: [{ type: 'reasoning_delta', content: 'generic large draft reasoning' }, { type: 'done' }],
+            assistantMessage: {
+              role: 'assistant',
+              reasoningContent: 'generic large draft reasoning',
+              content: '',
+            },
+          },
+        };
+      }
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-empty-repair',
+    content: 'Create a generic workspace change in reviewable batches.',
+    requirementConfirmationMode: 'off',
+  });
+  assertEqual(llmCalls, 2, 'empty actionBundle response triggers one compact repair');
+  assertEqual(submittedPlans.length, 1, 'repaired empty response reaches Kernel plan review once');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired empty response renders a plan card');
+  assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && String((event.payload as any).content ?? '').includes('没有返回有效 JSON')), true, 'empty response repair is visible as Thinking');
+}
+
+function genericWriteProposal(missingEvidence: boolean): Record<string, unknown> {
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind: 'actionBundle',
+    outputLanguage: 'en-US',
+    userPlan: [
+      '# Plan',
+      '',
+      '## Summary',
+      'Create the first small, reviewable scaffold batch for a generic workspace change after user approval.',
+      '',
+      '## Key Changes',
+      '- Write one scoped output file from a top-level code block.',
+      '- Keep this batch intentionally small so Kernel facts and user review can inspect the exact file scope.',
+      '',
+      '## Interfaces',
+      '- Use workspace.write with sourceBlockId to connect the planned action to the generated code block.',
+      '- Do not invoke shell, git, browser, network, or any unsupported capability in this batch.',
+      '',
+      '## Test Plan',
+      '- Kernel should record a write fact for the planned file path.',
+      '- User review should inspect the generated path and content before accepting completion.',
+      '',
+      '## Assumptions',
+      '- The target path is inside the authorized workspace or conversation root.',
+      '- Follow-up batches, if any, require review before continuation.',
+    ].join('\n'),
+    codeBlocks: [{
+      id: 'generic-block',
+      path: 'generic-output.txt',
+      content: 'generic content',
+    }],
+    actionBundle: {
+      version: '1',
+      id: 'generic-write-bundle',
+      goal: 'Create a generic scaffold.',
+      actions: [{
+        id: 'write-generic-output',
+        title: 'Write generic output',
+        capability: 'workspace.write',
+        kind: 'write',
+        resourceScope: ['generic-output.txt'],
+        sourceBlockId: 'generic-block',
+      }],
+      continuationExpectations: [],
+      validationExpectations: missingEvidence
+        ? []
+        : [{ id: 'generic-evidence', description: 'Kernel records the write fact for the generic output.' }],
+      reviewExpectations: missingEvidence
+        ? []
+        : [{ id: 'generic-review', description: 'User reviews the generic output and write scope.' }],
+    },
+    expectedValidation: 'Kernel records write facts for the generic output.',
+    reviewGuide: 'Review the generic output path and content before approval.',
+  };
+}
+
+function oversizedGenericWriteProposal(): Record<string, unknown> {
+  const proposal = genericWriteProposal(false);
+  proposal.codeBlocks = Array.from({ length: 5 }, (_item, index) => ({
+    id: `generic-block-${index}`,
+    path: `generic-output-${index}.txt`,
+    content: `generic content ${index}`,
+  }));
+  return proposal;
+}
+
+function jsonLlmResponse(payload: Record<string, unknown>): ApiResponse<LlmChatResult> {
+  return {
+    ok: true,
+    data: {
+      chunks: [{ type: 'reasoning_delta', content: 'generic reasoning' }, { type: 'done' }],
+      assistantMessage: {
+        role: 'assistant',
+        reasoningContent: 'generic reasoning',
+        content: JSON.stringify(payload),
+      },
+    },
+  };
+}
+
+function planKernel(
+  request: KernelCommandEnvelope,
+  sessionId: string,
+  submittedPlans: Array<Record<string, any>>
+): KernelReply {
+  const command = request.command as Record<string, any>;
+  if (command.kind === 'runCreate') return fakeKernel(request);
+  if (command.kind === 'proposalSubmit') {
+    return {
+      ok: true,
+      events: [{
+        kind: 'proposal.accepted',
+        runId: 'run-generic',
+        sessionId,
+        proposal: command.proposal,
+      }],
+    };
+  }
+  if (command.kind === 'planContractSubmit') {
+    submittedPlans.push(command.contract);
+    return {
+      ok: true,
+      events: [{
+        kind: 'plan.review_report_produced',
+        runId: 'run-generic',
+        sessionId,
+        report: {
+          planId: command.contract.id,
+          status: 'awaitingUserApproval',
+          requiredCapabilities: command.contract.requiredCapabilities,
+          requiredPermissions: ['temporaryGrant:workspace.write'],
+          permissionGaps: ['workspace.write'],
+          hardFloorHits: [],
+          deniedReasons: [],
+          blockedReasons: [],
+          findings: [],
+          kernelGeneratedPermissionSummary: 'Kernel preflight: status=awaitingUserApproval; capabilities=workspace.write; permissionGaps=workspace.write; hardFloor=none.',
+        },
+      }],
+    };
+  }
+  return { ok: true, events: [] };
 }
 
 function genericActionBundle(): ActionBundleDraft {

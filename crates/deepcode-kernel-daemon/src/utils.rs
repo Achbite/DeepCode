@@ -58,7 +58,7 @@ pub(crate) fn user_config_root() -> PathBuf {
     // 阶段 7/8 review 决策（B-α 精化）：DEEPCODE_PORTABLE=1 时启用便携模式，
     // 让打包发布版（bin/<platform>/DeepCode.exe）的可写配置写到 exe 同目录的
     // config/user/local/，而不是 %APPDATA%/DeepCode 或 ~/.config/deepcode。
-    // 注意：bin/<platform>/config/global/ 仍是只读分发资源（prompts/ruler/skills），
+    // 注意：bin/<platform>/config/global/ 仍是只读分发资源（ruler/skills/session resources），
     // 不应作为可写路径；secrets/settings 始终走 user/local/ 子目录。
     if env_truthy("DEEPCODE_PORTABLE") {
         return distribution_root()

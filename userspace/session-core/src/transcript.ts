@@ -4,7 +4,8 @@ export type TranscriptMetadataKind =
   | 'compact_boundary'
   | 'context_projection'
   | 'sidechain_ref'
-  | 'content_replacement';
+  | 'content_replacement'
+  | 'provider_trace';
 
 export interface SessionIndexEntry {
   sessionId: string;

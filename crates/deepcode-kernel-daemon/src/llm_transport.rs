@@ -161,11 +161,15 @@ pub(crate) async fn call_llm_profile(
         .cloned()
         .map(provider_tools_from_values)
         .unwrap_or_default();
+    let response_format = request_envelope
+        .get("responseFormat")
+        .or_else(|| request_envelope.get("response_format"))
+        .cloned();
     match profile.kind.as_str() {
         "anthropic" => call_anthropic_profile(profile, messages, tools).await,
         "ollama" => call_ollama_profile(profile, messages, tools).await,
         "openaiCompatible" | "codex" => {
-            call_openai_compatible_profile(profile, messages, tools).await
+            call_openai_compatible_profile(profile, messages, tools, response_format.as_ref()).await
         }
         other => Err(provider_local_error(
             profile,
@@ -181,6 +185,7 @@ pub(crate) async fn call_openai_compatible_profile(
     profile: &ResolvedLlmProfile,
     messages: Vec<Value>,
     tools: Vec<LlmToolDefinition>,
+    response_format: Option<&Value>,
 ) -> Result<LlmChatOutput, LlmProviderDiagnostic> {
     let api_key = profile.api_key.as_deref().ok_or_else(|| {
         provider_local_error(
@@ -192,7 +197,7 @@ pub(crate) async fn call_openai_compatible_profile(
         )
     })?;
     let url = normalize_openai_base_url(profile);
-    let body = openai_compatible_request_body(profile, messages, &tools);
+    let body = openai_compatible_request_body(profile, messages, &tools, response_format);
     let response = reqwest::Client::new()
         .post(url)
         .bearer_auth(api_key)
@@ -223,6 +228,7 @@ fn openai_compatible_request_body(
     profile: &ResolvedLlmProfile,
     messages: Vec<Value>,
     tools: &[LlmToolDefinition],
+    response_format: Option<&Value>,
 ) -> Value {
     let mut body = json!({
         "model": profile.model,
@@ -243,6 +249,9 @@ fn openai_compatible_request_body(
     if let Some(thinking) = profile.thinking.as_ref() {
         body["thinking"] = json!({ "type": thinking });
     }
+    if response_format_is_json_object(response_format) {
+        body["response_format"] = json!({ "type": "json_object" });
+    }
     if is_deepseek_profile(profile) {
         body["user_id"] = json!("deepcode_local");
     }
@@ -260,6 +269,13 @@ fn openai_compatible_request_body(
             .collect::<Vec<_>>());
     }
     body
+}
+
+fn response_format_is_json_object(response_format: Option<&Value>) -> bool {
+    response_format
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        == Some("json_object")
 }
 
 pub(crate) fn effective_openai_compatible_max_tokens(profile: &ResolvedLlmProfile) -> Option<u32> {
@@ -953,6 +969,7 @@ mod tests {
             &profile,
             vec![json!({ "role": "user", "content": "hello" })],
             &[],
+            None,
         );
 
         assert_eq!(
@@ -970,8 +987,24 @@ mod tests {
             &profile,
             vec![json!({ "role": "user", "content": "hello" })],
             &[],
+            None,
         );
 
         assert_eq!(body["max_tokens"].as_u64(), Some(2048));
+    }
+
+    #[test]
+    fn openai_request_body_preserves_json_response_format() {
+        let body = openai_compatible_request_body(
+            &test_profile(),
+            vec![json!({ "role": "user", "content": "hello" })],
+            &[],
+            Some(&json!({ "type": "json_object" })),
+        );
+
+        assert_eq!(
+            body["response_format"]["type"].as_str(),
+            Some("json_object")
+        );
     }
 }

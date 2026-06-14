@@ -33,7 +33,6 @@ export type KernelConfigDomain =
   | 'workflow'
   | 'policy'
   | 'skills'
-  | 'prompt'
   | 'ruler'
   | 'style'
   | 'i18n'
@@ -91,56 +90,6 @@ export interface KernelLocaleMessage {
   text: string;
   fallbackUsed?: string;
   missing: boolean;
-}
-
-export type KernelPromptSourceKind =
-  | 'kernelSafety'
-  | 'bundledProfile'
-  | 'userProfile'
-  | 'workspaceRule'
-  | 'codeStyle'
-  | 'skillPack'
-  | 'runGuidance'
-  | 'externalConnector';
-
-export type KernelPromptRole = 'system' | 'user' | 'assistant' | 'tool';
-
-export interface KernelPromptFragment {
-  id: string;
-  kind: KernelPromptSourceKind;
-  role: KernelPromptRole;
-  content: string;
-  path?: string;
-  contentHash?: string;
-  priority: number;
-  trustLevel?: string;
-}
-
-export interface KernelPromptSourceRef {
-  id: string;
-  kind: KernelPromptSourceKind;
-  path?: string;
-  contentHash?: string;
-  trustLevel?: string;
-}
-
-export interface KernelPromptMessage {
-  role: KernelPromptRole;
-  content: string;
-}
-
-export interface KernelPromptEnvelope {
-  id: string;
-  runId?: string;
-  phase?: string;
-  profileId?: string;
-  templateLocale?: string;
-  responseLanguage?: string;
-  messages: KernelPromptMessage[];
-  sourceRefs: KernelPromptSourceRef[];
-  rulesApplied: KernelPromptSourceRef[];
-  context: unknown;
-  hash?: string;
 }
 
 export type KernelAutonomyLevel =

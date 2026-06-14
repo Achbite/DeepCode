@@ -270,6 +270,114 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             }),
             &now_text(),
         )],
+        KernelEvent::ActionBatchAccepted { batch, .. } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "action_batch",
+                "phase": "execution",
+                "status": "accepted",
+                "summary": "Kernel accepted the action batch for execution.",
+                "batch": batch,
+                "channel": "task",
+                "visibility": "conversation",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::WorkUnitQueued { work_unit, .. } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "work_unit",
+                "phase": "execution",
+                "status": "queued",
+                "summary": work_unit.get("title").and_then(Value::as_str).unwrap_or("Work unit queued."),
+                "workUnit": work_unit,
+                "channel": "task",
+                "visibility": "conversation",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::WorkUnitStarted { work_unit_id, .. } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "work_unit",
+                "phase": "execution",
+                "status": "running",
+                "summary": format!("Work unit {work_unit_id} started."),
+                "workUnitId": work_unit_id,
+                "channel": "task",
+                "visibility": "conversation",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::WorkUnitCompleted {
+            work_unit_id,
+            output,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "work_unit",
+                "phase": "execution",
+                "status": "completed",
+                "summary": format!("Work unit {work_unit_id} completed."),
+                "workUnitId": work_unit_id,
+                "output": output,
+                "channel": "task",
+                "visibility": "conversation",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::WorkUnitFailed {
+            work_unit_id,
+            error,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "error",
+            json!({
+                "message": error.message.clone(),
+                "summary": format!("Work unit {work_unit_id} failed."),
+                "code": error.code.clone(),
+                "workUnitId": work_unit_id,
+                "channel": "error",
+                "visibility": "conversation",
+                "presentation": "body",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::WorkUnitBlocked {
+            work_unit_id,
+            reason,
+            ..
+        } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "work_unit",
+                "phase": "execution",
+                "status": "blocked",
+                "summary": reason,
+                "workUnitId": work_unit_id,
+                "channel": "task",
+                "visibility": "conversation",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
         KernelEvent::StageChanged {
             phase,
             status,

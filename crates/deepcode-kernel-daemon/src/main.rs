@@ -202,7 +202,6 @@ async fn main() {
             "/api/agent/workflow-config",
             get(agent_workflow_config_get).patch(agent_workflow_config_patch),
         )
-        .route("/api/agent/prompt-layers", get(agent_prompt_layers))
         .route("/api/agent/tools", get(agent_tools))
         .route("/api/agent/skills", get(agent_tools))
         .route("/api/browser/runtime-status", get(browser_status))
