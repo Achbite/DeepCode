@@ -14,8 +14,8 @@ fn kernel_command_round_trips_as_tagged_json() {
 }
 
 #[test]
-fn run_start_carries_workspace_binding_and_refs() {
-    let command = KernelCommand::RunStart {
+fn run_create_carries_workspace_binding_and_refs() {
+    let command = KernelCommand::RunCreate {
         request_id: RequestId("req-run".to_string()),
         session_id: Some(SessionId("session-1".to_string())),
         input: UserInput {
@@ -42,13 +42,13 @@ fn run_start_carries_workspace_binding_and_refs() {
         run_overrides: Some(serde_json::json!({ "mode": "plan" })),
     };
 
-    let encoded = serde_json::to_value(&command).expect("serialize run start");
-    assert_eq!(encoded["kind"], "runStart");
+    let encoded = serde_json::to_value(&command).expect("serialize run create");
+    assert_eq!(encoded["kind"], "runCreate");
     assert_eq!(encoded["workspaceBinding"]["activeFolderId"], "wf-0");
     assert_eq!(encoded["profileRef"]["id"], "developer");
     assert_eq!(encoded["workflowRef"]["id"], "plan-first");
 
-    let decoded: KernelCommand = serde_json::from_value(encoded).expect("deserialize run start");
+    let decoded: KernelCommand = serde_json::from_value(encoded).expect("deserialize run create");
     assert_eq!(decoded, command);
 }
 

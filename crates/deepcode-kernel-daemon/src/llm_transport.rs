@@ -269,6 +269,90 @@ pub(crate) fn effective_openai_compatible_max_tokens(profile: &ResolvedLlmProfil
         .map(|tokens| tokens.min(OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP))
 }
 
+fn token_limit_u32(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|raw| u32::try_from(raw).ok())
+        .or_else(|| {
+            value
+                .as_i64()
+                .filter(|raw| *raw > 0)
+                .and_then(|raw| u32::try_from(raw).ok())
+        })
+}
+
+fn normalize_openai_base_url(profile: &ResolvedLlmProfile) -> String {
+    let base = profile
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com/v1")
+        .trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/chat/completions")
+    }
+}
+
+fn normalize_anthropic_base_url(profile: &ResolvedLlmProfile) -> String {
+    let base = profile
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.anthropic.com")
+        .trim_end_matches('/');
+    if base.ends_with("/v1/messages") {
+        base.to_string()
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
+fn normalize_ollama_base_url(profile: &ResolvedLlmProfile) -> String {
+    let base = profile
+        .base_url
+        .as_deref()
+        .unwrap_or("http://127.0.0.1:11434")
+        .trim_end_matches('/');
+    if base.ends_with("/api/chat") {
+        base.to_string()
+    } else {
+        format!("{base}/api/chat")
+    }
+}
+
+fn should_send_sampling(profile: &ResolvedLlmProfile) -> bool {
+    !profile.model.to_ascii_lowercase().contains("deepseek")
+}
+
+fn is_deepseek_profile(profile: &ResolvedLlmProfile) -> bool {
+    let base_url = profile.base_url.as_deref().unwrap_or_default();
+    profile.model.to_ascii_lowercase().contains("deepseek")
+        || base_url.to_ascii_lowercase().contains("deepseek")
+}
+
+fn provider_tool_name(name: &str) -> String {
+    name.replace('.', "__")
+}
+
+fn internal_tool_name(name: &str) -> String {
+    name.replace("__", ".")
+}
+
+fn split_system_messages(messages: Vec<Value>) -> (String, Vec<Value>) {
+    let mut system = Vec::new();
+    let mut chat = Vec::new();
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            if let Some(content) = message.get("content").and_then(Value::as_str) {
+                system.push(content.to_string());
+            }
+        } else {
+            chat.push(message);
+        }
+    }
+    (system.join("\n\n"), chat)
+}
+
 pub(crate) async fn call_anthropic_profile(
     profile: &ResolvedLlmProfile,
     messages: Vec<Value>,

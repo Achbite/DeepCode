@@ -175,26 +175,6 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                 &now_text(),
             )],
         },
-        KernelEvent::LlmCallRequested {
-            phase,
-            llm_call_id,
-            profile_ref,
-            ..
-        } => vec![agent_event(
-            session_id,
-            "workflow_stage",
-            json!({
-                "stage": phase,
-                "phase": phase,
-                "status": "llm_requested",
-                "summary": format!("Kernel requested LLM call {llm_call_id}."),
-                "profileId": profile_ref.as_ref().map(|value| value.id.clone()),
-                "channel": "task",
-                "visibility": "task",
-                "kernelEvent": event
-            }),
-            &now_text(),
-        )],
         KernelEvent::LlmProviderError {
             run_id,
             phase,

@@ -14,7 +14,6 @@ deepcode-kernel-config.workspace = true
 deepcode-kernel-context.workspace = true
 deepcode-kernel-ledger.workspace = true
 deepcode-kernel-policy.workspace = true
-deepcode-kernel-prompt.workspace = true
 deepcode-kernel-skills.workspace = true
 deepcode-kernel-workflow.workspace = true
 serde.workspace = true

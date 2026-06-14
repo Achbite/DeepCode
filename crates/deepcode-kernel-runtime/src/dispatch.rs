@@ -10,23 +10,6 @@ impl DeepCodeKernelRuntime {
                 message_key: Some("kernel.host.ready".to_string()),
                 args: None,
             }]),
-            KernelCommand::RunStart {
-                request_id,
-                session_id,
-                input,
-                workspace_binding,
-                profile_ref,
-                workflow_ref,
-                run_overrides,
-            } => self.run_start(
-                request_id,
-                session_id,
-                input,
-                workspace_binding,
-                profile_ref,
-                workflow_ref.map(|value| value.id),
-                run_overrides,
-            ),
             KernelCommand::RunCreate {
                 request_id,
                 session_id,
@@ -76,19 +59,6 @@ impl DeepCodeKernelRuntime {
             KernelCommand::ReviewGateEvaluate { request_id, .. } => {
                 self.not_implemented(request_id, "review_gate.evaluate")
             }
-            KernelCommand::LlmResponseSubmit {
-                request_id,
-                run_id,
-                session_id,
-                llm_call_id,
-                response_envelope,
-            } => self.llm_response_submit(
-                request_id,
-                run_id,
-                session_id,
-                llm_call_id,
-                response_envelope,
-            ),
             KernelCommand::SnapshotGet {
                 request_id,
                 session_id,

@@ -1,154 +1,6 @@
 use super::*;
 
 impl DeepCodeKernelRuntime {
-    pub(crate) fn run_start(
-        &mut self,
-        request_id: RequestId,
-        session_id: Option<SessionId>,
-        input: UserInput,
-        workspace_binding: Option<WorkspaceBinding>,
-        profile_ref: Option<ProfileRef>,
-        workflow_id: Option<String>,
-        run_overrides: Option<Value>,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let input_text = input.text.clone();
-        let attachments = input.attachments;
-        let workspace_binding = workspace_binding.unwrap_or_else(empty_workspace_binding);
-        self.state.next_run_index += 1;
-        let run_id = format!("run-{}", self.state.next_run_index);
-        let session_id = session_id
-            .map(|value| value.0)
-            .unwrap_or_else(|| format!("session-{}", self.state.next_run_index));
-
-        let config_snapshot = self.resolve_minimal_config(
-            &run_id,
-            profile_ref.as_ref().map(|value| value.id.clone()),
-            workflow_id.clone(),
-            run_overrides,
-        )?;
-        let config_ref = ConfigSnapshotRef {
-            snapshot_id: config_snapshot.snapshot_id.clone(),
-            hash: config_snapshot.hash.clone(),
-        };
-        let workflow_state = self.workflow.initial_state(&session_id, Some(3));
-        let mut sequence = 0_u64;
-
-        sequence += 1;
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "run.started",
-            sequence,
-            serde_json::json!({
-                "summary": "Headless kernel run skeleton started.",
-                "inputText": &input_text,
-                "attachments": &attachments,
-                "workspaceBinding": &workspace_binding,
-                "configRef": &config_ref,
-                "profileRef": &profile_ref,
-                "policyProfile": &self.policy_profile.id,
-                "skillCount": self.skills.len(),
-                "promptCompiler": if self.prompt_compiler.require_kernel_safety { "layered" } else { "layered-unchecked" }
-            }),
-        )?;
-
-        sequence += 1;
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "config.snapshot.attached",
-            sequence,
-            serde_json::json!({
-                "summary": "Config snapshot attached.",
-                "snapshotRef": &config_ref,
-                "sources": &config_snapshot.source_refs
-            }),
-        )?;
-
-        sequence += 1;
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "workflow.checkpointed",
-            sequence,
-            serde_json::json!({
-                "summary": "Workflow checkpoint created.",
-                "runId": &run_id,
-                "sessionId": &session_id,
-                "phase": workflow_state.phase.as_str(),
-                "sequence": sequence,
-                "pendingPermissionId": null,
-                "activeWorkUnitIds": []
-            }),
-        )?;
-
-        sequence += 1;
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "stage.changed",
-            sequence,
-            serde_json::json!({
-                "summary": "Workflow entered plan stage.",
-                "phase": workflow_state.phase.as_str(),
-                "status": "running"
-            }),
-        )?;
-
-        self.state.records_by_session.insert(
-            session_id.clone(),
-            RuntimeRunRecord {
-                session_id: session_id.clone(),
-                run_id: run_id.clone(),
-                input_text: input_text.clone(),
-                attachments,
-                workspace_binding: workspace_binding.clone(),
-                config_ref: config_ref.clone(),
-                profile_ref: profile_ref.clone(),
-                phase: workflow_state.phase.clone(),
-                active_llm_call_id: None,
-                llm_call_index: 0,
-                decision_state: RunDecisionState::from_user_input(&input_text),
-            },
-        );
-
-        let llm_call = self.llm_call_requested_event(&run_id, &session_id)?;
-
-        Ok(vec![
-            KernelEvent::RunStarted {
-                request_id: Some(request_id),
-                run_id: RunId(run_id.clone()),
-                session_id: Some(SessionId(session_id.clone())),
-                workspace_binding,
-                sequence: Some(1),
-            },
-            KernelEvent::ConfigSnapshotAttached {
-                run_id: Some(RunId(run_id.clone())),
-                session_id: Some(SessionId(session_id.clone())),
-                snapshot_ref: config_ref,
-                sequence: Some(2),
-            },
-            KernelEvent::WorkflowCheckpointed {
-                run_id: RunId(run_id.clone()),
-                session_id: Some(SessionId(session_id.clone())),
-                checkpoint_id: format!("checkpoint-{run_id}-3"),
-                phase: workflow_state.phase.as_str().to_string(),
-                sequence: Some(3),
-            },
-            KernelEvent::StageChanged {
-                run_id: Some(RunId(run_id)),
-                session_id: Some(SessionId(session_id)),
-                turn_id: None,
-                stage_run_id: None,
-                phase: workflow_state.phase.as_str().to_string(),
-                status: StageStatus::Running,
-                reason: None,
-                sequence: Some(4),
-            },
-            llm_call,
-        ])
-    }
-
     pub(crate) fn run_create(
         &mut self,
         request_id: RequestId,
@@ -238,8 +90,6 @@ impl DeepCodeKernelRuntime {
                 config_ref,
                 profile_ref,
                 phase: workflow_state.phase.clone(),
-                active_llm_call_id: None,
-                llm_call_index: 0,
                 decision_state: RunDecisionState::from_user_input(&input.text),
             },
         );
@@ -604,23 +454,12 @@ impl DeepCodeKernelRuntime {
             sequence: Some(sequence),
         }];
         events.push(self.enter_phase_event(&run_id_text, &session_id, WorkflowPhase::Complete)?);
-        if self
-            .state
-            .approved_tools_by_run
-            .get(&run_id_text)
-            .map(|queue| !queue.is_empty())
-            .unwrap_or(false)
-        {
-            events.extend(self.auto_continue_after_tool(&run_id_text, &session_id)?);
-            events.push(self.workflow_decision_event(
-                RequestId("agent-plan-approved-tools".to_string()),
-                &run_id_text,
-                &session_id,
-                "approved_tools.completed",
-            )?);
-        } else {
-            events.push(self.llm_call_requested_event(&run_id_text, &session_id)?);
-        }
+        events.push(self.workflow_decision_event(
+            RequestId("agent-plan-accepted".to_string()),
+            &run_id_text,
+            &session_id,
+            "plan.accepted",
+        )?);
         Ok(events)
     }
 
@@ -708,7 +547,6 @@ impl DeepCodeKernelRuntime {
         {
             let record = self.record_by_run_mut(run_id)?;
             record.phase = phase.clone();
-            record.active_llm_call_id = None;
         }
         let sequence = self.ledger.next_sequence(run_id)?;
         self.append_ledger(
@@ -766,7 +604,6 @@ impl DeepCodeKernelRuntime {
         {
             let record = self.record_by_run_mut(run_id)?;
             record.phase = WorkflowPhase::Done;
-            record.active_llm_call_id = None;
         }
         let sequence = self.ledger.next_sequence(run_id)?;
         self.append_ledger(
@@ -1319,7 +1156,6 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
     match event {
         KernelEvent::HostStatus { .. } => "host.status",
         KernelEvent::SnapshotReady { .. } => "snapshot.ready",
-        KernelEvent::RunStarted { .. } => "run.started",
         KernelEvent::StateEntered { .. } => "state.entered",
         KernelEvent::DriverRequestProduced { .. } => "driver.request_produced",
         KernelEvent::ProposalAccepted { .. } => "proposal.accepted",
@@ -1336,7 +1172,6 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::RunCompleted { .. } => "run.completed",
         KernelEvent::StageChanged { .. } => "stage.changed",
         KernelEvent::MessageAppended { .. } => "message.appended",
-        KernelEvent::LlmCallRequested { .. } => "llm.call_requested",
         KernelEvent::LlmProviderError { .. } => "llm.provider_error",
         KernelEvent::ToolRequested { .. } => "tool.requested",
         KernelEvent::ToolCompleted { .. } => "tool.completed",
@@ -1374,8 +1209,7 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
 
 pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
     match event {
-        KernelEvent::RunStarted { sequence, .. }
-        | KernelEvent::StateEntered { sequence, .. }
+        KernelEvent::StateEntered { sequence, .. }
         | KernelEvent::DriverRequestProduced { sequence, .. }
         | KernelEvent::ProposalAccepted { sequence, .. }
         | KernelEvent::ProposalRejected { sequence, .. }
@@ -1391,7 +1225,6 @@ pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::RunCompleted { sequence, .. }
         | KernelEvent::StageChanged { sequence, .. }
         | KernelEvent::MessageAppended { sequence, .. }
-        | KernelEvent::LlmCallRequested { sequence, .. }
         | KernelEvent::LlmProviderError { sequence, .. }
         | KernelEvent::ToolRequested { sequence, .. }
         | KernelEvent::ToolCompleted { sequence, .. }

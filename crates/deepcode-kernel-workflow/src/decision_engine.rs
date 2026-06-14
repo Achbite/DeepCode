@@ -325,7 +325,6 @@ fn event_kind(event: &KernelEvent) -> &'static str {
     match event {
         KernelEvent::HostStatus { .. } => "host.status",
         KernelEvent::SnapshotReady { .. } => "snapshot.ready",
-        KernelEvent::RunStarted { .. } => "run.started",
         KernelEvent::StateEntered { .. } => "state.entered",
         KernelEvent::DriverRequestProduced { .. } => "driver.request_produced",
         KernelEvent::ProposalAccepted { .. } => "proposal.accepted",
@@ -342,7 +341,6 @@ fn event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::RunCompleted { .. } => "run.completed",
         KernelEvent::StageChanged { .. } => "stage.changed",
         KernelEvent::MessageAppended { .. } => "message.appended",
-        KernelEvent::LlmCallRequested { .. } => "llm.call_requested",
         KernelEvent::LlmProviderError { .. } => "llm.provider_error",
         KernelEvent::ToolRequested { .. } => "tool.requested",
         KernelEvent::ToolCompleted { .. } => "tool.completed",
@@ -380,8 +378,7 @@ fn event_kind(event: &KernelEvent) -> &'static str {
 
 fn event_sequence(event: &KernelEvent) -> Option<u64> {
     match event {
-        KernelEvent::RunStarted { sequence, .. }
-        | KernelEvent::StateEntered { sequence, .. }
+        KernelEvent::StateEntered { sequence, .. }
         | KernelEvent::DriverRequestProduced { sequence, .. }
         | KernelEvent::ProposalAccepted { sequence, .. }
         | KernelEvent::ProposalRejected { sequence, .. }
@@ -397,7 +394,6 @@ fn event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::RunCompleted { sequence, .. }
         | KernelEvent::StageChanged { sequence, .. }
         | KernelEvent::MessageAppended { sequence, .. }
-        | KernelEvent::LlmCallRequested { sequence, .. }
         | KernelEvent::LlmProviderError { sequence, .. }
         | KernelEvent::ToolRequested { sequence, .. }
         | KernelEvent::ToolCompleted { sequence, .. }

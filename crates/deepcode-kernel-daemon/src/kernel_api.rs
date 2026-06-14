@@ -11,9 +11,9 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
         "status": "ok",
         "kernel": "ready",
         "buildCommit": build_commit(),
-        "protocolVersion": deepcode_kernel_runtime::llm::AGENT_PROTOCOL_VERSION,
-        "toolCatalogVersion": deepcode_kernel_runtime::llm::TOOL_CATALOG_VERSION,
-        "toolCatalogCount": deepcode_kernel_runtime::llm::kernel_visible_tool_catalog_count(),
+        "protocolVersion": deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION,
+        "toolCatalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
+        "toolCatalogCount": deepcode_kernel_runtime::kernel_visible_tool_catalog_count(),
         "workspace": workspace
     }))
 }

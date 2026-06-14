@@ -27,15 +27,6 @@ pub enum KernelCommand {
         request_id: RequestId,
         patch: Value,
     },
-    RunStart {
-        request_id: RequestId,
-        session_id: Option<SessionId>,
-        input: UserInput,
-        workspace_binding: Option<WorkspaceBinding>,
-        profile_ref: Option<ProfileRef>,
-        workflow_ref: Option<WorkflowRef>,
-        run_overrides: Option<Value>,
-    },
     RunCreate {
         request_id: RequestId,
         session_id: Option<SessionId>,
@@ -84,13 +75,6 @@ pub enum KernelCommand {
         run_id: RunId,
         session_id: Option<SessionId>,
         decision: Value,
-    },
-    LlmResponseSubmit {
-        request_id: RequestId,
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        llm_call_id: String,
-        response_envelope: Value,
     },
     RunCancel {
         request_id: RequestId,

@@ -3,74 +3,6 @@
 
 use crate::prelude::*;
 use crate::*;
-use std::path::{Path as StdPath, PathBuf};
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ToolExecuteRequest {
-    pub(crate) workspace_binding: Option<WorkspaceBinding>,
-    pub(crate) tool_call: ToolCallRequest,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ToolCallRequest {
-    pub(crate) id: Option<String>,
-    pub(crate) name: String,
-    pub(crate) arguments: Value,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentResourceResolveRequest {
-    pub(crate) workspace_binding: Option<WorkspaceBinding>,
-    pub(crate) manifest: AgentResourceManifest,
-    pub(crate) request: AgentResourceRequest,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentResourceManifest {
-    pub(crate) id: String,
-    pub(crate) workspace_scope_key: String,
-    pub(crate) workspace_id: Option<String>,
-    pub(crate) entries: Vec<AgentResourceManifestEntry>,
-    pub(crate) budget: AgentResourceManifestBudget,
-    pub(crate) default_deny_patterns: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentResourceManifestBudget {
-    pub(crate) max_entries: usize,
-    pub(crate) max_bytes: usize,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentResourceManifestEntry {
-    pub(crate) id: String,
-    pub(crate) kind: String,
-    pub(crate) label: String,
-    pub(crate) resource_ref: String,
-    pub(crate) read_policy: String,
-    pub(crate) reason: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentResourceRequest {
-    pub(crate) id: String,
-    pub(crate) items: Vec<AgentResourceRequestItem>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentResourceRequestItem {
-    pub(crate) id: String,
-    pub(crate) manifest_entry_id: String,
-    pub(crate) reason: String,
-}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -325,48 +257,11 @@ pub(crate) async fn agent_session_send_message(
     Path(session_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
-    let request = build_agent_run_request(&body);
-    {
-        let mut gui = state.gui.lock().expect("gui state lock");
-        if !has_session(&gui, &session_id) {
-            return ApiResponse::error("agent_session_not_found", "agent session not found");
-        }
-        maybe_auto_title_session(&mut gui, &session_id, &request.content);
-    }
-
-    let user_event = agent_event(
-        &session_id,
-        "user_msg",
-        json!({
-            "content": request.content,
-            "attachments": body.get("attachments").cloned().unwrap_or_else(|| json!([])),
-            "channel": "user",
-            "visibility": "conversation"
-        }),
-        &now_text(),
-    );
-    append_session_projection(&state, &session_id, vec![user_event]);
-
-    if let Err(error) = start_kernel_agent_run(&state, &session_id, request).await {
-        append_session_projection(
-            &state,
-            &session_id,
-            vec![agent_event(
-                &session_id,
-                "error",
-                json!({
-                    "code": error.code,
-                    "message": error.message,
-                    "channel": "error",
-                    "visibility": "conversation"
-                }),
-                &now_text(),
-            )],
-        );
-    }
-
-    let gui = state.gui.lock().expect("gui state lock");
-    session_result(&gui, &session_id)
+    let _ = (state, session_id, body);
+    ApiResponse::error(
+        "agent_messages_endpoint_removed",
+        "Agent message sending is owned by userspace SessionDriverLoop. Use /api/kernel/commands, /api/llm/chat, and /api/agent/sessions/:id/events.",
+    )
 }
 
 pub(crate) async fn agent_session_cancel(
@@ -444,22 +339,9 @@ pub(crate) async fn agent_permission_resolve(
                 .clone()
         })
         .unwrap_or_else(|| "session-unknown".to_string());
-    if let Err(error) = drive_kernel_agent_loop(&state, &session_id, kernel_events).await {
-        append_session_projection(
-            &state,
-            &session_id,
-            vec![agent_event(
-                &session_id,
-                "error",
-                json!({
-                    "message": error,
-                    "channel": "error",
-                    "visibility": "conversation"
-                }),
-                &now_text(),
-            )],
-        );
-    }
+    record_kernel_events(&state, &kernel_events);
+    let projection = kernel_events_to_agent_events(&session_id, &kernel_events);
+    append_session_projection(&state, &session_id, projection);
     let gui = state.gui.lock().expect("gui state lock");
     if gui
         .sessions
@@ -520,20 +402,15 @@ pub(crate) async fn agent_plan_resolve(
                 let gui = state.gui.lock().expect("gui state lock");
                 gui.pending_plans.get(&plan_id).cloned()
             };
-            let attachments = pending_plan
-                .as_ref()
-                .map(|plan| latest_user_attachments_for_session(&state, &plan.session_id))
-                .unwrap_or_default();
             let plan_run_id = pending_plan
                 .as_ref()
                 .map(|plan| plan.run_id.clone())
                 .unwrap_or_else(|| run_id.clone());
-            let (grants, approved_tools, pending_review) = pending_plan.as_ref().map_or_else(
-                || (Vec::new(), Vec::new(), None),
+            let (grants, pending_review) = pending_plan.as_ref().map_or_else(
+                || (Vec::new(), None),
                 |plan| {
                     (
                         temporary_grants_for_pending_plan(plan),
-                        approved_tool_calls_for_pending_plan_with_attachments(plan, &attachments),
                         pending_review_for_plan(plan),
                     )
                 },
@@ -567,36 +444,7 @@ pub(crate) async fn agent_plan_resolve(
                     }
                 }
             }
-            if !grant_failed {
-                if let Err(error) =
-                    runtime.grant_explicit_attachments_for_run(&plan_run_id, &attachments)
-                {
-                    events.push(KernelEvent::Error {
-                        request_id: Some(rid("agent-plan-attachment-grants")),
-                        run_id: Some(deepcode_kernel_abi::RunId(plan_run_id.clone())),
-                        session_id: None,
-                        error: KernelErrorEnvelope::from(&error),
-                        message_key: None,
-                        args: None,
-                    });
-                    grant_failed = true;
-                }
-            }
-            if !grant_failed {
-                if let Err(error) =
-                    runtime.enqueue_approved_tool_calls(&plan_run_id, approved_tools)
-                {
-                    events.push(KernelEvent::Error {
-                        request_id: Some(rid("agent-plan-approved-tools")),
-                        run_id: Some(deepcode_kernel_abi::RunId(plan_run_id.clone())),
-                        session_id: None,
-                        error: KernelErrorEnvelope::from(&error),
-                        message_key: None,
-                        args: None,
-                    });
-                    grant_failed = true;
-                }
-            }
+            let _ = plan_run_id;
         }
         if grant_failed {
             events
@@ -644,22 +492,9 @@ pub(crate) async fn agent_plan_resolve(
         .expect("gui state lock")
         .pending_plans
         .remove(&plan_id);
-    if let Err(error) = drive_kernel_agent_loop(&state, &session_id, kernel_events).await {
-        append_session_projection(
-            &state,
-            &session_id,
-            vec![agent_event(
-                &session_id,
-                "error",
-                json!({
-                    "message": error,
-                    "channel": "error",
-                    "visibility": "conversation"
-                }),
-                &now_text(),
-            )],
-        );
-    }
+    record_kernel_events(&state, &kernel_events);
+    let projection = kernel_events_to_agent_events(&session_id, &kernel_events);
+    append_session_projection(&state, &session_id, projection);
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)
 }
@@ -855,300 +690,27 @@ fn continuation_plan_from_review(review: &PendingAgentReview) -> PendingAgentPla
     }
 }
 
-pub(crate) fn approved_tool_calls_for_pending_plan(
-    plan: &PendingAgentPlan,
-) -> Vec<(String, String, Value)> {
-    approved_tool_calls_for_pending_plan_with_attachments(plan, &[])
-}
-
-pub(crate) fn approved_tool_calls_for_pending_plan_with_attachments(
-    plan: &PendingAgentPlan,
-    attachments: &[Value],
-) -> Vec<(String, String, Value)> {
-    let code_blocks = plan
-        .code_blocks
-        .iter()
-        .filter_map(|block| {
-            let id = block.get("id")?.as_str()?.to_string();
-            Some((id, block.clone()))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let actions = plan
-        .action_bundle
-        .get("actions")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    actions
-        .iter()
-        .filter_map(|action| approved_tool_call_for_action(plan, action, &code_blocks, attachments))
-        .collect()
-}
-
-fn approved_tool_call_for_action(
-    plan: &PendingAgentPlan,
-    action: &Value,
-    code_blocks: &std::collections::BTreeMap<String, Value>,
-    attachments: &[Value],
-) -> Option<(String, String, Value)> {
-    let action_id = action.get("id")?.as_str()?.trim();
-    let capability = action.get("capability")?.as_str()?.trim();
-    let kind = action
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let resource_scope = action
-        .get("resourceScope")
-        .and_then(Value::as_array)
-        .and_then(|items| items.iter().find_map(Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let tool_call_id = format!(
-        "approved-{}-{}",
-        safe_path_segment(&plan.plan_id),
-        safe_path_segment(action_id)
-    );
-    match capability {
-        "workspace.write" if kind == "write" => {
-            let source_block_id = action.get("sourceBlockId")?.as_str()?.trim();
-            let block = code_blocks.get(source_block_id)?;
-            let path = block.get("path")?.as_str()?.trim();
-            let content = block.get("content")?.as_str()?;
-            Some((
-                tool_call_id,
-                "fs.write".to_string(),
-                json!({
-                    "path": path,
-                    "content": content
-                }),
-            ))
-        }
-        "workspace.delete" => Some((
-            tool_call_id,
-            "fs.delete".to_string(),
-            json!({
-                "path": resource_scope,
-                "reason": format!("Approved plan {} action {}", plan.plan_id, action_id)
-            }),
-        )),
-        "workspace.read" if kind == "list" => Some((
-            tool_call_id,
-            "fs.list".to_string(),
-            read_only_tool_arguments(resource_scope, attachments),
-        )),
-        "workspace.read" if kind == "read" => {
-            let (tool_name, arguments) = read_tool_for_scope(resource_scope, attachments);
-            Some((tool_call_id, tool_name, arguments))
-        }
-        "workspace.search" if kind == "search" => Some((
-            tool_call_id,
-            "code.search".to_string(),
-            json!({ "query": search_query_from_scope(resource_scope) }),
-        )),
-        _ => None,
-    }
-}
-
-fn read_tool_for_scope(scope: &str, attachments: &[Value]) -> (String, Value) {
-    if let Some(resolved) = resolve_scope_against_attachments(scope, attachments) {
-        let tool = if resolved.target_is_dir {
-            "fs.list"
-        } else {
-            "fs.read"
-        };
-        return (tool.to_string(), resolved.arguments);
-    }
-    if scope.trim() == "." || scope.trim().ends_with('/') {
-        return ("fs.list".to_string(), json!({ "path": scope }));
-    }
-    ("fs.read".to_string(), json!({ "path": scope }))
-}
-
-fn read_only_tool_arguments(scope: &str, attachments: &[Value]) -> Value {
-    resolve_scope_against_attachments(scope, attachments)
-        .map(|resolved| resolved.arguments)
-        .unwrap_or_else(|| json!({ "path": scope }))
-}
-
-struct ResolvedAttachmentScope {
-    arguments: Value,
-    target_is_dir: bool,
-}
-
-fn resolve_scope_against_attachments(
-    scope: &str,
-    attachments: &[Value],
-) -> Option<ResolvedAttachmentScope> {
-    let scope = scope.trim();
-    if scope.is_empty() {
-        return None;
-    }
-    attachments
-        .iter()
-        .find_map(|attachment| resolve_scope_against_attachment(scope, attachment))
-}
-
-fn resolve_scope_against_attachment(
-    scope: &str,
-    attachment: &Value,
-) -> Option<ResolvedAttachmentScope> {
-    let source = attachment
-        .get("source")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !matches!(source, "userSelected" | "contextMenu" | "mention") {
-        return None;
-    }
-    let kind = attachment
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("file");
-    let absolute_path = attachment
-        .get("absolutePath")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let attachment_path = PathBuf::from(absolute_path).canonicalize().ok()?;
-    if kind == "directory" {
-        resolve_scope_against_directory_attachment(scope, attachment, &attachment_path)
-    } else {
-        resolve_scope_against_file_attachment(scope, attachment, &attachment_path)
-    }
-}
-
-fn resolve_scope_against_directory_attachment(
-    scope: &str,
-    attachment: &Value,
-    root: &StdPath,
-) -> Option<ResolvedAttachmentScope> {
-    let relative = attachment_relative_scope(scope, attachment, root)?;
-    let target = root.join(&relative);
-    if !target.exists() {
-        return None;
-    }
-    let target_is_dir = target.is_dir();
-    Some(ResolvedAttachmentScope {
-        arguments: json!({
-            "path": path_for_tool_argument(&relative),
-            "attachmentRoot": root.to_string_lossy(),
-            "attachmentManifestEntryId": attachment_manifest_entry_id(attachment)
+fn plan_card_event(session_id: &str, plan: &PendingAgentPlan) -> Value {
+    agent_event(
+        session_id,
+        "plan_card",
+        json!({
+            "title": "Plan",
+            "summary": plan.user_plan,
+            "content": plan.user_plan,
+            "runId": plan.run_id,
+            "planId": plan.plan_id,
+            "actionBundle": plan.action_bundle,
+            "codeBlocks": plan.code_blocks,
+            "expectedValidation": plan.expected_validation,
+            "reviewGuide": plan.review_guide,
+            "planReviewReport": plan.plan_review_report,
+            "channel": "action",
+            "visibility": "conversation",
+            "presentation": "body"
         }),
-        target_is_dir,
-    })
-}
-
-fn resolve_scope_against_file_attachment(
-    scope: &str,
-    attachment: &Value,
-    file_path: &StdPath,
-) -> Option<ResolvedAttachmentScope> {
-    if !file_path.is_file() {
-        return None;
-    }
-    let file_name = file_path.file_name()?.to_string_lossy().to_string();
-    let display_path = attachment
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let scope_path = StdPath::new(scope);
-    let matches_scope = scope == display_path
-        || scope == file_name
-        || scope_path
-            .file_name()
-            .map(|value| value.to_string_lossy() == file_name)
-            .unwrap_or(false)
-        || scope_path
-            .canonicalize()
-            .ok()
-            .map(|value| value == file_path)
-            .unwrap_or(false);
-    if !matches_scope {
-        return None;
-    }
-    let root = file_path.parent()?;
-    Some(ResolvedAttachmentScope {
-        arguments: json!({
-            "path": file_name,
-            "attachmentRoot": root.to_string_lossy(),
-            "attachmentManifestEntryId": attachment_manifest_entry_id(attachment)
-        }),
-        target_is_dir: false,
-    })
-}
-
-fn attachment_relative_scope(scope: &str, attachment: &Value, root: &StdPath) -> Option<PathBuf> {
-    if scope == "." {
-        return Some(PathBuf::from("."));
-    }
-    let scope_path = StdPath::new(scope);
-    if scope_path.is_absolute() {
-        let absolute = scope_path.canonicalize().ok()?;
-        return absolute.strip_prefix(root).ok().map(PathBuf::from);
-    }
-    let display_path = attachment
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .trim_matches('/');
-    let normalized_scope = scope.replace('\\', "/");
-    let normalized_scope = normalized_scope.trim_matches('/');
-    if !display_path.is_empty() && normalized_scope == display_path {
-        return Some(PathBuf::from("."));
-    }
-    if !display_path.is_empty() {
-        if let Some(stripped) = normalized_scope.strip_prefix(&format!("{display_path}/")) {
-            return safe_relative_path(stripped);
-        }
-    }
-    safe_relative_path(normalized_scope)
-}
-
-fn safe_relative_path(value: &str) -> Option<PathBuf> {
-    let path = StdPath::new(value);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::Prefix(_)
-            )
-        })
-    {
-        return None;
-    }
-    Some(if value.is_empty() {
-        PathBuf::from(".")
-    } else {
-        PathBuf::from(value)
-    })
-}
-
-fn path_for_tool_argument(path: &StdPath) -> String {
-    let value = path.to_string_lossy().replace('\\', "/");
-    if value.is_empty() {
-        ".".to_string()
-    } else {
-        value
-    }
-}
-
-fn attachment_manifest_entry_id(attachment: &Value) -> String {
-    attachment
-        .get("id")
-        .or_else(|| attachment.get("manifestEntryId"))
-        .and_then(Value::as_str)
-        .or_else(|| attachment.get("path").and_then(Value::as_str))
-        .unwrap_or("explicit-attachment")
-        .to_string()
-}
-
-fn search_query_from_scope(scope: &str) -> String {
-    scope
-        .strip_prefix("search:")
-        .or_else(|| scope.strip_prefix("symbol:"))
-        .unwrap_or(scope)
-        .trim()
-        .to_string()
+        &now_text(),
+    )
 }
 
 fn temporary_grants_for_pending_plan(
@@ -1307,192 +869,6 @@ pub(crate) async fn agent_workflow_config_patch(
             "initialized": true
         })),
         Err(error) => ApiResponse::error("write_workflow_config_failed", error),
-    }
-}
-
-pub(crate) async fn agent_parse_actions() -> Json<ApiResponse> {
-    ApiResponse::ok(json!({ "actions": [], "errors": [] }))
-}
-
-pub(crate) async fn agent_fixture_run() -> Json<ApiResponse> {
-    ApiResponse::ok(json!({
-        "parse": { "actions": [], "errors": [] },
-        "observations": []
-    }))
-}
-
-pub(crate) async fn agent_resources_resolve(
-    State(state): State<AppState>,
-    Json(body): Json<AgentResourceResolveRequest>,
-) -> Json<ApiResponse> {
-    let mut items = Vec::new();
-    let entries = body
-        .manifest
-        .entries
-        .iter()
-        .map(|entry| (entry.id.as_str(), entry))
-        .collect::<HashMap<_, _>>();
-    let max_entries = body.manifest.budget.max_entries.max(1);
-    let max_bytes = body.manifest.budget.max_bytes.max(256);
-
-    for request_item in body.request.items.iter().take(max_entries) {
-        let Some(entry) = entries.get(request_item.manifest_entry_id.as_str()) else {
-            items.push(json!({
-                "requestItemId": request_item.id,
-                "manifestEntryId": request_item.manifest_entry_id,
-                "readPolicy": "denyRead",
-                "status": "denied",
-                "denialReason": "resource is not listed in ResourceManifest",
-                "sourceKind": "manifestOnly"
-            }));
-            continue;
-        };
-        match entry.read_policy.as_str() {
-            "denyRead" => items.push(json!({
-                "requestItemId": request_item.id,
-                "manifestEntryId": entry.id,
-                "readPolicy": entry.read_policy,
-                "status": "denied",
-                "denialReason": "resource is denied by manifest policy",
-                "sourceKind": "manifestOnly"
-            })),
-            "askRead" => items.push(json!({
-                "requestItemId": request_item.id,
-                "manifestEntryId": entry.id,
-                "readPolicy": entry.read_policy,
-                "status": "needsUserApproval",
-                "denialReason": "resource requires user approval before read",
-                "sourceKind": "manifestOnly"
-            })),
-            _ => {
-                let resource = resolve_auto_read_resource(
-                    &state,
-                    body.workspace_binding.as_ref(),
-                    entry,
-                    max_bytes,
-                );
-                match resource {
-                    Ok((content, refs)) => items.push(json!({
-                        "requestItemId": request_item.id,
-                        "manifestEntryId": entry.id,
-                        "readPolicy": "autoRead",
-                        "status": "provided",
-                        "contentSummary": content.content_summary,
-                        "promptContent": content.prompt_content,
-                        "contentKind": content.content_kind,
-                        "truncated": content.truncated,
-                        "originalBytes": content.original_bytes,
-                        "evidenceRefs": refs,
-                        "sourceKind": "kernelResource"
-                    })),
-                    Err(error) => items.push(json!({
-                        "requestItemId": request_item.id,
-                        "manifestEntryId": entry.id,
-                        "readPolicy": "autoRead",
-                        "status": "denied",
-                        "denialReason": error,
-                        "sourceKind": "kernelResource"
-                    })),
-                }
-            }
-        }
-    }
-
-    ApiResponse::ok(json!({
-        "id": format!("resource-packet-{}", now_millis()),
-        "workspaceScopeKey": body.manifest.workspace_scope_key,
-        "requestId": body.request.id,
-        "items": items
-    }))
-}
-
-fn resolve_auto_read_resource(
-    state: &AppState,
-    binding: Option<&WorkspaceBinding>,
-    entry: &AgentResourceManifestEntry,
-    max_bytes: usize,
-) -> Result<(ResolvedResourceContent, Vec<String>), String> {
-    ensure_workspace_binding(&state.runtime, binding).map_err(|error| error.message)?;
-    let output = match entry.kind.as_str() {
-        "file" | "ruler" => crate::workspace_api::dispatch_workspace(
-            &state.runtime,
-            KernelCommand::WorkspaceRead {
-                request_id: rid("agent-resource-read"),
-                folder_id: None,
-                path: entry.resource_ref.clone(),
-            },
-        )
-        .map_err(|error| error.message)?,
-        "search" | "symbol" => crate::workspace_api::dispatch_workspace(
-            &state.runtime,
-            KernelCommand::WorkspaceSearch {
-                request_id: rid("agent-resource-search"),
-                folder_id: None,
-                query: entry.resource_ref.clone(),
-                include: None,
-                is_regex: false,
-            },
-        )
-        .map_err(|error| error.message)?,
-        "index" | "checkpoint" => json!({
-            "summary": entry.resource_ref,
-            "reason": entry.reason
-        }),
-        other => {
-            return Err(format!(
-                "resource kind {other} is not supported by Kernel resource resolver"
-            ));
-        }
-    };
-    Ok((
-        summarize_resource_output(&output, max_bytes),
-        vec![format!("kernel-resource:{}:{}", entry.kind, entry.id)],
-    ))
-}
-
-struct ResolvedResourceContent {
-    content_summary: String,
-    prompt_content: String,
-    content_kind: &'static str,
-    truncated: bool,
-    original_bytes: usize,
-}
-
-fn summarize_resource_output(output: &Value, max_bytes: usize) -> ResolvedResourceContent {
-    let (content_kind, candidate) =
-        if let Some(content) = output.get("content").and_then(Value::as_str) {
-            ("fileText", content.to_string())
-        } else if let Some(text) = output.get("text").and_then(Value::as_str) {
-            ("text", text.to_string())
-        } else if let Some(nodes) = output.get("nodes") {
-            (
-                "directoryTree",
-                serde_json::to_string_pretty(nodes).unwrap_or_else(|_| nodes.to_string()),
-            )
-        } else if let Some(matches) = output.get("matches") {
-            (
-                "searchResults",
-                serde_json::to_string_pretty(matches).unwrap_or_else(|_| matches.to_string()),
-            )
-        } else if let Some(summary) = output.get("summary").and_then(Value::as_str) {
-            ("summary", summary.to_string())
-        } else {
-            (
-                "json",
-                serde_json::to_string_pretty(output).unwrap_or_else(|_| "{}".to_string()),
-            )
-        };
-    let original_bytes = candidate.len();
-    let max_chars = max_bytes.max(256);
-    let prompt_content = candidate.chars().take(max_chars).collect::<String>();
-    let truncated = prompt_content.len() < candidate.len();
-    let content_summary = prompt_content.chars().take(1200).collect::<String>();
-    ResolvedResourceContent {
-        content_summary,
-        prompt_content,
-        content_kind,
-        truncated,
-        original_bytes,
     }
 }
 

@@ -14,7 +14,6 @@ pub(crate) struct RuntimeState {
     pub(crate) current_workspace: Option<RuntimeWorkspace>,
     pub(crate) records_by_session: BTreeMap<String, RuntimeRunRecord>,
     pub(crate) pending_tools: BTreeMap<String, PendingKernelTool>,
-    pub(crate) approved_tools_by_run: BTreeMap<String, Vec<KernelLlmToolCall>>,
     pub(crate) temporary_grants_by_run: BTreeMap<String, Vec<TemporaryGrantEnvelope>>,
     pub(crate) change_operations_by_run: BTreeMap<String, Vec<ChangeOperation>>,
     pub(crate) validations_by_run: BTreeMap<String, Vec<ValidationResult>>,
@@ -53,8 +52,6 @@ pub(crate) struct RuntimeRunRecord {
     pub(crate) config_ref: ConfigSnapshotRef,
     pub(crate) profile_ref: Option<ProfileRef>,
     pub(crate) phase: WorkflowPhase,
-    pub(crate) active_llm_call_id: Option<String>,
-    pub(crate) llm_call_index: u64,
     pub(crate) decision_state: RunDecisionState,
 }
 
@@ -64,13 +61,6 @@ pub(crate) struct PendingKernelTool {
     pub(crate) session_id: String,
     pub(crate) tool_call_id: String,
     pub(crate) tool_name: String,
-    pub(crate) arguments: Value,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct KernelLlmToolCall {
-    pub(crate) id: String,
-    pub(crate) name: String,
     pub(crate) arguments: Value,
 }
 
@@ -212,10 +202,6 @@ impl DeepCodeKernelRuntime {
             .get("profileRef")
             .cloned()
             .and_then(|value| serde_json::from_value::<ProfileRef>(value).ok());
-        let llm_call_index = run_events
-            .iter()
-            .filter(|event| event.kind == "llm.call_requested")
-            .count() as u64;
         Ok(Some(RuntimeRunRecord {
             session_id: session_id.to_string(),
             run_id,
@@ -235,8 +221,6 @@ impl DeepCodeKernelRuntime {
             config_ref,
             profile_ref,
             phase,
-            active_llm_call_id: None,
-            llm_call_index,
             decision_state: RunDecisionState::default(),
         }))
     }

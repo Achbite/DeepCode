@@ -106,59 +106,10 @@ impl HttpKernelClient {
         mode: PromptMode,
         workspace_scope: Option<WorkspaceSessionScope>,
     ) -> KernelClientResult<PromptRunResult> {
-        let mut session_body = json!({
-            "title": "CLI Session",
-            "mode": mode.as_str(),
-        });
-        if let Some(scope) = workspace_scope {
-            if let Some(workspace_id) = scope.workspace_id {
-                session_body["workspaceId"] = json!(workspace_id);
-            }
-            if let Some(workspace_hash) = scope.workspace_hash {
-                session_body["workspaceHash"] = json!(workspace_hash);
-            }
-        }
-        let session_response = self
-            .http
-            .post(self.url("/api/agent/sessions"))
-            .json(&session_body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        let session_data = api_data(session_response)?;
-        let session_id = session_data
-            .get("session")
-            .and_then(|session| session.get("id"))
-            .and_then(Value::as_str)
-            .ok_or(KernelClientError::MissingField("session.id"))?
-            .to_string();
-
-        let message_response = self
-            .http
-            .post(self.url(&format!("/api/agent/sessions/{session_id}/messages")))
-            .json(&json!({
-                "content": prompt,
-                "mode": mode.as_str(),
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        let message_data = api_data(message_response)?;
-        let events = message_data
-            .get("events")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let final_answer = extract_final_answer(&events);
-        Ok(PromptRunResult {
-            session_id,
-            events,
-            final_answer,
-        })
+        let _ = (prompt, mode, workspace_scope);
+        Err(KernelClientError::Api(
+            "Agent prompt sending is owned by the userspace SessionDriverLoop; the legacy /messages path has been removed.".to_string(),
+        ))
     }
 
     pub async fn resolve_permission(

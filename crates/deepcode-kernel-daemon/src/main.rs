@@ -1,5 +1,4 @@
 mod agent_api;
-mod agent_loop;
 mod agent_timeline;
 mod api_response;
 mod browser_api;
@@ -21,7 +20,6 @@ mod workspace_api;
 use crate::prelude::*;
 
 pub(crate) use agent_api::*;
-pub(crate) use agent_loop::*;
 pub(crate) use agent_timeline::*;
 pub(crate) use api_response::*;
 pub(crate) use browser_api::*;
@@ -172,10 +170,6 @@ async fn main() {
             get(agent_session_events).post(agent_session_append_events),
         )
         .route(
-            "/api/agent/sessions/:session_id/messages",
-            post(agent_session_send_message),
-        )
-        .route(
             "/api/agent/sessions/:session_id/cancel",
             post(agent_session_cancel),
         )
@@ -208,16 +202,9 @@ async fn main() {
             "/api/agent/workflow-config",
             get(agent_workflow_config_get).patch(agent_workflow_config_patch),
         )
-        .route("/api/agent/parse-actions", post(agent_parse_actions))
-        .route("/api/agent/fixtures/run", post(agent_fixture_run))
-        .route(
-            "/api/agent/resources/resolve",
-            post(agent_resources_resolve),
-        )
         .route("/api/agent/prompt-layers", get(agent_prompt_layers))
         .route("/api/agent/tools", get(agent_tools))
         .route("/api/agent/skills", get(agent_tools))
-        .route("/api/agent/tools/execute", post(agent_tool_execute))
         .route("/api/browser/runtime-status", get(browser_status))
         .route("/api/browser/open", post(browser_open))
         .route("/api/browser/reload", post(browser_reload))

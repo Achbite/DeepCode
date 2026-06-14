@@ -56,16 +56,6 @@ impl Kernel {
             KernelCommand::ConfigPatch { request_id, .. } => {
                 self.not_implemented(request_id, "config.patch")
             }
-            KernelCommand::RunStart {
-                request_id,
-                workspace_binding,
-                ..
-            } => {
-                if workspace_binding.is_none() {
-                    return Err(KernelError::MissingWorkspaceBinding);
-                }
-                self.not_implemented(request_id, "run.start")
-            }
             KernelCommand::RunCreate { request_id, .. } => {
                 self.not_implemented(request_id, "run.create")
             }
@@ -89,9 +79,6 @@ impl Kernel {
             }
             KernelCommand::ReviewGateEvaluate { request_id, .. } => {
                 self.not_implemented(request_id, "review_gate.evaluate")
-            }
-            KernelCommand::LlmResponseSubmit { request_id, .. } => {
-                self.not_implemented(request_id, "llm.response_submit")
             }
             KernelCommand::RunCancel { request_id, .. } => {
                 self.not_implemented(request_id, "run.cancel")
@@ -243,54 +230,6 @@ mod tests {
             .expect_err("config is intentionally not implemented in stage 0");
 
         assert!(matches!(error, KernelError::NotImplemented("config.get")));
-    }
-
-    #[test]
-    fn run_start_without_workspace_binding_fails_closed() {
-        let mut kernel = Kernel::new(KernelContext::default());
-        let error = kernel
-            .handle_command(KernelCommand::RunStart {
-                request_id: RequestId("req-run".to_string()),
-                session_id: Some(SessionId("session-1".to_string())),
-                input: UserInput {
-                    text: "start".to_string(),
-                    attachments: vec![],
-                },
-                workspace_binding: None,
-                profile_ref: None,
-                workflow_ref: None,
-                run_overrides: None,
-            })
-            .expect_err("run.start must not proceed without host workspace binding");
-
-        assert!(matches!(error, KernelError::MissingWorkspaceBinding));
-    }
-
-    #[test]
-    fn run_start_with_binding_remains_not_implemented() {
-        let mut kernel = Kernel::new(KernelContext::default());
-        let error = kernel
-            .handle_command(KernelCommand::RunStart {
-                request_id: RequestId("req-run".to_string()),
-                session_id: Some(SessionId("session-1".to_string())),
-                input: UserInput {
-                    text: "start".to_string(),
-                    attachments: vec![],
-                },
-                workspace_binding: Some(WorkspaceBinding {
-                    workspace_id: Some("ws-1".to_string()),
-                    workspace_hash: Some("hash-1".to_string()),
-                    open_path: Some("/workspace".to_string()),
-                    active_folder_id: Some("wf-0".to_string()),
-                    folder_hash: None,
-                }),
-                profile_ref: None,
-                workflow_ref: None,
-                run_overrides: None,
-            })
-            .expect_err("stage 1 does not execute the real agent runtime");
-
-        assert!(matches!(error, KernelError::NotImplemented("run.start")));
     }
 
     #[test]

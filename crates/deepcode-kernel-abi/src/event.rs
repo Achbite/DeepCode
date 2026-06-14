@@ -1,8 +1,8 @@
 use crate::{
     ConfigSnapshotRef, DriverRequest, HostStatus, KernelErrorEnvelope, KernelSnapshot,
     KernelStateContract, LlmProviderDiagnostic, MessageRole, PermissionDecisionKind,
-    PermissionRequestEnvelope, ProfileRef, ProposalEnvelope, RequestId, RunId, RunStatus,
-    SessionId, StageRunId, StageStatus, TurnId, WorkflowDecision, WorkspaceBinding,
+    PermissionRequestEnvelope, ProposalEnvelope, RequestId, RunId, RunStatus, SessionId,
+    StageRunId, StageStatus, TurnId, WorkflowDecision,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,14 +26,6 @@ pub enum KernelEvent {
     SnapshotReady {
         request_id: RequestId,
         snapshot: KernelSnapshot,
-    },
-    #[serde(rename = "run.started")]
-    RunStarted {
-        request_id: Option<RequestId>,
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        workspace_binding: WorkspaceBinding,
-        sequence: Option<u64>,
     },
     #[serde(rename = "state.entered")]
     StateEntered {
@@ -173,16 +165,6 @@ pub enum KernelEvent {
         content: Option<String>,
         message_key: Option<String>,
         args: Option<Value>,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "llm.call_requested")]
-    LlmCallRequested {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        phase: String,
-        llm_call_id: String,
-        profile_ref: Option<ProfileRef>,
-        request_envelope: Value,
         sequence: Option<u64>,
     },
     #[serde(rename = "llm.provider_error")]

@@ -223,20 +223,6 @@ impl DeepCodeKernelRuntime {
         )?;
 
         let mut events = vec![resolved_event];
-        if matches!(
-            decision,
-            deepcode_kernel_abi::PermissionDecisionKind::Accept
-        ) {
-            let completed = self.execute_bound_tool(
-                &run_id,
-                &session_id,
-                pending.tool_call_id,
-                pending.tool_name,
-                pending.arguments,
-            )?;
-            events.push(completed);
-            events.extend(self.auto_continue_after_tool(&run_id, &session_id)?);
-        }
 
         let workflow_decision = {
             let record = self
@@ -267,23 +253,6 @@ impl DeepCodeKernelRuntime {
             decision: workflow_decision.clone(),
             sequence: Some(workflow_sequence),
         });
-        let run_id = match events.last() {
-            Some(KernelEvent::WorkflowDecisionMade { run_id, .. }) => run_id.0.clone(),
-            _ => unreachable!("last event is workflow decision"),
-        };
-        let session_id = match events.last() {
-            Some(KernelEvent::WorkflowDecisionMade {
-                session_id: Some(session_id),
-                ..
-            }) => session_id.0.clone(),
-            _ => unreachable!("workflow decision has session id"),
-        };
-        if let LlmPhaseAdvance::Continue(next_phase) =
-            next_phase_after_llm_response(&phase, &workflow_decision)
-        {
-            events.push(self.enter_phase_event(&run_id, &session_id, next_phase)?);
-            events.push(self.llm_call_requested_event(&run_id, &session_id)?);
-        }
         Ok(events)
     }
 

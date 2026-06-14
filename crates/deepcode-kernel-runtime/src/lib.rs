@@ -20,7 +20,6 @@ use deepcode_kernel_ledger::{
     LedgerEvent, NdjsonEventLedger, ReviewGate, ReviewGateStatus, ValidationKind, ValidationResult,
 };
 use deepcode_kernel_policy::{AutonomyLevel, PolicyDecisionKind, PolicyProfile, WorkspaceBoundary};
-use deepcode_kernel_prompt::LayeredPromptCompiler;
 use deepcode_kernel_skills::{
     builtin::builtin_executors, model_visible_skill_descriptors, InMemorySkillRegistry,
     SkillExecutionContext, SkillExecutorRegistry, SkillInvocation, SkillRegistry, SkillRuntime,
@@ -40,7 +39,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod context;
 pub mod dispatch;
-pub mod llm;
 pub mod obligations;
 pub mod permissions;
 pub mod state;
@@ -49,16 +47,21 @@ pub mod tools;
 pub mod workflow;
 pub mod workspace;
 
-pub(crate) use llm::*;
 pub(crate) use state::*;
 pub(crate) use temp_artifacts::*;
 pub(crate) use tools::*;
 pub(crate) use workflow::*;
 pub(crate) use workspace::*;
 
+pub const AGENT_PROTOCOL_VERSION: &str = "deepcode.agent.protocol.v3";
+pub const TOOL_CATALOG_VERSION: &str = "deepcode.tool_catalog.session-v3.v1";
+
+pub fn kernel_visible_tool_catalog_count() -> usize {
+    22
+}
+
 pub struct DeepCodeKernelRuntime {
     config_resolver: DefaultConfigResolver,
-    prompt_compiler: LayeredPromptCompiler,
     workflow: BuiltinWorkflowMachine,
     policy_profile: PolicyProfile,
     skills: InMemorySkillRegistry,
@@ -87,7 +90,6 @@ impl DeepCodeKernelRuntime {
             .unwrap_or(0);
         Self {
             config_resolver: DefaultConfigResolver,
-            prompt_compiler: LayeredPromptCompiler::default(),
             workflow: BuiltinWorkflowMachine::default(),
             policy_profile: PolicyProfile::developer_defaults(),
             skills: InMemorySkillRegistry::with_builtin_tools(),
