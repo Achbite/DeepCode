@@ -203,7 +203,7 @@ export function buildConversationProjection(input: ConversationProjectionInput):
     cards.push(
       conversationCard(input, createdAt, {
         kind: 'check_review',
-        title: 'Check / 计划确认',
+        title: '计划确认',
         summary:
           report?.kernelGeneratedPermissionSummary ??
           '等待 Kernel PlanReview 和用户计划确认；权限只作为预览，真实授权在执行前触发。',
