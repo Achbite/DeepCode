@@ -192,7 +192,7 @@ export class SessionDriverLoop {
       },
       resourcePackets: [],
       memoryHints: [
-        ...buildMemoryHints(input.existingEvents ?? []),
+        ...buildSessionMemoryDocument(input.existingEvents ?? []),
         ...implementationBatchHints(implementationBatch),
       ],
       implementationBatch,
@@ -468,12 +468,44 @@ export class SessionDriverLoop {
     }
 
     if (input.decision !== 'accept') {
-      return this.append(input.sessionId, [
+      let result = await this.append(input.sessionId, [
         reviewDecisionEvent(input.sessionId, review, 'needsRevision', input.guidance ?? '用户要求补充或修改。', false, this.ts(), this.id('review-revise')),
       ]);
+      const decisionReply = await this.kernel({
+        command: {
+          kind: 'userDecisionSubmit',
+          requestId: this.id('user-decision-review'),
+          runId: review.runId,
+          sessionId: input.sessionId,
+          decision: {
+            decisionId: this.id('decision-review'),
+            decisionKind: 'review',
+            targetId: review.reviewId,
+            payload: {
+              decision: input.decision,
+              guidance: input.guidance,
+              continuationRequested: true,
+              revisionRequested: true,
+            },
+          },
+        },
+      });
+      result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
+      return this.runUserTurn({
+        sessionId: input.sessionId,
+        content: reviewRevisionRequest(review, input.guidance),
+        attachments: [],
+        existingEvents: result.events,
+        workspaceBinding: input.workspaceBinding,
+        projectWorkingDirectory: input.projectWorkingDirectory,
+        profileId: input.profileId,
+        workflow: input.workflow,
+        appendUserMessage: false,
+        requirementConfirmationMode: 'off',
+      });
     }
 
-    const accepted = reviewDecisionEvent(input.sessionId, review, 'accepted', acceptedReviewContent(review), review.continuations.length > 0, this.ts(), this.id('review-accepted'));
+    const accepted = reviewDecisionEvent(input.sessionId, review, 'accepted', acceptedReviewContent(review), false, this.ts(), this.id('review-accepted'));
     let result = await this.append(input.sessionId, [accepted]);
     const decisionReply = await this.kernel({
       command: {
@@ -488,26 +520,13 @@ export class SessionDriverLoop {
           payload: {
             decision: input.decision,
             guidance: input.guidance,
-            continuationRequested: review.continuations.length > 0,
+            continuationRequested: false,
+            continuationRecorded: review.continuations.length > 0,
           },
         },
       },
     });
-    result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
-    if (review.continuations.length === 0) return result;
-
-    return this.runUserTurn({
-      sessionId: input.sessionId,
-      content: reviewContinuationRequest(review),
-      attachments: [],
-      existingEvents: result.events,
-      workspaceBinding: input.workspaceBinding,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
-      requirementConfirmationMode: 'off',
-    });
+    return this.appendProjectedKernelEvents(input.sessionId, decisionReply);
   }
 
   private async buildRequirementConfirmation(
@@ -1068,12 +1087,16 @@ function recentAttachmentFacts(events: AgentEvent[]): AgentContextAttachment[] {
   return output;
 }
 
-function buildMemoryHints(events: AgentEvent[]): string[] {
-  const hints: string[] = [];
-  for (const event of events.slice(-16)) {
+function buildSessionMemoryDocument(events: AgentEvent[]): string[] {
+  const intentContext: string[] = [];
+  const factContext: string[] = [];
+  const decisionContext: string[] = [];
+
+  for (const event of events.slice(-40)) {
     const payload = event.payload;
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) continue;
     const record = payload as Record<string, unknown>;
+
     if (event.kind === 'user_msg') {
       const content = typeof record.content === 'string' ? record.content.trim() : '';
       const attachments = Array.isArray(record.attachments)
@@ -1082,16 +1105,106 @@ function buildMemoryHints(events: AgentEvent[]): string[] {
           .map((item) => `${String(item.kind ?? 'resource')}:${String(item.path ?? item.absolutePath ?? '')}`)
           .filter((item) => item.trim().length > 0)
         : [];
-      hints.push(`Recent user turn: ${clip(content, 240)}${attachments.length ? ` attachments=${attachments.join(', ')}` : ''}`);
+      if (content) intentContext.push(`User request: ${clip(content, 300)}${attachments.length ? ` attachments=${attachments.join(', ')}` : ''}`);
     }
+
+    if (event.kind === 'requirement_confirmation') {
+      const status = stringValue(record.status) ?? 'pending';
+      const summary = stringValue(record.summary) ?? stringValue(record.content) ?? '';
+      if (summary.trim()) intentContext.push(`Requirement draft (${status}): ${clip(summary.trim(), 300)}`);
+    }
+
+    if (event.kind === 'plan_card') {
+      const summary = stringValue(record.summary) ?? stringValue(record.content) ?? '';
+      if (summary.trim()) intentContext.push(`Plan intent: ${clip(summary.trim(), 320)}`);
+      const actionBundle = objectRecord(record.actionBundle);
+      const continuations = Array.isArray(actionBundle?.continuationExpectations)
+        ? actionBundle.continuationExpectations
+        : [];
+      for (const continuation of continuations.slice(0, 4)) {
+        const text = continuationSummary(continuation);
+        if (text) intentContext.push(`Continuation intent: ${clip(text, 240)}`);
+      }
+    }
+
+    if (event.kind === 'review_summary') {
+      const status = stringValue(record.status) ?? 'unknown';
+      const content = stringValue(record.content) ?? stringValue(record.summary) ?? '';
+      if (content.trim()) {
+        const target = status === 'waitingUserReview' ? intentContext : decisionContext;
+        target.push(`Review ${status}: ${clip(content.trim(), 360)}`);
+      }
+      const facts = Array.isArray(record.facts) ? record.facts.filter((item): item is string => typeof item === 'string') : [];
+      for (const fact of facts.slice(0, 8)) factContext.push(`Review fact: ${clip(fact, 260)}`);
+      if (status === 'accepted' || status === 'needsRevision' || status === 'rejected') {
+        decisionContext.push(`Review decision: ${status}${content.trim() ? ` guidance=${clip(content.trim(), 240)}` : ''}`);
+      }
+    }
+
+    if (event.kind === 'requirement_decision' || event.kind === 'plan_review') {
+      const status = stringValue(record.status) ?? stringValue(record.decision) ?? 'unknown';
+      const summary = stringValue(record.summary) ?? stringValue(record.content) ?? '';
+      decisionContext.push(`${event.kind}: ${status}${summary.trim() ? ` ${clip(summary.trim(), 240)}` : ''}`);
+    }
+
     if (event.kind === 'assistant_msg') {
       const channel = typeof record.channel === 'string' ? record.channel : '';
       if (channel && channel !== 'final') continue;
       const content = typeof record.content === 'string' ? record.content.trim() : '';
-      if (content) hints.push(`Recent assistant final: ${clip(content, 240)}`);
+      if (content) intentContext.push(`Assistant final: ${clip(content, 260)}`);
+    }
+
+    if (event.kind === 'tool_result') {
+      const toolName = stringValue(record.toolName) ?? 'tool';
+      const summary = stringValue(record.summary) ?? '';
+      if (summary.trim()) factContext.push(`Resource/tool fact ${toolName}: ${clip(summary.trim(), 260)}`);
+      const output = objectRecord(record.output);
+      if (output) {
+        const items = Array.isArray(output.items) ? output.items : [];
+        for (const item of items.slice(0, 6)) {
+          const resource = objectRecord(item);
+          const path = stringValue(resource?.path) ?? stringValue(resource?.absolutePath) ?? stringValue(resource?.manifestEntryId);
+          const kind = stringValue(resource?.contentKind) ?? stringValue(resource?.resolvedKind) ?? 'resource';
+          if (path) factContext.push(`ResourcePacket fact: ${kind} ${clip(path, 220)}`);
+        }
+      }
+    }
+
+    if (event.kind === 'workflow_stage') {
+      const kernelEvent = objectRecord(record.kernelEvent);
+      if (!kernelEvent) continue;
+      const kind = stringValue(kernelEvent?.kind);
+      if (kind === 'tool.completed') {
+        const ok = kernelEvent?.ok === true;
+        const output = objectRecord(kernelEvent.output);
+        const path = stringValue(output?.path) ?? stringValue(output?.absolutePath);
+        const validation = objectRecord(output?.validation);
+        const validationKind = stringValue(validation?.kind);
+        factContext.push(`ToolCompleted fact: ok=${ok}${path ? ` path=${clip(path, 220)}` : ''}${validationKind ? ` validation=${validationKind}` : ''}`);
+      }
+      if (kind === 'work_unit.completed' || kind === 'work_unit.failed' || kind === 'work_unit.blocked') {
+        const workUnitId = stringValue(kernelEvent?.workUnitId);
+        const output = objectRecord(kernelEvent?.output);
+        const path = stringValue(output?.path) ?? stringValue(output?.absolutePath);
+        factContext.push(`WorkUnit fact: ${kind}${workUnitId ? ` id=${clip(workUnitId, 160)}` : ''}${path ? ` path=${clip(path, 220)}` : ''}`);
+      }
     }
   }
-  return hints.slice(-8);
+
+  const hints = [
+    'Session short-term memory document:',
+    'Boundary: intentContext is not evidence; factContext is the only generated-file evidence; decisionContext records user decisions and guidance.',
+    intentContext.length
+      ? `intentContext:\n${intentContext.slice(-10).map((item) => `- ${item}`).join('\n')}`
+      : 'intentContext: none',
+    factContext.length
+      ? `factContext:\n${factContext.slice(-14).map((item) => `- ${item}`).join('\n')}`
+      : 'factContext: none',
+    decisionContext.length
+      ? `decisionContext:\n${decisionContext.slice(-10).map((item) => `- ${item}`).join('\n')}`
+      : 'decisionContext: none',
+  ];
+  return hints;
 }
 
 function buildImplementationBatchContext(events: AgentEvent[]): ImplementationBatchContext {
@@ -1529,7 +1642,7 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
       ts,
       kind: 'plan_review',
       payload: {
-        title: 'Check / 计划确认',
+        title: '计划确认',
         summary,
         status,
         runId: typeof record.runId === 'string' ? record.runId : undefined,
@@ -1976,7 +2089,7 @@ function planReviewDecisionEvent(
     ts,
     kind: 'plan_review',
     payload: {
-      title: 'Check / 计划确认',
+      title: '计划确认',
       summary: summary || (status === 'accepted' ? '用户已确认计划，准备进入执行。' : '用户要求修改计划。'),
       status,
       runId: plan.runId,
@@ -2130,10 +2243,10 @@ function waitingReviewContent(
     '',
     '### 后续决策',
     failed || blocked
-      ? '- 如需修复，请在输入框输入 Review 修改意见；空输入通过会关闭当前 Review，但不会自动执行失败项。'
-      : '- 空输入通过 Review；输入文字会作为 Review 修订意见。',
+      ? '- 空输入通过并结束当前批次，不会自动执行失败项；如需修复，请在输入框输入 Review 修改意见，系统会重新进入 Plan。'
+      : '- 空输入通过并结束当前批次；输入文字会作为 Review 修订意见，系统会重新进入 Plan。',
     continuations.length
-      ? `- 当前计划登记了 ${continuations.length} 个后续意图；Review 通过后由 Session 重新生成下一批详细 Plan，再等待用户确认。`
+      ? `- 当前计划登记了 ${continuations.length} 个后续意图；Review 通过只记录这些意图，不会自动生成或执行下一批。需要继续时，请在输入框明确描述下一步。`
       : '- 当前计划没有登记后续批次。',
   ].join('\n');
 }
@@ -2228,8 +2341,8 @@ function reviewDecisionEvent(
     ts,
     kind: 'review_summary',
     payload: {
-      title: 'Review',
-      summary: status === 'accepted' ? '用户已通过 Review。' : '用户要求补充或修改。',
+      title: '审查',
+      summary: status === 'accepted' ? '用户已通过 Review，本批次结束。' : '用户要求补充或修改。',
       content,
       status,
       runId: review.runId,
@@ -2252,27 +2365,36 @@ function acceptedReviewContent(review: SessionReviewContext): string {
     '',
     '用户已通过当前批次 Review；Kernel facts 已作为本批次事实源保留。',
     '',
-    '### 后续任务',
+    '### 后续意图',
   ];
   if (!review.continuations.length) {
     lines.push('- 当前计划没有登记后续批次。');
   } else {
-    lines.push(`- 当前计划登记了 ${review.continuations.length} 个后续意图。后续批次必须由 Session 重新组装上下文并调用模型生成新的详细 Plan；这些意图不会被直接执行。`);
+    lines.push(`- 当前计划登记了 ${review.continuations.length} 个后续意图。Review 通过只记录这些意图，不会自动生成或执行下一批。`);
     for (const continuation of review.continuations.slice(0, 6)) lines.push(`- ${continuationSummary(continuation)}`);
   }
-  lines.push('', '### 决策边界', '- Review 通过只关闭当前批次。', '- 后续批次仍需生成新的 Plan，并等待用户确认后才能执行。');
+  lines.push('', '### 决策边界', '- Review 通过只关闭当前批次，并等待用户下一步输入。', '- 如果需要继续后续批次，请在输入框明确描述下一步；系统会重新组装上下文并生成新的 Plan。');
   return lines.join('\n');
 }
 
-function reviewContinuationRequest(review: SessionReviewContext): string {
+function reviewRevisionRequest(review: SessionReviewContext, guidance?: string): string {
   const continuations = review.continuations.map(continuationSummary).filter(Boolean);
   return [
-    '继续当前任务的下一批实现计划。',
-    '注意：下面的后续意图只是计划意图，不代表文件已经存在；只有 Kernel facts、ToolCompleted、WorkUnitCompleted 或 ResourcePacket 可以作为已生成事实。',
-    review.content ? `Review 摘要：\n${review.content}` : '',
-    review.facts.length ? `Kernel facts：\n${review.facts.join('\n')}` : 'Kernel facts：当前 Review 没有登记可复用事实。',
-    continuations.length ? `后续意图：\n${continuations.map((item) => `- ${item}`).join('\n')}` : '后续意图：根据最近的计划、Review 和 Kernel facts 生成下一批可审查计划。',
-    '请重新读取必要上下文，输出新的详细 Agent Protocol v3 actionBundle；每个 workspace.write action 必须引用本轮 codeBlocks 的 sourceBlockId。不要直接执行，仍需等待用户确认 Plan。',
+    '根据用户 Review 修订意见，重新理解需求并生成下一批可审查 Plan。',
+    '这是一轮 Review revise，不是 Review accept；不得把用户修订意见当成已授权执行。',
+    '上一批 Plan、Review guidance、continuation expectations 都是 intentContext；只有 Kernel facts、ToolCompleted(ok=true)、WorkUnitCompleted 或 ResourcePacket 才能作为已生成文件事实。',
+    guidance?.trim() ? `用户 Review 修订意见：\n${guidance.trim()}` : '用户 Review 修订意见：用户要求补充或修改当前批次。',
+    review.content ? `上一批 Review 卡内容：\n${review.content}` : '',
+    review.facts.length ? `上一批 Kernel facts：\n${review.facts.join('\n')}` : '上一批 Kernel facts：当前 Review 没有登记可复用事实。',
+    review.userPlan ? `上一批 Plan intent：\n${review.userPlan}` : '',
+    continuations.length ? `上一批 continuation intent：\n${continuations.map((item) => `- ${item}`).join('\n')}` : '',
+    [
+      '下一步要求：',
+      '- 如需基于现有代码继续修改，先用 resourceRequest 读取相关文件事实，例如构建脚本、入口源码、头文件、测试或容器配置。',
+      '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
+      '- 每个 workspace.write action 必须引用本轮 codeBlocks 的 sourceBlockId。',
+      '- 新 Plan 等待用户确认，不要假定已经执行。',
+    ].join('\n'),
   ].filter(Boolean).join('\n\n');
 }
 

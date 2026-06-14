@@ -34,6 +34,8 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
   await assertSessionDriverLoopRepairsOversizedActionBundle();
   await assertSessionDriverLoopRepairsEmptyActionBundleResponse();
+  await assertSessionDriverLoopReviewRevisionReturnsToPlanning();
+  await assertSessionDriverLoopReviewAcceptStopsAtCurrentBatch();
 }
 
 async function assertSessionDriverLoopRequestsRequirementConfirmationForSideEffectTask(): Promise<void> {
@@ -784,6 +786,143 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
   assertEqual(submittedPlans.length, 1, 'repaired empty response reaches Kernel plan review once');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired empty response renders a plan card');
   assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && String((event.payload as any).content ?? '').includes('没有返回有效 JSON')), true, 'empty response repair is visible as Thinking');
+}
+
+async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise<void> {
+  const events: AgentEvent[] = [{
+    id: 'review-waiting-generic',
+    sessionId: 'session-review-revision',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'review_summary',
+    payload: {
+      status: 'waitingUserReview',
+      runId: 'run-review-source',
+      reviewId: 'review-generic',
+      sourcePlanId: 'plan-generic',
+      content: '## Review\n\nThe first batch wrote a generic source file.',
+      userPlan: '# Plan\n\n## Summary\nCreate the first generic batch.',
+      facts: [
+        '- `fs.write` ok: {"path":"generic-output.txt","validation":{"kind":"readBack","passed":true}}',
+        '- `work-unit-generic` completed: {"path":"generic-output.txt"}',
+      ],
+      continuations: [{
+        id: 'next-generic-batch',
+        title: 'Add a generic follow-up script',
+        capability: 'workspace.write',
+        kind: 'write',
+        resourceScope: ['scripts/generic.sh'],
+      }],
+      confirmable: true,
+      channel: 'review',
+      visibility: 'conversation',
+    },
+  }];
+  const session: AgentSession = {
+    id: 'session-review-revision',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const submittedPlans: Array<Record<string, any>> = [];
+  const llmRequests: LlmChatRequest[] = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-review-revision', submittedPlans),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: 'session-review-revision',
+    kind: 'review',
+    decision: 'revise',
+    guidance: 'Add a generic script and document how to run it.',
+    runId: 'run-review-source',
+    existingEvents: events,
+  });
+
+  assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any).status === 'needsRevision'), true, 'review guidance is recorded as needsRevision');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'review revision starts a new planning turn');
+  assertEqual(submittedPlans.length, 1, 'review revision submits the new actionBundle to Kernel PlanReview');
+  assertEqual(llmRequests.length, 1, 'review revision calls the provider for a new plan once');
+  const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
+  assert(promptText.includes('Add a generic script and document how to run it.'), 'review guidance enters the next PromptEnvelope');
+  assert(promptText.includes('Session short-term memory document'), 'structured session memory is included');
+  assert(promptText.includes('factContext'), 'kernel facts are separated into factContext');
+  assert(promptText.includes('intentContext'), 'plans and continuations are separated into intentContext');
+}
+
+async function assertSessionDriverLoopReviewAcceptStopsAtCurrentBatch(): Promise<void> {
+  const events: AgentEvent[] = [{
+    id: 'review-waiting-accept-generic',
+    sessionId: 'session-review-accept',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'review_summary',
+    payload: {
+      status: 'waitingUserReview',
+      runId: 'run-review-accept',
+      reviewId: 'review-accept-generic',
+      sourcePlanId: 'plan-accept-generic',
+      content: '## Review\n\nThe first batch wrote a generic source file.',
+      userPlan: '# Plan\n\n## Summary\nCreate the first generic batch.',
+      facts: ['- `work-unit-generic` completed: {"path":"generic-output.txt"}'],
+      continuations: [{
+        id: 'next-generic-batch',
+        title: 'Add a generic follow-up script',
+        capability: 'workspace.write',
+        kind: 'write',
+        resourceScope: ['scripts/generic.sh'],
+      }],
+      confirmable: true,
+      channel: 'review',
+      visibility: 'conversation',
+    },
+  }];
+  const session: AgentSession = {
+    id: 'session-review-accept',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const submittedPlans: Array<Record<string, any>> = [];
+  const llmRequests: LlmChatRequest[] = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-review-accept', submittedPlans),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: 'session-review-accept',
+    kind: 'review',
+    decision: 'accept',
+    runId: 'run-review-accept',
+    existingEvents: events,
+  });
+
+  const acceptedReview = result.events.find((event) => event.kind === 'review_summary' && (event.payload as any).status === 'accepted');
+  if (!acceptedReview) throw new Error('review accept records an accepted review event');
+  const acceptedPayload = acceptedReview.payload as any;
+  assertEqual(acceptedPayload.continuationRequested, false, 'review accept records continuations without auto-continuing');
+  assert(String(acceptedPayload.content ?? '').includes('不会自动生成或执行下一批'), 'accepted review explains that continuations are intent only');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'review accept does not generate a continuation plan');
+  assertEqual(submittedPlans.length, 0, 'review accept does not submit a new plan');
+  assertEqual(llmRequests.length, 0, 'review accept does not call the provider');
 }
 
 function genericWriteProposal(missingEvidence: boolean): Record<string, unknown> {
