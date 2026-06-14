@@ -45,7 +45,7 @@ impl ProposalKind {
 #[serde(rename_all = "snake_case")]
 pub enum InvalidProposalPolicy {
     Reject,
-    RejectAndReprompt,
+    RejectAndRequestProposal,
     RejectAndReplan,
     BlockWorkflow,
 }

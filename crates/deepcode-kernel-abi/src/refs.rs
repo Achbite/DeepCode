@@ -18,13 +18,6 @@ pub struct WorkflowRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PromptEnvelopeRef {
-    pub id: String,
-    pub hash: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PolicyProfileRef {
     pub id: String,
 }

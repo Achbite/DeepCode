@@ -91,27 +91,6 @@ impl HttpKernelClient {
         api_data(value)
     }
 
-    pub async fn send_prompt(
-        &self,
-        prompt: &str,
-        mode: PromptMode,
-    ) -> KernelClientResult<PromptRunResult> {
-        self.send_prompt_with_workspace_scope(prompt, mode, None)
-            .await
-    }
-
-    pub async fn send_prompt_with_workspace_scope(
-        &self,
-        prompt: &str,
-        mode: PromptMode,
-        workspace_scope: Option<WorkspaceSessionScope>,
-    ) -> KernelClientResult<PromptRunResult> {
-        let _ = (prompt, mode, workspace_scope);
-        Err(KernelClientError::Api(
-            "Agent prompt sending is owned by the userspace SessionDriverLoop; the legacy /messages path has been removed.".to_string(),
-        ))
-    }
-
     pub async fn resolve_permission(
         &self,
         permission_id: &str,
@@ -145,31 +124,11 @@ impl HttpKernelClient {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceSessionScope {
-    pub workspace_id: Option<String>,
-    pub workspace_hash: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub service: String,
     pub ok: bool,
     pub raw: Value,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum PromptMode {
-    Ask,
-}
-
-impl PromptMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PromptMode::Ask => "plan",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,13 +144,6 @@ impl PermissionDecision {
             PermissionDecision::Deny => "deny",
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct PromptRunResult {
-    pub session_id: String,
-    pub events: Vec<Value>,
-    pub final_answer: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,32 +165,6 @@ fn api_data(value: Value) -> KernelClientResult<Value> {
     Ok(value.get("data").cloned().unwrap_or(value))
 }
 
-fn extract_final_answer(events: &[Value]) -> Option<String> {
-    events.iter().rev().find_map(|event| {
-        let kind = event
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let payload = event.get("payload").unwrap_or(event);
-        let content = payload
-            .get("content")
-            .or_else(|| payload.get("message"))
-            .or_else(|| payload.get("text"))
-            .and_then(Value::as_str)?;
-        if kind.contains("final") || content.contains("<final>") {
-            Some(
-                content
-                    .replace("<final>", "")
-                    .replace("</final>", "")
-                    .trim()
-                    .to_string(),
-            )
-        } else {
-            None
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,14 +173,5 @@ mod tests {
     fn trims_base_url_slash() {
         let config = KernelClientConfig::new("http://127.0.0.1:31245/");
         assert_eq!(config.base_url, "http://127.0.0.1:31245");
-    }
-
-    #[test]
-    fn extracts_final_answer_from_agent_events() {
-        let events = vec![json!({
-            "kind": "assistant_msg",
-            "payload": {"content": "<final>done</final>"}
-        })];
-        assert_eq!(extract_final_answer(&events).as_deref(), Some("done"));
     }
 }

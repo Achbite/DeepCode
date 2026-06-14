@@ -157,14 +157,6 @@ pub enum KernelCommand {
         skill_id: String,
         input: Value,
     },
-    ContextAttachReference {
-        request_id: RequestId,
-        source_path: String,
-        import_copy: bool,
-    },
-    ContextListReferences {
-        request_id: RequestId,
-    },
     WorkflowObserve {
         request_id: RequestId,
         run_id: RunId,

@@ -337,7 +337,7 @@ fn known_capabilities() -> BTreeSet<String> {
 }
 
 fn known_hooks() -> BTreeSet<String> {
-    ["prompt.plan.enter", "kernel.plan_review.preflight"]
+    ["driver.plan.enter", "kernel.plan_review.preflight"]
         .into_iter()
         .map(str::to_string)
         .collect()

@@ -328,15 +328,6 @@ pub enum KernelEvent {
         risk_report: Value,
         sequence: Option<u64>,
     },
-    #[serde(rename = "context.result")]
-    ContextResult {
-        request_id: RequestId,
-        operation: String,
-        ok: bool,
-        output: Option<Value>,
-        error: Option<KernelErrorEnvelope>,
-        sequence: Option<u64>,
-    },
     #[serde(rename = "tempArtifact.created")]
     TempArtifactCreated {
         run_id: RunId,

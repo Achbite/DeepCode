@@ -33,12 +33,7 @@ impl WorkspaceBoundary {
 
     pub fn assert_mutable_config_asset(path: &str) -> KernelResult<()> {
         let normalized = path.replace('\\', "/");
-        let protected = [
-            ".deepcode/prompts/",
-            ".deepcode/skills/",
-            ".deepcode/ruler/",
-            ".deepcode/policy/",
-        ];
+        let protected = [".deepcode/skills/", ".deepcode/ruler/", ".deepcode/policy/"];
         if protected.iter().any(|prefix| {
             normalized == prefix.trim_end_matches('/') || normalized.starts_with(prefix)
         }) {

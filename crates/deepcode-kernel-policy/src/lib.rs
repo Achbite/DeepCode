@@ -811,14 +811,9 @@ fn resource_is_protected_config_asset(request: &PermissionRequest) -> bool {
 
 fn is_deepcode_config_asset(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
-    [
-        ".deepcode/prompts/",
-        ".deepcode/skills/",
-        ".deepcode/ruler/",
-        ".deepcode/policy/",
-    ]
-    .iter()
-    .any(|prefix| normalized == prefix.trim_end_matches('/') || normalized.starts_with(prefix))
+    [".deepcode/skills/", ".deepcode/ruler/", ".deepcode/policy/"]
+        .iter()
+        .any(|prefix| normalized == prefix.trim_end_matches('/') || normalized.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -967,7 +962,7 @@ mod tests {
                 &profile,
                 &PermissionRequest {
                     resource_scope: Some(ResourceScope::workspace_file(
-                        ".deepcode/prompts/project-agent.md",
+                        ".deepcode/ruler/project-rules.md",
                     )),
                     ..request(Capability::workspace_write(), RiskLevel::High)
                 },

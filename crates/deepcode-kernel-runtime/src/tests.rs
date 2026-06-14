@@ -190,3 +190,251 @@ fn resource_resolve_reads_explicit_file_and_directory_manifest_entries() {
         .iter()
         .any(|item| item.get("contentKind").and_then(Value::as_str) == Some("directoryTree")));
 }
+
+#[test]
+fn action_batch_submit_executes_minimal_workspace_write() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Create a generic file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic",
+                "codeBlocks": [
+                    {
+                        "id": "block-generic",
+                        "path": "generated/output.txt",
+                        "content": "generic generated content\n"
+                    }
+                ],
+                "actionBundle": {
+                    "id": "bundle-generic",
+                    "goal": "Create a generic file.",
+                    "actions": [
+                        {
+                            "id": "write-generic",
+                            "title": "Write generic file",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["generated/output.txt"],
+                            "sourceBlockId": "block-generic"
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch succeeds");
+
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::ActionBatchAccepted { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitQueued { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitStarted { .. })));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok: true,
+                ..
+            } if tool_name == "fs.write"
+        )
+    }));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
+    assert_eq!(
+        fs::read_to_string(temp.join("generated").join("output.txt")).expect("written file"),
+        "generic generated content\n"
+    );
+}
+
+#[test]
+fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() {
+    let (mut runtime, workspace_root) = runtime_with_workspace();
+    let attached_root = std::env::temp_dir().join(format!(
+        "deepcode-runtime-v3-attachment-{}-{}",
+        std::process::id(),
+        TEMP_INDEX.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = fs::remove_dir_all(&attached_root);
+    fs::create_dir_all(&attached_root).expect("create attached root");
+
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Create a generic file under the explicit project directory.".to_string(),
+                attachments: vec![serde_json::json!({
+                    "kind": "directory",
+                    "path": "project-root",
+                    "absolutePath": attached_root.to_string_lossy(),
+                    "source": "userSelected",
+                    "scope": "message"
+                })],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(workspace_root.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic",
+                "codeBlocks": [
+                    {
+                        "id": "block-generic",
+                        "path": "generated/output.txt",
+                        "content": "attached root content\n"
+                    },
+                    {
+                        "id": "block-prefixed",
+                        "path": "project-root/prefixed.txt",
+                        "content": "prefixed path content\n"
+                    }
+                ],
+                "actionBundle": {
+                    "id": "bundle-generic",
+                    "goal": "Create a generic file under the explicit project directory.",
+                    "actions": [
+                        {
+                            "id": "write-generic",
+                            "title": "Write generic file",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["generated/output.txt"],
+                            "sourceBlockId": "block-generic"
+                        },
+                        {
+                            "id": "write-prefixed",
+                            "title": "Write prefixed generic file",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["project-root/prefixed.txt"],
+                            "sourceBlockId": "block-prefixed"
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch succeeds");
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok: true,
+                ..
+            } if tool_name == "fs.write"
+        )
+    }));
+    assert_eq!(
+        fs::read_to_string(attached_root.join("generated").join("output.txt"))
+            .expect("file written under attached root"),
+        "attached root content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(attached_root.join("prefixed.txt"))
+            .expect("prefixed file written under attached root"),
+        "prefixed path content\n"
+    );
+    assert!(
+        !workspace_root.join("generated").join("output.txt").exists(),
+        "relative writes with one explicit directory attachment must not fall back to the editor workspace root"
+    );
+    assert!(
+        !attached_root.join("project-root").join("prefixed.txt").exists(),
+        "paths prefixed with the attachment display path must be normalized under the attachment root"
+    );
+}
+
+#[test]
+fn action_batch_submit_blocks_unsupported_capability() {
+    let (mut runtime, _temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Propose a generic unsupported action.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic",
+                "codeBlocks": [],
+                "actionBundle": {
+                    "id": "bundle-generic",
+                    "goal": "Try unsupported action.",
+                    "actions": [
+                        {
+                            "id": "exec-generic",
+                            "title": "Run generic command",
+                            "capability": "process.exec",
+                            "kind": "command",
+                            "resourceScope": ["workspace"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch succeeds");
+
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitBlocked { .. })));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::ToolCompleted { .. })));
+}

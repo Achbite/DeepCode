@@ -3,7 +3,6 @@ members = [
   "crates/deepcode-kernel-abi",
   "crates/deepcode-kernel-core",
   "crates/deepcode-kernel-config",
-  "crates/deepcode-kernel-context",
   "crates/deepcode-kernel-policy",
   "crates/deepcode-kernel-runtime",
   "crates/deepcode-kernel-skills",
@@ -37,7 +36,6 @@ incremental = true
 [workspace.dependencies]
 deepcode-kernel-abi = { path = "crates/deepcode-kernel-abi" }
 deepcode-kernel-config = { path = "crates/deepcode-kernel-config" }
-deepcode-kernel-context = { path = "crates/deepcode-kernel-context" }
 deepcode-kernel-ledger = { path = "crates/deepcode-kernel-ledger" }
 deepcode-kernel-policy = { path = "crates/deepcode-kernel-policy" }
 deepcode-kernel-runtime = { path = "crates/deepcode-kernel-runtime" }

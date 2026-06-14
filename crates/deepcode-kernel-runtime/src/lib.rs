@@ -3,7 +3,7 @@ use deepcode_kernel_abi::{
     KernelErrorEnvelope, KernelEvent, KernelEventSummary, KernelResult, KernelSnapshot,
     KernelStateContract, ProfileRef, ProposalEnvelope, ProposalEnvelopeKind, RequestId,
     ResourceResolveRequest, RunId, SessionId, StageStatus, UserDecisionSubmit, UserInput,
-    WorkflowDecision, WorkflowDecisionAction, WorkflowRef, WorkspaceBinding,
+    WorkflowRef, WorkspaceBinding,
 };
 use deepcode_kernel_audit::{
     AuditActor, AuditBody, AuditCategory, AuditChain, AuditKeyMaterial, AuditRuntimeMode,
@@ -13,7 +13,6 @@ use deepcode_kernel_config::{
     ConfigLayer, ConfigResolver, ConfigResolverInput, ConfigScope, ConfigSource, ConfigSourceKind,
     ConfigTrustLevel, DefaultConfigResolver,
 };
-use deepcode_kernel_context::{ContextCandidatePayload, ContextRuntime};
 use deepcode_kernel_ledger::{
     ChangeOperation, ChangeSet, EventLedger, InMemoryEventLedger, KernelResource,
     KernelResourceCleanupPolicy, KernelResourceKind, KernelResourceOwner, KernelResourceScope,
@@ -37,7 +36,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub mod context;
+pub mod action_batch;
 pub mod dispatch;
 pub mod obligations;
 pub mod permissions;
@@ -67,7 +66,6 @@ pub struct DeepCodeKernelRuntime {
     skills: InMemorySkillRegistry,
     tool_executors: SkillExecutorRegistry,
     ledger: Box<dyn EventLedger>,
-    context_runtime: ContextRuntime,
     state: RuntimeState,
 }
 
@@ -95,7 +93,6 @@ impl DeepCodeKernelRuntime {
             skills: InMemorySkillRegistry::with_builtin_tools(),
             tool_executors: SkillExecutorRegistry::from_executors(builtin_executors()),
             ledger,
-            context_runtime: ContextRuntime::new(),
             state,
         }
     }

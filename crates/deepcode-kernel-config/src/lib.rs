@@ -77,7 +77,6 @@ pub enum ConfigDomain {
     Workflow,
     Policy,
     Skills,
-    Prompt,
     Ruler,
     Style,
     I18n,
@@ -395,7 +394,7 @@ mod tests {
                         values: serde_json::json!({
                             "agent": { "defaultMode": "plan" },
                             "policy": { "allowShellExec": false },
-                            "prompt": { "templateLocale": "en-US" }
+                            "session": { "templateLocale": "en-US" }
                         }),
                     },
                     ConfigLayer {
@@ -408,7 +407,7 @@ mod tests {
                         values: serde_json::json!({
                             "agent": { "defaultMode": "askBeforeWrite" },
                             "policy": { "allowShellExec": true },
-                            "prompt": { "templateLocale": null }
+                            "session": { "templateLocale": null }
                         }),
                     },
                 ],
@@ -421,7 +420,9 @@ mod tests {
 
         assert_eq!(snapshot.effective["agent"]["defaultMode"], "askBeforeWrite");
         assert_eq!(snapshot.effective["policy"]["allowShellExec"], false);
-        assert!(snapshot.effective["prompt"].get("templateLocale").is_none());
+        assert!(snapshot.effective["session"]
+            .get("templateLocale")
+            .is_none());
         assert_eq!(snapshot.source_refs.len(), 2);
         assert_eq!(
             snapshot.source_refs[1].trust_level.as_deref(),

@@ -21,7 +21,7 @@ states:
       - AgentPlanDraft
       - ActionBundleDraft
     entry_hooks:
-      - prompt.plan.enter
+      - driver.plan.enter
     exit_predicates:
       - predicate: proposal.kind.in
         args:
@@ -29,7 +29,7 @@ states:
             - PlanDraft
             - AgentPlanDraft
             - ActionBundleDraft
-    invalid_proposal_policy: reject_and_reprompt
+    invalid_proposal_policy: reject_and_request_proposal
   - id: check
     kind: kernel
     allowed_capabilities:

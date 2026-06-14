@@ -50,9 +50,12 @@ impl DeepCodeKernelRuntime {
                 session_id,
                 request,
             } => self.resource_resolve(request_id, run_id, session_id, request),
-            KernelCommand::ActionBatchSubmit { request_id, .. } => {
-                self.not_implemented(request_id, "action_batch.submit")
-            }
+            KernelCommand::ActionBatchSubmit {
+                request_id,
+                run_id,
+                session_id,
+                batch,
+            } => self.action_batch_submit(request_id, run_id, session_id, batch),
             KernelCommand::ReviewFactsGet { request_id, .. } => {
                 self.not_implemented(request_id, "review_facts.get")
             }
@@ -152,14 +155,6 @@ impl DeepCodeKernelRuntime {
                 skill_id,
                 input,
             } => self.skill_invoke(request_id, run_id, session_id, skill_id, input),
-            KernelCommand::ContextAttachReference {
-                request_id,
-                source_path,
-                import_copy,
-            } => self.context_attach_reference(request_id, source_path, import_copy),
-            KernelCommand::ContextListReferences { request_id } => {
-                self.context_list_references(request_id)
-            }
             KernelCommand::WorkflowObserve {
                 request_id,
                 run_id,

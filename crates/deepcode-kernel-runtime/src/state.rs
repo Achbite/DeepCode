@@ -417,8 +417,7 @@ impl DeepCodeKernelRuntime {
             values: serde_json::json!({
                 "run": { "id": run_id },
                 "workflow": { "default": workflow_id.unwrap_or_else(|| "plan-first".to_string()) },
-                "policy": { "profile": profile_id.unwrap_or_else(|| self.policy_profile.id.clone()) },
-                "prompt": { "compiler": "layered" }
+                "policy": { "profile": profile_id.unwrap_or_else(|| self.policy_profile.id.clone()) }
             }),
         }];
 

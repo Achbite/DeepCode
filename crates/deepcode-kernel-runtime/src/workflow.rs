@@ -446,20 +446,13 @@ impl DeepCodeKernelRuntime {
                 "autoAccepted": auto_accepted
             }),
         )?;
-        let mut events = vec![KernelEvent::PlanAccepted {
+        let events = vec![KernelEvent::PlanAccepted {
             run_id,
             session_id: Some(SessionId(session_id.clone())),
             plan_id,
             auto_accepted,
             sequence: Some(sequence),
         }];
-        events.push(self.enter_phase_event(&run_id_text, &session_id, WorkflowPhase::Complete)?);
-        events.push(self.workflow_decision_event(
-            RequestId("agent-plan-accepted".to_string()),
-            &run_id_text,
-            &session_id,
-            "plan.accepted",
-        )?);
         Ok(events)
     }
 
@@ -1191,7 +1184,6 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::SkillTrustRequested { .. } => "skill.trust_requested",
         KernelEvent::SkillTrustGranted { .. } => "skill.trust_granted",
         KernelEvent::McpRiskAcknowledgmentRequired { .. } => "mcp.risk_acknowledgment_required",
-        KernelEvent::ContextResult { .. } => "context.result",
         KernelEvent::AuditVerifyStarted { .. } => "audit.verify_started",
         KernelEvent::AuditVerifyCompleted { .. } => "audit.verify_completed",
         KernelEvent::AuditDegradedEntered { .. } => "audit.degraded_entered",
@@ -1244,7 +1236,6 @@ pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::SkillTrustRequested { sequence, .. }
         | KernelEvent::SkillTrustGranted { sequence, .. }
         | KernelEvent::McpRiskAcknowledgmentRequired { sequence, .. }
-        | KernelEvent::ContextResult { sequence, .. }
         | KernelEvent::AuditVerifyStarted { sequence, .. }
         | KernelEvent::AuditVerifyCompleted { sequence, .. }
         | KernelEvent::AuditDegradedEntered { sequence, .. }

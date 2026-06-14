@@ -125,12 +125,6 @@ impl Kernel {
             KernelCommand::SkillInvoke { request_id, .. } => {
                 self.not_implemented(request_id, "skill.invoke")
             }
-            KernelCommand::ContextAttachReference { request_id, .. } => {
-                self.not_implemented(request_id, "context.attach_reference")
-            }
-            KernelCommand::ContextListReferences { request_id } => {
-                self.not_implemented(request_id, "context.list_references")
-            }
             KernelCommand::WorkflowObserve { request_id, .. } => {
                 self.not_implemented(request_id, "workflow.observe")
             }

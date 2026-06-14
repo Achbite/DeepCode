@@ -40,13 +40,13 @@ pub fn builtin_plan_check_complete_review() -> WorkflowDescriptor {
                     ProposalKind::AgentPlanDraft,
                     ProposalKind::ActionBundleDraft,
                 ],
-                entry_hooks: vec!["prompt.plan.enter".to_string()],
+                entry_hooks: vec!["driver.plan.enter".to_string()],
                 exit_predicates: vec![proposal_kind_in(vec![
                     ProposalKind::PlanDraft,
                     ProposalKind::AgentPlanDraft,
                     ProposalKind::ActionBundleDraft,
                 ])],
-                invalid_proposal_policy: InvalidProposalPolicy::RejectAndReprompt,
+                invalid_proposal_policy: InvalidProposalPolicy::RejectAndRequestProposal,
             },
             WorkflowStateDescriptor {
                 id: "check".to_string(),
