@@ -5,7 +5,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 import WorkspaceSection from './sections/WorkspaceSection';
 import CommonSettingsSection from './sections/CommonSettingsSection';
 import SkillRuntimeSection from './sections/SkillRuntimeSection';
-import PromptInspectorSection from './sections/PromptInspectorSection';
+import SessionBoundarySection from './sections/SessionBoundarySection';
 import RuntimeDoctorSection from './sections/RuntimeDoctorSection';
 import RulerRulesSection from './sections/RulerRulesSection';
 import LlmSection from './sections/LlmSection';
@@ -17,7 +17,7 @@ type SettingsKey =
   | 'llm'
   | 'skill'
   | 'mcp'
-  | 'prompt'
+  | 'sessionBoundary'
   | 'doctor'
   | 'ruler';
 
@@ -49,7 +49,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     { key: 'llm', icon: 'AI', label: t(language, 'settings.nav.llm') },
     { key: 'skill', icon: 'SK', label: t(language, 'settings.nav.skill') },
     { key: 'mcp', icon: 'MC', label: t(language, 'settings.nav.mcp') },
-    { key: 'prompt', icon: 'PR', label: t(language, 'settings.nav.prompt') },
+    { key: 'sessionBoundary', icon: 'SB', label: t(language, 'settings.nav.sessionBoundary') },
     { key: 'doctor', icon: 'DR', label: t(language, 'settings.nav.doctor') },
     { key: 'ruler', icon: 'RL', label: t(language, 'settings.nav.ruler') },
   ];
@@ -73,8 +73,8 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
         return <SkillRuntimeSection />;
       case 'mcp':
         return <McpServicesSection />;
-      case 'prompt':
-        return <PromptInspectorSection />;
+      case 'sessionBoundary':
+        return <SessionBoundarySection />;
       case 'doctor':
         return <RuntimeDoctorSection />;
       case 'ruler':

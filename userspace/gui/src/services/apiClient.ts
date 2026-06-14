@@ -59,7 +59,6 @@ import type {
   CreateTerminalSessionRequest,
   TerminalInputRequest,
   TerminalResizeRequest,
-  PromptLayerResult,
   SkillReferenceResult,
   BrowserRuntimeStatusResult,
   OpenBrowserPreviewRequest,
@@ -765,10 +764,6 @@ export function getTerminalEvents(
     after: after === undefined ? undefined : String(after),
   });
   return getJson<TerminalEventsResult>(`${API_BASE}/terminal/events${qs}`);
-}
-
-export function getAgentPromptLayers(): Promise<ApiResponse<PromptLayerResult>> {
-  return getJson<PromptLayerResult>(`${API_BASE}/agent/prompt-layers`);
 }
 
 export function getAgentSkills(): Promise<ApiResponse<SkillReferenceResult>> {

@@ -9,6 +9,7 @@ import AgentSessionSelector from './AgentSessionSelector';
 import AgentTaskList from './AgentTaskList';
 import MessageList from './MessageList';
 import PermissionRequestBubble from './PermissionRequestBubble';
+import { findPendingComposerDecision } from './pendingDecision';
 import './agentPanel.css';
 
 const AgentPanel: React.FC = () => {
@@ -24,6 +25,7 @@ const AgentPanel: React.FC = () => {
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const pendingPermission = useAgentSessionStore((s) => s.pendingPermission);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
+  const resolvingRequirement = useAgentSessionStore((s) => s.resolvingRequirement);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
   const resolvingReview = useAgentSessionStore((s) => s.resolvingReview);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
@@ -39,6 +41,7 @@ const AgentPanel: React.FC = () => {
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
+  const resolveRequirement = useAgentSessionStore((s) => s.resolveRequirement);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
   const resolveReview = useAgentSessionStore((s) => s.resolveReview);
   const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
@@ -47,6 +50,14 @@ const AgentPanel: React.FC = () => {
   );
   const activeSessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
   const agentBusy = loading || activeSessionRunning;
+  const pendingDecision = findPendingComposerDecision({
+    events,
+    pendingPermission: pendingPermission?.request ?? null,
+    resolvingRequirement,
+    resolvingPlan,
+    resolvingReview,
+    resolvingPermission,
+  });
 
   useEffect(() => {
     void loadOrCreate();
@@ -129,6 +140,49 @@ const AgentPanel: React.FC = () => {
         onStop={() => void cancelCurrentRun()}
         onAddAttachment={addAttachment}
         onRemoveAttachment={removeAttachment}
+        pendingDecision={pendingDecision}
+        onDecisionSubmit={(guidance) => {
+          if (!pendingDecision) return;
+          if (pendingDecision.kind === 'requirement') {
+            void resolveRequirement(
+              pendingDecision.runId,
+              pendingDecision.requirementId,
+              guidance ? 'revise' : 'accept',
+              guidance
+            );
+            return;
+          }
+          if (pendingDecision.kind === 'plan') {
+            void resolvePlan(
+              pendingDecision.runId,
+              pendingDecision.planId,
+              guidance ? 'revise' : 'accept',
+              guidance
+            );
+            return;
+          }
+          if (pendingDecision.kind === 'review') {
+            void resolveReview(pendingDecision.runId, guidance ? 'revise' : 'accept', guidance);
+            return;
+          }
+          void acceptPermission();
+        }}
+        onDecisionReject={() => {
+          if (!pendingDecision) return;
+          if (pendingDecision.kind === 'requirement') {
+            void resolveRequirement(pendingDecision.runId, pendingDecision.requirementId, 'reject');
+            return;
+          }
+          if (pendingDecision.kind === 'plan') {
+            void resolvePlan(pendingDecision.runId, pendingDecision.planId, 'reject');
+            return;
+          }
+          if (pendingDecision.kind === 'review') {
+            void resolveReview(pendingDecision.runId, 'revise');
+            return;
+          }
+          void rejectPermission();
+        }}
       />
     </div>
   );

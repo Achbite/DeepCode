@@ -473,7 +473,6 @@ const PlanBlock: React.FC<{
   language: UiLanguage;
   onPlanResolve?: CodexTimelineProps['onPlanResolve'];
 }> = ({ block, language, onPlanResolve }) => {
-  const [guidance, setGuidance] = useState('');
   const reviewEvent = block.events.find((event) => event.kind === 'plan_review');
   const payload = isRecord(reviewEvent?.payload) ? reviewEvent.payload : {};
   const runId = stringField(payload, 'runId');
@@ -487,32 +486,8 @@ const PlanBlock: React.FC<{
       <MarkdownContent content={block.bodyMarkdown ?? block.summary} />
       <EventList events={block.events} compact />
       {confirmable && (
-        <div className="codex-plan-actions">
-          <textarea
-            value={guidance}
-            onChange={(event) => setGuidance(event.target.value)}
-            placeholder={t(language, 'deepcodeGui.plan.guidancePlaceholder')}
-          />
-          <div className="codex-plan-actions__buttons">
-            <button type="button" onClick={() => onPlanResolve?.(runId!, planId!, 'accept')}>
-              {t(language, 'deepcodeGui.plan.accept')}
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                onPlanResolve?.(
-                  runId!,
-                  planId!,
-                  guidance.trim() ? 'revise' : 'reject',
-                  guidance.trim() || undefined
-                )
-              }
-            >
-              {guidance.trim()
-                ? t(language, 'deepcodeGui.plan.sendRevision')
-                : t(language, 'deepcodeGui.plan.reject')}
-            </button>
-          </div>
+        <div className="codex-plan-actions codex-plan-actions--composer">
+          {t(language, 'deepcodeGui.plan.useComposer')}
         </div>
       )}
     </article>
@@ -568,7 +543,7 @@ function localFallbackTimeline(events: AgentEvent[]): AgentTimelineResult {
             status: 'running',
             blocks: events.map((event) => ({
               id: event.id,
-              kind: event.kind === 'user_msg' ? 'user' : event.kind === 'assistant_msg' ? 'assistant' : 'stage',
+              kind: fallbackBlockKind(event),
               title: event.kind,
               summary: eventSummary(event),
               status: 'completed',
@@ -581,6 +556,20 @@ function localFallbackTimeline(events: AgentEvent[]): AgentTimelineResult {
   };
 }
 
+function fallbackBlockKind(event: AgentEvent): AgentTimelineBlock['kind'] {
+  if (event.kind === 'user_msg') return 'user';
+  if (event.kind === 'plan_card' || event.kind === 'plan_review') return 'plan';
+  if (event.kind === 'review_summary') return 'review';
+  if (event.kind === 'error') return 'error';
+  if (event.kind === 'assistant_msg') {
+    const payload = isRecord(event.payload) ? event.payload : {};
+    if (payload.channel === 'reasoning') return 'thinking';
+    if (payload.channel === 'final') return 'assistant';
+    return 'stage';
+  }
+  return 'stage';
+}
+
 function eventSummary(event: AgentEvent): string {
   return eventText(event) || event.kind;
 }
@@ -588,6 +577,14 @@ function eventSummary(event: AgentEvent): string {
 function eventText(event: AgentEvent): string {
   if (typeof event.payload === 'string') return event.payload;
   if (!isRecord(event.payload)) return '';
+  if (event.kind === 'review_summary') {
+    return (
+      stringField(event.payload, 'content') ??
+      stringField(event.payload, 'summary') ??
+      stringField(event.payload, 'message') ??
+      ''
+    );
+  }
   return (
     stringField(event.payload, 'summary') ??
     stringField(event.payload, 'content') ??

@@ -6,6 +6,7 @@ import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
 import AgentComposer from '../../components/agent-panel/AgentComposer';
 import PermissionRequestBubble from '../../components/agent-panel/PermissionRequestBubble';
+import { findPendingComposerDecision } from '../../components/agent-panel/pendingDecision';
 import CodexTimeline from './CodexTimeline';
 
 interface CodexAgentPanelProps {
@@ -40,6 +41,9 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
   const sessionAttachments = useAgentSessionStore((s) => s.sessionAttachments);
   const pendingPermission = useAgentSessionStore((s) => s.pendingPermission);
   const resolvingPermission = useAgentSessionStore((s) => s.resolvingPermission);
+  const resolvingRequirement = useAgentSessionStore((s) => s.resolvingRequirement);
+  const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
+  const resolvingReview = useAgentSessionStore((s) => s.resolvingReview);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
   const setProfileId = useAgentSessionStore((s) => s.setProfileId);
@@ -49,7 +53,9 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
   const cancelCurrentRun = useAgentSessionStore((s) => s.cancelCurrentRun);
   const acceptPermission = useAgentSessionStore((s) => s.acceptPermission);
   const rejectPermission = useAgentSessionStore((s) => s.rejectPermission);
+  const resolveRequirement = useAgentSessionStore((s) => s.resolveRequirement);
   const resolvePlan = useAgentSessionStore((s) => s.resolvePlan);
+  const resolveReview = useAgentSessionStore((s) => s.resolveReview);
   const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
   const [timeline, setTimeline] = useState<AgentTimelineResult | null>(null);
   const [timelineError, setTimelineError] = useState<string | null>(null);
@@ -99,8 +105,16 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = (timeline?.turns.length ?? 0) > 0;
+  const pendingDecision = findPendingComposerDecision({
+    events,
+    pendingPermission: pendingPermission?.request ?? null,
+    resolvingRequirement,
+    resolvingPlan,
+    resolvingReview,
+    resolvingPermission,
+  });
   const showHome = forceHome || (
-    !sessionRunning && !pendingPermission && !errorMessage && !timelineError
+    !sessionRunning && !pendingDecision && !errorMessage && !timelineError
     && events.length === 0 && !hasTimelineTurns
   );
   const composerRunning = forceHome ? false : sessionRunning;
@@ -123,6 +137,49 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
       onStop={() => void cancelCurrentRun()}
       onAddAttachment={addAttachment}
       onRemoveAttachment={removeAttachment}
+      pendingDecision={pendingDecision}
+      onDecisionSubmit={(guidance) => {
+        if (!pendingDecision) return;
+        if (pendingDecision.kind === 'requirement') {
+          void resolveRequirement(
+            pendingDecision.runId,
+            pendingDecision.requirementId,
+            guidance ? 'revise' : 'accept',
+            guidance
+          );
+          return;
+        }
+        if (pendingDecision.kind === 'plan') {
+          void resolvePlan(
+            pendingDecision.runId,
+            pendingDecision.planId,
+            guidance ? 'revise' : 'accept',
+            guidance
+          );
+          return;
+        }
+        if (pendingDecision.kind === 'review') {
+          void resolveReview(pendingDecision.runId, guidance ? 'revise' : 'accept', guidance);
+          return;
+        }
+        void acceptPermission();
+      }}
+      onDecisionReject={() => {
+        if (!pendingDecision) return;
+        if (pendingDecision.kind === 'requirement') {
+          void resolveRequirement(pendingDecision.runId, pendingDecision.requirementId, 'reject');
+          return;
+        }
+        if (pendingDecision.kind === 'plan') {
+          void resolvePlan(pendingDecision.runId, pendingDecision.planId, 'reject');
+          return;
+        }
+        if (pendingDecision.kind === 'review') {
+          void resolveReview(pendingDecision.runId, 'revise');
+          return;
+        }
+        void rejectPermission();
+      }}
     />
   );
 

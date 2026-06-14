@@ -1114,16 +1114,59 @@ function PlanCard({
   );
 }
 
-function PlanReviewCard({
+function RequirementConfirmationCard({
   event,
-  onPlanResolve,
   language,
 }: {
   event: AgentEvent;
-  onPlanResolve?: MessageListProps['onPlanResolve'];
   language: UiLanguage;
 }) {
-  const [guidance, setGuidance] = React.useState('');
+  const title = stringField(event.payload, 'title') ?? t(language, 'agent.requirement.title');
+  const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
+  const content = stringField(event.payload, 'content');
+  const status = stringField(event.payload, 'status') ?? 'waitingUserConfirmation';
+  const confirmable = isRecord(event.payload) &&
+    event.payload.confirmable === true &&
+    status === 'waitingUserConfirmation';
+  return (
+    <section key={event.id} className="agent-flow-card agent-flow-card--requirement">
+      <div className="agent-flow-card__title">{title}</div>
+      <div className="agent-flow-card__summary">{summary}</div>
+      {content && <MarkdownContent content={content} />}
+      {confirmable && (
+        <div className="agent-plan-review-actions agent-plan-review-actions--composer">
+          {t(language, 'agent.requirement.useComposer')}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RequirementDecisionCard({
+  event,
+  language,
+}: {
+  event: AgentEvent;
+  language: UiLanguage;
+}) {
+  const title = stringField(event.payload, 'title') ?? t(language, 'agent.requirement.title');
+  const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
+  const status = stringField(event.payload, 'status') ?? 'completed';
+  return (
+    <section key={event.id} className={`agent-flow-card agent-flow-card--requirement agent-flow-card--${status}`}>
+      <div className="agent-flow-card__title">{title}</div>
+      <div className="agent-flow-card__summary">{summary}</div>
+    </section>
+  );
+}
+
+function PlanReviewCard({
+  event,
+  language,
+}: {
+  event: AgentEvent;
+  language: UiLanguage;
+}) {
   const title = stringField(event.payload, 'title') ?? t(language, 'agent.plan.reviewTitle');
   const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
   const status = stringField(event.payload, 'status') ?? 'pending';
@@ -1137,32 +1180,14 @@ function PlanReviewCard({
     status !== 'rejected' &&
     Boolean(runId) &&
     Boolean(planId);
-  const reviewDecision = guidance.trim().length > 0 ? 'revise' : 'reject';
   return (
     <section key={event.id} className={`agent-flow-card agent-flow-card--check agent-flow-card--${status}`}>
       <div className="agent-flow-card__title">{title}</div>
       <div className="agent-flow-card__summary">{summary}</div>
       {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
       {confirmable && (
-        <div className="agent-plan-review-actions">
-          <textarea
-            value={guidance}
-            onChange={(event) => setGuidance(event.target.value)}
-            placeholder={t(language, 'agent.plan.reviewPlaceholder')}
-          />
-          <div className="agent-plan-review-actions__buttons">
-            <button type="button" onClick={() => onPlanResolve?.(runId!, planId!, 'accept')}>
-              {t(language, 'agent.plan.accept')}
-            </button>
-            <button
-              type="button"
-              onClick={() => onPlanResolve?.(runId!, planId!, reviewDecision, guidance.trim() || undefined)}
-            >
-              {guidance.trim().length > 0
-                ? t(language, 'agent.plan.submitReview')
-                : t(language, 'agent.plan.reject')}
-            </button>
-          </div>
+        <div className="agent-plan-review-actions agent-plan-review-actions--composer">
+          {t(language, 'agent.plan.useComposer')}
         </div>
       )}
     </section>
@@ -1172,17 +1197,13 @@ function PlanReviewCard({
 function ReviewSummaryCard({
   event,
   language,
-  resolvingReview,
-  onReviewResolve,
 }: {
   event: AgentEvent;
   language: UiLanguage;
-  resolvingReview?: MessageListProps['resolvingReview'];
-  onReviewResolve?: MessageListProps['onReviewResolve'];
 }) {
-  const [guidance, setGuidance] = React.useState('');
   const title = stringField(event.payload, 'title') ?? t(language, 'agent.review.title');
   const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
+  const content = stringField(event.payload, 'content');
   const llmGuidance = stringField(event.payload, 'llmGuidance');
   const status = stringField(event.payload, 'status') ?? 'waitingUserReview';
   const runId = stringField(event.payload, 'runId');
@@ -1191,7 +1212,6 @@ function ReviewSummaryCard({
     event.payload.confirmable === true &&
     status === 'waitingUserReview' &&
     Boolean(runId);
-  const resolving = Boolean(runId && resolvingReview?.runId === runId);
   const facts = payloadArray(event.payload, 'facts');
   const continuationCount =
     isRecord(event.payload) && typeof event.payload.continuationCount === 'number'
@@ -1201,6 +1221,7 @@ function ReviewSummaryCard({
     <section key={event.id} className={`agent-flow-card agent-flow-card--review agent-flow-card--${status}`}>
       <div className="agent-flow-card__title">{title}</div>
       <div className="agent-flow-card__summary">{summary}</div>
+      {content && content !== summary && <MarkdownContent content={content} />}
       {continuationCount > 0 && (
         <div className="agent-flow-card__section">
           <div className="agent-flow-card__section-title">
@@ -1219,33 +1240,8 @@ function ReviewSummaryCard({
         </details>
       )}
       {confirmable && (
-        <div className="agent-plan-review-actions">
-          <textarea
-            value={guidance}
-            onChange={(event) => setGuidance(event.target.value)}
-            placeholder={t(language, 'agent.review.placeholder')}
-            disabled={resolving}
-          />
-          <div className="agent-plan-review-actions__buttons">
-            <button
-              type="button"
-              disabled={resolving}
-              onClick={() => onReviewResolve?.(runId!, 'accept')}
-            >
-              {resolving && resolvingReview?.decision === 'accept'
-                ? t(language, 'agent.review.accepting')
-                : t(language, 'agent.review.acceptContinue')}
-            </button>
-            <button
-              type="button"
-              disabled={resolving}
-              onClick={() => onReviewResolve?.(runId!, 'revise', guidance.trim() || undefined)}
-            >
-              {resolving && resolvingReview?.decision === 'revise'
-                ? t(language, 'agent.review.submitting')
-                : t(language, 'agent.review.submitRevision')}
-            </button>
-          </div>
+        <div className="agent-plan-review-actions agent-plan-review-actions--composer">
+          {t(language, 'agent.review.useComposer')}
         </div>
       )}
     </section>
@@ -1511,9 +1507,15 @@ function renderMessage(
       />
     );
   }
+  if (event.kind === 'requirement_confirmation') {
+    return <RequirementConfirmationCard key={event.id} event={event} language={language} />;
+  }
+  if (event.kind === 'requirement_decision') {
+    return <RequirementDecisionCard key={event.id} event={event} language={language} />;
+  }
   if (event.kind === 'plan_review') {
     if (shouldHidePlanReviewForConfirmedPlan(event, planState)) return null;
-    return <PlanReviewCard key={event.id} event={event} language={language} onPlanResolve={onPlanResolve} />;
+    return <PlanReviewCard key={event.id} event={event} language={language} />;
   }
   if (event.kind === 'review_summary') {
     return (
@@ -1521,8 +1523,6 @@ function renderMessage(
         key={event.id}
         event={event}
         language={language}
-        resolvingReview={resolvingReview}
-        onReviewResolve={onReviewResolve}
       />
     );
   }

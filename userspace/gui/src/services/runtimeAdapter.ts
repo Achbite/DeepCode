@@ -47,7 +47,6 @@ import type {
   PatchUserSettingsRequest,
   PatchUserSettingsResult,
   PatchWorkspaceSettingsResult,
-  PromptLayerResult,
   RenameAgentSessionRequest,
   RenameEntryResult,
   ResolveAgentPermissionRequest,
@@ -573,10 +572,6 @@ export function patchAgentWorkflowConfig(
 
 export function listAgentTools(mode?: AgentMode): Promise<ApiResponse<ListToolsResult>> {
   return api.listAgentTools(mode);
-}
-
-export function getAgentPromptLayers(): Promise<ApiResponse<PromptLayerResult>> {
-  return api.getAgentPromptLayers();
 }
 
 export function getAgentSkills(): Promise<ApiResponse<SkillReferenceResult>> {

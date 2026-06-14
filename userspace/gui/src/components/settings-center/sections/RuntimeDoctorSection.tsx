@@ -3,7 +3,6 @@ import { useSettingsStore } from '../../../state/settingsStore';
 import { useWorkspaceStore } from '../../../state/workspaceStore';
 import { normalizeUiLanguage, t } from '../../../i18n';
 import {
-  getAgentPromptLayers,
   getLlmProfiles,
   getRuntimeStatus,
   listAgentTools,
@@ -60,7 +59,6 @@ const RuntimeDoctorSection: React.FC = () => {
     const nextRuntime = await getRuntimeStatus();
     const llmProfiles = await getLlmProfiles();
     const agentTools = await listAgentTools();
-    const promptLayers = await getAgentPromptLayers();
 
     const skillMounts = parseArraySetting(effectiveSettings['skills.mounts']);
     const mcpServers = parseArraySetting(effectiveSettings['mcp.servers']);
@@ -118,15 +116,6 @@ const RuntimeDoctorSection: React.FC = () => {
                 defaultProfile: llmProfiles.data.defaultProfileId ?? t(language, 'settings.doctor.notSet'),
               })
             : llmProfiles.message ?? t(language, 'settings.doctor.noLlm'),
-      },
-      {
-        id: 'prompt',
-        title: t(language, 'settings.doctor.check.prompt'),
-        status: promptLayers.ok && promptLayers.data && promptLayers.data.layers.length > 0 ? 'ok' : 'warn',
-        detail:
-          promptLayers.ok && promptLayers.data && promptLayers.data.layers.length > 0
-            ? t(language, 'settings.doctor.detail.prompt', { count: promptLayers.data.layers.length })
-            : promptLayers.message ?? t(language, 'settings.doctor.noPrompt'),
       },
       {
         id: 'skills',

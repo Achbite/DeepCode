@@ -5,6 +5,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import ContextAttachmentPicker from './ContextAttachmentPicker';
 import UserAttachmentDialog, { type PickedUserAttachment } from './UserAttachmentDialog';
+import type { AgentComposerPendingDecision } from './pendingDecision';
 
 interface AgentComposerProps {
   messageAttachments: AgentContextAttachment[];
@@ -15,6 +16,9 @@ interface AgentComposerProps {
   onStop: () => void;
   onAddAttachment: (attachment: AgentContextAttachment) => void;
   onRemoveAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
+  pendingDecision?: AgentComposerPendingDecision | null;
+  onDecisionSubmit?: (guidance?: string) => void | Promise<void>;
+  onDecisionReject?: () => void | Promise<void>;
 }
 
 interface AgentModifiedFileView {
@@ -112,6 +116,51 @@ function isImeComposing(event: React.KeyboardEvent<HTMLTextAreaElement>): boolea
   );
 }
 
+function composerDecisionText(decision: AgentComposerPendingDecision, language: UiLanguage): { title: string; summary?: string } {
+  const fallbackTitle = decision.kind === 'requirement'
+    ? t(language, 'agent.composer.decision.requirement')
+    : decision.kind === 'plan'
+    ? t(language, 'agent.composer.decision.plan')
+    : decision.kind === 'review'
+      ? t(language, 'agent.composer.decision.review')
+      : t(language, 'agent.composer.decision.permission');
+  return {
+    title: decision.title || fallbackTitle,
+    summary: decision.summary,
+  };
+}
+
+function decisionPlaceholder(decision: AgentComposerPendingDecision, language: UiLanguage): string {
+  if (decision.kind === 'requirement') return t(language, 'agent.composer.decision.requirementPlaceholder');
+  if (decision.kind === 'plan') return t(language, 'agent.composer.decision.planPlaceholder');
+  if (decision.kind === 'review') return t(language, 'agent.composer.decision.reviewPlaceholder');
+  return t(language, 'agent.composer.decision.permissionPlaceholder');
+}
+
+function decisionSubmitLabel(decision: AgentComposerPendingDecision, value: string, language: UiLanguage): string {
+  if (decision.kind === 'permission') return t(language, 'agent.permission.accept');
+  if (decision.kind === 'requirement') {
+    return value.trim()
+      ? t(language, 'agent.requirement.submitRevision')
+      : t(language, 'agent.requirement.accept');
+  }
+  if (value.trim()) {
+    return decision.kind === 'review'
+      ? t(language, 'agent.review.submitRevision')
+      : t(language, 'agent.plan.submitReview');
+  }
+  return decision.kind === 'review'
+    ? t(language, 'agent.review.acceptContinue')
+    : t(language, 'agent.plan.accept');
+}
+
+function decisionSubmitTitle(decision: AgentComposerPendingDecision, value: string, language: UiLanguage): string {
+  if (decision.kind === 'permission') return t(language, 'agent.permission.accept');
+  return value.trim()
+    ? t(language, 'agent.composer.decision.submitGuidanceTitle')
+    : t(language, 'agent.composer.decision.acceptTitle');
+}
+
 const AgentComposer: React.FC<AgentComposerProps> = ({
   messageAttachments,
   sessionAttachments,
@@ -121,6 +170,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   onStop,
   onAddAttachment,
   onRemoveAttachment,
+  pendingDecision,
+  onDecisionSubmit,
+  onDecisionReject,
 }) => {
   const [value, setValue] = useState('');
   const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
@@ -143,6 +195,12 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
 
   const send = () => {
     const nextValue = value;
+    if (pendingDecision) {
+      if (pendingDecision.resolving) return;
+      setValue('');
+      void onDecisionSubmit?.(nextValue.trim() || undefined);
+      return;
+    }
     if (!nextValue.trim()) return;
     setValue('');
     void onSend(nextValue);
@@ -167,7 +225,18 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   };
 
   const chips = [...sessionAttachments, ...messageAttachments];
-  const composerExpanded = Boolean(value.trim() || chips.length > 0 || attachmentDialogOpen || mention);
+  const composerExpanded = Boolean(value.trim() || chips.length > 0 || attachmentDialogOpen || mention || pendingDecision);
+  const decisionText = pendingDecision ? composerDecisionText(pendingDecision, language) : null;
+  const sendDisabled = loading
+    ? false
+    : pendingDecision
+      ? Boolean(pendingDecision.resolving)
+      : !value.trim();
+  const sendLabel = loading
+    ? t(language, 'agent.composer.stop')
+    : pendingDecision
+      ? decisionSubmitLabel(pendingDecision, value, language)
+      : t(language, 'agent.composer.send');
 
   const openModifiedFile = (file: AgentModifiedFileView) => {
     const absolutePath = activeFolder?.absolutePath
@@ -204,6 +273,12 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
 
   return (
     <div className={`agent-composer ${composerExpanded ? 'agent-composer--expanded' : ''}`}>
+      {decisionText && (
+        <div className="agent-composer-decision">
+          <div className="agent-composer-decision__title">{decisionText.title}</div>
+          {decisionText.summary && <div className="agent-composer-decision__summary">{decisionText.summary}</div>}
+        </div>
+      )}
       {chips.length > 0 && (
         <div className="agent-attachment-chips">
           {chips.map((attachment) => (
@@ -292,7 +367,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             }
           }}
           placeholder={
-            loading
+            pendingDecision
+              ? decisionPlaceholder(pendingDecision, language)
+              : loading
               ? t(language, 'agent.composer.placeholder.running')
               : t(language, 'agent.composer.placeholder.idle')
           }
@@ -322,14 +399,27 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
         <button
           className={loading ? 'agent-composer__send-button--stop' : undefined}
           onClick={loading ? onStop : send}
-          disabled={loading ? false : !value.trim()}
+          disabled={sendDisabled}
           type="button"
           title={loading
             ? t(language, 'agent.composer.stopTitle')
-            : t(language, 'agent.composer.sendTitle')}
+            : pendingDecision
+              ? decisionSubmitTitle(pendingDecision, value, language)
+              : t(language, 'agent.composer.sendTitle')}
         >
-          {loading ? t(language, 'agent.composer.stop') : t(language, 'agent.composer.send')}
+          {sendLabel}
         </button>
+        {pendingDecision && !loading && (
+          <button
+            className="agent-composer__reject-button"
+            onClick={() => void onDecisionReject?.()}
+            disabled={Boolean(pendingDecision.resolving)}
+            type="button"
+            title={t(language, 'agent.composer.decision.rejectTitle')}
+          >
+            {t(language, 'agent.composer.decision.reject')}
+          </button>
+        )}
       </div>
       <UserAttachmentDialog
         visible={attachmentDialogOpen}

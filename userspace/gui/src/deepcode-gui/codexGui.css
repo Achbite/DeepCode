@@ -631,6 +631,15 @@ button {
   margin-top: 10px;
 }
 
+.codex-plan-actions--composer {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  color: var(--text-muted);
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
 .codex-plan-actions textarea {
   min-height: 72px;
   width: 100%;
@@ -861,6 +870,37 @@ button {
   justify-content: space-between;
   align-items: center;
   gap: 8px;
+}
+
+.agent-composer-decision {
+  border: 1px solid rgba(37, 99, 235, 0.2);
+  border-radius: 7px;
+  background: rgba(37, 99, 235, 0.06);
+  color: var(--text);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+
+.agent-composer-decision__title {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.agent-composer-decision__summary {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.agent-composer__footer button.agent-composer__reject-button {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.agent-composer__footer button.agent-composer__reject-button:hover {
+  border-color: #dc2626;
+  color: #dc2626;
 }
 
 .agent-composer__footer-left {
