@@ -140,16 +140,12 @@ running_process_ids_for_path() {
 target_app_process_ids() {
   local app_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/$TAURI_BIN_NAME"
   local kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
-  local app_macos_dir="$BIN_DIR/$APP_NAME.app/Contents/MacOS"
 
   if [ -e "$app_bin" ]; then
     running_process_ids_for_path "$app_bin" || true
   fi
   if [ -e "$kernel_bin" ]; then
     running_process_ids_for_path "$kernel_bin" || true
-  fi
-  if [ -d "$app_macos_dir" ] && command -v lsof >/dev/null 2>&1; then
-    lsof +D "$app_macos_dir" 2>/dev/null | awk 'NR > 1 && $2 ~ /^[0-9]+$/ { print $2 }' || true
   fi
 }
 

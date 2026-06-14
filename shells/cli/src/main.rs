@@ -1,5 +1,4 @@
-use deepcode_kernel_client::{HttpKernelClient, KernelClientConfig, PromptMode, PromptRunResult};
-use serde_json::Value;
+use deepcode_kernel_client::{HttpKernelClient, KernelClientConfig};
 use std::env;
 use std::io::{self, IsTerminal, Write};
 
@@ -40,23 +39,12 @@ async fn main() {
                 }
             }
         }
-        Command::Ask { api, prompt } => {
-            let client = client(api);
-            match client.send_prompt(&prompt, PromptMode::Ask).await {
-                Ok(result) => print_prompt_result(&client, result).await,
-                Err(error) => {
-                    eprintln!("run failed: {error}");
-                    std::process::exit(EXIT_DAEMON_UNAVAILABLE);
-                }
-            }
-        }
     }
 }
 
 enum Command {
     Help,
     Interactive,
-    Ask { api: Option<String>, prompt: String },
     DaemonStatus { api: Option<String> },
 }
 
@@ -74,13 +62,7 @@ impl Command {
                         return Err("--api requires a URL".to_string());
                     }
                 }
-                "-p" | "--print" => {
-                    let prompt = iter.collect::<Vec<_>>().join(" ");
-                    if prompt.trim().is_empty() {
-                        return Err("-p requires a prompt".to_string());
-                    }
-                    return Ok(Command::Ask { api, prompt });
-                }
+                "-p" | "--print" => return Err(format!("{arg} was removed; use the SessionDriverLoop host bridge when CLI chat is reattached")),
                 _ => rest.push(arg),
             }
         }
@@ -90,10 +72,6 @@ impl Command {
             [daemon, status] if daemon == "daemon" && status == "status" => {
                 Ok(Command::DaemonStatus { api })
             }
-            [ask, prompt @ ..] if ask == "ask" && !prompt.is_empty() => Ok(Command::Ask {
-                api,
-                prompt: prompt.join(" "),
-            }),
             _ => Err(format!("unknown command: {}", rest.join(" "))),
         }
     }
@@ -130,51 +108,19 @@ async fn run_interactive() -> Result<(), String> {
                 }
                 Err(error) => println!("daemon unavailable: {error}"),
             },
-            command if command.starts_with("/ask ") => {
-                run_prompt(&client, command.trim_start_matches("/ask ").trim()).await;
-            }
-            command if command.starts_with("ask ") => {
-                run_prompt(&client, command.trim_start_matches("ask ").trim()).await;
-            }
             command if command.starts_with('/') => {
                 println!("unknown command: {command}");
                 println!("type /help to list available commands");
             }
-            prompt => run_prompt(&client, prompt).await,
-        }
-    }
-    Ok(())
-}
-
-async fn run_prompt(client: &HttpKernelClient, prompt: &str) {
-    if prompt.trim().is_empty() {
-        println!("prompt is empty; type /help for usage");
-        return;
-    }
-    match client.send_prompt(prompt, PromptMode::Ask).await {
-        Ok(result) => {
-            print_prompt_result(client, result).await;
-        }
-        Err(error) => println!("run failed: {error}"),
-    }
-}
-
-async fn print_prompt_result(client: &HttpKernelClient, result: PromptRunResult) {
-    let printed_final = result.final_answer.is_some();
-    if let Some(answer) = result.final_answer.as_ref() {
-        println!("{answer}");
-    }
-
-    match client.agent_timeline(&result.session_id).await {
-        Ok(timeline) => print_timeline(&timeline, printed_final),
-        Err(error) if printed_final => eprintln!("timeline unavailable: {error}"),
-        Err(_) => {
-            println!("session: {}", result.session_id);
-            for event in result.events {
-                println!("{}", format_event(&event));
+            command => {
+                println!("unknown command: {command}");
+                println!(
+                    "CLI chat is not wired in this Host shell; use /help for available commands."
+                );
             }
         }
     }
+    Ok(())
 }
 
 fn client(api: Option<String>) -> HttpKernelClient {
@@ -190,8 +136,6 @@ fn print_help() {
 
 Usage:
   deepcode --help
-  deepcode -p "<prompt>"
-  deepcode ask "<prompt>"
   deepcode daemon status
 
 Options:
@@ -206,76 +150,21 @@ fn print_interactive_help() {
     println!(
         r#"DeepCode CLI Host Shell MVP
 
-Type a prompt and press Enter, or use:
+Type a command and press Enter:
   /help              Show this command list
   /status            Check Kernel daemon health
-  /ask <prompt>      Send one prompt through KernelClient
   /quit              Exit
 
 Examples:
   /status
-  /ask summarize current workspace
 
 Non-interactive:
-  deepcode -p "<prompt>"
   deepcode daemon status
 
-This is still stage 10.0; full CLI behavior remains stage 16."#
+This Host shell does not expose the legacy chat-submit path. CLI chat will be reattached
+through the same userspace SessionDriverLoop / Kernel boundary used by Editor and GUI."#
     );
     if !io::stdin().is_terminal() {
         println!("stdin is not a terminal; EOF exits immediately.");
-    }
-}
-
-fn print_timeline(timeline: &Value, omit_assistant_body: bool) {
-    let Some(turns) = timeline.get("turns").and_then(Value::as_array) else {
-        return;
-    };
-    let mut lines = Vec::new();
-    for turn in turns {
-        let turn_status = value_str(turn, "status").unwrap_or("unknown");
-        let Some(blocks) = turn.get("blocks").and_then(Value::as_array) else {
-            continue;
-        };
-        for block in blocks {
-            let kind = value_str(block, "kind").unwrap_or("stage");
-            if kind == "user" || (omit_assistant_body && kind == "assistant") {
-                continue;
-            }
-            let title = value_str(block, "title").unwrap_or(kind);
-            let status = value_str(block, "status").unwrap_or(turn_status);
-            let summary = value_str(block, "summary").unwrap_or("");
-            lines.push(format!("[{kind}:{status}] {title} {summary}"));
-        }
-    }
-    if lines.is_empty() {
-        return;
-    }
-    println!("-- Timeline --");
-    for line in lines {
-        println!("{line}");
-    }
-}
-
-fn value_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str)
-}
-
-fn format_event(event: &Value) -> String {
-    let kind = event
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("event");
-    let payload = event.get("payload").unwrap_or(event);
-    let text = payload
-        .get("content")
-        .or_else(|| payload.get("message"))
-        .or_else(|| payload.get("text"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    if text.is_empty() {
-        format!("[{kind}]")
-    } else {
-        format!("[{kind}] {text}")
     }
 }

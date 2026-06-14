@@ -8,10 +8,10 @@ DeepCode 是一个本地优先的 AI 编程工作台实验项目，目标是把 
 
 - Kernel daemon 提供 `/api/health`、会话归档、工具目录、权限审计、工作区、Git、内部浏览器等 API 入口。
 - live 会话协议只接受 `deepcode.agent.protocol.v3` JSON Envelope；userspace Session DriverLoop 负责 prompt 组装、provider 调用、parser 和一次 repair。tagged Markdown 协议输出会被 Session parser 拒绝。
-- Editor 是完整工作台封装：文件树、Monaco-based editor surface、终端、Agent 面板、Git 面板、内部浏览器。
+- Editor 是完整工作台封装：文件树、Monaco-based editor surface、终端、Agent 面板、Git 面板、内部浏览器。右侧 Agent 面板是嵌入在编辑器里的会话框，复用 DeepCode-GUI 的 Session projection 与消息语义，不是独立 Agent runtime。
 - DeepCode-GUI 是简洁对话式 GUI，不等同于完整 Editor。
 - GUI 只读分析可以由显式附件或 Session 记忆的项目默认工作目录锚定；这不同于 Editor workspace binding，后者仍是编辑器文件树和代码修改隔离边界。
-- CLI/TUI 是命令行和终端交互入口，复用同一个 Kernel/session 事实源。
+- CLI/TUI 是命令行和终端交互入口，复用同一个 Kernel/session 事实源。旧会话发送入口已删除，后续需要通过与 Editor / GUI 相同的 SessionDriverLoop bridge 重接。
 - Web Dev Host 仅用于开发预览和协议调试，不是正式 UI 封装。
 
 ## UI 封装口径
@@ -28,6 +28,8 @@ DeepCode 当前区分四套正式 UI 封装：
 UI shell 不拥有第二套 Kernel、Session truth、tool execution、permission 或用户偏好存储。功能组件、权限和工具调用由 Kernel/session 提供。会话编排、上下文组装、PromptEnvelope、provider lifecycle、协议解析和 repair 由 userspace Session DriverLoop 负责，UI 只负责展示、输入和交互差异。
 
 Editor workspace binding 是 Editor 的文件树展示、编辑和代码修改隔离事实。DeepCode-GUI 可以通过显式附件或 Session 项目默认工作目录携带 conversation roots，不要求必须存在 Editor workspace。写入、删除、Git、终端命令和跨项目修改仍必须进入可审查计划、Kernel policy 检查，并清晰披露目标范围。
+
+Editor 专属上下文，例如 workspace root、active file、selection、open tabs、terminal cwd，先进入 Session context assembly；Kernel 只处理 ResourceManifest、WorkspaceBinding、capability、permission、WorkUnit 和 facts。可见终端是 UI 面板，不是 Agent 命令执行事实源。
 
 ## 构建与发布模式
 

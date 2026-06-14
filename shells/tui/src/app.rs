@@ -1,6 +1,6 @@
 use crate::model::CardModel;
 use crate::renderer::Renderer;
-use deepcode_kernel_client::{HttpKernelClient, PromptMode};
+use deepcode_kernel_client::HttpKernelClient;
 
 pub struct TuiApp {
     client: HttpKernelClient,
@@ -77,18 +77,12 @@ impl TuiApp {
                 ));
             }
             "/quit" | "/exit" | "quit" | "exit" | "q" => return false,
-            command if command.starts_with("/ask ") => {
-                self.send_prompt(command.trim_start_matches("/ask ").trim())
-                    .await;
-            }
-            command if command.starts_with("ask ") => {
-                self.send_prompt(command.trim_start_matches("ask ").trim())
-                    .await;
-            }
             command if command.starts_with('/') => self.cards.push(CardModel::error(format!(
                 "未知命令：{command}\n输入 /help 查看可用命令。"
             ))),
-            prompt => self.send_prompt(prompt).await,
+            command => self.cards.push(CardModel::error(format!(
+                "未知命令：{command}\nTUI 不暴露旧会话发送入口；会话输入后续通过同一 SessionDriverLoop / Kernel 边界重接。"
+            ))),
         }
         true
     }
@@ -134,39 +128,6 @@ impl TuiApp {
             Err(error) => self
                 .cards
                 .push(CardModel::error(format!("审计检查失败：{error}"))),
-        }
-    }
-
-    async fn send_prompt(&mut self, prompt: &str) {
-        if prompt.trim().is_empty() {
-            self.cards
-                .push(CardModel::error("输入为空；可输入 /help 查看用法。"));
-            return;
-        }
-        self.cards.push(CardModel::user(prompt));
-        self.status = "运行中 · 等待 daemon 响应".to_string();
-        match self.client.send_prompt(prompt, PromptMode::Ask).await {
-            Ok(result) => {
-                self.status = format!("会话 {} · 已完成", result.session_id);
-                self.cards
-                    .push(CardModel::stage("会话", result.session_id.clone()));
-                match self.client.agent_timeline(&result.session_id).await {
-                    Ok(timeline) => self.cards.extend(CardModel::from_timeline(&timeline)),
-                    Err(_) => {
-                        for event in result.events {
-                            self.cards.push(CardModel::from_event(&event));
-                        }
-                        if let Some(answer) = result.final_answer {
-                            self.cards.push(CardModel::final_answer(answer));
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                self.status = "运行失败".to_string();
-                self.cards
-                    .push(CardModel::error(format!("运行失败：{error}")));
-            }
         }
     }
 }

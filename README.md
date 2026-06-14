@@ -8,10 +8,10 @@ DeepCode is a local-first AI coding workbench experiment. Its goal is to keep Ag
 
 - The Kernel daemon exposes `/api/health`, conversation archives, tool catalog, permission audit, workspace, Git, and internal browser APIs.
 - The live session protocol is `deepcode.agent.protocol.v3` JSON Envelope only. Userspace Session DriverLoop owns prompt assembly, provider calls, parser, and one-shot repair. Tagged Markdown protocol output is rejected by the Session parser.
-- Editor is the full workbench package: file tree, Monaco-based editor surface, terminal, Agent panel, Git panel, and internal browser.
+- Editor is the full workbench package: file tree, Monaco-based editor surface, terminal, Agent panel, Git panel, and internal browser. The right Agent panel is an embedded conversation panel that reuses the same Session projection and message semantics as DeepCode-GUI; it is not a separate Agent runtime.
 - DeepCode-GUI is a concise conversational GUI. It is not the full Editor.
 - GUI read-only analysis can be anchored by explicit attachments or by the project working directory remembered by Session. This is separate from Editor workspace binding, which remains the editing and file-tree isolation boundary.
-- CLI and TUI reuse the same Kernel/session source of truth.
+- CLI and TUI reuse the same Kernel/session source of truth. The legacy CLI/TUI chat-submit path is removed until those shells are reattached through the same SessionDriverLoop bridge as Editor and GUI.
 - Web Dev Host is only a development preview and protocol-debugging entry. It is not a formal UI package.
 
 ## UI Package Terms
@@ -28,6 +28,8 @@ DeepCode currently has four formal UI package forms:
 UI shells do not own a second Kernel, session truth, tool execution path, permission model, or user-preference store. Functional components, permissions, and tool calls are provided by Kernel/session. Conversation orchestration, context assembly, prompt envelopes, provider lifecycle, protocol parsing, and repair are owned by userspace Session DriverLoop. UI layers only own rendering, input, and interaction differences.
 
 Editor workspace binding is an Editor concern for file tree display, editing, and code-change isolation. DeepCode-GUI can carry conversation roots from explicit attachments or a Session project working directory without requiring an Editor workspace. Writes, deletes, Git operations, terminal commands, and cross-project modifications still require reviewable plans, Kernel policy checks, and clear target disclosure.
+
+Editor-only context such as workspace root, active file, selection, open tabs, and terminal cwd is Host context. It enters Session context assembly first; Kernel only sees ResourceManifest, WorkspaceBinding, capabilities, permissions, WorkUnits, and facts. The visible terminal is a UI surface, not an execution fact source for Agent commands.
 
 ## Build And Release Mode
 

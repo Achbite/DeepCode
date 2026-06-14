@@ -143,14 +143,11 @@ pub fn command_help() -> &'static str {
     "可用命令：\n\
 /help          显示命令列表\n\
 /status        检查 Kernel daemon 连接\n\
-/ask <prompt>  发送一条 prompt\n\
 /audit         显示审计占位状态\n\
 /clear         清理当前可见卡片\n\
 /quit          退出 TUI\n\
 \n\
-不带斜杠的文本会按 /ask <prompt> 发送。\n\
-\n\
-边界：TUI 只负责展示和输入，workflow、permission、tool execution 仍由 DeepCode Kernel/daemon 持有。"
+边界：TUI 只负责展示和输入，不暴露旧会话发送入口；会话输入后续通过同一 SessionDriverLoop / Kernel 边界重接。"
 }
 
 fn timeline_kind_title(kind: &str) -> &'static str {

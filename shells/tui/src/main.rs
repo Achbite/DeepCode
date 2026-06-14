@@ -157,14 +157,11 @@ Usage:
 Interactive commands:
   /help              显示 TUI 命令
   /status            检查 Kernel daemon 连接
-  /ask <prompt>      通过 KernelClient 发送一条 prompt
   /audit             显示审计占位状态
   /clear             清理当前可见卡片
   /quit              退出 TUI
 
-不带斜杠的文本会直接作为 prompt 发送。
-
 该终端界面参考 pi/Claude Code 的会话优先形态封装；TUI 只负责展示、
-输入和命令入口，不持有 workflow、permission 或 tool execution 事实。"#
+输入和命令入口，不暴露旧会话发送入口，不持有 workflow、permission 或 tool execution 事实。"#
     );
 }
