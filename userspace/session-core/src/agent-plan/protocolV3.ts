@@ -50,7 +50,7 @@ export function parseProposalEnvelope(input: ParseProposalEnvelopeInput): Propos
 
 function proposalPayload(envelope: Record<string, unknown>, kind: string): unknown {
   if (kind === 'answer') return requireObject(envelope.answer, 'Agent Protocol v3.answer');
-  if (kind === 'resourceRequest') return requireObject(envelope.resourceRequest, 'Agent Protocol v3.resourceRequest');
+  if (kind === 'resourceRequest') return normalizeResourceRequest(requireObject(envelope.resourceRequest, 'Agent Protocol v3.resourceRequest'));
   if (kind === 'requirementDraft') return requireObject(envelope.requirementDraft, 'Agent Protocol v3.requirementDraft');
   if (kind === 'repairProposal') return requireObject(envelope.repairProposal, 'Agent Protocol v3.repairProposal');
   if (kind === 'reviewPacketDraft') return requireObject(envelope.reviewPacketDraft, 'Agent Protocol v3.reviewPacketDraft');
@@ -60,6 +60,41 @@ function proposalPayload(envelope: Record<string, unknown>, kind: string): unkno
     actionBundle: requireObject(envelope.actionBundle, 'Agent Protocol v3.actionBundle'),
     expectedValidation: optionalString(envelope, 'expectedValidation'),
     reviewGuide: optionalString(envelope, 'reviewGuide'),
+  };
+}
+
+function normalizeResourceRequest(value: Record<string, unknown>): Record<string, unknown> {
+  const items = value.items;
+  if (!Array.isArray(items)) {
+    throw new AgentPlanParseError('invalid_resource_request', 'Agent Protocol v3.resourceRequest.items must be an array');
+  }
+  const normalizedItems = items.map((item, index) => {
+    const record = requireObject(item, `Agent Protocol v3.resourceRequest.items[${index}]`);
+    const id = optionalString(record, 'id') ?? `item-${index}`;
+    const manifestEntryId = optionalString(record, 'manifestEntryId');
+    const path = optionalString(record, 'path');
+    const rootId = optionalString(record, 'rootId');
+    const reason = optionalString(record, 'reason') ?? 'Resolve additional context.';
+    if (!manifestEntryId && !path) {
+      throw new AgentPlanParseError(
+        'invalid_resource_request_item',
+        `Agent Protocol v3.resourceRequest.items[${index}] must include manifestEntryId or path`
+      );
+    }
+    return {
+      id,
+      ...(manifestEntryId ? { manifestEntryId } : {}),
+      ...(path ? { path } : {}),
+      ...(rootId ? { rootId } : {}),
+      reason,
+    };
+  });
+  return {
+    ...value,
+    version: optionalString(value, 'version') ?? '1',
+    id: optionalString(value, 'id') ?? 'resource-request',
+    reason: optionalString(value, 'reason') ?? 'Resolve additional context.',
+    items: normalizedItems,
   };
 }
 

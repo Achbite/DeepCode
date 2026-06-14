@@ -162,7 +162,7 @@ export function buildConversationProjection(input: ConversationProjectionInput):
         title: 'ResourceRequest',
         summary: `请求补充 ${request.items.length} 项只读上下文。`,
         status: 'pending',
-        facts: request.items.map((item) => `${item.manifestEntryId}：${item.reason}`),
+        facts: request.items.map((item) => `${item.manifestEntryId ?? item.path ?? item.id}：${item.reason}`),
       })
     );
   }

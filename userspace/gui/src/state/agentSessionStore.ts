@@ -17,9 +17,11 @@ import {
   createWorkspaceScopeKey,
   findLatestPendingPermission,
   mergeContextAttachment,
+  SessionDriverLoop,
 } from '@deepcode/session-core';
 import {
   activateAgentSession,
+  appendAgentEvents,
   archiveAgentSession,
   deleteAgentSession,
   cancelAgentRun,
@@ -28,13 +30,14 @@ import {
   getAgentWorkflowConfig,
   getAgentEventSnapshot,
   getCurrentAgentSession,
+  kernelCommand,
   listAgentSessions,
+  llmChat,
   patchAgentWorkflowConfig,
   renameAgentSession,
   resolveAgentPlan,
   resolveAgentReview,
   resolveAgentPermission,
-  sendAgentMessage,
 } from '../services/runtimeAdapter';
 import { useSettingsStore } from './settingsStore';
 import { useWorkspaceStore } from './workspaceStore';
@@ -538,22 +541,32 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     let wasAborted = false;
 
     try {
-      const result = await sendAgentMessage(session.id, {
+      const driver = new SessionDriverLoop({
+        kernelCommand,
+        llmChat,
+        appendEvents: async (targetSessionId, events) => {
+          if (abortController.signal.aborted) {
+            throw new Error('request_aborted');
+          }
+          const result = await appendAgentEvents(targetSessionId, { events });
+          if (abortController.signal.aborted) {
+            throw new Error('request_aborted');
+          }
+          if (!result.ok || !result.data) {
+            throw new Error(result.message ?? 'Agent event append failed');
+          }
+          return result.data;
+        },
+      });
+      const data = await driver.runUserTurn({
+        sessionId: session.id,
         content: trimmed,
         attachments,
+        existingEvents: get().events,
         workspaceBinding: currentWorkspaceBinding(),
-        mode: get().mode,
         workflow: get().workflow,
-        workflowConfig: get().workflowConfig ?? undefined,
         profileId: get().profileId,
-      }, abortController.signal);
-      if (!result.ok || !result.data) {
-        if (result.error === 'request_aborted') {
-          throw new Error('request_aborted');
-        }
-        throw new Error(result.message ?? 'Agent message failed');
-      }
-      const data = result.data;
+      });
       refreshWorkspaceTreeForToolFacts(data.events);
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);

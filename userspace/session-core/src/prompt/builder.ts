@@ -48,7 +48,9 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       name: 'capabilityProjection',
       content: [
         'Agent Protocol v3 answer shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"answer","outputLanguage":"zh-CN","answer":{"format":"markdown","content":"..."}}',
-        'Agent Protocol v3 resource request shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"resourceRequest","outputLanguage":"zh-CN","resourceRequest":{"version":"1","id":"need-target","reason":"Need a concrete target resource.","items":[{"id":"target-entry","manifestEntryId":"current-selection","reason":"Resolve a manifest entry."}]}}',
+        'Agent Protocol v3 resource request shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"resourceRequest","outputLanguage":"zh-CN","resourceRequest":{"version":"1","id":"need-target","reason":"Need concrete project context.","items":[{"id":"target-entry","manifestEntryId":"current-selection","reason":"Resolve a manifest entry."},{"id":"target-path","rootId":"root-id","path":"relative/path.ext","reason":"Resolve a path under an available conversation root."}]}}',
+        'resourceRequest.items[] must include either manifestEntryId or path. Use path only for files or directories under listed conversation roots or explicit user attachments.',
+        'Never invent arbitrary absolute local paths. If you need more context from a project directory, request a root-relative path from the available conversation roots.',
         'Agent Protocol v3 action bundle shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"actionBundle","outputLanguage":"zh-CN","userPlan":"...","codeBlocks":[{"id":"...","path":"<workspace-resource>","content":"..."}],"actionBundle":{"version":"1","id":"...","goal":"...","actions":[{"id":"...","title":"...","capability":"workspace.write","kind":"write","resourceScope":["<workspace-resource>"],"sourceBlockId":"..."}],"continuationExpectations":[{"id":"delete-after-review","title":"Delete referenced workspace resource after user review is accepted","capability":"workspace.delete","kind":"delete","resourceScope":["<workspace-resource>"]}],"validationExpectations":[],"reviewExpectations":[]},"expectedValidation":"...","reviewGuide":"..."}',
         'Natural language is never executable. Tagged Markdown protocol output is not accepted; live proposal output must use Agent Protocol v3.',
         `Capabilities visible as proposals only, not authorization:\n${input.capabilityCatalogSummary}`,
@@ -121,9 +123,25 @@ function renderLayer(layer: PromptSystemLayer): string {
 
 function resourceContextSummary(input: PromptEnvelopeBuilderInput): string {
   const lines: string[] = [];
+  if (input.conversationRoots?.length) {
+    lines.push('Conversation roots:');
+    for (const root of input.conversationRoots) {
+      lines.push(`- rootId=${root.rootId} source=${root.source} path=${root.displayPath}`);
+      lines.push(`  label=${root.label}`);
+    }
+    lines.push('ResourceRequest path rule: use {"rootId":"<rootId>","path":"<relative path>"} for files or directories under these roots.');
+  }
   if (input.initialContext) {
     lines.push(`InitialContextPacket: ${input.initialContext.id}`);
     lines.push(`ResourceManifest: ${input.initialContext.manifest.id} entries=${input.initialContext.manifest.entries.length}`);
+    for (const entry of input.initialContext.manifest.entries.slice(0, 80)) {
+      lines.push(`- manifestEntry id=${entry.id} kind=${entry.kind} ref=${entry.resourceRef} policy=${entry.readPolicy}`);
+      lines.push(`  label=${entry.label}`);
+      lines.push(`  reason=${entry.reason}`);
+    }
+    if (input.initialContext.manifest.entries.length > 80) {
+      lines.push(`- manifestEntry list truncated: ${input.initialContext.manifest.entries.length - 80} additional entries omitted`);
+    }
   }
   for (const packet of input.resourcePackets ?? []) {
     lines.push(`ResourcePacket: ${packet.id} request=${packet.requestId} items=${packet.items.length}`);

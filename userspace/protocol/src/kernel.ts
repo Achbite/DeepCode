@@ -261,28 +261,26 @@ export interface KernelProfileRef {
   hash?: string;
 }
 
-export interface KernelLlmCallRequestedEvent {
-  kind: 'llm.call_requested';
-  runId: KernelRunId;
-  sessionId?: KernelSessionId;
-  phase: string;
-  llmCallId: string;
-  profileRef?: KernelProfileRef;
-  requestEnvelope: unknown;
-  sequence?: number;
+export interface KernelCommandEnvelope {
+  requestId?: string;
+  command: unknown;
+  idempotencyKey?: string;
+  expectedSnapshotSeq?: number;
 }
 
-export interface KernelLlmResponseSubmitCommand {
-  kind: 'llmResponseSubmit';
-  requestId: KernelRequestId;
-  runId: KernelRunId;
-  sessionId?: KernelSessionId;
-  llmCallId: string;
-  responseEnvelope: unknown;
+export interface KernelErrorEnvelope {
+  code: string;
+  message: string;
+  messageKey?: string;
+  args?: unknown;
 }
 
-export type KernelWorkflowTransportEvent = KernelLlmCallRequestedEvent;
-export type KernelWorkflowTransportCommand = KernelLlmResponseSubmitCommand;
+export interface KernelReply {
+  ok: boolean;
+  events: unknown[];
+  snapshot?: unknown;
+  error?: KernelErrorEnvelope;
+}
 
 export interface KernelCompletionCriteria {
   id: string;

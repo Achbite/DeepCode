@@ -68,7 +68,9 @@ export interface ReviewGuide {
 
 export interface ResourceRequestDraftItem {
   id: string;
-  manifestEntryId: string;
+  manifestEntryId?: string;
+  path?: string;
+  rootId?: string;
   reason: string;
 }
 

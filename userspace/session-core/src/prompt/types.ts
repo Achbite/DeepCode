@@ -1,4 +1,4 @@
-import type { InitialContextPacket, ResourcePacket } from '../context/types.js';
+import type { ConversationResourceRoot, InitialContextPacket, ResourcePacket } from '../context/types.js';
 import type { RequirementRecord } from '../requirement/types.js';
 import type { AuthoritativeDocExcerpt } from './docProbe.js';
 import type { CompiledRuler } from './ruler.js';
@@ -31,6 +31,7 @@ export interface PromptEnvelopeBuilderInput {
   authoritativeDocExcerpts?: AuthoritativeDocExcerpt[];
   requirement?: RequirementRecord;
   initialContext?: InitialContextPacket;
+  conversationRoots?: ConversationResourceRoot[];
   resourcePackets?: ResourcePacket[];
   userRequest: string;
   auditOnly?: {

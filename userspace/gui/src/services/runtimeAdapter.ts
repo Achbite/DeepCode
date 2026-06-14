@@ -8,10 +8,6 @@
 import type {
   AgentFeedbackRequest,
   AgentFeedbackResult,
-  AgentActionParseRequest,
-  AgentActionParseResult,
-  AgentFixtureRunRequest,
-  AgentFixtureRunResult,
   AgentMode,
   AgentSessionListResult,
   AgentSessionResult,
@@ -54,14 +50,11 @@ import type {
   PromptLayerResult,
   RenameAgentSessionRequest,
   RenameEntryResult,
-  ResolveAgentResourcesRequest,
-  AgentResourcePacketResult,
   ResolveAgentPermissionRequest,
   ResolveAgentPlanRequest,
   ResolveAgentReviewRequest,
   SaveWorkspaceFileRequest,
   SaveWorkspaceFileResult,
-  SendAgentMessageRequest,
   SetBrowserInspectModeRequest,
   ShellEnvironmentStatus,
   SkillReferenceResult,
@@ -73,6 +66,8 @@ import type {
   TerminalSessionsResult,
   TerminalWarmupStatus,
   WorkspaceState,
+  KernelCommandEnvelope,
+  KernelReply,
 } from '@deepcode/protocol';
 
 import * as api from './apiClient';
@@ -399,6 +394,10 @@ export function llmChat(request: LlmChatRequest): Promise<ApiResponse<LlmChatRes
   return api.llmChat(request);
 }
 
+export function kernelCommand(request: KernelCommandEnvelope): Promise<KernelReply> {
+  return api.kernelCommand(request);
+}
+
 export function codeSearch(request: CodeSearchInput): Promise<ApiResponse<CodeSearchResult>> {
   return api.codeSearch(request);
 }
@@ -467,14 +466,6 @@ export function appendAgentEvents(
 
 export function getAgentSession(sessionId: string): Promise<ApiResponse<AgentSessionResult>> {
   return api.getAgentSession(sessionId);
-}
-
-export function sendAgentMessage(
-  sessionId: string,
-  request: SendAgentMessageRequest,
-  signal?: AbortSignal
-): Promise<ApiResponse<AgentSessionResult>> {
-  return api.sendAgentMessage(sessionId, request, signal);
 }
 
 export function cancelAgentRun(sessionId: string): Promise<ApiResponse<AgentSessionResult>> {
@@ -582,24 +573,6 @@ export function patchAgentWorkflowConfig(
 
 export function listAgentTools(mode?: AgentMode): Promise<ApiResponse<ListToolsResult>> {
   return api.listAgentTools(mode);
-}
-
-export function parseAgentActions(
-  request: AgentActionParseRequest
-): Promise<ApiResponse<AgentActionParseResult>> {
-  return api.parseAgentActions(request);
-}
-
-export function runAgentFixture(
-  request: AgentFixtureRunRequest
-): Promise<ApiResponse<AgentFixtureRunResult>> {
-  return api.runAgentFixture(request);
-}
-
-export function resolveAgentResources(
-  request: ResolveAgentResourcesRequest
-): Promise<ApiResponse<AgentResourcePacketResult>> {
-  return api.resolveAgentResources(request);
 }
 
 export function getAgentPromptLayers(): Promise<ApiResponse<PromptLayerResult>> {

@@ -91,7 +91,7 @@ export interface LlmChatMessage {
 }
 
 export interface LlmChatRequest {
-  profileId: string;
+  profileId?: string;
   messages: LlmChatMessage[];
   tools?: ToolDefinition[];
   stream?: boolean;

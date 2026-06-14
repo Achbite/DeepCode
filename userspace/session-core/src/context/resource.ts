@@ -20,16 +20,20 @@ export function createResourcePacket(input: {
   const seen = new Set<string>();
 
   for (const requestItem of input.request.items.slice(0, input.manifest.budget.maxEntries)) {
-    if (seen.has(requestItem.manifestEntryId)) continue;
-    seen.add(requestItem.manifestEntryId);
-    const entry = entriesById.get(requestItem.manifestEntryId);
+    const manifestEntryId = requestItem.manifestEntryId;
+    const requestKey = manifestEntryId ?? requestItem.path ?? requestItem.id;
+    if (seen.has(requestKey)) continue;
+    seen.add(requestKey);
+    const entry = manifestEntryId ? entriesById.get(manifestEntryId) : undefined;
     if (!entry) {
       items.push({
         requestItemId: requestItem.id,
-        manifestEntryId: requestItem.manifestEntryId,
+        manifestEntryId: manifestEntryId ?? requestKey,
         readPolicy: 'denyRead',
         status: 'denied',
-        denialReason: 'resource is not listed in ResourceManifest',
+        denialReason: manifestEntryId
+          ? 'resource is not listed in ResourceManifest'
+          : 'path-based resource requests must be resolved by Session before packet creation',
       });
       continue;
     }

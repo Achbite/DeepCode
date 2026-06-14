@@ -13,7 +13,7 @@ export interface DynamicSuffixRef {
 
 export type ResourceReadPolicy = 'autoRead' | 'askRead' | 'denyRead';
 
-export type ResourceManifestEntryKind = 'file' | 'symbol' | 'search' | 'checkpoint' | 'index' | 'ruler';
+export type ResourceManifestEntryKind = 'file' | 'directory' | 'resource' | 'symbol' | 'search' | 'checkpoint' | 'index' | 'ruler';
 
 export interface ResourceManifestEntry {
   id: string;
@@ -38,6 +38,18 @@ export interface ResourceManifest {
   defaultDenyPatterns: string[];
 }
 
+export interface ProjectWorkingDirectory {
+  rootId: string;
+  label: string;
+  displayPath: string;
+  absolutePath?: string;
+  source: 'currentAttachment' | 'projectWorkingDirectory' | 'recentAttachment' | 'sessionAttachment' | 'workspaceBinding';
+}
+
+export interface ConversationResourceRoot extends ProjectWorkingDirectory {
+  kind: 'directory';
+}
+
 export interface InitialContextPacket {
   id: string;
   workspaceScopeKey: string;
@@ -53,7 +65,9 @@ export interface InitialContextPacket {
 
 export interface ResourceRequestItem {
   id: string;
-  manifestEntryId: string;
+  manifestEntryId?: string;
+  path?: string;
+  rootId?: string;
   reason: string;
 }
 
@@ -66,7 +80,7 @@ export interface ResourcePacketItem {
   requestItemId: string;
   manifestEntryId: string;
   readPolicy: ResourceReadPolicy;
-  status: 'provided' | 'needsUserApproval' | 'denied';
+  status: 'provided' | 'resolved' | 'needsUserApproval' | 'denied' | 'error';
   contentKind?: 'directoryTree' | 'fileText' | 'searchResults' | 'summary' | 'text' | 'json';
   contentSummary?: string;
   promptContent?: string;

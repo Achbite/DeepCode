@@ -39,7 +39,6 @@ import type {
   ArchiveAgentSessionRequest,
   AgentSessionResult,
   AppendAgentEventsRequest,
-  SendAgentMessageRequest,
   ResolveAgentPermissionRequest,
   ResolveAgentPlanRequest,
   ResolveAgentReviewRequest,
@@ -60,12 +59,6 @@ import type {
   CreateTerminalSessionRequest,
   TerminalInputRequest,
   TerminalResizeRequest,
-  AgentActionParseRequest,
-  AgentActionParseResult,
-  AgentFixtureRunRequest,
-  AgentFixtureRunResult,
-  ResolveAgentResourcesRequest,
-  AgentResourcePacketResult,
   PromptLayerResult,
   SkillReferenceResult,
   BrowserRuntimeStatusResult,
@@ -73,6 +66,8 @@ import type {
   SetBrowserInspectModeRequest,
   PanelSnapshotResult,
   AttachPanelSnapshotResult,
+  KernelCommandEnvelope,
+  KernelReply,
 } from '@deepcode/protocol';
 import { getKernelApiBase } from './hostTarget';
 
@@ -229,6 +224,33 @@ async function sendJson<T>(
 
 export function getHealth(): Promise<ApiResponse<HealthStatus>> {
   return getJson<HealthStatus>(`${API_BASE}/health`);
+}
+
+export function kernelCommand(request: KernelCommandEnvelope): Promise<KernelReply> {
+  return fetch(`${API_BASE}/kernel/commands`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  }).then(async (response) => {
+    if (!response.ok) {
+      return {
+        ok: false,
+        events: [],
+        error: {
+          code: 'http_error',
+          message: `HTTP ${response.status}: ${response.statusText}`,
+        },
+      } satisfies KernelReply;
+    }
+    return (await response.json()) as KernelReply;
+  }).catch((error) => ({
+    ok: false,
+    events: [],
+    error: {
+      code: 'network_error',
+      message: error instanceof Error ? error.message : String(error),
+    },
+  }));
 }
 
 // ---- 工作区 ----
@@ -559,19 +581,6 @@ export function getAgentSession(
   );
 }
 
-export function sendAgentMessage(
-  sessionId: string,
-  request: SendAgentMessageRequest,
-  signal?: AbortSignal
-): Promise<ApiResponse<AgentSessionResult>> {
-  return sendJson<AgentSessionResult>(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/messages`,
-    'POST',
-    request,
-    { signal }
-  );
-}
-
 export function cancelAgentRun(
   sessionId: string
 ): Promise<ApiResponse<AgentSessionResult>> {
@@ -756,36 +765,6 @@ export function getTerminalEvents(
     after: after === undefined ? undefined : String(after),
   });
   return getJson<TerminalEventsResult>(`${API_BASE}/terminal/events${qs}`);
-}
-
-export function parseAgentActions(
-  request: AgentActionParseRequest
-): Promise<ApiResponse<AgentActionParseResult>> {
-  return sendJson<AgentActionParseResult>(
-    `${API_BASE}/agent/parse-actions`,
-    'POST',
-    request
-  );
-}
-
-export function runAgentFixture(
-  request: AgentFixtureRunRequest
-): Promise<ApiResponse<AgentFixtureRunResult>> {
-  return sendJson<AgentFixtureRunResult>(
-    `${API_BASE}/agent/fixtures/run`,
-    'POST',
-    request
-  );
-}
-
-export function resolveAgentResources(
-  request: ResolveAgentResourcesRequest
-): Promise<ApiResponse<AgentResourcePacketResult>> {
-  return sendJson<AgentResourcePacketResult>(
-    `${API_BASE}/agent/resources/resolve`,
-    'POST',
-    request
-  );
 }
 
 export function getAgentPromptLayers(): Promise<ApiResponse<PromptLayerResult>> {
