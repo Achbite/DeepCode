@@ -914,8 +914,8 @@ write_build_info() {
   cat > "$dst" <<JSON
 {
   "buildCommit": "$BUILD_COMMIT",
-  "protocolVersion": "deepcode.agent.protocol.v2",
-  "toolCatalogVersion": "deepcode.tool_catalog.k7-k9.v1",
+  "protocolVersion": "deepcode.agent.protocol.v3",
+  "toolCatalogVersion": "deepcode.tool_catalog.session-v3.v1",
   "product": "$product"
 }
 JSON
@@ -987,11 +987,11 @@ verify_packaged_kernel_markers() {
     local strings_file
     strings_file="$(mktemp "${TMPDIR:-/tmp}/deepcode-kernel-strings.XXXXXX")"
     strings "$candidate" >"$strings_file"
-    if ! grep -Fq 'deepcode.agent.protocol.v2' "$strings_file"; then
+    if ! grep -Fq 'deepcode.agent.protocol.v3' "$strings_file"; then
       rm -f "$strings_file"
-      fail "$candidate is missing deepcode.agent.protocol.v2 marker"
+      fail "$candidate is missing deepcode.agent.protocol.v3 marker"
     fi
-    if ! grep -Fq 'deepcode.tool_catalog.k7-k9.v1' "$strings_file"; then
+    if ! grep -Fq 'deepcode.tool_catalog.session-v3.v1' "$strings_file"; then
       rm -f "$strings_file"
       fail "$candidate is missing tool catalog version marker"
     fi

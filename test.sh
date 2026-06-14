@@ -320,14 +320,14 @@ fi
 
 info "[4/8] stage 9/10/10.5/11/12/13/14/19/20 boundary grep gates"
 for runtime_module in \
-  dispatch state workspace tools workflow llm context permissions temp_artifacts obligations
+  dispatch state workspace tools workflow context permissions temp_artifacts obligations
 do
   test -f "crates/deepcode-kernel-runtime/src/${runtime_module}.rs" \
     || fail "missing runtime module ${runtime_module}.rs"
 done
 for daemon_module in \
   prelude api_response state ipc static_assets kernel_api workspace_api settings_api \
-  session_store agent_api agent_loop event_projection llm_transport terminal_api \
+  session_store agent_api event_projection llm_transport terminal_api \
   browser_api skill_api utils
 do
   test -f "crates/deepcode-kernel-daemon/src/${daemon_module}.rs" \
@@ -337,16 +337,15 @@ daemon_main_lines="$(wc -l < crates/deepcode-kernel-daemon/src/main.rs | tr -d '
 [ "$daemon_main_lines" -le 260 ] || fail "daemon main.rs must stay facade-sized, got ${daemon_main_lines} lines"
 ! search "KernelCommand::" crates/deepcode-kernel-runtime/src/lib.rs \
   || fail "runtime lib.rs must not contain KernelCommand dispatch arms"
-! search "fn (dispatch|workspace_|tool_invoke|execute_bound_tool|llm_response_submit|permission_resolve|run_start|run_resume|context_attach_reference|record_change_operation_for_tool)" crates/deepcode-kernel-runtime/src/lib.rs \
+! search "fn (dispatch|workspace_|tool_invoke|execute_bound_tool|permission_resolve|run_resume|context_attach_reference|record_change_operation_for_tool)" crates/deepcode-kernel-runtime/src/lib.rs \
   || fail "runtime lib.rs must remain facade-only"
-! search "pub\\(crate\\).*workspace_current|async fn workspace_current|pub\\(crate\\).*call_openai_compatible_profile|call_anthropic_profile|call_ollama_profile|drive_kernel_agent_loop|append_session_projection_jsonl|scan_skill_mount_dir|safe_asset_path" crates/deepcode-kernel-daemon/src/main.rs \
+! search "pub\\(crate\\).*workspace_current|async fn workspace_current|pub\\(crate\\).*call_openai_compatible_profile|call_anthropic_profile|call_ollama_profile|append_session_projection_jsonl|scan_skill_mount_dir|safe_asset_path" crates/deepcode-kernel-daemon/src/main.rs \
   || fail "daemon main.rs must not contain moved handler/provider/storage/static/skill-scan implementations"
 search "pub fn dispatch" crates/deepcode-kernel-runtime/src/dispatch.rs >/dev/null
 search "struct RuntimeState" crates/deepcode-kernel-runtime/src/state.rs >/dev/null
 search "fn workspace_open" crates/deepcode-kernel-runtime/src/workspace.rs >/dev/null
 search "fn tool_invoke" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
-search "fn run_start" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
-search "fn llm_response_submit" crates/deepcode-kernel-runtime/src/llm.rs >/dev/null
+search "fn run_create|fn state_contract_get|fn proposal_submit|fn resource_resolve" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
 search "fn context_attach_reference" crates/deepcode-kernel-runtime/src/context.rs >/dev/null
 search "fn permission_resolve" crates/deepcode-kernel-runtime/src/permissions.rs >/dev/null
 search "fn is_kernel_owned_temp_cleanup" crates/deepcode-kernel-runtime/src/temp_artifacts.rs >/dev/null
@@ -359,10 +358,9 @@ search "manifest.json|projection.jsonl|transcript.jsonl|exports/complete.md|expo
 search "/api/session-store/:session_id/archive|/api/session-store/:session_id/archive/file" crates/deepcode-kernel-daemon/src/main.rs >/dev/null
 ! search "conversation-archives" userspace/gui/dist shells/tauri/dist shells/tauri/src-tauri/tauri.conf.json 2>/dev/null \
   || fail "conversation archives must stay in user config data, not GUI/Tauri dist resources"
-search "fn drive_kernel_agent_loop|fn call_llm_profile" crates/deepcode-kernel-daemon/src/agent_loop.rs >/dev/null
 search "fn call_openai_compatible_profile|fn call_anthropic_profile|fn call_ollama_profile" crates/deepcode-kernel-daemon/src/llm_transport.rs >/dev/null
 search "LlmProviderDiagnostic|LlmProviderErrorLayer|ProviderJsonDecodeFailed|expected_schema|body_preview" crates/deepcode-kernel-abi/src/llm.rs crates/deepcode-kernel-abi/src/event.rs crates/deepcode-kernel-daemon/src/llm_transport.rs crates/deepcode-kernel-daemon/src/event_projection.rs >/dev/null
-search "llm.provider_error|LlmProviderError" crates/deepcode-kernel-abi/src/event.rs crates/deepcode-kernel-daemon/src/event_projection.rs crates/deepcode-kernel-daemon/src/agent_loop.rs >/dev/null
+search "llm.provider_error|LlmProviderError" crates/deepcode-kernel-abi/src/event.rs crates/deepcode-kernel-daemon/src/event_projection.rs >/dev/null
 search "fn safe_asset_path|fn gui_asset" crates/deepcode-kernel-daemon/src/static_assets.rs >/dev/null
 search "fn skill_mount_scan|fn scan_skill_mount_dir" crates/deepcode-kernel-daemon/src/skill_api.rs >/dev/null
 search "fn run_length_prefixed_ipc|fn run_stdio_ipc" crates/deepcode-kernel-daemon/src/ipc.rs >/dev/null
@@ -435,25 +433,25 @@ search "schema_version: \"1.0.0\"|id: plan-check-complete-review|workspace.read|
 search "with_descriptor|descriptor_transition_decision|SafeInterpreter|TransitionInput" crates/deepcode-kernel-workflow/src/machine.rs >/dev/null
 search "rejects_script_hook|rejects_forbidden_predicate|rejects_unbounded_self_loop|unknown_proposal_kind_fails_to_parse|allows_review_to_complete_user_replan_loop" crates/deepcode-kernel-workflow/src/validator.rs >/dev/null
 search "invalid_proposal_stays_without_transition|plan_draft_advances_to_check|action_bundle_draft_advances_to_check|complete_to_review_requires_all_predicates" crates/deepcode-kernel-workflow/src/interpreter.rs >/dev/null
-! search "\"workflow\": \"plan-check-complete-review\"|unwrap_or\\(\"planFirst\"\\)" crates/deepcode-kernel-client/src crates/deepcode-kernel-daemon/src/agent_loop.rs \
+! search "\"workflow\": \"plan-check-complete-review\"|unwrap_or\\(\"planFirst\"\\)" crates/deepcode-kernel-client/src crates/deepcode-kernel-daemon/src \
   || fail "agent clients must not inject the fixed plan-check-complete-review workflow path"
 ! search "PlanContractSubmit \\{ request_id, \\.\\. \\} =>" crates/deepcode-kernel-runtime/src/dispatch.rs || fail "PlanContractSubmit must not remain interface-only"
 search "fn plan_contract_submit|parse_plan_review_input|PlanReviewReportProduced|plan.review_report_produced" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
 search "plan_contract_submit_produces_review_report_without_entering_complete|plan_contract_submit_malformed_contract_returns_denied_report|plan_contract_submit_action_bundle_reports_permission_gap" crates/deepcode-kernel-runtime/src/tests.rs >/dev/null
-search "parseAgentPlan|actionBundle|expectedValidation|reviewGuide" userspace/session-core/src/agent-plan >/dev/null
-search "RESOURCE_REQUEST|resource_request_with_action_bundle|parseAgentPlanOutput|ResourceRequestDraft|RESOURCE_REQUEST_KEYS" userspace/session-core/src/agent-plan >/dev/null
+search "parseProposalEnvelope|ProposalEnvelope|actionBundle|expectedValidation|reviewGuide" userspace/session-core/src/agent-plan >/dev/null
+search "resourceRequest|ResourceRequestDraft|manifestEntryId" userspace/session-core/src/agent-plan >/dev/null
 search "DraftTaskQueue|ApprovedTaskQueue|createPlanContractSubmitCommand|compileActionBundleToPlanContract" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue >/dev/null
 search "PlanConfirmationPolicy|PermissionAutoApprovalPolicy|AutoConfirmDecision|DEFAULT_PLAN_CONFIRMATION_POLICY|decidePlanConfirmation|decidePermissionAutoApproval|autoApproveDelete" userspace/session-core/src/confirmation userspace/session-core/src/task-queue >/dev/null
 search "ConversationProjection|buildConversationProjection|exportConversationProjection|为什么这样做|review_summary|check_review" userspace/session-core/src/projection.ts >/dev/null
 search "ReviewSelfCheckInput|buildReviewPacket|permissionDecisions|toolResults|finalSummary|waitingUserReview" userspace/session-core/src/review userspace/session-core/src/projection.ts >/dev/null
-search "parse_pending_agent_plan|PlanContractSubmit|PlanAccept|agent_plan_resolve|plan_card|plan_review|review_summary|should_auto_accept_plan" crates/deepcode-kernel-daemon/src/agent_loop.rs crates/deepcode-kernel-daemon/src/agent_api.rs crates/deepcode-kernel-daemon/src/event_projection.rs >/dev/null
-search "plan -> check|\"plan\" => LlmPhaseAdvance::Stop|\"review\" \\{ \"review\" \\}|\"complete\" \\{ return Ok\\(events\\);" crates/deepcode-kernel-runtime/src/llm.rs >/dev/null
+search "PlanContractSubmit|PlanAccept|agent_plan_resolve|plan_card|plan_review|review_summary|should_auto_accept_plan" crates/deepcode-kernel-daemon/src/agent_api.rs crates/deepcode-kernel-daemon/src/event_projection.rs >/dev/null
 search "resolveAgentPlan|ResolveAgentPlanRequest|PlanReviewCard|提交评审意见|拒绝计划|agent-flow-card--check" userspace/protocol/src userspace/gui/src >/dev/null
-! search "DeepCode Kernel 调度的规划阶段|DeepCode Kernel 调度的检查阶段|DeepCode Kernel 调度的执行阶段|DeepCode Kernel 调度的复核阶段|身份信息、工具汇总和临时文件结果只允许" crates/deepcode-kernel-runtime/src/llm.rs crates/deepcode-kernel-daemon/src/agent_loop.rs crates/deepcode-kernel-daemon/src/event_projection.rs userspace/gui/src/components/agent-panel \
+! search "DeepCode Kernel 调度的规划阶段|DeepCode Kernel 调度的检查阶段|DeepCode Kernel 调度的执行阶段|DeepCode Kernel 调度的复核阶段|身份信息、工具汇总和临时文件结果只允许" crates/deepcode-kernel-daemon/src/event_projection.rs userspace/gui/src/components/agent-panel \
   || fail "old fixed LLM stage prompts must not return to the user-facing agent loop"
 search "DynamicWorkflowPlan|DynamicWorkflowSession|buildDynamicWorkflowSession|selectDynamicWorkflow|SessionOrchestrationMicroPhase|stateMachineBoundary|kernelOwnedStateMachine|projectionCardKinds|resource_request|resource_packet|repairLoop" userspace/session-core/src/workflow userspace/session-core/src/projection.ts >/dev/null
 search "ResourceManifest|InitialContextPacket|ResourceRequest|ResourcePacket|createResourcePacket|autoRead|askRead|denyRead|kernelEvidence|sourceKind|evidenceRefs" userspace/session-core/src/context >/dev/null
-search "agent_resources_resolve|AgentResourceResolveRequest|resolve_auto_read_resource|WorkspaceRead|WorkspaceSearch|needsUserApproval|denied" crates/deepcode-kernel-daemon/src/agent_api.rs crates/deepcode-kernel-daemon/src/main.rs >/dev/null
+! search "agent_resources_resolve|AgentResourceResolveRequest|resolve_auto_read_resource" crates/deepcode-kernel-daemon/src/agent_api.rs crates/deepcode-kernel-daemon/src/main.rs \
+  || fail "legacy daemon resource resolver must not return"
 search "ProjectIndex|CheckpointGraph|SymbolHistoryIndex|ContextLayering|createProjectIndex|deriveContextLayering" userspace/session-core/src/context >/dev/null
 search "PromptEnvelopeParts|ProtocolContractBlock|BuiltinSystemPromptBlock|RulerBlock|CurrentUserOverlayBlock|AuthoritativeDocExcerptBlock|MemoryHintBlock|ResourceContextBlock|AuditOnlyContextBlock|workflowProjectionSchema|ProviderCacheTelemetry|promptCacheHitTokens|promptCacheMissTokens" userspace/session-core/src/context userspace/session-core/src/cache >/dev/null
 search "RulerDocument|CompiledRuler|RulerConstraint|IgnoredRulerClause|canGrantPermission|canOverrideProtocolContract|canOverrideSystemPrompt" userspace/session-core/src/prompt/ruler.ts >/dev/null

@@ -7,9 +7,10 @@ DeepCode 是一个本地优先的 AI 编程工作台实验项目，目标是把 
 ## 当前状态
 
 - Kernel daemon 提供 `/api/health`、会话归档、工具目录、权限审计、工作区、Git、内部浏览器等 API 入口。
-- live 会话协议只接受 `deepcode.agent.protocol.v2` JSON Envelope；tagged Markdown 协议输出会被 Kernel/session parser 拒绝。
+- live 会话协议只接受 `deepcode.agent.protocol.v3` JSON Envelope；userspace Session DriverLoop 负责 prompt 组装、provider 调用、parser 和一次 repair。tagged Markdown 协议输出会被 Session parser 拒绝。
 - Editor 是完整工作台封装：文件树、Monaco-based editor surface、终端、Agent 面板、Git 面板、内部浏览器。
 - DeepCode-GUI 是简洁对话式 GUI，不等同于完整 Editor。
+- GUI 只读分析可以由显式附件或 Session 记忆的项目默认工作目录锚定；这不同于 Editor workspace binding，后者仍是编辑器文件树和代码修改隔离边界。
 - CLI/TUI 是命令行和终端交互入口，复用同一个 Kernel/session 事实源。
 - Web Dev Host 仅用于开发预览和协议调试，不是正式 UI 封装。
 
@@ -24,7 +25,9 @@ DeepCode 当前区分四套正式 UI 封装：
 | CLI | 脚本化 Host Shell | 面向自动化和集成 |
 | TUI | Ratatui/Crossterm 终端交互 | 面向轻量本地使用 |
 
-UI shell 不拥有第二套 Kernel、Session truth、tool execution、permission 或用户偏好存储。功能组件、权限、工具调用和 session 编排由 Kernel/session 提供，UI 只负责展示、输入和交互差异。
+UI shell 不拥有第二套 Kernel、Session truth、tool execution、permission 或用户偏好存储。功能组件、权限和工具调用由 Kernel/session 提供。会话编排、上下文组装、PromptEnvelope、provider lifecycle、协议解析和 repair 由 userspace Session DriverLoop 负责，UI 只负责展示、输入和交互差异。
+
+Editor workspace binding 是 Editor 的文件树展示、编辑和代码修改隔离事实。DeepCode-GUI 可以通过显式附件或 Session 项目默认工作目录携带 conversation roots，不要求必须存在 Editor workspace。写入、删除、Git、终端命令和跨项目修改仍必须进入可审查计划、Kernel policy 检查，并清晰披露目标范围。
 
 ## 构建与发布模式
 
@@ -111,17 +114,20 @@ bin/macos-arm64/
 
 本阶段 macOS 包是本机可运行包，不包含 DMG、Developer ID 签名或公证。脚本会生成 package-local 配置根，并写入 `build-info.json` 供 `/api/health` 诊断读取。
 
-如果 `/api/health` 没有 `buildCommit`、`protocolVersion` 或 `toolCatalogVersion`，或者新 run 归档仍显示旧中文 tagged protocol prompt 而不是 `deepcode.agent.protocol.v2`，先退出正在运行的 `DeepCode.app`，再执行 `make package-macos-clean`，然后重新打开 App。打包脚本会在目标 App 或其 bundled `deepcode-kernel` 仍在运行时 fail fast，因为旧进程不退出会导致 review 测试继续命中旧 Kernel。
+如果 `/api/health` 没有 `buildCommit`、`protocolVersion` 或 `toolCatalogVersion`，或者新 run 归档仍显示旧中文 tagged protocol prompt 而不是 `deepcode.agent.protocol.v3`，先退出正在运行的 `DeepCode.app`，再执行 `make package-macos-clean`，然后重新打开 App。打包脚本会在目标 App 或其 bundled `deepcode-kernel` 仍在运行时 fail fast，因为旧进程不退出会导致 review 测试继续命中旧 Kernel。
 
 ## 会话协议
 
-live plan 输出以 `deepcode.agent.protocol.v2` JSON Envelope 为准：
+live provider-facing 输出以 `deepcode.agent.protocol.v3` JSON Envelope 为准：
 
 ```json
 {
-  "schemaVersion": "deepcode.agent.protocol.v2",
+  "schemaVersion": "deepcode.agent.protocol.v3",
+  "proposalId": "proposal-example",
   "kind": "answer",
+  "source": "llm",
   "outputLanguage": "zh-CN",
+  "referencedResourcePacketRefs": [],
   "answer": {
     "format": "markdown",
     "content": "..."
@@ -132,17 +138,50 @@ live plan 输出以 `deepcode.agent.protocol.v2` JSON Envelope 为准：
 `kind` 只能是：
 
 - `answer`：只读回答、解释、身份说明、设计讨论。
-- `resourceRequest`：需要 Kernel resource resolver 补充上下文。
-- `actionBundle`：可审查的执行草案，不是授权或执行事实。
+- `resourceRequest`：通过 Kernel `ResourceResolve` 补充上下文，可以引用 Session 暴露的 manifest entry id，或 Session conversation root 下的相对路径。
+- `actionBundle`：提交给 Kernel 校验的可审查 proposal，不是授权或执行事实。
+
+Resource request 可以指向精确 manifest entry，也可以指向 Session
+conversation root 下的路径：
+
+```json
+{
+  "schemaVersion": "deepcode.agent.protocol.v3",
+  "proposalId": "proposal-context-request",
+  "kind": "resourceRequest",
+  "source": "llm",
+  "outputLanguage": "zh-CN",
+  "resourceRequest": {
+    "version": "1",
+    "id": "need-more-context",
+    "reason": "需要读取已附加项目中的更多上下文。",
+    "items": [
+      {
+        "id": "entry-readme",
+        "manifestEntryId": "manifest-entry-id",
+        "reason": "解析已知 manifest entry。"
+      },
+      {
+        "id": "project-file",
+        "rootId": "conversation-root-id",
+        "path": "relative/path.ext",
+        "reason": "解析 conversation root 下的文件。"
+      }
+    ]
+  }
+}
+```
 
 约束：
 
 - 协议字段、capability、tool schema、代码标识符固定使用英文。
 - 最终回答和 review 总结跟随用户语言，默认中文。
+- `resourceRequest.items[]` 必须包含 `manifestEntryId` 或 `path` 二选一。存在多个 conversation root 时，`path` 应搭配 `rootId`。
+- `path` 只由 Session 在显式附件、项目默认工作目录或已证明的 conversation roots 内解析，然后提交 Kernel `ResourceResolve`；LLM 自行生成的任意本地绝对路径无效。
 - `actionBundle.actions[].capability` 使用 capability namespace，如 `workspace.write`、`workspace.delete`、`network.egress`。
 - executor tool name 如 `fs.write`、`fs.delete`、`web.search` 只属于 complete 阶段工具调用。
 - 写入草案通过 top-level `codeBlocks` 表达，action 通过 `sourceBlockId` 引用。
-- parser 保持 fail-closed；解析失败只允许一次受控 LLM repair。
+- v3 parser 保持 fail-closed；解析失败只允许 Session 中的一次受控 LLM repair。Kernel 只验证结构化 proposal，不组装 prompt，也不 repair 模型输出。
 
 ## Kernel 能力
 

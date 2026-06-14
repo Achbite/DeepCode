@@ -7,9 +7,10 @@ DeepCode is a local-first AI coding workbench experiment. Its goal is to keep Ag
 ## Current Status
 
 - The Kernel daemon exposes `/api/health`, conversation archives, tool catalog, permission audit, workspace, Git, and internal browser APIs.
-- The live session protocol is `deepcode.agent.protocol.v2` JSON Envelope only. Tagged Markdown protocol output is rejected by Kernel/session parsers.
+- The live session protocol is `deepcode.agent.protocol.v3` JSON Envelope only. Userspace Session DriverLoop owns prompt assembly, provider calls, parser, and one-shot repair. Tagged Markdown protocol output is rejected by the Session parser.
 - Editor is the full workbench package: file tree, Monaco-based editor surface, terminal, Agent panel, Git panel, and internal browser.
 - DeepCode-GUI is a concise conversational GUI. It is not the full Editor.
+- GUI read-only analysis can be anchored by explicit attachments or by the project working directory remembered by Session. This is separate from Editor workspace binding, which remains the editing and file-tree isolation boundary.
 - CLI and TUI reuse the same Kernel/session source of truth.
 - Web Dev Host is only a development preview and protocol-debugging entry. It is not a formal UI package.
 
@@ -24,7 +25,9 @@ DeepCode currently has four formal UI package forms:
 | CLI | Scriptable Host Shell | Automation and integration |
 | TUI | Ratatui/Crossterm terminal UI | Lightweight local usage |
 
-UI shells do not own a second Kernel, session truth, tool execution path, permission model, or user-preference store. Functional components, permissions, tool calls, and session orchestration are provided by Kernel/session. UI layers only own rendering, input, and interaction differences.
+UI shells do not own a second Kernel, session truth, tool execution path, permission model, or user-preference store. Functional components, permissions, and tool calls are provided by Kernel/session. Conversation orchestration, context assembly, prompt envelopes, provider lifecycle, protocol parsing, and repair are owned by userspace Session DriverLoop. UI layers only own rendering, input, and interaction differences.
+
+Editor workspace binding is an Editor concern for file tree display, editing, and code-change isolation. DeepCode-GUI can carry conversation roots from explicit attachments or a Session project working directory without requiring an Editor workspace. Writes, deletes, Git operations, terminal commands, and cross-project modifications still require reviewable plans, Kernel policy checks, and clear target disclosure.
 
 ## Build And Release Mode
 
@@ -115,17 +118,20 @@ bin/macos-arm64/
 
 The current macOS package is a local runnable package. It does not include DMG packaging, Developer ID signing, or notarization. The script creates a package-local writable config root and writes `build-info.json` for `/api/health` diagnostics.
 
-If `/api/health` does not include `buildCommit`, `protocolVersion`, or `toolCatalogVersion`, or if a new run archive still shows an old Chinese tagged protocol prompt instead of `deepcode.agent.protocol.v2`, quit the running `DeepCode.app`, run `make package-macos-clean`, and reopen the app. The package script fails fast when the target app or its bundled `deepcode-kernel` is still running, because repackaging while the old process is alive can make review tests hit the stale Kernel.
+If `/api/health` does not include `buildCommit`, `protocolVersion`, or `toolCatalogVersion`, or if a new run archive still shows an old Chinese tagged protocol prompt instead of `deepcode.agent.protocol.v3`, quit the running `DeepCode.app`, run `make package-macos-clean`, and reopen the app. The package script fails fast when the target app or its bundled `deepcode-kernel` is still running, because repackaging while the old process is alive can make review tests hit the stale Kernel.
 
 ## Session Protocol
 
-Live plan output uses the `deepcode.agent.protocol.v2` JSON Envelope:
+Live provider-facing output uses the `deepcode.agent.protocol.v3` JSON Envelope:
 
 ```json
 {
-  "schemaVersion": "deepcode.agent.protocol.v2",
+  "schemaVersion": "deepcode.agent.protocol.v3",
+  "proposalId": "proposal-example",
   "kind": "answer",
+  "source": "llm",
   "outputLanguage": "en-US",
+  "referencedResourcePacketRefs": [],
   "answer": {
     "format": "markdown",
     "content": "..."
@@ -136,17 +142,50 @@ Live plan output uses the `deepcode.agent.protocol.v2` JSON Envelope:
 `kind` must be exactly one of:
 
 - `answer`: read-only answers, explanations, identity/capability descriptions, and design discussion.
-- `resourceRequest`: request more context through the Kernel resource resolver.
-- `actionBundle`: reviewable execution draft, never authorization or execution fact.
+- `resourceRequest`: request more context through Kernel `ResourceResolve` using manifest entry ids or root-relative paths exposed by Session.
+- `actionBundle`: reviewable execution draft submitted as a proposal, never authorization or execution fact.
+
+Resource requests can target an exact manifest entry or a path under a Session
+conversation root:
+
+```json
+{
+  "schemaVersion": "deepcode.agent.protocol.v3",
+  "proposalId": "proposal-context-request",
+  "kind": "resourceRequest",
+  "source": "llm",
+  "outputLanguage": "en-US",
+  "resourceRequest": {
+    "version": "1",
+    "id": "need-more-context",
+    "reason": "Need more context from the attached project.",
+    "items": [
+      {
+        "id": "entry-readme",
+        "manifestEntryId": "manifest-entry-id",
+        "reason": "Resolve a known manifest entry."
+      },
+      {
+        "id": "project-file",
+        "rootId": "conversation-root-id",
+        "path": "relative/path.ext",
+        "reason": "Resolve a file under a conversation root."
+      }
+    ]
+  }
+}
+```
 
 Rules:
 
 - Protocol fields, capabilities, tool schema, and code identifiers stay in English.
 - Final answers and review summaries follow the user's language. Chinese is the default when language is unclear.
+- `resourceRequest.items[]` must include either `manifestEntryId` or `path`. `rootId` should be provided with `path` when more than one conversation root is available.
+- `path` is resolved by Session under explicit attachments, the project working directory, or proven conversation roots, then submitted to Kernel `ResourceResolve`. Arbitrary absolute local paths generated by the LLM are invalid.
 - `actionBundle.actions[].capability` uses capability namespace such as `workspace.write`, `workspace.delete`, and `network.egress`.
 - Executor tool names such as `fs.write`, `fs.delete`, and `web.search` are complete-phase tool call names only.
 - File write drafts use top-level `codeBlocks`; actions refer to them through `sourceBlockId`.
-- The parser remains fail-closed. A parse failure may trigger exactly one controlled LLM repair attempt.
+- The v3 parser remains fail-closed. A parse failure may trigger exactly one controlled LLM repair attempt in Session; Kernel validates structured proposals but does not assemble prompts or repair model output.
 
 ## Kernel Capabilities
 
