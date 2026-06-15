@@ -1073,10 +1073,9 @@ pub(crate) enum PermissionAction {
 pub(crate) fn permission_action_for_kernel_tool(tool_id: &str) -> PermissionAction {
     match tool_id {
         "fs.write" | "fs.delete" | "shell.exec" | "web.search" | "web.fetch" | "git.stage"
-        | "git.unstage" | "git.commit" | "browser.open" | "browser.reload" | "browser.snapshot"
-        | "browser.inspect" | "browser.click" | "browser.type" | "browser.scroll" => {
-            PermissionAction::Ask
-        }
+        | "git.unstage" | "git.commit" | "git.push" | "browser.open" | "browser.reload"
+        | "browser.snapshot" | "browser.inspect" | "browser.click" | "browser.type"
+        | "browser.scroll" => PermissionAction::Ask,
         "fs.read" | "fs.list" | "fs.diff" | "code.search" | "shell.propose" | "git.status"
         | "git.diff" => PermissionAction::Allow,
         _ => PermissionAction::Deny,
@@ -1097,6 +1096,7 @@ pub(crate) fn needs_workspace_tool(tool_name: &str) -> bool {
             | "git.stage"
             | "git.unstage"
             | "git.commit"
+            | "git.push"
     )
 }
 
@@ -1267,6 +1267,7 @@ pub(crate) fn capability_for_tool(tool_id: &str) -> &'static str {
         "shell.exec" => "process.exec",
         "web.search" | "web.fetch" => "network.egress",
         "git.stage" | "git.unstage" | "git.commit" => "git.write",
+        "git.push" => "git.push",
         "browser.open" | "browser.reload" | "browser.snapshot" | "browser.inspect"
         | "browser.click" | "browser.type" | "browser.scroll" => "browser.control",
         "fs.read" | "fs.list" => "workspace.read",
@@ -1281,7 +1282,7 @@ pub(crate) fn capability_for_tool(tool_id: &str) -> &'static str {
 pub(crate) fn risk_for_tool(tool_id: &str) -> &'static str {
     match tool_id {
         "fs.delete" | "shell.exec" | "web.search" | "web.fetch" | "git.stage" | "git.unstage"
-        | "git.commit" | "browser.open" | "browser.reload" | "browser.snapshot"
+        | "git.commit" | "git.push" | "browser.open" | "browser.reload" | "browser.snapshot"
         | "browser.inspect" | "browser.click" | "browser.type" | "browser.scroll" => "high",
         "fs.write" => "medium",
         _ => "low",

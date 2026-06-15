@@ -54,7 +54,7 @@ pub const AGENT_PROTOCOL_VERSION: &str = "deepcode.agent.protocol.v3";
 pub const TOOL_CATALOG_VERSION: &str = "deepcode.tool_catalog.session-v3.v1";
 
 pub fn kernel_visible_tool_catalog_count() -> usize {
-    22
+    23
 }
 
 pub struct DeepCodeKernelRuntime {

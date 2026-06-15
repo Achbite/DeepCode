@@ -224,6 +224,20 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
     allowedModes: ['askBeforeWrite'],
   },
   {
+    name: 'git.push',
+    description: 'Push the current branch to a configured remote after explicit push approval.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        remote: { type: 'string' },
+        branch: { type: 'string' },
+      },
+    },
+    riskLevel: 'high',
+    needsApproval: true,
+    allowedModes: ['askBeforeWrite'],
+  },
+  {
     name: 'browser.open',
     description: 'Open a URL in the Editor internal browser after approval.',
     inputSchema: {

@@ -3,6 +3,8 @@
 
 use crate::prelude::*;
 use crate::*;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 pub(crate) async fn user_settings_get(State(state): State<AppState>) -> Json<ApiResponse> {
     let gui = state.gui.lock().expect("gui state lock");
@@ -19,16 +21,33 @@ pub(crate) async fn user_settings_patch(
 ) -> Json<ApiResponse> {
     let patches = body.get("patches").cloned().unwrap_or_else(|| json!({}));
     let mut gui = state.gui.lock().expect("gui state lock");
+    let old_hash = config_value_hash(&gui.user_settings);
     merge_object(&mut gui.user_settings, &patches);
+    let new_hash = config_value_hash(&gui.user_settings);
     let changed_keys = patches
         .as_object()
         .map(|object| object.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     match atomic_write_json(&gui.paths.settings_path, &gui.user_settings) {
-        Ok(()) => ApiResponse::ok(json!({
-            "settings": gui.user_settings,
-            "changedKeys": changed_keys
-        })),
+        Ok(()) => {
+            let store_path = gui.paths.settings_path.to_string_lossy().to_string();
+            drop(gui);
+            let config_audit = record_config_modified_audit(
+                &state,
+                "userSettings",
+                changed_keys.clone(),
+                Some(store_path),
+                Some(old_hash),
+                Some(new_hash),
+                "settings_api.user_settings_patch",
+            );
+            let gui = state.gui.lock().expect("gui state lock");
+            ApiResponse::ok(json!({
+                "settings": gui.user_settings,
+                "changedKeys": changed_keys,
+                "configAudit": config_audit
+            }))
+        }
         Err(error) => ApiResponse::error("write_settings_failed", error),
     }
 }
@@ -82,6 +101,7 @@ pub(crate) async fn llm_profiles_patch(
             );
         }
     }
+    let old_hash = config_value_hash(&gui.llm_profiles);
     gui.llm_profiles = json!({
         "profiles": profiles,
         "defaultProfileId": body.get("defaultProfileId").cloned().unwrap_or(Value::Null),
@@ -97,9 +117,79 @@ pub(crate) async fn llm_profiles_patch(
         }
     }
     match atomic_write_json(&gui.paths.llm_profiles_path, &gui.llm_profiles) {
-        Ok(()) => ApiResponse::ok(gui.llm_profiles.clone()),
+        Ok(()) => {
+            let new_hash = config_value_hash(&gui.llm_profiles);
+            let mut changed_keys = vec!["profiles".to_string(), "defaultProfileId".to_string()];
+            if secrets
+                .as_object()
+                .map(|object| !object.is_empty())
+                .unwrap_or(false)
+            {
+                changed_keys.push("secrets".to_string());
+            }
+            let store_path = gui.paths.llm_profiles_path.to_string_lossy().to_string();
+            let output = gui.llm_profiles.clone();
+            drop(gui);
+            let config_audit = record_config_modified_audit(
+                &state,
+                "llmProfiles",
+                changed_keys,
+                Some(store_path),
+                Some(old_hash),
+                Some(new_hash),
+                "settings_api.llm_profiles_patch",
+            );
+            let mut output = output;
+            if let Some(object) = output.as_object_mut() {
+                object.insert("configAudit".to_string(), config_audit);
+            }
+            ApiResponse::ok(output)
+        }
         Err(error) => ApiResponse::error("write_llm_profiles_failed", error),
     }
+}
+
+fn record_config_modified_audit(
+    state: &AppState,
+    config_kind: &str,
+    changed_keys: Vec<String>,
+    store_path: Option<String>,
+    old_hash: Option<String>,
+    new_hash: Option<String>,
+    source: &str,
+) -> Value {
+    match state
+        .runtime
+        .lock()
+        .expect("runtime state lock")
+        .config_modified_audit(
+            config_kind,
+            changed_keys.clone(),
+            store_path.clone(),
+            old_hash.clone(),
+            new_hash.clone(),
+            source,
+        ) {
+        Ok(value) => value,
+        Err(error) => json!({
+            "configKind": config_kind,
+            "changedKeys": changed_keys,
+            "storePath": store_path,
+            "oldHash": old_hash,
+            "newHash": new_hash,
+            "source": source,
+            "message": "配置文件已修改，但写入 Kernel 审计记录失败。",
+            "auditError": error.to_string()
+        }),
+    }
+}
+
+fn config_value_hash(value: &Value) -> String {
+    let mut hasher = DefaultHasher::new();
+    serde_json::to_string(value)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 pub(crate) async fn llm_probe(
@@ -194,7 +284,7 @@ pub(crate) async fn llm_chat(
 }
 
 pub(crate) fn default_user_settings() -> Value {
-    json!({
+    let mut settings = json!({
         "editor.tabSize": 4,
         "editor.insertSpaces": true,
         "editor.wordWrap": "off",
@@ -235,7 +325,20 @@ pub(crate) fn default_user_settings() -> Value {
         "mcp.servers": "[]",
         "ruler.enabled": true,
         "ruler.rules": "[{\"id\":\"default-safety\",\"name\":\"Default Safety Boundary\",\"source\":\"system\",\"priority\":100,\"path\":\"<builtin>/default-safety.md\",\"content\":\"Default to plan mode. Read before write. Show diff before saving files. Never run destructive commands without explicit approval.\",\"enabled\":true}]"
-    })
+    });
+    merge_object(
+        &mut settings,
+        &json!({
+            "agent.permissions.gitPush": "ask",
+            "agent.git.commitMessageMode": "generate",
+            "agent.integrations.github.enabled": false,
+            "agent.integrations.github.repoUrl": "",
+            "agent.integrations.github.authSecretRef": "",
+            "agent.integrations.github.defaultRemote": "origin",
+            "agent.integrations.github.pushPolicy": "manual"
+        }),
+    );
+    settings
 }
 
 pub(crate) fn default_llm_profiles() -> Value {

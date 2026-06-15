@@ -710,6 +710,7 @@ pub(crate) fn tool_name_for_capability(capability: &str) -> &str {
         "process.exec" | "cap.shell.exec" => "shell.exec",
         "network.egress" => "web.fetch",
         "git.write" => "git.commit",
+        "git.push" => "git.push",
         "browser.control" => "browser.snapshot",
         "cap.skill.executeExternal" => "skill.invoke",
         _ => capability,

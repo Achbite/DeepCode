@@ -174,7 +174,7 @@ fn risk_level_for_capabilities(capabilities: &[String]) -> PlanRiskLevel {
     if capabilities.iter().any(|capability| {
         matches!(
             capability.as_str(),
-            "process.exec" | "network.egress" | "browser.control" | "git.write"
+            "process.exec" | "network.egress" | "browser.control" | "git.write" | "git.push"
         )
     }) {
         return PlanRiskLevel::High;
@@ -201,6 +201,7 @@ fn high_risk_capability(capability: &str) -> bool {
             | "network.egress"
             | "browser.control"
             | "git.write"
+            | "git.push"
             | "secret.read"
             | "config.modify"
             | "kernel.modify"

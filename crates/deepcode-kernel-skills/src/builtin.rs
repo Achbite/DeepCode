@@ -27,6 +27,7 @@ pub fn builtin_executors() -> Vec<Box<dyn SkillExecutor>> {
         Box::new(GitStageExecutor),
         Box::new(GitUnstageExecutor),
         Box::new(GitCommitExecutor),
+        Box::new(GitPushExecutor),
         Box::new(BrowserOpenExecutor),
         Box::new(BrowserReloadExecutor),
         Box::new(BrowserSnapshotExecutor),
@@ -52,6 +53,7 @@ struct GitDiffExecutor;
 struct GitStageExecutor;
 struct GitUnstageExecutor;
 struct GitCommitExecutor;
+struct GitPushExecutor;
 struct BrowserOpenExecutor;
 struct BrowserReloadExecutor;
 struct BrowserSnapshotExecutor;
@@ -635,12 +637,72 @@ impl SkillExecutor for GitCommitExecutor {
                 "git.commit message is required".to_string(),
             ));
         }
+        let status_before = git_output(&root, &["status", "--porcelain=v1", "-uall"])?;
+        let diff_before = git_output(&root, &["diff", "--cached"])?;
         let output = git_output(&root, &["commit", "-m", &message])?;
+        let status_after = git_output(&root, &["status", "--porcelain=v1", "-uall"])?;
+        let commit_sha = git_output(&root, &["rev-parse", "HEAD"])
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
         Ok(ok(
             invocation.id,
             serde_json::json!({
                 "committed": true,
                 "message": message,
+                "commitSha": commit_sha,
+                "output": output,
+                "statusBefore": parse_git_status(&status_before),
+                "statusAfter": parse_git_status(&status_after),
+                "stagedDiff": limit_text(&diff_before, 64 * 1024),
+                "stagedDiffTruncated": diff_before.len() > 64 * 1024
+            }),
+        ))
+    }
+}
+
+impl SkillExecutor for GitPushExecutor {
+    fn descriptor(&self) -> SkillDescriptor {
+        descriptor(
+            "git.push",
+            "skill.git.push.description",
+            Capability::git_push(),
+            RiskLevel::Critical,
+            vec![CapabilityEffect::PushesGit],
+            vec!["complete"],
+            true,
+        )
+    }
+
+    fn invoke(
+        &self,
+        invocation: SkillInvocation,
+        context: SkillExecutionContext,
+    ) -> KernelResult<SkillResult> {
+        let root = workspace_root(&context)?;
+        let remote = get_string(&invocation.input, "remote")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "origin".to_string());
+        validate_git_ref_arg(&remote, "remote")?;
+        let branch = get_string(&invocation.input, "branch")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                git_output(&root, &["branch", "--show-current"])
+                    .map(|value| value.trim().to_string())
+                    .unwrap_or_default()
+            });
+        if branch.trim().is_empty() {
+            return Err(KernelError::InvalidCommand(
+                "git.push branch is required when current branch cannot be resolved".to_string(),
+            ));
+        }
+        validate_git_ref_arg(&branch, "branch")?;
+        let output = git_output(&root, &["push", &remote, &branch])?;
+        Ok(ok(
+            invocation.id,
+            serde_json::json!({
+                "pushed": true,
+                "remote": remote,
+                "branch": branch,
                 "output": output
             }),
         ))
@@ -1026,6 +1088,29 @@ fn validate_workspace_path_for_git(path: &str) -> KernelResult<()> {
         return Err(KernelError::PermissionDenied(
             "git paths must be workspace-relative and must not contain ..".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_git_ref_arg(value: &str, label: &str) -> KernelResult<()> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.contains("..")
+        || value.contains(' ')
+        || value.contains('\\')
+        || value.contains('~')
+        || value.contains('^')
+        || value.contains(':')
+        || value.contains('?')
+        || value.contains('*')
+        || value.contains('[')
+        || value.contains('\n')
+        || value.contains('\r')
+    {
+        return Err(KernelError::PermissionDenied(format!(
+            "git.push {label} must be a plain git remote or branch name"
+        )));
     }
     Ok(())
 }

@@ -503,5 +503,6 @@ pub(crate) fn needs_workspace(tool_name: &str) -> bool {
             | "git.stage"
             | "git.unstage"
             | "git.commit"
+            | "git.push"
     )
 }

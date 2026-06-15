@@ -1,6 +1,38 @@
 use super::*;
 
 impl DeepCodeKernelRuntime {
+    pub fn config_modified_audit(
+        &mut self,
+        config_kind: &str,
+        changed_keys: Vec<String>,
+        store_path: Option<String>,
+        old_hash: Option<String>,
+        new_hash: Option<String>,
+        source: &str,
+    ) -> KernelResult<Value> {
+        let sequence = self.ledger.list_all()?.len() as u64 + 1;
+        let payload = serde_json::json!({
+            "summary": "Protected configuration modified.",
+            "configKind": config_kind,
+            "changedKeys": changed_keys,
+            "storePath": store_path,
+            "oldHash": old_hash,
+            "newHash": new_hash,
+            "source": source,
+            "message": "配置文件已修改，并已写入 Kernel 审计记录。"
+        });
+        self.ledger.append(LedgerEvent {
+            id: format!("evt-config-modified-{sequence}"),
+            run_id: None,
+            session_id: None,
+            kind: "config.modified".to_string(),
+            sequence: Some(sequence),
+            payload: payload.clone(),
+            created_at: None,
+        })?;
+        Ok(payload)
+    }
+
     pub(crate) fn run_create(
         &mut self,
         request_id: RequestId,
@@ -370,11 +402,11 @@ impl DeepCodeKernelRuntime {
         run_id: RunId,
         session_id: Option<SessionId>,
     ) -> KernelResult<Vec<KernelEvent>> {
-        let record = self.record_by_run(&run_id.0)?;
+        let record = self.record_by_run(&run_id.0)?.clone();
         let session_id_text = session_id
             .map(|value| value.0)
             .unwrap_or_else(|| record.session_id.clone());
-        let facts = review_facts_for_run(&*self.ledger, &run_id.0)?;
+        let facts = review_facts_for_run(self, &*self.ledger, &run_id.0, &record)?;
         let sequence = self.ledger.next_sequence(&run_id.0)?;
         self.append_ledger(
             &run_id.0,
@@ -402,11 +434,11 @@ impl DeepCodeKernelRuntime {
         session_id: Option<SessionId>,
         decision: Value,
     ) -> KernelResult<Vec<KernelEvent>> {
-        let record = self.record_by_run(&run_id.0)?;
+        let record = self.record_by_run(&run_id.0)?.clone();
         let session_id_text = session_id
             .map(|value| value.0)
             .unwrap_or_else(|| record.session_id.clone());
-        let facts = review_facts_for_run(&*self.ledger, &run_id.0)?;
+        let facts = review_facts_for_run(self, &*self.ledger, &run_id.0, &record)?;
         let failed_count = facts
             .get("failedWorkUnits")
             .and_then(Value::as_array)
@@ -670,6 +702,8 @@ impl DeepCodeKernelRuntime {
                 "network.egress".to_string(),
                 "git.read".to_string(),
                 "git.write".to_string(),
+                "git.push".to_string(),
+                "config.modify".to_string(),
                 "browser.control".to_string(),
                 "provider.egress".to_string(),
             ],
@@ -1015,7 +1049,23 @@ fn proposal_action_bundle_review_report(proposal: &ProposalEnvelope) -> PlanRevi
     })
 }
 
-fn review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> KernelResult<Value> {
+fn review_facts_for_run(
+    runtime: &DeepCodeKernelRuntime,
+    ledger: &dyn EventLedger,
+    run_id: &str,
+    record: &RuntimeRunRecord,
+) -> KernelResult<Value> {
+    let mut facts = ledger_review_facts_for_run(ledger, run_id)?;
+    if let Some(object) = facts.as_object_mut() {
+        object.insert(
+            "gitReview".to_string(),
+            git_review_facts_for_record(runtime, run_id, record),
+        );
+    }
+    Ok(facts)
+}
+
+fn ledger_review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> KernelResult<Value> {
     let events = ledger.list_by_run(run_id)?;
     let mut work_units = Vec::new();
     let mut completed_work_units = Vec::new();
@@ -1071,6 +1121,194 @@ fn review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> KernelResult<
         "toolResults": tool_results,
         "writtenFiles": written_files
     }))
+}
+
+fn git_review_facts_for_record(
+    runtime: &DeepCodeKernelRuntime,
+    run_id: &str,
+    record: &RuntimeRunRecord,
+) -> Value {
+    let Some(root) = review_git_root(runtime, record) else {
+        return serde_json::json!({
+            "available": false,
+            "reason": "no workspace binding available for git review"
+        });
+    };
+    let repo_root = match review_git_output(&root, &["rev-parse", "--show-toplevel"]) {
+        Ok(output) => output.trim().to_string(),
+        Err(error) => {
+            return serde_json::json!({
+                "available": false,
+                "root": root.to_string_lossy(),
+                "reason": error
+            });
+        }
+    };
+    let status = match review_git_output(&root, &["status", "--porcelain=v1", "-uall"]) {
+        Ok(output) => output,
+        Err(error) => {
+            return serde_json::json!({
+                "available": false,
+                "root": root.to_string_lossy(),
+                "repoRoot": repo_root,
+                "reason": error
+            });
+        }
+    };
+    let unstaged_diff = review_git_output(&root, &["diff"]).unwrap_or_default();
+    let staged_diff = review_git_output(&root, &["diff", "--cached"]).unwrap_or_default();
+    let unstaged_numstat = review_git_output(&root, &["diff", "--numstat"]).unwrap_or_default();
+    let staged_numstat =
+        review_git_output(&root, &["diff", "--cached", "--numstat"]).unwrap_or_default();
+    let files = review_git_status_files(&status, &unstaged_numstat, &staged_numstat);
+    let changed_file_count = files.as_array().map(Vec::len).unwrap_or(0);
+    let has_diff = !unstaged_diff.trim().is_empty() || !staged_diff.trim().is_empty();
+    let mut diff_blocks = Vec::new();
+    if !staged_diff.trim().is_empty() {
+        diff_blocks.push(serde_json::json!({
+            "id": format!("git-staged-diff-{run_id}"),
+            "title": "Staged diff",
+            "staged": true,
+            "diff": review_limit_text(&staged_diff, 96 * 1024),
+            "truncated": staged_diff.len() > 96 * 1024,
+            "sizeBytes": staged_diff.len(),
+            "evidenceRef": format!("git:diff:staged:{run_id}")
+        }));
+    }
+    if !unstaged_diff.trim().is_empty() {
+        diff_blocks.push(serde_json::json!({
+            "id": format!("git-unstaged-diff-{run_id}"),
+            "title": "Unstaged diff",
+            "staged": false,
+            "diff": review_limit_text(&unstaged_diff, 96 * 1024),
+            "truncated": unstaged_diff.len() > 96 * 1024,
+            "sizeBytes": unstaged_diff.len(),
+            "evidenceRef": format!("git:diff:unstaged:{run_id}")
+        }));
+    }
+    let truncated = diff_blocks.iter().any(|block| {
+        block
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    serde_json::json!({
+        "available": true,
+        "root": root.to_string_lossy(),
+        "repoRoot": repo_root,
+        "summary": if changed_file_count == 0 {
+            "Git 工作区没有可展示的修改。".to_string()
+        } else {
+            format!("Git 工作区包含 {changed_file_count} 个变更文件。")
+        },
+        "statusRaw": status,
+        "files": files,
+        "stats": {
+            "changedFiles": changed_file_count,
+            "stagedDiffBytes": staged_diff.len(),
+            "unstagedDiffBytes": unstaged_diff.len(),
+            "hasDiff": has_diff
+        },
+        "diffBlocks": diff_blocks,
+        "truncated": truncated,
+        "evidenceRefs": [
+            format!("git:status:{run_id}"),
+            format!("git:diff:staged:{run_id}"),
+            format!("git:diff:unstaged:{run_id}")
+        ]
+    })
+}
+
+fn review_git_root(runtime: &DeepCodeKernelRuntime, record: &RuntimeRunRecord) -> Option<PathBuf> {
+    runtime
+        .state
+        .current_workspace
+        .as_ref()
+        .map(|workspace| workspace.root.clone())
+        .or_else(|| {
+            record
+                .workspace_binding
+                .open_path
+                .as_ref()
+                .map(PathBuf::from)
+        })
+}
+
+fn review_git_output(root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("start git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn review_git_status_files(status: &str, unstaged_numstat: &str, staged_numstat: &str) -> Value {
+    let mut paths = std::collections::BTreeMap::<String, serde_json::Map<String, Value>>::new();
+    for line in status.lines().filter(|line| line.len() >= 3) {
+        let path = line[3..].trim().to_string();
+        let entry = paths.entry(path.clone()).or_insert_with(|| {
+            let mut object = serde_json::Map::new();
+            object.insert("path".to_string(), Value::String(path));
+            object
+        });
+        entry.insert("index".to_string(), Value::String(line[0..1].to_string()));
+        entry.insert(
+            "worktree".to_string(),
+            Value::String(line[1..2].to_string()),
+        );
+        entry.insert("raw".to_string(), Value::String(line.to_string()));
+    }
+    apply_review_numstat(&mut paths, unstaged_numstat, false);
+    apply_review_numstat(&mut paths, staged_numstat, true);
+    Value::Array(paths.into_values().map(Value::Object).collect())
+}
+
+fn apply_review_numstat(
+    paths: &mut std::collections::BTreeMap<String, serde_json::Map<String, Value>>,
+    numstat: &str,
+    staged: bool,
+) {
+    for line in numstat.lines() {
+        let parts = line.split('\t').collect::<Vec<_>>();
+        if parts.len() < 3 {
+            continue;
+        }
+        let path = parts[2].to_string();
+        let entry = paths.entry(path.clone()).or_insert_with(|| {
+            let mut object = serde_json::Map::new();
+            object.insert("path".to_string(), Value::String(path));
+            object
+        });
+        let prefix = if staged { "staged" } else { "unstaged" };
+        entry.insert(format!("{prefix}Added"), review_numstat_value(parts[0]));
+        entry.insert(format!("{prefix}Deleted"), review_numstat_value(parts[1]));
+    }
+}
+
+fn review_numstat_value(value: &str) -> Value {
+    value
+        .parse::<u64>()
+        .map(|number| Value::Number(serde_json::Number::from(number)))
+        .unwrap_or_else(|_| Value::String(value.to_string()))
+}
+
+fn review_limit_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &value[..end])
 }
 
 fn review_ledger_event_summary(event: &LedgerEvent) -> Value {

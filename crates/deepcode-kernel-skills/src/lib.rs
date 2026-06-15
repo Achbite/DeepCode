@@ -278,6 +278,15 @@ impl InMemorySkillRegistry {
                 true,
             ),
             builtin(
+                "git.push",
+                "skill.git.push.description",
+                Capability::git_push(),
+                RiskLevel::Critical,
+                vec![CapabilityEffect::PushesGit],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
                 "browser.open",
                 "skill.browser.open.description",
                 Capability::browser_control(),
@@ -411,7 +420,7 @@ mod tests {
     #[test]
     fn builtin_catalog_contains_expected_tools() {
         let registry = InMemorySkillRegistry::with_builtin_tools();
-        assert_eq!(registry.len(), 22);
+        assert_eq!(registry.len(), 23);
         let write = registry.get("fs.write").unwrap().unwrap();
         assert_eq!(write.risk_level, RiskLevel::High);
         assert_eq!(

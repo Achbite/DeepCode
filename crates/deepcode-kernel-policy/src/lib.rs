@@ -56,6 +56,10 @@ impl Capability {
         Self::new("git.write")
     }
 
+    pub fn git_push() -> Self {
+        Self::new("git.push")
+    }
+
     pub fn process_propose() -> Self {
         Self::new("process.propose")
     }
@@ -97,6 +101,7 @@ pub enum CapabilityEffect {
     UsesNetwork,
     ReadsSecret,
     ModifiesGit,
+    PushesGit,
     ControlsBrowser,
     ModifiesKernel,
     ModifiesConfig,
@@ -456,6 +461,7 @@ impl PolicyProfile {
             Capability::workspace_list(),
             Capability::workspace_search(),
             Capability::workspace_preview_diff(),
+            Capability::git_read(),
         ] {
             profile
                 .grant(PolicyGrant {
@@ -471,6 +477,8 @@ impl PolicyProfile {
             Capability::workspace_create(),
             Capability::workspace_delete(),
             Capability::process_exec(),
+            Capability::git_write(),
+            Capability::git_push(),
         ] {
             profile
                 .grant(PolicyGrant {
@@ -505,13 +513,26 @@ impl PolicyProfile {
             .expect("kernel grant");
         profile
             .grant(PolicyGrant {
+                capability: Capability::git_read(),
+                decision: PolicyDecisionKind::Allow,
+                source: PolicySourceTrust::Kernel,
+                reason: Some("builtin git read capability".to_string()),
+            })
+            .expect("kernel grant");
+        profile
+            .grant(PolicyGrant {
                 capability: Capability::process_propose(),
                 decision: PolicyDecisionKind::Allow,
                 source: PolicySourceTrust::Kernel,
                 reason: Some("shell proposal is dry-run".to_string()),
             })
             .expect("kernel grant");
-        for capability in [Capability::workspace_write(), Capability::process_exec()] {
+        for capability in [
+            Capability::workspace_write(),
+            Capability::process_exec(),
+            Capability::git_write(),
+            Capability::git_push(),
+        ] {
             profile
                 .grant(PolicyGrant {
                     capability,
@@ -545,6 +566,7 @@ impl PolicyProfile {
             Capability::workspace_preview_diff(),
             Capability::workspace_write(),
             Capability::workspace_rename(),
+            Capability::git_read(),
         ] {
             profile
                 .grant(PolicyGrant {

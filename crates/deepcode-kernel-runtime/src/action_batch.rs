@@ -47,6 +47,7 @@ impl DeepCodeKernelRuntime {
             .and_then(Value::as_str)
             .unwrap_or("action-batch")
             .to_string();
+        let mut has_pending_permission = false;
 
         if actions.is_empty() {
             let work_unit_id = format!("work-unit-{}-empty", safe_work_unit_segment(&plan_id));
@@ -81,7 +82,7 @@ impl DeepCodeKernelRuntime {
                 .get("kind")
                 .and_then(Value::as_str)
                 .or_else(|| workspace_kind_from_capability(capability))
-                .unwrap_or("write");
+                .unwrap_or_else(|| default_kind_for_capability(capability));
             let work_unit = serde_json::json!({
                 "id": &work_unit_id,
                 "planId": &plan_id,
@@ -120,26 +121,20 @@ impl DeepCodeKernelRuntime {
                 continue;
             }
 
-            let compiled = match compile_workspace_action(
-                self,
-                &record,
-                action,
-                &code_blocks,
-                capability,
-                kind,
-            ) {
-                Ok(compiled) => compiled,
-                Err(error) => {
-                    events.push(self.work_unit_failed_event(
-                        &request_id,
-                        &run_id_text,
-                        &session_id_text,
-                        &work_unit_id,
-                        &error,
-                    )?);
-                    continue;
-                }
-            };
+            let compiled =
+                match compile_action(self, &record, action, &code_blocks, capability, kind) {
+                    Ok(compiled) => compiled,
+                    Err(error) => {
+                        events.push(self.work_unit_failed_event(
+                            &request_id,
+                            &run_id_text,
+                            &session_id_text,
+                            &work_unit_id,
+                            &error,
+                        )?);
+                        continue;
+                    }
+                };
 
             if let Some(root) = compiled.workspace_root.as_ref() {
                 let mut workspace_events = self.workspace_open(
@@ -152,13 +147,107 @@ impl DeepCodeKernelRuntime {
                 events.append(&mut workspace_events);
             }
 
+            let tool_call_id = format!(
+                "{work_unit_id}-{}",
+                safe_work_unit_segment(&compiled.tool_name)
+            );
+            let compiled_capability = capability_for_tool(&compiled.tool_name);
+            if matches!(compiled_capability, "git.write" | "git.push")
+                && self.effective_permission_action_for_tool(
+                    &run_id_text,
+                    &compiled.tool_name,
+                    &compiled.arguments,
+                )? == PermissionAction::Ask
+            {
+                has_pending_permission = true;
+                let request_sequence = self.ledger.next_sequence(&run_id_text)?;
+                let requested = KernelEvent::ToolRequested {
+                    run_id: Some(RunId(run_id_text.clone())),
+                    session_id: Some(SessionId(session_id_text.clone())),
+                    turn_id: None,
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: compiled.tool_name.clone(),
+                    args_preview: redact_tool_arguments(&compiled.tool_name, &compiled.arguments),
+                    sequence: Some(request_sequence),
+                };
+                self.append_ledger(
+                    &run_id_text,
+                    &session_id_text,
+                    "tool.requested",
+                    request_sequence,
+                    serde_json::json!({
+                        "summary": format!("Tool requested: {}", compiled.tool_name),
+                        "toolCallId": &tool_call_id,
+                        "toolName": &compiled.tool_name,
+                        "argsPreview": redact_tool_arguments(&compiled.tool_name, &compiled.arguments)
+                    }),
+                )?;
+                events.push(requested);
+
+                let permission_id = tool_call_id.clone();
+                self.state.pending_tools.insert(
+                    permission_id.clone(),
+                    PendingKernelTool {
+                        run_id: run_id_text.clone(),
+                        session_id: session_id_text.clone(),
+                        tool_name: compiled.tool_name.clone(),
+                        arguments: compiled.arguments.clone(),
+                    },
+                );
+                let permission_sequence = self.ledger.next_sequence(&run_id_text)?;
+                let permission = KernelEvent::PermissionRequested {
+                    run_id: Some(RunId(run_id_text.clone())),
+                    session_id: SessionId(session_id_text.clone()),
+                    request: deepcode_kernel_abi::PermissionRequestEnvelope {
+                        id: permission_id.clone(),
+                        capability: capability_for_tool(&compiled.tool_name).to_string(),
+                        risk_level: risk_for_tool(&compiled.tool_name).to_string(),
+                        summary: format!(
+                            "Allow {} to access workspace resources?",
+                            compiled.tool_name
+                        ),
+                        args_preview: redact_tool_arguments(
+                            &compiled.tool_name,
+                            &compiled.arguments,
+                        ),
+                    },
+                    sequence: Some(permission_sequence),
+                };
+                {
+                    let record = self.record_by_run_mut(&run_id_text)?;
+                    let permission_phase = record.phase.as_str().to_string();
+                    record
+                        .decision_state
+                        .apply_event(&permission, &permission_phase);
+                }
+                self.append_ledger(
+                    &run_id_text,
+                    &session_id_text,
+                    "permission.requested",
+                    permission_sequence,
+                    serde_json::json!({
+                        "summary": format!("Permission requested for {}.", compiled.tool_name),
+                        "permissionId": &permission_id,
+                        "toolCallId": &tool_call_id,
+                        "toolName": &compiled.tool_name,
+                        "capability": capability_for_tool(&compiled.tool_name),
+                        "riskLevel": risk_for_tool(&compiled.tool_name),
+                        "argsPreview": redact_tool_arguments(&compiled.tool_name, &compiled.arguments),
+                        "argumentsRef": {
+                            "storage": "runtime.pendingTools",
+                            "permissionId": &permission_id,
+                            "redaction": "raw arguments are kept in memory only and are not persisted to permission ledger"
+                        }
+                    }),
+                )?;
+                events.push(permission);
+                continue;
+            }
+
             let tool_event = self.execute_bound_tool(
                 &run_id_text,
                 &session_id_text,
-                format!(
-                    "{work_unit_id}-{}",
-                    safe_work_unit_segment(&compiled.tool_name)
-                ),
+                tool_call_id,
                 compiled.tool_name,
                 compiled.arguments,
             )?;
@@ -199,11 +288,13 @@ impl DeepCodeKernelRuntime {
             }
         }
 
-        events.push(self.enter_phase_event(
-            &run_id_text,
-            &session_id_text,
-            WorkflowPhase::Review,
-        )?);
+        if !has_pending_permission {
+            events.push(self.enter_phase_event(
+                &run_id_text,
+                &session_id_text,
+                WorkflowPhase::Review,
+            )?);
+        }
         Ok(events)
     }
 
@@ -380,8 +471,9 @@ fn is_external_capability(capability: &str) -> bool {
         capability,
         "process.exec"
             | "network.egress"
-            | "git.write"
-            | "git.read"
+            | "secret.read"
+            | "config.modify"
+            | "kernel.modify"
             | "browser.control"
             | "provider.egress"
     )
@@ -398,6 +490,14 @@ fn workspace_kind_from_capability(capability: &str) -> Option<&'static str> {
         "workspace.delete" => Some("delete"),
         "workspace.rename" => Some("rename"),
         _ => None,
+    }
+}
+
+fn default_kind_for_capability(capability: &str) -> &'static str {
+    match capability {
+        "git.read" => "status",
+        "git.push" => "push",
+        _ => "write",
     }
 }
 
@@ -453,6 +553,232 @@ fn compile_workspace_action(
             "unsupported workspace action kind: {other}"
         ))),
     }
+}
+
+fn compile_action(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    action: &Value,
+    code_blocks: &std::collections::BTreeMap<String, Value>,
+    capability: &str,
+    kind: &str,
+) -> KernelResult<CompiledWorkspaceAction> {
+    if matches!(capability, "git.read" | "git.write" | "git.push") {
+        return compile_git_action(runtime, record, action, capability, kind);
+    }
+    compile_workspace_action(runtime, record, action, code_blocks, capability, kind)
+}
+
+fn compile_git_action(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    action: &Value,
+    capability: &str,
+    kind: &str,
+) -> KernelResult<CompiledWorkspaceAction> {
+    let args = action.get("toolArgs").and_then(Value::as_object);
+    let workspace_root = git_workspace_root(runtime, record);
+    match (capability, kind) {
+        ("git.read", "status") | ("git.read", "read") => Ok(CompiledWorkspaceAction {
+            tool_name: "git.status".to_string(),
+            arguments: serde_json::json!({}),
+            workspace_root,
+        }),
+        ("git.read", "diff") => {
+            let path = git_optional_path_from_action(action);
+            let staged = args
+                .and_then(|object| object.get("staged"))
+                .or_else(|| action.get("staged"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut arguments = serde_json::json!({ "staged": staged });
+            if let Some(path) = path {
+                let normalized = git_relative_path(runtime, record, &path)?;
+                arguments["path"] = Value::String(normalized);
+            }
+            Ok(CompiledWorkspaceAction {
+                tool_name: "git.diff".to_string(),
+                arguments,
+                workspace_root,
+            })
+        }
+        ("git.write", "stage") => Ok(CompiledWorkspaceAction {
+            tool_name: "git.stage".to_string(),
+            arguments: git_paths_arguments(runtime, record, action)?,
+            workspace_root,
+        }),
+        ("git.write", "unstage") => Ok(CompiledWorkspaceAction {
+            tool_name: "git.unstage".to_string(),
+            arguments: git_paths_arguments(runtime, record, action)?,
+            workspace_root,
+        }),
+        ("git.write", "commit") => {
+            let message = args
+                .and_then(|object| object.get("message"))
+                .or_else(|| action.get("message"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    KernelError::InvalidCommand(
+                        "git.commit action requires toolArgs.message".to_string(),
+                    )
+                })?;
+            Ok(CompiledWorkspaceAction {
+                tool_name: "git.commit".to_string(),
+                arguments: serde_json::json!({ "message": message }),
+                workspace_root,
+            })
+        }
+        ("git.push", "push") | ("git.write", "push") => {
+            let remote = args
+                .and_then(|object| object.get("remote"))
+                .or_else(|| action.get("remote"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("origin");
+            let branch = args
+                .and_then(|object| object.get("branch"))
+                .or_else(|| action.get("branch"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let mut arguments = serde_json::json!({ "remote": remote });
+            if let Some(branch) = branch {
+                arguments["branch"] = Value::String(branch.to_string());
+            }
+            Ok(CompiledWorkspaceAction {
+                tool_name: "git.push".to_string(),
+                arguments,
+                workspace_root,
+            })
+        }
+        ("git.read", other) => Err(KernelError::InvalidCommand(format!(
+            "unsupported git.read action kind: {other}"
+        ))),
+        ("git.write", other) => Err(KernelError::InvalidCommand(format!(
+            "unsupported git.write action kind: {other}"
+        ))),
+        ("git.push", other) => Err(KernelError::InvalidCommand(format!(
+            "unsupported git.push action kind: {other}"
+        ))),
+        _ => Err(KernelError::InvalidCommand(format!(
+            "unsupported git action capability: {capability}"
+        ))),
+    }
+}
+
+fn git_workspace_root(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+) -> Option<PathBuf> {
+    if let Some(root) = runtime
+        .state
+        .current_workspace
+        .as_ref()
+        .map(|workspace| workspace.root.clone())
+    {
+        return Some(root);
+    }
+    if let Some(open_path) = record.workspace_binding.open_path.as_ref() {
+        return Some(PathBuf::from(open_path));
+    }
+    let roots = record
+        .attachments
+        .iter()
+        .filter(|attachment| attachment.get("kind").and_then(Value::as_str) == Some("directory"))
+        .filter_map(explicit_attachment_root)
+        .collect::<Vec<_>>();
+    if roots.len() == 1 {
+        roots.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn git_optional_path_from_action(action: &Value) -> Option<String> {
+    let args = action.get("toolArgs").and_then(Value::as_object);
+    args.and_then(|object| object.get("path"))
+        .or_else(|| action.get("path"))
+        .or_else(|| action.get("targetPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "workspace")
+        .map(str::to_string)
+        .or_else(|| {
+            action
+                .get("resourceScope")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .find(|value| !value.is_empty() && *value != "workspace" && !value.contains('*'))
+                .map(str::to_string)
+        })
+}
+
+fn git_paths_arguments(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    action: &Value,
+) -> KernelResult<Value> {
+    let args = action.get("toolArgs").and_then(Value::as_object);
+    let raw_paths = args
+        .and_then(|object| object.get("paths"))
+        .or_else(|| action.get("paths"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| {
+            args.and_then(|object| object.get("path"))
+                .or_else(|| action.get("path"))
+                .or_else(|| action.get("targetPath"))
+                .and_then(Value::as_str)
+                .map(|path| vec![path.to_string()])
+        })
+        .or_else(|| {
+            action
+                .get("resourceScope")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|value| !value.trim().is_empty() && *value != "workspace")
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default();
+    if raw_paths.is_empty() {
+        return Err(KernelError::InvalidCommand(
+            "git stage/unstage action requires toolArgs.path, toolArgs.paths, targetPath, or resourceScope".to_string(),
+        ));
+    }
+    let paths = raw_paths
+        .into_iter()
+        .map(|path| git_relative_path(runtime, record, &path))
+        .collect::<KernelResult<Vec<_>>>()?;
+    Ok(serde_json::json!({ "paths": paths }))
+}
+
+fn git_relative_path(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    raw_path: &str,
+) -> KernelResult<String> {
+    if raw_path.trim() == "." {
+        return Ok(".".to_string());
+    }
+    let (relative_path, _) = workspace_relative_write_path(runtime, record, raw_path)?;
+    Ok(relative_path)
 }
 
 fn workspace_write_from_action(
@@ -806,7 +1132,8 @@ fn summarize_action(action: &Value) -> Value {
         "capability": action.get("capability").and_then(Value::as_str),
         "kind": action.get("kind").and_then(Value::as_str),
         "resourceScope": action.get("resourceScope").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "sourceBlockId": action.get("sourceBlockId").and_then(Value::as_str)
+        "sourceBlockId": action.get("sourceBlockId").and_then(Value::as_str),
+        "toolArgs": action.get("toolArgs").cloned().unwrap_or(Value::Null)
     })
 }
 
