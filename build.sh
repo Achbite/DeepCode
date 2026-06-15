@@ -41,7 +41,20 @@ LINUX_DIR="$BIN_ROOT/linux-x64"
 WIN_DIR="$BIN_ROOT/win64"
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
-CARGO_TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  CARGO_TARGET_ROOT="$CARGO_TARGET_DIR"
+elif [ -f /.dockerenv ]; then
+  CARGO_TARGET_ROOT="$ROOT_DIR/.build-cache/cargo-target"
+else
+  CARGO_TARGET_ROOT="$ROOT_DIR/target"
+fi
+if [ -n "${DEEPCODE_TMPDIR:-}" ]; then
+  BUILD_TMPDIR="$DEEPCODE_TMPDIR"
+elif [ -f /.dockerenv ] && { [ -z "${TMPDIR:-}" ] || [ "${TMPDIR%/}" = "/tmp" ]; }; then
+  BUILD_TMPDIR="$ROOT_DIR/.build-cache/tmp"
+else
+  BUILD_TMPDIR="${TMPDIR:-/tmp}"
+fi
 PNPM_STORE_DIR="${PNPM_STORE_DIR:-$ROOT_DIR/.pnpm-store}"
 PNPM_REGISTRY="${DEEPCODE_PNPM_REGISTRY:-https://registry.yarnpkg.com}"
 PNPM_NETWORK_CONCURRENCY="${DEEPCODE_PNPM_NETWORK_CONCURRENCY:-4}"
@@ -53,8 +66,10 @@ BUILD_LINUX_TAURI_SHELL="${DEEPCODE_BUILD_LINUX_TAURI_SHELL:-0}"
 STAGE_STAMP_DIR="$ROOT_DIR/.build-cache/build-stamps"
 
 export CARGO_TARGET_DIR="$CARGO_TARGET_ROOT"
+export TMPDIR="$BUILD_TMPDIR"
 
 cd "$ROOT_DIR"
+mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
 
 usage() {
   cat <<'USAGE'
@@ -70,6 +85,9 @@ Default:
 
 Environment:
   CARGO_TARGET_DIR                  Override shared Cargo target directory.
+                                    Docker default: .build-cache/cargo-target.
+  DEEPCODE_TMPDIR                   Override temporary build directory.
+                                    Docker default: .build-cache/tmp.
   PNPM_STORE_DIR                    Override pnpm store directory.
   DEEPCODE_PNPM_REGISTRY            Override pnpm registry used by dependency install.
   DEEPCODE_PNPM_NETWORK_CONCURRENCY Override pnpm network concurrency.
@@ -243,6 +261,7 @@ build_started_at() {
 echo "==[build]== DeepCode cross-platform build started at $(build_started_at)"
 echo "==[build]== ROOT_DIR=$ROOT_DIR"
 echo "==[build]== CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+echo "==[build]== TMPDIR=$TMPDIR"
 echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
 echo "==[build]== PNPM_REGISTRY=$PNPM_REGISTRY"
 echo "==[build]== DEEPCODE_BUILD_LINUX_TAURI_SHELL=$BUILD_LINUX_TAURI_SHELL"
