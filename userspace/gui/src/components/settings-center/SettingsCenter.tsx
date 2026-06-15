@@ -1,9 +1,12 @@
 import React, { useState } from 'react';
+import type { AgentEvent } from '@deepcode/protocol';
+import type { SettingsSurface } from '@deepcode/protocol';
 import './settingsCenter.css';
 import { normalizeUiLanguage, t } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
 import WorkspaceSection from './sections/WorkspaceSection';
 import CommonSettingsSection from './sections/CommonSettingsSection';
+import TokenStatsSection from './sections/TokenStatsSection';
 import SkillRuntimeSection from './sections/SkillRuntimeSection';
 import SessionBoundarySection from './sections/SessionBoundarySection';
 import RuntimeDoctorSection from './sections/RuntimeDoctorSection';
@@ -14,6 +17,7 @@ import McpServicesSection from './sections/McpServicesSection';
 type SettingsKey =
   | 'workspace'
   | 'common'
+  | 'token'
   | 'llm'
   | 'skill'
   | 'mcp'
@@ -25,6 +29,8 @@ interface SettingsCenterProps {
   apiStatus: string;
   wsStatus: string;
   serverVersion?: string;
+  events?: AgentEvent[];
+  surface?: Extract<SettingsSurface, 'editor' | 'gui'>;
 }
 
 interface NavItem {
@@ -37,15 +43,18 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   apiStatus,
   wsStatus,
   serverVersion,
+  events = [],
+  surface = 'editor',
 }) => {
-  const [activeKey, setActiveKey] = useState<SettingsKey>('workspace');
+  const [activeKey, setActiveKey] = useState<SettingsKey>(surface === 'gui' ? 'common' : 'workspace');
   const [searchQuery, setSearchQuery] = useState('');
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
-  const navItems: NavItem[] = [
+  const editorNavItems: NavItem[] = [
     { key: 'workspace', icon: 'WS', label: t(language, 'settings.nav.workspace') },
     { key: 'common', icon: 'CM', label: t(language, 'settings.nav.common') },
+    { key: 'token', icon: 'TK', label: t(language, 'settings.nav.token') },
     { key: 'llm', icon: 'AI', label: t(language, 'settings.nav.llm') },
     { key: 'skill', icon: 'SK', label: t(language, 'settings.nav.skill') },
     { key: 'mcp', icon: 'MC', label: t(language, 'settings.nav.mcp') },
@@ -53,6 +62,10 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     { key: 'doctor', icon: 'DR', label: t(language, 'settings.nav.doctor') },
     { key: 'ruler', icon: 'RL', label: t(language, 'settings.nav.ruler') },
   ];
+  const guiNavItems: NavItem[] = [
+    { key: 'common', icon: 'GU', label: t(language, 'settings.nav.gui') },
+  ];
+  const navItems = surface === 'gui' ? guiNavItems : editorNavItems;
 
   const renderBody = () => {
     switch (activeKey) {
@@ -65,8 +78,11 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
             wsStatus={wsStatus}
             serverVersion={serverVersion}
             query={searchQuery}
+            surface={surface}
           />
         );
+      case 'token':
+        return <TokenStatsSection events={events} />;
       case 'llm':
         return <LlmSection />;
       case 'skill':

@@ -121,7 +121,7 @@ const DeepCodeGuiApp: React.FC = () => {
 
   useEffect(() => {
     document.documentElement.dataset.theme = String(
-      effectiveSettings['workbench.colorTheme'] ?? 'deepcode-gui-light'
+      effectiveSettings['gui.colorTheme'] ?? 'deepcode-gui-light'
     );
   }, [effectiveSettings]);
 

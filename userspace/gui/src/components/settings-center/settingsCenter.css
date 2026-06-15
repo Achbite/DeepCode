@@ -219,6 +219,93 @@
   overflow-wrap: anywhere;
 }
 
+.settings-token-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding: 16px;
+}
+
+.settings-token-metric {
+  min-width: 0;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-md, 6px);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 12px;
+}
+
+.settings-token-metric span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+}
+
+.settings-token-metric strong {
+  color: var(--text-strong, #fff);
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.settings-token-metric--muted strong {
+  color: var(--text-muted, #a1a1aa);
+}
+
+.settings-token-bars {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+
+.settings-token-bar-row {
+  display: grid;
+  gap: 7px;
+}
+
+.settings-token-bar-row__meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 12px;
+}
+
+.settings-token-bar-row__meta strong {
+  color: var(--text-main, #ededed);
+  font-weight: 650;
+}
+
+.settings-token-bar-track {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.settings-token-bar-fill {
+  min-width: 2px;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent, #0a84ff);
+}
+
+.settings-token-bar-fill--cache {
+  background: #22c55e;
+}
+
+.settings-token-bar-fill--miss {
+  background: #f97316;
+}
+
+.settings-token-bar-fill--completion {
+  background: #8b5cf6;
+}
+
+.settings-token-empty {
+  padding-top: 0;
+}
+
 .settings-field {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(190px, 280px);
@@ -727,6 +814,10 @@
   .settings-field__control {
     justify-content: flex-start;
   }
+
+  .settings-token-overview {
+    grid-template-columns: 1fr;
+  }
 }
 
 @container (max-width: 540px) {
@@ -751,6 +842,10 @@
   .settings-field__input,
   .settings-field__select {
     width: 100%;
+  }
+
+  .settings-token-overview {
+    grid-template-columns: 1fr;
   }
 
   .settings-kv td:first-child {

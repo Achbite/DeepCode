@@ -469,6 +469,24 @@
   align-self: flex-start;
 }
 
+.agent-narrative-narration {
+  align-self: flex-start;
+  max-width: 92%;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.agent-narrative-narration .agent-markdown {
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.agent-narrative-narration .agent-markdown__paragraph {
+  margin: 0;
+}
+
 .agent-message--collapsible {
   padding: 0;
   overflow: hidden;
@@ -1811,4 +1829,20 @@
   color: var(--danger, #ff3b30);
   padding: 8px;
   font-size: 12px;
+}
+
+.agent-flow-card__details--diff {
+  margin-top: 8px;
+}
+
+.agent-review-diff {
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-sm, 4px);
+  background: var(--bg-elevated, rgba(0, 0, 0, 0.18));
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.45;
 }

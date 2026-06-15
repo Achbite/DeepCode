@@ -86,10 +86,14 @@ const ASSISTANT_PREVIEW_TEXT_LIMIT = 180;
 const ASSISTANT_COLLAPSE_TEXT_LIMIT = 260;
 const ASSISTANT_COLLAPSE_LINE_LIMIT = 6;
 
+type TimelineRenderMode = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['renderMode']>;
+type TimelineTypewriterSpeed = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']>;
+
 type RenderContentItem =
   | { type: 'event'; event: AgentEvent; autoOpen?: boolean }
   | { type: 'trace'; group: TraceGroup }
   | { type: 'narrativeThinking'; block: AgentTimelineBlock }
+  | { type: 'narrativeNarration'; block: AgentTimelineBlock }
   | { type: 'toolBatch'; group: ToolBatchGroup }
   | { type: 'narrativeEvidence'; block: AgentTimelineBlock };
 
@@ -642,6 +646,11 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
         continue;
       }
 
+      if (narrativeKind === 'assistantNarration') {
+        pushTurnItem({ type: 'narrativeNarration', block });
+        continue;
+      }
+
       if (narrativeKind === 'operationEvidence' || narrativeKind === 'verification') {
         pushTurnItem({ type: 'narrativeEvidence', block });
         continue;
@@ -891,6 +900,9 @@ function renderItemCopyText(item: RenderContentItem, language: UiLanguage): stri
       item.block.title || t(language, 'agent.copy.thinking'),
       thinkingMarkdown(item.block),
     ].filter(Boolean).join('\n\n');
+  }
+  if (item.type === 'narrativeNarration') {
+    return sanitizeDisplayText(item.block.bodyMarkdown ?? item.block.summary ?? '');
   }
   if (item.type === 'trace') {
     const title = thoughtTraceTitle(item.group.events, language, item.group.running);
@@ -1323,6 +1335,7 @@ function ReviewSummaryCard({
     status === 'waitingUserReview' &&
     Boolean(runId);
   const facts = payloadArray(event.payload, 'facts');
+  const gitReview = isRecord(event.payload) ? event.payload.gitReview : undefined;
   const continuationCount =
     isRecord(event.payload) && typeof event.payload.continuationCount === 'number'
       ? event.payload.continuationCount
@@ -1343,6 +1356,7 @@ function ReviewSummaryCard({
         </div>
       )}
       {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
+      <GitReviewDiffDetails gitReview={gitReview} language={language} />
       {llmGuidance && llmGuidance !== summary && (
         <details className="agent-flow-card__details">
           <summary>{t(language, 'agent.review.llmGuidance')}</summary>
@@ -1355,6 +1369,56 @@ function ReviewSummaryCard({
         </div>
       )}
     </section>
+  );
+}
+
+function GitReviewDiffDetails({
+  gitReview,
+  language,
+}: {
+  gitReview: unknown;
+  language: UiLanguage;
+}) {
+  if (!isRecord(gitReview)) return null;
+  if (gitReview.available === false) {
+    const reason = stringField(gitReview, 'reason') ?? 'Git review unavailable';
+    return (
+      <div className="agent-flow-card__section">
+        <div className="agent-flow-card__section-title">Git Diff</div>
+        <div className="agent-flow-card__summary">{reason}</div>
+      </div>
+    );
+  }
+  const diffBlocks = Array.isArray(gitReview.diffBlocks) ? gitReview.diffBlocks.filter(isRecord) : [];
+  const files = Array.isArray(gitReview.files) ? gitReview.files.filter(isRecord) : [];
+  if (!diffBlocks.length && !files.length) return null;
+  return (
+    <div className="agent-flow-card__section agent-flow-card__section--git-review">
+      <div className="agent-flow-card__section-title">Git Diff</div>
+      {files.length > 0 && (
+        <ul className="agent-flow-card__facts">
+          {files.slice(0, 12).map((file, index) => {
+            const path = stringField(file, 'path') ?? `file-${index + 1}`;
+            return <li key={`${path}-${index}`}><code>{path}</code></li>;
+          })}
+          {files.length > 12 && <li>{language === 'zh-CN' ? `另有 ${files.length - 12} 个文件` : `${files.length - 12} more files`}</li>}
+        </ul>
+      )}
+      {diffBlocks.map((block, index) => {
+        const title = stringField(block, 'title') ?? `Diff ${index + 1}`;
+        const diff = stringField(block, 'diff') ?? '';
+        const truncated = block.truncated === true;
+        return (
+          <details key={`${title}-${index}`} className="agent-flow-card__details agent-flow-card__details--diff">
+            <summary>
+              {title}
+              {truncated ? (language === 'zh-CN' ? '（已截断）' : ' (truncated)') : ''}
+            </summary>
+            <pre className="agent-review-diff"><code>{diff}</code></pre>
+          </details>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1422,7 +1486,9 @@ function TraceGroupCard({ group, language }: { group: TraceGroup; language: UiLa
 
 function NarrativeThinkingCard({ block, language }: { block: AgentTimelineBlock; language: UiLanguage }) {
   const running = block.status === 'running' || block.status === 'waiting';
-  const [expanded, setExpanded] = React.useState(running || !block.defaultCollapsed);
+  const [expanded, setExpanded] = React.useState(
+    block.displayHints?.initialOpen ?? (running || !block.defaultCollapsed)
+  );
   const wasRunningRef = React.useRef(running);
 
   React.useEffect(() => {
@@ -1460,11 +1526,69 @@ function NarrativeThinkingCard({ block, language }: { block: AgentTimelineBlock;
       </button>
       {expanded && (
         <div className="agent-thinking-trace__body agent-thinking-trace__body--markdown">
-          <MarkdownContent content={markdown} />
+          <TypewriterMarkdown
+            content={markdown}
+            renderMode={block.displayHints?.renderMode}
+            speed={block.displayHints?.typewriterSpeed}
+          />
         </div>
       )}
     </div>
   );
+}
+
+function NarrativeNarrationText({ block }: { block: AgentTimelineBlock }) {
+  const content = sanitizeDisplayText(block.bodyMarkdown ?? block.summary ?? '');
+  if (!content.trim()) return null;
+  return (
+    <div className="agent-narrative-narration">
+      <TypewriterMarkdown
+        content={content}
+        renderMode={block.displayHints?.renderMode}
+        speed={block.displayHints?.typewriterSpeed}
+      />
+    </div>
+  );
+}
+
+function TypewriterMarkdown({
+  content,
+  renderMode = 'static',
+  speed = 'normal',
+}: {
+  content: string;
+  renderMode?: TimelineRenderMode;
+  speed?: TimelineTypewriterSpeed;
+}) {
+  const animate = renderMode === 'typewriter' || renderMode === 'accelerated';
+  const [visible, setVisible] = React.useState(() => (animate ? '' : content));
+  const visibleRef = React.useRef(visible);
+
+  React.useEffect(() => {
+    visibleRef.current = visible;
+  }, [visible]);
+
+  React.useEffect(() => {
+    if (!animate) {
+      setVisible(content);
+      return undefined;
+    }
+    const startIndex = content.startsWith(visibleRef.current) ? visibleRef.current.length : 0;
+    setVisible(content.slice(0, startIndex));
+    let index = startIndex;
+    const step = renderMode === 'accelerated' || speed === 'fast' ? 12 : speed === 'slow' ? 2 : 4;
+    const delayMs = renderMode === 'accelerated' || speed === 'fast' ? 8 : speed === 'slow' ? 20 : 12;
+    const timer = window.setInterval(() => {
+      index = Math.min(content.length, index + step);
+      setVisible(content.slice(0, index));
+      if (index >= content.length) {
+        window.clearInterval(timer);
+      }
+    }, delayMs);
+    return () => window.clearInterval(timer);
+  }, [animate, content, renderMode, speed]);
+
+  return <MarkdownContent content={animate ? visible : content} />;
 }
 
 function renderToolBatch(group: ToolBatchGroup, language: UiLanguage) {
@@ -1807,6 +1931,7 @@ const MessageList: React.FC<MessageListProps> = ({
       {renderItems.map((item) => {
         if (item.type === 'trace') return <TraceGroupCard key={item.group.id} group={item.group} language={language} />;
         if (item.type === 'narrativeThinking') return <NarrativeThinkingCard key={item.block.id} block={item.block} language={language} />;
+        if (item.type === 'narrativeNarration') return <NarrativeNarrationText key={item.block.id} block={item.block} />;
         if (item.type === 'toolBatch') return renderToolBatch(item.group, language);
         if (item.type === 'narrativeEvidence') return renderNarrativeEvidenceBlock(item.block, language);
         if (item.type === 'turnActions') {

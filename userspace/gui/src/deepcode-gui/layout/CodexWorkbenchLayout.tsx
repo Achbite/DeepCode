@@ -7,6 +7,7 @@ import { listAgentSessions } from '../../services/runtimeAdapter';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
+import { deriveTokenUsageStats, formatPercent, formatTokenCount } from '../../utils/tokenUsageStats';
 import CodexAgentPanel from '../panel/CodexAgentPanel';
 
 interface CodexWorkbenchLayoutProps {
@@ -25,6 +26,11 @@ interface CodexTaskItem {
   title: string;
   summary: string;
   status: string;
+}
+
+interface CodexCacheHitSummary {
+  label: string;
+  title: string;
 }
 
 type CodexSidebarIconName = 'compose' | 'folder' | 'plus' | 'settings';
@@ -339,6 +345,24 @@ function deriveTaskItems(
   return [];
 }
 
+function deriveCacheHitSummary(events: AgentEvent[], language: UiLanguage): CodexCacheHitSummary | null {
+  const stats = deriveTokenUsageStats(events);
+  const percent = formatPercent(stats.cacheHitRate);
+  const label = language === 'zh-CN' ? `缓存 ${percent}` : `Cache ${percent}`;
+  if (!stats.hasCacheData) {
+    return {
+      label,
+      title: language === 'zh-CN'
+        ? '当前会话尚未收到缓存命中统计'
+        : 'No cache hit telemetry has been reported for this session yet',
+    };
+  }
+  const title = language === 'zh-CN'
+    ? `当前会话累计缓存命中 ${formatTokenCount(stats.promptCacheHitTokens)} tokens，未命中 ${formatTokenCount(stats.promptCacheMissTokens)} tokens`
+    : `Current session cache hits ${formatTokenCount(stats.promptCacheHitTokens)} tokens, misses ${formatTokenCount(stats.promptCacheMissTokens)} tokens`;
+  return { label, title };
+}
+
 const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   apiStatus,
   wsStatus,
@@ -435,6 +459,10 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
       activeSession?.id
     ),
     [activeSession?.id, events, language, runningSessionIds]
+  );
+  const cacheHitSummary = useMemo(
+    () => deriveCacheHitSummary(events, language),
+    [events, language]
   );
   const activeProject = useMemo(
     () => projectRecords.find((project) => project.id === activeProjectId) ?? null,
@@ -714,6 +742,11 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
           <span>DeepCode-GUI</span>
         </div>
         <div className="codex-titlebar__status">
+          {cacheHitSummary && (
+            <span className="codex-status-pill codex-status-pill--cache" title={cacheHitSummary.title}>
+              {cacheHitSummary.label}
+            </span>
+          )}
           <span className={`codex-status-pill codex-status-pill--${apiStatus}`}>API {statusLabel(language, apiStatus)}</span>
         </div>
         <WindowControls language={language} />
@@ -1077,6 +1110,8 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                   apiStatus={apiStatus}
                   wsStatus={wsStatus}
                   serverVersion={serverVersion}
+                  events={events}
+                  surface="gui"
                 />
               </div>
             </section>

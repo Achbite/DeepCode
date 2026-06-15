@@ -191,6 +191,8 @@
     "settings.search.placeholder": "搜索设置",
     "settings.nav.workspace": "工作区",
     "settings.nav.common": "通用设置",
+    "settings.nav.gui": "GUI 设置",
+    "settings.nav.token": "Token 统计",
     "settings.nav.llm": "LLM 提供商",
     "settings.nav.skill": "Skill 运行时",
     "settings.nav.mcp": "MCP 服务",
@@ -205,6 +207,20 @@
     "settings.runtime.wsStatus": "WebSocket 状态",
     "settings.runtime.userSettingsFile": "用户设置文件",
     "settings.runtime.notLoaded": "尚未加载",
+    "settings.token.title": "Token 统计",
+    "settings.token.overview": "当前会话",
+    "settings.token.chart": "Token 消耗",
+    "settings.token.details": "详细计数",
+    "settings.token.cacheHitRate": "缓存命中率",
+    "settings.token.totalTokens": "总 Token",
+    "settings.token.requestCount": "请求次数",
+    "settings.token.cacheHitTokens": "缓存命中",
+    "settings.token.cacheMissTokens": "缓存未命中",
+    "settings.token.cachedTokens": "缓存 Token",
+    "settings.token.promptTokens": "输入 Token",
+    "settings.token.completionTokens": "输出 Token",
+    "settings.token.scopeHint": "统计范围为当前会话的完整流程，包括用户 review 和 Agent 自我修复过程。",
+    "settings.token.empty": "当前会话尚未收到 token usage 或缓存命中统计。",
     "settings.noSearchMatch": "没有匹配当前搜索的设置。",
     "settings.group.workbench": "工作台",
     "settings.group.editor": "编辑器",
@@ -213,6 +229,10 @@
     "settings.group.explorer": "资源管理器",
     "settings.group.terminal": "终端",
     "settings.group.agent": "Agent",
+    "settings.group.gui": "DeepCode-GUI",
+    "settings.group.skills": "Skill",
+    "settings.group.mcp": "MCP",
+    "settings.group.ruler": "Ruler",
     "settings.workbench.i18n.prefix": "语言包预留在 ",
     "settings.workbench.i18n.suffix": " 下。当前会保存显示语言；完整界面热切换与本地化接线将在后续阶段补齐。",
     "settings.workspaceHint": "来自工作区的值由当前工作区控制，需要在工作区设置中修改。",
@@ -787,6 +807,49 @@
       "description": "Git stage、unstage、commit WorkUnit 的权限策略。",
       "options": {
         "deny": "拒绝",
+        "ask": "询问",
+        "allow": "允许"
+      }
+    },
+    "agent.permissions.gitPush": {
+      "label": "Git Push",
+      "description": "Git push 的权限策略；默认不自动推送。",
+      "options": {
+        "deny": "拒绝",
+        "ask": "询问",
+        "allow": "允许"
+      }
+    },
+    "agent.git.commitMessageMode": {
+      "label": "Commit 信息生成",
+      "description": "允许 Agent 基于 Review diff facts 请求模型生成 commit message。",
+      "options": {
+        "generate": "生成",
+        "ask": "询问",
+        "off": "关闭"
+      }
+    },
+    "agent.integrations.github.enabled": {
+      "label": "GitHub 集成",
+      "description": "启用基于仓库配置和 secretRef 的 GitHub 元数据访问。"
+    },
+    "agent.integrations.github.repoUrl": {
+      "label": "GitHub 仓库 URL",
+      "description": "可选 GitHub 仓库地址；为空时使用工作区 git remote。"
+    },
+    "agent.integrations.github.authSecretRef": {
+      "label": "GitHub 认证 Secret Ref",
+      "description": "GitHub 认证的密钥引用；不要在此处保存明文 token。"
+    },
+    "agent.integrations.github.defaultRemote": {
+      "label": "GitHub 默认 Remote",
+      "description": "用于推导仓库信息的 git remote 名称。"
+    },
+    "agent.integrations.github.pushPolicy": {
+      "label": "GitHub Push 策略",
+      "description": "控制 push 是仅手动确认、按权限询问，还是遵循显式允许设置。",
+      "options": {
+        "manual": "手动",
         "ask": "询问",
         "allow": "允许"
       }

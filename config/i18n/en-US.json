@@ -191,6 +191,8 @@
     "settings.search.placeholder": "Search settings",
     "settings.nav.workspace": "Workspace",
     "settings.nav.common": "Common Settings",
+    "settings.nav.gui": "GUI Settings",
+    "settings.nav.token": "Token Stats",
     "settings.nav.llm": "LLM Providers",
     "settings.nav.skill": "Skill Runtime",
     "settings.nav.mcp": "MCP Services",
@@ -205,6 +207,20 @@
     "settings.runtime.wsStatus": "WebSocket status",
     "settings.runtime.userSettingsFile": "User settings file",
     "settings.runtime.notLoaded": "Not loaded yet",
+    "settings.token.title": "Token Stats",
+    "settings.token.overview": "Current Session",
+    "settings.token.chart": "Token Usage",
+    "settings.token.details": "Detailed Counts",
+    "settings.token.cacheHitRate": "Cache hit rate",
+    "settings.token.totalTokens": "Total tokens",
+    "settings.token.requestCount": "Requests",
+    "settings.token.cacheHitTokens": "Cache hits",
+    "settings.token.cacheMissTokens": "Cache misses",
+    "settings.token.cachedTokens": "Cached tokens",
+    "settings.token.promptTokens": "Prompt tokens",
+    "settings.token.completionTokens": "Completion tokens",
+    "settings.token.scopeHint": "Scope is the full current session flow, including user review and agent self-repair loops.",
+    "settings.token.empty": "No token usage or cache hit telemetry has been reported for this session yet.",
     "settings.noSearchMatch": "No settings match the current search.",
     "settings.group.workbench": "Workbench",
     "settings.group.editor": "Editor",
@@ -213,6 +229,10 @@
     "settings.group.explorer": "Explorer",
     "settings.group.terminal": "Terminal",
     "settings.group.agent": "Agent",
+    "settings.group.gui": "DeepCode-GUI",
+    "settings.group.skills": "Skill",
+    "settings.group.mcp": "MCP",
+    "settings.group.ruler": "Ruler",
     "settings.workbench.i18n.prefix": "Language packs are loaded from ",
     "settings.workbench.i18n.suffix": ". Changing the display language is stored now; full UI reload/localization wiring lands in a later stage.",
     "settings.workspaceHint": "Workspace-sourced values are controlled by the current workspace and must be changed in workspace settings.",
@@ -787,6 +807,49 @@
       "description": "Permission policy for Git stage, unstage, and commit work units.",
       "options": {
         "deny": "Deny",
+        "ask": "Ask",
+        "allow": "Allow"
+      }
+    },
+    "agent.permissions.gitPush": {
+      "label": "Git Push",
+      "description": "Permission policy for Git push. Push is not automatic by default.",
+      "options": {
+        "deny": "Deny",
+        "ask": "Ask",
+        "allow": "Allow"
+      }
+    },
+    "agent.git.commitMessageMode": {
+      "label": "Commit Message Mode",
+      "description": "Allow the Agent to ask the model for commit message suggestions from review diff facts.",
+      "options": {
+        "generate": "Generate",
+        "ask": "Ask",
+        "off": "Off"
+      }
+    },
+    "agent.integrations.github.enabled": {
+      "label": "GitHub Integration",
+      "description": "Enable GitHub metadata access through configured repository and secret references."
+    },
+    "agent.integrations.github.repoUrl": {
+      "label": "GitHub Repository URL",
+      "description": "Optional GitHub repository URL. Workspace git remote is used when this is empty."
+    },
+    "agent.integrations.github.authSecretRef": {
+      "label": "GitHub Auth Secret Ref",
+      "description": "Secret reference for GitHub authentication. Do not store plaintext tokens here."
+    },
+    "agent.integrations.github.defaultRemote": {
+      "label": "GitHub Default Remote",
+      "description": "Git remote name used when deriving repository information."
+    },
+    "agent.integrations.github.pushPolicy": {
+      "label": "GitHub Push Policy",
+      "description": "Controls whether push requires manual confirmation, asks through permission policy, or follows explicit allow settings.",
+      "options": {
+        "manual": "Manual",
         "ask": "Ask",
         "allow": "Allow"
       }

@@ -10,6 +10,7 @@ import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
 import { t, type UiLanguage } from '../../i18n';
 import { submitAgentFeedback } from '../../services/runtimeAdapter';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
+import { useSettingsStore } from '../../state/settingsStore';
 
 interface CodexTimelineProps {
   timeline: AgentTimelineResult | null;
@@ -23,6 +24,8 @@ interface CodexTimelineProps {
     guidance?: string
   ) => void;
 }
+
+type TypewriterSpeed = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']>;
 
 const CodexTimeline: React.FC<CodexTimelineProps> = ({
   timeline,
@@ -54,7 +57,17 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
     () => timelineScrollSignature(view, loading),
     [view, loading]
   );
-  const typewriterBlockIds = useAssistantTypewriterBlockIds(view, loading);
+  const typewriterEnabled = useSettingsStore((s) =>
+    Boolean(s.effectiveSettings['gui.typewriterAnimation'] ?? true)
+  );
+  const timelineDensity = useSettingsStore((s) =>
+    String(s.effectiveSettings['gui.timelineDensity'] ?? 'normal')
+  );
+  const collapseCompletedThinking = useSettingsStore((s) =>
+    Boolean(s.effectiveSettings['gui.collapseCompletedThinking'] ?? true)
+  );
+  const typewriterBlockIds = useTypewriterBlockIds(view, loading && typewriterEnabled);
+  const timelineDensityClass = timelineDensity === 'compact' ? ' codex-timeline--compact' : '';
 
   const setShouldFollow = useCallback((shouldFollow: boolean) => {
     shouldFollowRef.current = shouldFollow;
@@ -146,7 +159,7 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
   }, [scrollToTimelineEnd]);
 
   return (
-    <div className="codex-timeline" ref={timelineRef}>
+    <div className={`codex-timeline${timelineDensityClass}`} ref={timelineRef}>
       {view.turns.length === 0 && !loading && (
         <div className="codex-empty">
           <div className="codex-empty__title">{t(language, 'deepcodeGui.status.ready')}</div>
@@ -158,6 +171,7 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
           turn={turn}
           language={language}
           typewriterBlockIds={typewriterBlockIds}
+          collapseCompletedThinking={collapseCompletedThinking}
           onLiveContentChange={scrollToTimelineEndIfFollowing}
           onPlanResolve={onPlanResolve}
         />
@@ -219,22 +233,22 @@ function timelineScrollSignature(view: AgentTimelineResult, loading: boolean): s
   return `${lastTurn.id}:${lastTurn.status}:${loading ? 'running' : 'idle'}:${blockSignature}`;
 }
 
-function useAssistantTypewriterBlockIds(
+function useTypewriterBlockIds(
   view: AgentTimelineResult,
   loading: boolean
 ): Set<string> {
   const activeSessionIdRef = useRef<string | null>(null);
-  const seenAssistantBlockIdsRef = useRef<Set<string>>(new Set());
+  const seenBlockIdsRef = useRef<Set<string>>(new Set());
   const typewriterBlockIdsRef = useRef<Set<string>>(new Set());
   const liveSessionIdRef = useRef<string | null>(null);
 
   return useMemo(() => {
     const sessionId = view.sessionId;
-    const assistantIds = collectAssistantBlockIds(view);
+    const candidateIds = collectTypewriterBlockIds(view);
 
     if (activeSessionIdRef.current !== sessionId) {
       activeSessionIdRef.current = sessionId;
-      seenAssistantBlockIdsRef.current = new Set(assistantIds);
+      seenBlockIdsRef.current = new Set(candidateIds);
       typewriterBlockIdsRef.current = new Set();
       liveSessionIdRef.current = loading ? sessionId : null;
       return new Set<string>();
@@ -244,9 +258,9 @@ function useAssistantTypewriterBlockIds(
       liveSessionIdRef.current = sessionId;
     }
     const shouldAnimateNewAssistant = liveSessionIdRef.current === sessionId;
-    for (const blockId of assistantIds) {
-      if (seenAssistantBlockIdsRef.current.has(blockId)) continue;
-      seenAssistantBlockIdsRef.current.add(blockId);
+    for (const blockId of candidateIds) {
+      if (seenBlockIdsRef.current.has(blockId)) continue;
+      seenBlockIdsRef.current.add(blockId);
       if (shouldAnimateNewAssistant) {
         typewriterBlockIdsRef.current.add(blockId);
       }
@@ -256,10 +270,15 @@ function useAssistantTypewriterBlockIds(
   }, [loading, view]);
 }
 
-function collectAssistantBlockIds(view: AgentTimelineResult): string[] {
+function collectTypewriterBlockIds(view: AgentTimelineResult): string[] {
   return view.turns.flatMap((turn) =>
     turn.blocks
-      .filter((block) => block.kind === 'assistant' || block.narrativeKind === 'assistantText')
+      .filter((block) =>
+        block.displayHints?.renderMode === 'typewriter' ||
+        block.displayHints?.renderMode === 'accelerated' ||
+        block.narrativeKind === 'assistantText' ||
+        (!block.narrativeKind && block.kind === 'assistant')
+      )
       .filter((block) => (block.bodyMarkdown ?? block.summary ?? '').trim().length > 0)
       .map((block) => block.id)
   );
@@ -280,9 +299,10 @@ const TurnCard: React.FC<{
   turn: AgentTimelineTurn;
   language: UiLanguage;
   typewriterBlockIds: Set<string>;
+  collapseCompletedThinking: boolean;
   onLiveContentChange: () => void;
   onPlanResolve?: CodexTimelineProps['onPlanResolve'];
-}> = ({ turn, language, typewriterBlockIds, onLiveContentChange, onPlanResolve }) => {
+}> = ({ turn, language, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
   const blocks = turn.blocks;
 
@@ -300,6 +320,7 @@ const TurnCard: React.FC<{
             block={block}
             language={language}
             animateAssistant={typewriterBlockIds.has(block.id)}
+            collapseCompletedThinking={collapseCompletedThinking}
             onLiveContentChange={onLiveContentChange}
             onPlanResolve={onPlanResolve}
           />
@@ -460,9 +481,10 @@ const TimelineBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
   animateAssistant?: boolean;
+  collapseCompletedThinking?: boolean;
   onLiveContentChange: () => void;
   onPlanResolve?: CodexTimelineProps['onPlanResolve'];
-}> = ({ block, language, animateAssistant = false, onLiveContentChange, onPlanResolve }) => {
+}> = ({ block, language, animateAssistant = false, collapseCompletedThinking = true, onLiveContentChange, onPlanResolve }) => {
   const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
   if (block.kind === 'user') {
@@ -476,12 +498,26 @@ const TimelineBlock: React.FC<{
     );
   }
 
+  if (block.narrativeKind === 'assistantNarration') {
+    return (
+      <article className={`codex-assistant-narration${narrativeClass}${densityClass}`}>
+        <TypewriterMarkdown
+          content={block.bodyMarkdown ?? block.summary}
+          animate={animateAssistant}
+          speed={block.displayHints?.typewriterSpeed}
+          onVisibleContentChange={onLiveContentChange}
+        />
+      </article>
+    );
+  }
+
   if (block.kind === 'assistant') {
     return (
       <article className={`codex-assistant-text${narrativeClass}${densityClass}`}>
         <TypewriterMarkdown
           content={block.bodyMarkdown ?? block.summary}
           animate={animateAssistant}
+          speed={block.displayHints?.typewriterSpeed}
           onVisibleContentChange={onLiveContentChange}
         />
       </article>
@@ -493,7 +529,14 @@ const TimelineBlock: React.FC<{
   }
 
   if (block.kind === 'thinking' || block.narrativeKind === 'thinking') {
-    return <ThinkingBlock block={block} />;
+    return (
+      <ThinkingBlock
+        block={block}
+        animate={animateAssistant}
+        collapseCompletedThinking={collapseCompletedThinking}
+        onLiveContentChange={onLiveContentChange}
+      />
+    );
   }
 
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
@@ -506,18 +549,63 @@ const TimelineBlock: React.FC<{
       </summary>
       <div className="codex-block__details">
         {block.bodyMarkdown && <MarkdownContent content={block.bodyMarkdown} />}
+        {block.narrativeKind === 'review' && (
+          <CodexGitReviewDiffDetails gitReview={gitReviewFromBlock(block)} language={language} />
+        )}
         <EventList events={block.events} />
       </div>
     </details>
   );
 };
 
+const CodexGitReviewDiffDetails: React.FC<{ gitReview: unknown; language: UiLanguage }> = ({ gitReview, language }) => {
+  if (!isRecord(gitReview)) return null;
+  if (gitReview.available === false) {
+    const reason = stringField(gitReview, 'reason') ?? 'Git review unavailable';
+    return <div className="codex-git-review__summary">{reason}</div>;
+  }
+  const files = Array.isArray(gitReview.files) ? gitReview.files.filter(isRecord) : [];
+  const diffBlocks = Array.isArray(gitReview.diffBlocks) ? gitReview.diffBlocks.filter(isRecord) : [];
+  if (!files.length && !diffBlocks.length) return null;
+  return (
+    <div className="codex-git-review">
+      {files.length > 0 && (
+        <div className="codex-git-review__files">
+          {files.slice(0, 12).map((file, index) => {
+            const path = stringField(file, 'path') ?? `file-${index + 1}`;
+            return <code key={`${path}-${index}`}>{path}</code>;
+          })}
+          {files.length > 12 && <span>{language === 'zh-CN' ? `另有 ${files.length - 12} 个文件` : `${files.length - 12} more files`}</span>}
+        </div>
+      )}
+      {diffBlocks.map((block, index) => {
+        const title = stringField(block, 'title') ?? `Diff ${index + 1}`;
+        const diff = stringField(block, 'diff') ?? '';
+        const truncated = block.truncated === true;
+        return (
+          <details key={`${title}-${index}`} className="codex-git-review__diff">
+            <summary>
+              {title}
+              {truncated ? (language === 'zh-CN' ? '（已截断）' : ' (truncated)') : ''}
+            </summary>
+            <pre><code>{diff}</code></pre>
+          </details>
+        );
+      })}
+    </div>
+  );
+};
+
 const ThinkingBlock: React.FC<{
   block: AgentTimelineBlock;
-}> = ({ block }) => {
+  animate?: boolean;
+  collapseCompletedThinking?: boolean;
+  onLiveContentChange?: () => void;
+}> = ({ block, animate = false, collapseCompletedThinking = true, onLiveContentChange = () => undefined }) => {
   const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
-  const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
+  const completedThinkingOpen = block.status === 'completed' && !collapseCompletedThinking;
+  const open = completedThinkingOpen || (block.displayHints?.initialOpen ?? (!block.defaultCollapsed || block.status === 'running' || block.status === 'waiting'));
   const markdown = thinkingMarkdown(block);
   const summary = compactThinkingSummary(markdown);
 
@@ -529,7 +617,12 @@ const ThinkingBlock: React.FC<{
         {summary && <span className="codex-block__summary">{summary}</span>}
       </summary>
       <div className="codex-block__details codex-block__details--thinking">
-        <MarkdownContent content={markdown} />
+        <TypewriterMarkdown
+          content={markdown}
+          animate={animate}
+          speed={block.displayHints?.typewriterSpeed}
+          onVisibleContentChange={onLiveContentChange}
+        />
       </div>
     </details>
   );
@@ -576,14 +669,16 @@ const PlanBlock: React.FC<{
 const TypewriterMarkdown: React.FC<{
   content: string;
   animate: boolean;
+  speed?: TypewriterSpeed;
   onVisibleContentChange: () => void;
-}> = ({ content, animate, onVisibleContentChange }) => {
+}> = ({ content, animate, speed = 'normal', onVisibleContentChange }) => {
   const [visible, setVisible] = useState(() => (animate ? '' : content));
   const visibleRef = useRef(visible);
+  const renderedContent = animate ? visible : content;
 
   useLayoutEffect(() => {
-    if (animate) onVisibleContentChange();
-  }, [animate, onVisibleContentChange, visible]);
+    onVisibleContentChange();
+  }, [onVisibleContentChange, renderedContent]);
 
   useEffect(() => {
     visibleRef.current = visible;
@@ -598,17 +693,20 @@ const TypewriterMarkdown: React.FC<{
     setVisible(content.slice(0, startIndex));
     if (!content) return;
     let index = startIndex;
+    const step = speed === 'fast' ? 12 : speed === 'slow' ? 2 : 4;
+    const delayMs = speed === 'fast' ? 8 : speed === 'slow' ? 20 : 12;
     const id = window.setInterval(() => {
-      index = Math.min(content.length, index + 4);
+      index = Math.min(content.length, index + step);
       setVisible(content.slice(0, index));
+      window.requestAnimationFrame(onVisibleContentChange);
       if (index >= content.length) {
         window.clearInterval(id);
       }
-    }, 12);
+    }, delayMs);
     return () => window.clearInterval(id);
   }, [animate, content]);
 
-  return <MarkdownContent content={animate ? visible : content} />;
+  return <MarkdownContent content={renderedContent} />;
 };
 
 const EventList: React.FC<{ events: AgentEvent[]; compact?: boolean }> = ({ events, compact }) => (
@@ -813,6 +911,16 @@ function stringField(payload: Record<string, unknown>, key: string): string | un
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function gitReviewFromBlock(block: AgentTimelineBlock): unknown {
+  for (const event of block.events ?? []) {
+    if (event.kind !== 'review_summary' || !isRecord(event.payload)) continue;
+    if (event.payload.gitReview) return event.payload.gitReview;
+    const reviewFacts = event.payload.reviewFacts;
+    if (isRecord(reviewFacts) && reviewFacts.gitReview) return reviewFacts.gitReview;
+  }
+  return undefined;
 }
 
 function payloadAttachments(payload: unknown): AgentContextAttachment[] {

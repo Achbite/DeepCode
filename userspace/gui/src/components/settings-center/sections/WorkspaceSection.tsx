@@ -5,8 +5,8 @@ import { useWorkspaceStore } from '../../../state/workspaceStore';
 import { useUiStore } from '../../../state/uiStore';
 import SettingsField from '../SettingsField';
 import {
-  SETTING_DEFINITIONS,
   useSettingsStore,
+  workspaceSettingDefinitions,
 } from '../../../state/settingsStore';
 import type { UserSettingValue } from '@deepcode/protocol';
 import { normalizeUiLanguage, t } from '../../../i18n';
@@ -248,7 +248,7 @@ const WorkspaceSection: React.FC = () => {
           {t(language, 'workspace.deepcodeSettingsBody')}
         </div>
         <div className="settings-workspace-fields">
-          {SETTING_DEFINITIONS.map((definition) => localizeSettingDefinition(definition, language)).map((definition) => (
+          {workspaceSettingDefinitions().map((definition) => localizeSettingDefinition(definition, language)).map((definition) => (
             <SettingsField
               key={definition.key}
               definition={definition}

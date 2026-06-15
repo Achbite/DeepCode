@@ -2,6 +2,12 @@ import { create } from 'zustand';
 import { useMemo } from 'react';
 import {
   DEFAULT_USER_SETTINGS,
+  agentConfigurableSettingsIndex,
+  agentSettingsIndex,
+  shellPreferenceSettingsIndex,
+  workspaceOverridableSettingsIndex,
+  type SettingCatalogEntry,
+  type SettingsSurface,
   type UserSettingValue,
   type UserSettings,
 } from '@deepcode/protocol';
@@ -19,9 +25,21 @@ export interface SettingDefinition {
   key: string;
   label: string;
   description: string;
-  group: 'editor' | 'files' | 'keyboard' | 'explorer' | 'workbench' | 'terminal' | 'agent';
+  group:
+    | 'editor'
+    | 'files'
+    | 'keyboard'
+    | 'explorer'
+    | 'workbench'
+    | 'terminal'
+    | 'agent'
+    | 'gui'
+    | 'skills'
+    | 'mcp'
+    | 'ruler';
   control: SettingControlType;
   options?: Array<{ label: string; value: string }>;
+  catalog?: SettingCatalogEntry;
 }
 
 export interface EditorEffectiveOptions {
@@ -34,6 +52,18 @@ export interface EditorEffectiveOptions {
   theme: string;
 }
 
+export interface ConfigAuditNotice {
+  kind?: string;
+  configKind?: string;
+  changedKeys?: string[];
+  source?: string;
+  storePath?: string;
+  oldHash?: string;
+  newHash?: string;
+  message?: string;
+  auditError?: string;
+}
+
 interface SettingsStateData {
   userSettings: UserSettings;
   workspaceSettings: Record<string, unknown>;
@@ -43,6 +73,7 @@ interface SettingsStateData {
   storePath: string | null;
   loading: boolean;
   errorMessage: string | null;
+  lastConfigAudit: ConfigAuditNotice | null;
 }
 
 interface SettingsActions {
@@ -95,6 +126,42 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     options: [
       { label: 'VS Code', value: 'vscode' },
     ],
+  },
+  {
+    key: 'gui.colorTheme',
+    label: 'DeepCode-GUI Theme',
+    description: 'Theme used by the lightweight DeepCode-GUI shell. It does not affect the editor workbench theme.',
+    group: 'gui',
+    control: 'select',
+    options: [
+      { label: 'Light', value: 'deepcode-gui-light' },
+      { label: 'Dark', value: 'deepcode-gui-dark' },
+    ],
+  },
+  {
+    key: 'gui.timelineDensity',
+    label: 'GUI Timeline Density',
+    description: 'Timeline density for the lightweight conversational GUI shell.',
+    group: 'gui',
+    control: 'select',
+    options: [
+      { label: 'Normal', value: 'normal' },
+      { label: 'Compact', value: 'compact' },
+    ],
+  },
+  {
+    key: 'gui.typewriterAnimation',
+    label: 'GUI Typewriter Animation',
+    description: 'Animate model narration, thinking, and final answers in the DeepCode-GUI timeline.',
+    group: 'gui',
+    control: 'boolean',
+  },
+  {
+    key: 'gui.collapseCompletedThinking',
+    label: 'Collapse Completed Thinking',
+    description: 'Collapse completed thinking blocks in the DeepCode-GUI after the run settles.',
+    group: 'gui',
+    control: 'boolean',
   },
   {
     key: 'editor.tabSize',
@@ -315,6 +382,66 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     options: permissionPolicyOptions(),
   },
   {
+    key: 'agent.permissions.gitPush',
+    label: 'Git Push',
+    description: 'Permission policy for pushing commits to a remote. Push is never enabled by default.',
+    group: 'agent',
+    control: 'select',
+    options: permissionPolicyOptions(),
+  },
+  {
+    key: 'agent.git.commitMessageMode',
+    label: 'Commit Message Mode',
+    description: 'Allow the Agent to ask the model for commit message suggestions from review diff facts.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Generate', value: 'generate' },
+      { label: 'Ask', value: 'ask' },
+      { label: 'Off', value: 'off' },
+    ],
+  },
+  {
+    key: 'agent.integrations.github.enabled',
+    label: 'GitHub Integration',
+    description: 'Enable GitHub metadata access through configured repository and secret references.',
+    group: 'agent',
+    control: 'boolean',
+  },
+  {
+    key: 'agent.integrations.github.repoUrl',
+    label: 'GitHub Repository URL',
+    description: 'Optional GitHub repository URL. Workspace git remote is used when this is empty.',
+    group: 'agent',
+    control: 'text',
+  },
+  {
+    key: 'agent.integrations.github.authSecretRef',
+    label: 'GitHub Auth Secret Ref',
+    description: 'Secret reference for GitHub authentication. Tokens are not stored in this plain settings value.',
+    group: 'agent',
+    control: 'text',
+  },
+  {
+    key: 'agent.integrations.github.defaultRemote',
+    label: 'GitHub Default Remote',
+    description: 'Git remote name used when deriving repository information.',
+    group: 'agent',
+    control: 'text',
+  },
+  {
+    key: 'agent.integrations.github.pushPolicy',
+    label: 'GitHub Push Policy',
+    description: 'Controls whether push requires manual confirmation, asks through permission policy, or may follow explicit allow settings.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Manual', value: 'manual' },
+      { label: 'Ask', value: 'ask' },
+      { label: 'Allow', value: 'allow' },
+    ],
+  },
+  {
     key: 'agent.permissions.browserControl',
     label: 'Browser Control',
     description: 'Permission policy for browser.control work units.',
@@ -344,7 +471,53 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     group: 'agent',
     control: 'text',
   },
+  {
+    key: 'skills.mounts',
+    label: 'Project Skill Mounts',
+    description: 'JSON array of additional Skill mount definitions available to Agent runs.',
+    group: 'skills',
+    control: 'text',
+  },
+  {
+    key: 'mcp.servers',
+    label: 'Project MCP Servers',
+    description: 'JSON array of MCP service definitions available to Agent runs.',
+    group: 'mcp',
+    control: 'text',
+  },
+  {
+    key: 'ruler.rules',
+    label: 'Project Ruler Rules',
+    description: 'JSON array of Ruler rules or project-level additions used by Agent prompt assembly.',
+    group: 'ruler',
+    control: 'text',
+  },
 ];
+
+const SETTING_DEFINITION_BY_KEY = new Map(SETTING_DEFINITIONS.map((definition) => [definition.key, definition]));
+
+export function agentSettingDefinitions(): SettingDefinition[] {
+  return definitionsForCatalog(agentSettingsIndex());
+}
+
+export function shellPreferenceSettingDefinitions(surface: SettingsSurface): SettingDefinition[] {
+  return definitionsForCatalog(shellPreferenceSettingsIndex(surface));
+}
+
+export function workspaceSettingDefinitions(): SettingDefinition[] {
+  return definitionsForCatalog(workspaceOverridableSettingsIndex());
+}
+
+export function agentConfigurableSettingDefinitions(): SettingDefinition[] {
+  return definitionsForCatalog(agentConfigurableSettingsIndex());
+}
+
+function definitionsForCatalog(entries: readonly SettingCatalogEntry[]): SettingDefinition[] {
+  return entries.flatMap((entry) => {
+    const definition = SETTING_DEFINITION_BY_KEY.get(entry.key);
+    return definition ? [{ ...definition, catalog: entry }] : [];
+  });
+}
 
 function permissionPolicyOptions(): NonNullable<SettingDefinition['options']> {
   return [
@@ -355,6 +528,9 @@ function permissionPolicyOptions(): NonNullable<SettingDefinition['options']> {
 }
 
 const KNOWN_SETTING_KEYS = new Set(Object.keys(DEFAULT_USER_SETTINGS));
+const WORKSPACE_OVERRIDABLE_SETTING_KEYS = new Set(
+  workspaceOverridableSettingsIndex().map((entry) => entry.key)
+);
 
 function isSupportedSettingValue(value: unknown): value is UserSettingValue {
   return (
@@ -388,7 +564,7 @@ function normalizeWorkspaceSettings(settings: Record<string, unknown>): UserSett
     const key = rawKey.startsWith('deepcode.')
       ? rawKey.slice('deepcode.'.length)
       : rawKey;
-    if (!KNOWN_SETTING_KEYS.has(key)) continue;
+    if (!KNOWN_SETTING_KEYS.has(key) || !WORKSPACE_OVERRIDABLE_SETTING_KEYS.has(key)) continue;
     normalized[key] = normalizeSettingValue(key, rawValue);
   }
   return normalized;
@@ -418,6 +594,11 @@ function buildEffectiveSettings(
   return { effectiveSettings, sources };
 }
 
+function configAuditNotice(value: unknown): ConfigAuditNotice | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as ConfigAuditNotice;
+}
+
 export const useSettingsStore = create<SettingsStore>((set, get) => {
   const initialEffective = buildEffectiveSettings(DEFAULT_USER_SETTINGS, {}, []);
 
@@ -430,6 +611,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     storePath: null,
     loading: false,
     errorMessage: null,
+    lastConfigAudit: null,
 
     loadUserSettings: async () => {
       if (get().loading) return;
@@ -492,10 +674,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         effectiveSettings: next.effectiveSettings,
         sources: next.sources,
         errorMessage: null,
+        lastConfigAudit: configAuditNotice(result.data.configAudit),
       });
     },
 
     patchWorkspaceSetting: async (key, value) => {
+      if (!WORKSPACE_OVERRIDABLE_SETTING_KEYS.has(key)) {
+        set({ errorMessage: `Workspace setting is not allowed to override protected key: ${key}` });
+        return;
+      }
       const normalized = normalizeSettingValue(key, value);
       const result = await patchWorkspaceSettings({
         [`deepcode.${key}`]: normalized,
@@ -535,6 +722,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         effectiveSettings: next.effectiveSettings,
         sources: next.sources,
         errorMessage: null,
+        lastConfigAudit: configAuditNotice(result.data.configAudit),
       });
     },
 

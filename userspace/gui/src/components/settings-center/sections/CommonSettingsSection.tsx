@@ -1,11 +1,13 @@
 import React, { useMemo } from 'react';
 import SettingsField from '../SettingsField';
 import {
-  SETTING_DEFINITIONS,
+  agentSettingDefinitions,
+  shellPreferenceSettingDefinitions,
   useSettingsStore,
   type SettingDefinition,
 } from '../../../state/settingsStore';
 import type { UserSettingValue } from '@deepcode/protocol';
+import type { SettingsSurface } from '@deepcode/protocol';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../../i18n';
 import { localizeSettingDefinition } from '../../../settingsLocalization';
 
@@ -14,6 +16,7 @@ interface CommonSettingsSectionProps {
   apiStatus: string;
   wsStatus: string;
   query?: string;
+  surface?: SettingsSurface;
 }
 
 const GROUP_TITLE_KEYS: Record<string, string> = {
@@ -24,9 +27,13 @@ const GROUP_TITLE_KEYS: Record<string, string> = {
   explorer: 'settings.group.explorer',
   terminal: 'settings.group.terminal',
   agent: 'settings.group.agent',
+  gui: 'settings.group.gui',
+  skills: 'settings.group.skills',
+  mcp: 'settings.group.mcp',
+  ruler: 'settings.group.ruler',
 };
 
-const GROUP_ORDER = ['workbench', 'editor', 'files', 'keyboard', 'explorer', 'terminal', 'agent'];
+const GROUP_ORDER = ['workbench', 'editor', 'files', 'keyboard', 'explorer', 'terminal', 'gui', 'agent', 'skills', 'mcp', 'ruler'];
 
 function groupTitle(group: string, language: UiLanguage): string {
   const key = GROUP_TITLE_KEYS[group];
@@ -50,8 +57,16 @@ function matchesQuery(
   return target.includes(query.trim().toLowerCase());
 }
 
-function groupDefinitions(query: string, language: UiLanguage): Record<string, SettingDefinition[]> {
-  return SETTING_DEFINITIONS
+function definitionsForSurface(surface: SettingsSurface): SettingDefinition[] {
+  const agentDefinitions = agentSettingDefinitions().filter((definition) => definition.key.startsWith('agent.'));
+  return [
+    ...shellPreferenceSettingDefinitions(surface),
+    ...agentDefinitions,
+  ];
+}
+
+function groupDefinitions(query: string, language: UiLanguage, surface: SettingsSurface): Record<string, SettingDefinition[]> {
+  return definitionsForSurface(surface)
     .map((definition) => ({
       original: definition,
       localized: localizeSettingDefinition(definition, language),
@@ -69,6 +84,7 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
   apiStatus,
   wsStatus,
   query = '',
+  surface = 'editor',
 }) => {
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
@@ -79,7 +95,7 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
   const patchUserSetting = useSettingsStore((s) => s.patchUserSetting);
   const resetUserSetting = useSettingsStore((s) => s.resetUserSetting);
 
-  const grouped = useMemo(() => groupDefinitions(query, language), [language, query]);
+  const grouped = useMemo(() => groupDefinitions(query, language, surface), [language, query, surface]);
   const orderedGroups = useMemo(
     () => GROUP_ORDER.filter((group) => grouped[group]?.length),
     [grouped]
