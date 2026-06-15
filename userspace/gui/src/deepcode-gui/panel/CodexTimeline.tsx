@@ -48,11 +48,21 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
   const shouldFollowRef = useRef(true);
   const previousLoadingRef = useRef(false);
   const suppressScrollEventsUntilRef = useRef(0);
+  const liveScrollFrameRef = useRef<number | null>(null);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const scrollSignature = useMemo(
     () => timelineScrollSignature(view, loading),
     [view, loading]
   );
   const typewriterBlockIds = useAssistantTypewriterBlockIds(view, loading);
+
+  const setShouldFollow = useCallback((shouldFollow: boolean) => {
+    shouldFollowRef.current = shouldFollow;
+    setShowJumpToLatest((visible) => {
+      const nextVisible = !shouldFollow;
+      return visible === nextVisible ? visible : nextVisible;
+    });
+  }, []);
 
   const resolveScrollContainer = useCallback(() => {
     const cached = scrollContainerRef.current;
@@ -66,6 +76,7 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
     const container = resolveScrollContainer();
     if (!container) return;
 
+    setShouldFollow(true);
     suppressScrollEventsUntilRef.current = window.performance.now() + 160;
     container.scrollTop = container.scrollHeight;
     timelineEndRef.current?.scrollIntoView({
@@ -79,7 +90,23 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
         behavior: 'auto',
       });
     });
-  }, [resolveScrollContainer]);
+  }, [resolveScrollContainer, setShouldFollow]);
+
+  const scrollToTimelineEndIfFollowing = useCallback(() => {
+    if (!shouldFollowRef.current || liveScrollFrameRef.current !== null) return;
+    liveScrollFrameRef.current = window.requestAnimationFrame(() => {
+      liveScrollFrameRef.current = null;
+      if (shouldFollowRef.current) {
+        scrollToTimelineEnd();
+      }
+    });
+  }, [scrollToTimelineEnd]);
+
+  useEffect(() => () => {
+    if (liveScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(liveScrollFrameRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     const scrollContainer = resolveScrollContainer();
@@ -89,34 +116,34 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
       if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
       const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
       const distanceFromBottom = maxScrollTop - scrollContainer.scrollTop;
-      shouldFollowRef.current = distanceFromBottom < 180;
+      setShouldFollow(distanceFromBottom < 180);
     };
 
     updateShouldFollow();
     scrollContainer.addEventListener('scroll', updateShouldFollow, { passive: true });
     return () => scrollContainer.removeEventListener('scroll', updateShouldFollow);
-  }, [resolveScrollContainer]);
+  }, [resolveScrollContainer, setShouldFollow]);
 
   useLayoutEffect(() => {
     const startedRunning = loading && !previousLoadingRef.current;
     previousLoadingRef.current = loading;
-    if (startedRunning) shouldFollowRef.current = true;
+    if (startedRunning) setShouldFollow(true);
     if (!startedRunning && !shouldFollowRef.current) return;
 
     scrollToTimelineEnd();
-  }, [loading, scrollSignature, scrollToTimelineEnd]);
+  }, [loading, scrollSignature, scrollToTimelineEnd, setShouldFollow]);
 
   useEffect(() => {
     const target = timelineRef.current;
     if (!target || typeof ResizeObserver === 'undefined') return undefined;
     const observer = new ResizeObserver(() => {
-      if (loading || shouldFollowRef.current) {
+      if (shouldFollowRef.current) {
         scrollToTimelineEnd();
       }
     });
     observer.observe(target);
     return () => observer.disconnect();
-  }, [loading, scrollToTimelineEnd]);
+  }, [scrollToTimelineEnd]);
 
   return (
     <div className="codex-timeline" ref={timelineRef}>
@@ -131,6 +158,7 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
           turn={turn}
           language={language}
           typewriterBlockIds={typewriterBlockIds}
+          onLiveContentChange={scrollToTimelineEndIfFollowing}
           onPlanResolve={onPlanResolve}
         />
       ))}
@@ -139,6 +167,17 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
           <span className="codex-live-indicator__dot" />
           {t(language, 'deepcodeGui.status.running')}
         </div>
+      )}
+      {showJumpToLatest && (
+        <button
+          type="button"
+          className="codex-timeline-jump-latest"
+          aria-label="跳转到最新内容"
+          title="跳转到最新内容"
+          onClick={scrollToTimelineEnd}
+        >
+          ↓
+        </button>
       )}
       <div ref={timelineEndRef} className="codex-timeline__end" aria-hidden="true" />
     </div>
@@ -241,8 +280,9 @@ const TurnCard: React.FC<{
   turn: AgentTimelineTurn;
   language: UiLanguage;
   typewriterBlockIds: Set<string>;
+  onLiveContentChange: () => void;
   onPlanResolve?: CodexTimelineProps['onPlanResolve'];
-}> = ({ turn, language, typewriterBlockIds, onPlanResolve }) => {
+}> = ({ turn, language, typewriterBlockIds, onLiveContentChange, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
   const blocks = turn.blocks;
 
@@ -260,6 +300,7 @@ const TurnCard: React.FC<{
             block={block}
             language={language}
             animateAssistant={typewriterBlockIds.has(block.id)}
+            onLiveContentChange={onLiveContentChange}
             onPlanResolve={onPlanResolve}
           />
         ))}
@@ -419,8 +460,9 @@ const TimelineBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
   animateAssistant?: boolean;
+  onLiveContentChange: () => void;
   onPlanResolve?: CodexTimelineProps['onPlanResolve'];
-}> = ({ block, language, animateAssistant = false, onPlanResolve }) => {
+}> = ({ block, language, animateAssistant = false, onLiveContentChange, onPlanResolve }) => {
   const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
   if (block.kind === 'user') {
@@ -437,7 +479,11 @@ const TimelineBlock: React.FC<{
   if (block.kind === 'assistant') {
     return (
       <article className={`codex-assistant-text${narrativeClass}${densityClass}`}>
-        <TypewriterMarkdown content={block.bodyMarkdown ?? block.summary} animate={animateAssistant} />
+        <TypewriterMarkdown
+          content={block.bodyMarkdown ?? block.summary}
+          animate={animateAssistant}
+          onVisibleContentChange={onLiveContentChange}
+        />
       </article>
     );
   }
@@ -527,9 +573,17 @@ const PlanBlock: React.FC<{
   );
 };
 
-const TypewriterMarkdown: React.FC<{ content: string; animate: boolean }> = ({ content, animate }) => {
+const TypewriterMarkdown: React.FC<{
+  content: string;
+  animate: boolean;
+  onVisibleContentChange: () => void;
+}> = ({ content, animate, onVisibleContentChange }) => {
   const [visible, setVisible] = useState(() => (animate ? '' : content));
   const visibleRef = useRef(visible);
+
+  useLayoutEffect(() => {
+    if (animate) onVisibleContentChange();
+  }, [animate, onVisibleContentChange, visible]);
 
   useEffect(() => {
     visibleRef.current = visible;
