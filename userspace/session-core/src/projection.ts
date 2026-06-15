@@ -35,6 +35,8 @@ export interface SessionProjection {
 
 export const NARRATIVE_TIMELINE_SCHEMA_VERSION = 'deepcode.session.timeline.v1' as const;
 
+type NarrativeRenderMode = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['renderMode']>;
+
 export interface NarrativeTimelineProjectionInput {
   sessionId: string;
   events: AgentEvent[];
@@ -163,6 +165,10 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
   let syntheticTurnIndex = 0;
 
   input.events.forEach((event, index) => {
+    if (event.kind === 'cache_telemetry') {
+      return;
+    }
+
     if (event.kind === 'user_msg') {
       if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
       currentTurn = {
@@ -244,6 +250,7 @@ function narrativeBlockFromEvents(
   const status = narrativeStatus(events);
   const title = narrativeTitle(events, narrativeKind);
   const summary = summarizeAgentEvents(events);
+  const body = narrativeBody(events, narrativeKind);
   return {
     id: existingId ?? `${narrativeKind}-${first.id || index}`,
     kind: legacyKind,
@@ -252,8 +259,8 @@ function narrativeBlockFromEvents(
     summary,
     status,
     defaultCollapsed: narrativeDefaultCollapsed(narrativeKind, status),
-    bodyMarkdown: narrativeBody(events, narrativeKind),
-    displayHints: narrativeDisplayHints(narrativeKind, title, summary),
+    bodyMarkdown: body,
+    displayHints: narrativeDisplayHints(narrativeKind, status, title, summary, body),
     evidenceRefs: events.flatMap(eventEvidenceRefs),
     rawEventRefs: events.map(eventRefForAgentEvent),
     taskProjectionRef: shouldShowNarrativeInTaskList(narrativeKind) ? `task-${narrativeKind}-${first.id || index}` : undefined,
@@ -292,6 +299,9 @@ function narrativeKindForEvent(event: AgentEvent): AgentTimelineNarrativeKind {
   if (event.kind === 'assistant_msg') {
     const channel = stringValueFromPayload(event.payload, 'channel');
     if (channel === 'reasoning') return 'thinking';
+    if (channel === 'progress' && stringValueFromPayload(event.payload, 'source') === 'llm') {
+      return 'assistantNarration';
+    }
     if (channel === 'final') return 'assistantText';
     return 'operationEvidence';
   }
@@ -305,6 +315,7 @@ function legacyKindForNarrative(kind: AgentTimelineNarrativeKind): AgentTimeline
     case 'user':
       return 'user';
     case 'assistantText':
+    case 'assistantNarration':
       return 'assistant';
     case 'thinking':
       return 'thinking';
@@ -370,6 +381,7 @@ function narrativeTitle(events: AgentEvent[], kind: AgentTimelineNarrativeKind):
   const first = events[0];
   if (kind === 'user') return 'User';
   if (kind === 'assistantText') return 'DeepCode';
+  if (kind === 'assistantNarration') return 'DeepCode';
   if (kind === 'thinking') return 'Thinking';
   if (kind === 'operationEvidence') return firstNonEmpty(events, ['summary', 'toolName', 'name', 'stage']) ?? 'Operation evidence';
   if (kind === 'requirement') return firstNonEmpty(events, ['title', 'summary']) ?? 'Requirement';
@@ -397,24 +409,49 @@ function narrativeBody(events: AgentEvent[], kind: AgentTimelineNarrativeKind): 
 
 function narrativeDefaultCollapsed(kind: AgentTimelineNarrativeKind, status: AgentTimelineStatus): boolean {
   if (status === 'running' || status === 'waiting') return false;
+  if (kind === 'assistantNarration') return false;
   return kind === 'thinking' || kind === 'operationEvidence' || kind === 'permission';
 }
 
 function narrativeDisplayHints(
   kind: AgentTimelineNarrativeKind,
+  status: AgentTimelineStatus,
   title: string,
-  summary: string
+  summary: string,
+  body?: string
 ): AgentTimelineBlock['displayHints'] {
+  const textLength = (body ?? summary ?? '').length;
+  const renderMode = narrativeRenderMode(kind, status);
   return {
     density: kind === 'operationEvidence' ? 'compact' : 'normal',
     evidenceMode: kind === 'operationEvidence' ? 'collapsed' : 'inline',
+    renderMode,
+    initialOpen: status === 'running' || status === 'waiting' || kind === 'assistantNarration',
+    collapseAfterComplete: kind === 'thinking' || kind === 'operationEvidence',
+    typewriterSpeed: renderMode === 'accelerated'
+      ? 'fast'
+      : renderMode === 'typewriter'
+        ? (textLength > 1600 ? 'fast' : 'normal')
+        : undefined,
+    replaceOnComplete: kind === 'thinking',
     showInTaskList: shouldShowNarrativeInTaskList(kind),
     taskListLabel: title,
     taskListSummary: summary,
   };
 }
 
+function narrativeRenderMode(
+  kind: AgentTimelineNarrativeKind,
+  status: AgentTimelineStatus
+): NarrativeRenderMode {
+  if (kind === 'assistantNarration') return 'typewriter';
+  if (kind === 'assistantText') return 'typewriter';
+  if (kind === 'thinking') return status === 'running' || status === 'waiting' ? 'typewriter' : 'static';
+  return 'static';
+}
+
 function shouldShowNarrativeInTaskList(kind: AgentTimelineNarrativeKind): boolean {
+  if (kind === 'assistantNarration') return false;
   return kind === 'operationEvidence' ||
     kind === 'requirement' ||
     kind === 'plan' ||

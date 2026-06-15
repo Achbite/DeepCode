@@ -342,6 +342,7 @@ export interface PatchAgentWorkflowConfigRequest {
 export type AgentEventKind =
   | 'user_msg'
   | 'assistant_msg'
+  | 'cache_telemetry'
   | 'requirement_confirmation'
   | 'requirement_decision'
   | 'plan_card'
@@ -476,6 +477,7 @@ export type AgentTimelineBlockKind =
 export type AgentTimelineNarrativeKind =
   | 'user'
   | 'thinking'
+  | 'assistantNarration'
   | 'assistantText'
   | 'operationEvidence'
   | 'requirement'
@@ -496,6 +498,11 @@ export type AgentTimelineStatus =
 export interface AgentTimelineDisplayHints {
   density?: 'normal' | 'compact' | 'debug';
   evidenceMode?: 'inline' | 'collapsed' | 'debugOnly';
+  renderMode?: 'typewriter' | 'instant' | 'accelerated' | 'static';
+  initialOpen?: boolean;
+  collapseAfterComplete?: boolean;
+  typewriterSpeed?: 'slow' | 'normal' | 'fast';
+  replaceOnComplete?: boolean;
   showInTaskList?: boolean;
   taskListLabel?: string;
   taskListSummary?: string;

@@ -18,7 +18,7 @@ export function applyProviderCacheStrategy(input: ProviderCacheStrategyInput): P
   if (provider.includes('deepseek')) {
     return {
       semanticMode: 'deepseek-openai',
-      requestBody: { ...input.requestBody, prompt_cache_key: input.prefixHash },
+      requestBody: { ...input.requestBody },
       serverPromptCacheSupported: true,
     };
   }

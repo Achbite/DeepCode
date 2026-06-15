@@ -10,7 +10,12 @@ export type ActionKind =
   | 'command'
   | 'validation'
   | 'review'
-  | 'repair';
+  | 'repair'
+  | 'status'
+  | 'stage'
+  | 'unstage'
+  | 'commit'
+  | 'push';
 
 export interface CodeBlockDraft {
   id: string;
@@ -31,6 +36,7 @@ export interface PlannedActionDraft {
   conflictKeys: string[];
   purpose?: string;
   sourceBlockId?: string;
+  toolArgs?: Record<string, unknown>;
   permissionLabels?: string[];
   dependsOn?: string[];
 }
@@ -176,6 +182,7 @@ export interface ProposalEnvelope {
   sessionId?: string;
   source: ProposalEnvelopeSource;
   kind: ProposalEnvelopeKind;
+  narration?: string;
   payload: unknown;
   referencedResourcePacketRefs: string[];
   referencedEvidenceRefs: string[];

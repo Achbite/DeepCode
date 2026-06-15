@@ -13,6 +13,7 @@ export interface PromptSystemLayer {
     | 'currentUserOverlay'
     | 'authoritativeDocExcerpts'
     | 'memoryHints'
+    | 'currentWorkflowState'
     | 'currentRequirement'
     | 'resourceContext'
     | 'auditOnlyContext';

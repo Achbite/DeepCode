@@ -40,6 +40,7 @@ export function parseProposalEnvelope(input: ParseProposalEnvelopeInput): Propos
     sessionId: optionalString(envelope, 'sessionId') ?? input.sessionId,
     source: (optionalString(envelope, 'source') as ProposalEnvelopeSource | undefined) ?? input.source ?? 'llm',
     kind: kind as ProposalEnvelope['kind'],
+    narration: optionalString(envelope, 'narration'),
     payload: proposalPayload(envelope, kind, proposalId),
     referencedResourcePacketRefs: optionalStringArray(envelope, 'referencedResourcePacketRefs'),
     referencedEvidenceRefs: optionalStringArray(envelope, 'referencedEvidenceRefs'),

@@ -110,6 +110,7 @@ export interface LlmChatChunk {
 export interface LlmChatResult {
   chunks: LlmChatChunk[];
   assistantMessage?: LlmChatMessage;
+  usage?: Record<string, unknown>;
 }
 
 export interface LlmProbeRequest {

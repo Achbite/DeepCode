@@ -5,6 +5,9 @@ export interface ProviderCacheTelemetry {
   promptCacheHitTokens?: number;
   promptCacheMissTokens?: number;
   cachedTokens?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
   cacheHit?: boolean;
   cacheMissReason?: 'cold_start' | 'version_mismatch' | 'ttl_expired' | 'key_changed' | 'provider_unavailable';
 }

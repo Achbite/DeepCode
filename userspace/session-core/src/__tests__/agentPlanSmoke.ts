@@ -9,8 +9,18 @@ import type {
   LlmChatResult,
 } from '@deepcode/protocol';
 import {
+  agentConfigurableSettingsIndex,
+  agentSettingsIndex,
+  shellPreferenceSettingsIndex,
+  workspaceOverridableSettingsIndex,
+} from '@deepcode/protocol';
+import {
+  applyProviderCacheStrategy,
+  assembleContext,
   buildNarrativeTimelineProjection,
   buildPromptEnvelope,
+  buildSessionMemoryDocument,
+  buildSessionTaskGraph,
   createResourcePacket,
   parseProposalEnvelope,
   SessionDriver,
@@ -24,6 +34,11 @@ async function main(): Promise<void> {
   assertV3Parser();
   assertActionBundleProtocolFields();
   assertPromptEnvelope();
+  assertContextAssemblerCachePlan();
+  assertSessionMemoryDocument();
+  assertSessionTaskGraphProjection();
+  assertDeepSeekCacheStrategyDoesNotInjectRequestParameter();
+  assertSettingsCatalogBoundaries();
   assertNarrativeTimelineProjection();
   assertSessionDriverSkeleton();
   await assertSessionDriverLoop();
@@ -93,12 +108,14 @@ function assertV3Parser(): void {
     raw: JSON.stringify({
       schemaVersion: 'deepcode.agent.protocol.v3',
       kind: 'answer',
+      narration: 'This narration is ignored for final answer rendering.',
       outputLanguage: 'en-US',
       answer: { format: 'markdown', content: 'Generic answer.' },
     }),
   });
   assertEqual(answer.kind, 'answer', 'v3 answer parses');
   assertEqual(answer.runId, 'run-generic', 'v3 parser binds run id');
+  assertEqual(answer.narration, 'This narration is ignored for final answer rendering.', 'v3 parser preserves optional narration');
 
   const resourceRequest = parseProposalEnvelope({
     runId: 'run-generic',
@@ -219,12 +236,268 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('manifestEntry id=attachment-0-generic-file'), 'prompt exposes manifest entry ids');
   assert(prompt.dynamicSuffix.includes('Conversation roots'), 'prompt exposes conversation roots');
   assert(prompt.stablePrefix.includes('"path":"relative/path.ext"'), 'prompt documents path-based resourceRequest');
+  assert(prompt.stablePrefix.includes('optional top-level narration'), 'prompt documents model-generated narration');
   assert(prompt.stablePrefix.includes('Implementation batch budget'), 'prompt documents incremental implementation budget');
   assert(prompt.stablePrefix.includes('<systemStructure'), 'prompt includes the system structure layer');
   assert(prompt.stablePrefix.includes('black-box validation'), 'prompt treats tests as black-box validation');
   assert(prompt.stablePrefix.includes('Do not optimize for known tests'), 'prompt rejects test-specific optimization');
+  assert(!prompt.stablePrefix.includes('Current workflow state'), 'stable prefix excludes current workflow state');
+  assert(!prompt.stablePrefix.includes('Recent user turn'), 'stable prefix excludes session-local memory hints');
+  assert(prompt.dynamicSuffix.includes('Current workflow state: needProposal'), 'dynamic suffix carries current workflow state');
+  assert(prompt.dynamicSuffix.includes('Allowed proposals: answer, resourceRequest, actionBundle'), 'dynamic suffix carries allowed proposals');
+  assert(prompt.dynamicSuffix.includes('workspace.read'), 'dynamic suffix carries capability projection');
+  assert(prompt.dynamicLayerNames.includes('memoryHints'), 'memory hints are dynamic context');
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
   assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
+}
+
+function assertSettingsCatalogBoundaries(): void {
+  const sharedAgentKeys = new Set(agentSettingsIndex().map((entry) => entry.key));
+  const guiPreferenceKeys = new Set(shellPreferenceSettingsIndex('gui').map((entry) => entry.key));
+  const editorPreferenceKeys = new Set(shellPreferenceSettingsIndex('editor').map((entry) => entry.key));
+  const workspaceKeys = new Set(workspaceOverridableSettingsIndex().map((entry) => entry.key));
+  const agentConfigurableKeys = new Set(agentConfigurableSettingsIndex().map((entry) => entry.key));
+
+  assertEqual(sharedAgentKeys.has('agent.permissions.gitPush'), true, 'Git push policy is a shared Agent setting');
+  assertEqual(agentConfigurableKeys.has('agent.permissions.gitPush'), true, 'Agent can request shared Agent setting changes through audited config flow');
+  assertEqual(guiPreferenceKeys.has('gui.colorTheme'), true, 'GUI preferences use the gui namespace');
+  assertEqual(guiPreferenceKeys.has('workbench.colorTheme'), false, 'GUI preference index does not include editor workbench theme');
+  assertEqual(editorPreferenceKeys.has('gui.colorTheme'), false, 'Editor preference index does not include GUI theme');
+  assertEqual(workspaceKeys.has('agent.permissions.gitPush'), false, 'workspace overrides cannot change Agent security gates');
+  assertEqual(workspaceKeys.has('ruler.rules'), true, 'workspace overrides may provide project-level Ruler additions');
+}
+
+function assertContextAssemblerCachePlan(): void {
+  const manifest: ResourceManifest = {
+    id: 'manifest-cache-generic',
+    workspaceScopeKey: 'workspace-cache-generic',
+    entries: [],
+    budget: { maxEntries: 8, maxBytes: 8192 },
+    defaultDenyPatterns: [],
+  };
+  const memoryDocument = buildSessionMemoryDocument([
+    {
+      id: 'memory-user',
+      sessionId: 'session-cache',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_msg',
+      payload: { content: 'Analyze reusable context.' },
+    },
+  ]);
+  const base = assembleContext({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer', 'resourceRequest'],
+    capabilityCatalogSummary: 'workspace.read',
+    userRequest: 'Summarize the reusable context.',
+    memoryDocument,
+    initialContext: {
+      id: 'initial-cache-generic',
+      workspaceScopeKey: manifest.workspaceScopeKey,
+      manifest,
+    },
+    profile: {
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+    },
+    templateVersion: 'cache-plan-test',
+  });
+  const followUp = assembleContext({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer', 'resourceRequest'],
+    capabilityCatalogSummary: 'workspace.read',
+    userRequest: 'Answer a follow-up from the same reusable context.',
+    memoryDocument,
+    initialContext: {
+      id: 'initial-cache-generic',
+      workspaceScopeKey: manifest.workspaceScopeKey,
+      manifest,
+    },
+    profile: {
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+    },
+    templateVersion: 'cache-plan-test',
+  });
+
+  assertEqual(base.cachePlan.deepseekPrefixCache.requestParameterRequired, false, 'DeepSeek cache plan does not require request parameters');
+  assertEqual(base.cachePlan.cacheAffectsCorrectness, false, 'cache plan is observability only');
+  assertEqual(base.cachePlan.stablePrefixHash, followUp.cachePlan.stablePrefixHash, 'same stable layers keep stable prefix hash');
+  assert(base.cachePlan.dynamicSuffixHash !== followUp.cachePlan.dynamicSuffixHash, 'current request changes dynamic suffix hash');
+  assert(base.cachePlan.cacheHash !== followUp.cachePlan.cacheHash, 'overall cache hash changes with the dynamic suffix');
+  assert(!base.prompt.stablePrefix.includes('Summarize the reusable context.'), 'stable prefix excludes current user request');
+  assert(base.prompt.dynamicSuffix.includes('Summarize the reusable context.'), 'dynamic suffix carries current user request');
+}
+
+function assertSessionMemoryDocument(): void {
+  const document = buildSessionMemoryDocument([
+    {
+      id: 'memory-user',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_msg',
+      payload: {
+        content: 'Analyze a generic attachment.',
+        attachments: [{ kind: 'directory', path: 'generic-attachment', scope: 'message' }],
+      },
+    },
+    {
+      id: 'memory-plan',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:01.000Z',
+      kind: 'plan_card',
+      payload: { summary: 'Read a generic overview before proposing changes.' },
+    },
+    {
+      id: 'memory-tool',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:02.000Z',
+      kind: 'tool_result',
+      payload: {
+        toolName: 'fs.read',
+        summary: 'Read a generic source file.',
+        output: {
+          items: [{
+            manifestEntryId: 'entry-generic',
+            contentKind: 'fileText',
+            absolutePath: '/tmp/generic/source.txt',
+          }],
+        },
+      },
+    },
+    {
+      id: 'memory-review',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:03.000Z',
+      kind: 'review_summary',
+      payload: {
+        status: 'accepted',
+        content: 'The generic batch is accepted.',
+        facts: ['Kernel recorded the generic write fact.'],
+      },
+    },
+  ]);
+
+  assertEqual(document.schemaVersion, '1', 'memory document is versioned');
+  assert(document.intentContext.some((item) => item.includes('User request')), 'memory records user intent');
+  assert(document.intentContext.some((item) => item.includes('Plan intent')), 'memory records plan intent as intent context');
+  assert(document.factContext.some((item) => item.includes('Resource/tool fact fs.read')), 'memory records tool summaries as facts');
+  assert(document.factContext.some((item) => item.includes('ResourcePacket fact')), 'memory records resource packet facts');
+  assert(document.factContext.some((item) => item.includes('Review fact')), 'memory records review facts');
+  assert(document.decisionContext.some((item) => item.includes('Review decision: accepted')), 'memory records review decisions');
+  assert(document.resourceContext.some((item) => item.includes('Attached resource')), 'memory records reusable attachment facts');
+  assertEqual(document.factContext.some((item) => item.includes('Plan intent')), false, 'plan intent does not enter factContext');
+}
+
+function assertSessionTaskGraphProjection(): void {
+  const events: AgentEvent[] = [
+    {
+      id: 'task-requirement',
+      sessionId: 'session-task',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'requirement_confirmation',
+      payload: { status: 'pending', summary: 'Confirm a generic requirement.' },
+    },
+    {
+      id: 'task-requirement-decision',
+      sessionId: 'session-task',
+      ts: '2026-01-01T00:00:01.000Z',
+      kind: 'requirement_decision',
+      payload: { decision: 'accept', summary: 'Proceed with the generic requirement.' },
+    },
+    {
+      id: 'task-tool-call',
+      sessionId: 'session-task',
+      ts: '2026-01-01T00:00:02.000Z',
+      kind: 'tool_call',
+      payload: { toolName: 'fs.list', callId: 'list-generic', summary: 'List generic resources.' },
+    },
+    {
+      id: 'task-tool-result',
+      sessionId: 'session-task',
+      ts: '2026-01-01T00:00:03.000Z',
+      kind: 'tool_result',
+      payload: { toolName: 'fs.list', callId: 'list-generic', status: 'completed', summary: 'Listed generic resources.' },
+    },
+    {
+      id: 'task-plan',
+      sessionId: 'session-task',
+      ts: '2026-01-01T00:00:04.000Z',
+      kind: 'plan_card',
+      payload: { summary: 'Plan a generic reviewable batch.' },
+    },
+    {
+      id: 'task-permission',
+      sessionId: 'session-task',
+      ts: '2026-01-01T00:00:05.000Z',
+      kind: 'permission_request',
+      payload: { status: 'pending', summary: 'User decision is required.' },
+    },
+    {
+      id: 'task-review',
+      sessionId: 'session-task',
+      ts: '2026-01-01T00:00:06.000Z',
+      kind: 'review_summary',
+      payload: {
+        status: 'waitingUserReview',
+        content: 'Review a generic batch.',
+        continuations: [{ id: 'continue-generic', title: 'Continue generic work.' }],
+      },
+    },
+    {
+      id: 'task-answer',
+      sessionId: 'session-task',
+      ts: '2026-01-01T00:00:07.000Z',
+      kind: 'assistant_msg',
+      payload: { channel: 'final', content: 'Generic final answer.' },
+    },
+  ];
+  const graph = buildSessionTaskGraph({
+    sessionId: 'session-task',
+    runId: 'run-task',
+    events,
+    stateContract: {
+      runId: 'run-task',
+      stateId: 'needProposal',
+      stateKind: 'driverRequest',
+      allowedInputs: ['proposalSubmit'],
+      allowedProposals: ['answer', 'resourceRequest', 'actionBundle'],
+      proposalSchemaRefs: ['deepcode.agent.protocol.v3'],
+      capabilityProjection: ['workspace.read'],
+    },
+    driverRequest: {
+      id: 'driver-task',
+      runId: 'run-task',
+      sessionId: 'session-task',
+      kind: 'needProposal',
+      reason: 'Need a generic proposal.',
+    },
+  });
+
+  assertEqual(graph.schemaVersion, '1', 'task graph is versioned');
+  assertEqual(graph.stateContractRef?.stateId, 'needProposal', 'task graph carries state contract refs');
+  assertEqual(graph.driverRequestRef?.id, 'driver-task', 'task graph carries driver request refs');
+  assertEqual(taskStatus(graph, 'requirement'), 'completed', 'requirement task completes after user decision');
+  assertEqual(taskStatus(graph, 'resource-list-generic'), 'completed', 'resource task completes after tool result');
+  assertEqual(taskStatus(graph, 'waiting-user'), 'waiting', 'permission task waits for user input');
+  assertEqual(taskStatus(graph, 'review'), 'running', 'waiting review remains visible as active work');
+  assertEqual(taskStatus(graph, 'continuation'), 'queued', 'continuation intent is queued after review facts');
+  assertEqual(taskStatus(graph, 'analysis'), 'completed', 'final answer completes analysis task');
+}
+
+function assertDeepSeekCacheStrategyDoesNotInjectRequestParameter(): void {
+  const result = applyProviderCacheStrategy({
+    provider: 'deepseek',
+    model: 'deepseek-chat',
+    prefixHash: 'fnv1a32:generic',
+    requestBody: {
+      model: 'deepseek-chat',
+      messages: [{ role: 'user', content: 'generic' }],
+    },
+  });
+  assertEqual(result.semanticMode, 'deepseek-openai', 'DeepSeek keeps OpenAI-compatible semantic mode');
+  assertEqual(result.serverPromptCacheSupported, true, 'DeepSeek server prompt cache is marked as supported');
+  assertEqual(Object.prototype.hasOwnProperty.call(result.requestBody, 'prompt_cache_key'), false, 'DeepSeek request body does not include prompt_cache_key');
+  assertEqual(Object.prototype.hasOwnProperty.call(result.requestBody, 'cache_control'), false, 'DeepSeek request body does not include cache_control');
 }
 
 function assertNarrativeTimelineProjection(): void {
@@ -242,6 +515,34 @@ function assertNarrativeTimelineProjection(): void {
       ts: '2026-01-01T00:00:01.000Z',
       kind: 'assistant_msg',
       payload: { channel: 'reasoning', content: 'Need generic context.' },
+    },
+    {
+      id: 'event-progress',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:01.500Z',
+      kind: 'assistant_msg',
+      payload: { channel: 'progress', source: 'llm', content: 'I will resolve the selected resource before continuing.' },
+    },
+    {
+      id: 'event-progress-session',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:01.600Z',
+      kind: 'assistant_msg',
+      payload: { channel: 'progress', source: 'session', content: 'Session-local progress does not become narration.' },
+    },
+    {
+      id: 'event-cache',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:01.750Z',
+      kind: 'cache_telemetry',
+      payload: {
+        provider: 'deepseek-v4-pro-openai',
+        promptCacheHitTokens: 80,
+        promptCacheMissTokens: 20,
+        promptTokens: 100,
+        completionTokens: 12,
+        totalTokens: 112,
+      },
     },
     {
       id: 'event-tool',
@@ -281,6 +582,7 @@ function assertNarrativeTimelineProjection(): void {
   const kinds = projection.turns[0].blocks.map((block) => block.narrativeKind);
   assertEqual(kinds.includes('user'), true, 'user block is projected');
   assertEqual(kinds.includes('thinking'), true, 'thinking block is projected');
+  assertEqual(kinds.includes('assistantNarration'), true, 'llm progress assistant messages become narration');
   assertEqual(kinds.includes('operationEvidence'), true, 'tool facts become operation evidence');
   assertEqual(kinds.includes('plan'), true, 'plan facts become a plan block');
   assertEqual(kinds.includes('assistantText'), true, 'final answer becomes assistant text');
@@ -288,6 +590,20 @@ function assertNarrativeTimelineProjection(): void {
     projection.taskProjection?.items.some((item) => item.narrativeKind === 'operationEvidence'),
     true,
     'task projection is derived from narrative blocks'
+  );
+  assertEqual(
+    projection.taskProjection?.items.some((item) => item.narrativeKind === 'assistantNarration'),
+    false,
+    'assistant narration does not enter task projection'
+  );
+  const narrationBlock = projection.turns[0].blocks.find((block) => block.narrativeKind === 'assistantNarration');
+  assertEqual(narrationBlock?.displayHints?.renderMode, 'typewriter', 'assistant narration uses typewriter projection hints');
+  const thinkingBlock = projection.turns[0].blocks.find((block) => block.narrativeKind === 'thinking');
+  assertEqual(Boolean(thinkingBlock?.displayHints?.replaceOnComplete), true, 'thinking exposes replacement/collapse projection hints');
+  assertEqual(
+    projection.turns[0].blocks.some((block) => block.events.some((event) => event.kind === 'cache_telemetry')),
+    false,
+    'cache telemetry is hidden from narrative blocks'
   );
   assertEqual(
     projection.turns[0].blocks.some((block) => block.evidenceRefs?.includes('evidence-generic')),
@@ -1338,6 +1654,10 @@ function assertThrows(fn: () => unknown, expectedMessage: string): void {
     throw error;
   }
   throw new Error(`expected function to throw: ${expectedMessage}`);
+}
+
+function taskStatus(graph: ReturnType<typeof buildSessionTaskGraph>, id: string): string | undefined {
+  return graph.tasks.find((task) => task.id === id)?.status;
 }
 
 main().catch((error) => {

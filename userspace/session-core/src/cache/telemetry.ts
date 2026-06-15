@@ -8,6 +8,9 @@ export interface CacheTelemetryEvent {
   promptCacheHitTokens?: number;
   promptCacheMissTokens?: number;
   cachedTokens?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
 }
 
 export function providerTelemetryFromUsage(input: {
@@ -21,6 +24,9 @@ export function providerTelemetryFromUsage(input: {
     promptCacheHitTokens: numberField(input.usage, 'prompt_cache_hit_tokens'),
     promptCacheMissTokens: numberField(input.usage, 'prompt_cache_miss_tokens'),
     cachedTokens: numberField(input.usage, 'cached_tokens'),
+    promptTokens: numberField(input.usage, 'prompt_tokens'),
+    completionTokens: numberField(input.usage, 'completion_tokens'),
+    totalTokens: numberField(input.usage, 'total_tokens'),
     cacheHit: input.cacheHit,
     cacheMissReason: input.cacheMissReason,
   };

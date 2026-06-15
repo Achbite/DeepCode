@@ -25,10 +25,11 @@ import type {
   ResourcePacket,
   ResourcePacketItem,
 } from '../context/types.js';
-import { buildPromptEnvelope } from '../prompt/builder.js';
+import { assembleContext, buildSessionMemoryDocument, renderSessionMemoryHints, type PromptCachePlan, type SessionMemoryDocument } from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
 import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
+import { buildSessionTaskGraph, type SessionTaskGraph } from '../workflow/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 
 export interface SessionDriverLoopPorts {
@@ -81,7 +82,10 @@ interface SessionDriverLoopRunState {
   conversationRoots: ConversationResourceRoot[];
   initialContext: InitialContextPacket;
   resourcePackets: ResourcePacket[];
+  memoryDocument: SessionMemoryDocument;
   memoryHints: string[];
+  taskGraph: SessionTaskGraph;
+  cachePlan?: PromptCachePlan;
   implementationBatch: ImplementationBatchContext;
   resourceRequestRepairAttempted: boolean;
   planReviewRepairAttempted: boolean;
@@ -120,6 +124,8 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
   'process.exec',
   'network.egress',
   'git.write',
+  'git.push',
+  'config.modify',
   'browser.control',
 ]);
 
@@ -175,6 +181,7 @@ export class SessionDriverLoop {
 
     const manifestBuild = createManifest(input, this.id('resource-manifest'));
     const implementationBatch = buildImplementationBatchContext(input.existingEvents ?? []);
+    const memoryDocument = buildSessionMemoryDocument(input.existingEvents ?? []);
     const state: SessionDriverLoopRunState = {
       sessionId,
       runId,
@@ -190,10 +197,18 @@ export class SessionDriverLoop {
         manifest: manifestBuild.manifest,
       },
       resourcePackets: [],
+      memoryDocument,
       memoryHints: [
-        ...buildSessionMemoryDocument(input.existingEvents ?? []),
+        ...renderSessionMemoryHints(memoryDocument),
         ...implementationBatchHints(implementationBatch),
       ],
+      taskGraph: buildSessionTaskGraph({
+        sessionId,
+        runId,
+        events: input.existingEvents ?? [],
+        stateContract,
+        driverRequest,
+      }),
       implementationBatch,
       resourceRequestRepairAttempted: false,
       planReviewRepairAttempted: false,
@@ -225,7 +240,14 @@ export class SessionDriverLoop {
 
     let rounds = 0;
     while (rounds <= MAX_RESOURCE_ROUNDS) {
-      const prompt = buildPromptEnvelope({
+      state.taskGraph = buildSessionTaskGraph({
+        sessionId,
+        runId: state.runId,
+        events: lastResult.events,
+        stateContract: state.stateContract,
+        driverRequest: state.driverRequest,
+      });
+      const assembledContext = assembleContext({
         workflowState: state.stateContract?.stateId ?? state.driverRequest?.kind ?? 'needProposal',
         allowedProposals: state.stateContract?.allowedProposals ?? [
           'answer',
@@ -235,7 +257,8 @@ export class SessionDriverLoop {
           'diagnostic',
         ],
         capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
-        memoryHints: state.memoryHints,
+        memoryDocument: state.memoryDocument,
+        extraMemoryHints: implementationBatchHints(state.implementationBatch),
         userRequest: input.content,
         initialContext: state.initialContext,
         resourcePackets: state.resourcePackets,
@@ -246,6 +269,8 @@ export class SessionDriverLoop {
           sessionId,
         },
       });
+      state.cachePlan = assembledContext.cachePlan;
+      const prompt = assembledContext.prompt;
       let proposal: ProposalEnvelope;
       try {
         proposal = await this.callProviderAndParse(input, state, prompt);
@@ -261,6 +286,10 @@ export class SessionDriverLoop {
           ]);
         }
         throw error;
+      }
+      const narration = proposalNarrationEvent(sessionId, proposal, this.ts(), this.id('progress-model-narration'));
+      if (narration) {
+        lastResult = await this.append(sessionId, [narration]);
       }
       if (proposal.kind === 'answer') {
         return this.append(sessionId, [answerEvent(sessionId, proposal, this.ts(), this.id('answer'))]);
@@ -586,11 +615,12 @@ export class SessionDriverLoop {
     input: SessionDriverLoopInput,
     state: SessionDriverLoopRunState
   ): Promise<AgentEvent> {
-    const prompt = buildPromptEnvelope({
+    const assembledContext = assembleContext({
       workflowState: 'needDecisionRequest',
       allowedProposals: ['decisionRequest'],
       capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
-      memoryHints: state.memoryHints,
+      memoryDocument: state.memoryDocument,
+      extraMemoryHints: state.memoryHints,
       userOverlay: [
         'Before proposing side-effect work, request user intervention only if a concrete decision is needed.',
         'Return kind="decisionRequest" only.',
@@ -606,6 +636,8 @@ export class SessionDriverLoop {
         sessionId: state.sessionId,
       },
     });
+    state.cachePlan = assembledContext.cachePlan;
+    const prompt = assembledContext.prompt;
     const proposal = await this.callProviderAndParse(input, state, prompt);
     if (proposal.kind !== 'decisionRequest') {
       throw new SessionDriverLoopError(
@@ -761,6 +793,7 @@ export class SessionDriverLoop {
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
+    const actionBundle = readActionBundle(proposal);
     const proposalReply = await this.kernel({
       command: {
         kind: 'proposalSubmit',
@@ -770,7 +803,6 @@ export class SessionDriverLoop {
         proposal,
       },
     });
-    const actionBundle = readActionBundle(proposal);
     if (!actionBundle) return await this.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? fallback;
     const reviewReport = findPlanReviewReport(proposalReply.events);
     await this.appendProviderTrace(state, 'plan_review_report', {
@@ -891,17 +923,39 @@ export class SessionDriverLoop {
         this.id(`thinking-${stage}`)
       ),
     ]);
-    await this.appendProviderTrace(state, `${stage}.request`, { profileId, messages });
+    await this.appendProviderTrace(state, `${stage}.request`, {
+      profileId,
+      messages,
+      cachePlan: state.cachePlan,
+      taskGraph: state.taskGraph,
+    });
     const result = await this.ports.llmChat({
       profileId,
       messages,
       responseFormat: { type: 'json_object' },
+      providerOptions: {
+        deepcode: {
+          cachePlan: state.cachePlan,
+          taskGraph: state.taskGraph,
+        },
+      },
     });
     if (!result.ok || !result.data) {
       throw new SessionDriverLoopError(
         'llm_chat_failed',
         result.message ?? result.error ?? 'LLM provider request failed.'
       );
+    }
+    const cacheEvent = cacheTelemetryEvent(
+      state.sessionId,
+      profileId,
+      stage,
+      result.data,
+      this.ts(),
+      this.id(`cache-${stage}`)
+    );
+    if (cacheEvent) {
+      await this.append(state.sessionId, [cacheEvent]);
     }
     await this.appendProviderTrace(state, `${stage}.response`, result.data);
     const reasoning = collectReasoning(result.data);
@@ -1147,126 +1201,6 @@ function recentAttachmentFacts(events: AgentEvent[]): AgentContextAttachment[] {
     }
   }
   return output;
-}
-
-function buildSessionMemoryDocument(events: AgentEvent[]): string[] {
-  const intentContext: string[] = [];
-  const factContext: string[] = [];
-  const decisionContext: string[] = [];
-
-  for (const event of events.slice(-40)) {
-    const payload = event.payload;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) continue;
-    const record = payload as Record<string, unknown>;
-
-    if (event.kind === 'user_msg') {
-      const content = typeof record.content === 'string' ? record.content.trim() : '';
-      const attachments = Array.isArray(record.attachments)
-        ? record.attachments
-          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-          .map((item) => `${String(item.kind ?? 'resource')}:${String(item.path ?? item.absolutePath ?? '')}`)
-          .filter((item) => item.trim().length > 0)
-        : [];
-      if (content) intentContext.push(`User request: ${clip(content, 300)}${attachments.length ? ` attachments=${attachments.join(', ')}` : ''}`);
-    }
-
-    if (event.kind === 'requirement_confirmation') {
-      const status = stringValue(record.status) ?? 'pending';
-      const summary = stringValue(record.summary) ?? stringValue(record.content) ?? '';
-      if (summary.trim()) intentContext.push(`Requirement draft (${status}): ${clip(summary.trim(), 300)}`);
-    }
-
-    if (event.kind === 'plan_card') {
-      const summary = stringValue(record.summary) ?? stringValue(record.content) ?? '';
-      if (summary.trim()) intentContext.push(`Plan intent: ${clip(summary.trim(), 320)}`);
-      const actionBundle = objectRecord(record.actionBundle);
-      const continuations = Array.isArray(actionBundle?.continuationExpectations)
-        ? actionBundle.continuationExpectations
-        : [];
-      for (const continuation of continuations.slice(0, 4)) {
-        const text = continuationSummary(continuation);
-        if (text) intentContext.push(`Continuation intent: ${clip(text, 240)}`);
-      }
-    }
-
-    if (event.kind === 'review_summary') {
-      const status = stringValue(record.status) ?? 'unknown';
-      const content = stringValue(record.content) ?? stringValue(record.summary) ?? '';
-      if (content.trim()) {
-        const target = status === 'waitingUserReview' ? intentContext : decisionContext;
-        target.push(`Review ${status}: ${clip(content.trim(), 360)}`);
-      }
-      const facts = Array.isArray(record.facts) ? record.facts.filter((item): item is string => typeof item === 'string') : [];
-      for (const fact of facts.slice(0, 8)) factContext.push(`Review fact: ${clip(fact, 260)}`);
-      if (status === 'accepted' || status === 'needsRevision' || status === 'rejected') {
-        decisionContext.push(`Review decision: ${status}${content.trim() ? ` guidance=${clip(content.trim(), 240)}` : ''}`);
-      }
-    }
-
-    if (event.kind === 'requirement_decision' || event.kind === 'plan_review') {
-      const status = stringValue(record.status) ?? stringValue(record.decision) ?? 'unknown';
-      const summary = stringValue(record.summary) ?? stringValue(record.content) ?? '';
-      decisionContext.push(`${event.kind}: ${status}${summary.trim() ? ` ${clip(summary.trim(), 240)}` : ''}`);
-    }
-
-    if (event.kind === 'assistant_msg') {
-      const channel = typeof record.channel === 'string' ? record.channel : '';
-      if (channel && channel !== 'final') continue;
-      const content = typeof record.content === 'string' ? record.content.trim() : '';
-      if (content) intentContext.push(`Assistant final: ${clip(content, 260)}`);
-    }
-
-    if (event.kind === 'tool_result') {
-      const toolName = stringValue(record.toolName) ?? 'tool';
-      const summary = stringValue(record.summary) ?? '';
-      if (summary.trim()) factContext.push(`Resource/tool fact ${toolName}: ${clip(summary.trim(), 260)}`);
-      const output = objectRecord(record.output);
-      if (output) {
-        const items = Array.isArray(output.items) ? output.items : [];
-        for (const item of items.slice(0, 6)) {
-          const resource = objectRecord(item);
-          const path = stringValue(resource?.path) ?? stringValue(resource?.absolutePath) ?? stringValue(resource?.manifestEntryId);
-          const kind = stringValue(resource?.contentKind) ?? stringValue(resource?.resolvedKind) ?? 'resource';
-          if (path) factContext.push(`ResourcePacket fact: ${kind} ${clip(path, 220)}`);
-        }
-      }
-    }
-
-    if (event.kind === 'workflow_stage') {
-      const kernelEvent = objectRecord(record.kernelEvent);
-      if (!kernelEvent) continue;
-      const kind = stringValue(kernelEvent?.kind);
-      if (kind === 'tool.completed') {
-        const ok = kernelEvent?.ok === true;
-        const output = objectRecord(kernelEvent.output);
-        const path = stringValue(output?.path) ?? stringValue(output?.absolutePath);
-        const validation = objectRecord(output?.validation);
-        const validationKind = stringValue(validation?.kind);
-        factContext.push(`ToolCompleted fact: ok=${ok}${path ? ` path=${clip(path, 220)}` : ''}${validationKind ? ` validation=${validationKind}` : ''}`);
-      }
-      if (kind === 'work_unit.completed' || kind === 'work_unit.failed' || kind === 'work_unit.blocked') {
-        const workUnitId = stringValue(kernelEvent?.workUnitId);
-        const output = objectRecord(kernelEvent?.output);
-        const path = stringValue(output?.path) ?? stringValue(output?.absolutePath);
-        factContext.push(`WorkUnit fact: ${kind}${workUnitId ? ` id=${clip(workUnitId, 160)}` : ''}${path ? ` path=${clip(path, 220)}` : ''}`);
-      }
-    }
-  }
-
-  const hints = [
-    'Session short-term memory document:',
-    'Boundary: intentContext is not evidence; factContext is the only generated-file evidence; decisionContext records user decisions and guidance.',
-    intentContext.length
-      ? `intentContext:\n${intentContext.slice(-10).map((item) => `- ${item}`).join('\n')}`
-      : 'intentContext: none',
-    factContext.length
-      ? `factContext:\n${factContext.slice(-14).map((item) => `- ${item}`).join('\n')}`
-      : 'factContext: none',
-    decisionContext.length
-      ? `decisionContext:\n${decisionContext.slice(-10).map((item) => `- ${item}`).join('\n')}`
-      : 'decisionContext: none',
-  ];
-  return hints;
 }
 
 function buildImplementationBatchContext(events: AgentEvent[]): ImplementationBatchContext {
@@ -2289,7 +2223,8 @@ function temporaryGrant(plan: SessionPlanContext, capability: string, resourcePa
 
 function resourceKindForCapability(capability: string): string {
   if (['workspace.write', 'workspace.delete', 'workspace.rename', 'workspace.create'].includes(capability)) return 'workspaceFile';
-  if (capability === 'git.write') return 'git';
+  if (capability === 'git.write' || capability === 'git.push') return 'git';
+  if (capability === 'config.modify') return 'config';
   if (capability === 'process.exec') return 'process';
   if (capability === 'network.egress') return 'network';
   if (capability === 'browser.control') return 'browser';
@@ -2306,6 +2241,7 @@ function reviewSummaryEvent(
 ): AgentEvent {
   const facts = reviewFactLines(kernelEvents);
   const reviewFacts = findReviewFacts(kernelEvents);
+  const gitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
   const completed = reviewFacts
     ? arrayLength(reviewFacts.completedWorkUnits)
     : kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.completed').length;
@@ -2330,7 +2266,7 @@ function reviewSummaryEvent(
     payload: {
       title: 'Review',
       summary,
-      content: waitingReviewContent(plan, facts, summary, completed, failed, blocked, toolResults, continuations),
+      content: waitingReviewContent(plan, facts, summary, completed, failed, blocked, toolResults, continuations, gitReview),
       status: 'waitingUserReview',
       runId: plan.runId,
       reviewId: `${plan.runId}:${plan.planId}`,
@@ -2341,6 +2277,7 @@ function reviewSummaryEvent(
       continuations,
       reviewExpectations: Array.isArray(plan.actionBundle.reviewExpectations) ? plan.actionBundle.reviewExpectations : [],
       reviewFacts,
+      gitReview,
       facts,
       factCounts: {
         workUnitsCompleted: completed,
@@ -2363,9 +2300,11 @@ function waitingReviewContent(
   failed: number,
   blocked: number,
   toolResults: number,
-  continuations: unknown[]
+  continuations: unknown[],
+  gitReview?: Record<string, unknown>
 ): string {
   const reviewLines = reviewExpectationLines(plan);
+  const gitLines = gitReviewSummaryLines(gitReview);
   return [
     '## Review',
     '',
@@ -2379,6 +2318,9 @@ function waitingReviewContent(
     '',
     '### Kernel facts',
     facts.length ? facts.join('\n') : '- 当前批次没有可展示的 Kernel facts。',
+    '',
+    '### Git 变更',
+    gitLines.length ? gitLines.join('\n') : '- 当前没有可展示的 Git 变更事实。',
     '',
     '### 原计划摘要',
     clip(plan.userPlan, 1200),
@@ -2394,6 +2336,34 @@ function waitingReviewContent(
       ? `- 当前计划登记了 ${continuations.length} 个后续意图；Review 通过只记录这些意图，不会自动生成或执行下一批。需要继续时，请在输入框明确描述下一步。`
       : '- 当前计划没有登记后续批次。',
   ].join('\n');
+}
+
+function gitReviewSummaryLines(gitReview?: Record<string, unknown>): string[] {
+  if (!gitReview) return [];
+  if (gitReview.available === false) {
+    const reason = stringValue(gitReview.reason) ?? 'Git review is unavailable.';
+    return [`- Git diff 不可用：${reason}`];
+  }
+  const lines: string[] = [];
+  const summary = stringValue(gitReview.summary);
+  if (summary) lines.push(`- ${summary}`);
+  const stats = objectRecord(gitReview.stats);
+  const changedFiles = typeof stats?.changedFiles === 'number' ? stats.changedFiles : undefined;
+  const stagedBytes = typeof stats?.stagedDiffBytes === 'number' ? stats.stagedDiffBytes : 0;
+  const unstagedBytes = typeof stats?.unstagedDiffBytes === 'number' ? stats.unstagedDiffBytes : 0;
+  if (changedFiles !== undefined) {
+    lines.push(`- 文件数：${changedFiles}；staged diff：${stagedBytes} bytes；unstaged diff：${unstagedBytes} bytes。`);
+  }
+  const files = Array.isArray(gitReview.files) ? gitReview.files : [];
+  for (const item of files.slice(0, 12)) {
+    const record = objectRecord(item);
+    const path = stringValue(record?.path);
+    if (path) lines.push(`- \`${path}\``);
+  }
+  if (files.length > 12) lines.push(`- 另有 ${files.length - 12} 个文件未在摘要中展开。`);
+  const diffBlocks = Array.isArray(gitReview.diffBlocks) ? gitReview.diffBlocks : [];
+  if (diffBlocks.length) lines.push('- 完整 diff 已附加为可折叠 Review 证据。');
+  return lines;
 }
 
 function reviewFactLines(kernelEvents: unknown[]): string[] {
@@ -3001,6 +2971,81 @@ function collectReasoning(result: LlmChatResult): string {
     .map((chunk) => chunk.content)
     .join('');
   return result.assistantMessage?.reasoningContent ?? chunks;
+}
+
+function proposalNarrationEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent | null {
+  if (proposal.source !== 'llm') return null;
+  if (proposal.kind === 'answer') return null;
+  const content = proposal.narration?.trim();
+  if (!content) return null;
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'assistant_msg',
+    payload: {
+      content,
+      channel: 'progress',
+      source: 'llm',
+      visibility: 'conversation',
+      presentation: 'body',
+      label: 'DeepCode',
+      proposalId: proposal.proposalId,
+    },
+  };
+}
+
+function planInitialUserRequest(plan: SessionPlanContext): string {
+  return plan.userPlan;
+}
+
+function cacheTelemetryEvent(
+  sessionId: string,
+  profileId: string | undefined,
+  stage: string,
+  result: LlmChatResult,
+  ts: string,
+  id: string
+): AgentEvent | null {
+  const usage = objectRecord(result.usage);
+  const promptCacheHitTokens = numberValue(usage?.prompt_cache_hit_tokens);
+  const promptCacheMissTokens = numberValue(usage?.prompt_cache_miss_tokens);
+  const cachedTokens = numberValue(usage?.cached_tokens);
+  const promptTokens = numberValue(usage?.prompt_tokens);
+  const completionTokens = numberValue(usage?.completion_tokens);
+  const totalTokens = numberValue(usage?.total_tokens);
+  if (
+    promptCacheHitTokens === undefined &&
+    promptCacheMissTokens === undefined &&
+    cachedTokens === undefined &&
+    promptTokens === undefined &&
+    completionTokens === undefined &&
+    totalTokens === undefined
+  ) {
+    return null;
+  }
+
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'cache_telemetry',
+    payload: {
+      provider: profileId ?? 'unknown',
+      stage,
+      promptCacheHitTokens,
+      promptCacheMissTokens,
+      cachedTokens,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      cacheAffectsCorrectness: false,
+    },
+  };
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function providerStageSummary(stage: string, phase: 'request' | 'response'): string {
