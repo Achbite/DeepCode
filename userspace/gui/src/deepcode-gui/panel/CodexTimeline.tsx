@@ -6,6 +6,7 @@ import type {
   AgentTimelineResult,
   AgentTimelineTurn,
 } from '@deepcode/protocol';
+import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
 import { t, type UiLanguage } from '../../i18n';
 import { submitAgentFeedback } from '../../services/runtimeAdapter';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
@@ -31,10 +32,16 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
   onPlanResolve,
 }) => {
   const fallbackTimeline = useMemo(
-    () => localFallbackTimeline(fallbackEvents),
+    () => buildNarrativeTimelineProjection({
+      sessionId: fallbackEvents[0]?.sessionId ?? 'session',
+      events: fallbackEvents,
+    }),
     [fallbackEvents]
   );
-  const view = timeline ?? fallbackTimeline;
+  const view = useMemo(
+    () => normalizeNarrativeTimeline(timeline ?? fallbackTimeline),
+    [fallbackTimeline, timeline]
+  );
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLElement | null>(null);
@@ -98,6 +105,18 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
 
     scrollToTimelineEnd();
   }, [loading, scrollSignature, scrollToTimelineEnd]);
+
+  useEffect(() => {
+    const target = timelineRef.current;
+    if (!target || typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(() => {
+      if (loading || shouldFollowRef.current) {
+        scrollToTimelineEnd();
+      }
+    });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [loading, scrollToTimelineEnd]);
 
   return (
     <div className="codex-timeline" ref={timelineRef}>
@@ -201,10 +220,21 @@ function useAssistantTypewriterBlockIds(
 function collectAssistantBlockIds(view: AgentTimelineResult): string[] {
   return view.turns.flatMap((turn) =>
     turn.blocks
-      .filter((block) => block.kind === 'assistant')
+      .filter((block) => block.kind === 'assistant' || block.narrativeKind === 'assistantText')
       .filter((block) => (block.bodyMarkdown ?? block.summary ?? '').trim().length > 0)
       .map((block) => block.id)
   );
+}
+
+function normalizeNarrativeTimeline(view: AgentTimelineResult): AgentTimelineResult {
+  if (view.schemaVersion === 'deepcode.session.timeline.v1') return view;
+  const events = view.turns.flatMap((turn) => turn.blocks.flatMap((block) => block.events));
+  if (events.length === 0) return view;
+  return buildNarrativeTimelineProjection({
+    sessionId: view.sessionId,
+    events,
+    generatedAt: view.generatedAt,
+  });
 }
 
 const TurnCard: React.FC<{
@@ -214,7 +244,7 @@ const TurnCard: React.FC<{
   onPlanResolve?: CodexTimelineProps['onPlanResolve'];
 }> = ({ turn, language, typewriterBlockIds, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
-  const blocks = orderedTurnBlocks(turn.blocks);
+  const blocks = turn.blocks;
 
   return (
     <section className={`codex-turn codex-turn--${turn.status}`}>
@@ -385,53 +415,18 @@ const CodexAttachmentChips: React.FC<{
   );
 };
 
-function orderedTurnBlocks(blocks: AgentTimelineBlock[]): AgentTimelineBlock[] {
-  return blocks
-    .map((block, index) => ({ block, index }))
-    .sort((left, right) => {
-      const priorityDelta = timelineBlockPriority(left.block.kind) - timelineBlockPriority(right.block.kind);
-      return priorityDelta || left.index - right.index;
-    })
-    .map((entry) => entry.block);
-}
-
-function timelineBlockPriority(kind: AgentTimelineBlock['kind']): number {
-  switch (kind) {
-    case 'user':
-      return 0;
-    case 'thinking':
-      return 1;
-    case 'stage':
-      return 2;
-    case 'toolBatch':
-      return 3;
-    case 'permission':
-      return 4;
-    case 'plan':
-      return 5;
-    case 'review':
-      return 6;
-    case 'error':
-      return 7;
-    case 'turnActions':
-      return 8;
-    case 'assistant':
-      return 9;
-    default:
-      return 10;
-  }
-}
-
 const TimelineBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
   animateAssistant?: boolean;
   onPlanResolve?: CodexTimelineProps['onPlanResolve'];
 }> = ({ block, language, animateAssistant = false, onPlanResolve }) => {
+  const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
+  const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
   if (block.kind === 'user') {
     const attachments = blockAttachments(block);
     return (
-      <article className="codex-block codex-block--user">
+      <article className={`codex-block codex-block--user${narrativeClass}${densityClass}`}>
         <div className="codex-block__label">{t(language, 'agent.message.user')}</div>
         <CodexAttachmentChips attachments={attachments} language={language} />
         <MarkdownContent content={block.bodyMarkdown ?? block.summary} />
@@ -441,8 +436,7 @@ const TimelineBlock: React.FC<{
 
   if (block.kind === 'assistant') {
     return (
-      <article className="codex-block codex-block--assistant">
-        <div className="codex-block__label">DeepCode</div>
+      <article className={`codex-assistant-text${narrativeClass}${densityClass}`}>
         <TypewriterMarkdown content={block.bodyMarkdown ?? block.summary} animate={animateAssistant} />
       </article>
     );
@@ -452,9 +446,13 @@ const TimelineBlock: React.FC<{
     return <PlanBlock block={block} language={language} onPlanResolve={onPlanResolve} />;
   }
 
+  if (block.kind === 'thinking' || block.narrativeKind === 'thinking') {
+    return <ThinkingBlock block={block} />;
+  }
+
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
   return (
-    <details className={`codex-block codex-block--${block.kind}`} open={open}>
+    <details className={`codex-block codex-block--${block.kind}${narrativeClass}${densityClass}`} open={open}>
       <summary>
         <span className={`codex-block__status codex-block__status--${block.status}`} />
         <span className="codex-block__title">{block.title}</span>
@@ -463,6 +461,29 @@ const TimelineBlock: React.FC<{
       <div className="codex-block__details">
         {block.bodyMarkdown && <MarkdownContent content={block.bodyMarkdown} />}
         <EventList events={block.events} />
+      </div>
+    </details>
+  );
+};
+
+const ThinkingBlock: React.FC<{
+  block: AgentTimelineBlock;
+}> = ({ block }) => {
+  const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
+  const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
+  const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
+  const markdown = thinkingMarkdown(block);
+  const summary = compactThinkingSummary(markdown);
+
+  return (
+    <details className={`codex-block codex-block--thinking${narrativeClass}${densityClass}`} open={open}>
+      <summary>
+        <span className={`codex-block__status codex-block__status--${block.status}`} />
+        <span className="codex-block__title">{block.title}</span>
+        {summary && <span className="codex-block__summary">{summary}</span>}
+      </summary>
+      <div className="codex-block__details codex-block__details--thinking">
+        <MarkdownContent content={markdown} />
       </div>
     </details>
   );
@@ -479,32 +500,50 @@ const PlanBlock: React.FC<{
   const planId = stringField(payload, 'planId');
   const status = stringField(payload, 'status') ?? block.status;
   const confirmable = payload.confirmable === true && Boolean(runId && planId);
+  const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
+  const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
+  const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
 
   return (
-    <article className={`codex-block codex-block--plan codex-block--${status}`}>
-      <div className="codex-block__label">{block.title}</div>
-      <MarkdownContent content={block.bodyMarkdown ?? block.summary} />
-      <EventList events={block.events} compact />
-      {confirmable && (
-        <div className="codex-plan-actions codex-plan-actions--composer">
-          {t(language, 'deepcodeGui.plan.useComposer')}
-        </div>
-      )}
-    </article>
+    <details
+      className={`codex-block codex-block--plan codex-block--${status}${narrativeClass}${densityClass}`}
+      open={open}
+    >
+      <summary>
+        <span className={`codex-block__status codex-block__status--${block.status}`} />
+        <span className="codex-block__title">{block.title}</span>
+        <span className="codex-block__summary">{block.summary}</span>
+      </summary>
+      <div className="codex-block__details">
+        <MarkdownContent content={block.bodyMarkdown ?? block.summary} />
+        <EventList events={block.events} compact />
+        {confirmable && (
+          <div className="codex-plan-actions codex-plan-actions--composer">
+            {t(language, 'deepcodeGui.plan.useComposer')}
+          </div>
+        )}
+      </div>
+    </details>
   );
 };
 
 const TypewriterMarkdown: React.FC<{ content: string; animate: boolean }> = ({ content, animate }) => {
   const [visible, setVisible] = useState(() => (animate ? '' : content));
+  const visibleRef = useRef(visible);
+
+  useEffect(() => {
+    visibleRef.current = visible;
+  }, [visible]);
 
   useEffect(() => {
     if (!animate) {
       setVisible(content);
       return undefined;
     }
-    setVisible('');
+    const startIndex = content.startsWith(visibleRef.current) ? visibleRef.current.length : 0;
+    setVisible(content.slice(0, startIndex));
     if (!content) return;
-    let index = 0;
+    let index = startIndex;
     const id = window.setInterval(() => {
       index = Math.min(content.length, index + 4);
       setVisible(content.slice(0, index));
@@ -572,6 +611,41 @@ function fallbackBlockKind(event: AgentEvent): AgentTimelineBlock['kind'] {
 
 function eventSummary(event: AgentEvent): string {
   return eventText(event) || event.kind;
+}
+
+function thinkingMarkdown(block: AgentTimelineBlock): string {
+  for (let index = block.events.length - 1; index >= 0; index -= 1) {
+    const text = thinkingEventText(block.events[index]);
+    if (text) return text;
+  }
+  return (block.bodyMarkdown ?? block.summary ?? '').trim();
+}
+
+function compactThinkingSummary(markdown: string): string {
+  const text = markdown
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/[#*_>`\-[\]()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (text.length <= 120) return text;
+  return `${text.slice(0, 120).trimEnd()}...`;
+}
+
+function thinkingEventText(event: AgentEvent): string {
+  if (event.kind !== 'assistant_msg') return '';
+  if (typeof event.payload === 'string') return event.payload.trim();
+  if (!isRecord(event.payload)) return '';
+  const channel = stringField(event.payload, 'channel');
+  if (channel && channel !== 'reasoning' && channel !== 'thinking' && channel !== 'thought') {
+    return '';
+  }
+  return (
+    stringField(event.payload, 'content') ??
+    stringField(event.payload, 'message') ??
+    stringField(event.payload, 'details') ??
+    stringField(event.payload, 'summary') ??
+    ''
+  ).trim();
 }
 
 function eventText(event: AgentEvent): string {

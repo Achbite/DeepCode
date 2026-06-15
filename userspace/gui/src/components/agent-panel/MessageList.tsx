@@ -4,7 +4,9 @@ import type {
   AgentDisplayPolicy,
   AgentEvent,
   AgentEventPresentation,
+  AgentTimelineBlock,
 } from '@deepcode/protocol';
+import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
 import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
@@ -87,7 +89,9 @@ const ASSISTANT_COLLAPSE_LINE_LIMIT = 6;
 type RenderContentItem =
   | { type: 'event'; event: AgentEvent; autoOpen?: boolean }
   | { type: 'trace'; group: TraceGroup }
-  | { type: 'toolBatch'; group: ToolBatchGroup };
+  | { type: 'narrativeThinking'; block: AgentTimelineBlock }
+  | { type: 'toolBatch'; group: ToolBatchGroup }
+  | { type: 'narrativeEvidence'; block: AgentTimelineBlock };
 
 type RenderItem =
   | RenderContentItem
@@ -125,6 +129,31 @@ function payloadText(payload: unknown): string {
     stringField(payload, 'message') ??
     stringField(payload, 'summary') ??
     (typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2) ?? 'No details')
+  );
+}
+
+function thinkingMarkdown(block: AgentTimelineBlock): string {
+  for (let index = block.events.length - 1; index >= 0; index -= 1) {
+    const text = thinkingEventText(block.events[index]);
+    if (text) return text;
+  }
+  return sanitizeDisplayText(block.bodyMarkdown ?? block.summary ?? '');
+}
+
+function thinkingEventText(event: AgentEvent): string {
+  if (event.kind !== 'assistant_msg') return '';
+  if (typeof event.payload === 'string') return sanitizeDisplayText(event.payload);
+  if (!isRecord(event.payload)) return '';
+  const channel = eventChannel(event);
+  if (channel && channel !== 'reasoning' && channel !== 'thinking' && channel !== 'thought') {
+    return '';
+  }
+  return sanitizeDisplayText(
+    stringField(event.payload, 'content') ??
+    stringField(event.payload, 'message') ??
+    stringField(event.payload, 'details') ??
+    stringField(event.payload, 'summary') ??
+    ''
   );
 }
 
@@ -590,6 +619,77 @@ function traceGroupRunning(groupEvents: AgentEvent[], turnEvents: AgentEvent[], 
 }
 
 function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[] {
+  if (events.length === 0) return [];
+  const projection = buildNarrativeTimelineProjection({
+    sessionId: events[0]?.sessionId ?? 'session',
+    events,
+  });
+  if (projection.turns.length === 0) return createLegacyRenderItems(events, loading);
+
+  const items: RenderItem[] = [];
+
+  for (const turn of projection.turns) {
+    const turnItems: RenderContentItem[] = [];
+    const pushTurnItem = (item: RenderContentItem) => {
+      turnItems.push(item);
+      items.push(item);
+    };
+
+    for (const block of turn.blocks) {
+      const narrativeKind = block.narrativeKind;
+      if (narrativeKind === 'thinking') {
+        pushTurnItem({ type: 'narrativeThinking', block });
+        continue;
+      }
+
+      if (narrativeKind === 'operationEvidence' || narrativeKind === 'verification') {
+        pushTurnItem({ type: 'narrativeEvidence', block });
+        continue;
+      }
+
+      if (narrativeKind === 'permission') {
+        pushTurnItem({
+          type: 'toolBatch',
+          group: {
+            id: `permission-${block.id}`,
+            label: block.title,
+            events: block.events,
+            autoOpen: block.status === 'running' || block.status === 'waiting',
+          },
+        });
+        continue;
+      }
+
+      for (const event of block.events) {
+        if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') {
+          pushTurnItem({ type: 'narrativeEvidence', block });
+          break;
+        }
+        pushTurnItem({
+          type: 'event',
+          event,
+          autoOpen: !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting',
+        });
+      }
+    }
+
+    const turnEvents = turn.blocks.flatMap((block) => block.events);
+    const finalAssistant = pickVisibleAssistantEvent(turnEvents);
+    const turnActionTarget = pickTurnActionTarget(turnEvents, finalAssistant);
+    if (turnActionTarget && !loading) {
+      items.push({
+        type: 'turnActions',
+        id: `turn-actions-${turn.id}`,
+        items: turnItems,
+        targetEvent: turnActionTarget,
+      });
+    }
+  }
+
+  return items.length > 0 ? items : createLegacyRenderItems(events, loading);
+}
+
+function createLegacyRenderItems(events: AgentEvent[], loading: boolean): RenderItem[] {
   const items: RenderItem[] = [];
   let index = 0;
 
@@ -786,10 +886,20 @@ function eventCopyText(event: AgentEvent, language: UiLanguage): string {
 
 function renderItemCopyText(item: RenderContentItem, language: UiLanguage): string {
   if (item.type === 'event') return eventCopyText(item.event, language);
+  if (item.type === 'narrativeThinking') {
+    return [
+      item.block.title || t(language, 'agent.copy.thinking'),
+      thinkingMarkdown(item.block),
+    ].filter(Boolean).join('\n\n');
+  }
   if (item.type === 'trace') {
     const title = thoughtTraceTitle(item.group.events, language, item.group.running);
     const body = item.group.events.map((event) => eventCopyText(event, language)).filter(Boolean);
     return [title, ...body].join('\n\n');
+  }
+  if (item.type === 'narrativeEvidence') {
+    const body = item.block.events.map((event) => eventCopyText(event, language)).filter(Boolean);
+    return [item.block.title, item.block.summary, ...body].filter(Boolean).join('\n\n');
   }
   const body = item.group.events.map((event) => eventCopyText(event, language)).filter(Boolean);
   return [item.group.label, ...body].join('\n\n');
@@ -1310,6 +1420,53 @@ function TraceGroupCard({ group, language }: { group: TraceGroup; language: UiLa
   );
 }
 
+function NarrativeThinkingCard({ block, language }: { block: AgentTimelineBlock; language: UiLanguage }) {
+  const running = block.status === 'running' || block.status === 'waiting';
+  const [expanded, setExpanded] = React.useState(running || !block.defaultCollapsed);
+  const wasRunningRef = React.useRef(running);
+
+  React.useEffect(() => {
+    if (running) {
+      setExpanded(true);
+      wasRunningRef.current = true;
+      return;
+    }
+    if (wasRunningRef.current) {
+      setExpanded(false);
+      wasRunningRef.current = false;
+    }
+  }, [running]);
+
+  const markdown = thinkingMarkdown(block);
+  const summary = compactDisplayText(markdown, 140);
+  const title = [block.title || t(language, 'agent.copy.thinking'), summary]
+    .filter((part, index, parts) => Boolean(part && (index === 0 || part !== parts[0])))
+    .join(' · ');
+
+  return (
+    <div className={`agent-thinking-trace ${running ? 'agent-thinking-trace--running' : ''}`}>
+      <button
+        type="button"
+        className="agent-thinking-trace__summary"
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <span className="agent-thinking-trace__left">
+          <span className="agent-thinking-trace__dot" />
+          <span className="agent-thinking-trace__title">{title}</span>
+        </span>
+        <span className="agent-thinking-trace__hint">
+          {expanded ? t(language, 'agent.ui.hide') : t(language, 'agent.ui.show')}
+        </span>
+      </button>
+      {expanded && (
+        <div className="agent-thinking-trace__body agent-thinking-trace__body--markdown">
+          <MarkdownContent content={markdown} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function renderToolBatch(group: ToolBatchGroup, language: UiLanguage) {
   const hasError = group.events.some((event) => eventStatus(event) === 'error');
   const allDone = group.events.some((event) => event.kind === 'tool_result' || event.kind === 'permission_result');
@@ -1332,6 +1489,33 @@ function renderToolBatch(group: ToolBatchGroup, language: UiLanguage) {
             autoOpen={eventDefaultOpen(event) ?? group.autoOpen}
           />
         ))}
+      </div>
+    </details>
+  );
+}
+
+function renderNarrativeEvidenceBlock(block: AgentTimelineBlock, language: UiLanguage) {
+  const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
+  const status = block.status === 'completed' ? 'done' : block.status;
+  return (
+    <details
+      key={block.id}
+      className={`agent-tool-batch agent-tool-batch--narrative agent-tool-batch--${block.narrativeKind ?? block.kind}`}
+      open={open}
+    >
+      <summary>
+        <span className="agent-tool-batch__label">{block.title}</span>
+        <span className={`agent-tool-batch__status agent-tool-batch__status--${status}`}>
+          {localizedStatus(status, language)}
+        </span>
+      </summary>
+      <div className="agent-tool-batch__body">
+        {block.bodyMarkdown && (
+          <div className="agent-trace-output">
+            <MarkdownContent content={block.bodyMarkdown} />
+          </div>
+        )}
+        {block.events.map((event) => renderTraceEvent(event, language))}
       </div>
     </details>
   );
@@ -1622,7 +1806,9 @@ const MessageList: React.FC<MessageListProps> = ({
 
       {renderItems.map((item) => {
         if (item.type === 'trace') return <TraceGroupCard key={item.group.id} group={item.group} language={language} />;
+        if (item.type === 'narrativeThinking') return <NarrativeThinkingCard key={item.block.id} block={item.block} language={language} />;
         if (item.type === 'toolBatch') return renderToolBatch(item.group, language);
+        if (item.type === 'narrativeEvidence') return renderNarrativeEvidenceBlock(item.block, language);
         if (item.type === 'turnActions') {
           return (
             <TurnActions

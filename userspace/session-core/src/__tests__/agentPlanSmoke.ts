@@ -9,6 +9,7 @@ import type {
   LlmChatResult,
 } from '@deepcode/protocol';
 import {
+  buildNarrativeTimelineProjection,
   buildPromptEnvelope,
   createResourcePacket,
   parseProposalEnvelope,
@@ -23,6 +24,7 @@ async function main(): Promise<void> {
   assertV3Parser();
   assertActionBundleProtocolFields();
   assertPromptEnvelope();
+  assertNarrativeTimelineProjection();
   assertSessionDriverSkeleton();
   await assertSessionDriverLoop();
   await assertSessionDriverLoopPathResourceRequest();
@@ -218,8 +220,85 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('Conversation roots'), 'prompt exposes conversation roots');
   assert(prompt.stablePrefix.includes('"path":"relative/path.ext"'), 'prompt documents path-based resourceRequest');
   assert(prompt.stablePrefix.includes('Implementation batch budget'), 'prompt documents incremental implementation budget');
+  assert(prompt.stablePrefix.includes('<systemStructure'), 'prompt includes the system structure layer');
+  assert(prompt.stablePrefix.includes('black-box validation'), 'prompt treats tests as black-box validation');
+  assert(prompt.stablePrefix.includes('Do not optimize for known tests'), 'prompt rejects test-specific optimization');
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
   assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
+}
+
+function assertNarrativeTimelineProjection(): void {
+  const events: AgentEvent[] = [
+    {
+      id: 'event-user',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_msg',
+      payload: { content: 'Analyze a generic attachment.' },
+    },
+    {
+      id: 'event-thinking',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:01.000Z',
+      kind: 'assistant_msg',
+      payload: { channel: 'reasoning', content: 'Need generic context.' },
+    },
+    {
+      id: 'event-tool',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:02.000Z',
+      kind: 'tool_result',
+      payload: {
+        toolName: 'fs.read',
+        summary: 'Read generic resource.',
+        evidenceRefs: ['evidence-generic'],
+        status: 'completed',
+      },
+    },
+    {
+      id: 'event-plan',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:03.000Z',
+      kind: 'plan_card',
+      payload: { title: 'Generic plan', summary: 'Review generic next step.' },
+    },
+    {
+      id: 'event-answer',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:04.000Z',
+      kind: 'assistant_msg',
+      payload: { channel: 'final', content: 'Generic final answer.' },
+    },
+  ];
+
+  const projection = buildNarrativeTimelineProjection({
+    sessionId: 'session-narrative',
+    events,
+    generatedAt: '2026-01-01T00:00:05.000Z',
+  });
+  assertEqual(projection.schemaVersion, 'deepcode.session.timeline.v1', 'narrative timeline is versioned');
+  assertEqual(projection.turns.length, 1, 'events are grouped into one turn');
+  const kinds = projection.turns[0].blocks.map((block) => block.narrativeKind);
+  assertEqual(kinds.includes('user'), true, 'user block is projected');
+  assertEqual(kinds.includes('thinking'), true, 'thinking block is projected');
+  assertEqual(kinds.includes('operationEvidence'), true, 'tool facts become operation evidence');
+  assertEqual(kinds.includes('plan'), true, 'plan facts become a plan block');
+  assertEqual(kinds.includes('assistantText'), true, 'final answer becomes assistant text');
+  assertEqual(
+    projection.taskProjection?.items.some((item) => item.narrativeKind === 'operationEvidence'),
+    true,
+    'task projection is derived from narrative blocks'
+  );
+  assertEqual(
+    projection.turns[0].blocks.some((block) => block.evidenceRefs?.includes('evidence-generic')),
+    true,
+    'evidence refs are preserved for frontend drilldown'
+  );
+  assertEqual(
+    projection.rawEventRefs?.includes('event:event-tool'),
+    true,
+    'raw event refs are preserved for debug views'
+  );
 }
 
 function assertSessionDriverSkeleton(): void {

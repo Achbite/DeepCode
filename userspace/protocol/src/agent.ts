@@ -473,6 +473,18 @@ export type AgentTimelineBlockKind =
   | 'error'
   | 'turnActions';
 
+export type AgentTimelineNarrativeKind =
+  | 'user'
+  | 'thinking'
+  | 'assistantText'
+  | 'operationEvidence'
+  | 'requirement'
+  | 'plan'
+  | 'permission'
+  | 'verification'
+  | 'review'
+  | 'diagnostic';
+
 export type AgentTimelineStatus =
   | 'queued'
   | 'running'
@@ -481,14 +493,41 @@ export type AgentTimelineStatus =
   | 'completed'
   | 'failed';
 
+export interface AgentTimelineDisplayHints {
+  density?: 'normal' | 'compact' | 'debug';
+  evidenceMode?: 'inline' | 'collapsed' | 'debugOnly';
+  showInTaskList?: boolean;
+  taskListLabel?: string;
+  taskListSummary?: string;
+}
+
+export interface AgentTimelineTaskProjectionItem {
+  id: string;
+  title: string;
+  summary: string;
+  status: AgentTimelineStatus;
+  blockId: string;
+  narrativeKind: AgentTimelineNarrativeKind;
+}
+
+export interface AgentTimelineTaskProjection {
+  title: string;
+  items: AgentTimelineTaskProjectionItem[];
+}
+
 export interface AgentTimelineBlock {
   id: string;
   kind: AgentTimelineBlockKind;
+  narrativeKind?: AgentTimelineNarrativeKind;
   title: string;
   summary: string;
   status: AgentTimelineStatus;
   defaultCollapsed: boolean;
   bodyMarkdown?: string;
+  displayHints?: AgentTimelineDisplayHints;
+  evidenceRefs?: string[];
+  rawEventRefs?: string[];
+  taskProjectionRef?: string;
   events: AgentEvent[];
 }
 
@@ -502,10 +541,13 @@ export interface AgentTimelineTurn {
 }
 
 export interface AgentTimelineResult {
+  schemaVersion?: 'deepcode.session.timeline.v1';
   sessionId: string;
   generatedAt: string;
   turns: AgentTimelineTurn[];
   eventCount: number;
+  taskProjection?: AgentTimelineTaskProjection;
+  rawEventRefs?: string[];
 }
 
 /**

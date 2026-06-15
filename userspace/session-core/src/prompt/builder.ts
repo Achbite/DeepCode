@@ -57,7 +57,22 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       ].join('\n'),
     },
     {
+      name: 'systemStructure',
       priority: 2,
+      stable: true,
+      content: [
+        'System structure boundary: Session owns conversation orchestration, context assembly, prompt repair, and UI-facing projections.',
+        'Kernel owns permission validation, tool execution, audit facts, diffs, validation facts, and workflow transitions.',
+        'Frontend clients are presentation shells. They render Session projections and user decisions; they do not infer task type, permissions, tool success, or completion.',
+        'The model must reason from the current user request, ResourcePacket facts, available conversation roots, and protocol contract.',
+        'Do not optimize for known tests, fixtures, screenshots, examples, or previous black-box prompts.',
+        'Tests and scripts are controlled by the user as black-box validation. Never assume their hidden content, names, paths, or expected outputs.',
+        'Do not add project-name, path-name, file-name, fixed-question, language-keyword, or business-domain branches to satisfy a test or example.',
+        'Example task flows in documentation illustrate projection shape only; they are not implementation targets and must not affect proposal choices.',
+      ].join('\n'),
+    },
+    {
+      priority: 3,
       stable: true,
       name: 'capabilityProjection',
       content: [
@@ -75,25 +90,25 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
     },
     {
       name: 'rulerContext',
-      priority: 3,
+      priority: 4,
       stable: true,
       content: rulerContextSummary(input),
     },
     {
       name: 'currentUserOverlay',
-      priority: 4,
+      priority: 5,
       stable: false,
       content: input.userOverlay?.trim() || 'No current user overlay selected.',
     },
     {
       name: 'authoritativeDocExcerpts',
-      priority: 5,
+      priority: 6,
       stable: true,
       content: authoritativeDocSummary(input),
     },
     {
       name: 'memoryHints',
-      priority: 6,
+      priority: 7,
       stable: true,
       content: input.memoryHints?.length ? input.memoryHints.join('\n') : 'No memory hints selected.',
     },

@@ -7,6 +7,7 @@ export interface PromptSystemLayer {
   name:
     | 'protocolContract'
     | 'builtinSystemPrompt'
+    | 'systemStructure'
     | 'capabilityProjection'
     | 'rulerContext'
     | 'currentUserOverlay'

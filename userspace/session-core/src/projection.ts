@@ -1,4 +1,13 @@
-import type { AgentEvent, KernelPlanReviewReport, PermissionRequest } from '@deepcode/protocol';
+import type {
+  AgentEvent,
+  AgentTimelineBlock,
+  AgentTimelineBlockKind,
+  AgentTimelineNarrativeKind,
+  AgentTimelineResult,
+  AgentTimelineStatus,
+  KernelPlanReviewReport,
+  PermissionRequest,
+} from '@deepcode/protocol';
 import type { AgentPlanParts } from './agent-plan/types.js';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
 import type { ReviewPacket } from './review/types.js';
@@ -22,6 +31,14 @@ export interface SessionProjectionCard {
 export interface SessionProjection {
   messages: TranscriptMessageEntry[];
   cards: SessionProjectionCard[];
+}
+
+export const NARRATIVE_TIMELINE_SCHEMA_VERSION = 'deepcode.session.timeline.v1' as const;
+
+export interface NarrativeTimelineProjectionInput {
+  sessionId: string;
+  events: AgentEvent[];
+  generatedAt?: string;
 }
 
 export type ConversationProjectionCardKind =
@@ -138,6 +155,309 @@ export class ProjectionEngine {
     if (typeof requestId === 'string') return `kernel:${requestId}`;
     return `kernel:event:${index}`;
   }
+}
+
+export function buildNarrativeTimelineProjection(input: NarrativeTimelineProjectionInput): AgentTimelineResult {
+  const turns: AgentTimelineResult['turns'] = [];
+  let currentTurn: AgentTimelineResult['turns'][number] | null = null;
+  let syntheticTurnIndex = 0;
+
+  input.events.forEach((event, index) => {
+    if (event.kind === 'user_msg') {
+      if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
+      currentTurn = {
+        id: `turn-${event.id || index}`,
+        sessionId: input.sessionId,
+        status: 'running',
+        startedAt: event.ts,
+        blocks: [narrativeBlockFromEvents([event], index)],
+      };
+      return;
+    }
+
+    if (!currentTurn) {
+      syntheticTurnIndex += 1;
+      currentTurn = {
+        id: `turn-orphan-${syntheticTurnIndex}`,
+        sessionId: input.sessionId,
+        status: 'running',
+        startedAt: event.ts,
+        blocks: [],
+      };
+    }
+
+    appendNarrativeBlock(currentTurn.blocks, event, index);
+  });
+
+  if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
+  const rawEventRefs = input.events.map(eventRefForAgentEvent);
+  const taskItems = turns.flatMap((turn) =>
+    turn.blocks
+      .filter((block) => block.displayHints?.showInTaskList)
+      .map((block) => ({
+        id: block.taskProjectionRef ?? `task-${block.id}`,
+        title: block.displayHints?.taskListLabel ?? block.title,
+        summary: block.displayHints?.taskListSummary ?? block.summary,
+        status: block.status,
+        blockId: block.id,
+        narrativeKind: block.narrativeKind ?? narrativeKindForLegacyKind(block.kind),
+      }))
+  );
+
+  return {
+    schemaVersion: NARRATIVE_TIMELINE_SCHEMA_VERSION,
+    sessionId: input.sessionId,
+    generatedAt: input.generatedAt ?? new Date().toISOString(),
+    turns,
+    eventCount: input.events.length,
+    taskProjection: {
+      title: 'Task projection',
+      items: taskItems.slice(-8),
+    },
+    rawEventRefs,
+  };
+}
+
+function appendNarrativeBlock(blocks: AgentTimelineBlock[], event: AgentEvent, index: number): void {
+  const nextNarrativeKind = narrativeKindForEvent(event);
+  const nextLegacyKind = legacyKindForNarrative(nextNarrativeKind);
+  const groupable = nextNarrativeKind === 'operationEvidence' || nextNarrativeKind === 'thinking';
+  const last = blocks[blocks.length - 1];
+  if (groupable && last?.narrativeKind === nextNarrativeKind && last.status !== 'failed') {
+    const events = [...last.events, event];
+    blocks[blocks.length - 1] = narrativeBlockFromEvents(events, index, last.id, nextLegacyKind, nextNarrativeKind);
+    return;
+  }
+  blocks.push(narrativeBlockFromEvents([event], index, undefined, nextLegacyKind, nextNarrativeKind));
+}
+
+function narrativeBlockFromEvents(
+  events: AgentEvent[],
+  index: number,
+  existingId?: string,
+  forcedKind?: AgentTimelineBlockKind,
+  forcedNarrativeKind?: AgentTimelineNarrativeKind
+): AgentTimelineBlock {
+  const first = events[0];
+  const narrativeKind = forcedNarrativeKind ?? narrativeKindForEvent(first);
+  const legacyKind = forcedKind ?? legacyKindForNarrative(narrativeKind);
+  const status = narrativeStatus(events);
+  const title = narrativeTitle(events, narrativeKind);
+  const summary = summarizeAgentEvents(events);
+  return {
+    id: existingId ?? `${narrativeKind}-${first.id || index}`,
+    kind: legacyKind,
+    narrativeKind,
+    title,
+    summary,
+    status,
+    defaultCollapsed: narrativeDefaultCollapsed(narrativeKind, status),
+    bodyMarkdown: narrativeBody(events, narrativeKind),
+    displayHints: narrativeDisplayHints(narrativeKind, title, summary),
+    evidenceRefs: events.flatMap(eventEvidenceRefs),
+    rawEventRefs: events.map(eventRefForAgentEvent),
+    taskProjectionRef: shouldShowNarrativeInTaskList(narrativeKind) ? `task-${narrativeKind}-${first.id || index}` : undefined,
+    events,
+  };
+}
+
+function finalizeNarrativeTurn(turn: AgentTimelineResult['turns'][number]): AgentTimelineResult['turns'][number] {
+  const hasFailure = turn.blocks.some((block) => block.status === 'failed');
+  const hasWaiting = turn.blocks.some((block) => block.status === 'waiting' || block.status === 'blocked');
+  const hasRunning = turn.blocks.some((block) => block.status === 'running');
+  const hasAssistant = turn.blocks.some((block) => block.narrativeKind === 'assistantText');
+  const status: AgentTimelineStatus = hasFailure
+    ? 'failed'
+    : hasWaiting
+      ? 'blocked'
+      : hasRunning && !hasAssistant
+        ? 'running'
+        : 'completed';
+  return {
+    ...turn,
+    status,
+    completedAt: status === 'completed' || status === 'failed'
+      ? [...turn.blocks].reverse().flatMap((block) => [...block.events].reverse()).find((event) => event.ts)?.ts
+      : turn.completedAt,
+  };
+}
+
+function narrativeKindForEvent(event: AgentEvent): AgentTimelineNarrativeKind {
+  if (event.kind === 'user_msg') return 'user';
+  if (event.kind === 'requirement_confirmation' || event.kind === 'requirement_decision') return 'requirement';
+  if (event.kind === 'plan_card' || event.kind === 'plan_review') return 'plan';
+  if (event.kind === 'permission_request' || event.kind === 'permission_result') return 'permission';
+  if (event.kind === 'review_summary') return 'review';
+  if (event.kind === 'error') return 'diagnostic';
+  if (event.kind === 'assistant_msg') {
+    const channel = stringValueFromPayload(event.payload, 'channel');
+    if (channel === 'reasoning') return 'thinking';
+    if (channel === 'final') return 'assistantText';
+    return 'operationEvidence';
+  }
+  if (event.kind === 'tool_call' || event.kind === 'tool_result') return 'operationEvidence';
+  if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') return 'operationEvidence';
+  return 'operationEvidence';
+}
+
+function legacyKindForNarrative(kind: AgentTimelineNarrativeKind): AgentTimelineBlockKind {
+  switch (kind) {
+    case 'user':
+      return 'user';
+    case 'assistantText':
+      return 'assistant';
+    case 'thinking':
+      return 'thinking';
+    case 'plan':
+      return 'plan';
+    case 'permission':
+      return 'permission';
+    case 'review':
+      return 'review';
+    case 'diagnostic':
+      return 'error';
+    case 'operationEvidence':
+    case 'requirement':
+    case 'verification':
+      return 'stage';
+    default:
+      return 'stage';
+  }
+}
+
+function narrativeKindForLegacyKind(kind: AgentTimelineBlockKind): AgentTimelineNarrativeKind {
+  switch (kind) {
+    case 'user':
+      return 'user';
+    case 'assistant':
+      return 'assistantText';
+    case 'thinking':
+      return 'thinking';
+    case 'plan':
+      return 'plan';
+    case 'permission':
+      return 'permission';
+    case 'review':
+      return 'review';
+    case 'error':
+      return 'diagnostic';
+    default:
+      return 'operationEvidence';
+  }
+}
+
+function narrativeStatus(events: AgentEvent[]): AgentTimelineStatus {
+  if (events.some((event) => event.kind === 'error' || stringValueFromPayload(event.payload, 'status') === 'error')) {
+    return 'failed';
+  }
+  if (events.some((event) => event.kind === 'permission_request') && !events.some((event) => event.kind === 'permission_result')) {
+    return 'waiting';
+  }
+  if (events.some((event) => event.kind === 'plan_review' && stringValueFromPayload(event.payload, 'confirmable') !== 'false')) {
+    return 'waiting';
+  }
+  if (events.some((event) => event.kind === 'tool_call' || stringValueFromPayload(event.payload, 'status') === 'running')) {
+    const hasCompletion = events.some((event) =>
+      event.kind === 'tool_result' ||
+      ['completed', 'done', 'ok', 'succeeded'].includes(stringValueFromPayload(event.payload, 'status') ?? '')
+    );
+    if (!hasCompletion) return 'running';
+  }
+  return 'completed';
+}
+
+function narrativeTitle(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string {
+  const first = events[0];
+  if (kind === 'user') return 'User';
+  if (kind === 'assistantText') return 'DeepCode';
+  if (kind === 'thinking') return 'Thinking';
+  if (kind === 'operationEvidence') return firstNonEmpty(events, ['summary', 'toolName', 'name', 'stage']) ?? 'Operation evidence';
+  if (kind === 'requirement') return firstNonEmpty(events, ['title', 'summary']) ?? 'Requirement';
+  if (kind === 'plan') return firstNonEmpty(events, ['title', 'summary']) ?? 'Plan';
+  if (kind === 'permission') return firstNonEmpty(events, ['summary', 'toolName']) ?? 'Permission';
+  if (kind === 'verification') return firstNonEmpty(events, ['summary']) ?? 'Verification';
+  if (kind === 'review') return firstNonEmpty(events, ['title', 'summary']) ?? 'Review';
+  return firstNonEmpty([first], ['summary', 'message', 'details']) ?? 'Diagnostic';
+}
+
+function summarizeAgentEvents(events: AgentEvent[]): string {
+  const summaries = events
+    .map((event) => firstNonEmpty([event], ['summary', 'message', 'content', 'details', 'toolName', 'name', 'stage']))
+    .filter((value): value is string => Boolean(value));
+  if (summaries.length === 0) return `${events.length} event${events.length === 1 ? '' : 's'}`;
+  if (summaries.length === 1) return trimProjectionText(summaries[0], 180);
+  return trimProjectionText(summaries.join(' / '), 220);
+}
+
+function narrativeBody(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string | undefined {
+  if (kind === 'operationEvidence') return undefined;
+  const text = firstNonEmpty(events, ['content', 'message', 'summary', 'details']);
+  return text?.trim() ? text : undefined;
+}
+
+function narrativeDefaultCollapsed(kind: AgentTimelineNarrativeKind, status: AgentTimelineStatus): boolean {
+  if (status === 'running' || status === 'waiting') return false;
+  return kind === 'thinking' || kind === 'operationEvidence' || kind === 'permission';
+}
+
+function narrativeDisplayHints(
+  kind: AgentTimelineNarrativeKind,
+  title: string,
+  summary: string
+): AgentTimelineBlock['displayHints'] {
+  return {
+    density: kind === 'operationEvidence' ? 'compact' : 'normal',
+    evidenceMode: kind === 'operationEvidence' ? 'collapsed' : 'inline',
+    showInTaskList: shouldShowNarrativeInTaskList(kind),
+    taskListLabel: title,
+    taskListSummary: summary,
+  };
+}
+
+function shouldShowNarrativeInTaskList(kind: AgentTimelineNarrativeKind): boolean {
+  return kind === 'operationEvidence' ||
+    kind === 'requirement' ||
+    kind === 'plan' ||
+    kind === 'permission' ||
+    kind === 'verification' ||
+    kind === 'review' ||
+    kind === 'diagnostic';
+}
+
+function firstNonEmpty(events: AgentEvent[], keys: string[]): string | undefined {
+  for (const event of events) {
+    for (const key of keys) {
+      const value = stringValueFromPayload(event.payload, key);
+      if (value) return value;
+    }
+  }
+  return undefined;
+}
+
+function stringValueFromPayload(payload: unknown, key: string): string | undefined {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  const value = (payload as Record<string, unknown>)[key];
+  if (typeof value === 'boolean') return String(value);
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function eventEvidenceRefs(event: AgentEvent): string[] {
+  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) return [];
+  const payload = event.payload as Record<string, unknown>;
+  const refs = payload.evidenceRefs;
+  if (Array.isArray(refs)) return refs.flatMap((ref) => typeof ref === 'string' ? [ref] : []);
+  const auditRefs = payload.auditRefs;
+  if (Array.isArray(auditRefs)) return auditRefs.flatMap((ref) => typeof ref === 'string' ? [ref] : []);
+  return [];
+}
+
+function eventRefForAgentEvent(event: AgentEvent): string {
+  return `event:${event.id}`;
+}
+
+function trimProjectionText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}...`;
 }
 
 export function buildConversationProjection(input: ConversationProjectionInput): ConversationProjectionCard[] {

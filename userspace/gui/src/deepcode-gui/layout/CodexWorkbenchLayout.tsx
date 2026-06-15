@@ -1,5 +1,6 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import type { AgentEvent, AgentSession } from '@deepcode/protocol';
+import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
 import WindowControls from '../../components/window-controls/WindowControls';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import { listAgentSessions } from '../../services/runtimeAdapter';
@@ -296,29 +297,35 @@ function taskDedupKey(event: AgentEvent): string {
   return `${event.kind}:${event.id}`;
 }
 
-function deriveTaskItems(events: AgentEvent[], language: UiLanguage, loading: boolean): CodexTaskItem[] {
-  const latestEvents = latestTurnEvents(events);
-  const taskEvents = latestEvents
-    .filter((event) => event.kind !== 'user_msg' && event.kind !== 'assistant_msg')
-    .reduce((items, event) => {
-      const key = taskDedupKey(event);
-      const next = {
-        id: key,
-        title: taskTitle(language, event),
-        summary: eventText(event) || event.kind,
-        status: taskStatus(event),
-      };
-      const existingIndex = items.findIndex((item) => item.id === key);
-      if (existingIndex >= 0) {
-        items[existingIndex] = next;
-      } else {
-        items.push(next);
-      }
-      return items;
-    }, [] as CodexTaskItem[])
-    .slice(-6);
+function deriveTaskItems(
+  events: AgentEvent[],
+  language: UiLanguage,
+  loading: boolean,
+  sessionId?: string
+): CodexTaskItem[] {
+  const projection = buildNarrativeTimelineProjection({
+    sessionId: sessionId ?? events[0]?.sessionId ?? 'session',
+    events,
+  });
+  const latestTurn = projection.turns[projection.turns.length - 1];
+  const latestTaskBlockIds = new Set(
+    latestTurn?.blocks
+      .filter((block) => block.displayHints?.showInTaskList)
+      .map((block) => block.id) ?? []
+  );
+  const projectedItems = (projection.taskProjection?.items ?? [])
+    .filter((item) => latestTaskBlockIds.has(item.blockId));
 
-  if (loading && taskEvents.length === 0) {
+  if (projectedItems.length > 0) {
+    return projectedItems.slice(-6).map((item) => ({
+      id: item.id,
+      title: item.title,
+      summary: item.summary,
+      status: item.status,
+    }));
+  }
+
+  if (loading) {
     return [
       {
         id: 'runtime-preparing',
@@ -329,7 +336,7 @@ function deriveTaskItems(events: AgentEvent[], language: UiLanguage, loading: bo
     ];
   }
 
-  return taskEvents;
+  return [];
 }
 
 const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
@@ -421,7 +428,12 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     ? new Date(lastHeartbeatAt).toLocaleTimeString()
     : t(language, 'deepcodeGui.status.pending');
   const taskItems = useMemo(
-    () => deriveTaskItems(events, language, Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id))),
+    () => deriveTaskItems(
+      events,
+      language,
+      Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id)),
+      activeSession?.id
+    ),
     [activeSession?.id, events, language, runningSessionIds]
   );
   const activeProject = useMemo(

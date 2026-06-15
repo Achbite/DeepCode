@@ -1042,6 +1042,21 @@
   padding: 0 9px 10px 27px;
 }
 
+.agent-thinking-trace__body--markdown {
+  color: var(--text-main, #ededed);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.agent-thinking-trace__body--markdown .agent-markdown {
+  display: grid;
+  gap: 8px;
+}
+
+.agent-thinking-trace__body--markdown .agent-markdown__paragraph {
+  margin: 0;
+}
+
 .agent-plan-confirmed__body {
   color: var(--text-main, #ededed);
 }
@@ -1257,6 +1272,29 @@
   scrollbar-gutter: stable;
   padding: 12px 14px;
   border-top: 1px solid rgba(48, 209, 88, 0.18);
+}
+
+.agent-tool-batch--narrative {
+  border-left-width: 0;
+  border-color: var(--border-subtle, rgba(148, 163, 184, 0.25));
+  background: var(--surface-subtle, rgba(148, 163, 184, 0.06));
+  box-shadow: none;
+}
+
+.agent-tool-batch--narrative:hover {
+  border-color: var(--border, rgba(148, 163, 184, 0.42));
+  background: var(--surface-hover, rgba(148, 163, 184, 0.1));
+  box-shadow: none;
+}
+
+.agent-tool-batch--narrative > summary {
+  min-height: 42px;
+  padding: 10px 14px;
+}
+
+.agent-tool-batch--narrative .agent-tool-batch__body {
+  max-height: min(30vh, 280px);
+  border-top-color: var(--border-subtle, rgba(148, 163, 184, 0.18));
 }
 
 .agent-tool-bubble__details > summary {

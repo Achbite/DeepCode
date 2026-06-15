@@ -524,6 +524,11 @@ button {
   background: #1b1f27;
 }
 
+.codex-assistant-text {
+  min-width: 0;
+  color: var(--text);
+}
+
 .codex-block--user {
   background: #101116;
 }
@@ -593,6 +598,21 @@ button {
   display: grid;
   gap: 8px;
   padding: 0 11px 11px 30px;
+}
+
+.codex-block__details--thinking {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.codex-block__details--thinking .agent-markdown {
+  display: grid;
+  gap: 8px;
+}
+
+.codex-block__details--thinking .agent-markdown__paragraph {
+  margin: 0;
 }
 
 .codex-event-list {
@@ -2533,6 +2553,24 @@ button {
   background: transparent;
 }
 
+.codex-assistant-text {
+  max-width: min(100%, 780px);
+  padding: 2px 0 8px;
+  color: #24272d;
+  font-size: 14px;
+  line-height: 1.72;
+}
+
+.codex-assistant-text .markdown-content {
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.codex-assistant-text .markdown-content p {
+  margin: 0 0 12px;
+}
+
 .codex-block--assistant .codex-block__label {
   display: none;
 }
@@ -2566,6 +2604,22 @@ button {
 .codex-block--user .agent-message-attachments {
   justify-content: flex-start;
   margin: 0 0 7px;
+}
+
+.codex-block--plan,
+.codex-block--narrative-operationEvidence,
+.codex-block--narrative-verification {
+  padding: 0;
+}
+
+.codex-block--narrative-operationEvidence summary,
+.codex-block--narrative-verification summary {
+  min-height: 36px;
+}
+
+.codex-block--narrative-operationEvidence .codex-block__details,
+.codex-block--narrative-verification .codex-block__details {
+  padding-bottom: 9px;
 }
 
 .codex-block__label {
