@@ -151,8 +151,8 @@ impl RunDecisionState {
                     self.satisfy_obligation(AnswerObligationId::Identity, event);
                 }
             }
-            KernelEvent::PlanRejected { reason, .. } => {
-                self.blocked_reason = reason.clone().or_else(|| Some("plan rejected".to_string()));
+            KernelEvent::ProposalRejected { reason, .. } => {
+                self.blocked_reason = Some(reason.clone());
             }
             _ => {}
         }
@@ -328,6 +328,7 @@ fn event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::StateEntered { .. } => "state.entered",
         KernelEvent::DriverRequestProduced { .. } => "driver.request_produced",
         KernelEvent::ProposalAccepted { .. } => "proposal.accepted",
+        KernelEvent::ProposalReviewed { .. } => "proposal.reviewed",
         KernelEvent::ProposalRejected { .. } => "proposal.rejected",
         KernelEvent::ResourcePacketProduced { .. } => "resource.packet_produced",
         KernelEvent::ActionBatchAccepted { .. } => "action_batch.accepted",
@@ -348,10 +349,6 @@ fn event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::PermissionResolved { .. } => "permission.resolved",
         KernelEvent::AutonomyTransitioned { .. } => "autonomy.transitioned",
         KernelEvent::ConfigSnapshotAttached { .. } => "config.snapshot.attached",
-        KernelEvent::PlanProposed { .. } => "plan.proposed",
-        KernelEvent::PlanAccepted { .. } => "plan.accepted",
-        KernelEvent::PlanRejected { .. } => "plan.rejected",
-        KernelEvent::PlanReviewReportProduced { .. } => "plan.review_report_produced",
         KernelEvent::WorkflowCheckpointed { .. } => "workflow.checkpointed",
         KernelEvent::WorkflowResumed { .. } => "workflow.resumed",
         KernelEvent::WorkflowDecisionMade { .. } => "workflow.decision_made",
@@ -380,6 +377,7 @@ fn event_sequence(event: &KernelEvent) -> Option<u64> {
         KernelEvent::StateEntered { sequence, .. }
         | KernelEvent::DriverRequestProduced { sequence, .. }
         | KernelEvent::ProposalAccepted { sequence, .. }
+        | KernelEvent::ProposalReviewed { sequence, .. }
         | KernelEvent::ProposalRejected { sequence, .. }
         | KernelEvent::ResourcePacketProduced { sequence, .. }
         | KernelEvent::ActionBatchAccepted { sequence, .. }
@@ -400,10 +398,6 @@ fn event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::PermissionResolved { sequence, .. }
         | KernelEvent::AutonomyTransitioned { sequence, .. }
         | KernelEvent::ConfigSnapshotAttached { sequence, .. }
-        | KernelEvent::PlanProposed { sequence, .. }
-        | KernelEvent::PlanAccepted { sequence, .. }
-        | KernelEvent::PlanRejected { sequence, .. }
-        | KernelEvent::PlanReviewReportProduced { sequence, .. }
         | KernelEvent::WorkflowCheckpointed { sequence, .. }
         | KernelEvent::WorkflowResumed { sequence, .. }
         | KernelEvent::WorkflowDecisionMade { sequence, .. }

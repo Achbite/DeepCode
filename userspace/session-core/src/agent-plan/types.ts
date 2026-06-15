@@ -1,7 +1,12 @@
 export type ActionKind =
   | 'read'
+  | 'list'
+  | 'search'
+  | 'diff'
+  | 'create'
   | 'write'
   | 'delete'
+  | 'rename'
   | 'command'
   | 'validation'
   | 'review'
@@ -12,6 +17,8 @@ export interface CodeBlockDraft {
   path: string;
   content: string;
   language?: string;
+  operation?: 'create' | 'overwrite' | 'patch' | 'delete' | 'rename';
+  permissionLabels?: string[];
 }
 
 export interface PlannedActionDraft {
@@ -24,6 +31,19 @@ export interface PlannedActionDraft {
   conflictKeys: string[];
   purpose?: string;
   sourceBlockId?: string;
+  permissionLabels?: string[];
+  dependsOn?: string[];
+}
+
+export interface CommandBlockDraft {
+  commandId: string;
+  capability: 'process.exec';
+  cwd?: string;
+  argv: string[];
+  timeoutMs?: number;
+  envPolicy?: 'inheritSafe' | 'explicitOnly' | 'empty';
+  expectedOutput?: string;
+  permissionLabels?: string[];
 }
 
 export interface ValidationExpectationDraft {
@@ -50,6 +70,7 @@ export interface ActionBundleDraft {
   goal: string;
   requirementId?: string;
   actions: PlannedActionDraft[];
+  commandBlocks?: CommandBlockDraft[];
   continuationExpectations?: PlannedActionDraft[];
   validationExpectations: ValidationExpectationDraft[];
   reviewExpectations: ReviewExpectationDraft[];
@@ -87,6 +108,30 @@ export interface AnswerDraft {
   content: string;
 }
 
+export interface DecisionRequestOptionDraft {
+  id: string;
+  label: string;
+  description: string;
+  recommended?: boolean;
+}
+
+export interface DecisionRequestDraft {
+  version: '1';
+  id: string;
+  reason: string;
+  summary: string;
+  options: DecisionRequestOptionDraft[];
+  allowsFreeform: boolean;
+}
+
+export interface DiagnosticDraft {
+  version: '1';
+  id: string;
+  severity: 'info' | 'warning' | 'error';
+  summary: string;
+  details?: string;
+}
+
 export interface AgentPlanParts {
   userPlan: string;
   actionBundle: ActionBundleDraft;
@@ -120,10 +165,9 @@ export type ProposalEnvelopeSource = 'llm' | 'user' | 'system' | 'cache';
 export type ProposalEnvelopeKind =
   | 'answer'
   | 'resourceRequest'
-  | 'requirementDraft'
+  | 'decisionRequest'
   | 'actionBundle'
-  | 'repairProposal'
-  | 'reviewPacketDraft';
+  | 'diagnostic';
 
 export interface ProposalEnvelope {
   schemaVersion: 'deepcode.agent.protocol.v3';

@@ -131,18 +131,6 @@ impl Kernel {
             KernelCommand::PermissionResolve { request_id, .. } => {
                 self.not_implemented(request_id, "permission.resolve")
             }
-            KernelCommand::PlanAccept { request_id, .. } => {
-                self.not_implemented(request_id, "plan.accept")
-            }
-            KernelCommand::PlanReject { request_id, .. } => {
-                self.not_implemented(request_id, "plan.reject")
-            }
-            KernelCommand::PlanRevise { request_id, .. } => {
-                self.not_implemented(request_id, "plan.revise")
-            }
-            KernelCommand::PlanContractSubmit { request_id, .. } => {
-                self.not_implemented(request_id, "plan.contract_submit")
-            }
             KernelCommand::SkillTrustApprove { request_id, .. } => {
                 self.not_implemented(request_id, "skill.trust_approve")
             }
@@ -194,7 +182,6 @@ impl KernelClient for InProcessKernelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deepcode_kernel_abi::{SessionId, UserInput, WorkspaceBinding};
 
     #[test]
     fn health_check_returns_ready_event() {

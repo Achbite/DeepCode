@@ -10,8 +10,6 @@ import type {
 } from '@deepcode/protocol';
 import {
   buildPromptEnvelope,
-  compileActionBundleToPlanContract,
-  createPlanContractSubmitCommand,
   createResourcePacket,
   parseProposalEnvelope,
   SessionDriver,
@@ -23,22 +21,23 @@ import {
 
 async function main(): Promise<void> {
   assertV3Parser();
-  assertActionBundleCompiler();
+  assertActionBundleProtocolFields();
   assertPromptEnvelope();
   assertSessionDriverSkeleton();
   await assertSessionDriverLoop();
   await assertSessionDriverLoopPathResourceRequest();
   await assertSessionDriverLoopRejectsOutsidePath();
   await assertSessionDriverLoopUsesRecentAttachmentRoot();
-  await assertSessionDriverLoopRequestsRequirementConfirmationForSideEffectTask();
+  await assertSessionDriverLoopProjectsDecisionRequest();
   await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
+  await assertSessionDriverLoopRepairsInvalidSourceBlock();
   await assertSessionDriverLoopRepairsOversizedActionBundle();
   await assertSessionDriverLoopRepairsEmptyActionBundleResponse();
   await assertSessionDriverLoopReviewRevisionReturnsToPlanning();
   await assertSessionDriverLoopReviewAcceptStopsAtCurrentBatch();
 }
 
-async function assertSessionDriverLoopRequestsRequirementConfirmationForSideEffectTask(): Promise<void> {
+async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
   const events: AgentEvent[] = [];
   let llmCalls = 0;
   const session: AgentSession = {
@@ -57,19 +56,18 @@ async function assertSessionDriverLoopRequestsRequirementConfirmationForSideEffe
       llmCalls += 1;
       return jsonLlmResponse({
         schemaVersion: 'deepcode.agent.protocol.v3',
-        kind: 'requirementDraft',
+        kind: 'decisionRequest',
         outputLanguage: 'en-US',
-        requirementDraft: {
+        decisionRequest: {
           version: '1',
-          requirementId: 'req-generic-auto',
-          summary: 'Confirm a generic side-effect task before planning.',
-          goal: 'Prepare a scoped implementation requirement.',
-          scope: ['Create one reviewable implementation batch after confirmation.'],
-          outOfScope: ['Do not execute unsupported capabilities.'],
-          constraints: ['Keep the batch small and reviewable.'],
-          risks: ['Scope can expand if the target root is ambiguous.'],
-          acceptanceCriteria: ['User confirms the requirement before plan generation.'],
-          openQuestions: [],
+          id: 'decision-generic-auto',
+          reason: 'A generic user decision is required before planning.',
+          summary: 'Choose how to proceed with the generic side-effect task.',
+          options: [
+            { id: 'recommended', label: 'Proceed', description: 'Generate the next reviewable plan.', recommended: true },
+            { id: 'stop', label: 'Stop', description: 'Do not generate an implementation plan.' },
+          ],
+          allowsFreeform: true,
         },
       });
     },
@@ -81,9 +79,9 @@ async function assertSessionDriverLoopRequestsRequirementConfirmationForSideEffe
     sessionId: 'session-requirement-auto',
     content: 'Create a generic workspace change.',
   });
-  assertEqual(llmCalls, 1, 'auto requirement confirmation calls provider once for requirement draft');
-  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), true, 'auto mode emits requirement confirmation');
-  assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'auto mode does not generate a plan before requirement confirmation');
+  assertEqual(llmCalls, 1, 'decisionRequest is produced by provider once');
+  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), true, 'decisionRequest projects to a user intervention card');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'decisionRequest does not generate a plan before user decision');
 }
 
 function assertV3Parser(): void {
@@ -140,19 +138,25 @@ function assertV3Parser(): void {
   }), 'manifestEntryId or path');
 }
 
-function assertActionBundleCompiler(): void {
+function assertActionBundleProtocolFields(): void {
   const bundle = genericActionBundle();
-  const contract = compileActionBundleToPlanContract(bundle);
-  assertEqual(contract.requiredCapabilities.join(','), 'workspace.read,workspace.write', 'capabilities are sorted');
-  assertEqual(contract.requiresUserApproval, true, 'write proposal requires user approval');
+  assertEqual(bundle.actions.some((action) => action.capability === 'workspace.write'), true, 'actionBundle carries workspace.write capability');
+  assertEqual(bundle.validationExpectations.length > 0, true, 'actionBundle carries validation expectations');
+  assertEqual(bundle.reviewExpectations.length > 0, true, 'actionBundle carries review expectations');
 
-  const command = createPlanContractSubmitCommand({
-    requestId: 'req-plan',
-    runId: 'run-generic',
-    sessionId: 'session-generic',
-    bundle,
+  const proposal = parseProposalEnvelope({
+    runId: 'run-normalize',
+    sessionId: 'session-normalize',
+    raw: JSON.stringify(providerFacingWriteProposalWithoutMachineIds()),
   });
-  assertEqual(command.kind, 'planContractSubmit', 'actionBundle bridges through Kernel PlanReview command');
+  const payload = proposal.payload as any;
+  assertEqual(payload.actionBundle.id, 'proposal-run-normalize-actionBundle-action-bundle', 'Session parser fills actionBundle id deterministically');
+  assertEqual(payload.codeBlocks[0].id, 'generic-block', 'Session parser maps blockId to codeBlock id');
+  assertEqual(payload.codeBlocks[0].path, 'generic-output.txt', 'Session parser maps targetPath to codeBlock path');
+  assertEqual(payload.actionBundle.actions[0].id, 'write-generic-output', 'Session parser maps actionId to action id');
+  assertEqual(payload.actionBundle.actions[0].title, 'Write generic output', 'Session parser maps description to action title');
+  assertEqual(payload.actionBundle.actions[0].canParallelize, false, 'Session parser fills canParallelize default');
+  assertEqual(payload.actionBundle.actions[0].conflictKeys[0], 'generic-output.txt', 'Session parser derives conflict key from resource scope');
 }
 
 function assertPromptEnvelope(): void {
@@ -632,37 +636,25 @@ async function assertSessionDriverLoopRepairsSideEffectBundleEvidence(): Promise
       const command = request.command as Record<string, any>;
       if (command.kind === 'runCreate') return fakeKernel(request);
       if (command.kind === 'proposalSubmit') {
+        submittedPlans.push(command.proposal);
+        const actionBundle = command.proposal?.payload?.actionBundle ?? {};
         return {
           ok: true,
-          events: [{
-            kind: 'proposal.accepted',
-            runId: 'run-generic',
-            sessionId: 'session-plan-repair',
-            proposal: command.proposal,
-          }],
-        };
-      }
-      if (command.kind === 'planContractSubmit') {
-        submittedPlans.push(command.contract);
-        return {
-          ok: true,
-          events: [{
-            kind: 'plan.review_report_produced',
-            runId: 'run-generic',
-            sessionId: 'session-plan-repair',
-            report: {
-              planId: command.contract.id,
-              status: 'awaitingUserApproval',
-              requiredCapabilities: command.contract.requiredCapabilities,
-              requiredPermissions: ['temporaryGrant:workspace.write'],
-              permissionGaps: ['workspace.write'],
-              hardFloorHits: [],
-              deniedReasons: [],
-              blockedReasons: [],
-              findings: [],
-              kernelGeneratedPermissionSummary: 'Kernel preflight: status=awaitingUserApproval; capabilities=workspace.write; permissionGaps=workspace.write; hardFloor=none.',
+          events: [
+            {
+              kind: 'proposal.accepted',
+              runId: 'run-generic',
+              sessionId: 'session-plan-repair',
+              proposal: command.proposal,
             },
-          }],
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: 'session-plan-repair',
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(actionBundle),
+            },
+          ],
         };
       }
       return { ok: true, events: [] };
@@ -692,12 +684,58 @@ async function assertSessionDriverLoopRepairsSideEffectBundleEvidence(): Promise
     requirementConfirmationMode: 'off',
   });
   assertEqual(llmCalls, 2, 'side-effect actionBundle missing evidence triggers one protocol repair');
-  assertEqual(submittedPlans.length, 1, 'repaired actionBundle reaches Kernel plan contract submit once');
-  assertEqual((submittedPlans[0].completionCriteria ?? []).length, 1, 'repaired plan contains completion criteria');
+  assertEqual(submittedPlans.length, 1, 'repaired actionBundle reaches Kernel ProposalSubmit once');
+  assertEqual(submittedPlans[0].kind, 'actionBundle', 'repaired proposal remains an actionBundle');
+  const repairedBundle = submittedPlans[0].payload?.actionBundle ?? {};
+  assertEqual((repairedBundle.validationExpectations ?? []).length, 1, 'repaired actionBundle contains validation expectations');
+  assertEqual((repairedBundle.reviewExpectations ?? []).length, 1, 'repaired actionBundle contains review expectations');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired plan renders a plan card');
   assertEqual(result.events.some((event) => event.kind === 'plan_review'), true, 'repaired plan renders a plan review card');
   assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any).channel === 'reasoning'), true, 'provider reasoning is visible');
   assertEqual(transcript.some((entry) => entry.type === 'metadata' && entry.kind === 'provider_trace'), true, 'provider trace is archived');
+}
+
+async function assertSessionDriverLoopRepairsInvalidSourceBlock(): Promise<void> {
+  const events: AgentEvent[] = [];
+  let llmCalls = 0;
+  const submittedPlans: Array<Record<string, any>> = [];
+  const session: AgentSession = {
+    id: 'session-source-block-repair',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-source-block-repair', submittedPlans),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      const proposal = genericWriteProposal(false);
+      if (llmCalls === 1) {
+        (proposal.actionBundle as any).actions[0].sourceBlockId = 'missing-code-block';
+      }
+      return jsonLlmResponse(proposal);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmCalls + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-source-block-repair',
+    content: 'Create a generic scaffold.',
+    requirementConfirmationMode: 'off',
+  });
+  assertEqual(llmCalls, 2, 'invalid sourceBlockId triggers one protocol repair');
+  assertEqual(submittedPlans.length, 1, 'only repaired actionBundle reaches Kernel');
+  assertEqual(
+    submittedPlans[0].payload?.actionBundle?.actions?.[0]?.sourceBlockId,
+    'generic-block',
+    'repaired actionBundle sourceBlockId matches a code block'
+  );
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired sourceBlockId plan renders a plan card');
 }
 
 async function assertSessionDriverLoopRepairsOversizedActionBundle(): Promise<void> {
@@ -992,6 +1030,30 @@ function oversizedGenericWriteProposal(): Record<string, unknown> {
   return proposal;
 }
 
+function providerFacingWriteProposalWithoutMachineIds(): Record<string, unknown> {
+  const proposal = genericWriteProposal(false);
+  delete (proposal.actionBundle as any).id;
+  proposal.codeBlocks = [{
+    blockId: 'generic-block',
+    targetPath: 'generic-output.txt',
+    language: 'text',
+    operation: 'create',
+    content: 'generic content',
+    permissionLabels: ['workspace.write'],
+  }];
+  (proposal.actionBundle as any).actions = [{
+    actionId: 'write-generic-output',
+    description: 'Write generic output',
+    capability: 'workspace.write',
+    resourceScope: ['generic-output.txt'],
+    targetPath: 'generic-output.txt',
+    sourceBlockId: 'generic-block',
+    dependsOn: [],
+    permissionLabels: ['workspace.write'],
+  }];
+  return proposal;
+}
+
 function jsonLlmResponse(payload: Record<string, unknown>): ApiResponse<LlmChatResult> {
   return {
     ok: true,
@@ -1014,40 +1076,45 @@ function planKernel(
   const command = request.command as Record<string, any>;
   if (command.kind === 'runCreate') return fakeKernel(request);
   if (command.kind === 'proposalSubmit') {
+    submittedPlans.push(command.proposal);
+    const actionBundle = command.proposal?.payload?.actionBundle ?? {};
     return {
       ok: true,
-      events: [{
-        kind: 'proposal.accepted',
-        runId: 'run-generic',
-        sessionId,
-        proposal: command.proposal,
-      }],
-    };
-  }
-  if (command.kind === 'planContractSubmit') {
-    submittedPlans.push(command.contract);
-    return {
-      ok: true,
-      events: [{
-        kind: 'plan.review_report_produced',
-        runId: 'run-generic',
-        sessionId,
-        report: {
-          planId: command.contract.id,
-          status: 'awaitingUserApproval',
-          requiredCapabilities: command.contract.requiredCapabilities,
-          requiredPermissions: ['temporaryGrant:workspace.write'],
-          permissionGaps: ['workspace.write'],
-          hardFloorHits: [],
-          deniedReasons: [],
-          blockedReasons: [],
-          findings: [],
-          kernelGeneratedPermissionSummary: 'Kernel preflight: status=awaitingUserApproval; capabilities=workspace.write; permissionGaps=workspace.write; hardFloor=none.',
+      events: [
+        {
+          kind: 'proposal.accepted',
+          runId: 'run-generic',
+          sessionId,
+          proposal: command.proposal,
         },
-      }],
+        {
+          kind: 'proposal.reviewed',
+          runId: 'run-generic',
+          sessionId,
+          proposalId: command.proposal?.proposalId,
+          report: proposalReviewReport(actionBundle),
+        },
+      ],
     };
   }
   return { ok: true, events: [] };
+}
+
+function proposalReviewReport(actionBundle: Record<string, any>): Record<string, any> {
+  const actions = Array.isArray(actionBundle.actions) ? actionBundle.actions : [];
+  const capabilities = [...new Set(actions.map((action) => action.capability).filter(Boolean))].sort();
+  return {
+    planId: actionBundle.id ?? 'bundle-generic',
+    status: 'awaitingUserApproval',
+    requiredCapabilities: capabilities,
+    requiredPermissions: capabilities.includes('workspace.write') ? ['temporaryGrant:workspace.write'] : [],
+    permissionGaps: capabilities.includes('workspace.write') ? ['workspace.write'] : [],
+    hardFloorHits: [],
+    deniedReasons: [],
+    blockedReasons: [],
+    findings: [],
+    kernelGeneratedPermissionSummary: `Kernel preflight: status=awaitingUserApproval; capabilities=${capabilities.join(',')}; permissionGaps=${capabilities.includes('workspace.write') ? 'workspace.write' : 'none'}; hardFloor=none.`,
+  };
 }
 
 function genericActionBundle(): ActionBundleDraft {

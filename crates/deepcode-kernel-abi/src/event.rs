@@ -51,6 +51,15 @@ pub enum KernelEvent {
         proposal: ProposalEnvelope,
         sequence: Option<u64>,
     },
+    #[serde(rename = "proposal.reviewed")]
+    ProposalReviewed {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        proposal_id: String,
+        report: Value,
+        sequence: Option<u64>,
+    },
     #[serde(rename = "proposal.rejected")]
     ProposalRejected {
         request_id: Option<RequestId>,
@@ -229,38 +238,6 @@ pub enum KernelEvent {
         run_id: Option<RunId>,
         session_id: Option<SessionId>,
         snapshot_ref: ConfigSnapshotRef,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "plan.proposed")]
-    PlanProposed {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        plan_id: String,
-        summary: Option<String>,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "plan.accepted")]
-    PlanAccepted {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        plan_id: String,
-        auto_accepted: bool,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "plan.rejected")]
-    PlanRejected {
-        run_id: RunId,
-        session_id: Option<SessionId>,
-        plan_id: String,
-        reason: Option<String>,
-        sequence: Option<u64>,
-    },
-    #[serde(rename = "plan.review_report_produced")]
-    PlanReviewReportProduced {
-        request_id: Option<RequestId>,
-        run_id: Option<RunId>,
-        session_id: Option<SessionId>,
-        report: Value,
         sequence: Option<u64>,
     },
     #[serde(rename = "workflow.checkpointed")]

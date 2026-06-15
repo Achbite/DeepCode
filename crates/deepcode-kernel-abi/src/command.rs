@@ -168,29 +168,6 @@ pub enum KernelCommand {
         permission_id: String,
         decision: PermissionDecisionKind,
     },
-    PlanAccept {
-        request_id: RequestId,
-        run_id: RunId,
-        plan_id: String,
-    },
-    PlanReject {
-        request_id: RequestId,
-        run_id: RunId,
-        plan_id: String,
-        reason: Option<String>,
-    },
-    PlanRevise {
-        request_id: RequestId,
-        run_id: RunId,
-        plan_id: String,
-        guidance: String,
-    },
-    PlanContractSubmit {
-        request_id: RequestId,
-        run_id: Option<RunId>,
-        session_id: Option<SessionId>,
-        contract: Value,
-    },
     SkillTrustApprove {
         request_id: RequestId,
         skill_id: String,

@@ -9,7 +9,6 @@ import type {
   LlmChatRequest,
   LlmChatResult,
 } from '@deepcode/protocol';
-import { createPlanContractSubmitCommand } from '../agent-plan/compiler.js';
 import { parseProposalEnvelope } from '../agent-plan/protocolV3.js';
 import {
   AgentPlanParseError,
@@ -231,10 +230,9 @@ export class SessionDriverLoop {
         allowedProposals: state.stateContract?.allowedProposals ?? [
           'answer',
           'resourceRequest',
-          'requirementDraft',
+          'decisionRequest',
           'actionBundle',
-          'repairProposal',
-          'reviewPacketDraft',
+          'diagnostic',
         ],
         capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
         memoryHints: state.memoryHints,
@@ -266,6 +264,30 @@ export class SessionDriverLoop {
       }
       if (proposal.kind === 'answer') {
         return this.append(sessionId, [answerEvent(sessionId, proposal, this.ts(), this.id('answer'))]);
+      }
+      if (proposal.kind === 'decisionRequest') {
+        const requirement = requirementRecordFromProposal(proposal, input, state, this.ts());
+        return this.append(sessionId, [
+          requirementConfirmationEvent({
+            sessionId,
+            runId: state.runId,
+            requirement,
+            proposal,
+            originalUserRequest: input.content,
+            attachments: input.attachments ?? [],
+            ts: this.ts(),
+            id: this.id('decision-request'),
+          }),
+        ]);
+      }
+      if (proposal.kind === 'diagnostic') {
+        const diagnostic = objectRecord(proposal.payload) ?? {};
+        const summary = stringValue(diagnostic.summary)
+          ?? stringValue(diagnostic.details)
+          ?? '模型返回诊断信息，未生成计划或执行队列。';
+        return this.append(sessionId, [
+          finalDiagnosticEvent(sessionId, summary, this.ts(), this.id('diagnostic')),
+        ]);
       }
       if (proposal.kind === 'resourceRequest') {
         if (rounds >= MAX_RESOURCE_ROUNDS) {
@@ -448,11 +470,29 @@ export class SessionDriverLoop {
           planId: plan.planId,
           actionBundle: plan.actionBundle,
           codeBlocks: plan.codeBlocks,
+          commandBlocks: plan.commandBlocks,
         },
       },
     });
     result = await this.appendProjectedKernelEvents(input.sessionId, batchReply);
-    return this.append(input.sessionId, [reviewSummaryEvent(input.sessionId, plan, batchReply.events ?? [], this.ts(), this.id('review-summary'))]) ?? result;
+    const factsReply = await this.kernel({
+      command: {
+        kind: 'reviewFactsGet',
+        requestId: this.id('review-facts-get'),
+        runId: plan.runId,
+        sessionId: input.sessionId,
+      },
+    });
+    result = await this.appendProjectedKernelEvents(input.sessionId, factsReply);
+    return this.append(input.sessionId, [
+      reviewSummaryEvent(
+        input.sessionId,
+        plan,
+        [...(batchReply.events ?? []), ...(factsReply.events ?? [])],
+        this.ts(),
+        this.id('review-summary')
+      ),
+    ]) ?? result;
   }
 
   private async resolveReviewDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
@@ -526,7 +566,20 @@ export class SessionDriverLoop {
         },
       },
     });
-    return this.appendProjectedKernelEvents(input.sessionId, decisionReply);
+    result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
+    const gateReply = await this.kernel({
+      command: {
+        kind: 'reviewGateEvaluate',
+        requestId: this.id('review-gate-evaluate'),
+        runId: review.runId,
+        sessionId: input.sessionId,
+        decision: {
+          decision: input.decision,
+          guidance: input.guidance,
+        },
+      },
+    });
+    return this.appendProjectedKernelEvents(input.sessionId, gateReply) ?? result;
   }
 
   private async buildRequirementConfirmation(
@@ -534,14 +587,14 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState
   ): Promise<AgentEvent> {
     const prompt = buildPromptEnvelope({
-      workflowState: 'needRequirementDraft',
-      allowedProposals: ['requirementDraft'],
+      workflowState: 'needDecisionRequest',
+      allowedProposals: ['decisionRequest'],
       capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
       memoryHints: state.memoryHints,
       userOverlay: [
-        'Before proposing side-effect work, draft a requirement understanding confirmation for the user.',
-        'Return kind="requirementDraft" only.',
-        'Cover goal, scope, non-goals, constraints, risks, acceptance criteria, and open questions.',
+        'Before proposing side-effect work, request user intervention only if a concrete decision is needed.',
+        'Return kind="decisionRequest" only.',
+        'Provide 2-3 clear options with one recommended option and impact descriptions.',
         'Do not output actionBundle yet.',
       ].join('\n'),
       userRequest: input.content,
@@ -554,10 +607,10 @@ export class SessionDriverLoop {
       },
     });
     const proposal = await this.callProviderAndParse(input, state, prompt);
-    if (proposal.kind !== 'requirementDraft') {
+    if (proposal.kind !== 'decisionRequest') {
       throw new SessionDriverLoopError(
-        'requirement_draft_expected',
-        `Expected requirementDraft before side-effect planning, got ${proposal.kind}.`
+        'decision_request_expected',
+        `Expected decisionRequest before side-effect planning, got ${proposal.kind}.`
       );
     }
     const requirement = requirementRecordFromProposal(proposal, input, state, this.ts());
@@ -717,22 +770,24 @@ export class SessionDriverLoop {
         proposal,
       },
     });
-    let result = await this.appendProjectedKernelEvents(state.sessionId, proposalReply);
     const actionBundle = readActionBundle(proposal);
-    if (!actionBundle) return result ?? fallback;
-    const command = createPlanContractSubmitCommand({
-      requestId: this.id('plan-contract'),
-      runId: state.runId,
-      sessionId: state.sessionId,
-      bundle: actionBundle,
-    });
-    const planReply = await this.kernel({ command });
-    const reviewReport = findPlanReviewReport(planReply.events);
+    if (!actionBundle) return await this.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? fallback;
+    const reviewReport = findPlanReviewReport(proposalReply.events);
     await this.appendProviderTrace(state, 'plan_review_report', {
       proposalId: proposal.proposalId,
       report: reviewReport,
-      events: planReply.events,
+      events: proposalReply.events,
     });
+    if (!reviewReport) {
+      return this.append(state.sessionId, [
+        finalDiagnosticEvent(
+          state.sessionId,
+          'Kernel 未返回 actionBundle 的 proposal.reviewed 事件，Session 不会展示可确认计划。',
+          this.ts(),
+          this.id('plan-review-missing')
+        ),
+      ]);
+    }
     if (reviewReport && planReviewNeedsRepair(reviewReport) && !state.planReviewRepairAttempted) {
       state.planReviewRepairAttempted = true;
       await this.append(state.sessionId, [
@@ -748,9 +803,6 @@ export class SessionDriverLoop {
         repaired = await this.repairPlanReview(input, state, prompt, proposal, reviewReport);
       } catch (error) {
         const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-        const planCard = actionBundlePlanCardEvent(state, proposal, reviewReport, this.ts(), this.id('plan-card'));
-        await this.append(state.sessionId, [planCard]);
-        await this.appendProjectedKernelEvents(state.sessionId, planReply);
         return this.append(state.sessionId, [
           finalDiagnosticEvent(
             state.sessionId,
@@ -761,16 +813,26 @@ export class SessionDriverLoop {
         ]);
       }
       if (repaired.kind === 'actionBundle') {
-        return this.submitActionProposal(input, state, prompt, repaired, result ?? fallback);
+        return this.submitActionProposal(input, state, prompt, repaired, fallback);
       }
       if (repaired.kind === 'answer') {
         return this.append(state.sessionId, [answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]);
       }
-      return this.submitNonExecutableProposal(state, repaired, result ?? fallback);
+      return this.submitNonExecutableProposal(state, repaired, fallback);
+    }
+    let result = await this.appendProjectedKernelEvents(state.sessionId, proposalReply);
+    if (planReviewDenied(reviewReport)) {
+      return this.append(state.sessionId, [
+        finalDiagnosticEvent(
+          state.sessionId,
+          `Kernel 拒绝该计划：${planReviewDiagnosticSummary(reviewReport)}`,
+          this.ts(),
+          this.id('plan-review-denied')
+        ),
+      ]);
     }
     const planCard = actionBundlePlanCardEvent(state, proposal, reviewReport, this.ts(), this.id('plan-card'));
     result = await this.append(state.sessionId, [planCard]);
-    result = await this.appendProjectedKernelEvents(state.sessionId, planReply);
     return result ?? fallback;
   }
 
@@ -1629,7 +1691,7 @@ function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePa
 function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: string): AgentEvent {
   const record = objectRecord(event) ?? {};
   const kind = typeof record.kind === 'string' ? record.kind : 'kernel.event';
-  if (kind === 'plan.review_report_produced') {
+  if (kind === 'proposal.reviewed') {
     const report = objectRecord(record.report) ?? {};
     const status = typeof report.status === 'string' ? report.status : 'awaitingUserApproval';
     const planId = typeof report.planId === 'string' ? report.planId : 'agent-plan';
@@ -1804,6 +1866,15 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
   if (!bundle) {
     throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle must include an actionBundle object.');
   }
+  if (typeof bundle.id !== 'string' || !bundle.id.trim()) {
+    throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle.id must be a non-empty string.');
+  }
+  if (bundle.version !== '1') {
+    throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle.version must be "1".');
+  }
+  if (typeof bundle.goal !== 'string' || !bundle.goal.trim()) {
+    throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle.goal must be a non-empty string.');
+  }
   if (!Array.isArray(bundle.actions) || bundle.actions.length === 0) {
     throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle.actions must not be empty.');
   }
@@ -1820,9 +1891,15 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
       `ActionBundle has ${codeBlocks.length} codeBlocks; output only the next implementation batch with at most ${MAX_ACTION_BUNDLE_CODE_BLOCKS} codeBlocks.`
     );
   }
+  const codeBlockIds = new Set<string>();
   let totalCodeBytes = 0;
   for (const [index, block] of codeBlocks.entries()) {
     const record = objectRecord(block);
+    const blockId = typeof record?.id === 'string' ? record.id.trim() : '';
+    if (!blockId) {
+      throw new AgentPlanParseError('invalid_action_bundle', `codeBlocks[${index}].id must be a non-empty string.`);
+    }
+    codeBlockIds.add(blockId);
     const content = typeof record?.content === 'string' ? record.content : '';
     const size = utf8Bytes(content);
     totalCodeBytes += size;
@@ -1839,8 +1916,42 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
       `codeBlocks total content is ${totalCodeBytes} bytes; output only the next implementation batch with at most ${MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES} bytes of code.`
     );
   }
+  for (const [index, action] of bundle.actions.entries()) {
+    if (typeof action.id !== 'string' || !action.id.trim()) {
+      throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}].id must be a non-empty string.`);
+    }
+    if (typeof action.title !== 'string' || !action.title.trim()) {
+      throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}].title must be a non-empty string.`);
+    }
+    if (typeof action.capability !== 'string' || !action.capability.trim()) {
+      throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}].capability must be a non-empty string.`);
+    }
+    if (!Array.isArray(action.resourceScope)) {
+      throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}].resourceScope must be an array.`);
+    }
+    if ((action.capability === 'workspace.write' || action.capability === 'workspace.create') && !action.sourceBlockId?.trim()) {
+      throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${action.capability} must include sourceBlockId.`);
+    }
+    if (action.sourceBlockId && !codeBlockIds.has(action.sourceBlockId)) {
+      throw new AgentPlanParseError(
+        'invalid_action_bundle',
+        `actionBundle.actions[${index}].sourceBlockId "${action.sourceBlockId}" does not match any codeBlocks[].id.`
+      );
+    }
+  }
   const sideEffectful = bundle.actions.some((action) => SIDE_EFFECT_CAPABILITIES.has(action.capability));
   if (!sideEffectful) return;
+  for (const [index, block] of codeBlocks.entries()) {
+    const record = objectRecord(block);
+    const hasPath = typeof record?.path === 'string' && record.path.trim();
+    const hasTargetPath = typeof record?.targetPath === 'string' && record.targetPath.trim();
+    if (!hasPath && !hasTargetPath) {
+      throw new AgentPlanParseError('invalid_action_bundle', `codeBlocks[${index}] must include path or targetPath.`);
+    }
+    if (typeof record?.content !== 'string') {
+      throw new AgentPlanParseError('invalid_action_bundle', `codeBlocks[${index}].content must be a string.`);
+    }
+  }
   const userPlan = typeof payload.userPlan === 'string' ? payload.userPlan.trim() : '';
   validateDetailedUserPlan(userPlan);
   const validationExpectations = Array.isArray(bundle.validationExpectations) ? bundle.validationExpectations : [];
@@ -1907,6 +2018,7 @@ function actionBundlePlanCardEvent(
       implementationBatch: state.implementationBatch,
       actionBundle,
       codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
+      commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
       expectedValidation: typeof payload.expectedValidation === 'string' ? payload.expectedValidation : '',
       reviewGuide: typeof payload.reviewGuide === 'string' ? payload.reviewGuide : '',
       planReviewReport: report,
@@ -1920,7 +2032,7 @@ function actionBundlePlanCardEvent(
 function findPlanReviewReport(events: unknown[]): Record<string, unknown> | undefined {
   for (const event of events) {
     const record = objectRecord(event);
-    if (record?.kind !== 'plan.review_report_produced') continue;
+    if (record?.kind !== 'proposal.reviewed') continue;
     const report = objectRecord(record.report);
     if (report) return report;
   }
@@ -1928,6 +2040,12 @@ function findPlanReviewReport(events: unknown[]): Record<string, unknown> | unde
 }
 
 function planReviewNeedsRepair(report: Record<string, unknown>): boolean {
+  if (
+    report.status === 'denied' &&
+    planReviewDiagnosticSummary(report).includes('actionBundle payload failed Kernel schema validation')
+  ) {
+    return true;
+  }
   if (report.status !== 'needsRevision') return false;
   const repairableCodes = new Set(['completion_evidence_required']);
   const findings = Array.isArray(report.findings) ? report.findings : [];
@@ -1935,6 +2053,21 @@ function planReviewNeedsRepair(report: Record<string, unknown>): boolean {
     const record = objectRecord(finding);
     return typeof record?.code === 'string' && repairableCodes.has(record.code);
   });
+}
+
+function planReviewDenied(report: Record<string, unknown>): boolean {
+  return report.status === 'denied' || report.status === 'interfaceOnly';
+}
+
+function planReviewDiagnosticSummary(report: Record<string, unknown>): string {
+  const denied = Array.isArray(report.deniedReasons)
+    ? report.deniedReasons.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
+  const blocked = Array.isArray(report.blockedReasons)
+    ? report.blockedReasons.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
+  const summary = typeof report.kernelGeneratedPermissionSummary === 'string' ? report.kernelGeneratedPermissionSummary : '';
+  return [...denied, ...blocked, summary].filter(Boolean).join('；') || '计划审查未通过。';
 }
 
 function shouldAttemptActionBundleCompactionRepair(state: SessionDriverLoopRunState): boolean {
@@ -1973,6 +2106,7 @@ interface SessionPlanContext {
   userPlan: string;
   actionBundle: Record<string, unknown>;
   codeBlocks: unknown[];
+  commandBlocks: unknown[];
   expectedValidation: string;
   reviewGuide: string;
   planReviewReport?: Record<string, unknown>;
@@ -2035,6 +2169,7 @@ function planContextFromEvent(event: AgentEvent, payload: Record<string, unknown
     userPlan: stringValue(payload.content) ?? stringValue(payload.summary) ?? 'Agent plan',
     actionBundle,
     codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
+    commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
     expectedValidation: stringValue(payload.expectedValidation) ?? '',
     reviewGuide: stringValue(payload.reviewGuide) ?? '',
     planReviewReport: objectRecord(payload.planReviewReport) ?? undefined,
@@ -2170,10 +2305,19 @@ function reviewSummaryEvent(
   id: string
 ): AgentEvent {
   const facts = reviewFactLines(kernelEvents);
-  const completed = kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.completed').length;
-  const failed = kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.failed').length;
-  const blocked = kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.blocked').length;
-  const toolResults = kernelEvents.filter((event) => objectRecord(event)?.kind === 'tool.completed').length;
+  const reviewFacts = findReviewFacts(kernelEvents);
+  const completed = reviewFacts
+    ? arrayLength(reviewFacts.completedWorkUnits)
+    : kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.completed').length;
+  const failed = reviewFacts
+    ? arrayLength(reviewFacts.failedWorkUnits)
+    : kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.failed').length;
+  const blocked = reviewFacts
+    ? arrayLength(reviewFacts.blockedWorkUnits)
+    : kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.blocked').length;
+  const toolResults = reviewFacts
+    ? arrayLength(reviewFacts.toolResults)
+    : kernelEvents.filter((event) => objectRecord(event)?.kind === 'tool.completed').length;
   const continuations = Array.isArray(plan.actionBundle.continuationExpectations) ? plan.actionBundle.continuationExpectations : [];
   const summary = failed || blocked
     ? '当前批次已推进，但存在失败或阻塞项，请审查 Kernel facts 后决定是否修订。'
@@ -2196,6 +2340,7 @@ function reviewSummaryEvent(
       continuationCount: continuations.length,
       continuations,
       reviewExpectations: Array.isArray(plan.actionBundle.reviewExpectations) ? plan.actionBundle.reviewExpectations : [],
+      reviewFacts,
       facts,
       factCounts: {
         workUnitsCompleted: completed,
@@ -2252,6 +2397,35 @@ function waitingReviewContent(
 }
 
 function reviewFactLines(kernelEvents: unknown[]): string[] {
+  const facts = findReviewFacts(kernelEvents);
+  if (facts) {
+    const lines: string[] = [];
+    const completed = Array.isArray(facts.completedWorkUnits) ? facts.completedWorkUnits : [];
+    const failed = Array.isArray(facts.failedWorkUnits) ? facts.failedWorkUnits : [];
+    const blocked = Array.isArray(facts.blockedWorkUnits) ? facts.blockedWorkUnits : [];
+    const tools = Array.isArray(facts.toolResults) ? facts.toolResults : [];
+    for (const item of completed) {
+      const record = objectRecord(item);
+      lines.push(`- \`${stringValue(record?.workUnitId) ?? 'work-unit'}\` completed${record?.output ? `：${clipJson(record.output, 180)}` : ''}`);
+    }
+    for (const item of failed) {
+      const record = objectRecord(item);
+      const error = objectRecord(record?.error);
+      lines.push(`- \`${stringValue(record?.workUnitId) ?? 'work-unit'}\` failed：${stringValue(error?.message) ?? 'unknown error'}`);
+    }
+    for (const item of blocked) {
+      const record = objectRecord(item);
+      lines.push(`- \`${stringValue(record?.workUnitId) ?? 'work-unit'}\` blocked：${stringValue(record?.reason) ?? 'blocked'}`);
+    }
+    for (const item of tools) {
+      const record = objectRecord(item);
+      const error = objectRecord(record?.error);
+      const status = record?.ok === true ? 'ok' : 'error';
+      const detail = stringValue(error?.message) ?? (record?.output ? clipJson(record.output, 180) : 'no output');
+      lines.push(`- \`${stringValue(record?.toolName) ?? 'tool'}\` ${status}：${detail}`);
+    }
+    return lines;
+  }
   return kernelEvents.flatMap((event) => {
     const record = objectRecord(event);
     if (!record) return [];
@@ -2274,6 +2448,19 @@ function reviewFactLines(kernelEvents: unknown[]): string[] {
     }
     return [];
   });
+}
+
+function findReviewFacts(kernelEvents: unknown[]): Record<string, unknown> | undefined {
+  for (const event of [...kernelEvents].reverse()) {
+    const record = objectRecord(event);
+    if (record?.kind !== 'review.facts_produced') continue;
+    return objectRecord(record.facts) ?? undefined;
+  }
+  return undefined;
+}
+
+function arrayLength(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0;
 }
 
 function reviewExpectationLines(plan: SessionPlanContext): string[] {
@@ -2665,40 +2852,13 @@ function planReviewRepairMessages(
 
 function shouldRequestRequirementConfirmation(
   input: SessionDriverLoopInput,
-  state: SessionDriverLoopRunState
+  _state: SessionDriverLoopRunState
 ): boolean {
   if (input.confirmedRequirement) return false;
   const mode = input.requirementConfirmationMode ?? 'auto';
   if (mode === 'off') return false;
   if (mode === 'always') return true;
-  const allowed = state.stateContract?.allowedProposals ?? ['answer', 'resourceRequest', 'actionBundle'];
-  if (!allowed.includes('actionBundle')) return false;
-  return looksLikeSideEffectDevelopmentRequest(input.content);
-}
-
-function looksLikeSideEffectDevelopmentRequest(content: string): boolean {
-  const normalized = content.toLowerCase();
-  return [
-    'create',
-    'scaffold',
-    'implement',
-    'write',
-    'modify',
-    'delete',
-    'rename',
-    'refactor',
-    '生成',
-    '创建',
-    '新建',
-    '实现',
-    '落地',
-    '写入',
-    '修改',
-    '删除',
-    '重构',
-    '添加',
-    '搭建',
-  ].some((needle) => normalized.includes(needle));
+  return false;
 }
 
 function requirementRecordFromProposal(
@@ -2708,13 +2868,27 @@ function requirementRecordFromProposal(
   timestamp: string
 ): RequirementRecord {
   const draft = objectRecord(proposal.payload) ?? {};
+  const decisionOptions = Array.isArray(draft.options)
+    ? draft.options
+      .map((item) => objectRecord(item))
+      .filter((item): item is Record<string, unknown> => Boolean(item))
+      .map((item) => {
+        const label = stringValue(item.label) ?? stringValue(item.id) ?? 'option';
+        const description = stringValue(item.description);
+        const recommended = item.recommended === true ? '（推荐）' : '';
+        return [label + recommended, description].filter(Boolean).join('：');
+      })
+      .filter(Boolean)
+    : [];
   const requirementId = stringValue(draft.requirementId)
+    ?? stringValue(draft.id)
     ?? proposal.proposalId
     ?? `requirement-${state.runId}`;
   const checklist: RequirementChecklist = {
-    goal: stringValue(draft.goal) ?? stringValue(draft.summary) ?? input.content,
+    goal: stringValue(draft.goal) ?? stringValue(draft.summary) ?? stringValue(draft.reason) ?? input.content,
     explicitTasks: stringArrayValue(draft.scope)
       .concat(stringArrayValue(draft.explicitTasks))
+      .concat(decisionOptions)
       .filter(Boolean),
     inferredTasks: stringArrayValue(draft.inferredTasks)
       .concat(stringArrayValue(draft.constraints))
@@ -2757,7 +2931,7 @@ function requirementConfirmationEvent(input: {
     ts: input.ts,
     kind: 'requirement_confirmation',
     payload: {
-      title: '需求理解确认',
+      title: '用户介入请求',
       summary: requirementSummary(input.requirement),
       content,
       status: 'waitingUserConfirmation',
@@ -2765,7 +2939,7 @@ function requirementConfirmationEvent(input: {
       runId: input.runId,
       requirementId: input.requirement.requirementId,
       requirement: input.requirement,
-      requirementDraft: input.proposal.payload,
+      decisionRequest: input.proposal.payload,
       proposalId: input.proposal.proposalId,
       originalUserRequest: input.originalUserRequest,
       attachments: input.attachments,

@@ -139,12 +139,6 @@ impl DeepCodeKernelRuntime {
                 let permission_id = event.payload.get("permissionId")?.as_str()?.to_string();
                 let session_id = event.session_id.clone()?;
                 let tool_name = event.payload.get("toolName")?.as_str()?.to_string();
-                let tool_call_id = event
-                    .payload
-                    .get("toolCallId")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&permission_id)
-                    .to_string();
                 let arguments = event
                     .payload
                     .get("arguments")
@@ -155,7 +149,6 @@ impl DeepCodeKernelRuntime {
                     PendingKernelTool {
                         run_id: run_id.to_string(),
                         session_id,
-                        tool_call_id,
                         tool_name,
                         arguments,
                     },

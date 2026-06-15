@@ -16,7 +16,7 @@ use deepcode_kernel_config::{
 use deepcode_kernel_ledger::{
     ChangeOperation, ChangeSet, EventLedger, InMemoryEventLedger, KernelResource,
     KernelResourceCleanupPolicy, KernelResourceKind, KernelResourceOwner, KernelResourceScope,
-    LedgerEvent, NdjsonEventLedger, ReviewGate, ReviewGateStatus, ValidationKind, ValidationResult,
+    LedgerEvent, NdjsonEventLedger, ValidationKind, ValidationResult,
 };
 use deepcode_kernel_policy::{AutonomyLevel, PolicyDecisionKind, PolicyProfile, WorkspaceBoundary};
 use deepcode_kernel_skills::{
@@ -41,13 +41,11 @@ pub mod dispatch;
 pub mod obligations;
 pub mod permissions;
 pub mod state;
-pub mod temp_artifacts;
 pub mod tools;
 pub mod workflow;
 pub mod workspace;
 
 pub(crate) use state::*;
-pub(crate) use temp_artifacts::*;
 pub(crate) use tools::*;
 pub(crate) use workflow::*;
 pub(crate) use workspace::*;

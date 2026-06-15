@@ -65,7 +65,6 @@ impl DeepCodeKernelRuntime {
                 PendingKernelTool {
                     run_id: run_id.clone(),
                     session_id: session_id.clone(),
-                    tool_call_id: pending_tool_call_id.clone(),
                     tool_name: tool_name.clone(),
                     arguments: pending_arguments.clone(),
                 },
@@ -1343,6 +1342,10 @@ fn workflow_temp_resource_id(run_id: &str, path: &str) -> String {
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect::<String>();
     format!("agent-temp-{run_id}-{normalized}")
+}
+
+fn is_temp_file_path(value: &str) -> bool {
+    value.contains("_agent_tmp_")
 }
 
 pub(crate) fn get_string(value: &Value, key: &str) -> Option<String> {

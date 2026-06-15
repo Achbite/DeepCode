@@ -62,7 +62,8 @@ impl DeepCodeKernelRuntime {
 
         for (index, action) in actions.iter().enumerate() {
             let action_id = action
-                .get("id")
+                .get("actionId")
+                .or_else(|| action.get("id"))
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_string)
@@ -79,12 +80,17 @@ impl DeepCodeKernelRuntime {
             let kind = action
                 .get("kind")
                 .and_then(Value::as_str)
+                .or_else(|| workspace_kind_from_capability(capability))
                 .unwrap_or("write");
             let work_unit = serde_json::json!({
                 "id": &work_unit_id,
                 "planId": &plan_id,
                 "actionId": &action_id,
-                "title": action.get("title").and_then(Value::as_str).unwrap_or(&action_id),
+                "title": action
+                    .get("title")
+                    .or_else(|| action.get("description"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&action_id),
                 "capability": capability,
                 "kind": kind,
                 "resourceScope": action.get("resourceScope").cloned().unwrap_or_else(|| serde_json::json!([])),
@@ -103,21 +109,26 @@ impl DeepCodeKernelRuntime {
                 &work_unit_id,
             )?);
 
-            if capability != "workspace.write" || kind != "write" {
+            if is_external_capability(capability) {
                 events.push(self.work_unit_blocked_event(
                     &request_id,
                     &run_id_text,
                     &session_id_text,
                     &work_unit_id,
-                    &format!(
-                        "unsupported capability in minimal action batch executor: {capability}/{kind}"
-                    ),
+                    &format!("capability requires Phase 9 permission policy before execution: {capability}"),
                 )?);
                 continue;
             }
 
-            let write = match workspace_write_from_action(self, &record, action, &code_blocks) {
-                Ok(write) => write,
+            let compiled = match compile_workspace_action(
+                self,
+                &record,
+                action,
+                &code_blocks,
+                capability,
+                kind,
+            ) {
+                Ok(compiled) => compiled,
                 Err(error) => {
                     events.push(self.work_unit_failed_event(
                         &request_id,
@@ -130,7 +141,7 @@ impl DeepCodeKernelRuntime {
                 }
             };
 
-            if let Some(root) = write.workspace_root.as_ref() {
+            if let Some(root) = compiled.workspace_root.as_ref() {
                 let mut workspace_events = self.workspace_open(
                     RequestId(format!(
                         "action-batch-workspace-{}",
@@ -144,13 +155,12 @@ impl DeepCodeKernelRuntime {
             let tool_event = self.execute_bound_tool(
                 &run_id_text,
                 &session_id_text,
-                format!("{work_unit_id}-fs-write"),
-                "fs.write".to_string(),
-                serde_json::json!({
-                    "path": write.relative_path,
-                    "content": write.content,
-                    "create": true
-                }),
+                format!(
+                    "{work_unit_id}-{}",
+                    safe_work_unit_segment(&compiled.tool_name)
+                ),
+                compiled.tool_name,
+                compiled.arguments,
             )?;
             let tool_ok = matches!(&tool_event, KernelEvent::ToolCompleted { ok: true, .. });
             let tool_error = match &tool_event {
@@ -359,10 +369,36 @@ impl DeepCodeKernelRuntime {
     }
 }
 
-struct WorkspaceWriteDraft {
-    relative_path: String,
-    content: String,
+struct CompiledWorkspaceAction {
+    tool_name: String,
+    arguments: Value,
     workspace_root: Option<PathBuf>,
+}
+
+fn is_external_capability(capability: &str) -> bool {
+    matches!(
+        capability,
+        "process.exec"
+            | "network.egress"
+            | "git.write"
+            | "git.read"
+            | "browser.control"
+            | "provider.egress"
+    )
+}
+
+fn workspace_kind_from_capability(capability: &str) -> Option<&'static str> {
+    match capability {
+        "workspace.read" => Some("read"),
+        "workspace.list" => Some("list"),
+        "workspace.search" => Some("search"),
+        "workspace.diff" | "workspace.preview_diff" => Some("diff"),
+        "workspace.write" => Some("write"),
+        "workspace.create" => Some("create"),
+        "workspace.delete" => Some("delete"),
+        "workspace.rename" => Some("rename"),
+        _ => None,
+    }
 }
 
 fn action_bundle_value(batch: &Value) -> Option<&Value> {
@@ -384,6 +420,7 @@ fn collect_code_blocks(batch: &Value) -> std::collections::BTreeMap<String, Valu
         .filter_map(|block| {
             block
                 .get("id")
+                .or_else(|| block.get("blockId"))
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty())
                 .map(|id| (id.to_string(), block.clone()))
@@ -391,12 +428,39 @@ fn collect_code_blocks(batch: &Value) -> std::collections::BTreeMap<String, Valu
         .collect()
 }
 
+fn compile_workspace_action(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    action: &Value,
+    code_blocks: &std::collections::BTreeMap<String, Value>,
+    capability: &str,
+    kind: &str,
+) -> KernelResult<CompiledWorkspaceAction> {
+    if !capability.starts_with("workspace.") {
+        return Err(KernelError::InvalidCommand(format!(
+            "unsupported action capability: {capability}"
+        )));
+    }
+    match kind {
+        "write" | "create" => workspace_write_from_action(runtime, record, action, code_blocks),
+        "read" => workspace_path_tool_action(runtime, record, action, "fs.read"),
+        "list" => workspace_path_tool_action(runtime, record, action, "fs.list"),
+        "diff" => workspace_path_tool_action(runtime, record, action, "fs.diff"),
+        "delete" => workspace_path_tool_action(runtime, record, action, "fs.delete"),
+        "search" => workspace_search_tool_action(action),
+        "rename" => Err(KernelError::NotImplemented("workspace.rename.work_unit")),
+        other => Err(KernelError::InvalidCommand(format!(
+            "unsupported workspace action kind: {other}"
+        ))),
+    }
+}
+
 fn workspace_write_from_action(
     runtime: &DeepCodeKernelRuntime,
     record: &RuntimeRunRecord,
     action: &Value,
     code_blocks: &std::collections::BTreeMap<String, Value>,
-) -> KernelResult<WorkspaceWriteDraft> {
+) -> KernelResult<CompiledWorkspaceAction> {
     let source_block_id = action
         .get("sourceBlockId")
         .and_then(Value::as_str)
@@ -416,8 +480,15 @@ fn workspace_write_from_action(
         .to_string();
     let raw_path = block
         .get("path")
+        .or_else(|| block.get("targetPath"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            action
+                .get("targetPath")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
         .or_else(|| {
             action
                 .get("resourceScope")
@@ -430,10 +501,65 @@ fn workspace_write_from_action(
             KernelError::InvalidCommand(format!("codeBlock {source_block_id} has no write path"))
         })?;
     let (relative_path, workspace_root) = workspace_relative_write_path(runtime, record, raw_path)?;
-    Ok(WorkspaceWriteDraft {
-        relative_path,
-        content,
+    Ok(CompiledWorkspaceAction {
+        tool_name: "fs.write".to_string(),
+        arguments: serde_json::json!({
+            "path": relative_path,
+            "content": content,
+            "create": true
+        }),
         workspace_root,
+    })
+}
+
+fn workspace_path_tool_action(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    action: &Value,
+    tool_name: &str,
+) -> KernelResult<CompiledWorkspaceAction> {
+    let raw_path = action
+        .get("targetPath")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            action
+                .get("resourceScope")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or(".");
+    let (relative_path, workspace_root) = workspace_relative_write_path(runtime, record, raw_path)?;
+    Ok(CompiledWorkspaceAction {
+        tool_name: tool_name.to_string(),
+        arguments: serde_json::json!({ "path": relative_path }),
+        workspace_root,
+    })
+}
+
+fn workspace_search_tool_action(action: &Value) -> KernelResult<CompiledWorkspaceAction> {
+    let query = action
+        .get("query")
+        .or_else(|| action.get("targetPath"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            action
+                .get("resourceScope")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            KernelError::InvalidCommand("workspace.search action requires query".to_string())
+        })?;
+    Ok(CompiledWorkspaceAction {
+        tool_name: "code.search".to_string(),
+        arguments: serde_json::json!({ "query": query }),
+        workspace_root: None,
     })
 }
 

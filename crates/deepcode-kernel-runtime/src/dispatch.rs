@@ -56,12 +56,17 @@ impl DeepCodeKernelRuntime {
                 session_id,
                 batch,
             } => self.action_batch_submit(request_id, run_id, session_id, batch),
-            KernelCommand::ReviewFactsGet { request_id, .. } => {
-                self.not_implemented(request_id, "review_facts.get")
-            }
-            KernelCommand::ReviewGateEvaluate { request_id, .. } => {
-                self.not_implemented(request_id, "review_gate.evaluate")
-            }
+            KernelCommand::ReviewFactsGet {
+                request_id,
+                run_id,
+                session_id,
+            } => self.review_facts_get(request_id, run_id, session_id),
+            KernelCommand::ReviewGateEvaluate {
+                request_id,
+                run_id,
+                session_id,
+                decision,
+            } => self.review_gate_evaluate(request_id, run_id, session_id, decision),
             KernelCommand::SnapshotGet {
                 request_id,
                 session_id,
@@ -166,29 +171,6 @@ impl DeepCodeKernelRuntime {
                 permission_id,
                 decision,
             } => self.permission_resolve(request_id, permission_id, decision),
-            KernelCommand::PlanAccept {
-                request_id,
-                run_id,
-                plan_id,
-            } => self.plan_accept(request_id, run_id, plan_id, false),
-            KernelCommand::PlanReject {
-                request_id,
-                run_id,
-                plan_id,
-                reason,
-            } => self.plan_reject(request_id, run_id, plan_id, reason),
-            KernelCommand::PlanRevise {
-                request_id,
-                run_id,
-                plan_id,
-                guidance,
-            } => self.plan_revise(request_id, run_id, plan_id, guidance),
-            KernelCommand::PlanContractSubmit {
-                request_id,
-                run_id,
-                session_id,
-                contract,
-            } => self.plan_contract_submit(request_id, run_id, session_id, contract),
             KernelCommand::SkillTrustApprove {
                 request_id,
                 skill_id,

@@ -60,10 +60,9 @@ pub enum ProposalEnvelopeSource {
 pub enum ProposalEnvelopeKind {
     Answer,
     ResourceRequest,
-    RequirementDraft,
+    DecisionRequest,
     ActionBundle,
-    RepairProposal,
-    ReviewPacketDraft,
+    Diagnostic,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -11,7 +11,7 @@ export function routeEntryIntent(input: SessionDriverInput): EntryIntent {
     return 'developmentTask';
   }
   const allowed = input.stateContract?.allowedProposals ?? input.driverRequest?.stateContract?.allowedProposals ?? [];
-  if (allowed.includes('actionBundle') || allowed.includes('requirementDraft')) {
+  if (allowed.includes('actionBundle') || allowed.includes('decisionRequest')) {
     return 'developmentTask';
   }
   return 'readOnlyAnswer';

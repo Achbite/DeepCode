@@ -84,11 +84,9 @@ impl DeepCodeKernelRuntime {
             RuntimeRunRecord {
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
-                input_text: input.text.clone(),
                 attachments: input.attachments.clone(),
                 workspace_binding,
                 config_ref,
-                profile_ref,
                 phase: workflow_state.phase.clone(),
                 decision_state: RunDecisionState::from_user_input(&input.text),
             },
@@ -225,13 +223,53 @@ impl DeepCodeKernelRuntime {
                 "schemaVersion": &proposal.schema_version
             }),
         )?;
-        Ok(vec![KernelEvent::ProposalAccepted {
+        let mut events = vec![KernelEvent::ProposalAccepted {
             request_id: Some(request_id),
-            run_id,
+            run_id: run_id.clone(),
             session_id: Some(SessionId(session_id)),
-            proposal,
+            proposal: proposal.clone(),
             sequence: Some(sequence),
-        }])
+        }];
+
+        if proposal.kind == ProposalEnvelopeKind::ActionBundle {
+            let review_sequence = self.ledger.next_sequence(&run_id.0)?;
+            let report = proposal_action_bundle_review_report(&proposal);
+            let report_value =
+                serde_json::to_value(&report).unwrap_or_else(|_| serde_json::Value::Null);
+            let report_session_id = events
+                .iter()
+                .find_map(|event| {
+                    if let KernelEvent::ProposalAccepted { session_id, .. } = event {
+                        session_id.as_ref().map(|value| value.0.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| record.session_id.clone());
+            self.append_ledger(
+                &run_id.0,
+                &report_session_id,
+                "proposal.reviewed",
+                review_sequence,
+                serde_json::json!({
+                    "summary": report.kernel_generated_permission_summary,
+                    "proposalId": &proposal.proposal_id,
+                    "planId": report.plan_id,
+                    "status": plan_review_status_name(&report.status),
+                    "report": &report_value
+                }),
+            )?;
+            events.push(KernelEvent::ProposalReviewed {
+                request_id: None,
+                run_id,
+                session_id: Some(SessionId(report_session_id)),
+                proposal_id: proposal.proposal_id,
+                report: report_value,
+                sequence: Some(review_sequence),
+            });
+        }
+
+        Ok(events)
     }
 
     pub(crate) fn user_decision_submit(
@@ -323,6 +361,105 @@ impl DeepCodeKernelRuntime {
                 .map(|(_, session_id)| SessionId(session_id.clone())),
             packet,
             sequence,
+        }])
+    }
+
+    pub(crate) fn review_facts_get(
+        &mut self,
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let record = self.record_by_run(&run_id.0)?;
+        let session_id_text = session_id
+            .map(|value| value.0)
+            .unwrap_or_else(|| record.session_id.clone());
+        let facts = review_facts_for_run(&*self.ledger, &run_id.0)?;
+        let sequence = self.ledger.next_sequence(&run_id.0)?;
+        self.append_ledger(
+            &run_id.0,
+            &session_id_text,
+            "review.facts_produced",
+            sequence,
+            serde_json::json!({
+                "summary": "Kernel review facts produced.",
+                "facts": &facts
+            }),
+        )?;
+        Ok(vec![KernelEvent::ReviewFactsProduced {
+            request_id: Some(request_id),
+            run_id,
+            session_id: Some(SessionId(session_id_text)),
+            facts,
+            sequence: Some(sequence),
+        }])
+    }
+
+    pub(crate) fn review_gate_evaluate(
+        &mut self,
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        decision: Value,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let record = self.record_by_run(&run_id.0)?;
+        let session_id_text = session_id
+            .map(|value| value.0)
+            .unwrap_or_else(|| record.session_id.clone());
+        let facts = review_facts_for_run(&*self.ledger, &run_id.0)?;
+        let failed_count = facts
+            .get("failedWorkUnits")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let blocked_count = facts
+            .get("blockedWorkUnits")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let decision_kind = decision
+            .get("decision")
+            .and_then(Value::as_str)
+            .unwrap_or("needsUserReview");
+        let status = match decision_kind {
+            "accept" if failed_count == 0 && blocked_count == 0 => "accepted",
+            "accept" | "revise" => "needsReplan",
+            "reject" => "aborted",
+            _ => "needsUserReview",
+        };
+        let summary = match status {
+            "accepted" => "ReviewGate accepted Kernel facts and user review decision.",
+            "needsReplan" => "ReviewGate requires replan before completion.",
+            "aborted" => "ReviewGate aborted by user decision.",
+            _ => "ReviewGate still needs user review.",
+        };
+        let result = serde_json::json!({
+            "id": format!("review-{}", run_id.0),
+            "runId": run_id.0,
+            "status": status,
+            "decision": decision,
+            "failedWorkUnitCount": failed_count,
+            "blockedWorkUnitCount": blocked_count,
+            "summary": summary,
+            "factsRef": facts.get("factsRef").cloned().unwrap_or(Value::Null)
+        });
+        let sequence = self.ledger.next_sequence(&run_id.0)?;
+        self.append_ledger(
+            &run_id.0,
+            &session_id_text,
+            "review_gate.evaluated",
+            sequence,
+            serde_json::json!({
+                "summary": summary,
+                "result": &result
+            }),
+        )?;
+        Ok(vec![KernelEvent::ReviewGateEvaluated {
+            request_id: Some(request_id),
+            run_id,
+            session_id: Some(SessionId(session_id_text)),
+            result,
+            sequence: Some(sequence),
         }])
     }
 
@@ -424,113 +561,6 @@ impl DeepCodeKernelRuntime {
         }])
     }
 
-    pub(crate) fn plan_accept(
-        &mut self,
-        _request_id: RequestId,
-        run_id: RunId,
-        plan_id: String,
-        auto_accepted: bool,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let run_id_text = run_id.0.clone();
-        let record = self.record_by_run(&run_id_text)?;
-        let session_id = record.session_id.clone();
-        let sequence = self.ledger.next_sequence(&run_id_text)?;
-        self.append_ledger(
-            &run_id_text,
-            &session_id,
-            "plan.accepted",
-            sequence,
-            serde_json::json!({
-                "summary": "Plan accepted.",
-                "planId": &plan_id,
-                "autoAccepted": auto_accepted
-            }),
-        )?;
-        let events = vec![KernelEvent::PlanAccepted {
-            run_id,
-            session_id: Some(SessionId(session_id.clone())),
-            plan_id,
-            auto_accepted,
-            sequence: Some(sequence),
-        }];
-        Ok(events)
-    }
-
-    pub(crate) fn plan_reject(
-        &self,
-        _request_id: RequestId,
-        run_id: RunId,
-        plan_id: String,
-        reason: Option<String>,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let record = self.record_by_run(&run_id.0)?;
-        let sequence = self.ledger.next_sequence(&run_id.0)?;
-        self.append_ledger(
-            &run_id.0,
-            &record.session_id,
-            "plan.rejected",
-            sequence,
-            serde_json::json!({
-                "summary": "Plan rejected.",
-                "planId": &plan_id,
-                "reason": &reason
-            }),
-        )?;
-        Ok(vec![KernelEvent::PlanRejected {
-            run_id,
-            session_id: Some(SessionId(record.session_id)),
-            plan_id,
-            reason,
-            sequence: Some(sequence),
-        }])
-    }
-
-    pub(crate) fn plan_revise(
-        &self,
-        request_id: RequestId,
-        run_id: RunId,
-        plan_id: String,
-        guidance: String,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        self.plan_reject(request_id, run_id, plan_id, Some(guidance))
-    }
-
-    pub(crate) fn plan_contract_submit(
-        &mut self,
-        request_id: RequestId,
-        run_id: Option<RunId>,
-        session_id: Option<SessionId>,
-        contract: Value,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let (run_id, session_id) = self.resolve_run_session(run_id, session_id)?;
-        let report = match parse_plan_review_input(contract) {
-            Ok(input) => DefaultPlanReviewEngine.review_input(input),
-            Err(reason) => PlanReviewReport::denied("invalid-contract", reason),
-        };
-        let sequence = self.ledger.next_sequence(&run_id)?;
-        let report_value =
-            serde_json::to_value(&report).unwrap_or_else(|_| serde_json::Value::Null);
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "plan.review_report_produced",
-            sequence,
-            serde_json::json!({
-                "summary": report.kernel_generated_permission_summary,
-                "planId": report.plan_id,
-                "status": plan_review_status_name(&report.status),
-                "report": &report_value
-            }),
-        )?;
-        Ok(vec![KernelEvent::PlanReviewReportProduced {
-            request_id: Some(request_id),
-            run_id: Some(RunId(run_id)),
-            session_id: Some(SessionId(session_id)),
-            report: report_value,
-            sequence: Some(sequence),
-        }])
-    }
-
     pub(crate) fn enter_phase_event(
         &mut self,
         run_id: &str,
@@ -563,87 +593,6 @@ impl DeepCodeKernelRuntime {
             reason: None,
             sequence: Some(sequence),
         })
-    }
-
-    pub(crate) fn complete_run_event(
-        &mut self,
-        run_id: &str,
-        session_id: &str,
-    ) -> KernelResult<KernelEvent> {
-        let change_set = self.change_set_for_run(run_id)?;
-        let validations = self.validations_for_run(run_id)?;
-        let evidence_refs = self.evidence_refs_for_run(run_id)?;
-        let review_gate = ReviewGate;
-        let review_result =
-            review_gate.evaluate(run_id, change_set.as_ref(), &validations, evidence_refs);
-        let review_sequence = self.ledger.next_sequence(run_id)?;
-        self.append_ledger(
-            run_id,
-            session_id,
-            "review_gate.result",
-            review_sequence,
-            serde_json::json!({
-                "summary": review_result.summary,
-                "reviewGate": &review_result
-            }),
-        )?;
-        if review_result.status != ReviewGateStatus::Accepted {
-            return Err(KernelError::PermissionDenied(format!(
-                "review gate blocked completion: {}",
-                review_result.summary
-            )));
-        }
-        self.release_workflow_resources(run_id, session_id)?;
-        {
-            let record = self.record_by_run_mut(run_id)?;
-            record.phase = WorkflowPhase::Done;
-        }
-        let sequence = self.ledger.next_sequence(run_id)?;
-        self.append_ledger(
-            run_id,
-            session_id,
-            "run.completed",
-            sequence,
-            serde_json::json!({
-                "summary": "Kernel workflow completed.",
-                "status": "completed"
-            }),
-        )?;
-        Ok(KernelEvent::RunCompleted {
-            run_id: RunId(run_id.to_string()),
-            session_id: Some(SessionId(session_id.to_string())),
-            status: deepcode_kernel_abi::RunStatus::Completed,
-            summary: Some("Kernel workflow completed.".to_string()),
-            sequence: Some(sequence),
-        })
-    }
-
-    fn release_workflow_resources(&mut self, run_id: &str, session_id: &str) -> KernelResult<()> {
-        let owner = KernelResourceOwner::agent_workflow(None::<String>, run_id.to_string());
-        let resources = self.state.resource_registry.active_by_owner(&owner);
-        for resource in resources {
-            let cleanup = cleanup_workflow_resource(&resource);
-            let release = self.state.resource_registry.release(&resource.resource_id);
-            let sequence = self.ledger.next_sequence(run_id)?;
-            self.append_ledger(
-                run_id,
-                session_id,
-                "resource.released",
-                sequence,
-                serde_json::json!({
-                    "summary": format!("Kernel released workflow resource: {}", resource.resource_id),
-                    "resourceId": &resource.resource_id,
-                    "kind": &resource.kind,
-                    "owner": &resource.owner,
-                    "scope": &resource.scope,
-                    "cleanupPolicy": &resource.cleanup_policy,
-                    "cleanup": cleanup,
-                    "released": release.released,
-                    "error": release.error
-                }),
-            )?;
-        }
-        Ok(())
     }
 
     pub(crate) fn workflow_decision_event(
@@ -706,10 +655,9 @@ impl DeepCodeKernelRuntime {
             allowed_proposals: vec![
                 "answer".to_string(),
                 "resourceRequest".to_string(),
-                "requirementDraft".to_string(),
+                "decisionRequest".to_string(),
                 "actionBundle".to_string(),
-                "repairProposal".to_string(),
-                "reviewPacketDraft".to_string(),
+                "diagnostic".to_string(),
             ],
             proposal_schema_refs: vec!["deepcode.agent.protocol.v3".to_string()],
             required_user_decision: None,
@@ -723,6 +671,7 @@ impl DeepCodeKernelRuntime {
                 "git.read".to_string(),
                 "git.write".to_string(),
                 "browser.control".to_string(),
+                "provider.egress".to_string(),
             ],
             tool_catalog_ref: Some(TOOL_CATALOG_VERSION.to_string()),
             transition_predicates: vec![
@@ -778,10 +727,9 @@ fn proposal_kind_name(kind: &ProposalEnvelopeKind) -> &'static str {
     match kind {
         ProposalEnvelopeKind::Answer => "answer",
         ProposalEnvelopeKind::ResourceRequest => "resourceRequest",
-        ProposalEnvelopeKind::RequirementDraft => "requirementDraft",
+        ProposalEnvelopeKind::DecisionRequest => "decisionRequest",
         ProposalEnvelopeKind::ActionBundle => "actionBundle",
-        ProposalEnvelopeKind::RepairProposal => "repairProposal",
-        ProposalEnvelopeKind::ReviewPacketDraft => "reviewPacketDraft",
+        ProposalEnvelopeKind::Diagnostic => "diagnostic",
     }
 }
 
@@ -1025,55 +973,6 @@ fn clip_resource_text(text: &str, max_chars: usize) -> String {
     format!("{head}\n\n[... truncated ...]\n\n{tail}")
 }
 
-fn cleanup_workflow_resource(resource: &KernelResource) -> Value {
-    if resource.cleanup_policy != KernelResourceCleanupPolicy::OnWorkflowEnd {
-        return serde_json::json!({
-            "attempted": false,
-            "reason": "cleanup policy is not OnWorkflowEnd"
-        });
-    }
-    if !matches!(
-        resource.kind,
-        KernelResourceKind::TempArtifact
-            | KernelResourceKind::RedirectOutput
-            | KernelResourceKind::CacheFile
-    ) {
-        return serde_json::json!({
-            "attempted": false,
-            "reason": "resource kind has no file cleanup handler"
-        });
-    }
-    let Some(absolute_path) = resource
-        .metadata
-        .get("absolutePath")
-        .and_then(Value::as_str)
-    else {
-        return serde_json::json!({
-            "attempted": false,
-            "reason": "resource has no absolutePath metadata"
-        });
-    };
-    match fs::remove_file(absolute_path) {
-        Ok(()) => serde_json::json!({
-            "attempted": true,
-            "removed": true,
-            "absolutePath": absolute_path
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({
-            "attempted": true,
-            "removed": true,
-            "absolutePath": absolute_path,
-            "alreadyMissing": true
-        }),
-        Err(error) => serde_json::json!({
-            "attempted": true,
-            "removed": false,
-            "absolutePath": absolute_path,
-            "error": error.to_string()
-        }),
-    }
-}
-
 pub(crate) fn workflow_phase_from_str(phase: &str) -> Option<WorkflowPhase> {
     match phase {
         "plan" => Some(WorkflowPhase::Plan),
@@ -1087,27 +986,118 @@ pub(crate) fn workflow_phase_from_str(phase: &str) -> Option<WorkflowPhase> {
     }
 }
 
-fn parse_plan_review_input(contract: Value) -> Result<PlanReviewInput, String> {
-    if let Ok(input) = serde_json::from_value::<PlanReviewInput>(contract.clone()) {
-        return Ok(input);
+fn proposal_action_bundle_review_report(proposal: &ProposalEnvelope) -> PlanReviewReport {
+    let Some(payload) = proposal.payload.as_object() else {
+        return PlanReviewReport::denied(
+            proposal.proposal_id.clone(),
+            "actionBundle proposal payload must be an object",
+        );
+    };
+    let Some(action_bundle_value) = payload.get("actionBundle").cloned() else {
+        return PlanReviewReport::denied(
+            proposal.proposal_id.clone(),
+            "actionBundle proposal payload must include actionBundle",
+        );
+    };
+    let action_bundle = match serde_json::from_value::<ActionBundleDraft>(action_bundle_value) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return PlanReviewReport::denied(
+                proposal.proposal_id.clone(),
+                format!("actionBundle payload failed Kernel schema validation: {error}"),
+            );
+        }
+    };
+    let plan = plan_contract_from_action_bundle(&action_bundle);
+    DefaultPlanReviewEngine.review_input(PlanReviewInput {
+        plan,
+        action_bundle: Some(action_bundle),
+    })
+}
+
+fn review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> KernelResult<Value> {
+    let events = ledger.list_by_run(run_id)?;
+    let mut work_units = Vec::new();
+    let mut completed_work_units = Vec::new();
+    let mut failed_work_units = Vec::new();
+    let mut blocked_work_units = Vec::new();
+    let mut tool_results = Vec::new();
+    let mut written_files = Vec::new();
+
+    for event in &events {
+        match event.kind.as_str() {
+            "work_unit.queued"
+            | "work_unit.started"
+            | "work_unit.completed"
+            | "work_unit.failed"
+            | "work_unit.blocked" => {
+                let summary = review_ledger_event_summary(event);
+                work_units.push(summary.clone());
+                match event.kind.as_str() {
+                    "work_unit.completed" => completed_work_units.push(summary),
+                    "work_unit.failed" => failed_work_units.push(summary),
+                    "work_unit.blocked" => blocked_work_units.push(summary),
+                    _ => {}
+                }
+            }
+            "tool.completed" => {
+                let summary = review_ledger_event_summary(event);
+                if summary.get("toolName").and_then(Value::as_str) == Some("fs.write") {
+                    if let Some(path) = summary
+                        .get("output")
+                        .and_then(|output| output.get("path"))
+                        .and_then(Value::as_str)
+                    {
+                        written_files.push(serde_json::json!({
+                            "path": path,
+                            "toolCallId": summary.get("toolCallId").cloned().unwrap_or(Value::Null)
+                        }));
+                    }
+                }
+                tool_results.push(summary);
+            }
+            _ => {}
+        }
     }
-    if let Ok(plan) = serde_json::from_value::<PlanContract>(contract.clone()) {
-        return Ok(PlanReviewInput {
-            plan,
-            action_bundle: None,
-        });
+
+    Ok(serde_json::json!({
+        "factsRef": format!("review-facts-{run_id}"),
+        "runId": run_id,
+        "eventCount": events.len(),
+        "workUnits": work_units,
+        "completedWorkUnits": completed_work_units,
+        "failedWorkUnits": failed_work_units,
+        "blockedWorkUnits": blocked_work_units,
+        "toolResults": tool_results,
+        "writtenFiles": written_files
+    }))
+}
+
+fn review_ledger_event_summary(event: &LedgerEvent) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("kind".to_string(), Value::String(event.kind.clone()));
+    if let Some(sequence) = event.sequence {
+        object.insert(
+            "sequence".to_string(),
+            Value::Number(serde_json::Number::from(sequence)),
+        );
     }
-    if let Ok(action_bundle) = serde_json::from_value::<ActionBundleDraft>(contract) {
-        let plan = plan_contract_from_action_bundle(&action_bundle);
-        return Ok(PlanReviewInput {
-            plan,
-            action_bundle: Some(action_bundle),
-        });
+    for key in [
+        "summary",
+        "workUnitId",
+        "workUnit",
+        "toolCallId",
+        "toolName",
+        "ok",
+        "output",
+        "error",
+        "reason",
+    ] {
+        if let Some(value) = event.payload.get(key) {
+            object.insert(key.to_string(), value.clone());
+        }
     }
-    Err(
-        "contract must be a structured PlanContract, PlanReviewInput, or ActionBundleDraft"
-            .to_string(),
-    )
+    Value::Object(object)
 }
 
 fn plan_contract_from_action_bundle(bundle: &ActionBundleDraft) -> PlanContract {
@@ -1152,6 +1142,7 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::StateEntered { .. } => "state.entered",
         KernelEvent::DriverRequestProduced { .. } => "driver.request_produced",
         KernelEvent::ProposalAccepted { .. } => "proposal.accepted",
+        KernelEvent::ProposalReviewed { .. } => "proposal.reviewed",
         KernelEvent::ProposalRejected { .. } => "proposal.rejected",
         KernelEvent::ResourcePacketProduced { .. } => "resource.packet_produced",
         KernelEvent::ActionBatchAccepted { .. } => "action_batch.accepted",
@@ -1172,10 +1163,6 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::PermissionResolved { .. } => "permission.resolved",
         KernelEvent::AutonomyTransitioned { .. } => "autonomy.transitioned",
         KernelEvent::ConfigSnapshotAttached { .. } => "config.snapshot.attached",
-        KernelEvent::PlanProposed { .. } => "plan.proposed",
-        KernelEvent::PlanAccepted { .. } => "plan.accepted",
-        KernelEvent::PlanRejected { .. } => "plan.rejected",
-        KernelEvent::PlanReviewReportProduced { .. } => "plan.review_report_produced",
         KernelEvent::WorkflowCheckpointed { .. } => "workflow.checkpointed",
         KernelEvent::WorkflowResumed { .. } => "workflow.resumed",
         KernelEvent::WorkflowDecisionMade { .. } => "workflow.decision_made",
@@ -1204,6 +1191,7 @@ pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         KernelEvent::StateEntered { sequence, .. }
         | KernelEvent::DriverRequestProduced { sequence, .. }
         | KernelEvent::ProposalAccepted { sequence, .. }
+        | KernelEvent::ProposalReviewed { sequence, .. }
         | KernelEvent::ProposalRejected { sequence, .. }
         | KernelEvent::ResourcePacketProduced { sequence, .. }
         | KernelEvent::ActionBatchAccepted { sequence, .. }
@@ -1224,10 +1212,6 @@ pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::PermissionResolved { sequence, .. }
         | KernelEvent::AutonomyTransitioned { sequence, .. }
         | KernelEvent::ConfigSnapshotAttached { sequence, .. }
-        | KernelEvent::PlanProposed { sequence, .. }
-        | KernelEvent::PlanAccepted { sequence, .. }
-        | KernelEvent::PlanRejected { sequence, .. }
-        | KernelEvent::PlanReviewReportProduced { sequence, .. }
         | KernelEvent::WorkflowCheckpointed { sequence, .. }
         | KernelEvent::WorkflowResumed { sequence, .. }
         | KernelEvent::WorkflowDecisionMade { sequence, .. }

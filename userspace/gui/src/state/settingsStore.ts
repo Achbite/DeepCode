@@ -244,6 +244,18 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     ],
   },
   {
+    key: 'agent.requirementConfirmationMode',
+    label: 'Requirement Confirmation',
+    description: 'Controls whether Session asks for requirement confirmation before planning side-effect work.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Auto', value: 'auto' },
+      { label: 'Always', value: 'always' },
+      { label: 'Off', value: 'off' },
+    ],
+  },
+  {
     key: 'agent.permissions.allowFileRead',
     label: 'Allow File Read',
     description: 'Allow Agent tools to read workspace files.',
@@ -279,6 +291,46 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     control: 'boolean',
   },
   {
+    key: 'agent.permissions.processExec',
+    label: 'Process Execution',
+    description: 'Permission policy for process.exec work units.',
+    group: 'agent',
+    control: 'select',
+    options: permissionPolicyOptions(),
+  },
+  {
+    key: 'agent.permissions.networkEgress',
+    label: 'Network Egress',
+    description: 'Permission policy for outbound network or web evidence requests.',
+    group: 'agent',
+    control: 'select',
+    options: permissionPolicyOptions(),
+  },
+  {
+    key: 'agent.permissions.gitWrite',
+    label: 'Git Write',
+    description: 'Permission policy for Git stage, unstage, and commit work units.',
+    group: 'agent',
+    control: 'select',
+    options: permissionPolicyOptions(),
+  },
+  {
+    key: 'agent.permissions.browserControl',
+    label: 'Browser Control',
+    description: 'Permission policy for browser.control work units.',
+    group: 'agent',
+    control: 'select',
+    options: permissionPolicyOptions(),
+  },
+  {
+    key: 'agent.permissions.providerEgress',
+    label: 'Provider Egress',
+    description: 'Permission policy for provider egress audit and external model calls.',
+    group: 'agent',
+    control: 'select',
+    options: permissionPolicyOptions(),
+  },
+  {
     key: 'agent.shell.autoExecuteCommands',
     label: 'Auto Execute Commands',
     description: 'Allow non-blacklisted shell.exec requests to run automatically when shell execution is enabled.',
@@ -293,6 +345,14 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     control: 'text',
   },
 ];
+
+function permissionPolicyOptions(): NonNullable<SettingDefinition['options']> {
+  return [
+    { label: 'Deny', value: 'deny' },
+    { label: 'Ask', value: 'ask' },
+    { label: 'Allow', value: 'allow' },
+  ];
+}
 
 const KNOWN_SETTING_KEYS = new Set(Object.keys(DEFAULT_USER_SETTINGS));
 

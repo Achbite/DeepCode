@@ -2,31 +2,45 @@ use super::*;
 
 #[test]
 fn plan_review_and_skill_trust_placeholders_round_trip() {
-    let command = KernelCommand::PlanContractSubmit {
-        request_id: RequestId("req-plan-contract".to_string()),
-        run_id: Some(RunId("run-1".to_string())),
+    let command = KernelCommand::ProposalSubmit {
+        request_id: RequestId("req-proposal".to_string()),
+        run_id: RunId("run-1".to_string()),
         session_id: Some(SessionId("session-1".to_string())),
-        contract: serde_json::json!({ "id": "plan-1", "status": "draft" }),
+        proposal: ProposalEnvelope {
+            schema_version: "deepcode.agent.protocol.v3".to_string(),
+            proposal_id: "proposal-1".to_string(),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-1".to_string())),
+            source: ProposalEnvelopeSource::Llm,
+            kind: ProposalEnvelopeKind::ActionBundle,
+            payload: serde_json::json!({
+                "actionBundle": { "version": "1", "id": "plan-1", "goal": "review" }
+            }),
+            referenced_resource_packet_refs: vec![],
+            referenced_evidence_refs: vec![],
+            parser_diagnostics: None,
+        },
     };
-    let encoded = serde_json::to_value(&command).expect("serialize plan contract command");
-    assert_eq!(encoded["kind"], "planContractSubmit");
-    assert_eq!(encoded["contract"]["id"], "plan-1");
+    let encoded = serde_json::to_value(&command).expect("serialize proposal submit command");
+    assert_eq!(encoded["kind"], "proposalSubmit");
+    assert_eq!(encoded["proposal"]["proposalId"], "proposal-1");
     let decoded: KernelCommand =
-        serde_json::from_value(encoded).expect("deserialize plan contract command");
+        serde_json::from_value(encoded).expect("deserialize proposal submit command");
     assert_eq!(decoded, command);
 
-    let event = KernelEvent::PlanReviewReportProduced {
-        request_id: Some(RequestId("req-plan-review".to_string())),
-        run_id: Some(RunId("run-1".to_string())),
+    let event = KernelEvent::ProposalReviewed {
+        request_id: Some(RequestId("req-proposal-review".to_string())),
+        run_id: RunId("run-1".to_string()),
         session_id: Some(SessionId("session-1".to_string())),
+        proposal_id: "proposal-1".to_string(),
         report: serde_json::json!({ "status": "interfaceOnly" }),
         sequence: Some(9),
     };
-    let encoded = serde_json::to_value(&event).expect("serialize plan review event");
-    assert_eq!(encoded["kind"], "plan.review_report_produced");
+    let encoded = serde_json::to_value(&event).expect("serialize proposal review event");
+    assert_eq!(encoded["kind"], "proposal.reviewed");
     assert_eq!(encoded["report"]["status"], "interfaceOnly");
     let decoded: KernelEvent =
-        serde_json::from_value(encoded).expect("deserialize plan review event");
+        serde_json::from_value(encoded).expect("deserialize proposal review event");
     assert_eq!(decoded, event);
 
     let event = KernelEvent::SkillTrustRequested {

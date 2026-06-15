@@ -1,6 +1,4 @@
-use deepcode_kernel_abi::{
-    ConfigSnapshotRef, ProfileRef, TemporaryGrantEnvelope, WorkspaceBinding,
-};
+use deepcode_kernel_abi::{ConfigSnapshotRef, TemporaryGrantEnvelope, WorkspaceBinding};
 use deepcode_kernel_ledger::{ChangeOperation, KernelResourceRegistry, ValidationResult};
 use deepcode_kernel_workflow::{RunDecisionState, WorkflowPhase};
 use serde_json::Value;
@@ -46,11 +44,9 @@ pub(crate) enum WorkspaceSource {
 pub(crate) struct RuntimeRunRecord {
     pub(crate) session_id: String,
     pub(crate) run_id: String,
-    pub(crate) input_text: String,
     pub(crate) attachments: Vec<Value>,
     pub(crate) workspace_binding: WorkspaceBinding,
     pub(crate) config_ref: ConfigSnapshotRef,
-    pub(crate) profile_ref: Option<ProfileRef>,
     pub(crate) phase: WorkflowPhase,
     pub(crate) decision_state: RunDecisionState,
 }
@@ -59,7 +55,6 @@ pub(crate) struct RuntimeRunRecord {
 pub(crate) struct PendingKernelTool {
     pub(crate) run_id: String,
     pub(crate) session_id: String,
-    pub(crate) tool_call_id: String,
     pub(crate) tool_name: String,
     pub(crate) arguments: Value,
 }
@@ -197,20 +192,9 @@ impl DeepCodeKernelRuntime {
             snapshot_id: format!("restored-config-{run_id}"),
             hash: None,
         });
-        let profile_ref = started
-            .payload
-            .get("profileRef")
-            .cloned()
-            .and_then(|value| serde_json::from_value::<ProfileRef>(value).ok());
         Ok(Some(RuntimeRunRecord {
             session_id: session_id.to_string(),
             run_id,
-            input_text: started
-                .payload
-                .get("inputText")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
             attachments: started
                 .payload
                 .get("attachments")
@@ -219,7 +203,6 @@ impl DeepCodeKernelRuntime {
                 .unwrap_or_default(),
             workspace_binding,
             config_ref,
-            profile_ref,
             phase,
             decision_state: RunDecisionState::default(),
         }))

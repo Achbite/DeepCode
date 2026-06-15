@@ -18,6 +18,16 @@ export CI="${CI:-true}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+if [ -z "${CARGO_TARGET_DIR:-}" ] && [ -f /.dockerenv ]; then
+  export CARGO_TARGET_DIR="$ROOT_DIR/.build-cache/cargo-target"
+fi
+if [ -n "${DEEPCODE_TMPDIR:-}" ]; then
+  export TMPDIR="$DEEPCODE_TMPDIR"
+elif [ -f /.dockerenv ] && { [ -z "${TMPDIR:-}" ] || [ "${TMPDIR%/}" = "/tmp" ]; }; then
+  export TMPDIR="$ROOT_DIR/.build-cache/tmp"
+fi
+mkdir -p "${CARGO_TARGET_DIR:-$ROOT_DIR/target}" "${TMPDIR:-/tmp}"
+
 TEST_PORT="${DEEPCODE_TEST_PORT:-31246}"
 PROXY_PORT="${DEEPCODE_PROXY_TEST_PORT:-31247}"
 CONFIG_DIR=""
@@ -320,11 +330,15 @@ fi
 
 info "[4/8] stage 9/10/10.5/11/12/13/14/19/20 boundary grep gates"
 for runtime_module in \
-  dispatch state workspace tools workflow context permissions temp_artifacts obligations
+  dispatch state workspace tools workflow permissions obligations action_batch
 do
   test -f "crates/deepcode-kernel-runtime/src/${runtime_module}.rs" \
     || fail "missing runtime module ${runtime_module}.rs"
 done
+test ! -f crates/deepcode-kernel-runtime/src/context.rs \
+  || fail "Kernel runtime must not own session context assembly"
+test ! -f crates/deepcode-kernel-runtime/src/temp_artifacts.rs \
+  || fail "legacy temp_artifacts runtime module must not return"
 for daemon_module in \
   prelude api_response state ipc static_assets kernel_api workspace_api settings_api \
   session_store agent_api event_projection llm_transport terminal_api \
@@ -346,9 +360,7 @@ search "struct RuntimeState" crates/deepcode-kernel-runtime/src/state.rs >/dev/n
 search "fn workspace_open" crates/deepcode-kernel-runtime/src/workspace.rs >/dev/null
 search "fn tool_invoke" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
 search "fn run_create|fn state_contract_get|fn proposal_submit|fn resource_resolve" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
-search "fn context_attach_reference" crates/deepcode-kernel-runtime/src/context.rs >/dev/null
 search "fn permission_resolve" crates/deepcode-kernel-runtime/src/permissions.rs >/dev/null
-search "fn is_kernel_owned_temp_cleanup" crates/deepcode-kernel-runtime/src/temp_artifacts.rs >/dev/null
 search "fn record_change_operation_for_tool" crates/deepcode-kernel-runtime/src/obligations.rs >/dev/null
 search "fn workspace_current|fn workspace_open" crates/deepcode-kernel-daemon/src/workspace_api.rs >/dev/null
 search "fn user_settings_get|fn llm_profiles_get" crates/deepcode-kernel-daemon/src/settings_api.rs >/dev/null
@@ -375,15 +387,15 @@ search "trait SkillExecutor" crates/deepcode-kernel-skills/src/executor.rs >/dev
 ! search "DeepCodeKernelRuntime|deepcode-kernel-runtime" crates/deepcode-host-web/src crates/deepcode-host-web/Cargo.toml || fail "host-web must not hold Kernel runtime"
 ! search "run_agent_workflow|stage_prompt|call_agent_stage_llm|execute_stage_tool_calls|call_llm_profile" crates/deepcode-host-web/src || fail "host-web must not own workflow/provider loop"
 search "deepcode-kernel-daemon" Cargo.toml build.sh test.sh crates/deepcode-kernel-daemon/Cargo.toml >/dev/null
-for abi_file in ids error command event run refs config snapshot workspace permissions workflow plan tool skill mcp audit llm context temp_artifact; do
+for abi_file in ids error command event run refs config snapshot workspace permissions workflow plan skill mcp llm driver; do
   test -f "crates/deepcode-kernel-abi/src/${abi_file}.rs" || fail "missing ABI module ${abi_file}.rs"
 done
 test -f crates/deepcode-kernel-abi/src/tests/mod.rs || fail "missing ABI internal test module"
 test -f crates/deepcode-kernel-abi/tests/root_roundtrip.rs || fail "missing ABI crate-root integration test"
 ! search "pub enum KernelCommand|pub enum KernelEvent|pub struct KernelSnapshot|pub enum KernelError|pub struct KernelErrorEnvelope" crates/deepcode-kernel-abi/src/lib.rs || fail "ABI lib.rs must remain facade-only"
-search "pub enum KernelCommand|PlanContractSubmit|SkillTrustApprove|McpRiskAcknowledgmentSubmit|AuditVerify|AuditQuery" crates/deepcode-kernel-abi/src/command.rs >/dev/null
+	search "pub enum KernelCommand|ProposalSubmit|ActionBatchSubmit|ReviewFactsGet|ReviewGateEvaluate|SkillTrustApprove|McpRiskAcknowledgmentSubmit|AuditVerify|AuditQuery" crates/deepcode-kernel-abi/src/command.rs >/dev/null
 search "run_id: Option<RunId>|session_id: Option<SessionId>" crates/deepcode-kernel-abi/src/command.rs >/dev/null
-search "pub enum KernelEvent|PlanReviewReportProduced|SkillTrustRequested|SkillTrustGranted|McpRiskAcknowledgmentRequired|AuditVerifyCompleted|AuditDegradedEntered|AuditSegmentRotated" crates/deepcode-kernel-abi/src/event.rs >/dev/null
+	search "pub enum KernelEvent|ProposalReviewed|ReviewFactsProduced|ReviewGateEvaluated|SkillTrustRequested|SkillTrustGranted|McpRiskAcknowledgmentRequired|AuditVerifyCompleted|AuditDegradedEntered|AuditSegmentRotated" crates/deepcode-kernel-abi/src/event.rs >/dev/null
 search "pub struct KernelSnapshot" crates/deepcode-kernel-abi/src/snapshot.rs >/dev/null
 search "pub enum KernelError|pub struct KernelErrorEnvelope" crates/deepcode-kernel-abi/src/error.rs >/dev/null
 search "SkillTrustMode|BrokeredScript|DirectHostScript|ScriptBroker|ScriptBrokerPolicy|capability_for_broker_method" crates/deepcode-kernel-skills/src >/dev/null
@@ -411,7 +423,8 @@ test -f fixtures/skill-mcp-smoke/mcp/mcp-text-tools/binding-acknowledged.json ||
 test -f crates/deepcode-kernel-skills/tests/skill_mcp_smoke.rs || fail "missing Skill/MCP smoke integration test"
 search "fn skill_trust_approve|fn mcp_risk_acknowledgment_submit|fn brokered_script_dispatch|fn append_signed_audit_entry|fn audit_verify|audit.signed_entry_created|model_visible_skill_descriptors|permissionGranted|skill.invocation_completed|skill.broker_request_completed|mcp.stdio_tool_call_completed|auditProjection|KernelCommand::SkillInvoke" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
 ! search "not_implemented\\(request_id, \"audit.verify\"\\)" crates/deepcode-kernel-runtime/src/dispatch.rs || fail "AuditVerify must not remain interface-only in runtime"
-search "brokered_script_dispatch_routes_read_through_workspace_boundary_and_ledger|brokered_script_dispatch_rejects_write_without_permission_continuation|skill_invoke_without_active_run_fails_closed|audit_verify_detects_tampered_signed_entry|mcp_stdio_tool_call_completion_writes_signed_audit_entry" crates/deepcode-kernel-runtime/src/tests.rs >/dev/null
+search "fn brokered_script_dispatch|fn record_mcp_stdio_tool_call_completed|fn audit_verify|fn mcp_risk_acknowledgment_submit" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
+search "KernelCommand::SkillInvoke|KernelCommand::McpRiskAcknowledgmentSubmit|KernelCommand::AuditVerify" crates/deepcode-kernel-runtime/src/dispatch.rs >/dev/null
 search "brokered_text_skill_fixture_runs_under_supervisor|broker_policy_blocks_fixture_request_before_kernel_adapter|acknowledged_mcp_stdio_fixture_round_trips_tool_call|parse_mcp_stdio_tool_result|ProcessSupervisor" crates/deepcode-kernel-skills/tests/skill_mcp_smoke.rs >/dev/null
 search "from_entries|chain_can_resume_from_verified_entries|chain_resume_rejects_tampered_entries" crates/deepcode-kernel-audit/src/lib.rs >/dev/null
 search "kind: 'skillInvoke'|runId\\?: string|sessionId\\?: string|skillId: string" userspace/protocol/src/kernel.ts >/dev/null
@@ -435,16 +448,18 @@ search "rejects_script_hook|rejects_forbidden_predicate|rejects_unbounded_self_l
 search "invalid_proposal_stays_without_transition|plan_draft_advances_to_check|action_bundle_draft_advances_to_check|complete_to_review_requires_all_predicates" crates/deepcode-kernel-workflow/src/interpreter.rs >/dev/null
 ! search "\"workflow\": \"plan-check-complete-review\"|unwrap_or\\(\"planFirst\"\\)" crates/deepcode-kernel-client/src crates/deepcode-kernel-daemon/src \
   || fail "agent clients must not inject the fixed plan-check-complete-review workflow path"
-! search "PlanContractSubmit \\{ request_id, \\.\\. \\} =>" crates/deepcode-kernel-runtime/src/dispatch.rs || fail "PlanContractSubmit must not remain interface-only"
-search "fn plan_contract_submit|parse_plan_review_input|PlanReviewReportProduced|plan.review_report_produced" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
-search "plan_contract_submit_produces_review_report_without_entering_complete|plan_contract_submit_malformed_contract_returns_denied_report|plan_contract_submit_action_bundle_reports_permission_gap" crates/deepcode-kernel-runtime/src/tests.rs >/dev/null
-search "parseProposalEnvelope|ProposalEnvelope|actionBundle|expectedValidation|reviewGuide" userspace/session-core/src/agent-plan >/dev/null
-search "resourceRequest|ResourceRequestDraft|manifestEntryId" userspace/session-core/src/agent-plan >/dev/null
-search "DraftTaskQueue|ApprovedTaskQueue|createPlanContractSubmitCommand|compileActionBundleToPlanContract" userspace/session-core/src/agent-plan userspace/session-core/src/task-queue >/dev/null
+	! search "PlanContractSubmit|PlanAccept|PlanReject|PlanRevise" crates/deepcode-kernel-abi/src crates/deepcode-kernel-runtime/src crates/deepcode-kernel-daemon/src userspace/session-core/src userspace/protocol/src userspace/gui/src || fail "legacy live Plan* commands must not remain"
+	search "fn proposal_action_bundle_review_report|fn review_facts_for_run|fn review_gate_evaluate|proposal.reviewed|review.facts_produced|review_gate.evaluated" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
+	search "ActionBatchSubmit|WorkUnitQueued|WorkUnitStarted|WorkUnitCompleted|WorkUnitBlocked|ReviewFactsGet|ReviewGateEvaluate" crates/deepcode-kernel-runtime/src/tests.rs >/dev/null
+	search "parseProposalEnvelope|ProposalEnvelope|actionBundle|expectedValidation|reviewGuide" userspace/session-core/src/agent-plan >/dev/null
+	search "resourceRequest|ResourceRequestDraft|manifestEntryId" userspace/session-core/src/agent-plan >/dev/null
+	! search "createPlanContractSubmitCommand|compileActionBundleToPlanContract" userspace/session-core/src userspace/protocol/src userspace/gui/src || fail "Session must not bridge v3 actionBundle through legacy plan contract"
+	search "DraftTaskQueue|ApprovedTaskQueue" userspace/session-core/src/task-queue >/dev/null
 search "PlanConfirmationPolicy|PermissionAutoApprovalPolicy|AutoConfirmDecision|DEFAULT_PLAN_CONFIRMATION_POLICY|decidePlanConfirmation|decidePermissionAutoApproval|autoApproveDelete" userspace/session-core/src/confirmation userspace/session-core/src/task-queue >/dev/null
 search "ConversationProjection|buildConversationProjection|exportConversationProjection|为什么这样做|review_summary|check_review" userspace/session-core/src/projection.ts >/dev/null
 search "ReviewSelfCheckInput|buildReviewPacket|permissionDecisions|toolResults|finalSummary|waitingUserReview" userspace/session-core/src/review userspace/session-core/src/projection.ts >/dev/null
-search "PlanContractSubmit|PlanAccept|agent_plan_resolve|plan_card|plan_review|review_summary|should_auto_accept_plan" crates/deepcode-kernel-daemon/src/agent_api.rs crates/deepcode-kernel-daemon/src/event_projection.rs >/dev/null
+	! search "PlanContractSubmit|PlanAccept|agent_plan_resolve|agent_review_resolve|pending_plans|pending_reviews|should_auto_accept_plan" crates/deepcode-kernel-daemon/src/agent_api.rs crates/deepcode-kernel-daemon/src/event_projection.rs crates/deepcode-kernel-daemon/src/state.rs || fail "daemon must not own legacy plan/review execution truth"
+	search "plan_card|plan_review|review_summary|proposal.reviewed|review.facts_produced|review_gate.evaluated" crates/deepcode-kernel-daemon/src/event_projection.rs >/dev/null
 search "resolveAgentPlan|ResolveAgentPlanRequest|PlanReviewCard|提交评审意见|拒绝计划|agent-flow-card--check" userspace/protocol/src userspace/gui/src >/dev/null
 ! search "DeepCode Kernel 调度的规划阶段|DeepCode Kernel 调度的检查阶段|DeepCode Kernel 调度的执行阶段|DeepCode Kernel 调度的复核阶段|身份信息、工具汇总和临时文件结果只允许" crates/deepcode-kernel-daemon/src/event_projection.rs userspace/gui/src/components/agent-panel \
   || fail "old fixed LLM stage prompts must not return to the user-facing agent loop"

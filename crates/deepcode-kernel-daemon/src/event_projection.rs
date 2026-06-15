@@ -378,6 +378,38 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             }),
             &now_text(),
         )],
+        KernelEvent::ReviewFactsProduced { facts, .. } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "review_facts",
+                "phase": "review",
+                "status": "completed",
+                "summary": "Kernel review facts produced.",
+                "facts": facts,
+                "channel": "task",
+                "visibility": "conversation",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
+        KernelEvent::ReviewGateEvaluated { result, .. } => vec![agent_event(
+            session_id,
+            "workflow_stage",
+            json!({
+                "stage": "review_gate",
+                "phase": "review",
+                "status": result.get("status").and_then(Value::as_str).unwrap_or("needsUserReview"),
+                "summary": result.get("summary").and_then(Value::as_str).unwrap_or("Kernel ReviewGate evaluated."),
+                "result": result,
+                "channel": "task",
+                "visibility": "conversation",
+                "presentation": "stageSummary",
+                "kernelEvent": event
+            }),
+            &now_text(),
+        )],
         KernelEvent::StageChanged {
             phase,
             status,
@@ -490,78 +522,43 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             }),
             &now_text(),
         )],
-        KernelEvent::PlanReviewReportProduced { report, .. } => vec![agent_event(
-            session_id,
-            "plan_review",
-            json!({
-                "title": "Check / 计划确认",
-                "summary": report
-                    .get("kernelGeneratedPermissionSummary")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Kernel PlanReview 已完成，请确认是否同意计划。"),
-                "status": report.get("status").and_then(Value::as_str).unwrap_or("awaitingUserApproval"),
-                "runId": event_run_id(event),
-                "planId": report.get("planId").and_then(Value::as_str).unwrap_or("agent-plan"),
-                "confirmable": true,
-                "report": report,
-                "facts": plan_review_facts(report),
-                "channel": "progress",
-                "visibility": "conversation",
-                "presentation": "body",
-                "kernelEvent": event
-            }),
-            &now_text(),
-        )],
-        KernelEvent::PlanAccepted {
-            run_id,
-            plan_id,
-            auto_accepted,
+        KernelEvent::ProposalReviewed {
+            proposal_id,
+            report,
             ..
-        } => vec![agent_event(
-            session_id,
-            "plan_review",
-            json!({
-                "title": "Check / 计划确认",
-                "summary": if *auto_accepted { "计划已按只读自动确认策略通过。" } else { "用户已确认计划，准备进入执行。" },
-                "status": "accepted",
-                "runId": run_id.0,
-                "planId": plan_id,
-                "confirmable": false,
-                "facts": [
-                    if *auto_accepted { "确认方式：自动确认" } else { "确认方式：用户确认" }
-                ],
-                "channel": "progress",
-                "visibility": "conversation",
-                "presentation": "body",
-                "kernelEvent": event
-            }),
-            &now_text(),
-        )],
-        KernelEvent::PlanRejected {
-            run_id,
-            plan_id,
-            reason,
-            ..
-        } => vec![agent_event(
-            session_id,
-            "plan_review",
-            json!({
-                "title": "Check / 计划确认",
-                "summary": reason.clone().unwrap_or_else(|| "用户已拒绝计划，未进入执行。".to_string()),
-                "status": "rejected",
-                "runId": run_id.0,
-                "planId": plan_id,
-                "confirmable": false,
-                "facts": [
-                    "计划未获确认，不能生成 ApprovedTaskQueue。"
-                ],
-                "channel": "progress",
-                "visibility": "conversation",
-                "presentation": "body",
-                "kernelEvent": event
-            }),
-            &now_text(),
-        )],
+        } => {
+            let status = report
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("awaitingUserApproval");
+            let confirmable = matches!(
+                status,
+                "autoAccepted" | "awaitingUserApproval" | "awaitingTemporaryGrant" | "pending"
+            );
+            vec![agent_event(
+                session_id,
+                "plan_review",
+                json!({
+                    "title": "Check / 计划确认",
+                    "summary": report
+                        .get("kernelGeneratedPermissionSummary")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Kernel PlanReview 已完成，请确认是否同意计划。"),
+                    "status": status,
+                    "runId": event_run_id(event),
+                    "planId": report.get("planId").and_then(Value::as_str).unwrap_or("agent-plan"),
+                    "proposalId": proposal_id,
+                    "confirmable": confirmable,
+                    "report": report,
+                    "facts": plan_review_facts(report),
+                    "channel": "progress",
+                    "visibility": "conversation",
+                    "presentation": "body",
+                    "kernelEvent": event
+                }),
+                &now_text(),
+            )]
+        }
         KernelEvent::WorkflowDecisionMade { decision, .. } => {
             // 阶段 7/8 review 修复：把 stage / status / summary / details 提升到 payload 根字段，
             // 让 GUI MessageList 在事件分类与折叠卡标题渲染时能直接读取根字段，

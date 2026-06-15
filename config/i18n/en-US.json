@@ -735,6 +735,15 @@
         "actOnRequest": "Act On Request"
       }
     },
+    "agent.requirementConfirmationMode": {
+      "label": "Requirement Confirmation",
+      "description": "Controls whether Session asks the user to confirm requirement understanding before side-effect planning.",
+      "options": {
+        "auto": "Auto",
+        "always": "Always",
+        "off": "Off"
+      }
+    },
     "agent.permissions.allowFileRead": {
       "label": "Allow File Read",
       "description": "Allow Agent tools to read workspace files."
@@ -754,6 +763,51 @@
     "agent.permissions.allowShellExec": {
       "label": "Allow Shell Execution Requests",
       "description": "Allow Agent to request or execute shell commands through the Agent permission policy."
+    },
+    "agent.permissions.processExec": {
+      "label": "Process Execution",
+      "description": "Permission policy for process.exec work units.",
+      "options": {
+        "deny": "Deny",
+        "ask": "Ask",
+        "allow": "Allow"
+      }
+    },
+    "agent.permissions.networkEgress": {
+      "label": "Network Egress",
+      "description": "Permission policy for outbound network or web evidence requests.",
+      "options": {
+        "deny": "Deny",
+        "ask": "Ask",
+        "allow": "Allow"
+      }
+    },
+    "agent.permissions.gitWrite": {
+      "label": "Git Write",
+      "description": "Permission policy for Git stage, unstage, and commit work units.",
+      "options": {
+        "deny": "Deny",
+        "ask": "Ask",
+        "allow": "Allow"
+      }
+    },
+    "agent.permissions.browserControl": {
+      "label": "Browser Control",
+      "description": "Permission policy for browser.control work units.",
+      "options": {
+        "deny": "Deny",
+        "ask": "Ask",
+        "allow": "Allow"
+      }
+    },
+    "agent.permissions.providerEgress": {
+      "label": "Provider Egress",
+      "description": "Permission policy for provider egress audit and external model calls.",
+      "options": {
+        "deny": "Deny",
+        "ask": "Ask",
+        "allow": "Allow"
+      }
     },
     "agent.shell.autoExecuteCommands": {
       "label": "Auto Execute Commands",

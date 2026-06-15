@@ -285,33 +285,6 @@ export interface KernelSkillTrustRecord {
 
 export type KernelPlanCommand =
   | {
-      kind: 'planAccept';
-      requestId: string;
-      runId: string;
-      planId: string;
-    }
-  | {
-      kind: 'planReject';
-      requestId: string;
-      runId: string;
-      planId: string;
-      reason?: string;
-    }
-  | {
-      kind: 'planRevise';
-      requestId: string;
-      runId: string;
-      planId: string;
-      guidance: string;
-    }
-  | {
-      kind: 'planContractSubmit';
-      requestId: string;
-      runId?: string;
-      sessionId?: string;
-      contract: unknown;
-    }
-  | {
       kind: 'skillInvoke';
       requestId: string;
       runId?: string;
@@ -358,10 +331,11 @@ export type KernelWorkflowCheckpointEvent =
     };
 
 export type KernelPlanReviewEvent = {
-  kind: 'plan.review_report_produced';
+  kind: 'proposal.reviewed';
   requestId?: string;
   runId?: string;
   sessionId?: string;
+  proposalId?: string;
   report: unknown;
   sequence?: number;
 };
