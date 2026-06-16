@@ -22,6 +22,8 @@ export interface ResourceManifestEntry {
   resourceRef: string;
   readPolicy: ResourceReadPolicy;
   reason: string;
+  offsetBytes?: number;
+  limitBytes?: number;
 }
 
 export interface ResourceManifestBudget {
@@ -68,6 +70,8 @@ export interface ResourceRequestItem {
   manifestEntryId?: string;
   path?: string;
   rootId?: string;
+  offsetBytes?: number;
+  limitBytes?: number;
   reason: string;
 }
 
@@ -86,6 +90,10 @@ export interface ResourcePacketItem {
   promptContent?: string;
   truncated?: boolean;
   originalBytes?: number;
+  offsetBytes?: number;
+  limitBytes?: number;
+  returnedBytes?: number;
+  rangeComplete?: boolean;
   denialReason?: string;
   evidenceRefs?: string[];
   sourceKind?: 'kernelResource' | 'manifestOnly';

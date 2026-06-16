@@ -162,6 +162,8 @@ function normalizeResourceRequest(value: Record<string, unknown>): Record<string
     const manifestEntryId = optionalString(record, 'manifestEntryId');
     const path = optionalString(record, 'path');
     const rootId = optionalString(record, 'rootId');
+    const offsetBytes = optionalNonNegativeInteger(record, 'offsetBytes');
+    const limitBytes = optionalPositiveInteger(record, 'limitBytes');
     const reason = optionalString(record, 'reason') ?? 'Resolve additional context.';
     if (!manifestEntryId && !path) {
       throw new AgentPlanParseError(
@@ -174,6 +176,8 @@ function normalizeResourceRequest(value: Record<string, unknown>): Record<string
       ...(manifestEntryId ? { manifestEntryId } : {}),
       ...(path ? { path } : {}),
       ...(rootId ? { rootId } : {}),
+      ...(typeof offsetBytes === 'number' ? { offsetBytes } : {}),
+      ...(typeof limitBytes === 'number' ? { limitBytes } : {}),
       reason,
     };
   });
@@ -184,6 +188,18 @@ function normalizeResourceRequest(value: Record<string, unknown>): Record<string
     reason: optionalString(value, 'reason') ?? 'Resolve additional context.',
     items: normalizedItems,
   };
+}
+
+function optionalNonNegativeInteger(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key];
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  const integer = Math.floor(value);
+  return integer >= 0 ? integer : undefined;
+}
+
+function optionalPositiveInteger(record: Record<string, unknown>, key: string): number | undefined {
+  const value = optionalNonNegativeInteger(record, key);
+  return typeof value === 'number' && value > 0 ? value : undefined;
 }
 
 function normalizeDecisionRequest(value: Record<string, unknown>): Record<string, unknown> {

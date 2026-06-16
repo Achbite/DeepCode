@@ -98,6 +98,8 @@ export interface ResourceRequestDraftItem {
   manifestEntryId?: string;
   path?: string;
   rootId?: string;
+  offsetBytes?: number;
+  limitBytes?: number;
   reason: string;
 }
 

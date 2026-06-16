@@ -53,6 +53,8 @@ export interface SessionDriverLoopInput {
   appendUserMessage?: boolean;
   confirmedRequirement?: RequirementRecord;
   requirementConfirmationMode?: RequirementConfirmationMode;
+  resourceBudgetExtraRounds?: number;
+  resumeResourcePackets?: boolean;
 }
 
 export type RequirementConfirmationMode = 'auto' | 'always' | 'off';
@@ -109,7 +111,9 @@ interface ResourceRequestResolution {
   availableRoots: ConversationResourceRoot[];
 }
 
-const MAX_RESOURCE_ROUNDS = 4;
+const DEFAULT_READ_ONLY_RESOURCE_ROUNDS = 8;
+const READ_ONLY_RESOURCE_ROUND_GRANT = 8;
+const RESOURCE_BUDGET_REQUIREMENT_PREFIX = 'resource-budget';
 const MAX_DERIVED_MANIFEST_ENTRIES = 240;
 const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
 const MAX_ACTION_BUNDLE_ACTIONS = 6;
@@ -182,6 +186,9 @@ export class SessionDriverLoop {
     const manifestBuild = createManifest(input, this.id('resource-manifest'));
     const implementationBatch = buildImplementationBatchContext(input.existingEvents ?? []);
     const memoryDocument = buildSessionMemoryDocument(input.existingEvents ?? []);
+    const restoredResourcePackets = input.resumeResourcePackets
+      ? recentResourcePackets(input.existingEvents ?? [])
+      : [];
     const state: SessionDriverLoopRunState = {
       sessionId,
       runId,
@@ -196,7 +203,7 @@ export class SessionDriverLoop {
         workspaceScopeKey: manifestBuild.manifest.workspaceScopeKey,
         manifest: manifestBuild.manifest,
       },
-      resourcePackets: [],
+      resourcePackets: [...restoredResourcePackets],
       memoryDocument,
       memoryHints: [
         ...renderSessionMemoryHints(memoryDocument),
@@ -214,7 +221,7 @@ export class SessionDriverLoop {
       planReviewRepairAttempted: false,
     };
 
-    if (state.manifest.entries.length > 0) {
+    if (state.manifest.entries.length > 0 && !input.resumeResourcePackets) {
       const packet = await this.resolveResources(state, state.manifest);
       state.resourcePackets.push(packet);
       addDiscoveredManifestEntries(state.manifest, packet);
@@ -239,7 +246,8 @@ export class SessionDriverLoop {
     }
 
     let rounds = 0;
-    while (rounds <= MAX_RESOURCE_ROUNDS) {
+    const maxResourceRounds = DEFAULT_READ_ONLY_RESOURCE_ROUNDS + Math.max(0, Math.floor(input.resourceBudgetExtraRounds ?? 0));
+    while (rounds <= maxResourceRounds) {
       state.taskGraph = buildSessionTaskGraph({
         sessionId,
         runId: state.runId,
@@ -262,6 +270,11 @@ export class SessionDriverLoop {
         userRequest: input.content,
         initialContext: state.initialContext,
         resourcePackets: state.resourcePackets,
+        readOnlyResourceBudget: {
+          usedRounds: rounds,
+          maxRounds: maxResourceRounds,
+          remainingRounds: Math.max(0, maxResourceRounds - rounds),
+        },
         conversationRoots: state.conversationRoots,
         requirement: input.confirmedRequirement,
         auditOnly: {
@@ -319,14 +332,19 @@ export class SessionDriverLoop {
         ]);
       }
       if (proposal.kind === 'resourceRequest') {
-        if (rounds >= MAX_RESOURCE_ROUNDS) {
+        if (rounds >= maxResourceRounds) {
           return this.append(sessionId, [
-            finalDiagnosticEvent(
+            resourceBudgetConfirmationEvent({
               sessionId,
-              '资源请求轮次已达到安全上限，已停止继续读取上下文。请缩小附件范围或指定更具体的文件。',
-              this.ts(),
-              this.id('resource-budget')
-            ),
+              runId: state.runId,
+              originalUserRequest: input.content,
+              attachments: input.attachments ?? [],
+              usedRounds: rounds,
+              maxRounds: maxResourceRounds,
+              resourcePackets: state.resourcePackets,
+              ts: this.ts(),
+              id: this.id('resource-budget'),
+            }),
           ]);
         }
         let subset = manifestForResourceRequest(state.manifest, proposal.payload as ResourceRequestDraft, state.conversationRoots);
@@ -401,6 +419,25 @@ export class SessionDriverLoop {
     const decisionEvent = requirementDecisionEvent(input.sessionId, confirmation, input.decision, input.guidance, this.ts(), this.id('requirement-decision'));
     let result = await this.append(input.sessionId, [decisionEvent]);
     if (input.decision === 'reject') return result;
+    if (isResourceBudgetConfirmation(confirmation)) {
+      const originalRequest = requirementOriginalRequest(confirmation);
+      return this.runUserTurn({
+        sessionId: input.sessionId,
+        content: input.decision === 'revise' && input.guidance
+          ? `${originalRequest}\n\n用户对只读资源预算后的补充意见：${input.guidance}\n\n如果用户要求基于当前内容回答，请优先使用已有 ResourcePacket 收口；如果用户缩小范围且关键事实仍不足，可以在追加预算内继续按需读取。`
+          : originalRequest,
+        attachments: requirementAttachments(confirmation),
+        existingEvents: result.events,
+        workspaceBinding: input.workspaceBinding,
+        projectWorkingDirectory: input.projectWorkingDirectory,
+        profileId: input.profileId,
+        workflow: input.workflow,
+        appendUserMessage: false,
+        requirementConfirmationMode: 'off',
+        resourceBudgetExtraRounds: READ_ONLY_RESOURCE_ROUND_GRANT,
+        resumeResourcePackets: true,
+      });
+    }
 
     const originalRequest = requirementOriginalRequest(confirmation);
     const next = await this.runUserTurn({
@@ -1264,10 +1301,11 @@ function manifestForResourceRequest(
   const unresolved: string[] = [];
   const ambiguous: string[] = [];
 
-  const pushEntry = (entry: ResourceManifestEntry) => {
-    if (seen.has(entry.id)) return;
-    seen.add(entry.id);
-    entries.push(entry);
+  const pushEntry = (entry: ResourceManifestEntry, item?: ResourceRequestDraft['items'][number]) => {
+    const ranged = item ? resourceEntryWithRange(entry, item) : entry;
+    if (seen.has(ranged.id)) return;
+    seen.add(ranged.id);
+    entries.push(ranged);
   };
 
   for (const item of request.items ?? []) {
@@ -1275,7 +1313,7 @@ function manifestForResourceRequest(
     if (exactId) {
       const exact = manifest.entries.find((entry) => entry.id === exactId);
       if (exact) {
-        pushEntry(exact);
+        pushEntry(exact, item);
         continue;
       }
     }
@@ -1288,14 +1326,15 @@ function manifestForResourceRequest(
 
     const existing = findExistingEntryByPath(manifest, pathCandidate, roots);
     if (existing) {
-      pushEntry(existing);
+      pushEntry(existing, item);
       continue;
     }
 
     const synthesized = synthesizeManifestEntryForPath(manifest, roots, item.id, pathCandidate, item.rootId, item.reason);
     if (synthesized.kind === 'entry') {
+      const entry = resourceEntryWithRange(synthesized.entry, item);
       manifest.entries.push(synthesized.entry);
-      pushEntry(synthesized.entry);
+      pushEntry(entry);
       continue;
     }
     if (synthesized.kind === 'ambiguous') {
@@ -1315,6 +1354,36 @@ function manifestForResourceRequest(
     ambiguous,
     availableRoots: roots,
   };
+}
+
+function resourceEntryWithRange(entry: ResourceManifestEntry, item: ResourceRequestDraft['items'][number]): ResourceManifestEntry {
+  const offsetBytes = normalizedNonNegativeInteger(item.offsetBytes);
+  const limitBytes = normalizedPositiveInteger(item.limitBytes);
+  if (typeof offsetBytes !== 'number' && typeof limitBytes !== 'number') return entry;
+  const rangeId = [
+    entry.id,
+    'range',
+    typeof offsetBytes === 'number' ? offsetBytes : 0,
+    typeof limitBytes === 'number' ? limitBytes : 'default',
+  ].join(':');
+  return {
+    ...entry,
+    id: rangeId,
+    ...(typeof offsetBytes === 'number' ? { offsetBytes } : {}),
+    ...(typeof limitBytes === 'number' ? { limitBytes } : {}),
+    reason: `${entry.reason} Range request: offsetBytes=${offsetBytes ?? 0}, limitBytes=${limitBytes ?? 'default'}.`,
+  };
+}
+
+function normalizedNonNegativeInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  const integer = Math.floor(value);
+  return integer >= 0 ? integer : undefined;
+}
+
+function normalizedPositiveInteger(value: unknown): number | undefined {
+  const integer = normalizedNonNegativeInteger(value);
+  return typeof integer === 'number' && integer > 0 ? integer : undefined;
 }
 
 type SynthesizedManifestEntryResult =
@@ -1574,7 +1643,8 @@ function firstString(events: unknown[], key: string): string | undefined {
 function findResourcePacket(events: unknown[]): ResourcePacket | undefined {
   for (const event of events) {
     const record = objectRecord(event);
-    const packet = objectRecord(record?.packet);
+    const payload = objectRecord(record?.payload);
+    const packet = objectRecord(record?.packet) ?? objectRecord(payload?.output);
     if (!packet) continue;
     const items = Array.isArray(packet.items) ? packet.items : [];
     return {
@@ -1587,6 +1657,28 @@ function findResourcePacket(events: unknown[]): ResourcePacket | undefined {
     };
   }
   return undefined;
+}
+
+function recentResourcePackets(events: unknown[]): ResourcePacket[] {
+  const packets: ResourcePacket[] = [];
+  for (const event of [...events].reverse()) {
+    const record = objectRecord(event);
+    const payload = objectRecord(record?.payload);
+    if (record?.kind !== 'tool_result' && !objectRecord(record?.packet)) continue;
+    const packet = objectRecord(record?.packet) ?? objectRecord(payload?.output);
+    if (!packet) continue;
+    const items = Array.isArray(packet.items) ? packet.items : [];
+    packets.push({
+      id: typeof packet.id === 'string' ? packet.id : `resource-packet-${packets.length + 1}`,
+      workspaceScopeKey: typeof packet.workspaceScopeKey === 'string' ? packet.workspaceScopeKey : 'workspace',
+      requestId: typeof packet.requestId === 'string' ? packet.requestId : 'resource-request',
+      items: items
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+        .map(resourcePacketItemFromKernel),
+    });
+    if (packets.length >= 8) break;
+  }
+  return packets.reverse();
 }
 
 function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePacketItem {
@@ -1613,7 +1705,15 @@ function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePa
     contentSummary: typeof item.contentSummary === 'string' ? item.contentSummary : typeof item.message === 'string' ? item.message : undefined,
     promptContent: content,
     truncated: Boolean(item.truncated),
-    originalBytes: typeof item.sizeBytes === 'number' ? item.sizeBytes : undefined,
+    originalBytes: typeof item.originalBytes === 'number'
+      ? item.originalBytes
+      : typeof item.sizeBytes === 'number'
+        ? item.sizeBytes
+        : undefined,
+    offsetBytes: typeof item.offsetBytes === 'number' ? item.offsetBytes : undefined,
+    limitBytes: typeof item.limitBytes === 'number' ? item.limitBytes : undefined,
+    returnedBytes: typeof item.returnedBytes === 'number' ? item.returnedBytes : undefined,
+    rangeComplete: typeof item.rangeComplete === 'boolean' ? item.rangeComplete : undefined,
     denialReason: typeof item.reason === 'string' ? item.reason : typeof item.message === 'string' ? item.message : undefined,
     evidenceRefs: Array.isArray(item.evidenceRefs)
       ? item.evidenceRefs.filter((value): value is string => typeof value === 'string')
@@ -2918,6 +3018,115 @@ function requirementConfirmationEvent(input: {
       presentation: 'body',
     },
   };
+}
+
+function resourceBudgetConfirmationEvent(input: {
+  sessionId: string;
+  runId: string;
+  originalUserRequest: string;
+  attachments: AgentContextAttachment[];
+  usedRounds: number;
+  maxRounds: number;
+  resourcePackets: ResourcePacket[];
+  ts: string;
+  id: string;
+}): AgentEvent {
+  const resourceCount = input.resourcePackets.reduce((sum, packet) => sum + packet.items.length, 0);
+  const truncatedCount = input.resourcePackets.reduce((sum, packet) => sum + packet.items.filter((item) => item.truncated).length, 0);
+  const recentFacts = input.resourcePackets
+    .flatMap((packet) => packet.items)
+    .slice(-8)
+    .map((item) => {
+      const raw = item as typeof item & { path?: string; absolutePath?: string };
+      return `${item.contentKind ?? 'resource'} ${raw.path ?? raw.absolutePath ?? item.manifestEntryId} (${item.status}${item.truncated ? ', truncated' : ''})`;
+    });
+  const requirement: RequirementRecord = {
+    requirementId: `${RESOURCE_BUDGET_REQUIREMENT_PREFIX}-${input.runId}`,
+    sessionId: input.sessionId,
+    initialUserRequest: input.originalUserRequest,
+    checklist: {
+      goal: '只读资源预算已用完，需要用户决定是否继续读取上下文。',
+      explicitTasks: [
+        `已使用 ${input.usedRounds}/${input.maxRounds} 轮只读资源请求。`,
+        `已获得 ${resourceCount} 项资源结果。`,
+        truncatedCount > 0 ? `${truncatedCount} 项资源被截断，可继续按片段精读。` : '当前没有被标记为截断的资源。',
+      ],
+      inferredTasks: [
+        `接受：追加 ${READ_ONLY_RESOURCE_ROUND_GRANT} 轮只读资源预算，继续让模型按需读取。`,
+        '输入补充意见后提交：按你的范围调整后继续。',
+        '拒绝：停止本轮继续读取。',
+      ],
+      outOfScope: [
+        '该确认只放宽只读资源请求预算，不放宽写入、删除、命令、Git push 或配置修改权限。',
+      ],
+      affectedAreaCandidates: ['session resource budget', 'read-only context assembly'],
+      resourceRequests: recentFacts,
+      acceptanceCriteriaCandidates: [
+        '继续读取时保留已解析资源上下文。',
+        '模型仍只能通过 resourceRequest 请求受控只读资源。',
+      ],
+      clarificationQuestions: [
+        '是否继续追加只读读取预算，或输入更具体范围后继续？',
+      ],
+      riskNotes: [
+        '继续读取会增加上下文成本和等待时间，但不会执行写入或命令。',
+      ],
+    },
+    status: 'probing',
+    createdAt: input.ts,
+    updatedAt: input.ts,
+  };
+  const decisionPayload = {
+    version: '1',
+    id: requirement.requirementId,
+    reason: 'Read-only resource request budget reached.',
+    summary: requirement.checklist?.goal ?? requirement.initialUserRequest,
+    options: [
+      {
+        id: 'continue-readonly',
+        label: '继续读取',
+        description: `追加 ${READ_ONLY_RESOURCE_ROUND_GRANT} 轮只读资源预算，让模型继续按需读取。`,
+        recommended: true,
+      },
+      {
+        id: 'narrow-scope',
+        label: '缩小范围',
+        description: '输入补充意见后继续，让模型优先围绕更具体目标读取。',
+      },
+      {
+        id: 'answer-now',
+        label: '基于当前回答',
+        description: '要求模型尽量基于现有资源内容收口回答。',
+      },
+    ],
+    allowsFreeform: true,
+  };
+  return requirementConfirmationEvent({
+    sessionId: input.sessionId,
+    runId: input.runId,
+    requirement,
+    proposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `${input.id}-proposal`,
+      runId: input.runId,
+      sessionId: input.sessionId,
+      source: 'system',
+      kind: 'decisionRequest',
+      payload: decisionPayload,
+      referencedResourcePacketRefs: input.resourcePackets.map((packet) => packet.id),
+      referencedEvidenceRefs: [],
+    },
+    originalUserRequest: input.originalUserRequest,
+    attachments: input.attachments,
+    ts: input.ts,
+    id: input.id,
+  });
+}
+
+function isResourceBudgetConfirmation(event: AgentEvent): boolean {
+  const payload = objectRecord(event.payload);
+  const requirementId = stringValue(payload?.requirementId);
+  return Boolean(requirementId?.startsWith(`${RESOURCE_BUDGET_REQUIREMENT_PREFIX}-`));
 }
 
 function renderRequirementConfirmationMarkdown(requirement: RequirementRecord): string {

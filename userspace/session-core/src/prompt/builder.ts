@@ -78,9 +78,9 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       name: 'capabilityProjection',
       content: [
         'Agent Protocol v3 answer shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"answer","outputLanguage":"zh-CN","answer":{"format":"markdown","content":"..."}}',
-        'Agent Protocol v3 resource request shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"resourceRequest","outputLanguage":"zh-CN","narration":"我需要先补充几个受控资源，再继续分析。","resourceRequest":{"version":"1","id":"need-target","reason":"Need concrete project context.","items":[{"id":"target-entry","manifestEntryId":"current-selection","reason":"Resolve a manifest entry."},{"id":"target-path","rootId":"root-id","path":"relative/path.ext","reason":"Resolve a path under an available conversation root."}]}}',
+        'Agent Protocol v3 resource request shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"resourceRequest","outputLanguage":"zh-CN","narration":"我需要先补充几个受控资源，再继续分析。","resourceRequest":{"version":"1","id":"need-target","reason":"Need concrete project context.","items":[{"id":"target-entry","manifestEntryId":"current-selection","reason":"Resolve a manifest entry."},{"id":"target-path","rootId":"root-id","path":"relative/path.ext","reason":"Resolve a path under an available conversation root."},{"id":"target-range","rootId":"root-id","path":"relative/large-file.ext","offsetBytes":0,"limitBytes":12000,"reason":"Resolve a useful file segment when previous content was truncated."}]}}',
         'Agent Protocol v3 decision request shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","outputLanguage":"zh-CN","narration":"这里需要你确认边界后我再继续。","decisionRequest":{"version":"1","id":"decision-...","reason":"...","summary":"...","options":[{"id":"recommended","label":"推荐方案","description":"影响说明","recommended":true},{"id":"alternative","label":"备选方案","description":"影响说明"}],"allowsFreeform":true}}',
-        'resourceRequest.items[] must include either manifestEntryId or path. Use path only for files or directories under listed conversation roots or explicit user attachments.',
+        'resourceRequest.items[] must include either manifestEntryId or path. Use path only for files or directories under listed conversation roots or explicit user attachments. For file segments, include optional offsetBytes and limitBytes.',
         'Never invent arbitrary absolute local paths. If you need more context from a project directory, request a root-relative path from the available conversation roots.',
         'Agent Protocol v3 action bundle shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"actionBundle","outputLanguage":"zh-CN","narration":"我已经整理出下一批需要审查的操作，先交给 Kernel 做权限和计划检查。","userPlanMarkdown":"# Plan\\n\\n## Summary\\n...\\n\\n## Key Changes\\n- ...\\n\\n## Interfaces\\n- ...\\n\\n## Test Plan\\n- ...\\n\\n## Assumptions\\n- ...","codeBlocks":[{"blockId":"...","targetPath":"<workspace-resource>","language":"...","operation":"create","content":"...","permissionLabels":["workspace.write"]}],"commandBlocks":[{"commandId":"...","capability":"process.exec","cwd":"<workspace-resource>","argv":["bash","build.sh"],"timeoutMs":120000,"envPolicy":"inheritSafe","expectedOutput":"...","permissionLabels":["process.exec"]}],"actionBundle":{"version":"1","id":"...","goal":"...","actions":[{"actionId":"...","description":"...","capability":"workspace.write","resourceScope":["<workspace-resource>"],"targetPath":"<workspace-resource>","sourceBlockId":"...","dependsOn":[],"permissionLabels":["workspace.write"]}],"continuationExpectations":[{"id":"next-batch","title":"Continue with the next reviewable implementation batch after user approval","capability":"workspace.write","kind":"write","resourceScope":["<workspace-resource>"]}],"validationExpectations":[{"id":"files-written","description":"Kernel records write facts for every planned file and the final review can inspect the changed paths."}],"reviewExpectations":[{"id":"user-review","description":"User reviews this batch scope, generated files, and validation evidence before accepting completion."}]},"expectedValidation":"...","reviewGuide":"..."}',
         'Agent Protocol v3 diagnostic shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"diagnostic","outputLanguage":"zh-CN","narration":"我遇到了需要终止本轮的协议或上下文问题。","diagnostic":{"version":"1","id":"diagnostic-...","severity":"error","summary":"...","details":"..."}}',
@@ -183,6 +183,12 @@ function resourceContextSummary(input: PromptEnvelopeBuilderInput): string {
     }
     lines.push('ResourceRequest path rule: use {"rootId":"<rootId>","path":"<relative path>"} for files or directories under these roots.');
   }
+  if (input.readOnlyResourceBudget) {
+    const budget = input.readOnlyResourceBudget;
+    lines.push(`Read-only resource budget: usedRounds=${budget.usedRounds} maxRounds=${budget.maxRounds} remainingRounds=${budget.remainingRounds}`);
+    lines.push('Within the remaining read-only budget, request the directories, files, search results, or file segments that are useful for the task; do not answer prematurely if key facts are still missing.');
+    lines.push('Avoid low-value repetition: do not request the exact same path/range/query again unless a previous ResourcePacket shows an error or a different segment is needed.');
+  }
   if (input.initialContext) {
     lines.push(`InitialContextPacket: ${input.initialContext.id}`);
     lines.push(`ResourceManifest: ${input.initialContext.manifest.id} entries=${input.initialContext.manifest.entries.length}`);
@@ -202,6 +208,10 @@ function resourceContextSummary(input: PromptEnvelopeBuilderInput): string {
       if (item.contentKind) lines.push(`  contentKind=${item.contentKind}`);
       if (typeof item.originalBytes === 'number') lines.push(`  originalBytes=${item.originalBytes}`);
       if (item.truncated) lines.push('  truncated=true');
+      if (typeof item.offsetBytes === 'number') lines.push(`  offsetBytes=${item.offsetBytes}`);
+      if (typeof item.limitBytes === 'number') lines.push(`  limitBytes=${item.limitBytes}`);
+      if (typeof item.returnedBytes === 'number') lines.push(`  returnedBytes=${item.returnedBytes}`);
+      if (typeof item.rangeComplete === 'boolean') lines.push(`  rangeComplete=${item.rangeComplete}`);
       if (item.evidenceRefs?.length) lines.push(`  evidenceRefs=${item.evidenceRefs.join(',')}`);
       if (item.denialReason) lines.push(`  denialReason=${item.denialReason}`);
       const content = item.promptContent ?? item.contentSummary;
@@ -209,6 +219,16 @@ function resourceContextSummary(input: PromptEnvelopeBuilderInput): string {
         lines.push('  content:');
         lines.push(fencedText(clipResourceContext(content)));
       }
+    }
+  }
+  const truncatedItems = (input.resourcePackets ?? [])
+    .flatMap((packet) => packet.items)
+    .filter((item) => item.truncated);
+  if (truncatedItems.length) {
+    lines.push('Truncated resource hint: some file content was clipped for prompt budget. If the clipped middle section is important, request a useful segment with rootId+path plus offsetBytes/limitBytes instead of rereading the same whole file.');
+    for (const item of truncatedItems.slice(0, 12)) {
+      const raw = item as typeof item & { path?: string; absolutePath?: string };
+      lines.push(`- truncated item=${item.requestItemId} path=${raw.path ?? raw.absolutePath ?? item.manifestEntryId} originalBytes=${item.originalBytes ?? 'unknown'}`);
     }
   }
   return lines.length > 0 ? lines.join('\n') : 'ResourceContext: empty';
