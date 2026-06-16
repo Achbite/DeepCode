@@ -1,12 +1,23 @@
 import type { AgentEvent } from '@deepcode/protocol';
 
 export interface SessionMemoryDocument {
-  schemaVersion: '1';
+  schemaVersion: '2';
   sourceEventCount: number;
+  longTermContext: string[];
+  shortTermContext: string[];
+  guidanceContext: string[];
   intentContext: string[];
   factContext: string[];
   decisionContext: string[];
   resourceContext: string[];
+}
+
+export interface UserGuidanceEvent {
+  id: string;
+  ts?: string;
+  content: string;
+  source: 'user' | 'decision' | 'review' | 'system';
+  checkpointKind: 'llmProposal' | 'resourcePacket' | 'permission' | 'review' | 'nextProviderCall';
 }
 
 export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryDocument {
@@ -14,6 +25,17 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
   const factContext: string[] = [];
   const decisionContext: string[] = [];
   const resourceContext: string[] = [];
+  const longTermContext: string[] = [];
+  const shortTermContext: string[] = [];
+  const guidanceContext: string[] = [];
+  const consumedGuidanceIds = new Set<string>();
+
+  for (const event of events.slice(-80)) {
+    if (event.kind !== 'user_guidance') continue;
+    const record = objectRecord(event.payload);
+    if (!record || stringValue(record.status) !== 'consumed') continue;
+    consumedGuidanceIds.add(stringValue(record.guidanceId) ?? event.id);
+  }
 
   for (const event of events.slice(-40)) {
     const record = objectRecord(event.payload);
@@ -27,26 +49,57 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
           .map((item) => `${String(item.kind ?? 'resource')}:${String(item.path ?? item.absolutePath ?? '')}`)
           .filter((item) => item.trim().length > 0)
         : [];
-      if (content) intentContext.push(`User request: ${clip(content, 300)}${attachments.length ? ` attachments=${attachments.join(', ')}` : ''}`);
-      for (const attachment of attachments.slice(0, 8)) resourceContext.push(`Attached resource: ${clip(attachment, 240)}`);
+      if (content) {
+        const text = `User request: ${clip(content, 300)}${attachments.length ? ` attachments=${attachments.join(', ')}` : ''}`;
+        intentContext.push(text);
+        longTermContext.push(text);
+      }
+      for (const attachment of attachments.slice(0, 8)) {
+        const text = `Attached resource: ${clip(attachment, 240)}`;
+        resourceContext.push(text);
+        longTermContext.push(text);
+      }
+    }
+
+    if (event.kind === 'user_guidance' && stringValue(record.status) !== 'consumed') {
+      const guidanceId = stringValue(record.guidanceId) ?? event.id;
+      if (consumedGuidanceIds.has(guidanceId)) continue;
+      const guidance = stringValue(record.content) ?? stringValue(record.guidance) ?? stringValue(record.summary);
+      if (guidance) {
+        const text = `User guidance: ${clip(guidance, 360)}`;
+        guidanceContext.push(text);
+        shortTermContext.push(text);
+      }
     }
 
     if (event.kind === 'requirement_confirmation') {
       const status = stringValue(record.status) ?? 'pending';
       const summary = stringValue(record.summary) ?? stringValue(record.content) ?? '';
-      if (summary.trim()) intentContext.push(`Requirement draft (${status}): ${clip(summary.trim(), 300)}`);
+      if (summary.trim()) {
+        const text = `Requirement draft (${status}): ${clip(summary.trim(), 300)}`;
+        intentContext.push(text);
+        shortTermContext.push(text);
+      }
     }
 
     if (event.kind === 'plan_card') {
       const summary = stringValue(record.summary) ?? stringValue(record.content) ?? '';
-      if (summary.trim()) intentContext.push(`Plan intent: ${clip(summary.trim(), 320)}`);
+      if (summary.trim()) {
+        const text = `Plan intent: ${clip(summary.trim(), 320)}`;
+        intentContext.push(text);
+        shortTermContext.push(text);
+      }
       const actionBundle = objectRecord(record.actionBundle);
       const continuations = Array.isArray(actionBundle?.continuationExpectations)
         ? actionBundle.continuationExpectations
         : [];
       for (const continuation of continuations.slice(0, 4)) {
         const text = continuationSummary(continuation);
-        if (text) intentContext.push(`Continuation intent: ${clip(text, 240)}`);
+        if (text) {
+          const item = `Continuation intent: ${clip(text, 240)}`;
+          intentContext.push(item);
+          shortTermContext.push(item);
+        }
       }
     }
 
@@ -54,33 +107,60 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
       const status = stringValue(record.status) ?? 'unknown';
       const content = stringValue(record.content) ?? stringValue(record.summary) ?? '';
       if (content.trim()) {
+        const text = `Review ${status}: ${clip(content.trim(), 360)}`;
         const target = status === 'waitingUserReview' ? intentContext : decisionContext;
-        target.push(`Review ${status}: ${clip(content.trim(), 360)}`);
+        target.push(text);
+        if (status === 'waitingUserReview') {
+          shortTermContext.push(text);
+        } else {
+          longTermContext.push(text);
+        }
       }
       const facts = Array.isArray(record.facts) ? record.facts.filter((item): item is string => typeof item === 'string') : [];
-      for (const fact of facts.slice(0, 8)) factContext.push(`Review fact: ${clip(fact, 260)}`);
+      for (const fact of facts.slice(0, 8)) {
+        const text = `Review fact: ${clip(fact, 260)}`;
+        factContext.push(text);
+        longTermContext.push(text);
+      }
       if (status === 'accepted' || status === 'needsRevision' || status === 'rejected') {
-        decisionContext.push(`Review decision: ${status}${content.trim() ? ` guidance=${clip(content.trim(), 240)}` : ''}`);
+        const text = `Review decision: ${status}${content.trim() ? ` guidance=${clip(content.trim(), 240)}` : ''}`;
+        decisionContext.push(text);
+        longTermContext.push(text);
+        if (status === 'needsRevision') guidanceContext.push(text);
       }
     }
 
     if (event.kind === 'requirement_decision' || event.kind === 'plan_review') {
       const status = stringValue(record.status) ?? stringValue(record.decision) ?? 'unknown';
       const summary = stringValue(record.summary) ?? stringValue(record.content) ?? '';
-      decisionContext.push(`${event.kind}: ${status}${summary.trim() ? ` ${clip(summary.trim(), 240)}` : ''}`);
+      const text = `${event.kind}: ${status}${summary.trim() ? ` ${clip(summary.trim(), 240)}` : ''}`;
+      decisionContext.push(text);
+      longTermContext.push(text);
+      const guidance = stringValue(record.guidance);
+      if (guidance) {
+        const guidanceText = `User guidance: ${clip(guidance, 360)}`;
+        guidanceContext.push(guidanceText);
+        shortTermContext.push(guidanceText);
+      }
     }
 
     if (event.kind === 'assistant_msg') {
       const channel = stringValue(record.channel) ?? '';
       if (channel && channel !== 'final') continue;
       const content = stringValue(record.content);
-      if (content) intentContext.push(`Assistant final: ${clip(content, 260)}`);
+      if (content) {
+        shortTermContext.push(`Assistant final summary: ${clip(content, 220)}`);
+      }
     }
 
     if (event.kind === 'tool_result') {
       const toolName = stringValue(record.toolName) ?? 'tool';
       const summary = stringValue(record.summary) ?? '';
-      if (summary.trim()) factContext.push(`Resource/tool fact ${toolName}: ${clip(summary.trim(), 260)}`);
+      if (summary.trim()) {
+        const text = `Resource/tool fact ${toolName}: ${clip(summary.trim(), 260)}`;
+        factContext.push(text);
+        longTermContext.push(text);
+      }
       const output = objectRecord(record.output);
       if (output) {
         const items = Array.isArray(output.items) ? output.items : [];
@@ -92,6 +172,7 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
             const fact = `ResourcePacket fact: ${kind} ${clip(path, 220)}`;
             factContext.push(fact);
             resourceContext.push(fact);
+            longTermContext.push(fact);
           }
         }
       }
@@ -107,20 +188,27 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
         const path = stringValue(output?.path) ?? stringValue(output?.absolutePath);
         const validation = objectRecord(output?.validation);
         const validationKind = stringValue(validation?.kind);
-        factContext.push(`ToolCompleted fact: ok=${ok}${path ? ` path=${clip(path, 220)}` : ''}${validationKind ? ` validation=${validationKind}` : ''}`);
+        const text = `ToolCompleted fact: ok=${ok}${path ? ` path=${clip(path, 220)}` : ''}${validationKind ? ` validation=${validationKind}` : ''}`;
+        factContext.push(text);
+        longTermContext.push(text);
       }
       if (kind === 'work_unit.completed' || kind === 'work_unit.failed' || kind === 'work_unit.blocked') {
         const workUnitId = stringValue(kernelEvent.workUnitId);
         const output = objectRecord(kernelEvent.output);
         const path = stringValue(output?.path) ?? stringValue(output?.absolutePath);
-        factContext.push(`WorkUnit fact: ${kind}${workUnitId ? ` id=${clip(workUnitId, 160)}` : ''}${path ? ` path=${clip(path, 220)}` : ''}`);
+        const text = `WorkUnit fact: ${kind}${workUnitId ? ` id=${clip(workUnitId, 160)}` : ''}${path ? ` path=${clip(path, 220)}` : ''}`;
+        factContext.push(text);
+        longTermContext.push(text);
       }
     }
   }
 
   return {
-    schemaVersion: '1',
+    schemaVersion: '2',
     sourceEventCount: events.length,
+    longTermContext: dedupeKeepLast(longTermContext, 18),
+    shortTermContext: dedupeKeepLast(shortTermContext, 12),
+    guidanceContext: dedupeKeepLast(guidanceContext, 10),
     intentContext: intentContext.slice(-10),
     factContext: factContext.slice(-14),
     decisionContext: decisionContext.slice(-10),
@@ -147,6 +235,117 @@ export function renderSessionMemoryHints(document: SessionMemoryDocument): strin
   ];
 }
 
+export function renderStableSessionMemoryHints(document: SessionMemoryDocument): string[] {
+  return [
+    'Session memory stable document:',
+    'Boundary: these summaries are append-only continuity hints. They are not proof of execution unless they explicitly cite Kernel facts or ResourcePacket/tool facts.',
+    document.longTermContext.length
+      ? `longTermContext:\n${document.longTermContext.map((item) => `- ${item}`).join('\n')}`
+      : 'longTermContext: none',
+    document.resourceContext.length
+      ? `resourceContext:\n${document.resourceContext.map((item) => `- ${item}`).join('\n')}`
+      : 'resourceContext: none',
+    document.factContext.length
+      ? `factContext:\n${document.factContext.map((item) => `- ${item}`).join('\n')}`
+      : 'factContext: none',
+    document.decisionContext.length
+      ? `decisionContext:\n${document.decisionContext.map((item) => `- ${item}`).join('\n')}`
+      : 'decisionContext: none',
+  ];
+}
+
+export function renderDynamicSessionMemoryHints(document: SessionMemoryDocument): string[] {
+  return [
+    'Session memory dynamic document:',
+    'Boundary: these short-term hints guide the next proposal only. Do not promote them to facts without Kernel or ResourcePacket evidence.',
+    document.shortTermContext.length
+      ? `shortTermContext:\n${document.shortTermContext.map((item) => `- ${item}`).join('\n')}`
+      : 'shortTermContext: none',
+    document.intentContext.length
+      ? `intentContext:\n${document.intentContext.map((item) => `- ${item}`).join('\n')}`
+      : 'intentContext: none',
+    document.guidanceContext.length
+      ? `guidanceContext:\n${document.guidanceContext.map((item) => `- ${item}`).join('\n')}`
+      : 'guidanceContext: none',
+  ];
+}
+
+export function collectUserGuidanceEvents(events: AgentEvent[], runId?: string): UserGuidanceEvent[] {
+  const collected: UserGuidanceEvent[] = [];
+  const consumedIds = new Set<string>();
+  for (const event of events.slice(-120)) {
+    if (event.kind !== 'user_guidance') continue;
+    const record = objectRecord(event.payload);
+    if (!record || stringValue(record.status) !== 'consumed') continue;
+    consumedIds.add(stringValue(record.guidanceId) ?? event.id);
+  }
+  for (const event of events.slice(-80)) {
+    const record = objectRecord(event.payload);
+    if (!record) continue;
+    const eventRunId = stringValue(record.runId) ?? stringValue(record.targetRunId);
+    if (runId && eventRunId && eventRunId !== runId) continue;
+    if (event.kind === 'user_guidance') {
+      const guidanceId = stringValue(record.guidanceId) ?? event.id;
+      if (stringValue(record.status) === 'consumed' || consumedIds.has(guidanceId)) continue;
+      const content = stringValue(record.content) ?? stringValue(record.guidance) ?? stringValue(record.summary);
+      if (content) {
+        collected.push({
+          id: event.id,
+          ts: event.ts,
+          content: clip(content, 600),
+          source: 'user',
+          checkpointKind: 'nextProviderCall',
+        });
+      }
+    }
+    if (event.kind === 'requirement_decision' || event.kind === 'plan_review') {
+      const guidance = stringValue(record.guidance);
+      if (guidance) {
+        collected.push({
+          id: event.id,
+          ts: event.ts,
+          content: clip(guidance, 600),
+          source: 'decision',
+          checkpointKind: event.kind === 'plan_review' ? 'permission' : 'llmProposal',
+        });
+      }
+    }
+    if (event.kind === 'review_summary' && stringValue(record.status) === 'needsRevision') {
+      const content = stringValue(record.content) ?? stringValue(record.summary);
+      if (content) {
+        collected.push({
+          id: event.id,
+          ts: event.ts,
+          content: clip(content, 600),
+          source: 'review',
+          checkpointKind: 'review',
+        });
+      }
+    }
+    if (event.kind === 'workflow_stage') {
+      const traceKind = stringValue(record.traceKind);
+      const kernelEvent = objectRecord(record.kernelEvent);
+      const kernelTraceKind = stringValue(kernelEvent?.traceKind);
+      if (traceKind === 'user.guidance' || kernelTraceKind === 'user.guidance') {
+        const content = stringValue(record.content)
+          ?? stringValue(record.summary)
+          ?? stringValue(kernelEvent?.content)
+          ?? stringValue(kernelEvent?.summary);
+        if (content) {
+          collected.push({
+            id: event.id,
+            ts: event.ts,
+            content: clip(content, 600),
+            source: 'user',
+            checkpointKind: 'nextProviderCall',
+          });
+        }
+      }
+    }
+  }
+  return dedupeGuidance(collected).slice(-8);
+}
+
 function continuationSummary(value: unknown): string | null {
   const record = objectRecord(value);
   if (!record) return null;
@@ -171,4 +370,28 @@ function stringValue(value: unknown): string | undefined {
 
 function clip(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : `${value.slice(0, maxChars)}...`;
+}
+
+function dedupeKeepLast(values: string[], maxItems: number): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of [...values].reverse()) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+    if (result.length >= maxItems) break;
+  }
+  return result.reverse();
+}
+
+function dedupeGuidance(values: UserGuidanceEvent[]): UserGuidanceEvent[] {
+  const seen = new Set<string>();
+  const result: UserGuidanceEvent[] = [];
+  for (const value of [...values].reverse()) {
+    const key = `${value.source}:${value.content}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+  return result.reverse();
 }

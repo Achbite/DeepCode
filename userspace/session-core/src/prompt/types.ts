@@ -1,4 +1,4 @@
-import type { ConversationResourceRoot, InitialContextPacket, ResourcePacket } from '../context/types.js';
+import type { ConversationResourceRoot, InitialContextPacket, ResourcePacket, ResourcePromptContext } from '../context/types.js';
 import type { RequirementRecord } from '../requirement/types.js';
 import type { AuthoritativeDocExcerpt } from './docProbe.js';
 import type { CompiledRuler } from './ruler.js';
@@ -10,15 +10,38 @@ export interface PromptSystemLayer {
     | 'systemStructure'
     | 'capabilityProjection'
     | 'rulerContext'
-    | 'currentUserOverlay'
     | 'authoritativeDocExcerpts'
-    | 'memoryHints'
+    | 'stableMemoryHints'
+    | 'reusableResourceContext'
+    | 'requirementTranscript'
+    | 'shortTermMemoryHints'
+    | 'currentUserOverlay'
+    | 'userGuidance'
     | 'currentWorkflowState'
     | 'currentRequirement'
-    | 'resourceContext'
+    | 'currentResourceResults'
     | 'auditOnlyContext';
   priority: number;
   stable: boolean;
+  cacheClass: PromptSegmentCacheClass;
+  content: string;
+}
+
+export type PromptSegmentCacheClass =
+  | 'globalStable'
+  | 'workspaceStable'
+  | 'requirementAppendOnly'
+  | 'reusableResource'
+  | 'turnDynamic'
+  | 'auditOnly';
+
+export interface PromptSegment {
+  id: string;
+  name: PromptSystemLayer['name'];
+  priority: number;
+  stable: boolean;
+  auditOnly: boolean;
+  cacheClass: PromptSegmentCacheClass;
   content: string;
 }
 
@@ -29,12 +52,22 @@ export interface PromptEnvelopeBuilderInput {
   builtinSystemPromptVersion?: string;
   compiledRuler?: CompiledRuler;
   memoryHints?: string[];
+  stableMemoryHints?: string[];
+  dynamicMemoryHints?: string[];
   userOverlay?: string;
+  userGuidance?: Array<{
+    id: string;
+    ts?: string;
+    content: string;
+    source: 'user' | 'decision' | 'review' | 'system';
+    checkpointKind: 'llmProposal' | 'resourcePacket' | 'permission' | 'review' | 'nextProviderCall';
+  }>;
   authoritativeDocExcerpts?: AuthoritativeDocExcerpt[];
   requirement?: RequirementRecord;
   initialContext?: InitialContextPacket;
   conversationRoots?: ConversationResourceRoot[];
   resourcePackets?: ResourcePacket[];
+  resourcePromptContext?: ResourcePromptContext;
   readOnlyResourceBudget?: {
     usedRounds: number;
     maxRounds: number;
@@ -56,6 +89,7 @@ export interface PromptEnvelope {
   dynamicSuffix: string;
   auditOnlyContext: string;
   layers: PromptSystemLayer[];
+  segments: PromptSegment[];
   stableLayerNames: string[];
   dynamicLayerNames: string[];
   auditOnlyLayerNames: string[];

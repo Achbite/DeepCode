@@ -9,6 +9,7 @@ const ARCHIVE_DEBUG_STREAMS: &[&str] = &[
     "parser-results.jsonl",
     "trace-events.jsonl",
     "llm-exchanges.jsonl",
+    "context-assemblies.jsonl",
     "agent-plan-parts.jsonl",
     "action-bundle-drafts.jsonl",
     "draft-task-queues.jsonl",
@@ -681,6 +682,8 @@ fn refresh_conversation_archive(
     let projection = read_jsonl_file(&archive_dir.join("projection.jsonl"));
     let transcript = read_jsonl_file(&archive_dir.join("transcript.jsonl"));
     ensure_debug_stream_files(archive_dir)?;
+    let context_assemblies =
+        read_jsonl_file(&archive_dir.join("debug").join("context-assemblies.jsonl"));
     let created_at = read_json_file(&archive_dir.join("manifest.json"))
         .and_then(|manifest| {
             manifest
@@ -704,8 +707,13 @@ fn refresh_conversation_archive(
             "archiveRoot": archive_root.to_string_lossy(),
             "generatedAt": now_text(),
             "projection": projection,
-            "transcript": transcript
+            "transcript": transcript,
+            "contextAssemblies": context_assemblies
         }),
+    )?;
+    atomic_write_text_file(
+        &archive_dir.join("exports").join("context-assemblies.md"),
+        &conversation_context_assemblies_markdown(session_id, run_id, &context_assemblies),
     )?;
     let manifest = json!({
         "schemaVersion": "conversation-archive.v1",
@@ -812,6 +820,17 @@ fn debug_streams_for_entry(entry: &Value) -> Vec<&'static str> {
         ],
     ) {
         push_unique_stream(&mut streams, "llm-exchanges.jsonl");
+    }
+    if archive_contains_key(
+        entry,
+        &[
+            "contextassembly",
+            "contextassemblyid",
+            "stableprefixhash",
+            "dynamicsuffixhash",
+        ],
+    ) {
+        push_unique_stream(&mut streams, "context-assemblies.jsonl");
     }
     if archive_contains_key(entry, &["parserresult", "parsererror"]) {
         push_unique_stream(&mut streams, "parser-results.jsonl");
@@ -1244,6 +1263,163 @@ fn conversation_chronological_markdown(session_id: &str, entries: &[Value]) -> S
     lines.join("\n").trim_end().to_string()
 }
 
+fn conversation_context_assemblies_markdown(
+    session_id: &str,
+    run_id: &str,
+    entries: &[Value],
+) -> String {
+    let mut lines = vec![
+        "# DeepCode Context Assemblies".to_string(),
+        String::new(),
+        format!("- Session: `{session_id}`"),
+        format!("- Run: `{run_id}`"),
+        format!("- Export generated: `{}`", now_text()),
+        String::new(),
+        "This export is for prompt assembly and cache-hit analysis. Cache telemetry never decides PlanReview, PermissionGate, execution, ReviewGate, or accepted state.".to_string(),
+        String::new(),
+    ];
+    if entries.is_empty() {
+        lines.push("- No context assembly records.".to_string());
+        return lines.join("\n");
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let empty_assembly = Value::Null;
+        let stage = entry
+            .get("payload")
+            .and_then(|payload| payload.get("stage"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let assembly = entry
+            .get("payload")
+            .and_then(|payload| payload.get("payload"))
+            .and_then(|payload| payload.get("contextAssembly"))
+            .unwrap_or(&empty_assembly);
+        let assembly_id = assembly
+            .get("contextAssemblyId")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        lines.push(format!("## {}. `{}` · `{}`", index + 1, stage, assembly_id));
+        lines.push(String::new());
+        lines.push(format!(
+            "- stablePrefixHash: `{}`",
+            assembly
+                .get("stablePrefixHash")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ));
+        lines.push(format!(
+            "- dynamicSuffixHash: `{}`",
+            assembly
+                .get("dynamicSuffixHash")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ));
+        lines.push(format!(
+            "- cacheHash: `{}`",
+            assembly
+                .get("cacheHash")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ));
+        lines.push(String::new());
+        if let Some(segments) = assembly.get("segments").and_then(Value::as_array) {
+            lines.push("| Segment | Cache class | Prefix | Audit | Hash | Chars |".to_string());
+            lines.push("| --- | --- | --- | --- | --- | ---: |".to_string());
+            for segment in segments {
+                let name = segment
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("segment");
+                let cache_class = segment
+                    .get("cacheClass")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let prefix = segment
+                    .get("stablePrefix")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let audit = segment
+                    .get("auditOnly")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let hash = segment
+                    .get("contentHash")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let chars = segment
+                    .get("charLength")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                lines.push(format!(
+                    "| `{name}` | `{cache_class}` | `{prefix}` | `{audit}` | `{hash}` | {chars} |"
+                ));
+            }
+        } else {
+            lines.push("```json".to_string());
+            lines.push(
+                serde_json::to_string_pretty(&redact_archive_value(assembly.clone()))
+                    .unwrap_or_else(|_| "{}".to_string()),
+            );
+            lines.push("```".to_string());
+        }
+        lines.push(String::new());
+        lines.push(format!(
+            "- resourceFullTextCharCount: `{}`",
+            assembly
+                .get("resourceFullTextCharCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ));
+        lines.push(format!(
+            "- resourceSummaryCharCount: `{}`",
+            assembly
+                .get("resourceSummaryCharCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ));
+        if let Some(blocks) = assembly.get("resourceBlocks").and_then(Value::as_array) {
+            lines.push(String::new());
+            lines.push("| Resource block | Retention | Status | Hash | Chars | Volatile stripped |".to_string());
+            lines.push("| --- | --- | --- | --- | ---: | --- |".to_string());
+            for block in blocks {
+                let block_key = block
+                    .get("blockKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let display_ref = block
+                    .get("displayRef")
+                    .and_then(Value::as_str)
+                    .unwrap_or("resource");
+                let retention = block
+                    .get("retention")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let status = block
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let content_hash = block
+                    .get("contentHash")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let chars = block
+                    .get("charLength")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let stripped = block
+                    .get("volatileFieldStripped")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                lines.push(format!(
+                    "| `{display_ref}`<br>`{block_key}` | `{retention}` | `{status}` | `{content_hash}` | {chars} | `{stripped}` |"
+                ));
+            }
+        }
+        lines.push(String::new());
+    }
+    lines.join("\n").trim_end().to_string()
+}
+
 fn archive_projection_entry_title(entry: &Value) -> &'static str {
     let payload = entry.get("payload").unwrap_or(&Value::Null);
     if payload.get("traceKind").and_then(Value::as_str).is_some()
@@ -1419,6 +1595,45 @@ mod tests {
             "content": "完整请求",
             "authorization": "Bearer abc"
         });
+        let context_trace = json!({
+            "type": "metadata",
+            "role": "assistant",
+            "channel": "trace",
+            "runId": "run/1",
+            "kind": "provider_trace",
+            "payload": {
+                "stage": "provider_call.request",
+                "runId": "run/1",
+                "payload": {
+                    "contextAssembly": {
+                        "schemaVersion": "deepcode.session.context-assembly.v2",
+                        "contextAssemblyId": "context-generic",
+                        "stablePrefixHash": "hash-stable",
+                        "dynamicSuffixHash": "hash-dynamic",
+                        "cacheHash": "hash-cache",
+                        "resourceFullTextCharCount": 0,
+                        "resourceSummaryCharCount": 42,
+                        "segments": [{
+                            "name": "protocolContract",
+                            "cacheClass": "globalStable",
+                            "stablePrefix": true,
+                            "auditOnly": false,
+                            "contentHash": "hash-segment",
+                            "charLength": 42
+                        }],
+                        "resourceBlocks": [{
+                            "blockKey": "resource-block-generic",
+                            "displayRef": "generic/file.txt",
+                            "retention": "summary",
+                            "status": "resolved",
+                            "contentHash": "hash-resource",
+                            "charLength": 128,
+                            "volatileFieldStripped": true
+                        }]
+                    }
+                }
+            }
+        });
         let provider_error = json!({
             "kind": "error",
             "payload": {
@@ -1470,8 +1685,13 @@ mod tests {
             &[provider_error, reasoning, llm_trace],
         )
         .expect("provider error projection archive append");
-        append_conversation_archive_transcript(&root, session_id, Some(&session), &[transcript])
-            .expect("transcript archive append");
+        append_conversation_archive_transcript(
+            &root,
+            session_id,
+            Some(&session),
+            &[transcript, context_trace],
+        )
+        .expect("transcript archive append");
 
         let archive_dir = root
             .join("workspace-wf_0-hash_1")
@@ -1504,8 +1724,16 @@ mod tests {
             .join("debug")
             .join("llm-exchanges.jsonl")
             .exists());
+        assert!(archive_dir
+            .join("debug")
+            .join("context-assemblies.jsonl")
+            .exists());
         assert!(archive_dir.join("exports").join("complete.md").exists());
         assert!(archive_dir.join("exports").join("debug.json").exists());
+        assert!(archive_dir
+            .join("exports")
+            .join("context-assemblies.md")
+            .exists());
         let session_archive_dir = root
             .join("workspace-wf_0-hash_1")
             .join("session_test")
@@ -1550,6 +1778,16 @@ mod tests {
         assert!(files.iter().any(|file| {
             file.get("path").and_then(Value::as_str) == Some("debug/llm-provider-errors.jsonl")
         }));
+        assert!(files.iter().any(|file| {
+            file.get("path").and_then(Value::as_str) == Some("debug/context-assemblies.jsonl")
+        }));
+        let context_export =
+            fs::read_to_string(archive_dir.join("exports").join("context-assemblies.md"))
+                .expect("context assemblies markdown");
+        assert!(context_export.contains("context-generic"));
+        assert!(context_export.contains("globalStable"));
+        assert!(context_export.contains("resource-block-generic"));
+        assert!(context_export.contains("resourceSummaryCharCount"));
         let chronological =
             fs::read_to_string(session_archive_dir.join("exports").join("chronological.md"))
                 .expect("chronological markdown");

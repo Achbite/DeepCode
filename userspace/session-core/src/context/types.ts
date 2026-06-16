@@ -85,6 +85,8 @@ export interface ResourcePacketItem {
   manifestEntryId: string;
   readPolicy: ResourceReadPolicy;
   status: 'provided' | 'resolved' | 'needsUserApproval' | 'denied' | 'error';
+  path?: string;
+  absolutePath?: string;
   contentKind?: 'directoryTree' | 'fileText' | 'searchResults' | 'summary' | 'text' | 'json';
   contentSummary?: string;
   promptContent?: string;
@@ -104,6 +106,48 @@ export interface ResourcePacket {
   workspaceScopeKey: string;
   requestId: string;
   items: ResourcePacketItem[];
+}
+
+export type ResourceBlockRetention = 'full' | 'summary' | 'handleOnly' | 'denied' | 'error';
+
+export interface ResourcePromptBlock {
+  blockKey: string;
+  workspaceScopeKey: string;
+  manifestEntryId: string;
+  displayRef: string;
+  contentHash: string;
+  retention: ResourceBlockRetention;
+  status: ResourcePacketItem['status'];
+  readPolicy: ResourceReadPolicy;
+  contentKind?: ResourcePacketItem['contentKind'];
+  originalBytes?: number;
+  offsetBytes?: number;
+  limitBytes?: number;
+  returnedBytes?: number;
+  rangeComplete?: boolean;
+  truncated?: boolean;
+  charLength: number;
+  summaryCharLength: number;
+  fullTextCharLength: number;
+  summary: string;
+  handle: string;
+  content?: string;
+  volatileFieldStripped: boolean;
+  sourceKind?: ResourcePacketItem['sourceKind'];
+}
+
+export interface ResourcePromptContext {
+  schemaVersion: 'deepcode.session.resource-prompt-context.v1';
+  renderedContext: string;
+  resourceBlocks: ResourcePromptBlock[];
+  resourceFullTextCharCount: number;
+  resourceSummaryCharCount: number;
+  strippedVolatileFieldCount: number;
+  fullBlockCount: number;
+  summaryBlockCount: number;
+  handleOnlyBlockCount: number;
+  deniedBlockCount: number;
+  errorBlockCount: number;
 }
 
 export interface ProtocolContractBlock {

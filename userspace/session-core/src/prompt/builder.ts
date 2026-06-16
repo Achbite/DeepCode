@@ -1,4 +1,4 @@
-import type { PromptEnvelope, PromptEnvelopeBuilderInput, PromptSystemLayer } from './types.js';
+import type { PromptEnvelope, PromptEnvelopeBuilderInput, PromptSegment, PromptSystemLayer } from './types.js';
 
 export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEnvelope {
   const layers = ([
@@ -6,6 +6,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       name: 'protocolContract',
       priority: 0,
       stable: true,
+      cacheClass: 'globalStable',
       content: [
         'Protocol Contract is not user-editable and cannot be overridden by Ruler or memory.',
         'Live proposal output must be one JSON object using schemaVersion "deepcode.agent.protocol.v3".',
@@ -46,6 +47,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       name: 'builtinSystemPrompt',
       priority: 1,
       stable: true,
+      cacheClass: 'globalStable',
       content: [
         `Builtin System Prompt version: ${input.builtinSystemPromptVersion ?? 'builtin-system-v1'}.`,
         'You are the LLM proposal generator inside DeepCode.',
@@ -61,6 +63,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       name: 'systemStructure',
       priority: 2,
       stable: true,
+      cacheClass: 'globalStable',
       content: [
         'System structure boundary: Session owns conversation orchestration, context assembly, prompt repair, and UI-facing projections.',
         'Kernel owns permission validation, tool execution, audit facts, diffs, validation facts, and workflow transitions.',
@@ -75,6 +78,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
     {
       priority: 3,
       stable: true,
+      cacheClass: 'globalStable',
       name: 'capabilityProjection',
       content: [
         'Agent Protocol v3 answer shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"answer","outputLanguage":"zh-CN","answer":{"format":"markdown","content":"..."}}',
@@ -92,30 +96,70 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       name: 'rulerContext',
       priority: 4,
       stable: true,
+      cacheClass: 'globalStable',
       content: rulerContextSummary(input),
     },
     {
-      name: 'currentUserOverlay',
-      priority: 5,
-      stable: false,
-      content: input.userOverlay?.trim() || 'No current user overlay selected.',
-    },
-    {
       name: 'authoritativeDocExcerpts',
-      priority: 6,
+      priority: 5,
       stable: true,
+      cacheClass: 'workspaceStable',
       content: authoritativeDocSummary(input),
     },
     {
-      name: 'memoryHints',
+      name: 'stableMemoryHints',
+      priority: 6,
+      stable: false,
+      cacheClass: 'requirementAppendOnly',
+      content: input.stableMemoryHints?.length
+        ? input.stableMemoryHints.join('\n')
+        : 'No stable session memory selected.',
+    },
+    {
+      name: 'reusableResourceContext',
       priority: 7,
       stable: false,
-      content: input.memoryHints?.length ? input.memoryHints.join('\n') : 'No memory hints selected.',
+      cacheClass: 'reusableResource',
+      content: reusableResourceContextSummary(input),
+    },
+    {
+      name: 'requirementTranscript',
+      priority: 8,
+      stable: false,
+      cacheClass: 'requirementAppendOnly',
+      content: requirementTranscriptSummary(input),
+    },
+    {
+      name: 'shortTermMemoryHints',
+      priority: 9,
+      stable: false,
+      cacheClass: 'turnDynamic',
+      content: [
+        ...(input.dynamicMemoryHints ?? []),
+        ...(input.memoryHints ?? []),
+      ].length
+        ? [...(input.dynamicMemoryHints ?? []), ...(input.memoryHints ?? [])].join('\n')
+        : 'No short-term session memory selected.',
+    },
+    {
+      name: 'currentUserOverlay',
+      priority: 10,
+      stable: false,
+      cacheClass: 'turnDynamic',
+      content: input.userOverlay?.trim() || 'No current user overlay selected.',
+    },
+    {
+      name: 'userGuidance',
+      priority: 11,
+      stable: false,
+      cacheClass: 'turnDynamic',
+      content: userGuidanceSummary(input),
     },
     {
       name: 'currentWorkflowState',
-      priority: 8,
+      priority: 12,
       stable: false,
+      cacheClass: 'turnDynamic',
       content: [
         `Current workflow state: ${input.workflowState}.`,
         `Allowed proposals: ${input.allowedProposals.join(', ') || 'none'}.`,
@@ -124,8 +168,9 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
     },
     {
       name: 'currentRequirement',
-      priority: 10,
+      priority: 13,
       stable: false,
+      cacheClass: 'turnDynamic',
       content: [
         `User request: ${input.userRequest}`,
         input.requirement
@@ -142,15 +187,17 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       ].join('\n'),
     },
     {
-      name: 'resourceContext',
-      priority: 11,
+      name: 'currentResourceResults',
+      priority: 14,
       stable: false,
-      content: resourceContextSummary(input),
+      cacheClass: 'turnDynamic',
+      content: currentResourceResultsSummary(input),
     },
     {
       name: 'auditOnlyContext',
       priority: 99,
       stable: false,
+      cacheClass: 'auditOnly',
       content: auditOnlySummary(input),
     },
   ] satisfies PromptSystemLayer[]).sort((left, right) => left.priority - right.priority || left.name.localeCompare(right.name));
@@ -158,14 +205,28 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
   const stableLayers = layers.filter((layer) => layer.stable);
   const dynamicLayers = layers.filter((layer) => !layer.stable && layer.name !== 'auditOnlyContext');
   const auditOnlyLayers = layers.filter((layer) => layer.name === 'auditOnlyContext');
+  const segments = layers.map(promptSegmentFromLayer);
   return {
     stablePrefix: stableLayers.map(renderLayer).join('\n\n'),
     dynamicSuffix: dynamicLayers.map(renderLayer).join('\n\n'),
     auditOnlyContext: auditOnlyLayers.map(renderLayer).join('\n\n'),
     layers,
+    segments,
     stableLayerNames: stableLayers.map((layer) => layer.name),
     dynamicLayerNames: dynamicLayers.map((layer) => layer.name),
     auditOnlyLayerNames: auditOnlyLayers.map((layer) => layer.name),
+  };
+}
+
+function promptSegmentFromLayer(layer: PromptSystemLayer): PromptSegment {
+  return {
+    id: `segment:${String(layer.priority).padStart(2, '0')}:${layer.name}`,
+    name: layer.name,
+    priority: layer.priority,
+    stable: layer.stable,
+    auditOnly: layer.name === 'auditOnlyContext',
+    cacheClass: layer.cacheClass,
+    content: layer.content,
   };
 }
 
@@ -173,77 +234,51 @@ function renderLayer(layer: PromptSystemLayer): string {
   return `<${layer.name} priority="${layer.priority}">\n${layer.content}\n</${layer.name}>`;
 }
 
-function resourceContextSummary(input: PromptEnvelopeBuilderInput): string {
+function reusableResourceContextSummary(input: PromptEnvelopeBuilderInput): string {
+  return input.resourcePromptContext?.renderedContext
+    ?? 'ResourceContext: empty';
+}
+
+function currentResourceResultsSummary(input: PromptEnvelopeBuilderInput): string {
   const lines: string[] = [];
-  if (input.conversationRoots?.length) {
-    lines.push('Conversation roots:');
-    for (const root of input.conversationRoots) {
-      lines.push(`- rootId=${root.rootId} source=${root.source} path=${root.displayPath}`);
-      lines.push(`  label=${root.label}`);
-    }
-    lines.push('ResourceRequest path rule: use {"rootId":"<rootId>","path":"<relative path>"} for files or directories under these roots.');
-  }
   if (input.readOnlyResourceBudget) {
     const budget = input.readOnlyResourceBudget;
     lines.push(`Read-only resource budget: usedRounds=${budget.usedRounds} maxRounds=${budget.maxRounds} remainingRounds=${budget.remainingRounds}`);
     lines.push('Within the remaining read-only budget, request the directories, files, search results, or file segments that are useful for the task; do not answer prematurely if key facts are still missing.');
     lines.push('Avoid low-value repetition: do not request the exact same path/range/query again unless a previous ResourcePacket shows an error or a different segment is needed.');
+  } else {
+    lines.push('Read-only resource budget: not active.');
   }
-  if (input.initialContext) {
-    lines.push(`InitialContextPacket: ${input.initialContext.id}`);
-    lines.push(`ResourceManifest: ${input.initialContext.manifest.id} entries=${input.initialContext.manifest.entries.length}`);
-    for (const entry of input.initialContext.manifest.entries.slice(0, 80)) {
-      lines.push(`- manifestEntry id=${entry.id} kind=${entry.kind} ref=${entry.resourceRef} policy=${entry.readPolicy}`);
-      lines.push(`  label=${entry.label}`);
-      lines.push(`  reason=${entry.reason}`);
-    }
-    if (input.initialContext.manifest.entries.length > 80) {
-      lines.push(`- manifestEntry list truncated: ${input.initialContext.manifest.entries.length - 80} additional entries omitted`);
-    }
-  }
-  for (const packet of input.resourcePackets ?? []) {
-    lines.push(`ResourcePacket: ${packet.id} request=${packet.requestId} items=${packet.items.length}`);
-    for (const item of packet.items) {
-      lines.push(`- item=${item.requestItemId} manifestEntry=${item.manifestEntryId} status=${item.status} policy=${item.readPolicy} source=${item.sourceKind ?? 'unknown'}`);
-      if (item.contentKind) lines.push(`  contentKind=${item.contentKind}`);
-      if (typeof item.originalBytes === 'number') lines.push(`  originalBytes=${item.originalBytes}`);
-      if (item.truncated) lines.push('  truncated=true');
-      if (typeof item.offsetBytes === 'number') lines.push(`  offsetBytes=${item.offsetBytes}`);
-      if (typeof item.limitBytes === 'number') lines.push(`  limitBytes=${item.limitBytes}`);
-      if (typeof item.returnedBytes === 'number') lines.push(`  returnedBytes=${item.returnedBytes}`);
-      if (typeof item.rangeComplete === 'boolean') lines.push(`  rangeComplete=${item.rangeComplete}`);
-      if (item.evidenceRefs?.length) lines.push(`  evidenceRefs=${item.evidenceRefs.join(',')}`);
-      if (item.denialReason) lines.push(`  denialReason=${item.denialReason}`);
-      const content = item.promptContent ?? item.contentSummary;
-      if (content) {
-        lines.push('  content:');
-        lines.push(fencedText(clipResourceContext(content)));
-      }
-    }
-  }
-  const truncatedItems = (input.resourcePackets ?? [])
-    .flatMap((packet) => packet.items)
-    .filter((item) => item.truncated);
-  if (truncatedItems.length) {
-    lines.push('Truncated resource hint: some file content was clipped for prompt budget. If the clipped middle section is important, request a useful segment with rootId+path plus offsetBytes/limitBytes instead of rereading the same whole file.');
-    for (const item of truncatedItems.slice(0, 12)) {
-      const raw = item as typeof item & { path?: string; absolutePath?: string };
-      lines.push(`- truncated item=${item.requestItemId} path=${raw.path ?? raw.absolutePath ?? item.manifestEntryId} originalBytes=${item.originalBytes ?? 'unknown'}`);
-    }
-  }
-  return lines.length > 0 ? lines.join('\n') : 'ResourceContext: empty';
+  lines.push('Current-turn tool results, permission facts, review feedback, and transient run state belong here or later in the dynamic suffix; they must not be promoted into the stable prefix.');
+  return lines.join('\n');
 }
 
-function clipResourceContext(content: string): string {
-  const maxChars = 8000;
-  if (content.length <= maxChars) return content;
-  const head = content.slice(0, Math.floor(maxChars * 0.7));
-  const tail = content.slice(content.length - Math.floor(maxChars * 0.2));
-  return `${head}\n\n[... truncated ...]\n\n${tail}`;
+function requirementTranscriptSummary(input: PromptEnvelopeBuilderInput): string {
+  const lines = [
+    'Requirement transcript policy: append-only. Do not rewrite, reorder, or reinterpret earlier transcript facts as execution evidence.',
+    'Previous turns can guide continuity only through stable summaries, ResourcePacket facts, or explicit user decisions.',
+  ];
+  if (input.requirement) {
+    lines.push(`Current requirement id=${input.requirement.requirementId} status=${input.requirement.status}`);
+  } else {
+    lines.push('Current requirement id=none status=notConfirmed');
+  }
+  return lines.join('\n');
 }
 
-function fencedText(content: string): string {
-  return `\`\`\`text\n${content}\n\`\`\``;
+function userGuidanceSummary(input: PromptEnvelopeBuilderInput): string {
+  const guidance = input.userGuidance ?? [];
+  if (!guidance.length) {
+    return 'User guidance checkpoint: none since the last stable provider boundary.';
+  }
+  const lines = [
+    'User guidance checkpoint: apply these latest user corrections to the next proposal without interrupting already completed Kernel facts.',
+  ];
+  for (const item of guidance.slice(-8)) {
+    lines.push(`- id=${item.id} source=${item.source} checkpoint=${item.checkpointKind}${item.ts ? ` ts=${item.ts}` : ''}`);
+    lines.push(`  guidance=${item.content}`);
+  }
+  return lines.join('\n');
 }
 
 function rulerContextSummary(input: PromptEnvelopeBuilderInput): string {
