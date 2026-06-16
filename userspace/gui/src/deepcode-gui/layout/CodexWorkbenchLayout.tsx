@@ -377,7 +377,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   const [knownSessions, setKnownSessions] = useState<AgentSession[]>([]);
   const [projectRecords, setProjectRecords] = useState<CodexGuiProject[]>(() => readGuiProjects());
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
-  const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
+  const [draftTargetProjectId, setDraftTargetProjectId] = useState<string | null>(null);
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
   const [sessionMenu, setSessionMenu] = useState<CodexSessionContextMenu | null>(null);
   const [projectMenu, setProjectMenu] = useState<CodexProjectContextMenu | null>(null);
@@ -480,8 +480,8 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     [activeProjectId, projectRecords]
   );
   const draftProject = useMemo(
-    () => projectRecords.find((project) => project.id === draftProjectId) ?? null,
-    [draftProjectId, projectRecords]
+    () => projectRecords.find((project) => project.id === draftTargetProjectId) ?? null,
+    [draftTargetProjectId, projectRecords]
   );
   const assignedProjectSessionIds = useMemo(() => {
     const ids = new Set<string>();
@@ -504,7 +504,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     return Array.from(byId.values());
   }, [activeSession, events.length, knownSessions, sessions]);
   const activeSessionRunning = Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id));
-  const projectDraftActive = Boolean(draftProjectId);
+  const projectDraftActive = Boolean(draftTargetProjectId);
   const highlightedSessionId = projectDraftActive ? null : activeSession?.id ?? null;
   const isHome = projectDraftActive
     || (events.length === 0 && !loadingSession && !activeSessionRunning);
@@ -551,10 +551,12 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   };
 
   const handleCreateSession = async (projectId?: string | null) => {
-    const targetProjectId = projectId === undefined ? activeProjectId : projectId;
-    setActiveProjectId(targetProjectId ?? null);
-    setDraftProjectId(targetProjectId ?? null);
-    if (targetProjectId) return;
+    const targetProjectId = projectId ?? null;
+    setActiveProjectId(null);
+    setDraftTargetProjectId(targetProjectId);
+    if (targetProjectId) {
+      return;
+    }
     const nextSession = await createNewSession();
     if (nextSession?.id) {
       upsertKnownSession(nextSession);
@@ -570,14 +572,11 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   };
 
   const prepareProjectDraftSession = async () => {
-    if (!draftProjectId) return true;
-    const targetProjectId = draftProjectId;
+    if (!draftTargetProjectId) return true;
+    const targetProjectId = draftTargetProjectId;
     pendingProjectSendRef.current = null;
-    setActiveProjectId(targetProjectId);
-    setDraftProjectId(null);
     const nextSession = await createNewSession({ reuseEmpty: false });
     if (!nextSession?.id) {
-      setDraftProjectId(targetProjectId);
       return false;
     }
     pendingProjectSendRef.current = {
@@ -586,6 +585,8 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     };
     moveSessionToProject(targetProjectId, nextSession.id);
     upsertKnownSession(nextSession);
+    setActiveProjectId(targetProjectId);
+    setDraftTargetProjectId(null);
     return true;
   };
 
@@ -624,8 +625,8 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
       updatedAt: now,
     };
     setProjectRecords((current) => [project, ...current]);
-    setActiveProjectId(project.id);
-    setDraftProjectId(project.id);
+    setActiveProjectId(null);
+    setDraftTargetProjectId(project.id);
   };
 
   const openSessionContextMenu = (
@@ -733,8 +734,10 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   const handleMoveSessionToProject = (session: AgentSession, projectId: string) => {
     setSessionMenu(null);
     moveSessionToProject(projectId, session.id);
-    setActiveProjectId(projectId);
-    setDraftProjectId(null);
+    if (activeSession?.id === session.id) {
+      setActiveProjectId(projectId);
+    }
+    setDraftTargetProjectId(null);
   };
 
   const handleDeleteProject = (project: CodexGuiProject) => {
@@ -742,7 +745,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     setProjectRecords((current) => current.filter((item) => item.id !== project.id));
     setCollapsedProjectIds((current) => current.filter((id) => id !== project.id));
     if (activeProjectId === project.id) setActiveProjectId(null);
-    if (draftProjectId === project.id) setDraftProjectId(null);
+    if (draftTargetProjectId === project.id) setDraftTargetProjectId(null);
   };
 
   return (
@@ -853,7 +856,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                                 className={item.id === highlightedSessionId ? 'active' : ''}
                                 onClick={() => {
                                   setActiveProjectId(group.projectId ?? null);
-                                  setDraftProjectId(null);
+                                  setDraftTargetProjectId(null);
                                   void activateSession(item.id);
                                 }}
                                 onContextMenu={(event) => openSessionContextMenu(event, item)}
@@ -899,7 +902,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                     className={item.id === highlightedSessionId ? 'active' : ''}
                     onClick={() => {
                       setActiveProjectId(null);
-                      setDraftProjectId(null);
+                      setDraftTargetProjectId(null);
                       void activateSession(item.id);
                     }}
                     onContextMenu={(event) => openSessionContextMenu(event, item)}
