@@ -522,6 +522,33 @@ export interface AgentTimelineTaskProjection {
   items: AgentTimelineTaskProjectionItem[];
 }
 
+export interface AgentTimelineTokenUsageTotals {
+  promptCacheHitTokens: number;
+  promptCacheMissTokens: number;
+  cachedTokens: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  cacheHitRate: number | null;
+  providerCallCount: number;
+  providers: string[];
+}
+
+export interface AgentTimelineTokenUsageRequest extends AgentTimelineTokenUsageTotals {
+  requestId: string;
+  turnId: string;
+  userEventId: string;
+  title: string;
+  startedAt?: string;
+  completedAt?: string;
+  stages: string[];
+}
+
+export interface AgentTimelineTokenUsageProjection {
+  totals: AgentTimelineTokenUsageTotals;
+  requests: AgentTimelineTokenUsageRequest[];
+}
+
 export interface AgentTimelineBlock {
   id: string;
   kind: AgentTimelineBlockKind;
@@ -554,6 +581,7 @@ export interface AgentTimelineResult {
   turns: AgentTimelineTurn[];
   eventCount: number;
   taskProjection?: AgentTimelineTaskProjection;
+  tokenUsageProjection?: AgentTimelineTokenUsageProjection;
   rawEventRefs?: string[];
 }
 

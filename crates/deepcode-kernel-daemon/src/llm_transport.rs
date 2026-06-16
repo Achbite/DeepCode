@@ -40,6 +40,7 @@ pub(crate) struct LlmChatOutput {
     pub(crate) content: String,
     pub(crate) reasoning: Option<String>,
     pub(crate) tool_calls: Vec<LlmToolCall>,
+    pub(crate) usage: Option<Value>,
 }
 
 const OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP: u32 = 16_384;
@@ -221,7 +222,9 @@ pub(crate) async fn call_openai_compatible_profile(
     )
     .await?;
     let choice = require_openai_message(profile, "openaiCompatible", &response)?;
-    Ok(parse_openai_message(choice))
+    let mut output = parse_openai_message(choice);
+    output.usage = response.value.get("usage").cloned();
+    Ok(output)
 }
 
 fn openai_compatible_request_body(
@@ -813,6 +816,7 @@ pub(crate) fn parse_openai_message(message: &Value) -> LlmChatOutput {
         content,
         reasoning,
         tool_calls,
+        usage: None,
     }
 }
 
@@ -850,10 +854,12 @@ pub(crate) fn parse_anthropic_message(value: &Value) -> LlmChatOutput {
         content: content.join("\n"),
         reasoning: None,
         tool_calls,
+        usage: None,
     }
 }
 
 pub(crate) fn llm_output_payload(output: LlmChatOutput) -> Value {
+    let usage = output.usage.clone();
     let mut chunks = Vec::new();
     if let Some(reasoning) = output.reasoning.as_ref().filter(|value| !value.is_empty()) {
         chunks.push(json!({ "type": "reasoning_delta", "content": reasoning }));
@@ -872,7 +878,7 @@ pub(crate) fn llm_output_payload(output: LlmChatOutput) -> Value {
         }));
     }
     chunks.push(json!({ "type": "done" }));
-    json!({
+    let mut payload = json!({
         "chunks": chunks,
         "assistantMessage": {
             "role": "assistant",
@@ -884,7 +890,11 @@ pub(crate) fn llm_output_payload(output: LlmChatOutput) -> Value {
                 "arguments": call.arguments
             })).collect::<Vec<_>>()
         }
-    })
+    });
+    if let Some(usage) = usage {
+        payload["usage"] = usage;
+    }
+    payload
 }
 
 pub(crate) fn provider_tools_from_values(values: Vec<Value>) -> Vec<LlmToolDefinition> {
@@ -1006,5 +1016,27 @@ mod tests {
             body["response_format"]["type"].as_str(),
             Some("json_object")
         );
+    }
+
+    #[test]
+    fn llm_output_payload_preserves_provider_usage() {
+        let payload = llm_output_payload(LlmChatOutput {
+            content: "done".to_string(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: Some(json!({
+                "prompt_cache_hit_tokens": 80,
+                "prompt_cache_miss_tokens": 20,
+                "prompt_tokens": 100,
+                "completion_tokens": 12,
+                "total_tokens": 112
+            })),
+        });
+
+        assert_eq!(payload["usage"]["prompt_cache_hit_tokens"].as_u64(), Some(80));
+        assert_eq!(payload["usage"]["prompt_cache_miss_tokens"].as_u64(), Some(20));
+        assert_eq!(payload["usage"]["prompt_tokens"].as_u64(), Some(100));
+        assert_eq!(payload["usage"]["completion_tokens"].as_u64(), Some(12));
+        assert_eq!(payload["usage"]["total_tokens"].as_u64(), Some(112));
     }
 }

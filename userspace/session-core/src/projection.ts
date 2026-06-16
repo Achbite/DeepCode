@@ -5,6 +5,9 @@ import type {
   AgentTimelineNarrativeKind,
   AgentTimelineResult,
   AgentTimelineStatus,
+  AgentTimelineTokenUsageProjection,
+  AgentTimelineTokenUsageRequest,
+  AgentTimelineTokenUsageTotals,
   KernelPlanReviewReport,
   PermissionRequest,
 } from '@deepcode/protocol';
@@ -220,8 +223,198 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
       title: 'Task projection',
       items: taskItems.slice(-8),
     },
+    tokenUsageProjection: buildTokenUsageProjection(input.events),
     rawEventRefs,
   };
+}
+
+export function buildTokenUsageProjection(events: AgentEvent[]): AgentTimelineTokenUsageProjection {
+  const requests: MutableTokenUsageRequest[] = [];
+  let currentRequest: MutableTokenUsageRequest | null = null;
+
+  events.forEach((event, index) => {
+    if (event.kind === 'user_msg') {
+      finalizeTokenUsageRequest(currentRequest, requests);
+      currentRequest = createTokenUsageRequest(event, index, requests.length + 1);
+      return;
+    }
+
+    if (event.kind !== 'cache_telemetry' || !isRecordPayload(event.payload)) return;
+    if (!currentRequest) {
+      currentRequest = createSyntheticTokenUsageRequest(event, index, requests.length + 1);
+    }
+    addTokenUsageTelemetry(currentRequest, event);
+  });
+
+  finalizeTokenUsageRequest(currentRequest, requests);
+
+  const projectedRequests = requests.map(projectTokenUsageRequest);
+  const totals = projectTokenUsageTotals(projectedRequests);
+  return {
+    totals,
+    requests: projectedRequests,
+  };
+}
+
+interface MutableTokenUsageRequest {
+  requestId: string;
+  turnId: string;
+  userEventId: string;
+  title: string;
+  startedAt?: string;
+  completedAt?: string;
+  providers: Set<string>;
+  stages: Set<string>;
+  providerCallCount: number;
+  promptCacheHitTokens: number;
+  promptCacheMissTokens: number;
+  cachedTokens: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+function createTokenUsageRequest(event: AgentEvent, eventIndex: number, requestIndex: number): MutableTokenUsageRequest {
+  const eventId = event.id || `event-${eventIndex}`;
+  return {
+    requestId: eventId,
+    turnId: `turn-${eventId}`,
+    userEventId: eventId,
+    title: tokenUsageRequestTitle(event.payload, requestIndex),
+    startedAt: event.ts,
+    providers: new Set(),
+    stages: new Set(),
+    providerCallCount: 0,
+    promptCacheHitTokens: 0,
+    promptCacheMissTokens: 0,
+    cachedTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  };
+}
+
+function createSyntheticTokenUsageRequest(
+  event: AgentEvent,
+  eventIndex: number,
+  requestIndex: number
+): MutableTokenUsageRequest {
+  const request = createTokenUsageRequest(event, eventIndex, requestIndex);
+  request.requestId = `request-${requestIndex}`;
+  request.turnId = `turn-orphan-${requestIndex}`;
+  request.userEventId = '';
+  request.title = `Request ${requestIndex}`;
+  return request;
+}
+
+function addTokenUsageTelemetry(request: MutableTokenUsageRequest, event: AgentEvent): void {
+  const payload = event.payload as Record<string, unknown>;
+  request.providerCallCount += 1;
+  const provider = stringField(payload, 'provider');
+  const stage = stringField(payload, 'stage');
+  if (provider) request.providers.add(provider);
+  if (stage) request.stages.add(stage);
+  request.promptCacheHitTokens += numberField(payload, 'promptCacheHitTokens') ?? 0;
+  request.promptCacheMissTokens += numberField(payload, 'promptCacheMissTokens') ?? 0;
+  request.cachedTokens += numberField(payload, 'cachedTokens') ?? 0;
+  request.promptTokens += numberField(payload, 'promptTokens') ?? 0;
+  request.completionTokens += numberField(payload, 'completionTokens') ?? 0;
+  request.totalTokens += numberField(payload, 'totalTokens') ?? 0;
+  request.completedAt = event.ts ?? request.completedAt;
+}
+
+function finalizeTokenUsageRequest(
+  request: MutableTokenUsageRequest | null,
+  requests: MutableTokenUsageRequest[]
+): void {
+  if (!request) return;
+  const hasUsage =
+    request.providerCallCount > 0 ||
+    request.promptCacheHitTokens > 0 ||
+    request.promptCacheMissTokens > 0 ||
+    request.cachedTokens > 0 ||
+    request.promptTokens > 0 ||
+    request.completionTokens > 0 ||
+    request.totalTokens > 0;
+  if (hasUsage) requests.push(request);
+}
+
+function projectTokenUsageRequest(request: MutableTokenUsageRequest): AgentTimelineTokenUsageRequest {
+  const promptTokens = request.promptTokens > 0
+    ? request.promptTokens
+    : request.promptCacheHitTokens + request.promptCacheMissTokens;
+  const totalTokens = request.totalTokens > 0
+    ? request.totalTokens
+    : promptTokens + request.completionTokens;
+  return {
+    requestId: request.requestId,
+    turnId: request.turnId,
+    userEventId: request.userEventId,
+    title: request.title,
+    startedAt: request.startedAt,
+    completedAt: request.completedAt,
+    stages: Array.from(request.stages),
+    promptCacheHitTokens: request.promptCacheHitTokens,
+    promptCacheMissTokens: request.promptCacheMissTokens,
+    cachedTokens: request.cachedTokens,
+    promptTokens,
+    completionTokens: request.completionTokens,
+    totalTokens,
+    cacheHitRate: tokenUsageCacheHitRate(request.promptCacheHitTokens, request.promptCacheMissTokens),
+    providerCallCount: request.providerCallCount,
+    providers: Array.from(request.providers),
+  };
+}
+
+function projectTokenUsageTotals(requests: AgentTimelineTokenUsageRequest[]): AgentTimelineTokenUsageTotals {
+  const promptCacheHitTokens = sumTokenUsageRequests(requests, 'promptCacheHitTokens');
+  const promptCacheMissTokens = sumTokenUsageRequests(requests, 'promptCacheMissTokens');
+  const cachedTokens = sumTokenUsageRequests(requests, 'cachedTokens');
+  const promptTokens = sumTokenUsageRequests(requests, 'promptTokens');
+  const completionTokens = sumTokenUsageRequests(requests, 'completionTokens');
+  const totalTokens = sumTokenUsageRequests(requests, 'totalTokens');
+  return {
+    promptCacheHitTokens,
+    promptCacheMissTokens,
+    cachedTokens,
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    cacheHitRate: tokenUsageCacheHitRate(promptCacheHitTokens, promptCacheMissTokens),
+    providerCallCount: requests.reduce((total, request) => total + request.providerCallCount, 0),
+    providers: Array.from(new Set(requests.flatMap((request) => request.providers))),
+  };
+}
+
+type TokenUsageNumberField =
+  | 'promptCacheHitTokens'
+  | 'promptCacheMissTokens'
+  | 'cachedTokens'
+  | 'promptTokens'
+  | 'completionTokens'
+  | 'totalTokens';
+
+function sumTokenUsageRequests(
+  requests: AgentTimelineTokenUsageRequest[],
+  field: TokenUsageNumberField
+): number {
+  return requests.reduce((total, request) => total + request[field], 0);
+}
+
+function tokenUsageCacheHitRate(hitTokens: number, missTokens: number): number | null {
+  const denominator = hitTokens + missTokens;
+  return denominator > 0 ? hitTokens / denominator : null;
+}
+
+function tokenUsageRequestTitle(payload: unknown, index: number): string {
+  const text = isRecordPayload(payload)
+    ? stringField(payload, 'content') ?? stringField(payload, 'message') ?? stringField(payload, 'summary')
+    : typeof payload === 'string'
+      ? payload
+      : undefined;
+  const normalized = (text ?? '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return `Request ${index}`;
+  return normalized.length > 42 ? `${normalized.slice(0, 42)}…` : normalized;
 }
 
 function appendNarrativeBlock(blocks: AgentTimelineBlock[], event: AgentEvent, index: number): void {
@@ -476,6 +669,20 @@ function stringValueFromPayload(payload: unknown, key: string): string | undefin
   const value = (payload as Record<string, unknown>)[key];
   if (typeof value === 'boolean') return String(value);
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function isRecordPayload(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function stringField(value: Record<string, unknown>, key: string): string | undefined {
+  const field = value[key];
+  return typeof field === 'string' && field.trim().length > 0 ? field : undefined;
+}
+
+function numberField(value: Record<string, unknown>, key: string): number | undefined {
+  const field = value[key];
+  return typeof field === 'number' && Number.isFinite(field) ? field : undefined;
 }
 
 function eventEvidenceRefs(event: AgentEvent): string[] {

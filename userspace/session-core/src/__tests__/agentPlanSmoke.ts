@@ -45,6 +45,8 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopPathResourceRequest();
   await assertSessionDriverLoopRejectsOutsidePath();
   await assertSessionDriverLoopUsesRecentAttachmentRoot();
+  await assertSessionDriverLoopResourceBudgetRequestsUserDecision();
+  await assertSessionDriverLoopContinuesAfterResourceBudgetDecision();
   await assertSessionDriverLoopProjectsDecisionRequest();
   await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
   await assertSessionDriverLoopRepairsInvalidSourceBlock();
@@ -133,6 +135,27 @@ function assertV3Parser(): void {
     }),
   });
   assertEqual(resourceRequest.kind, 'resourceRequest', 'v3 resourceRequest path item parses');
+  const resourcePayload = resourceRequest.payload as any;
+  assertEqual(resourcePayload.items[0].path, 'src/generic.txt', 'v3 resourceRequest keeps root-relative path');
+
+  const rangedResourceRequest = parseProposalEnvelope({
+    runId: 'run-generic',
+    sessionId: 'session-generic',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'resourceRequest',
+      outputLanguage: 'en-US',
+      resourceRequest: {
+        version: '1',
+        id: 'request-generic-range',
+        reason: 'Need a generic file segment.',
+        items: [{ id: 'range-item', rootId: 'root-generic', path: 'src/generic.txt', offsetBytes: 12000, limitBytes: 6000, reason: 'Read a later generic segment.' }],
+      },
+    }),
+  });
+  const rangedPayload = rangedResourceRequest.payload as any;
+  assertEqual(rangedPayload.items[0].offsetBytes, 12000, 'v3 resourceRequest preserves offsetBytes');
+  assertEqual(rangedPayload.items[0].limitBytes, 6000, 'v3 resourceRequest preserves limitBytes');
 
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic',
@@ -210,6 +233,8 @@ function assertPromptEnvelope(): void {
       },
     },
   });
+  packet.items[0].truncated = true;
+  packet.items[0].originalBytes = 24000;
 
   const prompt = buildPromptEnvelope({
     workflowState: 'needProposal',
@@ -231,6 +256,11 @@ function assertPromptEnvelope(): void {
       source: 'currentAttachment',
     }],
     resourcePackets: [packet],
+    readOnlyResourceBudget: {
+      usedRounds: 2,
+      maxRounds: 8,
+      remainingRounds: 6,
+    },
   });
   assert(prompt.stablePrefix.includes('deepcode.agent.protocol.v3'), 'prompt enforces v3');
   assert(prompt.dynamicSuffix.includes('manifestEntry id=attachment-0-generic-file'), 'prompt exposes manifest entry ids');
@@ -248,6 +278,8 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('workspace.read'), 'dynamic suffix carries capability projection');
   assert(prompt.dynamicLayerNames.includes('memoryHints'), 'memory hints are dynamic context');
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
+  assert(prompt.dynamicSuffix.includes('Read-only resource budget: usedRounds=2 maxRounds=8 remainingRounds=6'), 'prompt exposes read-only resource budget');
+  assert(prompt.dynamicSuffix.includes('offsetBytes/limitBytes'), 'prompt hints range reread for truncated resources');
   assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
 }
 
@@ -537,11 +569,27 @@ function assertNarrativeTimelineProjection(): void {
       kind: 'cache_telemetry',
       payload: {
         provider: 'deepseek-v4-pro-openai',
+        stage: 'plan',
         promptCacheHitTokens: 80,
         promptCacheMissTokens: 20,
         promptTokens: 100,
         completionTokens: 12,
         totalTokens: 112,
+      },
+    },
+    {
+      id: 'event-cache-repair',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:01.850Z',
+      kind: 'cache_telemetry',
+      payload: {
+        provider: 'deepseek-v4-pro-openai',
+        stage: 'repair',
+        promptCacheHitTokens: 20,
+        promptCacheMissTokens: 80,
+        promptTokens: 100,
+        completionTokens: 8,
+        totalTokens: 108,
       },
     },
     {
@@ -604,6 +652,32 @@ function assertNarrativeTimelineProjection(): void {
     projection.turns[0].blocks.some((block) => block.events.some((event) => event.kind === 'cache_telemetry')),
     false,
     'cache telemetry is hidden from narrative blocks'
+  );
+  assertEqual(projection.tokenUsageProjection?.requests.length, 1, 'cache telemetry is grouped by user request');
+  assertEqual(
+    projection.tokenUsageProjection?.requests[0]?.providerCallCount,
+    2,
+    'multiple provider calls in one user turn are counted together'
+  );
+  assertEqual(
+    projection.tokenUsageProjection?.requests[0]?.promptCacheHitTokens,
+    100,
+    'request cache hit tokens are summed'
+  );
+  assertEqual(
+    projection.tokenUsageProjection?.requests[0]?.promptCacheMissTokens,
+    100,
+    'request cache miss tokens are summed'
+  );
+  assertEqual(
+    projection.tokenUsageProjection?.requests[0]?.cacheHitRate,
+    0.5,
+    'request cache hit rate uses hit divided by hit plus miss'
+  );
+  assertEqual(
+    projection.tokenUsageProjection?.totals.totalTokens,
+    220,
+    'token projection totals are summed across provider calls'
   );
   assertEqual(
     projection.turns[0].blocks.some((block) => block.evidenceRefs?.includes('evidence-generic')),
@@ -1006,6 +1080,205 @@ async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> 
   assertEqual(result.events.some((event) => event.kind === 'assistant_msg'), true, 'recent root path request reaches final answer');
   assertEqual(resourceResolveManifests.length, 1, 'recent attachment root is not auto-read before the model requests a path');
   assertEqual(resourceResolveManifests[0].entries[0].resourceRef, '/tmp/previous-generic-project/README.txt', 'recent root resolves path under the previous attachment');
+}
+
+async function assertSessionDriverLoopResourceBudgetRequestsUserDecision(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const resourceResolveManifests: Array<Record<string, any>> = [];
+  let llmCalls = 0;
+  const session: AgentSession = {
+    id: 'session-budget',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => resourceBudgetKernel(request, resourceResolveManifests, 'session-budget'),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return {
+        ok: true,
+        data: {
+          chunks: [{ type: 'done' }],
+          assistantMessage: {
+            role: 'assistant',
+            content: JSON.stringify({
+              schemaVersion: 'deepcode.agent.protocol.v3',
+              kind: 'resourceRequest',
+              outputLanguage: 'en-US',
+              resourceRequest: {
+                version: '1',
+                id: `budget-request-${llmCalls}`,
+                reason: 'Need another generic resource.',
+                items: [{ id: `budget-item-${llmCalls}`, path: `src/file-${llmCalls}.txt`, reason: 'Read the next generic source.' }],
+              },
+            }),
+          },
+        },
+      };
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-budget',
+    content: 'Analyze the attached generic project.',
+    attachments: [{
+      kind: 'directory',
+      path: 'generic-project',
+      absolutePath: '/tmp/generic-project',
+      source: 'userSelected',
+      scope: 'message',
+    }],
+  });
+  const budgetConfirmation = result.events.find((event) => event.kind === 'requirement_confirmation');
+  assert(Boolean(budgetConfirmation), 'read-only resource budget emits user decision card');
+  assertEqual(llmCalls, 9, 'ninth resourceRequest triggers budget decision after eight resolved rounds');
+  assertEqual(resourceResolveManifests.length, 9, 'initial attachment plus eight requested resource packets were resolved');
+  const summary = String((budgetConfirmation?.payload as any)?.summary ?? '');
+  assert(summary.includes('只读资源预算'), 'budget decision explains read-only budget');
+  assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any)?.diagnostic === true), false, 'budget exhaustion is not a terminal diagnostic');
+}
+
+async function assertSessionDriverLoopContinuesAfterResourceBudgetDecision(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const resourceResolveManifests: Array<Record<string, any>> = [];
+  let llmCalls = 0;
+  let continuationSawPriorResource = false;
+  const session: AgentSession = {
+    id: 'session-budget-continue',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => resourceBudgetKernel(request, resourceResolveManifests, 'session-budget-continue'),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls <= 9) {
+        return {
+          ok: true,
+          data: {
+            chunks: [{ type: 'done' }],
+            assistantMessage: {
+              role: 'assistant',
+              content: JSON.stringify({
+                schemaVersion: 'deepcode.agent.protocol.v3',
+                kind: 'resourceRequest',
+                outputLanguage: 'en-US',
+                resourceRequest: {
+                  version: '1',
+                  id: `budget-request-${llmCalls}`,
+                  reason: 'Need another generic resource.',
+                  items: [{ id: `budget-item-${llmCalls}`, path: `src/file-${llmCalls}.txt`, reason: 'Read the next generic source.' }],
+                },
+              }),
+            },
+          },
+        };
+      }
+      const promptText = request.messages.map((message) => message.content).join('\n');
+      continuationSawPriorResource = promptText.includes('content for src/file-8.txt');
+      return {
+        ok: true,
+        data: {
+          chunks: [{ type: 'done' }],
+          assistantMessage: {
+            role: 'assistant',
+            content: JSON.stringify({
+              schemaVersion: 'deepcode.agent.protocol.v3',
+              kind: 'answer',
+              outputLanguage: 'en-US',
+              answer: { format: 'markdown', content: 'Continued after budget approval with prior resources.' },
+            }),
+          },
+        },
+      };
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + 1}`,
+  });
+
+  const first = await loop.runUserTurn({
+    sessionId: 'session-budget-continue',
+    content: 'Analyze the attached generic project.',
+    attachments: [{
+      kind: 'directory',
+      path: 'generic-project',
+      absolutePath: '/tmp/generic-project',
+      source: 'userSelected',
+      scope: 'message',
+    }],
+  });
+  const confirmation = first.events.find((event) => event.kind === 'requirement_confirmation');
+  assert(confirmation, 'budget confirmation exists before continuation');
+  if (!confirmation) throw new Error('budget confirmation missing');
+  const next = await loop.resolveDecision({
+    sessionId: 'session-budget-continue',
+    kind: 'requirement',
+    decision: 'accept',
+    runId: String((confirmation.payload as any).runId),
+    targetId: String((confirmation.payload as any).requirementId),
+    existingEvents: first.events,
+  });
+  assertEqual(next.events.some((event) => event.kind === 'assistant_msg'), true, 'budget approval continues to final answer');
+  assertEqual(continuationSawPriorResource, true, 'budget continuation prompt includes prior ResourcePacket content');
+}
+
+function resourceBudgetKernel(
+  request: KernelCommandEnvelope,
+  resourceResolveManifests: Array<Record<string, any>>,
+  sessionId: string
+): KernelReply {
+  const command = request.command as Record<string, any>;
+  if (command.kind === 'runCreate') {
+    const reply = fakeKernel(request);
+    for (const event of reply.events ?? []) {
+      (event as any).sessionId = sessionId;
+    }
+    return reply;
+  }
+  if (command.kind === 'resourceResolve') {
+    resourceResolveManifests.push(command.request.manifest);
+    const entry = command.request.manifest.entries[0];
+    return {
+      ok: true,
+      events: [{
+        kind: 'resource.packet_produced',
+        runId: 'run-generic',
+        sessionId,
+        packet: {
+          id: `packet-budget-${resourceResolveManifests.length}`,
+          requestId: command.requestId,
+          items: [{
+            requestItemId: 'item-generic',
+            manifestEntryId: entry.id,
+            status: 'resolved',
+            readPolicy: 'explicit-manifest-readonly',
+            sourceKind: entry.kind,
+            contentKind: entry.kind === 'directory' ? 'directoryTree' : 'fileText',
+            absolutePath: entry.resourceRef,
+            path: entry.resourceRef,
+            nodes: entry.kind === 'directory' ? [{ type: 'file', path: 'src/file-1.txt' }] : undefined,
+            content: entry.kind === 'directory' ? undefined : `content for ${String(entry.resourceRef).replace('/tmp/generic-project/', '')}`,
+            truncated: entry.kind !== 'directory' && String(entry.resourceRef).endsWith('file-8.txt'),
+            originalBytes: entry.kind !== 'directory' ? 24000 : undefined,
+            evidenceRefs: ['evidence-budget'],
+          }],
+        },
+      }],
+    };
+  }
+  return { ok: true, events: [] };
 }
 
 async function assertSessionDriverLoopRepairsSideEffectBundleEvidence(): Promise<void> {
