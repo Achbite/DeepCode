@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import type { AgentEvent } from '@deepcode/protocol';
+import type { AgentEvent, AgentTimelineTokenUsageProjection } from '@deepcode/protocol';
 import type { SettingsSurface } from '@deepcode/protocol';
 import './settingsCenter.css';
 import { normalizeUiLanguage, t } from '../../i18n';
@@ -30,6 +30,7 @@ interface SettingsCenterProps {
   wsStatus: string;
   serverVersion?: string;
   events?: AgentEvent[];
+  tokenUsageProjection?: AgentTimelineTokenUsageProjection | null;
   surface?: Extract<SettingsSurface, 'editor' | 'gui'>;
 }
 
@@ -44,6 +45,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   wsStatus,
   serverVersion,
   events = [],
+  tokenUsageProjection,
   surface = 'editor',
 }) => {
   const [activeKey, setActiveKey] = useState<SettingsKey>(surface === 'gui' ? 'common' : 'workspace');
@@ -54,16 +56,11 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   const editorNavItems: NavItem[] = [
     { key: 'workspace', icon: 'WS', label: t(language, 'settings.nav.workspace') },
     { key: 'common', icon: 'CM', label: t(language, 'settings.nav.common') },
-    { key: 'token', icon: 'TK', label: t(language, 'settings.nav.token') },
-    { key: 'llm', icon: 'AI', label: t(language, 'settings.nav.llm') },
-    { key: 'skill', icon: 'SK', label: t(language, 'settings.nav.skill') },
-    { key: 'mcp', icon: 'MC', label: t(language, 'settings.nav.mcp') },
-    { key: 'sessionBoundary', icon: 'SB', label: t(language, 'settings.nav.sessionBoundary') },
-    { key: 'doctor', icon: 'DR', label: t(language, 'settings.nav.doctor') },
-    { key: 'ruler', icon: 'RL', label: t(language, 'settings.nav.ruler') },
+    ...agentNavItems(language),
   ];
   const guiNavItems: NavItem[] = [
     { key: 'common', icon: 'GU', label: t(language, 'settings.nav.gui') },
+    ...agentNavItems(language),
   ];
   const navItems = surface === 'gui' ? guiNavItems : editorNavItems;
 
@@ -82,7 +79,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
           />
         );
       case 'token':
-        return <TokenStatsSection events={events} />;
+        return <TokenStatsSection events={events} tokenUsageProjection={tokenUsageProjection} />;
       case 'llm':
         return <LlmSection />;
       case 'skill':
@@ -135,5 +132,17 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     </div>
   );
 };
+
+function agentNavItems(language: ReturnType<typeof normalizeUiLanguage>): NavItem[] {
+  return [
+    { key: 'token', icon: 'TK', label: t(language, 'settings.nav.token') },
+    { key: 'llm', icon: 'AI', label: t(language, 'settings.nav.llm') },
+    { key: 'skill', icon: 'SK', label: t(language, 'settings.nav.skill') },
+    { key: 'mcp', icon: 'MC', label: t(language, 'settings.nav.mcp') },
+    { key: 'sessionBoundary', icon: 'SB', label: t(language, 'settings.nav.sessionBoundary') },
+    { key: 'doctor', icon: 'DR', label: t(language, 'settings.nav.doctor') },
+    { key: 'ruler', icon: 'RL', label: t(language, 'settings.nav.ruler') },
+  ];
+}
 
 export default SettingsCenter;

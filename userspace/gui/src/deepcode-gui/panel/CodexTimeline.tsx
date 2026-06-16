@@ -10,7 +10,9 @@ import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
 import { t, type UiLanguage } from '../../i18n';
 import { submitAgentFeedback } from '../../services/runtimeAdapter';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
+import ToolEvidenceDetails from '../../components/agent-panel/ToolEvidenceDetails';
 import { useSettingsStore } from '../../state/settingsStore';
+import { formatToolEvidence } from '../../utils/toolEvidence';
 
 interface CodexTimelineProps {
   timeline: AgentTimelineResult | null;
@@ -539,6 +541,10 @@ const TimelineBlock: React.FC<{
     );
   }
 
+  if (block.narrativeKind === 'operationEvidence' || block.narrativeKind === 'verification') {
+    return <OperationEvidenceBlock block={block} language={language} />;
+  }
+
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
   return (
     <details className={`codex-block codex-block--${block.kind}${narrativeClass}${densityClass}`} open={open}>
@@ -553,6 +559,38 @@ const TimelineBlock: React.FC<{
           <CodexGitReviewDiffDetails gitReview={gitReviewFromBlock(block)} language={language} />
         )}
         <EventList events={block.events} />
+      </div>
+    </details>
+  );
+};
+
+const OperationEvidenceBlock: React.FC<{
+  block: AgentTimelineBlock;
+  language: UiLanguage;
+}> = ({ block, language }) => {
+  const evidence = formatToolEvidence(block.events, language, {
+    fallbackTitle: block.title,
+    fallbackSummary: block.summary,
+  });
+  const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
+  const status = evidence.status === 'completed' ? block.status : evidence.status;
+  const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
+  const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
+
+  return (
+    <details
+      className={`codex-block codex-block--${block.kind}${narrativeClass}${densityClass}`}
+      open={open}
+    >
+      <summary>
+        <span className={`codex-block__status codex-block__status--${status}`} />
+        <span className="codex-block__title">{evidence.title}</span>
+        {evidence.summary && <span className="codex-block__summary">{evidence.summary}</span>}
+      </summary>
+      <div className="codex-block__details">
+        {block.bodyMarkdown && <MarkdownContent content={block.bodyMarkdown} />}
+        <ToolEvidenceDetails evidence={evidence} language={language} />
+        {evidence.items.length === 0 && <EventList events={block.events} />}
       </div>
     </details>
   );

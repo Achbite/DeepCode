@@ -345,21 +345,25 @@ function deriveTaskItems(
   return [];
 }
 
-function deriveCacheHitSummary(events: AgentEvent[], language: UiLanguage): CodexCacheHitSummary | null {
-  const stats = deriveTokenUsageStats(events);
+function deriveCacheHitSummary(
+  events: AgentEvent[],
+  language: UiLanguage,
+  tokenUsageProjection?: ReturnType<typeof buildNarrativeTimelineProjection>['tokenUsageProjection'] | null
+): CodexCacheHitSummary | null {
+  const stats = deriveTokenUsageStats(events, tokenUsageProjection);
   const percent = formatPercent(stats.cacheHitRate);
   const label = language === 'zh-CN' ? `缓存 ${percent}` : `Cache ${percent}`;
   if (!stats.hasCacheData) {
     return {
       label,
       title: language === 'zh-CN'
-        ? '当前会话尚未收到缓存命中统计'
-        : 'No cache hit telemetry has been reported for this session yet',
+        ? '当前对话流程尚未收到缓存命中统计'
+        : 'No cache hit telemetry has been reported for this conversation flow yet',
     };
   }
   const title = language === 'zh-CN'
-    ? `当前会话累计缓存命中 ${formatTokenCount(stats.promptCacheHitTokens)} tokens，未命中 ${formatTokenCount(stats.promptCacheMissTokens)} tokens`
-    : `Current session cache hits ${formatTokenCount(stats.promptCacheHitTokens)} tokens, misses ${formatTokenCount(stats.promptCacheMissTokens)} tokens`;
+    ? `当前对话流程累计缓存命中 ${formatTokenCount(stats.promptCacheHitTokens)} tokens，未命中 ${formatTokenCount(stats.promptCacheMissTokens)} tokens`
+    : `Current conversation flow cache hits ${formatTokenCount(stats.promptCacheHitTokens)} tokens, misses ${formatTokenCount(stats.promptCacheMissTokens)} tokens`;
   return { label, title };
 }
 
@@ -460,9 +464,16 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     ),
     [activeSession?.id, events, language, runningSessionIds]
   );
+  const timelineProjection = useMemo(
+    () => buildNarrativeTimelineProjection({
+      sessionId: activeSession?.id ?? events[0]?.sessionId ?? 'session',
+      events,
+    }),
+    [activeSession?.id, events]
+  );
   const cacheHitSummary = useMemo(
-    () => deriveCacheHitSummary(events, language),
-    [events, language]
+    () => deriveCacheHitSummary(events, language, timelineProjection.tokenUsageProjection),
+    [events, language, timelineProjection.tokenUsageProjection]
   );
   const activeProject = useMemo(
     () => projectRecords.find((project) => project.id === activeProjectId) ?? null,
@@ -1111,6 +1122,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                   wsStatus={wsStatus}
                   serverVersion={serverVersion}
                   events={events}
+                  tokenUsageProjection={timelineProjection.tokenUsageProjection}
                   surface="gui"
                 />
               </div>

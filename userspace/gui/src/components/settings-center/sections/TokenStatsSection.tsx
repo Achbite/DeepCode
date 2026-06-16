@@ -1,16 +1,18 @@
 import React from 'react';
-import type { AgentEvent } from '@deepcode/protocol';
+import type { AgentEvent, AgentTimelineTokenUsageProjection } from '@deepcode/protocol';
 import { normalizeUiLanguage, t } from '../../../i18n';
 import { useSettingsStore } from '../../../state/settingsStore';
 import {
   deriveTokenUsageStats,
   formatPercent,
   formatTokenCount,
+  type TokenUsageRequestStats,
   type TokenUsageStats,
 } from '../../../utils/tokenUsageStats';
 
 interface TokenStatsSectionProps {
   events: AgentEvent[];
+  tokenUsageProjection?: AgentTimelineTokenUsageProjection | null;
 }
 
 interface TokenBarRowProps {
@@ -20,11 +22,11 @@ interface TokenBarRowProps {
   tone?: 'cache' | 'miss' | 'completion' | 'neutral';
 }
 
-const TokenStatsSection: React.FC<TokenStatsSectionProps> = ({ events }) => {
+const TokenStatsSection: React.FC<TokenStatsSectionProps> = ({ events, tokenUsageProjection }) => {
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
-  const stats = deriveTokenUsageStats(events);
+  const stats = deriveTokenUsageStats(events, tokenUsageProjection);
   const maxValue = Math.max(
     stats.promptCacheHitTokens,
     stats.promptCacheMissTokens,
@@ -95,6 +97,7 @@ const TokenStatsSection: React.FC<TokenStatsSectionProps> = ({ events }) => {
         )}
       </div>
 
+      <TokenRequestBreakdown stats={stats} />
       <TokenDetails stats={stats} />
     </div>
   );
@@ -162,10 +165,108 @@ const TokenDetails: React.FC<{ stats: TokenUsageStats }> = ({ stats }) => {
             <td>{t(language, 'settings.token.totalTokens')}</td>
             <td>{formatTokenCount(stats.totalTokens)}</td>
           </tr>
+          <tr>
+            <td>{language === 'zh-CN' ? 'Provider 调用' : 'Provider calls'}</td>
+            <td>{formatTokenCount(stats.providerCallCount)}</td>
+          </tr>
+          <tr>
+            <td>Provider</td>
+            <td>{stats.providerIds.length > 0 ? stats.providerIds.join(', ') : '-'}</td>
+          </tr>
         </tbody>
       </table>
     </div>
   );
 };
+
+const TokenRequestBreakdown: React.FC<{ stats: TokenUsageStats }> = ({ stats }) => {
+  const language = normalizeUiLanguage(
+    useSettingsStore((s) => s.effectiveSettings['workbench.language'])
+  );
+  if (stats.requests.length === 0) return null;
+  const maxTotal = Math.max(...stats.requests.map((request) => request.totalTokens), 1);
+  return (
+    <div className="settings-card">
+      <h3 className="settings-card__title">
+        {language === 'zh-CN' ? '请求消耗' : 'Request usage'}
+      </h3>
+      <div className="settings-token-requests">
+        {stats.requests.map((request, index) => (
+          <TokenRequestRow
+            key={request.id}
+            request={request}
+            index={index + 1}
+            maxTotal={maxTotal}
+            language={language}
+          />
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const TokenRequestRow: React.FC<{
+  request: TokenUsageRequestStats;
+  index: number;
+  maxTotal: number;
+  language: ReturnType<typeof normalizeUiLanguage>;
+}> = ({ request, index, maxTotal, language }) => {
+  const total = Math.max(request.totalTokens, request.promptTokens + request.completionTokens, 1);
+  const totalWidth = Math.max(4, Math.round((request.totalTokens / maxTotal) * 100));
+  const hitWidth = Math.max(0, Math.min(100, (request.promptCacheHitTokens / total) * 100));
+  const missWidth = Math.max(0, Math.min(100, (request.promptCacheMissTokens / total) * 100));
+  const completionWidth = Math.max(0, Math.min(100, (request.completionTokens / total) * 100));
+  const providerLabel = request.providerIds.length > 0 ? request.providerIds.join(', ') : '-';
+  const stageLabel = request.stages.length > 0 ? request.stages.join(', ') : '-';
+  const timeLabel = request.startedAt ? formatRequestTime(request.startedAt) : '';
+
+  return (
+    <div className="settings-token-request">
+      <div className="settings-token-request__header">
+        <div className="settings-token-request__title">
+          <span>#{index}</span>
+          <strong title={request.title}>{request.title}</strong>
+        </div>
+        <div className="settings-token-request__total">
+          {formatTokenCount(request.totalTokens)}
+        </div>
+      </div>
+      <div className="settings-token-request__meta">
+        <span>{providerLabel}</span>
+        <span>{language === 'zh-CN' ? `调用 ${request.providerCallCount} 次` : `${request.providerCallCount} calls`}</span>
+        <span>{formatPercent(request.cacheHitRate)}</span>
+        {timeLabel && <span>{timeLabel}</span>}
+      </div>
+      <div className="settings-token-request__track" aria-hidden="true">
+        <div className="settings-token-request__total-bar" style={{ width: `${totalWidth}%` }}>
+          <span
+            className="settings-token-request__segment settings-token-request__segment--cache"
+            style={{ width: `${hitWidth}%` }}
+          />
+          <span
+            className="settings-token-request__segment settings-token-request__segment--miss"
+            style={{ width: `${missWidth}%` }}
+          />
+          <span
+            className="settings-token-request__segment settings-token-request__segment--completion"
+            style={{ width: `${completionWidth}%` }}
+          />
+        </div>
+      </div>
+      <div className="settings-token-request__legend">
+        <span>{t(language, 'settings.token.cacheHitTokens')} {formatTokenCount(request.promptCacheHitTokens)}</span>
+        <span>{t(language, 'settings.token.cacheMissTokens')} {formatTokenCount(request.promptCacheMissTokens)}</span>
+        <span>{t(language, 'settings.token.completionTokens')} {formatTokenCount(request.completionTokens)}</span>
+        <span>{stageLabel}</span>
+      </div>
+    </div>
+  );
+};
+
+function formatRequestTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
 
 export default TokenStatsSection;

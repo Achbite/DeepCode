@@ -10,7 +10,9 @@ import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
 import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
+import ToolEvidenceDetails from './ToolEvidenceDetails';
 import { compactDisplayText, sanitizeDisplayText } from './displayText';
+import { formatToolEvidence } from '../../utils/toolEvidence';
 import {
   getConversationArchive,
   readConversationArchiveFile,
@@ -312,6 +314,7 @@ const STATUS_LABEL_KEYS: Record<string, string> = {
   started: 'agent.status.started',
   completed: 'agent.status.completed',
   error: 'agent.status.error',
+  failed: 'agent.status.error',
   updated: 'agent.status.updated',
   done: 'agent.status.done',
   running: 'agent.status.running',
@@ -1619,8 +1622,14 @@ function renderToolBatch(group: ToolBatchGroup, language: UiLanguage) {
 }
 
 function renderNarrativeEvidenceBlock(block: AgentTimelineBlock, language: UiLanguage) {
+  const evidence = formatToolEvidence(block.events, language, {
+    fallbackTitle: block.title,
+    fallbackSummary: block.summary,
+  });
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
-  const status = block.status === 'completed' ? 'done' : block.status;
+  const status = evidence.status === 'completed'
+    ? (block.status === 'completed' ? 'done' : block.status)
+    : evidence.status;
   return (
     <details
       key={block.id}
@@ -1628,7 +1637,7 @@ function renderNarrativeEvidenceBlock(block: AgentTimelineBlock, language: UiLan
       open={open}
     >
       <summary>
-        <span className="agent-tool-batch__label">{block.title}</span>
+        <span className="agent-tool-batch__label">{evidence.title}</span>
         <span className={`agent-tool-batch__status agent-tool-batch__status--${status}`}>
           {localizedStatus(status, language)}
         </span>
@@ -1639,7 +1648,8 @@ function renderNarrativeEvidenceBlock(block: AgentTimelineBlock, language: UiLan
             <MarkdownContent content={block.bodyMarkdown} />
           </div>
         )}
-        {block.events.map((event) => renderTraceEvent(event, language))}
+        <ToolEvidenceDetails evidence={evidence} language={language} />
+        {evidence.items.length === 0 && block.events.map((event) => renderTraceEvent(event, language))}
       </div>
     </details>
   );

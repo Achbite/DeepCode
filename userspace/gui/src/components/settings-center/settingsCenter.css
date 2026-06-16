@@ -306,6 +306,105 @@
   padding-top: 0;
 }
 
+.settings-token-requests {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.settings-token-request {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-md, 6px);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.settings-token-request__header,
+.settings-token-request__meta,
+.settings-token-request__legend {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.settings-token-request__header {
+  justify-content: space-between;
+}
+
+.settings-token-request__title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-main, #ededed);
+  font-size: 13px;
+}
+
+.settings-token-request__title span {
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+}
+
+.settings-token-request__title strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 650;
+}
+
+.settings-token-request__total {
+  flex: 0 0 auto;
+  color: var(--text-main, #ededed);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.settings-token-request__meta,
+.settings-token-request__legend {
+  flex-wrap: wrap;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+}
+
+.settings-token-request__track {
+  height: 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.settings-token-request__total-bar {
+  display: flex;
+  height: 100%;
+  min-width: 3px;
+  overflow: hidden;
+  border-radius: inherit;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.settings-token-request__segment {
+  display: block;
+  min-width: 0;
+  height: 100%;
+}
+
+.settings-token-request__segment--cache {
+  background: #22c55e;
+}
+
+.settings-token-request__segment--miss {
+  background: #f97316;
+}
+
+.settings-token-request__segment--completion {
+  background: #8b5cf6;
+}
+
 .settings-field {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(190px, 280px);
