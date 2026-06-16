@@ -341,6 +341,7 @@ export interface PatchAgentWorkflowConfigRequest {
 
 export type AgentEventKind =
   | 'user_msg'
+  | 'user_guidance'
   | 'assistant_msg'
   | 'cache_telemetry'
   | 'requirement_confirmation'
@@ -503,6 +504,7 @@ export interface AgentTimelineDisplayHints {
   collapseAfterComplete?: boolean;
   typewriterSpeed?: 'slow' | 'normal' | 'fast';
   replaceOnComplete?: boolean;
+  checkpointKind?: 'turnStart' | 'llmProposal' | 'resourcePacket' | 'userGuidance' | 'permission' | 'review' | 'final' | 'diagnostic';
   showInTaskList?: boolean;
   taskListLabel?: string;
   taskListSummary?: string;

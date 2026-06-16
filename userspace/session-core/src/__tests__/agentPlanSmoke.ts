@@ -19,8 +19,10 @@ import {
   assembleContext,
   buildNarrativeTimelineProjection,
   buildPromptEnvelope,
+  buildResourcePromptContext,
   buildSessionMemoryDocument,
   buildSessionTaskGraph,
+  collectUserGuidanceEvents,
   createResourcePacket,
   parseProposalEnvelope,
   SessionDriver,
@@ -35,6 +37,7 @@ async function main(): Promise<void> {
   assertActionBundleProtocolFields();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
+  assertResourcePromptBlocksStabilize();
   assertSessionMemoryDocument();
   assertSessionTaskGraphProjection();
   assertDeepSeekCacheStrategyDoesNotInjectRequestParameter();
@@ -42,6 +45,8 @@ async function main(): Promise<void> {
   assertNarrativeTimelineProjection();
   assertSessionDriverSkeleton();
   await assertSessionDriverLoop();
+  await assertSessionDriverLoopTerminalAnswerGuidanceRevision();
+  await assertSessionDriverLoopTerminalGuidanceRevisionFallback();
   await assertSessionDriverLoopPathResourceRequest();
   await assertSessionDriverLoopRejectsOutsidePath();
   await assertSessionDriverLoopUsesRecentAttachmentRoot();
@@ -54,6 +59,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopRepairsEmptyActionBundleResponse();
   await assertSessionDriverLoopReviewRevisionReturnsToPlanning();
   await assertSessionDriverLoopReviewAcceptStopsAtCurrentBatch();
+  await assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept();
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
@@ -235,6 +241,24 @@ function assertPromptEnvelope(): void {
   });
   packet.items[0].truncated = true;
   packet.items[0].originalBytes = 24000;
+  const initialContext = {
+    id: 'initial-generic',
+    workspaceScopeKey: manifest.workspaceScopeKey,
+    manifest,
+  };
+  const conversationRoots = [{
+    rootId: 'attachment-0-generic-file',
+    kind: 'directory' as const,
+    label: 'Directory generic',
+    displayPath: 'generic',
+    absolutePath: '/tmp/generic',
+    source: 'currentAttachment' as const,
+  }];
+  const resourcePromptContext = buildResourcePromptContext({
+    initialContext,
+    conversationRoots,
+    resourcePackets: [packet],
+  });
 
   const prompt = buildPromptEnvelope({
     workflowState: 'needProposal',
@@ -242,20 +266,9 @@ function assertPromptEnvelope(): void {
     capabilityCatalogSummary: 'workspace.read\nworkspace.write',
     memoryHints: ['Recent user turn: generic request attachments=file:generic/file.txt'],
     userRequest: 'Analyze the attached resource.',
-    initialContext: {
-      id: 'initial-generic',
-      workspaceScopeKey: manifest.workspaceScopeKey,
-      manifest,
-    },
-    conversationRoots: [{
-      rootId: 'attachment-0-generic-file',
-      kind: 'directory',
-      label: 'Directory generic',
-      displayPath: 'generic',
-      absolutePath: '/tmp/generic',
-      source: 'currentAttachment',
-    }],
-    resourcePackets: [packet],
+    initialContext,
+    conversationRoots,
+    resourcePromptContext,
     readOnlyResourceBudget: {
       usedRounds: 2,
       maxRounds: 8,
@@ -276,8 +289,11 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('Current workflow state: needProposal'), 'dynamic suffix carries current workflow state');
   assert(prompt.dynamicSuffix.includes('Allowed proposals: answer, resourceRequest, actionBundle'), 'dynamic suffix carries allowed proposals');
   assert(prompt.dynamicSuffix.includes('workspace.read'), 'dynamic suffix carries capability projection');
-  assert(prompt.dynamicLayerNames.includes('memoryHints'), 'memory hints are dynamic context');
+  assert(prompt.dynamicLayerNames.includes('shortTermMemoryHints'), 'short-term memory hints are dynamic context');
+  assert(prompt.dynamicLayerNames.includes('reusableResourceContext'), 'reusable resource context is separated from current request');
+  assert(prompt.dynamicSuffix.includes('blockKey='), 'prompt includes stable resource block keys');
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
+  assert(!prompt.dynamicSuffix.includes('evidence-generic'), 'prompt excludes volatile evidence refs from provider-visible resource context');
   assert(prompt.dynamicSuffix.includes('Read-only resource budget: usedRounds=2 maxRounds=8 remainingRounds=6'), 'prompt exposes read-only resource budget');
   assert(prompt.dynamicSuffix.includes('offsetBytes/limitBytes'), 'prompt hints range reread for truncated resources');
   assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
@@ -327,6 +343,12 @@ function assertContextAssemblerCachePlan(): void {
       workspaceScopeKey: manifest.workspaceScopeKey,
       manifest,
     },
+    userGuidance: [{
+      id: 'guidance-generic',
+      content: 'Prefer a concise continuation and keep already observed facts unchanged.',
+      source: 'user',
+      checkpointKind: 'nextProviderCall',
+    }],
     profile: {
       provider: 'deepseek',
       model: 'deepseek-chat',
@@ -353,11 +375,143 @@ function assertContextAssemblerCachePlan(): void {
 
   assertEqual(base.cachePlan.deepseekPrefixCache.requestParameterRequired, false, 'DeepSeek cache plan does not require request parameters');
   assertEqual(base.cachePlan.cacheAffectsCorrectness, false, 'cache plan is observability only');
+  assertEqual(base.cachePlan.contextAssemblyId, base.contextAssembly.contextAssemblyId, 'cache plan references the context assembly');
   assertEqual(base.cachePlan.stablePrefixHash, followUp.cachePlan.stablePrefixHash, 'same stable layers keep stable prefix hash');
   assert(base.cachePlan.dynamicSuffixHash !== followUp.cachePlan.dynamicSuffixHash, 'current request changes dynamic suffix hash');
   assert(base.cachePlan.cacheHash !== followUp.cachePlan.cacheHash, 'overall cache hash changes with the dynamic suffix');
   assert(!base.prompt.stablePrefix.includes('Summarize the reusable context.'), 'stable prefix excludes current user request');
   assert(base.prompt.dynamicSuffix.includes('Summarize the reusable context.'), 'dynamic suffix carries current user request');
+  assert(base.prompt.dynamicSuffix.includes('Prefer a concise continuation'), 'user guidance enters the dynamic suffix');
+  assertEqual(base.contextAssembly.userGuidanceCount, 1, 'context assembly records provider-checkpoint user guidance count');
+  assertEqual(base.contextAssembly.consumedUserGuidanceIds[0], 'guidance-generic', 'context assembly records consumed user guidance ids');
+  assertEqual(base.contextAssembly.schemaVersion, 'deepcode.session.context-assembly.v2', 'context assembly records v2 cache debug schema');
+  assertEqual(base.contextAssembly.cacheAffectsCorrectness, false, 'context assembly cache telemetry is observability only');
+  assertEqual(base.contextAssembly.resourceBlocks.length, 0, 'simple chat path has no resource blocks');
+  assertEqual(base.contextAssembly.resourceFullTextCharCount, 0, 'simple chat path has no full resource text');
+  assert(base.contextAssembly.segments.find((segment) => segment.name === 'reusableResourceContext')?.charLength ?? 0 < 1200, 'empty resource context stays small');
+  assertEqual(
+    base.contextAssembly.segments.some((segment) => segment.cacheClass === 'globalStable' && segment.stablePrefix),
+    true,
+    'context assembly records stable protocol segments'
+  );
+  assertEqual(
+    base.contextAssembly.segments.some((segment) => segment.cacheClass === 'reusableResource' && segment.name === 'reusableResourceContext'),
+    true,
+    'context assembly records reusable resource segment'
+  );
+  const reusableIndex = base.prompt.dynamicLayerNames.indexOf('reusableResourceContext');
+  const requirementIndex = base.prompt.dynamicLayerNames.indexOf('currentRequirement');
+  assert(reusableIndex >= 0 && requirementIndex > reusableIndex, 'reusable resources appear before current request in dynamic suffix');
+  assertEqual(
+    base.contextAssembly.segments.some((segment) => segment.auditOnly && segment.cacheClass === 'auditOnly'),
+    true,
+    'audit-only segment is tracked separately from cache prefix'
+  );
+}
+
+function assertResourcePromptBlocksStabilize(): void {
+  const alphaMiddleMarker = 'ALPHA_MIDDLE_SHOULD_NOT_REPEAT_AFTER_SUMMARY';
+  const alphaContent = `${'alpha-head '.repeat(90)}${alphaMiddleMarker}${' alpha-tail'.repeat(90)}`;
+  const betaContent = 'beta current resource content';
+  const manifest: ResourceManifest = {
+    id: 'manifest-resource-blocks',
+    workspaceScopeKey: 'workspace-resource-blocks',
+    entries: [
+      {
+        id: 'alpha-file',
+        kind: 'file',
+        label: 'File src/alpha.txt',
+        resourceRef: 'src/alpha.txt',
+        readPolicy: 'autoRead',
+        reason: 'Generic prior file.',
+      },
+      {
+        id: 'beta-file',
+        kind: 'file',
+        label: 'File src/beta.txt',
+        resourceRef: 'src/beta.txt',
+        readPolicy: 'autoRead',
+        reason: 'Generic current file.',
+      },
+    ],
+    budget: { maxEntries: 8, maxBytes: 64000 },
+    defaultDenyPatterns: [],
+  };
+  const initialContext = {
+    id: 'initial-resource-blocks',
+    workspaceScopeKey: manifest.workspaceScopeKey,
+    manifest,
+  };
+  const alphaPacket = createResourcePacket({
+    packetId: 'packet-alpha-volatile',
+    manifest,
+    request: {
+      id: 'request-alpha-volatile',
+      items: [{ id: 'item-alpha', manifestEntryId: 'alpha-file', reason: 'Read alpha.' }],
+    },
+    kernelEvidence: {
+      'alpha-file': {
+        contentKind: 'fileText',
+        promptContent: alphaContent,
+        evidenceRefs: ['volatile-evidence-alpha'],
+      },
+    },
+  });
+  const betaPacket = createResourcePacket({
+    packetId: 'packet-beta-volatile',
+    manifest,
+    request: {
+      id: 'request-beta-volatile',
+      items: [{ id: 'item-beta', manifestEntryId: 'beta-file', reason: 'Read beta.' }],
+    },
+    kernelEvidence: {
+      'beta-file': {
+        contentKind: 'fileText',
+        promptContent: betaContent,
+        evidenceRefs: ['volatile-evidence-beta'],
+      },
+    },
+  });
+
+  const first = assembleContext({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer', 'resourceRequest'],
+    capabilityCatalogSummary: 'workspace.read',
+    userRequest: 'Analyze alpha.',
+    initialContext,
+    resourcePackets: [alphaPacket],
+    profile: { provider: 'deepseek', model: 'deepseek-chat' },
+    templateVersion: 'resource-block-test',
+  });
+  const second = assembleContext({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer', 'resourceRequest'],
+    capabilityCatalogSummary: 'workspace.read',
+    userRequest: 'Analyze beta with prior alpha context.',
+    initialContext,
+    resourcePackets: [alphaPacket, betaPacket],
+    profile: { provider: 'deepseek', model: 'deepseek-chat' },
+    templateVersion: 'resource-block-test',
+  });
+
+  const firstAlpha = first.contextAssembly.resourceBlocks.find((block) => block.displayRef === 'src/alpha.txt');
+  const secondAlpha = second.contextAssembly.resourceBlocks.find((block) => block.displayRef === 'src/alpha.txt');
+  const secondBeta = second.contextAssembly.resourceBlocks.find((block) => block.displayRef === 'src/beta.txt');
+  assert(firstAlpha, 'first alpha block exists');
+  assert(secondAlpha, 'second alpha block exists');
+  assert(secondBeta, 'second beta block exists');
+  if (!firstAlpha || !secondAlpha || !secondBeta) throw new Error('resource block test setup failed');
+  assertEqual(firstAlpha.blockKey, secondAlpha.blockKey, 'old resource block keeps stable key across later packets');
+  assertEqual(firstAlpha.contentHash, secondAlpha.contentHash, 'old resource block keeps stable content hash across later packets');
+  assertEqual(firstAlpha.retention, 'full', 'latest small resource can be full text');
+  assertEqual(secondAlpha.retention, 'summary', 'old resource is downgraded to summary after a newer packet');
+  assertEqual(secondBeta.retention, 'full', 'new current small resource remains full text');
+  assertEqual(secondAlpha.volatileFieldStripped, true, 'resource block records volatile field stripping');
+  assert(second.prompt.dynamicSuffix.includes(betaContent), 'current resource full text remains available');
+  assert(!second.prompt.dynamicSuffix.includes(alphaMiddleMarker), 'old resource middle content is not repeatedly carried after summary downgrade');
+  assert(!second.prompt.dynamicSuffix.includes('volatile-evidence-alpha'), 'volatile evidence refs are not provider-visible');
+  assert(!second.prompt.dynamicSuffix.includes('packet-alpha-volatile'), 'volatile packet ids are not provider-visible');
+  assert(second.contextAssembly.resourceFullTextCharCount < first.contextAssembly.resourceFullTextCharCount + betaContent.length, 'full resource text budget does not grow by repeating old full text');
 }
 
 function assertSessionMemoryDocument(): void {
@@ -407,9 +561,19 @@ function assertSessionMemoryDocument(): void {
         facts: ['Kernel recorded the generic write fact.'],
       },
     },
+    {
+      id: 'memory-answer',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:04.000Z',
+      kind: 'assistant_msg',
+      payload: {
+        channel: 'final',
+        content: 'A long generic final answer that should be summarized as short-term continuity rather than stable execution fact.',
+      },
+    },
   ]);
 
-  assertEqual(document.schemaVersion, '1', 'memory document is versioned');
+  assertEqual(document.schemaVersion, '2', 'memory document is versioned');
   assert(document.intentContext.some((item) => item.includes('User request')), 'memory records user intent');
   assert(document.intentContext.some((item) => item.includes('Plan intent')), 'memory records plan intent as intent context');
   assert(document.factContext.some((item) => item.includes('Resource/tool fact fs.read')), 'memory records tool summaries as facts');
@@ -417,7 +581,26 @@ function assertSessionMemoryDocument(): void {
   assert(document.factContext.some((item) => item.includes('Review fact')), 'memory records review facts');
   assert(document.decisionContext.some((item) => item.includes('Review decision: accepted')), 'memory records review decisions');
   assert(document.resourceContext.some((item) => item.includes('Attached resource')), 'memory records reusable attachment facts');
+  assert(document.longTermContext.some((item) => item.includes('Attached resource')), 'stable memory records reusable attachment facts');
+  assert(document.shortTermContext.some((item) => item.includes('Plan intent')), 'short-term memory records active planning intent');
+  assert(document.shortTermContext.some((item) => item.includes('Assistant final summary')), 'assistant finals are summarized as short-term context');
+  assertEqual(document.intentContext.some((item) => item.includes('Assistant final')), false, 'assistant final text is not promoted as stable intent');
   assertEqual(document.factContext.some((item) => item.includes('Plan intent')), false, 'plan intent does not enter factContext');
+
+  const guidance = collectUserGuidanceEvents([
+    {
+      id: 'guidance-event',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:05.000Z',
+      kind: 'user_guidance',
+      payload: {
+        content: 'Use the existing facts before asking for more resources.',
+        runId: 'run-guidance',
+      },
+    },
+  ], 'run-guidance');
+  assertEqual(guidance.length, 1, 'user guidance events are collected for the next provider checkpoint');
+  assertEqual(guidance[0]?.checkpointKind, 'nextProviderCall', 'guidance is scheduled for the next provider call');
 }
 
 function assertSessionTaskGraphProjection(): void {
@@ -476,6 +659,28 @@ function assertSessionTaskGraphProjection(): void {
       },
     },
     {
+      id: 'task-guidance-queued',
+      sessionId: 'session-task',
+      ts: '2026-01-01T00:00:06.500Z',
+      kind: 'user_guidance',
+      payload: {
+        content: 'Use the already collected facts before requesting more resources.',
+        effectiveCheckpoint: 'nextProviderCall',
+        status: 'queued',
+      },
+    },
+    {
+      id: 'task-guidance-consumed',
+      sessionId: 'session-task',
+      ts: '2026-01-01T00:00:06.750Z',
+      kind: 'user_guidance',
+      payload: {
+        content: 'Prefer a concise final answer.',
+        effectiveCheckpoint: 'nextProviderCall',
+        status: 'consumed',
+      },
+    },
+    {
       id: 'task-answer',
       sessionId: 'session-task',
       ts: '2026-01-01T00:00:07.000Z',
@@ -513,6 +718,8 @@ function assertSessionTaskGraphProjection(): void {
   assertEqual(taskStatus(graph, 'waiting-user'), 'waiting', 'permission task waits for user input');
   assertEqual(taskStatus(graph, 'review'), 'running', 'waiting review remains visible as active work');
   assertEqual(taskStatus(graph, 'continuation'), 'queued', 'continuation intent is queued after review facts');
+  assertEqual(taskStatus(graph, 'guidance-task-guidance-queued'), 'queued', 'pending guidance is queued before provider consumption');
+  assertEqual(taskStatus(graph, 'guidance-task-guidance-consumed'), 'completed', 'consumed guidance is completed after provider checkpoint');
   assertEqual(taskStatus(graph, 'analysis'), 'completed', 'final answer completes analysis task');
 }
 
@@ -546,7 +753,7 @@ function assertNarrativeTimelineProjection(): void {
       sessionId: 'session-narrative',
       ts: '2026-01-01T00:00:01.000Z',
       kind: 'assistant_msg',
-      payload: { channel: 'reasoning', content: 'Need generic context.' },
+      payload: { channel: 'reasoning', status: 'running', content: 'Need generic context.' },
     },
     {
       id: 'event-progress',
@@ -605,6 +812,17 @@ function assertNarrativeTimelineProjection(): void {
       },
     },
     {
+      id: 'event-guidance',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:02.500Z',
+      kind: 'user_guidance',
+      payload: {
+        content: 'Apply this generic guidance at the next provider checkpoint.',
+        effectiveCheckpoint: 'nextProviderCall',
+        status: 'queued',
+      },
+    },
+    {
       id: 'event-plan',
       sessionId: 'session-narrative',
       ts: '2026-01-01T00:00:03.000Z',
@@ -632,6 +850,7 @@ function assertNarrativeTimelineProjection(): void {
   assertEqual(kinds.includes('thinking'), true, 'thinking block is projected');
   assertEqual(kinds.includes('assistantNarration'), true, 'llm progress assistant messages become narration');
   assertEqual(kinds.includes('operationEvidence'), true, 'tool facts become operation evidence');
+  assertEqual(kinds.includes('requirement'), true, 'user guidance is projected as a user-intervention timeline block');
   assertEqual(kinds.includes('plan'), true, 'plan facts become a plan block');
   assertEqual(kinds.includes('assistantText'), true, 'final answer becomes assistant text');
   assertEqual(
@@ -646,8 +865,14 @@ function assertNarrativeTimelineProjection(): void {
   );
   const narrationBlock = projection.turns[0].blocks.find((block) => block.narrativeKind === 'assistantNarration');
   assertEqual(narrationBlock?.displayHints?.renderMode, 'typewriter', 'assistant narration uses typewriter projection hints');
+  assertEqual(narrationBlock?.displayHints?.checkpointKind, 'llmProposal', 'assistant narration is tied to an LLM proposal checkpoint');
   const thinkingBlock = projection.turns[0].blocks.find((block) => block.narrativeKind === 'thinking');
   assertEqual(Boolean(thinkingBlock?.displayHints?.replaceOnComplete), true, 'thinking exposes replacement/collapse projection hints');
+  assertEqual(thinkingBlock?.displayHints?.typewriterSpeed, 'slow', 'running thinking uses a slower typewriter speed');
+  const guidanceBlock = projection.turns[0].blocks.find((block) => block.events.some((event) => event.kind === 'user_guidance'));
+  assertEqual(guidanceBlock?.title, 'User guidance', 'user guidance has its own visible timeline title');
+  assertEqual(guidanceBlock?.status, 'queued', 'user guidance remains queued before provider consumption');
+  assertEqual(guidanceBlock?.displayHints?.checkpointKind, 'userGuidance', 'user guidance marks the next provider checkpoint');
   assertEqual(
     projection.turns[0].blocks.some((block) => block.events.some((event) => event.kind === 'cache_telemetry')),
     false,
@@ -746,6 +971,188 @@ async function assertSessionDriverLoop(): Promise<void> {
   assertEqual(result.events.some((event) => event.kind === 'user_msg'), true, 'DriverLoop appends user turn');
   assertEqual(result.events.some((event) => event.kind === 'assistant_msg'), true, 'DriverLoop appends final answer');
   assertEqual(result.events.some((event) => event.kind === 'tool_result'), true, 'DriverLoop records ResourcePacket context');
+}
+
+async function assertSessionDriverLoopTerminalAnswerGuidanceRevision(): Promise<void> {
+  const events: AgentEvent[] = [];
+  let llmCalls = 0;
+  const session: AgentSession = {
+    id: 'session-terminal-guidance',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls === 1) {
+        events.push({
+          id: 'guidance-terminal-generic',
+          sessionId: 'session-terminal-guidance',
+          ts: '2026-01-01T00:00:00.500Z',
+          kind: 'user_guidance',
+          payload: {
+            content: 'Include a generic evaluation dashboard and visible metrics.',
+            guidance: 'Include a generic evaluation dashboard and visible metrics.',
+            targetRunId: 'run-generic',
+            status: 'queued',
+            source: 'user',
+            effectiveCheckpoint: 'nextProviderCall',
+          },
+        });
+        return jsonLlmResponse({
+          schemaVersion: 'deepcode.agent.protocol.v3',
+          kind: 'answer',
+          outputLanguage: 'en-US',
+          answer: { format: 'markdown', content: 'Initial generic plan without metrics.' },
+        });
+      }
+      const promptText = request.messages.map((message) => message.content).join('\n');
+      assert(promptText.includes('Unshown draft answer'), 'guidance revision prompt carries unshown draft answer');
+      assert(promptText.includes('Include a generic evaluation dashboard'), 'guidance revision prompt carries queued user guidance');
+      events.push({
+        id: 'guidance-during-revision-generic',
+        sessionId: 'session-terminal-guidance',
+        ts: '2026-01-01T00:00:00.750Z',
+        kind: 'user_guidance',
+        payload: {
+          content: 'Keep the final project plan concise.',
+          guidance: 'Keep the final project plan concise.',
+          targetRunId: 'run-generic',
+          status: 'queued',
+          source: 'user',
+          effectiveCheckpoint: 'nextProviderCall',
+        },
+      });
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'answer',
+        narration: 'I will merge the new evaluation-dashboard guidance into the current answer.',
+        outputLanguage: 'en-US',
+        answer: { format: 'markdown', content: 'Revised generic plan with an evaluation dashboard and visible metrics.' },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-terminal-guidance',
+    content: 'Plan a generic learning project.',
+  });
+
+  const finalMessages = result.events.filter((event) =>
+    event.kind === 'assistant_msg' && (event.payload as any)?.channel === 'final'
+  );
+  assertEqual(llmCalls, 2, 'terminal queued guidance triggers one guidance revision provider call');
+  assertEqual(finalMessages.length, 1, 'draft answer is replaced by a single final answer');
+  assert(String((finalMessages[0]?.payload as any)?.content ?? '').includes('evaluation dashboard'), 'final answer applies queued guidance');
+  assertEqual(Boolean((finalMessages[0]?.payload as any)?.guidanceRevision), true, 'final answer records guidance revision metadata');
+  assertEqual(
+    Array.isArray((finalMessages[0]?.payload as any)?.appliedGuidanceIds) &&
+      (finalMessages[0]?.payload as any).appliedGuidanceIds.includes('guidance-terminal-generic'),
+    true,
+    'final answer records applied guidance ids'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'assistant_msg' &&
+      (event.payload as any)?.source === 'session' &&
+      String((event.payload as any)?.content ?? '').includes('收到你的补充')
+    ),
+    true,
+    'session transition message is visible before guidance revision'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'assistant_msg' &&
+      (event.payload as any)?.source === 'llm' &&
+      String((event.payload as any)?.content ?? '').includes('evaluation-dashboard')
+    ),
+    true,
+    'LLM narration transition is visible when returned'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'user_guidance' &&
+      (event.payload as any)?.status === 'consumed' &&
+      (event.payload as any)?.guidanceId === 'guidance-terminal-generic' &&
+      (event.payload as any)?.appliedAtProviderStage === 'guidance_revision'
+    ),
+    true,
+    'consumed guidance records guidance revision provider checkpoint'
+  );
+  const remainingGuidance = collectUserGuidanceEvents(result.events, 'run-generic');
+  assertEqual(
+    remainingGuidance.some((item) => item.id === 'guidance-during-revision-generic'),
+    true,
+    'guidance arriving during guidance revision remains queued for a later checkpoint'
+  );
+}
+
+async function assertSessionDriverLoopTerminalGuidanceRevisionFallback(): Promise<void> {
+  const events: AgentEvent[] = [];
+  let llmCalls = 0;
+  const session: AgentSession = {
+    id: 'session-terminal-guidance-fallback',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls === 1) {
+        events.push({
+          id: 'guidance-terminal-fallback-generic',
+          sessionId: 'session-terminal-guidance-fallback',
+          ts: '2026-01-01T00:00:00.500Z',
+          kind: 'user_guidance',
+          payload: {
+            content: 'Add a generic evaluation view.',
+            guidance: 'Add a generic evaluation view.',
+            targetRunId: 'run-generic',
+            status: 'queued',
+            source: 'user',
+            effectiveCheckpoint: 'nextProviderCall',
+          },
+        });
+        return jsonLlmResponse({
+          schemaVersion: 'deepcode.agent.protocol.v3',
+          kind: 'answer',
+          outputLanguage: 'en-US',
+          answer: { format: 'markdown', content: 'Initial fallback answer.' },
+        });
+      }
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-terminal-guidance-fallback',
+    content: 'Plan another generic learning project.',
+  });
+
+  const finalMessages = result.events.filter((event) =>
+    event.kind === 'assistant_msg' && (event.payload as any)?.channel === 'final'
+  );
+  assertEqual(llmCalls, 2, 'terminal guidance fallback attempts one revision call');
+  assertEqual(finalMessages.length, 1, 'fallback path still produces one final answer');
+  assertEqual(String((finalMessages[0]?.payload as any)?.content ?? ''), 'Initial fallback answer.', 'fallback final answer uses initial draft');
+  assertEqual(Boolean((finalMessages[0]?.payload as any)?.guidanceRevisionFailed), true, 'fallback final answer records guidance revision failure');
+  assertEqual(result.events.some((event) => event.kind === 'error'), true, 'guidance revision failure records a diagnostic event');
 }
 
 async function assertSessionDriverLoopPathResourceRequest(): Promise<void> {
@@ -1560,7 +1967,8 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
   assertEqual(llmRequests.length, 1, 'review revision calls the provider for a new plan once');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
   assert(promptText.includes('Add a generic script and document how to run it.'), 'review guidance enters the next PromptEnvelope');
-  assert(promptText.includes('Session short-term memory document'), 'structured session memory is included');
+  assert(promptText.includes('Session memory stable document'), 'structured stable session memory is included');
+  assert(promptText.includes('Session memory dynamic document'), 'structured dynamic session memory is included');
   assert(promptText.includes('factContext'), 'kernel facts are separated into factContext');
   assert(promptText.includes('intentContext'), 'plans and continuations are separated into intentContext');
 }
@@ -1629,6 +2037,93 @@ async function assertSessionDriverLoopReviewAcceptStopsAtCurrentBatch(): Promise
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'review accept does not generate a continuation plan');
   assertEqual(submittedPlans.length, 0, 'review accept does not submit a new plan');
   assertEqual(llmRequests.length, 0, 'review accept does not call the provider');
+}
+
+async function assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept(): Promise<void> {
+  const events: AgentEvent[] = [
+    {
+      id: 'old-requirement-generic',
+      sessionId: 'session-stale-interaction',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'requirement_confirmation',
+      payload: {
+        title: 'Requirement confirmation',
+        summary: 'Confirm an earlier generic requirement.',
+        content: 'Create a generic workspace change.',
+        originalRequest: 'Create a generic workspace change.',
+        runId: 'run-stale-requirement',
+        requirementId: 'requirement-stale-generic',
+        status: 'waitingUserConfirmation',
+        confirmable: true,
+      },
+    },
+    {
+      id: 'new-review-generic',
+      sessionId: 'session-stale-interaction',
+      ts: '2026-01-01T00:00:01.000Z',
+      kind: 'review_summary',
+      payload: {
+        status: 'waitingUserReview',
+        runId: 'run-current-review',
+        reviewId: 'review-current-generic',
+        sourcePlanId: 'plan-current-generic',
+        content: '## Review\n\nThe current generic batch is ready for review.',
+        userPlan: '# Plan\n\n## Summary\nReview the current generic batch.',
+        facts: ['- `work-unit-generic` completed: {"path":"generic-output.txt"}'],
+        continuations: [{
+          id: 'next-generic-batch',
+          title: 'Record a later generic continuation.',
+          capability: 'workspace.write',
+          kind: 'write',
+          resourceScope: ['generic-follow-up.txt'],
+        }],
+        confirmable: true,
+      },
+    },
+  ];
+  const session: AgentSession = {
+    id: 'session-stale-interaction',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const submittedPlans: Array<Record<string, any>> = [];
+  const llmRequests: LlmChatRequest[] = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-stale-interaction', submittedPlans),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + 1}`,
+  });
+
+  const accepted = await loop.resolveDecision({
+    sessionId: 'session-stale-interaction',
+    kind: 'review',
+    decision: 'accept',
+    runId: 'run-current-review',
+    existingEvents: events,
+  });
+  assertEqual(accepted.events.some((event) => event.kind === 'review_summary' && (event.payload as any).status === 'accepted'), true, 'current review is accepted');
+
+  const stale = await loop.resolveDecision({
+    sessionId: 'session-stale-interaction',
+    kind: 'requirement',
+    decision: 'accept',
+    runId: 'run-stale-requirement',
+    targetId: 'requirement-stale-generic',
+    existingEvents: accepted.events,
+  });
+
+  assertEqual(stale.events.some((event) => event.kind === 'trace/requirement_decision_noop'), true, 'stale requirement decision is recorded as noop');
+  assertEqual(llmRequests.length, 0, 'stale requirement decision does not call the provider');
+  assertEqual(submittedPlans.length, 0, 'stale requirement decision does not submit a plan');
 }
 
 function genericWriteProposal(missingEvidence: boolean): Record<string, unknown> {

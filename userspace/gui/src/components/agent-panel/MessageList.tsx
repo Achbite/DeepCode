@@ -856,6 +856,13 @@ function eventCopyText(event: AgentEvent, language: UiLanguage): string {
           : `${stage && channel !== 'final' ? `Agent (${localizedStage(stage, language)})` : 'Agent'}`;
     return `${label}\n${payloadText(event.payload)}`;
   }
+  if (event.kind === 'user_guidance') {
+    return [
+      t(language, 'agent.guidance.title'),
+      stringField(event.payload, 'summary') ?? t(language, 'agent.guidance.summary'),
+      payloadText(event.payload),
+    ].filter(Boolean).join('\n');
+  }
   if (event.kind === 'workflow_stage') {
     const stage = stringField(event.payload, 'stage') ?? 'workflow';
     const status = stageStatus(event.payload);
@@ -967,6 +974,8 @@ function archiveProjectionTitle(kind: string): string {
       return '用户';
     case 'assistant_msg':
       return 'Agent';
+    case 'user_guidance':
+      return 'User guidance';
     case 'plan_card':
       return 'Plan';
     case 'plan_review':
@@ -1281,6 +1290,36 @@ function RequirementDecisionCard({
     <section key={event.id} className={`agent-flow-card agent-flow-card--requirement agent-flow-card--${status}`}>
       <div className="agent-flow-card__title">{title}</div>
       <div className="agent-flow-card__summary">{summary}</div>
+    </section>
+  );
+}
+
+function UserGuidanceCard({
+  event,
+  language,
+}: {
+  event: AgentEvent;
+  language: UiLanguage;
+}) {
+  const title = stringField(event.payload, 'title') ?? t(language, 'agent.guidance.title');
+  const summary = stringField(event.payload, 'summary') ?? t(language, 'agent.guidance.summary');
+  const content = stringField(event.payload, 'content') ?? stringField(event.payload, 'guidance');
+  const checkpoint =
+    stringField(event.payload, 'effectiveCheckpoint') ??
+    stringField(event.payload, 'checkpointKind') ??
+    'nextProviderCall';
+  const targetRunId = stringField(event.payload, 'targetRunId');
+  const facts = [
+    t(language, 'agent.guidance.checkpoint', { checkpoint }),
+    targetRunId ? t(language, 'agent.guidance.targetRun', { runId: targetRunId }) : undefined,
+  ].filter((item): item is string => Boolean(item));
+
+  return (
+    <section key={event.id} className="agent-flow-card agent-flow-card--guidance">
+      <div className="agent-flow-card__title">{title}</div>
+      <div className="agent-flow-card__summary">{summary}</div>
+      {content && content !== summary && <MarkdownContent content={content} />}
+      {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
     </section>
   );
 }
@@ -1843,6 +1882,9 @@ function renderMessage(
         language={language}
       />
     );
+  }
+  if (event.kind === 'user_guidance') {
+    return <UserGuidanceCard key={event.id} event={event} language={language} />;
   }
   if (
     event.kind === 'tool_call' ||

@@ -5,6 +5,7 @@ import type { DriverRequestRef, KernelStateContractRef } from '../driver/types.j
 export type SessionTaskKind =
   | 'requirement'
   | 'resourceDiscovery'
+  | 'guidance'
   | 'analysis'
   | 'planning'
   | 'waitingUser'
@@ -73,6 +74,17 @@ export function buildSessionTaskGraph(input: SessionTaskGraphInput): SessionTask
   };
 
   for (const event of input.events) {
+    if (event.kind === 'user_guidance') {
+      const guidanceId = eventPayloadString(event, 'guidanceId') ?? event.id;
+      upsert({
+        id: `guidance-${guidanceId}`,
+        kind: 'guidance',
+        status: eventPayloadString(event, 'status') === 'consumed' ? 'completed' : 'queued',
+        title: 'User guidance',
+        summary: eventSummary(event) || 'User guidance recorded for the next provider checkpoint.',
+        eventRef: event.id,
+      });
+    }
     if (event.kind === 'requirement_confirmation' || event.kind === 'requirement_decision') {
       upsert({
         id: 'requirement',

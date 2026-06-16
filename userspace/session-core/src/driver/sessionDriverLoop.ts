@@ -25,7 +25,15 @@ import type {
   ResourcePacket,
   ResourcePacketItem,
 } from '../context/types.js';
-import { assembleContext, buildSessionMemoryDocument, renderSessionMemoryHints, type PromptCachePlan, type SessionMemoryDocument } from '../context/index.js';
+import {
+  assembleContext,
+  buildSessionMemoryDocument,
+  collectUserGuidanceEvents,
+  type ContextAssemblyRecord,
+  type PromptCachePlan,
+  type SessionMemoryDocument,
+  type UserGuidanceEvent,
+} from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
 import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
@@ -88,9 +96,11 @@ interface SessionDriverLoopRunState {
   memoryHints: string[];
   taskGraph: SessionTaskGraph;
   cachePlan?: PromptCachePlan;
+  contextAssembly?: ContextAssemblyRecord;
   implementationBatch: ImplementationBatchContext;
   resourceRequestRepairAttempted: boolean;
   planReviewRepairAttempted: boolean;
+  terminalGuidanceRevisionAttempted: boolean;
 }
 
 interface ImplementationBatchContext {
@@ -205,10 +215,7 @@ export class SessionDriverLoop {
       },
       resourcePackets: [...restoredResourcePackets],
       memoryDocument,
-      memoryHints: [
-        ...renderSessionMemoryHints(memoryDocument),
-        ...implementationBatchHints(implementationBatch),
-      ],
+      memoryHints: implementationBatchHints(implementationBatch),
       taskGraph: buildSessionTaskGraph({
         sessionId,
         runId,
@@ -219,6 +226,7 @@ export class SessionDriverLoop {
       implementationBatch,
       resourceRequestRepairAttempted: false,
       planReviewRepairAttempted: false,
+      terminalGuidanceRevisionAttempted: false,
     };
 
     if (state.manifest.entries.length > 0 && !input.resumeResourcePackets) {
@@ -256,6 +264,7 @@ export class SessionDriverLoop {
         driverRequest: state.driverRequest,
       });
       const assembledContext = assembleContext({
+        contextAssemblyId: this.id('context-assembly'),
         workflowState: state.stateContract?.stateId ?? state.driverRequest?.kind ?? 'needProposal',
         allowedProposals: state.stateContract?.allowedProposals ?? [
           'answer',
@@ -267,6 +276,7 @@ export class SessionDriverLoop {
         capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
         memoryDocument: state.memoryDocument,
         extraMemoryHints: implementationBatchHints(state.implementationBatch),
+        userGuidance: collectUserGuidanceEvents(lastResult.events, state.runId),
         userRequest: input.content,
         initialContext: state.initialContext,
         resourcePackets: state.resourcePackets,
@@ -283,6 +293,8 @@ export class SessionDriverLoop {
         },
       });
       state.cachePlan = assembledContext.cachePlan;
+      state.contextAssembly = assembledContext.contextAssembly;
+      lastResult = await this.appendConsumedUserGuidanceEvents(sessionId, lastResult, state.contextAssembly, state.runId);
       const prompt = assembledContext.prompt;
       let proposal: ProposalEnvelope;
       try {
@@ -305,6 +317,8 @@ export class SessionDriverLoop {
         lastResult = await this.append(sessionId, [narration]);
       }
       if (proposal.kind === 'answer') {
+        const revised = await this.maybeReviseTerminalAnswerWithGuidance(input, state, proposal);
+        if (revised) return revised;
         return this.append(sessionId, [answerEvent(sessionId, proposal, this.ts(), this.id('answer'))]);
       }
       if (proposal.kind === 'decisionRequest') {
@@ -471,6 +485,16 @@ export class SessionDriverLoop {
 
   private async resolvePlanDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
     const events = input.existingEvents ?? [];
+    const active = findActiveDriverInteraction(events);
+    if (!active || active.kind !== 'plan' || active.runId !== input.runId || (input.targetId && active.planId !== input.targetId)) {
+      return this.append(input.sessionId, [
+        traceEvent(input.sessionId, 'trace/plan_accept_noop', '该计划已处理或已过期，没有再次提交执行。', this.ts(), this.id('plan-noop'), {
+          runId: input.runId,
+          planId: input.targetId,
+          decision: input.decision,
+        }),
+      ]);
+    }
     const plan = findPlanCard(events, input.runId, input.targetId);
     if (!plan || planAlreadyResolved(events, plan)) {
       return this.append(input.sessionId, [
@@ -653,11 +677,13 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState
   ): Promise<AgentEvent> {
     const assembledContext = assembleContext({
+      contextAssemblyId: this.id('context-assembly'),
       workflowState: 'needDecisionRequest',
       allowedProposals: ['decisionRequest'],
       capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
       memoryDocument: state.memoryDocument,
       extraMemoryHints: state.memoryHints,
+      userGuidance: collectUserGuidanceEvents(input.existingEvents ?? [], state.runId),
       userOverlay: [
         'Before proposing side-effect work, request user intervention only if a concrete decision is needed.',
         'Return kind="decisionRequest" only.',
@@ -674,6 +700,7 @@ export class SessionDriverLoop {
       },
     });
     state.cachePlan = assembledContext.cachePlan;
+    state.contextAssembly = assembledContext.contextAssembly;
     const prompt = assembledContext.prompt;
     const proposal = await this.callProviderAndParse(input, state, prompt);
     if (proposal.kind !== 'decisionRequest') {
@@ -693,6 +720,118 @@ export class SessionDriverLoop {
       ts: this.ts(),
       id: this.id('requirement-confirmation'),
     });
+  }
+
+  private async maybeReviseTerminalAnswerWithGuidance(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    draftAnswer: ProposalEnvelope
+  ): Promise<AgentSessionResult | null> {
+    if (state.terminalGuidanceRevisionAttempted) return null;
+    state.terminalGuidanceRevisionAttempted = true;
+
+    let result = await this.append(state.sessionId, []);
+    const guidance = collectQueuedUserGuidanceEvents(result.events, state.runId);
+    if (guidance.length === 0) return null;
+
+    result = await this.append(state.sessionId, [
+      guidanceRevisionTransitionEvent(
+        state.sessionId,
+        state.runId,
+        guidance.map((item) => item.id),
+        this.ts(),
+        this.id('guidance-revision-transition')
+      ),
+    ]);
+    state.taskGraph = buildSessionTaskGraph({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      events: result.events,
+      stateContract: state.stateContract,
+      driverRequest: state.driverRequest,
+    });
+    const assembledContext = assembleContext({
+      contextAssemblyId: this.id('context-assembly-guidance-revision'),
+      workflowState: 'guidanceRevision',
+      allowedProposals: ['answer'],
+      capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
+      memoryDocument: state.memoryDocument,
+      extraMemoryHints: implementationBatchHints(state.implementationBatch),
+      userOverlay: guidanceRevisionOverlay(input.content, draftAnswer, guidance),
+      userGuidance: guidance,
+      userRequest: input.content,
+      initialContext: state.initialContext,
+      resourcePackets: state.resourcePackets,
+      readOnlyResourceBudget: {
+        usedRounds: 0,
+        maxRounds: 0,
+        remainingRounds: 0,
+      },
+      conversationRoots: state.conversationRoots,
+      requirement: input.confirmedRequirement,
+      auditOnly: {
+        runId: state.runId,
+        sessionId: state.sessionId,
+      },
+    });
+    state.cachePlan = assembledContext.cachePlan;
+    state.contextAssembly = assembledContext.contextAssembly;
+    result = await this.appendConsumedUserGuidanceEvents(
+      state.sessionId,
+      result,
+      state.contextAssembly,
+      state.runId,
+      'guidance_revision'
+    );
+
+    let revised: ProposalEnvelope;
+    try {
+      const raw = await this.llm(input.profileId, state, 'guidance_revision', [
+        { role: 'system', content: assembledContext.prompt.stablePrefix },
+        { role: 'user', content: assembledContext.prompt.dynamicSuffix },
+      ]);
+      revised = parseAndValidateProposal({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+      });
+      if (revised.kind !== 'answer') {
+        throw new SessionDriverLoopError(
+          'guidance_revision_non_answer',
+          `Guidance revision expected answer, got ${revised.kind}.`
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.append(state.sessionId, [
+        guidanceRevisionDiagnosticEvent(
+          state.sessionId,
+          `用户引导合并失败，已回退到初版回复：${message}`,
+          this.ts(),
+          this.id('guidance-revision-failed')
+        ),
+      ]);
+      return this.append(state.sessionId, [
+        answerEvent(state.sessionId, draftAnswer, this.ts(), this.id('answer'), {
+          guidanceRevisionFailed: true,
+          appliedGuidanceIds: guidance.map((item) => item.id),
+          replacesDraftProposalId: draftAnswer.proposalId,
+        }),
+      ]);
+    }
+
+    const narration = answerNarrationEvent(state.sessionId, revised, this.ts(), this.id('guidance-revision-narration'));
+    if (narration) {
+      result = await this.append(state.sessionId, [narration]);
+    }
+    return this.append(state.sessionId, [
+      answerEvent(state.sessionId, revised, this.ts(), this.id('answer'), {
+        guidanceRevision: true,
+        appliedGuidanceIds: guidance.map((item) => item.id),
+        replacesDraftProposalId: draftAnswer.proposalId,
+      }),
+    ]);
   }
 
   private async callProviderAndParse(
@@ -964,6 +1103,7 @@ export class SessionDriverLoop {
       profileId,
       messages,
       cachePlan: state.cachePlan,
+      contextAssembly: state.contextAssembly,
       taskGraph: state.taskGraph,
     });
     const result = await this.ports.llmChat({
@@ -1053,6 +1193,62 @@ export class SessionDriverLoop {
 
   private async append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult> {
     return this.ports.appendEvents(sessionId, events);
+  }
+
+  private async appendConsumedUserGuidanceEvents(
+    sessionId: string,
+    result: AgentSessionResult,
+    contextAssembly: ContextAssemblyRecord | undefined,
+    runId: string,
+    appliedAtProviderStage = 'provider_call'
+  ): Promise<AgentSessionResult> {
+    const consumedIds = contextAssembly?.consumedUserGuidanceIds ?? [];
+    if (consumedIds.length === 0) return result;
+
+    const alreadyConsumed = new Set<string>();
+    const queuedGuidance = new Map<string, AgentEvent>();
+    for (const event of result.events) {
+      if (event.kind !== 'user_guidance') continue;
+      const payload = objectRecord(event.payload);
+      if (!payload) continue;
+      const guidanceId = stringValue(payload.guidanceId) ?? event.id;
+      if (stringValue(payload.status) === 'consumed') {
+        alreadyConsumed.add(guidanceId);
+      } else {
+        queuedGuidance.set(guidanceId, event);
+      }
+    }
+
+    const events: AgentEvent[] = [];
+    for (const guidanceId of consumedIds) {
+      if (alreadyConsumed.has(guidanceId)) continue;
+      const source = queuedGuidance.get(guidanceId);
+      if (!source) continue;
+      const payload = objectRecord(source.payload) ?? {};
+      events.push({
+        id: this.id('user-guidance-consumed'),
+        sessionId,
+        ts: this.ts(),
+        kind: 'user_guidance',
+        payload: {
+          title: 'User guidance',
+          summary: '用户引导已进入下一次 provider prompt。',
+          status: 'consumed',
+          guidanceId,
+          targetRunId: stringValue(payload.targetRunId) ?? stringValue(payload.runId) ?? runId,
+          targetInteractionKind: stringValue(payload.targetInteractionKind) ?? 'runningRunGuidance',
+          effectiveCheckpoint: 'nextProviderCall',
+          checkpointKind: 'userGuidance',
+          appliedAtProviderStage,
+          source: 'session',
+          channel: 'progress',
+          visibility: 'conversation',
+          presentation: 'body',
+        },
+      });
+    }
+
+    return events.length > 0 ? this.append(sessionId, events) : result;
   }
 
   private async appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult> {
@@ -1810,22 +2006,112 @@ function resourcePacketEvent(sessionId: string, packet: ResourcePacket, ts: stri
   };
 }
 
-function answerEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent {
-  const payload = objectRecord(proposal.payload) ?? {};
-  const answer = objectRecord(payload.answer) ?? payload;
+function answerEvent(
+  sessionId: string,
+  proposal: ProposalEnvelope,
+  ts: string,
+  id: string,
+  metadata: Record<string, unknown> = {}
+): AgentEvent {
+  const content = answerContent(proposal);
   return {
     id,
     sessionId,
     ts,
     kind: 'assistant_msg',
     payload: {
-      content: typeof answer.content === 'string' ? answer.content : '',
+      content,
       channel: 'final',
       visibility: 'conversation',
       label: 'DeepCode',
       proposalId: proposal.proposalId,
+      ...metadata,
     },
   };
+}
+
+function answerContent(proposal: ProposalEnvelope): string {
+  const payload = objectRecord(proposal.payload) ?? {};
+  const answer = objectRecord(payload.answer) ?? payload;
+  return typeof answer.content === 'string' ? answer.content : '';
+}
+
+function guidanceRevisionTransitionEvent(
+  sessionId: string,
+  runId: string,
+  guidanceIds: string[],
+  ts: string,
+  id: string
+): AgentEvent {
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'assistant_msg',
+    payload: {
+      content: '收到你的补充，我会把这条引导合并到当前回复里重新整理。',
+      channel: 'progress',
+      source: 'session',
+      visibility: 'conversation',
+      presentation: 'body',
+      label: 'DeepCode',
+      runId,
+      guidanceIds,
+    },
+  };
+}
+
+function guidanceRevisionDiagnosticEvent(sessionId: string, message: string, ts: string, id: string): AgentEvent {
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'error',
+    payload: {
+      message,
+      status: 'error',
+      channel: 'error',
+      visibility: 'conversation',
+      source: 'session',
+    },
+  };
+}
+
+function answerNarrationEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent | null {
+  const content = proposal.narration?.trim();
+  if (!content) return null;
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'assistant_msg',
+    payload: {
+      content,
+      channel: 'progress',
+      source: 'llm',
+      visibility: 'conversation',
+      presentation: 'body',
+      label: 'DeepCode',
+      proposalId: proposal.proposalId,
+    },
+  };
+}
+
+function guidanceRevisionOverlay(
+  originalRequest: string,
+  draftAnswer: ProposalEnvelope,
+  guidance: UserGuidanceEvent[]
+): string {
+  return [
+    'Terminal user guidance revision:',
+    'A draft answer was generated but has not been shown to the user because new user guidance arrived before the final response was committed.',
+    'Return a JSON ProposalEnvelope with kind="answer" only. Do not return resourceRequest, decisionRequest, actionBundle, or diagnostic.',
+    'Include a short top-level narration sentence that naturally acknowledges the guidance merge before the final answer.',
+    `Original user request:\n${clip(originalRequest, 1800)}`,
+    `Unshown draft answer:\n${clip(answerContent(draftAnswer), 3200)}`,
+    'Latest user guidance to apply:',
+    ...guidance.map((item) => `- id=${item.id} ${clip(item.content, 800)}`),
+  ].join('\n\n');
 }
 
 function finalDiagnosticEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent {
@@ -2547,6 +2833,10 @@ function reviewExpectationLines(plan: SessionPlanContext): string[] {
 }
 
 function findWaitingReview(events: AgentEvent[], runId?: string): SessionReviewContext | null {
+  const active = findActiveDriverInteraction(events);
+  if (!active || active.kind !== 'review' || (runId && active.runId !== runId)) {
+    return null;
+  }
   for (const event of [...events].reverse()) {
     if (event.kind !== 'review_summary') continue;
     const payload = objectRecord(event.payload);
@@ -2685,7 +2975,156 @@ function traceEvent(
   };
 }
 
+function collectQueuedUserGuidanceEvents(events: AgentEvent[], runId?: string): UserGuidanceEvent[] {
+  const consumedIds = new Set<string>();
+  for (const event of events.slice(-120)) {
+    if (event.kind !== 'user_guidance') continue;
+    const payload = objectRecord(event.payload);
+    if (!payload || stringValue(payload.status) !== 'consumed') continue;
+    consumedIds.add(stringValue(payload.guidanceId) ?? event.id);
+  }
+
+  const collected: UserGuidanceEvent[] = [];
+  const seen = new Set<string>();
+  for (const event of events.slice(-80)) {
+    if (event.kind !== 'user_guidance') continue;
+    const payload = objectRecord(event.payload);
+    if (!payload || stringValue(payload.status) === 'consumed') continue;
+    const eventRunId = stringValue(payload.targetRunId) ?? stringValue(payload.runId);
+    if (runId && eventRunId && eventRunId !== runId) continue;
+    const guidanceId = stringValue(payload.guidanceId) ?? event.id;
+    if (consumedIds.has(guidanceId) || seen.has(guidanceId)) continue;
+    const content = stringValue(payload.content) ?? stringValue(payload.guidance) ?? stringValue(payload.summary);
+    if (!content) continue;
+    seen.add(guidanceId);
+    collected.push({
+      id: guidanceId,
+      ts: event.ts,
+      content: clip(content, 600),
+      source: 'user',
+      checkpointKind: 'nextProviderCall',
+    });
+  }
+  return collected.slice(-8);
+}
+
+type DriverInteraction =
+  | { kind: 'review'; runId: string }
+  | { kind: 'plan'; runId: string; planId: string }
+  | { kind: 'requirement'; runId: string; requirementId: string };
+
+function findActiveDriverInteraction(events: AgentEvent[]): DriverInteraction | null {
+  const review = findLatestActiveReviewInteraction(events);
+  if (review) return review;
+  const plan = findLatestActivePlanInteraction(events);
+  if (plan) return plan;
+  return findLatestActiveRequirementInteraction(events);
+}
+
+function findLatestActiveReviewInteraction(events: AgentEvent[]): DriverInteraction | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.kind !== 'review_summary') continue;
+    const payload = objectRecord(event.payload);
+    if (!payload || stringValue(payload.status) !== 'waitingUserReview') continue;
+    if (hasLaterTerminalInteraction(events, index)) continue;
+    const runId = stringValue(payload.runId);
+    if (!runId) continue;
+    const review: SessionReviewContext = {
+      sessionId: event.sessionId,
+      runId,
+      reviewId: stringValue(payload.reviewId) ?? runId,
+      sourcePlanId: stringValue(payload.sourcePlanId),
+      summary: stringValue(payload.summary) ?? '',
+      content: stringValue(payload.content) ?? '',
+      userPlan: stringValue(payload.userPlan) ?? '',
+      continuations: Array.isArray(payload.continuations) ? payload.continuations : [],
+      reviewExpectations: Array.isArray(payload.reviewExpectations) ? payload.reviewExpectations : [],
+      expectedValidation: stringValue(payload.expectedValidation) ?? '',
+      reviewGuide: stringValue(payload.reviewGuide) ?? '',
+      facts: Array.isArray(payload.facts) ? payload.facts.filter((item): item is string => typeof item === 'string') : [],
+    };
+    if (reviewAlreadyResolved(events, review)) continue;
+    return { kind: 'review', runId };
+  }
+  return null;
+}
+
+function findLatestActivePlanInteraction(events: AgentEvent[]): DriverInteraction | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.kind !== 'plan_review') continue;
+    const payload = objectRecord(event.payload);
+    if (!payload) continue;
+    if (hasLaterTerminalInteraction(events, index)) continue;
+    const status = stringValue(payload.status);
+    const waiting = status === 'awaitingUserApproval' ||
+      status === 'awaitingTemporaryGrant' ||
+      status === 'pending';
+    const runId = stringValue(payload.runId);
+    const planId = stringValue(payload.planId);
+    if (!waiting || !runId || !planId) continue;
+    const plan = findPlanCard(events.slice(0, index + 1), runId, planId);
+    if (plan && planAlreadyResolved(events, plan)) continue;
+    return { kind: 'plan', runId, planId };
+  }
+  return null;
+}
+
+function findLatestActiveRequirementInteraction(events: AgentEvent[]): DriverInteraction | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.kind !== 'requirement_confirmation') continue;
+    const payload = objectRecord(event.payload);
+    if (!payload || payload.confirmable !== true) continue;
+    if (hasLaterTerminalInteraction(events, index)) continue;
+    const runId = stringValue(payload.runId);
+    const requirementId = stringValue(payload.requirementId);
+    if (!runId || !requirementId || stringValue(payload.status) !== 'waitingUserConfirmation') continue;
+    if (requirementAlreadyResolved(events, runId, requirementId)) continue;
+    return { kind: 'requirement', runId, requirementId };
+  }
+  return null;
+}
+
+function hasLaterTerminalInteraction(events: AgentEvent[], index: number): boolean {
+  for (let nextIndex = index + 1; nextIndex < events.length; nextIndex += 1) {
+    const event = events[nextIndex];
+    if (
+      event.kind !== 'requirement_decision' &&
+      event.kind !== 'plan_review' &&
+      event.kind !== 'review_summary'
+    ) {
+      continue;
+    }
+    const payload = objectRecord(event.payload);
+    const status = stringValue(payload?.status);
+    if (status === 'accepted' || status === 'rejected' || status === 'needsRevision') return true;
+  }
+  return false;
+}
+
+function requirementAlreadyResolved(events: AgentEvent[], runId: string, requirementId: string): boolean {
+  return events.some((event) => {
+    if (event.kind !== 'requirement_decision') return false;
+    const payload = objectRecord(event.payload);
+    if (!payload) return false;
+    const status = stringValue(payload.status);
+    if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return false;
+    return stringValue(payload.runId) === runId && stringValue(payload.requirementId) === requirementId;
+  });
+}
+
 function findRequirementConfirmation(events: AgentEvent[], runId?: string, requirementId?: string): AgentEvent | null {
+  const active = findActiveDriverInteraction(events);
+  if (
+    !active ||
+    active.kind !== 'requirement' ||
+    (runId && active.runId !== runId) ||
+    (requirementId && active.requirementId !== requirementId)
+  ) {
+    return null;
+  }
   return [...events].reverse().find((event) => {
     if (event.kind !== 'requirement_confirmation') return false;
     const payload = objectRecord(event.payload);

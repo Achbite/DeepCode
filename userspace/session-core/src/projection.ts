@@ -484,6 +484,7 @@ function finalizeNarrativeTurn(turn: AgentTimelineResult['turns'][number]): Agen
 
 function narrativeKindForEvent(event: AgentEvent): AgentTimelineNarrativeKind {
   if (event.kind === 'user_msg') return 'user';
+  if (event.kind === 'user_guidance') return 'requirement';
   if (event.kind === 'requirement_confirmation' || event.kind === 'requirement_decision') return 'requirement';
   if (event.kind === 'plan_card' || event.kind === 'plan_review') return 'plan';
   if (event.kind === 'permission_request' || event.kind === 'permission_result') return 'permission';
@@ -554,6 +555,11 @@ function narrativeStatus(events: AgentEvent[]): AgentTimelineStatus {
   if (events.some((event) => event.kind === 'error' || stringValueFromPayload(event.payload, 'status') === 'error')) {
     return 'failed';
   }
+  if (events.some((event) => event.kind === 'user_guidance')) {
+    return events.some((event) => stringValueFromPayload(event.payload, 'status') === 'consumed')
+      ? 'completed'
+      : 'queued';
+  }
   if (events.some((event) => event.kind === 'permission_request') && !events.some((event) => event.kind === 'permission_result')) {
     return 'waiting';
   }
@@ -573,6 +579,7 @@ function narrativeStatus(events: AgentEvent[]): AgentTimelineStatus {
 function narrativeTitle(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string {
   const first = events[0];
   if (kind === 'user') return 'User';
+  if (first.kind === 'user_guidance') return 'User guidance';
   if (kind === 'assistantText') return 'DeepCode';
   if (kind === 'assistantNarration') return 'DeepCode';
   if (kind === 'thinking') return 'Thinking';
@@ -621,16 +628,39 @@ function narrativeDisplayHints(
     renderMode,
     initialOpen: status === 'running' || status === 'waiting' || kind === 'assistantNarration',
     collapseAfterComplete: kind === 'thinking' || kind === 'operationEvidence',
-    typewriterSpeed: renderMode === 'accelerated'
-      ? 'fast'
-      : renderMode === 'typewriter'
-        ? (textLength > 1600 ? 'fast' : 'normal')
-        : undefined,
+    typewriterSpeed: narrativeTypewriterSpeed(kind, renderMode, textLength),
     replaceOnComplete: kind === 'thinking',
+    checkpointKind: narrativeCheckpointKind(kind),
     showInTaskList: shouldShowNarrativeInTaskList(kind),
     taskListLabel: title,
     taskListSummary: summary,
   };
+}
+
+function narrativeTypewriterSpeed(
+  kind: AgentTimelineNarrativeKind,
+  renderMode: NarrativeRenderMode,
+  textLength: number
+): NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']> | undefined {
+  if (renderMode === 'accelerated') return 'fast';
+  if (renderMode !== 'typewriter') return undefined;
+  if (kind === 'thinking') return 'slow';
+  if (kind === 'assistantText' && textLength > 1600) return 'fast';
+  return 'normal';
+}
+
+function narrativeCheckpointKind(
+  kind: AgentTimelineNarrativeKind
+): NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['checkpointKind']> | undefined {
+  if (kind === 'user') return 'turnStart';
+  if (kind === 'assistantNarration' || kind === 'thinking') return 'llmProposal';
+  if (kind === 'assistantText') return 'final';
+  if (kind === 'operationEvidence') return 'resourcePacket';
+  if (kind === 'requirement') return 'userGuidance';
+  if (kind === 'permission') return 'permission';
+  if (kind === 'review') return 'review';
+  if (kind === 'diagnostic') return 'diagnostic';
+  return undefined;
 }
 
 function narrativeRenderMode(

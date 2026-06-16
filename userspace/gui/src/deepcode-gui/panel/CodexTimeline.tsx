@@ -771,11 +771,11 @@ function localFallbackTimeline(events: AgentEvent[]): AgentTimelineResult {
             sessionId: events[0]?.sessionId ?? 'session',
             status: 'running',
             blocks: events.map((event) => ({
-              id: event.id,
-              kind: fallbackBlockKind(event),
-              title: event.kind,
+            id: event.id,
+            kind: fallbackBlockKind(event),
+              title: fallbackBlockTitle(event),
               summary: eventSummary(event),
-              status: 'completed',
+              status: fallbackBlockStatus(event),
               defaultCollapsed: event.kind !== 'user_msg' && event.kind !== 'assistant_msg',
               bodyMarkdown: eventText(event),
               events: [event],
@@ -787,6 +787,7 @@ function localFallbackTimeline(events: AgentEvent[]): AgentTimelineResult {
 
 function fallbackBlockKind(event: AgentEvent): AgentTimelineBlock['kind'] {
   if (event.kind === 'user_msg') return 'user';
+  if (event.kind === 'user_guidance') return 'stage';
   if (event.kind === 'plan_card' || event.kind === 'plan_review') return 'plan';
   if (event.kind === 'review_summary') return 'review';
   if (event.kind === 'error') return 'error';
@@ -797,6 +798,19 @@ function fallbackBlockKind(event: AgentEvent): AgentTimelineBlock['kind'] {
     return 'stage';
   }
   return 'stage';
+}
+
+function fallbackBlockTitle(event: AgentEvent): string {
+  if (event.kind === 'user_guidance') return 'User guidance';
+  return event.kind;
+}
+
+function fallbackBlockStatus(event: AgentEvent): AgentTimelineBlock['status'] {
+  if (event.kind === 'user_guidance') {
+    const payload = isRecord(event.payload) ? event.payload : {};
+    return stringField(payload, 'status') === 'consumed' ? 'completed' : 'queued';
+  }
+  return 'completed';
 }
 
 function eventSummary(event: AgentEvent): string {

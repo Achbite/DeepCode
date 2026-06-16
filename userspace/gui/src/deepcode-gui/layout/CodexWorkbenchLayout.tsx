@@ -240,6 +240,7 @@ function eventText(event: AgentEvent): string {
 }
 
 function taskTitle(language: UiLanguage, event: AgentEvent): string {
+  if (event.kind === 'user_guidance') return t(language, 'deepcodeGui.tasks.guidance');
   if (event.kind === 'plan_card' || event.kind === 'plan_review') return t(language, 'deepcodeGui.tasks.plan');
   if (event.kind === 'review_summary') return t(language, 'deepcodeGui.tasks.review');
   if (event.kind === 'tool_call' || event.kind === 'tool_result') return t(language, 'deepcodeGui.tasks.tool');
@@ -251,6 +252,9 @@ function taskTitle(language: UiLanguage, event: AgentEvent): string {
 
 function taskStatus(event: AgentEvent): string {
   if (event.kind === 'error') return 'failed';
+  if (event.kind === 'user_guidance') {
+    return stringField(event.payload, 'status') === 'consumed' ? 'completed' : 'queued';
+  }
   if (event.kind === 'permission_request' || event.kind === 'plan_review') return 'waiting';
   if (event.kind === 'tool_call' || event.kind === 'workflow_stage') return 'running';
   return 'completed';
@@ -296,6 +300,11 @@ function taskDedupKey(event: AgentEvent): string {
   }
   if (event.kind === 'review_summary') {
     return `review:${runId ?? eventText(event)}`;
+  }
+  if (event.kind === 'user_guidance') {
+    const guidanceId = stringField(event.payload, 'guidanceId');
+    const targetRunId = stringField(event.payload, 'targetRunId');
+    return `guidance:${guidanceId ?? targetRunId ?? runId ?? event.id}`;
   }
   if (event.kind === 'error') {
     return `error:${eventText(event)}`;
@@ -552,12 +561,13 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
 
   const handleCreateSession = async (projectId?: string | null) => {
     const targetProjectId = projectId ?? null;
+    pendingProjectSendRef.current = null;
     setActiveProjectId(null);
     setDraftTargetProjectId(targetProjectId);
     if (targetProjectId) {
       return;
     }
-    const nextSession = await createNewSession();
+    const nextSession = await createNewSession({ reuseEmpty: false });
     if (nextSession?.id) {
       upsertKnownSession(nextSession);
     }
@@ -855,6 +865,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                                 type="button"
                                 className={item.id === highlightedSessionId ? 'active' : ''}
                                 onClick={() => {
+                                  pendingProjectSendRef.current = null;
                                   setActiveProjectId(group.projectId ?? null);
                                   setDraftTargetProjectId(null);
                                   void activateSession(item.id);
@@ -901,6 +912,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                     type="button"
                     className={item.id === highlightedSessionId ? 'active' : ''}
                     onClick={() => {
+                      pendingProjectSendRef.current = null;
                       setActiveProjectId(null);
                       setDraftTargetProjectId(null);
                       void activateSession(item.id);

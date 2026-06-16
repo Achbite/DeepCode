@@ -1997,7 +1997,8 @@ button {
   border-right: 0;
   border-radius: 0;
   background: #f5f6f7;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .codex-sidebar-actions,

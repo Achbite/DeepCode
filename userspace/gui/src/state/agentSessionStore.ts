@@ -40,6 +40,7 @@ import {
 } from '../services/runtimeAdapter';
 import { getKernelHttpOrigin } from '../services/hostTarget';
 import { useSettingsStore } from './settingsStore';
+import { findActiveSessionInteraction } from './sessionInteractions';
 import { useWorkspaceStore } from './workspaceStore';
 
 interface PendingPermission {
@@ -229,6 +230,30 @@ function eventToolName(event: AgentEvent): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+function eventRunId(event: AgentEvent): string | undefined {
+  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
+    return undefined;
+  }
+  const payload = event.payload as Record<string, unknown>;
+  if (typeof payload.runId === 'string' && payload.runId.trim()) {
+    return payload.runId;
+  }
+  const kernelEvent = payload.kernelEvent;
+  if (kernelEvent && typeof kernelEvent === 'object' && !Array.isArray(kernelEvent)) {
+    const value = (kernelEvent as Record<string, unknown>).runId;
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return undefined;
+}
+
+function latestRunId(events: AgentEvent[]): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const runId = eventRunId(events[index]);
+    if (runId) return runId;
+  }
+  return undefined;
+}
+
 function shouldRefreshWorkspaceTree(events: AgentEvent[]): boolean {
   let shouldRefresh = false;
   for (const event of events) {
@@ -275,50 +300,57 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (get().session && get().workspaceScopeKey === nextScopeKey) return;
     if (get().loading) return;
     set({ loading: true, errorMessage: null });
-    const settings = useSettingsStore.getState().effectiveSettings;
-    const initialMode = settingMode(settings['agent.defaultMode']);
-    const workflow = settingWorkflow(settings['agent.defaultWorkflow']);
-    set({ mode: initialMode, workflow });
-    await get().loadWorkflowConfig();
-    const scope = currentWorkspaceScope();
-    const list = await listAgentSessions(scope);
-    if (list.ok && list.data) {
+    try {
+      const settings = useSettingsStore.getState().effectiveSettings;
+      const initialMode = settingMode(settings['agent.defaultMode']);
+      const workflow = settingWorkflow(settings['agent.defaultWorkflow']);
+      set({ mode: initialMode, workflow });
+      await get().loadWorkflowConfig();
+      const scope = currentWorkspaceScope();
+      const list = await listAgentSessions(scope);
+      if (list.ok && list.data) {
+        set({
+          sessions: list.data.sessions,
+          currentSessionId: list.data.currentSessionId,
+        });
+      }
+      const current = await getCurrentAgentSession(scope);
+      if (current.ok && current.data) {
+        refreshWorkspaceTreeForToolFacts(current.data.events);
+        set({
+          session: current.data.session,
+          workspaceScopeKey: nextScopeKey,
+          events: current.data.events,
+          mode: current.data.session.mode,
+          profileId: current.data.session.profileId,
+          loading: false,
+        });
+        void get().refreshTraceEvents(current.data.session.id);
+        return;
+      }
+      const created = await createAgentSession({ initialMode, ...scope });
+      if (created.ok && created.data) {
+        refreshWorkspaceTreeForToolFacts(created.data.events);
+        set({
+          session: created.data.session,
+          workspaceScopeKey: nextScopeKey,
+          sessions: [created.data.session, ...get().sessions.filter((item) => item.id !== created.data!.session.id)],
+          currentSessionId: created.data.session.id,
+          events: created.data.events,
+          mode: created.data.session.mode,
+          profileId: created.data.session.profileId,
+          loading: false,
+        });
+        void get().refreshTraceEvents(created.data.session.id);
+      } else {
+        set({
+          errorMessage: created.message ?? current.message ?? 'Agent session initialization failed',
+          loading: false,
+        });
+      }
+    } catch (err) {
       set({
-        sessions: list.data.sessions,
-        currentSessionId: list.data.currentSessionId,
-      });
-    }
-    const current = await getCurrentAgentSession(scope);
-    if (current.ok && current.data) {
-      refreshWorkspaceTreeForToolFacts(current.data.events);
-      set({
-        session: current.data.session,
-        workspaceScopeKey: nextScopeKey,
-        events: current.data.events,
-        mode: current.data.session.mode,
-        profileId: current.data.session.profileId,
-        loading: false,
-      });
-      void get().refreshTraceEvents(current.data.session.id);
-      return;
-    }
-    const created = await createAgentSession({ initialMode, ...scope });
-    if (created.ok && created.data) {
-      refreshWorkspaceTreeForToolFacts(created.data.events);
-      set({
-        session: created.data.session,
-        workspaceScopeKey: nextScopeKey,
-        sessions: [created.data.session, ...get().sessions.filter((item) => item.id !== created.data!.session.id)],
-        currentSessionId: created.data.session.id,
-        events: created.data.events,
-        mode: created.data.session.mode,
-        profileId: created.data.session.profileId,
-        loading: false,
-      });
-      void get().refreshTraceEvents(created.data.session.id);
-    } else {
-      set({
-        errorMessage: created.message ?? current.message ?? 'Agent session initialization failed',
+        errorMessage: err instanceof Error ? err.message : String(err),
         loading: false,
       });
     }
@@ -371,28 +403,35 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   activateSession: async (sessionId) => {
     if (get().session?.id === sessionId) return;
     set({ loading: true, errorMessage: null });
-    const result = await activateAgentSession(sessionId);
-    if (result.ok && result.data) {
+    try {
+      const result = await activateAgentSession(sessionId);
+      if (result.ok && result.data) {
+        set({
+          session: result.data.session,
+          workspaceScopeKey: currentWorkspaceScopeKey(),
+          currentSessionId: result.data.session.id,
+          events: result.data.events,
+          traceEvents: [],
+          mode: result.data.session.mode,
+          profileId: result.data.session.profileId,
+          pendingPermission: findLatestPendingPermission(result.data.events),
+          resolvingPermission: null,
+          resolvingRequirement: null,
+          resolvingPlan: null,
+          resolvingReview: null,
+          loading: false,
+        });
+        void get().refreshTraceEvents(result.data.session.id);
+        void get().refreshSessions();
+        return;
+      }
+      set({ errorMessage: result.message ?? 'Agent session activate failed', loading: false });
+    } catch (err) {
       set({
-        session: result.data.session,
-        workspaceScopeKey: currentWorkspaceScopeKey(),
-        currentSessionId: result.data.session.id,
-        events: result.data.events,
-        traceEvents: [],
-        mode: result.data.session.mode,
-        profileId: result.data.session.profileId,
-        pendingPermission: findLatestPendingPermission(result.data.events),
-        resolvingPermission: null,
-        resolvingRequirement: null,
-        resolvingPlan: null,
-        resolvingReview: null,
+        errorMessage: err instanceof Error ? err.message : String(err),
         loading: false,
       });
-      void get().refreshTraceEvents(result.data.session.id);
-      void get().refreshSessions();
-      return;
     }
-    set({ errorMessage: result.message ?? 'Agent session activate failed', loading: false });
   },
 
   renameSession: async (sessionId, title) => {
@@ -519,19 +558,69 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     if (!session) return;
 
     const attachments = readMessageAttachments(get(), attachmentsOverride);
+    const activeInteraction = findActiveSessionInteraction({
+      events: get().events,
+      pendingPermission: get().pendingPermission?.request ?? null,
+    });
+    if (activeInteraction) {
+      set({ messageAttachments: [], errorMessage: null });
+      if (activeInteraction.kind === 'requirement') {
+        await get().resolveRequirement(
+          activeInteraction.runId,
+          activeInteraction.requirementId,
+          'revise',
+          trimmed
+        );
+        return;
+      }
+      if (activeInteraction.kind === 'plan') {
+        await get().resolvePlan(activeInteraction.runId, activeInteraction.planId, 'revise', trimmed);
+        return;
+      }
+      if (activeInteraction.kind === 'review') {
+        await get().resolveReview(activeInteraction.runId, 'revise', trimmed);
+        return;
+      }
+      set({ errorMessage: 'Permission confirmation is pending. Resolve the permission request before sending new guidance.' });
+      return;
+    }
+
     if (get().runningSessionIds.includes(session.id)) {
-      const queuedEvent = createLocalEvent(session.id, 'user_msg', {
+      const targetRunId = latestRunId(get().events);
+      const guidanceEvent = createLocalEvent(session.id, 'user_guidance', {
         content: trimmed,
+        guidance: trimmed,
         attachments,
-        pending: true,
-        queued: true,
+        source: 'user',
+        targetRunId,
+        targetInteractionKind: 'runningRunGuidance',
+        effectiveCheckpoint: 'nextProviderCall',
+        checkpointKind: 'nextProviderCall',
+        status: 'queued',
+        summary: '用户补充引导已记录，将在下一次 provider call 生效。',
+        channel: 'user',
+        visibility: 'conversation',
+        presentation: 'body',
       });
-      set((state) => ({
-        events: [...state.events, queuedEvent],
-        messageAttachments: [],
-        queuedMessages: [...state.queuedMessages, { content: trimmed, attachments }],
-        errorMessage: null,
-      }));
+      const result = await appendAgentEvents(session.id, { events: [guidanceEvent] });
+      if (result.ok && result.data) {
+        set({
+          session: result.data.session,
+          sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
+          currentSessionId: result.data.session.id,
+          events: result.data.events,
+          pendingPermission: findLatestPendingPermission(result.data.events),
+          messageAttachments: [],
+          errorMessage: null,
+        });
+        void get().refreshTraceEvents(result.data.session.id);
+      } else {
+        set((state) => ({
+          events: [...state.events, guidanceEvent],
+          messageAttachments: [],
+          errorMessage: result.message ?? 'User guidance append failed',
+        }));
+      }
       return;
     }
 
