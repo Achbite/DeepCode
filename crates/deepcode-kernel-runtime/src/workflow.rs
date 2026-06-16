@@ -903,6 +903,22 @@ fn resolve_resource_manifest_entry(
     if metadata.is_file() {
         match fs::read_to_string(&path) {
             Ok(content) => {
+                let offset_bytes = resource_entry_u64(entry, "offsetBytes");
+                let limit_bytes = resource_entry_u64(entry, "limitBytes");
+                if offset_bytes.is_some() || limit_bytes.is_some() {
+                    return resource_packet_file_range_item(
+                        &request_item_id,
+                        &manifest_entry_id,
+                        source_kind,
+                        &path,
+                        entry,
+                        &content,
+                        offset_bytes,
+                        limit_bytes,
+                        &evidence_ref,
+                    );
+                }
+                let truncated = content.chars().count() > RESOURCE_PACKET_MAX_FILE_CHARS;
                 let clipped = clip_resource_text(&content, RESOURCE_PACKET_MAX_FILE_CHARS);
                 return serde_json::json!({
                     "requestItemId": request_item_id,
@@ -916,7 +932,10 @@ fn resolve_resource_manifest_entry(
                     "contentKind": "fileText",
                     "content": clipped,
                     "sizeBytes": content.len(),
-                    "truncated": content.chars().count() > RESOURCE_PACKET_MAX_FILE_CHARS,
+                    "originalBytes": content.len(),
+                    "returnedBytes": clipped.len(),
+                    "truncated": truncated,
+                    "rangeComplete": !truncated,
                     "contentSummary": entry.get("summary").and_then(Value::as_str).unwrap_or("File text resolved by Kernel ResourceResolve."),
                     "evidenceRef": evidence_ref,
                     "evidenceRefs": [evidence_ref]
@@ -941,6 +960,83 @@ fn resolve_resource_manifest_entry(
         "unsupported_resource_kind",
         &format!("{} is not a file or directory", path.display()),
     )
+}
+
+fn resource_packet_file_range_item(
+    request_item_id: &str,
+    manifest_entry_id: &str,
+    source_kind: &str,
+    path: &Path,
+    entry: &Value,
+    content: &str,
+    offset_bytes: Option<u64>,
+    limit_bytes: Option<u64>,
+    evidence_ref: &str,
+) -> Value {
+    let total_bytes = content.len();
+    let requested_offset = offset_bytes.unwrap_or(0) as usize;
+    if requested_offset > total_bytes {
+        return resource_packet_error_item(
+            request_item_id,
+            manifest_entry_id,
+            source_kind,
+            "range_out_of_bounds",
+            &format!(
+                "offsetBytes {requested_offset} is beyond file size {total_bytes} for {}",
+                path.display()
+            ),
+        );
+    }
+    let requested_limit = limit_bytes
+        .map(|value| value as usize)
+        .unwrap_or(RESOURCE_PACKET_MAX_FILE_CHARS)
+        .min(RESOURCE_PACKET_MAX_FILE_CHARS);
+    if requested_limit == 0 {
+        return resource_packet_error_item(
+            request_item_id,
+            manifest_entry_id,
+            source_kind,
+            "invalid_range",
+            "limitBytes must be greater than zero",
+        );
+    }
+    let requested_end = requested_offset
+        .saturating_add(requested_limit)
+        .min(total_bytes);
+    let start = ceil_char_boundary(content, requested_offset);
+    let end = floor_char_boundary(content, requested_end);
+    if start > end {
+        return resource_packet_error_item(
+            request_item_id,
+            manifest_entry_id,
+            source_kind,
+            "invalid_utf8_range",
+            "requested byte range does not include a valid UTF-8 text segment",
+        );
+    }
+    let segment = &content[start..end];
+    serde_json::json!({
+        "requestItemId": request_item_id,
+        "manifestEntryId": manifest_entry_id,
+        "status": "resolved",
+        "readPolicy": "explicit-manifest-readonly",
+        "sourceKind": source_kind,
+        "resolvedKind": "file",
+        "path": resource_entry_display_path(entry, path),
+        "absolutePath": path.to_string_lossy(),
+        "contentKind": "fileText",
+        "content": segment,
+        "sizeBytes": total_bytes,
+        "originalBytes": total_bytes,
+        "offsetBytes": start,
+        "limitBytes": requested_limit,
+        "returnedBytes": segment.len(),
+        "truncated": start > 0 || end < total_bytes,
+        "rangeComplete": end >= total_bytes,
+        "contentSummary": entry.get("summary").and_then(Value::as_str).unwrap_or("File text range resolved by Kernel ResourceResolve."),
+        "evidenceRef": evidence_ref,
+        "evidenceRefs": [evidence_ref]
+    })
 }
 
 fn resource_entry_path(entry: &Value, workspace_root: Option<&Path>) -> Option<PathBuf> {
@@ -968,6 +1064,26 @@ fn resource_entry_display_path(entry: &Value, path: &Path) -> String {
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+fn resource_entry_u64(entry: &Value, key: &str) -> Option<u64> {
+    entry.get(key).and_then(Value::as_u64)
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index < value.len() && !value.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 fn resource_packet_error_item(

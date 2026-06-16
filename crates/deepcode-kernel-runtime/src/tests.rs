@@ -192,6 +192,110 @@ fn resource_resolve_reads_explicit_file_and_directory_manifest_entries() {
 }
 
 #[test]
+fn resource_resolve_reads_file_byte_ranges() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    fs::write(
+        temp.join("range.txt"),
+        "0123456789abcdefghijklmnopqrstuvwxyz",
+    )
+    .expect("write range file");
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Resolve generic file range.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let manifest = serde_json::json!({
+        "id": "manifest-range",
+        "entries": [
+            {
+                "id": "entry-range",
+                "kind": "file",
+                "resourceRef": temp.join("range.txt").to_string_lossy(),
+                "offsetBytes": 10,
+                "limitBytes": 6,
+                "reason": "explicit file range"
+            },
+            {
+                "id": "entry-out-of-bounds",
+                "kind": "file",
+                "resourceRef": temp.join("range.txt").to_string_lossy(),
+                "offsetBytes": 9999,
+                "limitBytes": 6,
+                "reason": "invalid range"
+            }
+        ]
+    });
+    let events = runtime
+        .dispatch(KernelCommand::ResourceResolve {
+            request_id: RequestId("req-resource-range".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-generic".to_string())),
+            request: ResourceResolveRequest { manifest },
+        })
+        .expect("resource range resolve succeeds");
+
+    let packet = events
+        .iter()
+        .find_map(|event| {
+            if let KernelEvent::ResourcePacketProduced { packet, .. } = event {
+                Some(packet)
+            } else {
+                None
+            }
+        })
+        .expect("resource packet event");
+    let items = packet
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("items");
+    let range_item = items
+        .iter()
+        .find(|item| item.get("manifestEntryId").and_then(Value::as_str) == Some("entry-range"))
+        .expect("range item");
+    assert_eq!(
+        range_item.get("content").and_then(Value::as_str),
+        Some("abcdef")
+    );
+    assert_eq!(
+        range_item.get("offsetBytes").and_then(Value::as_u64),
+        Some(10)
+    );
+    assert_eq!(
+        range_item.get("returnedBytes").and_then(Value::as_u64),
+        Some(6)
+    );
+    assert_eq!(
+        range_item.get("rangeComplete").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let invalid_item = items
+        .iter()
+        .find(|item| {
+            item.get("manifestEntryId").and_then(Value::as_str) == Some("entry-out-of-bounds")
+        })
+        .expect("invalid range item");
+    assert_eq!(
+        invalid_item.get("status").and_then(Value::as_str),
+        Some("error")
+    );
+    assert_eq!(
+        invalid_item.get("reason").and_then(Value::as_str),
+        Some("range_out_of_bounds")
+    );
+}
+
+#[test]
 fn action_batch_submit_executes_minimal_workspace_write() {
     let (mut runtime, temp) = runtime_with_workspace();
     runtime
