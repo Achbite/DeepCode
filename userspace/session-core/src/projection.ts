@@ -997,12 +997,86 @@ function orderConversationCards(
 }
 
 export function findLatestPendingPermission(events: AgentEvent[]): PendingPermissionProjection | null {
+  const resolved = new Set<string>();
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
-    if (event.kind === 'permission_result') return null;
+    const resultId = permissionResultId(event);
+    if (resultId) {
+      resolved.add(resultId);
+      continue;
+    }
     if (event.kind === 'permission_request') {
-      return { request: event.payload as PermissionRequest };
+      const request = event.payload as PermissionRequest;
+      if (!resolved.has(request.id)) return { request };
+      continue;
+    }
+    const request = permissionRequestFromKernelWorkflowStage(event);
+    if (request && !resolved.has(request.id)) {
+      return { request };
     }
   }
   return null;
+}
+
+function permissionResultId(event: AgentEvent): string | undefined {
+  if (event.kind === 'permission_result') {
+    const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+      ? event.payload as Record<string, unknown>
+      : undefined;
+    return typeof payload?.permissionId === 'string'
+      ? payload.permissionId
+      : typeof payload?.id === 'string'
+        ? payload.id
+        : undefined;
+  }
+  const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+    ? event.payload as Record<string, unknown>
+    : undefined;
+  const kernelEvent = payload?.kernelEvent && typeof payload.kernelEvent === 'object' && !Array.isArray(payload.kernelEvent)
+    ? payload.kernelEvent as Record<string, unknown>
+    : undefined;
+  return kernelEvent?.kind === 'permission.resolved' && typeof kernelEvent.permissionId === 'string'
+    ? kernelEvent.permissionId
+    : undefined;
+}
+
+function permissionRequestFromKernelWorkflowStage(event: AgentEvent): PermissionRequest | null {
+  const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+    ? event.payload as Record<string, unknown>
+    : undefined;
+  const kernelEvent = payload?.kernelEvent && typeof payload.kernelEvent === 'object' && !Array.isArray(payload.kernelEvent)
+    ? payload.kernelEvent as Record<string, unknown>
+    : undefined;
+  if (kernelEvent?.kind !== 'permission.requested') return null;
+  const request = kernelEvent.request && typeof kernelEvent.request === 'object' && !Array.isArray(kernelEvent.request)
+    ? kernelEvent.request as Record<string, unknown>
+    : {};
+  const id = typeof request.id === 'string'
+    ? request.id
+    : typeof kernelEvent.permissionId === 'string'
+      ? kernelEvent.permissionId
+      : typeof kernelEvent.toolCallId === 'string'
+        ? kernelEvent.toolCallId
+        : undefined;
+  if (!id) return null;
+  const capability = typeof request.capability === 'string'
+    ? request.capability
+    : typeof kernelEvent.capability === 'string'
+      ? kernelEvent.capability
+      : 'workspace.write';
+  return {
+    id,
+    toolName: typeof kernelEvent.toolName === 'string' ? kernelEvent.toolName : capability,
+    riskLevel: request.riskLevel === 'low' || request.riskLevel === 'medium' || request.riskLevel === 'high'
+      ? request.riskLevel
+      : 'medium',
+    summary: typeof request.summary === 'string'
+      ? request.summary
+      : typeof kernelEvent.summary === 'string'
+        ? kernelEvent.summary
+        : `Permission requested for ${capability}.`,
+    argumentsPreview: request.argsPreview ?? kernelEvent.argsPreview ?? null,
+    ...(typeof kernelEvent.runId === 'string' ? { runId: kernelEvent.runId } : {}),
+    ...(typeof kernelEvent.planId === 'string' ? { planId: kernelEvent.planId } : {}),
+  } as PermissionRequest;
 }

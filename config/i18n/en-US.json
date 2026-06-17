@@ -769,6 +769,15 @@
         "off": "Off"
       }
     },
+    "agent.reviewContinuationMode": {
+      "label": "Review Continuation",
+      "description": "Controls whether accepted Review batches automatically generate the next Plan. Auto mode generates a Plan only and still waits for Plan confirmation.",
+      "options": {
+        "auto": "Auto Generate Next Plan",
+        "ask": "Ask First",
+        "off": "Off"
+      }
+    },
     "agent.permissions.allowFileRead": {
       "label": "Allow File Read",
       "description": "Allow Agent tools to read workspace files."

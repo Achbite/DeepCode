@@ -24,6 +24,7 @@ import {
   buildSessionTaskGraph,
   collectUserGuidanceEvents,
   createResourcePacket,
+  findLatestPendingPermission,
   parseProposalEnvelope,
   SessionDriver,
   SessionDriverLoop,
@@ -41,6 +42,7 @@ async function main(): Promise<void> {
   assertSessionMemoryDocument();
   assertSessionTaskGraphProjection();
   assertDeepSeekCacheStrategyDoesNotInjectRequestParameter();
+  await assertProviderCacheTelemetryNormalizesBigModelUsage();
   assertSettingsCatalogBoundaries();
   assertNarrativeTimelineProjection();
   assertSessionDriverSkeleton();
@@ -57,8 +59,12 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopRepairsInvalidSourceBlock();
   await assertSessionDriverLoopRepairsOversizedActionBundle();
   await assertSessionDriverLoopRepairsEmptyActionBundleResponse();
+  await assertSessionDriverLoopAcceptsLocalizedStructuredPlan();
+  await assertSessionDriverLoopPlanAcceptGroupsWorkspaceWriteGrants();
+  assertWorkflowStagePermissionProjectsPendingDecision();
   await assertSessionDriverLoopReviewRevisionReturnsToPlanning();
-  await assertSessionDriverLoopReviewAcceptStopsAtCurrentBatch();
+  await assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan();
+  await assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch();
   await assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept();
 }
 
@@ -737,6 +743,61 @@ function assertDeepSeekCacheStrategyDoesNotInjectRequestParameter(): void {
   assertEqual(result.serverPromptCacheSupported, true, 'DeepSeek server prompt cache is marked as supported');
   assertEqual(Object.prototype.hasOwnProperty.call(result.requestBody, 'prompt_cache_key'), false, 'DeepSeek request body does not include prompt_cache_key');
   assertEqual(Object.prototype.hasOwnProperty.call(result.requestBody, 'cache_control'), false, 'DeepSeek request body does not include cache_control');
+}
+
+async function assertProviderCacheTelemetryNormalizesBigModelUsage(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const session: AgentSession = {
+    id: 'session-cache-bigmodel',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => ({
+      ok: true,
+      data: {
+        chunks: [{ type: 'done' }],
+        usage: {
+          prompt_tokens: 1000,
+          completion_tokens: 100,
+          total_tokens: 1100,
+          prompt_tokens_details: {
+            cached_tokens: 77,
+          },
+        },
+        assistantMessage: {
+          role: 'assistant',
+          content: JSON.stringify({
+            schemaVersion: 'deepcode.agent.protocol.v3',
+            kind: 'answer',
+            outputLanguage: 'en-US',
+            answer: { format: 'markdown', content: 'Generic answer.' },
+          }),
+        },
+      },
+    }),
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-cache-bigmodel',
+    content: 'Answer a generic question.',
+    requirementConfirmationMode: 'off',
+  });
+  const telemetry = result.events.find((event) => event.kind === 'cache_telemetry');
+  if (!telemetry) throw new Error('cache telemetry should be emitted for provider usage');
+  const payload = telemetry.payload as any;
+  assertEqual(payload.promptCacheHitTokens, 77, 'BigModel prompt_tokens_details.cached_tokens maps to cache hit tokens');
+  assertEqual(payload.promptCacheMissTokens, 923, 'BigModel cache miss tokens are inferred from prompt tokens minus cached tokens');
+  assertEqual(payload.cachedTokens, 77, 'BigModel cached token detail is preserved');
+  assert(Array.isArray(payload.promptSegmentDigests) && payload.promptSegmentDigests.length > 0, 'cache telemetry includes prompt segment digests');
 }
 
 function assertNarrativeTimelineProjection(): void {
@@ -1901,6 +1962,61 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
   assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && String((event.payload as any).content ?? '').includes('没有返回有效 JSON')), true, 'empty response repair is visible as Thinking');
 }
 
+async function assertSessionDriverLoopAcceptsLocalizedStructuredPlan(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const submittedPlans: Array<Record<string, any>> = [];
+  const session: AgentSession = {
+    id: 'session-localized-plan',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-localized-plan', submittedPlans),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(localizedGenericWriteProposal()),
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-localized-plan',
+    content: 'Create a generic workspace change.',
+    requirementConfirmationMode: 'off',
+  });
+  assertEqual(submittedPlans.length, 1, 'localized structured plan reaches Kernel without heading repair');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'localized structured plan renders a plan card');
+}
+
+function assertWorkflowStagePermissionProjectsPendingDecision(): void {
+  const pending = findLatestPendingPermission([
+    {
+      id: 'event-permission',
+      sessionId: 'session-permission',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'workflow_stage',
+      payload: {
+        kernelEvent: {
+          kind: 'permission.requested',
+          runId: 'run-permission',
+          planId: 'plan-permission',
+          request: {
+            id: 'permission-generic',
+            capability: 'workspace.write',
+            riskLevel: 'medium',
+            summary: 'Allow a generic write operation?',
+            argsPreview: { path: 'generic-output.txt' },
+          },
+        },
+      },
+    },
+  ]);
+  assertEqual(pending?.request.id, 'permission-generic', 'workflow_stage permission.requested is recognized as pending permission');
+}
+
 async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise<void> {
   const events: AgentEvent[] = [{
     id: 'review-waiting-generic',
@@ -1973,7 +2089,84 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
   assert(promptText.includes('intentContext'), 'plans and continuations are separated into intentContext');
 }
 
-async function assertSessionDriverLoopReviewAcceptStopsAtCurrentBatch(): Promise<void> {
+async function assertSessionDriverLoopPlanAcceptGroupsWorkspaceWriteGrants(): Promise<void> {
+  const actionBundle = multiWriteActionBundle();
+  const events: AgentEvent[] = [
+    {
+      id: 'plan-card-multi-write',
+      sessionId: 'session-plan-grant-group',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'plan_card',
+      payload: {
+        runId: 'run-plan-grant-group',
+        planId: 'bundle-multi-write',
+        proposalId: 'proposal-multi-write',
+        content: '# Plan\n\n## Summary\nWrite multiple generic files.',
+        actionBundle,
+        codeBlocks: [
+          { id: 'code-one', targetPath: 'generic-one.txt', content: 'one' },
+          { id: 'code-two', targetPath: 'generic-two.txt', content: 'two' },
+        ],
+        commandBlocks: [],
+        planReviewReport: proposalReviewReport(actionBundle),
+      },
+    },
+    {
+      id: 'plan-review-multi-write',
+      sessionId: 'session-plan-grant-group',
+      ts: '2026-01-01T00:00:00.001Z',
+      kind: 'plan_review',
+      payload: {
+        status: 'awaitingTemporaryGrant',
+        runId: 'run-plan-grant-group',
+        planId: 'bundle-multi-write',
+        confirmable: true,
+        report: proposalReviewReport(actionBundle),
+      },
+    },
+  ];
+  const session: AgentSession = {
+    id: 'session-plan-grant-group',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const temporaryGrants: Array<Record<string, any>> = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
+      if (command.kind === 'permissionGrantTemporary') {
+        temporaryGrants.push(command.grant);
+        return { ok: true, events: [] };
+      }
+      if (command.kind === 'actionBatchSubmit') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + temporaryGrants.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: 'session-plan-grant-group',
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-plan-grant-group',
+    targetId: 'bundle-multi-write',
+    existingEvents: events,
+  });
+
+  assertEqual(temporaryGrants.length, 1, 'multiple workspace.write actions share one temporary grant');
+  assertEqual(temporaryGrants[0]?.capability, 'workspace.write', 'grouped temporary grant is keyed by capability');
+  assertEqual((temporaryGrants[0]?.permissionBundle as any)?.groupedBy, 'capability', 'temporary grant records capability grouping metadata');
+}
+
+async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promise<void> {
   const events: AgentEvent[] = [{
     id: 'review-waiting-accept-generic',
     sessionId: 'session-review-accept',
@@ -2032,11 +2225,74 @@ async function assertSessionDriverLoopReviewAcceptStopsAtCurrentBatch(): Promise
   const acceptedReview = result.events.find((event) => event.kind === 'review_summary' && (event.payload as any).status === 'accepted');
   if (!acceptedReview) throw new Error('review accept records an accepted review event');
   const acceptedPayload = acceptedReview.payload as any;
-  assertEqual(acceptedPayload.continuationRequested, false, 'review accept records continuations without auto-continuing');
-  assert(String(acceptedPayload.content ?? '').includes('不会自动生成或执行下一批'), 'accepted review explains that continuations are intent only');
-  assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'review accept does not generate a continuation plan');
-  assertEqual(submittedPlans.length, 0, 'review accept does not submit a new plan');
-  assertEqual(llmRequests.length, 0, 'review accept does not call the provider');
+  assertEqual(acceptedPayload.continuationRequested, false, 'review accept closes the current review before continuation planning');
+  assert(String(acceptedPayload.content ?? '').includes('不会跳过下一批 Plan 确认'), 'accepted review explains continuation stays at Plan confirmation');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'default review continuation mode generates the next plan');
+  assertEqual(submittedPlans.length, 1, 'default review continuation mode submits the next actionBundle for Kernel PlanReview');
+  assertEqual(llmRequests.length, 1, 'default review continuation mode calls the provider once for a new plan');
+}
+
+async function assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch(): Promise<void> {
+  const events: AgentEvent[] = [{
+    id: 'review-waiting-accept-off-generic',
+    sessionId: 'session-review-accept-off',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'review_summary',
+    payload: {
+      status: 'waitingUserReview',
+      runId: 'run-review-accept-off',
+      reviewId: 'review-accept-off-generic',
+      sourcePlanId: 'plan-accept-off-generic',
+      content: '## Review\n\nThe first batch wrote a generic source file.',
+      userPlan: '# Plan\n\n## Summary\nCreate the first generic batch.',
+      facts: ['- `work-unit-generic` completed: {"path":"generic-output.txt"}'],
+      continuations: [{
+        id: 'next-generic-batch',
+        title: 'Add a generic follow-up script',
+        capability: 'workspace.write',
+        kind: 'write',
+        resourceScope: ['scripts/generic.sh'],
+      }],
+      confirmable: true,
+      channel: 'review',
+      visibility: 'conversation',
+    },
+  }];
+  const session: AgentSession = {
+    id: 'session-review-accept-off',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const submittedPlans: Array<Record<string, any>> = [];
+  const llmRequests: LlmChatRequest[] = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-review-accept-off', submittedPlans),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: 'session-review-accept-off',
+    kind: 'review',
+    decision: 'accept',
+    runId: 'run-review-accept-off',
+    existingEvents: events,
+    reviewContinuationMode: 'off',
+  });
+
+  assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any).status === 'accepted'), true, 'review accept records an accepted review event');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'off review continuation mode does not generate a continuation plan');
+  assertEqual(submittedPlans.length, 0, 'off review continuation mode does not submit a new plan');
+  assertEqual(llmRequests.length, 0, 'off review continuation mode does not call the provider');
 }
 
 async function assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept(): Promise<void> {
@@ -2109,6 +2365,7 @@ async function assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAc
     decision: 'accept',
     runId: 'run-current-review',
     existingEvents: events,
+    reviewContinuationMode: 'off',
   });
   assertEqual(accepted.events.some((event) => event.kind === 'review_summary' && (event.payload as any).status === 'accepted'), true, 'current review is accepted');
 
@@ -2181,6 +2438,34 @@ function genericWriteProposal(missingEvidence: boolean): Record<string, unknown>
     expectedValidation: 'Kernel records write facts for the generic output.',
     reviewGuide: 'Review the generic output path and content before approval.',
   };
+}
+
+function localizedGenericWriteProposal(): Record<string, unknown> {
+  const proposal = genericWriteProposal(false);
+  proposal.outputLanguage = 'zh-CN';
+  proposal.userPlan = [
+    '# 通用计划',
+    '',
+    '## 概要',
+    '为一个通用工作区变更创建一个小批次，保持范围可审查，并等待 Kernel 记录真实执行事实后再进入审查。',
+    '',
+    '## 关键变更',
+    '- 从顶层代码块写入一个受控输出文件。',
+    '- 保持本批次足够小，方便用户检查路径、内容和权限范围。',
+    '',
+    '## 接口与影响面',
+    '- 使用 workspace.write 与 sourceBlockId 连接计划动作和代码块。',
+    '- 不调用命令、Git、网络、浏览器或其他外部能力。',
+    '',
+    '## 验证计划',
+    '- Kernel 应记录目标路径的写入事实。',
+    '- 用户审查时应能看到生成文件路径和内容摘要。',
+    '',
+    '## 假设与约束',
+    '- 目标路径位于已授权的工作区或会话资源根内。',
+    '- 后续批次仍需要新的计划确认和审查。',
+  ].join('\n');
+  return proposal;
 }
 
 function oversizedGenericWriteProposal(): Record<string, unknown> {
@@ -2308,6 +2593,38 @@ function genericActionBundle(): ActionBundleDraft {
     ],
     validationExpectations: [{ id: 'validation-generic', description: 'Kernel records the proposed validation.' }],
     reviewExpectations: [{ id: 'review-generic', description: 'User reviews the scoped change.' }],
+  };
+}
+
+function multiWriteActionBundle(): Record<string, any> {
+  return {
+    version: '1',
+    id: 'bundle-multi-write',
+    goal: 'Write multiple generic files in one reviewed batch.',
+    actions: [
+      {
+        id: 'write-generic-one',
+        title: 'Write generic file one',
+        kind: 'write',
+        capability: 'workspace.write',
+        resourceScope: ['generic-one.txt'],
+        canParallelize: false,
+        conflictKeys: ['generic-one.txt'],
+        sourceBlockId: 'code-one',
+      },
+      {
+        id: 'write-generic-two',
+        title: 'Write generic file two',
+        kind: 'write',
+        capability: 'workspace.write',
+        resourceScope: ['generic-two.txt'],
+        canParallelize: false,
+        conflictKeys: ['generic-two.txt'],
+        sourceBlockId: 'code-two',
+      },
+    ],
+    validationExpectations: [{ id: 'validation-multi', description: 'Kernel records file write facts.' }],
+    reviewExpectations: [{ id: 'review-multi', description: 'User reviews all written files.' }],
   };
 }
 

@@ -323,6 +323,18 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     ],
   },
   {
+    key: 'agent.reviewContinuationMode',
+    label: 'Review Continuation',
+    description: 'Controls whether accepted Review batches automatically generate the next Plan.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Auto', value: 'auto' },
+      { label: 'Ask', value: 'ask' },
+      { label: 'Off', value: 'off' },
+    ],
+  },
+  {
     key: 'agent.permissions.allowFileRead',
     label: 'Allow File Read',
     description: 'Allow Agent tools to read workspace files.',

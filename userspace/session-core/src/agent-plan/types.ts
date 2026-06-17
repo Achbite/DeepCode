@@ -5,6 +5,10 @@ export type ActionKind =
   | 'diff'
   | 'create'
   | 'write'
+  | 'patch'
+  | 'replaceBlock'
+  | 'insertBefore'
+  | 'insertAfter'
   | 'delete'
   | 'rename'
   | 'command'
@@ -22,7 +26,17 @@ export interface CodeBlockDraft {
   path: string;
   content: string;
   language?: string;
-  operation?: 'create' | 'overwrite' | 'patch' | 'delete' | 'rename';
+  operation?:
+    | 'create'
+    | 'createEmpty'
+    | 'overwrite'
+    | 'patch'
+    | 'replaceBlock'
+    | 'insertBefore'
+    | 'insertAfter'
+    | 'delete'
+    | 'rename';
+  allowEmptyContent?: boolean;
   permissionLabels?: string[];
 }
 
@@ -36,6 +50,9 @@ export interface PlannedActionDraft {
   conflictKeys: string[];
   purpose?: string;
   sourceBlockId?: string;
+  replacementBlockId?: string;
+  targetPath?: string;
+  patchSpec?: Record<string, unknown>;
   toolArgs?: Record<string, unknown>;
   permissionLabels?: string[];
   dependsOn?: string[];

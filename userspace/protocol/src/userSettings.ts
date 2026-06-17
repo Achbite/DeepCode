@@ -67,6 +67,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'agent.defaultMode': 'plan',
   'agent.defaultWorkflow': 'planFirst',
   'agent.requirementConfirmationMode': 'auto',
+  'agent.reviewContinuationMode': 'auto',
   'agent.permissions.allowFileRead': true,
   'agent.permissions.allowFileWrite': true,
   'agent.permissions.allowCodeSearch': true,

@@ -769,6 +769,15 @@
         "off": "关闭"
       }
     },
+    "agent.reviewContinuationMode": {
+      "label": "Review 后续批次",
+      "description": "控制 Review 通过后是否自动生成下一批计划。自动模式只生成 Plan，不跳过计划确认。",
+      "options": {
+        "auto": "自动生成下一批 Plan",
+        "ask": "先询问",
+        "off": "关闭"
+      }
+    },
     "agent.permissions.allowFileRead": {
       "label": "允许读取文件",
       "description": "允许 Agent 工具读取工作区文件。"

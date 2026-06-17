@@ -61,11 +61,13 @@ export interface SessionDriverLoopInput {
   appendUserMessage?: boolean;
   confirmedRequirement?: RequirementRecord;
   requirementConfirmationMode?: RequirementConfirmationMode;
+  reviewContinuationMode?: ReviewContinuationMode;
   resourceBudgetExtraRounds?: number;
   resumeResourcePackets?: boolean;
 }
 
 export type RequirementConfirmationMode = 'auto' | 'always' | 'off';
+export type ReviewContinuationMode = 'auto' | 'ask' | 'off';
 
 export interface SessionDecisionResolverInput {
   sessionId: string;
@@ -79,6 +81,7 @@ export interface SessionDecisionResolverInput {
   projectWorkingDirectory?: ProjectWorkingDirectory;
   profileId?: string;
   workflow?: string;
+  reviewContinuationMode?: ReviewContinuationMode;
 }
 
 interface SessionDriverLoopRunState {
@@ -149,6 +152,7 @@ export class SessionDriverLoop {
   async resolveDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
     if (input.kind === 'requirement') return this.resolveRequirementDecision(input);
     if (input.kind === 'plan') return this.resolvePlanDecision(input);
+    if (input.kind === 'permission') return this.resolvePermissionDecision(input);
     if (input.kind === 'review') return this.resolveReviewDecision(input);
     return this.append(input.sessionId, [
       finalDiagnosticEvent(
@@ -565,6 +569,9 @@ export class SessionDriverLoop {
       },
     });
     result = await this.appendProjectedKernelEvents(input.sessionId, batchReply);
+    if (!actionBatchReadyForReview(batchReply.events ?? [])) {
+      return result;
+    }
     const factsReply = await this.kernel({
       command: {
         kind: 'reviewFactsGet',
@@ -579,6 +586,56 @@ export class SessionDriverLoop {
         input.sessionId,
         plan,
         [...(batchReply.events ?? []), ...(factsReply.events ?? [])],
+        this.ts(),
+        this.id('review-summary')
+      ),
+    ]) ?? result;
+  }
+
+  private async resolvePermissionDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
+    const events = input.existingEvents ?? [];
+    const pending = findPendingPermissionContext(events, input.targetId);
+    if (!pending) {
+      return this.append(input.sessionId, [
+        traceEvent(input.sessionId, 'trace/permission_accept_noop', '该权限请求已处理或已过期，没有重复执行。', this.ts(), this.id('permission-noop'), {
+          runId: input.runId,
+          permissionId: input.targetId,
+          decision: input.decision,
+        }),
+      ]);
+    }
+    const decisionReply = await this.kernel({
+      command: {
+        kind: 'permissionResolve',
+        requestId: this.id('permission-resolve'),
+        permissionId: pending.id,
+        decision: input.decision === 'accept' ? 'accept' : 'reject',
+      },
+    });
+    let result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
+    if (!actionBatchReadyForReview(decisionReply.events ?? [])) {
+      return result;
+    }
+
+    const runId = pending.runId ?? input.runId ?? runIdFromKernelEvents(decisionReply.events ?? []);
+    if (!runId) return result;
+    const plan = findPlanCard(result.events, runId, pending.planId);
+    if (!plan) return result;
+
+    const factsReply = await this.kernel({
+      command: {
+        kind: 'reviewFactsGet',
+        requestId: this.id('review-facts-get'),
+        runId,
+        sessionId: input.sessionId,
+      },
+    });
+    result = await this.appendProjectedKernelEvents(input.sessionId, factsReply);
+    return this.append(input.sessionId, [
+      reviewSummaryEvent(
+        input.sessionId,
+        plan,
+        [...(decisionReply.events ?? []), ...(factsReply.events ?? [])],
         this.ts(),
         this.id('review-summary')
       ),
@@ -669,7 +726,30 @@ export class SessionDriverLoop {
         },
       },
     });
-    return this.appendProjectedKernelEvents(input.sessionId, gateReply) ?? result;
+    result = await this.appendProjectedKernelEvents(input.sessionId, gateReply) ?? result;
+
+    const continuationMode = input.reviewContinuationMode ?? 'auto';
+    if (!review.continuations.length || continuationMode === 'off') {
+      return result;
+    }
+    if (continuationMode === 'ask') {
+      return this.append(input.sessionId, [
+        continuationDecisionPromptEvent(input.sessionId, review, this.ts(), this.id('review-continuation-choice')),
+      ]) ?? result;
+    }
+    return this.runUserTurn({
+      sessionId: input.sessionId,
+      content: reviewContinuationRequest(review),
+      attachments: [],
+      existingEvents: result.events,
+      workspaceBinding: input.workspaceBinding,
+      projectWorkingDirectory: input.projectWorkingDirectory,
+      profileId: input.profileId,
+      workflow: input.workflow,
+      appendUserMessage: false,
+      requirementConfirmationMode: 'off',
+      reviewContinuationMode: continuationMode,
+    });
   }
 
   private async buildRequirementConfirmation(
@@ -1126,6 +1206,7 @@ export class SessionDriverLoop {
     const cacheEvent = cacheTelemetryEvent(
       state.sessionId,
       profileId,
+      state,
       stage,
       result.data,
       this.ts(),
@@ -1940,11 +2021,57 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
         runId: typeof record.runId === 'string' ? record.runId : undefined,
         planId,
         confirmable: status === 'awaitingUserApproval' || status === 'awaitingTemporaryGrant',
+        requiredPermissions: Array.isArray(report.requiredPermissions) ? report.requiredPermissions : [],
+        permissionGaps: Array.isArray(report.permissionGaps) ? report.permissionGaps : [],
         facts: planReviewFacts(report),
         channel: 'action',
         visibility: 'conversation',
         presentation: 'body',
         report,
+        kernelEvent: record,
+      },
+    };
+  }
+  if (kind === 'permission.requested') {
+    const request = objectRecord(record.request) ?? {};
+    const permissionId = stringValue(request.id) ?? stringValue(record.permissionId) ?? stringValue(record.toolCallId) ?? id;
+    const capability = stringValue(request.capability) ?? stringValue(record.capability) ?? 'workspace.write';
+    const toolName = stringValue(record.toolName) ?? stringValue(request.toolName) ?? capability;
+    return {
+      id,
+      sessionId,
+      ts,
+      kind: 'permission_request',
+      payload: {
+        id: permissionId,
+        toolName,
+        capability,
+        riskLevel: stringValue(request.riskLevel) ?? stringValue(request.risk_level) ?? stringValue(record.riskLevel) ?? 'medium',
+        summary: stringValue(request.summary) ?? stringValue(record.summary) ?? `Permission requested for ${toolName}.`,
+        argumentsPreview: request.argsPreview ?? record.argsPreview ?? null,
+        runId: stringValue(record.runId),
+        workUnitId: stringValue(record.workUnitId),
+        actionId: stringValue(record.actionId),
+        planId: stringValue(record.planId),
+        operationKind: stringValue(record.operationKind),
+        channel: 'tool',
+        visibility: 'conversation',
+        kernelEvent: record,
+      },
+    };
+  }
+  if (kind === 'permission.resolved') {
+    return {
+      id,
+      sessionId,
+      ts,
+      kind: 'permission_result',
+      payload: {
+        permissionId: stringValue(record.permissionId),
+        decision: record.decision,
+        runId: stringValue(record.runId),
+        channel: 'tool',
+        visibility: 'conversation',
         kernelEvent: record,
       },
     };
@@ -2223,6 +2350,14 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
     const content = typeof record?.content === 'string' ? record.content : '';
     const size = utf8Bytes(content);
     totalCodeBytes += size;
+    const operation = typeof record?.operation === 'string' ? record.operation : '';
+    const allowEmptyContent = record?.allowEmptyContent === true;
+    if (size === 0 && !(allowEmptyContent && ['createEmpty', 'patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(operation))) {
+      throw new AgentPlanParseError(
+        'invalid_action_bundle',
+        `codeBlocks[${index}].content must be non-empty unless allowEmptyContent is explicitly set for a createEmpty or patch operation.`
+      );
+    }
     if (size > MAX_ACTION_BUNDLE_CODE_BLOCK_BYTES) {
       throw new AgentPlanParseError(
         'action_bundle_budget_exceeded',
@@ -2249,13 +2384,30 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
     if (!Array.isArray(action.resourceScope)) {
       throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}].resourceScope must be an array.`);
     }
-    if ((action.capability === 'workspace.write' || action.capability === 'workspace.create') && !action.sourceBlockId?.trim()) {
+    const actionKind = typeof action.kind === 'string' ? action.kind : '';
+    const isPatchAction = ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(actionKind);
+    const replacementBlockId = typeof action.replacementBlockId === 'string'
+      ? action.replacementBlockId.trim()
+      : '';
+    if ((action.capability === 'workspace.write' || action.capability === 'workspace.create') && !isPatchAction && !action.sourceBlockId?.trim()) {
       throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${action.capability} must include sourceBlockId.`);
+    }
+    if (isPatchAction && !(replacementBlockId || action.sourceBlockId?.trim())) {
+      throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] patch action must include replacementBlockId or sourceBlockId.`);
+    }
+    if (isPatchAction && !objectRecord(action.patchSpec)) {
+      throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] patch action must include patchSpec.`);
     }
     if (action.sourceBlockId && !codeBlockIds.has(action.sourceBlockId)) {
       throw new AgentPlanParseError(
         'invalid_action_bundle',
         `actionBundle.actions[${index}].sourceBlockId "${action.sourceBlockId}" does not match any codeBlocks[].id.`
+      );
+    }
+    if (replacementBlockId && !codeBlockIds.has(replacementBlockId)) {
+      throw new AgentPlanParseError(
+        'invalid_action_bundle',
+        `actionBundle.actions[${index}].replacementBlockId "${replacementBlockId}" does not match any codeBlocks[].id.`
       );
     }
   }
@@ -2297,18 +2449,18 @@ function validateDetailedUserPlan(userPlan: string): void {
       'Side-effect actionBundle must include a detailed Markdown userPlan, not a one-line summary.'
     );
   }
-  const missing = ['Summary', 'Key Changes', 'Interfaces', 'Test Plan', 'Assumptions']
-    .filter((heading) => !new RegExp(`(^|\\n)#{1,3}\\s+${escapeRegExp(heading)}\\b`, 'i').test(userPlan));
-  if (missing.length > 0) {
+  const headings = userPlan
+    .split(/\r?\n/)
+    .filter((line) => /^#{1,3}\s+\S/.test(line.trim()));
+  const listItems = userPlan
+    .split(/\r?\n/)
+    .filter((line) => /^\s*[-*+]\s+\S/.test(line));
+  if (headings.length < 4 || listItems.length < 3) {
     throw new AgentPlanParseError(
       'action_bundle_plan_required',
-      `Side-effect actionBundle.userPlan is missing required Markdown section(s): ${missing.join(', ')}.`
+      'Side-effect actionBundle.userPlan must use structured Markdown with multiple headings and concrete reviewable items; localized headings are accepted.'
     );
   }
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function actionBundlePlanCardEvent(
@@ -2447,6 +2599,67 @@ interface SessionReviewContext {
   facts: string[];
 }
 
+interface PendingPermissionContext {
+  id: string;
+  runId?: string;
+  planId?: string;
+}
+
+function findPendingPermissionContext(events: AgentEvent[], permissionId?: string): PendingPermissionContext | null {
+  const resolved = new Set<string>();
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    const result = permissionResultContext(event);
+    if (result?.id) {
+      resolved.add(result.id);
+      continue;
+    }
+    const request = permissionRequestContext(event);
+    if (!request?.id) continue;
+    if (permissionId && request.id !== permissionId) continue;
+    if (resolved.has(request.id)) continue;
+    return request;
+  }
+  return null;
+}
+
+function permissionResultContext(event: AgentEvent): PendingPermissionContext | null {
+  if (event.kind === 'permission_result') {
+    const payload = objectRecord(event.payload);
+    const id = stringValue(payload?.permissionId) ?? stringValue(payload?.id);
+    return id ? { id, runId: stringValue(payload?.runId) } : null;
+  }
+  const payload = objectRecord(event.payload);
+  const kernelEvent = objectRecord(payload?.kernelEvent);
+  if (kernelEvent?.kind === 'permission.resolved') {
+    const id = stringValue(kernelEvent.permissionId);
+    return id ? { id, runId: stringValue(kernelEvent.runId) } : null;
+  }
+  return null;
+}
+
+function permissionRequestContext(event: AgentEvent): PendingPermissionContext | null {
+  if (event.kind === 'permission_request') {
+    const payload = objectRecord(event.payload);
+    const id = stringValue(payload?.id);
+    return id ? {
+      id,
+      runId: stringValue(payload?.runId),
+      planId: stringValue(payload?.planId),
+    } : null;
+  }
+  const payload = objectRecord(event.payload);
+  const kernelEvent = objectRecord(payload?.kernelEvent);
+  if (kernelEvent?.kind !== 'permission.requested') return null;
+  const request = objectRecord(kernelEvent.request);
+  const id = stringValue(request?.id) ?? stringValue(kernelEvent.permissionId) ?? stringValue(kernelEvent.toolCallId);
+  return id ? {
+    id,
+    runId: stringValue(kernelEvent.runId),
+    planId: stringValue(kernelEvent.planId),
+  } : null;
+}
+
 function findPlanCard(events: AgentEvent[], runId?: string, planId?: string): SessionPlanContext | null {
   for (const event of [...events].reverse()) {
     if (event.kind !== 'plan_card') continue;
@@ -2564,37 +2777,20 @@ function temporaryGrantsForPlan(plan: SessionPlanContext): Record<string, unknow
   const gaps = Array.isArray(report.permissionGaps)
     ? report.permissionGaps.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     : [];
-  const actions = Array.isArray(plan.actionBundle.actions)
-    ? plan.actionBundle.actions.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-    : [];
   const grants: Record<string, unknown>[] = [];
   const seen = new Set<string>();
   for (const capability of gaps) {
-    const scopes = resourceScopesForCapability(actions, capability);
-    if (!scopes.length) {
-      const key = `${capability}:*`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        grants.push(temporaryGrant(plan, capability));
-      }
-      continue;
-    }
-    for (const scope of scopes) {
-      const key = `${capability}:${scope}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      grants.push(temporaryGrant(plan, capability, scope));
-    }
+    if (!planAcceptedAutoGrantCapability(capability)) continue;
+    const key = capability;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    grants.push(temporaryGrant(plan, capability));
   }
   return grants;
 }
 
-function resourceScopesForCapability(actions: Record<string, unknown>[], capability: string): string[] {
-  return actions
-    .filter((action) => stringValue(action.capability) === capability)
-    .flatMap((action) => Array.isArray(action.resourceScope) ? action.resourceScope : [])
-    .filter((scope): scope is string => typeof scope === 'string' && scope.trim().length > 0)
-    .filter((scope) => scope !== 'workspace' && !scope.includes('*') && !scope.startsWith('search:') && !scope.startsWith('symbol:'));
+function planAcceptedAutoGrantCapability(capability: string): boolean {
+  return ['workspace.write', 'workspace.create', 'workspace.delete', 'workspace.rename'].includes(capability);
 }
 
 function temporaryGrant(plan: SessionPlanContext, capability: string, resourcePath?: string): Record<string, unknown> {
@@ -2603,7 +2799,13 @@ function temporaryGrant(plan: SessionPlanContext, capability: string, resourcePa
     capability,
     resourceKind: resourceKindForCapability(capability),
     resourcePath,
-    reason: `Plan ${plan.planId} accepted by user through Session DecisionResolver`,
+    reason: `Plan ${plan.planId} accepted by user through Session DecisionResolver; capability grant is scoped to the current batch/run and expires when ReviewGate closes.`,
+    permissionBundle: {
+      source: 'kernelPlanReview',
+      planId: plan.planId,
+      capability,
+      groupedBy: 'capability',
+    },
   };
 }
 
@@ -2678,6 +2880,45 @@ function reviewSummaryEvent(
   };
 }
 
+function actionBatchReadyForReview(kernelEvents: unknown[]): boolean {
+  if (kernelEvents.some((event) => objectRecord(event)?.kind === 'permission.requested')) {
+    return false;
+  }
+  if (kernelEvents.some((event) => {
+    const record = objectRecord(event);
+    return record?.kind === 'stage.changed' && stringValue(record.phase) === 'review';
+  })) {
+    return true;
+  }
+  const queued = new Set<string>();
+  const terminal = new Set<string>();
+  for (const event of kernelEvents) {
+    const record = objectRecord(event);
+    if (record?.kind === 'work_unit.queued') {
+      const workUnit = objectRecord(record.workUnit);
+      const id = stringValue(workUnit?.id);
+      if (id) queued.add(id);
+    } else if (
+      record?.kind === 'work_unit.completed' ||
+      record?.kind === 'work_unit.failed' ||
+      record?.kind === 'work_unit.blocked'
+    ) {
+      const id = stringValue(record.workUnitId);
+      if (id) terminal.add(id);
+    }
+  }
+  return queued.size > 0 && [...queued].every((id) => terminal.has(id));
+}
+
+function runIdFromKernelEvents(kernelEvents: unknown[]): string | undefined {
+  for (const event of kernelEvents) {
+    const record = objectRecord(event);
+    const runId = stringValue(record?.runId);
+    if (runId) return runId;
+  }
+  return undefined;
+}
+
 function waitingReviewContent(
   plan: SessionPlanContext,
   facts: string[],
@@ -2719,7 +2960,7 @@ function waitingReviewContent(
       ? '- 空输入通过并结束当前批次，不会自动执行失败项；如需修复，请在输入框输入 Review 修改意见，系统会重新进入 Plan。'
       : '- 空输入通过并结束当前批次；输入文字会作为 Review 修订意见，系统会重新进入 Plan。',
     continuations.length
-      ? `- 当前计划登记了 ${continuations.length} 个后续意图；Review 通过只记录这些意图，不会自动生成或执行下一批。需要继续时，请在输入框明确描述下一步。`
+      ? `- 当前计划登记了 ${continuations.length} 个后续意图；Review 通过后会按 agent.reviewContinuationMode 处理。自动模式只生成下一批 Plan，不会跳过 Plan 确认或自动执行。`
       : '- 当前计划没有登记后续批次。',
   ].join('\n');
 }
@@ -2917,11 +3158,31 @@ function acceptedReviewContent(review: SessionReviewContext): string {
   if (!review.continuations.length) {
     lines.push('- 当前计划没有登记后续批次。');
   } else {
-    lines.push(`- 当前计划登记了 ${review.continuations.length} 个后续意图。Review 通过只记录这些意图，不会自动生成或执行下一批。`);
+    lines.push(`- 当前计划登记了 ${review.continuations.length} 个后续意图。Review 通过会按 agent.reviewContinuationMode 设置决定是否生成下一批 Plan；即使自动生成，也不会跳过下一批 Plan 确认。`);
     for (const continuation of review.continuations.slice(0, 6)) lines.push(`- ${continuationSummary(continuation)}`);
   }
-  lines.push('', '### 决策边界', '- Review 通过只关闭当前批次，并等待用户下一步输入。', '- 如果需要继续后续批次，请在输入框明确描述下一步；系统会重新组装上下文并生成新的 Plan。');
+  lines.push('', '### 决策边界', '- Review 通过只关闭当前批次。', '- 后续批次只能重新生成 Plan，等待用户确认后才会执行。');
   return lines.join('\n');
+}
+
+function reviewContinuationRequest(review: SessionReviewContext): string {
+  const continuations = review.continuations.map(continuationSummary).filter(Boolean);
+  return [
+    '根据当前批次 Review 已通过的事实，继续规划下一批可审查 Plan。',
+    '这是一轮 Review accept 后的 continuation planning，不是已授权执行。',
+    '上一批 Plan 和 continuation expectations 只是 intentContext；只有 Kernel facts、ToolCompleted(ok=true)、WorkUnitCompleted 或 ResourcePacket 才能作为已生成文件事实。',
+    review.content ? `上一批 Review 卡内容：\n${review.content}` : '',
+    review.facts.length ? `上一批 Kernel facts：\n${review.facts.join('\n')}` : '上一批 Kernel facts：当前 Review 没有登记可复用事实。',
+    review.userPlan ? `上一批 Plan intent：\n${review.userPlan}` : '',
+    continuations.length ? `后续批次意图：\n${continuations.map((item) => `- ${item}`).join('\n')}` : '后续批次意图：当前没有登记后续批次。',
+    [
+      '下一步要求：',
+      '- 如需基于现有代码继续修改，先用 resourceRequest 读取相关文件事实。',
+      '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
+      '- 每个 workspace.write action 必须引用本轮 codeBlocks 的 sourceBlockId。',
+      '- 新 Plan 必须等待用户确认，不要假定已经执行。',
+    ].join('\n'),
+  ].filter(Boolean).join('\n\n');
 }
 
 function reviewRevisionRequest(review: SessionReviewContext, guidance?: string): string {
@@ -2948,6 +3209,31 @@ function reviewRevisionRequest(review: SessionReviewContext, guidance?: string):
 function continuationSummary(value: unknown): string {
   const record = objectRecord(value);
   return stringValue(record?.title) ?? stringValue(record?.description) ?? stringValue(record?.id) ?? clipJson(value, 160);
+}
+
+function continuationDecisionPromptEvent(sessionId: string, review: SessionReviewContext, ts: string, id: string): AgentEvent {
+  const continuations = review.continuations.map(continuationSummary).filter(Boolean);
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'assistant_msg',
+    payload: {
+      title: '后续批次确认',
+      content: [
+        '## 后续批次确认',
+        '',
+        '当前批次 Review 已通过，计划中登记了后续意图。当前设置要求先询问用户是否继续生成下一批 Plan。',
+        '',
+        continuations.length ? continuations.map((item) => `- ${item}`).join('\n') : '- 当前没有可展示的后续意图。',
+        '',
+        '如需继续，请在输入框描述下一步；系统会重新组装 Kernel facts 并生成新的 Plan，仍不会自动执行。',
+      ].join('\n'),
+      channel: 'progress',
+      visibility: 'conversation',
+      presentation: 'body',
+    },
+  };
 }
 
 function traceEvent(
@@ -3353,7 +3639,7 @@ function planReviewRepairMessages(
         'Kernel PlanReview report:',
         fenced(JSON.stringify(report, null, 2)),
         'Repair requirement:',
-        fenced('For side-effect actions, include a detailed Markdown userPlan with Summary, Key Changes, Interfaces, Test Plan, and Assumptions sections. Include non-empty actionBundle.validationExpectations and actionBundle.reviewExpectations. Each validation expectation must describe evidence Kernel or the user can inspect after execution.'),
+        fenced('For side-effect actions, include a detailed structured Markdown userPlan. It must cover summary, changes, interfaces or affected surfaces, validation or test plan, and assumptions or constraints; headings may be localized to the user language. Include non-empty actionBundle.validationExpectations and actionBundle.reviewExpectations. Each validation expectation must describe evidence Kernel or the user can inspect after execution.'),
       ].join('\n\n'),
     },
   ];
@@ -3650,25 +3936,31 @@ function planInitialUserRequest(plan: SessionPlanContext): string {
 function cacheTelemetryEvent(
   sessionId: string,
   profileId: string | undefined,
+  state: SessionDriverLoopRunState,
   stage: string,
   result: LlmChatResult,
   ts: string,
   id: string
 ): AgentEvent | null {
   const usage = objectRecord(result.usage);
-  const promptCacheHitTokens = numberValue(usage?.prompt_cache_hit_tokens);
-  const promptCacheMissTokens = numberValue(usage?.prompt_cache_miss_tokens);
-  const cachedTokens = numberValue(usage?.cached_tokens);
-  const promptTokens = numberValue(usage?.prompt_tokens);
-  const completionTokens = numberValue(usage?.completion_tokens);
-  const totalTokens = numberValue(usage?.total_tokens);
+  const normalized = normalizeProviderUsage(usage);
+  const promptSegmentDigests = state.contextAssembly?.segments.map((segment) => ({
+    id: segment.id,
+    name: segment.name,
+    cacheClass: segment.cacheClass,
+    stablePrefix: segment.stablePrefix,
+    auditOnly: segment.auditOnly,
+    contentHash: segment.contentHash,
+    charLength: segment.charLength,
+  })) ?? [];
   if (
-    promptCacheHitTokens === undefined &&
-    promptCacheMissTokens === undefined &&
-    cachedTokens === undefined &&
-    promptTokens === undefined &&
-    completionTokens === undefined &&
-    totalTokens === undefined
+    normalized.promptCacheHitTokens === undefined &&
+    normalized.promptCacheMissTokens === undefined &&
+    normalized.cachedTokens === undefined &&
+    normalized.promptTokens === undefined &&
+    normalized.completionTokens === undefined &&
+    normalized.totalTokens === undefined &&
+    promptSegmentDigests.length === 0
   ) {
     return null;
   }
@@ -3679,17 +3971,61 @@ function cacheTelemetryEvent(
     ts,
     kind: 'cache_telemetry',
     payload: {
-      provider: profileId ?? 'unknown',
+      provider: profileId ?? state.contextAssembly?.provider ?? 'unknown',
+      providerProfileId: profileId,
+      model: state.contextAssembly?.model,
       stage,
-      promptCacheHitTokens,
-      promptCacheMissTokens,
-      cachedTokens,
-      promptTokens,
-      completionTokens,
-      totalTokens,
+      promptCacheHitTokens: normalized.promptCacheHitTokens,
+      promptCacheMissTokens: normalized.promptCacheMissTokens,
+      cachedTokens: normalized.cachedTokens,
+      promptTokens: normalized.promptTokens,
+      completionTokens: normalized.completionTokens,
+      totalTokens: normalized.totalTokens,
+      normalizedUsage: normalized,
+      rawUsage: usage,
+      promptSegmentDigests,
+      stablePrefixHash: state.contextAssembly?.stablePrefixHash,
+      dynamicSuffixHash: state.contextAssembly?.dynamicSuffixHash,
+      cacheHash: state.contextAssembly?.cacheHash,
       cacheAffectsCorrectness: false,
     },
   };
+}
+
+function normalizeProviderUsage(usage: Record<string, unknown> | undefined): Record<string, number | undefined> {
+  const promptTokens = numberValue(usage?.prompt_tokens) ?? numberValue(usage?.input_tokens);
+  const completionTokens = numberValue(usage?.completion_tokens) ?? numberValue(usage?.output_tokens);
+  const totalTokens = numberValue(usage?.total_tokens)
+    ?? (promptTokens !== undefined && completionTokens !== undefined ? promptTokens + completionTokens : undefined);
+  const cachedTokens = numberValue(usage?.cached_tokens)
+    ?? numberAtPath(usage, ['prompt_tokens_details', 'cached_tokens'])
+    ?? numberAtPath(usage, ['input_tokens_details', 'cached_tokens']);
+  const promptCacheHitTokens = numberValue(usage?.prompt_cache_hit_tokens)
+    ?? numberValue(usage?.cache_read_input_tokens)
+    ?? cachedTokens;
+  const promptCacheMissTokens = numberValue(usage?.prompt_cache_miss_tokens)
+    ?? numberValue(usage?.cache_creation_input_tokens)
+    ?? (promptTokens !== undefined && promptCacheHitTokens !== undefined
+      ? Math.max(0, promptTokens - promptCacheHitTokens)
+      : undefined);
+  return {
+    promptCacheHitTokens,
+    promptCacheMissTokens,
+    cachedTokens,
+    promptTokens,
+    completionTokens,
+    totalTokens,
+  };
+}
+
+function numberAtPath(value: unknown, path: string[]): number | undefined {
+  let current: unknown = value;
+  for (const key of path) {
+    const record = objectRecord(current);
+    if (!record) return undefined;
+    current = record[key];
+  }
+  return numberValue(current);
 }
 
 function numberValue(value: unknown): number | undefined {

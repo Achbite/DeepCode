@@ -36,7 +36,6 @@ import {
   llmChat,
   patchAgentWorkflowConfig,
   renameAgentSession,
-  resolveAgentPermission,
 } from '../services/runtimeAdapter';
 import { getKernelHttpOrigin } from '../services/hostTarget';
 import { useSettingsStore } from './settingsStore';
@@ -152,6 +151,10 @@ function settingRequirementConfirmationMode(value: unknown): 'auto' | 'always' |
   return value === 'always' || value === 'off' ? value : 'auto';
 }
 
+function settingReviewContinuationMode(value: unknown): 'auto' | 'ask' | 'off' {
+  return value === 'ask' || value === 'off' ? value : 'auto';
+}
+
 function createLocalEvent(
   sessionId: string,
   kind: AgentEvent['kind'],
@@ -207,6 +210,11 @@ function createSessionDriver(): SessionDriverLoop {
       return result.data;
     },
   });
+}
+
+function permissionRequestRunId(request: PermissionRequest): string | undefined {
+  const record = request as unknown as Record<string, unknown>;
+  return typeof record.runId === 'string' ? record.runId : undefined;
 }
 
 function isEmptyAgentSession(session: AgentSession | null | undefined): boolean {
@@ -695,6 +703,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         requirementConfirmationMode: settingRequirementConfirmationMode(
           useSettingsStore.getState().effectiveSettings['agent.requirementConfirmationMode']
         ),
+        reviewContinuationMode: settingReviewContinuationMode(
+          useSettingsStore.getState().effectiveSettings['agent.reviewContinuationMode']
+        ),
       });
       refreshWorkspaceTreeForToolFacts(data.events);
       pollingStopped = true;
@@ -842,26 +853,29 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }, 300);
     void refreshProgress();
     try {
-      const result = await resolveAgentPermission(pending.request.id, { decision: 'accept' });
+      const driver = createSessionDriver();
+      const data = await driver.resolveDecision({
+        sessionId: session.id,
+        kind: 'permission',
+        decision: 'accept',
+        runId: permissionRequestRunId(pending.request),
+        targetId: pending.request.id,
+        existingEvents: get().events,
+        workspaceBinding: currentWorkspaceBinding(),
+        workflow: get().workflow,
+        profileId: get().profileId,
+      });
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      if (result.ok && result.data) {
-        refreshWorkspaceTreeForToolFacts(result.data.events);
-        set((state) => ({
-          session: result.data!.session,
-          events: result.data!.events,
-          pendingPermission: findLatestPendingPermission(result.data!.events),
-          resolvingPermission: null,
-          runningSessionIds: removeRunningSessionId(state.runningSessionIds, result.data!.session.id),
-        }));
-        void get().refreshTraceEvents(result.data.session.id);
-      } else {
-        set((state) => ({
-          errorMessage: result.message ?? 'Permission resolve failed',
-          resolvingPermission: null,
-          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-        }));
-      }
+      refreshWorkspaceTreeForToolFacts(data.events);
+      set((state) => ({
+        session: data.session,
+        events: data.events,
+        pendingPermission: findLatestPendingPermission(data.events),
+        resolvingPermission: null,
+        runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
+      }));
+      void get().refreshTraceEvents(data.session.id);
     } catch (err) {
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
@@ -905,26 +919,29 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }, 300);
     void refreshProgress();
     try {
-      const result = await resolveAgentPermission(pending.request.id, { decision: 'reject' });
+      const driver = createSessionDriver();
+      const data = await driver.resolveDecision({
+        sessionId: session.id,
+        kind: 'permission',
+        decision: 'reject',
+        runId: permissionRequestRunId(pending.request),
+        targetId: pending.request.id,
+        existingEvents: get().events,
+        workspaceBinding: currentWorkspaceBinding(),
+        workflow: get().workflow,
+        profileId: get().profileId,
+      });
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
-      if (result.ok && result.data) {
-        refreshWorkspaceTreeForToolFacts(result.data.events);
-        set((state) => ({
-          session: result.data!.session,
-          events: result.data!.events,
-          pendingPermission: findLatestPendingPermission(result.data!.events),
-          resolvingPermission: null,
-          runningSessionIds: removeRunningSessionId(state.runningSessionIds, result.data!.session.id),
-        }));
-        void get().refreshTraceEvents(result.data.session.id);
-      } else {
-        set((state) => ({
-          errorMessage: result.message ?? 'Permission resolve failed',
-          resolvingPermission: null,
-          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-        }));
-      }
+      refreshWorkspaceTreeForToolFacts(data.events);
+      set((state) => ({
+        session: data.session,
+        events: data.events,
+        pendingPermission: findLatestPendingPermission(data.events),
+        resolvingPermission: null,
+        runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
+      }));
+      void get().refreshTraceEvents(data.session.id);
     } catch (err) {
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
@@ -1123,6 +1140,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         workspaceBinding: currentWorkspaceBinding(),
         workflow: get().workflow,
         profileId: get().profileId,
+        reviewContinuationMode: settingReviewContinuationMode(
+          useSettingsStore.getState().effectiveSettings['agent.reviewContinuationMode']
+        ),
       });
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);

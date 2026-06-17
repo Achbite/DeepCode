@@ -549,6 +549,8 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                     "planId": report.get("planId").and_then(Value::as_str).unwrap_or("agent-plan"),
                     "proposalId": proposal_id,
                     "confirmable": confirmable,
+                    "requiredPermissions": report.get("requiredPermissions").cloned().unwrap_or_else(|| json!([])),
+                    "permissionGaps": report.get("permissionGaps").cloned().unwrap_or_else(|| json!([])),
                     "report": report,
                     "facts": plan_review_facts(report),
                     "channel": "progress",

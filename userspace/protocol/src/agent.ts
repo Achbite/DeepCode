@@ -357,6 +357,7 @@ export type AgentEventKind =
   | 'workflow_decision'
   | 'trace/requirement_decision_noop'
   | 'trace/plan_accept_noop'
+  | 'trace/permission_accept_noop'
   | 'trace/review_accept_noop'
   | 'error';
 
