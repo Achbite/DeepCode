@@ -259,6 +259,7 @@ function assertPromptEnvelope(): void {
     displayPath: 'generic',
     absolutePath: '/tmp/generic',
     source: 'currentAttachment' as const,
+    primary: true,
   }];
   const resourcePromptContext = buildResourcePromptContext({
     initialContext,
@@ -284,6 +285,9 @@ function assertPromptEnvelope(): void {
   assert(prompt.stablePrefix.includes('deepcode.agent.protocol.v3'), 'prompt enforces v3');
   assert(prompt.dynamicSuffix.includes('manifestEntry id=attachment-0-generic-file'), 'prompt exposes manifest entry ids');
   assert(prompt.dynamicSuffix.includes('Conversation roots'), 'prompt exposes conversation roots');
+  assert(prompt.dynamicSuffix.includes('primary=true'), 'prompt marks the primary conversation root');
+  assert(prompt.dynamicSuffix.includes('Primary conversation workspace root'), 'prompt exposes the primary workspace root');
+  assert(prompt.dynamicSuffix.includes('targetPath/codeBlocks targetPath must be relative to the primary root'), 'prompt tells the model to avoid root-prefixed write paths');
   assert(prompt.stablePrefix.includes('"path":"relative/path.ext"'), 'prompt documents path-based resourceRequest');
   assert(prompt.stablePrefix.includes('optional top-level narration'), 'prompt documents model-generated narration');
   assert(prompt.stablePrefix.includes('Implementation batch budget'), 'prompt documents incremental implementation budget');

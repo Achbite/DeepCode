@@ -153,7 +153,7 @@ impl DeepCodeKernelRuntime {
                 continue;
             }
 
-            let compiled = match compile_operation(self, &record, operation) {
+            let mut compiled = match compile_operation(self, &record, operation) {
                 Ok(compiled) => compiled,
                 Err(error) => {
                     events.push(self.work_unit_failed_event(
@@ -166,6 +166,13 @@ impl DeepCodeKernelRuntime {
                     continue;
                 }
             };
+            attach_kernel_context_to_arguments(
+                &mut compiled.arguments,
+                &plan_id,
+                &work_unit_id,
+                &action_id,
+                kind,
+            );
 
             if let Some(root) = compiled.workspace_root.as_ref() {
                 let mut workspace_events = self.workspace_open(
@@ -507,6 +514,15 @@ struct CompiledWorkspaceAction {
     tool_name: String,
     arguments: Value,
     workspace_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedWorkspacePath {
+    relative_path: String,
+    workspace_root: Option<PathBuf>,
+    stripped_prefixes: Vec<String>,
+    duplicate_root_path_detected: bool,
+    original_path: String,
 }
 
 fn operation_kind_name(operation: &PlannedOperation) -> &'static str {
@@ -906,8 +922,8 @@ fn git_relative_path(
     if raw_path.trim() == "." {
         return Ok(".".to_string());
     }
-    let (relative_path, _) = workspace_relative_write_path(runtime, record, raw_path)?;
-    Ok(relative_path)
+    let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
+    Ok(normalized.relative_path)
 }
 
 fn workspace_write_from_action(
@@ -960,15 +976,16 @@ fn workspace_write_from_action(
         .ok_or_else(|| {
             KernelError::InvalidCommand(format!("codeBlock {source_block_id} has no write path"))
         })?;
-    let (relative_path, workspace_root) = workspace_relative_write_path(runtime, record, raw_path)?;
+    let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
     Ok(CompiledWorkspaceAction {
         tool_name: "fs.write".to_string(),
         arguments: serde_json::json!({
-            "path": relative_path,
+            "path": normalized.relative_path,
             "content": content,
-            "create": true
+            "create": true,
+            "pathNormalization": path_normalization_json(&normalized)
         }),
-        workspace_root,
+        workspace_root: normalized.workspace_root,
     })
 }
 
@@ -1031,15 +1048,16 @@ fn workspace_patch_from_action(
     let patch_spec = action.get("patchSpec").cloned().ok_or_else(|| {
         KernelError::InvalidCommand("workspace.patch action requires patchSpec".to_string())
     })?;
-    let (relative_path, workspace_root) = workspace_relative_write_path(runtime, record, raw_path)?;
+    let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
     Ok(CompiledWorkspaceAction {
         tool_name: "fs.patch".to_string(),
         arguments: serde_json::json!({
-            "path": relative_path,
+            "path": normalized.relative_path,
             "patchSpec": patch_spec,
-            "replacement": replacement
+            "replacement": replacement,
+            "pathNormalization": path_normalization_json(&normalized)
         }),
-        workspace_root,
+        workspace_root: normalized.workspace_root,
     })
 }
 
@@ -1077,11 +1095,14 @@ fn workspace_path_tool_action(
                 .filter(|value| !value.trim().is_empty())
         })
         .unwrap_or(".");
-    let (relative_path, workspace_root) = workspace_relative_write_path(runtime, record, raw_path)?;
+    let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
     Ok(CompiledWorkspaceAction {
         tool_name: tool_name.to_string(),
-        arguments: serde_json::json!({ "path": relative_path }),
-        workspace_root,
+        arguments: serde_json::json!({
+            "path": normalized.relative_path,
+            "pathNormalization": path_normalization_json(&normalized)
+        }),
+        workspace_root: normalized.workspace_root,
     })
 }
 
@@ -1113,24 +1134,36 @@ fn workspace_relative_write_path(
     runtime: &DeepCodeKernelRuntime,
     record: &RuntimeRunRecord,
     raw_path: &str,
-) -> KernelResult<(String, Option<PathBuf>)> {
+) -> KernelResult<NormalizedWorkspacePath> {
     let raw_path = raw_path.trim();
     let path = Path::new(raw_path);
     if !path.is_absolute() {
-        if let Some((root, relative_path)) =
+        if let Some((root, normalized)) =
             single_directory_attachment_write_target(record, raw_path)?
         {
-            return Ok((relative_path, Some(root)));
+            return Ok(NormalizedWorkspacePath {
+                workspace_root: Some(root),
+                ..normalized
+            });
         }
         if runtime.state.current_workspace.is_none() {
             if let Some(open_path) = record.workspace_binding.open_path.as_ref() {
-                return Ok((
-                    normalize_write_relative_path(raw_path)?,
-                    Some(PathBuf::from(open_path)),
-                ));
+                return Ok(NormalizedWorkspacePath {
+                    relative_path: normalize_write_relative_path(raw_path)?,
+                    workspace_root: Some(PathBuf::from(open_path)),
+                    stripped_prefixes: Vec::new(),
+                    duplicate_root_path_detected: false,
+                    original_path: raw_path.to_string(),
+                });
             }
         }
-        return Ok((normalize_write_relative_path(raw_path)?, None));
+        return Ok(NormalizedWorkspacePath {
+            relative_path: normalize_write_relative_path(raw_path)?,
+            workspace_root: None,
+            stripped_prefixes: Vec::new(),
+            duplicate_root_path_detected: false,
+            original_path: raw_path.to_string(),
+        });
     }
 
     let target = path.components().collect::<PathBuf>();
@@ -1141,7 +1174,13 @@ fn workspace_relative_write_path(
         .map(|workspace| workspace.root.clone())
     {
         if let Some(relative) = strip_root(&target, &root) {
-            return Ok((relative, None));
+            return Ok(NormalizedWorkspacePath {
+                relative_path: relative,
+                workspace_root: None,
+                stripped_prefixes: vec![root.to_string_lossy().to_string()],
+                duplicate_root_path_detected: false,
+                original_path: raw_path.to_string(),
+            });
         }
     }
     if let Some(open_path) = record.workspace_binding.open_path.as_ref() {
@@ -1149,11 +1188,23 @@ fn workspace_relative_write_path(
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(open_path));
         if let Some(relative) = strip_root(&target, &root) {
-            return Ok((relative, Some(root)));
+            return Ok(NormalizedWorkspacePath {
+                relative_path: relative,
+                workspace_root: Some(root.clone()),
+                stripped_prefixes: vec![root.to_string_lossy().to_string()],
+                duplicate_root_path_detected: false,
+                original_path: raw_path.to_string(),
+            });
         }
     }
     if let Some((root, relative)) = attachment_root_for_target(record, &target)? {
-        return Ok((relative, Some(root)));
+        return Ok(NormalizedWorkspacePath {
+            relative_path: relative,
+            workspace_root: Some(root.clone()),
+            stripped_prefixes: vec![root.to_string_lossy().to_string()],
+            duplicate_root_path_detected: false,
+            original_path: raw_path.to_string(),
+        });
     }
     Err(KernelError::PermissionDenied(format!(
         "workspace.write target is outside workspace binding and explicit attachments: {raw_path}"
@@ -1210,28 +1261,26 @@ fn attachment_root_for_target(
 fn single_directory_attachment_write_target(
     record: &RuntimeRunRecord,
     raw_path: &str,
-) -> KernelResult<Option<(PathBuf, String)>> {
+) -> KernelResult<Option<(PathBuf, NormalizedWorkspacePath)>> {
     let mut roots = Vec::new();
-    for attachment in record
+    for (index, attachment) in record
         .attachments
         .iter()
-        .filter(|attachment| attachment.get("kind").and_then(Value::as_str) == Some("directory"))
+        .enumerate()
+        .filter(|(_, attachment)| {
+            attachment.get("kind").and_then(Value::as_str) == Some("directory")
+        })
     {
         let Some(root) = explicit_attachment_root(attachment) else {
             continue;
         };
-        let display_path = attachment
-            .get("path")
-            .and_then(Value::as_str)
-            .map(normalize_write_relative_path)
-            .transpose()?;
-        roots.push((root, display_path));
+        roots.push((root, attachment_prefix_candidates(attachment, index)?));
     }
     if roots.len() == 1 {
-        let (root, display_path) = roots.into_iter().next().expect("single root");
+        let (root, prefixes) = roots.into_iter().next().expect("single root");
         return Ok(Some((
             root,
-            normalize_attachment_relative_write_path(raw_path, display_path.as_deref())?,
+            normalize_attachment_relative_write_path(raw_path, &prefixes)?,
         )));
     }
     if roots.is_empty() {
@@ -1246,21 +1295,148 @@ fn single_directory_attachment_write_target(
 
 fn normalize_attachment_relative_write_path(
     raw_path: &str,
-    display_path: Option<&str>,
-) -> KernelResult<String> {
-    let normalized = normalize_write_relative_path(raw_path)?;
-    if let Some(display_path) = display_path.filter(|value| !value.trim().is_empty()) {
-        if normalized == display_path {
-            return Err(KernelError::InvalidCommand(
-                "workspace.write target resolves to an attachment directory, not a file"
-                    .to_string(),
-            ));
+    prefixes: &[String],
+) -> KernelResult<NormalizedWorkspacePath> {
+    let mut normalized = normalize_write_relative_path(raw_path)?;
+    let mut stripped_prefixes = Vec::new();
+    for _ in 0..4 {
+        let mut changed = false;
+        for prefix in prefixes {
+            if prefix.trim().is_empty() {
+                continue;
+            }
+            if normalized == *prefix {
+                stripped_prefixes.push(prefix.clone());
+                return Err(KernelError::InvalidCommand(
+                    "workspace.write target resolves to an attachment directory, not a file"
+                        .to_string(),
+                ));
+            }
+            if let Some(relative) = normalized.strip_prefix(&format!("{prefix}/")) {
+                stripped_prefixes.push(prefix.clone());
+                normalized = normalize_write_relative_path(relative)?;
+                changed = true;
+                break;
+            }
         }
-        if let Some(relative) = normalized.strip_prefix(&format!("{display_path}/")) {
-            return normalize_write_relative_path(relative);
+        if !changed {
+            break;
         }
     }
-    Ok(normalized)
+    if normalized.is_empty() || normalized == "." {
+        return Err(KernelError::InvalidCommand(
+            "workspace.write target resolves to an attachment directory, not a file".to_string(),
+        ));
+    }
+    Ok(NormalizedWorkspacePath {
+        relative_path: normalized,
+        workspace_root: None,
+        duplicate_root_path_detected: stripped_prefixes.len() > 1,
+        stripped_prefixes,
+        original_path: raw_path.to_string(),
+    })
+}
+
+fn attachment_prefix_candidates(attachment: &Value, index: usize) -> KernelResult<Vec<String>> {
+    let mut prefixes = Vec::new();
+    if let Some(root_id) = attachment.get("rootId").and_then(Value::as_str) {
+        push_normalized_prefix(&mut prefixes, root_id)?;
+    }
+    if let Some(path) = attachment.get("path").and_then(Value::as_str) {
+        push_normalized_prefix(&mut prefixes, path)?;
+        if let Some(base) = path_basename(path) {
+            push_normalized_prefix(&mut prefixes, &base)?;
+        }
+        push_normalized_prefix(
+            &mut prefixes,
+            &manifest_like_attachment_id(index, path, "attachment"),
+        )?;
+        push_normalized_prefix(
+            &mut prefixes,
+            &manifest_like_attachment_id(index, path, "recent-attachment"),
+        )?;
+    }
+    if let Some(absolute_path) = attachment.get("absolutePath").and_then(Value::as_str) {
+        if let Ok(normalized) = normalize_write_relative_path(absolute_path) {
+            push_normalized_prefix(&mut prefixes, &normalized)?;
+        }
+        if let Some(base) = path_basename(absolute_path) {
+            push_normalized_prefix(&mut prefixes, &base)?;
+        }
+    }
+    Ok(prefixes)
+}
+
+fn push_normalized_prefix(prefixes: &mut Vec<String>, value: &str) -> KernelResult<()> {
+    let normalized = normalize_write_relative_path(value)?;
+    if normalized == "." || prefixes.iter().any(|item| item == &normalized) {
+        return Ok(());
+    }
+    prefixes.push(normalized);
+    Ok(())
+}
+
+fn manifest_like_attachment_id(index: usize, path: &str, prefix: &str) -> String {
+    let base = path
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(96)
+        .collect::<String>();
+    format!(
+        "{prefix}-{index}-{}",
+        if base.is_empty() { "resource" } else { &base }
+    )
+}
+
+fn path_basename(path: &str) -> Option<String> {
+    let normalized = path
+        .trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    normalized
+        .split('/')
+        .next_back()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn path_normalization_json(path: &NormalizedWorkspacePath) -> Value {
+    serde_json::json!({
+        "originalPath": path.original_path,
+        "normalizedTargetPath": path.relative_path,
+        "strippedPathPrefixes": path.stripped_prefixes,
+        "duplicateRootPathDetected": path.duplicate_root_path_detected
+    })
+}
+
+fn attach_kernel_context_to_arguments(
+    arguments: &mut Value,
+    plan_id: &str,
+    work_unit_id: &str,
+    action_id: &str,
+    operation_kind: &str,
+) {
+    if let Some(object) = arguments.as_object_mut() {
+        object.insert(
+            "kernelContext".to_string(),
+            serde_json::json!({
+                "planId": plan_id,
+                "workUnitId": work_unit_id,
+                "actionId": action_id,
+                "operationKind": operation_kind
+            }),
+        );
+    }
 }
 
 fn normalize_write_relative_path(raw_path: &str) -> KernelResult<String> {

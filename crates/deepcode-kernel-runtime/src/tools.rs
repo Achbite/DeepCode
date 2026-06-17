@@ -153,6 +153,14 @@ impl DeepCodeKernelRuntime {
             .execute_kernel_tool(run_id, &tool_name, &arguments)
             .and_then(|mut output| {
                 self.attach_workspace_tool_diagnostics(&tool_name, &arguments, &mut output)?;
+                attach_agent_generated_artifact_metadata(
+                    run_id,
+                    session_id,
+                    &tool_call_id,
+                    &tool_name,
+                    &arguments,
+                    &mut output,
+                );
                 self.record_kernel_resource_effects(
                     run_id, session_id, &tool_name, &arguments, &output,
                 )?;
@@ -1041,6 +1049,94 @@ impl DeepCodeKernelRuntime {
             error: None,
             sequence: Some(sequence),
         }])
+    }
+}
+
+fn attach_agent_generated_artifact_metadata(
+    run_id: &str,
+    session_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+    output: &mut Value,
+) {
+    if !matches!(
+        tool_name,
+        "fs.write" | "fs.patch" | "fs.rename" | "fs.delete"
+    ) {
+        return;
+    }
+    let Some(object) = output.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "artifactOrigin".to_string(),
+        Value::String("agentGenerated".to_string()),
+    );
+    object.insert("runId".to_string(), Value::String(run_id.to_string()));
+    object.insert(
+        "sessionId".to_string(),
+        Value::String(session_id.to_string()),
+    );
+    object.insert(
+        "toolCallId".to_string(),
+        Value::String(tool_call_id.to_string()),
+    );
+    if let Some(context) = arguments.get("kernelContext") {
+        object.insert("kernelContext".to_string(), context.clone());
+        if let Some(plan_id) = context.get("planId").and_then(Value::as_str) {
+            object.insert("planId".to_string(), Value::String(plan_id.to_string()));
+        }
+        if let Some(work_unit_id) = context.get("workUnitId").and_then(Value::as_str) {
+            object.insert(
+                "workUnitId".to_string(),
+                Value::String(work_unit_id.to_string()),
+            );
+        }
+        if let Some(action_id) = context.get("actionId").and_then(Value::as_str) {
+            object.insert("actionId".to_string(), Value::String(action_id.to_string()));
+        }
+        if let Some(operation_kind) = context.get("operationKind").and_then(Value::as_str) {
+            object.insert(
+                "operation".to_string(),
+                Value::String(operation_kind.to_string()),
+            );
+        }
+    }
+    if let Some(path_normalization) = arguments.get("pathNormalization") {
+        object.insert("pathNormalization".to_string(), path_normalization.clone());
+        if let Some(normalized) = path_normalization
+            .get("normalizedTargetPath")
+            .and_then(Value::as_str)
+        {
+            object.insert(
+                "normalizedTargetPath".to_string(),
+                Value::String(normalized.to_string()),
+            );
+        }
+        if let Some(duplicate) = path_normalization
+            .get("duplicateRootPathDetected")
+            .and_then(Value::as_bool)
+        {
+            object.insert(
+                "duplicateRootPathDetected".to_string(),
+                Value::Bool(duplicate),
+            );
+        }
+    }
+    if tool_name == "fs.write" {
+        let validation = object.get("validation").and_then(Value::as_object).cloned();
+        if let Some(validation) = validation {
+            if let Some(hash) = validation.get("contentHash").and_then(Value::as_str) {
+                object.insert("contentHash".to_string(), Value::String(hash.to_string()));
+            }
+            if let Some(bytes) = validation.get("contentBytes").and_then(Value::as_u64) {
+                object.insert(
+                    "contentBytes".to_string(),
+                    Value::Number(serde_json::Number::from(bytes)),
+                );
+            }
+        }
     }
 }
 

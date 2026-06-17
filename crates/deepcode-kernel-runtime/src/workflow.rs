@@ -1278,6 +1278,8 @@ fn ledger_review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> Kernel
     let mut tool_results = Vec::new();
     let mut written_files = Vec::new();
     let mut patch_changed_ranges = Vec::new();
+    let mut generated_artifacts = Vec::new();
+    let mut path_normalization_diagnostics = Vec::new();
 
     for event in &events {
         match event.kind.as_str() {
@@ -1298,6 +1300,34 @@ fn ledger_review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> Kernel
             "tool.completed" => {
                 let summary = review_ledger_event_summary(event);
                 let tool_name = summary.get("toolName").and_then(Value::as_str);
+                let output = summary.get("output");
+                if let Some(output) = output {
+                    if output.get("artifactOrigin").and_then(Value::as_str)
+                        == Some("agentGenerated")
+                    {
+                        generated_artifacts.push(serde_json::json!({
+                            "toolName": tool_name,
+                            "toolCallId": summary.get("toolCallId").cloned().unwrap_or(Value::Null),
+                            "path": output.get("path").cloned().unwrap_or(Value::Null),
+                            "absolutePath": output.get("absolutePath").cloned().unwrap_or(Value::Null),
+                            "operation": output.get("operation").cloned().unwrap_or(Value::Null),
+                            "planId": output.get("planId").cloned().unwrap_or(Value::Null),
+                            "workUnitId": output.get("workUnitId").cloned().unwrap_or(Value::Null),
+                            "contentHash": output.get("contentHash").cloned().unwrap_or(Value::Null),
+                            "artifactOrigin": "agentGenerated"
+                        }));
+                    }
+                    if let Some(path_normalization) = output.get("pathNormalization") {
+                        path_normalization_diagnostics.push(serde_json::json!({
+                            "toolName": tool_name,
+                            "toolCallId": summary.get("toolCallId").cloned().unwrap_or(Value::Null),
+                            "path": output.get("path").cloned().unwrap_or(Value::Null),
+                            "absolutePath": output.get("absolutePath").cloned().unwrap_or(Value::Null),
+                            "pathNormalization": path_normalization,
+                            "duplicateRootPathDetected": output.get("duplicateRootPathDetected").cloned().unwrap_or(Value::Bool(false))
+                        }));
+                    }
+                }
                 if matches!(tool_name, Some("fs.write" | "fs.patch")) {
                     if let Some(path) = summary
                         .get("output")
@@ -1306,6 +1336,10 @@ fn ledger_review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> Kernel
                     {
                         written_files.push(serde_json::json!({
                             "path": path,
+                            "absolutePath": summary.get("output").and_then(|output| output.get("absolutePath")).cloned().unwrap_or(Value::Null),
+                            "contentHash": summary.get("output").and_then(|output| output.get("contentHash")).cloned().unwrap_or(Value::Null),
+                            "artifactOrigin": summary.get("output").and_then(|output| output.get("artifactOrigin")).cloned().unwrap_or(Value::Null),
+                            "pathNormalization": summary.get("output").and_then(|output| output.get("pathNormalization")).cloned().unwrap_or(Value::Null),
                             "toolCallId": summary.get("toolCallId").cloned().unwrap_or(Value::Null)
                         }));
                     }
@@ -1337,7 +1371,9 @@ fn ledger_review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> Kernel
         "blockedWorkUnits": blocked_work_units,
         "toolResults": tool_results,
         "writtenFiles": written_files,
-        "patchChangedRanges": patch_changed_ranges
+        "patchChangedRanges": patch_changed_ranges,
+        "generatedArtifacts": generated_artifacts,
+        "pathNormalizationDiagnostics": path_normalization_diagnostics
     }))
 }
 

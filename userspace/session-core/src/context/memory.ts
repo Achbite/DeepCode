@@ -188,9 +188,13 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
         const path = stringValue(output?.path) ?? stringValue(output?.absolutePath);
         const validation = objectRecord(output?.validation);
         const validationKind = stringValue(validation?.kind);
-        const text = `ToolCompleted fact: ok=${ok}${path ? ` path=${clip(path, 220)}` : ''}${validationKind ? ` validation=${validationKind}` : ''}`;
+        const origin = stringValue(output?.artifactOrigin);
+        const text = `ToolCompleted fact: ok=${ok}${path ? ` path=${clip(path, 220)}` : ''}${validationKind ? ` validation=${validationKind}` : ''}${origin ? ` artifactOrigin=${origin}` : ''}`;
         factContext.push(text);
         longTermContext.push(text);
+        if (origin === 'agentGenerated' && path) {
+          resourceContext.push(`Agent-generated artifact fact: ${clip(path, 220)}`);
+        }
       }
       if (kind === 'work_unit.completed' || kind === 'work_unit.failed' || kind === 'work_unit.blocked') {
         const workUnitId = stringValue(kernelEvent.workUnitId);

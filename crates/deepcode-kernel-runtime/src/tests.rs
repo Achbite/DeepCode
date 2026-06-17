@@ -770,7 +770,8 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                     "path": "project-root",
                     "absolutePath": attached_root.to_string_lossy(),
                     "source": "userSelected",
-                    "scope": "message"
+                    "scope": "message",
+                    "rootId": "primary-root-generic"
                 })],
             },
             workspace_binding: Some(WorkspaceBinding {
@@ -805,6 +806,26 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         "id": "block-prefixed",
                         "path": "project-root/prefixed.txt",
                         "content": "prefixed path content\n"
+                    },
+                    {
+                        "id": "block-root-id",
+                        "path": "primary-root-generic/root-id.txt",
+                        "content": "root id path content\n"
+                    },
+                    {
+                        "id": "block-manifest-id",
+                        "path": "attachment-0-project-root/manifest-id.txt",
+                        "content": "manifest id path content\n"
+                    },
+                    {
+                        "id": "block-basename",
+                        "path": "project-root/basename.txt",
+                        "content": "basename path content\n"
+                    },
+                    {
+                        "id": "block-repeated",
+                        "path": "project-root/project-root/repeated.txt",
+                        "content": "repeated root path content\n"
                     }
                 ],
                 "actionBundle": {
@@ -826,6 +847,38 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                             "kind": "write",
                             "resourceScope": ["project-root/prefixed.txt"],
                             "sourceBlockId": "block-prefixed"
+                        },
+                        {
+                            "id": "write-root-id",
+                            "title": "Write root id generic file",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["primary-root-generic/root-id.txt"],
+                            "sourceBlockId": "block-root-id"
+                        },
+                        {
+                            "id": "write-manifest-id",
+                            "title": "Write manifest id generic file",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["attachment-0-project-root/manifest-id.txt"],
+                            "sourceBlockId": "block-manifest-id"
+                        },
+                        {
+                            "id": "write-basename",
+                            "title": "Write basename generic file",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["project-root/basename.txt"],
+                            "sourceBlockId": "block-basename"
+                        },
+                        {
+                            "id": "write-repeated",
+                            "title": "Write repeated root generic file",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["project-root/project-root/repeated.txt"],
+                            "sourceBlockId": "block-repeated"
                         }
                     ]
                 }
@@ -853,6 +906,26 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
             .expect("prefixed file written under attached root"),
         "prefixed path content\n"
     );
+    assert_eq!(
+        fs::read_to_string(attached_root.join("root-id.txt"))
+            .expect("root id file written under attached root"),
+        "root id path content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(attached_root.join("manifest-id.txt"))
+            .expect("manifest id file written under attached root"),
+        "manifest id path content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(attached_root.join("basename.txt"))
+            .expect("basename file written under attached root"),
+        "basename path content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(attached_root.join("repeated.txt"))
+            .expect("repeated root file written under attached root"),
+        "repeated root path content\n"
+    );
     assert!(
         !workspace_root.join("generated").join("output.txt").exists(),
         "relative writes with one explicit directory attachment must not fall back to the editor workspace root"
@@ -861,6 +934,35 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
         !attached_root.join("project-root").join("prefixed.txt").exists(),
         "paths prefixed with the attachment display path must be normalized under the attachment root"
     );
+    assert!(
+        !attached_root
+            .join("project-root")
+            .join("project-root")
+            .join("repeated.txt")
+            .exists(),
+        "duplicate root prefixes must not create repeated directory trees"
+    );
+
+    let review = runtime
+        .dispatch(KernelCommand::ReviewFactsGet {
+            request_id: RequestId("req-review-facts".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+        })
+        .expect("review facts succeeds");
+    let facts = review
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ReviewFactsProduced { facts, .. } => Some(facts),
+            _ => None,
+        })
+        .expect("review facts produced");
+    assert_eq!(facts["generatedArtifacts"].as_array().unwrap().len(), 6);
+    assert!(facts["pathNormalizationDiagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["duplicateRootPathDetected"].as_bool() == Some(true)));
 }
 
 #[test]

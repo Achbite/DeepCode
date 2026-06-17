@@ -177,6 +177,7 @@ export class SessionDriverLoop {
         }),
       ]);
 
+    const kernelAttachments = kernelRunAttachments(input);
     const runReply = await this.kernel({
       command: {
         kind: 'runCreate',
@@ -184,7 +185,7 @@ export class SessionDriverLoop {
         sessionId,
         input: {
           text: input.content,
-          attachments: input.attachments ?? [],
+          attachments: kernelAttachments,
         },
         workspaceBinding: input.workspaceBinding,
         profileRef: input.profileId ? { id: input.profileId, kind: 'llm' } : undefined,
@@ -1374,6 +1375,7 @@ function createManifest(input: SessionDriverLoopInput, id: string): ResourceMani
   const conversationRoots: ConversationResourceRoot[] = [];
   const seenEntryRefs = new Set<string>();
   const seenRootRefs = new Set<string>();
+  const primaryRootRef = primaryConversationRootRef(input);
 
   const addAttachment = (
     attachment: AgentContextAttachment,
@@ -1409,6 +1411,7 @@ function createManifest(input: SessionDriverLoopInput, id: string): ResourceMani
         displayPath: attachment.path || resourceRef,
         absolutePath: attachment.absolutePath ?? (isAbsolutePath(resourceRef) ? resourceRef : undefined),
         source,
+        primary: comparablePath(resourceRef) === primaryRootRef,
       });
     }
   };
@@ -1443,6 +1446,7 @@ function createManifest(input: SessionDriverLoopInput, id: string): ResourceMani
         rootId: workingDirectory.rootId || `project-root-${sanitizeId(workingDirectory.displayPath)}`,
         kind: 'directory',
         absolutePath: workingDirectory.absolutePath ?? (isAbsolutePath(resourceRef) ? resourceRef : undefined),
+        primary: comparablePath(resourceRef) === primaryRootRef,
       });
     }
   }
@@ -1459,6 +1463,7 @@ function createManifest(input: SessionDriverLoopInput, id: string): ResourceMani
         displayPath: resourceRef,
         absolutePath: resourceRef,
         source: 'workspaceBinding',
+        primary: comparablePath(resourceRef) === primaryRootRef,
       });
     }
   }
@@ -1483,6 +1488,64 @@ function createManifest(input: SessionDriverLoopInput, id: string): ResourceMani
     },
     conversationRoots,
   };
+}
+
+function kernelRunAttachments(input: SessionDriverLoopInput): AgentContextAttachment[] {
+  const attachments = uniqueAttachments(input.attachments ?? []);
+  if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
+    const workingDirectory = input.projectWorkingDirectory;
+    attachments.push({
+      kind: 'directory',
+      path: workingDirectory.displayPath,
+      absolutePath: workingDirectory.absolutePath,
+      source: 'userSelected',
+      scope: 'session',
+      rootId: workingDirectory.rootId,
+    } as AgentContextAttachment);
+  }
+  const directoryAttachments = attachments.filter((attachment) => attachment.kind === 'directory');
+  if (directoryAttachments.length === 0) {
+    const recentDirectories = uniqueAttachments(recentAttachmentFacts(input.existingEvents ?? []))
+      .filter((attachment) => attachment.kind === 'directory');
+    if (recentDirectories.length === 1) {
+      attachments.push({
+        ...recentDirectories[0],
+        scope: recentDirectories[0].scope ?? 'session',
+      });
+    }
+  }
+  return uniqueAttachments(attachments);
+}
+
+function primaryConversationRootRef(input: SessionDriverLoopInput): string | undefined {
+  const currentDirectories = (input.attachments ?? [])
+    .filter((attachment) => attachment.kind === 'directory')
+    .map((attachment) => attachment.absolutePath ?? attachment.path)
+    .filter((value): value is string => Boolean(value && value.trim()));
+  if (currentDirectories.length === 1) return comparablePath(currentDirectories[0]);
+  if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
+    return comparablePath(input.projectWorkingDirectory.absolutePath ?? input.projectWorkingDirectory.displayPath);
+  }
+  const recentDirectories = recentAttachmentFacts(input.existingEvents ?? [])
+    .filter((attachment) => attachment.kind === 'directory')
+    .map((attachment) => attachment.absolutePath ?? attachment.path)
+    .filter((value): value is string => Boolean(value && value.trim()));
+  const unique = [...new Set(recentDirectories.map(comparablePath))];
+  return unique.length === 1 ? unique[0] : undefined;
+}
+
+function uniqueAttachments(attachments: AgentContextAttachment[]): AgentContextAttachment[] {
+  const output: AgentContextAttachment[] = [];
+  const seen = new Set<string>();
+  for (const attachment of attachments) {
+    const ref = attachment.absolutePath ?? attachment.path;
+    if (!ref) continue;
+    const key = `${attachment.kind}:${comparablePath(ref)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(attachment);
+  }
+  return output;
 }
 
 function manifestEntryId(
@@ -1823,6 +1886,7 @@ function basename(value: string): string {
 }
 
 function rootPriority(root: ConversationResourceRoot): number {
+  if (root.primary) return -1;
   if (root.source === 'currentAttachment') return 0;
   if (root.source === 'sessionAttachment') return 1;
   if (root.source === 'projectWorkingDirectory') return 2;
@@ -2854,7 +2918,7 @@ function reviewSummaryEvent(
     payload: {
       title: 'Review',
       summary,
-      content: waitingReviewContent(plan, facts, summary, completed, failed, blocked, toolResults, continuations, gitReview),
+      content: waitingReviewContent(plan, facts, summary, completed, failed, blocked, toolResults, continuations, gitReview, reviewFacts),
       status: 'waitingUserReview',
       runId: plan.runId,
       reviewId: `${plan.runId}:${plan.planId}`,
@@ -2928,10 +2992,13 @@ function waitingReviewContent(
   blocked: number,
   toolResults: number,
   continuations: unknown[],
-  gitReview?: Record<string, unknown>
+  gitReview?: Record<string, unknown>,
+  reviewFacts?: Record<string, unknown>
 ): string {
   const reviewLines = reviewExpectationLines(plan);
   const gitLines = gitReviewSummaryLines(gitReview);
+  const generatedLines = reviewGeneratedArtifactLines(reviewFacts);
+  const normalizationLines = reviewPathNormalizationLines(reviewFacts);
   return [
     '## Review',
     '',
@@ -2945,6 +3012,12 @@ function waitingReviewContent(
     '',
     '### Kernel facts',
     facts.length ? facts.join('\n') : '- 当前批次没有可展示的 Kernel facts。',
+    '',
+    '### 本轮 Agent 生成产物',
+    generatedLines.length ? generatedLines.join('\n') : '- 当前 ReviewFacts 没有记录 agentGenerated 产物。',
+    '',
+    '### 路径归一化诊断',
+    normalizationLines.length ? normalizationLines.join('\n') : '- 当前没有路径前缀剥离或重复根路径诊断。',
     '',
     '### Git 变更',
     gitLines.length ? gitLines.join('\n') : '- 当前没有可展示的 Git 变更事实。',
@@ -2991,6 +3064,35 @@ function gitReviewSummaryLines(gitReview?: Record<string, unknown>): string[] {
   const diffBlocks = Array.isArray(gitReview.diffBlocks) ? gitReview.diffBlocks : [];
   if (diffBlocks.length) lines.push('- 完整 diff 已附加为可折叠 Review 证据。');
   return lines;
+}
+
+function reviewGeneratedArtifactLines(reviewFacts?: Record<string, unknown>): string[] {
+  const artifacts = Array.isArray(reviewFacts?.generatedArtifacts) ? reviewFacts.generatedArtifacts : [];
+  return artifacts.slice(0, 24).map((item) => {
+    const record = objectRecord(item) ?? {};
+    const path = stringValue(record.path) ?? stringValue(record.absolutePath) ?? 'unknown';
+    const operation = stringValue(record.operation) ?? stringValue(record.toolName) ?? 'write';
+    const hash = stringValue(record.contentHash);
+    return `- \`${path}\` operation=${operation}${hash ? ` contentHash=${hash}` : ''}`;
+  }).concat(artifacts.length > 24 ? [`- 另有 ${artifacts.length - 24} 个 agentGenerated 产物未展开。`] : []);
+}
+
+function reviewPathNormalizationLines(reviewFacts?: Record<string, unknown>): string[] {
+  const diagnostics = Array.isArray(reviewFacts?.pathNormalizationDiagnostics)
+    ? reviewFacts.pathNormalizationDiagnostics
+    : [];
+  return diagnostics.slice(0, 24).map((item) => {
+    const record = objectRecord(item) ?? {};
+    const path = stringValue(record.path) ?? 'unknown';
+    const normalization = objectRecord(record.pathNormalization) ?? {};
+    const original = stringValue(normalization.originalPath);
+    const normalized = stringValue(normalization.normalizedTargetPath);
+    const stripped = Array.isArray(normalization.strippedPathPrefixes)
+      ? normalization.strippedPathPrefixes.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
+    const duplicate = record.duplicateRootPathDetected === true || normalization.duplicateRootPathDetected === true;
+    return `- \`${path}\`${original ? ` original=${original}` : ''}${normalized ? ` normalized=${normalized}` : ''}${stripped.length ? ` stripped=${stripped.join(', ')}` : ''}${duplicate ? ' duplicateRootPathDetected=true' : ''}`;
+  }).concat(diagnostics.length > 24 ? [`- 另有 ${diagnostics.length - 24} 条路径归一化诊断未展开。`] : []);
 }
 
 function reviewFactLines(kernelEvents: unknown[]): string[] {

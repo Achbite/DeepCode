@@ -46,6 +46,7 @@ export interface ProjectWorkingDirectory {
   displayPath: string;
   absolutePath?: string;
   source: 'currentAttachment' | 'projectWorkingDirectory' | 'recentAttachment' | 'sessionAttachment' | 'workspaceBinding';
+  primary?: boolean;
 }
 
 export interface ConversationResourceRoot extends ProjectWorkingDirectory {
