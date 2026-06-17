@@ -13,6 +13,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
         'Choose exactly one kind: "answer", "resourceRequest", "decisionRequest", "actionBundle", or "diagnostic".',
         'The Session parser converts the JSON object into a ProposalEnvelope before Kernel validation.',
         'For resourceRequest, decisionRequest, actionBundle, or diagnostic, you may include optional top-level narration as a short user-visible progress sentence.',
+        'narration must follow the current user language for user-visible text; protocol/schema/structured fields, tool names, and code identifiers stay English.',
         'narration must be natural, concise, and aligned with the next envelope behavior. It must not claim that files were read, tools ran, permissions were granted, tests passed, or work completed unless Kernel facts already prove that.',
         'Do not put raw JSON, parser repair details, hidden reasoning, provider/debug text, or protocol explanations in narration.',
         'For pure read-only explanations or capability answers, use kind="answer" only.',
@@ -41,7 +42,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
         'Before later batches, use resourceRequest with manifestEntryId or rootId+path to read current files under available conversation roots; do not ask to run shell search commands directly.',
         'If the user requests write, user review, then delete, current actionBundle.actions only writes and waits for review; put the post-review delete intent in actionBundle.continuationExpectations. Continuations are not executed until Kernel ReviewGate is accepted by the user.',
         'Unknown JSON fields, invalid JSON, and unsafe paths fail closed.',
-        'Language policy: human interaction prefers Chinese when the user writes Chinese; protocol/schema/structured fields stay English; code identifiers and tool names stay English; final answer and review summary follow the user language and default to Chinese.',
+        'Language policy: all user-visible answer, review summary, narration, and transition/progress prose must follow the current user language; protocol/schema/structured fields stay English; code identifiers and tool names stay English.',
         'Set outputLanguage from the current user request language. Protocol examples do not decide the response language.',
       ].join('\n'),
     },
@@ -243,14 +244,9 @@ function reusableResourceContextSummary(input: PromptEnvelopeBuilderInput): stri
 
 function currentResourceResultsSummary(input: PromptEnvelopeBuilderInput): string {
   const lines: string[] = [];
-  if (input.readOnlyResourceBudget) {
-    const budget = input.readOnlyResourceBudget;
-    lines.push(`Read-only resource budget: usedRounds=${budget.usedRounds} maxRounds=${budget.maxRounds} remainingRounds=${budget.remainingRounds}`);
-    lines.push('Within the remaining read-only budget, request the directories, files, search results, or file segments that are useful for the task; do not answer prematurely if key facts are still missing.');
-    lines.push('Avoid low-value repetition: do not request the exact same path/range/query again unless a previous ResourcePacket shows an error or a different segment is needed.');
-  } else {
-    lines.push('Read-only resource budget: not active.');
-  }
+  lines.push('Read-only resource requests are not governed by a fixed Session round budget; users may stop the run or add guidance while reading continues.');
+  lines.push('Request the directories, files, search results, or file segments that are useful for the task; do not answer prematurely if key facts are still missing.');
+  lines.push('Avoid low-value repetition: do not request the exact same path/range/query again unless a previous ResourcePacket shows an error or a different segment is needed.');
   lines.push('Current-turn tool results, permission facts, review feedback, and transient run state belong here or later in the dynamic suffix; they must not be promoted into the stable prefix.');
   return lines.join('\n');
 }

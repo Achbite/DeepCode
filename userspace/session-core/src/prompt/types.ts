@@ -68,11 +68,6 @@ export interface PromptEnvelopeBuilderInput {
   conversationRoots?: ConversationResourceRoot[];
   resourcePackets?: ResourcePacket[];
   resourcePromptContext?: ResourcePromptContext;
-  readOnlyResourceBudget?: {
-    usedRounds: number;
-    maxRounds: number;
-    remainingRounds: number;
-  };
   userRequest: string;
   auditOnly?: {
     runId?: string;

@@ -493,7 +493,7 @@ function narrativeKindForEvent(event: AgentEvent): AgentTimelineNarrativeKind {
   if (event.kind === 'assistant_msg') {
     const channel = stringValueFromPayload(event.payload, 'channel');
     if (channel === 'reasoning') return 'thinking';
-    if (channel === 'progress' && stringValueFromPayload(event.payload, 'source') === 'llm') {
+    if (channel === 'progress' && ['llm', 'session', 'provider'].includes(stringValueFromPayload(event.payload, 'source') ?? '')) {
       return 'assistantNarration';
     }
     if (channel === 'final') return 'assistantText';

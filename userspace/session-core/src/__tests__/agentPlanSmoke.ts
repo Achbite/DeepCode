@@ -52,8 +52,8 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopPathResourceRequest();
   await assertSessionDriverLoopRejectsOutsidePath();
   await assertSessionDriverLoopUsesRecentAttachmentRoot();
-  await assertSessionDriverLoopResourceBudgetRequestsUserDecision();
-  await assertSessionDriverLoopContinuesAfterResourceBudgetDecision();
+  await assertSessionDriverLoopReadOnlyRequestsContinueWithoutBudgetDecision();
+  await assertSessionDriverLoopOldResourceBudgetDecisionStillResumes();
   await assertSessionDriverLoopProjectsDecisionRequest();
   await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
   await assertSessionDriverLoopRepairsInvalidSourceBlock();
@@ -66,6 +66,9 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan();
   await assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch();
   await assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept();
+  await assertSessionDriverLoopNativeReadToolStreamsThroughResourceResolve();
+  await assertSessionDriverLoopNativeReadToolLoopHasNoFourRoundLimit();
+  await assertSessionDriverLoopNativeWriteToolBecomesReviewedPlan();
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
@@ -276,11 +279,6 @@ function assertPromptEnvelope(): void {
     initialContext,
     conversationRoots,
     resourcePromptContext,
-    readOnlyResourceBudget: {
-      usedRounds: 2,
-      maxRounds: 8,
-      remainingRounds: 6,
-    },
   });
   assert(prompt.stablePrefix.includes('deepcode.agent.protocol.v3'), 'prompt enforces v3');
   assert(prompt.dynamicSuffix.includes('manifestEntry id=attachment-0-generic-file'), 'prompt exposes manifest entry ids');
@@ -304,7 +302,8 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('blockKey='), 'prompt includes stable resource block keys');
   assert(prompt.dynamicSuffix.includes('generic content'), 'prompt includes ResourcePacket content');
   assert(!prompt.dynamicSuffix.includes('evidence-generic'), 'prompt excludes volatile evidence refs from provider-visible resource context');
-  assert(prompt.dynamicSuffix.includes('Read-only resource budget: usedRounds=2 maxRounds=8 remainingRounds=6'), 'prompt exposes read-only resource budget');
+  assert(!prompt.dynamicSuffix.includes('Read-only resource budget:'), 'prompt does not expose fixed read-only resource budget');
+  assert(prompt.dynamicSuffix.includes('not governed by a fixed Session round budget'), 'prompt explains read-only requests are user-controlled');
   assert(prompt.dynamicSuffix.includes('offsetBytes/limitBytes'), 'prompt hints range reread for truncated resources');
   assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
 }
@@ -1128,10 +1127,10 @@ async function assertSessionDriverLoopTerminalAnswerGuidanceRevision(): Promise<
     result.events.some((event) =>
       event.kind === 'assistant_msg' &&
       (event.payload as any)?.source === 'session' &&
-      String((event.payload as any)?.content ?? '').includes('收到你的补充')
+      String((event.payload as any)?.content ?? '').includes('received your update')
     ),
     true,
-    'session transition message is visible before guidance revision'
+    'session transition message follows the user language before guidance revision'
   );
   assertEqual(
     result.events.some((event) =>
@@ -1554,12 +1553,12 @@ async function assertSessionDriverLoopUsesRecentAttachmentRoot(): Promise<void> 
   assertEqual(resourceResolveManifests[0].entries[0].resourceRef, '/tmp/previous-generic-project/README.txt', 'recent root resolves path under the previous attachment');
 }
 
-async function assertSessionDriverLoopResourceBudgetRequestsUserDecision(): Promise<void> {
+async function assertSessionDriverLoopReadOnlyRequestsContinueWithoutBudgetDecision(): Promise<void> {
   const events: AgentEvent[] = [];
   const resourceResolveManifests: Array<Record<string, any>> = [];
   let llmCalls = 0;
   const session: AgentSession = {
-    id: 'session-budget',
+    id: 'session-readonly-unbounded',
     mode: 'plan',
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
@@ -1569,9 +1568,19 @@ async function assertSessionDriverLoopResourceBudgetRequestsUserDecision(): Prom
       events.push(...nextEvents);
       return { session: { ...session, eventCount: events.length }, events: [...events] };
     },
-    kernelCommand: async (request): Promise<KernelReply> => resourceBudgetKernel(request, resourceResolveManifests, 'session-budget'),
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+    kernelCommand: async (request): Promise<KernelReply> => resourceBudgetKernel(request, resourceResolveManifests, 'session-readonly-unbounded'),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
+      const promptText = request.messages.map((message) => message.content).join('\n');
+      assert(!promptText.includes('Read-only resource budget:'), 'provider prompt does not expose fixed read-only resource budget');
+      if (llmCalls > 12) {
+        return jsonLlmResponse({
+          schemaVersion: 'deepcode.agent.protocol.v3',
+          kind: 'answer',
+          outputLanguage: 'en-US',
+          answer: { format: 'markdown', content: 'Read-only exploration continued and then converged.' },
+        });
+      }
       return {
         ok: true,
         data: {
@@ -1598,7 +1607,7 @@ async function assertSessionDriverLoopResourceBudgetRequestsUserDecision(): Prom
   });
 
   const result = await loop.runUserTurn({
-    sessionId: 'session-budget',
+    sessionId: 'session-readonly-unbounded',
     content: 'Analyze the attached generic project.',
     attachments: [{
       kind: 'directory',
@@ -1608,58 +1617,69 @@ async function assertSessionDriverLoopResourceBudgetRequestsUserDecision(): Prom
       scope: 'message',
     }],
   });
-  const budgetConfirmation = result.events.find((event) => event.kind === 'requirement_confirmation');
-  assert(Boolean(budgetConfirmation), 'read-only resource budget emits user decision card');
-  assertEqual(llmCalls, 9, 'ninth resourceRequest triggers budget decision after eight resolved rounds');
-  assertEqual(resourceResolveManifests.length, 9, 'initial attachment plus eight requested resource packets were resolved');
-  const summary = String((budgetConfirmation?.payload as any)?.summary ?? '');
-  assert(summary.includes('只读资源预算'), 'budget decision explains read-only budget');
-  assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any)?.diagnostic === true), false, 'budget exhaustion is not a terminal diagnostic');
+  assertEqual(llmCalls, 13, 'read-only resource requests continue beyond the former eight-round budget and then converge');
+  assertEqual(resourceResolveManifests.length, 13, 'initial attachment plus twelve requested resource packets were resolved');
+  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'read-only resource loop no longer emits a budget decision card');
+  assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any)?.diagnostic === true), false, 'read-only continuation is not a terminal diagnostic');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'assistant_msg' &&
+      (event.payload as any)?.channel === 'final' &&
+      String((event.payload as any)?.content ?? '').includes('continued')
+    ),
+    true,
+    'read-only continuation produces a final answer when the provider converges'
+  );
 }
 
-async function assertSessionDriverLoopContinuesAfterResourceBudgetDecision(): Promise<void> {
+async function assertSessionDriverLoopOldResourceBudgetDecisionStillResumes(): Promise<void> {
   const events: AgentEvent[] = [];
   const resourceResolveManifests: Array<Record<string, any>> = [];
   let llmCalls = 0;
-  let continuationSawPriorResource = false;
   const session: AgentSession = {
-    id: 'session-budget-continue',
+    id: 'session-budget-legacy',
     mode: 'plan',
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const oldBudgetConfirmation: AgentEvent = {
+    id: 'legacy-resource-budget-confirmation',
+    sessionId: 'session-budget-legacy',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'requirement_confirmation',
+    payload: {
+      title: '用户介入请求',
+      summary: '只读资源预算已用完，需要用户决定是否继续读取上下文。',
+      status: 'waitingUserConfirmation',
+      confirmable: true,
+      runId: 'run-budget-legacy',
+      requirementId: 'resource-budget-run-budget-legacy',
+      originalUserRequest: 'Analyze the attached generic project.',
+      attachments: [],
+      requirement: {
+        requirementId: 'resource-budget-run-budget-legacy',
+        sessionId: 'session-budget-legacy',
+        initialUserRequest: 'Analyze the attached generic project.',
+        checklist: { goal: 'Legacy budget confirmation.' },
+        status: 'probing',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+      channel: 'action',
+      visibility: 'conversation',
+      presentation: 'body',
+    },
   };
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
       return { session: { ...session, eventCount: events.length }, events: [...events] };
     },
-    kernelCommand: async (request): Promise<KernelReply> => resourceBudgetKernel(request, resourceResolveManifests, 'session-budget-continue'),
+    kernelCommand: async (request): Promise<KernelReply> => resourceBudgetKernel(request, resourceResolveManifests, 'session-budget-legacy'),
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
-      if (llmCalls <= 9) {
-        return {
-          ok: true,
-          data: {
-            chunks: [{ type: 'done' }],
-            assistantMessage: {
-              role: 'assistant',
-              content: JSON.stringify({
-                schemaVersion: 'deepcode.agent.protocol.v3',
-                kind: 'resourceRequest',
-                outputLanguage: 'en-US',
-                resourceRequest: {
-                  version: '1',
-                  id: `budget-request-${llmCalls}`,
-                  reason: 'Need another generic resource.',
-                  items: [{ id: `budget-item-${llmCalls}`, path: `src/file-${llmCalls}.txt`, reason: 'Read the next generic source.' }],
-                },
-              }),
-            },
-          },
-        };
-      }
       const promptText = request.messages.map((message) => message.content).join('\n');
-      continuationSawPriorResource = promptText.includes('content for src/file-8.txt');
+      assert(!promptText.includes('Read-only resource budget:'), 'legacy budget continuation resumes without exposing a new fixed budget');
       return {
         ok: true,
         data: {
@@ -1670,7 +1690,7 @@ async function assertSessionDriverLoopContinuesAfterResourceBudgetDecision(): Pr
               schemaVersion: 'deepcode.agent.protocol.v3',
               kind: 'answer',
               outputLanguage: 'en-US',
-              answer: { format: 'markdown', content: 'Continued after budget approval with prior resources.' },
+              answer: { format: 'markdown', content: 'Continued after legacy budget approval.' },
             }),
           },
         },
@@ -1680,30 +1700,17 @@ async function assertSessionDriverLoopContinuesAfterResourceBudgetDecision(): Pr
     createId: (prefix) => `${prefix}-${events.length + 1}`,
   });
 
-  const first = await loop.runUserTurn({
-    sessionId: 'session-budget-continue',
-    content: 'Analyze the attached generic project.',
-    attachments: [{
-      kind: 'directory',
-      path: 'generic-project',
-      absolutePath: '/tmp/generic-project',
-      source: 'userSelected',
-      scope: 'message',
-    }],
-  });
-  const confirmation = first.events.find((event) => event.kind === 'requirement_confirmation');
-  assert(confirmation, 'budget confirmation exists before continuation');
-  if (!confirmation) throw new Error('budget confirmation missing');
   const next = await loop.resolveDecision({
-    sessionId: 'session-budget-continue',
+    sessionId: 'session-budget-legacy',
     kind: 'requirement',
     decision: 'accept',
-    runId: String((confirmation.payload as any).runId),
-    targetId: String((confirmation.payload as any).requirementId),
-    existingEvents: first.events,
+    runId: 'run-budget-legacy',
+    targetId: 'resource-budget-run-budget-legacy',
+    existingEvents: [oldBudgetConfirmation],
   });
-  assertEqual(next.events.some((event) => event.kind === 'assistant_msg'), true, 'budget approval continues to final answer');
-  assertEqual(continuationSawPriorResource, true, 'budget continuation prompt includes prior ResourcePacket content');
+  assertEqual(llmCalls, 1, 'legacy budget approval resumes by calling the provider once');
+  assertEqual(next.events.some((event) => event.kind === 'trace/requirement_decision_noop'), false, 'legacy budget confirmation is still recognized as active');
+  assertEqual(next.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any)?.channel === 'final'), true, 'legacy budget approval continues to final answer');
 }
 
 function resourceBudgetKernel(
@@ -2385,6 +2392,274 @@ async function assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAc
   assertEqual(stale.events.some((event) => event.kind === 'trace/requirement_decision_noop'), true, 'stale requirement decision is recorded as noop');
   assertEqual(llmRequests.length, 0, 'stale requirement decision does not call the provider');
   assertEqual(submittedPlans.length, 0, 'stale requirement decision does not submit a plan');
+}
+
+async function assertSessionDriverLoopNativeReadToolStreamsThroughResourceResolve(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const resourceResolveManifests: Array<Record<string, any>> = [];
+  const streamRequests: LlmChatRequest[] = [];
+  const deltas: unknown[] = [];
+  const session: AgentSession = {
+    id: 'session-native-read',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'resourceResolve') {
+        resourceResolveManifests.push(command.request.manifest);
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      throw new Error('native read smoke should use streaming provider path');
+    },
+    llmChatStream: async (request, onEvent): Promise<ApiResponse<LlmChatResult>> => {
+      streamRequests.push(request);
+      if (streamRequests.length === 1) {
+        const chunks: LlmChatResult['chunks'] = [
+          {
+            type: 'tool_call',
+            index: 0,
+            callId: 'call-generic-read',
+            toolCallDelta: { id: 'call-generic-read', index: 0, name: 'fs.read', argumentsDelta: '{"path":"' },
+          },
+          {
+            type: 'tool_call',
+            index: 0,
+            callId: 'call-generic-read',
+            toolCallDelta: { index: 0, argumentsDelta: 'generic-input.txt"}' },
+          },
+          { type: 'done' },
+        ];
+        for (const chunk of chunks.slice(0, 2)) {
+          await onEvent({ type: 'provider_tool_call_delta', chunk });
+        }
+        return {
+          ok: true,
+          data: {
+            chunks,
+            assistantMessage: {
+              role: 'assistant',
+              content: '',
+              toolCalls: [{
+                id: 'call-generic-read',
+                name: 'fs.read',
+                arguments: { path: 'generic-input.txt' },
+              }],
+            },
+          },
+        };
+      }
+      const toolMessage = request.messages.find((message) => message.role === 'tool');
+      assert(Boolean(toolMessage?.content.includes('resolved generic content')), 'provider resume receives Kernel resource tool result');
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'answer',
+        outputLanguage: 'en-US',
+        answer: {
+          format: 'markdown',
+          content: 'The generic read result was incorporated after Kernel ResourceResolve.',
+        },
+      });
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + streamRequests.length + resourceResolveManifests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-native-read',
+    content: 'Use a native read tool only if resource context is needed.',
+    attachments: [{ kind: 'directory', path: '.', absolutePath: '/tmp/generic-workspace', source: 'userSelected', scope: 'session' }],
+  });
+
+  assertEqual(streamRequests.length, 2, 'native read tool triggers provider resume after Kernel result');
+  assertEqual(resourceResolveManifests.length >= 1, true, 'native read tool is routed through Kernel ResourceResolve');
+  assertEqual(
+    resourceResolveManifests.some((manifest) =>
+      (manifest.entries ?? []).some((entry: Record<string, unknown>) => String(entry.resourceRef ?? '').endsWith('generic-input.txt'))
+    ),
+    true,
+    'native read manifest carries the requested resource'
+  );
+  assertEqual(result.events.some((event) => event.kind === 'tool_result'), true, 'Kernel ResourcePacket is committed as tool_result');
+  assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any).channel === 'final'), true, 'provider resume produces one final answer');
+  assertEqual(deltas.some((delta) => (delta as any).type === 'tool_call_delta'), true, 'streaming native tool deltas are exposed as active projection deltas');
+}
+
+async function assertSessionDriverLoopNativeReadToolLoopHasNoFourRoundLimit(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const resourceResolveManifests: Array<Record<string, any>> = [];
+  const streamRequests: LlmChatRequest[] = [];
+  const deltas: unknown[] = [];
+  const session: AgentSession = {
+    id: 'session-native-read-unbounded',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'resourceResolve') {
+        resourceResolveManifests.push(command.request.manifest);
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      throw new Error('native read unbounded smoke should use streaming provider path');
+    },
+    llmChatStream: async (request, onEvent): Promise<ApiResponse<LlmChatResult>> => {
+      streamRequests.push(request);
+      const round = streamRequests.length;
+      if (round <= 6) {
+        const path = `generic-input-${round}.txt`;
+        const chunk: LlmChatResult['chunks'][number] = {
+          type: 'tool_call',
+          index: 0,
+          callId: `call-generic-read-${round}`,
+          toolCallDelta: {
+            id: `call-generic-read-${round}`,
+            index: 0,
+            name: 'fs.read',
+            argumentsDelta: JSON.stringify({ path }),
+          },
+        };
+        await onEvent({ type: 'provider_tool_call_delta', chunk });
+        return {
+          ok: true,
+          data: {
+            chunks: [chunk, { type: 'done' }],
+            assistantMessage: {
+              role: 'assistant',
+              content: '',
+              toolCalls: [{
+                id: `call-generic-read-${round}`,
+                name: 'fs.read',
+                arguments: { path },
+              }],
+            },
+          },
+        };
+      }
+      const toolMessages = request.messages.filter((message) => message.role === 'tool');
+      assertEqual(toolMessages.length >= 6, true, 'provider resume receives all prior Kernel resource tool results');
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'answer',
+        outputLanguage: 'zh-CN',
+        answer: {
+          format: 'markdown',
+          content: '已在多轮只读资源读取后收口。',
+        },
+      });
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + streamRequests.length + resourceResolveManifests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-native-read-unbounded',
+    content: '分析这个项目，需要连续读取多个只读文件后再回答。',
+    attachments: [{ kind: 'directory', path: '.', absolutePath: '/tmp/generic-workspace', source: 'userSelected', scope: 'session' }],
+  });
+
+  assertEqual(streamRequests.length, 7, 'native read tool loop continues past the former four-resume limit and then converges');
+  assertEqual(resourceResolveManifests.length >= 6, true, 'each native read tool request is routed through Kernel ResourceResolve');
+  assertEqual(result.events.some((event) => event.id.includes('native_tool_loop_exhausted')), false, 'native read tool loop does not emit the former exhaustion diagnostic');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'assistant_msg' &&
+      (event.payload as any)?.source === 'session' &&
+      String((event.payload as any)?.content ?? '').includes('第 5 轮')
+    ),
+    true,
+    'Chinese user request gets Chinese visible native-tool progress for high read rounds'
+  );
+  assertEqual(deltas.some((delta) => (delta as any).type === 'tool_call_delta'), true, 'high-round native tool deltas remain visible');
+}
+
+async function assertSessionDriverLoopNativeWriteToolBecomesReviewedPlan(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const submittedPlans: Array<Record<string, any>> = [];
+  const streamRequests: LlmChatRequest[] = [];
+  const session: AgentSession = {
+    id: 'session-native-write',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-native-write', submittedPlans),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      throw new Error('native write smoke should use streaming provider path');
+    },
+    llmChatStream: async (request, onEvent): Promise<ApiResponse<LlmChatResult>> => {
+      streamRequests.push(request);
+      const chunk: LlmChatResult['chunks'][number] = {
+        type: 'tool_call',
+        index: 0,
+        callId: 'call-generic-write',
+        toolCallDelta: {
+          id: 'call-generic-write',
+          index: 0,
+          name: 'fs.write',
+          argumentsDelta: '{"path":"generic-output.txt","content":"generic content"}',
+        },
+      };
+      await onEvent({ type: 'provider_tool_call_delta', chunk });
+      return {
+        ok: true,
+        data: {
+          chunks: [chunk, { type: 'done' }],
+          assistantMessage: {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{
+              id: 'call-generic-write',
+              name: 'fs.write',
+              arguments: { path: 'generic-output.txt', content: 'generic content' },
+            }],
+          },
+        },
+      };
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + streamRequests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-native-write',
+    content: 'Use native write only as a reviewed proposal.',
+  });
+
+  assertEqual(streamRequests.length, 1, 'native write proposal does not resume provider before user review');
+  assertEqual(submittedPlans.length, 1, 'native write tool call is submitted to Kernel PlanReview as actionBundle');
+  const payload = submittedPlans[0].payload as any;
+  assertEqual(payload.actionBundle.actions[0].capability, 'workspace.write', 'native fs.write maps to workspace.write capability');
+  assertEqual(payload.codeBlocks[0].path, 'generic-output.txt', 'native fs.write content is held in a codeBlock');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'native write produces a user-reviewable plan card');
+  assertEqual(result.events.some((event) => event.kind === 'tool_result'), false, 'native write is not executed as an immediate tool result');
 }
 
 function genericWriteProposal(missingEvidence: boolean): Record<string, unknown> {

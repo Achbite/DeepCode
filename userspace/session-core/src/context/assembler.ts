@@ -115,7 +115,6 @@ export interface ContextAssemblyInput {
   existingEvents?: AgentEvent[];
   initialContext?: InitialContextPacket;
   resourcePackets?: ResourcePacket[];
-  readOnlyResourceBudget?: PromptEnvelopeBuilderInput['readOnlyResourceBudget'];
   conversationRoots?: ConversationResourceRoot[];
   requirement?: RequirementRecord;
   memoryDocument?: SessionMemoryDocument;
@@ -154,7 +153,6 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     initialContext: input.initialContext,
     resourcePackets: input.resourcePackets,
     resourcePromptContext,
-    readOnlyResourceBudget: input.readOnlyResourceBudget,
     conversationRoots: input.conversationRoots,
     requirement: input.requirement,
     auditOnly: input.auditOnly,

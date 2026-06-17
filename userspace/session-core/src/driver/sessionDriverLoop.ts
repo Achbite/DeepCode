@@ -7,8 +7,13 @@ import type {
   KernelCommandEnvelope,
   KernelReply,
   LlmChatRequest,
+  LlmChatStreamEvent,
   LlmChatResult,
+  ProjectionDelta,
+  ToolCall,
+  ToolDefinition,
 } from '@deepcode/protocol';
+import { listDefaultAgentTools } from '@deepcode/protocol';
 import { parseProposalEnvelope } from '../agent-plan/protocolV3.js';
 import {
   AgentPlanParseError,
@@ -45,6 +50,11 @@ export interface SessionDriverLoopPorts {
   appendTranscript?: (sessionId: string, entry: TranscriptEntry) => Promise<void>;
   kernelCommand(request: KernelCommandEnvelope): Promise<KernelReply>;
   llmChat(request: LlmChatRequest): Promise<ApiResponse<LlmChatResult>>;
+  llmChatStream?: (
+    request: LlmChatRequest,
+    onEvent: (event: LlmChatStreamEvent) => void | Promise<void>
+  ) => Promise<ApiResponse<LlmChatResult>>;
+  onProjectionDelta?: (delta: ProjectionDelta) => void | Promise<void>;
   now?: () => string;
   createId?: (prefix: string) => string;
 }
@@ -62,7 +72,6 @@ export interface SessionDriverLoopInput {
   confirmedRequirement?: RequirementRecord;
   requirementConfirmationMode?: RequirementConfirmationMode;
   reviewContinuationMode?: ReviewContinuationMode;
-  resourceBudgetExtraRounds?: number;
   resumeResourcePackets?: boolean;
 }
 
@@ -104,6 +113,7 @@ interface SessionDriverLoopRunState {
   resourceRequestRepairAttempted: boolean;
   planReviewRepairAttempted: boolean;
   terminalGuidanceRevisionAttempted: boolean;
+  activeTurn?: ActiveTurnState;
 }
 
 interface ImplementationBatchContext {
@@ -124,8 +134,38 @@ interface ResourceRequestResolution {
   availableRoots: ConversationResourceRoot[];
 }
 
-const DEFAULT_READ_ONLY_RESOURCE_ROUNDS = 8;
-const READ_ONLY_RESOURCE_ROUND_GRANT = 8;
+interface ActiveTurnState {
+  turnId: string;
+  seq: number;
+  stage: string;
+  providerCallId?: string;
+}
+
+interface NativeToolCallProposal {
+  callId: string;
+  index: number;
+  name: string;
+  arguments: Record<string, unknown>;
+  rawArguments?: string;
+}
+
+interface ProviderToolCallBufferItem {
+  callId?: string;
+  name?: string;
+  argumentsText: string;
+}
+
+interface LlmTurnResult {
+  result: LlmChatResult;
+  content: string;
+  reasoning: string;
+  toolCalls: NativeToolCallProposal[];
+}
+
+type NativeToolHandlingResult =
+  | { kind: 'resume'; toolMessages: LlmChatRequest['messages'] }
+  | { kind: 'proposal'; proposal: ProposalEnvelope };
+
 const RESOURCE_BUDGET_REQUIREMENT_PREFIX = 'resource-budget';
 const MAX_DERIVED_MANIFEST_ENTRIES = 240;
 const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
@@ -133,6 +173,7 @@ const MAX_ACTION_BUNDLE_ACTIONS = 6;
 const MAX_ACTION_BUNDLE_CODE_BLOCKS = 4;
 const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 12 * 1024;
 const MAX_ACTION_BUNDLE_CODE_BLOCK_BYTES = 6 * 1024;
+const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
 const SIDE_EFFECT_CAPABILITIES = new Set([
   'workspace.write',
   'workspace.create',
@@ -258,9 +299,7 @@ export class SessionDriverLoop {
       }
     }
 
-    let rounds = 0;
-    const maxResourceRounds = DEFAULT_READ_ONLY_RESOURCE_ROUNDS + Math.max(0, Math.floor(input.resourceBudgetExtraRounds ?? 0));
-    while (rounds <= maxResourceRounds) {
+    while (true) {
       state.taskGraph = buildSessionTaskGraph({
         sessionId,
         runId: state.runId,
@@ -285,11 +324,6 @@ export class SessionDriverLoop {
         userRequest: input.content,
         initialContext: state.initialContext,
         resourcePackets: state.resourcePackets,
-        readOnlyResourceBudget: {
-          usedRounds: rounds,
-          maxRounds: maxResourceRounds,
-          remainingRounds: Math.max(0, maxResourceRounds - rounds),
-        },
         conversationRoots: state.conversationRoots,
         requirement: input.confirmedRequirement,
         auditOnly: {
@@ -351,21 +385,6 @@ export class SessionDriverLoop {
         ]);
       }
       if (proposal.kind === 'resourceRequest') {
-        if (rounds >= maxResourceRounds) {
-          return this.append(sessionId, [
-            resourceBudgetConfirmationEvent({
-              sessionId,
-              runId: state.runId,
-              originalUserRequest: input.content,
-              attachments: input.attachments ?? [],
-              usedRounds: rounds,
-              maxRounds: maxResourceRounds,
-              resourcePackets: state.resourcePackets,
-              ts: this.ts(),
-              id: this.id('resource-budget'),
-            }),
-          ]);
-        }
         let subset = manifestForResourceRequest(state.manifest, proposal.payload as ResourceRequestDraft, state.conversationRoots);
         if (!subset.manifest.entries.length) {
           if (!state.resourceRequestRepairAttempted) {
@@ -409,7 +428,6 @@ export class SessionDriverLoop {
         state.resourcePackets.push(packet);
         addDiscoveredManifestEntries(state.manifest, packet);
         lastResult = await this.append(sessionId, [resourcePacketEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
-        rounds += 1;
         continue;
       }
       if (proposal.kind === 'actionBundle') {
@@ -453,7 +471,6 @@ export class SessionDriverLoop {
         workflow: input.workflow,
         appendUserMessage: false,
         requirementConfirmationMode: 'off',
-        resourceBudgetExtraRounds: READ_ONLY_RESOURCE_ROUND_GRANT,
         resumeResourcePackets: true,
       });
     }
@@ -820,6 +837,7 @@ export class SessionDriverLoop {
         state.sessionId,
         state.runId,
         guidance.map((item) => item.id),
+        input.content,
         this.ts(),
         this.id('guidance-revision-transition')
       ),
@@ -843,11 +861,6 @@ export class SessionDriverLoop {
       userRequest: input.content,
       initialContext: state.initialContext,
       resourcePackets: state.resourcePackets,
-      readOnlyResourceBudget: {
-        usedRounds: 0,
-        maxRounds: 0,
-        remainingRounds: 0,
-      },
       conversationRoots: state.conversationRoots,
       requirement: input.confirmedRequirement,
       auditOnly: {
@@ -922,10 +935,12 @@ export class SessionDriverLoop {
   ): Promise<ProposalEnvelope> {
     let raw: string;
     try {
-      raw = await this.llm(input.profileId, state, 'provider_call', [
+      const providerResult = await this.callProviderWithNativeTools(input, state, prompt, [
         { role: 'system', content: prompt.stablePrefix },
         { role: 'user', content: prompt.dynamicSuffix },
       ]);
+      if (typeof providerResult !== 'string') return providerResult;
+      raw = providerResult;
     } catch (error) {
       if (error instanceof SessionDriverLoopError
         && error.code === 'llm_empty_response'
@@ -998,6 +1013,161 @@ export class SessionDriverLoop {
         );
       }
     }
+  }
+
+  private async callProviderWithNativeTools(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    messages: LlmChatRequest['messages']
+  ): Promise<string | ProposalEnvelope> {
+    let currentMessages = [...messages];
+    for (let round = 0; ; round += 1) {
+      const stage = round === 0 ? 'provider_call' : `provider_tool_resume_${round}`;
+      const turn = await this.llmTurn(input.profileId, state, stage, currentMessages, {
+        responseFormat: { type: 'json_object' },
+        tools: nativeProviderToolsForState(state),
+      });
+      if (turn.toolCalls.length === 0) return turn.content;
+
+      const handled = await this.handleNativeToolCalls(input, state, prompt, turn, round);
+      if (handled.kind === 'proposal') return handled.proposal;
+
+      currentMessages = [
+        ...currentMessages,
+        {
+          role: 'assistant',
+          content: turn.content,
+          reasoningContent: turn.reasoning || undefined,
+          toolCalls: turn.toolCalls.map(nativeToolCallToProtocol),
+        },
+        ...handled.toolMessages,
+      ];
+      const guidanceMessages = await this.consumeQueuedGuidanceForProviderResume(state, stage);
+      currentMessages.push(...guidanceMessages);
+    }
+  }
+
+  private async handleNativeToolCalls(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    turn: LlmTurnResult,
+    round: number
+  ): Promise<NativeToolHandlingResult> {
+    const language = visibleLanguageForRequest(state.userRequest);
+    await this.append(state.sessionId, [
+      nativeToolProgressEvent(
+        state.sessionId,
+        state.runId,
+        nativeToolProgressMessage(turn.toolCalls.length, round, language),
+        this.ts(),
+        this.id('native-tool-call'),
+        {
+          nativeToolRound: round,
+          toolCallCount: turn.toolCalls.length,
+          resourcePacketCount: state.resourcePackets.length,
+        }
+      ),
+    ]);
+    const unsupportedOrSideEffect = turn.toolCalls.find((toolCall) => !canResolveNativeToolReadOnly(toolCall));
+    if (unsupportedOrSideEffect) {
+      return {
+        kind: 'proposal',
+        proposal: nativeToolCallActionProposal(input, state, prompt, unsupportedOrSideEffect, this.id('native-tool-proposal')),
+      };
+    }
+
+    const toolMessages: LlmChatRequest['messages'] = [];
+    for (const toolCall of turn.toolCalls) {
+      await this.emitProjectionDelta(state, {
+        type: 'tool_call_delta',
+        stage: 'native_tool_call',
+        status: 'running',
+        channel: 'tool',
+        source: 'session',
+        itemId: toolCall.callId,
+        summary: nativeToolResolveRunningSummary(toolCall.name, language),
+        payload: {
+          callId: toolCall.callId,
+          name: toolCall.name,
+          arguments: toolCall.arguments,
+          nativeToolRound: round,
+        },
+      });
+      const packet = await this.resolveNativeReadToolCall(state, toolCall);
+      state.resourcePackets.push(packet);
+      addDiscoveredManifestEntries(state.manifest, packet);
+      await this.append(state.sessionId, [
+        resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('native-resource-context')),
+      ]);
+      await this.emitProjectionDelta(state, {
+        type: 'resource_delta',
+        stage: 'native_tool_resource_resolve',
+        status: 'completed',
+        channel: 'resource',
+        source: 'kernel',
+        itemId: toolCall.callId,
+        summary: nativeToolResolveCompletedSummary(toolCall.name, language),
+        payload: {
+          callId: toolCall.callId,
+          packetId: packet.id,
+          itemCount: packet.items.length,
+          nativeToolRound: round,
+          resourcePacketCount: state.resourcePackets.length,
+        },
+      });
+      toolMessages.push({
+        role: 'tool',
+        toolCallId: toolCall.callId,
+        content: clipJson(nativeToolResultFromPacket(toolCall, packet), NATIVE_TOOL_RESULT_MAX_CHARS),
+      });
+    }
+    return { kind: 'resume', toolMessages };
+  }
+
+  private async resolveNativeReadToolCall(
+    state: SessionDriverLoopRunState,
+    toolCall: NativeToolCallProposal
+  ): Promise<ResourcePacket> {
+    const manifest = nativeReadToolManifest(state, toolCall);
+    return this.resolveResources(state, manifest);
+  }
+
+  private async consumeQueuedGuidanceForProviderResume(
+    state: SessionDriverLoopRunState,
+    stage: string
+  ): Promise<LlmChatRequest['messages']> {
+    const current = await this.append(state.sessionId, []);
+    const guidance = collectQueuedUserGuidanceEvents(current.events, state.runId);
+    if (guidance.length === 0) return [];
+    const language = visibleLanguageForRequest(state.userRequest);
+    const events = guidance.map((item) => {
+      const payload: Record<string, unknown> = {
+        title: 'User guidance',
+        summary: userGuidanceConsumedSummary(language),
+        status: 'consumed',
+        guidanceId: item.id,
+        targetRunId: state.runId,
+        targetInteractionKind: 'runningRunGuidance',
+        effectiveCheckpoint: 'nextProviderCall',
+        checkpointKind: 'userGuidance',
+        appliedAtProviderStage: stage,
+        source: 'session',
+        channel: 'progress',
+        visibility: 'conversation',
+        presentation: 'body',
+      };
+      return this.event(state.sessionId, 'user_guidance', payload);
+    });
+    await this.append(state.sessionId, events);
+    return [{
+      role: 'user',
+      content: [
+        'User guidance received before the provider resume. Apply it to the next response or tool decision without starting a parallel run:',
+        ...guidance.map((item) => `- ${item.id}: ${clip(item.content, 1200)}`),
+      ].join('\n'),
+    }];
   }
 
   private async repairResourceRequest(
@@ -1172,10 +1342,26 @@ export class SessionDriverLoop {
     stage: string,
     messages: LlmChatRequest['messages']
   ): Promise<string> {
+    const turn = await this.llmTurn(profileId, state, stage, messages, {
+      responseFormat: { type: 'json_object' },
+    });
+    if (!turn.content.trim()) {
+      throw new SessionDriverLoopError('llm_empty_response', 'LLM provider returned an empty response.');
+    }
+    return turn.content;
+  }
+
+  private async llmTurn(
+    profileId: string | undefined,
+    state: SessionDriverLoopRunState,
+    stage: string,
+    messages: LlmChatRequest['messages'],
+    options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {}
+  ): Promise<LlmTurnResult> {
     await this.append(state.sessionId, [
       thinkingEvent(
         state.sessionId,
-        providerStageSummary(stage, 'request'),
+        providerStageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
         this.ts(),
         this.id(`thinking-${stage}`)
       ),
@@ -1187,18 +1373,42 @@ export class SessionDriverLoop {
       contextAssembly: state.contextAssembly,
       taskGraph: state.taskGraph,
     });
-    const result = await this.ports.llmChat({
+    await this.emitProjectionDelta(state, {
+      type: 'active_turn',
+      stage,
+      status: this.ports.llmChatStream ? 'streaming' : 'running',
+      channel: 'progress',
+      source: 'session',
+      summary: providerStageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
+    });
+    const request: LlmChatRequest = {
       profileId,
       messages,
-      responseFormat: { type: 'json_object' },
+      responseFormat: options.responseFormat,
+      tools: options.tools,
+      stream: Boolean(this.ports.llmChatStream),
       providerOptions: {
         deepcode: {
           cachePlan: state.cachePlan,
           taskGraph: state.taskGraph,
         },
       },
-    });
+    };
+    const toolCallBuffer = new ProviderToolCallBuffer();
+    const result = this.ports.llmChatStream
+      ? await this.ports.llmChatStream(request, async (event) => {
+        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer);
+      })
+      : await this.ports.llmChat(request);
     if (!result.ok || !result.data) {
+      await this.emitProjectionDelta(state, {
+        type: 'error',
+        stage,
+        status: 'failed',
+        channel: 'progress',
+        source: 'provider',
+        summary: result.message ?? result.error ?? 'LLM provider request failed.',
+      });
       throw new SessionDriverLoopError(
         'llm_chat_failed',
         result.message ?? result.error ?? 'LLM provider request failed.'
@@ -1225,22 +1435,142 @@ export class SessionDriverLoop {
     } else {
       await this.append(state.sessionId, [
         thinkingEvent(
-          state.sessionId,
-          providerStageSummary(stage, 'response'),
-          this.ts(),
-          this.id(`thinking-${stage}-response`)
+            state.sessionId,
+            providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
+            this.ts(),
+            this.id(`thinking-${stage}-response`)
         ),
       ]);
     }
+    await this.emitProjectionDelta(state, {
+      type: 'active_turn',
+      stage,
+      status: 'completed',
+      channel: 'progress',
+      source: 'provider',
+      summary: providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
+    });
     const content = result.data.assistantMessage?.content
       ?? result.data.chunks
         .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
         .map((chunk) => chunk.content)
         .join('');
-    if (!content.trim()) {
+    const toolCalls = collectNativeToolCalls(result.data, toolCallBuffer);
+    if (!content.trim() && toolCalls.length === 0) {
       throw new SessionDriverLoopError('llm_empty_response', 'LLM provider returned an empty response.');
     }
-    return content;
+    return {
+      result: result.data,
+      content,
+      reasoning,
+      toolCalls,
+    };
+  }
+
+  private async handleLlmStreamEvent(
+    state: SessionDriverLoopRunState,
+    stage: string,
+    event: LlmChatStreamEvent,
+    toolCallBuffer: ProviderToolCallBuffer
+  ): Promise<void> {
+    const chunk = event.chunk;
+    if (event.type === 'provider_delta' && chunk?.content) {
+      if (providerStageExposesAssistantDelta(stage)) {
+        await this.emitProjectionDelta(state, {
+          type: 'assistant_delta',
+          stage,
+          status: 'streaming',
+          channel: 'final',
+          source: 'provider',
+          itemId: chunk.callId,
+          delta: chunk.content,
+          payload: chunk.rawProvider,
+        });
+      }
+      return;
+    }
+    if (event.type === 'provider_reasoning_delta' && chunk?.content) {
+      await this.emitProjectionDelta(state, {
+        type: 'reasoning_delta',
+        stage,
+        status: 'streaming',
+        channel: 'reasoning',
+        source: 'provider',
+        itemId: chunk.callId,
+        delta: chunk.content,
+        payload: chunk.rawProvider,
+      });
+      return;
+    }
+    if (event.type === 'provider_tool_call_delta' && chunk) {
+      const language = visibleLanguageForRequest(state.userRequest);
+      toolCallBuffer.addChunk(chunk);
+      await this.emitProjectionDelta(state, {
+        type: 'tool_call_delta',
+        stage,
+        status: 'streaming',
+        channel: 'tool',
+        source: 'provider',
+        itemId: chunk.callId ?? String(chunk.index ?? 0),
+        delta: chunk.toolCallDelta?.argumentsDelta,
+        summary: chunk.toolCallDelta?.name
+          ? providerToolCallPreparingSummary(chunk.toolCallDelta.name, language)
+          : providerToolCallStreamingSummary(language),
+        payload: {
+          index: chunk.index,
+          callId: chunk.callId,
+          finishReason: chunk.finishReason,
+          toolCallDelta: chunk.toolCallDelta,
+          rawProvider: chunk.rawProvider,
+        },
+      });
+      return;
+    }
+    if (event.type === 'provider_usage') {
+      await this.emitProjectionDelta(state, {
+        type: 'stage_delta',
+        stage,
+        status: 'running',
+        channel: 'progress',
+        source: 'provider',
+        summary: providerUsageSummary(visibleLanguageForRequest(state.userRequest)),
+        payload: event.usage ?? chunk?.usage,
+      });
+      return;
+    }
+    if (event.type === 'provider_error') {
+      await this.emitProjectionDelta(state, {
+        type: 'error',
+        stage,
+        status: 'failed',
+        channel: 'progress',
+        source: 'provider',
+        summary: event.error ?? chunk?.error ?? 'Provider stream error.',
+        payload: event.rawProvider ?? chunk?.rawProvider,
+      });
+    }
+  }
+
+  private async emitProjectionDelta(
+    state: SessionDriverLoopRunState,
+    delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>
+  ): Promise<void> {
+    if (!this.ports.onProjectionDelta) return;
+    const activeTurn = state.activeTurn ?? {
+      turnId: this.id('active-turn'),
+      seq: 0,
+      stage: delta.stage ?? 'provider_call',
+    };
+    activeTurn.seq += 1;
+    activeTurn.stage = delta.stage ?? activeTurn.stage;
+    state.activeTurn = activeTurn;
+    await this.ports.onProjectionDelta({
+      ...delta,
+      sessionId: state.sessionId,
+      runId: state.runId,
+      turnId: activeTurn.turnId,
+      seq: activeTurn.seq,
+    });
   }
 
   private async appendProviderTrace(
@@ -1368,6 +1698,462 @@ export class SessionDriverLoopError extends Error {
     super(message);
     this.name = 'SessionDriverLoopError';
   }
+}
+
+class ProviderToolCallBuffer {
+  private readonly items = new Map<number, ProviderToolCallBufferItem>();
+
+  addChunk(chunk: LlmChatResult['chunks'][number]): void {
+    if (chunk.toolCall) {
+      const index = typeof chunk.index === 'number' ? chunk.index : this.items.size;
+      this.items.set(index, {
+        callId: chunk.toolCall.id,
+        name: normalizeProviderToolName(chunk.toolCall.name),
+        argumentsText: typeof chunk.toolCall.arguments === 'string'
+          ? chunk.toolCall.arguments
+          : JSON.stringify(chunk.toolCall.arguments ?? {}),
+      });
+      return;
+    }
+    const delta = chunk.toolCallDelta;
+    if (!delta && !chunk.callId) return;
+    const index = typeof delta?.index === 'number'
+      ? delta.index
+      : typeof chunk.index === 'number'
+        ? chunk.index
+        : 0;
+    const item = this.items.get(index) ?? { argumentsText: '' };
+    item.callId = delta?.id ?? chunk.callId ?? item.callId;
+    item.name = delta?.name ? normalizeProviderToolName(delta.name) : item.name;
+    item.argumentsText += delta?.argumentsDelta ?? '';
+    this.items.set(index, item);
+  }
+
+  toToolCalls(): NativeToolCallProposal[] {
+    return [...this.items.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([index, item]) => ({
+        callId: item.callId ?? `tool-call-${index}`,
+        index,
+        name: normalizeProviderToolName(item.name ?? 'unknown'),
+        arguments: parseNativeToolArguments(item.argumentsText, item.name ?? 'unknown'),
+        rawArguments: item.argumentsText,
+      }));
+  }
+}
+
+function collectNativeToolCalls(
+  result: LlmChatResult,
+  buffer: ProviderToolCallBuffer
+): NativeToolCallProposal[] {
+  const output = new Map<string, NativeToolCallProposal>();
+  const add = (toolCall: ToolCall, index: number) => {
+    const callId = toolCall.id || `tool-call-${index}`;
+    output.set(callId, {
+      callId,
+      index,
+      name: normalizeProviderToolName(toolCall.name),
+      arguments: normalizeNativeToolArguments(toolCall.arguments, toolCall.name),
+      rawArguments: typeof toolCall.arguments === 'string' ? toolCall.arguments : undefined,
+    });
+  };
+  result.assistantMessage?.toolCalls?.forEach(add);
+  result.chunks.forEach((chunk, index) => {
+    if (chunk.toolCall) add(chunk.toolCall, typeof chunk.index === 'number' ? chunk.index : index);
+  });
+  for (const toolCall of buffer.toToolCalls()) {
+    output.set(toolCall.callId, toolCall);
+  }
+  return [...output.values()].sort((left, right) => left.index - right.index);
+}
+
+function nativeToolCallToProtocol(toolCall: NativeToolCallProposal): ToolCall {
+  return {
+    id: toolCall.callId,
+    name: toolCall.name,
+    arguments: toolCall.arguments,
+  };
+}
+
+function nativeProviderToolsForState(state: SessionDriverLoopRunState): ToolDefinition[] {
+  const allowed = state.stateContract?.allowedProposals ?? state.driverRequest?.stateContract?.allowedProposals ?? [];
+  const allowResources = allowed.length === 0 || allowed.includes('resourceRequest') || allowed.includes('answer');
+  const allowActions = allowed.length === 0 || allowed.includes('actionBundle');
+  const names = new Set<string>();
+  if (allowResources) {
+    names.add('fs.read');
+    names.add('fs.list');
+  }
+  if (allowActions) {
+    for (const name of [
+      'fs.diff',
+      'fs.write',
+      'fs.delete',
+      'shell.propose',
+      'shell.exec',
+      'web.search',
+      'web.fetch',
+      'git.status',
+      'git.diff',
+      'git.stage',
+      'git.unstage',
+      'git.commit',
+      'git.push',
+      'browser.open',
+      'browser.reload',
+      'browser.snapshot',
+      'browser.inspect',
+      'browser.click',
+      'browser.type',
+      'browser.scroll',
+    ]) {
+      names.add(name);
+    }
+  }
+  if (names.size === 0) return [];
+  return listDefaultAgentTools('askBeforeWrite').filter((tool) => names.has(tool.name));
+}
+
+function canResolveNativeToolReadOnly(toolCall: NativeToolCallProposal): boolean {
+  return toolCall.name === 'fs.read' || toolCall.name === 'fs.list';
+}
+
+function nativeReadToolManifest(
+  state: SessionDriverLoopRunState,
+  toolCall: NativeToolCallProposal
+): ResourceManifest {
+  const requestedPath = stringValue(toolCall.arguments.path)
+    ?? stringValue(toolCall.arguments.resourceRef)
+    ?? '.';
+  const itemId = `native-${sanitizeId(toolCall.callId)}`;
+  const kind: ResourceManifestEntry['kind'] = toolCall.name === 'fs.list' ? 'directory' : 'file';
+  const synthesized = synthesizeManifestEntryForPath(
+    state.manifest,
+    state.conversationRoots,
+    itemId,
+    requestedPath,
+    stringValue(toolCall.arguments.rootId),
+    `Provider-native ${toolCall.name} request normalized by Session.`
+  );
+  const baseEntry: ResourceManifestEntry = synthesized.kind === 'entry'
+    ? { ...synthesized.entry, kind }
+    : {
+        id: itemId,
+        kind,
+        label: `${toolCall.name} ${requestedPath}`,
+        resourceRef: requestedPath,
+        readPolicy: 'autoRead',
+        reason: `Provider-native ${toolCall.name} request normalized by Session.`,
+      };
+  const offsetBytes = normalizedNonNegativeInteger(toolCall.arguments.offsetBytes);
+  const limitBytes = normalizedPositiveInteger(toolCall.arguments.limitBytes);
+  const entry: ResourceManifestEntry = {
+    ...baseEntry,
+    id: itemId,
+    ...(typeof offsetBytes === 'number' ? { offsetBytes } : {}),
+    ...(typeof limitBytes === 'number' ? { limitBytes } : {}),
+  };
+  return {
+    ...state.manifest,
+    id: `${state.manifest.id}-${itemId}`,
+    entries: [entry],
+  };
+}
+
+function nativeToolResultFromPacket(
+  toolCall: NativeToolCallProposal,
+  packet: ResourcePacket
+): Record<string, unknown> {
+  return {
+    callId: toolCall.callId,
+    toolName: toolCall.name,
+    ok: packet.items.every((item) => item.status !== 'error' && item.status !== 'denied'),
+    packetId: packet.id,
+    items: packet.items.map((item) => ({
+      manifestEntryId: item.manifestEntryId,
+      status: item.status,
+      path: item.path,
+      absolutePath: item.absolutePath,
+      contentKind: item.contentKind,
+      contentSummary: item.contentSummary,
+      content: item.promptContent ? clip(item.promptContent, 9000) : undefined,
+      truncated: item.truncated,
+      originalBytes: item.originalBytes,
+      returnedBytes: item.returnedBytes,
+      denialReason: item.denialReason,
+    })),
+  };
+}
+
+function nativeToolCallActionProposal(
+  input: SessionDriverLoopInput,
+  state: SessionDriverLoopRunState,
+  prompt: PromptEnvelope,
+  toolCall: NativeToolCallProposal,
+  proposalId: string
+): ProposalEnvelope {
+  const planned = plannedNativeAction(toolCall);
+  const codeBlocks = planned.codeBlock ? [planned.codeBlock] : [];
+  const commandBlocks = planned.commandBlock ? [planned.commandBlock] : [];
+  const action = {
+    id: `action-${sanitizeId(toolCall.callId)}`,
+    actionId: `action-${sanitizeId(toolCall.callId)}`,
+    title: planned.title,
+    description: planned.description,
+    capability: planned.capability,
+    kind: planned.kind,
+    resourceScope: planned.resourceScope,
+    targetPath: planned.targetPath,
+    sourceBlockId: planned.codeBlock?.blockId,
+    canParallelize: false,
+    conflictKeys: planned.resourceScope,
+    purpose: planned.description,
+    toolArgs: toolCall.arguments,
+    permissionLabels: [planned.capability],
+  };
+  const envelope = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId,
+    runId: state.runId,
+    sessionId: state.sessionId,
+    source: 'llm',
+    kind: 'actionBundle',
+    outputLanguage: 'zh-CN',
+    narration: '模型请求了原生工具调用，我已把它转换为需要 Kernel 审查的计划。',
+    userPlanMarkdown: nativeToolUserPlan(input, prompt, toolCall, planned),
+    codeBlocks,
+    commandBlocks,
+    actionBundle: {
+      version: '1',
+      id: `native-tool-${sanitizeId(toolCall.callId)}`,
+      goal: `Review provider-native tool call ${toolCall.name} before execution.`,
+      actions: [action],
+      continuationExpectations: [],
+      validationExpectations: [{
+        id: 'kernel-facts',
+        description: 'Kernel records permission, WorkUnit, and tool facts for the normalized native tool action.',
+      }],
+      reviewExpectations: [{
+        id: 'user-review',
+        description: 'User reviews the normalized native tool action, its resource scope, and Kernel facts before accepting completion.',
+      }],
+    },
+    expectedValidation: 'Kernel facts must show the permission and execution result for the normalized native tool action.',
+    reviewGuide: 'Review the requested tool name, arguments, resource scope, and generated Kernel facts before accepting this batch.',
+  };
+  return parseAndValidateProposal({
+    raw: envelope,
+    runId: state.runId,
+    sessionId: state.sessionId,
+    source: 'llm',
+  });
+}
+
+function plannedNativeAction(toolCall: NativeToolCallProposal): {
+  title: string;
+  description: string;
+  capability: string;
+  kind: string;
+  resourceScope: string[];
+  targetPath?: string;
+  codeBlock?: Record<string, unknown>;
+  commandBlock?: Record<string, unknown>;
+} {
+  const path = stringValue(toolCall.arguments.path) ?? stringValue(toolCall.arguments.targetPath);
+  if (toolCall.name === 'fs.write') {
+    const content = typeof toolCall.arguments.content === 'string' ? toolCall.arguments.content : '';
+    const targetPath = path ?? 'native-tool-output.txt';
+    const blockId = `block-${sanitizeId(toolCall.callId)}`;
+    return {
+      title: `Write ${targetPath}`,
+      description: 'Provider-native fs.write was normalized into a workspace write proposal.',
+      capability: 'workspace.write',
+      kind: 'write',
+      resourceScope: [targetPath],
+      targetPath,
+      codeBlock: {
+        blockId,
+        id: blockId,
+        targetPath,
+        path: targetPath,
+        operation: 'overwrite',
+        language: 'text',
+        content,
+        permissionLabels: ['workspace.write'],
+      },
+    };
+  }
+  if (toolCall.name === 'fs.delete') {
+    const targetPath = path ?? 'unknown';
+    return {
+      title: `Delete ${targetPath}`,
+      description: 'Provider-native fs.delete was normalized into a workspace delete proposal.',
+      capability: 'workspace.delete',
+      kind: 'delete',
+      resourceScope: [targetPath],
+      targetPath,
+    };
+  }
+  if (toolCall.name === 'fs.diff') {
+    const targetPath = path ?? 'unknown';
+    return {
+      title: `Preview diff for ${targetPath}`,
+      description: 'Provider-native fs.diff was normalized into a Kernel-reviewed diff action.',
+      capability: 'workspace.read',
+      kind: 'diff',
+      resourceScope: [targetPath],
+      targetPath,
+    };
+  }
+  if (toolCall.name === 'shell.exec' || toolCall.name === 'shell.propose') {
+    const command = stringValue(toolCall.arguments.command) ?? '';
+    return {
+      title: 'Run proposed shell command',
+      description: 'Provider-native shell command was normalized into a commandBlock that requires Kernel permission handling.',
+      capability: 'process.exec',
+      kind: 'command',
+      resourceScope: [stringValue(toolCall.arguments.cwd) ?? '.'],
+      commandBlock: {
+        commandId: `command-${sanitizeId(toolCall.callId)}`,
+        capability: 'process.exec',
+        cwd: stringValue(toolCall.arguments.cwd),
+        argv: ['bash', '-lc', command],
+        timeoutMs: normalizedPositiveInteger(toolCall.arguments.timeoutMs) ?? 120000,
+        envPolicy: 'inheritSafe',
+        expectedOutput: stringValue(toolCall.arguments.reason) ?? `Execute provider-native ${toolCall.name}.`,
+        permissionLabels: ['process.exec'],
+      },
+    };
+  }
+  if (toolCall.name.startsWith('git.')) {
+    const capability = toolCall.name === 'git.push' ? 'git.push' : (toolCall.name === 'git.status' || toolCall.name === 'git.diff' ? 'git.read' : 'git.write');
+    return {
+      title: `Git operation ${toolCall.name}`,
+      description: `Provider-native ${toolCall.name} was normalized into a Kernel-reviewed Git action.`,
+      capability,
+      kind: toolCall.name.slice('git.'.length) || 'status',
+      resourceScope: [stringValue(toolCall.arguments.path) ?? '.'],
+      targetPath: stringValue(toolCall.arguments.path),
+    };
+  }
+  if (toolCall.name.startsWith('web.')) {
+    return {
+      title: `Network operation ${toolCall.name}`,
+      description: `Provider-native ${toolCall.name} was normalized into a network egress proposal.`,
+      capability: 'network.egress',
+      kind: toolCall.name === 'web.search' ? 'search' : 'read',
+      resourceScope: [stringValue(toolCall.arguments.url) ?? stringValue(toolCall.arguments.query) ?? 'network'],
+    };
+  }
+  if (toolCall.name.startsWith('browser.')) {
+    return {
+      title: `Browser operation ${toolCall.name}`,
+      description: `Provider-native ${toolCall.name} was normalized into a browser control proposal.`,
+      capability: 'browser.control',
+      kind: 'stage',
+      resourceScope: [stringValue(toolCall.arguments.url) ?? stringValue(toolCall.arguments.selector) ?? 'browser'],
+    };
+  }
+  return {
+    title: `Native tool call ${toolCall.name}`,
+    description: `Provider-native ${toolCall.name} is unsupported for immediate execution and was normalized into a reviewable action.`,
+    capability: 'config.modify',
+    kind: 'stage',
+    resourceScope: [toolCall.name],
+  };
+}
+
+function nativeToolUserPlan(
+  input: SessionDriverLoopInput,
+  prompt: PromptEnvelope,
+  toolCall: NativeToolCallProposal,
+  planned: ReturnType<typeof plannedNativeAction>
+): string {
+  return [
+    '# Provider-native tool call review',
+    '',
+    '## Summary',
+    `The provider requested native tool call \`${toolCall.name}\`. Session will not execute it directly. It has been normalized into the existing Kernel-reviewed action path.`,
+    '',
+    '## Requested operation',
+    `- Tool call id: \`${toolCall.callId}\``,
+    `- Capability: \`${planned.capability}\``,
+    `- Resource scope: ${planned.resourceScope.map((item) => `\`${item}\``).join(', ') || '`unknown`'}`,
+    `- Original user request: ${clip(input.content, 500)}`,
+    '',
+    '## Boundary handling',
+    '- Provider-native calls are treated as proposals, not as permission grants.',
+    '- Kernel PlanReview, PermissionGate, WorkspaceBoundary, and audit facts remain authoritative.',
+    '- Tool results must return through Kernel facts before they can be considered execution evidence.',
+    '',
+    '## Validation',
+    '- Verify that Kernel records the normalized proposal, any permission request, WorkUnit lifecycle, and final tool result.',
+    '- If execution is denied or blocked, the provider resume receives a denied or blocked tool result instead of a fabricated success.',
+    '',
+    '## Assumptions',
+    `- Current prompt stable prefix hash area is not modified by this conversion: ${clip(prompt.stablePrefix, 120).replace(/\s+/g, ' ')}`,
+    '- This batch does not add Anthropic-style streaming or direct provider-to-tool execution.',
+  ].join('\n');
+}
+
+function nativeToolProgressEvent(
+  sessionId: string,
+  runId: string,
+  content: string,
+  ts: string,
+  id: string,
+  extraPayload: Record<string, unknown> = {}
+): AgentEvent {
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'assistant_msg',
+    payload: {
+      content,
+      channel: 'progress',
+      source: 'session',
+      visibility: 'conversation',
+      presentation: 'body',
+      label: 'DeepCode',
+      runId,
+      ...extraPayload,
+    },
+  };
+}
+
+function providerStageExposesAssistantDelta(stage: string): boolean {
+  return stage === 'answer_stream' || stage === 'review_final';
+}
+
+function parseNativeToolArguments(raw: string, toolName: string): Record<string, unknown> {
+  const text = raw.trim();
+  if (!text) return {};
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return normalizeNativeToolArguments(parsed, toolName);
+  } catch (error) {
+    throw new SessionDriverLoopError(
+      'native_tool_arguments_invalid',
+      `Provider-native tool call ${toolName} returned invalid JSON arguments: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+function normalizeNativeToolArguments(value: unknown, toolName: string): Record<string, unknown> {
+  if (typeof value === 'string') return parseNativeToolArguments(value, toolName);
+  const record = objectRecord(value);
+  if (!record) {
+    throw new SessionDriverLoopError(
+      'native_tool_arguments_invalid',
+      `Provider-native tool call ${toolName} arguments must be a JSON object.`
+    );
+  }
+  return record;
+}
+
+function normalizeProviderToolName(name: string): string {
+  return name.replace(/__/g, '.');
 }
 
 function createManifest(input: SessionDriverLoopInput, id: string): ResourceManifestBuildResult {
@@ -2231,6 +3017,7 @@ function guidanceRevisionTransitionEvent(
   sessionId: string,
   runId: string,
   guidanceIds: string[],
+  userRequest: string,
   ts: string,
   id: string
 ): AgentEvent {
@@ -2240,7 +3027,7 @@ function guidanceRevisionTransitionEvent(
     ts,
     kind: 'assistant_msg',
     payload: {
-      content: '收到你的补充，我会把这条引导合并到当前回复里重新整理。',
+      content: guidanceRevisionTransitionMessage(visibleLanguageForRequest(userRequest)),
       channel: 'progress',
       source: 'session',
       visibility: 'conversation',
@@ -3847,109 +4634,6 @@ function requirementConfirmationEvent(input: {
   };
 }
 
-function resourceBudgetConfirmationEvent(input: {
-  sessionId: string;
-  runId: string;
-  originalUserRequest: string;
-  attachments: AgentContextAttachment[];
-  usedRounds: number;
-  maxRounds: number;
-  resourcePackets: ResourcePacket[];
-  ts: string;
-  id: string;
-}): AgentEvent {
-  const resourceCount = input.resourcePackets.reduce((sum, packet) => sum + packet.items.length, 0);
-  const truncatedCount = input.resourcePackets.reduce((sum, packet) => sum + packet.items.filter((item) => item.truncated).length, 0);
-  const recentFacts = input.resourcePackets
-    .flatMap((packet) => packet.items)
-    .slice(-8)
-    .map((item) => {
-      const raw = item as typeof item & { path?: string; absolutePath?: string };
-      return `${item.contentKind ?? 'resource'} ${raw.path ?? raw.absolutePath ?? item.manifestEntryId} (${item.status}${item.truncated ? ', truncated' : ''})`;
-    });
-  const requirement: RequirementRecord = {
-    requirementId: `${RESOURCE_BUDGET_REQUIREMENT_PREFIX}-${input.runId}`,
-    sessionId: input.sessionId,
-    initialUserRequest: input.originalUserRequest,
-    checklist: {
-      goal: '只读资源预算已用完，需要用户决定是否继续读取上下文。',
-      explicitTasks: [
-        `已使用 ${input.usedRounds}/${input.maxRounds} 轮只读资源请求。`,
-        `已获得 ${resourceCount} 项资源结果。`,
-        truncatedCount > 0 ? `${truncatedCount} 项资源被截断，可继续按片段精读。` : '当前没有被标记为截断的资源。',
-      ],
-      inferredTasks: [
-        `接受：追加 ${READ_ONLY_RESOURCE_ROUND_GRANT} 轮只读资源预算，继续让模型按需读取。`,
-        '输入补充意见后提交：按你的范围调整后继续。',
-        '拒绝：停止本轮继续读取。',
-      ],
-      outOfScope: [
-        '该确认只放宽只读资源请求预算，不放宽写入、删除、命令、Git push 或配置修改权限。',
-      ],
-      affectedAreaCandidates: ['session resource budget', 'read-only context assembly'],
-      resourceRequests: recentFacts,
-      acceptanceCriteriaCandidates: [
-        '继续读取时保留已解析资源上下文。',
-        '模型仍只能通过 resourceRequest 请求受控只读资源。',
-      ],
-      clarificationQuestions: [
-        '是否继续追加只读读取预算，或输入更具体范围后继续？',
-      ],
-      riskNotes: [
-        '继续读取会增加上下文成本和等待时间，但不会执行写入或命令。',
-      ],
-    },
-    status: 'probing',
-    createdAt: input.ts,
-    updatedAt: input.ts,
-  };
-  const decisionPayload = {
-    version: '1',
-    id: requirement.requirementId,
-    reason: 'Read-only resource request budget reached.',
-    summary: requirement.checklist?.goal ?? requirement.initialUserRequest,
-    options: [
-      {
-        id: 'continue-readonly',
-        label: '继续读取',
-        description: `追加 ${READ_ONLY_RESOURCE_ROUND_GRANT} 轮只读资源预算，让模型继续按需读取。`,
-        recommended: true,
-      },
-      {
-        id: 'narrow-scope',
-        label: '缩小范围',
-        description: '输入补充意见后继续，让模型优先围绕更具体目标读取。',
-      },
-      {
-        id: 'answer-now',
-        label: '基于当前回答',
-        description: '要求模型尽量基于现有资源内容收口回答。',
-      },
-    ],
-    allowsFreeform: true,
-  };
-  return requirementConfirmationEvent({
-    sessionId: input.sessionId,
-    runId: input.runId,
-    requirement,
-    proposal: {
-      schemaVersion: 'deepcode.agent.protocol.v3',
-      proposalId: `${input.id}-proposal`,
-      runId: input.runId,
-      sessionId: input.sessionId,
-      source: 'system',
-      kind: 'decisionRequest',
-      payload: decisionPayload,
-      referencedResourcePacketRefs: input.resourcePackets.map((packet) => packet.id),
-      referencedEvidenceRefs: [],
-    },
-    originalUserRequest: input.originalUserRequest,
-    attachments: input.attachments,
-    ts: input.ts,
-    id: input.id,
-  });
-}
-
 function isResourceBudgetConfirmation(event: AgentEvent): boolean {
   const payload = objectRecord(event.payload);
   const requirementId = stringValue(payload?.requirementId);
@@ -4134,13 +4818,73 @@ function numberValue(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
-function providerStageSummary(stage: string, phase: 'request' | 'response'): string {
+type VisibleLanguage = 'zh-CN' | 'en-US';
+
+function visibleLanguageForRequest(userRequest: string): VisibleLanguage {
+  return /[\u3400-\u9fff]/.test(userRequest) ? 'zh-CN' : 'en-US';
+}
+
+function providerStageSummary(stage: string, phase: 'request' | 'response', language: VisibleLanguage = 'zh-CN'): string {
   const label = stage
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (value) => value.toUpperCase());
+  if (language === 'en-US') {
+    return phase === 'request'
+      ? `${label}: requesting a structured model response.`
+      : `${label}: model response received; parsing protocol output.`;
+  }
   return phase === 'request'
     ? `${label}: 请求模型生成结构化回复。`
     : `${label}: 模型已返回，等待协议解析。`;
+}
+
+function nativeToolProgressMessage(toolCallCount: number, round: number, language: VisibleLanguage): string {
+  if (language === 'en-US') {
+    return `Provider requested ${toolCallCount} native tool call(s) in read-only round ${round + 1}. Session is normalizing them through Kernel boundaries.`;
+  }
+  return `Provider 在第 ${round + 1} 轮请求了 ${toolCallCount} 个原生工具调用，Session 正通过 Kernel 边界归一化处理。`;
+}
+
+function nativeToolResolveRunningSummary(toolName: string, language: VisibleLanguage): string {
+  return language === 'en-US'
+    ? `${toolName} is being resolved by Kernel ResourceResolve.`
+    : `${toolName} 正在通过 Kernel ResourceResolve 解析。`;
+}
+
+function nativeToolResolveCompletedSummary(toolName: string, language: VisibleLanguage): string {
+  return language === 'en-US'
+    ? `Kernel resolved native tool resource for ${toolName}.`
+    : `Kernel 已完成 ${toolName} 的原生工具资源解析。`;
+}
+
+function providerToolCallPreparingSummary(toolName: string, language: VisibleLanguage): string {
+  return language === 'en-US'
+    ? `Provider is preparing native tool call ${toolName}.`
+    : `Provider 正在准备原生工具调用 ${toolName}。`;
+}
+
+function providerToolCallStreamingSummary(language: VisibleLanguage): string {
+  return language === 'en-US'
+    ? 'Provider is streaming native tool call arguments.'
+    : 'Provider 正在流式输出原生工具调用参数。';
+}
+
+function providerUsageSummary(language: VisibleLanguage): string {
+  return language === 'en-US'
+    ? 'Provider usage telemetry received.'
+    : '已收到 provider 用量遥测。';
+}
+
+function userGuidanceConsumedSummary(language: VisibleLanguage): string {
+  return language === 'en-US'
+    ? 'User guidance entered the provider resume prompt.'
+    : '用户引导已进入 provider resume prompt。';
+}
+
+function guidanceRevisionTransitionMessage(language: VisibleLanguage): string {
+  return language === 'en-US'
+    ? 'I received your update and will merge it into the current response before finalizing.'
+    : '收到你的补充，我会把这条引导合并到当前回复里重新整理。';
 }
 
 function redactForArchive(value: unknown): unknown {
