@@ -76,6 +76,72 @@ interface SendJsonOptions {
   signal?: AbortSignal;
 }
 
+function endpointLabel(url: string): string {
+  try {
+    const parsed = new URL(url, typeof window === 'undefined' ? 'http://localhost' : window.location.origin);
+    return parsed.pathname;
+  } catch {
+    return url;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function stringField(value: Record<string, unknown>, key: string): string | null {
+  const field = value[key];
+  return typeof field === 'string' && field.trim() ? field : null;
+}
+
+function objectField(value: Record<string, unknown>, key: string): Record<string, unknown> | null {
+  const field = value[key];
+  return isRecord(field) ? field : null;
+}
+
+function extractErrorMessage(value: unknown): string | null {
+  if (!isRecord(value)) return null;
+  const direct = stringField(value, 'message') ?? stringField(value, 'error');
+  if (direct) return direct;
+  const error = objectField(value, 'error');
+  return error
+    ? stringField(error, 'message') ?? stringField(error, 'code')
+    : null;
+}
+
+function redactHttpErrorBody(value: string): string {
+  const lines = value.split(/\r?\n/).map((line) => {
+    const lower = line.toLowerCase();
+    return lower.includes('authorization') ||
+      lower.includes('api_key') ||
+      lower.includes('apikey') ||
+      lower.includes('secret') ||
+      lower.includes('password') ||
+      lower.includes('token') ||
+      lower.includes('bearer ')
+      ? '[redacted-http-error-line]'
+      : line;
+  });
+  return lines.join('\n').trim().slice(0, 800);
+}
+
+async function httpErrorMessage(response: Response, url: string): Promise<string> {
+  const label = endpointLabel(url);
+  const fallback = `HTTP ${response.status}: ${response.statusText} (${label})`;
+  const raw = await response.text().catch(() => '');
+  const preview = redactHttpErrorBody(raw);
+  if (!preview) return fallback;
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const parsedMessage = extractErrorMessage(parsed);
+    if (parsedMessage) return `${fallback} - ${parsedMessage}`;
+  } catch {
+    // 非 JSON 错误体直接使用安全摘要。
+  }
+  return `${fallback} - ${preview}`;
+}
+
 export interface SkillScanItem {
   sourceKind: 'manifest' | 'skillMd' | string;
   manifestStatus: 'parsed' | 'inferred' | string;
@@ -183,7 +249,7 @@ async function getJson<T>(url: string): Promise<ApiResponse<T>> {
       return {
         ok: false,
         error: 'http_error',
-        message: `HTTP ${response.status}: ${response.statusText}`,
+        message: await httpErrorMessage(response, url),
       };
     }
     return (await response.json()) as ApiResponse<T>;
@@ -210,7 +276,7 @@ async function sendJson<T>(
       return {
         ok: false,
         error: 'http_error',
-        message: `HTTP ${response.status}: ${response.statusText}`,
+        message: await httpErrorMessage(response, url),
       };
     }
     return (await response.json()) as ApiResponse<T>;
@@ -237,7 +303,7 @@ export function kernelCommand(request: KernelCommandEnvelope): Promise<KernelRep
         events: [],
         error: {
           code: 'http_error',
-          message: `HTTP ${response.status}: ${response.statusText}`,
+          message: await httpErrorMessage(response, `${API_BASE}/kernel/commands`),
         },
       } satisfies KernelReply;
     }

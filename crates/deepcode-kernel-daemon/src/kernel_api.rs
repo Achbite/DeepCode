@@ -47,9 +47,53 @@ fn read_packaged_build_commit() -> Option<String> {
 
 pub(crate) async fn kernel_commands(
     State(state): State<AppState>,
-    Json(body): Json<KernelCommandEnvelope>,
+    body: axum::body::Bytes,
 ) -> Json<KernelReply> {
+    let body = match serde_json::from_slice::<KernelCommandEnvelope>(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return Json(KernelReply {
+                ok: false,
+                events: Vec::new(),
+                snapshot: None,
+                error: Some(KernelErrorEnvelope {
+                    code: "kernel_command_decode_failed".to_string(),
+                    message: format!("Kernel command JSON decode failed: {error}"),
+                    message_key: None,
+                    args: Some(json!({
+                        "expected": "KernelCommandEnvelope { command: KernelCommand }",
+                        "bodyPreview": kernel_command_body_preview(&body)
+                    })),
+                }),
+            });
+        }
+    };
     Json(dispatch_kernel_command(&state, body))
+}
+
+fn kernel_command_body_preview(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let mut preview = String::new();
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("authorization")
+            || lower.contains("api_key")
+            || lower.contains("apikey")
+            || lower.contains("secret")
+            || lower.contains("password")
+            || lower.contains("token")
+            || lower.contains("bearer ")
+        {
+            preview.push_str("[redacted-kernel-command-line]\n");
+        } else {
+            preview.push_str(line);
+            preview.push('\n');
+        }
+        if preview.chars().count() >= 1200 {
+            break;
+        }
+    }
+    preview.trim().chars().take(1200).collect()
 }
 
 pub(crate) async fn kernel_snapshot(

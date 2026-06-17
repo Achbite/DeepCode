@@ -19,7 +19,7 @@
     "active": false,
     "targets": "all",
     "icon": [
-      "../../tauri/src-tauri/icons/icon.png"
+      "icons/icon.png"
     ]
   }
 }

@@ -3,6 +3,7 @@
 # 主要目标：
 #   make shell          -> 进入容器（镜像/容器不存在则懒构建；运行中则 restart 刷新环境）
 #   make build-deepcode-gui -> 在 Docker 内构建 Codex 风 DeepCode-GUI dist
+#   make build-deepcode-gui-tauri -> 在 Docker 内构建 Windows DeepCode-GUI.exe
 #   make dev-deepcode-gui   -> 在 Docker 内启动 31246 DeepCode-GUI 调试服务
 #   make clean          -> 全量清理（容器 + 镜像 + named volumes），下次 shell 全量重建
 #   make macos-package-service -> 在 macOS 宿主机启动 Docker 可请求的打包服务
@@ -28,6 +29,12 @@ DEEPCODE_NODE_DIST_BASE ?= https://npmmirror.com/mirrors/node
 DEEPCODE_NPM_REGISTRY ?= https://registry.npmmirror.com
 DEEPCODE_RUSTUP_DIST_SERVER ?= https://mirrors.ustc.edu.cn/rust-static
 DEEPCODE_RUSTUP_UPDATE_ROOT ?= https://mirrors.ustc.edu.cn/rust-static/rustup
+UNAME_R := $(shell uname -r 2>/dev/null)
+IS_WSL := $(findstring Microsoft,$(UNAME_R))$(findstring microsoft,$(UNAME_R))
+DEEPCODE_DOCKER_NET_ENV_PASSTHROUGH ?= auto
+DEEPCODE_CONTAINER_CARGO_TARGET_DIR ?= $(WORKDIR_IN_CTNR)/target
+DEEPCODE_CONTAINER_TMPDIR ?= /tmp/deepcode-build
+DEEPCODE_CONTAINER_SCCACHE_DIR ?= $(WORKDIR_IN_CTNR)/target/.sccache
 BUILD_ARGS := \
 	--build-arg DEEPCODE_APT_MIRROR=$(DEEPCODE_APT_MIRROR) \
 	--build-arg DEEPCODE_APT_SECURITY_MIRROR=$(DEEPCODE_APT_SECURITY_MIRROR) \
@@ -43,6 +50,36 @@ VOL_CARGO_REGISTRY    := deepcode-cargo-registry
 VOL_CARGO_TARGET      := deepcode-cargo-target
 VOL_NODE_MODULES      := deepcode-node-modules
 VOLUMES_ALL := $(VOL_PNPM_STORE) $(VOL_CARGO_REGISTRY) $(VOL_CARGO_TARGET) $(VOL_NODE_MODULES)
+
+# ---- WSL / Docker 网络变量透传 ----
+# 默认只在 WSL 自动启用，避免污染 macOS / Linux Docker 开发环境。
+# 仅传变量名，不在日志中展开值；docker run/exec 会从当前 shell 读取同名变量。
+NETWORK_ENV_ARGS_BASE := \
+	-e HTTP_PROXY \
+	-e HTTPS_PROXY \
+	-e ALL_PROXY \
+	-e NO_PROXY \
+	-e http_proxy \
+	-e https_proxy \
+	-e all_proxy \
+	-e no_proxy \
+	-e CARGO_HTTP_PROXY \
+	-e CARGO_HTTP_TIMEOUT \
+	-e CARGO_HTTP_CAINFO \
+	-e CARGO_HTTP_PROXY_CAINFO \
+	-e DEEPCODE_CARGO_SOURCE \
+	-e DEEPCODE_CARGO_FALLBACK_REGISTRY_URL \
+	-e DEEPCODE_CARGO_OFFICIAL_CWD
+
+ifeq ($(DEEPCODE_DOCKER_NET_ENV_PASSTHROUGH),1)
+NETWORK_ENV_ARGS := $(NETWORK_ENV_ARGS_BASE)
+else ifeq ($(DEEPCODE_DOCKER_NET_ENV_PASSTHROUGH),0)
+NETWORK_ENV_ARGS :=
+else ifneq ($(IS_WSL),)
+NETWORK_ENV_ARGS := $(NETWORK_ENV_ARGS_BASE)
+else
+NETWORK_ENV_ARGS :=
+endif
 
 # ---- 容器运行参数 ----
 # - $(CURDIR) 在 WSL 内自动为 /mnt/e/Dev-Agent/deepagent，挂载到容器 /workspace
@@ -60,9 +97,13 @@ RUN_ARGS := \
 	-e CARGO_HOME=/usr/local/cargo \
 	-e RUSTUP_HOME=/usr/local/rustup \
 	-e PNPM_HOME=/root/.local/share/pnpm \
-	-e PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+	-e CARGO_TARGET_DIR=$(DEEPCODE_CONTAINER_CARGO_TARGET_DIR) \
+	-e DEEPCODE_TMPDIR=$(DEEPCODE_CONTAINER_TMPDIR) \
+	-e SCCACHE_DIR=$(DEEPCODE_CONTAINER_SCCACHE_DIR) \
+	-e PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+	$(NETWORK_ENV_ARGS)
 
-.PHONY: help shell build-deepcode-gui dev-deepcode-gui clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _ensure_image _ensure_container
+.PHONY: help shell build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _ensure_image _ensure_container
 
 # ---- help：默认目标，列出可用入口 ----
 help:
@@ -70,6 +111,7 @@ help:
 	@echo ""
 	@echo "  make shell          进入开发容器（容器存在则刷新重启后再 exec）"
 	@echo "  make build-deepcode-gui  在 Docker 内构建 Codex 风 DeepCode-GUI dist"
+	@echo "  make build-deepcode-gui-tauri  在 Docker 内构建 Windows DeepCode-GUI.exe"
 	@echo "  make dev-deepcode-gui    在 Docker 内启动 DeepCode-GUI 调试服务：127.0.0.1:31246"
 	@echo "  make clean          全量清理（容器 + 镜像 + 4 个 named volumes），下次 shell 全量重建"
 	@echo "  make macos-package-service  在 macOS 宿主机启动 Docker 打包请求服务"
@@ -148,15 +190,19 @@ _ensure_container: _ensure_image
 # ---- shell：唯一交互入口 ----
 shell: _ensure_container
 	@echo "[make] exec 进入容器 $(CONTAINER_NAME) ..."
-	@docker exec -it $(CONTAINER_NAME) bash
+	@docker exec -it $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash
 
 build-deepcode-gui: _ensure_container
 	@echo "[make] Docker 内构建 DeepCode-GUI dist ..."
-	@docker exec $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui'
+	@docker exec $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui'
+
+build-deepcode-gui-tauri: _ensure_container
+	@echo "[make] Docker 内构建 Windows DeepCode-GUI.exe ..."
+	@docker exec $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui-tauri'
 
 dev-deepcode-gui: _ensure_container
 	@echo "[make] Docker 内启动 DeepCode-GUI 调试服务：http://127.0.0.1:31246/"
-	@docker exec -it $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui && DEEPCODE_HOST=0.0.0.0 DEEPCODE_PORT=31246 DEEPCODE_CLIENT_DIST=userspace/gui/dist-deepcode-gui cargo run -p deepcode-host-web'
+	@docker exec -it $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui && DEEPCODE_HOST=0.0.0.0 DEEPCODE_PORT=31246 DEEPCODE_CLIENT_DIST=userspace/gui/dist-deepcode-gui cargo run -p deepcode-host-web'
 
 # ---- clean：全量清理 ----
 clean:

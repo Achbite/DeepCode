@@ -4,6 +4,7 @@
 # Default scope is project-local and DeepCode-specific:
 #   - DeepCode dev container/image/named volumes
 #   - repo-local node_modules, pnpm store, Cargo target, build cache, dist outputs
+#   - Linux/Windows package build outputs while preserving package-local user data
 #   - macOS package build outputs while preserving package-local user data
 #
 # Host-global caches and global Docker pruning are opt-in because they can affect
@@ -58,6 +59,14 @@ Options:
   -h, --help                    Show this help.
 
 Preserved by default:
+  bin/linux-x64/config
+  bin/linux-x64/sessions
+  bin/linux-x64/conversation-archives
+  bin/linux-x64/kernel
+  bin/win64/config
+  bin/win64/sessions
+  bin/win64/conversation-archives
+  bin/win64/kernel
   bin/macos-arm64/config
   bin/macos-arm64/sessions
   bin/macos-arm64/conversation-archives
@@ -116,6 +125,57 @@ remove_path() {
     return 0
   fi
   run_command rm -rf "$path"
+}
+
+clear_directory_contents() {
+  local path="$1"
+  if [ ! -d "$path" ]; then
+    log "skip missing directory: $path"
+    return 0
+  fi
+  run_command find "$path" -mindepth 1 -delete
+}
+
+clean_portable_package_outputs() {
+  local package_dir="$1"
+  local platform="$2"
+  log "remove $platform package product outputs; preserve config/sessions/conversation-archives/kernel"
+
+  local generated_dirs=(
+    "$package_dir/web"
+    "$package_dir/web-deepcode-gui"
+    "$package_dir/packs"
+  )
+
+  local dir
+  for dir in "${generated_dirs[@]}"; do
+    clear_directory_contents "$dir"
+  done
+
+  local paths=(
+    "$package_dir/README.txt"
+    "$package_dir/build-info.json"
+    "$package_dir/deepcode"
+    "$package_dir/deepcode-cli"
+    "$package_dir/deepcode-gui"
+    "$package_dir/deepcode-kernel"
+    "$package_dir/deepcode-tui"
+    "$package_dir/DeepCode"
+    "$package_dir/deepcode-cli.bat"
+    "$package_dir/deepcode-tui.bat"
+    "$package_dir/deepcode.cmd"
+    "$package_dir/deepcode-cli.exe"
+    "$package_dir/deepcode-kernel.exe"
+    "$package_dir/deepcode-tui.exe"
+    "$package_dir/DeepCode.exe"
+    "$package_dir/DeepCode-GUI.exe"
+    "$package_dir/WebView2Loader.dll"
+  )
+
+  local path
+  for path in "${paths[@]}"; do
+    remove_path "$path"
+  done
 }
 
 command_exists() {
@@ -194,14 +254,15 @@ clean_repo_local() {
     "$ROOT_DIR/userspace/protocol/tsconfig.tsbuildinfo"
     "$ROOT_DIR/shells/tauri/tsconfig.tsbuildinfo"
     "$ROOT_DIR/shells/deepcode-gui/tsconfig.tsbuildinfo"
-    "$ROOT_DIR/bin/linux-x64"
-    "$ROOT_DIR/bin/win64"
   )
 
   local path
   for path in "${paths[@]}"; do
     remove_path "$path"
   done
+
+  clean_portable_package_outputs "$ROOT_DIR/bin/linux-x64" "linux-x64"
+  clean_portable_package_outputs "$ROOT_DIR/bin/win64" "win64"
 }
 
 clean_macos_package_outputs() {

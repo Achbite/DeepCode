@@ -20,11 +20,20 @@
 #   ./build.sh --stage tui      # Linux/Windows TUI Host shell
 #   ./build.sh --stage kernel   # 兼容入口：daemon + cli + tui
 #   ./build.sh --stage tauri    # Windows DeepCode.exe Tauri thin shell
+#   ./build.sh --stage deepcode-gui-tauri # Windows DeepCode-GUI.exe Tauri shell
 #   ./build.sh --stage package  # 复制已有构建产物到 bin/
 #   ./build.sh --stage all      # 等价默认完整构建
 #
 # 缓存开关：
 #   DEEPCODE_DISABLE_SCCACHE=1  禁用 sccache，回退到普通 cargo。
+#   DEEPCODE_CARGO_SOURCE=auto|repo|official
+#                                  Cargo registry source mode; auto retries registry/TLS failures on the fallback sparse source.
+#   DEEPCODE_CARGO_FALLBACK_REGISTRY_URL
+#                                  Override the fallback Cargo sparse registry URL; the default official crates.io source uses Cargo's built-in registry.
+#   DEEPCODE_CARGO_OFFICIAL_CWD
+#                                  Override cwd used for official crates.io fallback; default /tmp/deepcode-cargo-official-cwd.
+#   DEEPCODE_CARGO_AUTO_PRIMARY_RETRY
+#                                  Cargo retry count for the auto-mode primary source probe; default 0.
 #   DEEPCODE_FORCE_BUILD=1      忽略 stage hash，强制执行构建阶段。
 #   DEEPCODE_ALLOW_HOST_BUILD=1 显式允许宿主机直接构建（默认 Docker-only）。
 #   --clean-cache               清理 macOS 打包缓存后重新打包；保留用户配置和会话数据。
@@ -41,17 +50,51 @@ LINUX_DIR="$BIN_ROOT/linux-x64"
 WIN_DIR="$BIN_ROOT/win64"
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
+
+fs_type_of() {
+  stat -f -c %T "$1" 2>/dev/null || true
+}
+
+is_wsl_bind_fs_type() {
+  case "$1" in
+    v9fs|9p|drvfs|fuseblk)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_native_build_dir() {
+  local dir="$1"
+  local fs_type
+  [ -d "$dir" ] || return 1
+  fs_type="$(fs_type_of "$dir")"
+  [ -n "$fs_type" ] || return 1
+  ! is_wsl_bind_fs_type "$fs_type"
+}
+
+docker_cargo_target_default() {
+  local target_volume="$ROOT_DIR/target"
+  if is_native_build_dir "$target_volume"; then
+    printf '%s\n' "$target_volume"
+  else
+    printf '%s\n' "/tmp/deepcode-cargo-target"
+  fi
+}
+
 if [ -n "${CARGO_TARGET_DIR:-}" ]; then
   CARGO_TARGET_ROOT="$CARGO_TARGET_DIR"
 elif [ -f /.dockerenv ]; then
-  CARGO_TARGET_ROOT="$ROOT_DIR/.build-cache/cargo-target"
+  CARGO_TARGET_ROOT="$(docker_cargo_target_default)"
 else
   CARGO_TARGET_ROOT="$ROOT_DIR/target"
 fi
 if [ -n "${DEEPCODE_TMPDIR:-}" ]; then
   BUILD_TMPDIR="$DEEPCODE_TMPDIR"
 elif [ -f /.dockerenv ] && { [ -z "${TMPDIR:-}" ] || [ "${TMPDIR%/}" = "/tmp" ]; }; then
-  BUILD_TMPDIR="$ROOT_DIR/.build-cache/tmp"
+  BUILD_TMPDIR="/tmp/deepcode-build"
 else
   BUILD_TMPDIR="${TMPDIR:-/tmp}"
 fi
@@ -64,6 +107,7 @@ PNPM_FETCH_RETRY_MAXTIMEOUT_MS="${DEEPCODE_PNPM_FETCH_RETRY_MAXTIMEOUT_MS:-15000
 PNPM_FETCH_TIMEOUT_MS="${DEEPCODE_PNPM_FETCH_TIMEOUT_MS:-30000}"
 BUILD_LINUX_TAURI_SHELL="${DEEPCODE_BUILD_LINUX_TAURI_SHELL:-0}"
 STAGE_STAMP_DIR="$ROOT_DIR/.build-cache/build-stamps"
+CARGO_WITH_FALLBACK="$ROOT_DIR/scripts/cargo-with-fallback.sh"
 
 export CARGO_TARGET_DIR="$CARGO_TARGET_ROOT"
 export TMPDIR="$BUILD_TMPDIR"
@@ -74,7 +118,7 @@ mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./build.sh [--stage all|gui|deepcode-gui|macos-package-service|package-macos|package-macos-deepcode-gui|macos-deepcode-gui|daemon|cli|tui|kernel|tauri|package]...
+  ./build.sh [--stage all|gui|deepcode-gui|deepcode-gui-tauri|macos-package-service|package-macos|package-macos-deepcode-gui|macos-deepcode-gui|daemon|cli|tui|kernel|tauri|package]...
   ./build.sh --stage macos-package-service
   ./build.sh --full
   ./build.sh --stage package-macos --clean-cache
@@ -85,17 +129,39 @@ Default:
 
 Environment:
   CARGO_TARGET_DIR                  Override shared Cargo target directory.
-                                    Docker default: .build-cache/cargo-target.
+                                    Docker default prefers /workspace/target
+                                    when it is a native Docker volume, otherwise
+                                    falls back to /tmp/deepcode-cargo-target.
   DEEPCODE_TMPDIR                   Override temporary build directory.
-                                    Docker default: .build-cache/tmp.
+                                    Docker default: /tmp/deepcode-build.
   PNPM_STORE_DIR                    Override pnpm store directory.
   DEEPCODE_PNPM_REGISTRY            Override pnpm registry used by dependency install.
   DEEPCODE_PNPM_NETWORK_CONCURRENCY Override pnpm network concurrency.
   DEEPCODE_PNPM_FETCH_TIMEOUT_MS    Override pnpm fetch timeout in milliseconds.
   DEEPCODE_FORCE_BUILD=1            Ignore stage hash stamps and rebuild.
   DEEPCODE_DISABLE_SCCACHE=1        Disable sccache even when available.
+  DEEPCODE_CARGO_SOURCE=auto|repo|official
+                                    Cargo registry source mode. Default auto keeps
+                                    repo config first and retries registry/TLS
+                                    download failures with the fallback sparse source.
+  DEEPCODE_CARGO_FALLBACK_REGISTRY_URL
+                                    Override fallback Cargo sparse registry URL.
+                                    Default official crates.io source uses Cargo's
+                                    built-in registry instead of source replacement.
+  DEEPCODE_CARGO_OFFICIAL_CWD
+                                    Override cwd used for official crates.io
+                                    fallback. Default /tmp/deepcode-cargo-official-cwd
+                                    avoids project-local .cargo/config.toml.
+  DEEPCODE_CARGO_AUTO_PRIMARY_RETRY
+                                    Cargo retry count for auto-mode primary source
+                                    probe. Default 0 to fail fast into fallback.
   DEEPCODE_ALLOW_HOST_BUILD=1       Allow non-Docker host builds explicitly.
   SCCACHE_DIR                       Override local sccache cache directory.
+                                    Docker default prefers CARGO_TARGET_DIR/.sccache
+                                    on native Docker volumes, otherwise
+                                    falls back to /tmp/deepcode-sccache.
+  DEEPCODE_RESET_SCCACHE_SERVER=0   Do not stop an existing Docker sccache
+                                    server before first use.
   DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 Build optional Linux Tauri shell.
   DEEPCODE_MACOS_PACKAGE_MODE=auto|off|require
                                       From Docker, submit a macOS package request after full package stage.
@@ -180,7 +246,9 @@ run_daemon=0
 run_cli=0
 run_tui=0
 run_tauri=0
+run_deepcode_gui_tauri=0
 run_package=0
+SCCACHE_SERVER_RESET_DONE=0
 
 enable_stage() {
   case "$1" in
@@ -192,6 +260,7 @@ enable_stage() {
       run_cli=1
       run_tui=1
       run_tauri=1
+      run_deepcode_gui_tauri=1
       run_package=1
       ;;
     macos-package-service)
@@ -235,6 +304,11 @@ enable_stage() {
       run_deps=1
       run_tauri=1
       ;;
+    deepcode-gui-tauri)
+      run_deps=1
+      run_deepcode_gui=1
+      run_deepcode_gui_tauri=1
+      ;;
     package)
       run_package=1
       ;;
@@ -266,7 +340,7 @@ echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
 echo "==[build]== PNPM_REGISTRY=$PNPM_REGISTRY"
 echo "==[build]== DEEPCODE_BUILD_LINUX_TAURI_SHELL=$BUILD_LINUX_TAURI_SHELL"
 echo "==[build]== clean-cache=$clean_cache"
-echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui package-macos=$run_package_macos package-macos-deepcode-gui=$run_package_macos_deepcode_gui macos-package-service=$run_macos_package_service daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package"
+echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui deepcode-gui-tauri=$run_deepcode_gui_tauri package-macos=$run_package_macos package-macos-deepcode-gui=$run_package_macos_deepcode_gui macos-package-service=$run_macos_package_service daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package"
 mkdir -p "$STAGE_STAMP_DIR"
 
 is_docker_environment() {
@@ -419,8 +493,10 @@ submit_macos_package_requests() {
 }
 
 auto_submit_macos_package_request() {
-  [ "${DEEPCODE_MACOS_PACKAGE_MODE:-auto}" != "off" ] || return
-  is_docker_environment || return
+  if [ "${DEEPCODE_MACOS_PACKAGE_MODE:-auto}" = "off" ]; then
+    return 0
+  fi
+  is_docker_environment || return 0
 
   local required=0
   if [ "${DEEPCODE_MACOS_PACKAGE_MODE:-auto}" = "require" ]; then
@@ -434,7 +510,8 @@ host_macos_stage_count=$((run_package_macos + run_package_macos_deepcode_gui))
 if [ "$run_macos_package_service" = "1" ]; then
   if [ "$host_macos_stage_count" -gt 0 ] || [ "$run_deps" = "1" ] || [ "$run_gui" = "1" ] || \
     [ "$run_deepcode_gui" = "1" ] || [ "$run_daemon" = "1" ] || [ "$run_cli" = "1" ] || \
-    [ "$run_tui" = "1" ] || [ "$run_tauri" = "1" ] || [ "$run_package" = "1" ]; then
+    [ "$run_tui" = "1" ] || [ "$run_tauri" = "1" ] || [ "$run_deepcode_gui_tauri" = "1" ] || \
+    [ "$run_package" = "1" ]; then
     echo "==[build][error]== macos-package-service must run by itself." >&2
     exit 2
   fi
@@ -449,7 +526,7 @@ if [ "$host_macos_stage_count" -gt 0 ]; then
   fi
   if [ "$run_deps" = "1" ] || [ "$run_gui" = "1" ] || [ "$run_deepcode_gui" = "1" ] || \
     [ "$run_daemon" = "1" ] || [ "$run_cli" = "1" ] || [ "$run_tui" = "1" ] || \
-    [ "$run_tauri" = "1" ] || [ "$run_package" = "1" ]; then
+    [ "$run_tauri" = "1" ] || [ "$run_deepcode_gui_tauri" = "1" ] || [ "$run_package" = "1" ]; then
     echo "==[build][error]== macOS package stages are host orchestration stages; run them by themselves." >&2
     exit 2
   fi
@@ -485,9 +562,24 @@ configure_sccache() {
   fi
 
   if command -v sccache >/dev/null 2>&1; then
-    export SCCACHE_DIR="${SCCACHE_DIR:-$ROOT_DIR/.build-cache/sccache}"
+    if [ -z "${SCCACHE_DIR:-}" ]; then
+      if is_docker_environment && is_native_build_dir "$CARGO_TARGET_ROOT"; then
+        export SCCACHE_DIR="$CARGO_TARGET_ROOT/.sccache"
+      elif is_docker_environment; then
+        export SCCACHE_DIR="/tmp/deepcode-sccache"
+      else
+        export SCCACHE_DIR="$ROOT_DIR/.build-cache/sccache"
+      fi
+    else
+      export SCCACHE_DIR
+    fi
     mkdir -p "$SCCACHE_DIR"
     export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
+    if is_docker_environment && [ "${DEEPCODE_RESET_SCCACHE_SERVER:-1}" = "1" ] && [ "$SCCACHE_SERVER_RESET_DONE" = "0" ]; then
+      sccache --stop-server >/dev/null 2>&1 || true
+      SCCACHE_SERVER_RESET_DONE=1
+      echo "==[build][cache]== sccache server reset for Docker cache path"
+    fi
     echo "==[build][cache]== sccache enabled: RUSTC_WRAPPER=$RUSTC_WRAPPER SCCACHE_DIR=$SCCACHE_DIR"
   else
     echo "==[build][cache]== sccache not found; cargo builds continue without RUSTC_WRAPPER"
@@ -499,6 +591,41 @@ show_sccache_stats() {
     echo "==[build][cache]== sccache stats"
     sccache --show-stats || true
   fi
+}
+
+cargo_with_fallback() {
+  DEEPCODE_CARGO_MANIFEST_PATH="${DEEPCODE_CARGO_MANIFEST_PATH:-$ROOT_DIR/Cargo.toml}" \
+    bash "$CARGO_WITH_FALLBACK" "$@"
+}
+
+cargo_with_fallback_executable() {
+  local manifest_path="${1:-}"
+  local wrapper_dir="$TMPDIR/deepcode-cargo-wrapper"
+  local wrapper="$wrapper_dir/cargo"
+  local real_cargo
+  real_cargo="$(command -v cargo)"
+  mkdir -p "$wrapper_dir"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'export DEEPCODE_CARGO_CALLER_CWD="${DEEPCODE_CARGO_CALLER_CWD:-$(pwd)}"\n'
+    printf 'export DEEPCODE_CARGO_BIN="${DEEPCODE_CARGO_BIN:-%q}"\n' "$real_cargo"
+    if [ -n "$manifest_path" ]; then
+      printf 'export DEEPCODE_CARGO_MANIFEST_PATH=%q\n' "$manifest_path"
+    fi
+    printf 'exec bash %q "$@"\n' "$CARGO_WITH_FALLBACK"
+  } >"$wrapper"
+  chmod +x "$wrapper"
+  printf '%s\n' "$wrapper"
+}
+
+run_with_cargo_fallback_shim() {
+  local manifest_path="$1"
+  shift
+  local cargo_wrapper
+  local cargo_wrapper_dir
+  cargo_wrapper="$(cargo_with_fallback_executable "$manifest_path")"
+  cargo_wrapper_dir="$(dirname "$cargo_wrapper")"
+  CARGO="$cargo_wrapper" PATH="$cargo_wrapper_dir:$PATH" "$@"
 }
 
 tracked_files() {
@@ -561,6 +688,10 @@ stage_hash() {
       tauri)
         tracked_files package.json pnpm-lock.yaml shells/tauri
         find_existing_files "$CLIENT_DIR/dist" "$ROOT_DIR/shells/tauri/dist"
+        ;;
+      deepcode-gui-tauri)
+        tracked_files package.json pnpm-lock.yaml shells/deepcode-gui
+        find_existing_files "$CLIENT_DIR/dist-deepcode-gui" "$ROOT_DIR/shells/deepcode-gui/dist"
         ;;
       *)
         return 1
@@ -642,6 +773,15 @@ prepare_deepcode_gui_tauri_dist() {
   cp -r "$deepcode_gui_dist/." "$tauri_gui_dist/"
 }
 
+sync_deepcode_gui_runtime_assets() {
+  local runtime_dist="$1"
+  normalize_deepcode_gui_dist
+  validate_frontend_dist "$CLIENT_DIR/dist-deepcode-gui" "DeepCode-GUI" "deepcode-gui"
+  mkdir -p "$runtime_dist"
+  find "$runtime_dist" -mindepth 1 -delete 2>/dev/null || true
+  cp -r "$CLIENT_DIR/dist-deepcode-gui/." "$runtime_dist/"
+}
+
 validate_frontend_dist() {
   local dist_dir="$1"
   local label="$2"
@@ -701,9 +841,9 @@ build_daemon() {
   fi
   configure_sccache
   echo "==[build][daemon]== build Rust Kernel daemon for Linux"
-  cargo build --release -p deepcode-kernel-daemon
+  cargo_with_fallback build --release -p deepcode-kernel-daemon
   echo "==[build][daemon]== build Rust Kernel daemon for Windows GNU"
-  cargo build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon
+  cargo_with_fallback build --release --target "$WINDOWS_TARGET" -p deepcode-kernel-daemon
   mark_stage_built daemon
   show_sccache_stats
 }
@@ -717,9 +857,9 @@ build_cli() {
   fi
   configure_sccache
   echo "==[build][cli]== build Rust CLI Host shell for Linux"
-  cargo build --release -p deepcode-cli
+  cargo_with_fallback build --release -p deepcode-cli
   echo "==[build][cli]== build Rust CLI Host shell for Windows GNU"
-  cargo build --release --target "$WINDOWS_TARGET" -p deepcode-cli
+  cargo_with_fallback build --release --target "$WINDOWS_TARGET" -p deepcode-cli
   mark_stage_built cli
   show_sccache_stats
 }
@@ -732,9 +872,9 @@ build_tui() {
   fi
   configure_sccache
   echo "==[build][tui]== build Rust TUI Host shell for Linux"
-  cargo build --release -p deepcode-tui
+  cargo_with_fallback build --release -p deepcode-tui
   echo "==[build][tui]== build Rust TUI Host shell for Windows GNU"
-  cargo build --release --target "$WINDOWS_TARGET" -p deepcode-tui
+  cargo_with_fallback build --release --target "$WINDOWS_TARGET" -p deepcode-tui
   mark_stage_built tui
   show_sccache_stats
 }
@@ -757,8 +897,29 @@ build_tauri() {
   fi
   configure_sccache
   echo "==[build][tauri]== build Windows DeepCode.exe GUI shell"
-  pnpm --filter @deepcode/tauri-shell tauri:build -- --target "$WINDOWS_TARGET"
+  run_with_cargo_fallback_shim "$ROOT_DIR/shells/tauri/src-tauri/Cargo.toml" \
+    pnpm --filter @deepcode/tauri-shell tauri:build -- --target "$WINDOWS_TARGET"
   mark_stage_built tauri
+  show_sccache_stats
+}
+
+build_deepcode_gui_tauri() {
+  if [ ! -d "$CLIENT_DIR/dist-deepcode-gui" ]; then
+    echo "==[build][deepcode-gui-tauri]== DeepCode-GUI dist missing; building DeepCode-GUI first"
+    build_deepcode_gui
+  else
+    prepare_deepcode_gui_tauri_dist
+  fi
+  local runtime_dist="$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/web-deepcode-gui"
+  sync_deepcode_gui_runtime_assets "$runtime_dist"
+  if stage_should_skip deepcode-gui-tauri "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode-GUI.exe"; then
+    return
+  fi
+  configure_sccache
+  echo "==[build][deepcode-gui-tauri]== build Windows DeepCode-GUI.exe Tauri shell"
+  run_with_cargo_fallback_shim "$ROOT_DIR/shells/deepcode-gui/src-tauri/Cargo.toml" \
+    pnpm --filter @deepcode/deepcode-gui-shell tauri:build -- --target "$WINDOWS_TARGET"
+  mark_stage_built deepcode-gui-tauri
   show_sccache_stats
 }
 
@@ -768,11 +929,21 @@ prepare_distribution_tree() {
     "$dist_dir/config/global/prompts" \
     "$dist_dir/config/global/skills" \
     "$dist_dir/config/global/ruler" \
+    "$dist_dir/config/user/local/settings" \
+    "$dist_dir/config/user/local/secrets" \
+    "$dist_dir/sessions" \
+    "$dist_dir/conversation-archives" \
+    "$dist_dir/kernel" \
     "$dist_dir/packs" \
-    "$dist_dir/web"
+    "$dist_dir/web" \
+    "$dist_dir/web-deepcode-gui"
 
   if [ -d "$CLIENT_DIR/dist" ]; then
     cp -r "$CLIENT_DIR/dist/." "$dist_dir/web/"
+  fi
+  if [ -d "$CLIENT_DIR/dist-deepcode-gui" ]; then
+    normalize_deepcode_gui_dist
+    cp -r "$CLIENT_DIR/dist-deepcode-gui/." "$dist_dir/web-deepcode-gui/"
   fi
 }
 
@@ -788,47 +959,115 @@ copy_required_file() {
   cp -v "$src" "$dst"
 }
 
+require_package_file() {
+  local src="$1"
+  local hint="$2"
+  if [ ! -f "$src" ]; then
+    echo "==[build][error]== missing artifact before package cleanup: $src" >&2
+    echo "==[build][error]== $hint" >&2
+    return 1
+  fi
+}
+
+require_package_dir() {
+  local src="$1"
+  local hint="$2"
+  if [ ! -d "$src" ]; then
+    echo "==[build][error]== missing artifact directory before package cleanup: $src" >&2
+    echo "==[build][error]== $hint" >&2
+    return 1
+  fi
+}
+
+find_webview2_loader_dll() {
+  local webview2_loader_dll="$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/WebView2Loader.dll"
+  if [ -f "$webview2_loader_dll" ]; then
+    printf '%s\n' "$webview2_loader_dll"
+    return 0
+  fi
+  local build_dir="$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/build"
+  if [ -d "$build_dir" ]; then
+    find "$build_dir" \
+      -path '*/out/x64/WebView2Loader.dll' \
+      -type f \
+      | head -n 1
+  fi
+  return 0
+}
+
+validate_package_inputs() {
+  local missing=0
+  require_package_dir "$CLIENT_DIR/dist" "run ./build.sh --stage gui first" || missing=1
+  require_package_dir "$CLIENT_DIR/dist-deepcode-gui" "run ./build.sh --stage deepcode-gui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "run ./build.sh --stage tauri first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode-GUI.exe" "run ./build.sh --stage deepcode-gui-tauri first" || missing=1
+  local webview2_loader_dll
+  webview2_loader_dll="$(find_webview2_loader_dll)"
+  if [ ! -f "$webview2_loader_dll" ]; then
+    echo "==[build][error]== WebView2Loader.dll was not found before package cleanup" >&2
+    missing=1
+  fi
+  if [ "$missing" = "1" ]; then
+    exit 1
+  fi
+}
+
 write_readme() {
   local dist_dir="$1"
   local platform="$2"
-  local gui_entry="deepcode-gui          Linux GUI host launcher"
+  local gui_entries="  deepcode-gui          Linux GUI host launcher"
   if [ "$platform" = "win64" ]; then
-    gui_entry="DeepCode.exe          Windows GUI thin shell, starts the same-dir Kernel on a free localhost port"
+    gui_entries="  DeepCode.exe          Windows Editor shell, starts the same-dir Kernel on a free localhost port
+  DeepCode-GUI.exe      Windows Codex-style GUI shell, shares the same Kernel and config"
   fi
   cat > "$dist_dir/README.txt" <<README
 DeepCode Unified Distribution ($platform)
 =========================================
 
 This folder is one DeepCode host distribution. GUI, CLI, and TUI entries share
-the same Rust Kernel binary, bundled config directory, packs directory, and web assets.
+the same Rust Kernel binary, bundled config directory, and packs directory.
+Editor assets live in web/. DeepCode-GUI assets live in web-deepcode-gui/.
 User session composition lives in the TS session-core package; all sensitive
 workspace, process, skill, and context operations must enter the Kernel through
 syscalls.
 
-Writable user settings and LLM profile data are stored outside this distribution:
-  Linux:   \$XDG_CONFIG_HOME/deepcode/config or ~/.config/deepcode/config
-  Windows: %APPDATA%\DeepCode\config
-Set DEEPCODE_CONFIG_DIR to override the writable configuration root.
+Writable package-local data is preserved across package refreshes:
+  config/user/local/settings/     User settings, LLM profiles, workflow config.
+  config/user/local/secrets/      Local secret references. Do not share.
+  sessions/                       Session projection and transcript cache.
+  conversation-archives/          Conversation archive exports and debug packages.
+  kernel/                         Kernel ledger and runtime records.
+
+Packaged Tauri desktop shells set DEEPCODE_CONFIG_DIR to this package root.
+Direct CLI/daemon runs use the OS config root unless DEEPCODE_CONFIG_DIR is set.
 
 Entries:
   deepcode-kernel       Rust Kernel Daemon + localhost API
-  $gui_entry
+$gui_entries
   deepcode              CLI Host Shell MVP over KernelClient (Linux)
   deepcode-cli          CLI Host Shell MVP over KernelClient
   deepcode-tui          TUI Host Shell MVP over KernelClient
   deepcode.cmd          Windows CLI command alias for deepcode-cli.exe
 
 Windows GUI runtime:
-  DeepCode.exe requires WebView2Loader.dll next to the executable. The portable
-  distribution includes that loader DLL. The Microsoft Edge WebView2 Evergreen
-  Runtime is still expected to be installed on the target Windows system.
+  DeepCode.exe and DeepCode-GUI.exe require WebView2Loader.dll next to the
+  executable. The portable distribution includes that loader DLL. The Microsoft
+  Edge WebView2 Evergreen Runtime is still expected to be installed on the
+  target Windows system.
 
 Optional desktop shell:
-  Tauri thin shell source lives in shells/tauri. It embeds the same React GUI as
-  the browser host, starts or connects to the same-dir Kernel Daemon in the
-  background, and does not contain Agent runtime. Windows distribution includes
-  DeepCode.exe. The desktop shell chooses an available localhost port by
-  default; set DEEPCODE_PORT to force a fixed port such as 31245.
+  Tauri thin shell source lives in shells/tauri and shells/deepcode-gui. Each
+  shell embeds its matching React dist, starts or connects to the same-dir
+  Kernel Daemon in the background, and does not contain Agent runtime. Windows
+  distribution includes DeepCode.exe and DeepCode-GUI.exe. The desktop shell
+  chooses an available localhost port by default; set DEEPCODE_PORT to force a
+  fixed port such as 31245.
 
 Run the Linux GUI launcher or force DEEPCODE_PORT=31245, then open:
   http://127.0.0.1:31245/
@@ -841,11 +1080,49 @@ Health check:
 README
 }
 
+clear_package_generated_dir() {
+  local path="$1"
+  mkdir -p "$path"
+  find "$path" -mindepth 1 -delete 2>/dev/null || true
+}
+
+clean_package_generated_outputs() {
+  local dist_dir="$1"
+  local platform="$2"
+  echo "==[build][package]== clean $platform generated outputs; preserve config/sessions/conversation-archives/kernel"
+
+  clear_package_generated_dir "$dist_dir/web"
+  clear_package_generated_dir "$dist_dir/web-deepcode-gui"
+  clear_package_generated_dir "$dist_dir/packs"
+
+  local files=(
+    "$dist_dir/README.txt"
+    "$dist_dir/build-info.json"
+    "$dist_dir/deepcode"
+    "$dist_dir/deepcode-cli"
+    "$dist_dir/deepcode-gui"
+    "$dist_dir/deepcode-kernel"
+    "$dist_dir/deepcode-tui"
+    "$dist_dir/DeepCode"
+    "$dist_dir/deepcode-cli.bat"
+    "$dist_dir/deepcode-tui.bat"
+    "$dist_dir/deepcode.cmd"
+    "$dist_dir/deepcode-cli.exe"
+    "$dist_dir/deepcode-kernel.exe"
+    "$dist_dir/deepcode-tui.exe"
+    "$dist_dir/DeepCode.exe"
+    "$dist_dir/DeepCode-GUI.exe"
+    "$dist_dir/WebView2Loader.dll"
+  )
+  rm -f "${files[@]}"
+}
+
 package_distribution() {
   echo "==[build][package]== prepare bin/linux-x64 and bin/win64 directories"
+  validate_package_inputs
   mkdir -p "$LINUX_DIR" "$WIN_DIR"
-  find "$LINUX_DIR" -mindepth 1 -delete 2>/dev/null || true
-  find "$WIN_DIR" -mindepth 1 -delete 2>/dev/null || true
+  clean_package_generated_outputs "$LINUX_DIR" "linux-x64"
+  clean_package_generated_outputs "$WIN_DIR" "win64"
 
   prepare_distribution_tree "$LINUX_DIR"
   prepare_distribution_tree "$WIN_DIR"
@@ -869,14 +1146,12 @@ package_distribution() {
     "run ./build.sh --stage kernel first"
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "$WIN_DIR/DeepCode.exe" \
     "run ./build.sh --stage tauri first"
+  copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode-GUI.exe" "$WIN_DIR/DeepCode-GUI.exe" \
+    "run ./build.sh --stage deepcode-gui-tauri first"
+  validate_frontend_dist "$WIN_DIR/web-deepcode-gui" "DeepCode-GUI packaged assets" "deepcode-gui"
 
-  local webview2_loader_dll="$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/WebView2Loader.dll"
-  if [ ! -f "$webview2_loader_dll" ]; then
-    webview2_loader_dll="$(find "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/build" \
-      -path '*/out/x64/WebView2Loader.dll' \
-      -type f \
-      | head -n 1)"
-  fi
+  local webview2_loader_dll
+  webview2_loader_dll="$(find_webview2_loader_dll)"
   if [ ! -f "$webview2_loader_dll" ]; then
     echo "==[build][error]== WebView2Loader.dll was not found in Windows Tauri build output" >&2
     exit 1
@@ -928,7 +1203,8 @@ LAUNCHER
   if [ "$BUILD_LINUX_TAURI_SHELL" = "1" ]; then
     echo "==[build][opt]== build Linux Tauri thin shell"
     configure_sccache
-    pnpm --filter @deepcode/tauri-shell tauri:build
+    run_with_cargo_fallback_shim "$ROOT_DIR/shells/tauri/src-tauri/Cargo.toml" \
+      pnpm --filter @deepcode/tauri-shell tauri:build
     local tauri_release="$CARGO_TARGET_ROOT/release/DeepCode"
     if [ -x "$tauri_release" ]; then
       cp -v "$tauri_release" "$LINUX_DIR/DeepCode"
@@ -967,6 +1243,10 @@ fi
 
 if [ "$run_tauri" = "1" ]; then
   build_tauri
+fi
+
+if [ "$run_deepcode_gui_tauri" = "1" ]; then
+  build_deepcode_gui_tauri
 fi
 
 if [ "$run_package" = "1" ]; then
