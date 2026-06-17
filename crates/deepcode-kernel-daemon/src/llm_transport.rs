@@ -169,7 +169,7 @@ pub(crate) async fn call_llm_profile(
     match profile.kind.as_str() {
         "anthropic" => call_anthropic_profile(profile, messages, tools).await,
         "ollama" => call_ollama_profile(profile, messages, tools).await,
-        "openaiCompatible" | "codex" => {
+        "openaiCompatible" => {
             call_openai_compatible_profile(profile, messages, tools, response_format.as_ref()).await
         }
         other => Err(provider_local_error(

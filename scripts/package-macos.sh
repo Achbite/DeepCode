@@ -257,7 +257,7 @@ ensure_node() {
     node_path="$(command -v node)"
     node_real="$(realpath "$node_path" 2>/dev/null || printf '%s\n' "$node_path")"
     node_major="$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || printf '0')"
-    if [ "$node_major" -ge 20 ] 2>/dev/null && ! printf '%s\n' "$node_real" | grep -q '/Applications/Codex.app/'; then
+    if [ "$node_major" -ge 20 ] 2>/dev/null && ! printf '%s\n' "$node_real" | grep -Eq '/Applications/[^/]+\.app/'; then
       return
     fi
   fi

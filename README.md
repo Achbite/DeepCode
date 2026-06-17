@@ -2,34 +2,7 @@
 
 > Chinese translation: [README.zh-CN.md](README.zh-CN.md)
 
-DeepCode is a local-first AI coding workbench experiment. Its goal is to keep Agent session protocol, Kernel tool execution, permission audit, context compression, and Editor/GUI/CLI/TUI shells on one shared backend source of truth. The project is still in an active architecture-closure phase. Current work prioritizes Kernel and Session stability over release-grade product guarantees.
-
-## Current Status
-
-- The Kernel daemon exposes `/api/health`, conversation archives, tool catalog, permission audit, workspace, Git, and internal browser APIs.
-- The live session protocol is `deepcode.agent.protocol.v3` JSON Envelope only. Userspace Session DriverLoop owns prompt assembly, provider calls, parser, and one-shot repair. Tagged Markdown protocol output is rejected by the Session parser.
-- Editor is the full workbench package: file tree, Monaco-based editor surface, terminal, Agent panel, Git panel, and internal browser. The right Agent panel is an embedded conversation panel that reuses the same Session projection and message semantics as DeepCode-GUI; it is not a separate Agent runtime.
-- DeepCode-GUI is a concise conversational GUI. It is not the full Editor.
-- GUI read-only analysis can be anchored by explicit attachments or by the project working directory remembered by Session. This is separate from Editor workspace binding, which remains the editing and file-tree isolation boundary.
-- CLI and TUI reuse the same Kernel/session source of truth. The legacy CLI/TUI chat-submit path is removed until those shells are reattached through the same SessionDriverLoop bridge as Editor and GUI.
-- Web Dev Host is only a development preview and protocol-debugging entry. It is not a formal UI package.
-
-## UI Package Terms
-
-DeepCode currently has four formal UI package forms:
-
-| Name | Definition | Current Priority |
-| --- | --- | --- |
-| Editor / DeepCode Editor | Full packaged GUI workbench with an editor | First target for Git, internal browser, and workbench components |
-| DeepCode-GUI / GUI | Concise conversational GUI | Reuses the same component flow after Editor stabilizes |
-| CLI | Scriptable Host Shell | Automation and integration |
-| TUI | Ratatui/Crossterm terminal UI | Lightweight local usage |
-
-UI shells do not own a second Kernel, session truth, tool execution path, permission model, or user-preference store. Functional components, permissions, and tool calls are provided by Kernel/session. Conversation orchestration, context assembly, prompt envelopes, provider lifecycle, protocol parsing, and repair are owned by userspace Session DriverLoop. UI layers only own rendering, input, and interaction differences.
-
-Editor workspace binding is an Editor concern for file tree display, editing, and code-change isolation. DeepCode-GUI can carry conversation roots from explicit attachments or a Session project working directory without requiring an Editor workspace. Writes, deletes, Git operations, terminal commands, and cross-project modifications still require reviewable plans, Kernel policy checks, and clear target disclosure.
-
-Editor-only context such as workspace root, active file, selection, open tabs, and terminal cwd is Host context. It enters Session context assembly first; Kernel only sees ResourceManifest, WorkspaceBinding, capabilities, permissions, WorkUnits, and facts. The visible terminal is a UI surface, not an execution fact source for Agent commands.
+DeepCode v0.5.1 is a stable local-first AI coding workbench baseline. It keeps Agent session protocol, Kernel tool execution, permission audit, context compression, and Editor/GUI/CLI/TUI shells on one shared backend source of truth. This release focuses on a reproducible local build/package flow, a closed Kernel/Session execution loop, and clear boundaries for provider, tool, and UI shell integration.
 
 ## Build And Release Mode
 
@@ -121,6 +94,33 @@ bin/macos-arm64/
 The current macOS package is a local runnable package. It does not include DMG packaging, Developer ID signing, or notarization. The script creates a package-local writable config root and writes `build-info.json` for `/api/health` diagnostics.
 
 If `/api/health` does not include `buildCommit`, `protocolVersion`, or `toolCatalogVersion`, or if a new run archive still shows an old Chinese tagged protocol prompt instead of `deepcode.agent.protocol.v3`, quit the running `DeepCode.app`, run `make package-macos-clean`, and reopen the app. The package script fails fast when the target app or its bundled `deepcode-kernel` is still running, because repackaging while the old process is alive can make review tests hit the stale Kernel.
+
+## Current Status
+
+- The Kernel daemon exposes `/api/health`, conversation archives, tool catalog, permission audit, workspace, Git, and internal browser APIs.
+- The live session protocol is `deepcode.agent.protocol.v3` JSON Envelope only. Userspace Session DriverLoop owns prompt assembly, provider calls, parser, and one-shot repair. Tagged Markdown protocol output is rejected by the Session parser.
+- Editor is the full workbench package: file tree, Monaco-based editor surface, terminal, Agent panel, Git panel, and internal browser. The right Agent panel is an embedded conversation panel that reuses the same Session projection and message semantics as DeepCode-GUI; it is not a separate Agent runtime.
+- DeepCode-GUI is a concise conversational GUI. It is not the full Editor.
+- GUI read-only analysis can be anchored by explicit attachments or by the project working directory remembered by Session. This is separate from Editor workspace binding, which remains the editing and file-tree isolation boundary.
+- CLI and TUI reuse the same Kernel/session source of truth. The legacy CLI/TUI chat-submit path is removed until those shells are reattached through the same SessionDriverLoop bridge as Editor and GUI.
+- Web Dev Host is only a development preview and protocol-debugging entry. It is not a formal UI package.
+
+## UI Package Terms
+
+DeepCode currently has four formal UI package forms:
+
+| Name | Definition | Current Priority |
+| --- | --- | --- |
+| Editor / DeepCode Editor | Full packaged GUI workbench with an editor | First target for Git, internal browser, and workbench components |
+| DeepCode-GUI / GUI | Concise conversational GUI | Reuses the same component flow after Editor stabilizes |
+| CLI | Scriptable Host Shell | Automation and integration |
+| TUI | Ratatui/Crossterm terminal UI | Lightweight local usage |
+
+UI shells do not own a second Kernel, session truth, tool execution path, permission model, or user-preference store. Functional components, permissions, and tool calls are provided by Kernel/session. Conversation orchestration, context assembly, prompt envelopes, provider lifecycle, protocol parsing, and repair are owned by userspace Session DriverLoop. UI layers only own rendering, input, and interaction differences.
+
+Editor workspace binding is an Editor concern for file tree display, editing, and code-change isolation. DeepCode-GUI can carry conversation roots from explicit attachments or a Session project working directory without requiring an Editor workspace. Writes, deletes, Git operations, terminal commands, and cross-project modifications still require reviewable plans, Kernel policy checks, and clear target disclosure.
+
+Editor-only context such as workspace root, active file, selection, open tabs, and terminal cwd is Host context. It enters Session context assembly first; Kernel only sees ResourceManifest, WorkspaceBinding, capabilities, permissions, WorkUnits, and facts. The visible terminal is a UI surface, not an execution fact source for Agent commands.
 
 ## Session Protocol
 
@@ -228,7 +228,7 @@ This is an independent engineering adaptation and a respectful acknowledgement o
 ## Third Parties and Attribution
 
 - The editor is a Monaco-based editor surface with limited VS Code-style workspace interoperability.
-- Codex, Claude, Gemini, and similar tools are described only as AI-assisted development tools or architecture / workflow / UX reference. DeepCode is not an upstream project, fork, or official affiliate of those projects.
+- Claude, ChatGPT, Gemini, and similar commercial AI coding agents are described only as optional development assistance or architecture / workflow / UX references. DeepCode is not an upstream project, fork, official derivative, sponsored project, endorsed project, or affiliate of those agents or their vendors.
 - Codicons, Monaco, Tauri, React, Rust crates, Node packages, and other third-party dependencies remain under their respective licenses.
 
 See also:

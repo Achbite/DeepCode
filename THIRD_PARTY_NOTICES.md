@@ -22,7 +22,7 @@ DeepCode uses a Monaco-based editor surface and implements limited VS Code-style
 
 ## AI Coding Tool References
 
-Codex, Claude, Gemini, and similar systems may be referenced as AI-assisted development tools or architecture / workflow / UX references. DeepCode is not an upstream project, fork, official derivative, or endorsed project of those systems.
+Claude, ChatGPT, Gemini, and similar commercial AI coding agents may be referenced as optional AI-assisted development tools or architecture / workflow / UX references. DeepCode is not an upstream project, fork, official derivative, sponsored project, endorsed project, or affiliate of those systems or their vendors.
 
 ## DeepSeek Compatibility Wording
 

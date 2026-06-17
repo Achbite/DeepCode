@@ -7,9 +7,9 @@ import { t, type UiLanguage } from '../../i18n';
 import AgentComposer from '../../components/agent-panel/AgentComposer';
 import PermissionRequestBubble from '../../components/agent-panel/PermissionRequestBubble';
 import { findPendingComposerDecision } from '../../components/agent-panel/pendingDecision';
-import CodexTimeline from './CodexTimeline';
+import DeepCodeTimeline from './DeepCodeTimeline';
 
-interface CodexAgentPanelProps {
+interface DeepCodeAgentPanelProps {
   language: UiLanguage;
   forceHome?: boolean;
   homeProjectTitle?: string | null;
@@ -25,7 +25,7 @@ function displaySessionTitle(language: UiLanguage, title?: string): string {
   return value;
 }
 
-const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
+const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   language,
   forceHome = false,
   homeProjectTitle,
@@ -185,8 +185,8 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
 
   if (showHome) {
     return (
-      <div className="codex-agent-panel codex-agent-panel--home">
-        <div className="codex-home-panel">
+      <div className="deepcode-gui-agent-panel deepcode-gui-agent-panel--home">
+        <div className="deepcode-gui-home-panel">
           <h1>{homePrompt}</h1>
           {composer}
         </div>
@@ -195,16 +195,16 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
   }
 
   return (
-    <div className="codex-agent-panel">
-      <header className="codex-agent-panel__header">
+    <div className="deepcode-gui-agent-panel">
+      <header className="deepcode-gui-agent-panel__header">
         <div>
-          <div className="codex-agent-panel__title">{activeSessionTitle}</div>
-          <div className="codex-agent-panel__subtitle">{t(language, 'deepcodeGui.agent.subtitle')}</div>
+          <div className="deepcode-gui-agent-panel__title">{activeSessionTitle}</div>
+          <div className="deepcode-gui-agent-panel__subtitle">{t(language, 'deepcodeGui.agent.subtitle')}</div>
         </div>
         <button type="button" aria-label={t(language, 'deepcodeGui.session.actions')}>...</button>
       </header>
 
-      <CodexTimeline
+      <DeepCodeTimeline
         timeline={timeline}
         fallbackEvents={events}
         loading={sessionRunning}
@@ -230,7 +230,7 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
       )}
 
       {(errorMessage || timelineError) && (
-        <div className="codex-agent-panel__error">{errorMessage ?? timelineError}</div>
+        <div className="deepcode-gui-agent-panel__error">{errorMessage ?? timelineError}</div>
       )}
 
       {composer}
@@ -238,4 +238,4 @@ const CodexAgentPanel: React.FC<CodexAgentPanelProps> = ({
   );
 };
 
-export default CodexAgentPanel;
+export default DeepCodeAgentPanel;

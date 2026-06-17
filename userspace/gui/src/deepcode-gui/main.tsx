@@ -23,9 +23,9 @@ function renderBootstrapError(reason: unknown): void {
   const message = formatBootstrapError(reason);
   root.innerHTML = '';
   const shell = document.createElement('div');
-  shell.className = 'codex-bootstrap-error';
+  shell.className = 'deepcode-gui-bootstrap-error';
   shell.innerHTML = `
-    <div class="codex-bootstrap-error__card">
+    <div class="deepcode-gui-bootstrap-error__card">
       <h1>DeepCode-GUI 启动失败</h1>
       <p>前端工作台没有完成渲染。下面是启动阶段错误，便于定位打包白屏问题。</p>
       <pre></pre>
@@ -63,8 +63,8 @@ class ErrorBoundary extends React.Component<
   render(): React.ReactNode {
     if (this.state.error) {
       return (
-        <div className="codex-bootstrap-error">
-          <div className="codex-bootstrap-error__card">
+        <div className="deepcode-gui-bootstrap-error">
+          <div className="deepcode-gui-bootstrap-error__card">
             <h1>DeepCode-GUI 渲染失败</h1>
             <p>React 工作台启动后遇到异常。</p>
             <pre>{this.state.error.stack ?? this.state.error.message}</pre>

@@ -31,4 +31,4 @@ DeepCode includes best-effort support and optimization profiles for DeepSeek V4-
 
 DeepCode used AI coding tools as development assistance for requirement breakdown, architecture discussion, code generation, review, UI prototyping, and documentation drafting. This does not grant those tools authorship, sponsorship, endorsement, or project ownership.
 
-Relevant tool families may include Codex, Claude, Gemini, and other assistant systems used during development.
+Relevant tool families may include Claude, ChatGPT, Gemini, and other commercial AI coding agents used during development.

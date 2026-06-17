@@ -10,7 +10,7 @@
 #
 # 分阶段入口：
 #   ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
-#   ./build.sh --stage deepcode-gui # pnpm + Codex 风 DeepCode-GUI dist
+#   ./build.sh --stage deepcode-gui # pnpm + DeepCode-GUI dist
 #   ./build.sh --stage macos-package-service # macOS host: start package worker
 #   ./build.sh --stage package-macos # macOS host/Docker request: build complete macOS app set
 #   ./build.sh --stage package-macos-deepcode-gui # macOS host: build DeepCode-GUI.app package
@@ -823,7 +823,7 @@ build_deepcode_gui() {
   if stage_should_skip deepcode-gui "$CLIENT_DIR/dist-deepcode-gui/index.html" "$ROOT_DIR/shells/deepcode-gui/dist/index.html"; then
     return
   fi
-  echo "==[build][deepcode-gui]== build TS protocol/session-core/Codex GUI packages"
+  echo "==[build][deepcode-gui]== build TS protocol/session-core/DeepCode-GUI packages"
   pnpm --filter @deepcode/protocol build
   pnpm --filter @deepcode/session-core build
   pnpm --filter @deepcode/client build:deepcode-gui
@@ -1024,7 +1024,7 @@ write_readme() {
   local gui_entries="  deepcode-gui          Linux GUI host launcher"
   if [ "$platform" = "win64" ]; then
     gui_entries="  DeepCode.exe          Windows Editor shell, starts the same-dir Kernel on a free localhost port
-  DeepCode-GUI.exe      Windows Codex-style GUI shell, shares the same Kernel and config"
+  DeepCode-GUI.exe      Windows DeepCode-GUI shell, shares the same Kernel and config"
   fi
   cat > "$dist_dir/README.txt" <<README
 DeepCode Unified Distribution ($platform)
@@ -1072,7 +1072,7 @@ Optional desktop shell:
 Run the Linux GUI launcher or force DEEPCODE_PORT=31245, then open:
   http://127.0.0.1:31245/
 
-Codex internal browser, Chrome, or any regular browser can open that URL. The
+The internal browser, Chrome, or any regular browser can open that URL. The
 browser is only a Host client; the Kernel remains the fact source.
 
 Health check:

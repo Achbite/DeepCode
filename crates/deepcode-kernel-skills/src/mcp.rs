@@ -267,7 +267,7 @@ pub fn mcp_stdio_tool_call_payload(
             "protocolVersion": "2025-06-18",
             "clientInfo": {
                 "name": "deepcode-kernel",
-                "version": "0.1.0"
+                "version": "0.5.1"
             },
             "capabilities": {}
         }

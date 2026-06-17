@@ -11,9 +11,9 @@ import {
   healthVersion,
   warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
-import './codexGui.css';
+import './deepcodeGui.css';
 
-const CodexWorkbenchLayout = lazy(() => import('./layout/CodexWorkbenchLayout'));
+const DeepCodeWorkbenchLayout = lazy(() => import('./layout/DeepCodeWorkbenchLayout'));
 
 function afterFirstPaint(task: () => void): () => void {
   let cancelled = false;
@@ -42,9 +42,9 @@ function isEditableTarget(target: EventTarget | null): boolean {
 const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
 
 const BootFallback: React.FC = () => (
-  <div className="codex-boot-shell">
-    <div className="codex-boot-shell__title">DeepCode-GUI</div>
-    <div className="codex-boot-shell__body">Starting DeepCode-GUI...</div>
+  <div className="deepcode-gui-boot-shell">
+    <div className="deepcode-gui-boot-shell__title">DeepCode-GUI</div>
+    <div className="deepcode-gui-boot-shell__body">Starting DeepCode-GUI...</div>
   </div>
 );
 
@@ -197,7 +197,7 @@ const DeepCodeGuiApp: React.FC = () => {
 
   return (
     <Suspense fallback={<BootFallback />}>
-      <CodexWorkbenchLayout
+      <DeepCodeWorkbenchLayout
         apiStatus={apiStatus}
         wsStatus={wsStatus}
         serverVersion={serverVersion}

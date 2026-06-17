@@ -2,7 +2,7 @@
 # DeepCode 开发容器入口 (Makefile)
 # 主要目标：
 #   make shell          -> 进入容器（镜像/容器不存在则懒构建；运行中则 restart 刷新环境）
-#   make build-deepcode-gui -> 在 Docker 内构建 Codex 风 DeepCode-GUI dist
+#   make build-deepcode-gui -> 在 Docker 内构建 DeepCode-GUI dist
 #   make build-deepcode-gui-tauri -> 在 Docker 内构建 Windows DeepCode-GUI.exe
 #   make dev-deepcode-gui   -> 在 Docker 内启动 31246 DeepCode-GUI 调试服务
 #   make clean          -> 全量清理（容器 + 镜像 + named volumes），下次 shell 全量重建
@@ -110,7 +110,7 @@ help:
 	@echo "DeepCode 开发容器入口"
 	@echo ""
 	@echo "  make shell          进入开发容器（容器存在则刷新重启后再 exec）"
-	@echo "  make build-deepcode-gui  在 Docker 内构建 Codex 风 DeepCode-GUI dist"
+	@echo "  make build-deepcode-gui  在 Docker 内构建 DeepCode-GUI dist"
 	@echo "  make build-deepcode-gui-tauri  在 Docker 内构建 Windows DeepCode-GUI.exe"
 	@echo "  make dev-deepcode-gui    在 Docker 内启动 DeepCode-GUI 调试服务：127.0.0.1:31246"
 	@echo "  make clean          全量清理（容器 + 镜像 + 4 个 named volumes），下次 shell 全量重建"

@@ -3,7 +3,6 @@ import type { ToolCall, ToolDefinition } from './tools.js';
 export type LlmProviderKind =
   | 'openaiCompatible'
   | 'anthropic'
-  | 'codex'
   | 'ollama';
 
 export type LlmReasoningEffort = 'low' | 'medium' | 'high' | 'max';

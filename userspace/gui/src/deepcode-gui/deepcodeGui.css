@@ -26,8 +26,8 @@ button {
   letter-spacing: 0;
 }
 
-.codex-bootstrap-error,
-.codex-boot-shell {
+.deepcode-gui-bootstrap-error,
+.deepcode-gui-boot-shell {
   height: 100%;
   display: grid;
   place-items: center;
@@ -35,15 +35,15 @@ button {
   color: #202124;
 }
 
-.codex-boot-shell {
+.deepcode-gui-boot-shell {
   gap: 10px;
 }
 
-.codex-bootstrap-error {
+.deepcode-gui-bootstrap-error {
   padding: 24px;
 }
 
-.codex-bootstrap-error__card {
+.deepcode-gui-bootstrap-error__card {
   width: min(720px, 100%);
   padding: 18px 20px;
   border: 1px solid #dedbd2;
@@ -52,20 +52,20 @@ button {
   box-shadow: 0 18px 42px rgba(32, 33, 36, 0.08);
 }
 
-.codex-bootstrap-error__card h1 {
+.deepcode-gui-bootstrap-error__card h1 {
   margin: 0;
   color: #202124;
   font-size: 15px;
   font-weight: 620;
 }
 
-.codex-bootstrap-error__card p {
+.deepcode-gui-bootstrap-error__card p {
   margin: 8px 0 0;
   color: #667085;
   font-size: 12px;
 }
 
-.codex-bootstrap-error__card pre {
+.deepcode-gui-bootstrap-error__card pre {
   max-height: 360px;
   margin: 14px 0 0;
   overflow: auto;
@@ -75,18 +75,18 @@ button {
   line-height: 1.45;
 }
 
-.codex-boot-shell__title {
+.deepcode-gui-boot-shell__title {
   color: #202124;
   font-size: 18px;
   font-weight: 720;
 }
 
-.codex-boot-shell__body {
+.deepcode-gui-boot-shell__body {
   color: #667085;
   font-size: 13px;
 }
 
-.codex-workbench {
+.deepcode-gui-workbench {
   --line: #272a31;
   --line-strong: #343843;
   --panel: #14161b;
@@ -107,7 +107,7 @@ button {
   background: #0f1014;
 }
 
-.codex-titlebar {
+.deepcode-gui-titlebar {
   display: grid;
   grid-template-columns: minmax(180px, 0.8fr) minmax(220px, 1.2fr) auto auto;
   align-items: center;
@@ -119,9 +119,9 @@ button {
   background: #121318;
 }
 
-.codex-titlebar__brand,
-.codex-titlebar__center,
-.codex-titlebar__status {
+.deepcode-gui-titlebar__brand,
+.deepcode-gui-titlebar__center,
+.deepcode-gui-titlebar__status {
   min-width: 0;
   display: flex;
   align-items: center;
@@ -130,12 +130,12 @@ button {
   white-space: nowrap;
 }
 
-.codex-titlebar__brand {
+.deepcode-gui-titlebar__brand {
   font-size: 13px;
   font-weight: 760;
 }
 
-.codex-titlebar__mark {
+.deepcode-gui-titlebar__mark {
   display: grid;
   place-items: center;
   width: 24px;
@@ -148,23 +148,23 @@ button {
   background: #191c22;
 }
 
-.codex-titlebar__center {
+.deepcode-gui-titlebar__center {
   justify-content: center;
   color: var(--muted);
   font-size: 12px;
 }
 
-.codex-titlebar__center span:last-child {
+.deepcode-gui-titlebar__center span:last-child {
   color: var(--text);
 }
 
-.codex-titlebar__status {
+.deepcode-gui-titlebar__status {
   justify-content: flex-end;
   color: var(--muted);
   font-size: 11px;
 }
 
-.codex-status-pill {
+.deepcode-gui-status-pill {
   display: inline-flex;
   align-items: center;
   min-height: 20px;
@@ -174,25 +174,25 @@ button {
   background: #171a20;
 }
 
-.codex-status-pill--connected,
-.codex-status-pill--ready {
+.deepcode-gui-status-pill--connected,
+.deepcode-gui-status-pill--ready {
   color: var(--ok);
   border-color: rgba(139, 211, 176, 0.34);
 }
 
-.codex-status-pill--error,
-.codex-status-pill--disconnected {
+.deepcode-gui-status-pill--error,
+.deepcode-gui-status-pill--disconnected {
   color: var(--danger);
   border-color: rgba(239, 143, 143, 0.42);
 }
 
-.codex-status-pill--cache {
+.deepcode-gui-status-pill--cache {
   color: var(--accent);
   border-color: rgba(37, 99, 235, 0.24);
   background: rgba(37, 99, 235, 0.06);
 }
 
-.codex-shell {
+.deepcode-gui-shell {
   min-width: 0;
   min-height: 0;
   display: grid;
@@ -202,15 +202,15 @@ button {
   overflow: hidden;
 }
 
-.codex-left-rail,
-.codex-session-main,
-.codex-context-panel {
+.deepcode-gui-left-rail,
+.deepcode-gui-session-main,
+.deepcode-gui-context-panel {
   min-width: 0;
   min-height: 0;
   background: var(--panel);
 }
 
-.codex-left-rail {
+.deepcode-gui-left-rail {
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -218,33 +218,33 @@ button {
   overflow: auto;
 }
 
-.codex-rail-card,
-.codex-review-card {
+.deepcode-gui-rail-card,
+.deepcode-gui-review-card {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel-soft);
 }
 
-.codex-rail-card {
+.deepcode-gui-rail-card {
   display: grid;
   gap: 9px;
   padding: 12px;
 }
 
-.codex-rail-card--compact {
+.deepcode-gui-rail-card--compact {
   gap: 8px;
 }
 
-.codex-rail-card__eyebrow,
-.codex-session-topline__eyebrow,
-.codex-agent-panel__eyebrow {
+.deepcode-gui-rail-card__eyebrow,
+.deepcode-gui-session-topline__eyebrow,
+.deepcode-gui-agent-panel__eyebrow {
   color: var(--faint);
   font-size: 10px;
   font-weight: 760;
   text-transform: uppercase;
 }
 
-.codex-rail-card__title {
+.deepcode-gui-rail-card__title {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -254,7 +254,7 @@ button {
   font-weight: 760;
 }
 
-.codex-rail-card__path {
+.deepcode-gui-rail-card__path {
   min-width: 0;
   overflow-wrap: anywhere;
   color: var(--muted);
@@ -262,20 +262,20 @@ button {
   line-height: 1.45;
 }
 
-.codex-rail-card__error {
+.deepcode-gui-rail-card__error {
   color: var(--danger);
   font-size: 12px;
 }
 
-.codex-rail-card button,
-.codex-command-stack button,
-.codex-session-topline__actions button,
-.codex-context-tabs button,
-.codex-statusbar button,
-.codex-agent-panel__header button,
-.codex-agent-panel__sessions select,
-.codex-file-chip-list button,
-.codex-plan-actions__buttons button,
+.deepcode-gui-rail-card button,
+.deepcode-gui-command-stack button,
+.deepcode-gui-session-topline__actions button,
+.deepcode-gui-context-tabs button,
+.deepcode-gui-statusbar button,
+.deepcode-gui-agent-panel__header button,
+.deepcode-gui-agent-panel__sessions select,
+.deepcode-gui-file-chip-list button,
+.deepcode-gui-plan-actions__buttons button,
 .agent-permission__actions button,
 .agent-composer__footer button,
 .agent-add-file-button {
@@ -288,14 +288,14 @@ button {
   cursor: pointer;
 }
 
-.codex-rail-card button:hover,
-.codex-command-stack button:hover,
-.codex-session-topline__actions button:hover,
-.codex-context-tabs button:hover,
-.codex-statusbar button:hover,
-.codex-agent-panel__header button:hover,
-.codex-file-chip-list button:hover,
-.codex-plan-actions__buttons button:hover,
+.deepcode-gui-rail-card button:hover,
+.deepcode-gui-command-stack button:hover,
+.deepcode-gui-session-topline__actions button:hover,
+.deepcode-gui-context-tabs button:hover,
+.deepcode-gui-statusbar button:hover,
+.deepcode-gui-agent-panel__header button:hover,
+.deepcode-gui-file-chip-list button:hover,
+.deepcode-gui-plan-actions__buttons button:hover,
 .agent-permission__actions button:hover,
 .agent-composer__footer button:hover,
 .agent-add-file-button:hover {
@@ -303,20 +303,20 @@ button {
   background: var(--panel-raised);
 }
 
-.codex-rail-card button:disabled,
-.codex-agent-panel__header button:disabled {
+.deepcode-gui-rail-card button:disabled,
+.deepcode-gui-agent-panel__header button:disabled {
   cursor: not-allowed;
   opacity: 0.5;
 }
 
-.codex-command-stack,
-.codex-file-chip-list {
+.deepcode-gui-command-stack,
+.deepcode-gui-file-chip-list {
   display: grid;
   gap: 7px;
 }
 
-.codex-command-stack button,
-.codex-file-chip-list button {
+.deepcode-gui-command-stack button,
+.deepcode-gui-file-chip-list button {
   width: 100%;
   display: flex;
   justify-content: space-between;
@@ -324,14 +324,14 @@ button {
   text-align: left;
 }
 
-.codex-command-stack button.active,
-.codex-file-chip-list button.active,
-.codex-context-tabs button.active {
+.deepcode-gui-command-stack button.active,
+.deepcode-gui-file-chip-list button.active,
+.deepcode-gui-context-tabs button.active {
   border-color: rgba(231, 229, 223, 0.48);
   background: #252932;
 }
 
-.codex-metric-row {
+.deepcode-gui-metric-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -340,35 +340,35 @@ button {
   font-size: 12px;
 }
 
-.codex-metric-row strong {
+.deepcode-gui-metric-row strong {
   color: var(--text);
   font-weight: 680;
 }
 
-.codex-mini-empty {
+.deepcode-gui-mini-empty {
   color: var(--faint);
   font-size: 12px;
 }
 
-.codex-file-chip-list button span {
+.deepcode-gui-file-chip-list button span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.codex-file-chip-list em {
+.deepcode-gui-file-chip-list em {
   color: var(--warn);
   font-style: normal;
 }
 
-.codex-session-main {
+.deepcode-gui-session-main {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
 }
 
-.codex-session-topline {
+.deepcode-gui-session-topline {
   min-width: 0;
   display: flex;
   align-items: center;
@@ -379,21 +379,21 @@ button {
   background: #121318;
 }
 
-.codex-session-topline h1 {
+.deepcode-gui-session-topline h1 {
   margin: 2px 0 0;
   color: var(--text);
   font-size: 18px;
   line-height: 1.2;
 }
 
-.codex-session-topline__actions {
+.deepcode-gui-session-topline__actions {
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
 }
 
-.codex-agent-panel {
+.deepcode-gui-agent-panel {
   height: 100%;
   min-height: 0;
   display: grid;
@@ -401,7 +401,7 @@ button {
   background: #101116;
 }
 
-.codex-agent-panel__header {
+.deepcode-gui-agent-panel__header {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
@@ -411,7 +411,7 @@ button {
   background: #101116;
 }
 
-.codex-agent-panel__title {
+.deepcode-gui-agent-panel__title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -420,17 +420,17 @@ button {
   font-weight: 720;
 }
 
-.codex-agent-panel__sessions {
+.deepcode-gui-agent-panel__sessions {
   padding: 10px 16px;
   border-bottom: 1px solid var(--line);
 }
 
-.codex-agent-panel__sessions select {
+.deepcode-gui-agent-panel__sessions select {
   width: 100%;
   min-height: 34px;
 }
 
-.codex-agent-panel__error {
+.deepcode-gui-agent-panel__error {
   margin: 8px 16px;
   padding: 9px 10px;
   border: 1px solid rgba(239, 143, 143, 0.55);
@@ -440,19 +440,19 @@ button {
   font-size: 12px;
 }
 
-.codex-timeline {
+.deepcode-gui-timeline {
   position: relative;
   min-height: 0;
   overflow: auto;
   padding: 18px 16px 22px;
 }
 
-.codex-timeline__end {
+.deepcode-gui-timeline__end {
   width: 100%;
   height: 1px;
 }
 
-.codex-timeline-jump-latest {
+.deepcode-gui-timeline-jump-latest {
   position: fixed;
   left: 50%;
   bottom: 118px;
@@ -477,17 +477,17 @@ button {
     transform 0.15s ease;
 }
 
-.codex-timeline-jump-latest:hover {
+.deepcode-gui-timeline-jump-latest:hover {
   background: #ffffff;
   box-shadow: 0 16px 36px rgba(20, 24, 33, 0.22);
   transform: translateX(-50%) translateY(-1px);
 }
 
-.codex-timeline-jump-latest:active {
+.deepcode-gui-timeline-jump-latest:active {
   transform: translateX(-50%);
 }
 
-.codex-empty {
+.deepcode-gui-empty {
   min-height: 180px;
   display: grid;
   align-content: center;
@@ -498,18 +498,18 @@ button {
   background: #14161b;
 }
 
-.codex-empty__title {
+.deepcode-gui-empty__title {
   color: var(--text);
   font-size: 15px;
   font-weight: 760;
 }
 
-.codex-empty__body {
+.deepcode-gui-empty__body {
   color: var(--muted);
   font-size: 13px;
 }
 
-.codex-turn {
+.deepcode-gui-turn {
   position: relative;
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr);
@@ -517,7 +517,7 @@ button {
   margin-bottom: 14px;
 }
 
-.codex-turn__rail {
+.deepcode-gui-turn__rail {
   width: 2px;
   min-height: 100%;
   margin: 5px auto 0;
@@ -525,21 +525,21 @@ button {
   background: var(--line-strong);
 }
 
-.codex-turn--running .codex-turn__rail {
+.deepcode-gui-turn--running .deepcode-gui-turn__rail {
   background: var(--accent);
 }
 
-.codex-turn--failed .codex-turn__rail {
+.deepcode-gui-turn--failed .deepcode-gui-turn__rail {
   background: var(--danger);
 }
 
-.codex-turn__body {
+.deepcode-gui-turn__body {
   min-width: 0;
   display: grid;
   gap: 9px;
 }
 
-.codex-turn__meta {
+.deepcode-gui-turn__meta {
   display: flex;
   gap: 8px;
   color: var(--faint);
@@ -547,7 +547,7 @@ button {
   text-transform: uppercase;
 }
 
-.codex-block {
+.deepcode-gui-block {
   min-width: 0;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -555,34 +555,34 @@ button {
   color: var(--text);
 }
 
-.codex-block--user,
-.codex-block--assistant,
-.codex-block--plan {
+.deepcode-gui-block--user,
+.deepcode-gui-block--assistant,
+.deepcode-gui-block--plan {
   padding: 12px 13px;
 }
 
-.codex-block--assistant {
+.deepcode-gui-block--assistant {
   border-color: #39404b;
   background: #1b1f27;
 }
 
-.codex-assistant-text {
+.deepcode-gui-assistant-text {
   min-width: 0;
   color: var(--text);
 }
 
-.codex-assistant-narration {
+.deepcode-gui-assistant-narration {
   min-width: 0;
   color: var(--muted);
   font-size: 12px;
   line-height: 1.6;
 }
 
-.codex-block--user {
+.deepcode-gui-block--user {
   background: #101116;
 }
 
-.codex-block__label {
+.deepcode-gui-block__label {
   margin-bottom: 7px;
   color: var(--muted);
   font-size: 11px;
@@ -590,7 +590,7 @@ button {
   text-transform: uppercase;
 }
 
-.codex-block summary {
+.deepcode-gui-block summary {
   min-height: 42px;
   display: grid;
   grid-template-columns: 10px minmax(96px, auto) minmax(0, 1fr);
@@ -601,33 +601,33 @@ button {
   list-style: none;
 }
 
-.codex-block summary::-webkit-details-marker {
+.deepcode-gui-block summary::-webkit-details-marker {
   display: none;
 }
 
-.codex-block__status {
+.deepcode-gui-block__status {
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: var(--faint);
 }
 
-.codex-block__status--running {
+.deepcode-gui-block__status--running {
   background: var(--accent);
   box-shadow: 0 0 8px rgba(231, 229, 223, 0.44);
 }
 
-.codex-block__status--waiting,
-.codex-block__status--blocked {
+.deepcode-gui-block__status--waiting,
+.deepcode-gui-block__status--blocked {
   background: var(--warn);
 }
 
-.codex-block__status--failed {
+.deepcode-gui-block__status--failed {
   background: var(--danger);
 }
 
-.codex-block__title,
-.codex-block__summary {
+.deepcode-gui-block__title,
+.deepcode-gui-block__summary {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -635,45 +635,45 @@ button {
   font-size: 12px;
 }
 
-.codex-block__title {
+.deepcode-gui-block__title {
   font-weight: 720;
 }
 
-.codex-block__summary {
+.deepcode-gui-block__summary {
   color: var(--muted);
 }
 
-.codex-block__details {
+.deepcode-gui-block__details {
   display: grid;
   gap: 8px;
   padding: 0 11px 11px 30px;
 }
 
-.codex-block__details--thinking {
+.deepcode-gui-block__details--thinking {
   color: var(--text);
   font-size: 13px;
   line-height: 1.65;
 }
 
-.codex-block__details--thinking .agent-markdown {
+.deepcode-gui-block__details--thinking .agent-markdown {
   display: grid;
   gap: 8px;
 }
 
-.codex-block__details--thinking .agent-markdown__paragraph {
+.deepcode-gui-block__details--thinking .agent-markdown__paragraph {
   margin: 0;
 }
 
-.codex-event-list {
+.deepcode-gui-event-list {
   display: grid;
   gap: 6px;
 }
 
-.codex-event-list--compact {
+.deepcode-gui-event-list--compact {
   margin-top: 8px;
 }
 
-.codex-event {
+.deepcode-gui-event {
   min-width: 0;
   display: grid;
   grid-template-columns: 98px minmax(0, 1fr);
@@ -682,15 +682,15 @@ button {
   font-size: 11px;
 }
 
-.codex-event__kind,
-.codex-event__text {
+.deepcode-gui-event__kind,
+.deepcode-gui-event__text {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.codex-event__kind {
+.deepcode-gui-event__kind {
   color: var(--accent);
 }
 
@@ -770,13 +770,13 @@ button {
   padding: 4px 2px 0;
 }
 
-.codex-plan-actions {
+.deepcode-gui-plan-actions {
   display: grid;
   gap: 8px;
   margin-top: 10px;
 }
 
-.codex-plan-actions--composer {
+.deepcode-gui-plan-actions--composer {
   border: 1px solid var(--line);
   border-radius: 7px;
   background: var(--surface-subtle);
@@ -785,7 +785,7 @@ button {
   font-size: 12px;
 }
 
-.codex-plan-actions textarea {
+.deepcode-gui-plan-actions textarea {
   min-height: 72px;
   width: 100%;
   resize: vertical;
@@ -796,13 +796,13 @@ button {
   padding: 8px;
 }
 
-.codex-plan-actions__buttons {
+.deepcode-gui-plan-actions__buttons {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
 }
 
-.codex-live-indicator {
+.deepcode-gui-live-indicator {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -814,7 +814,7 @@ button {
   font-size: 12px;
 }
 
-.codex-live-indicator__dot {
+.deepcode-gui-live-indicator__dot {
   position: relative;
   isolation: isolate;
   flex: 0 0 auto;
@@ -825,7 +825,7 @@ button {
   box-shadow: 0 0 8px rgba(231, 229, 223, 0.6);
 }
 
-.codex-live-indicator__dot::before {
+.deepcode-gui-live-indicator__dot::before {
   content: "";
   position: absolute;
   z-index: -1;
@@ -834,10 +834,10 @@ button {
   background: rgba(37, 99, 235, 0.18);
   opacity: 0.72;
   transform: scale(0.55);
-  animation: codex-thinking-pulse 1.45s ease-out infinite;
+  animation: deepcode-gui-thinking-pulse 1.45s ease-out infinite;
 }
 
-@keyframes codex-thinking-pulse {
+@keyframes deepcode-gui-thinking-pulse {
   0% {
     opacity: 0.68;
     transform: scale(0.55);
@@ -855,27 +855,27 @@ button {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .codex-live-indicator__dot::before {
+  .deepcode-gui-live-indicator__dot::before {
     animation: none;
     opacity: 0.26;
     transform: scale(1);
   }
 }
 
-.codex-agent-panel .markdown-content {
+.deepcode-gui-agent-panel .markdown-content {
   font-size: 13px;
   line-height: 1.58;
 }
 
-.codex-agent-panel .markdown-content p:first-child {
+.deepcode-gui-agent-panel .markdown-content p:first-child {
   margin-top: 0;
 }
 
-.codex-agent-panel .markdown-content p:last-child {
+.deepcode-gui-agent-panel .markdown-content p:last-child {
   margin-bottom: 0;
 }
 
-.codex-agent-panel pre {
+.deepcode-gui-agent-panel pre {
   max-width: 100%;
   overflow: auto;
 }
@@ -1061,13 +1061,13 @@ button {
   color: #ffd2d2 !important;
 }
 
-.codex-context-panel {
+.deepcode-gui-context-panel {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
 }
 
-.codex-context-tabs {
+.deepcode-gui-context-tabs {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
@@ -1076,26 +1076,26 @@ button {
   background: #121318;
 }
 
-.codex-context-tabs button {
+.deepcode-gui-context-tabs button {
   min-width: 0;
   padding: 0 6px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.codex-context-body {
+.deepcode-gui-context-body {
   min-height: 0;
   overflow: hidden;
   background: #101116;
 }
 
-.codex-context-body > .file-tree,
-.codex-context-body > .settings-center,
-.codex-context-body > .terminal-placeholder {
+.deepcode-gui-context-body > .file-tree,
+.deepcode-gui-context-body > .settings-center,
+.deepcode-gui-context-body > .terminal-placeholder {
   height: 100%;
 }
 
-.codex-context-empty {
+.deepcode-gui-context-empty {
   height: 100%;
   display: grid;
   align-content: center;
@@ -1106,16 +1106,16 @@ button {
   font-size: 13px;
 }
 
-.codex-context-empty div {
+.deepcode-gui-context-empty div {
   color: var(--text);
   font-weight: 720;
 }
 
-.codex-context-empty span {
+.deepcode-gui-context-empty span {
   color: var(--faint);
 }
 
-.codex-review-stack {
+.deepcode-gui-review-stack {
   display: grid;
   gap: 8px;
   padding: 10px;
@@ -1123,33 +1123,33 @@ button {
   background: #121318;
 }
 
-.codex-review-card {
+.deepcode-gui-review-card {
   display: grid;
   gap: 4px;
   padding: 9px 10px;
 }
 
-.codex-review-card span {
+.deepcode-gui-review-card span {
   color: var(--faint);
   font-size: 10px;
   font-weight: 760;
   text-transform: uppercase;
 }
 
-.codex-review-card strong {
+.deepcode-gui-review-card strong {
   color: var(--muted);
   font-size: 12px;
   font-weight: 560;
   line-height: 1.4;
 }
 
-.codex-panel-fallback {
+.deepcode-gui-panel-fallback {
   padding: 14px;
   color: var(--faint);
   font-size: 12px;
 }
 
-.codex-statusbar {
+.deepcode-gui-statusbar {
   display: flex;
   align-items: center;
   gap: 14px;
@@ -1161,14 +1161,14 @@ button {
   font-size: 11px;
 }
 
-.codex-statusbar span {
+.deepcode-gui-statusbar span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.codex-statusbar button {
+.deepcode-gui-statusbar button {
   min-height: 20px;
   margin-left: auto;
   padding: 0 8px;
@@ -1207,12 +1207,12 @@ button {
   color: #202124;
 }
 
-:root[data-product='deepcode-gui'][data-shell='tauri'] .codex-workbench {
+:root[data-product='deepcode-gui'][data-shell='tauri'] .deepcode-gui-workbench {
   overflow: hidden;
   isolation: isolate;
 }
 
-.codex-workbench {
+.deepcode-gui-workbench {
   --canvas: #f6f5f1;
   --line: #dedbd2;
   --line-soft: #ece8dc;
@@ -1247,123 +1247,123 @@ button {
   color: var(--text);
 }
 
-.codex-titlebar {
+.deepcode-gui-titlebar {
   border-bottom-color: var(--line);
   background: rgba(255, 255, 255, 0.9);
   box-shadow: 0 1px 0 rgba(255, 255, 255, 0.8);
 }
 
-.codex-titlebar__mark {
+.deepcode-gui-titlebar__mark {
   border-color: #cfc8b8;
   background: #ffffff;
   color: #1f2937;
   box-shadow: var(--shadow-sm);
 }
 
-.codex-titlebar__brand {
+.deepcode-gui-titlebar__brand {
   color: var(--text);
 }
 
-.codex-titlebar__center,
-.codex-titlebar__status {
+.deepcode-gui-titlebar__center,
+.deepcode-gui-titlebar__status {
   color: var(--muted);
 }
 
-.codex-status-pill {
+.deepcode-gui-status-pill {
   border-color: var(--line);
   background: #f7f5ef;
   color: var(--muted);
 }
 
-.codex-status-pill--connected,
-.codex-status-pill--ready {
+.deepcode-gui-status-pill--connected,
+.deepcode-gui-status-pill--ready {
   border-color: rgba(20, 132, 95, 0.28);
   background: rgba(20, 132, 95, 0.08);
   color: var(--ok);
 }
 
-.codex-status-pill--error,
-.codex-status-pill--disconnected {
+.deepcode-gui-status-pill--error,
+.deepcode-gui-status-pill--disconnected {
   border-color: rgba(194, 65, 58, 0.28);
   background: rgba(194, 65, 58, 0.08);
   color: var(--danger);
 }
 
-.codex-status-pill--cache {
+.deepcode-gui-status-pill--cache {
   border-color: rgba(37, 99, 235, 0.18);
   background: rgba(37, 99, 235, 0.06);
   color: #2563eb;
 }
 
-.codex-shell {
+.deepcode-gui-shell {
   grid-template-columns: minmax(240px, 276px) minmax(600px, 1fr) minmax(340px, 420px);
   gap: 1px;
   background: var(--line);
 }
 
-.codex-left-rail,
-.codex-context-panel {
+.deepcode-gui-left-rail,
+.deepcode-gui-context-panel {
   background: #f3f1ea;
 }
 
-.codex-session-main,
-.codex-agent-panel {
+.deepcode-gui-session-main,
+.deepcode-gui-agent-panel {
   background: var(--panel);
 }
 
-.codex-left-rail {
+.deepcode-gui-left-rail {
   gap: 12px;
   padding: 12px;
 }
 
-.codex-rail-card,
-.codex-review-card {
+.deepcode-gui-rail-card,
+.deepcode-gui-review-card {
   border-color: var(--line);
   background: rgba(255, 255, 255, 0.84);
   box-shadow: var(--shadow-sm);
 }
 
-.codex-rail-card--workspace {
+.deepcode-gui-rail-card--workspace {
   background: #ffffff;
 }
 
-.codex-rail-card__eyebrow,
-.codex-session-topline__eyebrow,
-.codex-agent-panel__eyebrow,
-.codex-review-card span {
+.deepcode-gui-rail-card__eyebrow,
+.deepcode-gui-session-topline__eyebrow,
+.deepcode-gui-agent-panel__eyebrow,
+.deepcode-gui-review-card span {
   color: var(--faint);
   letter-spacing: 0;
 }
 
-.codex-rail-card__title,
-.codex-session-topline h1,
-.codex-agent-panel__title,
-.codex-context-empty div {
+.deepcode-gui-rail-card__title,
+.deepcode-gui-session-topline h1,
+.deepcode-gui-agent-panel__title,
+.deepcode-gui-context-empty div {
   color: var(--text);
 }
 
-.codex-rail-card__path,
-.codex-mini-empty,
-.codex-context-empty,
-.codex-context-empty span,
-.codex-review-card strong {
+.deepcode-gui-rail-card__path,
+.deepcode-gui-mini-empty,
+.deepcode-gui-context-empty,
+.deepcode-gui-context-empty span,
+.deepcode-gui-review-card strong {
   color: var(--muted);
 }
 
-.codex-rail-card__error,
-.codex-agent-panel__error {
+.deepcode-gui-rail-card__error,
+.deepcode-gui-agent-panel__error {
   color: var(--danger);
 }
 
-.codex-rail-card button,
-.codex-command-stack button,
-.codex-session-topline__actions button,
-.codex-context-tabs button,
-.codex-statusbar button,
-.codex-agent-panel__header button,
-.codex-agent-panel__sessions select,
-.codex-file-chip-list button,
-.codex-plan-actions__buttons button,
+.deepcode-gui-rail-card button,
+.deepcode-gui-command-stack button,
+.deepcode-gui-session-topline__actions button,
+.deepcode-gui-context-tabs button,
+.deepcode-gui-statusbar button,
+.deepcode-gui-agent-panel__header button,
+.deepcode-gui-agent-panel__sessions select,
+.deepcode-gui-file-chip-list button,
+.deepcode-gui-plan-actions__buttons button,
 .agent-permission__actions button,
 .agent-composer__footer button,
 .agent-add-file-button {
@@ -1373,14 +1373,14 @@ button {
   box-shadow: var(--shadow-sm);
 }
 
-.codex-rail-card button:hover,
-.codex-command-stack button:hover,
-.codex-session-topline__actions button:hover,
-.codex-context-tabs button:hover,
-.codex-statusbar button:hover,
-.codex-agent-panel__header button:hover,
-.codex-file-chip-list button:hover,
-.codex-plan-actions__buttons button:hover,
+.deepcode-gui-rail-card button:hover,
+.deepcode-gui-command-stack button:hover,
+.deepcode-gui-session-topline__actions button:hover,
+.deepcode-gui-context-tabs button:hover,
+.deepcode-gui-statusbar button:hover,
+.deepcode-gui-agent-panel__header button:hover,
+.deepcode-gui-file-chip-list button:hover,
+.deepcode-gui-plan-actions__buttons button:hover,
 .agent-permission__actions button:hover,
 .agent-composer__footer button:hover,
 .agent-add-file-button:hover {
@@ -1389,51 +1389,51 @@ button {
   color: #111318;
 }
 
-.codex-command-stack button.active,
-.codex-file-chip-list button.active,
-.codex-context-tabs button.active {
+.deepcode-gui-command-stack button.active,
+.deepcode-gui-file-chip-list button.active,
+.deepcode-gui-context-tabs button.active {
   border-color: rgba(37, 99, 235, 0.28);
   background: rgba(37, 99, 235, 0.08);
   color: #174ea6;
 }
 
-.codex-metric-row {
+.deepcode-gui-metric-row {
   color: var(--muted);
 }
 
-.codex-metric-row strong,
-.codex-file-chip-list em {
+.deepcode-gui-metric-row strong,
+.deepcode-gui-file-chip-list em {
   color: var(--text);
 }
 
-.codex-session-topline,
-.codex-agent-panel__header,
-.codex-agent-panel__sessions,
-.codex-context-tabs,
-.codex-review-stack,
-.codex-statusbar {
+.deepcode-gui-session-topline,
+.deepcode-gui-agent-panel__header,
+.deepcode-gui-agent-panel__sessions,
+.deepcode-gui-context-tabs,
+.deepcode-gui-review-stack,
+.deepcode-gui-statusbar {
   border-color: var(--line);
   background: rgba(255, 255, 255, 0.9);
 }
 
-.codex-session-topline {
+.deepcode-gui-session-topline {
   padding: 14px 18px;
 }
 
-.codex-agent-panel {
+.deepcode-gui-agent-panel {
   grid-template-rows: auto auto minmax(0, 1fr) auto auto;
 }
 
-.codex-agent-panel__header {
+.deepcode-gui-agent-panel__header {
   padding: 11px 18px;
 }
 
-.codex-agent-panel__sessions {
+.deepcode-gui-agent-panel__sessions {
   padding: 10px 18px;
 }
 
-.codex-agent-panel__sessions select,
-.codex-plan-actions textarea,
+.deepcode-gui-agent-panel__sessions select,
+.deepcode-gui-plan-actions textarea,
 .agent-composer__input-wrap textarea,
 .agent-composer textarea,
 .settings-search input,
@@ -1445,8 +1445,8 @@ button {
   box-shadow: var(--shadow-inset);
 }
 
-.codex-agent-panel__sessions select:focus,
-.codex-plan-actions textarea:focus,
+.deepcode-gui-agent-panel__sessions select:focus,
+.deepcode-gui-plan-actions textarea:focus,
 .agent-composer__input-wrap textarea:focus,
 .agent-composer textarea:focus,
 .settings-search input:focus {
@@ -1455,123 +1455,123 @@ button {
   outline: none;
 }
 
-.codex-agent-panel__error {
+.deepcode-gui-agent-panel__error {
   border-color: rgba(194, 65, 58, 0.24);
   background: rgba(194, 65, 58, 0.08);
 }
 
-.codex-timeline {
+.deepcode-gui-timeline {
   padding: 20px 18px 24px;
   background:
     linear-gradient(180deg, #ffffff 0%, #fbfaf6 100%);
 }
 
-.codex-empty {
+.deepcode-gui-empty {
   border-color: var(--line);
   background: #ffffff;
   box-shadow: var(--shadow-sm);
 }
 
-.codex-empty__title {
+.deepcode-gui-empty__title {
   color: var(--text);
 }
 
-.codex-empty__body,
-.codex-turn__meta,
-.codex-block__summary,
-.codex-live-indicator,
-.codex-event {
+.deepcode-gui-empty__body,
+.deepcode-gui-turn__meta,
+.deepcode-gui-block__summary,
+.deepcode-gui-live-indicator,
+.deepcode-gui-event {
   color: var(--muted);
 }
 
-.codex-turn__rail {
+.deepcode-gui-turn__rail {
   background: #d8d2c5;
 }
 
-.codex-turn--running .codex-turn__rail {
+.deepcode-gui-turn--running .deepcode-gui-turn__rail {
   background: var(--accent);
 }
 
-.codex-turn--failed .codex-turn__rail {
+.deepcode-gui-turn--failed .deepcode-gui-turn__rail {
   background: var(--danger);
 }
 
-.codex-block {
+.deepcode-gui-block {
   border-color: var(--line);
   background: #ffffff;
   color: var(--text);
   box-shadow: var(--shadow-sm);
 }
 
-.codex-block--assistant {
+.deepcode-gui-block--assistant {
   border-color: #d8d2c5;
   background: #fbfaf6;
 }
 
-.codex-block--user {
+.deepcode-gui-block--user {
   background: #ffffff;
 }
 
-.codex-block--thinking,
-.codex-block--stage,
-.codex-block--toolBatch,
-.codex-block--turnActions {
+.deepcode-gui-block--thinking,
+.deepcode-gui-block--stage,
+.deepcode-gui-block--toolBatch,
+.deepcode-gui-block--turnActions {
   background: #f8f6ef;
 }
 
-.codex-block--permission {
+.deepcode-gui-block--permission {
   border-color: rgba(183, 121, 31, 0.32);
   background: #fff8e8;
 }
 
-.codex-block--plan,
-.codex-block--review {
+.deepcode-gui-block--plan,
+.deepcode-gui-block--review {
   border-color: rgba(37, 99, 235, 0.22);
   background: #f7f9ff;
 }
 
-.codex-block--error {
+.deepcode-gui-block--error {
   border-color: rgba(194, 65, 58, 0.26);
   background: #fff6f5;
 }
 
-.codex-block__label {
+.deepcode-gui-block__label {
   color: var(--faint);
 }
 
-.codex-block__status {
+.deepcode-gui-block__status {
   background: #a9a295;
 }
 
-.codex-block__status--running {
+.deepcode-gui-block__status--running {
   background: var(--accent);
   box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
 }
 
-.codex-block__status--waiting,
-.codex-block__status--blocked {
+.deepcode-gui-block__status--waiting,
+.deepcode-gui-block__status--blocked {
   background: var(--warn);
 }
 
-.codex-block__status--failed {
+.deepcode-gui-block__status--failed {
   background: var(--danger);
 }
 
-.codex-block__event,
-.codex-event__kind {
+.deepcode-gui-block__event,
+.deepcode-gui-event__kind {
   color: #174ea6;
 }
 
-.codex-live-indicator__dot {
+.deepcode-gui-live-indicator__dot {
   background: var(--accent);
   box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
 }
 
-.codex-agent-panel .markdown-content {
+.deepcode-gui-agent-panel .markdown-content {
   color: var(--text);
 }
 
-.codex-agent-panel .markdown-content code {
+.deepcode-gui-agent-panel .markdown-content code {
   border: 1px solid var(--line-soft);
   border-radius: 4px;
   background: #f0eee7;
@@ -1579,7 +1579,7 @@ button {
   padding: 1px 4px;
 }
 
-.codex-agent-panel pre {
+.deepcode-gui-agent-panel pre {
   border: 1px solid #d8d2c5;
   border-radius: 8px;
   background: #20242c;
@@ -1692,28 +1692,28 @@ button {
   color: var(--danger) !important;
 }
 
-.codex-context-panel {
+.deepcode-gui-context-panel {
   background: #f3f1ea;
 }
 
-.codex-context-tabs {
+.deepcode-gui-context-tabs {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 7px;
   padding: 10px;
 }
 
-.codex-context-body {
+.deepcode-gui-context-body {
   background: #ffffff;
 }
 
-.codex-context-body > .file-tree,
-.codex-context-body > .settings-center,
-.codex-context-body > .terminal-placeholder,
-.codex-context-body > .terminal-panel {
+.deepcode-gui-context-body > .file-tree,
+.deepcode-gui-context-body > .settings-center,
+.deepcode-gui-context-body > .terminal-placeholder,
+.deepcode-gui-context-body > .terminal-panel {
   height: 100%;
 }
 
-.codex-context-dashboard {
+.deepcode-gui-context-dashboard {
   height: 100%;
   min-height: 0;
   overflow: auto;
@@ -1724,7 +1724,7 @@ button {
   background: #ffffff;
 }
 
-.codex-context-dashboard section {
+.deepcode-gui-context-dashboard section {
   display: grid;
   gap: 6px;
   padding: 12px;
@@ -1733,45 +1733,45 @@ button {
   background: #fbfaf6;
 }
 
-.codex-context-dashboard span {
+.deepcode-gui-context-dashboard span {
   color: var(--faint);
   font-size: 10px;
   font-weight: 760;
   text-transform: uppercase;
 }
 
-.codex-context-dashboard strong {
+.deepcode-gui-context-dashboard strong {
   color: var(--text);
   font-size: 13px;
   font-weight: 720;
 }
 
-.codex-context-dashboard p {
+.deepcode-gui-context-dashboard p {
   margin: 0;
   color: var(--muted);
   font-size: 12px;
   line-height: 1.45;
 }
 
-.codex-review-stack {
+.deepcode-gui-review-stack {
   gap: 8px;
   background: #f3f1ea;
 }
 
-.codex-review-card {
+.deepcode-gui-review-card {
   background: rgba(255, 255, 255, 0.86);
 }
 
-.codex-panel-fallback,
-.codex-statusbar {
+.deepcode-gui-panel-fallback,
+.deepcode-gui-statusbar {
   color: var(--muted);
 }
 
-.codex-statusbar {
+.deepcode-gui-statusbar {
   background: rgba(255, 255, 255, 0.88);
 }
 
-.codex-workbench .file-tree {
+.deepcode-gui-workbench .file-tree {
   --ft-bg: #ffffff;
   --ft-bg-2: #fbfaf6;
   --ft-fg: var(--text);
@@ -1784,156 +1784,156 @@ button {
   background: #ffffff;
 }
 
-.codex-workbench .file-tree__titlebar,
-.codex-workbench .settings-nav,
-.codex-workbench .settings-body {
+.deepcode-gui-workbench .file-tree__titlebar,
+.deepcode-gui-workbench .settings-nav,
+.deepcode-gui-workbench .settings-body {
   border-color: var(--line);
   background: #ffffff;
 }
 
-.codex-workbench .file-tree__toolbar-btn:hover,
-.codex-workbench .file-tree__empty-action,
-.codex-workbench .file-tree__row:hover,
-.codex-workbench .settings-nav-item:hover {
+.deepcode-gui-workbench .file-tree__toolbar-btn:hover,
+.deepcode-gui-workbench .file-tree__empty-action,
+.deepcode-gui-workbench .file-tree__row:hover,
+.deepcode-gui-workbench .settings-nav-item:hover {
   background: #f5f3ec;
   color: #111318;
 }
 
-.codex-workbench .file-tree__row--selected,
-.codex-workbench .file-tree__row--selected:hover,
-.codex-workbench .settings-nav-item--active {
+.deepcode-gui-workbench .file-tree__row--selected,
+.deepcode-gui-workbench .file-tree__row--selected:hover,
+.deepcode-gui-workbench .settings-nav-item--active {
   background: rgba(37, 99, 235, 0.08);
   color: #174ea6;
 }
 
-.codex-workbench .file-tree__icon,
-.codex-workbench .file-tree__chevron {
+.deepcode-gui-workbench .file-tree__icon,
+.deepcode-gui-workbench .file-tree__chevron {
   color: #8a8172;
 }
 
-.codex-workbench .settings-center {
+.deepcode-gui-workbench .settings-center {
   background: #ffffff;
   color: var(--text);
 }
 
-.codex-workbench .settings-title,
-.codex-workbench .settings-card__title,
-.codex-workbench .settings-kv td:last-child {
+.deepcode-gui-workbench .settings-title,
+.deepcode-gui-workbench .settings-card__title,
+.deepcode-gui-workbench .settings-kv td:last-child {
   color: var(--text);
 }
 
-.codex-workbench .settings-card,
-.codex-workbench .settings-card__inline-placeholder {
+.deepcode-gui-workbench .settings-card,
+.deepcode-gui-workbench .settings-card__inline-placeholder {
   border-color: var(--line);
   background: #fbfaf6;
   box-shadow: var(--shadow-sm);
 }
 
-.codex-workbench .settings-card__title {
+.deepcode-gui-workbench .settings-card__title {
   border-color: var(--line);
   background: #f5f3ec;
 }
 
-.codex-workbench .settings-card__body,
-.codex-workbench .settings-card__hint,
-.codex-workbench .settings-card__inline-placeholder,
-.codex-workbench .settings-kv td:first-child {
+.deepcode-gui-workbench .settings-card__body,
+.deepcode-gui-workbench .settings-card__hint,
+.deepcode-gui-workbench .settings-card__inline-placeholder,
+.deepcode-gui-workbench .settings-kv td:first-child {
   color: var(--muted);
 }
 
-.codex-workbench .terminal-panel,
-.codex-workbench .terminal-panel__body,
-.codex-workbench .terminal-panel__screen,
-.codex-workbench .terminal-panel__sidebar,
-.codex-workbench .terminal-panel__sidebar-header,
-.codex-workbench .terminal-panel__session-list {
+.deepcode-gui-workbench .terminal-panel,
+.deepcode-gui-workbench .terminal-panel__body,
+.deepcode-gui-workbench .terminal-panel__screen,
+.deepcode-gui-workbench .terminal-panel__sidebar,
+.deepcode-gui-workbench .terminal-panel__sidebar-header,
+.deepcode-gui-workbench .terminal-panel__session-list {
   background: var(--terminal-bg);
 }
 
-.codex-workbench .terminal-panel {
+.deepcode-gui-workbench .terminal-panel {
   border-top-color: rgba(255, 255, 255, 0.12);
   color: #e8e5de;
 }
 
-.codex-workbench .terminal-panel__sidebar {
+.deepcode-gui-workbench .terminal-panel__sidebar {
   border-left-color: rgba(255, 255, 255, 0.12);
   box-shadow: none;
 }
 
-.codex-workbench .terminal-panel__sidebar-header {
+.deepcode-gui-workbench .terminal-panel__sidebar-header {
   border-bottom-color: rgba(255, 255, 255, 0.12);
   box-shadow: none;
 }
 
-.codex-workbench .terminal-panel__command-input,
-.codex-workbench .terminal-panel__rename-input {
+.deepcode-gui-workbench .terminal-panel__command-input,
+.deepcode-gui-workbench .terminal-panel__rename-input {
   color: #ffffff;
 }
 
-.codex-workbench .terminal-panel__session:hover,
-.codex-workbench .terminal-panel__icon-btn:hover {
+.deepcode-gui-workbench .terminal-panel__session:hover,
+.deepcode-gui-workbench .terminal-panel__icon-btn:hover {
   background: rgba(255, 255, 255, 0.08);
   color: #ffffff;
 }
 
-.codex-workbench .terminal-panel__session--active {
+.deepcode-gui-workbench .terminal-panel__session--active {
   border-color: rgba(140, 180, 255, 0.34);
   background: rgba(140, 180, 255, 0.16);
   color: #ffffff;
 }
 
 @media (max-width: 1180px) {
-  .codex-shell {
+  .deepcode-gui-shell {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(420px, 1fr) minmax(320px, 42vh);
   }
 
-  .codex-left-rail {
+  .deepcode-gui-left-rail {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     max-height: 300px;
   }
 
-  .codex-titlebar {
+  .deepcode-gui-titlebar {
     grid-template-columns: minmax(0, 1fr) auto auto;
   }
 
-  .codex-titlebar__center {
+  .deepcode-gui-titlebar__center {
     display: none;
   }
 }
 
 @media (max-width: 760px) {
-  .codex-workbench {
+  .deepcode-gui-workbench {
     grid-template-rows: 38px minmax(0, 1fr) 24px;
   }
 
-  .codex-left-rail {
+  .deepcode-gui-left-rail {
     display: none;
   }
 
-  .codex-shell {
+  .deepcode-gui-shell {
     grid-template-rows: minmax(0, 1fr) minmax(280px, 38vh);
   }
 
-  .codex-session-topline {
+  .deepcode-gui-session-topline {
     padding: 10px;
   }
 
-  .codex-context-panel {
+  .deepcode-gui-context-panel {
     min-height: 0;
   }
 }
 
 /* Screenshot-aligned conversational layout: conversation first, tools as projection only. */
-.codex-workbench {
+.deepcode-gui-workbench {
   grid-template-rows: 38px minmax(0, 1fr);
   background: #f5f6f7;
   font-size: 13px;
   font-weight: 400;
 }
 
-.codex-titlebar {
+.deepcode-gui-titlebar {
   grid-template-columns: minmax(210px, 1fr) auto auto;
   height: 38px;
   padding: 0 12px;
@@ -1942,12 +1942,12 @@ button {
   box-shadow: none;
 }
 
-.codex-titlebar__brand {
+.deepcode-gui-titlebar__brand {
   font-size: 12px;
   font-weight: 620;
 }
 
-.codex-titlebar__mark {
+.deepcode-gui-titlebar__mark {
   width: 22px;
   height: 22px;
   border-radius: 6px;
@@ -1956,40 +1956,40 @@ button {
   box-shadow: none;
 }
 
-.codex-titlebar__center {
+.deepcode-gui-titlebar__center {
   color: #7b7f87;
 }
 
-.codex-titlebar__center span:last-child {
+.deepcode-gui-titlebar__center span:last-child {
   color: #2f3337;
 }
 
-.codex-titlebar__status {
+.deepcode-gui-titlebar__status {
   gap: 6px;
 }
 
-.codex-status-pill {
+.deepcode-gui-status-pill {
   min-height: 20px;
   border-radius: 999px;
   background: #f0f2f3;
 }
 
-.codex-shell {
+.deepcode-gui-shell {
   grid-template-columns: 280px minmax(540px, 1fr) 288px;
   grid-template-rows: minmax(0, 1fr);
   gap: 0;
   background: #f5f6f7;
 }
 
-.codex-shell--home {
+.deepcode-gui-shell--home {
   grid-template-columns: 280px minmax(0, 1fr);
 }
 
-.codex-shell--home .codex-context-panel {
+.deepcode-gui-shell--home .deepcode-gui-context-panel {
   display: none;
 }
 
-.codex-left-rail {
+.deepcode-gui-left-rail {
   display: flex;
   flex-direction: column;
   gap: 24px;
@@ -2001,16 +2001,16 @@ button {
   overflow-y: auto;
 }
 
-.codex-sidebar-actions,
-.codex-session-list {
+.deepcode-gui-sidebar-actions,
+.deepcode-gui-session-list {
   display: grid;
   gap: 7px;
 }
 
-.codex-sidebar-action,
-.codex-project-row,
-.codex-project-archive-group__sessions button,
-.codex-session-list button {
+.deepcode-gui-sidebar-action,
+.deepcode-gui-project-row,
+.deepcode-gui-project-archive-group__sessions button,
+.deepcode-gui-session-list button {
   width: 100%;
   min-height: 32px;
   display: flex;
@@ -2027,53 +2027,53 @@ button {
   font-weight: 470;
 }
 
-.codex-sidebar-action--primary {
+.deepcode-gui-sidebar-action--primary {
   font-weight: 580;
 }
 
-.codex-sidebar-icon {
+.deepcode-gui-sidebar-icon {
   flex: 0 0 auto;
   color: #5f666d;
   width: 19px;
   height: 19px;
 }
 
-.codex-sidebar-action:hover,
-.codex-project-row:hover,
-.codex-project-archive-group__sessions button:hover,
-.codex-session-list button:hover {
+.deepcode-gui-sidebar-action:hover,
+.deepcode-gui-project-row:hover,
+.deepcode-gui-project-archive-group__sessions button:hover,
+.deepcode-gui-session-list button:hover {
   background: #eceeef;
 }
 
-.codex-project-archive-group__sessions button.active,
-.codex-session-list button.active {
+.deepcode-gui-project-archive-group__sessions button.active,
+.deepcode-gui-session-list button.active {
   background: #e9ecec;
   color: #1f2933;
   font-weight: 560;
 }
 
-.codex-sidebar-section {
+.deepcode-gui-sidebar-section {
   display: grid;
   gap: 10px;
 }
 
-.codex-sidebar-section--sessions {
+.deepcode-gui-sidebar-section--sessions {
   min-height: 0;
   overflow: hidden;
 }
 
-.codex-sidebar-section__label {
+.deepcode-gui-sidebar-section__label {
   padding: 0 8px;
   color: #9aa0a6;
   font-size: 13px;
   font-weight: 620;
 }
 
-.codex-sidebar-section__label--nested {
+.deepcode-gui-sidebar-section__label--nested {
   margin-top: 22px;
 }
 
-.codex-sidebar-section__heading {
+.deepcode-gui-sidebar-section__heading {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
@@ -2082,19 +2082,19 @@ button {
   min-height: 28px;
 }
 
-.codex-sidebar-section__heading--project {
+.deepcode-gui-sidebar-section__heading--project {
   margin-top: 0;
 }
 
-.codex-sidebar-section__heading:not(.codex-sidebar-section__heading--project) {
+.deepcode-gui-sidebar-section__heading:not(.deepcode-gui-sidebar-section__heading--project) {
   margin-top: 26px;
 }
 
-.codex-sidebar-section__heading .codex-sidebar-section__label--nested {
+.deepcode-gui-sidebar-section__heading .deepcode-gui-sidebar-section__label--nested {
   margin-top: 0;
 }
 
-.codex-sidebar-new-chat {
+.deepcode-gui-sidebar-new-chat {
   width: 24px;
   height: 24px;
   display: grid;
@@ -2106,18 +2106,18 @@ button {
   padding: 0;
 }
 
-.codex-sidebar-new-chat:hover {
+.deepcode-gui-sidebar-new-chat:hover {
   background: #eceeef;
   color: #30343a;
 }
 
-.codex-sidebar-new-chat svg {
+.deepcode-gui-sidebar-new-chat svg {
   width: 15px;
   height: 15px;
 }
 
-.codex-sidebar-section__heading .codex-sidebar-text-action,
-.codex-sidebar-section__heading .codex-sidebar-new-chat {
+.deepcode-gui-sidebar-section__heading .deepcode-gui-sidebar-text-action,
+.deepcode-gui-sidebar-section__heading .deepcode-gui-sidebar-new-chat {
   opacity: 0;
   pointer-events: none;
   transform: translateX(3px);
@@ -2128,16 +2128,16 @@ button {
     color 120ms ease;
 }
 
-.codex-sidebar-section__heading:hover .codex-sidebar-text-action,
-.codex-sidebar-section__heading:focus-within .codex-sidebar-text-action,
-.codex-sidebar-section__heading:hover .codex-sidebar-new-chat,
-.codex-sidebar-section__heading:focus-within .codex-sidebar-new-chat {
+.deepcode-gui-sidebar-section__heading:hover .deepcode-gui-sidebar-text-action,
+.deepcode-gui-sidebar-section__heading:focus-within .deepcode-gui-sidebar-text-action,
+.deepcode-gui-sidebar-section__heading:hover .deepcode-gui-sidebar-new-chat,
+.deepcode-gui-sidebar-section__heading:focus-within .deepcode-gui-sidebar-new-chat {
   opacity: 1;
   pointer-events: auto;
   transform: translateX(0);
 }
 
-.codex-sidebar-text-action {
+.deepcode-gui-sidebar-text-action {
   height: 28px;
   border: 0;
   border-radius: 8px;
@@ -2148,61 +2148,61 @@ button {
   font-weight: 540;
 }
 
-.codex-sidebar-text-action:hover:not(:disabled) {
+.deepcode-gui-sidebar-text-action:hover:not(:disabled) {
   background: #eceeef;
   color: #30343a;
 }
 
-.codex-sidebar-text-action:disabled {
+.deepcode-gui-sidebar-text-action:disabled {
   opacity: 0.45;
 }
 
-.codex-project-row {
+.deepcode-gui-project-row {
   flex-direction: row;
   align-items: center;
   justify-content: flex-start;
   min-height: 42px;
 }
 
-.codex-project-row__body {
+.deepcode-gui-project-row__body {
   min-width: 0;
   display: grid;
   gap: 2px;
 }
 
-.codex-project-row__body span,
-.codex-project-archive-group__sessions button span,
-.codex-session-list button span {
+.deepcode-gui-project-row__body span,
+.deepcode-gui-project-archive-group__sessions button span,
+.deepcode-gui-session-list button span {
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.codex-project-row small,
-.codex-sidebar-empty,
-.codex-sidebar-error {
+.deepcode-gui-project-row small,
+.deepcode-gui-sidebar-empty,
+.deepcode-gui-sidebar-error {
   color: #8a8f98;
   font-size: 13px;
 }
 
-.codex-sidebar-error {
+.deepcode-gui-sidebar-error {
   color: var(--danger);
   padding: 0 8px;
 }
 
-.codex-project-archive-list {
+.deepcode-gui-project-archive-list {
   display: grid;
   gap: 15px;
   min-height: 0;
 }
 
-.codex-project-archive-group {
+.deepcode-gui-project-archive-group {
   display: grid;
   gap: 7px;
 }
 
-.codex-project-archive-group__title {
+.deepcode-gui-project-archive-group__title {
   width: 100%;
   min-height: 34px;
   display: grid;
@@ -2215,7 +2215,7 @@ button {
   padding: 0 6px 0 8px;
 }
 
-.codex-project-archive-group__select {
+.deepcode-gui-project-archive-group__select {
   min-width: 0;
   min-height: 34px;
   display: flex;
@@ -2230,26 +2230,26 @@ button {
   text-align: left;
 }
 
-.codex-project-archive-group__title:hover {
+.deepcode-gui-project-archive-group__title:hover {
   background: #eceeef;
 }
 
-.codex-project-archive-group__title:hover .codex-project-archive-group__select {
+.deepcode-gui-project-archive-group__title:hover .deepcode-gui-project-archive-group__select {
   color: #30343a;
 }
 
-.codex-project-archive-group__select:disabled {
+.deepcode-gui-project-archive-group__select:disabled {
   opacity: 1;
 }
 
-.codex-project-archive-group__select span {
+.deepcode-gui-project-archive-group__select span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.codex-project-archive-group__actions {
+.deepcode-gui-project-archive-group__actions {
   display: inline-flex;
   align-items: center;
   gap: 0;
@@ -2263,14 +2263,14 @@ button {
     color 120ms ease;
 }
 
-.codex-project-archive-group__title:hover .codex-project-archive-group__actions,
-.codex-project-archive-group__title:focus-within .codex-project-archive-group__actions {
+.deepcode-gui-project-archive-group__title:hover .deepcode-gui-project-archive-group__actions,
+.deepcode-gui-project-archive-group__title:focus-within .deepcode-gui-project-archive-group__actions {
   opacity: 1;
   pointer-events: auto;
   transform: translateX(0);
 }
 
-.codex-project-archive-group__compose {
+.deepcode-gui-project-archive-group__compose {
   width: 24px;
   height: 24px;
   display: grid;
@@ -2282,28 +2282,28 @@ button {
   padding: 0;
 }
 
-.codex-project-archive-group__compose:hover:not(:disabled) {
+.deepcode-gui-project-archive-group__compose:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.7);
   color: #30343a;
 }
 
-.codex-project-archive-group__compose svg {
+.deepcode-gui-project-archive-group__compose svg {
   width: 15px;
   height: 15px;
 }
 
-.codex-project-archive-group__sessions {
+.deepcode-gui-project-archive-group__sessions {
   display: grid;
   gap: 5px;
 }
 
-.codex-project-archive-group__sessions button {
+.deepcode-gui-project-archive-group__sessions button {
   min-height: 34px;
   justify-content: space-between;
   padding-left: 42px;
 }
 
-.codex-project-archive-group__sessions kbd {
+.deepcode-gui-project-archive-group__sessions kbd {
   flex: 0 0 auto;
   min-width: 28px;
   height: 22px;
@@ -2318,7 +2318,7 @@ button {
   font-weight: 520;
 }
 
-.codex-session-context-menu {
+.deepcode-gui-session-context-menu {
   position: fixed;
   z-index: 90;
   width: 188px;
@@ -2331,7 +2331,7 @@ button {
   padding: 7px;
 }
 
-.codex-session-context-menu__title {
+.deepcode-gui-session-context-menu__title {
   padding: 6px 8px 7px;
   color: #8a8f98;
   font-size: 11px;
@@ -2341,21 +2341,21 @@ button {
   white-space: nowrap;
 }
 
-.codex-session-context-menu__section {
+.deepcode-gui-session-context-menu__section {
   margin: 5px 0;
   padding: 6px 0 4px;
   border-top: 1px solid #ece8e0;
   border-bottom: 1px solid #ece8e0;
 }
 
-.codex-session-context-menu__section-title {
+.deepcode-gui-session-context-menu__section-title {
   padding: 4px 8px 6px;
   color: #9a9fa7;
   font-size: 11px;
   font-weight: 650;
 }
 
-.codex-session-context-menu button {
+.deepcode-gui-session-context-menu button {
   min-height: 30px;
   display: flex;
   align-items: center;
@@ -2369,19 +2369,19 @@ button {
   font-weight: 500;
 }
 
-.codex-session-context-menu button:hover:not(:disabled) {
+.deepcode-gui-session-context-menu button:hover:not(:disabled) {
   background: #f0f1f2;
 }
 
-.codex-session-context-menu button:disabled {
+.deepcode-gui-session-context-menu button:disabled {
   color: #b8bdc2;
 }
 
-.codex-session-context-menu__danger:not(:disabled) {
+.deepcode-gui-session-context-menu__danger:not(:disabled) {
   color: #c63f3f;
 }
 
-.codex-text-dialog-backdrop {
+.deepcode-gui-text-dialog-backdrop {
   position: fixed;
   inset: 0;
   z-index: 110;
@@ -2392,7 +2392,7 @@ button {
   backdrop-filter: blur(8px);
 }
 
-.codex-text-dialog {
+.deepcode-gui-text-dialog {
   width: min(380px, calc(100vw - 48px));
   display: grid;
   gap: 16px;
@@ -2403,23 +2403,23 @@ button {
   padding: 16px;
 }
 
-.codex-text-dialog header,
-.codex-text-dialog footer {
+.deepcode-gui-text-dialog header,
+.deepcode-gui-text-dialog footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
 }
 
-.codex-text-dialog h2 {
+.deepcode-gui-text-dialog h2 {
   margin: 0;
   color: #202124;
   font-size: 15px;
   font-weight: 620;
 }
 
-.codex-text-dialog header button,
-.codex-text-dialog footer button {
+.deepcode-gui-text-dialog header button,
+.deepcode-gui-text-dialog footer button {
   min-height: 30px;
   border: 1px solid #e4e1d8;
   border-radius: 10px;
@@ -2430,33 +2430,33 @@ button {
   font-weight: 540;
 }
 
-.codex-text-dialog header button {
+.deepcode-gui-text-dialog header button {
   width: 30px;
   padding: 0;
 }
 
-.codex-text-dialog footer button[type='submit'] {
+.deepcode-gui-text-dialog footer button[type='submit'] {
   border-color: #cfd8d3;
   background: #eef5f1;
   color: #1f6b4b;
 }
 
-.codex-text-dialog footer button:disabled {
+.deepcode-gui-text-dialog footer button:disabled {
   opacity: 0.45;
 }
 
-.codex-text-dialog label {
+.deepcode-gui-text-dialog label {
   display: grid;
   gap: 8px;
 }
 
-.codex-text-dialog label span {
+.deepcode-gui-text-dialog label span {
   color: #777f88;
   font-size: 12px;
   font-weight: 560;
 }
 
-.codex-text-dialog input {
+.deepcode-gui-text-dialog input {
   min-height: 38px;
   border: 1px solid #ddd9cf;
   border-radius: 12px;
@@ -2467,22 +2467,22 @@ button {
   outline: none;
 }
 
-.codex-text-dialog input:focus {
+.deepcode-gui-text-dialog input:focus {
   border-color: #b9c8be;
   box-shadow: 0 0 0 3px rgba(64, 121, 88, 0.12);
 }
 
-.codex-session-list {
+.deepcode-gui-session-list {
   min-height: 0;
   overflow: auto;
 }
 
-.codex-sidebar-spacer {
+.deepcode-gui-sidebar-spacer {
   flex: 1 1 auto;
   min-height: 12px;
 }
 
-.codex-sidebar-settings {
+.deepcode-gui-sidebar-settings {
   width: 100%;
   min-height: 34px;
   display: flex;
@@ -2499,11 +2499,11 @@ button {
   font-weight: 500;
 }
 
-.codex-sidebar-settings:hover {
+.deepcode-gui-sidebar-settings:hover {
   background: #eceeef;
 }
 
-.codex-sidebar-settings__icon {
+.deepcode-gui-sidebar-settings__icon {
   width: 20px;
   height: 20px;
   display: grid;
@@ -2511,12 +2511,12 @@ button {
   color: #626973;
 }
 
-.codex-sidebar-settings__icon svg {
+.deepcode-gui-sidebar-settings__icon svg {
   width: 17px;
   height: 17px;
 }
 
-.codex-session-main {
+.deepcode-gui-session-main {
   min-width: 0;
   min-height: 0;
   display: block;
@@ -2531,26 +2531,26 @@ button {
   overflow: hidden;
 }
 
-.codex-shell--home .codex-session-main {
+.deepcode-gui-shell--home .deepcode-gui-session-main {
   border-right: 0;
   border-top-right-radius: 0;
   border-bottom-right-radius: 0;
 }
 
-.codex-agent-panel {
+.deepcode-gui-agent-panel {
   height: 100%;
   min-height: 0;
   grid-template-rows: auto minmax(0, 1fr) auto auto auto;
   background: #ffffff;
 }
 
-.codex-agent-panel--home {
+.deepcode-gui-agent-panel--home {
   display: grid;
   place-items: center;
   grid-template-rows: minmax(0, 1fr);
 }
 
-.codex-home-panel {
+.deepcode-gui-home-panel {
   width: min(840px, calc(100% - 96px));
   display: grid;
   justify-items: center;
@@ -2558,7 +2558,7 @@ button {
   transform: translateY(-6vh);
 }
 
-.codex-home-panel h1 {
+.deepcode-gui-home-panel h1 {
   margin: 0;
   color: #24272d;
   font-size: 27px;
@@ -2567,7 +2567,7 @@ button {
   text-align: center;
 }
 
-.codex-home-panel .agent-composer {
+.deepcode-gui-home-panel .agent-composer {
   width: min(100%, 760px);
   margin: 0;
   border-radius: 20px;
@@ -2575,12 +2575,12 @@ button {
   box-shadow: 0 18px 38px rgba(32, 33, 36, 0.1);
 }
 
-.codex-home-panel .agent-composer:focus-within,
-.codex-home-panel .agent-composer--expanded {
+.deepcode-gui-home-panel .agent-composer:focus-within,
+.deepcode-gui-home-panel .agent-composer--expanded {
   width: min(100%, 820px);
 }
 
-.codex-agent-panel__header {
+.deepcode-gui-agent-panel__header {
   min-height: 44px;
   display: flex;
   align-items: center;
@@ -2592,24 +2592,24 @@ button {
   background: #ffffff;
 }
 
-.codex-agent-panel__header > div {
+.deepcode-gui-agent-panel__header > div {
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.codex-agent-panel__title {
+.deepcode-gui-agent-panel__title {
   color: #25282d;
   font-size: 13px;
   font-weight: 560;
 }
 
-.codex-agent-panel__subtitle {
+.deepcode-gui-agent-panel__subtitle {
   display: none;
 }
 
-.codex-agent-panel__header button {
+.deepcode-gui-agent-panel__header button {
   width: 24px;
   min-height: 24px;
   border: 0;
@@ -2620,22 +2620,22 @@ button {
   padding: 0;
 }
 
-.codex-agent-panel__header button:hover {
+.deepcode-gui-agent-panel__header button:hover {
   background: #f0f1f2;
 }
 
-.codex-agent-panel__sessions {
+.deepcode-gui-agent-panel__sessions {
   display: none;
 }
 
-.codex-timeline {
+.deepcode-gui-timeline {
   width: min(100%, 900px);
   margin: 0 auto;
   padding: 18px 28px 28px;
   background: #ffffff;
 }
 
-.codex-empty {
+.deepcode-gui-empty {
   min-height: 160px;
   display: grid;
   align-content: center;
@@ -2645,47 +2645,47 @@ button {
   box-shadow: none;
 }
 
-.codex-empty__title {
+.deepcode-gui-empty__title {
   color: #b0b4ba;
   font-size: 13px;
   font-weight: 520;
 }
 
-.codex-turn {
+.deepcode-gui-turn {
   grid-template-columns: minmax(0, 1fr);
   margin-bottom: 20px;
 }
 
-.codex-turn__rail {
+.deepcode-gui-turn__rail {
   display: none;
 }
 
-.codex-turn__body {
+.deepcode-gui-turn__body {
   gap: 10px;
 }
 
-.codex-turn__meta {
+.deepcode-gui-turn__meta {
   color: #9aa0a6;
   font-size: 10px;
   font-weight: 500;
   text-transform: none;
 }
 
-.codex-block {
+.deepcode-gui-block {
   border-color: #e4e1d8;
   border-radius: 14px;
   background: #ffffff;
   box-shadow: none;
 }
 
-.codex-block--assistant {
+.deepcode-gui-block--assistant {
   padding: 2px 0 8px;
   border: 0;
   border-radius: 0;
   background: transparent;
 }
 
-.codex-assistant-text {
+.deepcode-gui-assistant-text {
   max-width: min(100%, 780px);
   padding: 2px 0 8px;
   color: #24272d;
@@ -2693,17 +2693,17 @@ button {
   line-height: 1.72;
 }
 
-.codex-assistant-text .markdown-content {
+.deepcode-gui-assistant-text .markdown-content {
   color: inherit;
   font-size: inherit;
   line-height: inherit;
 }
 
-.codex-assistant-text .markdown-content p {
+.deepcode-gui-assistant-text .markdown-content p {
   margin: 0 0 12px;
 }
 
-.codex-assistant-narration {
+.deepcode-gui-assistant-narration {
   max-width: min(100%, 780px);
   padding: 0 0 6px;
   color: #5f6670;
@@ -2711,31 +2711,31 @@ button {
   line-height: 1.68;
 }
 
-.codex-assistant-narration .markdown-content {
+.deepcode-gui-assistant-narration .markdown-content {
   color: inherit;
   font-size: inherit;
   line-height: inherit;
 }
 
-.codex-assistant-narration .markdown-content p {
+.deepcode-gui-assistant-narration .markdown-content p {
   margin: 0 0 8px;
 }
 
-.codex-block--assistant .codex-block__label {
+.deepcode-gui-block--assistant .deepcode-gui-block__label {
   display: none;
 }
 
-.codex-block--assistant .markdown-content {
+.deepcode-gui-block--assistant .markdown-content {
   color: #24272d;
   font-size: 14px;
   line-height: 1.72;
 }
 
-.codex-block--assistant .markdown-content p {
+.deepcode-gui-block--assistant .markdown-content p {
   margin: 0 0 12px;
 }
 
-.codex-block--user {
+.deepcode-gui-block--user {
   justify-self: end;
   max-width: min(72%, 640px);
   padding: 6px 10px;
@@ -2747,32 +2747,32 @@ button {
   line-height: 1.38;
 }
 
-.codex-block--user .codex-block__label {
+.deepcode-gui-block--user .deepcode-gui-block__label {
   display: none;
 }
 
-.codex-block--user .agent-message-attachments {
+.deepcode-gui-block--user .agent-message-attachments {
   justify-content: flex-start;
   margin: 0 0 7px;
 }
 
-.codex-block--plan,
-.codex-block--narrative-operationEvidence,
-.codex-block--narrative-verification {
+.deepcode-gui-block--plan,
+.deepcode-gui-block--narrative-operationEvidence,
+.deepcode-gui-block--narrative-verification {
   padding: 0;
 }
 
-.codex-block--narrative-operationEvidence summary,
-.codex-block--narrative-verification summary {
+.deepcode-gui-block--narrative-operationEvidence summary,
+.deepcode-gui-block--narrative-verification summary {
   min-height: 36px;
 }
 
-.codex-block--narrative-operationEvidence .codex-block__details,
-.codex-block--narrative-verification .codex-block__details {
+.deepcode-gui-block--narrative-operationEvidence .deepcode-gui-block__details,
+.deepcode-gui-block--narrative-verification .deepcode-gui-block__details {
   padding-bottom: 9px;
 }
 
-.codex-block__label {
+.deepcode-gui-block__label {
   margin-bottom: 7px;
   color: #777f88;
   font-size: 10px;
@@ -2780,7 +2780,7 @@ button {
   letter-spacing: 0.02em;
 }
 
-.codex-turn-actions {
+.deepcode-gui-turn-actions {
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -2791,7 +2791,7 @@ button {
   color: #8e949a;
 }
 
-.codex-turn-actions__button {
+.deepcode-gui-turn-actions__button {
   width: 22px;
   height: 22px;
   display: inline-grid;
@@ -2804,28 +2804,28 @@ button {
   transition: background 120ms ease, color 120ms ease;
 }
 
-.codex-turn-actions__button:hover:not(:disabled) {
+.deepcode-gui-turn-actions__button:hover:not(:disabled) {
   background: #f0f1f2;
   color: #4f555c;
 }
 
-.codex-turn-actions__button:disabled {
+.deepcode-gui-turn-actions__button:disabled {
   cursor: default;
   opacity: 0.38;
 }
 
-.codex-turn-actions__status {
+.deepcode-gui-turn-actions__status {
   min-width: 0;
   color: #9aa0a6;
   font-size: 11px;
   white-space: nowrap;
 }
 
-.codex-turn-actions__status--error {
+.deepcode-gui-turn-actions__status--error {
   color: #c2413a;
 }
 
-.codex-context-panel {
+.deepcode-gui-context-panel {
   position: relative;
   display: flex;
   flex-direction: column;
@@ -2837,7 +2837,7 @@ button {
   overflow: auto;
 }
 
-.codex-context-panel::before {
+.deepcode-gui-context-panel::before {
   content: "";
   position: absolute;
   top: 0;
@@ -2848,8 +2848,8 @@ button {
   pointer-events: none;
 }
 
-.codex-task-list-card,
-.codex-progress-card {
+.deepcode-gui-task-list-card,
+.deepcode-gui-progress-card {
   display: grid;
   gap: 12px;
   padding: 16px;
@@ -2859,23 +2859,23 @@ button {
   box-shadow: 0 8px 22px rgba(32, 33, 36, 0.08);
 }
 
-.codex-task-list-card {
+.deepcode-gui-task-list-card {
   box-shadow: 0 10px 26px rgba(32, 33, 36, 0.07);
 }
 
-.codex-task-list-card__title,
-.codex-progress-card__title {
+.deepcode-gui-task-list-card__title,
+.deepcode-gui-progress-card__title {
   color: #7b7f87;
   font-size: 12px;
   font-weight: 560;
 }
 
-.codex-task-list {
+.deepcode-gui-task-list {
   display: grid;
   gap: 8px;
 }
 
-.codex-task-list-card__empty {
+.deepcode-gui-task-list-card__empty {
   min-height: 74px;
   display: grid;
   place-items: center;
@@ -2885,7 +2885,7 @@ button {
   font-size: 12px;
 }
 
-.codex-task-item {
+.deepcode-gui-task-item {
   display: grid;
   grid-template-columns: 8px minmax(0, 1fr) auto;
   align-items: start;
@@ -2896,7 +2896,7 @@ button {
   background: #fbfaf6;
 }
 
-.codex-task-item__dot {
+.deepcode-gui-task-item__dot {
   width: 7px;
   height: 7px;
   margin-top: 5px;
@@ -2904,29 +2904,29 @@ button {
   background: #a2a8b0;
 }
 
-.codex-task-item--running .codex-task-item__dot {
+.deepcode-gui-task-item--running .deepcode-gui-task-item__dot {
   background: #2f80ed;
 }
 
-.codex-task-item--waiting .codex-task-item__dot {
+.deepcode-gui-task-item--waiting .deepcode-gui-task-item__dot {
   background: #c87d16;
 }
 
-.codex-task-item--completed .codex-task-item__dot {
+.deepcode-gui-task-item--completed .deepcode-gui-task-item__dot {
   background: #2f9e6d;
 }
 
-.codex-task-item--failed .codex-task-item__dot {
+.deepcode-gui-task-item--failed .deepcode-gui-task-item__dot {
   background: #c2413a;
 }
 
-.codex-task-item__title {
+.deepcode-gui-task-item__title {
   color: #2f3337;
   font-size: 12px;
   font-weight: 560;
 }
 
-.codex-task-item__summary {
+.deepcode-gui-task-item__summary {
   min-width: 0;
   margin-top: 2px;
   overflow: hidden;
@@ -2937,13 +2937,13 @@ button {
   white-space: nowrap;
 }
 
-.codex-task-item strong {
+.deepcode-gui-task-item strong {
   color: #8a8f98;
   font-size: 10px;
   font-weight: 560;
 }
 
-.codex-progress-row {
+.deepcode-gui-progress-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
@@ -2952,7 +2952,7 @@ button {
   font-size: 11px;
 }
 
-.codex-progress-row strong {
+.deepcode-gui-progress-row strong {
   min-width: 0;
   max-width: 145px;
   overflow: hidden;
@@ -3041,7 +3041,7 @@ button {
   border-radius: 10px;
 }
 
-.codex-settings-overlay {
+.deepcode-gui-settings-overlay {
   position: fixed;
   inset: 0;
   z-index: 100;
@@ -3052,7 +3052,7 @@ button {
   backdrop-filter: blur(8px);
 }
 
-.codex-settings-sheet {
+.deepcode-gui-settings-sheet {
   width: min(980px, calc(100vw - 64px));
   height: min(760px, calc(100vh - 64px));
   min-height: 0;
@@ -3065,7 +3065,7 @@ button {
   box-shadow: 0 24px 70px rgba(32, 33, 36, 0.2);
 }
 
-.codex-settings-sheet__header {
+.deepcode-gui-settings-sheet__header {
   min-height: 58px;
   display: flex;
   align-items: center;
@@ -3075,21 +3075,21 @@ button {
   border-bottom: 1px solid #efede7;
 }
 
-.codex-settings-sheet__header h2 {
+.deepcode-gui-settings-sheet__header h2 {
   margin: 0;
   color: #202124;
   font-size: 15px;
   font-weight: 620;
 }
 
-.codex-settings-sheet__header span {
+.deepcode-gui-settings-sheet__header span {
   display: block;
   margin-top: 2px;
   color: #8a8f98;
   font-size: 11px;
 }
 
-.codex-settings-sheet__header button {
+.deepcode-gui-settings-sheet__header button {
   width: 30px;
   min-height: 30px;
   border: 1px solid #e4e1d8;
@@ -3099,11 +3099,11 @@ button {
   box-shadow: none;
 }
 
-.codex-settings-sheet__header button:hover {
+.deepcode-gui-settings-sheet__header button:hover {
   background: #f6f6f3;
 }
 
-.codex-settings-sheet__runtime {
+.deepcode-gui-settings-sheet__runtime {
   min-width: 0;
   display: flex;
   flex-wrap: wrap;
@@ -3113,7 +3113,7 @@ button {
   background: #fbfaf6;
 }
 
-.codex-settings-sheet__runtime span {
+.deepcode-gui-settings-sheet__runtime span {
   min-height: 22px;
   display: inline-flex;
   align-items: center;
@@ -3125,39 +3125,39 @@ button {
   font-size: 11px;
 }
 
-.codex-settings-sheet__body {
+.deepcode-gui-settings-sheet__body {
   min-height: 0;
   overflow: hidden;
 }
 
-.codex-settings-sheet .settings-center {
+.deepcode-gui-settings-sheet .settings-center {
   height: 100%;
 }
 
-.codex-settings-sheet .settings-nav,
-.codex-settings-sheet .settings-body {
+.deepcode-gui-settings-sheet .settings-nav,
+.deepcode-gui-settings-sheet .settings-body {
   border-radius: 0;
 }
 
-.codex-git-review {
+.deepcode-gui-git-review {
   display: grid;
   gap: 8px;
   margin-top: 10px;
 }
 
-.codex-git-review__summary {
+.deepcode-gui-git-review__summary {
   color: #8a8f98;
   font-size: 12px;
 }
 
-.codex-git-review__files {
+.deepcode-gui-git-review__files {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
 }
 
-.codex-git-review__files code,
-.codex-git-review__files span {
+.deepcode-gui-git-review__files code,
+.deepcode-gui-git-review__files span {
   border: 1px solid #e4e1d8;
   border-radius: 999px;
   background: #fbfaf6;
@@ -3166,7 +3166,7 @@ button {
   font-size: 11px;
 }
 
-.codex-git-review__diff pre {
+.deepcode-gui-git-review__diff pre {
   max-height: 420px;
   overflow: auto;
   white-space: pre;
@@ -3179,40 +3179,40 @@ button {
 }
 
 @media (max-width: 1180px) {
-  .codex-shell {
+  .deepcode-gui-shell {
     grid-template-columns: 220px minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
   }
 
-  .codex-left-rail {
+  .deepcode-gui-left-rail {
     display: flex;
     max-height: none;
   }
 
-  .codex-context-panel {
+  .deepcode-gui-context-panel {
     display: none;
   }
 }
 
 @media (max-width: 760px) {
-  .codex-workbench {
+  .deepcode-gui-workbench {
     grid-template-rows: 38px minmax(0, 1fr);
   }
 
-  .codex-shell {
+  .deepcode-gui-shell {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
   }
 
-  .codex-left-rail {
+  .deepcode-gui-left-rail {
     display: none;
   }
 
-  .codex-agent-panel__header {
+  .deepcode-gui-agent-panel__header {
     padding: 0 14px;
   }
 
-  .codex-timeline {
+  .deepcode-gui-timeline {
     padding: 18px 14px;
   }
 

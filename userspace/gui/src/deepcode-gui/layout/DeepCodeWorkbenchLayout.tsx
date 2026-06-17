@@ -8,9 +8,9 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { deriveTokenUsageStats, formatPercent, formatTokenCount } from '../../utils/tokenUsageStats';
-import CodexAgentPanel from '../panel/CodexAgentPanel';
+import DeepCodeAgentPanel from '../panel/DeepCodeAgentPanel';
 
-interface CodexWorkbenchLayoutProps {
+interface DeepCodeWorkbenchLayoutProps {
   apiStatus: string;
   wsStatus: string;
   serverVersion?: string;
@@ -21,28 +21,28 @@ const WorkspaceOpenDialog = lazy(() => import('../../components/workspace-open-d
 const CodeWorkspaceChoiceDialog = lazy(() => import('../../components/code-workspace-choice-dialog/CodeWorkspaceChoiceDialog'));
 const SettingsCenter = lazy(() => import('../../components/settings-center/SettingsCenter'));
 
-interface CodexTaskItem {
+interface DeepCodeTaskItem {
   id: string;
   title: string;
   summary: string;
   status: string;
 }
 
-interface CodexCacheHitSummary {
+interface DeepCodeCacheHitSummary {
   label: string;
   title: string;
 }
 
-type CodexSidebarIconName = 'compose' | 'folder' | 'plus' | 'settings';
+type DeepCodeSidebarIconName = 'compose' | 'folder' | 'plus' | 'settings';
 
-interface CodexProjectArchiveGroup {
+interface DeepCodeProjectArchiveGroup {
   key: string;
   title: string;
   sessions: AgentSession[];
   projectId?: string;
 }
 
-interface CodexGuiProject {
+interface DeepCodeGuiProject {
   id: string;
   title: string;
   sessionIds: string[];
@@ -50,25 +50,25 @@ interface CodexGuiProject {
   updatedAt: string;
 }
 
-interface CodexSessionContextMenu {
+interface DeepCodeSessionContextMenu {
   session: AgentSession;
   x: number;
   y: number;
 }
 
-interface CodexProjectContextMenu {
-  project: CodexGuiProject;
+interface DeepCodeProjectContextMenu {
+  project: DeepCodeGuiProject;
   x: number;
   y: number;
 }
 
-interface CodexTextInputDialog {
+interface DeepCodeTextInputDialog {
   kind: 'project' | 'renameSession' | 'renameProject';
   title: string;
   label: string;
   value: string;
   session?: AgentSession;
-  project?: CodexGuiProject;
+  project?: DeepCodeGuiProject;
 }
 
 interface PendingProjectSession {
@@ -76,9 +76,9 @@ interface PendingProjectSession {
   sessionId: string;
 }
 
-const CODEX_GUI_PROJECTS_STORAGE_KEY = 'deepcode-gui.projects.v1';
+const DEEPCODE_GUI_PROJECTS_STORAGE_KEY = 'deepcode-gui.projects.v1';
 
-const CodexSidebarIcon: React.FC<{ name: CodexSidebarIconName; className?: string }> = ({
+const DeepCodeSidebarIcon: React.FC<{ name: DeepCodeSidebarIconName; className?: string }> = ({
   name,
   className,
 }) => {
@@ -171,16 +171,16 @@ function shouldShowSidebarSession(session: AgentSession): boolean {
   return (session.eventCount ?? 0) > 0 || hasCustomSessionTitle(session.title);
 }
 
-function readGuiProjects(): CodexGuiProject[] {
+function readGuiProjects(): DeepCodeGuiProject[] {
   if (typeof window === 'undefined') return [];
   try {
-    const raw = window.localStorage.getItem(CODEX_GUI_PROJECTS_STORAGE_KEY);
+    const raw = window.localStorage.getItem(DEEPCODE_GUI_PROJECTS_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.flatMap((item): CodexGuiProject[] => {
+    return parsed.flatMap((item): DeepCodeGuiProject[] => {
       if (!item || typeof item !== 'object') return [];
-      const record = item as Partial<CodexGuiProject>;
+      const record = item as Partial<DeepCodeGuiProject>;
       if (!record.id || !record.title) return [];
       return [{
         id: String(record.id),
@@ -197,10 +197,10 @@ function readGuiProjects(): CodexGuiProject[] {
   }
 }
 
-function writeGuiProjects(projects: CodexGuiProject[]): void {
+function writeGuiProjects(projects: DeepCodeGuiProject[]): void {
   if (typeof window === 'undefined') return;
   try {
-    window.localStorage.setItem(CODEX_GUI_PROJECTS_STORAGE_KEY, JSON.stringify(projects));
+    window.localStorage.setItem(DEEPCODE_GUI_PROJECTS_STORAGE_KEY, JSON.stringify(projects));
   } catch {
     // localStorage can be unavailable in restricted WebView modes; project grouping stays in memory.
   }
@@ -208,8 +208,8 @@ function writeGuiProjects(projects: CodexGuiProject[]): void {
 
 function deriveProjectArchiveGroups(
   sessions: AgentSession[],
-  projects: CodexGuiProject[]
-): CodexProjectArchiveGroup[] {
+  projects: DeepCodeGuiProject[]
+): DeepCodeProjectArchiveGroup[] {
   const sessionById = new Map(sessions.map((session) => [session.id, session]));
   return projects.map((project) => {
     const projectSessions = project.sessionIds
@@ -317,7 +317,7 @@ function deriveTaskItems(
   language: UiLanguage,
   loading: boolean,
   sessionId?: string
-): CodexTaskItem[] {
+): DeepCodeTaskItem[] {
   const projection = buildNarrativeTimelineProjection({
     sessionId: sessionId ?? events[0]?.sessionId ?? 'session',
     events,
@@ -358,7 +358,7 @@ function deriveCacheHitSummary(
   events: AgentEvent[],
   language: UiLanguage,
   tokenUsageProjection?: ReturnType<typeof buildNarrativeTimelineProjection>['tokenUsageProjection'] | null
-): CodexCacheHitSummary | null {
+): DeepCodeCacheHitSummary | null {
   const stats = deriveTokenUsageStats(events, tokenUsageProjection);
   const percent = formatPercent(stats.cacheHitRate);
   const label = language === 'zh-CN' ? `缓存 ${percent}` : `Cache ${percent}`;
@@ -376,7 +376,7 @@ function deriveCacheHitSummary(
   return { label, title };
 }
 
-const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
+const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   apiStatus,
   wsStatus,
   serverVersion,
@@ -384,13 +384,13 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
 }) => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [knownSessions, setKnownSessions] = useState<AgentSession[]>([]);
-  const [projectRecords, setProjectRecords] = useState<CodexGuiProject[]>(() => readGuiProjects());
+  const [projectRecords, setProjectRecords] = useState<DeepCodeGuiProject[]>(() => readGuiProjects());
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [draftTargetProjectId, setDraftTargetProjectId] = useState<string | null>(null);
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
-  const [sessionMenu, setSessionMenu] = useState<CodexSessionContextMenu | null>(null);
-  const [projectMenu, setProjectMenu] = useState<CodexProjectContextMenu | null>(null);
-  const [textDialog, setTextDialog] = useState<CodexTextInputDialog | null>(null);
+  const [sessionMenu, setSessionMenu] = useState<DeepCodeSessionContextMenu | null>(null);
+  const [projectMenu, setProjectMenu] = useState<DeepCodeProjectContextMenu | null>(null);
+  const [textDialog, setTextDialog] = useState<DeepCodeTextInputDialog | null>(null);
   const pendingProjectSendRef = useRef<PendingProjectSession | null>(null);
   const workspace = useWorkspaceStore((s) => s.current);
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
@@ -627,7 +627,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   const commitProjectName = async (title: string) => {
     if (!title) return;
     const now = new Date().toISOString();
-    const project: CodexGuiProject = {
+    const project: DeepCodeGuiProject = {
       id: `project-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
       title,
       sessionIds: [],
@@ -656,7 +656,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
 
   const openProjectContextMenu = (
     event: React.MouseEvent<HTMLElement>,
-    project: CodexGuiProject
+    project: DeepCodeGuiProject
   ) => {
     event.preventDefault();
     event.stopPropagation();
@@ -680,7 +680,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     });
   };
 
-  const handleRenameProject = (project: CodexGuiProject) => {
+  const handleRenameProject = (project: DeepCodeGuiProject) => {
     setProjectMenu(null);
     setTextDialog({
       kind: 'renameProject',
@@ -699,7 +699,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     ));
   };
 
-  const commitProjectRename = (project: CodexGuiProject, nextTitle: string) => {
+  const commitProjectRename = (project: DeepCodeGuiProject, nextTitle: string) => {
     if (!nextTitle) return;
     const now = new Date().toISOString();
     setProjectRecords((current) => current.map((item) =>
@@ -750,7 +750,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
     setDraftTargetProjectId(null);
   };
 
-  const handleDeleteProject = (project: CodexGuiProject) => {
+  const handleDeleteProject = (project: DeepCodeGuiProject) => {
     setProjectMenu(null);
     setProjectRecords((current) => current.filter((item) => item.id !== project.id));
     setCollapsedProjectIds((current) => current.filter((id) => id !== project.id));
@@ -759,43 +759,43 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   };
 
   return (
-    <div className="codex-workbench">
-      <header className="codex-titlebar" data-tauri-drag-region>
-        <div className="codex-titlebar__brand">
-          <span className="codex-titlebar__mark">DC</span>
+    <div className="deepcode-gui-workbench">
+      <header className="deepcode-gui-titlebar" data-tauri-drag-region>
+        <div className="deepcode-gui-titlebar__brand">
+          <span className="deepcode-gui-titlebar__mark">DC</span>
           <span>DeepCode-GUI</span>
         </div>
-        <div className="codex-titlebar__status">
+        <div className="deepcode-gui-titlebar__status">
           {cacheHitSummary && (
-            <span className="codex-status-pill codex-status-pill--cache" title={cacheHitSummary.title}>
+            <span className="deepcode-gui-status-pill deepcode-gui-status-pill--cache" title={cacheHitSummary.title}>
               {cacheHitSummary.label}
             </span>
           )}
-          <span className={`codex-status-pill codex-status-pill--${apiStatus}`}>API {statusLabel(language, apiStatus)}</span>
+          <span className={`deepcode-gui-status-pill deepcode-gui-status-pill--${apiStatus}`}>API {statusLabel(language, apiStatus)}</span>
         </div>
         <WindowControls language={language} />
       </header>
 
-      <div className={`codex-shell ${isHome ? 'codex-shell--home' : ''}`}>
-        <aside className="codex-left-rail">
-          <div className="codex-sidebar-actions">
+      <div className={`deepcode-gui-shell ${isHome ? 'deepcode-gui-shell--home' : ''}`}>
+        <aside className="deepcode-gui-left-rail">
+          <div className="deepcode-gui-sidebar-actions">
             <button
               type="button"
-              className="codex-sidebar-action codex-sidebar-action--primary"
+              className="deepcode-gui-sidebar-action deepcode-gui-sidebar-action--primary"
               onClick={() => void handleCreateSession(null)}
               disabled={loadingSession}
             >
-              <CodexSidebarIcon name="compose" className="codex-sidebar-icon" />
+              <DeepCodeSidebarIcon name="compose" className="deepcode-gui-sidebar-icon" />
               <span>{t(language, 'deepcodeGui.nav.newChat')}</span>
             </button>
           </div>
 
-          <section className="codex-sidebar-section">
-            <div className="codex-sidebar-section__heading codex-sidebar-section__heading--project">
-              <div className="codex-sidebar-section__label">{t(language, 'deepcodeGui.sidebar.project')}</div>
+          <section className="deepcode-gui-sidebar-section">
+            <div className="deepcode-gui-sidebar-section__heading deepcode-gui-sidebar-section__heading--project">
+              <div className="deepcode-gui-sidebar-section__label">{t(language, 'deepcodeGui.sidebar.project')}</div>
               <button
                 type="button"
-                className="codex-sidebar-text-action"
+                className="deepcode-gui-sidebar-text-action"
                 onClick={() => void handleCreateProject()}
                 disabled={loadingSession}
               >
@@ -803,9 +803,9 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
               </button>
             </div>
             {projectArchiveGroups.length === 0 ? (
-              <div className="codex-sidebar-empty">{t(language, 'deepcodeGui.project.empty')}</div>
+              <div className="deepcode-gui-sidebar-empty">{t(language, 'deepcodeGui.project.empty')}</div>
             ) : (
-              <div className="codex-project-archive-list">
+              <div className="deepcode-gui-project-archive-list">
                 {projectArchiveGroups.slice(0, 6).map((group, groupIndex) => {
                   const projectRecord = group.projectId
                     ? projectRecords.find((project) => project.id === group.projectId) ?? null
@@ -816,17 +816,17 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                   return (
                     <div
                       key={group.key}
-                      className="codex-project-archive-group"
+                      className="deepcode-gui-project-archive-group"
                     >
                       <div
-                        className="codex-project-archive-group__title"
+                        className="deepcode-gui-project-archive-group__title"
                         onContextMenu={(event) => {
                           if (projectRecord) openProjectContextMenu(event, projectRecord);
                         }}
                       >
                       <button
                         type="button"
-                        className="codex-project-archive-group__select"
+                        className="deepcode-gui-project-archive-group__select"
                         onClick={() => group.projectId && toggleProjectExpanded(group.projectId)}
                         onContextMenu={(event) => {
                           if (projectRecord) openProjectContextMenu(event, projectRecord);
@@ -834,14 +834,14 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                         disabled={!group.projectId}
                         aria-expanded={!projectCollapsed}
                       >
-                        <CodexSidebarIcon name="folder" className="codex-sidebar-icon" />
+                        <DeepCodeSidebarIcon name="folder" className="deepcode-gui-sidebar-icon" />
                         <span>{group.title}</span>
                       </button>
                       {group.projectId && (
-                        <div className="codex-project-archive-group__actions" aria-hidden={false}>
+                        <div className="deepcode-gui-project-archive-group__actions" aria-hidden={false}>
                           <button
                             type="button"
-                            className="codex-project-archive-group__compose"
+                            className="deepcode-gui-project-archive-group__compose"
                             onClick={(event) => {
                               event.stopPropagation();
                               void handleCreateSession(group.projectId);
@@ -850,13 +850,13 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                             aria-label={t(language, 'deepcodeGui.project.newChat')}
                             title={t(language, 'deepcodeGui.project.newChat')}
                           >
-                            <CodexSidebarIcon name="compose" />
+                            <DeepCodeSidebarIcon name="compose" />
                           </button>
                         </div>
                       )}
                       </div>
                       {!projectCollapsed && (
-                        <div className="codex-project-archive-group__sessions">
+                        <div className="deepcode-gui-project-archive-group__sessions">
                           {group.sessions.slice(0, 4).map((item, itemIndex) => {
                             const shortcutIndex = groupIndex + itemIndex + 1;
                             return (
@@ -889,23 +889,23 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
               </div>
             )}
 
-            <div className="codex-sidebar-section__heading">
-              <div className="codex-sidebar-section__label codex-sidebar-section__label--nested">
+            <div className="deepcode-gui-sidebar-section__heading">
+              <div className="deepcode-gui-sidebar-section__label deepcode-gui-sidebar-section__label--nested">
                 {t(language, 'deepcodeGui.sidebar.chats')}
               </div>
               <button
                 type="button"
-                className="codex-sidebar-new-chat"
+                className="deepcode-gui-sidebar-new-chat"
                 onClick={() => void handleCreateSession(null)}
                 disabled={loadingSession}
                 aria-label={t(language, 'deepcodeGui.nav.newChat')}
                 title={t(language, 'deepcodeGui.nav.newChat')}
               >
-                <CodexSidebarIcon name="compose" />
+                <DeepCodeSidebarIcon name="compose" />
               </button>
             </div>
             {visibleSessions.length > 0 && (
-              <div className="codex-session-list">
+              <div className="deepcode-gui-session-list">
                 {visibleSessions.slice(0, 8).map((item) => (
                   <button
                     key={item.id}
@@ -928,21 +928,21 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
             )}
           </section>
 
-          <div className="codex-sidebar-spacer" />
+          <div className="deepcode-gui-sidebar-spacer" />
           <button
             type="button"
-            className="codex-sidebar-settings"
+            className="deepcode-gui-sidebar-settings"
             onClick={() => setSettingsOpen(true)}
           >
-            <span className="codex-sidebar-settings__icon">
-              <CodexSidebarIcon name="settings" />
+            <span className="deepcode-gui-sidebar-settings__icon">
+              <DeepCodeSidebarIcon name="settings" />
             </span>
             <span>{t(language, 'settings.title')}</span>
           </button>
         </aside>
 
-        <main className="codex-session-main">
-          <CodexAgentPanel
+        <main className="deepcode-gui-session-main">
+          <DeepCodeAgentPanel
             language={language}
             forceHome={projectDraftActive}
             homeProjectTitle={draftProject?.title ?? activeProject?.title ?? null}
@@ -951,19 +951,19 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
           />
         </main>
 
-        <aside className="codex-context-panel">
-          <section className="codex-task-list-card">
-            <div className="codex-task-list-card__title">{t(language, 'deepcodeGui.tasks.title')}</div>
+        <aside className="deepcode-gui-context-panel">
+          <section className="deepcode-gui-task-list-card">
+            <div className="deepcode-gui-task-list-card__title">{t(language, 'deepcodeGui.tasks.title')}</div>
             {taskItems.length === 0 ? (
-              <div className="codex-task-list-card__empty">{t(language, 'deepcodeGui.tasks.empty')}</div>
+              <div className="deepcode-gui-task-list-card__empty">{t(language, 'deepcodeGui.tasks.empty')}</div>
             ) : (
-              <div className="codex-task-list">
+              <div className="deepcode-gui-task-list">
                 {taskItems.map((item) => (
-                  <div key={item.id} className={`codex-task-item codex-task-item--${item.status}`}>
-                    <span className="codex-task-item__dot" />
+                  <div key={item.id} className={`deepcode-gui-task-item deepcode-gui-task-item--${item.status}`}>
+                    <span className="deepcode-gui-task-item__dot" />
                     <div>
-                      <div className="codex-task-item__title">{item.title}</div>
-                      <div className="codex-task-item__summary">{item.summary}</div>
+                      <div className="deepcode-gui-task-item__title">{item.title}</div>
+                      <div className="deepcode-gui-task-item__summary">{item.summary}</div>
                     </div>
                     <strong>{statusLabel(language, item.status)}</strong>
                   </div>
@@ -976,13 +976,13 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
 
       {sessionMenu && (
         <div
-          className="codex-session-context-menu"
+          className="deepcode-gui-session-context-menu"
           style={{ left: sessionMenu.x, top: sessionMenu.y }}
           onMouseDown={(event) => event.stopPropagation()}
           onClick={(event) => event.stopPropagation()}
           role="menu"
         >
-          <div className="codex-session-context-menu__title">
+          <div className="deepcode-gui-session-context-menu__title">
             {displaySessionTitle(language, sessionMenu.session.title)}
           </div>
           <button type="button" role="menuitem" onClick={() => handleRenameSession(sessionMenu.session)}>
@@ -991,14 +991,14 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
           <button
             type="button"
             role="menuitem"
-            className="codex-session-context-menu__danger"
+            className="deepcode-gui-session-context-menu__danger"
             onClick={() => void handleDeleteSession(sessionMenu.session)}
           >
             {t(language, 'agent.session.delete')}
           </button>
           {projectRecords.length > 0 && (
-            <div className="codex-session-context-menu__section">
-              <div className="codex-session-context-menu__section-title">
+            <div className="deepcode-gui-session-context-menu__section">
+              <div className="deepcode-gui-session-context-menu__section-title">
                 {t(language, 'deepcodeGui.session.addToProject')}
               </div>
               {projectRecords.slice(0, 8).map((project) => (
@@ -1025,13 +1025,13 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
 
       {projectMenu && (
         <div
-          className="codex-session-context-menu"
+          className="deepcode-gui-session-context-menu"
           style={{ left: projectMenu.x, top: projectMenu.y }}
           onMouseDown={(event) => event.stopPropagation()}
           onClick={(event) => event.stopPropagation()}
           role="menu"
         >
-          <div className="codex-session-context-menu__title">
+          <div className="deepcode-gui-session-context-menu__title">
             {projectMenu.project.title}
           </div>
           <button type="button" role="menuitem" onClick={() => handleRenameProject(projectMenu.project)}>
@@ -1040,7 +1040,7 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
           <button
             type="button"
             role="menuitem"
-            className="codex-session-context-menu__danger"
+            className="deepcode-gui-session-context-menu__danger"
             onClick={() => handleDeleteProject(projectMenu.project)}
           >
             {t(language, 'deepcodeGui.project.delete')}
@@ -1050,14 +1050,14 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
 
       {textDialog && (
         <div
-          className="codex-text-dialog-backdrop"
+          className="deepcode-gui-text-dialog-backdrop"
           role="dialog"
           aria-modal="true"
           aria-label={textDialog.title}
           onMouseDown={() => setTextDialog(null)}
         >
           <form
-            className="codex-text-dialog"
+            className="deepcode-gui-text-dialog"
             onSubmit={(event) => void handleTextDialogSubmit(event)}
             onMouseDown={(event) => event.stopPropagation()}
           >
@@ -1102,17 +1102,17 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
       <Suspense fallback={null}>
         {settingsOpen && (
           <div
-            className="codex-settings-overlay"
+            className="deepcode-gui-settings-overlay"
             role="dialog"
             aria-modal="true"
             aria-label={t(language, 'settings.title')}
             onMouseDown={() => setSettingsOpen(false)}
           >
             <section
-              className="codex-settings-sheet"
+              className="deepcode-gui-settings-sheet"
               onMouseDown={(event) => event.stopPropagation()}
             >
-              <header className="codex-settings-sheet__header">
+              <header className="deepcode-gui-settings-sheet__header">
                 <div>
                   <h2>{t(language, 'settings.title')}</h2>
                   <span>{workspaceName}</span>
@@ -1125,13 +1125,13 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
                   x
                 </button>
               </header>
-              <div className="codex-settings-sheet__runtime">
+              <div className="deepcode-gui-settings-sheet__runtime">
                 <span>API {statusLabel(language, apiStatus)}</span>
                 <span>WS {statusLabel(language, wsStatus)}</span>
                 <span>{t(language, 'deepcodeGui.progress.heartbeat')} {lastHeartbeatText}</span>
                 {serverVersion && <span>{serverVersion}</span>}
               </div>
-              <div className="codex-settings-sheet__body">
+              <div className="deepcode-gui-settings-sheet__body">
                 <SettingsCenter
                   apiStatus={apiStatus}
                   wsStatus={wsStatus}
@@ -1151,4 +1151,4 @@ const CodexWorkbenchLayout: React.FC<CodexWorkbenchLayoutProps> = ({
   );
 };
 
-export default CodexWorkbenchLayout;
+export default DeepCodeWorkbenchLayout;

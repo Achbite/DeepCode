@@ -14,7 +14,7 @@ import ToolEvidenceDetails from '../../components/agent-panel/ToolEvidenceDetail
 import { useSettingsStore } from '../../state/settingsStore';
 import { formatToolEvidence } from '../../utils/toolEvidence';
 
-interface CodexTimelineProps {
+interface DeepCodeTimelineProps {
   timeline: AgentTimelineResult | null;
   fallbackEvents: AgentEvent[];
   loading: boolean;
@@ -29,7 +29,7 @@ interface CodexTimelineProps {
 
 type TypewriterSpeed = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']>;
 
-const CodexTimeline: React.FC<CodexTimelineProps> = ({
+const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   timeline,
   fallbackEvents,
   loading,
@@ -69,7 +69,7 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
     Boolean(s.effectiveSettings['gui.collapseCompletedThinking'] ?? true)
   );
   const typewriterBlockIds = useTypewriterBlockIds(view, loading && typewriterEnabled);
-  const timelineDensityClass = timelineDensity === 'compact' ? ' codex-timeline--compact' : '';
+  const timelineDensityClass = timelineDensity === 'compact' ? ' deepcode-gui-timeline--compact' : '';
 
   const setShouldFollow = useCallback((shouldFollow: boolean) => {
     shouldFollowRef.current = shouldFollow;
@@ -161,10 +161,10 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
   }, [scrollToTimelineEnd]);
 
   return (
-    <div className={`codex-timeline${timelineDensityClass}`} ref={timelineRef}>
+    <div className={`deepcode-gui-timeline${timelineDensityClass}`} ref={timelineRef}>
       {view.turns.length === 0 && !loading && (
-        <div className="codex-empty">
-          <div className="codex-empty__title">{t(language, 'deepcodeGui.status.ready')}</div>
+        <div className="deepcode-gui-empty">
+          <div className="deepcode-gui-empty__title">{t(language, 'deepcodeGui.status.ready')}</div>
         </div>
       )}
       {view.turns.map((turn) => (
@@ -179,15 +179,15 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
         />
       ))}
       {loading && (
-        <div className="codex-live-indicator">
-          <span className="codex-live-indicator__dot" />
+        <div className="deepcode-gui-live-indicator">
+          <span className="deepcode-gui-live-indicator__dot" />
           {t(language, 'deepcodeGui.status.running')}
         </div>
       )}
       {showJumpToLatest && (
         <button
           type="button"
-          className="codex-timeline-jump-latest"
+          className="deepcode-gui-timeline-jump-latest"
           aria-label="跳转到最新内容"
           title="跳转到最新内容"
           onClick={scrollToTimelineEnd}
@@ -195,7 +195,7 @@ const CodexTimeline: React.FC<CodexTimelineProps> = ({
           ↓
         </button>
       )}
-      <div ref={timelineEndRef} className="codex-timeline__end" aria-hidden="true" />
+      <div ref={timelineEndRef} className="deepcode-gui-timeline__end" aria-hidden="true" />
     </div>
   );
 };
@@ -303,16 +303,16 @@ const TurnCard: React.FC<{
   typewriterBlockIds: Set<string>;
   collapseCompletedThinking: boolean;
   onLiveContentChange: () => void;
-  onPlanResolve?: CodexTimelineProps['onPlanResolve'];
+  onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
 }> = ({ turn, language, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
   const blocks = turn.blocks;
 
   return (
-    <section className={`codex-turn codex-turn--${turn.status}`}>
-      <div className="codex-turn__rail" />
-      <div className="codex-turn__body">
-        <div className="codex-turn__meta">
+    <section className={`deepcode-gui-turn deepcode-gui-turn--${turn.status}`}>
+      <div className="deepcode-gui-turn__rail" />
+      <div className="deepcode-gui-turn__body">
+        <div className="deepcode-gui-turn__meta">
           <span>{timelineStatusLabel(language, turn.status)}</span>
           {startedAtLabel && <span>{startedAtLabel}</span>}
         </div>
@@ -372,38 +372,38 @@ const TurnActionBar: React.FC<{
   };
 
   return (
-    <div className="codex-turn-actions" aria-label={t(language, 'agent.message.actions')}>
+    <div className="deepcode-gui-turn-actions" aria-label={t(language, 'agent.message.actions')}>
       <button
         type="button"
-        className="codex-turn-actions__button"
+        className="deepcode-gui-turn-actions__button"
         onClick={() => void copyTurn()}
         title={t(language, 'agent.message.copyAgentOutput')}
         aria-label={t(language, 'agent.message.copyAgentOutput')}
       >
-        <CodexTurnActionIcon name="copy" />
+        <DeepCodeTurnActionIcon name="copy" />
       </button>
       <button
         type="button"
-        className="codex-turn-actions__button"
+        className="deepcode-gui-turn-actions__button"
         onClick={() => rateTurn('up')}
         disabled={!feedbackEvent}
         title={t(language, 'agent.message.feedbackUpTitle')}
         aria-label={t(language, 'agent.message.feedbackUpTitle')}
       >
-        <CodexTurnActionIcon name="up" />
+        <DeepCodeTurnActionIcon name="up" />
       </button>
       <button
         type="button"
-        className="codex-turn-actions__button"
+        className="deepcode-gui-turn-actions__button"
         onClick={() => rateTurn('down')}
         disabled={!feedbackEvent}
         title={t(language, 'agent.message.feedbackDownTitle')}
         aria-label={t(language, 'agent.message.feedbackDownTitle')}
       >
-        <CodexTurnActionIcon name="down" />
+        <DeepCodeTurnActionIcon name="down" />
       </button>
       {status !== 'idle' && (
-        <span className={`codex-turn-actions__status codex-turn-actions__status--${status}`}>
+        <span className={`deepcode-gui-turn-actions__status deepcode-gui-turn-actions__status--${status}`}>
           {status === 'copied'
             ? t(language, 'agent.message.copyDone', { label: t(language, 'agent.message.copyAgentOutput') })
             : status === 'rated'
@@ -415,7 +415,7 @@ const TurnActionBar: React.FC<{
   );
 };
 
-const CodexTurnActionIcon: React.FC<{ name: 'copy' | 'up' | 'down' }> = ({ name }) => {
+const DeepCodeTurnActionIcon: React.FC<{ name: 'copy' | 'up' | 'down' }> = ({ name }) => {
   const common = {
     width: 17,
     height: 17,
@@ -454,7 +454,7 @@ const CodexTurnActionIcon: React.FC<{ name: 'copy' | 'up' | 'down' }> = ({ name 
   );
 };
 
-const CodexAttachmentChips: React.FC<{
+const DeepCodeAttachmentChips: React.FC<{
   attachments: AgentContextAttachment[];
   language: UiLanguage;
 }> = ({ attachments, language }) => {
@@ -485,16 +485,16 @@ const TimelineBlock: React.FC<{
   animateAssistant?: boolean;
   collapseCompletedThinking?: boolean;
   onLiveContentChange: () => void;
-  onPlanResolve?: CodexTimelineProps['onPlanResolve'];
+  onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
 }> = ({ block, language, animateAssistant = false, collapseCompletedThinking = true, onLiveContentChange, onPlanResolve }) => {
-  const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
-  const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
+  const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
+  const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   if (block.kind === 'user') {
     const attachments = blockAttachments(block);
     return (
-      <article className={`codex-block codex-block--user${narrativeClass}${densityClass}`}>
-        <div className="codex-block__label">{t(language, 'agent.message.user')}</div>
-        <CodexAttachmentChips attachments={attachments} language={language} />
+      <article className={`deepcode-gui-block deepcode-gui-block--user${narrativeClass}${densityClass}`}>
+        <div className="deepcode-gui-block__label">{t(language, 'agent.message.user')}</div>
+        <DeepCodeAttachmentChips attachments={attachments} language={language} />
         <MarkdownContent content={block.bodyMarkdown ?? block.summary} />
       </article>
     );
@@ -502,7 +502,7 @@ const TimelineBlock: React.FC<{
 
   if (block.narrativeKind === 'assistantNarration') {
     return (
-      <article className={`codex-assistant-narration${narrativeClass}${densityClass}`}>
+      <article className={`deepcode-gui-assistant-narration${narrativeClass}${densityClass}`}>
         <TypewriterMarkdown
           content={block.bodyMarkdown ?? block.summary}
           animate={animateAssistant}
@@ -515,7 +515,7 @@ const TimelineBlock: React.FC<{
 
   if (block.kind === 'assistant') {
     return (
-      <article className={`codex-assistant-text${narrativeClass}${densityClass}`}>
+      <article className={`deepcode-gui-assistant-text${narrativeClass}${densityClass}`}>
         <TypewriterMarkdown
           content={block.bodyMarkdown ?? block.summary}
           animate={animateAssistant}
@@ -547,16 +547,16 @@ const TimelineBlock: React.FC<{
 
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
   return (
-    <details className={`codex-block codex-block--${block.kind}${narrativeClass}${densityClass}`} open={open}>
+    <details className={`deepcode-gui-block deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}`} open={open}>
       <summary>
-        <span className={`codex-block__status codex-block__status--${block.status}`} />
-        <span className="codex-block__title">{block.title}</span>
-        <span className="codex-block__summary">{block.summary}</span>
+        <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
+        <span className="deepcode-gui-block__title">{block.title}</span>
+        <span className="deepcode-gui-block__summary">{block.summary}</span>
       </summary>
-      <div className="codex-block__details">
+      <div className="deepcode-gui-block__details">
         {block.bodyMarkdown && <MarkdownContent content={block.bodyMarkdown} />}
         {block.narrativeKind === 'review' && (
-          <CodexGitReviewDiffDetails gitReview={gitReviewFromBlock(block)} language={language} />
+          <DeepCodeGitReviewDiffDetails gitReview={gitReviewFromBlock(block)} language={language} />
         )}
         <EventList events={block.events} />
       </div>
@@ -574,20 +574,20 @@ const OperationEvidenceBlock: React.FC<{
   });
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
   const status = evidence.status === 'completed' ? block.status : evidence.status;
-  const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
-  const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
+  const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
+  const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
 
   return (
     <details
-      className={`codex-block codex-block--${block.kind}${narrativeClass}${densityClass}`}
+      className={`deepcode-gui-block deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}`}
       open={open}
     >
       <summary>
-        <span className={`codex-block__status codex-block__status--${status}`} />
-        <span className="codex-block__title">{evidence.title}</span>
-        {evidence.summary && <span className="codex-block__summary">{evidence.summary}</span>}
+        <span className={`deepcode-gui-block__status deepcode-gui-block__status--${status}`} />
+        <span className="deepcode-gui-block__title">{evidence.title}</span>
+        {evidence.summary && <span className="deepcode-gui-block__summary">{evidence.summary}</span>}
       </summary>
-      <div className="codex-block__details">
+      <div className="deepcode-gui-block__details">
         {block.bodyMarkdown && <MarkdownContent content={block.bodyMarkdown} />}
         <ToolEvidenceDetails evidence={evidence} language={language} />
         {evidence.items.length === 0 && <EventList events={block.events} />}
@@ -596,19 +596,19 @@ const OperationEvidenceBlock: React.FC<{
   );
 };
 
-const CodexGitReviewDiffDetails: React.FC<{ gitReview: unknown; language: UiLanguage }> = ({ gitReview, language }) => {
+const DeepCodeGitReviewDiffDetails: React.FC<{ gitReview: unknown; language: UiLanguage }> = ({ gitReview, language }) => {
   if (!isRecord(gitReview)) return null;
   if (gitReview.available === false) {
     const reason = stringField(gitReview, 'reason') ?? 'Git review unavailable';
-    return <div className="codex-git-review__summary">{reason}</div>;
+    return <div className="deepcode-gui-git-review__summary">{reason}</div>;
   }
   const files = Array.isArray(gitReview.files) ? gitReview.files.filter(isRecord) : [];
   const diffBlocks = Array.isArray(gitReview.diffBlocks) ? gitReview.diffBlocks.filter(isRecord) : [];
   if (!files.length && !diffBlocks.length) return null;
   return (
-    <div className="codex-git-review">
+    <div className="deepcode-gui-git-review">
       {files.length > 0 && (
-        <div className="codex-git-review__files">
+        <div className="deepcode-gui-git-review__files">
           {files.slice(0, 12).map((file, index) => {
             const path = stringField(file, 'path') ?? `file-${index + 1}`;
             return <code key={`${path}-${index}`}>{path}</code>;
@@ -621,7 +621,7 @@ const CodexGitReviewDiffDetails: React.FC<{ gitReview: unknown; language: UiLang
         const diff = stringField(block, 'diff') ?? '';
         const truncated = block.truncated === true;
         return (
-          <details key={`${title}-${index}`} className="codex-git-review__diff">
+          <details key={`${title}-${index}`} className="deepcode-gui-git-review__diff">
             <summary>
               {title}
               {truncated ? (language === 'zh-CN' ? '（已截断）' : ' (truncated)') : ''}
@@ -640,21 +640,21 @@ const ThinkingBlock: React.FC<{
   collapseCompletedThinking?: boolean;
   onLiveContentChange?: () => void;
 }> = ({ block, animate = false, collapseCompletedThinking = true, onLiveContentChange = () => undefined }) => {
-  const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
-  const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
+  const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
+  const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   const completedThinkingOpen = block.status === 'completed' && !collapseCompletedThinking;
   const open = completedThinkingOpen || (block.displayHints?.initialOpen ?? (!block.defaultCollapsed || block.status === 'running' || block.status === 'waiting'));
   const markdown = thinkingMarkdown(block);
   const summary = compactThinkingSummary(markdown);
 
   return (
-    <details className={`codex-block codex-block--thinking${narrativeClass}${densityClass}`} open={open}>
+    <details className={`deepcode-gui-block deepcode-gui-block--thinking${narrativeClass}${densityClass}`} open={open}>
       <summary>
-        <span className={`codex-block__status codex-block__status--${block.status}`} />
-        <span className="codex-block__title">{block.title}</span>
-        {summary && <span className="codex-block__summary">{summary}</span>}
+        <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
+        <span className="deepcode-gui-block__title">{block.title}</span>
+        {summary && <span className="deepcode-gui-block__summary">{summary}</span>}
       </summary>
-      <div className="codex-block__details codex-block__details--thinking">
+      <div className="deepcode-gui-block__details deepcode-gui-block__details--thinking">
         <TypewriterMarkdown
           content={markdown}
           animate={animate}
@@ -669,7 +669,7 @@ const ThinkingBlock: React.FC<{
 const PlanBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
-  onPlanResolve?: CodexTimelineProps['onPlanResolve'];
+  onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
 }> = ({ block, language, onPlanResolve }) => {
   const reviewEvent = block.events.find((event) => event.kind === 'plan_review');
   const payload = isRecord(reviewEvent?.payload) ? reviewEvent.payload : {};
@@ -677,25 +677,25 @@ const PlanBlock: React.FC<{
   const planId = stringField(payload, 'planId');
   const status = stringField(payload, 'status') ?? block.status;
   const confirmable = payload.confirmable === true && Boolean(runId && planId);
-  const narrativeClass = block.narrativeKind ? ` codex-block--narrative-${block.narrativeKind}` : '';
-  const densityClass = block.displayHints?.density ? ` codex-block--density-${block.displayHints.density}` : '';
+  const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
+  const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
 
   return (
     <details
-      className={`codex-block codex-block--plan codex-block--${status}${narrativeClass}${densityClass}`}
+      className={`deepcode-gui-block deepcode-gui-block--plan deepcode-gui-block--${status}${narrativeClass}${densityClass}`}
       open={open}
     >
       <summary>
-        <span className={`codex-block__status codex-block__status--${block.status}`} />
-        <span className="codex-block__title">{block.title}</span>
-        <span className="codex-block__summary">{block.summary}</span>
+        <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
+        <span className="deepcode-gui-block__title">{block.title}</span>
+        <span className="deepcode-gui-block__summary">{block.summary}</span>
       </summary>
-      <div className="codex-block__details">
+      <div className="deepcode-gui-block__details">
         <MarkdownContent content={block.bodyMarkdown ?? block.summary} />
         <EventList events={block.events} compact />
         {confirmable && (
-          <div className="codex-plan-actions codex-plan-actions--composer">
+          <div className="deepcode-gui-plan-actions deepcode-gui-plan-actions--composer">
             {t(language, 'deepcodeGui.plan.useComposer')}
           </div>
         )}
@@ -748,11 +748,11 @@ const TypewriterMarkdown: React.FC<{
 };
 
 const EventList: React.FC<{ events: AgentEvent[]; compact?: boolean }> = ({ events, compact }) => (
-  <div className={`codex-event-list ${compact ? 'codex-event-list--compact' : ''}`}>
+  <div className={`deepcode-gui-event-list ${compact ? 'deepcode-gui-event-list--compact' : ''}`}>
     {events.map((event) => (
-      <div key={event.id} className="codex-event">
-        <span className="codex-event__kind">{event.kind}</span>
-        <span className="codex-event__text">{eventSummary(event)}</span>
+      <div key={event.id} className="deepcode-gui-event">
+        <span className="deepcode-gui-event__kind">{event.kind}</span>
+        <span className="deepcode-gui-event__text">{eventSummary(event)}</span>
       </div>
     ))}
   </div>
@@ -1022,4 +1022,4 @@ function formatTurnTime(value?: string): string | null {
   return date.toLocaleTimeString();
 }
 
-export default CodexTimeline;
+export default DeepCodeTimeline;

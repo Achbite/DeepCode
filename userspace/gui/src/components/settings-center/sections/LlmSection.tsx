@@ -17,7 +17,6 @@ import { normalizeUiLanguage, t } from '../../../i18n';
 const PROVIDERS: Array<{ value: LlmProviderKind; label: string }> = [
   { value: 'openaiCompatible', label: 'OpenAI Compatible' },
   { value: 'anthropic', label: 'Anthropic' },
-  { value: 'codex', label: 'Codex' },
   { value: 'ollama', label: 'Ollama' },
 ];
 
