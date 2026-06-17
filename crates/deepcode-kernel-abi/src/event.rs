@@ -78,6 +78,15 @@ pub enum KernelEvent {
         packet: Value,
         sequence: Option<u64>,
     },
+    #[serde(rename = "artifact.registered")]
+    ArtifactRegistered {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        artifact: Value,
+        evidence_ref: String,
+        sequence: Option<u64>,
+    },
     #[serde(rename = "action_batch.accepted")]
     ActionBatchAccepted {
         request_id: Option<RequestId>,

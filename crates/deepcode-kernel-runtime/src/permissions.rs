@@ -1,4 +1,5 @@
 use super::*;
+use crate::action_batch::explicit_attachment_root;
 
 impl DeepCodeKernelRuntime {
     pub(crate) fn pending_permission_for_run(
@@ -151,6 +152,49 @@ impl DeepCodeKernelRuntime {
                         session_id,
                         tool_name,
                         arguments,
+                        request_id: event
+                            .payload
+                            .get("requestId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        work_unit_id: event
+                            .payload
+                            .get("workUnitId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        action_id: event
+                            .payload
+                            .get("actionId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        plan_id: event
+                            .payload
+                            .get("planId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        operation_kind: event
+                            .payload
+                            .get("operationKind")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        read_set: event
+                            .payload
+                            .get("readSet")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect(),
+                        write_set: event
+                            .payload
+                            .get("writeSet")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect(),
                     },
                 ))
             });
@@ -203,6 +247,13 @@ impl DeepCodeKernelRuntime {
                 .apply_event(&resolved_event, &resolved_phase);
         }
 
+        let work_unit_context = serde_json::json!({
+            "actionId": pending.action_id.as_deref(),
+            "planId": pending.plan_id.as_deref(),
+            "operationKind": pending.operation_kind.as_deref(),
+            "readSet": &pending.read_set,
+            "writeSet": &pending.write_set
+        });
         self.append_ledger(
             &run_id,
             &session_id,
@@ -211,11 +262,94 @@ impl DeepCodeKernelRuntime {
             serde_json::json!({
                 "summary": "Permission resolved by Kernel command.",
                 "permissionId": &permission_id,
-                "decision": &decision
+                "decision": &decision,
+                "workUnitContext": work_unit_context
             }),
         )?;
 
         let mut events = vec![resolved_event];
+        let work_unit_request_id = pending
+            .request_id
+            .as_ref()
+            .map(|value| RequestId(value.clone()))
+            .unwrap_or_else(|| request_id.clone());
+
+        if let Some(work_unit_id) = pending.work_unit_id.clone() {
+            match decision {
+                deepcode_kernel_abi::PermissionDecisionKind::Reject => {
+                    events.push(self.work_unit_blocked_event(
+                        &work_unit_request_id,
+                        &run_id,
+                        &session_id,
+                        &work_unit_id,
+                        "permission rejected by user",
+                    )?);
+                }
+                deepcode_kernel_abi::PermissionDecisionKind::Accept => {
+                    let tool_event = self.execute_bound_tool(
+                        &run_id,
+                        &session_id,
+                        permission_id.clone(),
+                        pending.tool_name.clone(),
+                        pending.arguments.clone(),
+                    )?;
+                    let tool_ok =
+                        matches!(&tool_event, KernelEvent::ToolCompleted { ok: true, .. });
+                    let tool_error = match &tool_event {
+                        KernelEvent::ToolCompleted {
+                            error: Some(error), ..
+                        } => Some(error.clone()),
+                        _ => None,
+                    };
+                    let tool_output = match &tool_event {
+                        KernelEvent::ToolCompleted { output, .. } => output.clone(),
+                        _ => None,
+                    };
+                    events.push(tool_event);
+                    if tool_ok {
+                        events.push(self.work_unit_completed_event(
+                            &work_unit_request_id,
+                            &run_id,
+                            &session_id,
+                            &work_unit_id,
+                            tool_output,
+                        )?);
+                    } else {
+                        let error = tool_error.unwrap_or_else(|| KernelErrorEnvelope {
+                            code: "tool_execution_failed".to_string(),
+                            message: format!(
+                                "{} did not produce a successful tool result",
+                                pending.tool_name
+                            ),
+                            message_key: None,
+                            args: None,
+                        });
+                        events.push(self.work_unit_failed_envelope_event(
+                            &work_unit_request_id,
+                            &run_id,
+                            &session_id,
+                            &work_unit_id,
+                            error,
+                        )?);
+                    }
+                }
+            }
+            if !self.has_pending_permission_for_run(&run_id) {
+                events.push(self.enter_phase_event(&run_id, &session_id, WorkflowPhase::Review)?);
+            }
+            return Ok(events);
+        }
+
+        if decision == deepcode_kernel_abi::PermissionDecisionKind::Accept {
+            let completed = self.execute_bound_tool(
+                &run_id,
+                &session_id,
+                permission_id,
+                pending.tool_name,
+                pending.arguments,
+            )?;
+            events.push(completed);
+        }
 
         let workflow_decision = {
             let record = self
@@ -329,6 +463,13 @@ impl DeepCodeKernelRuntime {
         Ok(base)
     }
 
+    fn has_pending_permission_for_run(&self, run_id: &str) -> bool {
+        self.state
+            .pending_tools
+            .values()
+            .any(|pending| pending.run_id == run_id)
+    }
+
     fn temporary_grant_allows(
         &self,
         run_id: &str,
@@ -354,8 +495,82 @@ impl DeepCodeKernelRuntime {
             grant
                 .resource_path
                 .as_deref()
-                .map(|path| argument_resource_matches(tool_name, arguments, path))
+                .map(|path| {
+                    argument_resource_matches(tool_name, arguments, path)
+                        || self
+                            .grant_scope_contains_argument(run_id, tool_name, arguments, path)
+                            .unwrap_or(false)
+                })
                 .unwrap_or(true)
+        }))
+    }
+
+    fn grant_scope_contains_argument(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+        grant_path: &str,
+    ) -> KernelResult<bool> {
+        if !matches!(
+            tool_name,
+            "fs.write"
+                | "fs.patch"
+                | "fs.delete"
+                | "fs.read"
+                | "fs.list"
+                | "code.search"
+                | "fs.diff"
+        ) {
+            return Ok(false);
+        }
+        let Some(raw_argument_path) = arguments
+            .get("path")
+            .or_else(|| arguments.get("include"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(false);
+        };
+        let grant_display = grant_path.trim().replace('\\', "/");
+        let argument_display = raw_argument_path.replace('\\', "/");
+        if !grant_display.is_empty()
+            && (argument_display == grant_display
+                || argument_display.starts_with(&format!("{grant_display}/")))
+        {
+            return Ok(true);
+        }
+        let grant_path = PathBuf::from(grant_path);
+        let grant_path = grant_path.canonicalize().unwrap_or(grant_path);
+        let argument_path = PathBuf::from(raw_argument_path);
+        if argument_path.is_absolute() {
+            let argument_path = argument_path.canonicalize().unwrap_or(argument_path);
+            return Ok(argument_path == grant_path || argument_path.starts_with(&grant_path));
+        }
+        let record = self.record_by_run(run_id)?;
+        let mut roots = Vec::new();
+        if let Some(root) = self
+            .state
+            .current_workspace
+            .as_ref()
+            .map(|workspace| workspace.root.clone())
+        {
+            roots.push(root);
+        }
+        if let Some(open_path) = record.workspace_binding.open_path.as_ref() {
+            roots.push(PathBuf::from(open_path));
+        }
+        for attachment in &record.attachments {
+            if let Some(root) = explicit_attachment_root(attachment) {
+                roots.push(root);
+            }
+        }
+        Ok(roots.into_iter().any(|root| {
+            let root = root.canonicalize().unwrap_or(root);
+            let target = root.join(raw_argument_path);
+            let target = target.canonicalize().unwrap_or(target);
+            target == grant_path || target.starts_with(&grant_path)
         }))
     }
 }

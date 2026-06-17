@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn builtin_executors() -> Vec<Box<dyn SkillExecutor>> {
     vec![
@@ -16,6 +17,7 @@ pub fn builtin_executors() -> Vec<Box<dyn SkillExecutor>> {
         Box::new(FsReadExecutor),
         Box::new(FsDiffExecutor),
         Box::new(FsWriteExecutor),
+        Box::new(FsPatchExecutor),
         Box::new(FsDeleteExecutor),
         Box::new(CodeSearchExecutor),
         Box::new(ShellProposeExecutor),
@@ -42,6 +44,7 @@ struct FsListExecutor;
 struct FsReadExecutor;
 struct FsDiffExecutor;
 struct FsWriteExecutor;
+struct FsPatchExecutor;
 struct FsDeleteExecutor;
 struct CodeSearchExecutor;
 struct ShellProposeExecutor;
@@ -169,6 +172,56 @@ impl SkillExecutor for FsWriteExecutor {
                 "path": normalize_relative_path(&path),
                 "saved": true,
                 "sizeBytes": fs::metadata(&target).map(|metadata| metadata.len()).unwrap_or(0)
+            }),
+        ))
+    }
+}
+
+impl SkillExecutor for FsPatchExecutor {
+    fn descriptor(&self) -> SkillDescriptor {
+        descriptor(
+            "fs.patch",
+            "skill.fs.patch.description",
+            Capability::workspace_write(),
+            RiskLevel::High,
+            vec![CapabilityEffect::WritesWorkspace],
+            vec!["complete"],
+            true,
+        )
+    }
+
+    fn invoke(
+        &self,
+        invocation: SkillInvocation,
+        context: SkillExecutionContext,
+    ) -> KernelResult<SkillResult> {
+        let root = workspace_root(&context)?;
+        let path = get_string(&invocation.input, "path").unwrap_or_default();
+        WorkspaceBoundary::assert_mutable_config_asset(&path)?;
+        let target = resolve_workspace_path(&root, &path)?;
+        if !target.is_file() {
+            return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
+        }
+        let original = fs::read_to_string(&target)
+            .map_err(|error| KernelError::Other(format!("read {path}: {error}")))?;
+        let replacement = get_string(&invocation.input, "replacement").unwrap_or_default();
+        let patch_spec = invocation.input.get("patchSpec").ok_or_else(|| {
+            KernelError::InvalidCommand("fs.patch requires patchSpec".to_string())
+        })?;
+        let patch = apply_text_patch(&original, &replacement, patch_spec)?;
+        atomic_write_text(&target, &patch.updated)?;
+        Ok(ok(
+            invocation.id,
+            serde_json::json!({
+                "folderId": "wf-0",
+                "path": normalize_relative_path(&path),
+                "patched": true,
+                "oldContentHash": crate::hash::hash_bytes(original.as_bytes()),
+                "newContentHash": crate::hash::hash_bytes(patch.updated.as_bytes()),
+                "oldContentBytes": original.len(),
+                "newContentBytes": patch.updated.len(),
+                "changedRanges": patch.changed_ranges,
+                "matchKind": patch.match_kind
             }),
         ))
     }
@@ -876,6 +929,204 @@ fn ok(invocation_id: String, output: Value) -> SkillResult {
     }
 }
 
+#[derive(Debug)]
+struct TextPatchResult {
+    updated: String,
+    match_kind: String,
+    changed_ranges: Value,
+}
+
+fn apply_text_patch(
+    original: &str,
+    replacement: &str,
+    patch_spec: &Value,
+) -> KernelResult<TextPatchResult> {
+    let matcher = patch_spec
+        .get("match")
+        .ok_or_else(|| KernelError::InvalidCommand("patchSpec.match is required".to_string()))?;
+    let kind = matcher
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("exactBlock");
+    match kind {
+        "exactBlock" => {
+            let needle = required_string(matcher, "text")?;
+            let (start, end) = unique_match_range(original, &needle)?;
+            Ok(TextPatchResult {
+                updated: replace_range(original, start, end, replacement),
+                match_kind: kind.to_string(),
+                changed_ranges: serde_json::json!([byte_range_json(start, end, replacement.len())]),
+            })
+        }
+        "contextBlock" => {
+            let before = get_string(matcher, "before").unwrap_or_default();
+            let target = required_string(matcher, "target")?;
+            let after = get_string(matcher, "after").unwrap_or_default();
+            let combined = format!("{before}{target}{after}");
+            let (combined_start, _) = unique_match_range(original, &combined)?;
+            let start = combined_start + before.len();
+            let end = start + target.len();
+            Ok(TextPatchResult {
+                updated: replace_range(original, start, end, replacement),
+                match_kind: kind.to_string(),
+                changed_ranges: serde_json::json!([byte_range_json(start, end, replacement.len())]),
+            })
+        }
+        "lineRange" => apply_line_range_patch(original, replacement, matcher),
+        other => Err(KernelError::InvalidCommand(format!(
+            "unsupported patchSpec.match.kind: {other}"
+        ))),
+    }
+}
+
+fn apply_line_range_patch(
+    original: &str,
+    replacement: &str,
+    matcher: &Value,
+) -> KernelResult<TextPatchResult> {
+    let expected_hash = get_string(matcher, "expectedFileHash");
+    let expected_before = get_string(matcher, "expectedBeforeBlock");
+    if expected_hash.is_none() && expected_before.is_none() {
+        return Err(KernelError::InvalidCommand(
+            "lineRange patch requires expectedFileHash or expectedBeforeBlock".to_string(),
+        ));
+    }
+    if let Some(expected_hash) = expected_hash {
+        let actual_hash = crate::hash::hash_bytes(original.as_bytes());
+        if expected_hash != actual_hash {
+            return Err(KernelError::InvalidCommand(format!(
+                "lineRange patch expectedFileHash mismatch: expected {expected_hash}, actual {actual_hash}"
+            )));
+        }
+    }
+    let start_line = matcher
+        .get("startLine")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| KernelError::InvalidCommand("lineRange.startLine is required".to_string()))?
+        as usize;
+    let end_line = matcher
+        .get("endLine")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| KernelError::InvalidCommand("lineRange.endLine is required".to_string()))?
+        as usize;
+    if start_line == 0 || end_line < start_line {
+        return Err(KernelError::InvalidCommand(
+            "lineRange requires 1-based startLine <= endLine".to_string(),
+        ));
+    }
+    let (start, end) = line_range_to_byte_range(original, start_line, end_line)?;
+    let before_block = &original[start..end];
+    if let Some(expected_before) = expected_before {
+        if before_block != expected_before {
+            return Err(KernelError::InvalidCommand(
+                "lineRange expectedBeforeBlock does not match current file content".to_string(),
+            ));
+        }
+    }
+    Ok(TextPatchResult {
+        updated: replace_range(original, start, end, replacement),
+        match_kind: "lineRange".to_string(),
+        changed_ranges: serde_json::json!([{
+            "startLine": start_line,
+            "endLine": end_line,
+            "startByte": start,
+            "endByte": end,
+            "replacementBytes": replacement.len()
+        }]),
+    })
+}
+
+fn unique_match_range(haystack: &str, needle: &str) -> KernelResult<(usize, usize)> {
+    if needle.is_empty() {
+        return Err(KernelError::InvalidCommand(
+            "patch match text must not be empty".to_string(),
+        ));
+    }
+    let mut matches = haystack.match_indices(needle);
+    let Some((start, _)) = matches.next() else {
+        return Err(KernelError::InvalidCommand(
+            "patch match did not occur in target file".to_string(),
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(KernelError::InvalidCommand(
+            "patch match is ambiguous; expected exactly one match".to_string(),
+        ));
+    }
+    Ok((start, start + needle.len()))
+}
+
+fn replace_range(original: &str, start: usize, end: usize, replacement: &str) -> String {
+    let mut updated = String::with_capacity(original.len() - (end - start) + replacement.len());
+    updated.push_str(&original[..start]);
+    updated.push_str(replacement);
+    updated.push_str(&original[end..]);
+    updated
+}
+
+fn byte_range_json(start: usize, end: usize, replacement_bytes: usize) -> Value {
+    serde_json::json!({
+        "startByte": start,
+        "endByte": end,
+        "replacementBytes": replacement_bytes
+    })
+}
+
+fn line_range_to_byte_range(
+    content: &str,
+    start_line: usize,
+    end_line: usize,
+) -> KernelResult<(usize, usize)> {
+    let mut line_start = 0usize;
+    let mut current_line = 1usize;
+    let mut start_byte = None;
+    let mut end_byte = None;
+    for segment in content.split_inclusive('\n') {
+        let next = line_start + segment.len();
+        if current_line == start_line {
+            start_byte = Some(line_start);
+        }
+        if current_line == end_line {
+            end_byte = Some(next);
+            break;
+        }
+        current_line += 1;
+        line_start = next;
+    }
+    if start_byte.is_none() && start_line == current_line && line_start == content.len() {
+        start_byte = Some(line_start);
+    }
+    if end_byte.is_none() && end_line == current_line && line_start == content.len() {
+        end_byte = Some(content.len());
+    }
+    let start = start_byte.ok_or_else(|| {
+        KernelError::InvalidCommand(format!("lineRange.startLine {start_line} is outside file"))
+    })?;
+    let end = end_byte.ok_or_else(|| {
+        KernelError::InvalidCommand(format!("lineRange.endLine {end_line} is outside file"))
+    })?;
+    Ok((start, end))
+}
+
+fn atomic_write_text(target: &Path, content: &str) -> KernelResult<()> {
+    let parent = target.parent().ok_or_else(|| {
+        KernelError::InvalidCommand("patch target has no parent directory".to_string())
+    })?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let file_name = target
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("patch-target");
+    let temp_path = parent.join(format!(".{file_name}.deepcode-patch-{stamp}.tmp"));
+    fs::write(&temp_path, content)
+        .map_err(|error| KernelError::Other(format!("write patch temp: {error}")))?;
+    fs::rename(&temp_path, target)
+        .map_err(|error| KernelError::Other(format!("commit patch: {error}")))
+}
+
 fn workspace_root(context: &SkillExecutionContext) -> KernelResult<PathBuf> {
     context
         .workspace_root
@@ -1283,4 +1534,82 @@ fn now_millis() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_block_patch_replaces_unique_match() {
+        let original = "alpha\nold block\nomega\n";
+        let patch = apply_text_patch(
+            original,
+            "new block\n",
+            &serde_json::json!({
+                "match": {
+                    "kind": "exactBlock",
+                    "text": "old block\n"
+                }
+            }),
+        )
+        .expect("unique exact block patch succeeds");
+
+        assert_eq!(patch.updated, "alpha\nnew block\nomega\n");
+        assert_eq!(patch.match_kind, "exactBlock");
+    }
+
+    #[test]
+    fn exact_block_patch_fails_without_match() {
+        let error = apply_text_patch(
+            "alpha\nold block\nomega\n",
+            "new block\n",
+            &serde_json::json!({
+                "match": {
+                    "kind": "exactBlock",
+                    "text": "missing block\n"
+                }
+            }),
+        )
+        .expect_err("missing exact block must fail closed");
+
+        assert!(format!("{error}").contains("did not occur"));
+    }
+
+    #[test]
+    fn exact_block_patch_fails_when_ambiguous() {
+        let error = apply_text_patch(
+            "alpha\nold block\nmiddle\nold block\nomega\n",
+            "new block\n",
+            &serde_json::json!({
+                "match": {
+                    "kind": "exactBlock",
+                    "text": "old block\n"
+                }
+            }),
+        )
+        .expect_err("ambiguous exact block must fail closed");
+
+        assert!(format!("{error}").contains("ambiguous"));
+    }
+
+    #[test]
+    fn line_range_patch_requires_matching_hash_or_before_block() {
+        let original = "alpha\nold block\nomega\n";
+        let error = apply_text_patch(
+            original,
+            "new block\n",
+            &serde_json::json!({
+                "match": {
+                    "kind": "lineRange",
+                    "startLine": 2,
+                    "endLine": 2,
+                    "expectedFileHash": "sha256:does-not-match"
+                }
+            }),
+        )
+        .expect_err("line range hash mismatch must fail closed");
+
+        assert!(format!("{error}").contains("expectedFileHash mismatch"));
+    }
 }

@@ -34,22 +34,52 @@ impl DeepCodeKernelRuntime {
             sequence: Some(accepted_sequence),
         }];
 
-        let action_bundle = action_bundle_value(&batch);
-        let actions = action_bundle
-            .and_then(|bundle| bundle.get("actions"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let code_blocks = collect_code_blocks(&batch);
+        let compiler = OperationCompiler::default();
         let plan_id = batch
             .get("planId")
-            .or_else(|| action_bundle_value(&batch).and_then(|bundle| bundle.get("id")))
+            .or_else(|| {
+                compiler
+                    .action_bundle_value(&batch)
+                    .and_then(|bundle| bundle.get("id"))
+            })
             .and_then(Value::as_str)
             .unwrap_or("action-batch")
             .to_string();
         let mut has_pending_permission = false;
 
-        if actions.is_empty() {
+        let operations = match compiler.compile_batch(&batch) {
+            Ok(operations) => operations,
+            Err(OperationCompileError::EmptyActions) => {
+                let work_unit_id = format!("work-unit-{}-empty", safe_work_unit_segment(&plan_id));
+                events.push(self.work_unit_blocked_event(
+                    &request_id,
+                    &run_id_text,
+                    &session_id_text,
+                    &work_unit_id,
+                    "action batch has no actions",
+                )?);
+                return Ok(events);
+            }
+            Err(error) => {
+                let work_unit_id =
+                    format!("work-unit-{}-compile", safe_work_unit_segment(&plan_id));
+                events.push(self.work_unit_failed_envelope_event(
+                    &request_id,
+                    &run_id_text,
+                    &session_id_text,
+                    &work_unit_id,
+                    KernelErrorEnvelope {
+                        code: "operation_compile_failed".to_string(),
+                        message: error.to_string(),
+                        message_key: None,
+                        args: None,
+                    },
+                )?);
+                return Ok(events);
+            }
+        };
+
+        if operations.is_empty() {
             let work_unit_id = format!("work-unit-{}-empty", safe_work_unit_segment(&plan_id));
             events.push(self.work_unit_blocked_event(
                 &request_id,
@@ -61,40 +91,40 @@ impl DeepCodeKernelRuntime {
             return Ok(events);
         }
 
-        for (index, action) in actions.iter().enumerate() {
-            let action_id = action
-                .get("actionId")
-                .or_else(|| action.get("id"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("action-{index}"));
+        let work_unit_graph = WorkUnitGraph::from_operations(&operations);
+        let graph_sequence = self.ledger.next_sequence(&run_id_text)?;
+        self.append_ledger(
+            &run_id_text,
+            &session_id_text,
+            "work_unit.graph",
+            graph_sequence,
+            serde_json::json!({
+                "summary": "Kernel compiled action batch into a WorkUnitGraph.",
+                "planId": &plan_id,
+                "workUnitGraph": &work_unit_graph
+            }),
+        )?;
+
+        for operation in operations.iter() {
+            let action_id = operation.id.clone();
             let work_unit_id = format!(
                 "work-unit-{}-{}",
                 safe_work_unit_segment(&plan_id),
                 safe_work_unit_segment(&action_id)
             );
-            let capability = action
-                .get("capability")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let kind = action
-                .get("kind")
-                .and_then(Value::as_str)
-                .or_else(|| workspace_kind_from_capability(capability))
-                .unwrap_or_else(|| default_kind_for_capability(capability));
+            let capability = operation.capability.as_str();
+            let kind = operation_kind_name(operation);
             let work_unit = serde_json::json!({
                 "id": &work_unit_id,
                 "planId": &plan_id,
                 "actionId": &action_id,
-                "title": action
-                    .get("title")
-                    .or_else(|| action.get("description"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(&action_id),
+                "title": &operation.title,
                 "capability": capability,
                 "kind": kind,
-                "resourceScope": action.get("resourceScope").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "readSet": &operation.read_set,
+                "writeSet": &operation.write_set,
+                "conflictKeys": &operation.conflict_keys,
+                "executionMode": operation.execution_mode,
                 "status": "queued"
             });
             events.push(self.work_unit_queued_event(
@@ -110,31 +140,32 @@ impl DeepCodeKernelRuntime {
                 &work_unit_id,
             )?);
 
-            if is_external_capability(capability) {
+            if operation.execution_mode != OperationExecutionMode::Execute {
                 events.push(self.work_unit_blocked_event(
                     &request_id,
                     &run_id_text,
                     &session_id_text,
                     &work_unit_id,
-                    &format!("capability requires Phase 9 permission policy before execution: {capability}"),
+                    &format!(
+                        "capability is not executable in the current Kernel policy slice: {capability}"
+                    ),
                 )?);
                 continue;
             }
 
-            let compiled =
-                match compile_action(self, &record, action, &code_blocks, capability, kind) {
-                    Ok(compiled) => compiled,
-                    Err(error) => {
-                        events.push(self.work_unit_failed_event(
-                            &request_id,
-                            &run_id_text,
-                            &session_id_text,
-                            &work_unit_id,
-                            &error,
-                        )?);
-                        continue;
-                    }
-                };
+            let compiled = match compile_operation(self, &record, operation) {
+                Ok(compiled) => compiled,
+                Err(error) => {
+                    events.push(self.work_unit_failed_event(
+                        &request_id,
+                        &run_id_text,
+                        &session_id_text,
+                        &work_unit_id,
+                        &error,
+                    )?);
+                    continue;
+                }
+            };
 
             if let Some(root) = compiled.workspace_root.as_ref() {
                 let mut workspace_events = self.workspace_open(
@@ -151,13 +182,11 @@ impl DeepCodeKernelRuntime {
                 "{work_unit_id}-{}",
                 safe_work_unit_segment(&compiled.tool_name)
             );
-            let compiled_capability = capability_for_tool(&compiled.tool_name);
-            if matches!(compiled_capability, "git.write" | "git.push")
-                && self.effective_permission_action_for_tool(
-                    &run_id_text,
-                    &compiled.tool_name,
-                    &compiled.arguments,
-                )? == PermissionAction::Ask
+            if self.effective_permission_action_for_tool(
+                &run_id_text,
+                &compiled.tool_name,
+                &compiled.arguments,
+            )? == PermissionAction::Ask
             {
                 has_pending_permission = true;
                 let request_sequence = self.ledger.next_sequence(&run_id_text)?;
@@ -192,6 +221,13 @@ impl DeepCodeKernelRuntime {
                         session_id: session_id_text.clone(),
                         tool_name: compiled.tool_name.clone(),
                         arguments: compiled.arguments.clone(),
+                        request_id: Some(request_id.0.clone()),
+                        work_unit_id: Some(work_unit_id.clone()),
+                        action_id: Some(action_id.clone()),
+                        plan_id: Some(plan_id.clone()),
+                        operation_kind: Some(kind.to_string()),
+                        read_set: operation.read_set.clone(),
+                        write_set: operation.write_set.clone(),
                     },
                 );
                 let permission_sequence = self.ledger.next_sequence(&run_id_text)?;
@@ -232,6 +268,13 @@ impl DeepCodeKernelRuntime {
                         "toolName": &compiled.tool_name,
                         "capability": capability_for_tool(&compiled.tool_name),
                         "riskLevel": risk_for_tool(&compiled.tool_name),
+                        "requestId": &request_id.0,
+                        "workUnitId": &work_unit_id,
+                        "actionId": &action_id,
+                        "planId": &plan_id,
+                        "operationKind": kind,
+                        "readSet": &operation.read_set,
+                        "writeSet": &operation.write_set,
                         "argsPreview": redact_tool_arguments(&compiled.tool_name, &compiled.arguments),
                         "argumentsRef": {
                             "storage": "runtime.pendingTools",
@@ -352,7 +395,7 @@ impl DeepCodeKernelRuntime {
         })
     }
 
-    fn work_unit_completed_event(
+    pub(crate) fn work_unit_completed_event(
         &mut self,
         request_id: &RequestId,
         run_id: &str,
@@ -399,7 +442,7 @@ impl DeepCodeKernelRuntime {
         )
     }
 
-    fn work_unit_failed_envelope_event(
+    pub(crate) fn work_unit_failed_envelope_event(
         &mut self,
         request_id: &RequestId,
         run_id: &str,
@@ -429,7 +472,7 @@ impl DeepCodeKernelRuntime {
         })
     }
 
-    fn work_unit_blocked_event(
+    pub(crate) fn work_unit_blocked_event(
         &mut self,
         request_id: &RequestId,
         run_id: &str,
@@ -466,39 +509,155 @@ struct CompiledWorkspaceAction {
     workspace_root: Option<PathBuf>,
 }
 
-fn is_external_capability(capability: &str) -> bool {
-    matches!(
-        capability,
-        "process.exec"
-            | "network.egress"
-            | "secret.read"
-            | "config.modify"
-            | "kernel.modify"
-            | "browser.control"
-            | "provider.egress"
-    )
-}
-
-fn workspace_kind_from_capability(capability: &str) -> Option<&'static str> {
-    match capability {
-        "workspace.read" => Some("read"),
-        "workspace.list" => Some("list"),
-        "workspace.search" => Some("search"),
-        "workspace.diff" | "workspace.preview_diff" => Some("diff"),
-        "workspace.write" => Some("write"),
-        "workspace.create" => Some("create"),
-        "workspace.delete" => Some("delete"),
-        "workspace.rename" => Some("rename"),
-        _ => None,
+fn operation_kind_name(operation: &PlannedOperation) -> &'static str {
+    match &operation.operation {
+        PlannedOperationKind::Workspace(WorkspaceOperation { kind, .. }) => match kind {
+            WorkspaceOperationKind::Read => "read",
+            WorkspaceOperationKind::List => "list",
+            WorkspaceOperationKind::Search => "search",
+            WorkspaceOperationKind::Diff => "diff",
+            WorkspaceOperationKind::Write => "write",
+            WorkspaceOperationKind::Create => "create",
+            WorkspaceOperationKind::Patch => "patch",
+            WorkspaceOperationKind::Delete => "delete",
+            WorkspaceOperationKind::Rename => "rename",
+        },
+        PlannedOperationKind::Git(GitOperation { kind, .. }) => match kind {
+            GitOperationKind::Status => "status",
+            GitOperationKind::Diff => "diff",
+            GitOperationKind::Stage => "stage",
+            GitOperationKind::Unstage => "unstage",
+            GitOperationKind::Commit => "commit",
+            GitOperationKind::Push => "push",
+        },
+        PlannedOperationKind::Process(_) => "exec",
+        PlannedOperationKind::Network(_) => "egress",
+        PlannedOperationKind::Browser(_) => "control",
+        PlannedOperationKind::Provider(_) => "egress",
     }
 }
 
-fn default_kind_for_capability(capability: &str) -> &'static str {
-    match capability {
-        "git.read" => "status",
-        "git.push" => "push",
-        _ => "write",
+fn compile_operation(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    operation: &PlannedOperation,
+) -> KernelResult<CompiledWorkspaceAction> {
+    match &operation.operation {
+        PlannedOperationKind::Workspace(workspace) => {
+            let (action, code_blocks) = workspace_operation_to_legacy_action(operation, workspace);
+            compile_workspace_action(
+                runtime,
+                record,
+                &action,
+                &code_blocks,
+                &operation.capability,
+                operation_kind_name(operation),
+            )
+        }
+        PlannedOperationKind::Git(git) => {
+            let action = git_operation_to_legacy_action(git);
+            compile_git_action(
+                runtime,
+                record,
+                &action,
+                &operation.capability,
+                operation_kind_name(operation),
+            )
+        }
+        PlannedOperationKind::Process(_)
+        | PlannedOperationKind::Network(_)
+        | PlannedOperationKind::Browser(_)
+        | PlannedOperationKind::Provider(_) => Err(KernelError::PermissionDenied(format!(
+            "operation is blocked by Kernel policy: {}",
+            operation.capability
+        ))),
     }
+}
+
+fn workspace_operation_to_legacy_action(
+    operation: &PlannedOperation,
+    workspace: &WorkspaceOperation,
+) -> (Value, std::collections::BTreeMap<String, Value>) {
+    let mut action = serde_json::json!({
+        "id": &operation.id,
+        "title": &operation.title,
+        "capability": &operation.capability,
+        "kind": operation_kind_name(operation),
+        "resourceScope": workspace
+            .target_path
+            .as_ref()
+            .map(|path| serde_json::json!([path]))
+            .unwrap_or_else(|| serde_json::json!([]))
+    });
+    if let Some(path) = workspace.target_path.as_ref() {
+        action["targetPath"] = Value::String(path.clone());
+    }
+    if let Some(query) = workspace.query.as_ref() {
+        action["query"] = Value::String(query.clone());
+    }
+    if let Some(patch_spec) = workspace.patch_spec.as_ref() {
+        action["patchSpec"] = patch_spec.clone();
+    }
+    if let Some(replacement_block_id) = workspace.replacement_block_id.as_ref() {
+        action["replacementBlockId"] = Value::String(replacement_block_id.clone());
+    }
+    let mut code_blocks = std::collections::BTreeMap::new();
+    if let (Some(source_block_id), Some(content)) = (
+        workspace.source_block_id.as_ref(),
+        workspace.content.as_ref(),
+    ) {
+        action["sourceBlockId"] = Value::String(source_block_id.clone());
+        code_blocks.insert(
+            source_block_id.clone(),
+            serde_json::json!({
+                "id": source_block_id,
+                "path": workspace.target_path.clone(),
+                "targetPath": workspace.target_path.clone(),
+                "content": content
+            }),
+        );
+    }
+    if let (Some(replacement_block_id), Some(content)) = (
+        workspace.replacement_block_id.as_ref(),
+        workspace.content.as_ref(),
+    ) {
+        code_blocks.insert(
+            replacement_block_id.clone(),
+            serde_json::json!({
+                "id": replacement_block_id,
+                "path": workspace.target_path.clone(),
+                "targetPath": workspace.target_path.clone(),
+                "content": content
+            }),
+        );
+    }
+    (action, code_blocks)
+}
+
+fn git_operation_to_legacy_action(git: &GitOperation) -> Value {
+    let mut action = serde_json::json!({
+        "toolArgs": {
+            "paths": &git.paths,
+            "staged": git.staged
+        }
+    });
+    if let Some(path) = git.paths.first() {
+        action["path"] = Value::String(path.clone());
+        action["targetPath"] = Value::String(path.clone());
+    }
+    if let Some(message) = git.message.as_ref() {
+        action["message"] = Value::String(message.clone());
+        action["toolArgs"]["message"] = Value::String(message.clone());
+    }
+    if let Some(remote) = git.remote.as_ref() {
+        action["remote"] = Value::String(remote.clone());
+        action["toolArgs"]["remote"] = Value::String(remote.clone());
+    }
+    if let Some(branch) = git.branch.as_ref() {
+        action["branch"] = Value::String(branch.clone());
+        action["toolArgs"]["branch"] = Value::String(branch.clone());
+    }
+    action
 }
 
 fn action_bundle_value(batch: &Value) -> Option<&Value> {
@@ -509,23 +668,6 @@ fn action_bundle_value(batch: &Value) -> Option<&Value> {
             None
         }
     })
-}
-
-fn collect_code_blocks(batch: &Value) -> std::collections::BTreeMap<String, Value> {
-    batch
-        .get("codeBlocks")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|block| {
-            block
-                .get("id")
-                .or_else(|| block.get("blockId"))
-                .and_then(Value::as_str)
-                .filter(|id| !id.trim().is_empty())
-                .map(|id| (id.to_string(), block.clone()))
-        })
-        .collect()
 }
 
 fn compile_workspace_action(
@@ -543,6 +685,7 @@ fn compile_workspace_action(
     }
     match kind {
         "write" | "create" => workspace_write_from_action(runtime, record, action, code_blocks),
+        "patch" => workspace_patch_from_action(runtime, record, action, code_blocks),
         "read" => workspace_path_tool_action(runtime, record, action, "fs.read"),
         "list" => workspace_path_tool_action(runtime, record, action, "fs.list"),
         "diff" => workspace_path_tool_action(runtime, record, action, "fs.diff"),
@@ -553,20 +696,6 @@ fn compile_workspace_action(
             "unsupported workspace action kind: {other}"
         ))),
     }
-}
-
-fn compile_action(
-    runtime: &DeepCodeKernelRuntime,
-    record: &RuntimeRunRecord,
-    action: &Value,
-    code_blocks: &std::collections::BTreeMap<String, Value>,
-    capability: &str,
-    kind: &str,
-) -> KernelResult<CompiledWorkspaceAction> {
-    if matches!(capability, "git.read" | "git.write" | "git.push") {
-        return compile_git_action(runtime, record, action, capability, kind);
-    }
-    compile_workspace_action(runtime, record, action, code_blocks, capability, kind)
 }
 
 fn compile_git_action(
@@ -804,6 +933,11 @@ fn workspace_write_from_action(
             KernelError::InvalidCommand(format!("codeBlock {source_block_id} has no content"))
         })?
         .to_string();
+    if content.is_empty() && !block_explicitly_allows_empty_content(block) {
+        return Err(KernelError::InvalidCommand(format!(
+            "codeBlock {source_block_id} has empty content; use allowEmptyContent with createEmpty to make this explicit"
+        )));
+    }
     let raw_path = block
         .get("path")
         .or_else(|| block.get("targetPath"))
@@ -836,6 +970,92 @@ fn workspace_write_from_action(
         }),
         workspace_root,
     })
+}
+
+fn workspace_patch_from_action(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    action: &Value,
+    code_blocks: &std::collections::BTreeMap<String, Value>,
+) -> KernelResult<CompiledWorkspaceAction> {
+    let replacement_block_id = action
+        .get("replacementBlockId")
+        .or_else(|| action.get("sourceBlockId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            KernelError::InvalidCommand(
+                "workspace.patch action requires replacementBlockId or sourceBlockId".to_string(),
+            )
+        })?;
+    let block = code_blocks.get(replacement_block_id).ok_or_else(|| {
+        KernelError::InvalidCommand(format!("codeBlock {replacement_block_id} was not provided"))
+    })?;
+    let replacement = block
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            KernelError::InvalidCommand(format!("codeBlock {replacement_block_id} has no content"))
+        })?
+        .to_string();
+    if replacement.is_empty() && !block_explicitly_allows_empty_content(block) {
+        return Err(KernelError::InvalidCommand(format!(
+            "codeBlock {replacement_block_id} has empty content; use allowEmptyContent with a patch operation to make this explicit"
+        )));
+    }
+    let raw_path = action
+        .get("targetPath")
+        .or_else(|| action.get("path"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            block
+                .get("path")
+                .or_else(|| block.get("targetPath"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            action
+                .get("resourceScope")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            KernelError::InvalidCommand(format!(
+                "codeBlock {replacement_block_id} has no patch target path"
+            ))
+        })?;
+    let patch_spec = action.get("patchSpec").cloned().ok_or_else(|| {
+        KernelError::InvalidCommand("workspace.patch action requires patchSpec".to_string())
+    })?;
+    let (relative_path, workspace_root) = workspace_relative_write_path(runtime, record, raw_path)?;
+    Ok(CompiledWorkspaceAction {
+        tool_name: "fs.patch".to_string(),
+        arguments: serde_json::json!({
+            "path": relative_path,
+            "patchSpec": patch_spec,
+            "replacement": replacement
+        }),
+        workspace_root,
+    })
+}
+
+fn block_explicitly_allows_empty_content(block: &Value) -> bool {
+    let operation = block
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    block
+        .get("allowEmptyContent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && matches!(
+            operation,
+            "createEmpty" | "patch" | "replaceBlock" | "insertBefore" | "insertAfter"
+        )
 }
 
 fn workspace_path_tool_action(
@@ -1087,7 +1307,7 @@ fn normalize_write_relative_path(raw_path: &str) -> KernelResult<String> {
     Ok(parts.join("/"))
 }
 
-fn explicit_attachment_root(attachment: &Value) -> Option<PathBuf> {
+pub(crate) fn explicit_attachment_root(attachment: &Value) -> Option<PathBuf> {
     let source = attachment
         .get("source")
         .and_then(Value::as_str)

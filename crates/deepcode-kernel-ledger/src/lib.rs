@@ -440,6 +440,7 @@ pub struct TempArtifactCleanupResult {
 pub enum KernelResourceKind {
     TerminalSession,
     TempArtifact,
+    Artifact,
     RedirectOutput,
     CacheFile,
     ProcessHandle,

@@ -396,6 +396,86 @@ impl DeepCodeKernelRuntime {
         }])
     }
 
+    pub(crate) fn artifact_register(
+        &mut self,
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        artifact: Value,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let record = self.record_by_run(&run_id.0)?.clone();
+        let session_id_text = session_id
+            .map(|value| value.0)
+            .unwrap_or_else(|| record.session_id.clone());
+        let sequence = self.ledger.next_sequence(&run_id.0)?;
+        let artifact_id = artifact
+            .get("id")
+            .or_else(|| artifact.get("artifactId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("artifact-{}-{sequence}", run_id.0));
+        let evidence_ref = format!("artifact:{artifact_id}");
+        let mut metadata = artifact.clone();
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("artifactId".to_string(), Value::String(artifact_id.clone()));
+            object.insert(
+                "evidenceRef".to_string(),
+                Value::String(evidence_ref.clone()),
+            );
+            object.insert(
+                "sourceAuthority".to_string(),
+                Value::String("session-submitted-artifact".to_string()),
+            );
+            object.insert(
+                "sideEffectPolicy".to_string(),
+                Value::String("metadata-only".to_string()),
+            );
+        } else {
+            metadata = serde_json::json!({
+                "artifactId": &artifact_id,
+                "value": artifact,
+                "evidenceRef": &evidence_ref,
+                "sourceAuthority": "session-submitted-artifact",
+                "sideEffectPolicy": "metadata-only"
+            });
+        }
+        self.state
+            .resource_registry
+            .register(KernelResource::active(
+                artifact_id.clone(),
+                KernelResourceKind::Artifact,
+                KernelResourceOwner::agent_workflow(
+                    Some(session_id_text.clone()),
+                    run_id.0.clone(),
+                ),
+                KernelResourceScope::Workflow,
+                KernelResourceCleanupPolicy::OnWorkflowEnd,
+                metadata.clone(),
+            ))?;
+        self.append_ledger(
+            &run_id.0,
+            &session_id_text,
+            "artifact.registered",
+            sequence,
+            serde_json::json!({
+                "summary": "Kernel registered an artifact as evidence metadata.",
+                "artifactId": &artifact_id,
+                "evidenceRef": &evidence_ref,
+                "artifact": &metadata
+            }),
+        )?;
+        Ok(vec![KernelEvent::ArtifactRegistered {
+            request_id: Some(request_id),
+            run_id,
+            session_id: Some(SessionId(session_id_text)),
+            artifact: metadata,
+            evidence_ref,
+            sequence: Some(sequence),
+        }])
+    }
+
     pub(crate) fn review_facts_get(
         &mut self,
         request_id: RequestId,
@@ -465,6 +545,12 @@ impl DeepCodeKernelRuntime {
             "aborted" => "ReviewGate aborted by user decision.",
             _ => "ReviewGate still needs user review.",
         };
+        let revoked_temporary_grant_count = self
+            .state
+            .temporary_grants_by_run
+            .remove(&run_id.0)
+            .map(|grants| grants.len())
+            .unwrap_or(0);
         let result = serde_json::json!({
             "id": format!("review-{}", run_id.0),
             "runId": run_id.0,
@@ -472,6 +558,7 @@ impl DeepCodeKernelRuntime {
             "decision": decision,
             "failedWorkUnitCount": failed_count,
             "blockedWorkUnitCount": blocked_count,
+            "revokedTemporaryGrantCount": revoked_temporary_grant_count,
             "summary": summary,
             "factsRef": facts.get("factsRef").cloned().unwrap_or(Value::Null)
         });
@@ -483,7 +570,8 @@ impl DeepCodeKernelRuntime {
             sequence,
             serde_json::json!({
                 "summary": summary,
-                "result": &result
+                "result": &result,
+                "revokedTemporaryGrantCount": revoked_temporary_grant_count
             }),
         )?;
         Ok(vec![KernelEvent::ReviewGateEvaluated {
@@ -1189,6 +1277,7 @@ fn ledger_review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> Kernel
     let mut blocked_work_units = Vec::new();
     let mut tool_results = Vec::new();
     let mut written_files = Vec::new();
+    let mut patch_changed_ranges = Vec::new();
 
     for event in &events {
         match event.kind.as_str() {
@@ -1208,7 +1297,8 @@ fn ledger_review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> Kernel
             }
             "tool.completed" => {
                 let summary = review_ledger_event_summary(event);
-                if summary.get("toolName").and_then(Value::as_str) == Some("fs.write") {
+                let tool_name = summary.get("toolName").and_then(Value::as_str);
+                if matches!(tool_name, Some("fs.write" | "fs.patch")) {
                     if let Some(path) = summary
                         .get("output")
                         .and_then(|output| output.get("path"))
@@ -1217,6 +1307,17 @@ fn ledger_review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> Kernel
                         written_files.push(serde_json::json!({
                             "path": path,
                             "toolCallId": summary.get("toolCallId").cloned().unwrap_or(Value::Null)
+                        }));
+                    }
+                }
+                if tool_name == Some("fs.patch") {
+                    if let Some(output) = summary.get("output") {
+                        patch_changed_ranges.push(serde_json::json!({
+                            "path": output.get("path").cloned().unwrap_or(Value::Null),
+                            "toolCallId": summary.get("toolCallId").cloned().unwrap_or(Value::Null),
+                            "changedRanges": output.get("changedRanges").cloned().unwrap_or(Value::Null),
+                            "oldContentHash": output.get("oldContentHash").cloned().unwrap_or(Value::Null),
+                            "newContentHash": output.get("newContentHash").cloned().unwrap_or(Value::Null)
                         }));
                     }
                 }
@@ -1235,7 +1336,8 @@ fn ledger_review_facts_for_run(ledger: &dyn EventLedger, run_id: &str) -> Kernel
         "failedWorkUnits": failed_work_units,
         "blockedWorkUnits": blocked_work_units,
         "toolResults": tool_results,
-        "writtenFiles": written_files
+        "writtenFiles": written_files,
+        "patchChangedRanges": patch_changed_ranges
     }))
 }
 
@@ -1499,6 +1601,7 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::ProposalReviewed { .. } => "proposal.reviewed",
         KernelEvent::ProposalRejected { .. } => "proposal.rejected",
         KernelEvent::ResourcePacketProduced { .. } => "resource.packet_produced",
+        KernelEvent::ArtifactRegistered { .. } => "artifact.registered",
         KernelEvent::ActionBatchAccepted { .. } => "action_batch.accepted",
         KernelEvent::WorkUnitQueued { .. } => "work_unit.queued",
         KernelEvent::WorkUnitStarted { .. } => "work_unit.started",
@@ -1548,6 +1651,7 @@ pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::ProposalReviewed { sequence, .. }
         | KernelEvent::ProposalRejected { sequence, .. }
         | KernelEvent::ResourcePacketProduced { sequence, .. }
+        | KernelEvent::ArtifactRegistered { sequence, .. }
         | KernelEvent::ActionBatchAccepted { sequence, .. }
         | KernelEvent::WorkUnitQueued { sequence, .. }
         | KernelEvent::WorkUnitStarted { sequence, .. }

@@ -331,6 +331,7 @@ fn event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::ProposalReviewed { .. } => "proposal.reviewed",
         KernelEvent::ProposalRejected { .. } => "proposal.rejected",
         KernelEvent::ResourcePacketProduced { .. } => "resource.packet_produced",
+        KernelEvent::ArtifactRegistered { .. } => "artifact.registered",
         KernelEvent::ActionBatchAccepted { .. } => "action_batch.accepted",
         KernelEvent::WorkUnitQueued { .. } => "work_unit.queued",
         KernelEvent::WorkUnitStarted { .. } => "work_unit.started",
@@ -380,6 +381,7 @@ fn event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::ProposalReviewed { sequence, .. }
         | KernelEvent::ProposalRejected { sequence, .. }
         | KernelEvent::ResourcePacketProduced { sequence, .. }
+        | KernelEvent::ArtifactRegistered { sequence, .. }
         | KernelEvent::ActionBatchAccepted { sequence, .. }
         | KernelEvent::WorkUnitQueued { sequence, .. }
         | KernelEvent::WorkUnitStarted { sequence, .. }

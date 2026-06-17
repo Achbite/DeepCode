@@ -13,12 +13,16 @@ pub enum PlanReviewStatus {
     InterfaceOnly,
 }
 
+pub type ProposalReviewStatus = PlanReviewStatus;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanReviewFinding {
     pub code: String,
     pub message: String,
 }
+
+pub type ProposalReviewFinding = PlanReviewFinding;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +31,8 @@ pub struct PlanReviewInput {
     #[serde(default)]
     pub action_bundle: Option<ActionBundleDraft>,
 }
+
+pub type ProposalReviewInput = PlanReviewInput;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +54,8 @@ pub struct PlanReviewReport {
     pub findings: Vec<PlanReviewFinding>,
     pub kernel_generated_permission_summary: String,
 }
+
+pub type ProposalReviewReport = PlanReviewReport;
 
 impl PlanReviewReport {
     pub fn denied(plan_id: impl Into<String>, reason: impl Into<String>) -> Self {
@@ -94,8 +102,14 @@ pub trait PlanReviewEngine {
     }
 }
 
+pub trait ProposalReviewEngine: PlanReviewEngine {}
+
+impl<T> ProposalReviewEngine for T where T: PlanReviewEngine {}
+
 #[derive(Debug, Clone, Default)]
 pub struct DefaultPlanReviewEngine;
+
+pub type DefaultProposalReviewEngine = DefaultPlanReviewEngine;
 
 impl PlanReviewEngine for DefaultPlanReviewEngine {
     fn review_plan(&self, plan: &PlanContract) -> PlanReviewReport {

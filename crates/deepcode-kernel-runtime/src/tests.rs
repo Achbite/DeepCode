@@ -24,6 +24,23 @@ fn runtime_with_workspace() -> (DeepCodeKernelRuntime, PathBuf) {
     (runtime, temp)
 }
 
+fn grant_workspace_write(runtime: &mut DeepCodeKernelRuntime) {
+    runtime
+        .dispatch(KernelCommand::PermissionGrantTemporary {
+            request_id: RequestId("req-grant-workspace-write".to_string()),
+            run_id: RunId("run-1".to_string()),
+            grant: deepcode_kernel_abi::TemporaryGrantEnvelope {
+                id: "grant-workspace-write".to_string(),
+                capability: "workspace.write".to_string(),
+                resource_kind: "workspace".to_string(),
+                resource_path: None,
+                expires_after_sequence: None,
+                reason: Some("test grants explicit workspace write permission".to_string()),
+            },
+        })
+        .expect("temporary workspace.write grant succeeds");
+}
+
 #[test]
 fn run_create_produces_state_contract_and_driver_request() {
     let (mut runtime, _temp) = runtime_with_workspace();
@@ -296,6 +313,254 @@ fn resource_resolve_reads_file_byte_ranges() {
 }
 
 #[test]
+fn artifact_register_records_metadata_only_evidence() {
+    let (mut runtime, _temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Register a generic subtask artifact.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let events = runtime
+        .dispatch(KernelCommand::ArtifactRegister {
+            request_id: RequestId("req-artifact".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            artifact: serde_json::json!({
+                "id": "artifact-generic",
+                "kind": "subtaskSummary",
+                "summary": "Generic subtask evidence."
+            }),
+        })
+        .expect("artifact register succeeds");
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ArtifactRegistered {
+                evidence_ref,
+                artifact,
+                ..
+            } if evidence_ref == "artifact:artifact-generic"
+                && artifact.get("sideEffectPolicy").and_then(Value::as_str) == Some("metadata-only")
+        )
+    }));
+    let resource = runtime
+        .state
+        .resource_registry
+        .get("artifact-generic")
+        .expect("artifact resource registered");
+    assert_eq!(resource.kind, KernelResourceKind::Artifact);
+}
+
+#[test]
+fn action_batch_submit_requests_permission_for_workspace_write_without_grant() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Create a generic file after permission.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic",
+                "codeBlocks": [
+                    {
+                        "id": "block-generic",
+                        "path": "generated/output.txt",
+                        "content": "generic generated content\n"
+                    }
+                ],
+                "actionBundle": {
+                    "id": "bundle-generic",
+                    "goal": "Create a generic file after permission.",
+                    "actions": [
+                        {
+                            "id": "write-generic",
+                            "title": "Write generic file",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["generated/output.txt"],
+                            "sourceBlockId": "block-generic"
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch succeeds");
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::PermissionRequested { request, .. }
+                if request.capability == "workspace.write"
+        )
+    }));
+    assert!(!events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ..
+            } if tool_name == "fs.write"
+        )
+    }));
+    assert!(!events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::StageChanged { phase, .. } if phase == "review"
+        )
+    }));
+    assert!(
+        !temp.join("generated").join("output.txt").exists(),
+        "permission-gated write must not touch disk before the user grants permission"
+    );
+}
+
+#[test]
+fn action_batch_permission_accept_executes_pending_workspace_write_and_enters_review() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Create a generic file after permission.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let requested = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic",
+                "codeBlocks": [
+                    {
+                        "id": "block-generic",
+                        "path": "generated/output.txt",
+                        "content": "generic generated content\n"
+                    }
+                ],
+                "actionBundle": {
+                    "id": "bundle-generic",
+                    "goal": "Create a generic file after permission.",
+                    "actions": [
+                        {
+                            "id": "write-generic",
+                            "title": "Write generic file",
+                            "capability": "workspace.write",
+                            "kind": "write",
+                            "resourceScope": ["generated/output.txt"],
+                            "sourceBlockId": "block-generic"
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch succeeds");
+
+    let permission_id = requested
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::PermissionRequested { request, .. } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("workspace.write permission requested");
+
+    let accepted = runtime
+        .dispatch(KernelCommand::PermissionResolve {
+            request_id: RequestId("req-permission-accept".to_string()),
+            permission_id,
+            decision: deepcode_kernel_abi::PermissionDecisionKind::Accept,
+        })
+        .expect("permission accept succeeds");
+
+    assert!(accepted.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok: true,
+                ..
+            } if tool_name == "fs.write"
+        )
+    }));
+    assert!(accepted
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
+    assert!(accepted.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::StageChanged { phase, .. } if phase == "review"
+        )
+    }));
+    assert_eq!(
+        fs::read_to_string(temp.join("generated").join("output.txt")).expect("written file"),
+        "generic generated content\n"
+    );
+
+    let review = runtime
+        .dispatch(KernelCommand::ReviewFactsGet {
+            request_id: RequestId("req-review-facts".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+        })
+        .expect("review facts succeeds");
+    let facts = review
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ReviewFactsProduced { facts, .. } => Some(facts),
+            _ => None,
+        })
+        .expect("review facts produced");
+    assert_eq!(facts["writtenFiles"].as_array().unwrap().len(), 1);
+    assert_eq!(facts["completedWorkUnits"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn action_batch_submit_executes_minimal_workspace_write() {
     let (mut runtime, temp) = runtime_with_workspace();
     runtime
@@ -318,6 +583,8 @@ fn action_batch_submit_executes_minimal_workspace_write() {
             run_overrides: None,
         })
         .expect("runCreate succeeds");
+
+    grant_workspace_write(&mut runtime);
 
     let events = runtime
         .dispatch(KernelCommand::ActionBatchSubmit {
@@ -380,6 +647,108 @@ fn action_batch_submit_executes_minimal_workspace_write() {
 }
 
 #[test]
+fn action_batch_submit_executes_exact_block_patch() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Patch a generic file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_write(&mut runtime);
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic",
+                "codeBlocks": [
+                    {
+                        "id": "replacement-generic",
+                        "path": "input.txt",
+                        "operation": "replaceBlock",
+                        "content": "patched generic input\n"
+                    }
+                ],
+                "actionBundle": {
+                    "id": "bundle-generic",
+                    "goal": "Patch a generic file.",
+                    "actions": [
+                        {
+                            "id": "patch-generic",
+                            "title": "Patch generic file",
+                            "capability": "workspace.write",
+                            "kind": "replaceBlock",
+                            "resourceScope": ["input.txt"],
+                            "targetPath": "input.txt",
+                            "replacementBlockId": "replacement-generic",
+                            "patchSpec": {
+                                "match": {
+                                    "kind": "exactBlock",
+                                    "text": "generic input\n"
+                                }
+                            }
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch succeeds");
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok: true,
+                ..
+            } if tool_name == "fs.patch"
+        )
+    }));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
+    assert_eq!(
+        fs::read_to_string(temp.join("input.txt")).expect("patched file"),
+        "patched generic input\n"
+    );
+
+    let review = runtime
+        .dispatch(KernelCommand::ReviewFactsGet {
+            request_id: RequestId("req-review-facts".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+        })
+        .expect("review facts succeeds");
+    let facts = review
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ReviewFactsProduced { facts, .. } => Some(facts),
+            _ => None,
+        })
+        .expect("review facts produced");
+    assert_eq!(facts["writtenFiles"].as_array().unwrap().len(), 1);
+    assert_eq!(facts["patchChangedRanges"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() {
     let (mut runtime, workspace_root) = runtime_with_workspace();
     let attached_root = std::env::temp_dir().join(format!(
@@ -416,6 +785,8 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
             run_overrides: None,
         })
         .expect("runCreate succeeds");
+
+    grant_workspace_write(&mut runtime);
 
     let events = runtime
         .dispatch(KernelCommand::ActionBatchSubmit {
@@ -570,7 +941,7 @@ fn action_batch_submit_executes_git_status_as_read_only() {
 }
 
 #[test]
-fn action_batch_submit_requests_permission_for_git_push() {
+fn action_batch_submit_blocks_git_push_until_phase9_policy() {
     let (mut runtime, temp) = runtime_with_workspace();
     runtime
         .dispatch(KernelCommand::RunCreate {
@@ -625,7 +996,7 @@ fn action_batch_submit_requests_permission_for_git_push() {
     assert!(events.iter().any(|event| {
         matches!(
             event,
-            KernelEvent::PermissionRequested { request, .. } if request.capability == "git.push"
+            KernelEvent::WorkUnitBlocked { reason, .. } if reason.contains("git.push")
         )
     }));
     assert!(!events.iter().any(|event| {

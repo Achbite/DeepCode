@@ -4,6 +4,7 @@ members = [
   "crates/deepcode-kernel-core",
   "crates/deepcode-kernel-config",
   "crates/deepcode-kernel-policy",
+  "crates/deepcode-kernel-tools",
   "crates/deepcode-kernel-runtime",
   "crates/deepcode-kernel-skills",
   "crates/deepcode-kernel-workflow",
@@ -38,6 +39,7 @@ deepcode-kernel-abi = { path = "crates/deepcode-kernel-abi" }
 deepcode-kernel-config = { path = "crates/deepcode-kernel-config" }
 deepcode-kernel-ledger = { path = "crates/deepcode-kernel-ledger" }
 deepcode-kernel-policy = { path = "crates/deepcode-kernel-policy" }
+deepcode-kernel-tools = { path = "crates/deepcode-kernel-tools" }
 deepcode-kernel-runtime = { path = "crates/deepcode-kernel-runtime" }
 deepcode-kernel-skills = { path = "crates/deepcode-kernel-skills" }
 deepcode-kernel-workflow = { path = "crates/deepcode-kernel-workflow" }

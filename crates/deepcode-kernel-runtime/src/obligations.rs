@@ -151,6 +151,7 @@ pub(crate) fn change_operation_for_tool(
 ) -> Option<(&'static str, String)> {
     match tool_id {
         "fs.write" => get_string(arguments, "path").map(|path| ("write", path)),
+        "fs.patch" => get_string(arguments, "path").map(|path| ("patch", path)),
         "fs.delete" => get_string(arguments, "path").map(|path| ("delete", path)),
         _ => None,
     }

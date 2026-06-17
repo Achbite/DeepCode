@@ -59,6 +59,12 @@ pub enum KernelCommand {
         session_id: Option<SessionId>,
         request: ResourceResolveRequest,
     },
+    ArtifactRegister {
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        artifact: Value,
+    },
     ActionBatchSubmit {
         request_id: RequestId,
         run_id: RunId,

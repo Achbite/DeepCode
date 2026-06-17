@@ -10,6 +10,8 @@ pub enum PlanRiskLevel {
     Critical,
 }
 
+pub type ProposalRiskLevel = PlanRiskLevel;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionCriteria {
@@ -54,6 +56,8 @@ pub struct PlanContract {
     #[serde(default)]
     pub review_policy: ReviewPolicy,
 }
+
+pub type ProposalContract = PlanContract;
 
 impl PlanContract {
     pub fn low_risk_direct(id: impl Into<String>, goal: impl Into<String>) -> Self {
@@ -147,6 +151,8 @@ pub struct PlannedAction {
     #[serde(default)]
     pub purpose: Option<String>,
 }
+
+pub type ProposedAction = PlannedAction;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

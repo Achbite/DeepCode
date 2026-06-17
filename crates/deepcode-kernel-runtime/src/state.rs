@@ -57,6 +57,13 @@ pub(crate) struct PendingKernelTool {
     pub(crate) session_id: String,
     pub(crate) tool_name: String,
     pub(crate) arguments: Value,
+    pub(crate) request_id: Option<String>,
+    pub(crate) work_unit_id: Option<String>,
+    pub(crate) action_id: Option<String>,
+    pub(crate) plan_id: Option<String>,
+    pub(crate) operation_kind: Option<String>,
+    pub(crate) read_set: Vec<String>,
+    pub(crate) write_set: Vec<String>,
 }
 
 use super::*;

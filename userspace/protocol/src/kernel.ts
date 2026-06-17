@@ -249,6 +249,8 @@ export interface KernelPlanContract {
   requiresUserApproval: boolean;
 }
 
+export type KernelProposalContract = KernelPlanContract;
+
 export type KernelPlanReviewStatus =
   | 'autoAccepted'
   | 'awaitingUserApproval'
@@ -256,6 +258,8 @@ export type KernelPlanReviewStatus =
   | 'denied'
   | 'needsRevision'
   | 'interfaceOnly';
+
+export type KernelProposalReviewStatus = KernelPlanReviewStatus;
 
 export interface KernelPlanReviewReport {
   planId: string;
@@ -269,6 +273,8 @@ export interface KernelPlanReviewReport {
   findings: unknown[];
   kernelGeneratedPermissionSummary?: string;
 }
+
+export type KernelProposalReviewReport = KernelPlanReviewReport;
 
 export type KernelSkillTrustMode = 'declarative' | 'brokeredScript' | 'directHostScript';
 
@@ -310,6 +316,13 @@ export type KernelPlanCommand =
       requestId: string;
       runId: string;
       grant: KernelTemporaryGrant;
+    }
+  | {
+      kind: 'artifactRegister';
+      requestId: string;
+      runId: string;
+      sessionId?: string;
+      artifact: unknown;
     };
 
 export type KernelWorkflowCheckpointEvent =
@@ -337,6 +350,18 @@ export type KernelPlanReviewEvent = {
   sessionId?: string;
   proposalId?: string;
   report: unknown;
+  sequence?: number;
+};
+
+export type KernelProposalReviewEvent = KernelPlanReviewEvent;
+
+export type KernelArtifactRegisteredEvent = {
+  kind: 'artifact.registered';
+  requestId?: string;
+  runId: string;
+  sessionId?: string;
+  artifact: unknown;
+  evidenceRef: string;
   sequence?: number;
 };
 

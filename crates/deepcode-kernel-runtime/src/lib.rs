@@ -24,6 +24,11 @@ use deepcode_kernel_skills::{
     SkillExecutionContext, SkillExecutorRegistry, SkillInvocation, SkillRegistry, SkillRuntime,
     SkillTrustMode, SkillTrustRecord,
 };
+use deepcode_kernel_tools::{
+    GitOperation, GitOperationKind, KernelToolRegistry, OperationCompileError, OperationCompiler,
+    OperationExecutionMode, PlannedOperation, PlannedOperationKind, ToolPermissionMode,
+    WorkUnitGraph, WorkspaceOperation, WorkspaceOperationKind,
+};
 use deepcode_kernel_workflow::{
     ActionBundleDraft, BuiltinWorkflowMachine, CompletionCriteria, DefaultPlanReviewEngine,
     PlanContract, PlanReviewEngine, PlanReviewInput, PlanReviewReport, PlanReviewStatus,
@@ -54,7 +59,7 @@ pub const AGENT_PROTOCOL_VERSION: &str = "deepcode.agent.protocol.v3";
 pub const TOOL_CATALOG_VERSION: &str = "deepcode.tool_catalog.session-v3.v1";
 
 pub fn kernel_visible_tool_catalog_count() -> usize {
-    23
+    KernelToolRegistry::default().all().count()
 }
 
 pub struct DeepCodeKernelRuntime {

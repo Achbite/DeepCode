@@ -197,6 +197,15 @@ impl InMemorySkillRegistry {
                 true,
             ),
             builtin(
+                "fs.patch",
+                "skill.fs.patch.description",
+                Capability::workspace_write(),
+                RiskLevel::High,
+                vec![CapabilityEffect::WritesWorkspace],
+                vec!["complete"],
+                true,
+            ),
+            builtin(
                 "fs.delete",
                 "skill.fs.delete.description",
                 Capability::workspace_delete(),
@@ -420,7 +429,7 @@ mod tests {
     #[test]
     fn builtin_catalog_contains_expected_tools() {
         let registry = InMemorySkillRegistry::with_builtin_tools();
-        assert_eq!(registry.len(), 23);
+        assert_eq!(registry.len(), 24);
         let write = registry.get("fs.write").unwrap().unwrap();
         assert_eq!(write.risk_level, RiskLevel::High);
         assert_eq!(
@@ -428,6 +437,13 @@ mod tests {
             Some(Capability::workspace_write())
         );
         assert!(write.model_visible);
+
+        let patch = registry.get("fs.patch").unwrap().unwrap();
+        assert_eq!(
+            patch.primary_capability(),
+            Some(Capability::workspace_write())
+        );
+        assert!(patch.effects.contains(&CapabilityEffect::WritesWorkspace));
 
         let delete = registry.get("fs.delete").unwrap().unwrap();
         assert_eq!(delete.risk_level, RiskLevel::Critical);

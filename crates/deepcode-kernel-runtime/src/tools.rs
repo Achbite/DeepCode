@@ -67,6 +67,13 @@ impl DeepCodeKernelRuntime {
                     session_id: session_id.clone(),
                     tool_name: tool_name.clone(),
                     arguments: pending_arguments.clone(),
+                    request_id: Some(request_id.0.clone()),
+                    work_unit_id: None,
+                    action_id: None,
+                    plan_id: None,
+                    operation_kind: None,
+                    read_set: Vec::new(),
+                    write_set: Vec::new(),
                 },
             );
             let permission_sequence = self.ledger.next_sequence(&run_id)?;
@@ -474,7 +481,7 @@ impl DeepCodeKernelRuntime {
     ) -> KernelResult<()> {
         if !matches!(
             tool_name,
-            "fs.write" | "fs.delete" | "fs.read" | "fs.list" | "code.search"
+            "fs.write" | "fs.patch" | "fs.delete" | "fs.read" | "fs.list" | "code.search"
         ) {
             return Ok(());
         }
@@ -523,6 +530,30 @@ impl DeepCodeKernelRuntime {
                                 "contentHash": actual_hash,
                                 "expectedContentBytes": expected.len(),
                                 "expectedContentHash": expected_hash
+                            }),
+                        );
+                    } else if tool_name == "fs.patch" {
+                        let old_hash = object
+                            .get("oldContentHash")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let new_hash = object
+                            .get("newContentHash")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let changed_ranges =
+                            object.get("changedRanges").cloned().unwrap_or(Value::Null);
+                        object.insert(
+                            "validation".to_string(),
+                            serde_json::json!({
+                                "kind": "patchReadBack",
+                                "passed": target.is_file(),
+                                "path": path,
+                                "oldContentHash": old_hash,
+                                "newContentHash": new_hash,
+                                "changedRanges": changed_ranges
                             }),
                         );
                     } else if tool_name == "fs.delete" {
@@ -1071,33 +1102,15 @@ pub(crate) enum PermissionAction {
 }
 
 pub(crate) fn permission_action_for_kernel_tool(tool_id: &str) -> PermissionAction {
-    match tool_id {
-        "fs.write" | "fs.delete" | "shell.exec" | "web.search" | "web.fetch" | "git.stage"
-        | "git.unstage" | "git.commit" | "git.push" | "browser.open" | "browser.reload"
-        | "browser.snapshot" | "browser.inspect" | "browser.click" | "browser.type"
-        | "browser.scroll" => PermissionAction::Ask,
-        "fs.read" | "fs.list" | "fs.diff" | "code.search" | "shell.propose" | "git.status"
-        | "git.diff" => PermissionAction::Allow,
-        _ => PermissionAction::Deny,
+    match KernelToolRegistry::default().permission_mode_for_tool(tool_id) {
+        ToolPermissionMode::Allow => PermissionAction::Allow,
+        ToolPermissionMode::Ask => PermissionAction::Ask,
+        ToolPermissionMode::Deny => PermissionAction::Deny,
     }
 }
 
 pub(crate) fn needs_workspace_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "fs.read"
-            | "fs.list"
-            | "fs.diff"
-            | "fs.write"
-            | "fs.delete"
-            | "code.search"
-            | "git.status"
-            | "git.diff"
-            | "git.stage"
-            | "git.unstage"
-            | "git.commit"
-            | "git.push"
-    )
+    KernelToolRegistry::default().needs_workspace(tool_name)
 }
 
 fn explicit_attachment_allows_target(attachment: &Value, root: &Path, target: &Path) -> bool {
@@ -1261,32 +1274,11 @@ fn runtime_audit_signer() -> KernelResult<LocalAuditSigner> {
 }
 
 pub(crate) fn capability_for_tool(tool_id: &str) -> &'static str {
-    match tool_id {
-        "fs.write" => "workspace.write",
-        "fs.delete" => "workspace.delete",
-        "shell.exec" => "process.exec",
-        "web.search" | "web.fetch" => "network.egress",
-        "git.stage" | "git.unstage" | "git.commit" => "git.write",
-        "git.push" => "git.push",
-        "browser.open" | "browser.reload" | "browser.snapshot" | "browser.inspect"
-        | "browser.click" | "browser.type" | "browser.scroll" => "browser.control",
-        "fs.read" | "fs.list" => "workspace.read",
-        "fs.diff" => "workspace.preview_diff",
-        "code.search" => "workspace.search",
-        "shell.propose" => "process.propose",
-        "git.status" | "git.diff" => "git.read",
-        _ => "unknown",
-    }
+    KernelToolRegistry::default().capability_for_tool(tool_id)
 }
 
 pub(crate) fn risk_for_tool(tool_id: &str) -> &'static str {
-    match tool_id {
-        "fs.delete" | "shell.exec" | "web.search" | "web.fetch" | "git.stage" | "git.unstage"
-        | "git.commit" | "git.push" | "browser.open" | "browser.reload" | "browser.snapshot"
-        | "browser.inspect" | "browser.click" | "browser.type" | "browser.scroll" => "high",
-        "fs.write" => "medium",
-        _ => "low",
-    }
+    KernelToolRegistry::default().risk_for_tool(tool_id)
 }
 
 pub(crate) fn redact_tool_arguments(tool_id: &str, arguments: &Value) -> Value {
@@ -1312,6 +1304,18 @@ pub(crate) fn redact_tool_arguments(tool_id: &str, arguments: &Value) -> Value {
                 "path": arguments.get("path").cloned().unwrap_or(Value::Null),
                 "contentBytes": content.len(),
                 "contentHash": deepcode_kernel_skills::hash::hash_bytes(content.as_bytes())
+            })
+        }
+        "fs.patch" => {
+            let content = arguments
+                .get("replacement")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            serde_json::json!({
+                "path": arguments.get("path").cloned().unwrap_or(Value::Null),
+                "replacementBytes": content.len(),
+                "replacementHash": deepcode_kernel_skills::hash::hash_bytes(content.as_bytes()),
+                "patchSpec": arguments.get("patchSpec").cloned().unwrap_or(Value::Null)
             })
         }
         "browser.type" => {

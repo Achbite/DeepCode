@@ -50,6 +50,12 @@ impl DeepCodeKernelRuntime {
                 session_id,
                 request,
             } => self.resource_resolve(request_id, run_id, session_id, request),
+            KernelCommand::ArtifactRegister {
+                request_id,
+                run_id,
+                session_id,
+                artifact,
+            } => self.artifact_register(request_id, run_id, session_id, artifact),
             KernelCommand::ActionBatchSubmit {
                 request_id,
                 run_id,
