@@ -18,3 +18,5 @@ tokio.workspace = true
 tower-http.workspace = true
 reqwest.workspace = true
 portable-pty.workspace = true
+async-stream.workspace = true
+bytes.workspace = true

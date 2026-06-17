@@ -283,6 +283,57 @@ pub(crate) async fn llm_chat(
     }
 }
 
+pub(crate) async fn llm_chat_stream(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let profile_id = body
+        .get("profileId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let profile = {
+        let gui = state.gui.lock().expect("gui state lock");
+        resolve_llm_profile(&gui, profile_id.as_deref())
+    };
+    let profile = match profile {
+        Ok(profile) => profile,
+        Err(error) => {
+            let data = json!({
+                "type": "provider_error",
+                "error": error,
+            });
+            let body = format!(
+                "event: provider_error\ndata: {}\n\n",
+                serde_json::to_string(&data).unwrap_or_else(|_| "{\"type\":\"provider_error\"}".to_string())
+            );
+            return (
+                [
+                    (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                body,
+            )
+                .into_response();
+        }
+    };
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut request_envelope = json!({
+        "messages": messages,
+        "tools": body.get("tools").cloned().unwrap_or_else(|| json!([]))
+    });
+    if let Some(response_format) = body
+        .get("responseFormat")
+        .or_else(|| body.get("response_format"))
+    {
+        request_envelope["responseFormat"] = response_format.clone();
+    }
+    llm_stream_response(profile, request_envelope)
+}
+
 pub(crate) fn default_user_settings() -> Value {
     let mut settings = json!({
         "editor.tabSize": 4,

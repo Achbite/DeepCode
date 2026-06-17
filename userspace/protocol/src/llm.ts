@@ -5,6 +5,7 @@ export type LlmProviderKind =
   | 'anthropic'
   | 'ollama';
 
+export type LlmProviderFlavor = 'openai' | 'deepseek' | 'zhipu';
 export type LlmReasoningEffort = 'low' | 'medium' | 'high' | 'max';
 export type LlmThinkingMode = 'enabled' | 'disabled';
 export type LlmResponseFormat = { type: 'json_object' };
@@ -13,6 +14,7 @@ export interface LlmProviderProfile {
   id: string;
   name: string;
   kind: LlmProviderKind;
+  providerFlavor?: LlmProviderFlavor;
   baseUrl?: string;
   model: string;
   contextWindowTokens?: number;
@@ -45,6 +47,7 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     id: 'deepseek-v4-flash-openai',
     name: 'DeepSeek V4 Flash',
     kind: 'openaiCompatible',
+    providerFlavor: 'deepseek',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     model: 'deepseek-v4-flash',
     contextWindowTokens: 1000000,
@@ -58,6 +61,7 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     id: 'deepseek-v4-pro-openai',
     name: 'DeepSeek V4 Pro',
     kind: 'openaiCompatible',
+    providerFlavor: 'deepseek',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     model: 'deepseek-v4-pro',
     contextWindowTokens: 1000000,
@@ -103,13 +107,68 @@ export interface LlmChatChunk {
   type: 'delta' | 'reasoning_delta' | 'tool_call' | 'done' | 'error';
   content?: string;
   toolCall?: ToolCall;
+  toolCallDelta?: {
+    id?: string;
+    index?: number;
+    name?: string;
+    argumentsDelta?: string;
+  };
   error?: string;
+  index?: number;
+  callId?: string;
+  finishReason?: string;
+  usage?: Record<string, unknown>;
+  rawProvider?: unknown;
 }
 
 export interface LlmChatResult {
   chunks: LlmChatChunk[];
   assistantMessage?: LlmChatMessage;
   usage?: Record<string, unknown>;
+}
+
+export type LlmChatStreamEventType =
+  | 'provider_delta'
+  | 'provider_reasoning_delta'
+  | 'provider_tool_call_delta'
+  | 'provider_usage'
+  | 'provider_done'
+  | 'provider_error';
+
+export interface LlmChatStreamEvent {
+  type: LlmChatStreamEventType;
+  chunk?: LlmChatChunk;
+  error?: string;
+  usage?: Record<string, unknown>;
+  rawProvider?: unknown;
+}
+
+export type ProjectionDeltaType =
+  | 'active_turn'
+  | 'assistant_delta'
+  | 'reasoning_delta'
+  | 'tool_call_delta'
+  | 'resource_delta'
+  | 'workunit_delta'
+  | 'stage_delta'
+  | 'committed'
+  | 'error';
+
+export interface ProjectionDelta {
+  type: ProjectionDeltaType;
+  seq?: number;
+  sessionId: string;
+  runId?: string;
+  turnId?: string;
+  itemId?: string;
+  stage?: string;
+  status?: 'queued' | 'running' | 'streaming' | 'waiting' | 'completed' | 'failed';
+  channel?: 'progress' | 'reasoning' | 'final' | 'tool' | 'resource' | 'workunit';
+  source?: 'session' | 'driver' | 'llm' | 'kernel' | 'provider';
+  delta?: string;
+  summary?: string;
+  payload?: unknown;
+  committedEventIds?: string[];
 }
 
 export interface LlmProbeRequest {

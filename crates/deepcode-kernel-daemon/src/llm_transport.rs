@@ -3,8 +3,12 @@
 
 use crate::prelude::*;
 use crate::*;
+use axum::body::Body;
+use bytes::Bytes;
 use deepcode_kernel_abi::{LlmProviderDiagnostic, LlmProviderErrorLayer};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone)]
@@ -12,6 +16,7 @@ pub(crate) struct ResolvedLlmProfile {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) kind: String,
+    pub(crate) provider_flavor: Option<String>,
     pub(crate) base_url: Option<String>,
     pub(crate) model: String,
     pub(crate) max_output_tokens: Option<u32>,
@@ -121,6 +126,11 @@ pub(crate) fn resolve_llm_profile(
             .unwrap_or(&id)
             .to_string(),
         kind,
+        provider_flavor: profile
+            .get("providerFlavor")
+            .or_else(|| profile.get("provider_flavor"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         base_url: profile
             .get("baseUrl")
             .and_then(Value::as_str)
@@ -198,7 +208,7 @@ pub(crate) async fn call_openai_compatible_profile(
         )
     })?;
     let url = normalize_openai_base_url(profile);
-    let body = openai_compatible_request_body(profile, messages, &tools, response_format);
+    let body = openai_compatible_request_body(profile, messages, &tools, response_format, false);
     let response = reqwest::Client::new()
         .post(url)
         .bearer_auth(api_key)
@@ -232,11 +242,12 @@ fn openai_compatible_request_body(
     messages: Vec<Value>,
     tools: &[LlmToolDefinition],
     response_format: Option<&Value>,
+    stream: bool,
 ) -> Value {
     let mut body = json!({
         "model": profile.model,
-        "messages": messages,
-        "stream": false
+        "messages": openai_compatible_messages(messages),
+        "stream": stream
     });
     if let Some(tokens) = effective_openai_compatible_max_tokens(profile) {
         body["max_tokens"] = json!(tokens);
@@ -257,6 +268,12 @@ fn openai_compatible_request_body(
     }
     if is_deepseek_profile(profile) {
         body["user_id"] = json!("deepcode_local");
+        if stream {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
+    }
+    if is_zhipu_profile(profile) && stream && !tools.is_empty() {
+        body["tool_stream"] = json!(true);
     }
     if !tools.is_empty() {
         body["tools"] = json!(tools
@@ -272,6 +289,239 @@ fn openai_compatible_request_body(
             .collect::<Vec<_>>());
     }
     body
+}
+
+fn openai_compatible_messages(messages: Vec<Value>) -> Vec<Value> {
+    messages
+        .into_iter()
+        .map(openai_compatible_message)
+        .collect()
+}
+
+fn openai_compatible_message(message: Value) -> Value {
+    let Some(record) = message.as_object() else {
+        return message;
+    };
+    let role = record
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user");
+    match role {
+        "assistant" => openai_compatible_assistant_message(record),
+        "tool" => openai_compatible_tool_message(record),
+        "system" | "user" => json!({
+            "role": role,
+            "content": message_content_string(record.get("content"))
+        }),
+        _ => json!({
+            "role": role,
+            "content": message_content_string(record.get("content"))
+        }),
+    }
+}
+
+fn openai_compatible_assistant_message(record: &serde_json::Map<String, Value>) -> Value {
+    let mut message = json!({
+        "role": "assistant",
+        "content": message_content_string(record.get("content"))
+    });
+    let tool_calls = record
+        .get("tool_calls")
+        .or_else(|| record.get("toolCalls"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(openai_compatible_tool_call)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+    message
+}
+
+fn openai_compatible_tool_message(record: &serde_json::Map<String, Value>) -> Value {
+    let tool_call_id = record
+        .get("tool_call_id")
+        .or_else(|| record.get("toolCallId"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool-call");
+    json!({
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": message_content_string(record.get("content"))
+    })
+}
+
+fn openai_compatible_tool_call(value: &Value) -> Option<Value> {
+    let record = value.as_object()?;
+    let function = record.get("function").and_then(Value::as_object);
+    let name = function
+        .and_then(|item| item.get("name"))
+        .or_else(|| record.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    let arguments = function
+        .and_then(|item| item.get("arguments"))
+        .or_else(|| record.get("arguments"));
+    Some(json!({
+        "id": record
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("tool-call"),
+        "type": "function",
+        "function": {
+            "name": provider_tool_name(name),
+            "arguments": tool_arguments_string(arguments)
+        }
+    }))
+}
+
+fn message_content_string(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+fn tool_arguments_string(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(value) => serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()),
+        None => "{}".to_string(),
+    }
+}
+
+pub(crate) fn llm_stream_response(profile: ResolvedLlmProfile, request_envelope: Value) -> Response {
+    let stream = async_stream::stream! {
+        if profile.kind.as_str() != "openaiCompatible" {
+            yield Ok::<Bytes, Infallible>(Bytes::from(sse_json_event(
+                "provider_error",
+                json!({
+                    "type": "provider_error",
+                    "error": format!("Streaming is only implemented for openaiCompatible profiles, got {}", profile.kind),
+                }),
+            )));
+            return;
+        }
+
+        let messages = request_envelope
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let tools = request_envelope
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .map(provider_tools_from_values)
+            .unwrap_or_default();
+        let response_format = request_envelope
+            .get("responseFormat")
+            .or_else(|| request_envelope.get("response_format"))
+            .cloned();
+        let Some(api_key) = profile.api_key.clone() else {
+            yield Ok(Bytes::from(sse_json_event(
+                "provider_error",
+                json!({
+                    "type": "provider_error",
+                    "error": format!("LLM profile `{}` has no API key", profile.name),
+                }),
+            )));
+            return;
+        };
+        let body = openai_compatible_request_body(&profile, messages, &tools, response_format.as_ref(), true);
+        let response = match reqwest::Client::new()
+            .post(normalize_openai_base_url(&profile))
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                yield Ok(Bytes::from(sse_json_event(
+                    "provider_error",
+                    json!({ "type": "provider_error", "error": error.to_string() }),
+                )));
+                return;
+            }
+        };
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            yield Ok(Bytes::from(sse_json_event(
+                "provider_error",
+                json!({
+                    "type": "provider_error",
+                    "error": format!("LLM provider returned HTTP {}", status.as_u16()),
+                    "rawProvider": {
+                        "status": status.as_u16(),
+                        "contentType": content_type,
+                        "bodyPreview": provider_body_preview(&body),
+                    },
+                }),
+            )));
+            return;
+        }
+
+        let mut parser = SseDataParser::default();
+        let mut accumulator = OpenAiCompatibleStreamAccumulator::default();
+        let mut response = response;
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let text = String::from_utf8_lossy(&chunk);
+                    for data in parser.push(&text) {
+                        for event in openai_stream_events_from_data(&mut accumulator, &data) {
+                            yield Ok(Bytes::from(event));
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    yield Ok(Bytes::from(sse_json_event(
+                        "provider_error",
+                        json!({ "type": "provider_error", "error": error.to_string() }),
+                    )));
+                    return;
+                }
+            }
+        }
+        for data in parser.finish() {
+            for event in openai_stream_events_from_data(&mut accumulator, &data) {
+                yield Ok(Bytes::from(event));
+            }
+        }
+        if !accumulator.done_emitted {
+            yield Ok(Bytes::from(sse_json_event(
+                "provider_done",
+                json!({
+                    "type": "provider_done",
+                    "chunk": {
+                        "type": "done",
+                        "usage": accumulator.usage,
+                    },
+                    "usage": accumulator.usage,
+                }),
+            )));
+        }
+    };
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| Response::new(Body::from("event: provider_error\ndata: {\"type\":\"provider_error\",\"error\":\"failed to build stream response\"}\n\n")))
 }
 
 fn response_format_is_json_object(response_format: Option<&Value>) -> bool {
@@ -344,9 +594,32 @@ fn should_send_sampling(profile: &ResolvedLlmProfile) -> bool {
 }
 
 fn is_deepseek_profile(profile: &ResolvedLlmProfile) -> bool {
+    if profile
+        .provider_flavor
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case("deepseek"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
     let base_url = profile.base_url.as_deref().unwrap_or_default();
     profile.model.to_ascii_lowercase().contains("deepseek")
         || base_url.to_ascii_lowercase().contains("deepseek")
+}
+
+fn is_zhipu_profile(profile: &ResolvedLlmProfile) -> bool {
+    if profile
+        .provider_flavor
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case("zhipu"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let base_url = profile.base_url.as_deref().unwrap_or_default();
+    let model = profile.model.to_ascii_lowercase();
+    let base = base_url.to_ascii_lowercase();
+    model.contains("glm") || model.contains("zhipu") || base.contains("bigmodel") || base.contains("zhipu")
 }
 
 fn provider_tool_name(name: &str) -> String {
@@ -773,6 +1046,270 @@ fn provider_schema_error(
     )
 }
 
+#[derive(Debug, Default)]
+struct SseDataParser {
+    buffer: String,
+}
+
+impl SseDataParser {
+    fn push(&mut self, chunk: &str) -> Vec<String> {
+        self.buffer.push_str(chunk);
+        self.drain_complete_events()
+    }
+
+    fn finish(&mut self) -> Vec<String> {
+        let mut events = self.drain_complete_events();
+        if !self.buffer.trim().is_empty() {
+            events.extend(parse_sse_event(&self.buffer));
+            self.buffer.clear();
+        }
+        events
+    }
+
+    fn drain_complete_events(&mut self) -> Vec<String> {
+        let mut events = Vec::new();
+        while let Some(index) = self.buffer.find("\n\n") {
+            let raw = self.buffer[..index].to_string();
+            self.buffer = self.buffer[index + 2..].to_string();
+            events.extend(parse_sse_event(&raw));
+        }
+        events
+    }
+}
+
+fn parse_sse_event(raw: &str) -> Vec<String> {
+    let mut data_lines = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+    if data_lines.is_empty() {
+        Vec::new()
+    } else {
+        vec![data_lines.join("\n")]
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolCallDeltaBuffer {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+#[derive(Debug, Default)]
+struct OpenAiCompatibleStreamAccumulator {
+    content: String,
+    reasoning: String,
+    tool_calls: BTreeMap<i64, ToolCallDeltaBuffer>,
+    usage: Option<Value>,
+    done_emitted: bool,
+}
+
+impl OpenAiCompatibleStreamAccumulator {
+    fn output(&self) -> LlmChatOutput {
+        let tool_calls = self
+            .tool_calls
+            .iter()
+            .filter_map(|(index, buffer)| {
+                let name = buffer.name.clone()?;
+                let arguments = if buffer.arguments.trim().is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str(&buffer.arguments).unwrap_or_else(|_| {
+                        json!({ "rawArguments": buffer.arguments })
+                    })
+                };
+                Some(LlmToolCall {
+                    id: buffer
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("tool-call-{index}")),
+                    name: internal_tool_name(&name),
+                    arguments,
+                })
+            })
+            .collect::<Vec<_>>();
+        LlmChatOutput {
+            content: self.content.clone(),
+            reasoning: (!self.reasoning.is_empty()).then(|| self.reasoning.clone()),
+            tool_calls,
+            usage: self.usage.clone(),
+        }
+    }
+}
+
+pub(crate) fn parse_openai_compatible_sse_text(text: &str) -> LlmChatOutput {
+    let mut parser = SseDataParser::default();
+    let mut accumulator = OpenAiCompatibleStreamAccumulator::default();
+    for data in parser.push(text).into_iter().chain(parser.finish()) {
+        let _ = openai_stream_events_from_data(&mut accumulator, &data);
+    }
+    accumulator.output()
+}
+
+fn openai_stream_events_from_data(
+    accumulator: &mut OpenAiCompatibleStreamAccumulator,
+    data: &str,
+) -> Vec<String> {
+    if data.trim() == "[DONE]" {
+        accumulator.done_emitted = true;
+        return vec![sse_json_event(
+            "provider_done",
+            json!({
+                "type": "provider_done",
+                "chunk": {
+                    "type": "done",
+                    "usage": accumulator.usage,
+                },
+                "usage": accumulator.usage,
+            }),
+        )];
+    }
+    let value = match serde_json::from_str::<Value>(data) {
+        Ok(value) => value,
+        Err(error) => {
+            return vec![sse_json_event(
+                "provider_error",
+                json!({
+                    "type": "provider_error",
+                    "error": error.to_string(),
+                    "rawProvider": data,
+                }),
+            )];
+        }
+    };
+    openai_stream_events_from_value(accumulator, value)
+}
+
+fn openai_stream_events_from_value(
+    accumulator: &mut OpenAiCompatibleStreamAccumulator,
+    value: Value,
+) -> Vec<String> {
+    let mut events = Vec::new();
+    if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()).cloned() {
+        accumulator.usage = Some(usage.clone());
+        events.push(sse_json_event(
+            "provider_usage",
+            json!({
+                "type": "provider_usage",
+                "usage": usage,
+                "chunk": {
+                    "type": "done",
+                    "usage": usage,
+                },
+            }),
+        ));
+    }
+    let choices = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for choice in choices {
+        let index = choice.get("index").and_then(Value::as_i64).unwrap_or(0);
+        let finish_reason = choice.get("finish_reason").and_then(Value::as_str).map(str::to_string);
+        let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
+        if let Some(reasoning) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            accumulator.reasoning.push_str(reasoning);
+            events.push(sse_json_event(
+                "provider_reasoning_delta",
+                json!({
+                    "type": "provider_reasoning_delta",
+                    "chunk": {
+                        "type": "reasoning_delta",
+                        "content": reasoning,
+                        "index": index,
+                        "finishReason": finish_reason,
+                        "rawProvider": choice.clone(),
+                    },
+                }),
+            ));
+        }
+        if let Some(content) = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            accumulator.content.push_str(content);
+            events.push(sse_json_event(
+                "provider_delta",
+                json!({
+                    "type": "provider_delta",
+                    "chunk": {
+                        "type": "delta",
+                        "content": content,
+                        "index": index,
+                        "finishReason": finish_reason,
+                        "rawProvider": choice.clone(),
+                    },
+                }),
+            ));
+        }
+        for tool_call in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let tool_index = tool_call
+                .get("index")
+                .and_then(Value::as_i64)
+                .unwrap_or(index);
+            let buffer = accumulator.tool_calls.entry(tool_index).or_default();
+            if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                buffer.id = Some(id.to_string());
+            }
+            let function = tool_call.get("function").cloned().unwrap_or_else(|| json!({}));
+            if let Some(name) = function.get("name").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+                buffer.name = Some(name.to_string());
+            }
+            let arguments_delta = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !arguments_delta.is_empty() {
+                buffer.arguments.push_str(&arguments_delta);
+            }
+            events.push(sse_json_event(
+                "provider_tool_call_delta",
+                json!({
+                    "type": "provider_tool_call_delta",
+                    "chunk": {
+                        "type": "tool_call",
+                        "index": tool_index,
+                        "callId": buffer.id.clone(),
+                        "finishReason": finish_reason,
+                        "toolCallDelta": {
+                            "id": buffer.id.clone(),
+                            "index": tool_index,
+                            "name": buffer.name.clone(),
+                            "argumentsDelta": arguments_delta,
+                        },
+                        "rawProvider": tool_call.clone(),
+                    },
+                }),
+            ));
+        }
+    }
+    events
+}
+
+fn sse_json_event(event: &str, value: Value) -> String {
+    let data = serde_json::to_string(&value).unwrap_or_else(|_| {
+        "{\"type\":\"provider_error\",\"error\":\"failed to serialize stream event\"}".to_string()
+    });
+    format!("event: {event}\ndata: {data}\n\n")
+}
+
 pub(crate) fn parse_openai_message(message: &Value) -> LlmChatOutput {
     let content = message
         .get("content")
@@ -926,6 +1463,7 @@ mod tests {
             id: "profile-1".to_string(),
             name: "DeepSeek V4 Pro".to_string(),
             kind: "openaiCompatible".to_string(),
+            provider_flavor: Some("deepseek".to_string()),
             base_url: Some("https://api.example.test/v1".to_string()),
             model: "deepseek-v4-pro".to_string(),
             max_output_tokens: Some(1024),
@@ -980,6 +1518,7 @@ mod tests {
             vec![json!({ "role": "user", "content": "hello" })],
             &[],
             None,
+            false,
         );
 
         assert_eq!(
@@ -998,6 +1537,7 @@ mod tests {
             vec![json!({ "role": "user", "content": "hello" })],
             &[],
             None,
+            false,
         );
 
         assert_eq!(body["max_tokens"].as_u64(), Some(2048));
@@ -1010,12 +1550,105 @@ mod tests {
             vec![json!({ "role": "user", "content": "hello" })],
             &[],
             Some(&json!({ "type": "json_object" })),
+            false,
         );
 
         assert_eq!(
             body["response_format"]["type"].as_str(),
             Some("json_object")
         );
+    }
+
+    #[test]
+    fn deepseek_stream_request_includes_usage_options() {
+        let body = openai_compatible_request_body(
+            &test_profile(),
+            vec![json!({ "role": "user", "content": "hello" })],
+            &[],
+            None,
+            true,
+        );
+
+        assert_eq!(body["stream"].as_bool(), Some(true));
+        assert_eq!(
+            body["stream_options"]["include_usage"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn zhipu_stream_request_enables_tool_stream_for_tools() {
+        let mut profile = test_profile();
+        profile.name = "Zhipu GLM".to_string();
+        profile.provider_flavor = Some("zhipu".to_string());
+        profile.base_url = Some("https://open.bigmodel.cn/api/paas/v4".to_string());
+        profile.model = "glm-4.5".to_string();
+        let tools = vec![LlmToolDefinition {
+            name: "fs.read".to_string(),
+            description: "Read a generic file.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }),
+        }];
+
+        let body = openai_compatible_request_body(
+            &profile,
+            vec![json!({ "role": "user", "content": "hello" })],
+            &tools,
+            None,
+            true,
+        );
+
+        assert_eq!(body["stream"].as_bool(), Some(true));
+        assert_eq!(body["tool_stream"].as_bool(), Some(true));
+        assert_eq!(
+            body["tools"][0]["function"]["name"].as_str(),
+            Some("fs__read")
+        );
+    }
+
+    #[test]
+    fn openai_request_body_normalizes_internal_tool_messages() {
+        let body = openai_compatible_request_body(
+            &test_profile(),
+            vec![
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "toolCalls": [{
+                        "id": "call-generic",
+                        "name": "fs.read",
+                        "arguments": { "path": "generic.txt" }
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "toolCallId": "call-generic",
+                    "content": { "ok": true }
+                }),
+            ],
+            &[],
+            None,
+            true,
+        );
+
+        let assistant = &body["messages"][0];
+        assert!(assistant.get("toolCalls").is_none());
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["name"].as_str(),
+            Some("fs__read")
+        );
+        let arguments = assistant["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        let parsed: Value = serde_json::from_str(arguments).unwrap();
+        assert_eq!(parsed["path"].as_str(), Some("generic.txt"));
+
+        let tool = &body["messages"][1];
+        assert!(tool.get("toolCallId").is_none());
+        assert_eq!(tool["tool_call_id"].as_str(), Some("call-generic"));
+        assert_eq!(tool["content"].as_str(), Some("{\"ok\":true}"));
     }
 
     #[test]
@@ -1038,5 +1671,42 @@ mod tests {
         assert_eq!(payload["usage"]["prompt_tokens"].as_u64(), Some(100));
         assert_eq!(payload["usage"]["completion_tokens"].as_u64(), Some(12));
         assert_eq!(payload["usage"]["total_tokens"].as_u64(), Some(112));
+    }
+
+    #[test]
+    fn openai_sse_parser_collects_content_reasoning_and_usage() {
+        let output = parse_openai_compatible_sse_text(
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"reason "}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"hel"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}
+
+data: [DONE]
+
+"#,
+        );
+
+        assert_eq!(output.reasoning.as_deref(), Some("reason "));
+        assert_eq!(output.content, "hello");
+        assert_eq!(output.usage.unwrap()["total_tokens"].as_u64(), Some(6));
+    }
+
+    #[test]
+    fn openai_sse_parser_accumulates_tool_call_arguments() {
+        let output = parse_openai_compatible_sse_text(
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-generic","function":{"name":"fs__read","arguments":"{\"pa"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"generic.txt\"}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#,
+        );
+
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].id, "call-generic");
+        assert_eq!(output.tool_calls[0].name, "fs.read");
+        assert_eq!(output.tool_calls[0].arguments["path"].as_str(), Some("generic.txt"));
     }
 }

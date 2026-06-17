@@ -122,6 +122,7 @@ async fn main() {
         )
         .route("/api/llm/probe", post(llm_probe))
         .route("/api/llm/chat", post(llm_chat))
+        .route("/api/llm/chat/stream", post(llm_chat_stream))
         .route("/api/code/search", post(code_search))
         .route("/api/git/status", get(git_status))
         .route("/api/git/diff", get(git_diff))
