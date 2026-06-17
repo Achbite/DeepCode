@@ -35,6 +35,7 @@ import type {
   ListAgentSessionsRequest,
   ListToolsResult,
   LlmChatRequest,
+  LlmChatStreamEvent,
   LlmChatResult,
   LlmProbeRequest,
   LlmProbeResult,
@@ -92,6 +93,12 @@ export interface RuntimeStatus {
   version: string;
   platform: string;
   arch?: string;
+}
+
+export interface KernelStartResult {
+  started: boolean;
+  blocked: boolean;
+  message: string;
 }
 
 export function healthVersion(health?: HealthStatus): string {
@@ -173,6 +180,27 @@ export async function closeAppWindow(): Promise<void> {
   await runWindowCommand('close', () => {
     window.close();
   });
+}
+
+export async function startKernelAfterPermission(): Promise<ApiResponse<KernelStartResult>> {
+  const invoke = getTauriInvoke();
+  if (!invoke) {
+    return {
+      ok: false,
+      error: 'kernel_start_unavailable',
+      message: 'Kernel retry is only available in the desktop shell.',
+    };
+  }
+  try {
+    const result = await invoke<KernelStartResult>('deepcode_start_kernel_after_permission');
+    return { ok: true, data: result };
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'kernel_start_failed',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 export async function getDefaultWorkspacePath(): Promise<ApiResponse<string | null>> {
@@ -391,6 +419,13 @@ export function probeLlmProfile(
 
 export function llmChat(request: LlmChatRequest): Promise<ApiResponse<LlmChatResult>> {
   return api.llmChat(request);
+}
+
+export function llmChatStream(
+  request: LlmChatRequest,
+  onEvent: (event: LlmChatStreamEvent) => void | Promise<void>
+): Promise<ApiResponse<LlmChatResult>> {
+  return api.llmChatStream(request, onEvent);
 }
 
 export function kernelCommand(request: KernelCommandEnvelope): Promise<KernelReply> {

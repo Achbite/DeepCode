@@ -15,6 +15,9 @@ interface DeepCodeWorkbenchLayoutProps {
   wsStatus: string;
   serverVersion?: string;
   lastHeartbeatAt?: string;
+  kernelStartBusy?: boolean;
+  kernelStartMessage?: string | null;
+  onRetryKernelStart?: () => void | Promise<void>;
 }
 
 const WorkspaceOpenDialog = lazy(() => import('../../components/workspace-open-dialog/WorkspaceOpenDialog'));
@@ -381,12 +384,16 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   wsStatus,
   serverVersion,
   lastHeartbeatAt,
+  kernelStartBusy = false,
+  kernelStartMessage,
+  onRetryKernelStart,
 }) => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [knownSessions, setKnownSessions] = useState<AgentSession[]>([]);
   const [projectRecords, setProjectRecords] = useState<DeepCodeGuiProject[]>(() => readGuiProjects());
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [draftTargetProjectId, setDraftTargetProjectId] = useState<string | null>(null);
+  const [standaloneDraftActive, setStandaloneDraftActive] = useState(false);
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
   const [sessionMenu, setSessionMenu] = useState<DeepCodeSessionContextMenu | null>(null);
   const [projectMenu, setProjectMenu] = useState<DeepCodeProjectContextMenu | null>(null);
@@ -514,8 +521,9 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   }, [activeSession, events.length, knownSessions, sessions]);
   const activeSessionRunning = Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id));
   const projectDraftActive = Boolean(draftTargetProjectId);
-  const highlightedSessionId = projectDraftActive ? null : activeSession?.id ?? null;
-  const isHome = projectDraftActive
+  const anyDraftActive = standaloneDraftActive || projectDraftActive;
+  const highlightedSessionId = anyDraftActive ? null : activeSession?.id ?? null;
+  const isHome = anyDraftActive
     || (events.length === 0 && !loadingSession && !activeSessionRunning);
   const visibleSessions = useMemo(
     () => displaySessions.filter((item) => {
@@ -564,13 +572,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     pendingProjectSendRef.current = null;
     setActiveProjectId(null);
     setDraftTargetProjectId(targetProjectId);
-    if (targetProjectId) {
-      return;
-    }
-    const nextSession = await createNewSession({ reuseEmpty: false });
-    if (nextSession?.id) {
-      upsertKnownSession(nextSession);
-    }
+    setStandaloneDraftActive(!targetProjectId);
   };
 
   const toggleProjectExpanded = (projectId: string) => {
@@ -582,21 +584,26 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   };
 
   const prepareProjectDraftSession = async () => {
-    if (!draftTargetProjectId) return true;
+    if (!draftTargetProjectId && !standaloneDraftActive) return true;
     const targetProjectId = draftTargetProjectId;
     pendingProjectSendRef.current = null;
     const nextSession = await createNewSession({ reuseEmpty: false });
     if (!nextSession?.id) {
       return false;
     }
-    pendingProjectSendRef.current = {
-      projectId: targetProjectId,
-      sessionId: nextSession.id,
-    };
-    moveSessionToProject(targetProjectId, nextSession.id);
+    if (targetProjectId) {
+      pendingProjectSendRef.current = {
+        projectId: targetProjectId,
+        sessionId: nextSession.id,
+      };
+      moveSessionToProject(targetProjectId, nextSession.id);
+      setActiveProjectId(targetProjectId);
+    } else {
+      setActiveProjectId(null);
+    }
     upsertKnownSession(nextSession);
-    setActiveProjectId(targetProjectId);
     setDraftTargetProjectId(null);
+    setStandaloneDraftActive(false);
     return true;
   };
 
@@ -637,6 +644,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     setProjectRecords((current) => [project, ...current]);
     setActiveProjectId(null);
     setDraftTargetProjectId(project.id);
+    setStandaloneDraftActive(false);
   };
 
   const openSessionContextMenu = (
@@ -748,6 +756,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       setActiveProjectId(projectId);
     }
     setDraftTargetProjectId(null);
+    setStandaloneDraftActive(false);
   };
 
   const handleDeleteProject = (project: DeepCodeGuiProject) => {
@@ -770,6 +779,19 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             <span className="deepcode-gui-status-pill deepcode-gui-status-pill--cache" title={cacheHitSummary.title}>
               {cacheHitSummary.label}
             </span>
+          )}
+          {apiStatus !== 'connected' && onRetryKernelStart && (
+            <button
+              type="button"
+              className="deepcode-gui-status-pill deepcode-gui-status-pill--button"
+              title={kernelStartMessage ?? undefined}
+              disabled={kernelStartBusy}
+              onClick={() => void onRetryKernelStart()}
+            >
+              {kernelStartBusy
+                ? (language === 'zh-CN' ? '启动中' : 'Starting')
+                : (language === 'zh-CN' ? '重试' : 'Retry')}
+            </button>
           )}
           <span className={`deepcode-gui-status-pill deepcode-gui-status-pill--${apiStatus}`}>API {statusLabel(language, apiStatus)}</span>
         </div>
@@ -813,10 +835,14 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                   const projectCollapsed = Boolean(
                     group.projectId && collapsedProjectIdSet.has(group.projectId)
                   );
+                  const projectIsCurrent = Boolean(
+                    group.projectId
+                    && (group.projectId === activeProjectId || group.projectId === draftTargetProjectId)
+                  );
                   return (
                     <div
                       key={group.key}
-                      className="deepcode-gui-project-archive-group"
+                      className={`deepcode-gui-project-archive-group${projectIsCurrent ? ' deepcode-gui-project-archive-group--current' : ''}`}
                     >
                       <div
                         className="deepcode-gui-project-archive-group__title"
@@ -868,6 +894,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                                   pendingProjectSendRef.current = null;
                                   setActiveProjectId(group.projectId ?? null);
                                   setDraftTargetProjectId(null);
+                                  setStandaloneDraftActive(false);
                                   void activateSession(item.id);
                                 }}
                                 onContextMenu={(event) => openSessionContextMenu(event, item)}
@@ -915,6 +942,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                       pendingProjectSendRef.current = null;
                       setActiveProjectId(null);
                       setDraftTargetProjectId(null);
+                      setStandaloneDraftActive(false);
                       void activateSession(item.id);
                     }}
                     onContextMenu={(event) => openSessionContextMenu(event, item)}
@@ -944,8 +972,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         <main className="deepcode-gui-session-main">
           <DeepCodeAgentPanel
             language={language}
-            forceHome={projectDraftActive}
-            homeProjectTitle={draftProject?.title ?? activeProject?.title ?? null}
+            forceHome={anyDraftActive}
+            homeProjectTitle={draftProject?.title ?? null}
             onBeforeSend={prepareProjectDraftSession}
             onAfterSend={commitDraftProjectSession}
           />

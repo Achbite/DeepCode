@@ -8,7 +8,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use deepcode_kernel_client::{HttpKernelClient, KernelClientConfig};
+use deepcode_kernel_client::{KernelBootstrap, KernelBootstrapOptions};
 use renderer::Renderer;
 use std::{
     env,
@@ -24,11 +24,18 @@ async fn main() {
         return;
     }
 
-    let client = HttpKernelClient::new(
-        args.api
-            .map(KernelClientConfig::new)
-            .unwrap_or_else(KernelClientConfig::from_env),
-    );
+    let bootstrap = match KernelBootstrap::connect(
+        KernelBootstrapOptions::new(args.api).auto_start(!args.no_auto_start_kernel),
+    )
+    .await
+    {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            eprintln!("deepcode-tui failed to connect Kernel: {error}");
+            std::process::exit(1);
+        }
+    };
+    let client = bootstrap.client().clone();
     let renderer = Renderer::default();
     let mut app = TuiApp::new(
         client,
@@ -42,6 +49,7 @@ async fn main() {
 
     if args.smoke {
         print!("{}", app.renderer().render_plain(app.cards()));
+        drop(bootstrap);
         return;
     }
 
@@ -63,6 +71,7 @@ struct Args {
     smoke: bool,
     workspace: Option<String>,
     no_workspace: bool,
+    no_auto_start_kernel: bool,
 }
 
 impl Args {
@@ -73,6 +82,7 @@ impl Args {
             smoke: false,
             workspace: None,
             no_workspace: false,
+            no_auto_start_kernel: false,
         };
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -80,6 +90,7 @@ impl Args {
                 "--help" | "-h" => parsed.help = true,
                 "--smoke" => parsed.smoke = true,
                 "--api" => parsed.api = iter.next(),
+                "--no-auto-start-kernel" => parsed.no_auto_start_kernel = true,
                 "--workspace" | "-C" => parsed.workspace = iter.next(),
                 "--no-workspace" => parsed.no_workspace = true,
                 _ => {}
@@ -166,8 +177,14 @@ Usage:
   deepcode-tui
   deepcode-tui --smoke
   deepcode-tui --api <url>
+  deepcode-tui --no-auto-start-kernel
   deepcode-tui --workspace <path>
   deepcode-tui --no-workspace
+
+Kernel:
+  默认先连接 --api / DEEPCODE_API_URL / DEEPCODE_HOST:DEEPCODE_PORT。
+  本地 API 不可达时会后台启动同目录或开发产物中的 deepcode-kernel。
+  设置 DEEPCODE_KERNEL_AUTO_START=0 或传 --no-auto-start-kernel 可禁用。
 
 Interactive commands:
   /help              显示 TUI 命令

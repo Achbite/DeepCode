@@ -1,11 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::Serialize;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
 
@@ -25,6 +24,16 @@ impl KernelProcess {
     fn new(child: Option<Child>) -> Self {
         Self {
             child: Mutex::new(child),
+        }
+    }
+
+    fn replace(&self, child: Option<Child>) {
+        if let Ok(mut current) = self.child.lock() {
+            if let Some(mut process) = current.take() {
+                let _ = process.kill();
+                let _ = process.wait();
+            }
+            *current = child;
         }
     }
 
@@ -52,6 +61,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             deepcode_boot_target,
             deepcode_default_workspace_path,
+            deepcode_start_kernel_after_permission,
             deepcode_window_minimize,
             deepcode_window_toggle_maximize,
             deepcode_window_close
@@ -59,10 +69,12 @@ fn main() {
         .setup(|app| {
             let target = resolve_launch_target();
             app.manage(target.clone());
-            let child = spawn_kernel_if_available(&target.host, &target.port);
-            app.manage(KernelProcess::new(child));
-            wait_for_kernel_port(&target.host, &target.port);
+            app.manage(KernelProcess::new(None));
             create_main_window(app, &target)?;
+            if startup_permission_preflight(APP_ASSET_DIR) {
+                let child = spawn_kernel_if_available(&target.host, &target.port);
+                app.state::<KernelProcess>().replace(child);
+            }
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -83,6 +95,14 @@ struct LaunchTarget {
     port: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KernelStartResult {
+    started: bool,
+    blocked: bool,
+    message: String,
+}
+
 #[tauri::command]
 fn deepcode_boot_target(target: State<'_, LaunchTarget>) -> LaunchTarget {
     target.inner().clone()
@@ -91,6 +111,33 @@ fn deepcode_boot_target(target: State<'_, LaunchTarget>) -> LaunchTarget {
 #[tauri::command]
 fn deepcode_default_workspace_path() -> Option<String> {
     default_workspace_path().map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn deepcode_start_kernel_after_permission(
+    target: State<'_, LaunchTarget>,
+    kernel: State<'_, KernelProcess>,
+) -> KernelStartResult {
+    if !startup_permission_preflight(APP_ASSET_DIR) {
+        return KernelStartResult {
+            started: false,
+            blocked: true,
+            message: "startup permission preflight did not complete".to_string(),
+        };
+    }
+
+    let child = spawn_kernel_if_available(&target.host, &target.port);
+    let started = child.is_some();
+    kernel.replace(child);
+    KernelStartResult {
+        started,
+        blocked: false,
+        message: if started {
+            "kernel start requested".to_string()
+        } else {
+            "kernel binary was not found or could not be started".to_string()
+        },
+    }
 }
 
 #[tauri::command]
@@ -160,25 +207,52 @@ fn create_main_window(
     Ok(())
 }
 
-fn connect_kernel_api(endpoint: &str) -> std::io::Result<TcpStream> {
-    let mut last_error = None;
-    for _ in 0..40 {
-        match TcpStream::connect(endpoint) {
-            Ok(stream) => return Ok(stream),
-            Err(err) => {
-                last_error = Some(err);
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
+fn startup_permission_preflight(web_dir_name: &str) -> bool {
+    if env_truthy("DEEPCODE_SKIP_STARTUP_PERMISSION_PREFLIGHT") || !cfg!(target_os = "macos") {
+        return true;
     }
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, "kernel api connect timed out")
-    }))
+
+    let Some(exe_dir) = current_exe_dir() else {
+        return true;
+    };
+    let mut paths = Vec::new();
+    if let Some(path) = std::env::var_os("DEEPCODE_CONFIG_DIR").map(PathBuf::from) {
+        paths.push(path);
+    }
+    if let Some(path) = std::env::var_os("DEEPCODE_CLIENT_DIST").map(PathBuf::from) {
+        paths.push(path);
+    }
+    if let Some(path) = std::env::var_os("DEEPCODE_DEFAULT_WORKSPACE").map(PathBuf::from) {
+        paths.push(path);
+    }
+    if let Some(path) = find_bundled_dir(&exe_dir, web_dir_name) {
+        paths.push(path);
+    }
+    if let Some(path) = package_root(&exe_dir) {
+        paths.push(path);
+    }
+
+    paths.iter().all(|path| path_permission_available(path))
 }
 
-fn wait_for_kernel_port(host: &str, port: &str) {
-    let endpoint = format!("{host}:{port}");
-    let _ = connect_kernel_api(&endpoint);
+fn path_permission_available(path: &Path) -> bool {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return error.kind() != std::io::ErrorKind::PermissionDenied,
+    };
+    if metadata.is_dir() {
+        return match std::fs::read_dir(path) {
+            Ok(mut entries) => {
+                let _ = entries.next();
+                true
+            }
+            Err(error) => error.kind() != std::io::ErrorKind::PermissionDenied,
+        };
+    }
+    match std::fs::File::open(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::PermissionDenied,
+    }
 }
 
 fn serve_bundled_asset(web_dir_name: &str, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
@@ -363,25 +437,7 @@ fn default_workspace_path() -> Option<PathBuf> {
             return Some(path);
         }
     }
-
-    platform_desktop_dir()
-        .filter(|path| path.is_dir())
-        .or_else(|| user_home_dir().filter(|path| path.is_dir()))
-}
-
-fn platform_desktop_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "linux") {
-        if let Some(path) = std::env::var_os("XDG_DESKTOP_DIR").map(PathBuf::from) {
-            return Some(path);
-        }
-    }
-    user_home_dir().map(|home| home.join("Desktop"))
-}
-
-fn user_home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+    None
 }
 
 fn env_truthy(name: &str) -> bool {

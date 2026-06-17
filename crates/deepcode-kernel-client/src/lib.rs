@@ -1,9 +1,15 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 use thiserror::Error;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 #[derive(Debug, Error)]
 pub enum KernelClientError {
@@ -17,6 +23,8 @@ pub enum KernelClientError {
     MissingField(&'static str),
     #[error("session host bridge failed: {0}")]
     Bridge(String),
+    #[error("kernel bootstrap failed: {0}")]
+    Bootstrap(String),
 }
 
 pub type KernelClientResult<T> = Result<T, KernelClientError>;
@@ -53,7 +61,10 @@ impl HttpKernelClient {
     pub fn new(config: KernelClientConfig) -> Self {
         Self {
             config,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -305,6 +316,119 @@ impl HttpKernelClient {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct KernelBootstrapOptions {
+    pub api: Option<String>,
+    pub auto_start: bool,
+}
+
+impl KernelBootstrapOptions {
+    pub fn new(api: Option<String>) -> Self {
+        Self {
+            api,
+            auto_start: true,
+        }
+    }
+
+    pub fn auto_start(mut self, auto_start: bool) -> Self {
+        self.auto_start = auto_start;
+        self
+    }
+}
+
+pub struct KernelBootstrap {
+    client: HttpKernelClient,
+    _guard: KernelBootstrapGuard,
+}
+
+impl KernelBootstrap {
+    pub async fn connect(options: KernelBootstrapOptions) -> KernelClientResult<Self> {
+        let config = options
+            .api
+            .map(KernelClientConfig::new)
+            .unwrap_or_else(KernelClientConfig::from_env);
+        let client = HttpKernelClient::new(config);
+        if probe_kernel_health(&client).await {
+            return Ok(Self {
+                client,
+                _guard: KernelBootstrapGuard::external(),
+            });
+        }
+
+        if !kernel_auto_start_enabled(options.auto_start) {
+            return Ok(Self {
+                client,
+                _guard: KernelBootstrapGuard::external(),
+            });
+        }
+
+        if !is_local_kernel_url(client.base_url()) {
+            return Ok(Self {
+                client,
+                _guard: KernelBootstrapGuard::external(),
+            });
+        }
+
+        let (host, port) = parse_kernel_host_port(client.base_url()).ok_or_else(|| {
+            KernelClientError::Bootstrap(format!(
+                "cannot resolve local host/port from {}",
+                client.base_url()
+            ))
+        })?;
+        let kernel_bin = find_kernel_binary().ok_or_else(|| {
+            KernelClientError::Bootstrap(
+                "cannot find deepcode-kernel or deepcode-kernel-daemon; set DEEPCODE_KERNEL_BIN"
+                    .to_string(),
+            )
+        })?;
+        let mut child = spawn_kernel_binary(&kernel_bin, &host, &port)?;
+
+        for _ in 0..80 {
+            if probe_kernel_health(&client).await {
+                return Ok(Self {
+                    client,
+                    _guard: KernelBootstrapGuard::owned(child),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(75));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(KernelClientError::Bootstrap(format!(
+            "kernel did not become healthy at {}",
+            client.base_url()
+        )))
+    }
+
+    pub fn client(&self) -> &HttpKernelClient {
+        &self.client
+    }
+}
+
+pub struct KernelBootstrapGuard {
+    child: Option<Child>,
+}
+
+impl KernelBootstrapGuard {
+    fn external() -> Self {
+        Self { child: None }
+    }
+
+    fn owned(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+}
+
+impl Drop for KernelBootstrapGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub service: String,
@@ -548,6 +672,213 @@ fn find_bridge_from_root(root: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+async fn probe_kernel_health(client: &HttpKernelClient) -> bool {
+    if !probe_kernel_tcp(client.base_url()) {
+        return false;
+    }
+    matches!(client.health().await, Ok(status) if status.ok)
+}
+
+fn probe_kernel_tcp(base_url: &str) -> bool {
+    let Some((host, port)) = parse_kernel_host_port(base_url) else {
+        return false;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return false;
+    };
+    let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|addr| connect_socket(addr, Duration::from_millis(180)).is_ok())
+}
+
+fn connect_socket(addr: SocketAddr, timeout: Duration) -> std::io::Result<TcpStream> {
+    TcpStream::connect_timeout(&addr, timeout)
+}
+
+fn kernel_auto_start_enabled(default_enabled: bool) -> bool {
+    match std::env::var("DEEPCODE_KERNEL_AUTO_START") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => default_enabled,
+    }
+}
+
+fn parse_kernel_host_port(base_url: &str) -> Option<(String, String)> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let (scheme, rest) = trimmed.split_once("://")?;
+    let authority = rest.split('/').next()?.split('@').next_back()?;
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (host, tail) = after_bracket.split_once(']')?;
+        let port = tail
+            .strip_prefix(':')
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| default_port_for_scheme(scheme).to_string());
+        return Some((host.to_string(), port));
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .map(|(host, port)| (host.to_string(), port.to_string()))
+        .unwrap_or_else(|| {
+            (
+                authority.to_string(),
+                default_port_for_scheme(scheme).to_string(),
+            )
+        });
+    Some((host, port))
+}
+
+fn default_port_for_scheme(scheme: &str) -> &'static str {
+    if scheme.eq_ignore_ascii_case("https") {
+        "443"
+    } else {
+        "80"
+    }
+}
+
+fn is_local_kernel_url(base_url: &str) -> bool {
+    let Some((host, _)) = parse_kernel_host_port(base_url) else {
+        return false;
+    };
+    matches!(
+        host.trim_matches(|ch| ch == '[' || ch == ']')
+            .to_ascii_lowercase()
+            .as_str(),
+        "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"
+    )
+}
+
+fn find_kernel_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("DEEPCODE_KERNEL_BIN").map(PathBuf::from) {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let mut roots = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            roots.push(parent.to_path_buf());
+            if cfg!(target_os = "macos") {
+                if let Some(contents) = parent.parent() {
+                    roots.push(contents.join("MacOS"));
+                    roots.push(contents.join("Resources"));
+                }
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+
+    for root in &roots {
+        for candidate in kernel_binary_candidates(root) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for root in roots {
+        for ancestor in root.ancestors() {
+            for profile in ["debug", "release"] {
+                for name in kernel_binary_names() {
+                    let direct = ancestor.join("target").join(profile).join(name);
+                    if direct.is_file() {
+                        return Some(direct);
+                    }
+                    let nested = ancestor
+                        .join("DeepCode")
+                        .join("target")
+                        .join(profile)
+                        .join(name);
+                    if nested.is_file() {
+                        return Some(nested);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn kernel_binary_candidates(root: &Path) -> Vec<PathBuf> {
+    kernel_binary_names()
+        .into_iter()
+        .map(|name| root.join(name))
+        .collect()
+}
+
+fn kernel_binary_names() -> Vec<&'static str> {
+    if cfg!(windows) {
+        vec!["deepcode-kernel.exe", "deepcode-kernel-daemon.exe"]
+    } else {
+        vec!["deepcode-kernel", "deepcode-kernel-daemon"]
+    }
+}
+
+fn spawn_kernel_binary(kernel_bin: &Path, host: &str, port: &str) -> KernelClientResult<Child> {
+    let kernel_dir = kernel_bin
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let log_file = open_kernel_log_file(&kernel_dir)?;
+    let stderr = log_file.try_clone().map_err(|error| {
+        KernelClientError::Bootstrap(format!("failed to clone kernel log handle: {error}"))
+    })?;
+    let mut command = Command::new(kernel_bin);
+    command
+        .current_dir(&kernel_dir)
+        .env("DEEPCODE_HOST", host)
+        .env("DEEPCODE_PORT", port)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr));
+
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+
+    command.spawn().map_err(|error| {
+        KernelClientError::Bootstrap(format!("failed to start {}: {error}", kernel_bin.display()))
+    })
+}
+
+fn open_kernel_log_file(kernel_dir: &Path) -> KernelClientResult<File> {
+    let log_dir = std::env::var_os("DEEPCODE_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| kernel_dir.join("logs"));
+    match open_log_in_dir(&log_dir) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            open_log_in_dir(&std::env::temp_dir().join("deepcode")).map_err(|fallback_error| {
+                KernelClientError::Bootstrap(format!(
+                    "failed to open kernel log at {}: {error}; fallback failed: {fallback_error}",
+                    log_dir.display()
+                ))
+            })
+        }
+        Err(error) => Err(KernelClientError::Bootstrap(format!(
+            "failed to open kernel log at {}: {error}",
+            log_dir.display()
+        ))),
+    }
+}
+
+fn open_log_in_dir(log_dir: &Path) -> std::io::Result<File> {
+    std::fs::create_dir_all(log_dir)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("deepcode-kernel.log"))
 }
 
 trait StringFallback {

@@ -10,6 +10,7 @@ import type {
   AgentWorkflowMode,
   ListAgentSessionsRequest,
   PermissionRequest,
+  ProjectionDelta,
 } from '@deepcode/protocol';
 import {
   createWorkspaceBinding,
@@ -34,6 +35,7 @@ import {
   kernelCommand,
   listAgentSessions,
   llmChat,
+  llmChatStream,
   patchAgentWorkflowConfig,
   renameAgentSession,
 } from '../services/runtimeAdapter';
@@ -169,6 +171,118 @@ function createLocalEvent(
   };
 }
 
+function projectionDeltaLocalEvent(delta: ProjectionDelta): AgentEvent | null {
+  const sessionId = delta.sessionId;
+  const id = [
+    'active',
+    delta.turnId ?? delta.runId ?? sessionId,
+    delta.type,
+    delta.itemId ?? delta.stage ?? 'item',
+  ].join(':');
+  const basePayload = {
+    activeProjectionDelta: true,
+    projectionDeltaType: delta.type,
+    stage: delta.stage,
+    status: delta.status,
+    summary: delta.summary,
+    source: delta.source,
+    channel: delta.channel,
+    visibility: 'conversation',
+    presentation: 'collapsible',
+    runId: delta.runId,
+    itemId: delta.itemId,
+    payload: delta.payload,
+  };
+  if (delta.type === 'assistant_delta' || delta.type === 'reasoning_delta') {
+    return {
+      id,
+      sessionId,
+      ts: new Date().toISOString(),
+      kind: 'assistant_msg',
+      payload: {
+        ...basePayload,
+        content: delta.delta ?? delta.summary ?? '',
+        channel: delta.channel === 'final' ? 'progress' : (delta.channel ?? 'reasoning'),
+        label: delta.type === 'reasoning_delta' ? 'Thinking' : 'DeepCode',
+      },
+    };
+  }
+  if (delta.type === 'tool_call_delta') {
+    return {
+      id,
+      sessionId,
+      ts: new Date().toISOString(),
+      kind: 'tool_call',
+      payload: {
+        ...basePayload,
+        toolName: typeof (delta.payload as Record<string, unknown> | undefined)?.toolCallDelta === 'object'
+          ? ((delta.payload as Record<string, unknown>).toolCallDelta as Record<string, unknown>).name
+          : undefined,
+        status: delta.status ?? 'running',
+        argumentsDelta: delta.delta,
+        channel: 'tool',
+      },
+    };
+  }
+  if (delta.type === 'resource_delta' || delta.type === 'workunit_delta' || delta.type === 'active_turn' || delta.type === 'stage_delta') {
+    return {
+      id,
+      sessionId,
+      ts: new Date().toISOString(),
+      kind: 'workflow_stage',
+      payload: {
+        ...basePayload,
+        stage: delta.stage ?? delta.type,
+        status: delta.status ?? 'running',
+        channel: delta.channel ?? 'progress',
+      },
+    };
+  }
+  if (delta.type === 'error') {
+    return {
+      id,
+      sessionId,
+      ts: new Date().toISOString(),
+      kind: 'error',
+      payload: {
+        ...basePayload,
+        message: delta.summary ?? 'Active provider stream error.',
+        status: 'error',
+        channel: 'error',
+      },
+    };
+  }
+  return null;
+}
+
+function mergeProjectionDeltaEvent(events: AgentEvent[], event: AgentEvent): AgentEvent[] {
+  const index = events.findIndex((item) => item.id === event.id);
+  if (index < 0) return [...events, event];
+  const previous = events[index];
+  const previousPayload = previous.payload && typeof previous.payload === 'object' && !Array.isArray(previous.payload)
+    ? previous.payload as Record<string, unknown>
+    : {};
+  const nextPayload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+    ? event.payload as Record<string, unknown>
+    : {};
+  const previousContent = typeof previousPayload.content === 'string' ? previousPayload.content : '';
+  const nextContent = typeof nextPayload.content === 'string' ? nextPayload.content : '';
+  const merged: AgentEvent = {
+    ...previous,
+    ts: event.ts,
+    payload: {
+      ...previousPayload,
+      ...nextPayload,
+      content: previousContent || nextContent ? `${previousContent}${nextContent}` : nextPayload.content,
+    },
+  };
+  return [
+    ...events.slice(0, index),
+    merged,
+    ...events.slice(index + 1),
+  ];
+}
+
 function readMessageAttachments(state: Store, override?: AgentContextAttachment[]): AgentContextAttachment[] {
   return override ?? [
     ...state.sessionAttachments,
@@ -199,6 +313,7 @@ function createSessionDriver(): SessionDriverLoop {
   return new SessionDriverLoop({
     kernelCommand,
     llmChat,
+    llmChatStream,
     appendTranscript: async (targetSessionId, entry) => {
       await transcriptClient.appendTranscript(targetSessionId, entry);
     },
@@ -675,6 +790,14 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       const driver = new SessionDriverLoop({
         kernelCommand,
         llmChat,
+        llmChatStream,
+        onProjectionDelta: async (delta) => {
+          const event = projectionDeltaLocalEvent(delta);
+          if (!event || get().session?.id !== delta.sessionId) return;
+          set((state) => ({
+            events: mergeProjectionDeltaEvent(state.events, event),
+          }));
+        },
         appendTranscript: async (targetSessionId, entry) => {
           await transcriptClient.appendTranscript(targetSessionId, entry);
         },

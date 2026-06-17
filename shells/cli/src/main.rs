@@ -1,6 +1,6 @@
 use deepcode_kernel_client::{
-    CreateAgentSessionRequest, HttpKernelClient, KernelClientConfig, ListAgentSessionsRequest,
-    PermissionDecision, SessionHostBridgeRequest,
+    CreateAgentSessionRequest, HttpKernelClient, KernelBootstrap, KernelBootstrapOptions,
+    ListAgentSessionsRequest, PermissionDecision, SessionHostBridgeRequest,
 };
 use serde_json::Value;
 use std::env;
@@ -32,35 +32,90 @@ async fn run(command: Command) -> Result<(), String> {
             print_help();
             Ok(())
         }
-        Command::Interactive { api, host } => run_interactive(client(api), host).await,
-        Command::DaemonStatus { api } => print_daemon_status(&client(api)).await,
+        Command::Interactive {
+            api,
+            no_auto_start_kernel,
+            host,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            run_interactive(bootstrap.client().clone(), host).await
+        }
+        Command::DaemonStatus {
+            api,
+            no_auto_start_kernel,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            print_daemon_status(bootstrap.client()).await
+        }
         Command::SessionsList {
             api,
+            no_auto_start_kernel,
             include_archived,
-        } => print_sessions(&client(api), include_archived).await,
-        Command::SessionsNew { api, title } => create_session(&client(api), title).await,
-        Command::SessionsResume { api, session_id } => {
-            activate_and_print_timeline(&client(api), &session_id).await
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            print_sessions(bootstrap.client(), include_archived).await
+        }
+        Command::SessionsNew {
+            api,
+            no_auto_start_kernel,
+            title,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            create_session(bootstrap.client(), title).await
+        }
+        Command::SessionsResume {
+            api,
+            no_auto_start_kernel,
+            session_id,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            activate_and_print_timeline(bootstrap.client(), &session_id).await
         }
         Command::SessionsRename {
             api,
+            no_auto_start_kernel,
             session_id,
             title,
-        } => rename_session(&client(api), &session_id, &title).await,
-        Command::SessionsDelete { api, session_id } => {
-            delete_or_archive_session(&client(api), &session_id, false).await
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            rename_session(bootstrap.client(), &session_id, &title).await
         }
-        Command::SessionsArchive { api, session_id } => {
-            delete_or_archive_session(&client(api), &session_id, true).await
+        Command::SessionsDelete {
+            api,
+            no_auto_start_kernel,
+            session_id,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            delete_or_archive_session(bootstrap.client(), &session_id, false).await
         }
-        Command::Timeline { api, session_id } => print_timeline(&client(api), session_id).await,
+        Command::SessionsArchive {
+            api,
+            no_auto_start_kernel,
+            session_id,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            delete_or_archive_session(bootstrap.client(), &session_id, true).await
+        }
+        Command::Timeline {
+            api,
+            no_auto_start_kernel,
+            session_id,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            print_timeline(bootstrap.client(), session_id).await
+        }
         Command::Permission {
             api,
+            no_auto_start_kernel,
             permission_id,
             decision,
-        } => resolve_permission(&client(api), &permission_id, decision).await,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            resolve_permission(bootstrap.client(), &permission_id, decision).await
+        }
         Command::Decision {
             api,
+            no_auto_start_kernel,
             kind,
             decision,
             run_id,
@@ -68,8 +123,9 @@ async fn run(command: Command) -> Result<(), String> {
             guidance,
             host,
         } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
             resolve_session_decision(
-                &client(api),
+                bootstrap.client(),
                 kind,
                 decision,
                 run_id,
@@ -81,10 +137,14 @@ async fn run(command: Command) -> Result<(), String> {
         }
         Command::Ask {
             api,
+            no_auto_start_kernel,
             prompt,
             plain,
             host,
-        } => ask(&client(api), prompt, plain, host).await,
+        } => {
+            let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
+            ask(bootstrap.client(), prompt, plain, host).await
+        }
     }
 }
 
@@ -92,47 +152,58 @@ enum Command {
     Help,
     Interactive {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         host: SessionHostOptions,
     },
     DaemonStatus {
         api: Option<String>,
+        no_auto_start_kernel: bool,
     },
     SessionsList {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         include_archived: bool,
     },
     SessionsNew {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         title: Option<String>,
     },
     SessionsResume {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         session_id: String,
     },
     SessionsRename {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         session_id: String,
         title: String,
     },
     SessionsDelete {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         session_id: String,
     },
     SessionsArchive {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         session_id: String,
     },
     Timeline {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         session_id: Option<String>,
     },
     Permission {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         permission_id: String,
         decision: PermissionDecision,
     },
     Decision {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         kind: String,
         decision: String,
         run_id: Option<String>,
@@ -142,6 +213,7 @@ enum Command {
     },
     Ask {
         api: Option<String>,
+        no_auto_start_kernel: bool,
         prompt: String,
         plain: bool,
         host: SessionHostOptions,
@@ -155,6 +227,7 @@ impl Command {
         let mut include_archived = false;
         let mut workspace = None;
         let mut no_workspace = false;
+        let mut no_auto_start_kernel = false;
         let mut session_id = None;
         let mut rest = Vec::new();
         let mut iter = args.into_iter();
@@ -167,6 +240,7 @@ impl Command {
                         return Err("--api requires a URL".to_string());
                     }
                 }
+                "--no-auto-start-kernel" => no_auto_start_kernel = true,
                 "-p" | "--print" => plain = true,
                 "--include-archived" => include_archived = true,
                 "--workspace" | "-C" => {
@@ -192,22 +266,33 @@ impl Command {
         };
 
         match rest.as_slice() {
-            [] => Ok(Command::Interactive { api, host }),
+            [] => Ok(Command::Interactive {
+                api,
+                no_auto_start_kernel,
+                host,
+            }),
             [daemon, status] if daemon == "daemon" && status == "status" => {
-                Ok(Command::DaemonStatus { api })
+                Ok(Command::DaemonStatus {
+                    api,
+                    no_auto_start_kernel,
+                })
             }
             [sessions, list] if sessions == "sessions" && list == "list" => {
                 Ok(Command::SessionsList {
                     api,
+                    no_auto_start_kernel,
                     include_archived,
                 })
             }
-            [sessions, new] if sessions == "sessions" && new == "new" => {
-                Ok(Command::SessionsNew { api, title: None })
-            }
+            [sessions, new] if sessions == "sessions" && new == "new" => Ok(Command::SessionsNew {
+                api,
+                no_auto_start_kernel,
+                title: None,
+            }),
             [sessions, new, title @ ..] if sessions == "sessions" && new == "new" => {
                 Ok(Command::SessionsNew {
                     api,
+                    no_auto_start_kernel,
                     title: Some(title.join(" ")),
                 })
             }
@@ -216,6 +301,7 @@ impl Command {
             {
                 Ok(Command::SessionsResume {
                     api,
+                    no_auto_start_kernel,
                     session_id: session_id.to_string(),
                 })
             }
@@ -224,6 +310,7 @@ impl Command {
             {
                 Ok(Command::SessionsRename {
                     api,
+                    no_auto_start_kernel,
                     session_id: session_id.to_string(),
                     title: title.join(" "),
                 })
@@ -231,21 +318,25 @@ impl Command {
             [sessions, delete, session_id] if sessions == "sessions" && delete == "delete" => {
                 Ok(Command::SessionsDelete {
                     api,
+                    no_auto_start_kernel,
                     session_id: session_id.to_string(),
                 })
             }
             [sessions, archive, session_id] if sessions == "sessions" && archive == "archive" => {
                 Ok(Command::SessionsArchive {
                     api,
+                    no_auto_start_kernel,
                     session_id: session_id.to_string(),
                 })
             }
             [timeline] if timeline == "timeline" => Ok(Command::Timeline {
                 api,
+                no_auto_start_kernel,
                 session_id: None,
             }),
             [timeline, session_id] if timeline == "timeline" => Ok(Command::Timeline {
                 api,
+                no_auto_start_kernel,
                 session_id: Some(session_id.to_string()),
             }),
             [permission, allow, permission_id]
@@ -253,6 +344,7 @@ impl Command {
             {
                 Ok(Command::Permission {
                     api,
+                    no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
                     decision: PermissionDecision::Allow,
                 })
@@ -260,6 +352,7 @@ impl Command {
             [permission, deny, permission_id] if permission == "permission" && deny == "deny" => {
                 Ok(Command::Permission {
                     api,
+                    no_auto_start_kernel,
                     permission_id: permission_id.to_string(),
                     decision: PermissionDecision::Deny,
                 })
@@ -274,6 +367,7 @@ impl Command {
                 };
                 Ok(Command::Decision {
                     api,
+                    no_auto_start_kernel,
                     kind: kind.to_string(),
                     decision: decision.to_string(),
                     run_id,
@@ -295,6 +389,7 @@ impl Command {
                 };
                 Ok(Command::Decision {
                     api,
+                    no_auto_start_kernel,
                     kind: kind.to_string(),
                     decision: decision.to_string(),
                     run_id,
@@ -305,12 +400,14 @@ impl Command {
             }
             [ask, prompt @ ..] if ask == "ask" && !prompt.is_empty() => Ok(Command::Ask {
                 api,
+                no_auto_start_kernel,
                 prompt: prompt.join(" "),
                 plain,
                 host,
             }),
             prompt if plain && !prompt.is_empty() => Ok(Command::Ask {
                 api,
+                no_auto_start_kernel,
                 prompt: prompt.join(" "),
                 plain,
                 host,
@@ -653,11 +750,13 @@ async fn resolve_permission(
     Ok(())
 }
 
-fn client(api: Option<String>) -> HttpKernelClient {
-    let config = api
-        .map(KernelClientConfig::new)
-        .unwrap_or_else(KernelClientConfig::from_env);
-    HttpKernelClient::new(config)
+async fn bootstrap_kernel(
+    api: Option<String>,
+    no_auto_start_kernel: bool,
+) -> Result<KernelBootstrap, String> {
+    KernelBootstrap::connect(KernelBootstrapOptions::new(api).auto_start(!no_auto_start_kernel))
+        .await
+        .map_err(|error| format!("daemon unavailable: {error}"))
 }
 
 fn render_timeline(timeline: &Value) {
@@ -733,10 +832,15 @@ Usage:
   deepcode-cli ask [-p|--print] [--session <id>] [--workspace <path>|--no-workspace] <prompt>
 
 Options:
-  --api <url>       Kernel daemon HTTP base URL. Defaults to DEEPCODE_API_URL or http://$DEEPCODE_HOST:$DEEPCODE_PORT.
-  --workspace, -C   Bind the turn to a workspace path. Defaults to the current directory for terminal chat.
-  --no-workspace    Send an ordinary chat turn without a workspace binding.
-  --session <id>    Continue a specific Agent session.
+  --api <url>                 Kernel daemon HTTP base URL. Defaults to DEEPCODE_API_URL or http://$DEEPCODE_HOST:$DEEPCODE_PORT.
+  --no-auto-start-kernel      Do not start a local Kernel when the API is unavailable.
+  --workspace, -C             Bind the turn to a workspace path. Defaults to the current directory for terminal chat.
+  --no-workspace              Send an ordinary chat turn without a workspace binding.
+  --session <id>              Continue a specific Agent session.
+
+Environment:
+  DEEPCODE_KERNEL_AUTO_START=0 disables local Kernel auto-start.
+  DEEPCODE_KERNEL_BIN=/path/to/deepcode-kernel overrides Kernel binary lookup.
 
 Boundary:
   CLI/TUI/GUI/Editor are shells over the same SessionDriverLoop, Kernel permissions, and timeline projection."#

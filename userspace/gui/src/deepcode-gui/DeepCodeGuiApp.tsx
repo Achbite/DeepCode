@@ -1,4 +1,4 @@
-import React, { Suspense, lazy, useCallback, useEffect, useRef } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import useAppStatusStore from '../state/appStatusStore';
 import { useEditorStore, getTabId } from '../state/editorStore';
 import { useSettingsStore } from '../state/settingsStore';
@@ -9,6 +9,7 @@ import {
   getHealth,
   getRuntimeStatus,
   healthVersion,
+  startKernelAfterPermission,
   warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
 import './deepcodeGui.css';
@@ -64,6 +65,8 @@ const DeepCodeGuiApp: React.FC = () => {
   const syncWorkspaceSettings = useSettingsStore((s) => s.syncWorkspaceSettings);
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const connectedReloadDoneRef = useRef(false);
+  const [kernelStartBusy, setKernelStartBusy] = useState(false);
+  const [kernelStartMessage, setKernelStartMessage] = useState<string | null>(null);
   const dirtySignature = useEditorStore((s) =>
     s.tabs
       .flatMap((tab) =>
@@ -78,6 +81,45 @@ const DeepCodeGuiApp: React.FC = () => {
     if (activeTab?.kind !== 'file') return false;
     return saveFile(getTabId(activeTab));
   }, []);
+
+  const retryKernelStart = useCallback(async () => {
+    setKernelStartBusy(true);
+    setKernelStartMessage(null);
+    setApiStatus('checking');
+    const start = await startKernelAfterPermission();
+    if (!start.ok) {
+      setApiStatus('error');
+      setErrorMessage(start.message || 'Kernel start failed');
+      setKernelStartMessage(start.message || 'Kernel start failed');
+      setKernelStartBusy(false);
+      return;
+    }
+    if (start.data?.blocked) {
+      setApiStatus('error');
+      setErrorMessage(start.data.message);
+      setKernelStartMessage(start.data.message);
+      setKernelStartBusy(false);
+      return;
+    }
+
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      const result = await getHealth();
+      if (result.ok && result.data) {
+        setApiStatus('connected');
+        setServerVersion(healthVersion(result.data));
+        setKernelStartMessage(null);
+        setKernelStartBusy(false);
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    }
+
+    const message = start.data?.message || 'Kernel start requested, waiting for API health.';
+    setApiStatus('error');
+    setErrorMessage(message);
+    setKernelStartMessage(message);
+    setKernelStartBusy(false);
+  }, [setApiStatus, setErrorMessage, setServerVersion]);
 
   useEffect(() => {
     document.documentElement.dataset.product = 'deepcode-gui';
@@ -202,6 +244,9 @@ const DeepCodeGuiApp: React.FC = () => {
         wsStatus={wsStatus}
         serverVersion={serverVersion}
         lastHeartbeatAt={lastHeartbeatAt}
+        kernelStartBusy={kernelStartBusy}
+        kernelStartMessage={kernelStartMessage}
+        onRetryKernelStart={retryKernelStart}
       />
     </Suspense>
   );

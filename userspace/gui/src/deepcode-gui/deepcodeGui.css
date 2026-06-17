@@ -174,6 +174,16 @@ button {
   background: #171a20;
 }
 
+.deepcode-gui-status-pill--button {
+  cursor: pointer;
+  font: inherit;
+}
+
+.deepcode-gui-status-pill--button:disabled {
+  cursor: default;
+  opacity: 0.64;
+}
+
 .deepcode-gui-status-pill--connected,
 .deepcode-gui-status-pill--ready {
   color: var(--ok);
@@ -2264,7 +2274,8 @@ button {
 }
 
 .deepcode-gui-project-archive-group__title:hover .deepcode-gui-project-archive-group__actions,
-.deepcode-gui-project-archive-group__title:focus-within .deepcode-gui-project-archive-group__actions {
+.deepcode-gui-project-archive-group__title:focus-within .deepcode-gui-project-archive-group__actions,
+.deepcode-gui-project-archive-group--current .deepcode-gui-project-archive-group__actions {
   opacity: 1;
   pointer-events: auto;
   transform: translateX(0);
