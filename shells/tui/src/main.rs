@@ -2,7 +2,7 @@ mod app;
 mod model;
 mod renderer;
 
-use app::TuiApp;
+use app::{TuiApp, TuiHostOptions};
 use crossterm::{
     event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -30,7 +30,14 @@ async fn main() {
             .unwrap_or_else(KernelClientConfig::from_env),
     );
     let renderer = Renderer::default();
-    let mut app = TuiApp::new(client, renderer);
+    let mut app = TuiApp::new(
+        client,
+        renderer,
+        TuiHostOptions {
+            workspace_path: args.workspace,
+            no_workspace: args.no_workspace,
+        },
+    );
     app.bootstrap().await;
 
     if args.smoke {
@@ -54,6 +61,8 @@ struct Args {
     api: Option<String>,
     help: bool,
     smoke: bool,
+    workspace: Option<String>,
+    no_workspace: bool,
 }
 
 impl Args {
@@ -62,6 +71,8 @@ impl Args {
             api: None,
             help: false,
             smoke: false,
+            workspace: None,
+            no_workspace: false,
         };
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
@@ -69,6 +80,8 @@ impl Args {
                 "--help" | "-h" => parsed.help = true,
                 "--smoke" => parsed.smoke = true,
                 "--api" => parsed.api = iter.next(),
+                "--workspace" | "-C" => parsed.workspace = iter.next(),
+                "--no-workspace" => parsed.no_workspace = true,
                 _ => {}
             }
         }
@@ -153,15 +166,24 @@ Usage:
   deepcode-tui
   deepcode-tui --smoke
   deepcode-tui --api <url>
+  deepcode-tui --workspace <path>
+  deepcode-tui --no-workspace
 
 Interactive commands:
   /help              显示 TUI 命令
   /status            检查 Kernel daemon 连接
   /audit             显示审计占位状态
+  /sessions          列出 Agent 会话
+  /new [title]       新建 Agent 会话
+  /use <id>          激活会话
+  /timeline [id]     读取 timeline
+  /allow <id>        允许权限请求
+  /deny <id>         拒绝权限请求
+  /decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]
   /clear             清理当前可见卡片
   /quit              退出 TUI
 
-该终端界面参考 pi/Claude Code 的会话优先形态封装；TUI 只负责展示、
-输入和命令入口，不暴露旧会话发送入口，不持有 workflow、permission 或 tool execution 事实。"#
+普通文本会直接通过共享 SessionDriverLoop 发送到当前会话；TUI 只负责展示、
+输入和命令入口，不持有 workflow、permission 或 tool execution 事实。"#
     );
 }

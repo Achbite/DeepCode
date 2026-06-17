@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import DeepCodeGuiApp from './DeepCodeGuiApp';
+import { installNativeContextMenuGuard } from '../utils/nativeContextMenuGuard';
 
 function formatBootstrapError(reason: unknown): string {
   if (reason instanceof Error) {
@@ -87,6 +88,8 @@ const isTauriShell =
 
 document.documentElement.dataset.product = 'deepcode-gui';
 document.documentElement.dataset.shell = isTauriShell ? 'tauri' : 'browser';
+
+installNativeContextMenuGuard();
 
 try {
   ReactDOM.createRoot(rootEl).render(

@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './app/App';
+import { installNativeContextMenuGuard } from './utils/nativeContextMenuGuard';
 
 const ROOT_EL_ID = 'root';
 
@@ -123,6 +124,8 @@ const rootEl = document.getElementById(ROOT_EL_ID);
 if (!rootEl) {
   throw new Error('Cannot find #root element');
 }
+
+installNativeContextMenuGuard();
 
 ReactDOM.createRoot(rootEl).render(
   <React.StrictMode>
