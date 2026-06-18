@@ -72,11 +72,14 @@ export interface SessionDriverLoopInput {
   confirmedRequirement?: RequirementRecord;
   requirementConfirmationMode?: RequirementConfirmationMode;
   reviewContinuationMode?: ReviewContinuationMode;
+  interventionLevel?: InterventionLevel;
   resumeResourcePackets?: boolean;
+  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
 }
 
 export type RequirementConfirmationMode = 'auto' | 'always' | 'off';
 export type ReviewContinuationMode = 'auto' | 'ask' | 'off';
+export type InterventionLevel = 'low' | 'medium' | 'high';
 
 export interface SessionDecisionResolverInput {
   sessionId: string;
@@ -91,12 +94,14 @@ export interface SessionDecisionResolverInput {
   profileId?: string;
   workflow?: string;
   reviewContinuationMode?: ReviewContinuationMode;
+  interventionLevel?: InterventionLevel;
 }
 
 interface SessionDriverLoopRunState {
   sessionId: string;
   runId: string;
   userRequest: string;
+  phase: SessionTurnPhase;
   workspaceScopeKey: string;
   stateContract?: KernelStateContractRef;
   driverRequest?: DriverRequestRef;
@@ -110,16 +115,87 @@ interface SessionDriverLoopRunState {
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
   implementationBatch: ImplementationBatchContext;
+  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   resourceRequestRepairAttempted: boolean;
   planReviewRepairAttempted: boolean;
+  acceptedPlanScopeRepairAttempted: boolean;
   terminalGuidanceRevisionAttempted: boolean;
   activeTurn?: ActiveTurnState;
+}
+
+type SessionTurnPhase =
+  | 'context_reading'
+  | 'provider_proposing'
+  | 'waiting_plan_review'
+  | 'waiting_permission'
+  | 'executing_accepted_plan'
+  | 'executing'
+  | 'waiting_review'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+interface DecisionOwnerRef {
+  kind: 'requirement' | 'plan' | 'review' | 'permission';
+  runId: string;
+  targetId?: string;
+  planId?: string;
+  requirementId?: string;
+  reviewId?: string;
+  permissionId?: string;
 }
 
 interface ImplementationBatchContext {
   batchIndex: number;
   recentPlanSummaries: string[];
   continuationSummaries: string[];
+}
+
+interface AcceptedImplementationPlanTaskContext {
+  taskId: string;
+  title?: string;
+  capability?: string;
+  targets: string[];
+}
+
+interface AcceptedImplementationPlanExecutionRoot {
+  attachment: AgentContextAttachment;
+  ref: string;
+  source: 'projectWorkingDirectory' | 'workspaceBinding' | 'recentAttachment';
+}
+
+interface AcceptedImplementationPlanContext {
+  planId: string;
+  runId: string;
+  title?: string;
+  summary?: string;
+  tasks: AcceptedImplementationPlanTaskContext[];
+  capabilities: string[];
+  targetScopes: string[];
+  executionRoot?: AcceptedImplementationPlanExecutionRoot;
+  interventionLevel?: InterventionLevel;
+  batchIndex: number;
+  completedTaskIds: string[];
+  rawPlan: Record<string, unknown>;
+}
+
+interface AcceptedPlanBatchValidationResult {
+  ok: boolean;
+  reasons: string[];
+}
+
+interface AcceptedPlanTargetScope {
+  raw: string;
+  normalized: string;
+}
+
+interface AcceptedPlanBatchProgress {
+  actionIds: string[];
+  targetPaths: string[];
+  workUnitIds: string[];
+  newlyCompletedTaskIds: string[];
+  completedTaskIds: string[];
+  remainingTaskIds: string[];
 }
 
 interface ResourceManifestBuildResult {
@@ -185,6 +261,7 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
   'git.push',
   'config.modify',
   'browser.control',
+  'provider.egress',
 ]);
 
 export class SessionDriverLoop {
@@ -240,7 +317,11 @@ export class SessionDriverLoop {
     const driverRequest = findDriverRequest(runReply.events);
 
     const manifestBuild = createManifest(input, this.id('resource-manifest'));
+    const acceptedImplementationPlan = input.acceptedImplementationPlan;
     const implementationBatch = buildImplementationBatchContext(input.existingEvents ?? []);
+    if (acceptedImplementationPlan) {
+      implementationBatch.batchIndex = acceptedImplementationPlan.batchIndex;
+    }
     const memoryDocument = buildSessionMemoryDocument(input.existingEvents ?? []);
     const restoredResourcePackets = input.resumeResourcePackets
       ? recentResourcePackets(input.existingEvents ?? [])
@@ -249,6 +330,7 @@ export class SessionDriverLoop {
       sessionId,
       runId,
       userRequest: input.content,
+      phase: 'context_reading',
       workspaceScopeKey: manifestBuild.manifest.workspaceScopeKey,
       stateContract,
       driverRequest,
@@ -261,7 +343,7 @@ export class SessionDriverLoop {
       },
       resourcePackets: [...restoredResourcePackets],
       memoryDocument,
-      memoryHints: implementationBatchHints(implementationBatch),
+      memoryHints: implementationBatchHints(implementationBatch, acceptedImplementationPlan),
       taskGraph: buildSessionTaskGraph({
         sessionId,
         runId,
@@ -270,8 +352,10 @@ export class SessionDriverLoop {
         driverRequest,
       }),
       implementationBatch,
+      acceptedImplementationPlan,
       resourceRequestRepairAttempted: false,
       planReviewRepairAttempted: false,
+      acceptedPlanScopeRepairAttempted: false,
       terminalGuidanceRevisionAttempted: false,
     };
 
@@ -285,7 +369,25 @@ export class SessionDriverLoop {
     if (shouldRequestRequirementConfirmation(input, state)) {
       try {
         const event = await this.buildRequirementConfirmation(input, state);
-        return this.append(sessionId, [event]);
+        state.phase = 'waiting_plan_review';
+        const payload = objectRecord(event.payload) ?? {};
+        return this.append(sessionId, [
+          event,
+          sessionRunStateEvent({
+            sessionId,
+            runId: state.runId,
+            phase: 'waiting_plan_review',
+            reason: 'requirement',
+            decisionOwner: {
+              kind: 'requirement',
+              runId: state.runId,
+              targetId: stringValue(payload.requirementId),
+              requirementId: stringValue(payload.requirementId),
+            },
+            ts: this.ts(),
+            id: this.id('session-run-waiting-requirement'),
+          }),
+        ]);
       } catch (error) {
         const message = error instanceof SessionDriverLoopError ? error.message : String(error);
         return this.append(sessionId, [
@@ -319,7 +421,8 @@ export class SessionDriverLoop {
         ],
         capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
         memoryDocument: state.memoryDocument,
-        extraMemoryHints: implementationBatchHints(state.implementationBatch),
+        extraMemoryHints: implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
+        interventionLevel: input.interventionLevel,
         userGuidance: collectUserGuidanceEvents(lastResult.events, state.runId),
         userRequest: input.content,
         initialContext: state.initialContext,
@@ -335,6 +438,7 @@ export class SessionDriverLoop {
       state.contextAssembly = assembledContext.contextAssembly;
       lastResult = await this.appendConsumedUserGuidanceEvents(sessionId, lastResult, state.contextAssembly, state.runId);
       const prompt = assembledContext.prompt;
+      state.phase = 'provider_proposing';
       let proposal: ProposalEnvelope;
       try {
         proposal = await this.callProviderAndParse(input, state, prompt);
@@ -362,8 +466,7 @@ export class SessionDriverLoop {
       }
       if (proposal.kind === 'decisionRequest') {
         const requirement = requirementRecordFromProposal(proposal, input, state, this.ts());
-        return this.append(sessionId, [
-          requirementConfirmationEvent({
+        const confirmation = requirementConfirmationEvent({
             sessionId,
             runId: state.runId,
             requirement,
@@ -372,6 +475,23 @@ export class SessionDriverLoop {
             attachments: input.attachments ?? [],
             ts: this.ts(),
             id: this.id('decision-request'),
+          });
+        state.phase = 'waiting_plan_review';
+        return this.append(sessionId, [
+          confirmation,
+          sessionRunStateEvent({
+            sessionId,
+            runId: state.runId,
+            phase: 'waiting_plan_review',
+            reason: 'requirement',
+            decisionOwner: {
+              kind: 'requirement',
+              runId: state.runId,
+              targetId: requirement.requirementId,
+              requirementId: requirement.requirementId,
+            },
+            ts: this.ts(),
+            id: this.id('session-run-waiting-requirement'),
           }),
         ]);
       }
@@ -382,6 +502,27 @@ export class SessionDriverLoop {
           ?? '模型返回诊断信息，未生成计划或执行队列。';
         return this.append(sessionId, [
           finalDiagnosticEvent(sessionId, summary, this.ts(), this.id('diagnostic')),
+        ]);
+      }
+      if (proposal.kind === 'implementationPlan') {
+        const planId = stringValue(objectRecord(proposal.payload)?.id) ?? proposal.proposalId;
+        state.phase = 'waiting_plan_review';
+        return this.append(sessionId, [
+          implementationPlanCardEvent(state, proposal, this.ts(), this.id('implementation-plan')),
+          sessionRunStateEvent({
+            sessionId,
+            runId: state.runId,
+            phase: 'waiting_plan_review',
+            reason: 'plan_review',
+            decisionOwner: {
+              kind: 'plan',
+              runId: state.runId,
+              targetId: planId,
+              planId,
+            },
+            ts: this.ts(),
+            id: this.id('session-run-waiting-plan'),
+          }),
         ]);
       }
       if (proposal.kind === 'resourceRequest') {
@@ -471,6 +612,7 @@ export class SessionDriverLoop {
         workflow: input.workflow,
         appendUserMessage: false,
         requirementConfirmationMode: 'off',
+        interventionLevel: input.interventionLevel,
         resumeResourcePackets: true,
       });
     }
@@ -490,6 +632,7 @@ export class SessionDriverLoop {
       appendUserMessage: false,
       confirmedRequirement: input.decision === 'accept' ? requirementRecordFromEvent(confirmation, 'confirmed') : undefined,
       requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
+      interventionLevel: input.interventionLevel,
     });
 
     if (input.decision !== 'accept') return next;
@@ -508,12 +651,16 @@ export class SessionDriverLoop {
   private async resolvePlanDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
     const events = input.existingEvents ?? [];
     const active = findActiveDriverInteraction(events);
-    if (!active || active.kind !== 'plan' || active.runId !== input.runId || (input.targetId && active.planId !== input.targetId)) {
+    const activePlanMatches = active?.kind === 'plan' &&
+      active.runId === input.runId &&
+      (!input.targetId || active.planId === input.targetId || Boolean(findPlanCard(events, input.runId, input.targetId)));
+    if (!activePlanMatches) {
       return this.append(input.sessionId, [
         traceEvent(input.sessionId, 'trace/plan_accept_noop', '该计划已处理或已过期，没有再次提交执行。', this.ts(), this.id('plan-noop'), {
           runId: input.runId,
           planId: input.targetId,
           decision: input.decision,
+          visibility: 'debug',
         }),
       ]);
     }
@@ -524,6 +671,7 @@ export class SessionDriverLoop {
           runId: input.runId,
           planId: input.targetId,
           decision: input.decision,
+          visibility: 'debug',
         }),
       ]);
     }
@@ -537,6 +685,25 @@ export class SessionDriverLoop {
     let result = await this.append(input.sessionId, [
       planReviewDecisionEvent(input.sessionId, plan, 'accepted', '用户已确认计划，准备进入执行。', this.ts(), this.id('plan-accepted')),
     ]);
+    if (plan.implementationPlan) {
+      const executionRoot = acceptedPlanExecutionRootFromDecision(input, result.events);
+      const acceptedPlan = acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot);
+      return this.runUserTurn({
+        sessionId: input.sessionId,
+        content: implementationPlanExecutionRequest(plan, acceptedPlan, input.guidance),
+        attachments: acceptedPlan.executionRoot ? [acceptedPlan.executionRoot.attachment] : [],
+        existingEvents: result.events,
+        workspaceBinding: input.workspaceBinding,
+        projectWorkingDirectory: input.projectWorkingDirectory,
+        profileId: input.profileId,
+        workflow: input.workflow,
+        appendUserMessage: false,
+        requirementConfirmationMode: 'off',
+        reviewContinuationMode: input.reviewContinuationMode,
+        interventionLevel: input.interventionLevel,
+        acceptedImplementationPlan: acceptedPlan,
+      });
+    }
     const decisionReply = await this.kernel({
       command: {
         kind: 'userDecisionSubmit',
@@ -588,6 +755,26 @@ export class SessionDriverLoop {
     });
     result = await this.appendProjectedKernelEvents(input.sessionId, batchReply);
     if (!actionBatchReadyForReview(batchReply.events ?? [])) {
+      if (kernelEventsContainPermissionRequest(batchReply.events ?? [])) {
+        const permissionId = permissionIdFromKernelEvents(batchReply.events ?? []);
+        return this.append(input.sessionId, [
+          sessionRunStateEvent({
+            sessionId: input.sessionId,
+            runId: plan.runId,
+            phase: 'waiting_permission',
+            reason: 'permission',
+            decisionOwner: {
+              kind: 'permission',
+              runId: plan.runId,
+              targetId: permissionId,
+              permissionId,
+              planId: plan.planId,
+            },
+            ts: this.ts(),
+            id: this.id('session-run-waiting-permission'),
+          }),
+        ]) ?? result;
+      }
       return result;
     }
     const factsReply = await this.kernel({
@@ -599,14 +786,31 @@ export class SessionDriverLoop {
       },
     });
     result = await this.appendProjectedKernelEvents(input.sessionId, factsReply);
+    const review = reviewSummaryEvent(
+      input.sessionId,
+      plan,
+      [...(batchReply.events ?? []), ...(factsReply.events ?? [])],
+      this.ts(),
+      this.id('review-summary')
+    );
+    const reviewPayload = objectRecord(review.payload) ?? {};
     return this.append(input.sessionId, [
-      reviewSummaryEvent(
-        input.sessionId,
-        plan,
-        [...(batchReply.events ?? []), ...(factsReply.events ?? [])],
-        this.ts(),
-        this.id('review-summary')
-      ),
+      review,
+      sessionRunStateEvent({
+        sessionId: input.sessionId,
+        runId: plan.runId,
+        phase: 'waiting_review',
+        reason: 'review',
+        decisionOwner: {
+          kind: 'review',
+          runId: plan.runId,
+          targetId: stringValue(reviewPayload.reviewId) ?? plan.runId,
+          reviewId: stringValue(reviewPayload.reviewId) ?? plan.runId,
+          planId: plan.planId,
+        },
+        ts: this.ts(),
+        id: this.id('session-run-waiting-review'),
+      }),
     ]) ?? result;
   }
 
@@ -632,6 +836,27 @@ export class SessionDriverLoop {
     });
     let result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
     if (!actionBatchReadyForReview(decisionReply.events ?? [])) {
+      if (kernelEventsContainPermissionRequest(decisionReply.events ?? [])) {
+        const runId = pending.runId ?? input.runId ?? runIdFromKernelEvents(decisionReply.events ?? []) ?? 'run-unknown';
+        const permissionId = permissionIdFromKernelEvents(decisionReply.events ?? []);
+        return this.append(input.sessionId, [
+          sessionRunStateEvent({
+            sessionId: input.sessionId,
+            runId,
+            phase: 'waiting_permission',
+            reason: 'permission',
+            decisionOwner: {
+              kind: 'permission',
+              runId,
+              targetId: permissionId,
+              permissionId,
+              planId: pending.planId,
+            },
+            ts: this.ts(),
+            id: this.id('session-run-waiting-permission'),
+          }),
+        ]) ?? result;
+      }
       return result;
     }
 
@@ -649,14 +874,31 @@ export class SessionDriverLoop {
       },
     });
     result = await this.appendProjectedKernelEvents(input.sessionId, factsReply);
-    return this.append(input.sessionId, [
-      reviewSummaryEvent(
+    const review = reviewSummaryEvent(
         input.sessionId,
         plan,
         [...(decisionReply.events ?? []), ...(factsReply.events ?? [])],
         this.ts(),
         this.id('review-summary')
-      ),
+      );
+    const reviewPayload = objectRecord(review.payload) ?? {};
+    return this.append(input.sessionId, [
+      review,
+      sessionRunStateEvent({
+        sessionId: input.sessionId,
+        runId,
+        phase: 'waiting_review',
+        reason: 'review',
+        decisionOwner: {
+          kind: 'review',
+          runId,
+          targetId: stringValue(reviewPayload.reviewId) ?? runId,
+          reviewId: stringValue(reviewPayload.reviewId) ?? runId,
+          planId: plan.planId,
+        },
+        ts: this.ts(),
+        id: this.id('session-run-waiting-review'),
+      }),
     ]) ?? result;
   }
 
@@ -707,6 +949,7 @@ export class SessionDriverLoop {
         workflow: input.workflow,
         appendUserMessage: false,
         requirementConfirmationMode: 'off',
+        interventionLevel: input.interventionLevel,
       });
     }
 
@@ -767,6 +1010,7 @@ export class SessionDriverLoop {
       appendUserMessage: false,
       requirementConfirmationMode: 'off',
       reviewContinuationMode: continuationMode,
+      interventionLevel: input.interventionLevel,
     });
   }
 
@@ -781,6 +1025,7 @@ export class SessionDriverLoop {
       capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
       memoryDocument: state.memoryDocument,
       extraMemoryHints: state.memoryHints,
+      interventionLevel: input.interventionLevel,
       userGuidance: collectUserGuidanceEvents(input.existingEvents ?? [], state.runId),
       userOverlay: [
         'Before proposing side-effect work, request user intervention only if a concrete decision is needed.',
@@ -856,6 +1101,7 @@ export class SessionDriverLoop {
       capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
       memoryDocument: state.memoryDocument,
       extraMemoryHints: implementationBatchHints(state.implementationBatch),
+      interventionLevel: input.interventionLevel,
       userOverlay: guidanceRevisionOverlay(input.content, draftAnswer, guidance),
       userGuidance: guidance,
       userRequest: input.content,
@@ -1056,25 +1302,40 @@ export class SessionDriverLoop {
     round: number
   ): Promise<NativeToolHandlingResult> {
     const language = visibleLanguageForRequest(state.userRequest);
-    await this.append(state.sessionId, [
-      nativeToolProgressEvent(
-        state.sessionId,
-        state.runId,
-        nativeToolProgressMessage(turn.toolCalls.length, round, language),
-        this.ts(),
-        this.id('native-tool-call'),
-        {
+    const narration = turn.content.trim();
+    if (narration) {
+      await this.append(state.sessionId, [
+        this.event(state.sessionId, 'assistant_msg', {
+          content: narration,
+          channel: 'progress',
+          source: 'llm',
+          visibility: 'conversation',
+          presentation: 'body',
+          runId: state.runId,
+        }),
+      ]);
+    } else {
+      await this.emitProjectionDelta(state, {
+        type: 'stage_delta',
+        stage: `native_tool_round_${round + 1}`,
+        status: 'running',
+        channel: 'progress',
+        source: 'session',
+        summary: 'native_tool_checkpoint',
+        payload: {
+          visibility: 'task',
           nativeToolRound: round,
           toolCallCount: turn.toolCalls.length,
           resourcePacketCount: state.resourcePackets.length,
-        }
-      ),
-    ]);
+        },
+      });
+    }
     const unsupportedOrSideEffect = turn.toolCalls.find((toolCall) => !canResolveNativeToolReadOnly(toolCall));
     if (unsupportedOrSideEffect) {
+      const repaired = await this.repairSideEffectNativeTool(input, state, prompt, unsupportedOrSideEffect, turn);
       return {
         kind: 'proposal',
-        proposal: nativeToolCallActionProposal(input, state, prompt, unsupportedOrSideEffect, this.id('native-tool-proposal')),
+        proposal: repaired,
       };
     }
 
@@ -1132,6 +1393,47 @@ export class SessionDriverLoop {
   ): Promise<ResourcePacket> {
     const manifest = nativeReadToolManifest(state, toolCall);
     return this.resolveResources(state, manifest);
+  }
+
+  private async repairSideEffectNativeTool(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    toolCall: NativeToolCallProposal,
+    turn: LlmTurnResult
+  ): Promise<ProposalEnvelope> {
+    await this.emitProjectionDelta(state, {
+      type: 'stage_delta',
+      stage: 'native_tool_side_effect_blocked',
+      status: 'failed',
+      channel: 'progress',
+      source: 'session',
+      summary: 'side_effect_native_tool_blocked',
+      payload: {
+        visibility: 'task',
+        callId: toolCall.callId,
+        name: toolCall.name,
+      },
+    });
+    const raw = await this.llm(
+      input.profileId,
+      state,
+      'native_tool_side_effect_repair',
+      sideEffectNativeToolRepairMessages(prompt, state, toolCall, turn)
+    );
+    try {
+      return parseAndValidateProposal({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+      });
+    } catch (error) {
+      throw new SessionDriverLoopError(
+        'native_tool_side_effect_repair_failed',
+        `Provider requested side-effect native tool ${toolCall.name}; repair failed: ${normalizeParseError(error).message}`
+      );
+    }
   }
 
   private async consumeQueuedGuidanceForProviderResume(
@@ -1221,6 +1523,9 @@ export class SessionDriverLoop {
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
     const actionBundle = readActionBundle(proposal);
+    if (actionBundle && state.acceptedImplementationPlan) {
+      return this.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback);
+    }
     const proposalReply = await this.kernel({
       command: {
         kind: 'proposalSubmit',
@@ -1291,8 +1596,393 @@ export class SessionDriverLoop {
       ]);
     }
     const planCard = actionBundlePlanCardEvent(state, proposal, reviewReport, this.ts(), this.id('plan-card'));
-    result = await this.append(state.sessionId, [planCard]);
+    const planId = stringValue(objectRecord(planCard.payload)?.planId) ?? proposal.proposalId;
+    state.phase = 'waiting_plan_review';
+    result = await this.append(state.sessionId, [
+      planCard,
+      sessionRunStateEvent({
+        sessionId: state.sessionId,
+        runId: state.runId,
+        phase: 'waiting_plan_review',
+        reason: 'plan_review',
+        decisionOwner: {
+          kind: 'plan',
+          runId: state.runId,
+          targetId: planId,
+          planId,
+        },
+        ts: this.ts(),
+        id: this.id('session-run-waiting-plan'),
+      }),
+    ]);
     return result ?? fallback;
+  }
+
+  private async submitAcceptedPlanActionProposal(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    proposal: ProposalEnvelope,
+    fallback: AgentSessionResult
+  ): Promise<AgentSessionResult> {
+    const accepted = state.acceptedImplementationPlan;
+    const actionBundle = readActionBundle(proposal);
+    if (!accepted || !actionBundle) return fallback;
+
+    const validation = validateAcceptedImplementationPlanActionBundle(accepted, proposal);
+    if (!validation.ok) {
+      if (!state.acceptedPlanScopeRepairAttempted) {
+        state.acceptedPlanScopeRepairAttempted = true;
+        await this.append(state.sessionId, [
+          thinkingEvent(
+            state.sessionId,
+            '当前自动执行批次超出已确认计划范围，Session 正在要求模型按 accepted implementationPlan 重新拆分一次。',
+            this.ts(),
+            this.id('accepted-plan-scope-repair')
+          ),
+        ]);
+        try {
+          const repaired = await this.repairAcceptedPlanScope(input, state, prompt, proposal, validation);
+          if (repaired.kind === 'actionBundle') {
+            return this.submitAcceptedPlanActionProposal(input, state, prompt, repaired, fallback);
+          }
+          if (repaired.kind === 'decisionRequest') {
+            const requirement = requirementRecordFromProposal(repaired, input, state, this.ts());
+            const confirmation = requirementConfirmationEvent({
+              sessionId: state.sessionId,
+              runId: state.runId,
+              requirement,
+              proposal: repaired,
+              originalUserRequest: input.content,
+              attachments: input.attachments ?? [],
+              ts: this.ts(),
+              id: this.id('accepted-plan-scope-repair-decision'),
+            });
+            state.phase = 'waiting_plan_review';
+            return this.append(state.sessionId, [
+              confirmation,
+              sessionRunStateEvent({
+                sessionId: state.sessionId,
+                runId: state.runId,
+                phase: 'waiting_plan_review',
+                reason: 'requirement',
+                decisionOwner: {
+                  kind: 'requirement',
+                  runId: state.runId,
+                  targetId: requirement.requirementId,
+                  requirementId: requirement.requirementId,
+                },
+                ts: this.ts(),
+                id: this.id('session-run-waiting-accepted-plan-repair-decision'),
+              }),
+            ]);
+          }
+          if (repaired.kind === 'implementationPlan') {
+            const planId = stringValue(objectRecord(repaired.payload)?.id) ?? repaired.proposalId;
+            state.phase = 'waiting_plan_review';
+            return this.append(state.sessionId, [
+              implementationPlanCardEvent(state, repaired, this.ts(), this.id('accepted-plan-scope-repair-plan')),
+              sessionRunStateEvent({
+                sessionId: state.sessionId,
+                runId: state.runId,
+                phase: 'waiting_plan_review',
+                reason: 'plan_review',
+                decisionOwner: {
+                  kind: 'plan',
+                  runId: state.runId,
+                  targetId: planId,
+                  planId,
+                },
+                ts: this.ts(),
+                id: this.id('session-run-waiting-accepted-plan-repair-plan'),
+              }),
+            ]);
+          }
+          return this.submitNonExecutableProposal(state, repaired, fallback);
+        } catch (error) {
+          const message = error instanceof SessionDriverLoopError ? error.message : String(error);
+          return this.append(state.sessionId, [
+            finalDiagnosticEvent(
+              state.sessionId,
+              `自动执行批次越界，且模型 repair 失败：${message}`,
+              this.ts(),
+              this.id('accepted-plan-scope-repair-failed')
+            ),
+          ]);
+        }
+      }
+      return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, validation);
+    }
+
+    state.phase = 'executing_accepted_plan';
+    let result = await this.append(state.sessionId, [
+      sessionRunStateEvent({
+        sessionId: state.sessionId,
+        runId: state.runId,
+        phase: 'executing_accepted_plan',
+        status: 'running',
+        reason: 'accepted_plan_execution',
+        decisionOwner: {
+          kind: 'plan',
+          runId: state.runId,
+          targetId: accepted.planId,
+          planId: accepted.planId,
+        },
+        ts: this.ts(),
+        id: this.id('session-run-accepted-plan-execution'),
+      }),
+    ]) ?? fallback;
+
+    const proposalReply = await this.kernel({
+      command: {
+        kind: 'proposalSubmit',
+        requestId: this.id('proposal-submit-accepted-plan'),
+        runId: state.runId,
+        sessionId: state.sessionId,
+        proposal,
+      },
+    });
+    const reviewReport = findPlanReviewReport(proposalReply.events);
+    await this.appendProviderTrace(state, 'accepted_plan_batch_review_report', {
+      acceptedPlanId: accepted.planId,
+      proposalId: proposal.proposalId,
+      report: reviewReport,
+      events: proposalReply.events,
+    });
+    if (!reviewReport) {
+      return this.append(state.sessionId, [
+        finalDiagnosticEvent(
+          state.sessionId,
+          'Kernel 未返回 accepted-plan actionBundle 的 proposal.reviewed 事件，Session 不会自动执行该批次。',
+          this.ts(),
+          this.id('accepted-plan-review-missing')
+        ),
+      ]);
+    }
+    if (reviewReport && planReviewNeedsRepair(reviewReport) && !state.planReviewRepairAttempted) {
+      state.planReviewRepairAttempted = true;
+      await this.append(state.sessionId, [
+        thinkingEvent(
+          state.sessionId,
+          'Kernel PlanReview 要求补充当前自动执行批次的证据，Session 正在进行一次受控 repair。',
+          this.ts(),
+          this.id('accepted-plan-review-repair')
+        ),
+      ]);
+      let repaired: ProposalEnvelope;
+      try {
+        repaired = await this.repairPlanReview(input, state, prompt, proposal, reviewReport);
+      } catch (error) {
+        const message = error instanceof SessionDriverLoopError ? error.message : String(error);
+        return this.append(state.sessionId, [
+          finalDiagnosticEvent(
+            state.sessionId,
+            `自动执行批次需要修订，但模型 repair 失败：${message}`,
+            this.ts(),
+            this.id('accepted-plan-review-repair-failed')
+          ),
+        ]);
+      }
+      if (repaired.kind === 'actionBundle') {
+        return this.submitAcceptedPlanActionProposal(input, state, prompt, repaired, fallback);
+      }
+      if (repaired.kind === 'answer') {
+        return this.append(state.sessionId, [answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]);
+      }
+      return this.submitNonExecutableProposal(state, repaired, fallback);
+    }
+
+    result = await this.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? result;
+    if (planReviewDenied(reviewReport)) {
+      return this.append(state.sessionId, [
+        finalDiagnosticEvent(
+          state.sessionId,
+          `Kernel 拒绝该自动执行批次：${planReviewDiagnosticSummary(reviewReport)}`,
+          this.ts(),
+          this.id('accepted-plan-review-denied')
+        ),
+      ]);
+    }
+    if (reviewReport.status === 'needsRevision') {
+      return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, {
+        ok: false,
+        reasons: [`Kernel PlanReview 要求修订当前批次：${planReviewDiagnosticSummary(reviewReport)}`],
+      });
+    }
+
+    const autoGrantBlockers = nonAcceptedPlanPermissionGaps(reviewReport, accepted);
+    if (autoGrantBlockers.length) {
+      return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, {
+        ok: false,
+        reasons: autoGrantBlockers.map((capability) => `当前批次需要额外权限 ${capability}，不属于 accepted implementationPlan 自动执行范围。`),
+      });
+    }
+
+    const plan = acceptedPlanExecutionContext(state, proposal, reviewReport);
+    const grantEvents: unknown[] = [];
+    for (const grant of temporaryGrantsForPlan(plan)) {
+      const grantReply = await this.kernel({
+        command: {
+          kind: 'permissionGrantTemporary',
+          requestId: this.id('accepted-plan-temp-grant'),
+          runId: state.runId,
+          grant,
+        },
+      });
+      grantEvents.push(...(grantReply.events ?? []));
+    }
+    if (grantEvents.length) {
+      result = await this.appendProjectedKernelEvents(state.sessionId, { ok: true, events: grantEvents }) ?? result;
+    }
+
+    const batchReply = await this.kernel({
+      command: {
+        kind: 'actionBatchSubmit',
+        requestId: this.id('accepted-plan-action-batch-submit'),
+        runId: state.runId,
+        sessionId: state.sessionId,
+        batch: {
+          planId: accepted.planId,
+          actionBundle: plan.actionBundle,
+          codeBlocks: plan.codeBlocks,
+          commandBlocks: plan.commandBlocks,
+        },
+      },
+    });
+    result = await this.appendProjectedKernelEvents(state.sessionId, batchReply) ?? result;
+    if (!actionBatchReadyForReview(batchReply.events ?? [])) {
+      if (kernelEventsContainPermissionRequest(batchReply.events ?? [])) {
+        const permissionId = permissionIdFromKernelEvents(batchReply.events ?? []);
+        return this.append(state.sessionId, [
+          sessionRunStateEvent({
+            sessionId: state.sessionId,
+            runId: state.runId,
+            phase: 'waiting_permission',
+            reason: 'permission',
+            decisionOwner: {
+              kind: 'permission',
+              runId: state.runId,
+              targetId: permissionId,
+              permissionId,
+              planId: accepted.planId,
+            },
+            ts: this.ts(),
+            id: this.id('session-run-waiting-permission'),
+          }),
+        ]) ?? result;
+      }
+      return result;
+    }
+    const batchProgress = acceptedPlanBatchProgress(accepted, proposal, batchReply.events ?? []);
+    const nextAccepted = acceptedPlanAfterBatch(accepted, batchProgress.completedTaskIds);
+    result = await this.append(state.sessionId, [
+      acceptedPlanBatchCheckpointEvent(
+        state.sessionId,
+        state.runId,
+        accepted,
+        proposal,
+        batchReply.events ?? [],
+        batchProgress,
+        this.ts(),
+        this.id('accepted-plan-batch-checkpoint')
+      ),
+    ]) ?? result;
+
+    if (!actionBatchHasFailureOrBlocker(batchReply.events ?? []) && !acceptedPlanComplete(nextAccepted)) {
+      return this.runUserTurn({
+        sessionId: input.sessionId,
+        content: implementationPlanExecutionRequest(
+          { ...acceptedPlanExecutionContext(state, proposal, reviewReport), implementationPlan: accepted.rawPlan },
+          nextAccepted
+        ),
+        attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
+        existingEvents: result.events,
+        workspaceBinding: input.workspaceBinding,
+        projectWorkingDirectory: input.projectWorkingDirectory,
+        profileId: input.profileId,
+        workflow: input.workflow,
+        appendUserMessage: false,
+        requirementConfirmationMode: 'off',
+        reviewContinuationMode: input.reviewContinuationMode,
+        interventionLevel: input.interventionLevel,
+        resumeResourcePackets: true,
+        acceptedImplementationPlan: nextAccepted,
+      });
+    }
+
+    const factsReply = await this.kernel({
+      command: {
+        kind: 'reviewFactsGet',
+        requestId: this.id('accepted-plan-review-facts-get'),
+        runId: state.runId,
+        sessionId: state.sessionId,
+      },
+    });
+    result = await this.appendProjectedKernelEvents(state.sessionId, factsReply) ?? result;
+    const review = reviewSummaryEvent(
+      state.sessionId,
+      plan,
+      [...(batchReply.events ?? []), ...(factsReply.events ?? [])],
+      this.ts(),
+      this.id('review-summary')
+    );
+    const reviewPayload = objectRecord(review.payload) ?? {};
+    return this.append(state.sessionId, [
+      review,
+      sessionRunStateEvent({
+        sessionId: state.sessionId,
+        runId: state.runId,
+        phase: 'waiting_review',
+        reason: 'review',
+        decisionOwner: {
+          kind: 'review',
+          runId: state.runId,
+          targetId: stringValue(reviewPayload.reviewId) ?? state.runId,
+          reviewId: stringValue(reviewPayload.reviewId) ?? state.runId,
+          planId: accepted.planId,
+        },
+        ts: this.ts(),
+        id: this.id('session-run-waiting-review'),
+      }),
+    ]) ?? result;
+  }
+
+  private async appendAcceptedPlanBatchOutOfScope(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    proposal: ProposalEnvelope,
+    validation: AcceptedPlanBatchValidationResult
+  ): Promise<AgentSessionResult> {
+    const decisionProposal = acceptedPlanOutOfScopeDecisionProposal(state, proposal, validation, this.id('accepted-plan-scope-decision'));
+    const requirement = requirementRecordFromProposal(decisionProposal, input, state, this.ts());
+    const confirmation = requirementConfirmationEvent({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      requirement,
+      proposal: decisionProposal,
+      originalUserRequest: input.content,
+      attachments: input.attachments ?? [],
+      ts: this.ts(),
+      id: this.id('accepted-plan-scope-confirmation'),
+    });
+    state.phase = 'waiting_plan_review';
+    return this.append(state.sessionId, [
+      confirmation,
+      sessionRunStateEvent({
+        sessionId: state.sessionId,
+        runId: state.runId,
+        phase: 'waiting_plan_review',
+        reason: 'requirement',
+        decisionOwner: {
+          kind: 'requirement',
+          runId: state.runId,
+          targetId: requirement.requirementId,
+          requirementId: requirement.requirementId,
+        },
+        ts: this.ts(),
+        id: this.id('session-run-waiting-accepted-plan-scope'),
+      }),
+    ]);
   }
 
   private async repairPlanReview(
@@ -1314,6 +2004,29 @@ export class SessionDriverLoop {
       throw new SessionDriverLoopError(
         'agent_protocol_repair_failed',
         `模型计划 repair 后仍无法解析：${normalizeParseError(error).message}`
+      );
+    }
+  }
+
+  private async repairAcceptedPlanScope(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    proposal: ProposalEnvelope,
+    validation: AcceptedPlanBatchValidationResult
+  ): Promise<ProposalEnvelope> {
+    const raw = await this.llm(input.profileId, state, 'accepted_plan_scope_repair', acceptedPlanScopeRepairMessages(prompt, state, proposal, validation));
+    try {
+      return parseAndValidateProposal({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+      });
+    } catch (error) {
+      throw new SessionDriverLoopError(
+        'accepted_plan_scope_repair_failed',
+        `模型 accepted-plan scope repair 后仍无法解析：${normalizeParseError(error).message}`
       );
     }
   }
@@ -1778,37 +2491,10 @@ function nativeToolCallToProtocol(toolCall: NativeToolCallProposal): ToolCall {
 function nativeProviderToolsForState(state: SessionDriverLoopRunState): ToolDefinition[] {
   const allowed = state.stateContract?.allowedProposals ?? state.driverRequest?.stateContract?.allowedProposals ?? [];
   const allowResources = allowed.length === 0 || allowed.includes('resourceRequest') || allowed.includes('answer');
-  const allowActions = allowed.length === 0 || allowed.includes('actionBundle');
   const names = new Set<string>();
   if (allowResources) {
     names.add('fs.read');
     names.add('fs.list');
-  }
-  if (allowActions) {
-    for (const name of [
-      'fs.diff',
-      'fs.write',
-      'fs.delete',
-      'shell.propose',
-      'shell.exec',
-      'web.search',
-      'web.fetch',
-      'git.status',
-      'git.diff',
-      'git.stage',
-      'git.unstage',
-      'git.commit',
-      'git.push',
-      'browser.open',
-      'browser.reload',
-      'browser.snapshot',
-      'browser.inspect',
-      'browser.click',
-      'browser.type',
-      'browser.scroll',
-    ]) {
-      names.add(name);
-    }
   }
   if (names.size === 0) return [];
   return listDefaultAgentTools('askBeforeWrite').filter((tool) => names.has(tool.name));
@@ -1882,243 +2568,6 @@ function nativeToolResultFromPacket(
       returnedBytes: item.returnedBytes,
       denialReason: item.denialReason,
     })),
-  };
-}
-
-function nativeToolCallActionProposal(
-  input: SessionDriverLoopInput,
-  state: SessionDriverLoopRunState,
-  prompt: PromptEnvelope,
-  toolCall: NativeToolCallProposal,
-  proposalId: string
-): ProposalEnvelope {
-  const planned = plannedNativeAction(toolCall);
-  const codeBlocks = planned.codeBlock ? [planned.codeBlock] : [];
-  const commandBlocks = planned.commandBlock ? [planned.commandBlock] : [];
-  const action = {
-    id: `action-${sanitizeId(toolCall.callId)}`,
-    actionId: `action-${sanitizeId(toolCall.callId)}`,
-    title: planned.title,
-    description: planned.description,
-    capability: planned.capability,
-    kind: planned.kind,
-    resourceScope: planned.resourceScope,
-    targetPath: planned.targetPath,
-    sourceBlockId: planned.codeBlock?.blockId,
-    canParallelize: false,
-    conflictKeys: planned.resourceScope,
-    purpose: planned.description,
-    toolArgs: toolCall.arguments,
-    permissionLabels: [planned.capability],
-  };
-  const envelope = {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    proposalId,
-    runId: state.runId,
-    sessionId: state.sessionId,
-    source: 'llm',
-    kind: 'actionBundle',
-    outputLanguage: 'zh-CN',
-    narration: '模型请求了原生工具调用，我已把它转换为需要 Kernel 审查的计划。',
-    userPlanMarkdown: nativeToolUserPlan(input, prompt, toolCall, planned),
-    codeBlocks,
-    commandBlocks,
-    actionBundle: {
-      version: '1',
-      id: `native-tool-${sanitizeId(toolCall.callId)}`,
-      goal: `Review provider-native tool call ${toolCall.name} before execution.`,
-      actions: [action],
-      continuationExpectations: [],
-      validationExpectations: [{
-        id: 'kernel-facts',
-        description: 'Kernel records permission, WorkUnit, and tool facts for the normalized native tool action.',
-      }],
-      reviewExpectations: [{
-        id: 'user-review',
-        description: 'User reviews the normalized native tool action, its resource scope, and Kernel facts before accepting completion.',
-      }],
-    },
-    expectedValidation: 'Kernel facts must show the permission and execution result for the normalized native tool action.',
-    reviewGuide: 'Review the requested tool name, arguments, resource scope, and generated Kernel facts before accepting this batch.',
-  };
-  return parseAndValidateProposal({
-    raw: envelope,
-    runId: state.runId,
-    sessionId: state.sessionId,
-    source: 'llm',
-  });
-}
-
-function plannedNativeAction(toolCall: NativeToolCallProposal): {
-  title: string;
-  description: string;
-  capability: string;
-  kind: string;
-  resourceScope: string[];
-  targetPath?: string;
-  codeBlock?: Record<string, unknown>;
-  commandBlock?: Record<string, unknown>;
-} {
-  const path = stringValue(toolCall.arguments.path) ?? stringValue(toolCall.arguments.targetPath);
-  if (toolCall.name === 'fs.write') {
-    const content = typeof toolCall.arguments.content === 'string' ? toolCall.arguments.content : '';
-    const targetPath = path ?? 'native-tool-output.txt';
-    const blockId = `block-${sanitizeId(toolCall.callId)}`;
-    return {
-      title: `Write ${targetPath}`,
-      description: 'Provider-native fs.write was normalized into a workspace write proposal.',
-      capability: 'workspace.write',
-      kind: 'write',
-      resourceScope: [targetPath],
-      targetPath,
-      codeBlock: {
-        blockId,
-        id: blockId,
-        targetPath,
-        path: targetPath,
-        operation: 'overwrite',
-        language: 'text',
-        content,
-        permissionLabels: ['workspace.write'],
-      },
-    };
-  }
-  if (toolCall.name === 'fs.delete') {
-    const targetPath = path ?? 'unknown';
-    return {
-      title: `Delete ${targetPath}`,
-      description: 'Provider-native fs.delete was normalized into a workspace delete proposal.',
-      capability: 'workspace.delete',
-      kind: 'delete',
-      resourceScope: [targetPath],
-      targetPath,
-    };
-  }
-  if (toolCall.name === 'fs.diff') {
-    const targetPath = path ?? 'unknown';
-    return {
-      title: `Preview diff for ${targetPath}`,
-      description: 'Provider-native fs.diff was normalized into a Kernel-reviewed diff action.',
-      capability: 'workspace.read',
-      kind: 'diff',
-      resourceScope: [targetPath],
-      targetPath,
-    };
-  }
-  if (toolCall.name === 'shell.exec' || toolCall.name === 'shell.propose') {
-    const command = stringValue(toolCall.arguments.command) ?? '';
-    return {
-      title: 'Run proposed shell command',
-      description: 'Provider-native shell command was normalized into a commandBlock that requires Kernel permission handling.',
-      capability: 'process.exec',
-      kind: 'command',
-      resourceScope: [stringValue(toolCall.arguments.cwd) ?? '.'],
-      commandBlock: {
-        commandId: `command-${sanitizeId(toolCall.callId)}`,
-        capability: 'process.exec',
-        cwd: stringValue(toolCall.arguments.cwd),
-        argv: ['bash', '-lc', command],
-        timeoutMs: normalizedPositiveInteger(toolCall.arguments.timeoutMs) ?? 120000,
-        envPolicy: 'inheritSafe',
-        expectedOutput: stringValue(toolCall.arguments.reason) ?? `Execute provider-native ${toolCall.name}.`,
-        permissionLabels: ['process.exec'],
-      },
-    };
-  }
-  if (toolCall.name.startsWith('git.')) {
-    const capability = toolCall.name === 'git.push' ? 'git.push' : (toolCall.name === 'git.status' || toolCall.name === 'git.diff' ? 'git.read' : 'git.write');
-    return {
-      title: `Git operation ${toolCall.name}`,
-      description: `Provider-native ${toolCall.name} was normalized into a Kernel-reviewed Git action.`,
-      capability,
-      kind: toolCall.name.slice('git.'.length) || 'status',
-      resourceScope: [stringValue(toolCall.arguments.path) ?? '.'],
-      targetPath: stringValue(toolCall.arguments.path),
-    };
-  }
-  if (toolCall.name.startsWith('web.')) {
-    return {
-      title: `Network operation ${toolCall.name}`,
-      description: `Provider-native ${toolCall.name} was normalized into a network egress proposal.`,
-      capability: 'network.egress',
-      kind: toolCall.name === 'web.search' ? 'search' : 'read',
-      resourceScope: [stringValue(toolCall.arguments.url) ?? stringValue(toolCall.arguments.query) ?? 'network'],
-    };
-  }
-  if (toolCall.name.startsWith('browser.')) {
-    return {
-      title: `Browser operation ${toolCall.name}`,
-      description: `Provider-native ${toolCall.name} was normalized into a browser control proposal.`,
-      capability: 'browser.control',
-      kind: 'stage',
-      resourceScope: [stringValue(toolCall.arguments.url) ?? stringValue(toolCall.arguments.selector) ?? 'browser'],
-    };
-  }
-  return {
-    title: `Native tool call ${toolCall.name}`,
-    description: `Provider-native ${toolCall.name} is unsupported for immediate execution and was normalized into a reviewable action.`,
-    capability: 'config.modify',
-    kind: 'stage',
-    resourceScope: [toolCall.name],
-  };
-}
-
-function nativeToolUserPlan(
-  input: SessionDriverLoopInput,
-  prompt: PromptEnvelope,
-  toolCall: NativeToolCallProposal,
-  planned: ReturnType<typeof plannedNativeAction>
-): string {
-  return [
-    '# Provider-native tool call review',
-    '',
-    '## Summary',
-    `The provider requested native tool call \`${toolCall.name}\`. Session will not execute it directly. It has been normalized into the existing Kernel-reviewed action path.`,
-    '',
-    '## Requested operation',
-    `- Tool call id: \`${toolCall.callId}\``,
-    `- Capability: \`${planned.capability}\``,
-    `- Resource scope: ${planned.resourceScope.map((item) => `\`${item}\``).join(', ') || '`unknown`'}`,
-    `- Original user request: ${clip(input.content, 500)}`,
-    '',
-    '## Boundary handling',
-    '- Provider-native calls are treated as proposals, not as permission grants.',
-    '- Kernel PlanReview, PermissionGate, WorkspaceBoundary, and audit facts remain authoritative.',
-    '- Tool results must return through Kernel facts before they can be considered execution evidence.',
-    '',
-    '## Validation',
-    '- Verify that Kernel records the normalized proposal, any permission request, WorkUnit lifecycle, and final tool result.',
-    '- If execution is denied or blocked, the provider resume receives a denied or blocked tool result instead of a fabricated success.',
-    '',
-    '## Assumptions',
-    `- Current prompt stable prefix hash area is not modified by this conversion: ${clip(prompt.stablePrefix, 120).replace(/\s+/g, ' ')}`,
-    '- This batch does not add Anthropic-style streaming or direct provider-to-tool execution.',
-  ].join('\n');
-}
-
-function nativeToolProgressEvent(
-  sessionId: string,
-  runId: string,
-  content: string,
-  ts: string,
-  id: string,
-  extraPayload: Record<string, unknown> = {}
-): AgentEvent {
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'assistant_msg',
-    payload: {
-      content,
-      channel: 'progress',
-      source: 'session',
-      visibility: 'conversation',
-      presentation: 'body',
-      label: 'DeepCode',
-      runId,
-      ...extraPayload,
-    },
   };
 }
 
@@ -2277,6 +2726,9 @@ function createManifest(input: SessionDriverLoopInput, id: string): ResourceMani
 }
 
 function kernelRunAttachments(input: SessionDriverLoopInput): AgentContextAttachment[] {
+  if (input.acceptedImplementationPlan?.executionRoot) {
+    return uniqueAttachments([input.acceptedImplementationPlan.executionRoot.attachment]);
+  }
   const attachments = uniqueAttachments(input.attachments ?? []);
   if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
     const workingDirectory = input.projectWorkingDirectory;
@@ -2304,6 +2756,9 @@ function kernelRunAttachments(input: SessionDriverLoopInput): AgentContextAttach
 }
 
 function primaryConversationRootRef(input: SessionDriverLoopInput): string | undefined {
+  if (input.acceptedImplementationPlan?.executionRoot?.ref) {
+    return comparablePath(input.acceptedImplementationPlan.executionRoot.ref);
+  }
   const currentDirectories = (input.attachments ?? [])
     .filter((attachment) => attachment.kind === 'directory')
     .map((attachment) => attachment.absolutePath ?? attachment.path)
@@ -2402,12 +2857,30 @@ function buildImplementationBatchContext(events: AgentEvent[]): ImplementationBa
   };
 }
 
-function implementationBatchHints(context: ImplementationBatchContext): string[] {
+function implementationBatchHints(
+  context: ImplementationBatchContext,
+  acceptedPlan?: AcceptedImplementationPlanContext
+): string[] {
   const hints = [
     `Implementation batch context: nextBatchIndex=${context.batchIndex}. Generate only the next reviewable batch when proposing side-effect actions.`,
     'Context boundary: plan cards and continuation expectations are intent only; they are not evidence that files exist or were modified.',
     'Authoritative generated-file facts come only from ResourcePacket contents, ToolCompleted(ok=true), or WorkUnitCompleted facts.',
   ];
+  if (acceptedPlan) {
+    const currentTask = acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
+    hints.push(
+      `Accepted implementationPlan active: planId=${acceptedPlan.planId}; batchIndex=${acceptedPlan.batchIndex}; completedTasks=${acceptedPlan.completedTaskIds.length}/${acceptedPlan.tasks.length}. Automatic execution is allowed for related batches whose targets and capabilities stay inside the accepted plan.`,
+      currentTask
+        ? `Current accepted implementationPlan task: taskId=${currentTask.taskId}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}.`
+        : 'Current accepted implementationPlan task could not be inferred from batchIndex; keep the next batch minimal and in scope.',
+      `Accepted implementationPlan capabilities: ${acceptedPlan.capabilities.length ? acceptedPlan.capabilities.join(', ') : 'none'}.`,
+      `Accepted implementationPlan target scopes: ${acceptedPlan.targetScopes.length ? acceptedPlan.targetScopes.join(', ') : 'none'}.`,
+      acceptedPlan.executionRoot
+        ? `Accepted implementationPlan primary root: ${acceptedPlan.executionRoot.ref}. All actionBundle targetPath/codeBlock paths must be relative to this root and must not include the root directory name.`
+        : 'Accepted implementationPlan primary root is not explicit; use relative target paths from the authorized workspace root only.',
+      'Do not ask the user to reconfirm routine implementation batches already covered by the accepted implementationPlan. If new targets, capabilities, or material technical choices are needed, return decisionRequest or implementationPlan revision instead of an out-of-scope actionBundle.'
+    );
+  }
   if (context.recentPlanSummaries.length) {
     hints.push(`Recent implementation batch plans (intent only, not execution facts): ${context.recentPlanSummaries.join(' | ')}`);
   }
@@ -2852,7 +3325,7 @@ function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePa
 function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: string): AgentEvent {
   const record = objectRecord(event) ?? {};
   const kind = typeof record.kind === 'string' ? record.kind : 'kernel.event';
-  if (kind === 'proposal.reviewed') {
+ if (kind === 'proposal.reviewed') {
     const report = objectRecord(record.report) ?? {};
     const status = typeof report.status === 'string' ? report.status : 'awaitingUserApproval';
     const planId = typeof report.planId === 'string' ? report.planId : 'agent-plan';
@@ -2870,13 +3343,14 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
         status,
         runId: typeof record.runId === 'string' ? record.runId : undefined,
         planId,
-        confirmable: status === 'awaitingUserApproval' || status === 'awaitingTemporaryGrant',
+        confirmable: false,
+        auditOnly: true,
         requiredPermissions: Array.isArray(report.requiredPermissions) ? report.requiredPermissions : [],
         permissionGaps: Array.isArray(report.permissionGaps) ? report.permissionGaps : [],
         facts: planReviewFacts(report),
-        channel: 'action',
-        visibility: 'conversation',
-        presentation: 'body',
+        channel: 'trace',
+        visibility: 'debug',
+        presentation: 'collapsible',
         report,
         kernelEvent: record,
       },
@@ -2933,7 +3407,7 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
       ts,
       kind: 'error',
       payload: {
-        message: typeof record.reason === 'string' ? record.reason : 'Kernel rejected the proposal.',
+        message: kernelFailureMessage(kind, record),
         channel: 'error',
         visibility: 'conversation',
         kernelEvent: record,
@@ -2955,6 +3429,28 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
       kernelEvent: record,
     },
   };
+}
+
+function kernelFailureMessage(kind: string, record: Record<string, unknown>): string {
+  const error = objectRecord(record.error);
+  const reason = stringValue(record.reason)
+    ?? stringValue(record.summary)
+    ?? stringValue(error?.message)
+    ?? stringValue(error?.reason)
+    ?? stringValue(record.message);
+  if (kind === 'work_unit.failed') {
+    const workUnitId = stringValue(record.workUnitId)
+      ?? stringValue(objectRecord(record.workUnit)?.id)
+      ?? stringValue(record.actionId);
+    const suffix = reason ? `：${reason}` : '。';
+    return workUnitId
+      ? `Kernel work unit ${workUnitId} 执行失败${suffix}`
+      : `Kernel work unit 执行失败${suffix}`;
+  }
+  if (kind === 'proposal.rejected') {
+    return reason ? `Kernel 拒绝 proposal：${reason}` : 'Kernel 拒绝 proposal。';
+  }
+  return reason ?? 'Kernel 返回失败事件。';
 }
 
 function kernelEventSummary(kind: string, record: Record<string, unknown>): string {
@@ -3326,6 +3822,9 @@ function actionBundlePlanCardEvent(
   const userPlan = typeof payload.userPlan === 'string' && payload.userPlan.trim()
     ? payload.userPlan
     : actionBundle?.goal ?? 'Agent plan';
+  const status = stringValue(report?.status) ?? 'pending';
+  const planId = actionBundle?.id ?? proposal.proposalId;
+  const confirmable = planReviewStatusAwaitingUser(status);
   return {
     id,
     sessionId: state.sessionId,
@@ -3336,8 +3835,17 @@ function actionBundlePlanCardEvent(
       summary: userPlan,
       content: userPlan,
       runId: proposal.runId,
-      planId: actionBundle?.id ?? proposal.proposalId,
+      planId,
       proposalId: proposal.proposalId,
+      status,
+      confirmable,
+      decisionOwner: {
+        kind: 'plan',
+        runId: proposal.runId,
+        targetId: planId,
+        planId,
+        source: 'plan_card',
+      },
       implementationBatch: state.implementationBatch,
       actionBundle,
       codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
@@ -3349,6 +3857,140 @@ function actionBundlePlanCardEvent(
       visibility: 'conversation',
       presentation: 'body',
     },
+  };
+}
+
+function implementationPlanCardEvent(
+  state: SessionDriverLoopRunState,
+  proposal: ProposalEnvelope,
+  ts: string,
+  id: string
+): AgentEvent {
+  const implementationPlan = objectRecord(proposal.payload) ?? {};
+  const language = visibleLanguageForRequest(state.userRequest);
+  const planId = stringValue(implementationPlan.id) ?? proposal.proposalId;
+  const title = stringValue(implementationPlan.title) ?? localizedImplementationPlanHeading(language, 'title');
+  const summary = stringValue(implementationPlan.summary) ?? title;
+  const content = renderImplementationPlanMarkdown(implementationPlan, summary, language);
+  return {
+    id,
+    sessionId: state.sessionId,
+    ts,
+    kind: 'plan_card',
+    payload: {
+      title,
+      summary,
+      content,
+      runId: proposal.runId,
+      planId,
+      proposalId: proposal.proposalId,
+      status: 'pending',
+      confirmable: true,
+      decisionOwner: {
+        kind: 'plan',
+        runId: proposal.runId,
+        targetId: planId,
+        planId,
+        source: 'plan_card',
+      },
+      implementationBatch: state.implementationBatch,
+      implementationPlan,
+      actionBundle: {
+        version: '1',
+        id: planId,
+        goal: summary,
+        actions: [],
+        continuationExpectations: [],
+        validationExpectations: [],
+        reviewExpectations: [],
+      },
+      codeBlocks: [],
+      commandBlocks: [],
+      expectedValidation: '',
+      reviewGuide: language === 'zh-CN'
+        ? '请先审查任务清单、验收标准和失败重规划条件；确认后再生成编辑内容。'
+        : 'Review the task checklist, acceptance criteria, and failure criteria before edits are generated.',
+      channel: 'action',
+      visibility: 'conversation',
+      presentation: 'body',
+    },
+  };
+}
+
+function renderImplementationPlanMarkdown(
+  plan: Record<string, unknown>,
+  fallbackSummary: string,
+  language: VisibleLanguage
+): string {
+  const headings = implementationPlanMarkdownLabels(language);
+  const lines = [`## ${headings.plan}`, '', fallbackSummary, ''];
+  const tasks = Array.isArray(plan.tasks) ? plan.tasks : [];
+  if (tasks.length) {
+    lines.push(`## ${headings.checklist}`, '');
+    for (const task of tasks) {
+      const record = objectRecord(task) ?? {};
+      const title = stringValue(record.title) ?? stringValue(record.taskId) ?? headings.task;
+      lines.push(`- ${title}`);
+      const target = stringArrayValue(record.target);
+      if (target.length) lines.push(`  - Target: ${target.join(', ')}`);
+      const scope = stringValue(record.scope);
+      if (scope) lines.push(`  - Scope: ${scope}`);
+      const capability = stringValue(record.capability);
+      if (capability) lines.push(`  - Capability: ${capability}`);
+      const acceptance = stringArrayValue(record.acceptanceCriteria);
+      if (acceptance.length) lines.push(`  - Acceptance: ${acceptance.join('; ')}`);
+      const failure = stringArrayValue(record.failureCriteria);
+      if (failure.length) lines.push(`  - Stop/Replan: ${failure.join('; ')}`);
+    }
+    lines.push('');
+  }
+  const risks = stringArrayValue(plan.risks);
+  if (risks.length) {
+    lines.push(`## ${headings.risks}`, '', ...risks.map((item) => `- ${item}`), '');
+  }
+  const checkpoints = stringArrayValue(plan.reviewCheckpoints);
+  if (checkpoints.length) {
+    lines.push(`## ${headings.reviewCheckpoints}`, '', ...checkpoints.map((item) => `- ${item}`), '');
+  }
+  lines.push(`## ${headings.boundary}`, '', `- ${headings.boundaryMessage}`);
+  return lines.join('\n');
+}
+
+function localizedImplementationPlanHeading(language: VisibleLanguage, key: 'title'): string {
+  if (language === 'zh-CN') {
+    return key === 'title' ? '实现计划' : '实现计划';
+  }
+  return 'Implementation plan';
+}
+
+function implementationPlanMarkdownLabels(language: VisibleLanguage): {
+  plan: string;
+  checklist: string;
+  task: string;
+  risks: string;
+  reviewCheckpoints: string;
+  boundary: string;
+  boundaryMessage: string;
+} {
+  if (language === 'zh-CN') {
+    return {
+      plan: '计划',
+      checklist: '任务清单',
+      task: '任务',
+      risks: '风险',
+      reviewCheckpoints: 'Review 节点',
+      boundary: '边界',
+      boundaryMessage: '这只是计划，不是执行结果；代码和命令只会在用户确认后生成。',
+    };
+  }
+  return {
+    plan: 'Plan',
+    checklist: 'Checklist',
+    task: 'Task',
+    risks: 'Risks',
+    reviewCheckpoints: 'Review Checkpoints',
+    boundary: 'Boundary',
+    boundaryMessage: 'This plan is not execution. Code and commands are generated only after user acceptance.',
   };
 }
 
@@ -3380,6 +4022,13 @@ function planReviewNeedsRepair(report: Record<string, unknown>): boolean {
 
 function planReviewDenied(report: Record<string, unknown>): boolean {
   return report.status === 'denied' || report.status === 'interfaceOnly';
+}
+
+function planReviewStatusAwaitingUser(status: string | undefined): boolean {
+  return status === 'awaitingUserApproval' ||
+    status === 'awaitingTemporaryGrant' ||
+    status === 'pending' ||
+    status === undefined;
 }
 
 function planReviewDiagnosticSummary(report: Record<string, unknown>): string {
@@ -3433,6 +4082,7 @@ interface SessionPlanContext {
   expectedValidation: string;
   reviewGuide: string;
   planReviewReport?: Record<string, unknown>;
+  implementationPlan?: Record<string, unknown>;
 }
 
 interface SessionReviewContext {
@@ -3538,10 +4188,16 @@ function latestExecutablePlan(events: AgentEvent[], previousRunId?: string): Ses
 }
 
 function planContextFromEvent(event: AgentEvent, payload: Record<string, unknown>): SessionPlanContext | null {
-  const actionBundle = objectRecord(payload.actionBundle);
+  const implementationPlan = objectRecord(payload.implementationPlan) ?? undefined;
+  const actionBundle = objectRecord(payload.actionBundle) ?? (implementationPlan ? {
+    id: stringValue(payload.planId) ?? stringValue(implementationPlan.id) ?? stringValue(payload.proposalId),
+    version: '1',
+    actions: [],
+  } : undefined);
   if (!actionBundle) return null;
   const planId = stringValue(payload.planId)
     ?? stringValue(actionBundle.id)
+    ?? stringValue(implementationPlan?.id)
     ?? stringValue(payload.proposalId);
   const runId = stringValue(payload.runId);
   if (!planId || !runId) return null;
@@ -3551,12 +4207,13 @@ function planContextFromEvent(event: AgentEvent, payload: Record<string, unknown
     planId,
     proposalId: stringValue(payload.proposalId),
     userPlan: stringValue(payload.content) ?? stringValue(payload.summary) ?? 'Agent plan',
-    actionBundle,
+    actionBundle: actionBundle as unknown as Record<string, unknown>,
     codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
     commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
     expectedValidation: stringValue(payload.expectedValidation) ?? '',
     reviewGuide: stringValue(payload.reviewGuide) ?? '',
     planReviewReport: objectRecord(payload.planReviewReport) ?? undefined,
+    implementationPlan,
   };
 }
 
@@ -3594,6 +4251,470 @@ function planAutoExecutableAfterRequirement(plan: SessionPlanContext): boolean {
   return hardFloorHits.length === 0 && deniedReasons.length === 0 && blockedReasons.length === 0;
 }
 
+function acceptedImplementationPlanContext(
+  plan: SessionPlanContext,
+  interventionLevel?: InterventionLevel,
+  executionRoot?: AcceptedImplementationPlanExecutionRoot
+): AcceptedImplementationPlanContext {
+  const rawPlan = plan.implementationPlan ?? {};
+  const tasks = Array.isArray(rawPlan.tasks) ? rawPlan.tasks : [];
+  const taskContexts = tasks.flatMap((item, index): AcceptedImplementationPlanTaskContext[] => {
+    const record = objectRecord(item);
+    if (!record) return [];
+    const taskId = stringValue(record.taskId) ?? stringValue(record.id) ?? `task-${index + 1}`;
+    return [{
+      taskId,
+      title: stringValue(record.title),
+      capability: stringValue(record.capability),
+      targets: stringArrayValue(record.target).map(normalizePlanScope).filter(Boolean),
+    }];
+  });
+  const capabilities = [...new Set(taskContexts.map((task) => task.capability).filter((item): item is string => Boolean(item)))];
+  const targetScopes = [...new Set(taskContexts.flatMap((task) => task.targets).filter(Boolean))];
+  return {
+    planId: plan.planId,
+    runId: plan.runId,
+    title: stringValue(rawPlan.title),
+    summary: stringValue(rawPlan.summary),
+    tasks: taskContexts,
+    capabilities,
+    targetScopes,
+    executionRoot,
+    interventionLevel,
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan,
+  };
+}
+
+function acceptedPlanExecutionRootFromDecision(
+  input: SessionDecisionResolverInput,
+  events: AgentEvent[]
+): AcceptedImplementationPlanExecutionRoot | undefined {
+  if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
+    const workingDirectory = input.projectWorkingDirectory;
+    const ref = workingDirectory.absolutePath ?? workingDirectory.displayPath;
+    return {
+      attachment: {
+        kind: 'directory',
+        path: workingDirectory.displayPath,
+        absolutePath: workingDirectory.absolutePath,
+        source: 'userSelected',
+        scope: 'session',
+      },
+      ref,
+      source: 'projectWorkingDirectory',
+    };
+  }
+  if (input.workspaceBinding?.openPath) {
+    return {
+      attachment: {
+        kind: 'directory',
+        path: input.workspaceBinding.openPath,
+        absolutePath: input.workspaceBinding.openPath,
+        source: 'userSelected',
+        scope: 'session',
+      },
+      ref: input.workspaceBinding.openPath,
+      source: 'workspaceBinding',
+    };
+  }
+  const recentDirectories = uniqueAttachments(recentAttachmentFacts(events))
+    .filter((attachment) => attachment.kind === 'directory');
+  const uniqueRefs = [...new Set(recentDirectories.map((attachment) => comparablePath(attachment.absolutePath ?? attachment.path)))];
+  if (uniqueRefs.length !== 1) return undefined;
+  const attachment = recentDirectories.find((item) => comparablePath(item.absolutePath ?? item.path) === uniqueRefs[0]);
+  if (!attachment) return undefined;
+  const ref = attachment.absolutePath ?? attachment.path;
+  return {
+    attachment: {
+      ...attachment,
+      path: attachment.path || ref,
+      scope: 'session',
+    },
+    ref,
+    source: 'recentAttachment',
+  };
+}
+
+function acceptedPlanExecutionContext(
+  state: SessionDriverLoopRunState,
+  proposal: ProposalEnvelope,
+  planReviewReport: Record<string, unknown>
+): SessionPlanContext {
+  const accepted = state.acceptedImplementationPlan;
+  const payload = objectRecord(proposal.payload) ?? {};
+  const actionBundle = readActionBundle(proposal) ?? {
+    id: accepted?.planId ?? proposal.proposalId,
+    version: '1',
+    goal: stringValue(accepted?.summary) ?? 'Accepted implementation plan batch',
+    actions: [],
+    validationExpectations: [],
+    reviewExpectations: [],
+  };
+  return {
+    sessionId: state.sessionId,
+    runId: state.runId,
+    planId: accepted?.planId ?? stringValue(actionBundle.id) ?? proposal.proposalId,
+    proposalId: proposal.proposalId,
+    userPlan: stringValue(payload.userPlan) ?? stringValue(accepted?.summary) ?? 'Accepted implementation plan batch',
+    actionBundle: actionBundle as unknown as Record<string, unknown>,
+    codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
+    commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
+    expectedValidation: stringValue(payload.expectedValidation) ?? '',
+    reviewGuide: stringValue(payload.reviewGuide) ?? '',
+    planReviewReport,
+    implementationPlan: accepted?.rawPlan,
+  };
+}
+
+function validateAcceptedImplementationPlanActionBundle(
+  accepted: AcceptedImplementationPlanContext,
+  proposal: ProposalEnvelope
+): AcceptedPlanBatchValidationResult {
+  const actionBundle = readActionBundle(proposal);
+  if (!actionBundle) return { ok: false, reasons: ['当前 provider 输出不包含 actionBundle，无法按已确认计划自动执行。'] };
+  const reasons: string[] = [];
+  const allowedCapabilities = new Set(accepted.capabilities);
+  const allowedScopes = accepted.targetScopes.map(normalizePlanScope).filter(Boolean);
+  const batchTargets = acceptedPlanProposalTargetScopes(proposal, accepted);
+  for (const target of batchTargets) {
+    const targetError = acceptedPlanRelativeTargetError(target, accepted);
+    if (targetError) reasons.push(targetError);
+  }
+  for (const action of actionBundle.actions ?? []) {
+    const capability = action.capability;
+    if (!acceptedPlanAutoExecutableCapability(capability)) {
+      reasons.push(`能力 ${capability || '[empty]'} 需要单独用户介入，不能在 accepted implementationPlan 后自动执行。`);
+      continue;
+    }
+    if (!allowedCapabilities.has(capability)) {
+      reasons.push(`能力 ${capability} 未出现在已确认 implementationPlan 的任务能力列表中。`);
+    }
+    const scopes = actionPlanTargetScopes(action, proposal)
+      .map((scope) => normalizeAcceptedPlanTargetScope(scope, accepted))
+      .filter(Boolean);
+    if (scopes.length === 0) {
+      reasons.push(`动作 ${action.id || action.title || '[unnamed]'} 缺少 target/resourceScope，不能证明其落在已确认计划范围内。`);
+      continue;
+    }
+    for (const scope of scopes) {
+      if (!scopeCoveredByAcceptedPlan(scope, allowedScopes)) {
+        reasons.push(`目标 ${scope} 超出已确认 implementationPlan 的 target 范围。`);
+      }
+    }
+  }
+  return { ok: reasons.length === 0, reasons: [...new Set(reasons)] };
+}
+
+function acceptedPlanProposalTargetScopes(
+  proposal: ProposalEnvelope,
+  accepted: AcceptedImplementationPlanContext
+): AcceptedPlanTargetScope[] {
+  const actionBundle = readActionBundle(proposal);
+  const targets: string[] = [];
+  for (const action of actionBundle?.actions ?? []) {
+    targets.push(...actionPlanTargetScopes(action, proposal));
+  }
+  const payload = objectRecord(proposal.payload) ?? {};
+  const codeBlocks = Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [];
+  for (const block of codeBlocks) {
+    const record = objectRecord(block);
+    if (!record) continue;
+    targets.push(...stringArrayValue(record.path), ...stringArrayValue(record.targetPath));
+  }
+  const output: AcceptedPlanTargetScope[] = [];
+  const seen = new Set<string>();
+  for (const raw of targets) {
+    const normalized = normalizeAcceptedPlanTargetScope(raw, accepted);
+    const key = `${raw}\u0000${normalized}`;
+    if (!normalized || seen.has(key)) continue;
+    seen.add(key);
+    output.push({ raw, normalized });
+  }
+  return output;
+}
+
+function acceptedPlanRelativeTargetError(
+  target: AcceptedPlanTargetScope,
+  accepted: AcceptedImplementationPlanContext
+): string | undefined {
+  const raw = target.raw;
+  const normalized = target.normalized;
+  if (!normalized) return 'actionBundle 目标路径为空，不能自动执行。';
+  if (normalized === '.' || normalized === '..') {
+    return `目标 ${raw} 指向 primary root 目录本身，不是可写入文件。`;
+  }
+  if (normalized === '.' || normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) {
+    return `目标 ${raw} 不能包含跨出 primary root 的相对路径。`;
+  }
+  const rootRef = accepted.executionRoot?.ref;
+  if (isAbsolutePath(raw)) {
+    if (!rootRef) {
+      return `目标 ${raw} 必须是相对 workspace root 的路径；当前没有可归一化的 attachment root。`;
+    }
+    const root = comparablePath(rootRef);
+    const candidate = comparablePath(raw);
+    if (candidate !== root && !candidate.startsWith(`${root}/`)) {
+      return `目标 ${raw} 是绝对路径，但不在已确认 primary root ${rootRef} 内。`;
+    }
+  }
+  if (rootRef) {
+    const rootName = basename(rootRef);
+    const rawNormalized = normalizePlanScope(raw);
+    if (rootName && rawNormalized === rootName) {
+      return `目标 ${raw} 指向 primary root 目录本身，不是可写入文件。`;
+    }
+  }
+  return undefined;
+}
+
+function acceptedPlanBatchProgress(
+  accepted: AcceptedImplementationPlanContext,
+  proposal: ProposalEnvelope,
+  kernelEvents: unknown[]
+): AcceptedPlanBatchProgress {
+  const actionBundle = readActionBundle(proposal);
+  const actions = actionBundle?.actions ?? [];
+  const actionIds = actions
+    .map((action) => {
+      const record = objectRecord(action) ?? {};
+      return stringValue(record.actionId) ?? stringValue(record.id) ?? stringValue(record.title);
+    })
+    .filter((item): item is string => Boolean(item));
+  const actionCapabilities = new Set(actions.map((action) => stringValue(action.capability)).filter((item): item is string => Boolean(item)));
+  const targetPaths = [...new Set(acceptedPlanProposalTargetScopes(proposal, accepted)
+    .map((target) => target.normalized)
+    .filter((target) => target && target !== '.' && target !== '..'))];
+  const workUnitIds = workUnitIdsFromKernelEvents(kernelEvents);
+  const priorCompleted = new Set(accepted.completedTaskIds);
+  const newlyCompleted = new Set<string>();
+  for (const task of accepted.tasks) {
+    if (priorCompleted.has(task.taskId)) continue;
+    if (acceptedPlanTaskCoveredByBatch(task, targetPaths, actionCapabilities)) {
+      newlyCompleted.add(task.taskId);
+    }
+  }
+  if (!newlyCompleted.size && !actionBatchHasFailureOrBlocker(kernelEvents)) {
+    const currentTask = accepted.tasks[Math.max(0, accepted.batchIndex - 1)];
+    if (currentTask && !priorCompleted.has(currentTask.taskId)) {
+      newlyCompleted.add(currentTask.taskId);
+    }
+  }
+  const completedTaskIds = [...new Set([...accepted.completedTaskIds, ...newlyCompleted])];
+  const completed = new Set(completedTaskIds);
+  const remainingTaskIds = accepted.tasks
+    .map((task) => task.taskId)
+    .filter((taskId) => !completed.has(taskId));
+  return {
+    actionIds: [...new Set(actionIds)],
+    targetPaths,
+    workUnitIds,
+    newlyCompletedTaskIds: [...newlyCompleted],
+    completedTaskIds,
+    remainingTaskIds,
+  };
+}
+
+function acceptedPlanTaskCoveredByBatch(
+  task: AcceptedImplementationPlanTaskContext,
+  targetPaths: string[],
+  actionCapabilities: Set<string>
+): boolean {
+  if (task.capability && actionCapabilities.size && !actionCapabilities.has(task.capability)) return false;
+  if (!task.targets.length) return !task.capability || actionCapabilities.has(task.capability);
+  if (!targetPaths.length) return false;
+  return task.targets.every((taskTarget) => {
+    const normalizedTaskTarget = normalizePlanScope(taskTarget);
+    return targetPaths.some((targetPath) =>
+      planScopeCovers(normalizedTaskTarget, targetPath) ||
+      planScopeCovers(targetPath, normalizedTaskTarget)
+    );
+  });
+}
+
+function acceptedPlanAfterBatch(
+  accepted: AcceptedImplementationPlanContext,
+  completedTaskIds: string[]
+): AcceptedImplementationPlanContext {
+  const completed = new Set(completedTaskIds);
+  const nextIndex = accepted.tasks.findIndex((task) => !completed.has(task.taskId));
+  return {
+    ...accepted,
+    completedTaskIds,
+    batchIndex: nextIndex >= 0 ? nextIndex + 1 : accepted.tasks.length + 1,
+  };
+}
+
+function acceptedPlanComplete(accepted: AcceptedImplementationPlanContext): boolean {
+  if (!accepted.tasks.length) return true;
+  const completed = new Set(accepted.completedTaskIds);
+  return accepted.tasks.every((task) => completed.has(task.taskId));
+}
+
+function workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[] {
+  const ids = new Set<string>();
+  for (const event of kernelEvents) {
+    const record = objectRecord(event);
+    if (!record) continue;
+    const workUnit = objectRecord(record.workUnit);
+    const id = stringValue(record.workUnitId) ?? stringValue(workUnit?.id);
+    if (id) ids.add(id);
+  }
+  return [...ids];
+}
+
+function normalizeAcceptedPlanTargetScope(
+  value: string,
+  accepted: AcceptedImplementationPlanContext
+): string {
+  const normalized = normalizePlanScope(value);
+  const rootRef = accepted.executionRoot?.ref;
+  if (!rootRef) return normalized;
+  const root = comparablePath(rootRef);
+  const candidate = comparablePath(value);
+  if (isAbsolutePath(value) || isAbsolutePath(normalized)) {
+    if (candidate === root) return '.';
+    if (candidate.startsWith(`${root}/`)) return normalizePlanScope(candidate.slice(root.length + 1));
+    return normalized;
+  }
+  const rootName = basename(rootRef);
+  if (rootName && normalized === rootName) return '.';
+  if (rootName && normalized.startsWith(`${rootName}/`)) {
+    return normalizePlanScope(normalized.slice(rootName.length + 1));
+  }
+  return normalized;
+}
+
+function acceptedPlanAutoExecutableCapability(capability: string): boolean {
+  return [
+    'workspace.read',
+    'workspace.write',
+    'workspace.create',
+    'workspace.delete',
+    'workspace.rename',
+    'process.exec',
+    'network.egress',
+    'git.read',
+    'git.write',
+    'git.push',
+    'config.modify',
+    'browser.control',
+    'provider.egress',
+  ].includes(capability);
+}
+
+function actionPlanTargetScopes(action: { resourceScope?: unknown; targetPath?: unknown; sourceBlockId?: unknown; replacementBlockId?: unknown }, proposal: ProposalEnvelope): string[] {
+  const scopes = stringArrayValue(action.resourceScope).concat(stringArrayValue(action.targetPath));
+  const payload = objectRecord(proposal.payload) ?? {};
+  const codeBlocks = Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [];
+  const blockIds = new Set([
+    stringValue(action.sourceBlockId),
+    stringValue(action.replacementBlockId),
+  ].filter((item): item is string => Boolean(item)));
+  for (const block of codeBlocks) {
+    const record = objectRecord(block);
+    const blockId = stringValue(record?.id);
+    if (!blockId || !blockIds.has(blockId)) continue;
+    scopes.push(...stringArrayValue(record?.path), ...stringArrayValue(record?.targetPath));
+  }
+  return scopes;
+}
+
+function scopeCoveredByAcceptedPlan(scope: string, acceptedScopes: string[]): boolean {
+  if (acceptedScopes.length === 0) return false;
+  return acceptedScopes.some((accepted) => planScopeCovers(accepted, scope));
+}
+
+function planScopeCovers(accepted: string, candidate: string): boolean {
+  if (!accepted || !candidate) return false;
+  if (accepted === candidate) return true;
+  const acceptedDir = accepted.endsWith('/') ? accepted : `${accepted}/`;
+  return candidate.startsWith(acceptedDir);
+}
+
+function normalizePlanScope(value: string): string {
+  return value
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/+/g, '/')
+    .trim();
+}
+
+function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted: AcceptedImplementationPlanContext): string[] {
+  const gaps = Array.isArray(report.permissionGaps)
+    ? report.permissionGaps.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
+  const acceptedCapabilities = new Set(accepted.capabilities);
+  return gaps.filter((capability) => !planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
+}
+
+function acceptedPlanOutOfScopeDecisionProposal(
+  state: SessionDriverLoopRunState,
+  proposal: ProposalEnvelope,
+  validation: AcceptedPlanBatchValidationResult,
+  proposalId: string
+): ProposalEnvelope {
+  const language = visibleLanguageForRequest(state.userRequest);
+  const accepted = state.acceptedImplementationPlan;
+  const summary = language === 'en-US'
+    ? 'The next batch is outside the accepted implementation plan.'
+    : '下一批 actionBundle 超出已确认 implementationPlan 范围。';
+  const reasons = validation.reasons.length ? validation.reasons : [summary];
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId,
+    runId: state.runId,
+    sessionId: state.sessionId,
+    source: 'system',
+    kind: 'decisionRequest',
+    payload: {
+      id: `accepted-plan-scope-${safeSegment(accepted?.planId ?? proposal.proposalId)}`,
+      goal: summary,
+      summary: `${summary}\n${reasons.map((reason) => `- ${reason}`).join('\n')}`,
+      question: language === 'en-US'
+        ? 'How should DeepCode continue?'
+        : '接下来如何继续？',
+      options: language === 'en-US'
+        ? [
+          {
+            id: 'regenerate-in-scope',
+            label: 'Regenerate in scope',
+            description: 'Keep the accepted plan and ask the agent to output the next batch within its targets and capabilities.',
+            recommended: true,
+          },
+          {
+            id: 'revise-plan',
+            label: 'Revise plan scope',
+            description: 'Treat the new targets or capabilities as a plan revision before continuing.',
+          },
+        ]
+        : [
+          {
+            id: 'regenerate-in-scope',
+            label: '重新生成合规批次',
+            description: '保持已确认计划不变，让 Agent 重新输出落在目标和能力范围内的下一批。',
+            recommended: true,
+          },
+          {
+            id: 'revise-plan',
+            label: '修订计划范围',
+            description: '把新增目标或能力作为计划修订先确认，再继续执行。',
+          },
+        ],
+      allowsFreeform: true,
+      risks: reasons,
+      affectedAreas: accepted?.targetScopes ?? [],
+      constraints: [
+        'Accepted implementationPlan controls automatic batch execution scope.',
+        'Kernel permissions remain authoritative.',
+      ],
+    },
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  };
+}
+
 function planReviewDecisionEvent(
   sessionId: string,
   plan: SessionPlanContext,
@@ -3619,6 +4740,93 @@ function planReviewDecisionEvent(
       visibility: 'conversation',
       presentation: 'body',
       report: plan.planReviewReport,
+    },
+  };
+}
+
+function sessionRunStateEvent(input: {
+  sessionId: string;
+  runId: string;
+  phase: SessionTurnPhase;
+  status?: 'waiting' | 'running';
+  reason: 'requirement' | 'plan_review' | 'permission' | 'review' | 'accepted_plan_execution';
+  decisionOwner: DecisionOwnerRef;
+  ts: string;
+  id: string;
+}): AgentEvent {
+  const status = input.status ?? 'waiting';
+  return {
+    id: input.id,
+    sessionId: input.sessionId,
+    ts: input.ts,
+    kind: 'session_run_state',
+    payload: {
+      status,
+      phase: input.phase,
+      reason: input.reason,
+      runId: input.runId,
+      decisionKind: input.decisionOwner.kind,
+      targetId: input.decisionOwner.targetId,
+      decisionOwner: input.decisionOwner,
+      summary: sessionRunStateSummary(input.reason, status),
+      channel: 'task',
+      visibility: 'debug',
+      presentation: 'stageSummary',
+    },
+  };
+}
+
+function sessionRunStateSummary(
+  reason: 'requirement' | 'plan_review' | 'permission' | 'review' | 'accepted_plan_execution',
+  status: 'waiting' | 'running'
+): string {
+  if (reason === 'accepted_plan_execution') return 'Session run is executing the accepted implementation plan.';
+  if (status === 'running') return 'Session run is running.';
+  if (reason === 'requirement') return 'Session run is waiting for requirement confirmation.';
+  if (reason === 'permission') return 'Session run is waiting for a permission decision.';
+  if (reason === 'review') return 'Session run is waiting for user review.';
+  return 'Session run is waiting for plan review.';
+}
+
+function acceptedPlanBatchCheckpointEvent(
+  sessionId: string,
+  runId: string,
+  accepted: AcceptedImplementationPlanContext,
+  proposal: ProposalEnvelope,
+  kernelEvents: unknown[],
+  progress: AcceptedPlanBatchProgress,
+  ts: string,
+  id: string
+): AgentEvent {
+  const failedOrBlocked = actionBatchHasFailureOrBlocker(kernelEvents);
+  const complete = !failedOrBlocked && progress.remainingTaskIds.length === 0;
+  const summary = failedOrBlocked
+    ? '已确认计划的当前执行批次存在失败或阻塞，已暂停自动推进。'
+    : complete
+      ? '已确认计划的任务清单已执行完成，准备进入最终 Review。'
+      : '已确认计划的当前执行批次已完成，Session 将继续生成下一批。';
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'workflow_stage',
+    payload: {
+      stage: 'accepted_plan.batch_checkpoint',
+      status: failedOrBlocked ? 'blocked' : 'completed',
+      summary,
+      runId,
+      planId: accepted.planId,
+      proposalId: proposal.proposalId,
+      batchIndex: accepted.batchIndex,
+      actionIds: progress.actionIds,
+      targetPaths: progress.targetPaths,
+      workUnitIds: progress.workUnitIds,
+      newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
+      completedTaskIds: progress.completedTaskIds,
+      remainingTaskIds: progress.remainingTaskIds,
+      channel: 'progress',
+      visibility: 'conversation',
+      presentation: 'collapsible',
     },
   };
 }
@@ -3732,7 +4940,7 @@ function reviewSummaryEvent(
 }
 
 function actionBatchReadyForReview(kernelEvents: unknown[]): boolean {
-  if (kernelEvents.some((event) => objectRecord(event)?.kind === 'permission.requested')) {
+  if (kernelEventsContainPermissionRequest(kernelEvents)) {
     return false;
   }
   if (kernelEvents.some((event) => {
@@ -3759,6 +4967,30 @@ function actionBatchReadyForReview(kernelEvents: unknown[]): boolean {
     }
   }
   return queued.size > 0 && [...queued].every((id) => terminal.has(id));
+}
+
+function actionBatchHasFailureOrBlocker(kernelEvents: unknown[]): boolean {
+  return kernelEvents.some((event) => {
+    const record = objectRecord(event);
+    return record?.kind === 'work_unit.failed' ||
+      record?.kind === 'work_unit.blocked' ||
+      (record?.kind === 'stage.changed' && ['blocked', 'failed'].includes(stringValue(record.phase) ?? ''));
+  });
+}
+
+function kernelEventsContainPermissionRequest(kernelEvents: unknown[]): boolean {
+  return kernelEvents.some((event) => objectRecord(event)?.kind === 'permission.requested');
+}
+
+function permissionIdFromKernelEvents(kernelEvents: unknown[]): string | undefined {
+  for (const event of kernelEvents) {
+    const record = objectRecord(event);
+    if (record?.kind !== 'permission.requested') continue;
+    const request = objectRecord(record.request);
+    const id = stringValue(request?.id) ?? stringValue(record.permissionId) ?? stringValue(record.toolCallId);
+    if (id) return id;
+  }
+  return undefined;
 }
 
 function runIdFromKernelEvents(kernelEvents: unknown[]): string | undefined {
@@ -3820,7 +5052,7 @@ function waitingReviewContent(
       ? '- 空输入通过并结束当前批次，不会自动执行失败项；如需修复，请在输入框输入 Review 修改意见，系统会重新进入 Plan。'
       : '- 空输入通过并结束当前批次；输入文字会作为 Review 修订意见，系统会重新进入 Plan。',
     continuations.length
-      ? `- 当前计划登记了 ${continuations.length} 个后续意图；Review 通过后会按 agent.reviewContinuationMode 处理。自动模式只生成下一批 Plan，不会跳过 Plan 确认或自动执行。`
+      ? `- 当前计划登记了 ${continuations.length} 个后续意图；Review 通过后会按 agent.reviewContinuationMode 处理。自动模式会生成下一批 Plan；新 Plan 仍需确认，确认后的合规 actionBundle 会自动提交 Kernel 执行。`
       : '- 当前计划没有登记后续批次。',
   ].join('\n');
 }
@@ -4047,10 +5279,10 @@ function acceptedReviewContent(review: SessionReviewContext): string {
   if (!review.continuations.length) {
     lines.push('- 当前计划没有登记后续批次。');
   } else {
-    lines.push(`- 当前计划登记了 ${review.continuations.length} 个后续意图。Review 通过会按 agent.reviewContinuationMode 设置决定是否生成下一批 Plan；即使自动生成，也不会跳过下一批 Plan 确认。`);
+    lines.push(`- 当前计划登记了 ${review.continuations.length} 个后续意图。Review 通过会按 agent.reviewContinuationMode 设置决定是否生成下一批 Plan；新 Plan 仍需确认，确认后的合规 actionBundle 会自动提交 Kernel 执行。`);
     for (const continuation of review.continuations.slice(0, 6)) lines.push(`- ${continuationSummary(continuation)}`);
   }
-  lines.push('', '### 决策边界', '- Review 通过只关闭当前批次。', '- 后续批次只能重新生成 Plan，等待用户确认后才会执行。');
+  lines.push('', '### 决策边界', '- Review 通过只关闭当前批次。', '- 后续批次只能重新生成 Plan；新 Plan 经用户确认后，范围内 actionBundle 由 Session 自动提交 Kernel 执行。');
   return lines.join('\n');
 }
 
@@ -4071,6 +5303,36 @@ function reviewContinuationRequest(review: SessionReviewContext): string {
       '- 每个 workspace.write action 必须引用本轮 codeBlocks 的 sourceBlockId。',
       '- 新 Plan 必须等待用户确认，不要假定已经执行。',
     ].join('\n'),
+  ].filter(Boolean).join('\n\n');
+}
+
+function implementationPlanExecutionRequest(
+  plan: SessionPlanContext,
+  acceptedPlan: AcceptedImplementationPlanContext,
+  guidance?: string
+): string {
+  const planJson = JSON.stringify(plan.implementationPlan ?? {}, null, 2);
+  const currentTask = acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
+  return [
+    '用户已接受 implementationPlan。现在进入 Edit 阶段，生成下一批可自动执行 actionBundle。',
+    'implementationPlan 是 intent/checklist，不是执行事实；不得声称文件已创建、测试已通过或权限已授予。',
+    '选择当前任务清单中的下一组相关工作，允许在同一个 actionBundle 中输出多个相关文件或动作；不要一次性输出整个大型项目。',
+    currentTask
+      ? `当前任务：taskId=${currentTask.taskId}; title=${currentTask.title ?? '未命名'}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}。`
+      : '当前任务无法从 batchIndex 唯一定位；请输出最小合规 actionBundle，或返回 decisionRequest/implementationPlan 修订。',
+    acceptedPlan.completedTaskIds.length
+      ? `已完成 taskId：${acceptedPlan.completedTaskIds.join(', ')}。不要重复生成已完成任务，除非 Kernel facts 显示失败或用户要求修订。`
+      : '当前 accepted implementationPlan 尚无已完成任务。',
+    acceptedPlan.executionRoot
+      ? `primary root：${acceptedPlan.executionRoot.ref}。所有 targetPath、resourceScope、codeBlock.path/codeBlock.targetPath 必须相对该 root，例如 include/MemoryPool.h；禁止绝对路径、禁止包含 root 目录名、禁止 ../。`
+      : '所有 targetPath、resourceScope、codeBlock.path/codeBlock.targetPath 必须是相对 workspace root 的路径，禁止绝对路径和 ../。',
+    '该 actionBundle 如果落在 accepted implementationPlan 的 target/capability 范围内，会由 Session 直接提交 Kernel 执行，不会再次展示 Plan 确认卡。',
+    '不要重新询问 implementationPlan 中已经确认的技术路线、目录结构、Docker/script workflow、模块拆分或验证策略。',
+    '如果发现必须新增 target/capability，或缺少关键技术选择，请返回 kind="decisionRequest" 或 kind="implementationPlan" 修订，而不是输出超范围 actionBundle。',
+    '本轮 actionBundle 必须包含具体 codeBlocks/commandBlocks（如需要）和 Kernel 可审查的 validationExpectations/reviewExpectations。',
+    '不要一次性输出整个项目源码；剩余任务放入 actionBundle.continuationExpectations，Session 会在 Kernel facts 返回后继续后续 checkpoint。',
+    guidance?.trim() ? `用户确认计划时补充的 guidance：\n${guidance.trim()}` : '',
+    `Accepted implementationPlan:\n${planJson}`,
   ].filter(Boolean).join('\n\n');
 }
 
@@ -4228,22 +5490,36 @@ function findLatestActiveReviewInteraction(events: AgentEvent[]): DriverInteract
 function findLatestActivePlanInteraction(events: AgentEvent[]): DriverInteraction | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
-    if (event.kind !== 'plan_review') continue;
+    if (event.kind !== 'plan_review' && event.kind !== 'plan_card') continue;
     const payload = objectRecord(event.payload);
     if (!payload) continue;
     if (hasLaterTerminalInteraction(events, index)) continue;
-    const status = stringValue(payload.status);
-    const waiting = status === 'awaitingUserApproval' ||
-      status === 'awaitingTemporaryGrant' ||
-      status === 'pending';
+    const waiting = event.kind === 'plan_card'
+      ? planCardAwaitingDecision(payload)
+      : planReviewEventAwaitingDecision(payload);
     const runId = stringValue(payload.runId);
     const planId = stringValue(payload.planId);
     if (!waiting || !runId || !planId) continue;
-    const plan = findPlanCard(events.slice(0, index + 1), runId, planId);
-    if (plan && planAlreadyResolved(events, plan)) continue;
+    const plan = event.kind === 'plan_card'
+      ? planContextFromEvent(event, payload)
+      : findPlanCard(events.slice(0, index + 1), runId, planId);
+    if (!plan || planAlreadyResolved(events, plan)) continue;
     return { kind: 'plan', runId, planId };
   }
   return null;
+}
+
+function planCardAwaitingDecision(payload: Record<string, unknown>): boolean {
+  const confirmable = payload.confirmable;
+  if (confirmable === false) return false;
+  const status = stringValue(payload.status);
+  if (!status) return true;
+  return planReviewStatusAwaitingUser(status);
+}
+
+function planReviewEventAwaitingDecision(payload: Record<string, unknown>): boolean {
+  if (payload.confirmable === false) return false;
+  return planReviewStatusAwaitingUser(stringValue(payload.status));
 }
 
 function findLatestActiveRequirementInteraction(events: AgentEvent[]): DriverInteraction | null {
@@ -4319,6 +5595,12 @@ function requirementDecisionEvent(
   id: string
 ): AgentEvent {
   const payload = objectRecord(event.payload) ?? {};
+  const decisionRequest = objectRecord(payload.decisionRequest);
+  const selectedOption = decision === 'accept'
+    ? selectedDecisionOptionFromGuidance(decisionRequest, guidance)
+    : undefined;
+  const language = visibleLanguageForRequest(stringValue(payload.originalUserRequest) ?? '');
+  const summary = requirementDecisionSummary(decision, selectedOption, language);
   return {
     id,
     sessionId,
@@ -4326,17 +5608,88 @@ function requirementDecisionEvent(
     kind: 'requirement_decision',
     payload: {
       title: 'Requirement decision',
-      summary: decision === 'accept' ? '用户已确认需求理解。' : decision === 'revise' ? '用户要求修订需求理解。' : '用户拒绝当前需求理解。',
+      summary,
       status: decision === 'accept' ? 'accepted' : decision === 'revise' ? 'needsRevision' : 'rejected',
       runId: stringValue(payload.runId),
       requirementId: stringValue(payload.requirementId),
       decision,
       guidance,
+      selectedOption,
       channel: 'progress',
       visibility: 'conversation',
       presentation: 'body',
     },
   };
+}
+
+function requirementDecisionSummary(
+  decision: 'accept' | 'reject' | 'revise',
+  selectedOption: RequirementDecisionOption | undefined,
+  language: VisibleLanguage
+): string {
+  if (language === 'en-US') {
+    if (decision === 'accept' && selectedOption?.label) return `Selected option: ${selectedOption.label}`;
+    if (decision === 'accept') return 'The user confirmed the requirement understanding.';
+    if (decision === 'revise') return 'The user requested requirement revisions.';
+    return 'The user rejected the current requirement understanding.';
+  }
+  if (decision === 'accept' && selectedOption?.label) return `已选择方案：${selectedOption.label}`;
+  if (decision === 'accept') return '用户已确认需求理解。';
+  if (decision === 'revise') return '用户要求修订需求理解。';
+  return '用户拒绝当前需求理解。';
+}
+
+interface RequirementDecisionOption {
+  id: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+}
+
+function isDecisionRequestPayload(value: Record<string, unknown> | undefined): boolean {
+  return decisionRequestOptions(value).length >= 2;
+}
+
+function decisionRequestSummary(value: Record<string, unknown> | undefined): string | undefined {
+  if (!value) return undefined;
+  return stringValue(value.summary)
+    ?? stringValue(value.question)
+    ?? stringValue(value.reason)
+    ?? stringValue(value.goal);
+}
+
+function decisionRequestOptions(value: Record<string, unknown> | undefined): RequirementDecisionOption[] {
+  if (!Array.isArray(value?.options)) return [];
+  return value.options.flatMap((item): RequirementDecisionOption[] => {
+    const record = objectRecord(item);
+    if (!record) return [];
+    const id = stringValue(record.id) ?? stringValue(record.label);
+    const label = stringValue(record.label) ?? id;
+    if (!id || !label) return [];
+    const description = stringValue(record.description)
+      ?? stringValue(record.impact)
+      ?? stringValue(record.tradeoff);
+    return [{
+      id,
+      label,
+      description,
+      recommended: record.recommended === true,
+    }];
+  });
+}
+
+function selectedDecisionOptionFromGuidance(
+  decisionRequest: Record<string, unknown> | undefined,
+  guidance: string | undefined
+): RequirementDecisionOption | undefined {
+  const options = decisionRequestOptions(decisionRequest);
+  if (!options.length) return undefined;
+  const selectedId = guidance?.match(/^- id:\s*(.+)$/m)?.[1]?.trim();
+  const selectedLabel = guidance?.match(/^- label:\s*(.+)$/m)?.[1]?.trim();
+  return (selectedId ? options.find((option) => option.id === selectedId) : undefined)
+    ?? (selectedLabel ? options.find((option) => option.label === selectedLabel) : undefined)
+    ?? options.find((option) => option.recommended)
+    ?? options[0];
 }
 
 function requirementRecordFromEvent(event: AgentEvent, status: RequirementRecord['status']): RequirementRecord | undefined {
@@ -4462,6 +5815,54 @@ function actionBundleCompactionRepairMessages(
   ];
 }
 
+function sideEffectNativeToolRepairMessages(
+  prompt: PromptEnvelope,
+  state: SessionDriverLoopRunState,
+  toolCall: NativeToolCallProposal,
+  turn: LlmTurnResult
+): LlmChatRequest['messages'] {
+  const afterAcceptedPlan = Boolean(state.acceptedImplementationPlan) || state.implementationBatch.batchIndex > 1;
+  const requestedKind = afterAcceptedPlan ? 'actionBundle' : 'decisionRequest-or-implementationPlan';
+  const guardrail = afterAcceptedPlan
+    ? 'A plan has already been accepted. Return kind="actionBundle" for the next related automatically executable batch within the accepted plan scope. Multiple related files are allowed when all target paths stay in scope. Use relative target paths only.'
+    : 'No implementation plan has been accepted for this side-effect work. Return kind="decisionRequest" if a material engineering choice needs user selection; otherwise return kind="implementationPlan".';
+  return [
+    {
+      role: 'system',
+      content: [
+        'You are the DeepCode Agent Protocol v3 native-tool repair step.',
+        'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
+        'Provider-native side-effect tools are disabled in Session Runtime. Do not call tools.',
+        guardrail,
+        'Never claim that files were written, commands ran, permissions were granted, or validation passed.',
+        'If returning decisionRequest, ask one concise question with 2-3 mutually exclusive options, exactly one recommended option, impact descriptions, allowsFreeform=true, and user-visible text in the current user language.',
+        'If returning implementationPlan, include task checklist, targets, capabilities, acceptanceCriteria, and failureCriteria; do not include codeBlocks, commandBlocks, patches, or full source code.',
+        'If returning actionBundle, include only a small reviewable batch with codeBlocks or commandBlocks and concrete validationExpectations/reviewExpectations.',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: [
+        `Requested repair kind: ${requestedKind}`,
+        `Blocked native tool: ${toolCall.name}`,
+        `Tool call id: ${toolCall.callId}`,
+        'Tool arguments:',
+        fenced(JSON.stringify(toolCall.arguments, null, 2)),
+        'Provider narration before blocked tool:',
+        fenced(turn.content || '[empty]'),
+        'Original stable prompt:',
+        fenced(prompt.stablePrefix),
+        'Original dynamic prompt:',
+        fenced(prompt.dynamicSuffix),
+        'ResourcePacket facts:',
+        fenced(JSON.stringify(state.resourcePackets, null, 2)),
+        'Implementation batch context:',
+        fenced(JSON.stringify(state.implementationBatch, null, 2)),
+      ].join('\n\n'),
+    },
+  ];
+}
+
 function resourceRequestRepairMessages(
   prompt: PromptEnvelope,
   state: SessionDriverLoopRunState,
@@ -4534,6 +5935,47 @@ function planReviewRepairMessages(
   ];
 }
 
+function acceptedPlanScopeRepairMessages(
+  prompt: PromptEnvelope,
+  state: SessionDriverLoopRunState,
+  proposal: ProposalEnvelope,
+  validation: AcceptedPlanBatchValidationResult
+): LlmChatRequest['messages'] {
+  return [
+    {
+      role: 'system',
+      content: [
+        'You are the DeepCode Agent Protocol v3 accepted-plan scope repair step.',
+        'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
+        'A user has already accepted an implementationPlan. Repair the current batch so it stays inside the accepted task targets and capabilities.',
+        'If executable work is still valid, return kind="actionBundle" with one related implementation batch. Multiple related files are allowed when all targets are inside the accepted plan.',
+        'If the accepted plan is missing a required target, capability, or material technical choice, return kind="decisionRequest" or kind="implementationPlan" revision.',
+        'Do not return resourceRequest in this repair step.',
+        'Do not claim execution, permissions, tests passed, or task completion.',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: [
+        'Original stable prompt:',
+        fenced(prompt.stablePrefix),
+        'Original dynamic prompt:',
+        fenced(prompt.dynamicSuffix),
+        'ResourcePacket facts:',
+        fenced(JSON.stringify(state.resourcePackets, null, 2)),
+        'Accepted implementationPlan:',
+        fenced(JSON.stringify(state.acceptedImplementationPlan?.rawPlan ?? {}, null, 2)),
+        'Invalid ProposalEnvelope:',
+        fenced(JSON.stringify(proposal, null, 2)),
+        'Session validation reasons:',
+        fenced(validation.reasons.map((reason) => `- ${reason}`).join('\n')),
+        'Repair requirement:',
+        fenced('Return a corrected actionBundle within the accepted plan scope, or return decisionRequest/implementationPlan revision if scope expansion is truly required.'),
+      ].join('\n\n'),
+    },
+  ];
+}
+
 function shouldRequestRequirementConfirmation(
   input: SessionDriverLoopInput,
   _state: SessionDriverLoopRunState
@@ -4552,18 +5994,6 @@ function requirementRecordFromProposal(
   timestamp: string
 ): RequirementRecord {
   const draft = objectRecord(proposal.payload) ?? {};
-  const decisionOptions = Array.isArray(draft.options)
-    ? draft.options
-      .map((item) => objectRecord(item))
-      .filter((item): item is Record<string, unknown> => Boolean(item))
-      .map((item) => {
-        const label = stringValue(item.label) ?? stringValue(item.id) ?? 'option';
-        const description = stringValue(item.description);
-        const recommended = item.recommended === true ? '（推荐）' : '';
-        return [label + recommended, description].filter(Boolean).join('：');
-      })
-      .filter(Boolean)
-    : [];
   const requirementId = stringValue(draft.requirementId)
     ?? stringValue(draft.id)
     ?? proposal.proposalId
@@ -4572,7 +6002,6 @@ function requirementRecordFromProposal(
     goal: stringValue(draft.goal) ?? stringValue(draft.summary) ?? stringValue(draft.reason) ?? input.content,
     explicitTasks: stringArrayValue(draft.scope)
       .concat(stringArrayValue(draft.explicitTasks))
-      .concat(decisionOptions)
       .filter(Boolean),
     inferredTasks: stringArrayValue(draft.inferredTasks)
       .concat(stringArrayValue(draft.constraints))
@@ -4608,7 +6037,12 @@ function requirementConfirmationEvent(input: {
   ts: string;
   id: string;
 }): AgentEvent {
-  const content = renderRequirementConfirmationMarkdown(input.requirement);
+  const decisionRequest = objectRecord(input.proposal.payload);
+  const language = visibleLanguageForRequest(input.originalUserRequest);
+  const content = decisionRequest && isDecisionRequestPayload(decisionRequest)
+    ? renderDecisionRequestMarkdown(decisionRequest, language)
+    : renderRequirementConfirmationMarkdown(input.requirement);
+  const summary = decisionRequestSummary(decisionRequest) ?? requirementSummary(input.requirement);
   return {
     id: input.id,
     sessionId: input.sessionId,
@@ -4616,7 +6050,7 @@ function requirementConfirmationEvent(input: {
     kind: 'requirement_confirmation',
     payload: {
       title: '用户介入请求',
-      summary: requirementSummary(input.requirement),
+      summary,
       content,
       status: 'waitingUserConfirmation',
       confirmable: true,
@@ -4659,6 +6093,39 @@ function renderRequirementConfirmationMarkdown(requirement: RequirementRecord): 
       return `## ${heading}\n${body}`;
     })
     .join('\n\n');
+}
+
+function renderDecisionRequestMarkdown(
+  decisionRequest: Record<string, unknown>,
+  language: VisibleLanguage
+): string {
+  const options = decisionRequestOptions(decisionRequest);
+  const summary = decisionRequestSummary(decisionRequest);
+  const labels = language === 'en-US'
+    ? {
+      heading: 'Decision needed',
+      options: 'Options',
+      recommended: 'recommended',
+      supplement: 'Supplemental input',
+      supplementText: 'Use the input box to choose an option or add constraints before continuing.',
+    }
+    : {
+      heading: '需要确认的选择',
+      options: '可选方案',
+      recommended: '推荐',
+      supplement: '补充信息',
+      supplementText: '可在输入框选择方案编号，或补充约束后再继续。',
+    };
+  const lines = [`## ${labels.heading}`];
+  if (summary) lines.push('', summary);
+  lines.push('', `## ${labels.options}`, '');
+  options.forEach((option, index) => {
+    const recommended = option.recommended ? `（${labels.recommended}）` : '';
+    lines.push(`${index + 1}. ${option.label}${recommended}`);
+    if (option.description) lines.push(`   ${option.description}`);
+  });
+  lines.push('', `## ${labels.supplement}`, '', labels.supplementText);
+  return lines.join('\n');
 }
 
 function requirementSummary(requirement: RequirementRecord): string {
@@ -4836,13 +6303,6 @@ function providerStageSummary(stage: string, phase: 'request' | 'response', lang
   return phase === 'request'
     ? `${label}: 请求模型生成结构化回复。`
     : `${label}: 模型已返回，等待协议解析。`;
-}
-
-function nativeToolProgressMessage(toolCallCount: number, round: number, language: VisibleLanguage): string {
-  if (language === 'en-US') {
-    return `Provider requested ${toolCallCount} native tool call(s) in read-only round ${round + 1}. Session is normalizing them through Kernel boundaries.`;
-  }
-  return `Provider 在第 ${round + 1} 轮请求了 ${toolCallCount} 个原生工具调用，Session 正通过 Kernel 边界归一化处理。`;
 }
 
 function nativeToolResolveRunningSummary(toolName: string, language: VisibleLanguage): string {

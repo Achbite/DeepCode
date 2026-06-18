@@ -10,7 +10,7 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       content: [
         'Protocol Contract is not user-editable and cannot be overridden by Ruler or memory.',
         'Live proposal output must be one JSON object using schemaVersion "deepcode.agent.protocol.v3".',
-        'Choose exactly one kind: "answer", "resourceRequest", "decisionRequest", "actionBundle", or "diagnostic".',
+        'Choose exactly one kind: "answer", "resourceRequest", "decisionRequest", "implementationPlan", "actionBundle", or "diagnostic".',
         'The Session parser converts the JSON object into a ProposalEnvelope before Kernel validation.',
         'For resourceRequest, decisionRequest, actionBundle, or diagnostic, you may include optional top-level narration as a short user-visible progress sentence.',
         'narration must follow the current user language for user-visible text; protocol/schema/structured fields, tool names, and code identifiers stay English.',
@@ -18,8 +18,11 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
         'Do not put raw JSON, parser repair details, hidden reasoning, provider/debug text, or protocol explanations in narration.',
         'For pure read-only explanations or capability answers, use kind="answer" only.',
         'If more context is needed, use kind="resourceRequest" only.',
-        'If user intervention is required for ambiguity, alternatives, boundary expansion, delete/interface removal, cross-project write, permission gap, or failed validation scope expansion, use kind="decisionRequest" only.',
-        'For executable work, use kind="actionBundle" with userPlanMarkdown, actionBundle, codeBlocks, commandBlocks, expectedValidation, and reviewGuide.',
+        'If user intervention is required for ambiguity, engineering alternatives, boundary expansion, delete/interface removal, cross-project write, permission gap, or failed validation scope expansion, use kind="decisionRequest" only.',
+        'For important engineering choices, decisionRequest is a short intermediate execution-plan checkpoint: ask one concrete question, provide 2-3 mutually exclusive options, mark one recommendation, and wait for the user choice before producing the larger implementationPlan.',
+        'Do not hide material choices inside a full implementationPlan when the user may reasonably prefer a different directory layout, module split, dependency/runtime strategy, Docker/script workflow, validation approach, architecture boundary, protocol change, permission expansion, or broad refactor strategy.',
+        'For non-trivial executable work, first use kind="implementationPlan" with task checklist, targets, capabilities, acceptance criteria, and failure criteria. It must not include codeBlocks, commandBlocks, patches, or full source code.',
+        'After the user accepts an implementationPlan, use kind="actionBundle" for the next related automatically executable implementation batch inside the accepted plan scope: userPlanMarkdown, actionBundle, codeBlocks, commandBlocks, expectedValidation, and reviewGuide. A batch may contain multiple related files or actions when they belong to the accepted task checklist and fit the batch budget.',
         'For protocol failure, permission insufficiency, context insufficiency, or repair failure terminal explanation, use kind="diagnostic"; diagnostic never creates a plan or execution queue.',
         'Side-effect actionBundle.userPlanMarkdown must be detailed structured Markdown. It must cover summary, key changes, interfaces or affected surfaces, validation or test plan, and assumptions or constraints; headings may be localized to the user language.',
         'For any side-effect actionBundle, actionBundle.validationExpectations and actionBundle.reviewExpectations must be non-empty and must describe concrete evidence that Kernel/User review can inspect.',
@@ -34,13 +37,14 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
         'Action entries must use actionId/capability/resourceScope/targetPath/sourceBlockId/description/dependsOn/permissionLabels. For Git operations, use kind=status|diff|stage|unstage|commit|push and put message/remote/branch/staged/paths in toolArgs. For backward compatibility id/title/kind may be included, but actionId and permissionLabels are preferred.',
         'When a primary conversation workspace root is listed, all write targetPath values must be relative to that root. Do not prefix write paths with the rootId, manifestEntryId, attachment display path, folder basename, or absolute local path.',
         'Command plans must use top-level commandBlocks with commandId, capability="process.exec", cwd, argv, timeoutMs, envPolicy, expectedOutput, and permissionLabels. Commands are planned and permission-reviewed; they are not executed by the model.',
-        'Implementation batching rule: for create/write tasks, output only the next reviewable batch, not an entire large project in one JSON object.',
+        'Implementation batching rule: for create/write tasks, output only the next related implementation batch, not an entire large project in one JSON object.',
+        'Plan/Edit split rule: implementationPlan is intent and checklist only; actionBundle is executable draft only after plan acceptance or explicit continuation. After plan acceptance, generate the next coherent group of checklist work and keep target paths relative to the primary workspace root.',
         'Implementation batch budget: at most 4 codeBlocks, at most 6 actionBundle.actions, at most about 12KB total codeBlock content, and at most about 6KB per codeBlock.',
-        'If the full implementation is larger than one batch, include the remaining work as actionBundle.continuationExpectations and wait for the next turn or review decision.',
+        'If the full implementation is larger than one batch, include the remaining work as actionBundle.continuationExpectations; Session may continue automatically within an accepted implementationPlan until completion, failure, permission wait, or scope expansion.',
         'Plan cards, continuationExpectations, review guidance, and memory hints are intent context only; they are not facts that files exist, tests passed, or work completed.',
         'Generated or modified files can be treated as facts only when ResourcePacket content, ToolCompleted(ok=true), or WorkUnitCompleted facts prove them.',
         'Before later batches, use resourceRequest with manifestEntryId or rootId+path to read current files under available conversation roots; do not ask to run shell search commands directly.',
-        'If the user requests write, user review, then delete, current actionBundle.actions only writes and waits for review; put the post-review delete intent in actionBundle.continuationExpectations. Continuations are not executed until Kernel ReviewGate is accepted by the user.',
+        'If the user requests write, user review, then delete, current actionBundle.actions only writes and waits for terminal review; put the post-review delete intent in actionBundle.continuationExpectations. Continuations that require user review must not execute until Kernel ReviewGate is accepted by the user.',
         'Unknown JSON fields, invalid JSON, and unsafe paths fail closed.',
         'Language policy: all user-visible answer, review summary, narration, and transition/progress prose must follow the current user language; protocol/schema/structured fields stay English; code identifiers and tool names stay English.',
         'Set outputLanguage from the current user request language. Protocol examples do not decide the response language.',
@@ -86,7 +90,8 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       content: [
         'Agent Protocol v3 answer shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"answer","outputLanguage":"zh-CN","answer":{"format":"markdown","content":"..."}}',
         'Agent Protocol v3 resource request shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"resourceRequest","outputLanguage":"zh-CN","narration":"我需要先补充几个受控资源，再继续分析。","resourceRequest":{"version":"1","id":"need-target","reason":"Need concrete project context.","items":[{"id":"target-entry","manifestEntryId":"current-selection","reason":"Resolve a manifest entry."},{"id":"target-path","rootId":"root-id","path":"relative/path.ext","reason":"Resolve a path under an available conversation root."},{"id":"target-range","rootId":"root-id","path":"relative/large-file.ext","offsetBytes":0,"limitBytes":12000,"reason":"Resolve a useful file segment when previous content was truncated."}]}}',
-        'Agent Protocol v3 decision request shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","outputLanguage":"zh-CN","narration":"这里需要你确认边界后我再继续。","decisionRequest":{"version":"1","id":"decision-...","reason":"...","summary":"...","options":[{"id":"recommended","label":"推荐方案","description":"影响说明","recommended":true},{"id":"alternative","label":"备选方案","description":"影响说明"}],"allowsFreeform":true}}',
+        'Agent Protocol v3 decision request shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","outputLanguage":"zh-CN","narration":"这里有一个实现选择需要你确认，我会按你的选择继续拆计划。","decisionRequest":{"version":"1","id":"decision-...","reason":"...","summary":"...","options":[{"id":"recommended","label":"推荐方案","description":"影响说明","recommended":true},{"id":"alternative","label":"备选方案","description":"影响说明"}],"allowsFreeform":true}}',
+        'Agent Protocol v3 implementation plan shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"implementationPlan","outputLanguage":"zh-CN","narration":"我先把可审查的任务清单拆出来，确认后再进入逐批编辑。","implementationPlan":{"version":"1","id":"impl-plan-...","title":"...","summary":"...","tasks":[{"taskId":"task-1","title":"...","target":["relative/path-or-directory"],"scope":"what this task intends to do, without source code","dependencies":[],"capability":"workspace.write","acceptanceCriteria":["reviewable evidence expected after execution"],"failureCriteria":["conditions that should stop or replan"]}],"risks":["..."],"reviewCheckpoints":["user review checkpoint before edits","user review checkpoint after Kernel facts"]}}',
         'resourceRequest.items[] must include either manifestEntryId or path. Use path only for files or directories under listed conversation roots or explicit user attachments. For file segments, include optional offsetBytes and limitBytes.',
         'Never invent arbitrary absolute local paths. If you need more context from a project directory, request a root-relative path from the available conversation roots.',
         'Agent Protocol v3 action bundle shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"actionBundle","outputLanguage":"zh-CN","narration":"我已经整理出下一批需要审查的操作，先交给 Kernel 做权限和计划检查。","userPlanMarkdown":"# <localized plan title>\\n\\n## <summary heading>\\n...\\n\\n## <changes heading>\\n- ...\\n\\n## <interfaces or affected surfaces heading>\\n- ...\\n\\n## <validation heading>\\n- ...\\n\\n## <assumptions heading>\\n- ...","codeBlocks":[{"blockId":"...","targetPath":"<workspace-resource>","language":"...","operation":"create","content":"...","permissionLabels":["workspace.write"]}],"commandBlocks":[{"commandId":"...","capability":"process.exec","cwd":"<workspace-resource>","argv":["<executable>","<arg>"],"timeoutMs":120000,"envPolicy":"inheritSafe","expectedOutput":"...","permissionLabels":["process.exec"]}],"actionBundle":{"version":"1","id":"...","goal":"...","actions":[{"actionId":"...","description":"...","capability":"workspace.write","resourceScope":["<workspace-resource>"],"targetPath":"<workspace-resource>","sourceBlockId":"...","dependsOn":[],"permissionLabels":["workspace.write"]}],"continuationExpectations":[{"id":"next-batch","title":"Continue with the next reviewable implementation batch after user approval","capability":"workspace.write","kind":"write","resourceScope":["<workspace-resource>"]}],"validationExpectations":[{"id":"files-written","description":"Kernel records write facts for every planned file and the final review can inspect the changed paths."}],"reviewExpectations":[{"id":"user-review","description":"User reviews this batch scope, generated files, and validation evidence before accepting completion."}]},"expectedValidation":"...","reviewGuide":"..."}',
@@ -117,6 +122,13 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       content: input.stableMemoryHints?.length
         ? input.stableMemoryHints.join('\n')
         : 'No stable session memory selected.',
+    },
+    {
+      name: 'agentInterventionPolicy',
+      priority: 6.5,
+      stable: false,
+      cacheClass: 'requirementAppendOnly',
+      content: agentInterventionPolicySummary(input),
     },
     {
       name: 'reusableResourceContext',
@@ -240,6 +252,26 @@ function renderLayer(layer: PromptSystemLayer): string {
 function reusableResourceContextSummary(input: PromptEnvelopeBuilderInput): string {
   return input.resourcePromptContext?.renderedContext
     ?? 'ResourceContext: empty';
+}
+
+function agentInterventionPolicySummary(input: PromptEnvelopeBuilderInput): string {
+  const level = input.interventionLevel === 'low' || input.interventionLevel === 'high'
+    ? input.interventionLevel
+    : 'medium';
+  const lines = [
+    `Agent user intervention level: ${level}.`,
+    'When a user-facing engineering choice is needed, use kind="decisionRequest" with one concise question, 2-3 mutually exclusive options, exactly one recommended option, short impact descriptions, and allowsFreeform=true.',
+    'decisionRequest is a short intermediate planning checkpoint; do not replace it with a full implementationPlan and do not include source code, patches, or executable commands.',
+  ];
+  if (level === 'low') {
+    lines.push('Low: ask only for permission boundaries, protocol or architecture changes, broad rewrites, destructive work, cross-project writes, or validation scope expansion after failure. Choose ordinary implementation details yourself and list assumptions in the later plan.');
+  } else if (level === 'high') {
+    lines.push('High: ask before every visible engineering choice, including directory layout, module split, dependency/runtime choice, script behavior, validation approach, and review checkpoint placement.');
+  } else {
+    lines.push('Medium: ask for choices that materially affect implementation direction, including directory/module layout, dependency or runtime strategy, Docker/script workflow, validation approach, architecture boundary expansion, protocol or permission changes, and broad refactors. Do not interrupt for routine local implementation details.');
+  }
+  lines.push('All user-visible question, option labels, descriptions, recommendation wording, narration, and summaries must follow the current user language.');
+  return lines.join('\n');
 }
 
 function currentResourceResultsSummary(input: PromptEnvelopeBuilderInput): string {

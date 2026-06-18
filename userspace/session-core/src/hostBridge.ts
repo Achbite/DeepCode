@@ -8,6 +8,9 @@ import type {
   KernelReply,
   LlmChatRequest,
   LlmChatResult,
+  LlmChatStreamEvent,
+  ProjectionDelta,
+  ToolCall,
 } from '@deepcode/protocol';
 import { SessionDriverLoop, type SessionDecisionResolverInput } from './driver/sessionDriverLoop.js';
 import { SessionStorageClient } from './storageClient.js';
@@ -19,14 +22,16 @@ declare const process: {
   env: Record<string, string | undefined>;
   exitCode?: number;
   stdin: AsyncIterable<unknown>;
-  stdout: { write(value: string): void };
+  stdout: { write(value: string, callback?: () => void): boolean };
   stderr: { write(value: string): void };
+  exit(code?: number): never;
 };
 
 interface HostBridgeRequest {
   op: 'ask' | 'resolveDecision';
   apiBase?: string;
   sessionId?: string;
+  hostRunId?: string;
   prompt?: string;
   attachments?: AgentContextAttachment[];
   workspacePath?: string;
@@ -35,6 +40,7 @@ interface HostBridgeRequest {
   workflow?: 'planFirst' | 'actOnRequest';
   requirementConfirmationMode?: 'off' | 'auto' | 'always';
   reviewContinuationMode?: 'auto' | 'ask' | 'off';
+  interventionLevel?: 'low' | 'medium' | 'high';
   title?: string;
   decisionKind?: SessionDecisionResolverInput['kind'];
   decision?: 'accept' | 'reject' | 'revise';
@@ -50,6 +56,10 @@ interface HostBridgeResult {
   events?: unknown[];
   timeline?: AgentTimelineResult;
   finalText?: string;
+  runStatus?: 'waiting' | 'completed' | 'failed' | string;
+  decisionKind?: string;
+  targetId?: string;
+  terminalReason?: string;
   message?: string;
   error?: string;
 }
@@ -60,7 +70,8 @@ async function main(): Promise<void> {
   const result = request.op === 'resolveDecision'
     ? await resolveDecision(request)
     : await runAsk(request);
-  writeJson(result);
+  await writeJson(result);
+  process.exit(0);
 }
 
 async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
@@ -77,7 +88,7 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
 
   const sessionId = sessionResult.session.id;
   const existingEvents = sessionResult.events ?? [];
-  const driver = createDriver(apiBase);
+  const driver = createDriver(apiBase, request.hostRunId);
   const result = await driver.runUserTurn({
     sessionId,
     content,
@@ -89,15 +100,19 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
     workflow: request.workflow,
     requirementConfirmationMode: request.requirementConfirmationMode,
     reviewContinuationMode: request.reviewContinuationMode,
+    interventionLevel: request.interventionLevel,
   });
   const timeline = await readTimeline(apiBase, result.session.id);
+  const finalText = extractFinalText(timeline);
+  const lifecycle = inferHostRunLifecycle(result.events, finalText);
   return {
     ok: true,
     sessionId: result.session.id,
     session: result.session,
     events: result.events,
     timeline,
-    finalText: extractFinalText(timeline),
+    finalText,
+    ...lifecycle,
   };
 }
 
@@ -110,7 +125,7 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
   const current = await getAgentSession(apiBase, request.sessionId);
   const binding = request.noWorkspace ? undefined : workspaceBindingFromPath(request.workspacePath);
   const projectWorkingDirectory = request.noWorkspace ? undefined : projectWorkingDirectoryFromPath(request.workspacePath);
-  const driver = createDriver(apiBase);
+  const driver = createDriver(apiBase, request.hostRunId);
   const result = await driver.resolveDecision({
     sessionId: request.sessionId,
     kind: request.decisionKind,
@@ -124,23 +139,31 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
     profileId: request.profileId,
     workflow: request.workflow,
     reviewContinuationMode: request.reviewContinuationMode,
+    interventionLevel: request.interventionLevel,
   });
   const timeline = await readTimeline(apiBase, result.session.id);
+  const finalText = extractFinalText(timeline);
+  const lifecycle = inferHostRunLifecycle(result.events, finalText);
   return {
     ok: true,
     sessionId: result.session.id,
     session: result.session,
     events: result.events,
     timeline,
-    finalText: extractFinalText(timeline),
+    finalText,
+    ...lifecycle,
   };
 }
 
-function createDriver(apiBase: string): SessionDriverLoop {
+function createDriver(apiBase: string, hostRunId?: string): SessionDriverLoop {
   const transcriptClient = new SessionStorageClient(apiBase);
   return new SessionDriverLoop({
     kernelCommand: (request) => kernelCommand(apiBase, request),
     llmChat: (request) => llmChat(apiBase, request),
+    llmChatStream: (request, onEvent) => llmChatStream(apiBase, request, onEvent),
+    onProjectionDelta: hostRunId
+      ? (delta) => postProjectionDelta(apiBase, hostRunId, delta)
+      : undefined,
     appendTranscript: (sessionId, entry) => transcriptClient.appendTranscript(sessionId, entry),
     appendEvents: async (sessionId, events) => {
       const response = await postJson<ApiResponse<AgentSessionResult>>(
@@ -214,6 +237,94 @@ async function llmChat(apiBase: string, request: LlmChatRequest): Promise<ApiRes
   return postJson<ApiResponse<LlmChatResult>>(`${apiBase}/api/llm/chat`, request);
 }
 
+async function llmChatStream(
+  apiBase: string,
+  request: LlmChatRequest,
+  onEvent: (event: LlmChatStreamEvent) => void | Promise<void>
+): Promise<ApiResponse<LlmChatResult>> {
+  try {
+    const response = await fetch(`${apiBase}/api/llm/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify({ ...request, stream: true }),
+    });
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: 'http_error',
+        message: `HTTP ${response.status}: ${response.statusText}`,
+      };
+    }
+    if (!response.body) {
+      return {
+        ok: false,
+        error: 'stream_unavailable',
+        message: 'LLM stream response body is unavailable.',
+      };
+    }
+
+    const chunks: LlmChatResult['chunks'] = [];
+    let usage: Record<string, unknown> | undefined;
+    let errorMessage: string | undefined;
+    const parser = new SseClientParser();
+    const decoder = new TextDecoder();
+    const consume = async (event: LlmChatStreamEvent) => {
+      if (event.chunk) chunks.push(event.chunk);
+      if (event.usage) usage = event.usage;
+      if (event.chunk?.usage) usage = event.chunk.usage;
+      if (event.type === 'provider_error') {
+        errorMessage = event.error ?? event.chunk?.error ?? 'Provider stream error.';
+      }
+      await onEvent(event);
+    };
+
+    const reader = response.body.getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      for (const event of parser.push(text)) {
+        await consume(event);
+      }
+    }
+    const tail = decoder.decode();
+    for (const event of parser.push(tail)) {
+      await consume(event);
+    }
+    for (const event of parser.finish()) {
+      await consume(event);
+    }
+
+    if (errorMessage) {
+      return {
+        ok: false,
+        error: 'provider_stream_error',
+        message: errorMessage,
+      };
+    }
+    return {
+      ok: true,
+      data: buildStreamResult(chunks, usage),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.name : 'Error',
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function postProjectionDelta(apiBase: string, hostRunId: string, delta: ProjectionDelta): Promise<void> {
+  await postJson<ApiResponse<unknown>>(
+    `${apiBase}/api/agent/sessions/${encodeURIComponent(delta.sessionId)}/runs/${encodeURIComponent(hostRunId)}/deltas`,
+    delta
+  );
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -228,6 +339,119 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   return await response.json() as T;
+}
+
+class SseClientParser {
+  private buffer = '';
+
+  push(text: string): LlmChatStreamEvent[] {
+    if (!text) return [];
+    this.buffer += text;
+    const events: LlmChatStreamEvent[] = [];
+    for (;;) {
+      const boundary = this.buffer.search(/\r?\n\r?\n/);
+      if (boundary < 0) break;
+      const raw = this.buffer.slice(0, boundary);
+      const separator = this.buffer.slice(boundary).match(/^\r?\n\r?\n/);
+      this.buffer = this.buffer.slice(boundary + (separator?.[0].length ?? 2));
+      const event = parseSseClientEvent(raw);
+      if (event) events.push(event);
+    }
+    return events;
+  }
+
+  finish(): LlmChatStreamEvent[] {
+    const text = this.buffer.trim();
+    this.buffer = '';
+    const event = parseSseClientEvent(text);
+    return event ? [event] : [];
+  }
+}
+
+function parseSseClientEvent(raw: string): LlmChatStreamEvent | null {
+  if (!raw.trim()) return null;
+  const data: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line || line.startsWith(':')) continue;
+    const separator = line.indexOf(':');
+    const field = separator >= 0 ? line.slice(0, separator) : line;
+    const value = separator >= 0 ? line.slice(separator + 1).replace(/^ /, '') : '';
+    if (field === 'data') data.push(value);
+  }
+  const payload = data.join('\n').trim();
+  if (!payload || payload === '[DONE]') {
+    return { type: 'provider_done', chunk: { type: 'done' } };
+  }
+  try {
+    return JSON.parse(payload) as LlmChatStreamEvent;
+  } catch (error) {
+    return {
+      type: 'provider_error',
+      error: `Invalid LLM stream event JSON: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+function buildStreamResult(
+  chunks: LlmChatResult['chunks'],
+  usage: Record<string, unknown> | undefined
+): LlmChatResult {
+  const content = chunks
+    .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
+    .map((chunk) => chunk.content)
+    .join('');
+  const reasoningContent = chunks
+    .filter((chunk) => chunk.type === 'reasoning_delta' && typeof chunk.content === 'string')
+    .map((chunk) => chunk.content)
+    .join('');
+  const toolCalls = collectStreamToolCalls(chunks);
+  return {
+    chunks,
+    usage,
+    assistantMessage: {
+      role: 'assistant',
+      content,
+      ...(reasoningContent ? { reasoningContent } : {}),
+      ...(toolCalls.length ? { toolCalls } : {}),
+    },
+  };
+}
+
+function collectStreamToolCalls(chunks: LlmChatResult['chunks']): ToolCall[] {
+  const byIndex = new Map<number, { id?: string; name?: string; argumentsText: string }>();
+  const ready: ToolCall[] = [];
+  for (const chunk of chunks) {
+    if (chunk.type === 'tool_call' && chunk.toolCall) {
+      ready.push(chunk.toolCall);
+      continue;
+    }
+    if (chunk.type !== 'tool_call' || !chunk.toolCallDelta) continue;
+    const index = chunk.toolCallDelta.index ?? chunk.index ?? 0;
+    const current = byIndex.get(index) ?? { argumentsText: '' };
+    current.id = chunk.toolCallDelta.id ?? chunk.callId ?? current.id;
+    current.name = chunk.toolCallDelta.name ?? current.name;
+    current.argumentsText += chunk.toolCallDelta.argumentsDelta ?? '';
+    byIndex.set(index, current);
+  }
+  for (const [index, item] of byIndex.entries()) {
+    if (!item.name) continue;
+    ready.push({
+      id: item.id ?? `tool-call-${index + 1}`,
+      name: item.name,
+      arguments: parseToolArguments(item.argumentsText),
+    });
+  }
+  return ready;
+}
+
+function parseToolArguments(raw: string): unknown {
+  const text = raw.trim();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw };
+  }
 }
 
 function workspaceBindingFromPath(path: string | undefined): AgentWorkspaceBinding | undefined {
@@ -296,6 +520,96 @@ function extractFinalText(timeline: AgentTimelineResult): string {
   return '';
 }
 
+function inferHostRunLifecycle(
+  events: unknown[],
+  finalText: string
+): Pick<HostBridgeResult, 'runStatus' | 'decisionKind' | 'targetId' | 'terminalReason'> {
+  for (const event of [...events].reverse()) {
+    const record = objectRecord(event);
+    const kind = stringField(record, 'kind');
+    const payload = objectRecord(record?.payload);
+    if (!kind || !payload) continue;
+
+    if (kind === 'error') {
+      return {
+        runStatus: 'failed',
+        terminalReason: stringField(payload, 'message') ?? stringField(payload, 'summary') ?? 'session run failed',
+      };
+    }
+
+    if (kind === 'session_run_state' && stringField(payload, 'status') === 'waiting') {
+      const owner = objectRecord(payload.decisionOwner);
+      return {
+        runStatus: 'waiting',
+        decisionKind: stringField(payload, 'decisionKind') ?? stringField(owner, 'kind'),
+        targetId: stringField(payload, 'targetId') ?? stringField(owner, 'targetId'),
+        terminalReason: stringField(payload, 'summary') ?? 'Session run is waiting for user input.',
+      };
+    }
+
+    if (kind === 'permission_request') {
+      return {
+        runStatus: 'waiting',
+        decisionKind: 'permission',
+        targetId: stringField(payload, 'id') ?? stringField(payload, 'permissionId'),
+        terminalReason: stringField(payload, 'summary') ?? 'Session run is waiting for a permission decision.',
+      };
+    }
+
+    if (kind === 'review_summary' && stringField(payload, 'status') === 'waitingUserReview') {
+      return {
+        runStatus: 'waiting',
+        decisionKind: 'review',
+        targetId: stringField(payload, 'reviewId') ?? stringField(payload, 'runId'),
+        terminalReason: stringField(payload, 'summary') ?? 'Session run is waiting for user review.',
+      };
+    }
+
+    if (kind === 'requirement_confirmation' && stringField(payload, 'status') === 'waitingUserConfirmation') {
+      return {
+        runStatus: 'waiting',
+        decisionKind: 'requirement',
+        targetId: stringField(payload, 'requirementId'),
+        terminalReason: stringField(payload, 'summary') ?? 'Session run is waiting for requirement confirmation.',
+      };
+    }
+
+    if (kind === 'plan_card' && planCardAwaitingDecision(payload)) {
+      return {
+        runStatus: 'waiting',
+        decisionKind: 'plan',
+        targetId: stringField(payload, 'planId'),
+        terminalReason: stringField(payload, 'summary') ?? 'Session run is waiting for plan review.',
+      };
+    }
+  }
+
+  return {
+    runStatus: finalText ? 'completed' : 'completed',
+    terminalReason: finalText ? 'final_answer' : 'session_run_returned',
+  };
+}
+
+function planCardAwaitingDecision(payload: Record<string, unknown>): boolean {
+  if (payload.confirmable === false) return false;
+  const status = stringField(payload, 'status');
+  if (!status) return true;
+  return status === 'awaitingUserApproval' ||
+    status === 'awaitingTemporaryGrant' ||
+    status === 'pending';
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringField(record: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
 async function readStdin(): Promise<string> {
   let raw = '';
   for await (const chunk of process.stdin) {
@@ -304,15 +618,18 @@ async function readStdin(): Promise<string> {
   return raw;
 }
 
-function writeJson(result: HostBridgeResult): void {
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+function writeJson(result: HostBridgeResult): Promise<void> {
+  return new Promise((resolve) => {
+    process.stdout.write(`${JSON.stringify(result)}\n`, resolve);
+  });
 }
 
 main().catch((error: unknown) => {
-  writeJson({
+  void writeJson({
     ok: false,
     error: error instanceof Error ? error.name : 'Error',
     message: error instanceof Error ? error.message : String(error),
+  }).finally(() => {
+    process.exit(1);
   });
-  process.exitCode = 1;
 });

@@ -157,6 +157,27 @@ export interface DiagnosticDraft {
   details?: string;
 }
 
+export interface ImplementationPlanTaskDraft {
+  taskId: string;
+  title: string;
+  target: string[];
+  scope: string;
+  dependencies: string[];
+  capability: string;
+  acceptanceCriteria: string[];
+  failureCriteria: string[];
+}
+
+export interface ImplementationPlanDraft {
+  version: '1';
+  id: string;
+  title: string;
+  summary: string;
+  tasks: ImplementationPlanTaskDraft[];
+  risks: string[];
+  reviewCheckpoints: string[];
+}
+
 export interface AgentPlanParts {
   userPlan: string;
   actionBundle: ActionBundleDraft;
@@ -191,6 +212,7 @@ export type ProposalEnvelopeKind =
   | 'answer'
   | 'resourceRequest'
   | 'decisionRequest'
+  | 'implementationPlan'
   | 'actionBundle'
   | 'diagnostic';
 

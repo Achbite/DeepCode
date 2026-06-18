@@ -171,6 +171,9 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     if (event.kind === 'cache_telemetry') {
       return;
     }
+    if (isDebugTimelineEvent(event)) {
+      return;
+    }
 
     if (event.kind === 'user_msg') {
       if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
@@ -212,6 +215,9 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
         narrativeKind: block.narrativeKind ?? narrativeKindForLegacyKind(block.kind),
       }))
   );
+  const implementationTaskItems = input.events.flatMap((event, index) =>
+    implementationPlanTaskProjectionItems(input.events, event, index)
+  );
 
   return {
     schemaVersion: NARRATIVE_TIMELINE_SCHEMA_VERSION,
@@ -221,11 +227,245 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     eventCount: input.events.length,
     taskProjection: {
       title: 'Task projection',
-      items: taskItems.slice(-8),
+      items: [...taskItems, ...implementationTaskItems].slice(-8),
     },
     tokenUsageProjection: buildTokenUsageProjection(input.events),
     rawEventRefs,
   };
+}
+
+function implementationPlanTaskProjectionItems(
+  events: AgentEvent[],
+  event: AgentEvent,
+  eventIndex: number
+): NonNullable<AgentTimelineResult['taskProjection']>['items'] {
+  if (event.kind !== 'plan_card' || !isRecordPayload(event.payload)) return [];
+  const implementationPlan = event.payload.implementationPlan;
+  if (!isRecordPayload(implementationPlan)) return [];
+  const tasks = Array.isArray(implementationPlan.tasks) ? implementationPlan.tasks : [];
+  const lifecycle = implementationPlanLifecycle(events, event, eventIndex);
+  return tasks.flatMap((item, index) => {
+    if (!isRecordPayload(item)) return [];
+    const taskId = stringField(item, 'taskId') ?? stringField(item, 'id') ?? `task-${index + 1}`;
+    const title = stringField(item, 'title') ?? taskId;
+    const acceptance = stringArrayField(item, 'acceptanceCriteria');
+    const failure = stringArrayField(item, 'failureCriteria');
+    const scope = stringField(item, 'scope');
+    const targets = stringArrayOrSingleField(item, 'target');
+    const summary = [
+      scope,
+      acceptance.length ? `Acceptance: ${acceptance.join('; ')}` : '',
+      failure.length ? `Stop/Replan: ${failure.join('; ')}` : '',
+    ].filter(Boolean).join(' · ');
+    return [{
+      id: `implementation-plan-${event.id || eventIndex}-${taskId}`,
+      title,
+      summary: summary || stringField(implementationPlan, 'summary') || '',
+      status: implementationTaskStatus(lifecycle, targets, taskId),
+      blockId: `plan-${event.id || eventIndex}`,
+      narrativeKind: 'plan' as const,
+    }];
+  });
+}
+
+interface ImplementationPlanLifecycle {
+  accepted: boolean;
+  needsRevision: boolean;
+  rejected: boolean;
+  completedPaths: string[];
+  runningPaths: string[];
+  failedPaths: string[];
+  completedIds: string[];
+  runningIds: string[];
+  failedIds: string[];
+}
+
+function implementationPlanLifecycle(
+  events: AgentEvent[],
+  planEvent: AgentEvent,
+  planEventIndex: number
+): ImplementationPlanLifecycle {
+  const planPayload = isRecordPayload(planEvent.payload) ? planEvent.payload : {};
+  const planRunId = stringField(planPayload, 'runId');
+  const planId = stringField(planPayload, 'planId');
+  const lifecycle: ImplementationPlanLifecycle = {
+    accepted: false,
+    needsRevision: false,
+    rejected: false,
+    completedPaths: [],
+    runningPaths: [],
+    failedPaths: [],
+    completedIds: [],
+    runningIds: [],
+    failedIds: [],
+  };
+
+  for (const later of events.slice(planEventIndex + 1)) {
+    const payload = isRecordPayload(later.payload) ? later.payload : {};
+    if (later.kind === 'plan_review' && samePlanDecision(payload, planRunId, planId)) {
+      const status = stringField(payload, 'status');
+      if (status === 'accepted') lifecycle.accepted = true;
+      if (status === 'needsRevision') lifecycle.needsRevision = true;
+      if (status === 'rejected' || status === 'failed' || status === 'cancelled') lifecycle.rejected = true;
+    }
+    if (!lifecycle.accepted) continue;
+
+    const fact = implementationFactFromEvent(later);
+    if (!fact) continue;
+    if (fact.status === 'completed') {
+      lifecycle.completedPaths.push(...fact.paths);
+      lifecycle.completedIds.push(...fact.ids);
+    } else if (fact.status === 'running' || fact.status === 'queued') {
+      lifecycle.runningPaths.push(...fact.paths);
+      lifecycle.runningIds.push(...fact.ids);
+    } else if (fact.status === 'failed' || fact.status === 'blocked') {
+      lifecycle.failedPaths.push(...fact.paths);
+      lifecycle.failedIds.push(...fact.ids);
+    }
+  }
+
+  lifecycle.completedPaths = [...new Set(lifecycle.completedPaths.map(normalizeTaskPath).filter(Boolean))];
+  lifecycle.runningPaths = [...new Set(lifecycle.runningPaths.map(normalizeTaskPath).filter(Boolean))];
+  lifecycle.failedPaths = [...new Set(lifecycle.failedPaths.map(normalizeTaskPath).filter(Boolean))];
+  lifecycle.completedIds = [...new Set(lifecycle.completedIds.map(normalizeTaskId).filter(Boolean))];
+  lifecycle.runningIds = [...new Set(lifecycle.runningIds.map(normalizeTaskId).filter(Boolean))];
+  lifecycle.failedIds = [...new Set(lifecycle.failedIds.map(normalizeTaskId).filter(Boolean))];
+  return lifecycle;
+}
+
+function implementationTaskStatus(
+  lifecycle: ImplementationPlanLifecycle,
+  targets: string[],
+  taskId: string
+): AgentTimelineStatus {
+  if (lifecycle.rejected) return 'failed';
+  if (lifecycle.needsRevision) return 'waiting';
+  if (!lifecycle.accepted) return 'waiting';
+
+  const normalizedTargets = targets.map(normalizeTaskPath).filter(Boolean);
+  const normalizedTaskId = normalizeTaskId(taskId);
+  if (normalizedTargets.length > 0) {
+    if (normalizedTargets.some((target) => lifecycle.failedPaths.some((path) => pathMatchesTaskTarget(path, target)))) return 'failed';
+    if (normalizedTargets.some((target) => lifecycle.runningPaths.some((path) => pathMatchesTaskTarget(path, target)))) return 'running';
+    if (normalizedTargets.some((target) => lifecycle.completedPaths.some((path) => pathMatchesTaskTarget(path, target)))) return 'completed';
+  }
+  if (normalizedTaskId) {
+    if (lifecycle.failedIds.some((id) => idMatchesTaskId(id, normalizedTaskId))) return 'failed';
+    if (lifecycle.runningIds.some((id) => idMatchesTaskId(id, normalizedTaskId))) return 'running';
+    if (lifecycle.completedIds.some((id) => idMatchesTaskId(id, normalizedTaskId))) return 'completed';
+  }
+  return 'queued';
+}
+
+function samePlanDecision(payload: Record<string, unknown>, planRunId?: string, planId?: string): boolean {
+  const decisionRunId = stringField(payload, 'runId');
+  const decisionPlanId = stringField(payload, 'planId');
+  return (!planRunId || !decisionRunId || decisionRunId === planRunId) &&
+    (!planId || !decisionPlanId || decisionPlanId === planId);
+}
+
+interface ImplementationFact {
+  status: AgentTimelineStatus;
+  paths: string[];
+  ids: string[];
+}
+
+function implementationFactFromEvent(event: AgentEvent): ImplementationFact | null {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
+  const kind = stringField(kernelEvent ?? {}, 'kind') ?? stringField(payload, 'stage');
+  const status = implementationFactStatus(kind, stringField(payload, 'status'));
+  if (!status) return null;
+  return {
+    status,
+    paths: eventPathCandidates(payload),
+    ids: eventIdCandidates(payload),
+  };
+}
+
+function implementationFactStatus(kind: string | undefined, status: string | undefined): AgentTimelineStatus | null {
+  if (kind === 'work_unit.queued') return 'queued';
+  if (kind === 'work_unit.started') return 'running';
+  if (kind === 'work_unit.completed' || kind === 'tool.completed') return 'completed';
+  if (kind === 'work_unit.failed' || kind === 'tool.failed') return 'failed';
+  if (kind === 'work_unit.blocked') return 'blocked';
+  if (kind === 'work_unit') {
+    if (status === 'queued') return 'queued';
+    if (status === 'running' || status === 'started') return 'running';
+    if (status === 'completed') return 'completed';
+    if (status === 'failed') return 'failed';
+    if (status === 'blocked') return 'blocked';
+  }
+  return null;
+}
+
+function eventPathCandidates(payload: Record<string, unknown>): string[] {
+  const candidates: string[] = [];
+  const collect = (value: unknown): void => {
+    if (!isRecordPayload(value)) return;
+    for (const key of ['path', 'absolutePath', 'resourceScope', 'target']) {
+      const field = value[key];
+      if (typeof field === 'string' && field.trim()) candidates.push(field);
+      if (Array.isArray(field)) {
+        for (const item of field) {
+          if (typeof item === 'string' && item.trim()) candidates.push(item);
+        }
+      }
+    }
+  };
+  collect(payload);
+  const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
+  collect(kernelEvent);
+  if (kernelEvent) collect(kernelEvent.output);
+  if (kernelEvent) collect(kernelEvent.workUnit);
+  const output = isRecordPayload(payload.output) ? payload.output : undefined;
+  collect(output);
+  const workUnit = isRecordPayload(payload.workUnit) ? payload.workUnit : undefined;
+  collect(workUnit);
+  return candidates;
+}
+
+function eventIdCandidates(payload: Record<string, unknown>): string[] {
+  const candidates: string[] = [];
+  const collect = (value: unknown): void => {
+    if (!isRecordPayload(value)) return;
+    for (const key of ['id', 'actionId', 'workUnitId', 'toolCallId']) {
+      const field = value[key];
+      if (typeof field === 'string' && field.trim()) candidates.push(field);
+    }
+  };
+  collect(payload);
+  const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
+  collect(kernelEvent);
+  if (kernelEvent) collect(kernelEvent.workUnit);
+  const workUnit = isRecordPayload(payload.workUnit) ? payload.workUnit : undefined;
+  collect(workUnit);
+  return candidates;
+}
+
+function stringArrayOrSingleField(record: Record<string, unknown>, key: string): string[] {
+  const value = record[key];
+  if (typeof value === 'string' && value.trim()) return [value.trim()];
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  return [];
+}
+
+function normalizeTaskPath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim();
+}
+
+function pathMatchesTaskTarget(path: string, target: string): boolean {
+  if (!path || !target) return false;
+  return path === target || path.endsWith(`/${target}`) || target.endsWith(`/${path}`);
+}
+
+function normalizeTaskId(id: string): string {
+  return id.trim().toLowerCase();
+}
+
+function idMatchesTaskId(id: string, taskId: string): boolean {
+  if (!id || !taskId) return false;
+  return id === taskId || id.endsWith(`:${taskId}`) || id.endsWith(`/${taskId}`) || id.includes(taskId);
 }
 
 export function buildTokenUsageProjection(events: AgentEvent[]): AgentTimelineTokenUsageProjection {
@@ -563,7 +803,22 @@ function narrativeStatus(events: AgentEvent[]): AgentTimelineStatus {
   if (events.some((event) => event.kind === 'permission_request') && !events.some((event) => event.kind === 'permission_result')) {
     return 'waiting';
   }
-  if (events.some((event) => event.kind === 'plan_review' && stringValueFromPayload(event.payload, 'confirmable') !== 'false')) {
+  if (events.some((event) => event.kind === 'session_run_state' && stringValueFromPayload(event.payload, 'status') === 'waiting')) {
+    return 'waiting';
+  }
+  if (
+    events.some((event) =>
+      event.kind === 'requirement_confirmation' &&
+      stringValueFromPayload(event.payload, 'status') === 'waitingUserConfirmation'
+    ) &&
+    !events.some((event) => event.kind === 'requirement_decision')
+  ) {
+    return 'waiting';
+  }
+  if (events.some((event) => event.kind === 'plan_card' && planCardEventAwaitingDecision(event))) {
+    return 'waiting';
+  }
+  if (events.some((event) => event.kind === 'plan_review' && planReviewEventAwaitingDecision(event))) {
     return 'waiting';
   }
   if (events.some((event) => event.kind === 'tool_call' || stringValueFromPayload(event.payload, 'status') === 'running')) {
@@ -701,6 +956,32 @@ function stringValueFromPayload(payload: unknown, key: string): string | undefin
   return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
+function isDebugTimelineEvent(event: AgentEvent): boolean {
+  if (event.kind.startsWith('trace/')) return true;
+  return stringValueFromPayload(event.payload, 'visibility') === 'debug';
+}
+
+function planCardEventAwaitingDecision(event: AgentEvent): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  if (payload.confirmable === false) return false;
+  const status = stringField(payload, 'status');
+  if (!status) return true;
+  return planReviewStatusAwaitingUser(status);
+}
+
+function planReviewEventAwaitingDecision(event: AgentEvent): boolean {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  if (payload.confirmable === false) return false;
+  return planReviewStatusAwaitingUser(stringField(payload, 'status'));
+}
+
+function planReviewStatusAwaitingUser(status?: string): boolean {
+  return status === undefined ||
+    status === 'awaitingUserApproval' ||
+    status === 'awaitingTemporaryGrant' ||
+    status === 'pending';
+}
+
 function isRecordPayload(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -708,6 +989,12 @@ function isRecordPayload(value: unknown): value is Record<string, unknown> {
 function stringField(value: Record<string, unknown>, key: string): string | undefined {
   const field = value[key];
   return typeof field === 'string' && field.trim().length > 0 ? field : undefined;
+}
+
+function stringArrayField(value: Record<string, unknown>, key: string): string[] {
+  const field = value[key];
+  if (!Array.isArray(field)) return [];
+  return field.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
 }
 
 function numberField(value: Record<string, unknown>, key: string): number | undefined {

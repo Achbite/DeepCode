@@ -106,11 +106,27 @@ export function buildSessionTaskGraph(input: SessionTaskGraphInput): SessionTask
         eventRef: event.id,
       });
     }
-    if (event.kind === 'plan_card' || event.kind === 'plan_review') {
+    if (event.kind === 'plan_card') {
+      const implementationTasks = implementationPlanTasks(event);
+      if (implementationTasks.length) {
+        for (const task of implementationTasks) {
+          upsert({
+            id: `implementation-${task.taskId}`,
+            kind: 'planning',
+            status: 'queued',
+            title: task.title,
+            summary: task.summary,
+            eventRef: event.id,
+            dependsOn: task.dependencies,
+          });
+        }
+      }
+    }
+    if ((event.kind === 'plan_card' || event.kind === 'plan_review') && !eventIsDebug(event)) {
       upsert({
         id: 'planning',
         kind: 'planning',
-        status: event.kind === 'plan_review' ? 'waiting' : 'running',
+        status: event.kind === 'plan_card' && planCardAwaitingDecision(event) ? 'waiting' : eventStatus(event, 'running'),
         title: 'Planning',
         summary: eventSummary(event) || 'Plan is being reviewed.',
         eventRef: event.id,
@@ -228,6 +244,7 @@ function activeTaskId(tasks: SessionTaskState[]): string | undefined {
 function proposalTaskId(proposal: ProposalEnvelope): string {
   if (proposal.kind === 'resourceRequest') return 'resource-request-proposal';
   if (proposal.kind === 'decisionRequest') return 'requirement';
+  if (proposal.kind === 'implementationPlan') return 'planning';
   if (proposal.kind === 'actionBundle') return 'planning';
   if (proposal.kind === 'diagnostic') return 'diagnostic';
   return 'analysis';
@@ -236,6 +253,7 @@ function proposalTaskId(proposal: ProposalEnvelope): string {
 function proposalTaskKind(proposal: ProposalEnvelope): SessionTaskKind {
   if (proposal.kind === 'resourceRequest') return 'resourceDiscovery';
   if (proposal.kind === 'decisionRequest') return 'requirement';
+  if (proposal.kind === 'implementationPlan') return 'planning';
   if (proposal.kind === 'actionBundle') return 'planning';
   if (proposal.kind === 'diagnostic') return 'diagnostic';
   return 'analysis';
@@ -245,6 +263,7 @@ function proposalTaskStatus(proposal: ProposalEnvelope): SessionTaskStatus {
   if (proposal.kind === 'answer') return 'completed';
   if (proposal.kind === 'diagnostic') return 'failed';
   if (proposal.kind === 'decisionRequest') return 'waiting';
+  if (proposal.kind === 'implementationPlan') return 'waiting';
   return 'running';
 }
 
@@ -261,7 +280,7 @@ function taskExists(tasks: Map<string, SessionTaskState>, id: string): boolean {
 function eventStatus(event: AgentEvent, fallback: SessionTaskStatus): SessionTaskStatus {
   const status = eventPayloadString(event, 'status') ?? eventPayloadString(event, 'decision');
   if (status === 'error' || status === 'failed') return 'failed';
-  if (status === 'awaitingUserApproval' || status === 'pending' || status === 'waiting') return 'waiting';
+  if (status === 'awaitingUserApproval' || status === 'awaitingTemporaryGrant' || status === 'pending' || status === 'waiting') return 'waiting';
   if (status === 'completed' || status === 'done' || status === 'ok' || status === 'accepted') return 'completed';
   if (status === 'running' || status === 'started') return 'running';
   return fallback;
@@ -282,9 +301,66 @@ function eventPayloadString(event: AgentEvent, key: string): string | undefined 
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function eventPayloadBoolean(event: AgentEvent, key: string): boolean | undefined {
+  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) return undefined;
+  const value = (event.payload as Record<string, unknown>)[key];
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function eventIsDebug(event: AgentEvent): boolean {
+  return event.kind.startsWith('trace/') || eventPayloadString(event, 'visibility') === 'debug';
+}
+
+function planCardAwaitingDecision(event: AgentEvent): boolean {
+  if (eventPayloadBoolean(event, 'confirmable') === false) return false;
+  const status = eventPayloadString(event, 'status');
+  if (!status) return true;
+  return status === 'awaitingUserApproval' ||
+    status === 'awaitingTemporaryGrant' ||
+    status === 'pending';
+}
+
 function eventHasContinuation(event: AgentEvent): boolean {
   if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) return false;
   const payload = event.payload as Record<string, unknown>;
   const continuations = payload.continuations ?? payload.continuationExpectations;
   return Array.isArray(continuations) && continuations.length > 0;
+}
+
+function implementationPlanTasks(event: AgentEvent): Array<{
+  taskId: string;
+  title: string;
+  summary: string;
+  dependencies: string[];
+}> {
+  const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+    ? event.payload as Record<string, unknown>
+    : undefined;
+  const implementationPlan = payload?.implementationPlan && typeof payload.implementationPlan === 'object' && !Array.isArray(payload.implementationPlan)
+    ? payload.implementationPlan as Record<string, unknown>
+    : undefined;
+  const tasks = Array.isArray(implementationPlan?.tasks) ? implementationPlan.tasks : [];
+  return tasks.flatMap((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const record = item as Record<string, unknown>;
+    const taskId = typeof record.taskId === 'string' && record.taskId.trim()
+      ? record.taskId
+      : `task-${index + 1}`;
+    const title = typeof record.title === 'string' && record.title.trim()
+      ? record.title
+      : taskId;
+    const scope = typeof record.scope === 'string' ? record.scope : '';
+    const acceptance = Array.isArray(record.acceptanceCriteria)
+      ? record.acceptanceCriteria.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
+    const dependencies = Array.isArray(record.dependencies)
+      ? record.dependencies.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
+    return [{
+      taskId,
+      title,
+      summary: [scope, acceptance.length ? `Acceptance: ${acceptance.join('; ')}` : ''].filter(Boolean).join(' · '),
+      dependencies,
+    }];
+  });
 }

@@ -6,6 +6,7 @@ const V3_KINDS = new Set([
   'answer',
   'resourceRequest',
   'decisionRequest',
+  'implementationPlan',
   'actionBundle',
   'diagnostic',
 ]);
@@ -52,8 +53,46 @@ function proposalPayload(envelope: Record<string, unknown>, kind: string, propos
   if (kind === 'answer') return requireObject(envelope.answer, 'Agent Protocol v3.answer');
   if (kind === 'resourceRequest') return normalizeResourceRequest(requireObject(envelope.resourceRequest, 'Agent Protocol v3.resourceRequest'));
   if (kind === 'decisionRequest') return normalizeDecisionRequest(requireObject(envelope.decisionRequest, 'Agent Protocol v3.decisionRequest'));
+  if (kind === 'implementationPlan') return normalizeImplementationPlan(requireObject(envelope.implementationPlan, 'Agent Protocol v3.implementationPlan'), proposalId);
   if (kind === 'diagnostic') return normalizeDiagnostic(requireObject(envelope.diagnostic, 'Agent Protocol v3.diagnostic'));
   return normalizeActionBundlePayload(envelope, proposalId);
+}
+
+function normalizeImplementationPlan(value: Record<string, unknown>, proposalId: string): Record<string, unknown> {
+  const tasks = value.tasks;
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    throw new AgentPlanParseError('invalid_implementation_plan', 'Agent Protocol v3.implementationPlan.tasks must be a non-empty array');
+  }
+  return {
+    ...value,
+    version: optionalString(value, 'version') ?? '1',
+    id: optionalString(value, 'id') ?? `${proposalId}-implementation-plan`,
+    title: optionalString(value, 'title') ?? optionalString(value, 'summary') ?? 'Implementation plan',
+    summary: optionalString(value, 'summary') ?? optionalString(value, 'title') ?? 'Implementation plan',
+    risks: optionalStringArray(value, 'risks'),
+    reviewCheckpoints: optionalStringArray(value, 'reviewCheckpoints'),
+    tasks: tasks.map((item, index) => {
+      const record = requireObject(item, `Agent Protocol v3.implementationPlan.tasks[${index}]`);
+      const taskId = optionalString(record, 'taskId') ?? optionalString(record, 'id') ?? `task-${index + 1}`;
+      const target = optionalStringArray(record, 'target').length
+        ? optionalStringArray(record, 'target')
+        : optionalStringArray(record, 'targets');
+      return {
+        ...record,
+        taskId,
+        id: optionalString(record, 'id') ?? taskId,
+        title: optionalString(record, 'title') ?? taskId,
+        target,
+        scope: optionalString(record, 'scope') ?? optionalString(record, 'intent') ?? '',
+        dependencies: optionalStringArray(record, 'dependencies').length
+          ? optionalStringArray(record, 'dependencies')
+          : optionalStringArray(record, 'dependsOn'),
+        capability: optionalString(record, 'capability') ?? '',
+        acceptanceCriteria: optionalStringArray(record, 'acceptanceCriteria'),
+        failureCriteria: optionalStringArray(record, 'failureCriteria'),
+      };
+    }),
+  };
 }
 
 function normalizeActionBundlePayload(envelope: Record<string, unknown>, proposalId: string): Record<string, unknown> {

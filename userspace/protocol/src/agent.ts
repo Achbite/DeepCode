@@ -353,6 +353,7 @@ export type AgentEventKind =
   | 'tool_result'
   | 'permission_request'
   | 'permission_result'
+  | 'session_run_state'
   | 'workflow_stage'
   | 'workflow_decision'
   | 'trace/requirement_decision_noop'

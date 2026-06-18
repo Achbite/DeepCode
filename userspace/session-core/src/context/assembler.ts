@@ -119,6 +119,7 @@ export interface ContextAssemblyInput {
   requirement?: RequirementRecord;
   memoryDocument?: SessionMemoryDocument;
   extraMemoryHints?: string[];
+  interventionLevel?: PromptEnvelopeBuilderInput['interventionLevel'];
   userOverlay?: string;
   profile?: {
     provider?: string;
@@ -147,6 +148,7 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
       ...renderDynamicSessionMemoryHints(memoryDocument),
       ...(input.extraMemoryHints ?? []),
     ],
+    interventionLevel: input.interventionLevel,
     userOverlay: input.userOverlay,
     userGuidance,
     userRequest: input.userRequest,

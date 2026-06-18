@@ -15,6 +15,7 @@ export interface PromptSystemLayer {
     | 'reusableResourceContext'
     | 'requirementTranscript'
     | 'shortTermMemoryHints'
+    | 'agentInterventionPolicy'
     | 'currentUserOverlay'
     | 'userGuidance'
     | 'currentWorkflowState'
@@ -54,6 +55,7 @@ export interface PromptEnvelopeBuilderInput {
   memoryHints?: string[];
   stableMemoryHints?: string[];
   dynamicMemoryHints?: string[];
+  interventionLevel?: 'low' | 'medium' | 'high';
   userOverlay?: string;
   userGuidance?: Array<{
     id: string;
