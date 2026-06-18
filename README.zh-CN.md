@@ -74,9 +74,10 @@ bin/macos-arm64/
   DeepCode.app
   DeepCode-GUI.app
   deepcode-kernel
-  deepcode-cli
-  deepcode-tui
   DeepCode-TUI.command
+  DeepCode-CLI.command
+  libexec/DeepCode-TUI
+  libexec/DeepCode-CLI
   web/
   DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui/
   config/
@@ -98,7 +99,7 @@ bin/macos-arm64/
 - Editor 是完整工作台封装：文件树、Monaco-based editor surface、终端、Agent 面板、Git 面板、内部浏览器。右侧 Agent 面板是嵌入在编辑器里的会话框，复用 DeepCode-GUI 的 Session projection 与消息语义，不是独立 Agent runtime。
 - DeepCode-GUI 是简洁对话式 GUI，不等同于完整 Editor。
 - GUI 只读分析可以由显式附件或 Session 记忆的项目默认工作目录锚定；这不同于 Editor workspace binding，后者仍是编辑器文件树和代码修改隔离边界。
-- CLI/TUI 是命令行和终端交互入口，复用同一个 Kernel/session 事实源。旧会话发送入口已删除，后续需要通过与 Editor / GUI 相同的 SessionDriverLoop bridge 重接。
+- CLI/TUI 是命令行和终端交互入口，复用同一个 Kernel/session 事实源。普通输入、决策和 cancel 请求都通过 daemon shared Session Runtime run API 提交；TUI 在终端里渲染共享 session timeline projection。
 - Web Dev Host 仅用于开发预览和协议调试，不是正式 UI 封装。
 
 ## UI 封装口径

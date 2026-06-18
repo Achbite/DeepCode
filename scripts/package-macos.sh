@@ -58,6 +58,10 @@ SEED_CARGO_REGISTRY="${DEEPCODE_MACOS_SEED_CARGO_REGISTRY:-1}"
 CARGO_OFFLINE="${DEEPCODE_MACOS_CARGO_OFFLINE:-1}"
 TAURI_NETWORK_FALLBACK="${DEEPCODE_MACOS_TAURI_NETWORK_FALLBACK:-1}"
 CLEAN_PACKAGE_CACHE="${DEEPCODE_MACOS_CLEAN:-0}"
+CLI_COMMAND_NAME="DeepCode-CLI.command"
+LIBEXEC_DIR="$BIN_DIR/libexec"
+TUI_EXEC_NAME="DeepCode-TUI"
+CLI_EXEC_NAME="DeepCode-CLI"
 
 export CARGO_TARGET_DIR="$CARGO_TARGET_ROOT"
 
@@ -216,6 +220,7 @@ clean_macos_package_cache() {
   log "preserve package-local user data: config/, sessions/, conversation-archives/, kernel/"
 
   rm -rf "$BIN_DIR/$APP_NAME.app" "$BIN_DIR/$WEB_DIR_NAME" "$TAURI_DIR/dist"
+  rm -rf "$BIN_DIR/session-core" "$BIN_DIR/node_modules" "$BIN_DIR/node" "$LIBEXEC_DIR"
   if [ -n "$TUI_COMMAND_NAME" ]; then
     rm -f "$BIN_DIR/$TUI_COMMAND_NAME"
   fi
@@ -223,6 +228,7 @@ clean_macos_package_cache() {
     "$BIN_DIR/deepcode-kernel" \
     "$BIN_DIR/deepcode-cli" \
     "$BIN_DIR/deepcode-tui" \
+    "$BIN_DIR/$CLI_COMMAND_NAME" \
     "$BIN_DIR/README.txt" \
     "$BIN_DIR/build-info.json"
 
@@ -511,6 +517,51 @@ copy_required_file() {
   install -m "$mode" "$src" "$dst"
 }
 
+copy_session_core_runtime() {
+  local session_dist="$ROOT_DIR/userspace/session-core/dist"
+  local protocol_dist="$ROOT_DIR/userspace/protocol/dist"
+  local session_dst="$BIN_DIR/session-core"
+  local protocol_dst="$BIN_DIR/node_modules/@deepcode/protocol"
+
+  [ -f "$session_dist/hostBridge.js" ] || fail "session-core bridge missing at $session_dist/hostBridge.js; build session-core before packaging"
+  [ -d "$protocol_dist" ] || fail "protocol dist missing at $protocol_dist; build protocol before packaging"
+
+  rm -rf "$session_dst" "$protocol_dst"
+  mkdir -p "$session_dst/dist" "$protocol_dst/dist"
+  cp -R "$session_dist/." "$session_dst/dist/"
+  cp -R "$protocol_dist/." "$protocol_dst/dist/"
+  copy_required_file "$ROOT_DIR/userspace/session-core/package.json" "$session_dst/package.json" 644
+  copy_required_file "$ROOT_DIR/userspace/protocol/package.json" "$protocol_dst/package.json" 644
+
+  cat > "$session_dst/hostBridge.js" <<'BRIDGE'
+import "./dist/hostBridge.js";
+BRIDGE
+  chmod 644 "$session_dst/hostBridge.js"
+}
+
+ensure_packaged_node_runtime() {
+  local src=""
+  if [ -x "$NODE_HOME/bin/node" ]; then
+    src="$NODE_HOME/bin/node"
+  else
+    ensure_node
+    if [ -x "$NODE_HOME/bin/node" ]; then
+      src="$NODE_HOME/bin/node"
+    elif command -v node >/dev/null 2>&1; then
+      src="$(command -v node)"
+    fi
+  fi
+
+  [ -n "$src" ] && [ -x "$src" ] || fail "node 20+ not found for packaged daemon session runtime"
+  local node_major
+  node_major="$("$src" -p "process.versions.node.split('.')[0]" 2>/dev/null || printf '0')"
+  [ "$node_major" -ge 20 ] 2>/dev/null || fail "packaged node runtime is too old: $("$src" --version 2>/dev/null || printf 'unknown')"
+
+  rm -rf "$BIN_DIR/node"
+  mkdir -p "$BIN_DIR/node/bin"
+  install -m 755 "$src" "$BIN_DIR/node/bin/node"
+}
+
 copy_web_dist() {
   local dst="$1"
   [ -f "$CLIENT_DIST_DIR/index.html" ] || fail "GUI dist missing at $CLIENT_DIST_DIR"
@@ -675,7 +726,7 @@ set -euo pipefail
 SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 HOST="\${DEEPCODE_HOST:-127.0.0.1}"
 KERNEL_BIN="\$SCRIPT_DIR/deepcode-kernel"
-TUI_BIN="\$SCRIPT_DIR/deepcode-tui"
+TUI_BIN="\$SCRIPT_DIR/libexec/$TUI_EXEC_NAME"
 WEB_DIR="\$SCRIPT_DIR/$WEB_DIR_NAME"
 CONFIG_ROOT="\${DEEPCODE_CONFIG_DIR:-\$SCRIPT_DIR}"
 LOG_DIR="\${DEEPCODE_LOG_DIR:-\$CONFIG_ROOT/logs}"
@@ -762,9 +813,62 @@ export DEEPCODE_HOST="\$HOST"
 export DEEPCODE_PORT="\$PORT"
 export DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT"
 export DEEPCODE_API_URL="\$API_URL"
-"\$TUI_BIN" --api "\$API_URL"
+if [ -f "\$SCRIPT_DIR/session-core/hostBridge.js" ]; then
+  export DEEPCODE_SESSION_BRIDGE="\$SCRIPT_DIR/session-core/hostBridge.js"
+fi
+if [ -x "\$SCRIPT_DIR/node/bin/node" ]; then
+  export DEEPCODE_NODE="\$SCRIPT_DIR/node/bin/node"
+elif [ "\${DEEPCODE_NODE:-}" = "" ] && command -v node >/dev/null 2>&1; then
+  export DEEPCODE_NODE="\$(command -v node)"
+fi
+TUI_ARGS=(--api "\$API_URL")
+if [ "\${DEEPCODE_WORKSPACE:-}" != "" ]; then
+  TUI_ARGS+=(--workspace "\$DEEPCODE_WORKSPACE")
+fi
+"\$TUI_BIN" "\${TUI_ARGS[@]}" "\$@"
 LAUNCHER
   chmod +x "$BIN_DIR/$TUI_COMMAND_NAME"
+}
+
+write_cli_launcher() {
+  [ "$WRITE_TUI_LAUNCHER" = "1" ] || return 0
+  cat > "$BIN_DIR/$CLI_COMMAND_NAME" <<LAUNCHER
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+CLI_BIN="\$SCRIPT_DIR/libexec/$CLI_EXEC_NAME"
+KERNEL_BIN="\$SCRIPT_DIR/deepcode-kernel"
+CONFIG_ROOT="\${DEEPCODE_CONFIG_DIR:-\$SCRIPT_DIR}"
+HOST="\${DEEPCODE_HOST:-127.0.0.1}"
+PORT="\${DEEPCODE_PORT:-$DEFAULT_PORT}"
+
+fail() {
+  printf '$PRODUCT CLI launcher error: %s\n' "\$*" >&2
+  printf 'Press Enter to close this window...'
+  read -r _ || true
+  exit 1
+}
+
+[ -x "\$CLI_BIN" ] || fail "missing executable: \$CLI_BIN"
+[ -x "\$KERNEL_BIN" ] || fail "missing executable: \$KERNEL_BIN"
+
+export DEEPCODE_HOST="\$HOST"
+export DEEPCODE_PORT="\$PORT"
+export DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT"
+export DEEPCODE_KERNEL_BIN="\$KERNEL_BIN"
+if [ -f "\$SCRIPT_DIR/session-core/hostBridge.js" ]; then
+  export DEEPCODE_SESSION_BRIDGE="\$SCRIPT_DIR/session-core/hostBridge.js"
+fi
+if [ -x "\$SCRIPT_DIR/node/bin/node" ]; then
+  export DEEPCODE_NODE="\$SCRIPT_DIR/node/bin/node"
+elif [ "\${DEEPCODE_NODE:-}" = "" ] && command -v node >/dev/null 2>&1; then
+  export DEEPCODE_NODE="\$(command -v node)"
+fi
+
+"\$CLI_BIN" "\$@"
+LAUNCHER
+  chmod +x "$BIN_DIR/$CLI_COMMAND_NAME"
 }
 
 write_app_info_plist() {
@@ -820,14 +924,18 @@ sync_signed_kernel_sidecar_to_root() {
 }
 
 write_readme() {
-  local tui_section root_web_entry asset_entries notes app_entries gui_section note_assets
+  local terminal_section root_web_entry asset_entries notes app_entries gui_section note_assets
   if [ "$WRITE_TUI_LAUNCHER" = "1" ]; then
-    tui_section="TUI:
-  open $TUI_COMMAND_NAME
-  ./deepcode-tui --api http://127.0.0.1:$DEFAULT_PORT"
+    terminal_section="TUI/CLI:
+  ./$TUI_COMMAND_NAME
+  DEEPCODE_WORKSPACE=/path/to/project ./$TUI_COMMAND_NAME
+  ./$TUI_COMMAND_NAME --smoke -C /path/to/project
+  In TUI, /cancel submits a daemon session run cancel and refreshes shared session projection.
+  ./$CLI_COMMAND_NAME --help
+  ./$CLI_COMMAND_NAME ask -C /path/to/project \"explain this project\""
   else
-    tui_section="TUI:
-  Use the shared DeepCode TUI launcher or ./deepcode-tui. DeepCode-GUI is only an alternate GUI shell."
+    terminal_section="TUI/CLI:
+  Use the shared DeepCode package terminal launchers. DeepCode-GUI is only an alternate GUI shell."
   fi
 
   if [ "$COPY_ROOT_WEB_DIST" = "1" ]; then
@@ -841,6 +949,12 @@ write_readme() {
   notes="  bin/macos-arm64 is the shared macOS distribution directory for DeepCode and
   DeepCode-GUI. Both GUI variants use the same kernel/session/user settings
   model unless DEEPCODE_CONFIG_DIR is explicitly overridden.
+  TUI/CLI ordinary input, decisions, and cancel requests go through the daemon
+  shared Session Runtime run API. The daemon uses session-core/dist/hostBridge.js,
+  package-local node/bin/node, and node_modules/@deepcode/protocol internally.
+  Set DEEPCODE_NODE or DEEPCODE_SESSION_BRIDGE only when overriding that packaged
+  daemon runtime. DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS controls the daemon session
+  run hard timeout; default 600000 ms, 0 disables it.
 	  By default, this local package stores writable user data under:
 	    config/user/local/settings/
 	    config/user/local/secrets/
@@ -883,13 +997,15 @@ DeepCode macOS arm64 Distribution
 GUI:
 $gui_section
 
-$tui_section
+$terminal_section
 
 Files:
 $app_entries
   deepcode-kernel           Darwin arm64 Kernel daemon.
-  deepcode-cli              Darwin arm64 CLI host.
-  deepcode-tui              Darwin arm64 Ratatui/Crossterm TUI host.
+  $TUI_COMMAND_NAME         User-facing TUI launcher.
+  $CLI_COMMAND_NAME         User-facing CLI launcher.
+  libexec/$CLI_EXEC_NAME    Internal Darwin arm64 CLI host.
+  libexec/$TUI_EXEC_NAME    Internal Darwin arm64 Ratatui/Crossterm TUI host.
 $asset_entries
   config/                  Package-local writable user config root.
   sessions/                Package-local session projection/transcript cache.
@@ -920,11 +1036,16 @@ JSON
 package_distribution() {
   log "prepare $BIN_DIR"
   mkdir -p "$BIN_DIR"
-  rm -rf "$BIN_DIR/$APP_NAME.app" "$BIN_DIR/$WEB_DIR_NAME"
+  rm -rf "$BIN_DIR/$APP_NAME.app" "$BIN_DIR/$WEB_DIR_NAME" "$LIBEXEC_DIR"
+  mkdir -p "$LIBEXEC_DIR"
   if [ -n "$TUI_COMMAND_NAME" ]; then
     rm -rf "$BIN_DIR/$TUI_COMMAND_NAME"
   fi
-  rm -f "$BIN_DIR/README.txt"
+  rm -f \
+    "$BIN_DIR/$CLI_COMMAND_NAME" \
+    "$BIN_DIR/deepcode-cli" \
+    "$BIN_DIR/deepcode-tui" \
+    "$BIN_DIR/README.txt"
   if [ "$PRODUCT" = "DeepCode-GUI" ]; then
     rm -rf "$ROOT_DIR/bin/macos-arm64-deepcode-gui"
     rm -rf "$BIN_DIR/web-deepcode-gui" "$BIN_DIR/DeepCode-GUI-TUI.command"
@@ -943,8 +1064,10 @@ package_distribution() {
   log "copy Darwin sidecars into app bundle and distribution root"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$app_macos_dir/deepcode-kernel" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$BIN_DIR/deepcode-kernel" 755
-  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$BIN_DIR/deepcode-cli" 755
-  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "$BIN_DIR/deepcode-tui" 755
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LIBEXEC_DIR/$CLI_EXEC_NAME" 755
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "$LIBEXEC_DIR/$TUI_EXEC_NAME" 755
+  copy_session_core_runtime
+  ensure_packaged_node_runtime
   write_build_info "$BIN_DIR/build-info.json" "macos-arm64"
   write_build_info "$app_macos_dir/build-info.json"
 
@@ -955,6 +1078,7 @@ package_distribution() {
     verify_copied_web_dist "$BIN_DIR/$WEB_DIR_NAME"
   fi
   write_tui_launcher
+  write_cli_launcher
   write_readme
   sign_app_bundle "$BIN_DIR/$APP_NAME.app"
   sync_signed_kernel_sidecar_to_root
@@ -1045,8 +1169,9 @@ main() {
   log "GUI: open $BIN_DIR/$APP_NAME.app"
   if [ "$WRITE_TUI_LAUNCHER" = "1" ]; then
     log "TUI: open $BIN_DIR/$TUI_COMMAND_NAME"
+    log "CLI: open $BIN_DIR/$CLI_COMMAND_NAME or run it with arguments"
   else
-    log "TUI: use the shared DeepCode TUI launcher or ./deepcode-tui"
+    log "TUI/CLI: use the shared DeepCode package terminal launchers"
   fi
 }
 

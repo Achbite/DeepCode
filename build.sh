@@ -380,7 +380,7 @@ run_macos_package_from_host() {
   echo "$BIN_ROOT/macos-arm64/$output_app"
 }
 
-resolved_macos_products=()
+declare -a resolved_macos_products=()
 
 add_macos_product() {
   local product="$1"
@@ -389,9 +389,11 @@ add_macos_product() {
     DeepCode|DeepCode-GUI) ;;
     *) echo "==[build][error]== unsupported macOS product: $product" >&2; exit 2 ;;
   esac
-  for existing in "${resolved_macos_products[@]}"; do
-    [ "$existing" != "$product" ] || return 0
-  done
+  if [ "${#resolved_macos_products[@]}" -gt 0 ]; then
+    for existing in "${resolved_macos_products[@]}"; do
+      [ "$existing" != "$product" ] || return 0
+    done
+  fi
   resolved_macos_products+=("$product")
 }
 

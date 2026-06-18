@@ -78,9 +78,10 @@ bin/macos-arm64/
   DeepCode.app
   DeepCode-GUI.app
   deepcode-kernel
-  deepcode-cli
-  deepcode-tui
   DeepCode-TUI.command
+  DeepCode-CLI.command
+  libexec/DeepCode-TUI
+  libexec/DeepCode-CLI
   web/
   DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui/
   config/
@@ -102,7 +103,7 @@ If `/api/health` does not include `buildCommit`, `protocolVersion`, or `toolCata
 - Editor is the full workbench package: file tree, Monaco-based editor surface, terminal, Agent panel, Git panel, and internal browser. The right Agent panel is an embedded conversation panel that reuses the same Session projection and message semantics as DeepCode-GUI; it is not a separate Agent runtime.
 - DeepCode-GUI is a concise conversational GUI. It is not the full Editor.
 - GUI read-only analysis can be anchored by explicit attachments or by the project working directory remembered by Session. This is separate from Editor workspace binding, which remains the editing and file-tree isolation boundary.
-- CLI and TUI reuse the same Kernel/session source of truth. The legacy CLI/TUI chat-submit path is removed until those shells are reattached through the same SessionDriverLoop bridge as Editor and GUI.
+- CLI and TUI reuse the same Kernel/session source of truth. Ordinary input, decisions, and cancel requests are submitted through the daemon shared Session Runtime run API; TUI renders the shared session timeline projection in a terminal surface.
 - Web Dev Host is only a development preview and protocol-debugging entry. It is not a formal UI package.
 
 ## UI Package Terms
