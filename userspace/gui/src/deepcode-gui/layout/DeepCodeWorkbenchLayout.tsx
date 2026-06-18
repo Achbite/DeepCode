@@ -1,14 +1,22 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
-import type { AgentEvent, AgentSession } from '@deepcode/protocol';
+import type {
+  AgentContextAttachment,
+  AgentEvent,
+  AgentSession,
+  BrowseEntry,
+  BrowsePathResult,
+  InitialLocation,
+} from '@deepcode/protocol';
 import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
 import WindowControls from '../../components/window-controls/WindowControls';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
-import { listAgentSessions } from '../../services/runtimeAdapter';
+import { browsePath, getInitialLocations, listAgentSessions } from '../../services/runtimeAdapter';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { deriveTokenUsageStats, formatPercent, formatTokenCount } from '../../utils/tokenUsageStats';
 import DeepCodeAgentPanel from '../panel/DeepCodeAgentPanel';
+import '../../components/workspace-open-dialog/workspaceOpenDialog.css';
 
 interface DeepCodeWorkbenchLayoutProps {
   apiStatus: string;
@@ -36,7 +44,7 @@ interface DeepCodeCacheHitSummary {
   title: string;
 }
 
-type DeepCodeSidebarIconName = 'compose' | 'folder' | 'plus' | 'settings';
+type DeepCodeSidebarIconName = 'compose' | 'folder' | 'folderPlus' | 'plus' | 'settings';
 
 interface DeepCodeProjectArchiveGroup {
   key: string;
@@ -49,6 +57,9 @@ interface DeepCodeGuiProject {
   id: string;
   title: string;
   sessionIds: string[];
+  workspaceFolderPath?: string;
+  defaultSessionDirectoryPath?: string;
+  fixedContextAttachments?: AgentContextAttachment[];
   createdAt: string;
   updatedAt: string;
 }
@@ -65,11 +76,17 @@ interface DeepCodeProjectContextMenu {
   y: number;
 }
 
+interface DeepCodeProjectCreateMenu {
+  x: number;
+  y: number;
+}
+
 interface DeepCodeTextInputDialog {
   kind: 'project' | 'renameSession' | 'renameProject';
   title: string;
   label: string;
   value: string;
+  projectFolderPath?: string;
   session?: AgentSession;
   project?: DeepCodeGuiProject;
 }
@@ -111,6 +128,16 @@ const DeepCodeSidebarIcon: React.FC<{ name: DeepCodeSidebarIconName; className?:
     return (
       <svg {...common}>
         <path d="M3 6.8A2.8 2.8 0 0 1 5.8 4h4.1l2 2H18a3 3 0 0 1 3 3v7.2A2.8 2.8 0 0 1 18.2 19H5.8A2.8 2.8 0 0 1 3 16.2V6.8z" />
+      </svg>
+    );
+  }
+
+  if (name === 'folderPlus') {
+    return (
+      <svg {...common}>
+        <path d="M3 6.8A2.8 2.8 0 0 1 5.8 4h4.1l2 2H18a3 3 0 0 1 3 3v7.2A2.8 2.8 0 0 1 18.2 19H5.8A2.8 2.8 0 0 1 3 16.2V6.8z" />
+        <path d="M16 11v5" />
+        <path d="M13.5 13.5h5" />
       </svg>
     );
   }
@@ -174,6 +201,38 @@ function shouldShowSidebarSession(session: AgentSession): boolean {
   return (session.eventCount ?? 0) > 0 || hasCustomSessionTitle(session.title);
 }
 
+function projectDirectoryAttachment(absolutePath: string): AgentContextAttachment {
+  return {
+    kind: 'directory',
+    path: '.',
+    absolutePath,
+    source: 'userSelected',
+    scope: 'session',
+  };
+}
+
+function readProjectFixedContextAttachments(value: unknown): AgentContextAttachment[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): AgentContextAttachment[] => {
+    if (!item || typeof item !== 'object') return [];
+    const record = item as Partial<AgentContextAttachment>;
+    if (record.kind !== 'directory' && record.kind !== 'file' && record.kind !== 'panelSnapshot') return [];
+    if (typeof record.path !== 'string') return [];
+    if (record.source !== 'mention' && record.source !== 'contextMenu' && record.source !== 'browser' && record.source !== 'userSelected') return [];
+    if (record.scope !== 'message' && record.scope !== 'session') return [];
+    const attachment: AgentContextAttachment = {
+      kind: record.kind,
+      path: record.path,
+      source: record.source,
+      scope: record.scope,
+    };
+    if (typeof record.absolutePath === 'string') attachment.absolutePath = record.absolutePath;
+    if (typeof record.folderId === 'string') attachment.folderId = record.folderId;
+    if (record.snapshot) attachment.snapshot = record.snapshot;
+    return [attachment];
+  });
+}
+
 function readGuiProjects(): DeepCodeGuiProject[] {
   if (typeof window === 'undefined') return [];
   try {
@@ -185,7 +244,19 @@ function readGuiProjects(): DeepCodeGuiProject[] {
       if (!item || typeof item !== 'object') return [];
       const record = item as Partial<DeepCodeGuiProject>;
       if (!record.id || !record.title) return [];
-      return [{
+      const workspaceFolderPath = typeof record.workspaceFolderPath === 'string'
+        ? record.workspaceFolderPath
+        : undefined;
+      const defaultSessionDirectoryPath = typeof record.defaultSessionDirectoryPath === 'string'
+        ? record.defaultSessionDirectoryPath
+        : workspaceFolderPath;
+      const storedAttachments = readProjectFixedContextAttachments(record.fixedContextAttachments);
+      const fixedContextAttachments = storedAttachments.length > 0
+        ? storedAttachments
+        : defaultSessionDirectoryPath
+          ? [projectDirectoryAttachment(defaultSessionDirectoryPath)]
+          : undefined;
+      const project: DeepCodeGuiProject = {
         id: String(record.id),
         title: String(record.title),
         sessionIds: Array.isArray(record.sessionIds)
@@ -193,7 +264,11 @@ function readGuiProjects(): DeepCodeGuiProject[] {
           : [],
         createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
         updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : new Date().toISOString(),
-      }];
+      };
+      if (workspaceFolderPath) project.workspaceFolderPath = workspaceFolderPath;
+      if (defaultSessionDirectoryPath) project.defaultSessionDirectoryPath = defaultSessionDirectoryPath;
+      if (fixedContextAttachments) project.fixedContextAttachments = fixedContextAttachments;
+      return [project];
     });
   } catch {
     return [];
@@ -230,6 +305,251 @@ function deriveProjectArchiveGroups(
     };
   });
 }
+
+interface DeepCodeProjectFolderDialogProps {
+  language: UiLanguage;
+  onCancel: () => void;
+  onSelect: (absolutePath: string) => void;
+}
+
+const DeepCodeProjectFolderDialog: React.FC<DeepCodeProjectFolderDialogProps> = ({
+  language,
+  onCancel,
+  onSelect,
+}) => {
+  const [locations, setLocations] = useState<InitialLocation[]>([]);
+  const [browseResult, setBrowseResult] = useState<BrowsePathResult | null>(null);
+  const [addressInput, setAddressInput] = useState('');
+  const [selectedEntry, setSelectedEntry] = useState<BrowseEntry | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [showHidden, setShowHidden] = useState(false);
+
+  const navigateTo = async (absolutePath: string): Promise<void> => {
+    setLoading(true);
+    setError(null);
+    setSelectedEntry(null);
+    const result = await browsePath(absolutePath);
+    if (result.ok && result.data) {
+      setBrowseResult(result.data);
+      setAddressInput(result.data.absolutePath);
+    } else {
+      setError(result.message ?? t(language, 'workspaceDialog.error.browse'));
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const init = await getInitialLocations();
+      if (cancelled) return;
+      if (init.ok && init.data) {
+        setLocations(init.data.locations);
+        const first = init.data.locations[0];
+        if (first) {
+          await navigateTo(first.absolutePath);
+        } else {
+          setLoading(false);
+        }
+        return;
+      }
+      setError(init.message ?? t(language, 'workspaceDialog.error.initialLocations'));
+      setLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel]);
+
+  const visibleEntries = useMemo<BrowseEntry[]>(() => {
+    if (!browseResult) return [];
+    return showHidden
+      ? browseResult.entries
+      : browseResult.entries.filter((entry) => !entry.hidden);
+  }, [browseResult, showHidden]);
+
+  const selectedPath =
+    selectedEntry?.type === 'directory'
+      ? selectedEntry.absolutePath
+      : browseResult?.absolutePath ?? '';
+  const folderButtonLabel = selectedEntry?.type === 'directory'
+    ? t(language, 'workspaceDialog.openSelectedFolder')
+    : t(language, 'workspaceDialog.openCurrentFolder');
+
+  const handleAddressKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Enter' && addressInput.trim()) {
+      void navigateTo(addressInput.trim());
+    }
+  };
+
+  const handleEntryDoubleClick = (entry: BrowseEntry) => {
+    if (entry.type === 'directory') {
+      void navigateTo(entry.absolutePath);
+    }
+  };
+
+  return (
+    <div className="ws-open-dialog__backdrop" onClick={onCancel}>
+      <div
+        className="ws-open-dialog"
+        onClick={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={t(language, 'deepcodeGui.project.folderDialogTitle')}
+      >
+        <div className="ws-open-dialog__header">
+          <span>{t(language, 'deepcodeGui.project.folderDialogTitle')}</span>
+          <button
+            className="ws-open-dialog__close"
+            onClick={onCancel}
+            title={t(language, 'window.close')}
+            type="button"
+          >
+            x
+          </button>
+        </div>
+
+        <div className="ws-open-dialog__addressbar">
+          <button
+            className="ws-open-dialog__btn"
+            disabled={!browseResult?.parentPath}
+            onClick={() => browseResult?.parentPath && void navigateTo(browseResult.parentPath)}
+            title={t(language, 'workspaceDialog.parent')}
+            type="button"
+          >
+            {t(language, 'workspaceDialog.up')}
+          </button>
+          <input
+            className="ws-open-dialog__address"
+            value={addressInput}
+            placeholder={t(language, 'workspaceDialog.addressPlaceholder')}
+            onChange={(event) => setAddressInput(event.target.value)}
+            onKeyDown={handleAddressKeyDown}
+          />
+          <button
+            className="ws-open-dialog__btn"
+            onClick={() => addressInput.trim() && void navigateTo(addressInput.trim())}
+            type="button"
+          >
+            {t(language, 'workspaceDialog.go')}
+          </button>
+          <label className="ws-open-dialog__toggle" title={t(language, 'workspaceDialog.hiddenTitle')}>
+            <input
+              type="checkbox"
+              checked={showHidden}
+              onChange={(event) => setShowHidden(event.target.checked)}
+            />
+            <span>{t(language, 'workspaceDialog.hidden')}</span>
+          </label>
+        </div>
+
+        <div className="ws-open-dialog__body">
+          <aside className="ws-open-dialog__sidebar">
+            <div className="ws-open-dialog__sidebar-title">
+              {t(language, 'workspaceDialog.quickLocations')}
+            </div>
+            {locations.map((location) => (
+              <button
+                key={`${location.kind}::${location.absolutePath}`}
+                className="ws-open-dialog__sidebar-item"
+                onClick={() => void navigateTo(location.absolutePath)}
+                title={location.absolutePath}
+                type="button"
+              >
+                <span className="ws-open-dialog__sidebar-icon">
+                  {location.kind === 'home' ? 'HOME' : location.kind === 'drive' ? 'DISK' : 'WS'}
+                </span>
+                <span>{location.label}</span>
+              </button>
+            ))}
+          </aside>
+
+          <main className="ws-open-dialog__main">
+            {loading && (
+              <div className="ws-open-dialog__placeholder">
+                {t(language, 'workspaceDialog.loading')}
+              </div>
+            )}
+            {error && <div className="ws-open-dialog__error">{error}</div>}
+            {!loading && !error && visibleEntries.length === 0 && (
+              <div className="ws-open-dialog__placeholder">
+                {t(language, 'workspaceDialog.empty')}
+              </div>
+            )}
+            {!loading && !error && visibleEntries.length > 0 && (
+              <ul className="ws-open-dialog__entries">
+                {visibleEntries.map((entry) => {
+                  const isSelected = selectedEntry?.absolutePath === entry.absolutePath;
+                  return (
+                    <li
+                      key={entry.absolutePath}
+                      className={
+                        'ws-open-dialog__entry' +
+                        (isSelected ? ' ws-open-dialog__entry--selected' : '') +
+                        (entry.isCodeWorkspace ? ' ws-open-dialog__entry--code-workspace' : '')
+                      }
+                      onClick={() => setSelectedEntry(entry)}
+                      onDoubleClick={() => handleEntryDoubleClick(entry)}
+                      title={entry.absolutePath}
+                    >
+                      <span className="ws-open-dialog__entry-icon">
+                        {entry.type === 'directory'
+                          ? 'DIR'
+                          : entry.isCodeWorkspace
+                            ? 'WS'
+                            : 'FILE'}
+                      </span>
+                      <span className="ws-open-dialog__entry-name">{entry.name}</span>
+                      {entry.isCodeWorkspace && (
+                        <span className="ws-open-dialog__entry-tag">
+                          {t(language, 'workspaceDialog.workspaceTag')}
+                        </span>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </main>
+        </div>
+
+        <div className="ws-open-dialog__footer">
+          <div className="ws-open-dialog__footer-info">
+            {selectedPath && (
+              <span>
+                {t(language, 'workspaceDialog.selected')} <strong>{selectedPath}</strong>
+              </span>
+            )}
+          </div>
+          <div className="ws-open-dialog__footer-actions">
+            <button className="ws-open-dialog__btn" onClick={onCancel} type="button">
+              {t(language, 'workspaceDialog.cancel')}
+            </button>
+            <button
+              className="ws-open-dialog__btn ws-open-dialog__btn--primary"
+              disabled={!selectedPath}
+              onClick={() => selectedPath && onSelect(selectedPath)}
+              type="button"
+            >
+              {folderButtonLabel}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 function eventText(event: AgentEvent): string {
   if (typeof event.payload === 'string') return event.payload;
@@ -420,10 +740,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const [projectRecords, setProjectRecords] = useState<DeepCodeGuiProject[]>(() => readGuiProjects());
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [draftTargetProjectId, setDraftTargetProjectId] = useState<string | null>(null);
-  const [standaloneDraftActive, setStandaloneDraftActive] = useState(false);
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
   const [sessionMenu, setSessionMenu] = useState<DeepCodeSessionContextMenu | null>(null);
   const [projectMenu, setProjectMenu] = useState<DeepCodeProjectContextMenu | null>(null);
+  const [projectCreateMenu, setProjectCreateMenu] = useState<DeepCodeProjectCreateMenu | null>(null);
+  const [projectFolderDialogOpen, setProjectFolderDialogOpen] = useState(false);
   const [textDialog, setTextDialog] = useState<DeepCodeTextInputDialog | null>(null);
   const pendingProjectSendRef = useRef<PendingProjectSession | null>(null);
   const workspace = useWorkspaceStore((s) => s.current);
@@ -468,10 +789,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   }, [projectRecords]);
 
   useEffect(() => {
-    if (!sessionMenu && !projectMenu) return undefined;
+    if (!sessionMenu && !projectMenu && !projectCreateMenu) return undefined;
     const close = () => {
       setSessionMenu(null);
       setProjectMenu(null);
+      setProjectCreateMenu(null);
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') close();
@@ -484,7 +806,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       window.removeEventListener('resize', close);
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [sessionMenu, projectMenu]);
+  }, [sessionMenu, projectMenu, projectCreateMenu]);
 
   const activeFolder = useMemo(() => {
     if (!workspace || workspace.folders.length === 0) return null;
@@ -548,9 +870,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   }, [activeSession, events.length, knownSessions, sessions]);
   const activeSessionRunning = Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id));
   const projectDraftActive = Boolean(draftTargetProjectId);
-  const anyDraftActive = standaloneDraftActive || projectDraftActive;
-  const highlightedSessionId = anyDraftActive ? null : activeSession?.id ?? null;
-  const isHome = anyDraftActive
+  const highlightedSessionId = projectDraftActive ? null : activeSession?.id ?? null;
+  const isHome = projectDraftActive
     || (events.length === 0 && !loadingSession && !activeSessionRunning);
   const visibleSessions = useMemo(
     () => displaySessions.filter((item) => {
@@ -569,12 +890,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     () => new Set(collapsedProjectIds),
     [collapsedProjectIds]
   );
-  const activeSessionProjectId = useMemo(() => {
-    if (!activeSession?.id) return null;
-    return projectRecords.find((project) => project.sessionIds.includes(activeSession.id))?.id ?? null;
-  }, [activeSession?.id, projectRecords]);
-  const currentProjectContextId = draftTargetProjectId ?? activeProjectId ?? activeSessionProjectId;
-
   const moveSessionToProject = (projectId: string, sessionId: string) => {
     const now = new Date().toISOString();
     setProjectRecords((current) => current.map((project) => {
@@ -602,9 +917,15 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const handleCreateSession = async (projectId?: string | null) => {
     const targetProjectId = projectId ?? null;
     pendingProjectSendRef.current = null;
-    setActiveProjectId(targetProjectId);
+    setActiveProjectId(null);
     setDraftTargetProjectId(targetProjectId);
-    setStandaloneDraftActive(!targetProjectId);
+    if (targetProjectId) {
+      return;
+    }
+    const nextSession = await createNewSession({ reuseEmpty: false });
+    if (nextSession?.id) {
+      upsertKnownSession(nextSession);
+    }
   };
 
   const toggleProjectExpanded = (projectId: string) => {
@@ -616,26 +937,21 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   };
 
   const prepareProjectDraftSession = async () => {
-    if (!draftTargetProjectId && !standaloneDraftActive) return true;
+    if (!draftTargetProjectId) return true;
     const targetProjectId = draftTargetProjectId;
     pendingProjectSendRef.current = null;
     const nextSession = await createNewSession({ reuseEmpty: false });
     if (!nextSession?.id) {
       return false;
     }
-    if (targetProjectId) {
-      pendingProjectSendRef.current = {
-        projectId: targetProjectId,
-        sessionId: nextSession.id,
-      };
-      moveSessionToProject(targetProjectId, nextSession.id);
-      setActiveProjectId(targetProjectId);
-    } else {
-      setActiveProjectId(null);
-    }
+    pendingProjectSendRef.current = {
+      projectId: targetProjectId,
+      sessionId: nextSession.id,
+    };
+    moveSessionToProject(targetProjectId, nextSession.id);
     upsertKnownSession(nextSession);
+    setActiveProjectId(targetProjectId);
     setDraftTargetProjectId(null);
-    setStandaloneDraftActive(false);
     return true;
   };
 
@@ -653,17 +969,39 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     }
   };
 
-  const handleCreateProject = () => {
+  const openProjectCreateMenu = (event: React.MouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const width = 230;
+    const height = 96;
+    setSessionMenu(null);
+    setProjectMenu(null);
+    const x = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+    const y = Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - height - 8));
+    setProjectCreateMenu({
+      x,
+      y,
+    });
+  };
+
+  const handleCreateBlankProject = () => {
+    setProjectCreateMenu(null);
     const defaultName = t(language, 'deepcodeGui.project.defaultName');
     setTextDialog({
       kind: 'project',
-      title: t(language, 'deepcodeGui.project.new'),
+      title: t(language, 'deepcodeGui.project.newBlank'),
       label: t(language, 'deepcodeGui.project.namePrompt'),
       value: defaultName,
     });
   };
 
-  const commitProjectName = async (title: string) => {
+  const handleCreateProjectFromFolder = () => {
+    setProjectCreateMenu(null);
+    setProjectFolderDialogOpen(true);
+  };
+
+  const commitProjectName = async (title: string, projectFolderPath?: string) => {
     if (!title) return;
     const now = new Date().toISOString();
     const project: DeepCodeGuiProject = {
@@ -673,10 +1011,20 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       createdAt: now,
       updatedAt: now,
     };
+    if (projectFolderPath) {
+      project.workspaceFolderPath = projectFolderPath;
+      project.defaultSessionDirectoryPath = projectFolderPath;
+      project.fixedContextAttachments = [projectDirectoryAttachment(projectFolderPath)];
+    }
     setProjectRecords((current) => [project, ...current]);
     setActiveProjectId(null);
     setDraftTargetProjectId(project.id);
-    setStandaloneDraftActive(false);
+  };
+
+  const commitProjectFolderPath = (projectFolderPath: string) => {
+    setProjectFolderDialogOpen(false);
+    const defaultName = basename(projectFolderPath) || t(language, 'deepcodeGui.project.defaultName');
+    void commitProjectName(defaultName, projectFolderPath);
   };
 
   const openSessionContextMenu = (
@@ -754,7 +1102,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     if (!value) return;
     setTextDialog(null);
     if (textDialog.kind === 'project') {
-      await commitProjectName(value);
+      await commitProjectName(value, textDialog.projectFolderPath);
       return;
     }
     if (textDialog.kind === 'renameProject' && textDialog.project) {
@@ -788,7 +1136,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       setActiveProjectId(projectId);
     }
     setDraftTargetProjectId(null);
-    setStandaloneDraftActive(false);
   };
 
   const handleDeleteProject = (project: DeepCodeGuiProject) => {
@@ -836,7 +1183,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             <button
               type="button"
               className="deepcode-gui-sidebar-action deepcode-gui-sidebar-action--primary"
-              onClick={() => void handleCreateSession(currentProjectContextId)}
+              onClick={() => void handleCreateSession(null)}
               disabled={loadingSession}
             >
               <DeepCodeSidebarIcon name="compose" className="deepcode-gui-sidebar-icon" />
@@ -850,8 +1197,10 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               <button
                 type="button"
                 className="deepcode-gui-sidebar-text-action"
-                onClick={() => void handleCreateProject()}
+                onClick={openProjectCreateMenu}
                 disabled={loadingSession}
+                aria-haspopup="menu"
+                aria-expanded={Boolean(projectCreateMenu)}
               >
                 {t(language, 'deepcodeGui.project.new')}
               </button>
@@ -885,19 +1234,13 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                       <button
                         type="button"
                         className="deepcode-gui-project-archive-group__select"
-                        onClick={() => {
-                          if (!group.projectId) return;
-                          pendingProjectSendRef.current = null;
-                          setActiveProjectId(group.projectId);
-                          setDraftTargetProjectId(group.projectId);
-                          setStandaloneDraftActive(false);
-                          toggleProjectExpanded(group.projectId);
-                        }}
+                        onClick={() => group.projectId && toggleProjectExpanded(group.projectId)}
                         onContextMenu={(event) => {
                           if (projectRecord) openProjectContextMenu(event, projectRecord);
                         }}
                         disabled={!group.projectId}
                         aria-expanded={!projectCollapsed}
+                        title={projectRecord?.workspaceFolderPath ?? group.title}
                       >
                         <DeepCodeSidebarIcon name="folder" className="deepcode-gui-sidebar-icon" />
                         <span>{group.title}</span>
@@ -933,7 +1276,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                                   pendingProjectSendRef.current = null;
                                   setActiveProjectId(group.projectId ?? null);
                                   setDraftTargetProjectId(null);
-                                  setStandaloneDraftActive(false);
                                   void activateSession(item.id);
                                 }}
                                 onContextMenu={(event) => openSessionContextMenu(event, item)}
@@ -962,7 +1304,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               <button
                 type="button"
                 className="deepcode-gui-sidebar-new-chat"
-                onClick={() => void handleCreateSession(currentProjectContextId)}
+                onClick={() => void handleCreateSession(null)}
                 disabled={loadingSession}
                 aria-label={t(language, 'deepcodeGui.nav.newChat')}
                 title={t(language, 'deepcodeGui.nav.newChat')}
@@ -981,7 +1323,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                       pendingProjectSendRef.current = null;
                       setActiveProjectId(null);
                       setDraftTargetProjectId(null);
-                      setStandaloneDraftActive(false);
                       void activateSession(item.id);
                     }}
                     onContextMenu={(event) => openSessionContextMenu(event, item)}
@@ -1011,8 +1352,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         <main className="deepcode-gui-session-main">
           <DeepCodeAgentPanel
             language={language}
-            forceHome={anyDraftActive}
-            homeProjectTitle={draftProject?.title ?? null}
+            forceHome={projectDraftActive}
+            homeProjectTitle={draftProject?.title ?? activeProject?.title ?? null}
             onBeforeSend={prepareProjectDraftSession}
             onAfterSend={commitDraftProjectSession}
           />
@@ -1040,6 +1381,25 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           </section>
         </aside>
       </div>
+
+      {projectCreateMenu && (
+        <div
+          className="deepcode-gui-project-create-menu"
+          style={{ left: projectCreateMenu.x, top: projectCreateMenu.y }}
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+          role="menu"
+        >
+          <button type="button" role="menuitem" onClick={handleCreateBlankProject}>
+            <DeepCodeSidebarIcon name="folderPlus" />
+            <span>{t(language, 'deepcodeGui.project.newBlank')}</span>
+          </button>
+          <button type="button" role="menuitem" onClick={handleCreateProjectFromFolder}>
+            <DeepCodeSidebarIcon name="folder" />
+            <span>{t(language, 'deepcodeGui.project.fromFolder')}</span>
+          </button>
+        </div>
+      )}
 
       {sessionMenu && (
         <div
@@ -1164,6 +1524,14 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             </footer>
           </form>
         </div>
+      )}
+
+      {projectFolderDialogOpen && (
+        <DeepCodeProjectFolderDialog
+          language={language}
+          onCancel={() => setProjectFolderDialogOpen(false)}
+          onSelect={commitProjectFolderPath}
+        />
       )}
 
       <Suspense fallback={null}>

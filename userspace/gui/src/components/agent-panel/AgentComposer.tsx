@@ -123,10 +123,14 @@ function composerDecisionText(decision: AgentComposerPendingDecision, language: 
       summary: decision.decisionRequest.summary || decision.decisionRequest.reason || decision.summary,
     };
   }
+  if (decision.kind === 'plan') {
+    return {
+      title: t(language, 'agent.composer.decision.planQuestion'),
+      summary: decision.summary,
+    };
+  }
   const fallbackTitle = decision.kind === 'requirement'
     ? t(language, 'agent.composer.decision.requirement')
-    : decision.kind === 'plan'
-    ? t(language, 'agent.composer.decision.plan')
     : decision.kind === 'review'
       ? t(language, 'agent.composer.decision.review')
       : t(language, 'agent.composer.decision.permission');
@@ -168,6 +172,11 @@ function decisionSubmitTitle(decision: AgentComposerPendingDecision, value: stri
   return value.trim()
     ? t(language, 'agent.composer.decision.submitGuidanceTitle')
     : t(language, 'agent.composer.decision.acceptTitle');
+}
+
+function decisionPrimaryOptionLabel(decision: AgentComposerPendingDecision, language: UiLanguage): string {
+  if (decision.kind === 'plan') return t(language, 'agent.composer.decision.planOption');
+  return decisionSubmitLabel(decision, '', language);
 }
 
 function isTechnicalChoiceDecision(
@@ -212,7 +221,6 @@ function recommendedChoice(options: AgentComposerDecisionOption[]): AgentCompose
 
 function parseTechnicalChoiceInput(
   value: string,
-  options: AgentComposerDecisionOption[],
   fallback: AgentComposerDecisionOption
 ): { action: 'accept' | 'reject'; option: AgentComposerDecisionOption; supplement?: string } {
   const trimmed = value.trim();
@@ -225,16 +233,6 @@ function parseTechnicalChoiceInput(
     trimmed === '拒绝'
   ) {
     return { action: 'reject', option: fallback };
-  }
-  const numbered = trimmed.match(/^([1-3])(?:\s+([\s\S]+))?$/);
-  if (numbered) {
-    const index = Number(numbered[1]) - 1;
-    const option = options[index] ?? fallback;
-    return {
-      action: 'accept',
-      option,
-      supplement: numbered[2]?.trim() || undefined,
-    };
   }
   return {
     action: 'accept',
@@ -336,7 +334,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     if (pendingDecision) {
       if (pendingDecision.resolving) return;
       if (isTechnicalChoiceDecision(pendingDecision) && selectedChoice) {
-        const parsed = parseTechnicalChoiceInput(nextValue, technicalChoiceOptions, selectedChoice);
+        const parsed = parseTechnicalChoiceInput(nextValue, selectedChoice);
         setValue('');
         setSelectedChoiceId(parsed.option.id);
         if (parsed.action === 'reject') {
@@ -376,6 +374,10 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     if (mention) {
       setValue(`${value.slice(0, mention.start)}${value.slice(mention.start + mention.query.length + 1)}`);
     }
+  };
+
+  const updateValue = (nextValue: string) => {
+    setValue(nextValue);
   };
 
   const chips = [...sessionAttachments, ...messageAttachments];
@@ -432,9 +434,45 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     setSelectedChoiceId(option.id);
     textareaRef.current?.focus();
   };
+  const renderDecisionInput = () => (
+    <div className="agent-composer-decision__input-row">
+      <span className="agent-composer-decision__input-icon" aria-hidden="true">
+        ✎
+      </span>
+      <div className="agent-composer-decision__input-wrap">
+        <textarea
+          ref={textareaRef}
+          value={value}
+          onChange={(event) => updateValue(event.target.value)}
+          disabled={decisionResolving}
+          onKeyDown={(event) => {
+            if (pendingDecision && event.key === 'Escape') {
+              event.preventDefault();
+              setValue('');
+              if (!pendingDecision.resolving) void onDecisionReject?.();
+              return;
+            }
+            if (event.key === 'Enter' && !event.shiftKey) {
+              if (isImeComposing(event)) return;
+              event.preventDefault();
+              send();
+            }
+          }}
+          placeholder={pendingDecision ? decisionPlaceholder(pendingDecision, language) : undefined}
+        />
+        {mention && (
+          <ContextAttachmentPicker
+            query={mention.query}
+            language={language}
+            onPick={pickAttachment}
+          />
+        )}
+      </div>
+    </div>
+  );
 
   return (
-    <div className={`agent-composer ${composerExpanded ? 'agent-composer--expanded' : ''}`}>
+    <div className={`agent-composer${composerExpanded ? ' agent-composer--expanded' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
       {decisionText && (
         <div className="agent-composer-decision">
           <div className="agent-composer-decision__header">
@@ -452,45 +490,80 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
             </div>
           ) : (
             <>
-              {technicalChoiceOptions.length > 0 && (
-                <div className="agent-composer-decision__options agent-composer-decision__options--choices">
-                  {technicalChoiceOptions.map((option, index) => (
-                    <button
-                      key={option.id}
-                      className={`agent-composer-decision__option${option.id === selectedChoice?.id ? ' agent-composer-decision__option--selected' : ''}`}
-                      type="button"
-                      disabled={decisionResolving}
-                      title={option.description}
-                      onClick={() => selectTechnicalChoice(option)}
-                    >
-                      <span className="agent-composer-decision__number">{index + 1}</span>
-                      <span className="agent-composer-decision__option-body">
-                        <span className="agent-composer-decision__label">
-                          {option.label}
-                          {option.recommended && (
-                            <span className="agent-composer-decision__recommended">
-                              {t(language, 'agent.composer.decision.recommended')}
-                            </span>
-                          )}
-                        </span>
-                        {option.description && (
-                          <span className="agent-composer-decision__description">{option.description}</span>
+              <div
+                className={`agent-composer-decision__options${
+                  technicalChoiceOptions.length > 0 ? ' agent-composer-decision__options--choices' : ''
+                }`}
+              >
+                {technicalChoiceOptions.length > 0 ? technicalChoiceOptions.map((option, index) => (
+                  <button
+                    key={option.id}
+                    className={`agent-composer-decision__option${option.id === selectedChoice?.id ? ' agent-composer-decision__option--selected' : ''}`}
+                    type="button"
+                    disabled={decisionResolving}
+                    title={option.description}
+                    onClick={() => selectTechnicalChoice(option)}
+                  >
+                    <span className="agent-composer-decision__number">{index + 1}</span>
+                    <span className="agent-composer-decision__option-body">
+                      <span className="agent-composer-decision__label">
+                        {option.label}
+                        {option.recommended && (
+                          <span className="agent-composer-decision__recommended">
+                            {t(language, 'agent.composer.decision.recommended')}
+                          </span>
                         )}
                       </span>
-                    </button>
-                  ))}
+                      {option.description && (
+                        <span className="agent-composer-decision__description">{option.description}</span>
+                      )}
+                    </span>
+                  </button>
+                )) : (
+                  <button
+                    className="agent-composer-decision__option agent-composer-decision__option--selected"
+                    type="button"
+                    disabled={decisionResolving}
+                    title={decisionSubmitTitle(pendingDecision!, '', language)}
+                    onClick={send}
+                  >
+                    <span className="agent-composer-decision__number">1</span>
+                    <span className="agent-composer-decision__option-body">
+                      <span className="agent-composer-decision__label">
+                        {decisionPrimaryOptionLabel(pendingDecision!, language)}
+                      </span>
+                    </span>
+                  </button>
+                )}
+              </div>
+              <div className="agent-composer-decision__control-row">
+                {renderDecisionInput()}
+                <div className="agent-composer-decision__actions">
+                  <button
+                    type="button"
+                    className="agent-composer-decision__reject"
+                    onClick={() => void onDecisionReject?.()}
+                    disabled={Boolean(pendingDecision?.resolving)}
+                    title={t(language, 'agent.composer.decision.rejectTitle')}
+                  >
+                    {t(language, 'agent.composer.decision.ignore')}
+                    <span className="agent-composer-decision__shortcut">
+                      {t(language, 'agent.composer.decision.escape')}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="agent-composer-decision__confirm"
+                    onClick={send}
+                    disabled={decisionResolving}
+                    title={decisionSubmitTitle(pendingDecision!, value, language)}
+                  >
+                    {t(language, 'agent.composer.decision.submit')}
+                    <span className="agent-composer-decision__enter" aria-hidden="true">
+                      ↵
+                    </span>
+                  </button>
                 </div>
-              )}
-              <div className="agent-composer-decision__actions">
-                <button
-                  type="button"
-                  className="agent-composer-decision__confirm"
-                  onClick={send}
-                  disabled={loading || sendDisabled}
-                  title={decisionSubmitTitle(pendingDecision!, value, language)}
-                >
-                  {decisionSubmitLabel(pendingDecision!, value, language)}
-                </button>
               </div>
             </>
           )}
@@ -571,42 +644,33 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           )}
         </div>
       )}
-      <div className="agent-composer__input-wrap">
-        <textarea
-          ref={textareaRef}
-          value={value}
-          onChange={(event) => setValue(event.target.value)}
-          disabled={decisionResolving}
-          onKeyDown={(event) => {
-            if (pendingDecision && event.key === 'Escape') {
-              event.preventDefault();
-              setValue('');
-              if (!pendingDecision.resolving) void onDecisionReject?.();
-              return;
-            }
-            if (event.key === 'Enter' && !event.shiftKey) {
-              if (isImeComposing(event)) return;
-              event.preventDefault();
-              send();
-            }
-          }}
-          placeholder={
-            pendingDecision
-              ? decisionPlaceholder(pendingDecision, language)
-              : loading
+      {!pendingDecision && (
+        <div className="agent-composer__input-wrap">
+          <textarea
+            ref={textareaRef}
+            value={value}
+            onChange={(event) => updateValue(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey) {
+                if (isImeComposing(event)) return;
+                event.preventDefault();
+                send();
+              }
+            }}
+            placeholder={loading
               ? t(language, 'agent.composer.placeholder.running')
-              : t(language, 'agent.composer.placeholder.idle')
-          }
-        />
-        {mention && (
-          <ContextAttachmentPicker
-            query={mention.query}
-            language={language}
-            onPick={pickAttachment}
+              : t(language, 'agent.composer.placeholder.idle')}
           />
-        )}
-      </div>
-      <div className="agent-composer__footer">
+          {mention && (
+            <ContextAttachmentPicker
+              query={mention.query}
+              language={language}
+              onPick={pickAttachment}
+            />
+          )}
+        </div>
+      )}
+      {!pendingDecision && <div className="agent-composer__footer">
         <div className="agent-composer__footer-left">
           <div className="agent-composer__attach-wrap">
             <button
@@ -627,25 +691,11 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           type="button"
           title={loading
             ? t(language, 'agent.composer.stopTitle')
-            : pendingDecision
-              ? decisionSubmitTitle(pendingDecision, value, language)
-              : t(language, 'agent.composer.sendTitle')}
+            : t(language, 'agent.composer.sendTitle')}
         >
           {sendLabel}
         </button>
-        {pendingDecision && !loading && (
-          <button
-            className="agent-composer__reject-button"
-            onClick={() => void onDecisionReject?.()}
-            disabled={Boolean(pendingDecision.resolving)}
-            type="button"
-            title={t(language, 'agent.composer.decision.rejectTitle')}
-          >
-            {t(language, 'agent.composer.decision.end')}
-            <span className="agent-composer__shortcut">{t(language, 'agent.composer.decision.escape')}</span>
-          </button>
-        )}
-      </div>
+      </div>}
       <UserAttachmentDialog
         visible={attachmentDialogOpen}
         initialDirectory={dialogInitialDirectory}
