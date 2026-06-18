@@ -88,16 +88,15 @@ function findLatestActivePlan(
 ): ActiveSessionInteraction | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
-    if (event.kind !== 'plan_review') continue;
+    if (event.kind !== 'plan_review' && event.kind !== 'plan_card') continue;
     const payload = asRecord(event.payload);
     if (!payload) continue;
     if (hasLaterTerminalInteraction(events, index)) continue;
     const runId = stringField(payload, 'runId');
     const planId = stringField(payload, 'planId');
-    const status = stringField(payload, 'status');
-    const waiting = status === 'awaitingUserApproval' ||
-      status === 'awaitingTemporaryGrant' ||
-      status === 'pending';
+    const waiting = event.kind === 'plan_card'
+      ? planCardAwaitingDecision(payload)
+      : planReviewAwaitingDecision(payload);
     const planKey = planDecisionKey(runId, planId);
     if (!waiting || !runId || !planId || resolvedPlans.has(planKey) || resolvedPlanRuns.has(runId)) continue;
     return {
@@ -227,7 +226,30 @@ function collectResolvedPlanRuns(events: AgentEvent[]): Set<string> {
 }
 
 function isTerminalStatus(status?: string): boolean {
-  return status === 'accepted' || status === 'rejected' || status === 'needsRevision';
+  return status === 'accepted' ||
+    status === 'rejected' ||
+    status === 'needsRevision' ||
+    status === 'cancelled' ||
+    status === 'failed';
+}
+
+function planCardAwaitingDecision(payload: Record<string, unknown>): boolean {
+  if (payload.confirmable === false) return false;
+  const status = stringField(payload, 'status');
+  if (!status) return true;
+  return planReviewStatusAwaitingUser(status);
+}
+
+function planReviewAwaitingDecision(payload: Record<string, unknown>): boolean {
+  if (payload.confirmable === false) return false;
+  return planReviewStatusAwaitingUser(stringField(payload, 'status'));
+}
+
+function planReviewStatusAwaitingUser(status?: string): boolean {
+  return status === undefined ||
+    status === 'awaitingUserApproval' ||
+    status === 'awaitingTemporaryGrant' ||
+    status === 'pending';
 }
 
 function planDecisionKey(runId?: string, planId?: string): string {

@@ -3,7 +3,7 @@
  *
  * 阶段 5.7 后不再维护 Tauri / Node 多后端分支。GUI 只作为 UI 层，
  * 通过 HTTP API 访问 Rust Kernel Web Host；跨 Host 共享的会话拼装
- * 逻辑放在 @deepcode/session-core。
+ * 由 daemon shared Session Runtime 承载，GUI 不直接编排 provider / Kernel loop。
  */
 import type {
   AgentFeedbackRequest,
@@ -34,9 +34,6 @@ import type {
   InitialLocations,
   ListAgentSessionsRequest,
   ListToolsResult,
-  LlmChatRequest,
-  LlmChatStreamEvent,
-  LlmChatResult,
   LlmProbeRequest,
   LlmProbeResult,
   LlmProfilesResult,
@@ -66,8 +63,6 @@ import type {
   TerminalSessionsResult,
   TerminalWarmupStatus,
   WorkspaceState,
-  KernelCommandEnvelope,
-  KernelReply,
 } from '@deepcode/protocol';
 
 import * as api from './apiClient';
@@ -417,21 +412,6 @@ export function probeLlmProfile(
   return api.probeLlmProfile(request);
 }
 
-export function llmChat(request: LlmChatRequest): Promise<ApiResponse<LlmChatResult>> {
-  return api.llmChat(request);
-}
-
-export function llmChatStream(
-  request: LlmChatRequest,
-  onEvent: (event: LlmChatStreamEvent) => void | Promise<void>
-): Promise<ApiResponse<LlmChatResult>> {
-  return api.llmChatStream(request, onEvent);
-}
-
-export function kernelCommand(request: KernelCommandEnvelope): Promise<KernelReply> {
-  return api.kernelCommand(request);
-}
-
 export function codeSearch(request: CodeSearchInput): Promise<ApiResponse<CodeSearchResult>> {
   return api.codeSearch(request);
 }
@@ -500,6 +480,35 @@ export function appendAgentEvents(
 
 export function getAgentSession(sessionId: string): Promise<ApiResponse<AgentSessionResult>> {
   return api.getAgentSession(sessionId);
+}
+
+export function startAgentRun(
+  sessionId: string,
+  request: api.StartAgentRunRequest
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.startAgentRun(sessionId, request);
+}
+
+export function getAgentRun(
+  sessionId: string,
+  runId: string
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.getAgentRun(sessionId, runId);
+}
+
+export function cancelAgentRunById(
+  sessionId: string,
+  runId: string
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.cancelAgentRunById(sessionId, runId);
+}
+
+export function submitAgentRunGuidance(
+  sessionId: string,
+  runId: string,
+  request: { guidance: string; attachments?: unknown[] }
+): Promise<ApiResponse<api.AgentRunResult>> {
+  return api.submitAgentRunGuidance(sessionId, runId, request);
 }
 
 export function cancelAgentRun(sessionId: string): Promise<ApiResponse<AgentSessionResult>> {

@@ -244,6 +244,9 @@ function eventText(event: AgentEvent): string {
 
 function taskTitle(language: UiLanguage, event: AgentEvent): string {
   if (event.kind === 'user_guidance') return t(language, 'deepcodeGui.tasks.guidance');
+  if (event.kind === 'requirement_confirmation' || event.kind === 'requirement_decision') {
+    return t(language, 'deepcodeGui.tasks.requirement');
+  }
   if (event.kind === 'plan_card' || event.kind === 'plan_review') return t(language, 'deepcodeGui.tasks.plan');
   if (event.kind === 'review_summary') return t(language, 'deepcodeGui.tasks.review');
   if (event.kind === 'tool_call' || event.kind === 'tool_result') return t(language, 'deepcodeGui.tasks.tool');
@@ -258,7 +261,16 @@ function taskStatus(event: AgentEvent): string {
   if (event.kind === 'user_guidance') {
     return stringField(event.payload, 'status') === 'consumed' ? 'completed' : 'queued';
   }
-  if (event.kind === 'permission_request' || event.kind === 'plan_review') return 'waiting';
+  if (event.kind === 'requirement_confirmation') {
+    return stringField(event.payload, 'status') === 'waitingUserConfirmation' ? 'waiting' : 'completed';
+  }
+  if (event.kind === 'requirement_decision') {
+    const status = stringField(event.payload, 'status');
+    if (status === 'rejected') return 'failed';
+    if (status === 'needsRevision') return 'waiting';
+    return 'completed';
+  }
+  if (event.kind === 'permission_request' || event.kind === 'plan_card' || event.kind === 'plan_review') return 'waiting';
   if (event.kind === 'tool_call' || event.kind === 'workflow_stage') return 'running';
   return 'completed';
 }
@@ -301,6 +313,10 @@ function taskDedupKey(event: AgentEvent): string {
   if (event.kind === 'plan_card' || event.kind === 'plan_review') {
     return `plan:${planId ?? runId ?? eventText(event)}`;
   }
+  if (event.kind === 'requirement_confirmation' || event.kind === 'requirement_decision') {
+    const requirementId = stringField(event.payload, 'requirementId');
+    return `requirement:${requirementId ?? runId ?? eventText(event)}`;
+  }
   if (event.kind === 'review_summary') {
     return `review:${runId ?? eventText(event)}`;
   }
@@ -313,6 +329,15 @@ function taskDedupKey(event: AgentEvent): string {
     return `error:${eventText(event)}`;
   }
   return `${event.kind}:${event.id}`;
+}
+
+function dedupeTaskItems(items: DeepCodeTaskItem[]): DeepCodeTaskItem[] {
+  const byKey = new Map<string, DeepCodeTaskItem>();
+  for (const item of items) {
+    const key = `${item.title.trim()}::${item.summary.trim() || item.id}`;
+    byKey.set(key, item);
+  }
+  return Array.from(byKey.values());
 }
 
 function deriveTaskItems(
@@ -335,12 +360,14 @@ function deriveTaskItems(
     .filter((item) => latestTaskBlockIds.has(item.blockId));
 
   if (projectedItems.length > 0) {
-    return projectedItems.slice(-6).map((item) => ({
-      id: item.id,
-      title: item.title,
-      summary: item.summary,
-      status: item.status,
-    }));
+    return dedupeTaskItems(
+      projectedItems.map((item) => ({
+        id: item.id,
+        title: item.title,
+        summary: item.summary,
+        status: item.status,
+      }))
+    ).slice(-6);
   }
 
   if (loading) {
@@ -542,6 +569,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     () => new Set(collapsedProjectIds),
     [collapsedProjectIds]
   );
+  const activeSessionProjectId = useMemo(() => {
+    if (!activeSession?.id) return null;
+    return projectRecords.find((project) => project.sessionIds.includes(activeSession.id))?.id ?? null;
+  }, [activeSession?.id, projectRecords]);
+  const currentProjectContextId = draftTargetProjectId ?? activeProjectId ?? activeSessionProjectId;
 
   const moveSessionToProject = (projectId: string, sessionId: string) => {
     const now = new Date().toISOString();
@@ -570,7 +602,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const handleCreateSession = async (projectId?: string | null) => {
     const targetProjectId = projectId ?? null;
     pendingProjectSendRef.current = null;
-    setActiveProjectId(null);
+    setActiveProjectId(targetProjectId);
     setDraftTargetProjectId(targetProjectId);
     setStandaloneDraftActive(!targetProjectId);
   };
@@ -804,7 +836,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             <button
               type="button"
               className="deepcode-gui-sidebar-action deepcode-gui-sidebar-action--primary"
-              onClick={() => void handleCreateSession(null)}
+              onClick={() => void handleCreateSession(currentProjectContextId)}
               disabled={loadingSession}
             >
               <DeepCodeSidebarIcon name="compose" className="deepcode-gui-sidebar-icon" />
@@ -853,7 +885,14 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                       <button
                         type="button"
                         className="deepcode-gui-project-archive-group__select"
-                        onClick={() => group.projectId && toggleProjectExpanded(group.projectId)}
+                        onClick={() => {
+                          if (!group.projectId) return;
+                          pendingProjectSendRef.current = null;
+                          setActiveProjectId(group.projectId);
+                          setDraftTargetProjectId(group.projectId);
+                          setStandaloneDraftActive(false);
+                          toggleProjectExpanded(group.projectId);
+                        }}
                         onContextMenu={(event) => {
                           if (projectRecord) openProjectContextMenu(event, projectRecord);
                         }}
@@ -923,7 +962,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               <button
                 type="button"
                 className="deepcode-gui-sidebar-new-chat"
-                onClick={() => void handleCreateSession(null)}
+                onClick={() => void handleCreateSession(currentProjectContextId)}
                 disabled={loadingSession}
                 aria-label={t(language, 'deepcodeGui.nav.newChat')}
                 title={t(language, 'deepcodeGui.nav.newChat')}

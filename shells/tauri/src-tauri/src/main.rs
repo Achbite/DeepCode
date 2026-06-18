@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::Serialize;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
 
@@ -127,9 +128,18 @@ fn deepcode_start_kernel_after_permission(
         };
     }
 
+    if local_port_has_listener(&target.host, &target.port) {
+        return KernelStartResult {
+            started: false,
+            blocked: false,
+            message: "kernel is already running".to_string(),
+        };
+    }
     let child = spawn_kernel_if_available(&target.host, &target.port);
     let started = child.is_some();
-    kernel.replace(child);
+    if started {
+        kernel.replace(child);
+    }
     KernelStartResult {
         started,
         blocked: false,
@@ -325,6 +335,13 @@ fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
     if env_truthy("DEEPCODE_SHELL_CONNECT_ONLY") {
         return None;
     }
+    if local_port_has_listener(host, port) {
+        return None;
+    }
+    let _start_lock = acquire_kernel_start_lock(host, port)?;
+    if local_port_has_listener(host, port) {
+        return None;
+    }
 
     let exe_dir = current_exe_dir()?;
     let kernel_path = find_bundled_file(&exe_dir, kernel_binary_name())?;
@@ -353,7 +370,80 @@ fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
 
-    command.spawn().ok()
+    let child = command.spawn().ok()?;
+    wait_for_kernel_listener(host, port, 20);
+    Some(child)
+}
+
+struct KernelStartLock {
+    path: PathBuf,
+}
+
+impl Drop for KernelStartLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_kernel_start_lock(host: &str, port: &str) -> Option<KernelStartLock> {
+    let path = std::env::temp_dir().join(format!(
+        "deepcode-kernel-start-{}-{}.lock",
+        sanitize_lock_component(host),
+        sanitize_lock_component(port)
+    ));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            let _ = std::io::Write::write_all(&mut file, format!("pid={}\n", std::process::id()).as_bytes());
+            Some(KernelStartLock { path })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if kernel_start_lock_is_stale(&path) {
+                let _ = std::fs::remove_file(&path);
+                return acquire_kernel_start_lock(host, port);
+            }
+            wait_for_kernel_listener(host, port, 40);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+fn kernel_start_lock_is_stale(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|age| age > Duration::from_secs(30))
+        .unwrap_or(false)
+}
+
+fn sanitize_lock_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
+}
+
+fn wait_for_kernel_listener(host: &str, port: &str, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if local_port_has_listener(host, port) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(75));
+    }
+    false
+}
+
+fn local_port_has_listener(host: &str, port: &str) -> bool {
+    let Ok(port) = port.parse::<u16>() else {
+        return false;
+    };
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(180)).is_ok())
 }
 
 fn available_local_port(host: &str) -> Option<String> {

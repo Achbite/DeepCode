@@ -27,10 +27,6 @@ import type {
   PatchLlmProfilesRequest,
   LlmProbeRequest,
   LlmProbeResult,
-  LlmChatRequest,
-  LlmChatStreamEvent,
-  LlmChatResult,
-  ToolCall,
   CodeSearchInput,
   CodeSearchResult,
   AgentMode,
@@ -67,8 +63,6 @@ import type {
   SetBrowserInspectModeRequest,
   PanelSnapshotResult,
   AttachPanelSnapshotResult,
-  KernelCommandEnvelope,
-  KernelReply,
 } from '@deepcode/protocol';
 import { getKernelApiBase } from './hostTarget';
 
@@ -76,6 +70,43 @@ const API_BASE = getKernelApiBase();
 
 interface SendJsonOptions {
   signal?: AbortSignal;
+}
+
+export interface StartAgentRunRequest {
+  op?: 'ask' | 'resolveDecision';
+  content?: string;
+  prompt?: string;
+  attachments?: unknown[];
+  workspacePath?: string;
+  noWorkspace?: boolean;
+  profileId?: string;
+  workflow?: string;
+  requirementConfirmationMode?: 'auto' | 'always' | 'off';
+  reviewContinuationMode?: 'auto' | 'ask' | 'off';
+  interventionLevel?: 'low' | 'medium' | 'high';
+  title?: string;
+  decisionKind?: 'requirement' | 'plan' | 'review' | 'permission' | 'boundary';
+  decision?: 'accept' | 'reject' | 'revise';
+  guidance?: string;
+  runId?: string;
+  targetId?: string;
+}
+
+export interface AgentRunStatus {
+  runId: string;
+  sessionId: string;
+  status: 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled' | string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  message?: string;
+  finalText?: string;
+}
+
+export interface AgentRunResult {
+  run: AgentRunStatus;
+  session: AgentSessionResult['session'];
+  events: AgentSessionResult['events'];
 }
 
 function endpointLabel(url: string): string {
@@ -293,33 +324,6 @@ export function getHealth(): Promise<ApiResponse<HealthStatus>> {
   return getJson<HealthStatus>(`${API_BASE}/health`);
 }
 
-export function kernelCommand(request: KernelCommandEnvelope): Promise<KernelReply> {
-  return fetch(`${API_BASE}/kernel/commands`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
-  }).then(async (response) => {
-    if (!response.ok) {
-      return {
-        ok: false,
-        events: [],
-        error: {
-          code: 'http_error',
-          message: await httpErrorMessage(response, `${API_BASE}/kernel/commands`),
-        },
-      } satisfies KernelReply;
-    }
-    return (await response.json()) as KernelReply;
-  }).catch((error) => ({
-    ok: false,
-    events: [],
-    error: {
-      code: 'network_error',
-      message: error instanceof Error ? error.message : String(error),
-    },
-  }));
-}
-
 // ---- 工作区 ----
 
 export function getCurrentWorkspace(): Promise<ApiResponse<WorkspaceState>> {
@@ -511,217 +515,6 @@ export function probeLlmProfile(
   );
 }
 
-export function llmChat(
-  request: LlmChatRequest
-): Promise<ApiResponse<LlmChatResult>> {
-  return sendJson<LlmChatResult>(
-    `${API_BASE}/llm/chat`,
-    'POST',
-    request
-  );
-}
-
-export async function llmChatStream(
-  request: LlmChatRequest,
-  onEvent: (event: LlmChatStreamEvent) => void | Promise<void>
-): Promise<ApiResponse<LlmChatResult>> {
-  try {
-    const response = await fetch(`${API_BASE}/llm/chat/stream`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-      },
-      body: JSON.stringify({ ...request, stream: true }),
-    });
-    if (!response.ok) {
-      return {
-        ok: false,
-        error: 'http_error',
-        message: await httpErrorMessage(response, `${API_BASE}/llm/chat/stream`),
-      };
-    }
-    if (!response.body) {
-      return {
-        ok: false,
-        error: 'stream_unavailable',
-        message: 'LLM stream response body is unavailable.',
-      };
-    }
-    const chunks: LlmChatResult['chunks'] = [];
-    let usage: Record<string, unknown> | undefined;
-    let errorMessage: string | undefined;
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    const parser = new SseClientParser();
-    const consume = async (event: LlmChatStreamEvent) => {
-      if (event.chunk) chunks.push(event.chunk);
-      if (event.usage) usage = event.usage;
-      if (event.chunk?.usage) usage = event.chunk.usage;
-      if (event.type === 'provider_error') {
-        errorMessage = event.error ?? event.chunk?.error ?? 'Provider stream error.';
-      }
-      await onEvent(event);
-    };
-
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      const text = decoder.decode(value, { stream: true });
-      for (const event of parser.push(text)) {
-        await consume(event);
-      }
-    }
-    const tail = decoder.decode();
-    for (const event of parser.push(tail)) {
-      await consume(event);
-    }
-    for (const event of parser.finish()) {
-      await consume(event);
-    }
-    if (errorMessage) {
-      return {
-        ok: false,
-        error: 'provider_stream_error',
-        message: errorMessage,
-      };
-    }
-    return {
-      ok: true,
-      data: buildStreamResult(chunks, usage),
-    };
-  } catch (err) {
-    return toErrorResponse(err);
-  }
-}
-
-class SseClientParser {
-  private buffer = '';
-
-  push(text: string): LlmChatStreamEvent[] {
-    if (!text) return [];
-    this.buffer += text;
-    const events: LlmChatStreamEvent[] = [];
-    for (;;) {
-      const boundary = this.buffer.search(/\r?\n\r?\n/);
-      if (boundary < 0) break;
-      const raw = this.buffer.slice(0, boundary);
-      const match = this.buffer.slice(boundary).match(/^\r?\n\r?\n/);
-      this.buffer = this.buffer.slice(boundary + (match?.[0].length ?? 2));
-      const event = parseSseClientEvent(raw);
-      if (event) events.push(event);
-    }
-    return events;
-  }
-
-  finish(): LlmChatStreamEvent[] {
-    const text = this.buffer.trim();
-    this.buffer = '';
-    const event = parseSseClientEvent(text);
-    return event ? [event] : [];
-  }
-}
-
-function parseSseClientEvent(raw: string): LlmChatStreamEvent | null {
-  if (!raw.trim()) return null;
-  const data: string[] = [];
-  for (const line of raw.split(/\r?\n/)) {
-    if (!line || line.startsWith(':')) continue;
-    const separator = line.indexOf(':');
-    const field = separator >= 0 ? line.slice(0, separator) : line;
-    const value = separator >= 0 ? line.slice(separator + 1).replace(/^ /, '') : '';
-    if (field === 'data') data.push(value);
-  }
-  const payload = data.join('\n').trim();
-  if (!payload || payload === '[DONE]') {
-    return { type: 'provider_done', chunk: { type: 'done' } };
-  }
-  try {
-    return JSON.parse(payload) as LlmChatStreamEvent;
-  } catch (error) {
-    return {
-      type: 'provider_error',
-      error: `Invalid LLM stream event JSON: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-}
-
-function buildStreamResult(
-  chunks: LlmChatResult['chunks'],
-  usage: Record<string, unknown> | undefined
-): LlmChatResult {
-  const content = chunks
-    .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
-    .map((chunk) => chunk.content)
-    .join('');
-  const reasoningContent = chunks
-    .filter((chunk) => chunk.type === 'reasoning_delta' && typeof chunk.content === 'string')
-    .map((chunk) => chunk.content)
-    .join('');
-  const toolCalls = collectStreamToolCalls(chunks);
-  const assistantMessage: LlmChatResult['assistantMessage'] = {
-    role: 'assistant',
-    content,
-    ...(reasoningContent ? { reasoningContent } : {}),
-    ...(toolCalls.length ? { toolCalls } : {}),
-  };
-  return {
-    chunks,
-    assistantMessage,
-    usage,
-  };
-}
-
-function collectStreamToolCalls(chunks: LlmChatResult['chunks']): ToolCall[] {
-  const byIndex = new Map<number, { id?: string; name?: string; argumentsText: string }>();
-  for (const [fallbackIndex, chunk] of chunks.entries()) {
-    if (chunk.toolCall) {
-      const index = typeof chunk.index === 'number' ? chunk.index : fallbackIndex;
-      byIndex.set(index, {
-        id: chunk.toolCall.id,
-        name: normalizeProviderToolName(chunk.toolCall.name),
-        argumentsText: typeof chunk.toolCall.arguments === 'string'
-          ? chunk.toolCall.arguments
-          : JSON.stringify(chunk.toolCall.arguments ?? {}),
-      });
-      continue;
-    }
-    const delta = chunk.toolCallDelta;
-    if (!delta && !chunk.callId) continue;
-    const index = typeof delta?.index === 'number'
-      ? delta.index
-      : typeof chunk.index === 'number'
-        ? chunk.index
-        : fallbackIndex;
-    const item = byIndex.get(index) ?? { argumentsText: '' };
-    item.id = delta?.id ?? chunk.callId ?? item.id;
-    item.name = delta?.name ? normalizeProviderToolName(delta.name) : item.name;
-    item.argumentsText += delta?.argumentsDelta ?? '';
-    byIndex.set(index, item);
-  }
-  return [...byIndex.entries()]
-    .sort(([left], [right]) => left - right)
-    .map(([index, item]) => ({
-      id: item.id ?? `tool-call-${index}`,
-      name: normalizeProviderToolName(item.name ?? 'unknown'),
-      arguments: parseToolArguments(item.argumentsText),
-    }));
-}
-
-function parseToolArguments(text: string): unknown {
-  const value = text.trim();
-  if (!value) return {};
-  try {
-    return JSON.parse(value) as unknown;
-  } catch {
-    return { rawArguments: value, parseError: true };
-  }
-}
-
-function normalizeProviderToolName(name: string): string {
-  return name.replace(/__/g, '.');
-}
-
 export function codeSearch(
   request: CodeSearchInput
 ): Promise<ApiResponse<CodeSearchResult>> {
@@ -846,6 +639,49 @@ export function getAgentSession(
 ): Promise<ApiResponse<AgentSessionResult>> {
   return getJson<AgentSessionResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/events`
+  );
+}
+
+export function startAgentRun(
+  sessionId: string,
+  request: StartAgentRunRequest
+): Promise<ApiResponse<AgentRunResult>> {
+  return sendJson<AgentRunResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs`,
+    'POST',
+    request
+  );
+}
+
+export function getAgentRun(
+  sessionId: string,
+  runId: string
+): Promise<ApiResponse<AgentRunResult>> {
+  return getJson<AgentRunResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`
+  );
+}
+
+export function cancelAgentRunById(
+  sessionId: string,
+  runId: string
+): Promise<ApiResponse<AgentRunResult>> {
+  return sendJson<AgentRunResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/cancel`,
+    'POST',
+    {}
+  );
+}
+
+export function submitAgentRunGuidance(
+  sessionId: string,
+  runId: string,
+  request: { guidance: string; attachments?: unknown[] }
+): Promise<ApiResponse<AgentRunResult>> {
+  return sendJson<AgentRunResult>(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/guidance`,
+    'POST',
+    request
   );
 }
 

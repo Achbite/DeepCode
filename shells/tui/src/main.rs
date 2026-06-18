@@ -31,7 +31,7 @@ async fn main() {
     {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
-            eprintln!("deepcode-tui failed to connect Kernel: {error}");
+            eprintln!("DeepCode-TUI failed to connect Kernel: {error}");
             std::process::exit(1);
         }
     };
@@ -48,7 +48,7 @@ async fn main() {
     app.bootstrap().await;
 
     if args.smoke {
-        print!("{}", app.renderer().render_plain(app.cards()));
+        print!("{}", app.renderer().render_plain(&app));
         drop(bootstrap);
         return;
     }
@@ -60,7 +60,7 @@ async fn main() {
     };
 
     if let Err(error) = result {
-        eprintln!("deepcode-tui failed: {error}");
+        eprintln!("DeepCode-TUI failed: {error}");
         std::process::exit(1);
     }
 }
@@ -80,7 +80,9 @@ impl Args {
             api: None,
             help: false,
             smoke: false,
-            workspace: None,
+            workspace: env::var("DEEPCODE_WORKSPACE")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             no_workspace: false,
             no_auto_start_kernel: false,
         };
@@ -107,25 +109,39 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
     terminal.clear()?;
 
     loop {
+        app.poll_pending_run().await;
         terminal.draw(|frame| app.renderer().draw(frame, &app))?;
         if event::poll(Duration::from_millis(180))? {
-            let CrosstermEvent::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Esc => app.clear_input(),
-                KeyCode::Backspace => app.backspace_input(),
-                KeyCode::Enter => {
-                    let line = app.take_input();
-                    if !app.submit_line(&line).await {
-                        break;
+            match event::read()? {
+                CrosstermEvent::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break;
+                        }
+                        KeyCode::Esc => app.clear_input(),
+                        KeyCode::Backspace => app.backspace_input(),
+                        KeyCode::Enter => {
+                            if app.should_hold_input_for_running_turn() {
+                                app.notify_running_input_held();
+                                continue;
+                            }
+                            let line = app.take_input();
+                            if app.preview_submit_line(&line) {
+                                terminal.draw(|frame| app.renderer().draw(frame, &app))?;
+                            }
+                            if !app.submit_line(&line).await {
+                                break;
+                            }
+                        }
+                        KeyCode::Tab => app.push_input('\t'),
+                        KeyCode::Char(ch) => app.push_input(ch),
+                        _ => {}
                     }
                 }
-                KeyCode::Char(ch) => app.push_input(ch),
+                CrosstermEvent::Paste(text) => app.push_input_text(&text),
                 _ => {}
             }
         }
@@ -134,9 +150,10 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
 }
 
 async fn run_plain(mut app: TuiApp) -> io::Result<()> {
-    print!("{}", app.renderer().render_plain(app.cards()));
+    print!("{}", app.renderer().render_plain(&app));
     let mut line = String::new();
     loop {
+        app.poll_pending_run().await;
         print!("DeepCode TUI> ");
         io::stdout().flush()?;
         line.clear();
@@ -147,7 +164,13 @@ async fn run_plain(mut app: TuiApp) -> io::Result<()> {
         if !app.submit_line(line.trim()).await {
             break;
         }
-        print!("{}", app.renderer().render_plain(app.cards()));
+        while app.is_run_pending() {
+            app.poll_pending_run().await;
+            if app.is_run_pending() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        print!("{}", app.renderer().render_plain(&app));
     }
     Ok(())
 }
@@ -174,12 +197,24 @@ fn print_help() {
         r#"DeepCode TUI
 
 Usage:
-  deepcode-tui
-  deepcode-tui --smoke
-  deepcode-tui --api <url>
-  deepcode-tui --no-auto-start-kernel
-  deepcode-tui --workspace <path>
-  deepcode-tui --no-workspace
+  DeepCode-TUI
+  DeepCode-TUI --smoke
+  DeepCode-TUI --api <url>
+  DeepCode-TUI --no-auto-start-kernel
+  DeepCode-TUI --workspace <path>
+  DeepCode-TUI --no-workspace
+
+Workspace:
+  默认绑定当前目录；也可传 --workspace/-C 或设置 DEEPCODE_WORKSPACE。
+  --no-workspace 只用于普通对话；workspace 工具会按 Kernel 边界失败关闭。
+
+Session Runtime:
+  普通输入通过 daemon /api/agent/sessions/:id/runs 提交到共享 Session Runtime。
+  TUI 只读取 run status、timeline projection 和权限/决策事件；不维护独立会话编排。
+  若共享运行时提示缺少 session-core，请运行 pnpm --filter @deepcode/session-core build，
+  或使用包含 session-core/dist、node_modules/@deepcode/protocol 和 node/bin/node 的打包产物。
+  可通过 DEEPCODE_SESSION_BRIDGE 或 DEEPCODE_NODE 覆盖 daemon 内部查找。
+  DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS 控制 daemon 内部 session run hard timeout，默认 600000；0 表示禁用。
 
 Kernel:
   默认先连接 --api / DEEPCODE_API_URL / DEEPCODE_HOST:DEEPCODE_PORT。
@@ -189,6 +224,8 @@ Kernel:
 Interactive commands:
   /help              显示 TUI 命令
   /status            检查 Kernel daemon 连接
+  /workspace         显示或调整 workspace 绑定
+  /cancel            停止当前 TUI 等待并刷新共享 session projection
   /audit             显示审计占位状态
   /sessions          列出 Agent 会话
   /new [title]       新建 Agent 会话
@@ -200,7 +237,11 @@ Interactive commands:
   /clear             清理当前可见卡片
   /quit              退出 TUI
 
-普通文本会直接通过共享 SessionDriverLoop 发送到当前会话；TUI 只负责展示、
+pending 计划/Review 时，空 Enter 或 1 确认；文本或 2 <文本> 提交 Review 信息；
+3、end、结束表示结束。/decision 是显式 fallback。
+
+普通文本会直接通过共享 Session Runtime 发送到当前会话；/allow、/deny、
+/decision、/cancel 是 GUI composer decision / Stop 的终端输入形式。TUI 只负责展示、
 输入和命令入口，不持有 workflow、permission 或 tool execution 事实。"#
     );
 }

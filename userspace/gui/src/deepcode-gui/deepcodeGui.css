@@ -1028,27 +1028,170 @@ button {
 }
 
 .agent-composer-decision {
-  border: 1px solid rgba(37, 99, 235, 0.2);
-  border-radius: 7px;
-  background: rgba(37, 99, 235, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #ffffff;
   color: var(--text);
-  padding: 8px 10px;
-  margin-bottom: 8px;
+  padding: 14px 16px 12px;
+  margin-bottom: 10px;
+  box-shadow: 0 18px 45px rgba(32, 33, 36, 0.1);
+}
+
+.agent-composer-decision__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .agent-composer-decision__title {
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 720;
+  color: var(--text);
+}
+
+.agent-composer-decision__count {
+  flex: 0 0 auto;
+  color: var(--muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 650;
 }
 
 .agent-composer-decision__summary {
-  margin-top: 3px;
+  margin-top: 6px;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.35;
 }
 
+.agent-composer-decision__options {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.agent-composer-decision__option {
+  min-height: 32px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  padding: 7px 8px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-composer-decision__option--selected {
+  border-color: rgba(37, 99, 235, 0.58);
+  background: rgba(37, 99, 235, 0.08);
+}
+
+.agent-composer-decision__option:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.agent-composer-decision__number {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  border: 1px solid #d8d6d0;
+  border-radius: 999px;
+  background: #f4f4f2;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.agent-composer-decision__label {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 720;
+  overflow-wrap: anywhere;
+}
+
+.agent-composer-decision__option-body {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.agent-composer-decision__recommended {
+  flex: 0 0 auto;
+  border: 1px solid rgba(37, 99, 235, 0.58);
+  border-radius: 999px;
+  padding: 1px 6px;
+  color: #174ea6;
+  font-size: 10px;
+  font-weight: 720;
+}
+
+.agent-composer-decision__description {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.agent-composer-decision__resolving {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f7f7f5;
+  color: var(--text-muted);
+  padding: 9px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.agent-composer-decision__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.agent-composer-decision__confirm {
+  min-height: 32px;
+  border: 1px solid #2563eb;
+  border-radius: 10px;
+  background: #2563eb;
+  color: #fff;
+  padding: 0 14px;
+  font-size: 12px;
+  font-weight: 720;
+  cursor: pointer;
+}
+
+.agent-composer-decision__confirm:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.agent-composer-decision__option:hover .agent-composer-decision__number {
+  border-color: rgba(37, 99, 235, 0.58);
+  color: #174ea6;
+}
+
+.agent-composer-decision__option:hover .agent-composer-decision__label {
+  color: #111318;
+}
+
 .agent-composer__footer button.agent-composer__reject-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   background: transparent;
   color: var(--text-muted);
 }
@@ -1056,6 +1199,20 @@ button {
 .agent-composer__footer button.agent-composer__reject-button:hover {
   border-color: #dc2626;
   color: #dc2626;
+}
+
+.agent-composer__shortcut {
+  min-width: 24px;
+  min-height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: #eceae4;
+  color: inherit;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 720;
 }
 
 .agent-composer__footer-left {
@@ -2264,9 +2421,9 @@ button {
   align-items: center;
   gap: 0;
   color: #737980;
-  opacity: 0;
-  pointer-events: none;
-  transform: translateX(3px);
+  opacity: 0.72;
+  pointer-events: auto;
+  transform: translateX(0);
   transition:
     opacity 120ms ease,
     transform 120ms ease,

@@ -5,12 +5,10 @@ import type {
   AgentMode,
   AgentSession,
   AgentTraceEvent,
-  AgentWorkspaceBinding,
   AgentWorkflowConfig,
   AgentWorkflowMode,
   ListAgentSessionsRequest,
   PermissionRequest,
-  ProjectionDelta,
 } from '@deepcode/protocol';
 import {
   createWorkspaceBinding,
@@ -18,28 +16,26 @@ import {
   createWorkspaceScopeKey,
   findLatestPendingPermission,
   mergeContextAttachment,
-  SessionStorageClient,
-  SessionDriverLoop,
 } from '@deepcode/session-core';
 import {
   activateAgentSession,
-  appendAgentEvents,
   archiveAgentSession,
   deleteAgentSession,
   cancelAgentRun,
+  cancelAgentRunById,
   createAgentSession,
+  getAgentRun,
   getAgentSession,
   getAgentWorkflowConfig,
   getAgentEventSnapshot,
   getCurrentAgentSession,
-  kernelCommand,
   listAgentSessions,
-  llmChat,
-  llmChatStream,
   patchAgentWorkflowConfig,
   renameAgentSession,
+  startAgentRun,
+  submitAgentRunGuidance,
 } from '../services/runtimeAdapter';
-import { getKernelHttpOrigin } from '../services/hostTarget';
+import type { AgentRunResult, StartAgentRunRequest } from '../services/apiClient';
 import { useSettingsStore } from './settingsStore';
 import { findActiveSessionInteraction } from './sessionInteractions';
 import { useWorkspaceStore } from './workspaceStore';
@@ -132,7 +128,7 @@ interface AgentSessionActions {
 
 type Store = AgentSessionState & AgentSessionActions;
 
-const activeAgentAbortControllers = new Map<string, AbortController>();
+const activeAgentRunIds = new Map<string, string>();
 const workspaceTreeRefreshEventIds = new Set<string>();
 
 function emptyWorkflowConfig(): AgentWorkflowConfig {
@@ -157,6 +153,10 @@ function settingReviewContinuationMode(value: unknown): 'auto' | 'ask' | 'off' {
   return value === 'ask' || value === 'off' ? value : 'auto';
 }
 
+function settingInterventionLevel(value: unknown): 'low' | 'medium' | 'high' {
+  return value === 'low' || value === 'high' ? value : 'medium';
+}
+
 function createLocalEvent(
   sessionId: string,
   kind: AgentEvent['kind'],
@@ -169,118 +169,6 @@ function createLocalEvent(
     kind,
     payload,
   };
-}
-
-function projectionDeltaLocalEvent(delta: ProjectionDelta): AgentEvent | null {
-  const sessionId = delta.sessionId;
-  const id = [
-    'active',
-    delta.turnId ?? delta.runId ?? sessionId,
-    delta.type,
-    delta.itemId ?? delta.stage ?? 'item',
-  ].join(':');
-  const basePayload = {
-    activeProjectionDelta: true,
-    projectionDeltaType: delta.type,
-    stage: delta.stage,
-    status: delta.status,
-    summary: delta.summary,
-    source: delta.source,
-    channel: delta.channel,
-    visibility: 'conversation',
-    presentation: 'collapsible',
-    runId: delta.runId,
-    itemId: delta.itemId,
-    payload: delta.payload,
-  };
-  if (delta.type === 'assistant_delta' || delta.type === 'reasoning_delta') {
-    return {
-      id,
-      sessionId,
-      ts: new Date().toISOString(),
-      kind: 'assistant_msg',
-      payload: {
-        ...basePayload,
-        content: delta.delta ?? delta.summary ?? '',
-        channel: delta.channel === 'final' ? 'progress' : (delta.channel ?? 'reasoning'),
-        label: delta.type === 'reasoning_delta' ? 'Thinking' : 'DeepCode',
-      },
-    };
-  }
-  if (delta.type === 'tool_call_delta') {
-    return {
-      id,
-      sessionId,
-      ts: new Date().toISOString(),
-      kind: 'tool_call',
-      payload: {
-        ...basePayload,
-        toolName: typeof (delta.payload as Record<string, unknown> | undefined)?.toolCallDelta === 'object'
-          ? ((delta.payload as Record<string, unknown>).toolCallDelta as Record<string, unknown>).name
-          : undefined,
-        status: delta.status ?? 'running',
-        argumentsDelta: delta.delta,
-        channel: 'tool',
-      },
-    };
-  }
-  if (delta.type === 'resource_delta' || delta.type === 'workunit_delta' || delta.type === 'active_turn' || delta.type === 'stage_delta') {
-    return {
-      id,
-      sessionId,
-      ts: new Date().toISOString(),
-      kind: 'workflow_stage',
-      payload: {
-        ...basePayload,
-        stage: delta.stage ?? delta.type,
-        status: delta.status ?? 'running',
-        channel: delta.channel ?? 'progress',
-      },
-    };
-  }
-  if (delta.type === 'error') {
-    return {
-      id,
-      sessionId,
-      ts: new Date().toISOString(),
-      kind: 'error',
-      payload: {
-        ...basePayload,
-        message: delta.summary ?? 'Active provider stream error.',
-        status: 'error',
-        channel: 'error',
-      },
-    };
-  }
-  return null;
-}
-
-function mergeProjectionDeltaEvent(events: AgentEvent[], event: AgentEvent): AgentEvent[] {
-  const index = events.findIndex((item) => item.id === event.id);
-  if (index < 0) return [...events, event];
-  const previous = events[index];
-  const previousPayload = previous.payload && typeof previous.payload === 'object' && !Array.isArray(previous.payload)
-    ? previous.payload as Record<string, unknown>
-    : {};
-  const nextPayload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
-    ? event.payload as Record<string, unknown>
-    : {};
-  const previousContent = typeof previousPayload.content === 'string' ? previousPayload.content : '';
-  const nextContent = typeof nextPayload.content === 'string' ? nextPayload.content : '';
-  const merged: AgentEvent = {
-    ...previous,
-    ts: event.ts,
-    payload: {
-      ...previousPayload,
-      ...nextPayload,
-      content: previousContent || nextContent ? `${previousContent}${nextContent}` : nextPayload.content,
-    },
-  };
-  return [
-    ...events.slice(0, index),
-    merged,
-    ...events.slice(index + 1),
-  ];
 }
 
 function readMessageAttachments(state: Store, override?: AgentContextAttachment[]): AgentContextAttachment[] {
@@ -299,32 +187,13 @@ function currentWorkspaceScopeKey(): string {
   return createWorkspaceScopeKey(useWorkspaceStore.getState().current);
 }
 
-function currentWorkspaceBinding(): AgentWorkspaceBinding | undefined {
+function currentWorkspacePath(): string | undefined {
   const workspaceState = useWorkspaceStore.getState();
   return createWorkspaceBinding({
     current: workspaceState.current,
     activeFolder: workspaceState.getActiveFolder(),
     activeFolderId: workspaceState.activeFolderId ?? undefined,
-  });
-}
-
-function createSessionDriver(): SessionDriverLoop {
-  const transcriptClient = new SessionStorageClient(getKernelHttpOrigin());
-  return new SessionDriverLoop({
-    kernelCommand,
-    llmChat,
-    llmChatStream,
-    appendTranscript: async (targetSessionId, entry) => {
-      await transcriptClient.appendTranscript(targetSessionId, entry);
-    },
-    appendEvents: async (targetSessionId, events) => {
-      const result = await appendAgentEvents(targetSessionId, { events });
-      if (!result.ok || !result.data) {
-        throw new Error(result.message ?? 'Agent event append failed');
-      }
-      return result.data;
-    },
-  });
+  })?.openPath;
 }
 
 function permissionRequestRunId(request: PermissionRequest): string | undefined {
@@ -344,6 +213,41 @@ function removeRunningSessionId(ids: string[], sessionId: string): string[] {
   return ids.filter((id) => id !== sessionId);
 }
 
+function isTerminalRunStatus(status: string): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'waiting';
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function startAndWaitAgentRun(
+  sessionId: string,
+  request: StartAgentRunRequest
+): Promise<AgentRunResult> {
+  const started = await startAgentRun(sessionId, request);
+  if (!started.ok || !started.data) {
+    throw new Error(started.message ?? started.error ?? 'Shared session run start failed');
+  }
+  let result = started.data;
+  activeAgentRunIds.set(sessionId, result.run.runId);
+  try {
+    while (!isTerminalRunStatus(result.run.status)) {
+      await sleep(300);
+      const current = await getAgentRun(result.run.sessionId, result.run.runId);
+      if (!current.ok || !current.data) {
+        throw new Error(current.message ?? current.error ?? 'Shared session run refresh failed');
+      }
+      result = current.data;
+    }
+    return result;
+  } finally {
+    if (activeAgentRunIds.get(sessionId) === result.run.runId) {
+      activeAgentRunIds.delete(sessionId);
+    }
+  }
+}
+
 function eventToolName(event: AgentEvent): string | undefined {
   if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
     return undefined;
@@ -351,30 +255,6 @@ function eventToolName(event: AgentEvent): string | undefined {
   const payload = event.payload as Record<string, unknown>;
   const value = payload.toolName ?? payload.name;
   return typeof value === 'string' ? value : undefined;
-}
-
-function eventRunId(event: AgentEvent): string | undefined {
-  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
-    return undefined;
-  }
-  const payload = event.payload as Record<string, unknown>;
-  if (typeof payload.runId === 'string' && payload.runId.trim()) {
-    return payload.runId;
-  }
-  const kernelEvent = payload.kernelEvent;
-  if (kernelEvent && typeof kernelEvent === 'object' && !Array.isArray(kernelEvent)) {
-    const value = (kernelEvent as Record<string, unknown>).runId;
-    if (typeof value === 'string' && value.trim()) return value;
-  }
-  return undefined;
-}
-
-function latestRunId(events: AgentEvent[]): string | undefined {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const runId = eventRunId(events[index]);
-    if (runId) return runId;
-  }
-  return undefined;
 }
 
 function shouldRefreshWorkspaceTree(events: AgentEvent[]): boolean {
@@ -709,23 +589,15 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }
 
     if (get().runningSessionIds.includes(session.id)) {
-      const targetRunId = latestRunId(get().events);
-      const guidanceEvent = createLocalEvent(session.id, 'user_guidance', {
-        content: trimmed,
+      const activeRunId = activeAgentRunIds.get(session.id);
+      if (!activeRunId) {
+        set({ errorMessage: 'No active shared run id is available for guidance. Refresh the session or start a new turn.' });
+        return;
+      }
+      const result = await submitAgentRunGuidance(session.id, activeRunId, {
         guidance: trimmed,
         attachments,
-        source: 'user',
-        targetRunId,
-        targetInteractionKind: 'runningRunGuidance',
-        effectiveCheckpoint: 'nextProviderCall',
-        checkpointKind: 'nextProviderCall',
-        status: 'queued',
-        summary: '用户补充引导已记录，将在下一次 provider call 生效。',
-        channel: 'user',
-        visibility: 'conversation',
-        presentation: 'body',
       });
-      const result = await appendAgentEvents(session.id, { events: [guidanceEvent] });
       if (result.ok && result.data) {
         set({
           session: result.data.session,
@@ -738,11 +610,10 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         });
         void get().refreshTraceEvents(result.data.session.id);
       } else {
-        set((state) => ({
-          events: [...state.events, guidanceEvent],
+        set({
           messageAttachments: [],
           errorMessage: result.message ?? 'User guidance append failed',
-        }));
+        });
       }
       return;
     }
@@ -781,46 +652,12 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }, 300);
     void refreshProgress();
 
-    const abortController = new AbortController();
-    activeAgentAbortControllers.set(session.id, abortController);
-    let wasAborted = false;
-
     try {
-      const transcriptClient = new SessionStorageClient(getKernelHttpOrigin());
-      const driver = new SessionDriverLoop({
-        kernelCommand,
-        llmChat,
-        llmChatStream,
-        onProjectionDelta: async (delta) => {
-          const event = projectionDeltaLocalEvent(delta);
-          if (!event || get().session?.id !== delta.sessionId) return;
-          set((state) => ({
-            events: mergeProjectionDeltaEvent(state.events, event),
-          }));
-        },
-        appendTranscript: async (targetSessionId, entry) => {
-          await transcriptClient.appendTranscript(targetSessionId, entry);
-        },
-        appendEvents: async (targetSessionId, events) => {
-          if (abortController.signal.aborted) {
-            throw new Error('request_aborted');
-          }
-          const result = await appendAgentEvents(targetSessionId, { events });
-          if (abortController.signal.aborted) {
-            throw new Error('request_aborted');
-          }
-          if (!result.ok || !result.data) {
-            throw new Error(result.message ?? 'Agent event append failed');
-          }
-          return result.data;
-        },
-      });
-      const data = await driver.runUserTurn({
-        sessionId: session.id,
+      const result = await startAndWaitAgentRun(session.id, {
+        op: 'ask',
         content: trimmed,
         attachments,
-        existingEvents: get().events,
-        workspaceBinding: currentWorkspaceBinding(),
+        workspacePath: currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
         requirementConfirmationMode: settingRequirementConfirmationMode(
@@ -829,7 +666,14 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         reviewContinuationMode: settingReviewContinuationMode(
           useSettingsStore.getState().effectiveSettings['agent.reviewContinuationMode']
         ),
+        interventionLevel: settingInterventionLevel(
+          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
+        ),
       });
+      const data = {
+        session: result.session,
+        events: result.events,
+      };
       refreshWorkspaceTreeForToolFacts(data.events);
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
@@ -856,33 +700,16 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       const message = err instanceof Error ? err.message : String(err);
-      wasAborted = abortController.signal.aborted || message === 'request_aborted';
-      if (wasAborted) {
-        set((state) => ({
-          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-          errorMessage: null,
-          queuedMessages: [],
-        }));
-      } else {
-        set((state) => ({
-          events: state.session?.id === session.id
-            ? [
-                ...state.events,
-                createLocalEvent(session.id, 'error', { message }),
-              ]
-            : state.events,
-          errorMessage: state.session?.id === session.id ? message : state.errorMessage,
-          runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
-        }));
-      }
-    } finally {
-      if (activeAgentAbortControllers.get(session.id) === abortController) {
-        activeAgentAbortControllers.delete(session.id);
-      }
-    }
-
-    if (wasAborted) {
-      return;
+      set((state) => ({
+        events: state.session?.id === session.id
+          ? [
+              ...state.events,
+              createLocalEvent(session.id, 'error', { message }),
+            ]
+          : state.events,
+        errorMessage: state.session?.id === session.id ? message : state.errorMessage,
+        runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+      }));
     }
 
     const nextQueuedMessage = get().queuedMessages[0];
@@ -897,7 +724,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   cancelCurrentRun: async () => {
     const session = get().session;
     if (!session) return;
-    activeAgentAbortControllers.get(session.id)?.abort();
+    const activeRunId = activeAgentRunIds.get(session.id);
     set((state) => ({
       runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
       queuedMessages: [],
@@ -909,9 +736,12 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       errorMessage: null,
     }));
 
-    const result = await cancelAgentRun(session.id);
+    const result = activeRunId
+      ? await cancelAgentRunById(session.id, activeRunId)
+      : await cancelAgentRun(session.id);
     if (result.ok && result.data) {
       refreshWorkspaceTreeForToolFacts(result.data.events);
+      activeAgentRunIds.delete(session.id);
       set({
         session: result.data.session,
         sessions: [result.data.session, ...get().sessions.filter((item) => item.id !== result.data!.session.id)],
@@ -932,12 +762,12 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set((state) => ({
       events: [
         ...state.events,
-        createLocalEvent(session.id, 'assistant_msg', {
-          content: "\u5df2\u4e2d\u6b62\u5f53\u524d Agent \u8bf7\u6c42\u3002",
-          channel: 'final',
-          visibility: 'conversation',
-          label: 'Agent',
-          cancelled: true,
+        createLocalEvent(session.id, 'workflow_stage', {
+          stage: 'session_run',
+          status: 'cancelled',
+          summary: '当前 Agent 请求已请求停止。',
+          channel: 'task',
+          visibility: 'task',
         }),
       ],
       loading: false,
@@ -976,18 +806,23 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }, 300);
     void refreshProgress();
     try {
-      const driver = createSessionDriver();
-      const data = await driver.resolveDecision({
-        sessionId: session.id,
-        kind: 'permission',
+      const result = await startAndWaitAgentRun(session.id, {
+        op: 'resolveDecision',
+        decisionKind: 'permission',
         decision: 'accept',
         runId: permissionRequestRunId(pending.request),
         targetId: pending.request.id,
-        existingEvents: get().events,
-        workspaceBinding: currentWorkspaceBinding(),
+        workspacePath: currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
+        interventionLevel: settingInterventionLevel(
+          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
+        ),
       });
+      const data = {
+        session: result.session,
+        events: result.events,
+      };
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       refreshWorkspaceTreeForToolFacts(data.events);
@@ -1042,18 +877,23 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }, 300);
     void refreshProgress();
     try {
-      const driver = createSessionDriver();
-      const data = await driver.resolveDecision({
-        sessionId: session.id,
-        kind: 'permission',
+      const result = await startAndWaitAgentRun(session.id, {
+        op: 'resolveDecision',
+        decisionKind: 'permission',
         decision: 'reject',
         runId: permissionRequestRunId(pending.request),
         targetId: pending.request.id,
-        existingEvents: get().events,
-        workspaceBinding: currentWorkspaceBinding(),
+        workspacePath: currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
+        interventionLevel: settingInterventionLevel(
+          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
+        ),
       });
+      const data = {
+        session: result.session,
+        events: result.events,
+      };
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       refreshWorkspaceTreeForToolFacts(data.events);
@@ -1110,19 +950,24 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     void refreshProgress();
 
     try {
-      const driver = createSessionDriver();
-      const data = await driver.resolveDecision({
-        sessionId: session.id,
-        kind: 'requirement',
+      const result = await startAndWaitAgentRun(session.id, {
+        op: 'resolveDecision',
+        decisionKind: 'requirement',
         decision,
         guidance,
         runId,
         targetId: requirementId,
-        existingEvents: get().events,
-        workspaceBinding: currentWorkspaceBinding(),
+        workspacePath: currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
+        interventionLevel: settingInterventionLevel(
+          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
+        ),
       });
+      const data = {
+        session: result.session,
+        events: result.events,
+      };
       refreshWorkspaceTreeForToolFacts(data.events);
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
@@ -1181,19 +1026,24 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }, 300);
     void refreshProgress();
     try {
-      const driver = createSessionDriver();
-      const data = await driver.resolveDecision({
-        sessionId: session.id,
-        kind: 'plan',
+      const result = await startAndWaitAgentRun(session.id, {
+        op: 'resolveDecision',
+        decisionKind: 'plan',
         decision,
         guidance,
         runId,
         targetId: planId,
-        existingEvents: get().events,
-        workspaceBinding: currentWorkspaceBinding(),
+        workspacePath: currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
+        interventionLevel: settingInterventionLevel(
+          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
+        ),
       });
+      const data = {
+        session: result.session,
+        events: result.events,
+      };
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       refreshWorkspaceTreeForToolFacts(data.events);
@@ -1252,21 +1102,26 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     }, 300);
     void refreshProgress();
     try {
-      const driver = createSessionDriver();
-      const data = await driver.resolveDecision({
-        sessionId: session.id,
-        kind: 'review',
+      const result = await startAndWaitAgentRun(session.id, {
+        op: 'resolveDecision',
+        decisionKind: 'review',
         decision,
         guidance,
         runId,
-        existingEvents: get().events,
-        workspaceBinding: currentWorkspaceBinding(),
+        workspacePath: currentWorkspacePath(),
         workflow: get().workflow,
         profileId: get().profileId,
         reviewContinuationMode: settingReviewContinuationMode(
           useSettingsStore.getState().effectiveSettings['agent.reviewContinuationMode']
         ),
+        interventionLevel: settingInterventionLevel(
+          useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
+        ),
       });
+      const data = {
+        session: result.session,
+        events: result.events,
+      };
       pollingStopped = true;
       if (progressTimer !== undefined) window.clearInterval(progressTimer);
       refreshWorkspaceTreeForToolFacts(data.events);

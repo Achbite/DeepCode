@@ -3,7 +3,7 @@ use crate::{
     model::{CardKind, CardModel},
 };
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     prelude::{Alignment, Frame},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -59,24 +59,28 @@ impl Renderer {
             .split(area);
 
         self.draw_header(frame, vertical[0]);
-        self.draw_timeline(frame, vertical[1], app.cards());
+        self.draw_timeline(frame, vertical[1], app);
         self.draw_composer(frame, vertical[2], app.input());
         self.draw_footer(frame, vertical[3], app.status());
     }
 
-    pub fn render_plain(&self, cards: &[CardModel]) -> String {
+    pub fn render_plain(&self, app: &TuiApp) -> String {
         let mut output = String::new();
-        output.push_str("DeepCode TUI · pi-style session shell\n");
+        output.push_str("DeepCode TUI · daemon Session Runtime host shell\n");
         output.push_str("────────────────────────────────────────\n");
-        if cards.is_empty() {
-            output.push_str("我们应该在 DeepCode 中做些什么？\n\n");
+        if app.cards().is_empty() {
+            for line in cover_plain_lines(app) {
+                output.push_str(&line);
+                output.push('\n');
+            }
+            output.push('\n');
         } else {
-            for card in cards {
+            for card in app.cards() {
                 output.push_str(&self.render_plain_card(card));
             }
         }
         output.push_str("────────────────────────────────────────\n");
-        output.push_str("输入消息，或使用 /help /status /audit /clear /quit\n");
+        output.push_str("输入消息，或使用 /help /workspace /sessions /status /quit\n");
         output
     }
 
@@ -94,14 +98,14 @@ impl Renderer {
                 Span::styled("Agent Session", Style::default().fg(Color::Gray)),
             ]),
             Line::from(vec![Span::styled(
-                "KernelClient Host Shell · timeline display only",
+                "KernelClient Host Shell · shared daemon Session Runtime",
                 Style::default().fg(self.theme.dim),
             )]),
         ]);
         frame.render_widget(header, area);
     }
 
-    fn draw_timeline(&self, frame: &mut Frame<'_>, area: Rect, cards: &[CardModel]) {
+    fn draw_timeline(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -112,24 +116,12 @@ impl Renderer {
             .split(area);
         let area = columns[1];
 
+        let cards = app.cards();
         if cards.is_empty() {
-            let empty = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "我们应该在 DeepCode 中做些什么？",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "输入消息后会生成 timeline；TUI 只负责显示，不接管会话编排。",
-                    Style::default().fg(self.theme.dim),
-                )),
-            ])
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true });
-            frame.render_widget(empty, area);
+            let cover = Paragraph::new(self.cover_lines(app))
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true });
+            frame.render_widget(cover, area);
             return;
         }
 
@@ -144,6 +136,68 @@ impl Renderer {
             .collect::<Vec<_>>();
         let list = List::new(items).block(Block::default().borders(Borders::NONE));
         frame.render_widget(list, area);
+    }
+
+    fn cover_lines(&self, app: &TuiApp) -> Vec<Line<'static>> {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "          +----------------------+",
+                Style::default().fg(self.theme.accent),
+            )),
+            Line::from(vec![
+                Span::styled("          | ", Style::default().fg(self.theme.accent)),
+                Span::styled(
+                    "D C",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  01  ", Style::default().fg(self.theme.dim)),
+                Span::styled("KERNEL", Style::default().fg(self.theme.warning)),
+                Span::styled("      |", Style::default().fg(self.theme.accent)),
+            ]),
+            Line::from(vec![
+                Span::styled("          | ", Style::default().fg(self.theme.accent)),
+                Span::styled("TERM", Style::default().fg(self.theme.success)),
+                Span::styled(" -> ", Style::default().fg(self.theme.dim)),
+                Span::styled("AGENT", Style::default().fg(self.theme.accent)),
+                Span::styled("        |", Style::default().fg(self.theme.accent)),
+            ]),
+            Line::from(Span::styled(
+                "          +----------------------+",
+                Style::default().fg(self.theme.accent),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "DeepCode",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "TUI host shell over the shared daemon Session Runtime",
+                Style::default().fg(self.theme.dim),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                app.workspace_status(),
+                Style::default().fg(self.theme.success),
+            )),
+            Line::from(Span::styled(
+                format!("session: {}", app.current_session_label()),
+                Style::default().fg(self.theme.dim),
+            )),
+            Line::from(Span::styled(
+                app.runtime_status().to_string(),
+                Style::default().fg(self.theme.dim),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Type a message to start. Use /workspace, /sessions, /help, /quit.",
+                Style::default().fg(Color::Gray),
+            )),
+        ]
     }
 
     fn draw_composer(&self, frame: &mut Frame<'_>, area: Rect, input: &str) {
@@ -166,6 +220,7 @@ impl Renderer {
                 Span::raw(input.to_string()),
             ])
         };
+        let composer_area = columns[1];
         let composer = Paragraph::new(content).wrap(Wrap { trim: true }).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -173,7 +228,8 @@ impl Renderer {
                 .border_style(self.border_style())
                 .title(" 消息 "),
         );
-        frame.render_widget(composer, columns[1]);
+        frame.render_widget(composer, composer_area);
+        frame.set_cursor_position(composer_cursor_position(composer_area, input));
     }
 
     fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect, status: &str) {
@@ -288,7 +344,7 @@ impl Renderer {
             CardKind::Permission => self.theme.warning,
             CardKind::Plan => self.theme.accent,
             CardKind::Review => self.theme.success,
-            CardKind::Error => self.theme.danger,
+            CardKind::Error | CardKind::BridgeError => self.theme.danger,
             CardKind::Final => self.theme.success,
             CardKind::AuditStatus => self.theme.warning,
         }
@@ -296,7 +352,7 @@ impl Renderer {
 
     fn body_color(&self, card: &CardModel) -> Color {
         match card.kind {
-            CardKind::Error => self.theme.danger,
+            CardKind::Error | CardKind::BridgeError => self.theme.danger,
             CardKind::Thinking | CardKind::Stage | CardKind::AuditStatus => Color::Gray,
             _ => Color::White,
         }
@@ -319,6 +375,7 @@ fn icon(card: &CardModel) -> &'static str {
         CardKind::Plan => "◇",
         CardKind::Review => "✓",
         CardKind::Error => "×",
+        CardKind::BridgeError => "!",
         CardKind::AuditStatus => "◌",
     }
 }
@@ -335,9 +392,52 @@ fn label(card: &CardModel) -> &'static str {
         CardKind::Plan => "计划",
         CardKind::Review => "审查",
         CardKind::Error => "错误",
+        CardKind::BridgeError => "Runtime",
         CardKind::Final => "DeepCode",
         CardKind::AuditStatus => "审计",
     }
+}
+
+fn composer_cursor_position(area: Rect, input: &str) -> Position {
+    let inner_width = area.width.saturating_sub(2).max(1);
+    let inner_height = area.height.saturating_sub(2).max(1);
+    let offset = if input.is_empty() {
+        0
+    } else {
+        2 + terminal_text_width(input)
+    };
+    let line = (offset / inner_width).min(inner_height.saturating_sub(1));
+    let column = if line == inner_height.saturating_sub(1) && offset / inner_width > line {
+        inner_width.saturating_sub(1)
+    } else {
+        offset % inner_width
+    };
+    Position::new(
+        area.x.saturating_add(1).saturating_add(column),
+        area.y.saturating_add(1).saturating_add(line),
+    )
+}
+
+fn terminal_text_width(value: &str) -> u16 {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
+fn cover_plain_lines(app: &TuiApp) -> Vec<String> {
+    vec![
+        "          +----------------------+".to_string(),
+        "          | D C  01  KERNEL      |".to_string(),
+        "          | TERM -> AGENT        |".to_string(),
+        "          +----------------------+".to_string(),
+        "DeepCode".to_string(),
+        "TUI host shell over the shared daemon Session Runtime".to_string(),
+        app.workspace_status(),
+        format!("session: {}", app.current_session_label()),
+        app.runtime_status().to_string(),
+        "Type a message to start. Use /workspace, /sessions, /help, /quit.".to_string(),
+    ]
 }
 
 fn compact_line(input: &str, max_width: usize) -> String {

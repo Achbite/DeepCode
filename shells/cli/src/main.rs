@@ -1,13 +1,16 @@
 use deepcode_kernel_client::{
-    CreateAgentSessionRequest, HttpKernelClient, KernelBootstrap, KernelBootstrapOptions,
-    ListAgentSessionsRequest, PermissionDecision, SessionHostBridgeRequest,
+    terminal_workspace_scope, AgentRunResult, CreateAgentSessionRequest, HttpKernelClient,
+    KernelBootstrap, KernelBootstrapOptions, ListAgentSessionsRequest, PermissionDecision,
+    StartAgentRunRequest, TerminalWorkspaceScope,
 };
 use serde_json::Value;
 use std::env;
 use std::io::{self, IsTerminal, Write};
+use std::time::Duration;
 
 const EXIT_DAEMON_UNAVAILABLE: i32 = 3;
 const EXIT_BAD_ARGS: i32 = 4;
+const RUN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[tokio::main]
 async fn main() {
@@ -51,17 +54,19 @@ async fn run(command: Command) -> Result<(), String> {
             api,
             no_auto_start_kernel,
             include_archived,
+            host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_sessions(bootstrap.client(), include_archived).await
+            print_sessions(bootstrap.client(), include_archived, &host).await
         }
         Command::SessionsNew {
             api,
             no_auto_start_kernel,
             title,
+            host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            create_session(bootstrap.client(), title).await
+            create_session(bootstrap.client(), title, &host).await
         }
         Command::SessionsResume {
             api,
@@ -100,9 +105,10 @@ async fn run(command: Command) -> Result<(), String> {
             api,
             no_auto_start_kernel,
             session_id,
+            host,
         } => {
             let bootstrap = bootstrap_kernel(api, no_auto_start_kernel).await?;
-            print_timeline(bootstrap.client(), session_id).await
+            print_timeline(bootstrap.client(), session_id, &host).await
         }
         Command::Permission {
             api,
@@ -163,11 +169,13 @@ enum Command {
         api: Option<String>,
         no_auto_start_kernel: bool,
         include_archived: bool,
+        host: SessionHostOptions,
     },
     SessionsNew {
         api: Option<String>,
         no_auto_start_kernel: bool,
         title: Option<String>,
+        host: SessionHostOptions,
     },
     SessionsResume {
         api: Option<String>,
@@ -194,6 +202,7 @@ enum Command {
         api: Option<String>,
         no_auto_start_kernel: bool,
         session_id: Option<String>,
+        host: SessionHostOptions,
     },
     Permission {
         api: Option<String>,
@@ -225,7 +234,9 @@ impl Command {
         let mut api = None;
         let mut plain = false;
         let mut include_archived = false;
-        let mut workspace = None;
+        let mut workspace = env::var("DEEPCODE_WORKSPACE")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let mut no_workspace = false;
         let mut no_auto_start_kernel = false;
         let mut session_id = None;
@@ -282,18 +293,21 @@ impl Command {
                     api,
                     no_auto_start_kernel,
                     include_archived,
+                    host,
                 })
             }
             [sessions, new] if sessions == "sessions" && new == "new" => Ok(Command::SessionsNew {
                 api,
                 no_auto_start_kernel,
                 title: None,
+                host,
             }),
             [sessions, new, title @ ..] if sessions == "sessions" && new == "new" => {
                 Ok(Command::SessionsNew {
                     api,
                     no_auto_start_kernel,
                     title: Some(title.join(" ")),
+                    host,
                 })
             }
             [sessions, action, session_id]
@@ -333,11 +347,13 @@ impl Command {
                 api,
                 no_auto_start_kernel,
                 session_id: None,
+                host,
             }),
             [timeline, session_id] if timeline == "timeline" => Ok(Command::Timeline {
                 api,
                 no_auto_start_kernel,
                 session_id: Some(session_id.to_string()),
+                host,
             }),
             [permission, allow, permission_id]
                 if permission == "permission" && allow == "allow" =>
@@ -424,8 +440,11 @@ struct SessionHostOptions {
     session_id: Option<String>,
 }
 
-async fn run_interactive(client: HttpKernelClient, host: SessionHostOptions) -> Result<(), String> {
-    print_interactive_help();
+async fn run_interactive(
+    client: HttpKernelClient,
+    mut host: SessionHostOptions,
+) -> Result<(), String> {
+    print_interactive_help(&host);
     let mut line = String::new();
     loop {
         print!("deepcode> ");
@@ -444,7 +463,7 @@ async fn run_interactive(client: HttpKernelClient, host: SessionHostOptions) -> 
             continue;
         }
         match input {
-            "/help" | "help" => print_interactive_help(),
+            "/help" | "help" => print_interactive_help(&host),
             "/quit" | "/exit" | "quit" | "exit" | "q" => break,
             "/status" | "status" => {
                 if let Err(error) = print_daemon_status(&client).await {
@@ -452,14 +471,23 @@ async fn run_interactive(client: HttpKernelClient, host: SessionHostOptions) -> 
                 }
             }
             "/sessions" | "sessions" => {
-                if let Err(error) = print_sessions(&client, false).await {
+                if let Err(error) = print_sessions(&client, false, &host).await {
                     println!("{error}");
                 }
             }
             "/timeline" | "timeline" => {
-                if let Err(error) = print_timeline(&client, None).await {
+                if let Err(error) = print_timeline(&client, None, &host).await {
                     println!("{error}");
                 }
+            }
+            "/workspace" | "workspace" => print_workspace_status(&host),
+            command if command.starts_with("/workspace ") || command.starts_with("workspace ") => {
+                let args = command
+                    .split_once(' ')
+                    .map(|(_, value)| value.trim())
+                    .unwrap_or_default();
+                update_workspace(&mut host, args);
+                print_workspace_status(&host);
             }
             command if command.starts_with("/decision ") || command.starts_with("decision ") => {
                 let args = command
@@ -490,30 +518,31 @@ async fn ask(
     plain: bool,
     host: SessionHostOptions,
 ) -> Result<(), String> {
-    let mut request = SessionHostBridgeRequest::ask(prompt);
-    request.session_id = host.session_id;
-    request.workspace_path = workspace_path(host.workspace, host.no_workspace);
-    request.no_workspace = host.no_workspace;
-    let result = client
-        .run_session_host_bridge(request)
-        .map_err(|error| format!("failed to run shared session driver: {error}"))?;
+    let session_id = session_id_for_turn(client, &host, &prompt).await?;
+    let mut request = StartAgentRunRequest::ask(prompt);
+    request.workspace_path = workspace_path_for_host(&host);
+    request.no_workspace = Some(host.no_workspace);
+    let result = start_and_wait_for_run(client, &session_id, request).await?;
     if plain {
-        let text = result.final_text.unwrap_or_default();
+        let mut text = result.run.final_text.clone().unwrap_or_default();
         if text.trim().is_empty() {
-            println!("(no final answer yet)");
+            if let Ok(timeline) = client.agent_timeline(&result.run.session_id).await {
+                text = extract_final_text(&timeline).unwrap_or_default();
+            }
+        }
+        if text.trim().is_empty() {
+            println!("({})", result.run.status);
         } else {
             println!("{text}");
         }
         return Ok(());
     }
-    if let Some(session_id) = result.session_id.as_deref() {
-        println!("session: {session_id}");
-    }
-    if let Some(timeline) = result.timeline.as_ref() {
-        render_timeline(timeline);
-    } else if let Some(text) = result.final_text {
-        println!("{text}");
-    }
+    println!("session: {}", result.run.session_id);
+    let timeline = client
+        .agent_timeline(&result.run.session_id)
+        .await
+        .map_err(|error| format!("failed to read timeline: {error}"))?;
+    render_timeline(&timeline);
     Ok(())
 }
 
@@ -557,35 +586,83 @@ async fn resolve_session_decision(
     if !matches!(decision.as_str(), "accept" | "reject" | "revise") {
         return Err("decision must be accept, reject, or revise".to_string());
     }
-    let session_id = if let Some(session_id) = host.session_id {
+    let session_id = if let Some(session_id) = host.session_id.clone() {
         session_id
     } else {
-        current_session_id(client).await?.ok_or_else(|| {
+        current_session_id(client, &host).await?.ok_or_else(|| {
             "no current session; pass --session <id> or create a session first".to_string()
         })?
     };
-    let mut request = SessionHostBridgeRequest::resolve_decision(kind, decision);
-    request.session_id = Some(session_id);
+    let mut request = StartAgentRunRequest::resolve_decision(kind, decision);
     request.run_id = run_id;
     request.target_id = target_id;
     request.guidance = guidance;
-    request.workspace_path = workspace_path(host.workspace, host.no_workspace);
-    request.no_workspace = host.no_workspace;
-    let result = client
-        .run_session_host_bridge(request)
-        .map_err(|error| format!("failed to resolve shared session decision: {error}"))?;
-    if let Some(session_id) = result.session_id.as_deref() {
-        println!("session: {session_id}");
-    }
-    if let Some(timeline) = result.timeline.as_ref() {
-        render_timeline(timeline);
-    }
+    request.workspace_path = workspace_path_for_host(&host);
+    request.no_workspace = Some(host.no_workspace);
+    let result = start_and_wait_for_run(client, &session_id, request).await?;
+    println!("session: {}", result.run.session_id);
+    let timeline = client
+        .agent_timeline(&result.run.session_id)
+        .await
+        .map_err(|error| format!("failed to read timeline: {error}"))?;
+    render_timeline(&timeline);
     Ok(())
 }
 
-async fn current_session_id(client: &HttpKernelClient) -> Result<Option<String>, String> {
+async fn session_id_for_turn(
+    client: &HttpKernelClient,
+    host: &SessionHostOptions,
+    title: &str,
+) -> Result<String, String> {
+    if let Some(session_id) = host.session_id.clone() {
+        return Ok(session_id);
+    }
+    if let Some(session_id) = current_session_id(client, host).await? {
+        return Ok(session_id);
+    }
+    let scope = workspace_scope(host);
+    let result = client
+        .create_agent_session(CreateAgentSessionRequest {
+            initial_mode: Some("plan".to_string()),
+            workspace_id: scope.as_ref().map(|scope| scope.workspace_id.clone()),
+            workspace_hash: scope.as_ref().map(|scope| scope.workspace_hash.clone()),
+            title: Some(title.to_string()),
+            ..CreateAgentSessionRequest::default()
+        })
+        .await
+        .map_err(|error| format!("failed to create session: {error}"))?;
+    session_id(&result.session)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "created session has no id".to_string())
+}
+
+async fn start_and_wait_for_run(
+    client: &HttpKernelClient,
+    session_id: &str,
+    request: StartAgentRunRequest,
+) -> Result<AgentRunResult, String> {
+    let mut result = client
+        .start_agent_run(session_id, request)
+        .await
+        .map_err(|error| format!("failed to start shared session run: {error}"))?;
+    while !result.run.is_terminal() {
+        tokio::time::sleep(RUN_POLL_INTERVAL).await;
+        let session_id = result.run.session_id.clone();
+        let run_id = result.run.run_id.clone();
+        result = client
+            .get_agent_run(&session_id, &run_id)
+            .await
+            .map_err(|error| format!("failed to read shared session run: {error}"))?;
+    }
+    Ok(result)
+}
+
+async fn current_session_id(
+    client: &HttpKernelClient,
+    host: &SessionHostOptions,
+) -> Result<Option<String>, String> {
     let current = client
-        .current_agent_session(ListAgentSessionsRequest::default())
+        .current_agent_session(session_list_request(host, None))
         .await
         .map_err(|error| format!("failed to read current session: {error}"))?;
     Ok(current
@@ -606,6 +683,73 @@ fn workspace_path(explicit: Option<String>, no_workspace: bool) -> Option<String
         .map(|path| path.to_string_lossy().to_string())
 }
 
+fn workspace_path_for_host(host: &SessionHostOptions) -> Option<String> {
+    workspace_path(host.workspace.clone(), host.no_workspace)
+}
+
+fn workspace_scope(host: &SessionHostOptions) -> Option<TerminalWorkspaceScope> {
+    let path = workspace_path_for_host(host);
+    terminal_workspace_scope(path.as_deref())
+}
+
+fn session_list_request(
+    host: &SessionHostOptions,
+    include_archived: Option<bool>,
+) -> ListAgentSessionsRequest {
+    let scope = workspace_scope(host);
+    ListAgentSessionsRequest {
+        workspace_id: scope.as_ref().map(|scope| scope.workspace_id.clone()),
+        workspace_hash: scope.as_ref().map(|scope| scope.workspace_hash.clone()),
+        include_archived,
+    }
+}
+
+fn workspace_status(host: &SessionHostOptions) -> String {
+    if host.no_workspace {
+        return "workspace: none (ordinary chat only)".to_string();
+    }
+    if host.workspace.is_some() {
+        return format!(
+            "workspace: {}",
+            workspace_path_for_host(host).unwrap_or_else(|| "-".to_string())
+        );
+    }
+    format!(
+        "workspace: cwd fallback {}",
+        workspace_path_for_host(host).unwrap_or_else(|| "-".to_string())
+    )
+}
+
+fn print_workspace_status(host: &SessionHostOptions) {
+    println!("{}", workspace_status(host));
+    if let Some(scope) = workspace_scope(host) {
+        println!("scope: {} / {}", scope.workspace_id, scope.workspace_hash);
+        println!("normalized: {}", scope.normalized_path);
+    } else {
+        println!("scope: none");
+    }
+}
+
+fn update_workspace(host: &mut SessionHostOptions, args: &str) {
+    match args.trim() {
+        "" => {}
+        "clear" | "none" | "off" => {
+            host.workspace = None;
+            host.no_workspace = true;
+        }
+        "cwd" | "." => {
+            host.workspace = env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+            host.no_workspace = false;
+        }
+        path => {
+            host.workspace = Some(path.to_string());
+            host.no_workspace = false;
+        }
+    }
+}
+
 async fn print_daemon_status(client: &HttpKernelClient) -> Result<(), String> {
     let status = client
         .daemon_status()
@@ -617,14 +761,16 @@ async fn print_daemon_status(client: &HttpKernelClient) -> Result<(), String> {
     Ok(())
 }
 
-async fn print_sessions(client: &HttpKernelClient, include_archived: bool) -> Result<(), String> {
+async fn print_sessions(
+    client: &HttpKernelClient,
+    include_archived: bool,
+    host: &SessionHostOptions,
+) -> Result<(), String> {
     let result = client
-        .list_agent_sessions(ListAgentSessionsRequest {
-            include_archived: Some(include_archived),
-            ..ListAgentSessionsRequest::default()
-        })
+        .list_agent_sessions(session_list_request(host, Some(include_archived)))
         .await
         .map_err(|error| format!("failed to list sessions: {error}"))?;
+    println!("{}", workspace_status(host));
     println!(
         "current: {}",
         result.current_session_id.as_deref().unwrap_or("-")
@@ -645,10 +791,17 @@ async fn print_sessions(client: &HttpKernelClient, include_archived: bool) -> Re
     Ok(())
 }
 
-async fn create_session(client: &HttpKernelClient, title: Option<String>) -> Result<(), String> {
+async fn create_session(
+    client: &HttpKernelClient,
+    title: Option<String>,
+    host: &SessionHostOptions,
+) -> Result<(), String> {
+    let scope = workspace_scope(host);
     let result = client
         .create_agent_session(CreateAgentSessionRequest {
             initial_mode: Some("plan".to_string()),
+            workspace_id: scope.as_ref().map(|scope| scope.workspace_id.clone()),
+            workspace_hash: scope.as_ref().map(|scope| scope.workspace_hash.clone()),
             title,
             ..CreateAgentSessionRequest::default()
         })
@@ -670,7 +823,12 @@ async fn activate_and_print_timeline(
         .activate_agent_session(session_id)
         .await
         .map_err(|error| format!("failed to activate session: {error}"))?;
-    print_timeline(client, Some(session_id.to_string())).await
+    print_timeline(
+        client,
+        Some(session_id.to_string()),
+        &SessionHostOptions::default(),
+    )
+    .await
 }
 
 async fn rename_session(
@@ -712,12 +870,13 @@ async fn delete_or_archive_session(
 async fn print_timeline(
     client: &HttpKernelClient,
     requested_session_id: Option<String>,
+    host: &SessionHostOptions,
 ) -> Result<(), String> {
     let session_id = match requested_session_id {
         Some(id) => id,
         None => {
             let current = client
-                .current_agent_session(ListAgentSessionsRequest::default())
+                .current_agent_session(session_list_request(host, None))
                 .await
                 .map_err(|error| format!("failed to read current session: {error}"))?;
             let Some(current) = current else {
@@ -800,6 +959,36 @@ fn render_timeline(timeline: &Value) {
     }
 }
 
+fn extract_final_text(timeline: &Value) -> Option<String> {
+    let turns = timeline.get("turns").and_then(Value::as_array)?;
+    for turn in turns.iter().rev() {
+        let Some(blocks) = turn.get("blocks").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks.iter().rev() {
+            let narrative = block
+                .get("narrativeKind")
+                .or_else(|| block.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if narrative != "assistantText" && narrative != "assistant" {
+                continue;
+            }
+            let text = block
+                .get("bodyMarkdown")
+                .or_else(|| block.get("summary"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
 fn session_id(session: &Value) -> Option<&str> {
     session.get("id").and_then(Value::as_str)
 }
@@ -817,57 +1006,84 @@ fn print_help() {
         r#"DeepCode CLI Host Shell
 
 Usage:
-  deepcode-cli --help
-  deepcode-cli daemon status
-  deepcode-cli sessions list [--include-archived]
-  deepcode-cli sessions new [title]
-  deepcode-cli sessions resume <session-id>
-  deepcode-cli sessions rename <session-id> <title>
-  deepcode-cli sessions delete <session-id>
-  deepcode-cli sessions archive <session-id>
-  deepcode-cli timeline [session-id]
-  deepcode-cli permission allow <permission-id>
-  deepcode-cli permission deny <permission-id>
-  deepcode-cli decision <requirement|plan|review> <accept|reject|revise> [--session <id>] [run-id] [target-id] [guidance]
-  deepcode-cli ask [-p|--print] [--session <id>] [--workspace <path>|--no-workspace] <prompt>
+  DeepCode-CLI --help
+  DeepCode-CLI daemon status
+  DeepCode-CLI sessions list [--include-archived]
+  DeepCode-CLI sessions new [title]
+  DeepCode-CLI sessions resume <session-id>
+  DeepCode-CLI sessions rename <session-id> <title>
+  DeepCode-CLI sessions delete <session-id>
+  DeepCode-CLI sessions archive <session-id>
+  DeepCode-CLI timeline [session-id]
+  DeepCode-CLI permission allow <permission-id>
+  DeepCode-CLI permission deny <permission-id>
+  DeepCode-CLI decision <requirement|plan|review> <accept|reject|revise> [--session <id>] [run-id] [target-id] [guidance]
+  DeepCode-CLI ask [-p|--print] [--session <id>] [--workspace <path>|--no-workspace] <prompt>
 
 Options:
   --api <url>                 Kernel daemon HTTP base URL. Defaults to DEEPCODE_API_URL or http://$DEEPCODE_HOST:$DEEPCODE_PORT.
   --no-auto-start-kernel      Do not start a local Kernel when the API is unavailable.
-  --workspace, -C             Bind the turn to a workspace path. Defaults to the current directory for terminal chat.
+  --workspace, -C             Bind the turn to a workspace path. Defaults to DEEPCODE_WORKSPACE or the current directory.
   --no-workspace              Send an ordinary chat turn without a workspace binding.
   --session <id>              Continue a specific Agent session.
 
 Environment:
   DEEPCODE_KERNEL_AUTO_START=0 disables local Kernel auto-start.
   DEEPCODE_KERNEL_BIN=/path/to/deepcode-kernel overrides Kernel binary lookup.
+  DEEPCODE_WORKSPACE=/path/to/project sets the default terminal workspace.
+  DEEPCODE_SESSION_BRIDGE=/path/to/hostBridge.js overrides daemon session-core lookup.
+  DEEPCODE_NODE=/path/to/node overrides daemon internal Node runtime lookup.
+  DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS controls daemon session run timeout. Defaults to 600000; 0 disables it.
+
+Session Runtime:
+  Ordinary input is submitted to daemon /api/agent/sessions/:id/runs.
+  CLI only polls run status and renders shared timeline projection.
+  If the daemon session runtime is missing, run `pnpm --filter @deepcode/session-core build`
+  or use a packaged distribution that includes session-core/dist, node_modules/@deepcode/protocol,
+  and node/bin/node.
 
 Boundary:
-  CLI/TUI/GUI/Editor are shells over the same SessionDriverLoop, Kernel permissions, and timeline projection."#
+  CLI/TUI/GUI/Editor are shells over the same daemon Session Runtime, Kernel permissions, and timeline projection."#
     );
 }
 
-fn print_interactive_help() {
+fn print_interactive_help(host: &SessionHostOptions) {
     println!(
         r#"DeepCode CLI Host Shell
 
-Commands:
-  /help              Show this command list
-  /status            Check Kernel daemon health
-  /sessions          List Agent sessions
-  /timeline          Print current session timeline
-  /decision ...      Resolve requirement/plan/review through the shared SessionDriverLoop
-  /quit              Exit
-  any text           Send a message through the shared SessionDriverLoop
+Core:
+  /help                 Show this command list
+  /status               Check Kernel daemon health
+  /workspace            Show current workspace binding
+  /workspace <path>     Bind terminal turns to a workspace
+  /workspace cwd        Bind to the current directory
+  /workspace clear      Clear workspace binding; ordinary chat remains available
+  /quit                 Exit
+
+Sessions:
+  /sessions             List Agent sessions for the current workspace scope
+  /timeline             Print current session timeline
+
+Permissions and decisions:
+  /decision ...         Resolve requirement/plan/review through the shared Session Runtime
+  decision plan accept  Confirm a pending plan
+  decision plan revise  Submit review guidance for a pending plan
+  decision plan reject  End a pending plan
+  any text              Send a message through the shared Session Runtime
 
 Non-interactive:
-  deepcode-cli daemon status
-  deepcode-cli sessions list
-  deepcode-cli timeline [session-id]
-  deepcode-cli ask "..."          Run a live turn
-  deepcode-cli -p ask "..."       Print only the final answer
+  DeepCode-CLI daemon status
+  DeepCode-CLI sessions list
+  DeepCode-CLI timeline [session-id]
+  DeepCode-CLI ask "..."          Run a live turn
+  DeepCode-CLI -p ask "..."       Print only the final answer
 
-This shell uses the same SessionDriverLoop and Kernel permission settings as the GUI/Editor."#
+This shell uses the same daemon Session Runtime and Kernel permission settings as the GUI/Editor."#
+    );
+    println!("{}", workspace_status(host));
+    println!("session runtime: daemon /runs");
+    println!(
+        "session run timeout: DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS, default 600000 ms, 0 disables"
     );
     if !io::stdin().is_terminal() {
         println!("stdin is not a terminal; EOF exits immediately.");

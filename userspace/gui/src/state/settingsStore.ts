@@ -335,6 +335,18 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     ],
   },
   {
+    key: 'agent.interventionLevel',
+    label: 'User Intervention Level',
+    description: 'Controls how often Agent asks the user to choose between engineering details before planning.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Low', value: 'low' },
+      { label: 'Medium', value: 'medium' },
+      { label: 'High', value: 'high' },
+    ],
+  },
+  {
     key: 'agent.permissions.allowFileRead',
     label: 'Allow File Read',
     description: 'Allow Agent tools to read workspace files.',

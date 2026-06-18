@@ -12,6 +12,7 @@ pub enum CardKind {
     Plan,
     Review,
     Error,
+    BridgeError,
     Final,
     AuditStatus,
 }
@@ -26,6 +27,10 @@ pub struct CardModel {
 impl CardModel {
     pub fn command_help() -> Self {
         Self::new(CardKind::CommandHelp, "帮助", command_help())
+    }
+
+    pub fn user(body: impl Into<String>) -> Self {
+        Self::new(CardKind::User, "你", body)
     }
 
     pub fn stage(title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -91,6 +96,7 @@ impl CardModel {
             "plan" => CardKind::Plan,
             "review" => CardKind::Review,
             "error" => CardKind::Error,
+            "bridgeError" => CardKind::BridgeError,
             _ => match kind {
                 "user" => CardKind::User,
                 "assistant" => CardKind::Final,
@@ -99,6 +105,7 @@ impl CardModel {
                 "plan" => CardKind::Plan,
                 "review" => CardKind::Review,
                 "error" => CardKind::Error,
+                "bridgeError" => CardKind::BridgeError,
                 _ => CardKind::Stage,
             },
         };
@@ -119,24 +126,36 @@ impl CardModel {
 }
 
 pub fn command_help() -> &'static str {
-    "可用命令：\n\
-/help          显示命令列表\n\
-/status        检查 Kernel daemon 连接\n\
-/sessions      列出 Agent 会话\n\
-/new [title]   新建 Agent 会话\n\
-/use <id>      激活会话并读取 timeline\n\
-/timeline [id] 读取当前或指定会话 timeline\n\
-/rename <id> <title>  重命名会话\n\
-/delete <id>   删除会话\n\
-/archive <id>  归档会话\n\
-/allow <id>    允许权限请求\n\
-/deny <id>     拒绝权限请求\n\
-/decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]\n\
-/audit         显示审计占位状态\n\
-/clear         清理当前可见卡片\n\
-/quit          退出 TUI\n\
+    "核心命令：\n\
+/help                 显示命令列表\n\
+/status               检查 Kernel daemon 连接\n\
+/workspace            显示当前 workspace 绑定\n\
+/workspace <path>     绑定 workspace\n\
+/workspace cwd        绑定当前目录\n\
+/workspace clear      清除 workspace，普通对话仍可用\n\
+/cancel               停止当前 TUI 等待并刷新共享 session 投影\n\
+/clear                清理当前可见卡片\n\
+/quit                 退出 TUI\n\
 \n\
-普通文本会通过共享 SessionDriverLoop 发送；TUI 只负责展示、输入和权限确认，不持有 workflow、permission 或 tool execution 事实。"
+会话命令：\n\
+/sessions             列出当前 workspace scope 的 Agent 会话\n\
+/new [title]          新建 Agent 会话\n\
+/use <id>             激活会话并读取 timeline\n\
+/timeline [id]        读取当前或指定会话 timeline\n\
+/rename <id> <title>  重命名会话\n\
+/delete <id>          删除会话\n\
+/archive <id>         归档会话\n\
+\n\
+权限和决策：\n\
+/allow <id>           允许权限请求\n\
+/deny <id>            拒绝权限请求\n\
+/decision <requirement|plan|review> <accept|reject|revise> [run-id] [target-id] [guidance]\n\
+/audit                显示审计占位状态\n\
+\n\
+pending 计划/Review 时，空 Enter 或 1 表示确认；输入文本或 2 <文本> 表示提交 Review 信息；3、end、结束表示结束。\n\
+这些命令对应 GUI composer decision / Stop 的终端输入形式；会话事实仍来自共享 daemon Session Runtime projection。\n\
+\n\
+普通文本会通过共享 daemon Session Runtime 发送；TUI 只负责展示、输入和权限确认，不持有 workflow、permission 或 tool execution 事实。"
 }
 
 fn timeline_kind_title(kind: &str) -> &'static str {

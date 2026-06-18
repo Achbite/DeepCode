@@ -141,13 +141,14 @@ const AgentPanel: React.FC = () => {
         onAddAttachment={addAttachment}
         onRemoveAttachment={removeAttachment}
         pendingDecision={pendingDecision}
-        onDecisionSubmit={(guidance) => {
+        onDecisionSubmit={(guidance, action) => {
           if (!pendingDecision) return;
+          const decision = action ?? (guidance ? 'revise' : 'accept');
           if (pendingDecision.kind === 'requirement') {
             void resolveRequirement(
               pendingDecision.runId,
               pendingDecision.requirementId,
-              guidance ? 'revise' : 'accept',
+              decision,
               guidance
             );
             return;
@@ -156,13 +157,13 @@ const AgentPanel: React.FC = () => {
             void resolvePlan(
               pendingDecision.runId,
               pendingDecision.planId,
-              guidance ? 'revise' : 'accept',
+              decision,
               guidance
             );
             return;
           }
           if (pendingDecision.kind === 'review') {
-            void resolveReview(pendingDecision.runId, guidance ? 'revise' : 'accept', guidance);
+            void resolveReview(pendingDecision.runId, decision, guidance);
             return;
           }
           void acceptPermission();
