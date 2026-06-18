@@ -2,7 +2,7 @@
 
 > Chinese translation: [README.zh-CN.md](README.zh-CN.md)
 
-DeepCode v0.5.1 is a stable local-first AI coding workbench baseline. It keeps Agent session protocol, Kernel tool execution, permission audit, context compression, and Editor/GUI/CLI/TUI shells on one shared backend source of truth. This release focuses on a reproducible local build/package flow, a closed Kernel/Session execution loop, and clear boundaries for provider, tool, and UI shell integration.
+DeepCode v0.5.2 is a stable local-first AI coding workbench baseline. It keeps Agent session protocol, Kernel tool execution, permission audit, context compression, and Editor/GUI/CLI/TUI shells on one shared backend source of truth. This release stabilizes the DeepCode-GUI project session workflow, project-created fixed folder context handoff, intervention-card interaction, and shared language setting entry while preserving the reproducible local build/package flow and clear provider, tool, session, kernel, and UI shell boundaries.
 
 ## Build And Release Mode
 

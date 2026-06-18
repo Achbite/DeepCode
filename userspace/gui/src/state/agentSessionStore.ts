@@ -90,6 +90,7 @@ interface AgentSessionState {
   loading: boolean;
   runningSessionIds: string[];
   errorMessage: string | null;
+  fixedContextAttachments: AgentContextAttachment[];
   messageAttachments: AgentContextAttachment[];
   sessionAttachments: AgentContextAttachment[];
   pendingPermission: PendingPermission | null;
@@ -114,6 +115,7 @@ interface AgentSessionActions {
   setMode: (mode: AgentMode) => void;
   setWorkflow: (workflow: AgentWorkflowMode) => void;
   setProfileId: (profileId?: string) => void;
+  setFixedContextAttachments: (attachments: AgentContextAttachment[]) => void;
   addAttachment: (attachment: AgentContextAttachment) => void;
   removeAttachment: (path: string, scope: AgentContextAttachment['scope']) => void;
   clearMessageAttachments: () => void;
@@ -172,10 +174,17 @@ function createLocalEvent(
 }
 
 function readMessageAttachments(state: Store, override?: AgentContextAttachment[]): AgentContextAttachment[] {
-  return override ?? [
-    ...state.sessionAttachments,
-    ...state.messageAttachments,
-  ];
+  return mergeContextAttachments(
+    state.fixedContextAttachments,
+    state.sessionAttachments,
+    override ?? state.messageAttachments
+  );
+}
+
+function mergeContextAttachments(...groups: AgentContextAttachment[][]): AgentContextAttachment[] {
+  return groups.reduce((merged, group) => {
+    return group.reduce((current, attachment) => mergeContextAttachment(current, attachment), merged);
+  }, [] as AgentContextAttachment[]);
 }
 
 function currentWorkspaceScope(): ListAgentSessionsRequest {
@@ -289,6 +298,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   loading: false,
   runningSessionIds: [],
   errorMessage: null,
+  fixedContextAttachments: [],
   messageAttachments: [],
   sessionAttachments: [],
   pendingPermission: null,
@@ -528,6 +538,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   setMode: (mode) => set({ mode }),
   setWorkflow: (workflow) => set({ workflow }),
   setProfileId: (profileId) => set({ profileId }),
+  setFixedContextAttachments: (attachments) => set({
+    fixedContextAttachments: mergeContextAttachments(attachments),
+  }),
 
   addAttachment: (attachment) => {
     if (attachment.scope === 'session') {

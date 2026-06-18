@@ -59,7 +59,11 @@ function matchesQuery(
 
 function definitionsForSurface(surface: SettingsSurface): SettingDefinition[] {
   const agentDefinitions = agentSettingDefinitions().filter((definition) => definition.key.startsWith('agent.'));
+  const guiSharedWorkbenchDefinitions = surface === 'gui'
+    ? shellPreferenceSettingDefinitions('editor').filter((definition) => definition.key === 'workbench.language')
+    : [];
   return [
+    ...guiSharedWorkbenchDefinitions,
     ...shellPreferenceSettingDefinitions(surface),
     ...agentDefinitions,
   ];

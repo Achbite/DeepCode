@@ -211,6 +211,14 @@ function projectDirectoryAttachment(absolutePath: string): AgentContextAttachmen
   };
 }
 
+function projectFixedContextAttachments(project: DeepCodeGuiProject | null | undefined): AgentContextAttachment[] {
+  if (!project) return [];
+  if (project.fixedContextAttachments?.length) return project.fixedContextAttachments;
+  return project.defaultSessionDirectoryPath
+    ? [projectDirectoryAttachment(project.defaultSessionDirectoryPath)]
+    : [];
+}
+
 function readProjectFixedContextAttachments(value: unknown): AgentContextAttachment[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item): AgentContextAttachment[] => {
@@ -758,6 +766,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
   const deleteSession = useAgentSessionStore((s) => s.deleteSession);
+  const setFixedContextAttachments = useAgentSessionStore((s) => s.setFixedContextAttachments);
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
@@ -890,6 +899,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     () => new Set(collapsedProjectIds),
     [collapsedProjectIds]
   );
+
+  useEffect(() => {
+    setFixedContextAttachments(projectFixedContextAttachments(draftProject ?? activeProject));
+  }, [activeProject, draftProject, setFixedContextAttachments]);
+
   const moveSessionToProject = (projectId: string, sessionId: string) => {
     const now = new Date().toISOString();
     setProjectRecords((current) => current.map((project) => {
@@ -917,6 +931,10 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const handleCreateSession = async (projectId?: string | null) => {
     const targetProjectId = projectId ?? null;
     pendingProjectSendRef.current = null;
+    const targetProject = targetProjectId
+      ? projectRecords.find((project) => project.id === targetProjectId) ?? null
+      : null;
+    setFixedContextAttachments(projectFixedContextAttachments(targetProject));
     setActiveProjectId(null);
     setDraftTargetProjectId(targetProjectId);
     if (targetProjectId) {
@@ -939,6 +957,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const prepareProjectDraftSession = async () => {
     if (!draftTargetProjectId) return true;
     const targetProjectId = draftTargetProjectId;
+    const targetProject = projectRecords.find((project) => project.id === targetProjectId) ?? null;
+    setFixedContextAttachments(projectFixedContextAttachments(targetProject));
     pendingProjectSendRef.current = null;
     const nextSession = await createNewSession({ reuseEmpty: false });
     if (!nextSession?.id) {
@@ -1276,6 +1296,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                                   pendingProjectSendRef.current = null;
                                   setActiveProjectId(group.projectId ?? null);
                                   setDraftTargetProjectId(null);
+                                  setFixedContextAttachments(projectFixedContextAttachments(projectRecord));
                                   void activateSession(item.id);
                                 }}
                                 onContextMenu={(event) => openSessionContextMenu(event, item)}
@@ -1323,6 +1344,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                       pendingProjectSendRef.current = null;
                       setActiveProjectId(null);
                       setDraftTargetProjectId(null);
+                      setFixedContextAttachments([]);
                       void activateSession(item.id);
                     }}
                     onContextMenu={(event) => openSessionContextMenu(event, item)}
