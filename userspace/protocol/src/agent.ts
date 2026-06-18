@@ -661,7 +661,7 @@ export interface ResolveAgentPlanRequest {
 }
 
 export interface ResolveAgentReviewRequest {
-  decision: 'accept' | 'revise';
+  decision: 'accept' | 'reject' | 'revise';
   guidance?: string;
 }
 

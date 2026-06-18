@@ -30,7 +30,7 @@ interface MessageListProps {
   } | null;
   resolvingReview?: {
     runId: string;
-    decision: 'accept' | 'revise';
+    decision: 'accept' | 'reject' | 'revise';
   } | null;
   onPlanResolve?: (
     runId: string,
@@ -40,7 +40,7 @@ interface MessageListProps {
   ) => void;
   onReviewResolve?: (
     runId: string,
-    decision: 'accept' | 'revise',
+    decision: 'accept' | 'reject' | 'revise',
     guidance?: string
   ) => void;
 }

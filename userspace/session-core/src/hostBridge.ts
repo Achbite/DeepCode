@@ -545,6 +545,12 @@ function inferHostRunLifecycle(
           terminalReason: stringField(payload, 'summary') ?? 'Session run is completed.',
         };
       }
+      if (status === 'cancelled') {
+        return {
+          runStatus: 'cancelled',
+          terminalReason: stringField(payload, 'summary') ?? 'Session run is cancelled.',
+        };
+      }
       if (status === 'waiting') {
         const owner = objectRecord(payload.decisionOwner);
         return {

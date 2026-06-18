@@ -63,7 +63,7 @@ type RequirementResolution = {
 
 type ReviewResolution = {
   runId: string;
-  decision: 'accept' | 'revise';
+  decision: 'accept' | 'reject' | 'revise';
 };
 
 interface QueuedAgentMessage {
@@ -123,7 +123,7 @@ interface AgentSessionActions {
   rejectPermission: () => Promise<void>;
   resolveRequirement: (runId: string, requirementId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
   resolvePlan: (runId: string, planId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
-  resolveReview: (runId: string, decision: 'accept' | 'revise', guidance?: string) => Promise<void>;
+  resolveReview: (runId: string, decision: 'accept' | 'reject' | 'revise', guidance?: string) => Promise<void>;
 }
 
 type Store = AgentSessionState & AgentSessionActions;

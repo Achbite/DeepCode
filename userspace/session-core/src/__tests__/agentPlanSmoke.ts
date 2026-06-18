@@ -78,6 +78,10 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan();
   await assertSessionDriverLoopReviewAcceptWithoutContinuationCompletesRun();
   await assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch();
+  await assertSessionDriverLoopRequirementRejectCancelsRun();
+  await assertSessionDriverLoopPlanRejectCancelsRun();
+  await assertSessionDriverLoopReviewRejectCancelsRun();
+  await assertSessionDriverLoopPermissionRejectCancelsRun();
   await assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept();
   await assertSessionDriverLoopNativeReadToolStreamsThroughResourceResolve();
   await assertSessionDriverLoopNativeReadToolLoopHasNoFourRoundLimit();
@@ -317,6 +321,10 @@ function assertPromptEnvelope(): void {
   assert(prompt.stablePrefix.includes('<systemStructure'), 'prompt includes the system structure layer');
   assert(prompt.stablePrefix.includes('black-box validation'), 'prompt treats tests as black-box validation');
   assert(prompt.stablePrefix.includes('Do not optimize for known tests'), 'prompt rejects test-specific optimization');
+  assert(prompt.stablePrefix.includes('fixed prompts'), 'prompt forbids fixed prompt special-casing');
+  assert(prompt.stablePrefix.includes('keyword branches'), 'prompt forbids keyword branches');
+  assert(prompt.stablePrefix.includes('tokenizer branches'), 'prompt forbids tokenizer-specific branches');
+  assert(prompt.stablePrefix.includes('example-specific branches'), 'prompt forbids example-specific logic');
   assert(!prompt.stablePrefix.includes('Current workflow state'), 'stable prefix excludes current workflow state');
   assert(!prompt.stablePrefix.includes('Recent user turn'), 'stable prefix excludes session-local memory hints');
   assert(prompt.dynamicSuffix.includes('Current workflow state: needProposal'), 'dynamic suffix carries current workflow state');
@@ -3412,6 +3420,227 @@ async function assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch(): Prom
   assertEqual(llmRequests.length, 0, 'off review continuation mode does not call the provider');
 }
 
+async function assertSessionDriverLoopRequirementRejectCancelsRun(): Promise<void> {
+  const events: AgentEvent[] = [{
+    id: 'requirement-waiting-generic',
+    sessionId: 'session-requirement-reject',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'requirement_confirmation',
+    payload: {
+      title: 'Requirement confirmation',
+      summary: 'Confirm a generic requirement.',
+      content: 'Confirm how to proceed with a generic request.',
+      originalRequest: 'Create a generic workspace change.',
+      runId: 'run-requirement-reject',
+      requirementId: 'requirement-generic-reject',
+      status: 'waitingUserConfirmation',
+      confirmable: true,
+    },
+  }];
+  const session: AgentSession = {
+    id: 'session-requirement-reject',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'requirement',
+    decision: 'reject',
+    runId: 'run-requirement-reject',
+    targetId: 'requirement-generic-reject',
+    existingEvents: events,
+  });
+
+  assertEqual(result.events.some((event) => event.kind === 'requirement_decision' && (event.payload as any)?.status === 'rejected'), true, 'requirement reject records a rejected decision');
+  assertCancelledRunState(result.events, 'requirement', 'run-requirement-reject', 'requirement-generic-reject');
+  assertEqual(llmCalls, 0, 'requirement reject does not call the provider');
+}
+
+async function assertSessionDriverLoopPlanRejectCancelsRun(): Promise<void> {
+  const events = [acceptedImplementationPlanCardEvent('session-plan-reject', 'run-plan-reject')];
+  const session: AgentSession = {
+    id: 'session-plan-reject',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'actionBatchSubmit') actionBatchSubmits += 1;
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + actionBatchSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'reject',
+    runId: 'run-plan-reject',
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+  });
+
+  assertEqual(result.events.some((event) => event.kind === 'plan_review' && (event.payload as any)?.status === 'rejected'), true, 'plan reject records a rejected plan decision');
+  assertCancelledRunState(result.events, 'plan_review', 'run-plan-reject', 'impl-generic-auto');
+  assertEqual(actionBatchSubmits, 0, 'plan reject does not submit an action batch');
+}
+
+async function assertSessionDriverLoopReviewRejectCancelsRun(): Promise<void> {
+  const events: AgentEvent[] = [{
+    id: 'review-waiting-reject-generic',
+    sessionId: 'session-review-reject',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'review_summary',
+    payload: {
+      status: 'waitingUserReview',
+      runId: 'run-review-reject',
+      reviewId: 'review-generic-reject',
+      sourcePlanId: 'plan-generic-reject',
+      content: '## Review\n\nA generic batch is ready.',
+      userPlan: '# Plan\n\n## Summary\nCreate a generic batch.',
+      facts: ['- `work-unit-generic` completed: {"path":"generic-output.txt"}'],
+      continuations: [{ id: 'next-generic', title: 'A generic follow-up task.' }],
+      confirmable: true,
+      channel: 'review',
+      visibility: 'conversation',
+    },
+  }];
+  const session: AgentSession = {
+    id: 'session-review-reject',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let userDecisionSubmits = 0;
+  let llmCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'userDecisionSubmit') {
+        userDecisionSubmits += 1;
+        assertEqual(command.decision?.payload?.decision, 'reject', 'review ignore sends a reject user decision to Kernel audit');
+        assertEqual(command.decision?.payload?.continuationRequested, false, 'review reject does not request continuation');
+        assertEqual(command.decision?.payload?.revisionRequested, false, 'review reject does not request revision');
+        return { ok: true, events: [] };
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + userDecisionSubmits + llmCalls + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'review',
+    decision: 'reject',
+    runId: 'run-review-reject',
+    existingEvents: events,
+  });
+
+  assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'rejected'), true, 'review reject records a rejected review decision');
+  assertCancelledRunState(result.events, 'review', 'run-review-reject', 'review-generic-reject');
+  assertEqual(userDecisionSubmits, 1, 'review reject records exactly one Kernel user decision');
+  assertEqual(llmCalls, 0, 'review reject does not call the provider for revision or continuation');
+}
+
+async function assertSessionDriverLoopPermissionRejectCancelsRun(): Promise<void> {
+  const events: AgentEvent[] = [{
+    id: 'permission-request-generic',
+    sessionId: 'session-permission-reject',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'permission_request',
+    payload: {
+      id: 'permission-generic-reject',
+      runId: 'run-permission-reject',
+      planId: 'plan-permission-reject',
+      status: 'pending',
+      summary: 'A generic permission request is pending.',
+    },
+  }];
+  const session: AgentSession = {
+    id: 'session-permission-reject',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let permissionResolves = 0;
+  let reviewFactsRequests = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'permissionResolve') {
+        permissionResolves += 1;
+        assertEqual(command.decision, 'reject', 'permission ignore sends a reject decision to Kernel');
+        return {
+          ok: true,
+          events: [{
+            kind: 'permission.resolved',
+            permissionId: 'permission-generic-reject',
+            runId: 'run-permission-reject',
+            sessionId: session.id,
+            decision: 'reject',
+          }],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') reviewFactsRequests += 1;
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + permissionResolves + reviewFactsRequests + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'permission',
+    decision: 'reject',
+    runId: 'run-permission-reject',
+    targetId: 'permission-generic-reject',
+    existingEvents: events,
+  });
+
+  assertCancelledRunState(result.events, 'permission', 'run-permission-reject', 'permission-generic-reject');
+  assertEqual(permissionResolves, 1, 'permission reject resolves exactly one Kernel permission request');
+  assertEqual(reviewFactsRequests, 0, 'permission reject does not continue into review facts');
+}
+
 async function assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept(): Promise<void> {
   const events: AgentEvent[] = [
     {
@@ -4381,6 +4610,23 @@ function assertEqual<T>(actual: T, expected: T, message: string): void {
   if (actual !== expected) {
     throw new Error(`${message}: expected ${String(expected)}, got ${String(actual)}`);
   }
+}
+
+function assertCancelledRunState(
+  events: AgentEvent[],
+  reason: string,
+  runId: string,
+  targetId?: string
+): void {
+  const event = events.find((candidate) =>
+    candidate.kind === 'session_run_state' &&
+    (candidate.payload as any)?.status === 'cancelled' &&
+    (candidate.payload as any)?.phase === 'cancelled' &&
+    (candidate.payload as any)?.reason === reason &&
+    (candidate.payload as any)?.runId === runId &&
+    (targetId ? (candidate.payload as any)?.targetId === targetId : true)
+  );
+  assert(Boolean(event), `expected cancelled session run state for ${reason}`);
 }
 
 function assertThrows(fn: () => unknown, expectedMessage: string): void {

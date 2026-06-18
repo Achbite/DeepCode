@@ -597,7 +597,28 @@ export class SessionDriverLoop {
 
     const decisionEvent = requirementDecisionEvent(input.sessionId, confirmation, input.decision, input.guidance, this.ts(), this.id('requirement-decision'));
     let result = await this.append(input.sessionId, [decisionEvent]);
-    if (input.decision === 'reject') return result;
+    if (input.decision === 'reject') {
+      const payload = objectRecord(decisionEvent.payload) ?? {};
+      const runId = stringValue(payload.runId) ?? input.runId ?? 'run-unknown';
+      const resolvedRequirementId = stringValue(payload.requirementId) ?? requirementId;
+      return this.append(input.sessionId, [
+        sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId,
+          phase: 'cancelled',
+          status: 'cancelled',
+          reason: 'requirement',
+          decisionOwner: {
+            kind: 'requirement',
+            runId,
+            targetId: resolvedRequirementId,
+            requirementId: resolvedRequirementId,
+          },
+          ts: this.ts(),
+          id: this.id('session-run-cancelled-requirement'),
+        }),
+      ]) ?? result;
+    }
     if (isResourceBudgetConfirmation(confirmation)) {
       const originalRequest = requirementOriginalRequest(confirmation);
       return this.runUserTurn({
@@ -678,9 +699,30 @@ export class SessionDriverLoop {
     }
 
     if (input.decision !== 'accept') {
-      return this.append(input.sessionId, [
-        planReviewDecisionEvent(input.sessionId, plan, input.decision === 'revise' ? 'needsRevision' : 'rejected', input.guidance, this.ts(), this.id('plan-decision')),
+      const status = input.decision === 'revise' ? 'needsRevision' : 'rejected';
+      let result = await this.append(input.sessionId, [
+        planReviewDecisionEvent(input.sessionId, plan, status, input.guidance, this.ts(), this.id('plan-decision')),
       ]);
+      if (input.decision === 'reject') {
+        result = await this.append(input.sessionId, [
+          sessionRunStateEvent({
+            sessionId: input.sessionId,
+            runId: plan.runId,
+            phase: 'cancelled',
+            status: 'cancelled',
+            reason: 'plan_review',
+            decisionOwner: {
+              kind: 'plan',
+              runId: plan.runId,
+              targetId: plan.planId,
+              planId: plan.planId,
+            },
+            ts: this.ts(),
+            id: this.id('session-run-cancelled-plan'),
+          }),
+        ]) ?? result;
+      }
+      return result;
     }
 
     let result = await this.append(input.sessionId, [
@@ -836,6 +878,27 @@ export class SessionDriverLoop {
       },
     });
     let result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
+    if (input.decision === 'reject') {
+      const runId = pending.runId ?? input.runId ?? runIdFromKernelEvents(decisionReply.events ?? []) ?? 'run-unknown';
+      return this.append(input.sessionId, [
+        sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId,
+          phase: 'cancelled',
+          status: 'cancelled',
+          reason: 'permission',
+          decisionOwner: {
+            kind: 'permission',
+            runId,
+            targetId: pending.id,
+            permissionId: pending.id,
+            planId: pending.planId,
+          },
+          ts: this.ts(),
+          id: this.id('session-run-cancelled-permission'),
+        }),
+      ]) ?? result;
+    }
     if (!actionBatchReadyForReview(decisionReply.events ?? [])) {
       if (kernelEventsContainPermissionRequest(decisionReply.events ?? [])) {
         const runId = pending.runId ?? input.runId ?? runIdFromKernelEvents(decisionReply.events ?? []) ?? 'run-unknown';
@@ -913,6 +976,51 @@ export class SessionDriverLoop {
           decision: input.decision,
         }),
       ]);
+    }
+
+    if (input.decision === 'reject') {
+      let result = await this.append(input.sessionId, [
+        reviewDecisionEvent(input.sessionId, review, 'rejected', input.guidance ?? '用户已忽略当前 Review，本轮会话已中止。', false, this.ts(), this.id('review-rejected')),
+      ]);
+      const decisionReply = await this.kernel({
+        command: {
+          kind: 'userDecisionSubmit',
+          requestId: this.id('user-decision-review'),
+          runId: review.runId,
+          sessionId: input.sessionId,
+          decision: {
+            decisionId: this.id('decision-review'),
+            decisionKind: 'review',
+            targetId: review.reviewId,
+            payload: {
+              decision: input.decision,
+              guidance: input.guidance,
+              continuationRequested: false,
+              revisionRequested: false,
+              ignored: true,
+            },
+          },
+        },
+      });
+      result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
+      return this.append(input.sessionId, [
+        sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId: review.runId,
+          phase: 'cancelled',
+          status: 'cancelled',
+          reason: 'review',
+          decisionOwner: {
+            kind: 'review',
+            runId: review.runId,
+            targetId: review.reviewId,
+            reviewId: review.reviewId,
+            planId: review.sourcePlanId,
+          },
+          ts: this.ts(),
+          id: this.id('session-run-cancelled-review'),
+        }),
+      ]) ?? result;
     }
 
     if (input.decision !== 'accept') {
@@ -4769,7 +4877,7 @@ function sessionRunStateEvent(input: {
   sessionId: string;
   runId: string;
   phase: SessionTurnPhase;
-  status?: 'waiting' | 'running' | 'completed';
+  status?: 'waiting' | 'running' | 'completed' | 'cancelled';
   reason: 'requirement' | 'plan_review' | 'permission' | 'review' | 'accepted_plan_execution';
   decisionOwner: DecisionOwnerRef;
   ts: string;
@@ -4799,8 +4907,9 @@ function sessionRunStateEvent(input: {
 
 function sessionRunStateSummary(
   reason: 'requirement' | 'plan_review' | 'permission' | 'review' | 'accepted_plan_execution',
-  status: 'waiting' | 'running' | 'completed'
+  status: 'waiting' | 'running' | 'completed' | 'cancelled'
 ): string {
+  if (status === 'cancelled') return '用户已忽略当前介入点，本轮会话已中止。';
   if (status === 'completed' && reason === 'review') return 'Review 已通过，本次计划执行完成。';
   if (status === 'completed') return 'Session run is completed.';
   if (reason === 'accepted_plan_execution') return 'Session run is executing the accepted implementation plan.';
@@ -5274,7 +5383,11 @@ function reviewDecisionEvent(
     kind: 'review_summary',
     payload: {
       title: '审查',
-      summary: status === 'accepted' ? '用户已通过 Review，本批次结束。' : '用户要求补充或修改。',
+      summary: status === 'accepted'
+        ? '用户已通过 Review，本批次结束。'
+        : status === 'rejected'
+          ? '用户已忽略 Review，本轮会话已中止。'
+          : '用户要求补充或修改。',
       content,
       status,
       runId: review.runId,

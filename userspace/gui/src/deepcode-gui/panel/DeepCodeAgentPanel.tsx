@@ -176,7 +176,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
           return;
         }
         if (pendingDecision.kind === 'review') {
-          void resolveReview(pendingDecision.runId, 'revise');
+          void resolveReview(pendingDecision.runId, 'reject');
           return;
         }
         void rejectPermission();

@@ -1021,6 +1021,9 @@ fn finish_run_from_projection(state: &AppState, run_id: &str, lifecycle: RunProj
         RunProjectionLifecycle::Waiting(message) => {
             let _ = set_run_terminal(state, run_id, "waiting", Some(message), None);
         }
+        RunProjectionLifecycle::Cancelled(message) => {
+            let _ = set_run_terminal(state, run_id, "cancelled", Some(message), None);
+        }
         RunProjectionLifecycle::Failed(message) => {
             let _ = set_run_terminal(state, run_id, "failed", Some(message), None);
         }
@@ -1030,6 +1033,7 @@ fn finish_run_from_projection(state: &AppState, run_id: &str, lifecycle: RunProj
 enum RunProjectionLifecycle {
     Completed(Option<String>),
     Waiting(String),
+    Cancelled(String),
     Failed(String),
 }
 
@@ -1055,6 +1059,10 @@ fn projection_lifecycle(
             lifecycle = Some(RunProjectionLifecycle::Completed(None));
             continue;
         }
+        if let Some(message) = session_run_cancelled_message(event) {
+            lifecycle = Some(RunProjectionLifecycle::Cancelled(message));
+            continue;
+        }
         if waiting_for_user_message(event).is_some() {
             lifecycle = waiting_for_user_message(event).map(RunProjectionLifecycle::Waiting);
         }
@@ -1069,6 +1077,20 @@ fn session_run_completed(event: &Value) -> bool {
             .and_then(|payload| payload.get("status"))
             .and_then(Value::as_str)
             == Some("completed")
+}
+
+fn session_run_cancelled_message(event: &Value) -> Option<String> {
+    if event.get("kind").and_then(Value::as_str) != Some("session_run_state") {
+        return None;
+    }
+    let status = event
+        .get("payload")
+        .and_then(|payload| payload.get("status"))
+        .and_then(Value::as_str)?;
+    if status != "cancelled" {
+        return None;
+    }
+    Some(event_message(event).unwrap_or_else(|| "Session run is cancelled.".to_string()))
 }
 
 fn waiting_for_user_message(event: &Value) -> Option<String> {
@@ -1863,6 +1885,25 @@ mod tests {
             }
         });
         assert!(session_run_completed(&event));
+        assert_eq!(waiting_for_user_message(&event), None);
+    }
+
+    #[test]
+    fn cancelled_lifecycle_uses_explicit_session_run_state() {
+        let event = json!({
+            "kind": "session_run_state",
+            "payload": {
+                "status": "cancelled",
+                "reason": "review",
+                "summary": "Session run cancelled by user.",
+                "visibility": "debug"
+            }
+        });
+        assert_eq!(
+            session_run_cancelled_message(&event).as_deref(),
+            Some("Session run cancelled by user.")
+        );
+        assert!(!session_run_completed(&event));
         assert_eq!(waiting_for_user_message(&event), None);
     }
 
