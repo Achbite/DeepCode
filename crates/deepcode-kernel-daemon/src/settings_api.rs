@@ -390,6 +390,7 @@ pub(crate) fn default_user_settings() -> Value {
             "agent.integrations.github.pushPolicy": "manual"
         }),
     );
+    settings["agent.interventionLevel"] = json!("medium");
     settings
 }
 

@@ -12,6 +12,28 @@ pub(crate) struct AgentSessionScopeQuery {
     pub(crate) include_archived: Option<bool>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentSessionRunRequest {
+    pub(crate) op: Option<String>,
+    pub(crate) content: Option<String>,
+    pub(crate) prompt: Option<String>,
+    pub(crate) attachments: Option<Vec<Value>>,
+    pub(crate) workspace_path: Option<String>,
+    pub(crate) no_workspace: Option<bool>,
+    pub(crate) profile_id: Option<String>,
+    pub(crate) workflow: Option<String>,
+    pub(crate) requirement_confirmation_mode: Option<String>,
+    pub(crate) review_continuation_mode: Option<String>,
+    pub(crate) intervention_level: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) decision_kind: Option<String>,
+    pub(crate) decision: Option<String>,
+    pub(crate) guidance: Option<String>,
+    pub(crate) run_id: Option<String>,
+    pub(crate) target_id: Option<String>,
+}
+
 pub(crate) async fn agent_sessions_list(
     State(state): State<AppState>,
     Query(query): Query<AgentSessionScopeQuery>,
@@ -260,10 +282,302 @@ pub(crate) async fn agent_session_send_message(
     )
 }
 
+pub(crate) async fn agent_session_run_start(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<AgentSessionRunRequest>,
+) -> Json<ApiResponse> {
+    let Some((session, events)) = session_payload(&state, &session_id) else {
+        return ApiResponse::error("agent_session_not_found", "agent session not found");
+    };
+    let start_event_count = events.len();
+    let run_id = format!("session-run-{}", now_millis());
+    let run = AgentRunState::running(run_id.clone(), session_id.clone());
+    {
+        let mut runs = state.session_runs.lock().expect("session run state lock");
+        runs.insert(run_id.clone(), run.clone());
+    }
+
+    let intervention_level = body
+        .intervention_level
+        .clone()
+        .or_else(|| user_setting_string(&state, "agent.interventionLevel"))
+        .or_else(|| Some("medium".to_string()));
+    let request = host_bridge_request(&session_id, &run_id, &body, intervention_level);
+    let worker_state = state.clone();
+    let worker_session_id = session_id.clone();
+    let worker_run_id = run_id.clone();
+    thread::spawn(move || {
+        run_session_bridge_worker(
+            worker_state,
+            worker_session_id,
+            worker_run_id,
+            request,
+            start_event_count,
+        );
+    });
+
+    ApiResponse::ok(json!({
+        "run": run,
+        "session": session,
+        "events": events
+    }))
+}
+
+pub(crate) async fn agent_session_run_get(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+) -> Json<ApiResponse> {
+    run_response(&state, &session_id, &run_id)
+}
+
+pub(crate) async fn agent_session_run_cancel(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+) -> Json<ApiResponse> {
+    let changed = set_run_terminal(
+        &state,
+        &run_id,
+        "cancelled",
+        Some("Run cancelled by user.".to_string()),
+        None,
+    );
+    if changed {
+        append_session_projection(
+            &state,
+            &session_id,
+            vec![agent_event(
+                &session_id,
+                "workflow_stage",
+                json!({
+                    "stage": "session_run",
+                    "phase": "cancel",
+                    "status": "cancelled",
+                    "summary": "Run cancelled by user.",
+                    "channel": "task",
+                    "visibility": "task",
+                    "presentation": "stageSummary",
+                    "runId": run_id.clone()
+                }),
+                &now_text(),
+            )],
+        );
+    }
+    run_response(&state, &session_id, &run_id)
+}
+
+pub(crate) async fn agent_session_run_delta(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    if !run_belongs_to_session(&state, &session_id, &run_id) {
+        return ApiResponse::error("agent_run_not_found", "agent run not found");
+    }
+    let delta = normalize_run_delta(&session_id, &run_id, body);
+    {
+        let mut deltas = state
+            .session_run_deltas
+            .lock()
+            .expect("session run delta state lock");
+        let queue = deltas.entry(run_id.clone()).or_default();
+        queue.push(delta);
+        const MAX_RUN_DELTAS: usize = 2_000;
+        if queue.len() > MAX_RUN_DELTAS {
+            let overflow = queue.len() - MAX_RUN_DELTAS;
+            queue.drain(0..overflow);
+        }
+    }
+    touch_run(&state, &run_id, None);
+    run_response(&state, &session_id, &run_id)
+}
+
+pub(crate) async fn agent_session_run_guidance(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Json<ApiResponse> {
+    let run = {
+        let runs = state.session_runs.lock().expect("session run state lock");
+        runs.get(&run_id)
+            .filter(|run| run.session_id == session_id)
+            .cloned()
+    };
+    let Some(run) = run else {
+        return ApiResponse::error("agent_run_not_found", "agent run not found");
+    };
+    if run_status_terminal(&run.status) {
+        return ApiResponse::error(
+            "agent_run_not_active",
+            "run is not active; start a new run or resolve the pending decision",
+        );
+    }
+    let events = session_projection(&state, &session_id);
+    if pending_permission_message(&events).is_some() {
+        return ApiResponse::error(
+            "permission_pending",
+            "permission confirmation is pending; resolve it before sending guidance",
+        );
+    }
+    let guidance = body
+        .get("guidance")
+        .or_else(|| body.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if guidance.is_empty() {
+        return ApiResponse::error("empty_guidance", "guidance must not be empty");
+    }
+    let attachments = body
+        .get("attachments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let guidance_id = format!("guidance-{}", now_millis());
+    append_session_projection(
+        &state,
+        &session_id,
+        vec![agent_event(
+            &session_id,
+            "user_guidance",
+            json!({
+                "guidanceId": guidance_id,
+                "content": guidance.clone(),
+                "guidance": guidance.clone(),
+                "attachments": attachments,
+                "source": "user",
+                "targetRunId": run_id.clone(),
+                "targetInteractionKind": "runningRunGuidance",
+                "effectiveCheckpoint": "nextProviderCall",
+                "checkpointKind": "nextProviderCall",
+                "status": "queued",
+                "summary": "用户补充引导已记录，将在下一次 provider checkpoint 生效。",
+                "channel": "user",
+                "visibility": "conversation",
+                "presentation": "body"
+            }),
+            &now_text(),
+        )],
+    );
+    touch_run(&state, &run_id, Some("guidance queued".to_string()));
+    run_response(&state, &session_id, &run_id)
+}
+
+pub(crate) async fn agent_session_run_stream(
+    State(state): State<AppState>,
+    Path((session_id, run_id)): Path<(String, String)>,
+) -> Response {
+    let stream_state = state.clone();
+    let stream = async_stream::stream! {
+        let mut sent_delta_count = 0usize;
+        let mut sent_event_count = 0usize;
+        let mut last_run_status = String::new();
+        let mut heartbeat_at = Instant::now();
+        loop {
+            let run = {
+                let runs = stream_state.session_runs.lock().expect("session run state lock");
+                runs.get(&run_id)
+                    .filter(|run| run.session_id == session_id)
+                    .cloned()
+            };
+            let Some(run) = run else {
+                yield sse_bytes("error", json!({
+                    "code": "agent_run_not_found",
+                    "message": "agent run not found",
+                    "sessionId": session_id.clone(),
+                    "runId": run_id.clone()
+                }));
+                break;
+            };
+
+            if run.status != last_run_status {
+                last_run_status = run.status.clone();
+                yield sse_bytes("run", json!({
+                    "run": run.clone(),
+                    "sessionId": session_id.clone()
+                }));
+            }
+
+            let deltas = {
+                let deltas = stream_state
+                    .session_run_deltas
+                    .lock()
+                    .expect("session run delta state lock");
+                deltas.get(&run_id).cloned().unwrap_or_default()
+            };
+            for delta in deltas.iter().skip(sent_delta_count) {
+                yield sse_bytes("delta", json!({
+                    "sessionId": session_id.clone(),
+                    "runId": run_id.clone(),
+                    "delta": delta
+                }));
+            }
+            sent_delta_count = deltas.len();
+
+            let events = session_projection(&stream_state, &session_id);
+            if events.len() != sent_event_count {
+                let new_events = events.iter().skip(sent_event_count).cloned().collect::<Vec<_>>();
+                sent_event_count = events.len();
+                yield sse_bytes("events", json!({
+                    "sessionId": session_id.clone(),
+                    "runId": run_id.clone(),
+                    "events": new_events,
+                    "eventCount": sent_event_count
+                }));
+            }
+
+            if run_status_terminal(&run.status) {
+                yield sse_bytes("terminal", json!({
+                    "sessionId": session_id.clone(),
+                    "runId": run_id.clone(),
+                    "run": run.clone(),
+                    "events": events
+                }));
+                break;
+            }
+
+            if heartbeat_at.elapsed() >= Duration::from_secs(10) {
+                heartbeat_at = Instant::now();
+                yield sse_bytes("heartbeat", json!({
+                    "sessionId": session_id.clone(),
+                    "runId": run_id.clone(),
+                    "at": now_text()
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
 pub(crate) async fn agent_session_cancel(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Json<ApiResponse> {
+    let active_runs = {
+        let runs = state.session_runs.lock().expect("session run state lock");
+        runs.values()
+            .filter(|run| run.session_id == session_id && run_status_active(&run.status))
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>()
+    };
+    for run_id in active_runs {
+        let _ = set_run_terminal(
+            &state,
+            &run_id,
+            "cancelled",
+            Some("Run cancelled by user.".to_string()),
+            None,
+        );
+    }
     let gui = state.gui.lock().expect("gui state lock");
     session_result(&gui, &session_id)
 }
@@ -355,6 +669,726 @@ pub(crate) async fn agent_permission_resolve(
                 .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, &session_id))
         }))
     }
+}
+
+fn run_response(state: &AppState, session_id: &str, run_id: &str) -> Json<ApiResponse> {
+    let run = {
+        let runs = state.session_runs.lock().expect("session run state lock");
+        runs.get(run_id)
+            .filter(|run| run.session_id == session_id)
+            .cloned()
+    };
+    let Some(run) = run else {
+        return ApiResponse::error("agent_run_not_found", "agent run not found");
+    };
+    let Some((session, events)) = session_payload(state, session_id) else {
+        return ApiResponse::error("agent_session_not_found", "agent session not found");
+    };
+    ApiResponse::ok(json!({
+        "run": run,
+        "session": session,
+        "events": events
+    }))
+}
+
+fn session_payload(state: &AppState, session_id: &str) -> Option<(Value, Vec<Value>)> {
+    let gui = state.gui.lock().expect("gui state lock");
+    let session = session_by_id(&gui, session_id)?.clone();
+    let events = gui
+        .session_projection_cache
+        .get(session_id)
+        .cloned()
+        .unwrap_or_else(|| read_session_projection_jsonl(&gui.paths.sessions_dir, session_id));
+    Some((session, events))
+}
+
+fn host_bridge_request(
+    session_id: &str,
+    host_run_id: &str,
+    body: &AgentSessionRunRequest,
+    intervention_level: Option<String>,
+) -> Value {
+    let op = body.op.as_deref().unwrap_or_else(|| {
+        if body.decision_kind.is_some() {
+            "resolveDecision"
+        } else {
+            "ask"
+        }
+    });
+    let prompt = body
+        .prompt
+        .as_ref()
+        .or(body.content.as_ref())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    json!({
+        "op": op,
+        "apiBase": daemon_api_base(),
+        "sessionId": session_id,
+        "hostRunId": host_run_id,
+        "prompt": prompt,
+        "title": body.title.clone(),
+        "attachments": body.attachments.clone().unwrap_or_default(),
+        "workspacePath": body.workspace_path.clone(),
+        "noWorkspace": body.no_workspace.unwrap_or(false),
+        "profileId": body.profile_id.clone(),
+        "workflow": body.workflow.clone(),
+        "requirementConfirmationMode": body.requirement_confirmation_mode.clone(),
+        "reviewContinuationMode": body.review_continuation_mode.clone(),
+        "interventionLevel": intervention_level,
+        "decisionKind": body.decision_kind.clone(),
+        "decision": body.decision.clone(),
+        "guidance": body.guidance.clone(),
+        "runId": body.run_id.clone(),
+        "targetId": body.target_id.clone()
+    })
+}
+
+fn user_setting_string(state: &AppState, key: &str) -> Option<String> {
+    let gui = state.gui.lock().expect("gui state lock");
+    gui.user_settings
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn daemon_api_base() -> String {
+    if let Ok(base_url) = std::env::var("DEEPCODE_API_URL") {
+        let trimmed = base_url.trim().trim_end_matches('/').to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    let host = std::env::var("DEEPCODE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = std::env::var("DEEPCODE_PORT").unwrap_or_else(|_| "31245".to_string());
+    format!("http://{host}:{port}")
+}
+
+fn run_session_bridge_worker(
+    state: AppState,
+    session_id: String,
+    run_id: String,
+    request: Value,
+    start_event_count: usize,
+) {
+    let Some(bridge) = find_session_host_bridge_daemon() else {
+        fail_run_with_event(
+            &state,
+            &session_id,
+            &run_id,
+            "session_bridge_unavailable",
+            format!(
+                "cannot find session host bridge; {}",
+                session_host_bridge_hint_daemon()
+            ),
+        );
+        return;
+    };
+    let node = find_session_host_node_daemon(&bridge);
+    let mut child = match Command::new(&node)
+        .arg(&bridge)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            fail_run_with_event(
+                &state,
+                &session_id,
+                &run_id,
+                "session_bridge_spawn_failed",
+                format!(
+                    "failed to start Node runtime `{}` for bridge `{}`: {error}; {}",
+                    node.display(),
+                    bridge.display(),
+                    session_host_bridge_hint_daemon()
+                ),
+            );
+            return;
+        }
+    };
+
+    match child.stdin.take() {
+        Some(mut stdin) => {
+            let payload = match serde_json::to_vec(&request) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    fail_run_with_event(
+                        &state,
+                        &session_id,
+                        &run_id,
+                        "session_bridge_request_encode_failed",
+                        format!("failed to encode session run request: {error}"),
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = stdin.write_all(&payload) {
+                let _ = child.kill();
+                let _ = child.wait();
+                fail_run_with_event(
+                    &state,
+                    &session_id,
+                    &run_id,
+                    "session_bridge_write_failed",
+                    format!("failed to write session run request: {error}"),
+                );
+                return;
+            }
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            fail_run_with_event(
+                &state,
+                &session_id,
+                &run_id,
+                "session_bridge_stdin_unavailable",
+                "session bridge stdin is unavailable",
+            );
+            return;
+        }
+    }
+
+    match wait_for_session_bridge_output(&state, &session_id, &run_id, child, start_event_count) {
+        Ok(output) => {
+            finish_run_from_bridge_output(&state, &session_id, &run_id, output, start_event_count)
+        }
+        Err(BridgeWorkerStop::Projection(lifecycle)) => {
+            finish_run_from_projection(&state, &run_id, lifecycle)
+        }
+        Err(BridgeWorkerStop::Cancelled) => {
+            let _ = set_run_terminal(
+                &state,
+                &run_id,
+                "cancelled",
+                Some("Run cancelled by user.".to_string()),
+                None,
+            );
+        }
+        Err(BridgeWorkerStop::Failed(message)) => {
+            fail_run_with_event(
+                &state,
+                &session_id,
+                &run_id,
+                "session_bridge_failed",
+                message,
+            );
+        }
+    }
+}
+
+enum BridgeWorkerStop {
+    Projection(RunProjectionLifecycle),
+    Cancelled,
+    Failed(String),
+}
+
+fn wait_for_session_bridge_output(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    mut child: Child,
+    start_event_count: usize,
+) -> Result<Output, BridgeWorkerStop> {
+    let started_at = Instant::now();
+    let timeout = session_host_bridge_timeout();
+    loop {
+        if let Some(lifecycle) = projection_lifecycle(state, session_id, start_event_count) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(BridgeWorkerStop::Projection(lifecycle));
+        }
+        if run_cancelled(state, run_id) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(BridgeWorkerStop::Cancelled);
+        }
+        if let Some(limit) = timeout {
+            if started_at.elapsed() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BridgeWorkerStop::Failed(format!(
+                    "session run timed out after {} ms; set DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS=0 to disable the hard timeout",
+                    limit.as_millis()
+                )));
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child.wait_with_output().map_err(|error| {
+                    BridgeWorkerStop::Failed(format!(
+                        "failed to read session bridge output: {error}"
+                    ))
+                });
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BridgeWorkerStop::Failed(format!(
+                    "failed to wait for session bridge output: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn finish_run_from_bridge_output(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    output: Output,
+    start_event_count: usize,
+) {
+    if let Some(lifecycle) = projection_lifecycle(state, session_id, start_event_count) {
+        finish_run_from_projection(state, run_id, lifecycle);
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let result = match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(result) => result,
+        Err(error) => {
+            fail_run_with_event(
+                state,
+                session_id,
+                run_id,
+                "session_bridge_invalid_json",
+                format!(
+                    "session bridge returned invalid JSON: {error}; stdout={}; stderr={}",
+                    stdout.trim(),
+                    stderr.trim()
+                ),
+            );
+            return;
+        }
+    };
+    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if !output.status.success() || !ok {
+        let message = result
+            .get("message")
+            .or_else(|| result.get("error"))
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    "session bridge failed".to_string()
+                } else {
+                    stderr.to_string()
+                }
+            });
+        fail_run_with_event(state, session_id, run_id, "session_bridge_failed", message);
+        return;
+    }
+
+    if let Some(lifecycle) = projection_lifecycle(state, session_id, start_event_count) {
+        finish_run_from_projection(state, run_id, lifecycle);
+        return;
+    }
+
+    if result.get("runStatus").and_then(Value::as_str) == Some("waiting") {
+        let message = result
+            .get("terminalReason")
+            .and_then(Value::as_str)
+            .unwrap_or("Session run is waiting for user input.")
+            .to_string();
+        let _ = set_run_terminal(state, run_id, "waiting", Some(message), None);
+        return;
+    }
+
+    let final_text = result
+        .get("finalText")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| latest_final_text(state, session_id, start_event_count));
+    let _ = set_run_terminal(state, run_id, "completed", None, final_text);
+}
+
+fn finish_run_from_projection(state: &AppState, run_id: &str, lifecycle: RunProjectionLifecycle) {
+    match lifecycle {
+        RunProjectionLifecycle::Completed(final_text) => {
+            let _ = set_run_terminal(state, run_id, "completed", None, final_text);
+        }
+        RunProjectionLifecycle::Waiting(message) => {
+            let _ = set_run_terminal(state, run_id, "waiting", Some(message), None);
+        }
+        RunProjectionLifecycle::Failed(message) => {
+            let _ = set_run_terminal(state, run_id, "failed", Some(message), None);
+        }
+    }
+}
+
+enum RunProjectionLifecycle {
+    Completed(Option<String>),
+    Waiting(String),
+    Failed(String),
+}
+
+fn projection_lifecycle(
+    state: &AppState,
+    session_id: &str,
+    start_event_count: usize,
+) -> Option<RunProjectionLifecycle> {
+    let events = session_projection(state, session_id);
+    let mut lifecycle = None;
+    for event in events.iter().skip(start_event_count) {
+        if event.get("kind").and_then(Value::as_str) == Some("error") {
+            lifecycle = Some(RunProjectionLifecycle::Failed(
+                event_message(event).unwrap_or_else(|| "session run failed".to_string()),
+            ));
+            continue;
+        }
+        if is_final_assistant_event(event) {
+            lifecycle = Some(RunProjectionLifecycle::Completed(event_message(event)));
+            continue;
+        }
+        if waiting_for_user_message(event).is_some() {
+            lifecycle = waiting_for_user_message(event).map(RunProjectionLifecycle::Waiting);
+        }
+    }
+    lifecycle
+}
+
+fn waiting_for_user_message(event: &Value) -> Option<String> {
+    let kind = event.get("kind").and_then(Value::as_str)?;
+    let payload = event.get("payload").unwrap_or(&Value::Null);
+    match kind {
+        "permission_request" => {
+            Some("Session run is waiting for a permission decision.".to_string())
+        }
+        "session_run_state" => {
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if status == "waiting" {
+                Some(
+                    event_message(event)
+                        .unwrap_or_else(|| "Session run is waiting for user input.".to_string()),
+                )
+            } else {
+                None
+            }
+        }
+        "requirement_confirmation" => {
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if status == "waitingUserConfirmation" {
+                Some("Session run is waiting for requirement confirmation.".to_string())
+            } else {
+                None
+            }
+        }
+        "plan_card" => {
+            if payload.get("confirmable").and_then(Value::as_bool) == Some(false) {
+                None
+            } else {
+                Some("Session run is waiting for plan review.".to_string())
+            }
+        }
+        "plan_review" | "review_summary" => {
+            if payload.get("confirmable").and_then(Value::as_bool) == Some(false)
+                || payload.get("visibility").and_then(Value::as_str) == Some("debug")
+            {
+                return None;
+            }
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if status.contains("waiting") || status == "pending" {
+                Some("Session run is waiting for user review.".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_final_assistant_event(event: &Value) -> bool {
+    if event.get("kind").and_then(Value::as_str) != Some("assistant_msg") {
+        return false;
+    }
+    let Some(payload) = event.get("payload") else {
+        return false;
+    };
+    payload.get("channel").and_then(Value::as_str) == Some("final")
+        || payload.get("kind").and_then(Value::as_str) == Some("final")
+}
+
+fn latest_final_text(
+    state: &AppState,
+    session_id: &str,
+    start_event_count: usize,
+) -> Option<String> {
+    session_projection(state, session_id)
+        .into_iter()
+        .skip(start_event_count)
+        .rev()
+        .find_map(|event| {
+            if is_final_assistant_event(&event) {
+                event_message(&event)
+            } else {
+                None
+            }
+        })
+}
+
+fn event_message(event: &Value) -> Option<String> {
+    event
+        .get("payload")
+        .and_then(|payload| {
+            payload
+                .get("content")
+                .or_else(|| payload.get("summary"))
+                .or_else(|| payload.get("message"))
+        })
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn fail_run_with_event(
+    state: &AppState,
+    session_id: &str,
+    run_id: &str,
+    code: &str,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    let _ = set_run_terminal(state, run_id, "failed", Some(message.clone()), None);
+    append_session_projection(
+        state,
+        session_id,
+        vec![agent_event(
+            session_id,
+            "error",
+            json!({
+                "code": code,
+                "message": message,
+                "summary": message,
+                "channel": "error",
+                "visibility": "conversation",
+                "presentation": "body",
+                "runId": run_id
+            }),
+            &now_text(),
+        )],
+    );
+}
+
+fn set_run_terminal(
+    state: &AppState,
+    run_id: &str,
+    status: &str,
+    message: Option<String>,
+    final_text: Option<String>,
+) -> bool {
+    let mut runs = state.session_runs.lock().expect("session run state lock");
+    let Some(run) = runs.get_mut(run_id) else {
+        return false;
+    };
+    if run_status_terminal(&run.status) {
+        return false;
+    }
+    let now = now_text();
+    run.status = status.to_string();
+    run.updated_at = now.clone();
+    run.completed_at = Some(now);
+    run.message = message;
+    run.final_text = final_text;
+    true
+}
+
+fn touch_run(state: &AppState, run_id: &str, message: Option<String>) -> bool {
+    let mut runs = state.session_runs.lock().expect("session run state lock");
+    let Some(run) = runs.get_mut(run_id) else {
+        return false;
+    };
+    if run_status_terminal(&run.status) {
+        return false;
+    }
+    run.updated_at = now_text();
+    if let Some(message) = message {
+        run.message = Some(message);
+    }
+    true
+}
+
+fn run_belongs_to_session(state: &AppState, session_id: &str, run_id: &str) -> bool {
+    let runs = state.session_runs.lock().expect("session run state lock");
+    runs.get(run_id)
+        .map(|run| run.session_id == session_id)
+        .unwrap_or(false)
+}
+
+fn normalize_run_delta(session_id: &str, host_run_id: &str, mut delta: Value) -> Value {
+    if let Value::Object(object) = &mut delta {
+        object.entry("sessionId".to_string()).or_insert_with(|| json!(session_id));
+        object
+            .entry("hostRunId".to_string())
+            .or_insert_with(|| json!(host_run_id));
+        object.entry("receivedAt".to_string()).or_insert_with(|| json!(now_text()));
+    }
+    delta
+}
+
+fn pending_permission_message(events: &[Value]) -> Option<String> {
+    for event in events.iter().rev() {
+        match event.get("kind").and_then(Value::as_str) {
+            Some("permission_result") => return None,
+            Some("permission_request") => {
+                return Some(
+                    event_message(event)
+                        .unwrap_or_else(|| "permission confirmation is pending".to_string()),
+                );
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn sse_bytes(event: &str, payload: Value) -> Result<bytes::Bytes, std::convert::Infallible> {
+    let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    Ok(bytes::Bytes::from(format!("event: {event}\ndata: {data}\n\n")))
+}
+
+fn run_cancelled(state: &AppState, run_id: &str) -> bool {
+    let runs = state.session_runs.lock().expect("session run state lock");
+    runs.get(run_id)
+        .map(|run| run.status == "cancelled")
+        .unwrap_or(false)
+}
+
+fn run_status_active(status: &str) -> bool {
+    !run_status_terminal(status)
+}
+
+fn run_status_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled" | "waiting")
+}
+
+fn session_host_bridge_timeout() -> Option<Duration> {
+    const DEFAULT_TIMEOUT_MS: u64 = 600_000;
+    let millis = std::env::var("DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_MS);
+    if millis == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(millis))
+    }
+}
+
+fn find_session_host_bridge_daemon() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("DEEPCODE_SESSION_BRIDGE") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let mut roots = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    for root in roots {
+        if let Some(path) = find_bridge_from_root_daemon(&root) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_bridge_from_root_daemon(root: &FsPath) -> Option<PathBuf> {
+    for ancestor in root.ancestors() {
+        for candidate in [
+            ancestor.join("session-core/dist/hostBridge.js"),
+            ancestor.join("session-core/hostBridge.js"),
+            ancestor.join("userspace/session-core/dist/hostBridge.js"),
+            ancestor.join("DeepCode/userspace/session-core/dist/hostBridge.js"),
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn find_session_host_node_daemon(bridge: &FsPath) -> PathBuf {
+    if let Ok(path) = std::env::var("DEEPCODE_NODE") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+
+    let mut roots = Vec::new();
+    if let Some(parent) = bridge.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+
+    for root in roots {
+        if let Some(node) = find_node_from_root_daemon(&root) {
+            return node;
+        }
+    }
+    PathBuf::from(node_executable_name_daemon())
+}
+
+fn find_node_from_root_daemon(root: &FsPath) -> Option<PathBuf> {
+    for ancestor in root.ancestors() {
+        for candidate in [
+            ancestor
+                .join("node/bin")
+                .join(node_executable_name_daemon()),
+            ancestor.join("bin").join(node_executable_name_daemon()),
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn node_executable_name_daemon() -> &'static str {
+    if cfg!(windows) {
+        "node.exe"
+    } else {
+        "node"
+    }
+}
+
+fn session_host_bridge_hint_daemon() -> &'static str {
+    "run `pnpm --filter @deepcode/session-core build`, set DEEPCODE_SESSION_BRIDGE, set DEEPCODE_NODE, or use a packaged distribution that includes session-core/dist/hostBridge.js, node_modules/@deepcode/protocol, and node/bin/node"
 }
 
 pub(crate) fn latest_user_attachments_for_session(
@@ -786,6 +1820,37 @@ pub(crate) fn agent_event(session_id: &str, kind: &str, payload: Value, ts: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_lifecycle_uses_explicit_session_run_state() {
+        let event = json!({
+            "kind": "session_run_state",
+            "payload": {
+                "status": "waiting",
+                "reason": "plan_review",
+                "summary": "Session run is waiting for plan review.",
+                "visibility": "debug"
+            }
+        });
+        assert_eq!(
+            waiting_for_user_message(&event).as_deref(),
+            Some("Session run is waiting for plan review.")
+        );
+    }
+
+    #[test]
+    fn debug_plan_review_is_not_a_waiting_lifecycle_owner() {
+        let event = json!({
+            "kind": "plan_review",
+            "payload": {
+                "status": "awaitingTemporaryGrant",
+                "confirmable": false,
+                "visibility": "debug",
+                "summary": "Kernel preflight."
+            }
+        });
+        assert_eq!(waiting_for_user_message(&event), None);
+    }
 
     #[test]
     fn scoped_session_list_and_current_are_workspace_owned() {

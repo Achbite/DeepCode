@@ -4,8 +4,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[cfg(windows)]
@@ -259,6 +264,82 @@ impl HttpKernelClient {
         decode_api_data(value)
     }
 
+    pub async fn start_agent_run(
+        &self,
+        session_id: &str,
+        request: StartAgentRunRequest,
+    ) -> KernelClientResult<AgentRunResult> {
+        let value = self
+            .http
+            .post(self.url(&format!("/api/agent/sessions/{session_id}/runs")))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data(value)
+    }
+
+    pub async fn get_agent_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> KernelClientResult<AgentRunResult> {
+        let value = self
+            .http
+            .get(self.url(&format!("/api/agent/sessions/{session_id}/runs/{run_id}")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data(value)
+    }
+
+    pub async fn cancel_agent_run_by_id(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> KernelClientResult<AgentRunResult> {
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/agent/sessions/{session_id}/runs/{run_id}/cancel"
+            )))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data(value)
+    }
+
+    pub async fn submit_agent_run_guidance(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        guidance: impl Into<String>,
+        attachments: Vec<Value>,
+    ) -> KernelClientResult<AgentRunResult> {
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/agent/sessions/{session_id}/runs/{run_id}/guidance"
+            )))
+            .json(&json!({
+                "guidance": guidance.into(),
+                "attachments": attachments,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data(value)
+    }
+
     pub async fn cancel_agent_run(
         &self,
         session_id: &str,
@@ -300,7 +381,16 @@ impl HttpKernelClient {
         mut request: SessionHostBridgeRequest,
     ) -> KernelClientResult<SessionHostBridgeResult> {
         request.api_base = Some(self.config.base_url.clone());
-        run_session_host_bridge(request)
+        run_session_host_bridge(request, None)
+    }
+
+    pub fn run_session_host_bridge_with_cancel(
+        &self,
+        mut request: SessionHostBridgeRequest,
+        cancel_requested: Arc<AtomicBool>,
+    ) -> KernelClientResult<SessionHostBridgeResult> {
+        request.api_base = Some(self.config.base_url.clone());
+        run_session_host_bridge(request, Some(cancel_requested))
     }
 
     pub async fn audit_verify(&self) -> KernelClientResult<AuditVerifyResult> {
@@ -375,6 +465,27 @@ impl KernelBootstrap {
                 client.base_url()
             ))
         })?;
+        let Some(_start_lock) = acquire_kernel_start_lock(&host, &port)? else {
+            for _ in 0..80 {
+                if probe_kernel_health(&client).await {
+                    return Ok(Self {
+                        client,
+                        _guard: KernelBootstrapGuard::external(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(75));
+            }
+            return Err(KernelClientError::Bootstrap(format!(
+                "kernel start is already in progress for {} but did not become healthy",
+                client.base_url()
+            )));
+        };
+        if probe_kernel_health(&client).await {
+            return Ok(Self {
+                client,
+                _guard: KernelBootstrapGuard::external(),
+            });
+        }
         let kernel_bin = find_kernel_binary().ok_or_else(|| {
             KernelClientError::Bootstrap(
                 "cannot find deepcode-kernel or deepcode-kernel-daemon; set DEEPCODE_KERNEL_BIN"
@@ -470,12 +581,108 @@ pub struct AgentSessionResult {
     pub events: Vec<Value>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartAgentRunRequest {
+    pub op: Option<String>,
+    pub content: Option<String>,
+    pub prompt: Option<String>,
+    pub attachments: Option<Vec<Value>>,
+    pub workspace_path: Option<String>,
+    pub no_workspace: Option<bool>,
+    pub profile_id: Option<String>,
+    pub workflow: Option<String>,
+    pub requirement_confirmation_mode: Option<String>,
+    pub review_continuation_mode: Option<String>,
+    pub intervention_level: Option<String>,
+    pub title: Option<String>,
+    pub decision_kind: Option<String>,
+    pub decision: Option<String>,
+    pub guidance: Option<String>,
+    pub run_id: Option<String>,
+    pub target_id: Option<String>,
+}
+
+impl StartAgentRunRequest {
+    pub fn ask(content: impl Into<String>) -> Self {
+        Self {
+            op: Some("ask".to_string()),
+            content: Some(content.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn resolve_decision(kind: impl Into<String>, decision: impl Into<String>) -> Self {
+        Self {
+            op: Some("resolveDecision".to_string()),
+            decision_kind: Some(kind.into()),
+            decision: Some(decision.into()),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunStatus {
+    pub run_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub message: Option<String>,
+    pub final_text: Option<String>,
+}
+
+impl AgentRunStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "completed" | "failed" | "cancelled" | "waiting"
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunResult {
+    pub run: AgentRunStatus,
+    pub session: Value,
+    pub events: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalWorkspaceScope {
+    pub workspace_id: String,
+    pub workspace_hash: String,
+    pub normalized_path: String,
+}
+
+pub fn terminal_workspace_scope(path: Option<&str>) -> Option<TerminalWorkspaceScope> {
+    let normalized_path = normalize_terminal_workspace_path(path?)?;
+    Some(TerminalWorkspaceScope {
+        workspace_id: "terminal".to_string(),
+        workspace_hash: simple_workspace_hash(&normalized_path),
+        normalized_path,
+    })
+}
+
+pub fn session_host_bridge_path() -> Option<PathBuf> {
+    find_session_host_bridge()
+}
+
+pub fn session_host_bridge_hint() -> &'static str {
+    "run `pnpm --filter @deepcode/session-core build`, set DEEPCODE_SESSION_BRIDGE, set DEEPCODE_NODE, or use a packaged distribution that includes session-core/dist/hostBridge.js, node_modules/@deepcode/protocol, and node/bin/node"
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHostBridgeRequest {
     pub op: String,
     pub api_base: Option<String>,
     pub session_id: Option<String>,
+    pub host_run_id: Option<String>,
     pub prompt: Option<String>,
     pub title: Option<String>,
     pub attachments: Vec<Value>,
@@ -484,6 +691,8 @@ pub struct SessionHostBridgeRequest {
     pub profile_id: Option<String>,
     pub workflow: Option<String>,
     pub requirement_confirmation_mode: Option<String>,
+    pub review_continuation_mode: Option<String>,
+    pub intervention_level: Option<String>,
     pub decision_kind: Option<String>,
     pub decision: Option<String>,
     pub guidance: Option<String>,
@@ -497,6 +706,7 @@ impl SessionHostBridgeRequest {
             op: "ask".to_string(),
             api_base: None,
             session_id: None,
+            host_run_id: None,
             prompt: Some(prompt.into()),
             title: None,
             attachments: Vec::new(),
@@ -505,6 +715,8 @@ impl SessionHostBridgeRequest {
             profile_id: None,
             workflow: None,
             requirement_confirmation_mode: None,
+            review_continuation_mode: None,
+            intervention_level: None,
             decision_kind: None,
             decision: None,
             guidance: None,
@@ -518,6 +730,7 @@ impl SessionHostBridgeRequest {
             op: "resolveDecision".to_string(),
             api_base: None,
             session_id: None,
+            host_run_id: None,
             prompt: None,
             title: None,
             attachments: Vec::new(),
@@ -526,6 +739,8 @@ impl SessionHostBridgeRequest {
             profile_id: None,
             workflow: None,
             requirement_confirmation_mode: None,
+            review_continuation_mode: None,
+            intervention_level: None,
             decision_kind: Some(kind.into()),
             decision: Some(decision.into()),
             guidance: None,
@@ -588,33 +803,40 @@ fn decode_api_data<T: DeserializeOwned>(value: Value) -> KernelClientResult<T> {
 
 fn run_session_host_bridge(
     request: SessionHostBridgeRequest,
+    cancel_requested: Option<Arc<AtomicBool>>,
 ) -> KernelClientResult<SessionHostBridgeResult> {
     let bridge = find_session_host_bridge().ok_or_else(|| {
-        KernelClientError::Bridge(
-            "cannot find userspace/session-core/dist/hostBridge.js; run `pnpm --filter @deepcode/session-core build` or set DEEPCODE_SESSION_BRIDGE".to_string(),
-        )
+        KernelClientError::Bridge(format!(
+            "cannot find session host bridge; {}",
+            session_host_bridge_hint()
+        ))
     })?;
-    let node = std::env::var("DEEPCODE_NODE").unwrap_or_else(|_| "node".to_string());
-    let mut child = Command::new(node)
+    let node = find_session_host_node(&bridge);
+    let mut child = Command::new(&node)
         .arg(&bridge)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| KernelClientError::Bridge(format!("failed to start bridge: {error}")))?;
+        .map_err(|error| {
+            KernelClientError::Bridge(format!(
+                "failed to start Node runtime `{}` for bridge `{}`: {error}; {}",
+                node.display(),
+                bridge.display(),
+                session_host_bridge_hint()
+            ))
+        })?;
     {
-        let stdin = child
+        let mut stdin = child
             .stdin
-            .as_mut()
+            .take()
             .ok_or_else(|| KernelClientError::Bridge("bridge stdin is unavailable".to_string()))?;
         let payload = serde_json::to_vec(&request)?;
         stdin.write_all(&payload).map_err(|error| {
             KernelClientError::Bridge(format!("failed to write bridge request: {error}"))
         })?;
     }
-    let output = child.wait_with_output().map_err(|error| {
-        KernelClientError::Bridge(format!("failed to read bridge output: {error}"))
-    })?;
+    let output = wait_for_bridge_output(child, cancel_requested)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let result: SessionHostBridgeResult = serde_json::from_str(stdout.trim()).map_err(|error| {
@@ -636,6 +858,64 @@ fn run_session_host_bridge(
     Ok(result)
 }
 
+fn wait_for_bridge_output(
+    mut child: Child,
+    cancel_requested: Option<Arc<AtomicBool>>,
+) -> KernelClientResult<Output> {
+    let started_at = Instant::now();
+    let timeout = session_host_bridge_timeout();
+    loop {
+        if cancel_requested
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::SeqCst))
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(KernelClientError::Bridge(
+                "bridge cancelled by TUI stop request".to_string(),
+            ));
+        }
+        if let Some(limit) = timeout {
+            if started_at.elapsed() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(KernelClientError::Bridge(format!(
+                    "bridge timed out after {} ms; set DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS=0 to disable the hard timeout",
+                    limit.as_millis()
+                )));
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child.wait_with_output().map_err(|error| {
+                    KernelClientError::Bridge(format!("failed to read bridge output: {error}"))
+                });
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(KernelClientError::Bridge(format!(
+                    "failed to wait for bridge output: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn session_host_bridge_timeout() -> Option<Duration> {
+    const DEFAULT_TIMEOUT_MS: u64 = 600_000;
+    let millis = std::env::var("DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_MS);
+    if millis == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(millis))
+    }
+}
+
 fn find_session_host_bridge() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("DEEPCODE_SESSION_BRIDGE") {
         let path = PathBuf::from(path);
@@ -644,13 +924,13 @@ fn find_session_host_bridge() -> Option<PathBuf> {
         }
     }
     let mut roots = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             roots.push(parent.to_path_buf());
         }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
     }
     for root in roots {
         if let Some(path) = find_bridge_from_root(&root) {
@@ -662,6 +942,14 @@ fn find_session_host_bridge() -> Option<PathBuf> {
 
 fn find_bridge_from_root(root: &Path) -> Option<PathBuf> {
     for ancestor in root.ancestors() {
+        let packaged_dist = ancestor.join("session-core/dist/hostBridge.js");
+        if packaged_dist.is_file() {
+            return Some(packaged_dist);
+        }
+        let packaged = ancestor.join("session-core/hostBridge.js");
+        if packaged.is_file() {
+            return Some(packaged);
+        }
         let candidate = ancestor.join("userspace/session-core/dist/hostBridge.js");
         if candidate.is_file() {
             return Some(candidate);
@@ -672,6 +960,76 @@ fn find_bridge_from_root(root: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn find_session_host_node(bridge: &Path) -> PathBuf {
+    if let Ok(path) = std::env::var("DEEPCODE_NODE") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+
+    let mut roots = Vec::new();
+    if let Some(parent) = bridge.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+
+    for root in roots {
+        if let Some(node) = find_node_from_root(&root) {
+            return node;
+        }
+    }
+
+    PathBuf::from(node_executable_name())
+}
+
+fn find_node_from_root(root: &Path) -> Option<PathBuf> {
+    for ancestor in root.ancestors() {
+        let packaged = ancestor.join("node/bin").join(node_executable_name());
+        if packaged.is_file() {
+            return Some(packaged);
+        }
+        let bin = ancestor.join("bin").join(node_executable_name());
+        if bin.is_file() {
+            return Some(bin);
+        }
+    }
+    None
+}
+
+fn node_executable_name() -> &'static str {
+    if cfg!(windows) {
+        "node.exe"
+    } else {
+        "node"
+    }
+}
+
+fn normalize_terminal_workspace_path(path: &str) -> Option<String> {
+    let normalized = path.trim().replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn simple_workspace_hash(value: &str) -> String {
+    let mut hash = 2166136261u32;
+    for unit in value.encode_utf16() {
+        hash ^= u32::from(unit);
+        hash = hash.wrapping_mul(16777619);
+    }
+    format!("ws-{hash:x}")
 }
 
 async fn probe_kernel_health(client: &HttpKernelClient) -> bool {
@@ -850,6 +1208,67 @@ fn spawn_kernel_binary(kernel_bin: &Path, host: &str, port: &str) -> KernelClien
     command.spawn().map_err(|error| {
         KernelClientError::Bootstrap(format!("failed to start {}: {error}", kernel_bin.display()))
     })
+}
+
+struct KernelStartLock {
+    path: PathBuf,
+}
+
+impl Drop for KernelStartLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_kernel_start_lock(host: &str, port: &str) -> KernelClientResult<Option<KernelStartLock>> {
+    let path = std::env::temp_dir().join(format!(
+        "deepcode-kernel-start-{}-{}.lock",
+        sanitize_lock_component(host),
+        sanitize_lock_component(port)
+    ));
+    match create_kernel_start_lock_file(&path) {
+        Ok(()) => Ok(Some(KernelStartLock { path })),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            if kernel_start_lock_is_stale(&path) {
+                let _ = std::fs::remove_file(&path);
+                return match create_kernel_start_lock_file(&path) {
+                    Ok(()) => Ok(Some(KernelStartLock { path })),
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
+                    Err(error) => Err(KernelClientError::Bootstrap(format!(
+                        "failed to create kernel start lock {}: {error}",
+                        path.display()
+                    ))),
+                };
+            }
+            Ok(None)
+        }
+        Err(error) => Err(KernelClientError::Bootstrap(format!(
+            "failed to create kernel start lock {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn create_kernel_start_lock_file(path: &Path) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    writeln!(file, "pid={}", std::process::id())?;
+    Ok(())
+}
+
+fn kernel_start_lock_is_stale(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|age| age > Duration::from_secs(30))
+        .unwrap_or(false)
+}
+
+fn sanitize_lock_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
 }
 
 fn open_kernel_log_file(kernel_dir: &Path) -> KernelClientResult<File> {

@@ -10,6 +10,8 @@ pub(crate) struct AppState {
     pub(crate) gui: Arc<Mutex<GuiState>>,
     pub(crate) terminal_runtime: Arc<Mutex<crate::terminal_api::TerminalRuntime>>,
     pub(crate) kernel_events: Arc<Mutex<Vec<KernelEvent>>>,
+    pub(crate) session_runs: Arc<Mutex<HashMap<String, AgentRunState>>>,
+    pub(crate) session_run_deltas: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 }
 
 pub(crate) type SharedRuntime = Arc<Mutex<DeepCodeKernelRuntime>>;
@@ -36,6 +38,38 @@ pub(crate) struct GuiState {
     pub(crate) session_projection_cache: HashMap<String, Vec<Value>>,
     pub(crate) trace_events: HashMap<String, Vec<Value>>,
     pub(crate) browser: BrowserState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentRunState {
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) status: String,
+    pub(crate) started_at: String,
+    pub(crate) updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) final_text: Option<String>,
+}
+
+impl AgentRunState {
+    pub(crate) fn running(run_id: String, session_id: String) -> Self {
+        let now = now_text();
+        Self {
+            run_id,
+            session_id,
+            status: "running".to_string(),
+            started_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+            message: None,
+            final_text: None,
+        }
+    }
 }
 
 #[derive(Debug)]

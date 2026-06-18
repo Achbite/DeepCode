@@ -520,6 +520,7 @@ struct CompiledWorkspaceAction {
 struct NormalizedWorkspacePath {
     relative_path: String,
     workspace_root: Option<PathBuf>,
+    root_source: Option<&'static str>,
     stripped_prefixes: Vec<String>,
     duplicate_root_path_detected: bool,
     original_path: String,
@@ -1143,14 +1144,19 @@ fn workspace_relative_write_path(
         {
             return Ok(NormalizedWorkspacePath {
                 workspace_root: Some(root),
+                root_source: Some("attachment"),
                 ..normalized
             });
+        }
+        if has_explicit_attachment_roots(record) {
+            return relative_file_attachment_write_target(record, raw_path);
         }
         if runtime.state.current_workspace.is_none() {
             if let Some(open_path) = record.workspace_binding.open_path.as_ref() {
                 return Ok(NormalizedWorkspacePath {
                     relative_path: normalize_write_relative_path(raw_path)?,
                     workspace_root: Some(PathBuf::from(open_path)),
+                    root_source: Some("workspaceBinding"),
                     stripped_prefixes: Vec::new(),
                     duplicate_root_path_detected: false,
                     original_path: raw_path.to_string(),
@@ -1160,6 +1166,7 @@ fn workspace_relative_write_path(
         return Ok(NormalizedWorkspacePath {
             relative_path: normalize_write_relative_path(raw_path)?,
             workspace_root: None,
+            root_source: None,
             stripped_prefixes: Vec::new(),
             duplicate_root_path_detected: false,
             original_path: raw_path.to_string(),
@@ -1167,6 +1174,21 @@ fn workspace_relative_write_path(
     }
 
     let target = path.components().collect::<PathBuf>();
+    if let Some((root, relative)) = attachment_root_for_target(record, &target)? {
+        return Ok(NormalizedWorkspacePath {
+            relative_path: relative,
+            workspace_root: Some(root.clone()),
+            root_source: Some("attachment"),
+            stripped_prefixes: vec![root.to_string_lossy().to_string()],
+            duplicate_root_path_detected: false,
+            original_path: raw_path.to_string(),
+        });
+    }
+    if has_explicit_attachment_roots(record) {
+        return Err(KernelError::PermissionDenied(format!(
+            "workspace.write target is outside workspace binding and explicit attachments: {raw_path}"
+        )));
+    }
     if let Some(root) = runtime
         .state
         .current_workspace
@@ -1177,6 +1199,7 @@ fn workspace_relative_write_path(
             return Ok(NormalizedWorkspacePath {
                 relative_path: relative,
                 workspace_root: None,
+                root_source: Some("workspace"),
                 stripped_prefixes: vec![root.to_string_lossy().to_string()],
                 duplicate_root_path_detected: false,
                 original_path: raw_path.to_string(),
@@ -1191,20 +1214,12 @@ fn workspace_relative_write_path(
             return Ok(NormalizedWorkspacePath {
                 relative_path: relative,
                 workspace_root: Some(root.clone()),
+                root_source: Some("workspaceBinding"),
                 stripped_prefixes: vec![root.to_string_lossy().to_string()],
                 duplicate_root_path_detected: false,
                 original_path: raw_path.to_string(),
             });
         }
-    }
-    if let Some((root, relative)) = attachment_root_for_target(record, &target)? {
-        return Ok(NormalizedWorkspacePath {
-            relative_path: relative,
-            workspace_root: Some(root.clone()),
-            stripped_prefixes: vec![root.to_string_lossy().to_string()],
-            duplicate_root_path_detected: false,
-            original_path: raw_path.to_string(),
-        });
     }
     Err(KernelError::PermissionDenied(format!(
         "workspace.write target is outside workspace binding and explicit attachments: {raw_path}"
@@ -1237,6 +1252,12 @@ fn attachment_root_for_target(
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("file");
+        if kind == "directory" && target == root {
+            return Err(KernelError::InvalidCommand(
+                "workspace.write target resolves to an attachment directory, not a file"
+                    .to_string(),
+            ));
+        }
         let allowed = if kind == "directory" {
             target.starts_with(&root)
         } else {
@@ -1256,6 +1277,13 @@ fn attachment_root_for_target(
         }
     }
     Ok(None)
+}
+
+fn has_explicit_attachment_roots(record: &RuntimeRunRecord) -> bool {
+    record
+        .attachments
+        .iter()
+        .any(|attachment| explicit_attachment_root(attachment).is_some())
 }
 
 fn single_directory_attachment_write_target(
@@ -1291,6 +1319,44 @@ fn single_directory_attachment_write_target(
                 .to_string(),
         ))
     }
+}
+
+fn relative_file_attachment_write_target(
+    record: &RuntimeRunRecord,
+    raw_path: &str,
+) -> KernelResult<NormalizedWorkspacePath> {
+    let normalized = normalize_write_relative_path(raw_path)?;
+    for (index, attachment) in record
+        .attachments
+        .iter()
+        .enumerate()
+        .filter(|(_, attachment)| attachment.get("kind").and_then(Value::as_str) == Some("file"))
+    {
+        let Some(root) = explicit_attachment_root(attachment) else {
+            continue;
+        };
+        let Some(write_root) = root.parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        let Some(relative) = strip_root(&root, &write_root) else {
+            continue;
+        };
+        let mut candidates = attachment_prefix_candidates(attachment, index)?;
+        candidates.push(relative.clone());
+        if candidates.iter().any(|candidate| candidate == &normalized) {
+            return Ok(NormalizedWorkspacePath {
+                relative_path: relative,
+                workspace_root: Some(write_root),
+                root_source: Some("attachment"),
+                stripped_prefixes: Vec::new(),
+                duplicate_root_path_detected: false,
+                original_path: raw_path.to_string(),
+            });
+        }
+    }
+    Err(KernelError::PermissionDenied(format!(
+        "workspace.write target is outside workspace binding and explicit attachments: {raw_path}"
+    )))
 }
 
 fn normalize_attachment_relative_write_path(
@@ -1331,6 +1397,7 @@ fn normalize_attachment_relative_write_path(
     Ok(NormalizedWorkspacePath {
         relative_path: normalized,
         workspace_root: None,
+        root_source: Some("attachment"),
         duplicate_root_path_detected: stripped_prefixes.len() > 1,
         stripped_prefixes,
         original_path: raw_path.to_string(),
@@ -1340,31 +1407,41 @@ fn normalize_attachment_relative_write_path(
 fn attachment_prefix_candidates(attachment: &Value, index: usize) -> KernelResult<Vec<String>> {
     let mut prefixes = Vec::new();
     if let Some(root_id) = attachment.get("rootId").and_then(Value::as_str) {
-        push_normalized_prefix(&mut prefixes, root_id)?;
+        push_attachment_prefix(&mut prefixes, root_id)?;
     }
     if let Some(path) = attachment.get("path").and_then(Value::as_str) {
-        push_normalized_prefix(&mut prefixes, path)?;
+        push_attachment_prefix(&mut prefixes, path)?;
         if let Some(base) = path_basename(path) {
-            push_normalized_prefix(&mut prefixes, &base)?;
+            push_attachment_prefix(&mut prefixes, &base)?;
         }
-        push_normalized_prefix(
+        push_attachment_prefix(
             &mut prefixes,
             &manifest_like_attachment_id(index, path, "attachment"),
         )?;
-        push_normalized_prefix(
+        push_attachment_prefix(
             &mut prefixes,
             &manifest_like_attachment_id(index, path, "recent-attachment"),
         )?;
     }
     if let Some(absolute_path) = attachment.get("absolutePath").and_then(Value::as_str) {
-        if let Ok(normalized) = normalize_write_relative_path(absolute_path) {
-            push_normalized_prefix(&mut prefixes, &normalized)?;
-        }
+        push_attachment_prefix(&mut prefixes, absolute_path)?;
         if let Some(base) = path_basename(absolute_path) {
-            push_normalized_prefix(&mut prefixes, &base)?;
+            push_attachment_prefix(&mut prefixes, &base)?;
         }
     }
     Ok(prefixes)
+}
+
+fn push_attachment_prefix(prefixes: &mut Vec<String>, value: &str) -> KernelResult<()> {
+    match normalize_write_relative_path(value) {
+        Ok(normalized) => push_normalized_prefix(prefixes, &normalized),
+        Err(KernelError::InvalidCommand(message))
+            if message.starts_with("workspace.write target must be relative:") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn push_normalized_prefix(prefixes: &mut Vec<String>, value: &str) -> KernelResult<()> {
@@ -1414,6 +1491,7 @@ fn path_normalization_json(path: &NormalizedWorkspacePath) -> Value {
     serde_json::json!({
         "originalPath": path.original_path,
         "normalizedTargetPath": path.relative_path,
+        "rootSource": path.root_source,
         "strippedPathPrefixes": path.stripped_prefixes,
         "duplicateRootPathDetected": path.duplicate_root_path_detected
     })

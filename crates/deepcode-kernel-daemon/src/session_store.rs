@@ -1994,6 +1994,8 @@ mod tests {
             })),
             terminal_runtime: Arc::new(Mutex::new(crate::terminal_api::TerminalRuntime::new())),
             kernel_events: Arc::new(Mutex::new(Vec::new())),
+            session_runs: Arc::new(Mutex::new(HashMap::new())),
+            session_run_deltas: Arc::new(Mutex::new(HashMap::new())),
         };
 
         append_session_projection(&state, session_id, vec![appended_event.clone()]);

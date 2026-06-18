@@ -54,6 +54,8 @@ async fn main() {
         gui: Arc::new(Mutex::new(GuiState::new())),
         terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
         kernel_events: Arc::new(Mutex::new(Vec::new())),
+        session_runs: Arc::new(Mutex::new(HashMap::new())),
+        session_run_deltas: Arc::new(Mutex::new(HashMap::new())),
     };
     if std::env::var("DEEPCODE_DAEMON_IPC_STDIO")
         .map(|value| value == "1")
@@ -173,6 +175,30 @@ async fn main() {
         .route(
             "/api/agent/sessions/:session_id/cancel",
             post(agent_session_cancel),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs",
+            post(agent_session_run_start),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs/:run_id",
+            get(agent_session_run_get),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs/:run_id/cancel",
+            post(agent_session_run_cancel),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs/:run_id/deltas",
+            post(agent_session_run_delta),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs/:run_id/guidance",
+            post(agent_session_run_guidance),
+        )
+        .route(
+            "/api/agent/sessions/:session_id/runs/:run_id/stream",
+            get(agent_session_run_stream),
         )
         .route(
             "/api/agent/sessions/:session_id/trace",
