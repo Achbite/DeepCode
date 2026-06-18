@@ -75,6 +75,7 @@ async function main(): Promise<void> {
   assertWorkflowStagePermissionProjectsPendingDecision();
   await assertSessionDriverLoopReviewRevisionReturnsToPlanning();
   await assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan();
+  await assertSessionDriverLoopReviewAcceptWithoutContinuationCompletesRun();
   await assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch();
   await assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept();
   await assertSessionDriverLoopNativeReadToolStreamsThroughResourceResolve();
@@ -3171,9 +3172,83 @@ async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promi
   const acceptedPayload = acceptedReview.payload as any;
   assertEqual(acceptedPayload.continuationRequested, false, 'review accept closes the current review before continuation planning');
   assert(String(acceptedPayload.content ?? '').includes('确认后的合规 actionBundle 会自动提交 Kernel 执行'), 'accepted review explains confirmed continuation batches auto-submit to Kernel');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.status === 'completed' &&
+      (event.payload as any)?.reason === 'review'
+    ),
+    false,
+    'auto continuation review accept does not mark the current run completed before continuation planning'
+  );
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'default review continuation mode generates the next plan');
   assertEqual(submittedPlans.length, 1, 'default review continuation mode submits the next actionBundle for Kernel PlanReview');
   assertEqual(llmRequests.length, 1, 'default review continuation mode calls the provider once for a new plan');
+}
+
+async function assertSessionDriverLoopReviewAcceptWithoutContinuationCompletesRun(): Promise<void> {
+  const events: AgentEvent[] = [{
+    id: 'review-waiting-terminal-generic',
+    sessionId: 'session-review-terminal',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'review_summary',
+    payload: {
+      status: 'waitingUserReview',
+      runId: 'run-review-terminal',
+      reviewId: 'review-terminal-generic',
+      sourcePlanId: 'plan-terminal-generic',
+      content: '## Review\n\nThe generic batch completed.',
+      userPlan: '# Plan\n\n## Summary\nCreate a generic batch.',
+      facts: ['- `work-unit-generic` completed: {"path":"generic-output.txt"}'],
+      continuations: [],
+      confirmable: true,
+      channel: 'review',
+      visibility: 'conversation',
+    },
+  }];
+  const session: AgentSession = {
+    id: 'session-review-terminal',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const submittedPlans: Array<Record<string, any>> = [];
+  const llmRequests: LlmChatRequest[] = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-review-terminal', submittedPlans),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: 'session-review-terminal',
+    kind: 'review',
+    decision: 'accept',
+    runId: 'run-review-terminal',
+    existingEvents: events,
+  });
+
+  assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any).status === 'accepted'), true, 'terminal review accept records an accepted review event');
+  const completedState = result.events.find((event) =>
+    event.kind === 'session_run_state' &&
+    (event.payload as any)?.status === 'completed' &&
+    (event.payload as any)?.reason === 'review'
+  );
+  assert(Boolean(completedState), 'terminal review accept records an explicit completed session state');
+  const completedPayload = completedState?.payload as any;
+  assertEqual(completedPayload.phase, 'completed', 'terminal review completed state carries completed phase');
+  assertEqual(completedPayload.decisionKind, 'review', 'terminal review completed state keeps review owner kind');
+  assertEqual(completedPayload.targetId, 'review-terminal-generic', 'terminal review completed state keeps review owner target');
+  assertEqual(submittedPlans.length, 0, 'terminal review accept does not submit a new plan');
+  assertEqual(llmRequests.length, 0, 'terminal review accept does not call the provider');
 }
 
 async function assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch(): Promise<void> {
@@ -3234,6 +3309,15 @@ async function assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch(): Prom
   });
 
   assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any).status === 'accepted'), true, 'review accept records an accepted review event');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.status === 'completed' &&
+      (event.payload as any)?.reason === 'review'
+    ),
+    true,
+    'off review continuation mode records an explicit completed session state'
+  );
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'off review continuation mode does not generate a continuation plan');
   assertEqual(submittedPlans.length, 0, 'off review continuation mode does not submit a new plan');
   assertEqual(llmRequests.length, 0, 'off review continuation mode does not call the provider');
@@ -3822,6 +3906,22 @@ function planKernel(
           sessionId,
           proposalId: command.proposal?.proposalId,
           report: proposalReviewReport(actionBundle),
+        },
+      ],
+    };
+  }
+  if (command.kind === 'reviewGateEvaluate') {
+    return {
+      ok: true,
+      events: [
+        {
+          kind: 'review_gate.evaluated',
+          runId: command.runId ?? 'run-generic',
+          sessionId: command.sessionId ?? sessionId,
+          result: {
+            status: 'accepted',
+            summary: 'ReviewGate accepted Kernel facts and user review decision.',
+          },
         },
       ],
     };

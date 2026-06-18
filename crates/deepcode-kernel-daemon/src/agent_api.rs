@@ -1051,11 +1051,24 @@ fn projection_lifecycle(
             lifecycle = Some(RunProjectionLifecycle::Completed(event_message(event)));
             continue;
         }
+        if session_run_completed(event) {
+            lifecycle = Some(RunProjectionLifecycle::Completed(None));
+            continue;
+        }
         if waiting_for_user_message(event).is_some() {
             lifecycle = waiting_for_user_message(event).map(RunProjectionLifecycle::Waiting);
         }
     }
     lifecycle
+}
+
+fn session_run_completed(event: &Value) -> bool {
+    event.get("kind").and_then(Value::as_str) == Some("session_run_state")
+        && event
+            .get("payload")
+            .and_then(|payload| payload.get("status"))
+            .and_then(Value::as_str)
+            == Some("completed")
 }
 
 fn waiting_for_user_message(event: &Value) -> Option<String> {
@@ -1836,6 +1849,37 @@ mod tests {
             waiting_for_user_message(&event).as_deref(),
             Some("Session run is waiting for plan review.")
         );
+    }
+
+    #[test]
+    fn completed_lifecycle_uses_explicit_session_run_state() {
+        let event = json!({
+            "kind": "session_run_state",
+            "payload": {
+                "status": "completed",
+                "reason": "review",
+                "summary": "Review accepted; session run completed.",
+                "visibility": "debug"
+            }
+        });
+        assert!(session_run_completed(&event));
+        assert_eq!(waiting_for_user_message(&event), None);
+    }
+
+    #[test]
+    fn driver_request_progress_is_not_a_lifecycle_owner() {
+        let event = json!({
+            "kind": "workflow_stage",
+            "payload": {
+                "stage": "driver.request_produced",
+                "summary": "Session DriverRequest produced by Kernel.",
+                "kernelEvent": {
+                    "kind": "driver.request_produced"
+                }
+            }
+        });
+        assert!(!session_run_completed(&event));
+        assert_eq!(waiting_for_user_message(&event), None);
     }
 
     #[test]

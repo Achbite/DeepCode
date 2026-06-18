@@ -991,6 +991,26 @@ export class SessionDriverLoop {
 
     const continuationMode = input.reviewContinuationMode ?? 'auto';
     if (!review.continuations.length || continuationMode === 'off') {
+      if (kernelReviewGateStatus(gateReply.events) === 'accepted') {
+        result = await this.append(input.sessionId, [
+          sessionRunStateEvent({
+            sessionId: input.sessionId,
+            runId: review.runId,
+            phase: 'completed',
+            status: 'completed',
+            reason: 'review',
+            decisionOwner: {
+              kind: 'review',
+              runId: review.runId,
+              targetId: review.reviewId,
+              reviewId: review.reviewId,
+              planId: review.sourcePlanId,
+            },
+            ts: this.ts(),
+            id: this.id('session-run-completed-review'),
+          }),
+        ]) ?? result;
+      }
       return result;
     }
     if (continuationMode === 'ask') {
@@ -4748,7 +4768,7 @@ function sessionRunStateEvent(input: {
   sessionId: string;
   runId: string;
   phase: SessionTurnPhase;
-  status?: 'waiting' | 'running';
+  status?: 'waiting' | 'running' | 'completed';
   reason: 'requirement' | 'plan_review' | 'permission' | 'review' | 'accepted_plan_execution';
   decisionOwner: DecisionOwnerRef;
   ts: string;
@@ -4778,8 +4798,10 @@ function sessionRunStateEvent(input: {
 
 function sessionRunStateSummary(
   reason: 'requirement' | 'plan_review' | 'permission' | 'review' | 'accepted_plan_execution',
-  status: 'waiting' | 'running'
+  status: 'waiting' | 'running' | 'completed'
 ): string {
+  if (status === 'completed' && reason === 'review') return 'Review 已通过，本次计划执行完成。';
+  if (status === 'completed') return 'Session run is completed.';
   if (reason === 'accepted_plan_execution') return 'Session run is executing the accepted implementation plan.';
   if (status === 'running') return 'Session run is running.';
   if (reason === 'requirement') return 'Session run is waiting for requirement confirmation.';
@@ -5284,6 +5306,17 @@ function acceptedReviewContent(review: SessionReviewContext): string {
   }
   lines.push('', '### 决策边界', '- Review 通过只关闭当前批次。', '- 后续批次只能重新生成 Plan；新 Plan 经用户确认后，范围内 actionBundle 由 Session 自动提交 Kernel 执行。');
   return lines.join('\n');
+}
+
+function kernelReviewGateStatus(kernelEvents: unknown[] | undefined): string | undefined {
+  for (const event of [...(kernelEvents ?? [])].reverse()) {
+    const record = objectRecord(event);
+    if (stringValue(record?.kind) !== 'review_gate.evaluated') continue;
+    const result = objectRecord(record?.result);
+    const status = stringValue(result?.status);
+    if (status) return status;
+  }
+  return undefined;
 }
 
 function reviewContinuationRequest(review: SessionReviewContext): string {

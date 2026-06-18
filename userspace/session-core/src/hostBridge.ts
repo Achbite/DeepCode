@@ -537,14 +537,23 @@ function inferHostRunLifecycle(
       };
     }
 
-    if (kind === 'session_run_state' && stringField(payload, 'status') === 'waiting') {
-      const owner = objectRecord(payload.decisionOwner);
-      return {
-        runStatus: 'waiting',
-        decisionKind: stringField(payload, 'decisionKind') ?? stringField(owner, 'kind'),
-        targetId: stringField(payload, 'targetId') ?? stringField(owner, 'targetId'),
-        terminalReason: stringField(payload, 'summary') ?? 'Session run is waiting for user input.',
-      };
+    if (kind === 'session_run_state') {
+      const status = stringField(payload, 'status');
+      if (status === 'completed') {
+        return {
+          runStatus: 'completed',
+          terminalReason: stringField(payload, 'summary') ?? 'Session run is completed.',
+        };
+      }
+      if (status === 'waiting') {
+        const owner = objectRecord(payload.decisionOwner);
+        return {
+          runStatus: 'waiting',
+          decisionKind: stringField(payload, 'decisionKind') ?? stringField(owner, 'kind'),
+          targetId: stringField(payload, 'targetId') ?? stringField(owner, 'targetId'),
+          terminalReason: stringField(payload, 'summary') ?? 'Session run is waiting for user input.',
+        };
+      }
     }
 
     if (kind === 'permission_request') {
