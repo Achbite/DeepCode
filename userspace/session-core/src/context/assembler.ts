@@ -79,6 +79,32 @@ export interface ContextAssemblyResourceBlockRecord {
   preview: string;
 }
 
+export interface ContextAssemblyBudgetPlan {
+  policy: 'softCapReserveOutput';
+  contextWindowTokens: number;
+  maxOutputTokens: number;
+  protectedPrefixBudgetTokens: number;
+  intentMemoryBudgetTokens: number;
+  evidenceTailBudgetTokens: number;
+  auditOnlyBudgetTokens: number;
+}
+
+export interface ContextAssemblyPartitionCharCounts {
+  protectedPrefix: number;
+  intentMemory: number;
+  evidenceTail: number;
+  auditOnly: number;
+  providerVisibleTotal: number;
+}
+
+export interface ContextAssemblyPartitionTokenEstimates {
+  protectedPrefix: number;
+  intentMemory: number;
+  evidenceTail: number;
+  auditOnly: number;
+  providerVisibleTotal: number;
+}
+
 export interface ContextAssemblyRecord {
   schemaVersion: 'deepcode.session.context-assembly.v2';
   contextAssemblyId: string;
@@ -104,6 +130,11 @@ export interface ContextAssemblyRecord {
   resourcePacketCount: number;
   userGuidanceCount: number;
   consumedUserGuidanceIds: string[];
+  budgetPlan: ContextAssemblyBudgetPlan;
+  partitionCharCounts: ContextAssemblyPartitionCharCounts;
+  partitionTokenEstimates: ContextAssemblyPartitionTokenEstimates;
+  resourceEvidenceTailCount: number;
+  traceArchiveMode: 'compact-provider-trace';
   redactionNote: string;
 }
 
@@ -179,6 +210,7 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     model,
     templateVersion,
   });
+  const partitionCharCounts = contextAssemblyPartitionCharCounts(prompt.segments);
   const contextAssembly: ContextAssemblyRecord = {
     schemaVersion: 'deepcode.session.context-assembly.v2',
     contextAssemblyId,
@@ -204,7 +236,20 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     resourcePacketCount: input.resourcePackets?.length ?? 0,
     userGuidanceCount: userGuidance.length,
     consumedUserGuidanceIds: userGuidance.map((item) => item.id),
-    redactionNote: 'Segment previews are clipped for inspection; full provider messages remain in the provider trace archive.',
+    budgetPlan: {
+      policy: 'softCapReserveOutput',
+      contextWindowTokens: 1_000_000,
+      maxOutputTokens: 384_000,
+      protectedPrefixBudgetTokens: 64_000,
+      intentMemoryBudgetTokens: 256_000,
+      evidenceTailBudgetTokens: 256_000,
+      auditOnlyBudgetTokens: 8_000,
+    },
+    partitionCharCounts,
+    partitionTokenEstimates: contextAssemblyPartitionTokenEstimates(partitionCharCounts),
+    resourceEvidenceTailCount: resourcePromptContext.resourceBlocks.length,
+    traceArchiveMode: 'compact-provider-trace',
+    redactionNote: 'Segment previews and provider traces are compacted for inspection; raw provider token deltas and full prompt messages are not stored in transcript.',
   };
   return {
     promptInput,
@@ -228,6 +273,53 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
       cacheAffectsCorrectness: false,
     },
   };
+}
+
+function contextAssemblyPartitionCharCounts(segments: PromptSegment[]): ContextAssemblyPartitionCharCounts {
+  const protectedNames = new Set<PromptSegment['name']>([
+    'protocolContract',
+    'builtinSystemPrompt',
+    'systemStructure',
+    'capabilityProjection',
+    'rulerContext',
+    'authoritativeDocExcerpts',
+  ]);
+  const evidenceNames = new Set<PromptSegment['name']>([
+    'reusableResourceContext',
+    'currentResourceResults',
+  ]);
+  const auditNames = new Set<PromptSegment['name']>(['auditOnlyContext']);
+  const counts: ContextAssemblyPartitionCharCounts = {
+    protectedPrefix: 0,
+    intentMemory: 0,
+    evidenceTail: 0,
+    auditOnly: 0,
+    providerVisibleTotal: 0,
+  };
+  for (const segment of segments) {
+    if (protectedNames.has(segment.name)) counts.protectedPrefix += segment.content.length;
+    else if (evidenceNames.has(segment.name)) counts.evidenceTail += segment.content.length;
+    else if (auditNames.has(segment.name)) counts.auditOnly += segment.content.length;
+    else counts.intentMemory += segment.content.length;
+  }
+  counts.providerVisibleTotal = counts.protectedPrefix + counts.intentMemory + counts.evidenceTail;
+  return counts;
+}
+
+function contextAssemblyPartitionTokenEstimates(
+  counts: ContextAssemblyPartitionCharCounts
+): ContextAssemblyPartitionTokenEstimates {
+  return {
+    protectedPrefix: estimateTokens(counts.protectedPrefix),
+    intentMemory: estimateTokens(counts.intentMemory),
+    evidenceTail: estimateTokens(counts.evidenceTail),
+    auditOnly: estimateTokens(counts.auditOnly),
+    providerVisibleTotal: estimateTokens(counts.providerVisibleTotal),
+  };
+}
+
+function estimateTokens(chars: number): number {
+  return Math.ceil(chars / 4);
 }
 
 function contextAssemblyResourceBlock(block: ResourcePromptBlock): ContextAssemblyResourceBlockRecord {

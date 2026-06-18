@@ -43,6 +43,7 @@ async function main(): Promise<void> {
   assertSessionTaskGraphProjection();
   assertDeepSeekCacheStrategyDoesNotInjectRequestParameter();
   await assertProviderCacheTelemetryNormalizesBigModelUsage();
+  await assertProviderTraceArchiveCompactsStreamingChunks();
   assertSettingsCatalogBoundaries();
   assertNarrativeTimelineProjection();
   assertImplementationPlanTaskProjectionProgress();
@@ -419,8 +420,14 @@ function assertContextAssemblerCachePlan(): void {
   assertEqual(base.contextAssembly.consumedUserGuidanceIds[0], 'guidance-generic', 'context assembly records consumed user guidance ids');
   assertEqual(base.contextAssembly.schemaVersion, 'deepcode.session.context-assembly.v2', 'context assembly records v2 cache debug schema');
   assertEqual(base.contextAssembly.cacheAffectsCorrectness, false, 'context assembly cache telemetry is observability only');
+  assertEqual(base.contextAssembly.budgetPlan.contextWindowTokens, 1_000_000, 'context assembly records 1M soft context budget');
+  assertEqual(base.contextAssembly.budgetPlan.maxOutputTokens, 384_000, 'context assembly records 384K output reserve');
+  assertEqual(base.contextAssembly.traceArchiveMode, 'compact-provider-trace', 'context assembly records compact trace archive mode');
   assertEqual(base.contextAssembly.resourceBlocks.length, 0, 'simple chat path has no resource blocks');
   assertEqual(base.contextAssembly.resourceFullTextCharCount, 0, 'simple chat path has no full resource text');
+  assertEqual(base.contextAssembly.resourceEvidenceTailCount, 0, 'simple chat path has no resource evidence tail entries');
+  assert(base.contextAssembly.partitionCharCounts.protectedPrefix > 0, 'context assembly records protected prefix partition');
+  assert(base.contextAssembly.partitionCharCounts.intentMemory > 0, 'context assembly records intent/memory partition');
   assert(base.contextAssembly.segments.find((segment) => segment.name === 'reusableResourceContext')?.charLength ?? 0 < 1200, 'empty resource context stays small');
   assertEqual(
     base.contextAssembly.segments.some((segment) => segment.cacheClass === 'globalStable' && segment.stablePrefix),
@@ -434,7 +441,9 @@ function assertContextAssemblerCachePlan(): void {
   );
   const reusableIndex = base.prompt.dynamicLayerNames.indexOf('reusableResourceContext');
   const requirementIndex = base.prompt.dynamicLayerNames.indexOf('currentRequirement');
-  assert(reusableIndex >= 0 && requirementIndex > reusableIndex, 'reusable resources appear before current request in dynamic suffix');
+  const currentResourceIndex = base.prompt.dynamicLayerNames.indexOf('currentResourceResults');
+  assert(reusableIndex > requirementIndex, 'reusable resource evidence appears after current request in the dynamic suffix');
+  assert(currentResourceIndex > reusableIndex, 'current resource policy and tool results remain at the evidence tail');
   assertEqual(
     base.contextAssembly.segments.some((segment) => segment.auditOnly && segment.cacheClass === 'auditOnly'),
     true,
@@ -825,6 +834,86 @@ async function assertProviderCacheTelemetryNormalizesBigModelUsage(): Promise<vo
   assertEqual(payload.promptCacheMissTokens, 923, 'BigModel cache miss tokens are inferred from prompt tokens minus cached tokens');
   assertEqual(payload.cachedTokens, 77, 'BigModel cached token detail is preserved');
   assert(Array.isArray(payload.promptSegmentDigests) && payload.promptSegmentDigests.length > 0, 'cache telemetry includes prompt segment digests');
+}
+
+async function assertProviderTraceArchiveCompactsStreamingChunks(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const transcript: TranscriptEntry[] = [];
+  const session: AgentSession = {
+    id: 'session-trace-archive',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const chunks: LlmChatResult['chunks'] = [];
+  for (let index = 0; index < 5000; index += 1) {
+    chunks.push({
+      type: index % 5 === 0 ? 'reasoning_delta' : 'delta',
+      content: `generic stream fragment ${index} ${'x'.repeat(80)}`,
+      rawProvider: {
+        id: `raw-provider-${index}`,
+        payload: `raw-provider-payload-${index}-${'y'.repeat(200)}`,
+      },
+    });
+  }
+  chunks.push({
+    type: 'done',
+    finishReason: 'stop',
+    usage: { promptTokens: 1000, completionTokens: 384000, totalTokens: 385000 },
+    rawProvider: { id: 'raw-provider-done', payload: 'raw-provider-payload-done' },
+  });
+
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    appendTranscript: async (_sessionId, entry) => {
+      transcript.push(entry);
+    },
+    kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => ({
+      ok: true,
+      data: {
+        chunks,
+        usage: { promptTokens: 1000, completionTokens: 384000, totalTokens: 385000 },
+        assistantMessage: {
+          role: 'assistant',
+          reasoningContent: 'generic reasoning '.repeat(1000),
+          content: JSON.stringify({
+            schemaVersion: 'deepcode.agent.protocol.v3',
+            kind: 'answer',
+            outputLanguage: 'en-US',
+            answer: { format: 'markdown', content: 'Generic compact trace answer.' },
+          }),
+        },
+      },
+    }),
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + transcript.length + 1}`,
+  });
+
+  await loop.runUserTurn({
+    sessionId: 'session-trace-archive',
+    content: 'Answer a generic high-volume streaming question.',
+    requirementConfirmationMode: 'off',
+  });
+
+  const responseTrace = transcript.find((entry): entry is TranscriptEntry & { type: 'metadata'; payload: any } =>
+    entry.type === 'metadata' &&
+    entry.kind === 'provider_trace' &&
+    (entry.payload as any)?.stage === 'provider_call.response'
+  );
+  if (!responseTrace) throw new Error('provider response trace should be archived');
+  const payload = (responseTrace.payload as any).payload;
+  const archivedJson = JSON.stringify(payload);
+  assertEqual(payload.traceArchiveMode, 'compact', 'provider response trace uses compact archive mode');
+  assertEqual(payload.response.chunkSummary.chunkCount, chunks.length, 'compact trace records chunk count');
+  assertEqual(payload.response.chunkSummary.rawProviderCount, chunks.length, 'compact trace records raw provider count without raw payloads');
+  assertEqual(Boolean(payload.response.chunks), false, 'compact trace does not retain raw chunks array');
+  assert(archivedJson.length < 120_000, 'compact provider trace stays below transcript body risk threshold');
+  assert(!archivedJson.includes('raw-provider-payload-4999'), 'compact trace strips raw provider payload values');
+  assert(!archivedJson.includes('generic stream fragment 4999'), 'compact trace strips per-token content values');
 }
 
 function assertNarrativeTimelineProjection(): void {

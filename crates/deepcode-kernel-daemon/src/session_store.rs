@@ -253,8 +253,17 @@ pub(crate) async fn session_store_transcript_get(
 pub(crate) async fn session_store_transcript_append(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Json<ApiResponse> {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            return json_body_rejection_response(
+                "/api/session-store/:session_id/transcript",
+                rejection,
+            )
+        }
+    };
     let entry = body.get("entry").cloned().unwrap_or_else(|| body.clone());
     let (sessions_dir, archive_root, session) = {
         let gui = state.gui.lock().expect("gui state lock");

@@ -243,8 +243,12 @@ pub(crate) async fn llm_probe(
 
 pub(crate) async fn llm_chat(
     State(state): State<AppState>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Json<ApiResponse> {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_body_rejection_response("/api/llm/chat", rejection),
+    };
     let profile_id = body
         .get("profileId")
         .and_then(Value::as_str)
@@ -285,8 +289,23 @@ pub(crate) async fn llm_chat(
 
 pub(crate) async fn llm_chat_stream(
     State(state): State<AppState>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            let (_, message) = json_body_rejection_error("/api/llm/chat/stream", &rejection);
+            return llm_stream_error_response(json!({
+                "type": "provider_error",
+                "error": "http_body_rejected",
+                "message": message,
+                "route": "/api/llm/chat/stream",
+                "status": rejection.status().as_u16(),
+                "bodyLimitBytes": LARGE_JSON_BODY_LIMIT_BYTES,
+                "suggestion": "Compact provider traces and avoid archiving raw streaming chunks or full provider payload arrays."
+            }));
+        }
+    };
     let profile_id = body
         .get("profileId")
         .and_then(Value::as_str)
@@ -298,22 +317,10 @@ pub(crate) async fn llm_chat_stream(
     let profile = match profile {
         Ok(profile) => profile,
         Err(error) => {
-            let data = json!({
+            return llm_stream_error_response(json!({
                 "type": "provider_error",
                 "error": error,
-            });
-            let body = format!(
-                "event: provider_error\ndata: {}\n\n",
-                serde_json::to_string(&data).unwrap_or_else(|_| "{\"type\":\"provider_error\"}".to_string())
-            );
-            return (
-                [
-                    (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
-                    (header::CACHE_CONTROL, "no-cache"),
-                ],
-                body,
-            )
-                .into_response();
+            }));
         }
     };
     let messages = body
@@ -332,6 +339,22 @@ pub(crate) async fn llm_chat_stream(
         request_envelope["responseFormat"] = response_format.clone();
     }
     llm_stream_response(profile, request_envelope)
+}
+
+fn llm_stream_error_response(data: Value) -> Response {
+    let body = format!(
+        "event: provider_error\ndata: {}\n\n",
+        serde_json::to_string(&data)
+            .unwrap_or_else(|_| "{\"type\":\"provider_error\"}".to_string())
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 pub(crate) fn default_user_settings() -> Value {

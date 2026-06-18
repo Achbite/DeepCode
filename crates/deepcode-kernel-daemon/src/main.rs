@@ -86,7 +86,9 @@ async fn main() {
         )
         .route(
             "/api/session-store/:session_id/transcript",
-            get(session_store_transcript_get).post(session_store_transcript_append),
+            get(session_store_transcript_get)
+                .post(session_store_transcript_append)
+                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/session-store/:session_id/archive",
@@ -123,8 +125,14 @@ async fn main() {
             get(llm_profiles_get).patch(llm_profiles_patch),
         )
         .route("/api/llm/probe", post(llm_probe))
-        .route("/api/llm/chat", post(llm_chat))
-        .route("/api/llm/chat/stream", post(llm_chat_stream))
+        .route(
+            "/api/llm/chat",
+            post(llm_chat).layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/llm/chat/stream",
+            post(llm_chat_stream).layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+        )
         .route("/api/code/search", post(code_search))
         .route("/api/git/status", get(git_status))
         .route("/api/git/diff", get(git_diff))
