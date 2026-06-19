@@ -496,6 +496,15 @@ export function getAgentRun(
   return api.getAgentRun(sessionId, runId);
 }
 
+export function streamAgentRun(
+  sessionId: string,
+  runId: string,
+  onEvent: (event: api.AgentRunStreamEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  return api.streamAgentRun(sessionId, runId, onEvent, signal);
+}
+
 export function cancelAgentRunById(
   sessionId: string,
   runId: string

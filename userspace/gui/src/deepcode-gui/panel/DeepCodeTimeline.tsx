@@ -5,6 +5,7 @@ import type {
   AgentTimelineBlock,
   AgentTimelineResult,
   AgentTimelineTurn,
+  ProjectionDelta,
 } from '@deepcode/protocol';
 import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
 import { t, type UiLanguage } from '../../i18n';
@@ -19,6 +20,7 @@ interface DeepCodeTimelineProps {
   fallbackEvents: AgentEvent[];
   loading: boolean;
   language: UiLanguage;
+  activeDeltas?: ProjectionDelta[];
   onPlanResolve?: (
     runId: string,
     planId: string,
@@ -34,6 +36,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   fallbackEvents,
   loading,
   language,
+  activeDeltas = [],
   onPlanResolve,
 }) => {
   const fallbackTimeline = useMemo(
@@ -47,6 +50,10 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     () => normalizeNarrativeTimeline(timeline ?? fallbackTimeline),
     [fallbackTimeline, timeline]
   );
+  const viewWithActive = useMemo(
+    () => appendActiveDeltaTurn(view, activeDeltas, language),
+    [activeDeltas, language, view]
+  );
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLElement | null>(null);
@@ -56,8 +63,8 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   const liveScrollFrameRef = useRef<number | null>(null);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const scrollSignature = useMemo(
-    () => timelineScrollSignature(view, loading),
-    [view, loading]
+    () => timelineScrollSignature(viewWithActive, loading),
+    [viewWithActive, loading]
   );
   const typewriterEnabled = useSettingsStore((s) =>
     Boolean(s.effectiveSettings['gui.typewriterAnimation'] ?? true)
@@ -68,7 +75,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   const collapseCompletedThinking = useSettingsStore((s) =>
     Boolean(s.effectiveSettings['gui.collapseCompletedThinking'] ?? true)
   );
-  const typewriterBlockIds = useTypewriterBlockIds(view, loading && typewriterEnabled);
+  const typewriterBlockIds = useTypewriterBlockIds(viewWithActive, loading && typewriterEnabled);
   const timelineDensityClass = timelineDensity === 'compact' ? ' deepcode-gui-timeline--compact' : '';
 
   const setShouldFollow = useCallback((shouldFollow: boolean) => {
@@ -162,12 +169,12 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 
   return (
     <div className={`deepcode-gui-timeline${timelineDensityClass}`} ref={timelineRef}>
-      {view.turns.length === 0 && !loading && (
+      {viewWithActive.turns.length === 0 && !loading && (
         <div className="deepcode-gui-empty">
           <div className="deepcode-gui-empty__title">{t(language, 'deepcodeGui.status.ready')}</div>
         </div>
       )}
-      {view.turns.map((turn) => (
+      {viewWithActive.turns.map((turn) => (
         <TurnCard
           key={turn.id}
           turn={turn}
@@ -199,6 +206,199 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     </div>
   );
 };
+
+function appendActiveDeltaTurn(
+  view: AgentTimelineResult,
+  deltas: ProjectionDelta[],
+  language: UiLanguage
+): AgentTimelineResult {
+  const active = deltas
+    .filter((delta) => delta.sessionId === view.sessionId && delta.type !== 'committed')
+    .sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
+  if (active.length === 0) return view;
+
+  const runId = active.find((delta) => delta.runId)?.runId ?? 'active-run';
+  const turnId = active.find((delta) => delta.turnId)?.turnId ?? `active-${runId}`;
+  const status = activeTimelineStatus(active);
+  const parentDeltas = active.filter((delta) => !isBranchDelta(delta));
+  const branchDeltas = active.filter(isBranchDelta);
+  const reasoningMarkdown = parentDeltas
+    .filter((delta) => delta.type === 'reasoning_delta' && typeof delta.delta === 'string')
+    .map((delta) => delta.delta)
+    .join('');
+  const assistantMarkdown = parentDeltas
+    .filter((delta) => delta.type === 'assistant_delta' && typeof delta.delta === 'string')
+    .map((delta) => delta.delta)
+    .join('');
+  const branchReasoning = groupedBranchReasoning(branchDeltas);
+  const progressLines = active
+    .filter((delta) => delta.type !== 'reasoning_delta')
+    .filter((delta) => !parentTextDelta(delta))
+    .map((delta) => activeDeltaProgressLine(delta))
+    .filter((line): line is string => Boolean(line))
+    .slice(-32);
+
+  const blocks: AgentTimelineBlock[] = [];
+  if (reasoningMarkdown.trim()) {
+    blocks.push({
+      id: `active-thinking-${runId}`,
+      kind: 'thinking',
+      narrativeKind: 'thinking',
+      title: language === 'zh-CN' ? '思考中' : 'Thinking',
+      summary: language === 'zh-CN' ? 'Provider 正在输出 reasoning。' : 'Provider reasoning is streaming.',
+      status,
+      defaultCollapsed: false,
+      bodyMarkdown: reasoningMarkdown,
+      displayHints: {
+        renderMode: 'typewriter',
+        typewriterSpeed: 'slow',
+        initialOpen: true,
+        replaceOnComplete: true,
+      },
+      events: [],
+    });
+  }
+  for (const branch of branchReasoning) {
+    blocks.push({
+      id: `active-thinking-${runId}-${safeActiveBlockId(branch.key)}`,
+      kind: 'thinking',
+      narrativeKind: 'thinking',
+      title: language === 'zh-CN' ? `子代理思考 ${branch.label}` : `Sub-agent Thinking ${branch.label}`,
+      summary: language === 'zh-CN' ? '子代理正在生成任务草稿。' : 'A sub-agent branch is drafting a task fragment.',
+      status,
+      defaultCollapsed: true,
+      bodyMarkdown: branch.markdown,
+      displayHints: {
+        renderMode: 'typewriter',
+        typewriterSpeed: 'slow',
+        initialOpen: false,
+        replaceOnComplete: true,
+        density: 'compact',
+      },
+      events: [],
+    });
+  }
+  if (assistantMarkdown.trim()) {
+    blocks.push({
+      id: `active-assistant-${runId}`,
+      kind: 'assistant',
+      narrativeKind: 'assistantText',
+      title: 'DeepCode',
+      summary: language === 'zh-CN' ? 'DeepCode 正在回复。' : 'DeepCode is responding.',
+      status,
+      defaultCollapsed: false,
+      bodyMarkdown: assistantMarkdown,
+      displayHints: {
+        renderMode: 'typewriter',
+        typewriterSpeed: 'normal',
+        replaceOnComplete: true,
+      },
+      events: [],
+    });
+  }
+  if (progressLines.length > 0) {
+    blocks.push({
+      id: `active-progress-${runId}`,
+      kind: 'stage',
+      narrativeKind: 'operationEvidence',
+      title: language === 'zh-CN' ? '实时进度' : 'Live Progress',
+      summary: progressLines[progressLines.length - 1],
+      status,
+      defaultCollapsed: false,
+      bodyMarkdown: progressLines.map((line) => `- ${line}`).join('\n'),
+      displayHints: {
+        renderMode: 'instant',
+        density: 'compact',
+        evidenceMode: 'collapsed',
+        replaceOnComplete: true,
+      },
+      events: [],
+    });
+  }
+  if (blocks.length === 0) return view;
+
+  return {
+    ...view,
+    turns: [
+      ...view.turns,
+      {
+        id: `active-${turnId}`,
+        sessionId: view.sessionId,
+        status,
+        startedAt: active[0]?.payload && isRecord(active[0].payload)
+          ? stringField(active[0].payload, 'startedAt')
+          : undefined,
+        blocks,
+      },
+    ],
+  };
+}
+
+function isBranchDelta(delta: ProjectionDelta): boolean {
+  return Boolean(delta.branchId || delta.subAgentId);
+}
+
+function parentTextDelta(delta: ProjectionDelta): boolean {
+  return !isBranchDelta(delta) && (delta.type === 'reasoning_delta' || delta.type === 'assistant_delta');
+}
+
+function groupedBranchReasoning(deltas: ProjectionDelta[]): Array<{ key: string; label: string; markdown: string }> {
+  const groups = new Map<string, { key: string; label: string; parts: string[] }>();
+  for (const delta of deltas) {
+    if (delta.type !== 'reasoning_delta' || typeof delta.delta !== 'string') continue;
+    const key = delta.branchId ?? delta.subAgentId ?? 'branch';
+    const label = delta.subAgentId ?? delta.branchId ?? key;
+    const group = groups.get(key) ?? { key, label, parts: [] };
+    group.parts.push(delta.delta);
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .map((group) => ({ key: group.key, label: group.label, markdown: group.parts.join('') }))
+    .filter((group) => group.markdown.trim().length > 0);
+}
+
+function safeActiveBlockId(value: string): string {
+  const safe = value.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return safe || 'branch';
+}
+
+function activeTimelineStatus(deltas: ProjectionDelta[]): AgentTimelineTurn['status'] {
+  if (deltas.some((delta) => delta.status === 'failed' || delta.type === 'error')) return 'failed';
+  const latest = deltas[deltas.length - 1];
+  if (latest?.status === 'waiting') return 'waiting';
+  return 'running';
+}
+
+function activeDeltaProgressLine(delta: ProjectionDelta): string | null {
+  const summary = (delta.summary ?? '').trim();
+  const label = activeDeltaLabel(delta);
+  const branch = delta.branchId ? ` ${delta.branchId}` : '';
+  const target = delta.targetPath ? ` ${delta.targetPath}` : '';
+  if (summary) return `${label}${branch}${target}: ${summary}`;
+  if (delta.type === 'assistant_delta' && isBranchDelta(delta)) {
+    return `${label}${branch}${target}: sub-agent draft is streaming`;
+  }
+  if (delta.type === 'part_delta' || delta.type === 'draft_delta') {
+    return `${label}${branch}${target}`;
+  }
+  if (delta.type === 'tool_call_delta' || delta.type === 'resource_delta' || delta.type === 'workunit_delta') {
+    return `${label}${branch}${target}`;
+  }
+  return null;
+}
+
+function activeDeltaLabel(delta: ProjectionDelta): string {
+  if (delta.type === 'part_delta') return 'part';
+  if (delta.type === 'draft_delta') return 'draft';
+  if (delta.type === 'resource_delta') return 'resource';
+  if (delta.type === 'workunit_delta') return 'workunit';
+  if (delta.type === 'tool_call_delta') return 'tool';
+  if (delta.type === 'assistant_delta') return 'assistant';
+  if (delta.type === 'stage_delta') return delta.stage ?? 'stage';
+  if (delta.type === 'active_turn') return delta.stage ?? 'run';
+  if (delta.type === 'error') return 'error';
+  return delta.type;
+}
 
 function findTimelineScrollContainer(timelineElement: HTMLElement | null): HTMLElement | null {
   let element = timelineElement;

@@ -812,6 +812,27 @@
         "off": "Off"
       }
     },
+    "agent.interventionLevel": {
+      "label": "User Intervention Level",
+      "description": "Controls how often Agent asks the user to choose between engineering details before planning.",
+      "options": {
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High"
+      }
+    },
+    "agent.subagents.mode": {
+      "label": "Sub-agents",
+      "description": "Conservative parallel draft generation for independent accepted-plan tasks. Parent Session still validates and submits all work.",
+      "options": {
+        "auto": "Auto",
+        "off": "Off"
+      }
+    },
+    "agent.subagents.maxParallel": {
+      "label": "Sub-agent Max Parallel",
+      "description": "Maximum parallel sub-agent draft branches. Version 1 clamps this value to 2."
+    },
     "agent.permissions.allowFileRead": {
       "label": "Allow File Read",
       "description": "Allow Agent tools to read workspace files."

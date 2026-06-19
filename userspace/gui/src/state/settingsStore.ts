@@ -347,6 +347,24 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     ],
   },
   {
+    key: 'agent.subagents.mode',
+    label: 'Sub-agents',
+    description: 'Conservative parallel draft generation for independent accepted-plan tasks. Parent Session still validates and submits all work.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Auto', value: 'auto' },
+      { label: 'Off', value: 'off' },
+    ],
+  },
+  {
+    key: 'agent.subagents.maxParallel',
+    label: 'Sub-agent Max Parallel',
+    description: 'Maximum parallel sub-agent draft branches. Version 1 clamps this value to 2.',
+    group: 'agent',
+    control: 'number',
+  },
+  {
     key: 'agent.permissions.allowFileRead',
     label: 'Allow File Read',
     description: 'Allow Agent tools to read workspace files.',

@@ -84,6 +84,8 @@ export interface StartAgentRunRequest {
   requirementConfirmationMode?: 'auto' | 'always' | 'off';
   reviewContinuationMode?: 'auto' | 'ask' | 'off';
   interventionLevel?: 'low' | 'medium' | 'high';
+  subAgentMode?: 'auto' | 'off';
+  subAgentMaxParallel?: number;
   title?: string;
   decisionKind?: 'requirement' | 'plan' | 'review' | 'permission' | 'boundary';
   decision?: 'accept' | 'reject' | 'revise';
@@ -315,6 +317,79 @@ async function sendJson<T>(
     return (await response.json()) as ApiResponse<T>;
   } catch (err) {
     return toErrorResponse(err);
+  }
+}
+
+async function streamSse(
+  url: string,
+  onEvent: (event: AgentRunStreamEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const response = await fetch(url, {
+    headers: { Accept: 'text/event-stream' },
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await httpErrorMessage(response, url));
+  }
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error(`Streaming response has no body (${endpointLabel(url)})`);
+  }
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const consumed = consumeSseEvents(buffer);
+    buffer = consumed.remaining;
+    for (const event of consumed.items) onEvent(event);
+  }
+  buffer += decoder.decode();
+  const consumed = consumeSseEvents(`${buffer}\n\n`);
+  for (const event of consumed.items) onEvent(event);
+}
+
+function consumeSseEvents(buffer: string): { items: AgentRunStreamEvent[]; remaining: string } {
+  const items: AgentRunStreamEvent[] = [];
+  let remaining = buffer;
+  for (;;) {
+    const boundary = remaining.search(/\r?\n\r?\n/);
+    if (boundary < 0) break;
+    const raw = remaining.slice(0, boundary);
+    const separator = remaining.slice(boundary).match(/^\r?\n\r?\n/);
+    remaining = remaining.slice(boundary + (separator?.[0].length ?? 2));
+    const event = parseAgentRunSseEvent(raw);
+    if (event) items.push(event);
+  }
+  return { items, remaining };
+}
+
+function parseAgentRunSseEvent(raw: string): AgentRunStreamEvent | null {
+  if (!raw.trim()) return null;
+  let eventName: AgentRunStreamEvent['event'] = 'delta';
+  const data: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line || line.startsWith(':')) continue;
+    const separator = line.indexOf(':');
+    const field = separator >= 0 ? line.slice(0, separator) : line;
+    const value = separator >= 0 ? line.slice(separator + 1).replace(/^ /, '') : '';
+    if (field === 'event') eventName = value as AgentRunStreamEvent['event'];
+    if (field === 'data') data.push(value);
+  }
+  const payload = data.join('\n').trim();
+  if (!payload) return null;
+  try {
+    return { event: eventName, data: JSON.parse(payload) as unknown };
+  } catch {
+    return {
+      event: 'error',
+      data: {
+        code: 'invalid_sse_payload',
+        message: 'Agent run stream returned invalid JSON payload.',
+      },
+    };
   }
 }
 
@@ -659,6 +734,24 @@ export function getAgentRun(
 ): Promise<ApiResponse<AgentRunResult>> {
   return getJson<AgentRunResult>(
     `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`
+  );
+}
+
+export interface AgentRunStreamEvent {
+  event: 'run' | 'delta' | 'events' | 'terminal' | 'heartbeat' | 'error';
+  data: unknown;
+}
+
+export function streamAgentRun(
+  sessionId: string,
+  runId: string,
+  onEvent: (event: AgentRunStreamEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  return streamSse(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/stream`,
+    onEvent,
+    signal
   );
 }
 

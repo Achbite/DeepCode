@@ -46,6 +46,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const resolvingRequirement = useAgentSessionStore((s) => s.resolvingRequirement);
   const resolvingPlan = useAgentSessionStore((s) => s.resolvingPlan);
   const resolvingReview = useAgentSessionStore((s) => s.resolvingReview);
+  const activeDeltas = useAgentSessionStore((s) => s.activeDeltas);
   const loadOrCreate = useAgentSessionStore((s) => s.loadOrCreate);
   const refreshSessions = useAgentSessionStore((s) => s.refreshSessions);
   const setProfileId = useAgentSessionStore((s) => s.setProfileId);
@@ -214,6 +215,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         fallbackEvents={events}
         loading={sessionRunning}
         language={language}
+        activeDeltas={activeDeltas}
         onPlanResolve={(runId, planId, decision, guidance) =>
           void resolvePlan(runId, planId, decision, guidance)
         }

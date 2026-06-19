@@ -105,8 +105,8 @@ function writeLastAttachmentDirectory(workspaceRoot: string | undefined, absolut
   }
 }
 
-function isImeComposing(event: React.KeyboardEvent<HTMLTextAreaElement>): boolean {
-  const syntheticEvent = event as React.KeyboardEvent<HTMLTextAreaElement> & { isComposing?: boolean };
+function isImeComposing(event: React.KeyboardEvent<HTMLElement>): boolean {
+  const syntheticEvent = event as React.KeyboardEvent<HTMLElement> & { isComposing?: boolean };
   const nativeEvent = event.nativeEvent as KeyboardEvent & { isComposing?: boolean; keyCode?: number };
   return Boolean(
     syntheticEvent.isComposing ||
@@ -358,6 +358,32 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   };
 
   useEffect(() => {
+    if (!pendingDecision || pendingDecision.resolving) return;
+    setValue('');
+    const frame = window.requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [decisionKey]);
+
+  const handleDecisionShortcut = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (!pendingDecision || pendingDecision.resolving) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      setValue('');
+      void onDecisionReject?.();
+      return;
+    }
+    if (event.key === 'Enter' && !event.shiftKey) {
+      if (isImeComposing(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      send();
+    }
+  };
+
+  useEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
     textarea.style.height = '34px';
@@ -444,19 +470,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
           value={value}
           onChange={(event) => updateValue(event.target.value)}
           disabled={decisionResolving}
-          onKeyDown={(event) => {
-            if (pendingDecision && event.key === 'Escape') {
-              event.preventDefault();
-              setValue('');
-              if (!pendingDecision.resolving) void onDecisionReject?.();
-              return;
-            }
-            if (event.key === 'Enter' && !event.shiftKey) {
-              if (isImeComposing(event)) return;
-              event.preventDefault();
-              send();
-            }
-          }}
+          onKeyDown={handleDecisionShortcut}
           placeholder={pendingDecision ? decisionPlaceholder(pendingDecision, language) : undefined}
         />
         {mention && (
@@ -473,7 +487,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   return (
     <div className={`agent-composer${composerExpanded ? ' agent-composer--expanded' : ''}${pendingDecision ? ' agent-composer--decision' : ''}`}>
       {decisionText && (
-        <div className="agent-composer-decision">
+        <div className="agent-composer-decision" onKeyDown={handleDecisionShortcut}>
           <div className="agent-composer-decision__header">
             <div className="agent-composer-decision__title">{decisionText.title}</div>
             {technicalChoiceOptions.length > 0 && (

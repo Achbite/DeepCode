@@ -812,6 +812,27 @@
         "off": "关闭"
       }
     },
+    "agent.interventionLevel": {
+      "label": "用户介入粒度",
+      "description": "控制 Agent 在规划前请求用户选择工程细节的频率。",
+      "options": {
+        "low": "低",
+        "medium": "中",
+        "high": "高"
+      }
+    },
+    "agent.subagents.mode": {
+      "label": "子代理",
+      "description": "对已确认计划中的独立任务进行保守并行草稿生成。最终校验与提交仍由父 Session 完成。",
+      "options": {
+        "auto": "自动",
+        "off": "关闭"
+      }
+    },
+    "agent.subagents.maxParallel": {
+      "label": "子代理最大并发",
+      "description": "子代理并行草稿分支上限。v1 会保守限制为 2。"
+    },
     "agent.permissions.allowFileRead": {
       "label": "允许读取文件",
       "description": "允许 Agent 工具读取工作区文件。"

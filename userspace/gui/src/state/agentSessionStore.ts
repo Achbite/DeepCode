@@ -9,6 +9,7 @@ import type {
   AgentWorkflowMode,
   ListAgentSessionsRequest,
   PermissionRequest,
+  ProjectionDelta,
 } from '@deepcode/protocol';
 import {
   createWorkspaceBinding,
@@ -33,6 +34,7 @@ import {
   patchAgentWorkflowConfig,
   renameAgentSession,
   startAgentRun,
+  streamAgentRun,
   submitAgentRunGuidance,
 } from '../services/runtimeAdapter';
 import type { AgentRunResult, StartAgentRunRequest } from '../services/apiClient';
@@ -82,6 +84,7 @@ interface AgentSessionState {
   workspaceScopeKey?: string;
   events: AgentEvent[];
   traceEvents: AgentTraceEvent[];
+  activeDeltas: ProjectionDelta[];
   mode: AgentMode;
   workflow: AgentWorkflowMode;
   workflowConfig: AgentWorkflowConfig | null;
@@ -159,6 +162,15 @@ function settingInterventionLevel(value: unknown): 'low' | 'medium' | 'high' {
   return value === 'low' || value === 'high' ? value : 'medium';
 }
 
+function settingSubAgentMode(value: unknown): 'auto' | 'off' {
+  return value === 'off' ? 'off' : 'auto';
+}
+
+function settingSubAgentMaxParallel(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(numeric) && numeric >= 2 ? 2 : 2;
+}
+
 function createLocalEvent(
   sessionId: string,
   kind: AgentEvent['kind'],
@@ -222,6 +234,46 @@ function removeRunningSessionId(ids: string[], sessionId: string): string[] {
   return ids.filter((id) => id !== sessionId);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function mergeEventsById(existing: AgentEvent[], incoming: AgentEvent[]): AgentEvent[] {
+  const byId = new Map<string, AgentEvent>();
+  for (const event of existing) byId.set(event.id, event);
+  for (const event of incoming) byId.set(event.id, event);
+  return [...byId.values()].sort((left, right) => (left.ts ?? '').localeCompare(right.ts ?? ''));
+}
+
+function streamHandlersForSession(sessionId: string): {
+  onDelta: (delta: ProjectionDelta) => void;
+  onEvents: (events: AgentEvent[]) => void;
+} {
+  return {
+    onDelta: (delta) => {
+      if (delta.sessionId !== sessionId) return;
+      const activeSession = useAgentSessionStore.getState().session;
+      if (activeSession?.id !== sessionId) return;
+      useAgentSessionStore.setState((state) => ({
+        activeDeltas: [...state.activeDeltas, delta].slice(-1200),
+      }));
+    },
+    onEvents: (events) => {
+      if (!events.length) return;
+      refreshWorkspaceTreeForToolFacts(events);
+      const activeSession = useAgentSessionStore.getState().session;
+      if (activeSession?.id !== sessionId) return;
+      useAgentSessionStore.setState((state) => {
+        const merged = mergeEventsById(state.events, events);
+        return {
+          events: merged,
+          pendingPermission: findLatestPendingPermission(merged),
+        };
+      });
+    },
+  };
+}
+
 function isTerminalRunStatus(status: string): boolean {
   return status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'waiting';
 }
@@ -232,7 +284,11 @@ function sleep(ms: number): Promise<void> {
 
 async function startAndWaitAgentRun(
   sessionId: string,
-  request: StartAgentRunRequest
+  request: StartAgentRunRequest,
+  handlers: {
+    onDelta?: (delta: ProjectionDelta) => void;
+    onEvents?: (events: AgentEvent[]) => void;
+  } = {}
 ): Promise<AgentRunResult> {
   const started = await startAgentRun(sessionId, request);
   if (!started.ok || !started.data) {
@@ -240,6 +296,20 @@ async function startAndWaitAgentRun(
   }
   let result = started.data;
   activeAgentRunIds.set(sessionId, result.run.runId);
+  const controller = new AbortController();
+  const streamDone = streamAgentRun(sessionId, result.run.runId, (event) => {
+    const data = event.data;
+    if (event.event === 'delta' && isRecord(data)) {
+      const delta = data.delta;
+      if (isRecord(delta)) handlers.onDelta?.(delta as unknown as ProjectionDelta);
+    }
+    if (event.event === 'events' && isRecord(data) && Array.isArray(data.events)) {
+      handlers.onEvents?.(data.events.filter(isRecord) as unknown as AgentEvent[]);
+    }
+    if (event.event === 'terminal' && isRecord(data) && Array.isArray(data.events)) {
+      handlers.onEvents?.(data.events.filter(isRecord) as unknown as AgentEvent[]);
+    }
+  }, controller.signal).catch(() => undefined);
   try {
     while (!isTerminalRunStatus(result.run.status)) {
       await sleep(300);
@@ -251,6 +321,8 @@ async function startAndWaitAgentRun(
     }
     return result;
   } finally {
+    controller.abort();
+    await streamDone;
     if (activeAgentRunIds.get(sessionId) === result.run.runId) {
       activeAgentRunIds.delete(sessionId);
     }
@@ -292,6 +364,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   workspaceScopeKey: undefined,
   events: [],
   traceEvents: [],
+  activeDeltas: [],
   mode: 'plan',
   workflow: 'planFirst',
   workflowConfig: null,
@@ -640,6 +713,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
       events: [...state.events, localUserEvent],
       messageAttachments: [],
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
+      activeDeltas: [],
       errorMessage: null,
     }));
 
@@ -682,7 +756,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
-      });
+        subAgentMode: settingSubAgentMode(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
+        ),
+        subAgentMaxParallel: settingSubAgentMaxParallel(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
+        ),
+      }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
         events: result.events,
@@ -699,6 +779,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           resolvingRequirement: null,
           resolvingPlan: null,
           resolvingReview: null,
+          activeDeltas: [],
         };
         if (isActiveSession) {
           nextState.session = data.session;
@@ -722,6 +803,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
           : state.events,
         errorMessage: state.session?.id === session.id ? message : state.errorMessage,
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+        activeDeltas: [],
       }));
     }
 
@@ -740,6 +822,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     const activeRunId = activeAgentRunIds.get(session.id);
     set((state) => ({
       runningSessionIds: removeRunningSessionId(state.runningSessionIds, session.id),
+      activeDeltas: [],
       queuedMessages: [],
       pendingPermission: null,
       resolvingPermission: null,
@@ -831,7 +914,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
-      });
+        subAgentMode: settingSubAgentMode(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
+        ),
+        subAgentMaxParallel: settingSubAgentMaxParallel(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
+        ),
+      }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
         events: result.events,
@@ -844,6 +933,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         events: data.events,
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
+        activeDeltas: [],
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
       void get().refreshTraceEvents(data.session.id);
@@ -866,6 +956,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set((state) => ({
       resolvingPermission: { id: pending.request.id, decision: 'reject' },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
+      activeDeltas: [],
       errorMessage: null,
     }));
     let progressTimer: number | undefined;
@@ -902,7 +993,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
-      });
+        subAgentMode: settingSubAgentMode(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
+        ),
+        subAgentMaxParallel: settingSubAgentMaxParallel(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
+        ),
+      }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
         events: result.events,
@@ -915,6 +1012,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         events: data.events,
         pendingPermission: findLatestPendingPermission(data.events),
         resolvingPermission: null,
+        activeDeltas: [],
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
       void get().refreshTraceEvents(data.session.id);
@@ -937,6 +1035,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set((state) => ({
       resolvingRequirement: { runId, requirementId, decision },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
+      activeDeltas: [],
       errorMessage: null,
     }));
 
@@ -976,7 +1075,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
-      });
+        subAgentMode: settingSubAgentMode(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
+        ),
+        subAgentMaxParallel: settingSubAgentMaxParallel(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
+        ),
+      }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
         events: result.events,
@@ -994,6 +1099,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         resolvingPermission: null,
         resolvingPlan: null,
         resolvingReview: null,
+        activeDeltas: [],
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
       void get().refreshTraceEvents(data.session.id);
@@ -1015,6 +1121,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set((state) => ({
       resolvingPlan: { runId, planId, decision },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
+      activeDeltas: [],
       errorMessage: null,
     }));
     let progressTimer: number | undefined;
@@ -1052,7 +1159,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
-      });
+        subAgentMode: settingSubAgentMode(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
+        ),
+        subAgentMaxParallel: settingSubAgentMaxParallel(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
+        ),
+      }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
         events: result.events,
@@ -1070,6 +1183,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         resolvingRequirement: null,
         resolvingPlan: null,
         resolvingReview: null,
+        activeDeltas: [],
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
       void get().refreshTraceEvents(data.session.id);
@@ -1091,6 +1205,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
     set((state) => ({
       resolvingReview: { runId, decision },
       runningSessionIds: addRunningSessionId(state.runningSessionIds, session.id),
+      activeDeltas: [],
       errorMessage: null,
     }));
     let progressTimer: number | undefined;
@@ -1130,7 +1245,13 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
-      });
+        subAgentMode: settingSubAgentMode(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
+        ),
+        subAgentMaxParallel: settingSubAgentMaxParallel(
+          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
+        ),
+      }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
         events: result.events,
@@ -1148,6 +1269,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         resolvingRequirement: null,
         resolvingPlan: null,
         resolvingReview: null,
+        activeDeltas: [],
         runningSessionIds: removeRunningSessionId(state.runningSessionIds, data.session.id),
       }));
       void get().refreshTraceEvents(data.session.id);
