@@ -203,18 +203,6 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
 
   if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
   const rawEventRefs = input.events.map(eventRefForAgentEvent);
-  const taskItems = turns.flatMap((turn) =>
-    turn.blocks
-      .filter((block) => block.displayHints?.showInTaskList)
-      .map((block) => ({
-        id: block.taskProjectionRef ?? `task-${block.id}`,
-        title: block.displayHints?.taskListLabel ?? block.title,
-        summary: block.displayHints?.taskListSummary ?? block.summary,
-        status: block.status,
-        blockId: block.id,
-        narrativeKind: block.narrativeKind ?? narrativeKindForLegacyKind(block.kind),
-      }))
-  );
   const implementationTaskItems = input.events.flatMap((event, index) =>
     implementationPlanTaskProjectionItems(input.events, event, index)
   );
@@ -227,7 +215,7 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     eventCount: input.events.length,
     taskProjection: {
       title: 'Task projection',
-      items: [...taskItems, ...implementationTaskItems].slice(-8),
+      items: implementationTaskItems.slice(-8),
     },
     tokenUsageProjection: buildTokenUsageProjection(input.events),
     rawEventRefs,

@@ -5,16 +5,17 @@ import type { CompiledRuler } from './ruler.js';
 
 export interface PromptSystemLayer {
   name:
+    | 'protectedStablePrefix'
     | 'protocolContract'
     | 'builtinSystemPrompt'
     | 'systemStructure'
     | 'capabilityProjection'
     | 'rulerContext'
     | 'authoritativeDocExcerpts'
-    | 'stableMemoryHints'
+    | 'projectMemory'
     | 'reusableResourceContext'
     | 'requirementTranscript'
-    | 'shortTermMemoryHints'
+    | 'sessionMemory'
     | 'agentInterventionPolicy'
     | 'currentUserOverlay'
     | 'userGuidance'
@@ -31,6 +32,8 @@ export interface PromptSystemLayer {
 export type PromptSegmentCacheClass =
   | 'globalStable'
   | 'workspaceStable'
+  | 'projectMemory'
+  | 'sessionMemory'
   | 'requirementAppendOnly'
   | 'reusableResource'
   | 'turnDynamic'
@@ -55,6 +58,8 @@ export interface PromptEnvelopeBuilderInput {
   memoryHints?: string[];
   stableMemoryHints?: string[];
   dynamicMemoryHints?: string[];
+  projectMemoryHints?: string[];
+  sessionMemoryHints?: string[];
   interventionLevel?: 'low' | 'medium' | 'high';
   userOverlay?: string;
   userGuidance?: Array<{

@@ -104,7 +104,7 @@ export interface LlmChatRequest {
 }
 
 export interface LlmChatChunk {
-  type: 'delta' | 'reasoning_delta' | 'tool_call' | 'done' | 'error';
+  type: 'delta' | 'reasoning_delta' | 'tool_call' | 'part' | 'done' | 'error';
   content?: string;
   toolCall?: ToolCall;
   toolCallDelta?: {
@@ -119,6 +119,38 @@ export interface LlmChatChunk {
   finishReason?: string;
   usage?: Record<string, unknown>;
   rawProvider?: unknown;
+}
+
+export type AgentStreamPartKind =
+  | 'thinkingDelta'
+  | 'codeBlockChunk'
+  | 'actionDraftChunk'
+  | 'fileDone'
+  | 'batchDone'
+  | 'diagnostic';
+
+export interface AgentStreamPartFrame {
+  schemaVersion: 'deepcode.agent.stream.part.v1';
+  partKind: AgentStreamPartKind;
+  draftId?: string;
+  frameId?: string;
+  runId?: string;
+  targetPath?: string;
+  language?: string;
+  capability?: string;
+  blockId?: string;
+  actionId?: string;
+  sequence?: number;
+  chunk?: string;
+  contentHash?: string;
+  summary?: string;
+  diagnostic?: {
+    severity?: 'info' | 'warning' | 'error';
+    code?: string;
+    message?: string;
+  };
+  resumeHandle?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface LlmChatResult {
@@ -148,6 +180,8 @@ export type ProjectionDeltaType =
   | 'assistant_delta'
   | 'reasoning_delta'
   | 'tool_call_delta'
+  | 'part_delta'
+  | 'draft_delta'
   | 'resource_delta'
   | 'workunit_delta'
   | 'stage_delta'
@@ -163,7 +197,7 @@ export interface ProjectionDelta {
   itemId?: string;
   stage?: string;
   status?: 'queued' | 'running' | 'streaming' | 'waiting' | 'completed' | 'failed';
-  channel?: 'progress' | 'reasoning' | 'final' | 'tool' | 'resource' | 'workunit';
+  channel?: 'progress' | 'reasoning' | 'final' | 'tool' | 'resource' | 'workunit' | 'draft';
   source?: 'session' | 'driver' | 'llm' | 'kernel' | 'provider';
   delta?: string;
   summary?: string;

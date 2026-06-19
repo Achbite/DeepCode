@@ -1,8 +1,10 @@
 import type { AgentEvent } from '@deepcode/protocol';
 
 export interface SessionMemoryDocument {
-  schemaVersion: '2';
+  schemaVersion: '3';
   sourceEventCount: number;
+  projectMemoryContext: string[];
+  sessionMemoryContext: string[];
   longTermContext: string[];
   shortTermContext: string[];
   guidanceContext: string[];
@@ -208,8 +210,20 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
   }
 
   return {
-    schemaVersion: '2',
+    schemaVersion: '3',
     sourceEventCount: events.length,
+    projectMemoryContext: capMemoryLines(dedupeKeepLast([
+      ...longTermContext,
+      ...resourceContext.map((item) => `Project resource index: ${item}`),
+      ...factContext.map((item) => `Project fact index: ${item}`),
+      ...decisionContext.map((item) => `Cross-session decision index: ${item}`),
+    ], 40), 128_000),
+    sessionMemoryContext: capMemoryLines(dedupeKeepLast([
+      ...shortTermContext,
+      ...intentContext.map((item) => `Session intent: ${item}`),
+      ...guidanceContext.map((item) => `Session guidance: ${item}`),
+      ...decisionContext.map((item) => `Session decision: ${item}`),
+    ], 48), 256_000),
     longTermContext: dedupeKeepLast(longTermContext, 18),
     shortTermContext: dedupeKeepLast(shortTermContext, 12),
     guidanceContext: dedupeKeepLast(guidanceContext, 10),
@@ -218,6 +232,42 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
     decisionContext: decisionContext.slice(-10),
     resourceContext: resourceContext.slice(-12),
   };
+}
+
+export function renderProjectMemoryHints(document: SessionMemoryDocument): string[] {
+  const lines = document.projectMemoryContext.length
+    ? document.projectMemoryContext
+    : [
+      ...document.longTermContext,
+      ...document.resourceContext.map((item) => `Project resource index: ${item}`),
+      ...document.factContext.map((item) => `Project fact index: ${item}`),
+      ...document.decisionContext.map((item) => `Cross-session decision index: ${item}`),
+    ];
+  return [
+    'ProjectMemory document (project-scoped, 128k soft cap):',
+    'Boundary: shared project memory stores durable norms, user preferences, historical gotchas, long-term planning summaries, and cross-session decision indexes. It is not Kernel authority and must be refreshed from ResourcePacket/tool facts when code may have changed.',
+    lines.length
+      ? `projectMemoryContext:\n${capMemoryLines(lines, 128_000).map((item) => `- ${item}`).join('\n')}`
+      : 'projectMemoryContext: none',
+  ];
+}
+
+export function renderSessionScopedMemoryHints(document: SessionMemoryDocument): string[] {
+  const lines = document.sessionMemoryContext.length
+    ? document.sessionMemoryContext
+    : [
+      ...document.shortTermContext,
+      ...document.intentContext.map((item) => `Session intent: ${item}`),
+      ...document.guidanceContext.map((item) => `Session guidance: ${item}`),
+      ...document.decisionContext.map((item) => `Session decision: ${item}`),
+    ];
+  return [
+    'SessionMemory document (single-session, 256k soft cap):',
+    'Boundary: session memory stores the active task focus, accepted plan, user guidance, review decisions, and compressed local conversation summary. It must not crowd out current user input or EvidenceTail facts.',
+    lines.length
+      ? `sessionMemoryContext:\n${capMemoryLines(lines, 256_000).map((item) => `- ${item}`).join('\n')}`
+      : 'sessionMemoryContext: none',
+  ];
 }
 
 export function renderSessionMemoryHints(document: SessionMemoryDocument): string[] {
@@ -240,38 +290,11 @@ export function renderSessionMemoryHints(document: SessionMemoryDocument): strin
 }
 
 export function renderStableSessionMemoryHints(document: SessionMemoryDocument): string[] {
-  return [
-    'Session memory stable document:',
-    'Boundary: these summaries are append-only continuity hints. They are not proof of execution unless they explicitly cite Kernel facts or ResourcePacket/tool facts.',
-    document.longTermContext.length
-      ? `longTermContext:\n${document.longTermContext.map((item) => `- ${item}`).join('\n')}`
-      : 'longTermContext: none',
-    document.resourceContext.length
-      ? `resourceContext:\n${document.resourceContext.map((item) => `- ${item}`).join('\n')}`
-      : 'resourceContext: none',
-    document.factContext.length
-      ? `factContext:\n${document.factContext.map((item) => `- ${item}`).join('\n')}`
-      : 'factContext: none',
-    document.decisionContext.length
-      ? `decisionContext:\n${document.decisionContext.map((item) => `- ${item}`).join('\n')}`
-      : 'decisionContext: none',
-  ];
+  return renderProjectMemoryHints(document);
 }
 
 export function renderDynamicSessionMemoryHints(document: SessionMemoryDocument): string[] {
-  return [
-    'Session memory dynamic document:',
-    'Boundary: these short-term hints guide the next proposal only. Do not promote them to facts without Kernel or ResourcePacket evidence.',
-    document.shortTermContext.length
-      ? `shortTermContext:\n${document.shortTermContext.map((item) => `- ${item}`).join('\n')}`
-      : 'shortTermContext: none',
-    document.intentContext.length
-      ? `intentContext:\n${document.intentContext.map((item) => `- ${item}`).join('\n')}`
-      : 'intentContext: none',
-    document.guidanceContext.length
-      ? `guidanceContext:\n${document.guidanceContext.map((item) => `- ${item}`).join('\n')}`
-      : 'guidanceContext: none',
-  ];
+  return renderSessionScopedMemoryHints(document);
 }
 
 export function collectUserGuidanceEvents(events: AgentEvent[], runId?: string): UserGuidanceEvent[] {
@@ -386,6 +409,19 @@ function dedupeKeepLast(values: string[], maxItems: number): string[] {
     if (result.length >= maxItems) break;
   }
   return result.reverse();
+}
+
+function capMemoryLines(values: string[], softTokenCap: number): string[] {
+  const maxChars = softTokenCap * 4;
+  const result: string[] = [];
+  let total = 0;
+  for (const value of values) {
+    const nextLength = value.length + 3;
+    if (total + nextLength > maxChars) break;
+    result.push(value);
+    total += nextLength;
+  }
+  return result;
 }
 
 function dedupeGuidance(values: UserGuidanceEvent[]): UserGuidanceEvent[] {

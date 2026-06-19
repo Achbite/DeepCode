@@ -2,6 +2,7 @@ import type {
   AgentContextAttachment,
   AgentEvent,
   AgentSessionResult,
+  AgentStreamPartFrame,
   AgentWorkspaceBinding,
   ApiResponse,
   KernelCommandEnvelope,
@@ -216,6 +217,7 @@ interface ActiveTurnState {
   seq: number;
   stage: string;
   providerCallId?: string;
+  partFrameParser?: ProviderPartFrameParser;
 }
 
 interface NativeToolCallProposal {
@@ -2292,11 +2294,11 @@ export class SessionDriverLoop {
       source: 'provider',
       summary: providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
     });
-    const content = result.data.assistantMessage?.content
+    const content = stripProviderPartFrames(result.data.assistantMessage?.content
       ?? result.data.chunks
         .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
         .map((chunk) => chunk.content)
-        .join('');
+        .join(''));
     const toolCalls = collectNativeToolCalls(result.data, toolCallBuffer);
     if (!content.trim() && toolCalls.length === 0) {
       throw new SessionDriverLoopError('llm_empty_response', 'LLM provider returned an empty response.');
@@ -2317,6 +2319,10 @@ export class SessionDriverLoop {
   ): Promise<void> {
     const chunk = event.chunk;
     if (event.type === 'provider_delta' && chunk?.content) {
+      const frames = this.consumeProviderPartFrames(state, stage, chunk.content);
+      for (const frame of frames) {
+        await this.submitProviderPartFrame(state, stage, frame);
+      }
       if (providerStageExposesAssistantDelta(stage)) {
         await this.emitProjectionDelta(state, {
           type: 'assistant_delta',
@@ -2413,6 +2419,79 @@ export class SessionDriverLoop {
       turnId: activeTurn.turnId,
       seq: activeTurn.seq,
     });
+  }
+
+  private consumeProviderPartFrames(
+    state: SessionDriverLoopRunState,
+    stage: string,
+    content: string
+  ): AgentStreamPartFrame[] {
+    const activeTurn = state.activeTurn ?? {
+      turnId: this.id('active-turn'),
+      seq: 0,
+      stage,
+    };
+    activeTurn.partFrameParser ??= new ProviderPartFrameParser();
+    state.activeTurn = activeTurn;
+    return activeTurn.partFrameParser.push(content);
+  }
+
+  private async submitProviderPartFrame(
+    state: SessionDriverLoopRunState,
+    stage: string,
+    frame: AgentStreamPartFrame
+  ): Promise<void> {
+    await this.emitProjectionDelta(state, {
+      type: 'part_delta',
+      stage,
+      status: 'streaming',
+      channel: frame.partKind === 'thinkingDelta' ? 'reasoning' : 'draft',
+      source: 'session',
+      itemId: frame.frameId ?? frame.draftId,
+      delta: frame.chunk,
+      summary: frame.summary ?? `Provider stream part: ${frame.partKind}`,
+      payload: frame,
+    });
+
+    const reply = await this.ports.kernelCommand({
+      requestId: this.id('draft-ledger-submit'),
+      command: {
+        kind: 'draftLedgerSubmit',
+        requestId: this.id('draft-ledger'),
+        runId: state.runId,
+        sessionId: state.sessionId,
+        frame: {
+          ...frame,
+          runId: frame.runId ?? state.runId,
+        },
+      },
+    });
+    if (!reply.ok) {
+      await this.emitProjectionDelta(state, {
+        type: 'error',
+        stage,
+        status: 'failed',
+        channel: 'draft',
+        source: 'kernel',
+        itemId: frame.frameId ?? frame.draftId,
+        summary: reply.error?.message ?? 'Kernel draft ledger rejected provider stream part.',
+        payload: reply.error,
+      });
+      return;
+    }
+    for (const event of reply.events) {
+      const record = objectRecord(event);
+      await this.emitProjectionDelta(state, {
+        type: 'draft_delta',
+        stage,
+        status: 'streaming',
+        channel: 'draft',
+        source: 'kernel',
+        itemId: stringValue(record?.draftId) ?? frame.draftId,
+        summary: stringValue(record?.summary) ?? stringValue(objectRecord(record?.draft)?.summary),
+        payload: event,
+      });
+    }
   }
 
   private async appendProviderTrace(
@@ -2539,6 +2618,61 @@ export class SessionDriverLoopError extends Error {
   ) {
     super(message);
     this.name = 'SessionDriverLoopError';
+  }
+}
+
+class ProviderPartFrameParser {
+  private buffer = '';
+
+  push(content: string): AgentStreamPartFrame[] {
+    this.buffer = `${this.buffer}${content}`;
+    if (this.buffer.length > 512 * 1024) {
+      this.buffer = this.buffer.slice(-256 * 1024);
+    }
+    return [
+      ...this.consumeNdjsonFrames(),
+      ...this.consumeTaggedFrames(),
+    ];
+  }
+
+  private consumeTaggedFrames(): AgentStreamPartFrame[] {
+    const frames: AgentStreamPartFrame[] = [];
+    const startTag = '<deepcode-part>';
+    const endTag = '</deepcode-part>';
+    while (true) {
+      const start = this.buffer.indexOf(startTag);
+      if (start < 0) {
+        if (this.buffer.length > startTag.length) {
+          this.buffer = this.buffer.slice(-(startTag.length - 1));
+        }
+        break;
+      }
+      const payloadStart = start + startTag.length;
+      const end = this.buffer.indexOf(endTag, payloadStart);
+      if (end < 0) {
+        if (start > 0) this.buffer = this.buffer.slice(start);
+        break;
+      }
+      const raw = this.buffer.slice(payloadStart, end);
+      this.buffer = this.buffer.slice(end + endTag.length);
+      const frame = parseProviderPartFrame(raw);
+      if (frame) frames.push(frame);
+    }
+    return frames;
+  }
+
+  private consumeNdjsonFrames(): AgentStreamPartFrame[] {
+    const frames: AgentStreamPartFrame[] = [];
+    while (true) {
+      const newline = this.buffer.indexOf('\n');
+      if (newline < 0) break;
+      const line = this.buffer.slice(0, newline).trim();
+      if (!line.includes('"deepcode.agent.stream.part.v1"')) break;
+      this.buffer = this.buffer.slice(newline + 1);
+      const frame = parseProviderPartFrame(line);
+      if (frame) frames.push(frame);
+    }
+    return frames;
   }
 }
 
@@ -2966,9 +3100,7 @@ function buildImplementationBatchContext(events: AgentEvent[]): ImplementationBa
         : '';
     if (summary.trim()) recentPlanSummaries.push(clip(summary.trim(), 240));
     const actionBundle = objectRecord(payload.actionBundle);
-    const continuations = Array.isArray(actionBundle?.continuationExpectations)
-      ? actionBundle.continuationExpectations
-      : [];
+    const continuations = concreteContinuationExpectations(actionBundle?.continuationExpectations);
     for (const continuation of continuations) {
       const record = objectRecord(continuation);
       const title = typeof record?.title === 'string' ? record.title.trim() : '';
@@ -2984,6 +3116,21 @@ function buildImplementationBatchContext(events: AgentEvent[]): ImplementationBa
     recentPlanSummaries: recentPlanSummaries.slice(-3),
     continuationSummaries: continuationSummaries.slice(-6),
   };
+}
+
+function concreteContinuationExpectations(value: unknown): unknown[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item) => continuationHasConcreteScope(item));
+}
+
+function continuationHasConcreteScope(item: unknown): boolean {
+  const record = objectRecord(item);
+  if (!record) return false;
+  const scopes = [
+    ...stringArrayValue(record.targetPath),
+    ...stringArrayValue(record.resourceScope),
+  ];
+  return scopes.some((scope) => Boolean(concreteFileOperationTarget(scope)));
 }
 
 function implementationBatchHints(
@@ -3476,6 +3623,7 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
         auditOnly: true,
         requiredPermissions: Array.isArray(report.requiredPermissions) ? report.requiredPermissions : [],
         permissionGaps: Array.isArray(report.permissionGaps) ? report.permissionGaps : [],
+        requiredFileOperations: requiredFileOperationsFromReport(report),
         facts: planReviewFacts(report),
         channel: 'trace',
         visibility: 'debug',
@@ -3865,6 +4013,15 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
     const replacementBlockId = typeof action.replacementBlockId === 'string'
       ? action.replacementBlockId.trim()
       : '';
+    if (action.capability === 'workspace.delete') {
+      const deleteTargetError = deleteActionTargetError(action);
+      if (deleteTargetError) {
+        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${deleteTargetError}`);
+      }
+      if (action.sourceBlockId?.trim() || replacementBlockId) {
+        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] workspace.delete must not reference codeBlocks/sourceBlockId.`);
+      }
+    }
     if ((action.capability === 'workspace.write' || action.capability === 'workspace.create') && !isPatchAction && !action.sourceBlockId?.trim()) {
       throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${action.capability} must include sourceBlockId.`);
     }
@@ -3916,6 +4073,34 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
       'Side-effect actionBundle must include non-empty reviewExpectations describing user review obligations.'
     );
   }
+}
+
+function deleteActionTargetError(action: ActionBundleDraft['actions'][number]): string | undefined {
+  const kind = stringValue(action.kind);
+  if (kind !== 'delete') {
+    return 'workspace.delete must use kind="delete".';
+  }
+  const target = stringValue(action.targetPath) ?? stringArrayValue(action.resourceScope)[0];
+  if (!target) {
+    return 'workspace.delete must include a concrete targetPath or resourceScope[0].';
+  }
+  const normalized = normalizeSlashes(target);
+  if (!normalized || normalized === '.' || normalized === './') {
+    return 'workspace.delete target cannot be empty or the workspace root.';
+  }
+  if (isAbsolutePath(normalized)) {
+    return 'workspace.delete target must be relative to the primary workspace root.';
+  }
+  if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) {
+    return 'workspace.delete target cannot escape the primary workspace root.';
+  }
+  if (normalized.includes('*')) {
+    return 'workspace.delete target must name concrete files; wildcard cleanup is not allowed.';
+  }
+  if (normalized.endsWith('/')) {
+    return 'workspace.delete target must name concrete files, not a directory root.';
+  }
+  return undefined;
 }
 
 function validateDetailedUserPlan(userPlan: string): void {
@@ -3982,6 +4167,7 @@ function actionBundlePlanCardEvent(
       expectedValidation: typeof payload.expectedValidation === 'string' ? payload.expectedValidation : '',
       reviewGuide: typeof payload.reviewGuide === 'string' ? payload.reviewGuide : '',
       planReviewReport: report,
+      requiredFileOperations: requiredFileOperationsFromReport(report),
       channel: 'action',
       visibility: 'conversation',
       presentation: 'body',
@@ -4195,6 +4381,9 @@ function planReviewFacts(report: Record<string, unknown> | undefined): string[] 
     const code = typeof record?.code === 'string' ? record.code : '';
     const message = typeof record?.message === 'string' ? record.message : '';
     if (code || message) facts.push(`finding: ${[code, message].filter(Boolean).join(' - ')}`);
+  }
+  for (const operation of requiredFileOperationsFromReport(report)) {
+    facts.push(`fileOperation: ${operation.operation} ${operation.targetPath} (${operation.capability})`);
   }
   return facts;
 }
@@ -4865,6 +5054,7 @@ function planReviewDecisionEvent(
       planId: plan.planId,
       confirmable: false,
       facts: planReviewFacts(plan.planReviewReport),
+      requiredFileOperations: requiredFileOperationsFromReport(plan.planReviewReport),
       channel: status === 'accepted' ? 'progress' : 'final',
       visibility: 'conversation',
       presentation: 'body',
@@ -4968,16 +5158,59 @@ function temporaryGrantsForPlan(plan: SessionPlanContext): Record<string, unknow
   const gaps = Array.isArray(report.permissionGaps)
     ? report.permissionGaps.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     : [];
+  const gapSet = new Set(gaps);
+  const fileOperations = requiredFileOperationsFromReport(report);
   const grants: Record<string, unknown>[] = [];
   const seen = new Set<string>();
-  for (const capability of gaps) {
+  for (const operation of fileOperations) {
+    const capability = operation.capability;
+    if (!gapSet.has(capability)) continue;
     if (!planAcceptedAutoGrantCapability(capability)) continue;
-    const key = capability;
+    const targetPath = concreteFileOperationTarget(operation.targetPath);
+    if (!targetPath) continue;
+    const key = `${capability}\0${targetPath}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    grants.push(temporaryGrant(plan, capability));
+    grants.push(temporaryGrant(plan, capability, targetPath));
   }
   return grants;
+}
+
+interface RequiredFileOperationProjection {
+  operation: string;
+  targetPath: string;
+  capability: string;
+  actionId?: string;
+}
+
+function requiredFileOperationsFromReport(report: Record<string, unknown> | undefined): RequiredFileOperationProjection[] {
+  const operations = Array.isArray(report?.requiredFileOperations) ? report.requiredFileOperations : [];
+  const output: RequiredFileOperationProjection[] = [];
+  const seen = new Set<string>();
+  for (const item of operations) {
+    const record = objectRecord(item);
+    if (!record) continue;
+    const operation = stringValue(record.operation);
+    const targetPath = concreteFileOperationTarget(stringValue(record.targetPath) ?? '');
+    const capability = stringValue(record.capability);
+    if (!operation || !targetPath || !capability) continue;
+    const actionId = stringValue(record.actionId);
+    const key = `${operation}\0${capability}\0${targetPath}\0${actionId ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push({ operation, targetPath, capability, actionId });
+  }
+  return output;
+}
+
+function concreteFileOperationTarget(value: string): string | undefined {
+  const normalized = normalizePlanScope(value);
+  if (!normalized || normalized === '.' || normalized === './') return undefined;
+  if (isAbsolutePath(normalized)) return undefined;
+  if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) return undefined;
+  if (normalized.includes('*')) return undefined;
+  if (normalized.endsWith('/')) return undefined;
+  return normalized;
 }
 
 function planAcceptedAutoGrantCapability(capability: string): boolean {
@@ -4990,12 +5223,14 @@ function temporaryGrant(plan: SessionPlanContext, capability: string, resourcePa
     capability,
     resourceKind: resourceKindForCapability(capability),
     resourcePath,
-    reason: `Plan ${plan.planId} accepted by user through Session DecisionResolver; capability grant is scoped to the current batch/run and expires when ReviewGate closes.`,
+    reason: resourcePath
+      ? `Plan ${plan.planId} accepted by user through Session DecisionResolver; Kernel-reviewed file operation grant is scoped to ${resourcePath} and expires when ReviewGate closes.`
+      : `Plan ${plan.planId} accepted by user through Session DecisionResolver; capability grant is scoped to the current batch/run and expires when ReviewGate closes.`,
     permissionBundle: {
       source: 'kernelPlanReview',
       planId: plan.planId,
       capability,
-      groupedBy: 'capability',
+      groupedBy: resourcePath ? 'fileOperation' : 'capability',
     },
   };
 }
@@ -5033,7 +5268,7 @@ function reviewSummaryEvent(
   const toolResults = reviewFacts
     ? arrayLength(reviewFacts.toolResults)
     : kernelEvents.filter((event) => objectRecord(event)?.kind === 'tool.completed').length;
-  const continuations = Array.isArray(plan.actionBundle.continuationExpectations) ? plan.actionBundle.continuationExpectations : [];
+  const continuations = concreteContinuationExpectations(plan.actionBundle.continuationExpectations);
   const summary = failed || blocked
     ? '当前批次已推进，但存在失败或阻塞项，请审查 Kernel facts 后决定是否修订。'
     : '当前批次已执行，请审查 Kernel tool facts 与验证结果。';
@@ -5447,7 +5682,8 @@ function reviewContinuationRequest(review: SessionReviewContext): string {
       '下一步要求：',
       '- 如需基于现有代码继续修改，先用 resourceRequest 读取相关文件事实。',
       '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
-      '- 每个 workspace.write action 必须引用本轮 codeBlocks 的 sourceBlockId。',
+      '- 每个 workspace.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId。',
+      '- workspace.delete action 必须使用 kind="delete"、capability="workspace.delete"、明确相对文件 targetPath/resourceScope；不得使用 codeBlocks/sourceBlockId、空内容写入或 workspace.write 伪装删除。',
       '- 新 Plan 必须等待用户确认，不要假定已经执行。',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
@@ -5477,6 +5713,7 @@ function implementationPlanExecutionRequest(
     '不要重新询问 implementationPlan 中已经确认的技术路线、目录结构、Docker/script workflow、模块拆分或验证策略。',
     '如果发现必须新增 target/capability，或缺少关键技术选择，请返回 kind="decisionRequest" 或 kind="implementationPlan" 修订，而不是输出超范围 actionBundle。',
     '本轮 actionBundle 必须包含具体 codeBlocks/commandBlocks（如需要）和 Kernel 可审查的 validationExpectations/reviewExpectations。',
+    '删除文件时必须输出 workspace.delete action：kind="delete"、capability="workspace.delete"、targetPath/resourceScope 为已确认任务范围内的相对文件路径；删除 action 不需要也不得引用 codeBlocks/sourceBlockId。',
     '不要一次性输出整个项目源码；剩余任务放入 actionBundle.continuationExpectations，Session 会在 Kernel facts 返回后继续后续 checkpoint。',
     guidance?.trim() ? `用户确认计划时补充的 guidance：\n${guidance.trim()}` : '',
     `Accepted implementationPlan:\n${planJson}`,
@@ -5498,7 +5735,8 @@ function reviewRevisionRequest(review: SessionReviewContext, guidance?: string):
       '下一步要求：',
       '- 如需基于现有代码继续修改，先用 resourceRequest 读取相关文件事实，例如构建脚本、入口源码、头文件、测试或容器配置。',
       '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
-      '- 每个 workspace.write action 必须引用本轮 codeBlocks 的 sourceBlockId。',
+      '- 每个 workspace.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId。',
+      '- workspace.delete action 必须使用 kind="delete"、capability="workspace.delete"、明确相对文件 targetPath/resourceScope；不得使用 codeBlocks/sourceBlockId、空内容写入或 workspace.write 伪装删除。',
       '- 新 Plan 等待用户确认，不要假定已经执行。',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
@@ -6756,6 +6994,51 @@ function isSensitiveKey(key: string): boolean {
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function parseProviderPartFrame(raw: string): AgentStreamPartFrame | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const record = objectRecord(parsed);
+  if (!record || record.schemaVersion !== 'deepcode.agent.stream.part.v1') return null;
+  const partKind = stringValue(record.partKind);
+  if (!partKind || !isAgentStreamPartKind(partKind)) return null;
+  return {
+    schemaVersion: 'deepcode.agent.stream.part.v1',
+    partKind,
+    draftId: stringValue(record.draftId),
+    frameId: stringValue(record.frameId),
+    runId: stringValue(record.runId),
+    targetPath: stringValue(record.targetPath),
+    language: stringValue(record.language),
+    capability: stringValue(record.capability),
+    blockId: stringValue(record.blockId),
+    actionId: stringValue(record.actionId),
+    sequence: typeof record.sequence === 'number' ? record.sequence : undefined,
+    chunk: typeof record.chunk === 'string' ? record.chunk : undefined,
+    contentHash: stringValue(record.contentHash),
+    summary: stringValue(record.summary),
+    diagnostic: objectRecord(record.diagnostic) as AgentStreamPartFrame['diagnostic'],
+    resumeHandle: stringValue(record.resumeHandle),
+    metadata: objectRecord(record.metadata),
+  };
+}
+
+function stripProviderPartFrames(content: string): string {
+  return content.replace(/<deepcode-part>[\s\S]*?<\/deepcode-part>/g, '').trim();
+}
+
+function isAgentStreamPartKind(value: string): value is AgentStreamPartFrame['partKind'] {
+  return value === 'thinkingDelta'
+    || value === 'codeBlockChunk'
+    || value === 'actionDraftChunk'
+    || value === 'fileDone'
+    || value === 'batchDone'
+    || value === 'diagnostic';
 }
 
 function utf8Bytes(value: string): number {
