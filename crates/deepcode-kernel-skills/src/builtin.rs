@@ -1,5 +1,5 @@
 use crate::{
-    builtin, SkillDescriptor, SkillExecutionContext, SkillExecutor, SkillInvocation, SkillResult,
+    SkillDescriptor, SkillExecutionContext, SkillExecutor, SkillInvocation, SkillResult, builtin,
 };
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use deepcode_kernel_policy::{Capability, CapabilityEffect, RiskLevel, WorkspaceBoundary};
@@ -326,12 +326,31 @@ impl SkillExecutor for CodeSearchExecutor {
                 "search query is required".to_string(),
             ));
         }
+        let includes = string_array(&invocation.input, "include");
+        let context_lines = invocation
+            .input
+            .get("contextLines")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let max_results = invocation
+            .input
+            .get("maxResults")
+            .and_then(Value::as_u64)
+            .unwrap_or(CODE_SEARCH_DEFAULT_MAX_RESULTS as u64) as u32;
+        let result =
+            search_workspace_with_options(&root, &query, &includes, context_lines, max_results)?;
+        let returned_matches = result.matches.len();
         Ok(ok(
             invocation.id,
             serde_json::json!({
                 "folderId": "wf-0",
                 "query": query,
-                "matches": search_workspace(&root, &query, &[])?
+                "include": includes,
+                "contextLines": result.context_lines,
+                "maxResults": result.max_results,
+                "returnedMatches": returned_matches,
+                "truncated": result.truncated,
+                "matches": result.matches
             }),
         ))
     }
@@ -1143,6 +1162,21 @@ fn get_string(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
+fn string_array(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .filter(|item| !item.trim().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 fn required_string(value: &Value, key: &str) -> KernelResult<String> {
     get_string(value, key)
         .filter(|value| !value.trim().is_empty())
@@ -1459,10 +1493,45 @@ fn compare_dir_entries(left: &fs::DirEntry, right: &fs::DirEntry) -> Ordering {
     }
 }
 
-fn search_workspace(root: &Path, query: &str, includes: &[String]) -> KernelResult<Vec<Value>> {
+const CODE_SEARCH_DEFAULT_MAX_RESULTS: usize = 200;
+const CODE_SEARCH_MAX_RESULTS: usize = 500;
+const CODE_SEARCH_MAX_CONTEXT_LINES: usize = 5;
+const CODE_SEARCH_MAX_VISITED_FILES: usize = 500;
+
+struct CodeSearchResult {
+    matches: Vec<Value>,
+    truncated: bool,
+    context_lines: usize,
+    max_results: usize,
+}
+
+fn search_workspace_with_options(
+    root: &Path,
+    query: &str,
+    includes: &[String],
+    context_lines: u32,
+    max_results: u32,
+) -> KernelResult<CodeSearchResult> {
     let mut matches = Vec::new();
-    search_dir(root, root, query, includes, &mut matches)?;
-    Ok(matches)
+    let context_lines = (context_lines as usize).min(CODE_SEARCH_MAX_CONTEXT_LINES);
+    let max_results = (max_results as usize).clamp(1, CODE_SEARCH_MAX_RESULTS);
+    let mut visited_files = 0_usize;
+    let truncated = search_dir(
+        root,
+        root,
+        query,
+        includes,
+        context_lines,
+        max_results,
+        &mut visited_files,
+        &mut matches,
+    )?;
+    Ok(CodeSearchResult {
+        matches,
+        truncated,
+        context_lines,
+        max_results,
+    })
 }
 
 fn search_dir(
@@ -1470,8 +1539,11 @@ fn search_dir(
     dir: &Path,
     query: &str,
     includes: &[String],
+    context_lines: usize,
+    max_results: usize,
+    visited_files: &mut usize,
     matches: &mut Vec<Value>,
-) -> KernelResult<()> {
+) -> KernelResult<bool> {
     for entry in fs::read_dir(dir)
         .map_err(|error| KernelError::Other(format!("search {}: {error}", dir.display())))?
     {
@@ -1481,7 +1553,18 @@ fn search_dir(
             if skip_directory(&path) {
                 continue;
             }
-            search_dir(root, &path, query, includes, matches)?;
+            if search_dir(
+                root,
+                &path,
+                query,
+                includes,
+                context_lines,
+                max_results,
+                visited_files,
+                matches,
+            )? {
+                return Ok(true);
+            }
             continue;
         }
         if !path.is_file() {
@@ -1495,20 +1578,53 @@ fn search_dir(
         if !includes.is_empty() && !includes.iter().any(|pattern| relative.contains(pattern)) {
             continue;
         }
+        *visited_files += 1;
+        if *visited_files > CODE_SEARCH_MAX_VISITED_FILES {
+            return Ok(true);
+        }
         let Ok(content) = fs::read_to_string(&path) else {
             continue;
         };
-        for (line_index, line) in content.lines().enumerate() {
+        let lines = content.lines().collect::<Vec<_>>();
+        for (line_index, line) in lines.iter().enumerate() {
             if line.contains(query) {
-                matches.push(serde_json::json!({
+                let mut item = serde_json::json!({
                     "path": relative,
                     "line": line_index + 1,
                     "preview": line
-                }));
+                });
+                if context_lines > 0 {
+                    if let Some(record) = item.as_object_mut() {
+                        let before_start = line_index.saturating_sub(context_lines);
+                        let before = (before_start..line_index)
+                            .map(|index| {
+                                serde_json::json!({
+                                    "line": index + 1,
+                                    "text": lines[index]
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let after_end = (line_index + 1 + context_lines).min(lines.len());
+                        let after = (line_index + 1..after_end)
+                            .map(|index| {
+                                serde_json::json!({
+                                    "line": index + 1,
+                                    "text": lines[index]
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        record.insert("before".to_string(), Value::Array(before));
+                        record.insert("after".to_string(), Value::Array(after));
+                    }
+                }
+                matches.push(item);
+                if matches.len() >= max_results {
+                    return Ok(true);
+                }
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn skip_directory(path: &Path) -> bool {

@@ -292,6 +292,8 @@ impl DeepCodeKernelRuntime {
         folder_id: Option<String>,
         query: String,
         include: Option<Vec<String>>,
+        context_lines: Option<u32>,
+        max_results: Option<u32>,
         is_regex: bool,
     ) -> KernelResult<Vec<KernelEvent>> {
         let result = (|| {
@@ -306,11 +308,26 @@ impl DeepCodeKernelRuntime {
                 ));
             }
             let includes = include.unwrap_or_default();
-            let matches = search_workspace(&workspace.root, &query, &includes)?;
+            let context_lines = context_lines.unwrap_or(0);
+            let max_results = max_results.unwrap_or(WORKSPACE_SEARCH_DEFAULT_MAX_RESULTS as u32);
+            let result = search_workspace_with_options(
+                &workspace.root,
+                &query,
+                &includes,
+                context_lines,
+                max_results,
+            )?;
+            let returned_matches = result.matches.len();
             Ok(serde_json::json!({
                 "folderId": "wf-0",
                 "query": query,
-                "matches": matches
+                "include": includes,
+                "contextLines": result.context_lines,
+                "maxResults": result.max_results,
+                "returnedMatches": returned_matches,
+                "truncated": result.truncated,
+                "visitedFiles": result.visited_files,
+                "matches": result.matches
             }))
         })();
         self.workspace_result(request_id, "workspace.search", result)
@@ -578,14 +595,32 @@ pub(crate) fn compare_dir_entries(left: &fs::DirEntry, right: &fs::DirEntry) -> 
         ))
 }
 
-pub(crate) fn search_workspace(
+pub(crate) const WORKSPACE_SEARCH_DEFAULT_MAX_RESULTS: usize = 200;
+const WORKSPACE_SEARCH_MAX_RESULTS: usize = 500;
+const WORKSPACE_SEARCH_MAX_VISITED_FILES: usize = 500;
+const WORKSPACE_SEARCH_MAX_CONTEXT_LINES: usize = 5;
+
+pub(crate) struct WorkspaceSearchResult {
+    pub(crate) matches: Vec<Value>,
+    pub(crate) truncated: bool,
+    pub(crate) visited_files: usize,
+    pub(crate) context_lines: usize,
+    pub(crate) max_results: usize,
+}
+
+pub(crate) fn search_workspace_with_options(
     root: &Path,
     query: &str,
     includes: &[String],
-) -> KernelResult<Vec<Value>> {
+    context_lines: u32,
+    max_results: u32,
+) -> KernelResult<WorkspaceSearchResult> {
     let mut matches = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     let mut visited_files = 0_usize;
+    let context_lines = (context_lines as usize).min(WORKSPACE_SEARCH_MAX_CONTEXT_LINES);
+    let max_results = (max_results as usize).clamp(1, WORKSPACE_SEARCH_MAX_RESULTS);
+    let mut truncated = false;
 
     while let Some(path) = stack.pop() {
         if skip_directory(&path) {
@@ -616,27 +651,67 @@ pub(crate) fn search_workspace(
                 continue;
             }
             visited_files += 1;
-            if visited_files > 500 {
+            if visited_files > WORKSPACE_SEARCH_MAX_VISITED_FILES {
+                truncated = true;
                 break;
             }
             let Ok(content) = fs::read_to_string(&entry_path) else {
                 continue;
             };
-            for (index, line) in content.lines().enumerate() {
+            let lines = content.lines().collect::<Vec<_>>();
+            for (index, line) in lines.iter().enumerate() {
                 if line.contains(query) {
-                    matches.push(serde_json::json!({
+                    let mut item = serde_json::json!({
                         "path": relative,
                         "line": index + 1,
                         "preview": line
-                    }));
-                    if matches.len() >= 200 {
-                        return Ok(matches);
+                    });
+                    if context_lines > 0 {
+                        if let Some(record) = item.as_object_mut() {
+                            let before_start = index.saturating_sub(context_lines);
+                            let before = (before_start..index)
+                                .map(|line_index| {
+                                    serde_json::json!({
+                                        "line": line_index + 1,
+                                        "text": lines[line_index]
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            let after_end = (index + 1 + context_lines).min(lines.len());
+                            let after = (index + 1..after_end)
+                                .map(|line_index| {
+                                    serde_json::json!({
+                                        "line": line_index + 1,
+                                        "text": lines[line_index]
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            record.insert("before".to_string(), Value::Array(before));
+                            record.insert("after".to_string(), Value::Array(after));
+                        }
+                    }
+                    matches.push(item);
+                    if matches.len() >= max_results {
+                        truncated = true;
+                        return Ok(WorkspaceSearchResult {
+                            matches,
+                            truncated,
+                            visited_files,
+                            context_lines,
+                            max_results,
+                        });
                     }
                 }
             }
         }
     }
-    Ok(matches)
+    Ok(WorkspaceSearchResult {
+        matches,
+        truncated,
+        visited_files,
+        context_lines,
+        max_results,
+    })
 }
 
 pub(crate) fn skip_directory(path: &Path) -> bool {

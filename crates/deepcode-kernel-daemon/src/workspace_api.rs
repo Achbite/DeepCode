@@ -61,6 +61,8 @@ pub(crate) struct SearchRequest {
     pub(crate) folder_id: Option<String>,
     pub(crate) query: String,
     pub(crate) include: Option<Vec<String>>,
+    pub(crate) context_lines: Option<u32>,
+    pub(crate) max_results: Option<u32>,
     pub(crate) is_regex: Option<bool>,
 }
 
@@ -410,6 +412,8 @@ pub(crate) async fn code_search(
             folder_id: body.folder_id,
             query: body.query,
             include: body.include,
+            context_lines: body.context_lines,
+            max_results: body.max_results,
             is_regex: body.is_regex.unwrap_or(false),
         },
     ) {

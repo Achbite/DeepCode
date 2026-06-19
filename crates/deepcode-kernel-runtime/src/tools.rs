@@ -838,11 +838,34 @@ impl DeepCodeKernelRuntime {
                         )
                     });
                 query.and_then(|query| {
+                    let include = request
+                        .arguments
+                        .get("include")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        });
+                    let context_lines = request
+                        .arguments
+                        .get("contextLines")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as u32);
+                    let max_results = request
+                        .arguments
+                        .get("maxResults")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as u32);
                     self.workspace_search(
                         RequestId(request.request_id.clone()),
                         None,
                         query,
-                        None,
+                        include,
+                        context_lines,
+                        max_results,
                         false,
                     )
                     .and_then(broker_workspace_output)

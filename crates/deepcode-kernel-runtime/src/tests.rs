@@ -99,12 +99,16 @@ fn run_create_produces_state_contract_and_driver_request() {
         })
         .expect("runCreate succeeds");
 
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::StateEntered { .. })));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::DriverRequestProduced { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::StateEntered { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::DriverRequestProduced { .. }))
+    );
 }
 
 #[test]
@@ -146,12 +150,16 @@ fn draft_ledger_submit_records_open_and_chunk_without_workspace_write() {
         })
         .expect("draft ledger submit succeeds");
 
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::DraftOpen { .. })));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::DraftChunk { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::DraftOpen { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::DraftChunk { .. }))
+    );
     assert!(
         !temp.join("src").join("generated.txt").exists(),
         "draft ledger chunks must not directly write workspace files"
@@ -198,9 +206,11 @@ fn proposal_submit_accepts_only_protocol_v3() {
             },
         })
         .expect("v3 proposal command succeeds");
-    assert!(accepted
-        .iter()
-        .any(|event| matches!(event, KernelEvent::ProposalAccepted { .. })));
+    assert!(
+        accepted
+            .iter()
+            .any(|event| matches!(event, KernelEvent::ProposalAccepted { .. }))
+    );
 
     let rejected = runtime
         .dispatch(KernelCommand::ProposalSubmit {
@@ -221,9 +231,11 @@ fn proposal_submit_accepts_only_protocol_v3() {
             },
         })
         .expect("invalid proposal returns rejection event");
-    assert!(rejected
-        .iter()
-        .any(|event| matches!(event, KernelEvent::ProposalRejected { .. })));
+    assert!(
+        rejected
+            .iter()
+            .any(|event| matches!(event, KernelEvent::ProposalRejected { .. }))
+    );
 }
 
 #[test]
@@ -309,6 +321,236 @@ fn proposal_submit_plan_review_extracts_code_block_file_targets() {
 }
 
 #[test]
+fn proposal_submit_plan_review_accepts_matching_action_id_alias() {
+    let (mut runtime, _temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Review a generic delete action.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let events = runtime
+        .dispatch(KernelCommand::ProposalSubmit {
+            request_id: RequestId("req-proposal-matching-action-id".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            proposal: ProposalEnvelope {
+                schema_version: "deepcode.agent.protocol.v3".to_string(),
+                proposal_id: "proposal-matching-action-id".to_string(),
+                run_id: RunId("run-1".to_string()),
+                session_id: Some(SessionId("session-generic".to_string())),
+                source: deepcode_kernel_abi::ProposalEnvelopeSource::Llm,
+                kind: deepcode_kernel_abi::ProposalEnvelopeKind::ActionBundle,
+                payload: serde_json::json!({
+                    "actionBundle": {
+                        "id": "bundle-matching-action-id",
+                        "goal": "Delete a generic target.",
+                        "actions": [
+                            {
+                                "id": "delete-generic-target",
+                                "actionId": "delete-generic-target",
+                                "title": "Delete generic target",
+                                "description": "Delete generic target",
+                                "kind": "delete",
+                                "capability": "workspace.delete",
+                                "resourceScope": ["generic-target.tmp"],
+                                "targetPath": "generic-target.tmp"
+                            }
+                        ],
+                        "validationExpectations": [
+                            { "id": "validation-generic", "description": "Kernel records file delete facts." }
+                        ],
+                        "reviewExpectations": []
+                    }
+                }),
+                referenced_resource_packet_refs: vec![],
+                referenced_evidence_refs: vec![],
+                parser_diagnostics: None,
+            },
+        })
+        .expect("actionBundle proposal command succeeds");
+
+    let report = events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ProposalReviewed { report, .. } => Some(report),
+            _ => None,
+        })
+        .expect("proposal reviewed report is emitted");
+    assert_ne!(report.get("status").and_then(Value::as_str), Some("denied"));
+    assert!(
+        report
+            .get("requiredFileOperations")
+            .and_then(Value::as_array)
+            .is_some_and(|operations| !operations.is_empty())
+    );
+}
+
+#[test]
+fn proposal_submit_plan_review_accepts_continuation_action_aliases() {
+    let (mut runtime, _temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Review a generic bundle with continuation actions.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let events = runtime
+        .dispatch(KernelCommand::ProposalSubmit {
+            request_id: RequestId("req-proposal-continuation-alias".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            proposal: ProposalEnvelope {
+                schema_version: "deepcode.agent.protocol.v3".to_string(),
+                proposal_id: "proposal-continuation-alias".to_string(),
+                run_id: RunId("run-1".to_string()),
+                session_id: Some(SessionId("session-generic".to_string())),
+                source: deepcode_kernel_abi::ProposalEnvelopeSource::Llm,
+                kind: deepcode_kernel_abi::ProposalEnvelopeKind::ActionBundle,
+                payload: serde_json::json!({
+                    "actionBundle": {
+                        "id": "bundle-continuation-alias",
+                        "goal": "Review generic continuation field compatibility.",
+                        "actions": [
+                            {
+                                "id": "write-generic-target",
+                                "title": "Write generic target",
+                                "kind": "write",
+                                "capability": "workspace.write",
+                                "resourceScope": ["generic-output.txt"],
+                                "targetPath": "generic-output.txt"
+                            }
+                        ],
+                        "continuationExpectations": [
+                            {
+                                "actionId": "write-generic-follow-up",
+                                "description": "Write generic follow-up",
+                                "kind": "write",
+                                "capability": "workspace.write",
+                                "resourceScope": ["generic-follow-up.txt"],
+                                "targetPath": "generic-follow-up.txt"
+                            }
+                        ],
+                        "validationExpectations": [
+                            { "id": "validation-generic", "description": "Kernel records file facts." }
+                        ],
+                        "reviewExpectations": []
+                    }
+                }),
+                referenced_resource_packet_refs: vec![],
+                referenced_evidence_refs: vec![],
+                parser_diagnostics: None,
+            },
+        })
+        .expect("actionBundle proposal command succeeds");
+
+    let report = events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ProposalReviewed { report, .. } => Some(report),
+            _ => None,
+        })
+        .expect("proposal reviewed report is emitted");
+    assert_ne!(report.get("status").and_then(Value::as_str), Some("denied"));
+}
+
+#[test]
+fn proposal_submit_plan_review_rejects_conflicting_action_id_alias() {
+    let (mut runtime, _temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Review a generic action conflict.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let events = runtime
+        .dispatch(KernelCommand::ProposalSubmit {
+            request_id: RequestId("req-proposal-conflicting-action-id".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            proposal: ProposalEnvelope {
+                schema_version: "deepcode.agent.protocol.v3".to_string(),
+                proposal_id: "proposal-conflicting-action-id".to_string(),
+                run_id: RunId("run-1".to_string()),
+                session_id: Some(SessionId("session-generic".to_string())),
+                source: deepcode_kernel_abi::ProposalEnvelopeSource::Llm,
+                kind: deepcode_kernel_abi::ProposalEnvelopeKind::ActionBundle,
+                payload: serde_json::json!({
+                    "actionBundle": {
+                        "id": "bundle-conflicting-action-id",
+                        "goal": "Review a conflicting action.",
+                        "actions": [
+                            {
+                                "id": "action-a",
+                                "actionId": "action-b",
+                                "title": "Conflicting generic action",
+                                "description": "Conflicting generic action",
+                                "capability": "workspace.write",
+                                "resourceScope": ["generic-output.txt"],
+                                "targetPath": "generic-output.txt"
+                            }
+                        ],
+                        "validationExpectations": [
+                            { "id": "validation-generic", "description": "Kernel records file facts." }
+                        ],
+                        "reviewExpectations": []
+                    }
+                }),
+                referenced_resource_packet_refs: vec![],
+                referenced_evidence_refs: vec![],
+                parser_diagnostics: None,
+            },
+        })
+        .expect("actionBundle proposal command succeeds");
+
+    let report = events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ProposalReviewed { report, .. } => Some(report),
+            _ => None,
+        })
+        .expect("proposal reviewed report is emitted");
+    assert_eq!(report.get("status").and_then(Value::as_str), Some("denied"));
+    assert!(
+        report
+            .get("deniedReasons")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| reasons.iter().any(|reason| {
+                reason
+                    .as_str()
+                    .is_some_and(|text| text.contains("id/actionId conflict"))
+            }))
+    );
+}
+
+#[test]
 fn resource_resolve_reads_explicit_file_and_directory_manifest_entries() {
     let (mut runtime, temp) = runtime_with_workspace();
     runtime
@@ -367,12 +609,101 @@ fn resource_resolve_reads_explicit_file_and_directory_manifest_entries() {
         .and_then(Value::as_array)
         .expect("items");
     assert_eq!(items.len(), 2);
-    assert!(items
+    assert!(
+        items
+            .iter()
+            .any(|item| item.get("contentKind").and_then(Value::as_str) == Some("fileText"))
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item.get("contentKind").and_then(Value::as_str) == Some("directoryTree"))
+    );
+}
+
+#[test]
+fn resource_resolve_returns_search_results_manifest_entries() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    fs::write(
+        temp.join("nested").join("searchable.txt"),
+        "before\nneedle generic anchor\nafter\n",
+    )
+    .expect("write searchable file");
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create-search".to_string()),
+            session_id: Some(SessionId("session-generic-search".to_string())),
+            input: UserInput {
+                text: "Resolve generic search evidence.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let manifest = serde_json::json!({
+        "id": "manifest-search",
+        "entries": [
+            {
+                "id": "entry-search",
+                "kind": "search",
+                "resourceRef": temp.to_string_lossy(),
+                "query": "needle generic anchor",
+                "include": ["nested/"],
+                "contextLines": 1,
+                "maxResults": 5,
+                "reason": "generic search"
+            }
+        ]
+    });
+    let events = runtime
+        .dispatch(KernelCommand::ResourceResolve {
+            request_id: RequestId("req-resource-search".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-generic-search".to_string())),
+            request: ResourceResolveRequest { manifest },
+        })
+        .expect("resource search resolve succeeds");
+
+    let packet = events
         .iter()
-        .any(|item| item.get("contentKind").and_then(Value::as_str) == Some("fileText")));
-    assert!(items
+        .find_map(|event| {
+            if let KernelEvent::ResourcePacketProduced { packet, .. } = event {
+                Some(packet)
+            } else {
+                None
+            }
+        })
+        .expect("resource packet event");
+    let items = packet
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("items");
+    let search_item = items
         .iter()
-        .any(|item| item.get("contentKind").and_then(Value::as_str) == Some("directoryTree")));
+        .find(|item| item.get("manifestEntryId").and_then(Value::as_str) == Some("entry-search"))
+        .expect("search item");
+    assert_eq!(
+        search_item.get("contentKind").and_then(Value::as_str),
+        Some("searchResults")
+    );
+    assert_eq!(
+        search_item.get("returnedMatches").and_then(Value::as_u64),
+        Some(1)
+    );
+    let matches = search_item
+        .get("matches")
+        .and_then(Value::as_array)
+        .expect("matches");
+    assert_eq!(
+        matches[0].get("path").and_then(Value::as_str),
+        Some("nested/searchable.txt")
+    );
+    assert!(matches[0].get("before").and_then(Value::as_array).is_some());
+    assert!(matches[0].get("after").and_then(Value::as_array).is_some());
 }
 
 #[test]
@@ -695,9 +1026,11 @@ fn action_batch_permission_accept_executes_pending_workspace_write_and_enters_re
             } if tool_name == "fs.write"
         )
     }));
-    assert!(accepted
-        .iter()
-        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
+    assert!(
+        accepted
+            .iter()
+            .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. }))
+    );
     assert!(accepted.iter().any(|event| {
         matches!(
             event,
@@ -785,15 +1118,21 @@ fn action_batch_submit_executes_minimal_workspace_write() {
         })
         .expect("action batch succeeds");
 
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::ActionBatchAccepted { .. })));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::WorkUnitQueued { .. })));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::WorkUnitStarted { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::ActionBatchAccepted { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::WorkUnitQueued { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::WorkUnitStarted { .. }))
+    );
     assert!(events.iter().any(|event| {
         matches!(
             event,
@@ -804,9 +1143,11 @@ fn action_batch_submit_executes_minimal_workspace_write() {
             } if tool_name == "fs.write"
         )
     }));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. }))
+    );
     assert_eq!(
         fs::read_to_string(temp.join("generated").join("output.txt")).expect("written file"),
         "generic generated content\n"
@@ -875,9 +1216,11 @@ fn action_batch_submit_executes_workspace_delete_with_grant() {
             } if tool_name == "fs.delete"
         )
     }));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. }))
+    );
     assert!(
         !temp.join("input.txt").exists(),
         "workspace.delete removes the targeted file"
@@ -1148,9 +1491,11 @@ fn action_batch_submit_executes_exact_block_patch() {
             } if tool_name == "fs.patch"
         )
     }));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. }))
+    );
     assert_eq!(
         fs::read_to_string(temp.join("input.txt")).expect("patched file"),
         "patched generic input\n"
@@ -1357,7 +1702,10 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
         "relative writes with one explicit directory attachment must not fall back to the editor workspace root"
     );
     assert!(
-        !attached_root.join("project-root").join("prefixed.txt").exists(),
+        !attached_root
+            .join("project-root")
+            .join("prefixed.txt")
+            .exists(),
         "paths prefixed with the attachment display path must be normalized under the attachment root"
     );
     assert!(
@@ -1384,11 +1732,13 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
         })
         .expect("review facts produced");
     assert_eq!(facts["generatedArtifacts"].as_array().unwrap().len(), 6);
-    assert!(facts["pathNormalizationDiagnostics"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item["duplicateRootPathDetected"].as_bool() == Some(true)));
+    assert!(
+        facts["pathNormalizationDiagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["duplicateRootPathDetected"].as_bool() == Some(true))
+    );
 }
 
 #[test]
@@ -1973,10 +2323,14 @@ fn action_batch_submit_blocks_unsupported_capability() {
         })
         .expect("action batch succeeds");
 
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::WorkUnitBlocked { .. })));
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, KernelEvent::ToolCompleted { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::WorkUnitBlocked { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::ToolCompleted { .. }))
+    );
 }

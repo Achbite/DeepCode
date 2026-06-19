@@ -1195,7 +1195,12 @@ fn workspace_search_tool_action(action: &Value) -> KernelResult<CompiledWorkspac
         })?;
     Ok(CompiledWorkspaceAction {
         tool_name: "code.search".to_string(),
-        arguments: serde_json::json!({ "query": query }),
+        arguments: serde_json::json!({
+            "query": query,
+            "include": action.get("include").cloned().unwrap_or(Value::Null),
+            "contextLines": action.get("contextLines").cloned().unwrap_or(Value::Null),
+            "maxResults": action.get("maxResults").cloned().unwrap_or(Value::Null)
+        }),
         workspace_root: None,
     })
 }

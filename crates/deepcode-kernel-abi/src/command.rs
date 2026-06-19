@@ -148,6 +148,8 @@ pub enum KernelCommand {
         folder_id: Option<String>,
         query: String,
         include: Option<Vec<String>>,
+        context_lines: Option<u32>,
+        max_results: Option<u32>,
         is_regex: bool,
     },
     ToolInvoke {

@@ -1073,6 +1073,27 @@ fn resolve_resource_manifest_entry(
     } else {
         "other"
     };
+    if source_kind == "search" {
+        if !metadata.is_dir() {
+            return resource_packet_error_item(
+                &request_item_id,
+                &manifest_entry_id,
+                source_kind,
+                "not_directory",
+                &format!(
+                    "{} is {actual_kind}, not searchable directory",
+                    path.display()
+                ),
+            );
+        }
+        return resource_packet_search_item(
+            &request_item_id,
+            &manifest_entry_id,
+            entry,
+            &path,
+            &evidence_ref,
+        );
+    }
     if source_kind == "file" && !metadata.is_file() {
         return resource_packet_error_item(
             &request_item_id,
@@ -1256,6 +1277,75 @@ fn resource_packet_file_range_item(
     })
 }
 
+fn resource_packet_search_item(
+    request_item_id: &str,
+    manifest_entry_id: &str,
+    entry: &Value,
+    path: &Path,
+    evidence_ref: &str,
+) -> Value {
+    let Some(query) = entry
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return resource_packet_error_item(
+            request_item_id,
+            manifest_entry_id,
+            "search",
+            "missing_query",
+            "search manifest entry requires a non-empty query",
+        );
+    };
+    let includes = resource_entry_string_array(entry, "include");
+    let context_lines = resource_entry_u64(entry, "contextLines").unwrap_or(0) as u32;
+    let max_results = resource_entry_u64(entry, "maxResults")
+        .unwrap_or(WORKSPACE_SEARCH_DEFAULT_MAX_RESULTS as u64) as u32;
+    match search_workspace_with_options(path, query, &includes, context_lines, max_results) {
+        Ok(result) => {
+            let returned_matches = result.matches.len();
+            let prompt_content = serde_json::to_string_pretty(&serde_json::json!({
+                "query": query,
+                "include": &includes,
+                "contextLines": result.context_lines,
+                "maxResults": result.max_results,
+                "returnedMatches": returned_matches,
+                "truncated": result.truncated,
+                "matches": &result.matches
+            }))
+            .unwrap_or_else(|_| "[]".to_string());
+            serde_json::json!({
+                "requestItemId": request_item_id,
+                "manifestEntryId": manifest_entry_id,
+                "status": "resolved",
+                "readPolicy": "explicit-manifest-readonly",
+                "sourceKind": "search",
+                "resolvedKind": "search",
+                "path": resource_entry_display_path(entry, path),
+                "absolutePath": path.to_string_lossy(),
+                "contentKind": "searchResults",
+                "query": query,
+                "include": includes,
+                "matches": result.matches,
+                "returnedMatches": returned_matches,
+                "truncated": result.truncated,
+                "promptContent": prompt_content,
+                "contentSummary": entry.get("summary").and_then(Value::as_str).unwrap_or("Search results resolved by Kernel ResourceResolve."),
+                "evidenceRef": evidence_ref,
+                "evidenceRefs": [evidence_ref]
+            })
+        }
+        Err(error) => resource_packet_error_item(
+            request_item_id,
+            manifest_entry_id,
+            "search",
+            "search_failed",
+            &error.to_string(),
+        ),
+    }
+}
+
 fn resource_entry_path(entry: &Value, workspace_root: Option<&Path>) -> Option<PathBuf> {
     let raw = entry
         .get("absolutePath")
@@ -1285,6 +1375,21 @@ fn resource_entry_display_path(entry: &Value, path: &Path) -> String {
 
 fn resource_entry_u64(entry: &Value, key: &str) -> Option<u64> {
     entry.get(key).and_then(Value::as_u64)
+}
+
+fn resource_entry_string_array(entry: &Value, key: &str) -> Vec<String> {
+    entry
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .filter(|item| !item.trim().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn floor_char_boundary(value: &str, mut index: usize) -> usize {
@@ -1366,7 +1471,11 @@ fn proposal_action_bundle_review_report(proposal: &ProposalEnvelope) -> PlanRevi
             "actionBundle proposal payload must include actionBundle",
         );
     };
-    let action_bundle_value = action_bundle_with_code_block_targets(payload, action_bundle_value);
+    let action_bundle_value =
+        match canonical_action_bundle_for_plan_review(payload, action_bundle_value) {
+            Ok(value) => value,
+            Err(reason) => return PlanReviewReport::denied(proposal.proposal_id.clone(), reason),
+        };
     let action_bundle = match serde_json::from_value::<ActionBundleDraft>(action_bundle_value) {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -1383,24 +1492,27 @@ fn proposal_action_bundle_review_report(proposal: &ProposalEnvelope) -> PlanRevi
     })
 }
 
-fn action_bundle_with_code_block_targets(
+fn canonical_action_bundle_for_plan_review(
     payload: &serde_json::Map<String, Value>,
     mut action_bundle: Value,
-) -> Value {
+) -> Result<Value, String> {
     let code_block_targets = code_block_targets_by_id(payload);
-    if code_block_targets.is_empty() {
-        return action_bundle;
-    }
+    canonical_planned_action_array(&mut action_bundle, "actions")?;
+    canonical_planned_action_array(&mut action_bundle, "continuationExpectations")?;
+
     let Some(actions) = action_bundle
         .get_mut("actions")
         .and_then(Value::as_array_mut)
     else {
-        return action_bundle;
+        return Ok(action_bundle);
     };
-    for action in actions {
+    for action in actions.iter_mut() {
         let Some(action_object) = action.as_object_mut() else {
             continue;
         };
+        if code_block_targets.is_empty() {
+            continue;
+        }
         let has_target = action_object
             .get("targetPath")
             .and_then(Value::as_str)
@@ -1430,7 +1542,58 @@ fn action_bundle_with_code_block_targets(
             serde_json::json!([target_path]),
         );
     }
-    action_bundle
+    Ok(action_bundle)
+}
+
+fn canonical_planned_action_array(action_bundle: &mut Value, key: &str) -> Result<(), String> {
+    let Some(actions) = action_bundle.get_mut(key).and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for (index, action) in actions.iter_mut().enumerate() {
+        let Some(action_object) = action.as_object_mut() else {
+            continue;
+        };
+        canonical_action_identifiers(key, index, action_object)?;
+    }
+    Ok(())
+}
+
+fn canonical_action_identifiers(
+    array_key: &str,
+    index: usize,
+    action_object: &mut serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let id = json_string_field(action_object, "id");
+    let action_id = json_string_field(action_object, "actionId");
+    match (id.as_deref(), action_id.as_deref()) {
+        (Some(id), Some(action_id)) if id != action_id => {
+            return Err(format!(
+                "actionBundle.{array_key}[{index}] id/actionId conflict: both fields must match when both are present"
+            ));
+        }
+        (None, Some(action_id)) => {
+            action_object.insert("id".to_string(), Value::String(action_id.to_string()));
+        }
+        _ => {}
+    }
+
+    let title = json_string_field(action_object, "title");
+    let description = json_string_field(action_object, "description");
+    if title.is_none() {
+        if let Some(description) = description {
+            action_object.insert("title".to_string(), Value::String(description));
+        }
+    }
+    Ok(())
+}
+
+fn json_string_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn code_block_targets_by_id(

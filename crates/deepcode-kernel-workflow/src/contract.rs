@@ -139,9 +139,7 @@ impl ActionBundleDraft {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannedAction {
-    #[serde(alias = "actionId")]
     pub id: String,
-    #[serde(alias = "description")]
     pub title: String,
     #[serde(default)]
     pub kind: Option<String>,
