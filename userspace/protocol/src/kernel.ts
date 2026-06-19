@@ -217,6 +217,36 @@ export interface KernelCommandEnvelope {
   expectedSnapshotSeq?: number;
 }
 
+export type KernelDraftLedgerEventKind =
+  | 'draft.open'
+  | 'draft.chunk'
+  | 'draft.file_completed'
+  | 'draft.batch_completed'
+  | 'draft.discarded'
+  | 'draft.committed';
+
+export interface KernelDraftLedgerFrame {
+  schemaVersion: 'deepcode.agent.stream.part.v1';
+  partKind: string;
+  draftId?: string;
+  frameId?: string;
+  runId?: string;
+  targetPath?: string;
+  capability?: string;
+  chunk?: string;
+  contentHash?: string;
+  sequence?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface KernelDraftLedgerSubmitCommand {
+  kind: 'draftLedgerSubmit';
+  requestId: string;
+  runId: string;
+  sessionId?: string;
+  frame: KernelDraftLedgerFrame;
+}
+
 export interface KernelErrorEnvelope {
   code: string;
   message: string;
@@ -261,12 +291,20 @@ export type KernelPlanReviewStatus =
 
 export type KernelProposalReviewStatus = KernelPlanReviewStatus;
 
+export interface KernelRequiredFileOperation {
+  operation: 'write' | 'create' | 'delete' | 'rename' | string;
+  targetPath: string;
+  capability: string;
+  actionId?: string;
+}
+
 export interface KernelPlanReviewReport {
   planId: string;
   status: KernelPlanReviewStatus;
   requiredCapabilities: string[];
   requiredPermissions: string[];
   permissionGaps?: string[];
+  requiredFileOperations?: KernelRequiredFileOperation[];
   hardFloorHits: string[];
   deniedReasons?: string[];
   blockedReasons: string[];

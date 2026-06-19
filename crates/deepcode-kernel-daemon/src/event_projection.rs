@@ -551,6 +551,7 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                     "confirmable": confirmable,
                     "requiredPermissions": report.get("requiredPermissions").cloned().unwrap_or_else(|| json!([])),
                     "permissionGaps": report.get("permissionGaps").cloned().unwrap_or_else(|| json!([])),
+                    "requiredFileOperations": report.get("requiredFileOperations").cloned().unwrap_or_else(|| json!([])),
                     "report": report,
                     "facts": plan_review_facts(report),
                     "channel": "progress",
@@ -733,9 +734,37 @@ fn plan_review_facts(report: &Value) -> Vec<String> {
             report_array_text(report, "requiredCapabilities")
         ),
         format!("权限缺口：{}", report_array_text(report, "permissionGaps")),
+        format!("文件操作范围：{}", required_file_operations_text(report)),
         format!("拒绝原因：{}", report_array_text(report, "deniedReasons")),
         "用户确认计划后才会进入执行；权限缺口会在执行前由 PermissionGate 请求。".to_string(),
     ]
+}
+
+fn required_file_operations_text(report: &Value) -> String {
+    let Some(items) = report
+        .get("requiredFileOperations")
+        .and_then(Value::as_array)
+    else {
+        return "none".to_string();
+    };
+    let values = items
+        .iter()
+        .filter_map(|item| {
+            let operation = item.get("operation").and_then(Value::as_str)?;
+            let target_path = item.get("targetPath").and_then(Value::as_str)?;
+            let capability = item.get("capability").and_then(Value::as_str).unwrap_or("");
+            Some(if capability.is_empty() {
+                format!("{operation}:{target_path}")
+            } else {
+                format!("{operation}:{target_path}({capability})")
+            })
+        })
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
 }
 
 fn report_array_text(report: &Value, key: &str) -> String {

@@ -41,6 +41,32 @@ fn kernel_event_uses_locale_neutral_dotted_kind() {
 }
 
 #[test]
+fn draft_ledger_events_round_trip() {
+    let event = KernelEvent::DraftChunk {
+        request_id: Some(RequestId("req-draft".to_string())),
+        run_id: RunId("run-1".to_string()),
+        session_id: Some(SessionId("session-1".to_string())),
+        draft: serde_json::json!({
+            "draftId": "draft-generic",
+            "status": "draft.chunk",
+            "frame": {
+                "schemaVersion": "deepcode.agent.stream.part.v1",
+                "partKind": "codeBlockChunk",
+                "targetPath": "src/generated.txt"
+            }
+        }),
+        sequence: Some(9),
+    };
+
+    let encoded = serde_json::to_value(&event).expect("serialize draft event");
+    assert_eq!(encoded["kind"], "draft.chunk");
+    assert_eq!(encoded["draft"]["frame"]["partKind"], "codeBlockChunk");
+
+    let decoded: KernelEvent = serde_json::from_value(encoded).expect("deserialize draft event");
+    assert_eq!(decoded, event);
+}
+
+#[test]
 fn driver_loop_v3_events_round_trip() {
     let contract = KernelStateContract {
         run_id: RunId("run-1".to_string()),

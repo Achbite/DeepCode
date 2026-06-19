@@ -56,6 +56,12 @@ impl DeepCodeKernelRuntime {
                 session_id,
                 artifact,
             } => self.artifact_register(request_id, run_id, session_id, artifact),
+            KernelCommand::DraftLedgerSubmit {
+                request_id,
+                run_id,
+                session_id,
+                frame,
+            } => self.draft_ledger_submit(request_id, run_id, session_id, frame),
             KernelCommand::ActionBatchSubmit {
                 request_id,
                 run_id,

@@ -87,6 +87,54 @@ pub enum KernelEvent {
         evidence_ref: String,
         sequence: Option<u64>,
     },
+    #[serde(rename = "draft.open")]
+    DraftOpen {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        draft: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "draft.chunk")]
+    DraftChunk {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        draft: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "draft.file_completed")]
+    DraftFileCompleted {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        draft: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "draft.batch_completed")]
+    DraftBatchCompleted {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        draft: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "draft.discarded")]
+    DraftDiscarded {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        draft: Value,
+        sequence: Option<u64>,
+    },
+    #[serde(rename = "draft.committed")]
+    DraftCommitted {
+        request_id: Option<RequestId>,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        draft: Value,
+        sequence: Option<u64>,
+    },
     #[serde(rename = "action_batch.accepted")]
     ActionBatchAccepted {
         request_id: Option<RequestId>,

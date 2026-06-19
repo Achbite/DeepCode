@@ -116,6 +116,25 @@ fn driver_loop_v3_commands_round_trip() {
     let decoded: KernelCommand =
         serde_json::from_value(encoded).expect("deserialize user decision");
     assert_eq!(decoded, command);
+
+    let command = KernelCommand::DraftLedgerSubmit {
+        request_id: RequestId("req-draft".to_string()),
+        run_id: RunId("run-1".to_string()),
+        session_id: Some(SessionId("session-1".to_string())),
+        frame: serde_json::json!({
+            "schemaVersion": "deepcode.agent.stream.part.v1",
+            "partKind": "codeBlockChunk",
+            "draftId": "draft-generic",
+            "targetPath": "src/generated.txt",
+            "chunk": "generic draft content\n"
+        }),
+    };
+    let encoded = serde_json::to_value(&command).expect("serialize draft ledger submit");
+    assert_eq!(encoded["kind"], "draftLedgerSubmit");
+    assert_eq!(encoded["frame"]["partKind"], "codeBlockChunk");
+    let decoded: KernelCommand =
+        serde_json::from_value(encoded).expect("deserialize draft ledger submit");
+    assert_eq!(decoded, command);
 }
 
 #[test]

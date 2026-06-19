@@ -332,6 +332,12 @@ fn event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::ProposalRejected { .. } => "proposal.rejected",
         KernelEvent::ResourcePacketProduced { .. } => "resource.packet_produced",
         KernelEvent::ArtifactRegistered { .. } => "artifact.registered",
+        KernelEvent::DraftOpen { .. } => "draft.open",
+        KernelEvent::DraftChunk { .. } => "draft.chunk",
+        KernelEvent::DraftFileCompleted { .. } => "draft.file_completed",
+        KernelEvent::DraftBatchCompleted { .. } => "draft.batch_completed",
+        KernelEvent::DraftDiscarded { .. } => "draft.discarded",
+        KernelEvent::DraftCommitted { .. } => "draft.committed",
         KernelEvent::ActionBatchAccepted { .. } => "action_batch.accepted",
         KernelEvent::WorkUnitQueued { .. } => "work_unit.queued",
         KernelEvent::WorkUnitStarted { .. } => "work_unit.started",
@@ -382,6 +388,12 @@ fn event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::ProposalRejected { sequence, .. }
         | KernelEvent::ResourcePacketProduced { sequence, .. }
         | KernelEvent::ArtifactRegistered { sequence, .. }
+        | KernelEvent::DraftOpen { sequence, .. }
+        | KernelEvent::DraftChunk { sequence, .. }
+        | KernelEvent::DraftFileCompleted { sequence, .. }
+        | KernelEvent::DraftBatchCompleted { sequence, .. }
+        | KernelEvent::DraftDiscarded { sequence, .. }
+        | KernelEvent::DraftCommitted { sequence, .. }
         | KernelEvent::ActionBatchAccepted { sequence, .. }
         | KernelEvent::WorkUnitQueued { sequence, .. }
         | KernelEvent::WorkUnitStarted { sequence, .. }

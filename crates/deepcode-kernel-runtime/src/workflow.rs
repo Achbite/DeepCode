@@ -681,6 +681,135 @@ impl DeepCodeKernelRuntime {
         }])
     }
 
+    pub(crate) fn draft_ledger_submit(
+        &mut self,
+        request_id: RequestId,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+        frame: Value,
+    ) -> KernelResult<Vec<KernelEvent>> {
+        let session_id = session_id
+            .map(|value| value.0)
+            .or_else(|| {
+                self.record_by_run(&run_id.0)
+                    .ok()
+                    .map(|record| record.session_id)
+            })
+            .ok_or_else(|| {
+                KernelError::InvalidCommand(format!("run {} has no active session", run_id.0))
+            })?;
+        let part_kind = frame
+            .get("partKind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                KernelError::InvalidCommand("draft frame missing partKind".to_string())
+            })?;
+        let draft_id = frame
+            .get("draftId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("draft-default")
+            .to_string();
+        let draft_key = format!("{}:{draft_id}", run_id.0);
+        let mut events = Vec::new();
+        if !self.state.draft_ledger_keys.contains(&draft_key) {
+            self.state.draft_ledger_keys.insert(draft_key);
+            let sequence = self.ledger.next_sequence(&run_id.0)?;
+            let draft = draft_payload(&draft_id, "draft.open", &frame);
+            self.append_ledger(
+                &run_id.0,
+                &session_id,
+                "draft.open",
+                sequence,
+                draft.clone(),
+            )?;
+            events.push(KernelEvent::DraftOpen {
+                request_id: Some(request_id.clone()),
+                run_id: run_id.clone(),
+                session_id: Some(SessionId(session_id.clone())),
+                draft,
+                sequence: Some(sequence),
+            });
+        }
+
+        let (event_kind, event) = match part_kind {
+            "thinkingDelta" | "codeBlockChunk" | "actionDraftChunk" => {
+                let sequence = self.ledger.next_sequence(&run_id.0)?;
+                let draft = draft_payload(&draft_id, "draft.chunk", &frame);
+                (
+                    "draft.chunk",
+                    KernelEvent::DraftChunk {
+                        request_id: Some(request_id.clone()),
+                        run_id: run_id.clone(),
+                        session_id: Some(SessionId(session_id.clone())),
+                        draft: draft.clone(),
+                        sequence: Some(sequence),
+                    },
+                )
+            }
+            "fileDone" => {
+                let sequence = self.ledger.next_sequence(&run_id.0)?;
+                let draft = draft_payload(&draft_id, "draft.file_completed", &frame);
+                (
+                    "draft.file_completed",
+                    KernelEvent::DraftFileCompleted {
+                        request_id: Some(request_id.clone()),
+                        run_id: run_id.clone(),
+                        session_id: Some(SessionId(session_id.clone())),
+                        draft: draft.clone(),
+                        sequence: Some(sequence),
+                    },
+                )
+            }
+            "batchDone" => {
+                let sequence = self.ledger.next_sequence(&run_id.0)?;
+                let draft = draft_payload(&draft_id, "draft.batch_completed", &frame);
+                (
+                    "draft.batch_completed",
+                    KernelEvent::DraftBatchCompleted {
+                        request_id: Some(request_id.clone()),
+                        run_id: run_id.clone(),
+                        session_id: Some(SessionId(session_id.clone())),
+                        draft: draft.clone(),
+                        sequence: Some(sequence),
+                    },
+                )
+            }
+            "diagnostic" => {
+                let sequence = self.ledger.next_sequence(&run_id.0)?;
+                let draft = draft_payload(&draft_id, "draft.discarded", &frame);
+                (
+                    "draft.discarded",
+                    KernelEvent::DraftDiscarded {
+                        request_id: Some(request_id.clone()),
+                        run_id: run_id.clone(),
+                        session_id: Some(SessionId(session_id.clone())),
+                        draft: draft.clone(),
+                        sequence: Some(sequence),
+                    },
+                )
+            }
+            other => {
+                return Err(KernelError::InvalidCommand(format!(
+                    "unsupported draft part kind: {other}"
+                )));
+            }
+        };
+        let sequence = kernel_event_sequence(&event).ok_or_else(|| {
+            KernelError::InvalidCommand("draft event missing sequence".to_string())
+        })?;
+        let draft = match &event {
+            KernelEvent::DraftChunk { draft, .. }
+            | KernelEvent::DraftFileCompleted { draft, .. }
+            | KernelEvent::DraftBatchCompleted { draft, .. }
+            | KernelEvent::DraftDiscarded { draft, .. } => draft.clone(),
+            _ => Value::Null,
+        };
+        self.append_ledger(&run_id.0, &session_id, event_kind, sequence, draft)?;
+        events.push(event);
+        Ok(events)
+    }
+
     pub(crate) fn enter_phase_event(
         &mut self,
         run_id: &str,
@@ -1237,6 +1366,7 @@ fn proposal_action_bundle_review_report(proposal: &ProposalEnvelope) -> PlanRevi
             "actionBundle proposal payload must include actionBundle",
         );
     };
+    let action_bundle_value = action_bundle_with_code_block_targets(payload, action_bundle_value);
     let action_bundle = match serde_json::from_value::<ActionBundleDraft>(action_bundle_value) {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -1251,6 +1381,88 @@ fn proposal_action_bundle_review_report(proposal: &ProposalEnvelope) -> PlanRevi
         plan,
         action_bundle: Some(action_bundle),
     })
+}
+
+fn action_bundle_with_code_block_targets(
+    payload: &serde_json::Map<String, Value>,
+    mut action_bundle: Value,
+) -> Value {
+    let code_block_targets = code_block_targets_by_id(payload);
+    if code_block_targets.is_empty() {
+        return action_bundle;
+    }
+    let Some(actions) = action_bundle
+        .get_mut("actions")
+        .and_then(Value::as_array_mut)
+    else {
+        return action_bundle;
+    };
+    for action in actions {
+        let Some(action_object) = action.as_object_mut() else {
+            continue;
+        };
+        let has_target = action_object
+            .get("targetPath")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+            || action_object
+                .get("resourceScope")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item.as_str().is_some_and(|value| !value.trim().is_empty()))
+                });
+        if has_target {
+            continue;
+        }
+        let block_id = action_object
+            .get("sourceBlockId")
+            .or_else(|| action_object.get("replacementBlockId"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        let Some(target_path) = block_id.and_then(|id| code_block_targets.get(id)) else {
+            continue;
+        };
+        action_object.insert("targetPath".to_string(), serde_json::json!(target_path));
+        action_object.insert(
+            "resourceScope".to_string(),
+            serde_json::json!([target_path]),
+        );
+    }
+    action_bundle
+}
+
+fn code_block_targets_by_id(
+    payload: &serde_json::Map<String, Value>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut targets = std::collections::BTreeMap::new();
+    let Some(code_blocks) = payload.get("codeBlocks").and_then(Value::as_array) else {
+        return targets;
+    };
+    for block in code_blocks {
+        let Some(record) = block.as_object() else {
+            continue;
+        };
+        let Some(id) = record
+            .get("id")
+            .or_else(|| record.get("blockId"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(target_path) = record
+            .get("targetPath")
+            .or_else(|| record.get("path"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        targets.insert(id.to_string(), target_path.to_string());
+    }
+    targets
 }
 
 fn review_facts_for_run(
@@ -1565,6 +1777,15 @@ fn review_limit_text(value: &str, max_bytes: usize) -> String {
     format!("{}…[truncated]", &value[..end])
 }
 
+fn draft_payload(draft_id: &str, status: &str, frame: &Value) -> Value {
+    serde_json::json!({
+        "summary": format!("Kernel draft ledger recorded {status}."),
+        "draftId": draft_id,
+        "status": status,
+        "frame": frame
+    })
+}
+
 fn review_ledger_event_summary(event: &LedgerEvent) -> Value {
     let mut object = serde_json::Map::new();
     object.insert("kind".to_string(), Value::String(event.kind.clone()));
@@ -1584,6 +1805,7 @@ fn review_ledger_event_summary(event: &LedgerEvent) -> Value {
         "output",
         "error",
         "reason",
+        "draft",
     ] {
         if let Some(value) = event.payload.get(key) {
             object.insert(key.to_string(), value.clone());
@@ -1638,6 +1860,12 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::ProposalRejected { .. } => "proposal.rejected",
         KernelEvent::ResourcePacketProduced { .. } => "resource.packet_produced",
         KernelEvent::ArtifactRegistered { .. } => "artifact.registered",
+        KernelEvent::DraftOpen { .. } => "draft.open",
+        KernelEvent::DraftChunk { .. } => "draft.chunk",
+        KernelEvent::DraftFileCompleted { .. } => "draft.file_completed",
+        KernelEvent::DraftBatchCompleted { .. } => "draft.batch_completed",
+        KernelEvent::DraftDiscarded { .. } => "draft.discarded",
+        KernelEvent::DraftCommitted { .. } => "draft.committed",
         KernelEvent::ActionBatchAccepted { .. } => "action_batch.accepted",
         KernelEvent::WorkUnitQueued { .. } => "work_unit.queued",
         KernelEvent::WorkUnitStarted { .. } => "work_unit.started",
@@ -1688,6 +1916,12 @@ pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::ProposalRejected { sequence, .. }
         | KernelEvent::ResourcePacketProduced { sequence, .. }
         | KernelEvent::ArtifactRegistered { sequence, .. }
+        | KernelEvent::DraftOpen { sequence, .. }
+        | KernelEvent::DraftChunk { sequence, .. }
+        | KernelEvent::DraftFileCompleted { sequence, .. }
+        | KernelEvent::DraftBatchCompleted { sequence, .. }
+        | KernelEvent::DraftDiscarded { sequence, .. }
+        | KernelEvent::DraftCommitted { sequence, .. }
         | KernelEvent::ActionBatchAccepted { sequence, .. }
         | KernelEvent::WorkUnitQueued { sequence, .. }
         | KernelEvent::WorkUnitStarted { sequence, .. }

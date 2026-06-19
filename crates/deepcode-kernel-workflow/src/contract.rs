@@ -139,9 +139,15 @@ impl ActionBundleDraft {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannedAction {
+    #[serde(alias = "actionId")]
     pub id: String,
+    #[serde(alias = "description")]
     pub title: String,
+    #[serde(default)]
+    pub kind: Option<String>,
     pub capability: String,
+    #[serde(default)]
+    pub target_path: Option<String>,
     #[serde(default)]
     pub resource_scope: Vec<String>,
     #[serde(default)]
@@ -226,7 +232,9 @@ mod tests {
             actions: vec![PlannedAction {
                 id: "action-1".to_string(),
                 title: "List files".to_string(),
+                kind: None,
                 capability: "workspace.read".to_string(),
+                target_path: None,
                 resource_scope: vec![".".to_string()],
                 can_parallelize: true,
                 conflict_keys: Vec::new(),
@@ -260,7 +268,9 @@ mod tests {
             actions: vec![PlannedAction {
                 id: "write-1".to_string(),
                 title: "LLM says it needs admin permission".to_string(),
+                kind: None,
                 capability: "workspace.write".to_string(),
+                target_path: None,
                 resource_scope: vec!["src".to_string()],
                 can_parallelize: false,
                 conflict_keys: vec!["src/out.txt".to_string()],

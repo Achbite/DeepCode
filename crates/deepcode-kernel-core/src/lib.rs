@@ -71,6 +71,9 @@ impl Kernel {
             KernelCommand::ResourceResolve { request_id, .. } => {
                 self.not_implemented(request_id, "resource.resolve")
             }
+            KernelCommand::DraftLedgerSubmit { request_id, .. } => {
+                self.not_implemented(request_id, "draft_ledger.submit")
+            }
             KernelCommand::ActionBatchSubmit { request_id, .. } => {
                 self.not_implemented(request_id, "action_batch.submit")
             }

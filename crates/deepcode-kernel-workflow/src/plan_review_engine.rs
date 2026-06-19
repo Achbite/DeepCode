@@ -1,6 +1,7 @@
-use crate::{ActionBundleDraft, PlanContract};
+use crate::{ActionBundleDraft, PlanContract, PlannedAction};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::path::Component;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +25,15 @@ pub struct PlanReviewFinding {
 
 pub type ProposalReviewFinding = PlanReviewFinding;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequiredFileOperation {
+    pub operation: String,
+    pub target_path: String,
+    pub capability: String,
+    pub action_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanReviewInput {
@@ -44,6 +54,8 @@ pub struct PlanReviewReport {
     pub required_permissions: Vec<String>,
     #[serde(default)]
     pub permission_gaps: Vec<String>,
+    #[serde(default)]
+    pub required_file_operations: Vec<RequiredFileOperation>,
     #[serde(default)]
     pub hard_floor_hits: Vec<String>,
     #[serde(default)]
@@ -66,6 +78,7 @@ impl PlanReviewReport {
             required_capabilities: Vec::new(),
             required_permissions: Vec::new(),
             permission_gaps: Vec::new(),
+            required_file_operations: Vec::new(),
             hard_floor_hits: Vec::new(),
             denied_reasons: vec![reason.clone()],
             blocked_reasons: vec![reason],
@@ -82,6 +95,7 @@ impl PlanReviewReport {
             required_capabilities: sorted(plan.required_capabilities.iter().cloned()),
             required_permissions: Vec::new(),
             permission_gaps: Vec::new(),
+            required_file_operations: Vec::new(),
             hard_floor_hits: Vec::new(),
             denied_reasons: Vec::new(),
             blocked_reasons: vec![
@@ -169,6 +183,10 @@ fn review_structured_plan(input: PlanReviewInput) -> PlanReviewReport {
         });
     }
 
+    let (required_file_operations, file_operation_findings) =
+        required_file_operations_for_input(&input);
+    findings.extend(file_operation_findings);
+
     let status = if !denied_reasons.is_empty() || !hard_floor_hits.is_empty() {
         PlanReviewStatus::Denied
     } else if !findings.is_empty() {
@@ -203,6 +221,7 @@ fn review_structured_plan(input: PlanReviewInput) -> PlanReviewReport {
         required_capabilities,
         required_permissions,
         permission_gaps,
+        required_file_operations,
         hard_floor_hits,
         denied_reasons,
         blocked_reasons,
@@ -246,6 +265,137 @@ fn list_or_none(values: &[String]) -> String {
 
 fn sorted(values: impl Iterator<Item = String>) -> Vec<String> {
     values.collect::<BTreeSet<_>>().into_iter().collect()
+}
+
+fn required_file_operations_for_input(
+    input: &PlanReviewInput,
+) -> (Vec<RequiredFileOperation>, Vec<PlanReviewFinding>) {
+    let mut operations = Vec::new();
+    let mut findings = Vec::new();
+    let mut seen = BTreeSet::new();
+    let Some(bundle) = &input.action_bundle else {
+        return (operations, findings);
+    };
+    for action in &bundle.actions {
+        let Some(operation) = mutation_operation_for_action(action) else {
+            continue;
+        };
+        let raw_target = action.target_path.as_deref().or_else(|| {
+            action
+                .resource_scope
+                .iter()
+                .find_map(|scope| concrete_target(scope))
+        });
+        let Some(raw_target) = raw_target else {
+            findings.push(file_operation_finding(
+                "file_operation_target_required",
+                action,
+                "requires targetPath or resourceScope with a concrete file path",
+            ));
+            continue;
+        };
+        match normalize_file_operation_target(raw_target) {
+            Ok(target_path) => {
+                let key = format!(
+                    "{}:{}:{}:{}",
+                    operation, action.capability, action.id, target_path
+                );
+                if seen.insert(key) {
+                    operations.push(RequiredFileOperation {
+                        operation: operation.to_string(),
+                        target_path,
+                        capability: action.capability.clone(),
+                        action_id: action.id.clone(),
+                    });
+                }
+            }
+            Err(reason) => findings.push(file_operation_finding(
+                "file_operation_target_invalid",
+                action,
+                &reason,
+            )),
+        }
+    }
+    (operations, findings)
+}
+
+fn concrete_target(value: &String) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn mutation_operation_for_action(action: &PlannedAction) -> Option<&'static str> {
+    match action
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some("delete") => Some("delete"),
+        Some("create") => Some("create"),
+        Some("rename") => Some("rename"),
+        Some("write" | "patch" | "replaceBlock" | "insertBefore" | "insertAfter") => Some("write"),
+        Some(_) | None => mutation_operation_for_capability(&action.capability),
+    }
+}
+
+fn mutation_operation_for_capability(capability: &str) -> Option<&'static str> {
+    match capability {
+        "workspace.write" => Some("write"),
+        "workspace.create" => Some("create"),
+        "workspace.delete" => Some("delete"),
+        "workspace.rename" => Some("rename"),
+        _ => None,
+    }
+}
+
+fn normalize_file_operation_target(raw: &str) -> Result<String, String> {
+    let normalized = raw.trim().replace('\\', "/");
+    if normalized.is_empty() || normalized == "." || normalized == "./" {
+        return Err("target must be a concrete file path, not the workspace root".to_string());
+    }
+    if normalized.contains('*') {
+        return Err("target must be a concrete file path, not a wildcard".to_string());
+    }
+    let path = std::path::Path::new(&normalized);
+    if path.is_absolute() {
+        return Err("target must be relative to the authorized workspace root".to_string());
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => components.push(value.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err("target must not escape the authorized workspace root".to_string())
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("target must be relative to the authorized workspace root".to_string())
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err("target must be a concrete file path, not the workspace root".to_string());
+    }
+    let target = components.join("/");
+    if target.ends_with('/') {
+        return Err("target must be a concrete file path, not a directory".to_string());
+    }
+    Ok(target)
+}
+
+fn file_operation_finding(code: &str, action: &PlannedAction, reason: &str) -> PlanReviewFinding {
+    PlanReviewFinding {
+        code: code.to_string(),
+        message: format!(
+            "workspace mutation action {} ({}) {}",
+            action.id, action.capability, reason
+        ),
+    }
 }
 
 fn known_capability(capability: &str) -> bool {
@@ -388,7 +538,9 @@ mod tests {
             actions: vec![PlannedAction {
                 id: "action-1".to_string(),
                 title: "LLM says admin permission is needed".to_string(),
+                kind: None,
                 capability: "workspace.write".to_string(),
+                target_path: None,
                 resource_scope: vec!["src".to_string()],
                 can_parallelize: false,
                 conflict_keys: Vec::new(),
@@ -411,5 +563,95 @@ mod tests {
         assert!(!report
             .kernel_generated_permission_summary
             .contains("admin permission"));
+    }
+
+    #[test]
+    fn action_bundle_review_reports_required_file_operations() {
+        let mut plan = PlanContract::low_risk_direct("plan-file-ops", "file ops");
+        plan.completion_criteria[0]
+            .evidence_required
+            .push("tool fact".to_string());
+        let bundle = ActionBundleDraft {
+            id: "bundle-file-ops".to_string(),
+            goal: "update generic files".to_string(),
+            actions: vec![
+                PlannedAction {
+                    id: "write-generic".to_string(),
+                    title: "Write generic output".to_string(),
+                    kind: Some("write".to_string()),
+                    capability: "workspace.write".to_string(),
+                    target_path: Some("./generic-output.txt".to_string()),
+                    resource_scope: Vec::new(),
+                    can_parallelize: false,
+                    conflict_keys: Vec::new(),
+                    purpose: None,
+                },
+                PlannedAction {
+                    id: "delete-generic".to_string(),
+                    title: "Delete generic obsolete file".to_string(),
+                    kind: Some("delete".to_string()),
+                    capability: "workspace.delete".to_string(),
+                    target_path: None,
+                    resource_scope: vec!["generic-obsolete.tmp".to_string()],
+                    can_parallelize: false,
+                    conflict_keys: Vec::new(),
+                    purpose: None,
+                },
+            ],
+            validation_expectations: Vec::new(),
+            review_expectations: Vec::new(),
+        };
+
+        let report = DefaultPlanReviewEngine.review_input(PlanReviewInput {
+            plan,
+            action_bundle: Some(bundle),
+        });
+
+        assert_eq!(report.status, PlanReviewStatus::AwaitingTemporaryGrant);
+        assert_eq!(report.required_file_operations.len(), 2);
+        assert!(report.required_file_operations.iter().any(|operation| {
+            operation.operation == "write"
+                && operation.capability == "workspace.write"
+                && operation.target_path == "generic-output.txt"
+        }));
+        assert!(report.required_file_operations.iter().any(|operation| {
+            operation.operation == "delete"
+                && operation.capability == "workspace.delete"
+                && operation.target_path == "generic-obsolete.tmp"
+        }));
+    }
+
+    #[test]
+    fn action_bundle_review_rejects_mutation_without_concrete_file_target() {
+        let plan = PlanContract::low_risk_direct("plan-invalid-file-op", "invalid file op");
+        let bundle = ActionBundleDraft {
+            id: "bundle-invalid-file-op".to_string(),
+            goal: "delete root".to_string(),
+            actions: vec![PlannedAction {
+                id: "delete-root".to_string(),
+                title: "Delete root".to_string(),
+                kind: Some("delete".to_string()),
+                capability: "workspace.delete".to_string(),
+                target_path: Some(".".to_string()),
+                resource_scope: Vec::new(),
+                can_parallelize: false,
+                conflict_keys: Vec::new(),
+                purpose: None,
+            }],
+            validation_expectations: Vec::new(),
+            review_expectations: Vec::new(),
+        };
+
+        let report = DefaultPlanReviewEngine.review_input(PlanReviewInput {
+            plan,
+            action_bundle: Some(bundle),
+        });
+
+        assert_eq!(report.status, PlanReviewStatus::NeedsRevision);
+        assert!(report.required_file_operations.is_empty());
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "file_operation_target_invalid"));
     }
 }

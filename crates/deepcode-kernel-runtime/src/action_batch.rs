@@ -706,7 +706,7 @@ fn compile_workspace_action(
         "read" => workspace_path_tool_action(runtime, record, action, "fs.read"),
         "list" => workspace_path_tool_action(runtime, record, action, "fs.list"),
         "diff" => workspace_path_tool_action(runtime, record, action, "fs.diff"),
-        "delete" => workspace_path_tool_action(runtime, record, action, "fs.delete"),
+        "delete" => workspace_delete_tool_action(runtime, record, action),
         "search" => workspace_search_tool_action(action),
         "rename" => Err(KernelError::NotImplemented("workspace.rename.work_unit")),
         other => Err(KernelError::InvalidCommand(format!(
@@ -1099,6 +1099,75 @@ fn workspace_path_tool_action(
     let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
     Ok(CompiledWorkspaceAction {
         tool_name: tool_name.to_string(),
+        arguments: serde_json::json!({
+            "path": normalized.relative_path,
+            "pathNormalization": path_normalization_json(&normalized)
+        }),
+        workspace_root: normalized.workspace_root,
+    })
+}
+
+fn workspace_delete_tool_action(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    action: &Value,
+) -> KernelResult<CompiledWorkspaceAction> {
+    let raw_path = action
+        .get("targetPath")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            action
+                .get("resourceScope")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            KernelError::InvalidCommand(
+                "workspace.delete action requires targetPath or resourceScope".to_string(),
+            )
+        })?;
+    let trimmed = raw_path.trim();
+    if trimmed == "." || trimmed == "./" {
+        return Err(KernelError::InvalidCommand(
+            "workspace.delete cannot remove workspace root".to_string(),
+        ));
+    }
+    if trimmed.contains('*') {
+        return Err(KernelError::InvalidCommand(
+            "workspace.delete target must be a concrete path".to_string(),
+        ));
+    }
+    let normalized = match workspace_relative_write_path(runtime, record, trimmed) {
+        Ok(normalized) => normalized,
+        Err(KernelError::InvalidCommand(message))
+            if message.contains("workspace.write target resolves to an attachment directory") =>
+        {
+            return Err(KernelError::InvalidCommand(
+                "workspace.delete cannot remove workspace root".to_string(),
+            ));
+        }
+        Err(KernelError::PermissionDenied(message))
+            if message.contains("workspace.write target is outside") =>
+        {
+            return Err(KernelError::PermissionDenied(
+                message.replace("workspace.write", "workspace.delete"),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if normalized.relative_path.trim().is_empty()
+        || normalized.relative_path == "."
+        || normalized.relative_path == "./"
+    {
+        return Err(KernelError::InvalidCommand(
+            "workspace.delete cannot remove workspace root".to_string(),
+        ));
+    }
+    Ok(CompiledWorkspaceAction {
+        tool_name: "fs.delete".to_string(),
         arguments: serde_json::json!({
             "path": normalized.relative_path,
             "pathNormalization": path_normalization_json(&normalized)

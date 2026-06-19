@@ -363,6 +363,10 @@ pub enum OperationCompileError {
     EmptyCodeContent { source_block_id: String },
     #[error("workspace action {action_id} requires target path")]
     MissingTargetPath { action_id: String },
+    #[error("workspace.delete action {action_id} requires targetPath or resourceScope")]
+    MissingDeleteTarget { action_id: String },
+    #[error("workspace.delete cannot remove workspace root")]
+    DeleteWorkspaceRoot { action_id: String },
     #[error("workspace.search action {action_id} requires query")]
     MissingSearchQuery { action_id: String },
     #[error("unsupported capability {capability}")]
@@ -571,12 +575,25 @@ impl OperationCompiler {
             }
         }
         target_path = target_path.or_else(|| first_resource_scope(action));
+        if kind == WorkspaceOperationKind::Delete {
+            let path = target_path
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| OperationCompileError::MissingDeleteTarget {
+                    action_id: id.clone(),
+                })?;
+            if path == "." || path == "./" {
+                return Err(OperationCompileError::DeleteWorkspaceRoot {
+                    action_id: id.clone(),
+                });
+            }
+        }
         if matches!(
             kind,
             WorkspaceOperationKind::Read
                 | WorkspaceOperationKind::List
                 | WorkspaceOperationKind::Diff
-                | WorkspaceOperationKind::Delete
                 | WorkspaceOperationKind::Rename
         ) && target_path.is_none()
         {
@@ -1470,6 +1487,71 @@ mod tests {
                 kind: WorkspaceOperationKind::Write,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn compiler_builds_workspace_delete_operation_without_code_block() {
+        let compiler = OperationCompiler::default();
+        let batch = serde_json::json!({
+            "actions": [{
+                "id": "delete-1",
+                "title": "Delete file",
+                "kind": "delete",
+                "capability": "workspace.delete",
+                "targetPath": "generated/obsolete.txt",
+                "resourceScope": ["generated/obsolete.txt"],
+                "permissionLabels": ["workspace.delete"]
+            }]
+        });
+        let operations = compiler.compile_batch(&batch).unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].write_set, vec!["generated/obsolete.txt"]);
+        assert!(matches!(
+            operations[0].operation,
+            PlannedOperationKind::Workspace(WorkspaceOperation {
+                kind: WorkspaceOperationKind::Delete,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn compiler_rejects_workspace_delete_without_target() {
+        let compiler = OperationCompiler::default();
+        let batch = serde_json::json!({
+            "actions": [{
+                "id": "delete-1",
+                "title": "Delete file",
+                "kind": "delete",
+                "capability": "workspace.delete",
+                "resourceScope": [],
+                "permissionLabels": ["workspace.delete"]
+            }]
+        });
+        assert!(matches!(
+            compiler.compile_batch(&batch),
+            Err(OperationCompileError::MissingDeleteTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn compiler_rejects_workspace_delete_root_target() {
+        let compiler = OperationCompiler::default();
+        let batch = serde_json::json!({
+            "actions": [{
+                "id": "delete-1",
+                "title": "Delete root",
+                "kind": "delete",
+                "capability": "workspace.delete",
+                "targetPath": ".",
+                "resourceScope": ["."],
+                "permissionLabels": ["workspace.delete"]
+            }]
+        });
+        assert!(matches!(
+            compiler.compile_batch(&batch),
+            Err(OperationCompileError::DeleteWorkspaceRoot { .. })
         ));
     }
 

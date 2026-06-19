@@ -39,6 +39,7 @@ pub use plan_review_engine::{
     DefaultPlanReviewEngine, DefaultProposalReviewEngine, PlanReviewEngine, PlanReviewFinding,
     PlanReviewInput, PlanReviewReport, PlanReviewStatus, ProposalReviewEngine,
     ProposalReviewFinding, ProposalReviewInput, ProposalReviewReport, ProposalReviewStatus,
+    RequiredFileOperation,
 };
 pub use predicate::{PredicateExpr, PredicateId, PredicateRegistry};
 pub use proposal::{InvalidProposalPolicy, ProposalEnvelope, ProposalKind};
