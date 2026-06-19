@@ -135,6 +135,9 @@ export interface AgentStreamPartFrame {
   draftId?: string;
   frameId?: string;
   runId?: string;
+  branchId?: string;
+  subAgentId?: string;
+  mergeGroupId?: string;
   targetPath?: string;
   language?: string;
   capability?: string;
@@ -194,9 +197,14 @@ export interface ProjectionDelta {
   sessionId: string;
   runId?: string;
   turnId?: string;
+  branchId?: string;
+  subAgentId?: string;
+  mergeGroupId?: string;
+  draftId?: string;
+  targetPath?: string;
   itemId?: string;
   stage?: string;
-  status?: 'queued' | 'running' | 'streaming' | 'waiting' | 'completed' | 'failed';
+  status?: 'queued' | 'running' | 'streaming' | 'waiting' | 'draftReady' | 'discarded' | 'skipped' | 'completed' | 'failed';
   channel?: 'progress' | 'reasoning' | 'final' | 'tool' | 'resource' | 'workunit' | 'draft';
   source?: 'session' | 'driver' | 'llm' | 'kernel' | 'provider';
   delta?: string;

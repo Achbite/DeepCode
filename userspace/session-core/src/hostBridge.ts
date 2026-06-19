@@ -41,6 +41,8 @@ interface HostBridgeRequest {
   requirementConfirmationMode?: 'off' | 'auto' | 'always';
   reviewContinuationMode?: 'auto' | 'ask' | 'off';
   interventionLevel?: 'low' | 'medium' | 'high';
+  subAgentMode?: 'auto' | 'off';
+  subAgentMaxParallel?: number;
   title?: string;
   decisionKind?: SessionDecisionResolverInput['kind'];
   decision?: 'accept' | 'reject' | 'revise';
@@ -101,6 +103,8 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
     requirementConfirmationMode: request.requirementConfirmationMode,
     reviewContinuationMode: request.reviewContinuationMode,
     interventionLevel: request.interventionLevel,
+    subAgentMode: request.subAgentMode,
+    subAgentMaxParallel: request.subAgentMaxParallel,
   });
   const timeline = await readTimeline(apiBase, result.session.id);
   const finalText = extractFinalText(timeline);
@@ -140,6 +144,8 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
     workflow: request.workflow,
     reviewContinuationMode: request.reviewContinuationMode,
     interventionLevel: request.interventionLevel,
+    subAgentMode: request.subAgentMode,
+    subAgentMaxParallel: request.subAgentMaxParallel,
   });
   const timeline = await readTimeline(apiBase, result.session.id);
   const finalText = extractFinalText(timeline);

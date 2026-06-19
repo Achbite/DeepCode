@@ -168,6 +168,11 @@ export interface ImplementationPlanTaskDraft {
   target: string[];
   scope: string;
   dependencies: string[];
+  hardDependencies?: string[];
+  softOrderAfter?: string[];
+  conflictKeys?: string[];
+  canDraftInParallel?: boolean;
+  role?: 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review';
   capability: string;
   acceptanceCriteria: string[];
   failureCriteria: string[];

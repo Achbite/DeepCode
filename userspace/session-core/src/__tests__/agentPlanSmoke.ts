@@ -66,8 +66,13 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptsLocalizedStructuredPlan();
   await assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatch();
+  await assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteBatchForKernel();
   await assertSessionDriverLoopAcceptedImplementationPlanPreservesExecutionRoot();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMultiTargetBatch();
+  await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsMergeIndependentTasks();
+  await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsDiscardFailedBranchAndFallback();
+  await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsTreatLegacyDependenciesAsSoftOrder();
+  await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsSkipHardDependency();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDeleteAction();
   await assertSessionDriverLoopAcceptedImplementationPlanRejectsDeleteRootTarget();
   await assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTasksComplete();
@@ -80,6 +85,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopPlanAcceptGroupsWorkspaceWriteGrants();
   assertWorkflowStagePermissionProjectsPendingDecision();
   await assertSessionDriverLoopReviewRevisionReturnsToPlanning();
+  await assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactive();
   await assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan();
   await assertSessionDriverLoopReviewAcceptWithoutContinuationCompletesRun();
   await assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch();
@@ -984,6 +990,9 @@ async function assertProviderPartFramesEnterKernelDraftLedger(): Promise<void> {
     partKind: 'codeBlockChunk',
     draftId: 'draft-generic',
     frameId: 'frame-generic-1',
+    branchId: 'branch-generic',
+    subAgentId: 'subagent-generic',
+    mergeGroupId: 'merge-generic',
     targetPath: 'src/generated.txt',
     capability: 'workspace.write',
     sequence: 1,
@@ -1049,7 +1058,10 @@ async function assertProviderPartFramesEnterKernelDraftLedger(): Promise<void> {
 
   assertEqual(draftFrames.length, 1, 'closed provider part frame is submitted to Kernel draft ledger once');
   assertEqual(draftFrames[0].targetPath, 'src/generated.txt', 'draft frame target path is preserved for Kernel audit');
+  assertEqual(draftFrames[0].branchId, 'branch-generic', 'draft frame branch metadata is preserved for Kernel audit');
+  assertEqual(draftFrames[0].subAgentId, 'subagent-generic', 'draft frame sub-agent metadata is preserved for Kernel audit');
   assertEqual(deltas.some((delta) => (delta as any).type === 'part_delta'), true, 'Session emits volatile part delta');
+  assertEqual(deltas.some((delta) => (delta as any).type === 'part_delta' && (delta as any).branchId === 'branch-generic'), true, 'part delta carries branch metadata');
   assertEqual(deltas.some((delta) => (delta as any).type === 'draft_delta'), true, 'Session emits Kernel draft ledger delta');
   assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any).channel === 'final'), true, 'final answer still commits through the ordinary parser path');
 }
@@ -2635,6 +2647,86 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
   assert(promptText.includes('Session intent'), 'plans and continuations are separated into session intent context');
 }
 
+async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactive(): Promise<void> {
+  const events: AgentEvent[] = [{
+    id: 'review-waiting-inactive-audit',
+    sessionId: 'session-review-revision-inactive-audit',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'review_summary',
+    payload: {
+      status: 'waitingUserReview',
+      runId: 'run-review-inactive-audit',
+      reviewId: 'review-inactive-audit',
+      sourcePlanId: 'plan-inactive-audit',
+      content: '## Review\n\nA generic completed batch needs a revision.',
+      userPlan: '# Plan\n\n## Summary\nCreate a generic batch.',
+      facts: ['- `work-unit-generic` completed: {"path":"generic-output.txt"}'],
+      continuations: [],
+      confirmable: true,
+      channel: 'review',
+      visibility: 'conversation',
+    },
+  }];
+  const session: AgentSession = {
+    id: 'session-review-revision-inactive-audit',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const submittedPlans: Array<Record<string, any>> = [];
+  const llmRequests: LlmChatRequest[] = [];
+  let userDecisionSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'userDecisionSubmit') {
+        userDecisionSubmits += 1;
+        return {
+          ok: false,
+          events: [],
+          error: {
+            code: 'run_not_active',
+            message: 'invalid command: run is not active',
+          },
+        };
+      }
+      return planKernel(request, session.id, submittedPlans);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + llmRequests.length + userDecisionSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'review',
+    decision: 'revise',
+    guidance: 'Revise the generic batch with an additional safe detail.',
+    runId: 'run-review-inactive-audit',
+    existingEvents: events,
+  });
+
+  assertEqual(userDecisionSubmits, 1, 'review revise still attempts one Kernel audit decision');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'trace/review_accept_noop' &&
+      (event.payload as any)?.errorCode === 'run_not_active'
+    ),
+    true,
+    'inactive review audit is recorded as a Session trace'
+  );
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'review revise continues to a new planning turn after audit failure');
+  assertEqual(submittedPlans.length, 1, 'review revise still submits the repaired plan to Kernel PlanReview');
+  assertEqual(llmRequests.length, 1, 'review revise calls provider once after best-effort audit failure');
+}
+
 async function assertSessionDriverLoopPlanAcceptGroupsWorkspaceWriteGrants(): Promise<void> {
   const actionBundle = multiWriteActionBundle();
   const events: AgentEvent[] = [
@@ -2894,6 +2986,90 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
   );
 }
 
+async function assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteBatchForKernel(): Promise<void> {
+  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-normalize', 'run-accepted-plan-normalize')];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-normalize',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let submittedBatch: any;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        submittedBatch = command.batch;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.queued',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnit: { id: 'work-unit-generic', actionId: 'write-generic-output', status: 'queued', writeSet: ['generic-output.txt'] },
+            },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: 'work-unit-generic',
+              output: { path: 'generic-output.txt' },
+            },
+            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-normalize',
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+  });
+
+  assert(Boolean(submittedBatch), 'accepted implementationPlan submits a normalized action batch');
+  const action = submittedBatch.actionBundle.actions[0];
+  const block = submittedBatch.codeBlocks[0];
+  assertEqual(action.kind, 'write', 'workspace.write action keeps explicit write kind before Kernel submit');
+  assertEqual(action.targetPath, 'generic-output.txt', 'workspace.write action has explicit targetPath before Kernel submit');
+  assertEqual(action.resourceScope[0], 'generic-output.txt', 'workspace.write action keeps concrete resourceScope before Kernel submit');
+  assertEqual(block.id, 'generic-block', 'codeBlock keeps canonical id before Kernel submit');
+  assertEqual(block.blockId, 'generic-block', 'codeBlock also carries blockId compatibility field before Kernel submit');
+  assertEqual(block.path, 'generic-output.txt', 'codeBlock keeps path before Kernel submit');
+  assertEqual(block.targetPath, 'generic-output.txt', 'codeBlock carries targetPath before Kernel submit');
+}
+
 async function assertSessionDriverLoopAcceptedImplementationPlanPreservesExecutionRoot(): Promise<void> {
   const root = '/workspace/generic-project';
   const events: AgentEvent[] = [
@@ -3063,6 +3239,462 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMult
     ),
     true,
     'multi-target batch records an accepted-plan checkpoint with no remaining tasks'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsMergeIndependentTasks(): Promise<void> {
+  const events = [independentMultiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-subagents', 'run-accepted-plan-subagents')];
+  const deltas: unknown[] = [];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-subagents',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const submittedPlans: Array<Record<string, any>> = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        submittedPlans.push(command.proposal);
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: 'work-unit-one',
+              output: { path: 'generic-one.txt' },
+            },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: 'work-unit-two',
+              output: { path: 'generic-two.txt' },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      const deepcode = request.providerOptions?.deepcode as any;
+      const targetPath = deepcode?.subAgent?.targetPath;
+      if (targetPath === 'generic-one.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-one.txt', 'one'));
+      if (targetPath === 'generic-two.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-two.txt', 'two'));
+      throw new Error('sub-agent merge smoke expected only sliced provider calls');
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + llmCalls + deltas.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-subagents',
+    targetId: 'impl-generic-independent',
+    existingEvents: events,
+    subAgentMode: 'auto',
+    subAgentMaxParallel: 2,
+  });
+
+  assertEqual(llmCalls, 2, 'sub-agent auto mode calls provider once per independent task slice');
+  assertEqual(
+    proposalSubmits,
+    1,
+    `sub-agent fragments are merged into one Kernel PlanReview submission (llmCalls=${llmCalls}, actionBatchSubmits=${actionBatchSubmits}, deltas=${deltas.length})`
+  );
+  assertEqual(actionBatchSubmits, 1, 'merged sub-agent fragments are submitted to Kernel once');
+  assertEqual(
+    deltas.some((delta) => (delta as any).type === 'stage_delta' && (delta as any).stage === 'subagent_plan.created') &&
+      deltas.some((delta) => (delta as any).type === 'stage_delta' && (delta as any).stage === 'subagent_merge.started') &&
+      deltas.some((delta) => (delta as any).type === 'stage_delta' && (delta as any).stage === 'subagent_merge.completed'),
+    true,
+    'sub-agent merge emits stable parent progress deltas'
+  );
+  assertEqual(
+    deltas.filter((delta) => (delta as any).branchId && (delta as any).subAgentId).length >= 2,
+    true,
+    'branch deltas carry branch and sub-agent metadata'
+  );
+  const actionBundle = submittedPlans[0]?.payload?.actionBundle;
+  assertEqual(Array.isArray(actionBundle?.actions) && actionBundle.actions.length, 2, 'merged actionBundle contains both independent task actions');
+  assertEqual(typeof submittedPlans[0]?.payload?.narration, 'undefined', 'merged sub-agent batch does not create a formal assistant narration');
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsDiscardFailedBranchAndFallback(): Promise<void> {
+  await runSubAgentFailureFallbackSmoke(
+    'diagnostic',
+    () => jsonLlmResponse(genericDiagnosticProposal('generic branch diagnostic'))
+  );
+  await runSubAgentFailureFallbackSmoke(
+    'parse-failure',
+    () => ({
+      ok: true,
+      data: {
+        chunks: [{ type: 'reasoning_delta', content: 'generic invalid reasoning' }, { type: 'done' }],
+        assistantMessage: {
+          role: 'assistant',
+          reasoningContent: 'generic invalid reasoning',
+          content: '{invalid-json',
+        },
+      },
+    })
+  );
+}
+
+async function runSubAgentFailureFallbackSmoke(
+  caseName: string,
+  failedBranchResponse: () => ApiResponse<LlmChatResult>
+): Promise<void> {
+  const events = [independentMultiTargetAcceptedImplementationPlanCardEvent(`session-accepted-plan-subagents-fallback-${caseName}`, `run-accepted-plan-subagents-fallback-${caseName}`)];
+  const deltas: unknown[] = [];
+  const session: AgentSession = {
+    id: `session-accepted-plan-subagents-fallback-${caseName}`,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let parentLlmCalls = 0;
+  let subAgentLlmCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const submittedPlans: Array<Record<string, any>> = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        submittedPlans.push(command.proposal);
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: 'work-unit-fallback-one',
+              output: { path: 'generic-one.txt' },
+            },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: 'work-unit-fallback-two',
+              output: { path: 'generic-two.txt' },
+            },
+            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      const deepcode = request.providerOptions?.deepcode as any;
+      const targetPath = deepcode?.subAgent?.targetPath;
+      if (deepcode?.subAgent) {
+        subAgentLlmCalls += 1;
+        if (targetPath === 'generic-one.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-one.txt', `fallback-${caseName}-one`));
+        if (targetPath === 'generic-two.txt') return failedBranchResponse();
+        throw new Error(`unexpected sub-agent target in fallback smoke: ${targetPath}`);
+      }
+      parentLlmCalls += 1;
+      const promptText = request.messages.map((message) => message.content).join('\n');
+      assert(promptText.includes('子代理并行草稿已全部丢弃'), 'parent fallback prompt explains discarded sub-agent drafts');
+      assert(promptText.includes('不得把未提交草稿当成已执行事实'), 'parent fallback prompt prevents treating failed drafts as facts');
+      return jsonLlmResponse(multiWriteProposal());
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + parentLlmCalls + subAgentLlmCalls + proposalSubmits + actionBatchSubmits + deltas.length + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: `run-accepted-plan-subagents-fallback-${caseName}`,
+    targetId: 'impl-generic-independent',
+    existingEvents: events,
+    subAgentMode: 'auto',
+    subAgentMaxParallel: 2,
+  });
+
+  assertEqual(subAgentLlmCalls, 2, `${caseName}: sub-agent path attempts both independent slices once`);
+  assertEqual(parentLlmCalls, 1, `${caseName}: failed branch falls back to one parent provider checkpoint`);
+  assertEqual(proposalSubmits, 1, `${caseName}: only parent fallback actionBundle reaches Kernel PlanReview`);
+  assertEqual(actionBatchSubmits, 1, `${caseName}: only parent fallback actionBundle reaches Kernel execution`);
+  assertEqual(result.events.some((event) => event.kind === 'error'), false, `${caseName}: branch failure does not become a terminal Session error event`);
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_branch.failed' &&
+      (delta as any).status === 'failed'
+    ),
+    true,
+    `${caseName}: failed branch is projected as a branch-scoped stage`
+  );
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_merge.discarded' &&
+      (delta as any).payload?.reason === 'branch_failed' &&
+      Array.isArray((delta as any).payload?.failedBranchIds) &&
+      (delta as any).payload.failedBranchIds.length === 1
+    ),
+    true,
+    `${caseName}: failed branch discards the merge group with diagnostics`
+  );
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_parent_fallback'
+    ),
+    true,
+    `${caseName}: parent fallback checkpoint is visible`
+  );
+  const actionBundle = submittedPlans[0]?.payload?.actionBundle;
+  assertEqual(Array.isArray(actionBundle?.actions) && actionBundle.actions.length, 2, `${caseName}: parent fallback submits the full merged batch`);
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsTreatLegacyDependenciesAsSoftOrder(): Promise<void> {
+  const events = [multiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-subagents-soft', 'run-accepted-plan-subagents-soft')];
+  const deltas: unknown[] = [];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-subagents-soft',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      const deepcode = request.providerOptions?.deepcode as any;
+      const targetPath = deepcode?.subAgent?.targetPath;
+      if (targetPath === 'generic-one.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-one.txt', 'soft-one'));
+      if (targetPath === 'generic-two.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-two.txt', 'soft-two'));
+      throw new Error('legacy soft-order smoke expected sliced provider calls');
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + llmCalls + deltas.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-subagents-soft',
+    targetId: 'impl-generic-multi',
+    existingEvents: events,
+    subAgentMode: 'auto',
+    subAgentMaxParallel: 2,
+  });
+
+  assertEqual(llmCalls, 2, 'legacy implementationPlan dependencies are treated as soft order for sub-agent draft generation');
+  assertEqual(proposalSubmits, 1, 'soft-order sub-agent fragments merge into one Kernel PlanReview submission');
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_plan.created'
+    ),
+    true,
+    'soft-order sub-agent path emits subagent_plan.created'
+  );
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_branch.draft_ready' &&
+      (delta as any).status === 'draftReady'
+    ),
+    true,
+    'soft-order sub-agent path emits branch draft-ready facts'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsSkipHardDependency(): Promise<void> {
+  const events = [hardDependencyAcceptedImplementationPlanCardEvent('session-accepted-plan-subagents-hard', 'run-accepted-plan-subagents-hard')];
+  const deltas: unknown[] = [];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-subagents-hard',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let parentLlmCalls = 0;
+  let subAgentLlmCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      const deepcode = request.providerOptions?.deepcode as any;
+      if (deepcode?.subAgent) {
+        subAgentLlmCalls += 1;
+      } else {
+        parentLlmCalls += 1;
+      }
+      return jsonLlmResponse(singleTargetWriteProposal('generic-one.txt', 'hard-parent'));
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + parentLlmCalls + subAgentLlmCalls + deltas.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-subagents-hard',
+    targetId: 'impl-generic-hard',
+    existingEvents: events,
+    subAgentMode: 'auto',
+    subAgentMaxParallel: 2,
+  });
+
+  assertEqual(subAgentLlmCalls, 0, 'hard dependency blocks sub-agent parallel draft calls');
+  assert(parentLlmCalls >= 1, 'hard dependency fallback continues through the parent provider');
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_skipped' &&
+      (delta as any).payload?.reason === 'hard_dependency_blocked'
+    ),
+    true,
+    'hard dependency skip emits explicit subagent_skipped reason'
   );
 }
 
@@ -3352,6 +3984,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
     runId: 'run-accepted-plan-continue',
     targetId: 'impl-generic-multi',
     existingEvents: events,
+    subAgentMode: 'off',
   });
 
   assertEqual(llmCalls, 2, 'accepted implementationPlan automatically requests the second provider batch');
@@ -3399,7 +4032,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAllowsAbsoluteAt
               runId: 'run-generic',
               sessionId: session.id,
               proposalId: command.proposal?.proposalId,
-              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}, root),
             },
           ],
         };
@@ -3502,6 +4135,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanProjectsWorkUnit
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
+  let reviewFactsRequests = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -3530,14 +4164,33 @@ async function assertSessionDriverLoopAcceptedImplementationPlanProjectsWorkUnit
           ok: true,
           events: [
             {
+              kind: 'work_unit.queued',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnit: { id: 'work-unit-generic', actionId: 'write-generic-output', status: 'queued', writeSet: ['generic-output.txt'] },
+            },
+            {
+              kind: 'work_unit.started',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnit: { id: 'work-unit-generic', actionId: 'write-generic-output', status: 'running', writeSet: ['generic-output.txt'] },
+            },
+            {
               kind: 'work_unit.failed',
               runId: 'run-generic',
               sessionId: session.id,
               workUnitId: 'work-unit-generic',
+              actionId: 'write-generic-output',
+              writeSet: ['generic-output.txt'],
               error: { code: 'invalid_path', message: 'workspace.write target is outside workspace binding' },
             },
+            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
           ],
         };
+      }
+      if (command.kind === 'reviewFactsGet') {
+        reviewFactsRequests += 1;
+        return { ok: true, events: [] };
       }
       return fakeKernel(request);
     },
@@ -3562,6 +4215,26 @@ async function assertSessionDriverLoopAcceptedImplementationPlanProjectsWorkUnit
   assert(errorMessage.includes('work-unit-generic'), 'work_unit.failed projection includes the work unit id');
   assert(errorMessage.includes('workspace.write target is outside workspace binding'), 'work_unit.failed projection includes the Kernel error message');
   assert(!errorMessage.includes('Kernel rejected the proposal'), 'work_unit.failed projection is not mislabeled as proposal rejection');
+  assertEqual(reviewFactsRequests, 0, 'work_unit.failed stops accepted-plan flow before reviewFactsGet');
+  assertEqual(result.events.some((event) => event.kind === 'review_summary'), false, 'work_unit.failed does not create terminal review');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.status === 'failed' &&
+      (event.payload as any)?.reason === 'work_unit_failed'
+    ),
+    true,
+    'work_unit.failed appends explicit failed session lifecycle'
+  );
+  const failureCheckpoint = result.events.find((event) =>
+    event.kind === 'workflow_stage' &&
+    (event.payload as any)?.stage === 'accepted_plan.batch_failed'
+  );
+  assert(Boolean(failureCheckpoint), 'work_unit.failed records an accepted-plan failure checkpoint');
+  assert(
+    JSON.stringify((failureCheckpoint?.payload as any)?.failures ?? []).includes('generic-output.txt'),
+    'failure checkpoint retains writeSet details'
+  );
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanRejectsOutOfScopeBatch(): Promise<void> {
@@ -4940,11 +5613,11 @@ function planKernel(
   return { ok: true, events: [] };
 }
 
-function proposalReviewReport(actionBundle: Record<string, any>): Record<string, any> {
+function proposalReviewReport(actionBundle: Record<string, any>, attachmentRoot?: string): Record<string, any> {
   const actions = Array.isArray(actionBundle.actions) ? actionBundle.actions : [];
   const capabilities = [...new Set(actions.map((action) => action.capability).filter(Boolean))].sort();
   const permissionGaps = capabilities.filter((capability) => capability !== 'workspace.read' && capability !== 'git.read');
-  const requiredFileOperations = requiredFileOperationsFromActionBundle(actionBundle);
+  const requiredFileOperations = requiredFileOperationsFromActionBundle(actionBundle, attachmentRoot);
   return {
     planId: actionBundle.id ?? 'bundle-generic',
     status: 'awaitingUserApproval',
@@ -4960,7 +5633,7 @@ function proposalReviewReport(actionBundle: Record<string, any>): Record<string,
   };
 }
 
-function requiredFileOperationsFromActionBundle(actionBundle: Record<string, any>): Array<Record<string, string>> {
+function requiredFileOperationsFromActionBundle(actionBundle: Record<string, any>, attachmentRoot?: string): Array<Record<string, string>> {
   const actions = Array.isArray(actionBundle.actions) ? actionBundle.actions : [];
   const operations: Array<Record<string, string>> = [];
   for (const action of actions) {
@@ -4973,7 +5646,8 @@ function requiredFileOperationsFromActionBundle(actionBundle: Record<string, any
         ? action.targetPath
         : Array.isArray(action.resourceScope) && typeof action.resourceScope[0] === 'string'
           ? action.resourceScope[0]
-          : ''
+          : '',
+      attachmentRoot
     );
     if (!target) continue;
     operations.push({
@@ -4999,10 +5673,16 @@ function fileOperationForAction(action: Record<string, any>, capability: string)
   return undefined;
 }
 
-function concreteTestTarget(value: string): string | undefined {
+function concreteTestTarget(value: string, attachmentRoot?: string): string | undefined {
   const normalized = value.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/');
   if (!normalized || normalized === '.' || normalized === './') return undefined;
-  if (normalized.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(normalized)) return undefined;
+  if (normalized.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(normalized)) {
+    const root = attachmentRoot?.trim().replace(/\\/g, '/').replace(/\/+/g, '/');
+    if (!root) return undefined;
+    if (normalized === root) return undefined;
+    if (normalized.startsWith(`${root}/`)) return concreteTestTarget(normalized.slice(root.length + 1));
+    return undefined;
+  }
   if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) return undefined;
   if (normalized.includes('*') || normalized.endsWith('/')) return undefined;
   return normalized;
@@ -5135,6 +5815,34 @@ function multiTargetAcceptedImplementationPlanCardEvent(sessionId: string, runId
   return event;
 }
 
+function independentMultiTargetAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event = multiTargetAcceptedImplementationPlanCardEvent(sessionId, runId);
+  const payload = event.payload as any;
+  payload.planId = 'impl-generic-independent';
+  payload.implementationPlan.id = 'impl-generic-independent';
+  for (const task of payload.implementationPlan.tasks ?? []) {
+    task.dependencies = [];
+  }
+  return event;
+}
+
+function hardDependencyAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event = multiTargetAcceptedImplementationPlanCardEvent(sessionId, runId);
+  const payload = event.payload as any;
+  payload.planId = 'impl-generic-hard';
+  payload.implementationPlan.id = 'impl-generic-hard';
+  payload.implementationPlan.tasks[0].role = 'sourceCode';
+  payload.implementationPlan.tasks[0].conflictKeys = ['generic-one.txt'];
+  payload.implementationPlan.tasks[0].canDraftInParallel = true;
+  payload.implementationPlan.tasks[1].role = 'sourceCode';
+  payload.implementationPlan.tasks[1].dependencies = [];
+  payload.implementationPlan.tasks[1].hardDependencies = ['task-generic-one'];
+  payload.implementationPlan.tasks[1].softOrderAfter = [];
+  payload.implementationPlan.tasks[1].conflictKeys = ['generic-two.txt'];
+  payload.implementationPlan.tasks[1].canDraftInParallel = true;
+  return event;
+}
+
 function deleteAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
   const event = acceptedImplementationPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
@@ -5155,6 +5863,71 @@ function deleteAcceptedImplementationPlanCardEvent(sessionId: string, runId: str
     },
   ];
   return event;
+}
+
+function singleTargetWriteProposal(targetPath: string, contentSuffix: string): Record<string, unknown> {
+  const blockId = `code-${contentSuffix}`;
+  const actionId = `write-${contentSuffix}`;
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind: 'actionBundle',
+    outputLanguage: 'en-US',
+    userPlan: [
+      '# Generic task slice',
+      '',
+      '## Summary',
+      `Write the accepted target ${targetPath} as one independent task slice.`,
+      '',
+      '## Key Changes',
+      '- Produce one code block for the accepted target.',
+      '- Produce one workspace.write action scoped to that same target.',
+      '- Do not introduce shell, git, network, browser, or provider egress actions.',
+      '',
+      '## Validation',
+      '- Kernel should record a work unit for the accepted target.',
+      '- Parent Session should merge this fragment with sibling independent fragments before submitting.',
+      '',
+      '## Assumptions',
+      '- The target belongs to the accepted implementationPlan file scope.',
+    ].join('\n'),
+    codeBlocks: [
+      { id: blockId, blockId, targetPath, content: `generic ${contentSuffix}` },
+    ],
+    actionBundle: {
+      version: '1',
+      id: `bundle-${contentSuffix}`,
+      goal: `Write ${targetPath}.`,
+      actions: [{
+        id: actionId,
+        actionId,
+        title: `Write ${targetPath}`,
+        kind: 'write',
+        capability: 'workspace.write',
+        resourceScope: [targetPath],
+        targetPath,
+        sourceBlockId: blockId,
+        permissionLabels: ['workspace.write'],
+      }],
+      validationExpectations: [{ id: `validation-${contentSuffix}`, description: `Kernel records ${targetPath}.` }],
+      reviewExpectations: [{ id: `review-${contentSuffix}`, description: `Review ${targetPath}.` }],
+    },
+    expectedValidation: `Kernel records ${targetPath}.`,
+    reviewGuide: `Review ${targetPath}.`,
+  };
+}
+
+function genericDiagnosticProposal(summary: string): Record<string, unknown> {
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind: 'diagnostic',
+    outputLanguage: 'en-US',
+    diagnostic: {
+      version: '1',
+      id: 'diagnostic-generic',
+      severity: 'warning',
+      summary,
+    },
+  };
 }
 
 function processExecAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {

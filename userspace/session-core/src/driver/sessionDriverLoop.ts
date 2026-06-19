@@ -75,6 +75,8 @@ export interface SessionDriverLoopInput {
   requirementConfirmationMode?: RequirementConfirmationMode;
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
+  subAgentMode?: SubAgentMode;
+  subAgentMaxParallel?: number;
   resumeResourcePackets?: boolean;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
 }
@@ -82,6 +84,7 @@ export interface SessionDriverLoopInput {
 export type RequirementConfirmationMode = 'auto' | 'always' | 'off';
 export type ReviewContinuationMode = 'auto' | 'ask' | 'off';
 export type InterventionLevel = 'low' | 'medium' | 'high';
+export type SubAgentMode = 'auto' | 'off';
 
 export interface SessionDecisionResolverInput {
   sessionId: string;
@@ -97,6 +100,8 @@ export interface SessionDecisionResolverInput {
   workflow?: string;
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
+  subAgentMode?: SubAgentMode;
+  subAgentMaxParallel?: number;
 }
 
 interface SessionDriverLoopRunState {
@@ -121,6 +126,15 @@ interface SessionDriverLoopRunState {
   resourceRequestRepairAttempted: boolean;
   planReviewRepairAttempted: boolean;
   acceptedPlanScopeRepairAttempted: boolean;
+  subAgentMergeAttempted: boolean;
+  subAgentMode: SubAgentMode;
+  subAgentMaxParallel: number;
+  subAgentTelemetry?: {
+    mode: SubAgentMode;
+    sliceCount?: number;
+    mergeGroupId?: string;
+    branchContextCharCounts?: Record<string, number>;
+  };
   terminalGuidanceRevisionAttempted: boolean;
   activeTurn?: ActiveTurnState;
 }
@@ -158,6 +172,12 @@ interface AcceptedImplementationPlanTaskContext {
   title?: string;
   capability?: string;
   targets: string[];
+  dependencies: string[];
+  hardDependencies: string[];
+  softOrderAfter: string[];
+  conflictKeys: string[];
+  canDraftInParallel: boolean;
+  role?: ExecutionSliceRole;
 }
 
 interface AcceptedImplementationPlanExecutionRoot {
@@ -181,6 +201,64 @@ interface AcceptedImplementationPlanContext {
   rawPlan: Record<string, unknown>;
 }
 
+type ExecutionSliceRole = 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review';
+
+interface SubAgentTaskSlice {
+  sliceId: string;
+  branchId: string;
+  subAgentId: string;
+  task: AcceptedImplementationPlanTaskContext;
+  role?: ExecutionSliceRole;
+  hardDependencies: string[];
+  softOrderAfter: string[];
+  conflictKeys: string[];
+}
+
+interface SubAgentBranchState {
+  slice: SubAgentTaskSlice;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  error?: string;
+  proposal?: ProposalEnvelope;
+  contextCharCount: number;
+}
+
+interface SubAgentFragment {
+  branchId: string;
+  subAgentId: string;
+  proposal: ProposalEnvelope;
+}
+
+interface SubAgentBranchDiagnostic {
+  branchId: string;
+  subAgentId: string;
+  taskId: string;
+  title?: string;
+  targets: string[];
+  reason: string;
+}
+
+interface SubAgentMergeGroup {
+  mergeGroupId: string;
+  slices: SubAgentTaskSlice[];
+  branches: SubAgentBranchState[];
+}
+
+interface SubAgentMergeGroupEvaluation {
+  mergeGroup: SubAgentMergeGroup | null;
+  reason: SubAgentSkippedReason;
+  summary?: string;
+}
+
+type SubAgentSkippedReason =
+  | 'mode_off'
+  | 'max_parallel_lt_2'
+  | 'insufficient_slices'
+  | 'hard_dependency_blocked'
+  | 'target_conflict'
+  | 'capability_not_parallel_safe'
+  | 'queued_guidance'
+  | 'already_attempted';
+
 interface AcceptedPlanBatchValidationResult {
   ok: boolean;
   reasons: string[];
@@ -200,6 +278,16 @@ interface AcceptedPlanBatchProgress {
   remainingTaskIds: string[];
 }
 
+type SessionRunStateStatus = 'waiting' | 'running' | 'completed' | 'cancelled' | 'failed';
+
+type SessionRunStateReason =
+  | 'requirement'
+  | 'plan_review'
+  | 'permission'
+  | 'review'
+  | 'accepted_plan_execution'
+  | 'work_unit_failed';
+
 interface ResourceManifestBuildResult {
   manifest: ResourceManifest;
   conversationRoots: ConversationResourceRoot[];
@@ -218,6 +306,14 @@ interface ActiveTurnState {
   stage: string;
   providerCallId?: string;
   partFrameParser?: ProviderPartFrameParser;
+}
+
+interface ProjectionDeltaBranchContext {
+  branchId?: string;
+  subAgentId?: string;
+  mergeGroupId?: string;
+  draftId?: string;
+  targetPath?: string;
 }
 
 interface NativeToolCallProposal {
@@ -325,6 +421,8 @@ export class SessionDriverLoop {
     if (acceptedImplementationPlan) {
       implementationBatch.batchIndex = acceptedImplementationPlan.batchIndex;
     }
+    const subAgentMode = input.subAgentMode === 'off' ? 'off' : 'auto';
+    const subAgentMaxParallel = clampSubAgentMaxParallel(input.subAgentMaxParallel);
     const memoryDocument = buildSessionMemoryDocument(input.existingEvents ?? []);
     const restoredResourcePackets = input.resumeResourcePackets
       ? recentResourcePackets(input.existingEvents ?? [])
@@ -359,6 +457,9 @@ export class SessionDriverLoop {
       resourceRequestRepairAttempted: false,
       planReviewRepairAttempted: false,
       acceptedPlanScopeRepairAttempted: false,
+      subAgentMergeAttempted: false,
+      subAgentMode,
+      subAgentMaxParallel,
       terminalGuidanceRevisionAttempted: false,
     };
 
@@ -432,6 +533,7 @@ export class SessionDriverLoop {
         resourcePackets: state.resourcePackets,
         conversationRoots: state.conversationRoots,
         requirement: input.confirmedRequirement,
+        subAgentTelemetry: state.subAgentTelemetry ?? { mode: state.subAgentMode },
         auditOnly: {
           runId: state.runId,
           sessionId,
@@ -746,6 +848,8 @@ export class SessionDriverLoop {
         requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
+        subAgentMode: input.subAgentMode,
+        subAgentMaxParallel: input.subAgentMaxParallel,
         acceptedImplementationPlan: acceptedPlan,
       });
     }
@@ -1029,26 +1133,30 @@ export class SessionDriverLoop {
       let result = await this.append(input.sessionId, [
         reviewDecisionEvent(input.sessionId, review, 'needsRevision', input.guidance ?? '用户要求补充或修改。', false, this.ts(), this.id('review-revise')),
       ]);
-      const decisionReply = await this.kernel({
-        command: {
-          kind: 'userDecisionSubmit',
-          requestId: this.id('user-decision-review'),
-          runId: review.runId,
-          sessionId: input.sessionId,
-          decision: {
-            decisionId: this.id('decision-review'),
-            decisionKind: 'review',
-            targetId: review.reviewId,
-            payload: {
-              decision: input.decision,
-              guidance: input.guidance,
-              continuationRequested: true,
-              revisionRequested: true,
+      result = await this.tryKernelAudit(
+        input.sessionId,
+        {
+          command: {
+            kind: 'userDecisionSubmit',
+            requestId: this.id('user-decision-review'),
+            runId: review.runId,
+            sessionId: input.sessionId,
+            decision: {
+              decisionId: this.id('decision-review'),
+              decisionKind: 'review',
+              targetId: review.reviewId,
+              payload: {
+                decision: input.decision,
+                guidance: input.guidance,
+                continuationRequested: true,
+                revisionRequested: true,
+              },
             },
           },
         },
-      });
-      result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
+        'trace/review_accept_noop',
+        'Kernel 未接受 Review 修订决策审计；Session 将继续按用户补充信息发起修订流程。'
+      ) ?? result;
       return this.runUserTurn({
         sessionId: input.sessionId,
         content: reviewRevisionRequest(review, input.guidance),
@@ -1311,6 +1419,9 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     prompt: PromptEnvelope
   ): Promise<ProposalEnvelope> {
+    const subAgentProposal = await this.trySubAgentAcceptedPlanProposal(input, state, prompt);
+    if (subAgentProposal) return subAgentProposal;
+
     let raw: string;
     try {
       const providerResult = await this.callProviderWithNativeTools(input, state, prompt, [
@@ -1391,6 +1502,489 @@ export class SessionDriverLoop {
         );
       }
     }
+  }
+
+  private async trySubAgentAcceptedPlanProposal(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope
+  ): Promise<ProposalEnvelope | null> {
+    if (!state.acceptedImplementationPlan) return null;
+    if (state.subAgentMode !== 'auto') {
+      await this.emitSubAgentSkipped(state, 'mode_off');
+      return null;
+    }
+    if (state.subAgentMaxParallel < 2) {
+      await this.emitSubAgentSkipped(state, 'max_parallel_lt_2');
+      return null;
+    }
+    if (state.subAgentMergeAttempted) {
+      await this.emitSubAgentSkipped(state, 'already_attempted');
+      return null;
+    }
+    const evaluation = buildSubAgentMergeGroup(state, this.id('subagent-merge'));
+    if (!evaluation.mergeGroup) {
+      await this.emitSubAgentSkipped(state, evaluation.reason, evaluation.summary);
+      return null;
+    }
+    const mergeGroup = evaluation.mergeGroup;
+    state.subAgentMergeAttempted = true;
+    state.subAgentTelemetry = {
+      mode: state.subAgentMode,
+      sliceCount: mergeGroup.slices.length,
+      mergeGroupId: mergeGroup.mergeGroupId,
+      branchContextCharCounts: {},
+    };
+    const initialGuidanceMessages = await this.consumeQueuedGuidanceForProviderResume(state, 'subagent_preflight_guidance');
+    if (initialGuidanceMessages.length) {
+      await this.emitSubAgentSkipped(state, 'queued_guidance', 'Session 在启动子代理前发现新的用户引导，已回到 parent checkpoint。');
+      return this.parentProviderCheckpointAfterSubAgentGuidance(
+        input,
+        state,
+        prompt,
+        'subagent_preflight_guidance',
+        initialGuidanceMessages,
+        'Session 在启动子代理前发现了新的用户引导；不会启动并行分支，将由 parent provider 重新决策。'
+      );
+    }
+    await this.emitProjectionDelta(state, {
+      type: 'stage_delta',
+      stage: 'subagent_plan.created',
+      status: 'queued',
+      channel: 'progress',
+      source: 'session',
+      summary: `Session 已创建 ${mergeGroup.slices.length} 个子代理并行任务切片。`,
+      payload: {
+        mergeGroupId: mergeGroup.mergeGroupId,
+        planId: state.acceptedImplementationPlan.planId,
+        mode: state.subAgentMode,
+        sliceCount: mergeGroup.slices.length,
+        slices: mergeGroup.slices.map((slice) => ({
+          sliceId: slice.sliceId,
+          branchId: slice.branchId,
+          subAgentId: slice.subAgentId,
+          taskId: slice.task.taskId,
+          taskIds: [slice.task.taskId],
+          title: slice.task.title,
+          role: slice.role,
+          targets: slice.task.targets,
+          capability: slice.task.capability,
+          hardDependencies: slice.hardDependencies,
+          softOrderAfter: slice.softOrderAfter,
+          conflictKeys: slice.conflictKeys,
+        })),
+      },
+    });
+    await this.emitProjectionDelta(state, {
+      type: 'stage_delta',
+      stage: 'subagent_merge.started',
+      status: 'running',
+      channel: 'progress',
+      source: 'session',
+      summary: `Session 正在并行处理 ${mergeGroup.slices.length} 个已确认的独立任务切片。`,
+      payload: {
+        mergeGroupId: mergeGroup.mergeGroupId,
+        planId: state.acceptedImplementationPlan.planId,
+        sliceCount: mergeGroup.slices.length,
+      },
+    });
+    for (const slice of mergeGroup.slices) {
+      await this.emitProjectionDelta(state, {
+        type: 'stage_delta',
+        stage: 'subagent_branch.queued',
+        status: 'queued',
+        channel: 'progress',
+        source: 'session',
+        summary: `子代理 ${slice.subAgentId} 已排队处理 ${slice.task.taskId}。`,
+        payload: subAgentSlicePayload(state, mergeGroup, slice, 'queued'),
+      }, {
+        branchId: slice.branchId,
+        subAgentId: slice.subAgentId,
+        mergeGroupId: mergeGroup.mergeGroupId,
+        targetPath: slice.task.targets[0],
+      });
+    }
+
+    const branches = await Promise.all(mergeGroup.slices.map(async (slice): Promise<SubAgentBranchState> => {
+      const branchContext = subAgentTaskSlicePrompt(state, prompt, slice, mergeGroup.mergeGroupId);
+      const deltaContext: ProjectionDeltaBranchContext = {
+        branchId: slice.branchId,
+        subAgentId: slice.subAgentId,
+        mergeGroupId: mergeGroup.mergeGroupId,
+        targetPath: slice.task.targets[0],
+      };
+      try {
+        await this.emitProjectionDelta(state, {
+          type: 'stage_delta',
+          stage: 'subagent_branch.started',
+          status: 'running',
+          channel: 'progress',
+          source: 'session',
+          summary: `子代理 ${slice.subAgentId} 正在生成 ${slice.task.taskId} 的草稿。`,
+          payload: subAgentSlicePayload(state, mergeGroup, slice, 'running'),
+        }, deltaContext);
+        await this.emitProjectionDelta(state, {
+          type: 'stage_delta',
+          stage: 'subagent_branch.context_ready',
+          status: 'running',
+          channel: 'progress',
+          source: 'session',
+          summary: `子代理 ${slice.subAgentId} 已获得切片上下文。`,
+          payload: {
+            ...subAgentSlicePayload(state, mergeGroup, slice, 'running'),
+            contextCharCount: branchContext.length,
+          },
+        }, deltaContext);
+        await this.emitProjectionDelta(state, {
+          type: 'stage_delta',
+          stage: 'subagent_branch.provider_streaming',
+          status: 'streaming',
+          channel: 'progress',
+          source: 'session',
+          summary: `子代理 ${slice.subAgentId} 正在流式生成草稿。`,
+          payload: subAgentSlicePayload(state, mergeGroup, slice, 'streaming'),
+        }, deltaContext);
+        const raw = await this.llmSubAgent(
+          input.profileId,
+          state,
+          `subagent_${slice.task.taskId}`,
+          [
+            { role: 'system', content: prompt.stablePrefix },
+            { role: 'user', content: branchContext },
+          ],
+          deltaContext
+        );
+        const proposal = parseAndValidateProposal({
+          raw,
+          runId: state.runId,
+          sessionId: state.sessionId,
+          source: 'llm',
+        });
+        if (proposal.kind !== 'actionBundle') {
+          throw new SessionDriverLoopError(
+            'subagent_non_action_bundle',
+            `子代理 ${slice.subAgentId} 返回 ${proposal.kind}，但并行切片只能返回 actionBundle fragment。`
+          );
+        }
+        await this.emitProjectionDelta(state, {
+          type: 'stage_delta',
+          stage: 'subagent_branch.draft_ready',
+          status: 'draftReady',
+          channel: 'progress',
+          source: 'session',
+          summary: `子代理 ${slice.subAgentId} 已生成 ${slice.task.taskId} 的草稿。`,
+          payload: subAgentSlicePayload(state, mergeGroup, slice, 'draftReady'),
+        }, deltaContext);
+        return {
+          slice,
+          status: 'completed',
+          proposal,
+          contextCharCount: branchContext.length,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.emitProjectionDelta(state, {
+          type: 'stage_delta',
+          stage: 'subagent_branch.failed',
+          status: 'failed',
+          channel: 'progress',
+          source: 'session',
+          summary: message,
+          payload: {
+            ...subAgentSlicePayload(state, mergeGroup, slice, 'failed'),
+            reason: message,
+          },
+        }, deltaContext);
+        return {
+          slice,
+          status: 'failed',
+          error: message,
+          contextCharCount: branchContext.length,
+        };
+      }
+    }));
+
+    mergeGroup.branches = branches;
+    state.subAgentTelemetry = {
+      ...state.subAgentTelemetry,
+      branchContextCharCounts: Object.fromEntries(
+        branches.map((branch) => [branch.slice.branchId, branch.contextCharCount])
+      ),
+    };
+    const guidanceMessages = await this.consumeQueuedGuidanceForProviderResume(state, 'subagent_merge_guidance');
+    if (guidanceMessages.length) {
+      await this.emitProjectionDelta(state, {
+        type: 'stage_delta',
+        stage: 'subagent_merge.discarded',
+        status: 'discarded',
+        channel: 'progress',
+        source: 'session',
+        summary: '并行草稿已因为新的用户引导而作废，Session 将回到 parent provider checkpoint。',
+        payload: {
+          mergeGroupId: mergeGroup.mergeGroupId,
+          planId: state.acceptedImplementationPlan.planId,
+          discardedBranchIds: branches.map((branch) => branch.slice.branchId),
+          reason: 'queued_guidance',
+        },
+      });
+      return this.parentProviderCheckpointAfterSubAgentGuidance(
+        input,
+        state,
+        prompt,
+        'subagent_merge_guidance',
+        guidanceMessages,
+        'Session 在子代理并行期间收到新的用户引导；所有子代理草稿仅作为临时草稿丢弃，不进入 Kernel actionBatch。请基于用户引导重新输出同一 accepted implementationPlan 范围内的下一步。'
+      );
+    }
+    const failedBranches = branches.filter((branch) => branch.status === 'failed' || !branch.proposal);
+    if (failedBranches.length) {
+      const diagnostics = failedBranches.map(subAgentBranchDiagnostic);
+      await this.emitProjectionDelta(state, {
+        type: 'stage_delta',
+        stage: 'subagent_merge.discarded',
+        status: 'discarded',
+        channel: 'progress',
+        source: 'session',
+        summary: '子代理并行草稿失败，Session 已丢弃全部分支草稿并回退到 parent provider checkpoint。',
+        payload: {
+          mergeGroupId: mergeGroup.mergeGroupId,
+          planId: state.acceptedImplementationPlan.planId,
+          discardedBranchIds: branches.map((branch) => branch.slice.branchId),
+          failedBranchIds: failedBranches.map((branch) => branch.slice.branchId),
+          diagnostics,
+          reason: 'branch_failed',
+        },
+      });
+      await this.appendProviderTrace(state, 'subagent_merge.discarded', {
+        reason: 'branch_failed',
+        mergeGroupId: mergeGroup.mergeGroupId,
+        planId: state.acceptedImplementationPlan.planId,
+        diagnostics,
+      });
+      return this.parentProviderCheckpointAfterSubAgentDiscard(
+        input,
+        state,
+        prompt,
+        mergeGroup,
+        diagnostics
+      );
+    }
+    const fragments = branches.map((branch): SubAgentFragment => ({
+      branchId: branch.slice.branchId,
+      subAgentId: branch.slice.subAgentId,
+      proposal: branch.proposal!,
+    }));
+    const merged = mergeSubAgentFragments(state, mergeGroup, fragments);
+    await this.emitProjectionDelta(state, {
+      type: 'stage_delta',
+      stage: 'subagent_merge.completed',
+      status: 'completed',
+      channel: 'progress',
+      source: 'session',
+      summary: `Session 已合并 ${fragments.length} 个子代理草稿，准备交给 Kernel 统一审核。`,
+      payload: {
+        mergeGroupId: mergeGroup.mergeGroupId,
+        planId: state.acceptedImplementationPlan.planId,
+        branchIds: fragments.map((fragment) => fragment.branchId),
+      },
+    });
+    return parseAndValidateProposal({
+      raw: merged,
+      runId: state.runId,
+      sessionId: state.sessionId,
+      source: 'llm',
+    });
+  }
+
+  private async emitSubAgentSkipped(
+    state: SessionDriverLoopRunState,
+    reason: SubAgentSkippedReason,
+    summary?: string
+  ): Promise<void> {
+    if (!state.acceptedImplementationPlan) return;
+    await this.emitProjectionDelta(state, {
+      type: 'stage_delta',
+      stage: 'subagent_skipped',
+      status: 'skipped',
+      channel: 'progress',
+      source: 'session',
+      summary: summary ?? subAgentSkippedSummary(reason),
+      payload: {
+        runId: state.runId,
+        planId: state.acceptedImplementationPlan.planId,
+        status: 'skipped',
+        reason,
+      },
+    });
+  }
+
+  private async parentProviderCheckpointAfterSubAgentGuidance(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    stage: string,
+    guidanceMessages: LlmChatRequest['messages'],
+    reason: string
+  ): Promise<ProposalEnvelope> {
+    await this.emitProjectionDelta(state, {
+      type: 'stage_delta',
+      stage,
+      status: 'running',
+      channel: 'progress',
+      source: 'session',
+      summary: reason,
+    });
+    const providerResult = await this.callProviderWithNativeTools(input, state, prompt, [
+      { role: 'system', content: prompt.stablePrefix },
+      { role: 'user', content: `${prompt.dynamicSuffix}\n\n${reason}` },
+      ...guidanceMessages,
+    ]);
+    if (typeof providerResult !== 'string') return providerResult;
+    try {
+      return parseAndValidateProposal({
+        raw: providerResult,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+      });
+    } catch (error) {
+      throw new SessionDriverLoopError(
+        'subagent_guidance_parent_repair_failed',
+        `用户引导 checkpoint 后模型输出无法解析：${normalizeParseError(error).message}`
+      );
+    }
+  }
+
+  private async parentProviderCheckpointAfterSubAgentDiscard(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    mergeGroup: SubAgentMergeGroup,
+    diagnostics: SubAgentBranchDiagnostic[]
+  ): Promise<ProposalEnvelope> {
+    const reason = [
+      'Session 子代理并行草稿已全部丢弃，因为至少一个 branch 没有返回可合并的 actionBundle。',
+      '这些 branch 输出不是 Kernel facts，也不是已提交文件；不得把未提交草稿当成已执行事实。',
+      '请由 parent provider 继续同一个 accepted implementationPlan，在已确认 target/capability 范围内输出下一批 actionBundle。',
+      '不要再次启动子代理；本 checkpoint 需要 parent 直接生成合规批次或返回 resourceRequest/decisionRequest/implementationPlan 修订。',
+      diagnostics.length
+        ? `子代理诊断摘要：\n${diagnostics.map((item) =>
+          `- branch=${item.branchId}; subAgent=${item.subAgentId}; task=${item.taskId}; targets=${item.targets.join(',') || 'none'}; reason=${item.reason}`
+        ).join('\n')}`
+        : '子代理诊断摘要：无。',
+    ].join('\n\n');
+    await this.emitProjectionDelta(state, {
+      type: 'stage_delta',
+      stage: 'subagent_parent_fallback',
+      status: 'running',
+      channel: 'progress',
+      source: 'session',
+      summary: 'Session 正在由 parent provider 接管已丢弃的子代理并行草稿。',
+      payload: {
+        mergeGroupId: mergeGroup.mergeGroupId,
+        planId: state.acceptedImplementationPlan?.planId,
+        reason: 'branch_failed',
+        diagnostics,
+      },
+    });
+    const providerResult = await this.callProviderWithNativeTools(input, state, prompt, [
+      { role: 'system', content: prompt.stablePrefix },
+      { role: 'user', content: `${prompt.dynamicSuffix}\n\n${reason}` },
+    ]);
+    if (typeof providerResult !== 'string') return providerResult;
+    try {
+      return parseAndValidateProposal({
+        raw: providerResult,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+      });
+    } catch (error) {
+      throw new SessionDriverLoopError(
+        'subagent_discard_parent_repair_failed',
+        `子代理草稿丢弃后 parent provider 输出无法解析：${normalizeParseError(error).message}`
+      );
+    }
+  }
+
+  private async llmSubAgent(
+    profileId: string | undefined,
+    state: SessionDriverLoopRunState,
+    stage: string,
+    messages: LlmChatRequest['messages'],
+    deltaContext: ProjectionDeltaBranchContext
+  ): Promise<string> {
+    await this.appendProviderTrace(state, `${stage}.request`, {
+      profileId,
+      messages,
+      cachePlan: state.cachePlan,
+      contextAssembly: state.contextAssembly,
+      subAgent: deltaContext,
+    });
+    await this.emitProjectionDelta(state, {
+      type: 'active_turn',
+      stage,
+      status: this.ports.llmChatStream ? 'streaming' : 'running',
+      channel: 'progress',
+      source: 'session',
+      summary: providerStageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
+    }, deltaContext);
+    const request: LlmChatRequest = {
+      profileId,
+      messages,
+      responseFormat: { type: 'json_object' },
+      stream: Boolean(this.ports.llmChatStream),
+      providerOptions: {
+        deepcode: {
+          cachePlan: state.cachePlan,
+          taskGraph: state.taskGraph,
+          subAgent: deltaContext,
+        },
+      },
+    };
+    const toolCallBuffer = new ProviderToolCallBuffer();
+    const result = this.ports.llmChatStream
+      ? await this.ports.llmChatStream(request, async (event) => {
+        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, deltaContext);
+      })
+      : await this.ports.llmChat(request);
+    if (!result.ok || !result.data) {
+      await this.emitProjectionDelta(state, {
+        type: 'error',
+        stage,
+        status: 'failed',
+        channel: 'progress',
+        source: 'provider',
+        summary: result.message ?? result.error ?? 'LLM provider request failed.',
+      }, deltaContext);
+      throw new SessionDriverLoopError(
+        'subagent_llm_chat_failed',
+        result.message ?? result.error ?? 'LLM provider request failed.'
+      );
+    }
+    await this.appendProviderTrace(state, `${stage}.response`, {
+      usage: result.data.usage,
+      assistantContentLength: result.data.assistantMessage?.content?.length ?? 0,
+      chunkSummary: providerTraceChunkSummary(result.data.chunks),
+      subAgent: deltaContext,
+    });
+    await this.emitProjectionDelta(state, {
+      type: 'active_turn',
+      stage,
+      status: 'completed',
+      channel: 'progress',
+      source: 'provider',
+      summary: providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
+    }, deltaContext);
+    const content = stripProviderPartFrames(result.data.assistantMessage?.content
+      ?? result.data.chunks
+        .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
+        .map((chunk) => chunk.content)
+        .join(''));
+    if (!content.trim()) {
+      throw new SessionDriverLoopError('subagent_empty_response', 'Sub-agent provider returned an empty response.');
+    }
+    return content;
   }
 
   private async callProviderWithNativeTools(
@@ -1813,6 +2407,8 @@ export class SessionDriverLoop {
               requirementConfirmationMode: 'off',
               reviewContinuationMode: input.reviewContinuationMode,
               interventionLevel: input.interventionLevel,
+              subAgentMode: input.subAgentMode,
+              subAgentMaxParallel: input.subAgentMaxParallel,
               resumeResourcePackets: true,
               acceptedImplementationPlan: accepted,
             });
@@ -2006,21 +2602,39 @@ export class SessionDriverLoop {
       result = await this.appendProjectedKernelEvents(state.sessionId, { ok: true, events: grantEvents }) ?? result;
     }
 
+    const normalizedBatch = normalizeAcceptedPlanKernelBatch(accepted.planId, plan, accepted);
+    if (!normalizedBatch.ok) {
+      return this.append(state.sessionId, acceptedPlanNormalizationFailureEvents(
+        state.sessionId,
+        state.runId,
+        accepted,
+        normalizedBatch.reasons,
+        this.ts(),
+        this.id('accepted-plan-batch-normalization-failed')
+      )) ?? result;
+    }
+
     const batchReply = await this.kernel({
       command: {
         kind: 'actionBatchSubmit',
         requestId: this.id('accepted-plan-action-batch-submit'),
         runId: state.runId,
         sessionId: state.sessionId,
-        batch: {
-          planId: accepted.planId,
-          actionBundle: plan.actionBundle,
-          codeBlocks: plan.codeBlocks,
-          commandBlocks: plan.commandBlocks,
-        },
+        batch: normalizedBatch.batch,
       },
     });
     result = await this.appendProjectedKernelEvents(state.sessionId, batchReply) ?? result;
+    const batchEvents = batchReply.events ?? [];
+    if (actionBatchHasFailureOrBlocker(batchEvents)) {
+      return this.append(state.sessionId, acceptedPlanExecutionFailureEvents(
+        state.sessionId,
+        state.runId,
+        accepted,
+        batchEvents,
+        this.ts(),
+        this.id('accepted-plan-batch-failed')
+      )) ?? result;
+    }
     if (!actionBatchReadyForReview(batchReply.events ?? [])) {
       if (kernelEventsContainPermissionRequest(batchReply.events ?? [])) {
         const permissionId = permissionIdFromKernelEvents(batchReply.events ?? []);
@@ -2076,6 +2690,8 @@ export class SessionDriverLoop {
         requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
+        subAgentMode: input.subAgentMode,
+        subAgentMaxParallel: input.subAgentMaxParallel,
         resumeResourcePackets: true,
         acceptedImplementationPlan: nextAccepted,
       });
@@ -2224,11 +2840,12 @@ export class SessionDriverLoop {
     profileId: string | undefined,
     state: SessionDriverLoopRunState,
     stage: string,
-    messages: LlmChatRequest['messages']
+    messages: LlmChatRequest['messages'],
+    deltaContext?: ProjectionDeltaBranchContext
   ): Promise<string> {
     const turn = await this.llmTurn(profileId, state, stage, messages, {
       responseFormat: { type: 'json_object' },
-    });
+    }, deltaContext);
     if (!turn.content.trim()) {
       throw new SessionDriverLoopError('llm_empty_response', 'LLM provider returned an empty response.');
     }
@@ -2240,7 +2857,8 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     stage: string,
     messages: LlmChatRequest['messages'],
-    options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {}
+    options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {},
+    deltaContext?: ProjectionDeltaBranchContext
   ): Promise<LlmTurnResult> {
     await this.append(state.sessionId, [
       thinkingEvent(
@@ -2264,7 +2882,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'session',
       summary: providerStageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
-    });
+    }, deltaContext);
     const request: LlmChatRequest = {
       profileId,
       messages,
@@ -2281,7 +2899,7 @@ export class SessionDriverLoop {
     const toolCallBuffer = new ProviderToolCallBuffer();
     const result = this.ports.llmChatStream
       ? await this.ports.llmChatStream(request, async (event) => {
-        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer);
+        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, deltaContext);
       })
       : await this.ports.llmChat(request);
     if (!result.ok || !result.data) {
@@ -2292,7 +2910,7 @@ export class SessionDriverLoop {
         channel: 'progress',
         source: 'provider',
         summary: result.message ?? result.error ?? 'LLM provider request failed.',
-      });
+      }, deltaContext);
       throw new SessionDriverLoopError(
         'llm_chat_failed',
         result.message ?? result.error ?? 'LLM provider request failed.'
@@ -2333,7 +2951,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'provider',
       summary: providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
-    });
+    }, deltaContext);
     const content = stripProviderPartFrames(result.data.assistantMessage?.content
       ?? result.data.chunks
         .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
@@ -2355,13 +2973,14 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     stage: string,
     event: LlmChatStreamEvent,
-    toolCallBuffer: ProviderToolCallBuffer
+    toolCallBuffer: ProviderToolCallBuffer,
+    deltaContext?: ProjectionDeltaBranchContext
   ): Promise<void> {
     const chunk = event.chunk;
     if (event.type === 'provider_delta' && chunk?.content) {
       const frames = this.consumeProviderPartFrames(state, stage, chunk.content);
       for (const frame of frames) {
-        await this.submitProviderPartFrame(state, stage, frame);
+        await this.submitProviderPartFrame(state, stage, frame, deltaContext);
       }
       if (providerStageExposesAssistantDelta(stage)) {
         await this.emitProjectionDelta(state, {
@@ -2373,7 +2992,7 @@ export class SessionDriverLoop {
           itemId: chunk.callId,
           delta: chunk.content,
           payload: chunk.rawProvider,
-        });
+        }, deltaContext);
       }
       return;
     }
@@ -2387,7 +3006,7 @@ export class SessionDriverLoop {
         itemId: chunk.callId,
         delta: chunk.content,
         payload: chunk.rawProvider,
-      });
+      }, deltaContext);
       return;
     }
     if (event.type === 'provider_tool_call_delta' && chunk) {
@@ -2411,7 +3030,7 @@ export class SessionDriverLoop {
           toolCallDelta: chunk.toolCallDelta,
           rawProvider: chunk.rawProvider,
         },
-      });
+      }, deltaContext);
       return;
     }
     if (event.type === 'provider_usage') {
@@ -2423,7 +3042,7 @@ export class SessionDriverLoop {
         source: 'provider',
         summary: providerUsageSummary(visibleLanguageForRequest(state.userRequest)),
         payload: event.usage ?? chunk?.usage,
-      });
+      }, deltaContext);
       return;
     }
     if (event.type === 'provider_error') {
@@ -2435,13 +3054,14 @@ export class SessionDriverLoop {
         source: 'provider',
         summary: event.error ?? chunk?.error ?? 'Provider stream error.',
         payload: event.rawProvider ?? chunk?.rawProvider,
-      });
+      }, deltaContext);
     }
   }
 
   private async emitProjectionDelta(
     state: SessionDriverLoopRunState,
-    delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>
+    delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>,
+    deltaContext?: ProjectionDeltaBranchContext
   ): Promise<void> {
     if (!this.ports.onProjectionDelta) return;
     const activeTurn = state.activeTurn ?? {
@@ -2454,6 +3074,7 @@ export class SessionDriverLoop {
     state.activeTurn = activeTurn;
     await this.ports.onProjectionDelta({
       ...delta,
+      ...deltaContext,
       sessionId: state.sessionId,
       runId: state.runId,
       turnId: activeTurn.turnId,
@@ -2479,19 +3100,33 @@ export class SessionDriverLoop {
   private async submitProviderPartFrame(
     state: SessionDriverLoopRunState,
     stage: string,
-    frame: AgentStreamPartFrame
+    frame: AgentStreamPartFrame,
+    deltaContext?: ProjectionDeltaBranchContext
   ): Promise<void> {
+    const enrichedFrame = {
+      ...frame,
+      branchId: frame.branchId ?? deltaContext?.branchId,
+      subAgentId: frame.subAgentId ?? deltaContext?.subAgentId,
+      mergeGroupId: frame.mergeGroupId ?? deltaContext?.mergeGroupId,
+      draftId: frame.draftId ?? deltaContext?.draftId,
+      targetPath: frame.targetPath ?? deltaContext?.targetPath,
+    };
     await this.emitProjectionDelta(state, {
       type: 'part_delta',
       stage,
       status: 'streaming',
-      channel: frame.partKind === 'thinkingDelta' ? 'reasoning' : 'draft',
+      channel: enrichedFrame.partKind === 'thinkingDelta' ? 'reasoning' : 'draft',
       source: 'session',
-      itemId: frame.frameId ?? frame.draftId,
-      delta: frame.chunk,
-      summary: frame.summary ?? `Provider stream part: ${frame.partKind}`,
-      payload: frame,
-    });
+      itemId: enrichedFrame.frameId ?? enrichedFrame.draftId,
+      branchId: enrichedFrame.branchId,
+      subAgentId: enrichedFrame.subAgentId,
+      mergeGroupId: enrichedFrame.mergeGroupId,
+      draftId: enrichedFrame.draftId,
+      targetPath: enrichedFrame.targetPath,
+      delta: enrichedFrame.chunk,
+      summary: enrichedFrame.summary ?? `Provider stream part: ${enrichedFrame.partKind}`,
+      payload: enrichedFrame,
+    }, deltaContext);
 
     const reply = await this.ports.kernelCommand({
       requestId: this.id('draft-ledger-submit'),
@@ -2501,8 +3136,8 @@ export class SessionDriverLoop {
         runId: state.runId,
         sessionId: state.sessionId,
         frame: {
-          ...frame,
-          runId: frame.runId ?? state.runId,
+          ...enrichedFrame,
+          runId: enrichedFrame.runId ?? state.runId,
         },
       },
     });
@@ -2513,10 +3148,15 @@ export class SessionDriverLoop {
         status: 'failed',
         channel: 'draft',
         source: 'kernel',
-        itemId: frame.frameId ?? frame.draftId,
+        itemId: enrichedFrame.frameId ?? enrichedFrame.draftId,
+        branchId: enrichedFrame.branchId,
+        subAgentId: enrichedFrame.subAgentId,
+        mergeGroupId: enrichedFrame.mergeGroupId,
+        draftId: enrichedFrame.draftId,
+        targetPath: enrichedFrame.targetPath,
         summary: reply.error?.message ?? 'Kernel draft ledger rejected provider stream part.',
         payload: reply.error,
-      });
+      }, deltaContext);
       return;
     }
     for (const event of reply.events) {
@@ -2527,10 +3167,15 @@ export class SessionDriverLoop {
         status: 'streaming',
         channel: 'draft',
         source: 'kernel',
-        itemId: stringValue(record?.draftId) ?? frame.draftId,
+        itemId: stringValue(record?.draftId) ?? enrichedFrame.draftId,
+        branchId: enrichedFrame.branchId,
+        subAgentId: enrichedFrame.subAgentId,
+        mergeGroupId: enrichedFrame.mergeGroupId,
+        draftId: stringValue(record?.draftId) ?? enrichedFrame.draftId,
+        targetPath: enrichedFrame.targetPath,
         summary: stringValue(record?.summary) ?? stringValue(objectRecord(record?.draft)?.summary),
         payload: event,
-      });
+      }, deltaContext);
     }
   }
 
@@ -2562,6 +3207,33 @@ export class SessionDriverLoop {
       );
     }
     return reply;
+  }
+
+  private async tryKernelAudit(
+    sessionId: string,
+    request: KernelCommandEnvelope,
+    traceKind: AgentEvent['kind'],
+    summary: string
+  ): Promise<AgentSessionResult> {
+    try {
+      const reply = await this.ports.kernelCommand(request);
+      if (reply.ok) {
+        return this.appendProjectedKernelEvents(sessionId, reply);
+      }
+      return this.append(sessionId, [
+        traceEvent(sessionId, traceKind, summary, this.ts(), this.id('kernel-audit-noop'), {
+          errorCode: reply.error?.code ?? 'kernel_audit_failed',
+          errorMessage: reply.error?.message ?? 'Kernel audit command failed.',
+        }),
+      ]);
+    } catch (error) {
+      return this.append(sessionId, [
+        traceEvent(sessionId, traceKind, summary, this.ts(), this.id('kernel-audit-noop'), {
+          errorCode: error instanceof SessionDriverLoopError ? error.code : 'kernel_audit_failed',
+          errorMessage: error instanceof Error ? error.message : String(error),
+        }),
+      ]);
+    }
   }
 
   private async append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult> {
@@ -4705,11 +5377,32 @@ function acceptedImplementationPlanContext(
     const record = objectRecord(item);
     if (!record) return [];
     const taskId = stringValue(record.taskId) ?? stringValue(record.id) ?? `task-${index + 1}`;
+    const legacyDependencies = stringArrayValue(record.dependencies)
+      .concat(stringArrayValue(record.dependsOn))
+      .map(normalizePlanScope)
+      .filter(Boolean);
+    const hardDependencies = stringArrayValue(record.hardDependencies)
+      .concat(stringArrayValue(record.hardDependsOn))
+      .map(normalizePlanScope)
+      .filter(Boolean);
+    const explicitSoftOrder = stringArrayValue(record.softOrderAfter)
+      .concat(stringArrayValue(record.softDependencies))
+      .map(normalizePlanScope)
+      .filter(Boolean);
+    const conflictKeys = stringArrayValue(record.conflictKeys)
+      .map(normalizePlanScope)
+      .filter(Boolean);
     return [{
       taskId,
       title: stringValue(record.title),
       capability: stringValue(record.capability),
       targets: stringArrayValue(record.target).map(normalizePlanScope).filter(Boolean),
+      dependencies: legacyDependencies,
+      hardDependencies,
+      softOrderAfter: [...new Set([...explicitSoftOrder, ...legacyDependencies.filter((dependency) => !hardDependencies.includes(dependency))])],
+      conflictKeys,
+      canDraftInParallel: record.canDraftInParallel !== false,
+      role: executionSliceRoleValue(record.role),
     }];
   });
   const capabilities = [...new Set(taskContexts.map((task) => task.capability).filter((item): item is string => Boolean(item)))];
@@ -4808,6 +5501,129 @@ function acceptedPlanExecutionContext(
     reviewGuide: stringValue(payload.reviewGuide) ?? '',
     planReviewReport,
     implementationPlan: accepted?.rawPlan,
+  };
+}
+
+interface NormalizedAcceptedPlanKernelBatch {
+  ok: boolean;
+  batch?: {
+    planId: string;
+    actionBundle: Record<string, unknown>;
+    codeBlocks: unknown[];
+    commandBlocks: unknown[];
+  };
+  reasons: string[];
+}
+
+function normalizeAcceptedPlanKernelBatch(
+  planId: string,
+  plan: SessionPlanContext,
+  accepted?: AcceptedImplementationPlanContext
+): NormalizedAcceptedPlanKernelBatch {
+  const actionBundle = objectRecord(plan.actionBundle);
+  const actions = Array.isArray(actionBundle?.actions) ? actionBundle.actions : [];
+  const codeBlocks = plan.codeBlocks.map((block) => objectRecord(block) ? { ...(objectRecord(block) ?? {}) } : block);
+  const commandBlocks = [...plan.commandBlocks];
+  const codeBlockById = new Map<string, Record<string, unknown>>();
+  const reasons: string[] = [];
+
+  for (const [index, block] of codeBlocks.entries()) {
+    const record = objectRecord(block);
+    if (!record) continue;
+    const id = stringValue(record.id) ?? stringValue(record.blockId);
+    if (!id) continue;
+    record.id = id;
+    record.blockId = stringValue(record.blockId) ?? id;
+    const path = acceptedPlanConcreteFileOperationTarget(
+      stringValue(record.targetPath) ?? stringValue(record.path) ?? '',
+      accepted
+    );
+    if (path) {
+      record.targetPath = path;
+      record.path = stringValue(record.path) ?? path;
+    }
+    codeBlocks[index] = record;
+    codeBlockById.set(id, record);
+  }
+
+  const normalizedActions = actions.map((action, index) => {
+    const record = objectRecord(action);
+    if (!record) {
+      reasons.push(`actionBundle.actions[${index}] 不是对象，不能提交 Kernel。`);
+      return action;
+    }
+    const next = { ...record };
+    const capability = stringValue(next.capability);
+    const kind = stringValue(next.kind);
+    if (capability === 'workspace.delete') {
+      next.kind = kind ?? 'delete';
+      const target = acceptedPlanConcreteFileOperationTarget(
+        stringValue(next.targetPath) ?? stringArrayValue(next.resourceScope)[0] ?? '',
+        accepted
+      );
+      if (target) {
+        next.targetPath = target;
+        next.resourceScope = stringArrayValue(next.resourceScope).length ? stringArrayValue(next.resourceScope) : [target];
+      }
+      return next;
+    }
+
+    if (capability !== 'workspace.write' && capability !== 'workspace.create') {
+      return next;
+    }
+
+    const patchLike = ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(kind ?? '');
+    next.kind = kind ?? (capability === 'workspace.create' ? 'create' : 'write');
+    const blockRef = stringValue(next.replacementBlockId) ?? stringValue(next.sourceBlockId);
+    if (!blockRef) {
+      reasons.push(`actionBundle.actions[${index}] ${capability} 缺少 sourceBlockId/replacementBlockId。`);
+      return next;
+    }
+    const block = codeBlockById.get(blockRef);
+    if (!block) {
+      reasons.push(`actionBundle.actions[${index}] 引用的 codeBlock "${blockRef}" 不存在。`);
+      return next;
+    }
+    const target = acceptedPlanConcreteFileOperationTarget(
+      stringValue(next.targetPath) ??
+      stringArrayValue(next.resourceScope)[0] ??
+      stringValue(block.targetPath) ??
+      stringValue(block.path) ??
+      '',
+      accepted
+    );
+    if (!target) {
+      reasons.push(`actionBundle.actions[${index}] ${capability} 缺少可执行的文件 targetPath/resourceScope。`);
+      return next;
+    }
+    next.targetPath = target;
+    const existingScope = stringArrayValue(next.resourceScope)
+      .map((scope) => acceptedPlanConcreteFileOperationTarget(scope, accepted))
+      .filter((scope): scope is string => Boolean(scope));
+    next.resourceScope = existingScope.length ? existingScope : [target];
+    block.targetPath = stringValue(block.targetPath) ?? target;
+    block.path = stringValue(block.path) ?? target;
+    if (patchLike && !stringValue(next.replacementBlockId)) {
+      next.replacementBlockId = blockRef;
+    } else if (!stringValue(next.sourceBlockId)) {
+      next.sourceBlockId = blockRef;
+    }
+    return next;
+  });
+
+  if (reasons.length) return { ok: false, reasons: [...new Set(reasons)] };
+  return {
+    ok: true,
+    reasons: [],
+    batch: {
+      planId,
+      actionBundle: {
+        ...(actionBundle ?? {}),
+        actions: normalizedActions,
+      },
+      codeBlocks,
+      commandBlocks,
+    },
   };
 }
 
@@ -5063,6 +5879,352 @@ function acceptedPlanAfterBatch(
   };
 }
 
+function clampSubAgentMaxParallel(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric < 2) return 2;
+  return Math.min(2, Math.floor(numeric));
+}
+
+function buildSubAgentMergeGroup(
+  state: SessionDriverLoopRunState,
+  mergeGroupId: string
+): SubAgentMergeGroupEvaluation {
+  const accepted = state.acceptedImplementationPlan;
+  if (!accepted) return { mergeGroup: null, reason: 'insufficient_slices' };
+  const completed = new Set(accepted.completedTaskIds);
+  const remaining = accepted.tasks.filter((task) => !completed.has(task.taskId));
+  const candidates: SubAgentTaskSlice[] = [];
+  const skipped = {
+    hardDependencyBlocked: 0,
+    targetConflict: 0,
+    capabilityUnsafe: 0,
+  };
+  for (const task of remaining) {
+    if (!task.targets.length) continue;
+    if (!task.capability) continue;
+    if (!subAgentParallelSafeCapability(task.capability) || !task.canDraftInParallel) {
+      skipped.capabilityUnsafe += 1;
+      continue;
+    }
+    if (task.hardDependencies.some((dependency) => !completed.has(dependency))) {
+      skipped.hardDependencyBlocked += 1;
+      continue;
+    }
+    const conflicts = candidates.some((candidate) =>
+      taskSlicesConflict(candidate.task, task) ||
+      candidate.hardDependencies.includes(task.taskId) ||
+      task.hardDependencies.includes(candidate.task.taskId)
+    );
+    if (conflicts) {
+      skipped.targetConflict += 1;
+      continue;
+    }
+    const branchId = `branch-${safeSegment(task.taskId)}`;
+    candidates.push({
+      sliceId: `slice-${safeSegment(task.taskId)}`,
+      branchId,
+      subAgentId: `subagent-${safeSegment(task.taskId)}`,
+      task,
+      role: task.role,
+      hardDependencies: task.hardDependencies,
+      softOrderAfter: task.softOrderAfter,
+      conflictKeys: subAgentTaskConflictKeys(task),
+    });
+    if (candidates.length >= state.subAgentMaxParallel) break;
+  }
+  if (candidates.length < 2) {
+    const reason = subAgentSkippedReasonFromCounts(skipped);
+    return {
+      mergeGroup: null,
+      reason,
+      summary: subAgentSkippedSummary(reason, {
+        candidateCount: candidates.length,
+        remainingCount: remaining.length,
+        hardDependencyBlocked: skipped.hardDependencyBlocked,
+        targetConflict: skipped.targetConflict,
+        capabilityUnsafe: skipped.capabilityUnsafe,
+      }),
+    };
+  }
+  return {
+    mergeGroup: {
+      mergeGroupId,
+      slices: candidates,
+      branches: candidates.map((slice) => ({
+        slice,
+        status: 'queued',
+        contextCharCount: 0,
+      })),
+    },
+    reason: 'insufficient_slices',
+  };
+}
+
+function taskSlicesConflict(
+  left: AcceptedImplementationPlanTaskContext,
+  right: AcceptedImplementationPlanTaskContext
+): boolean {
+  return subAgentTaskConflictKeys(left).some((leftTarget) =>
+    subAgentTaskConflictKeys(right).some((rightTarget) =>
+      planScopeCovers(leftTarget, rightTarget) || planScopeCovers(rightTarget, leftTarget)
+    )
+  );
+}
+
+function subAgentTaskConflictKeys(task: AcceptedImplementationPlanTaskContext): string[] {
+  const keys = task.conflictKeys.length ? task.conflictKeys : task.targets;
+  return [...new Set(keys.map(normalizePlanScope).filter(Boolean))];
+}
+
+function subAgentParallelSafeCapability(capability: string): boolean {
+  return ['workspace.read', 'workspace.write', 'workspace.create', 'workspace.delete', 'workspace.rename'].includes(capability);
+}
+
+function subAgentSkippedReasonFromCounts(input: {
+  hardDependencyBlocked: number;
+  targetConflict: number;
+  capabilityUnsafe: number;
+}): SubAgentSkippedReason {
+  if (input.capabilityUnsafe > 0) return 'capability_not_parallel_safe';
+  if (input.hardDependencyBlocked > 0) return 'hard_dependency_blocked';
+  if (input.targetConflict > 0) return 'target_conflict';
+  return 'insufficient_slices';
+}
+
+function subAgentSkippedSummary(
+  reason: SubAgentSkippedReason,
+  counts?: {
+    candidateCount?: number;
+    remainingCount?: number;
+    hardDependencyBlocked?: number;
+    targetConflict?: number;
+    capabilityUnsafe?: number;
+  }
+): string {
+  const suffix = counts
+    ? `（remaining=${counts.remainingCount ?? 0}, candidates=${counts.candidateCount ?? 0}, hardBlocked=${counts.hardDependencyBlocked ?? 0}, targetConflict=${counts.targetConflict ?? 0}, unsafe=${counts.capabilityUnsafe ?? 0}）`
+    : '';
+  if (reason === 'mode_off') return `子代理已在设置中关闭，Session 将按串行执行。${suffix}`;
+  if (reason === 'max_parallel_lt_2') return `子代理最大并发小于 2，Session 将按串行执行。${suffix}`;
+  if (reason === 'already_attempted') return `本轮 accepted plan 已尝试过子代理并行，Session 不会重复启动分支。${suffix}`;
+  if (reason === 'hard_dependency_blocked') return `当前剩余任务存在真实 hard dependency 阻塞，Session 暂不并行。${suffix}`;
+  if (reason === 'target_conflict') return `当前剩余任务存在目标或 conflictKey 重叠，Session 暂不并行。${suffix}`;
+  if (reason === 'capability_not_parallel_safe') return `当前剩余任务包含不适合子代理草稿并行的能力，Session 暂不并行。${suffix}`;
+  if (reason === 'queued_guidance') return `检测到新的用户引导，Session 将回到 parent checkpoint。${suffix}`;
+  return `当前 accepted plan 没有足够独立任务切片，Session 将按串行执行。${suffix}`;
+}
+
+function subAgentTaskSlicePrompt(
+  state: SessionDriverLoopRunState,
+  prompt: PromptEnvelope,
+  slice: SubAgentTaskSlice,
+  mergeGroupId: string
+): string {
+  const accepted = state.acceptedImplementationPlan;
+  const task = slice.task;
+  const evidence = relevantResourceEvidenceForTargets(state.resourcePackets, task.targets);
+  return [
+    'Sub-agent task slice for an already accepted implementationPlan.',
+    'Boundary: return only one Agent Protocol v3 actionBundle fragment for this task slice. Do not ask the user for confirmation, do not create a new implementationPlan, and do not include sibling task work.',
+    'The parent Session will validate and merge this fragment before submitting one unified actionBatch to Kernel. You must not claim that any file was written or tested.',
+    `mergeGroupId=${mergeGroupId}; branchId=${slice.branchId}; subAgentId=${slice.subAgentId}`,
+    `Task: taskId=${task.taskId}; title=${task.title ?? task.taskId}; capability=${task.capability ?? 'none'}; targets=${task.targets.join(', ')}`,
+    accepted ? `Accepted plan summary: ${accepted.summary ?? accepted.title ?? accepted.planId}` : '',
+    accepted ? `Accepted plan id: ${accepted.planId}` : '',
+    `Slice role: ${slice.role ?? 'sourceCode'}; hardDependencies=${slice.hardDependencies.join(', ') || 'none'}; softOrderAfter=${slice.softOrderAfter.join(', ') || 'none'}; conflictKeys=${slice.conflictKeys.join(', ') || 'none'}.`,
+    'Allowed output: kind="actionBundle" only. Use relative targetPath/resourceScope under the accepted primary root. Keep all action/codeBlock ids unique and include the branch id if practical.',
+    'If modifying an existing file, use exactBlock patch only when current ResourcePacket evidence below contains the exact match text. If evidence is insufficient, return a diagnostic actionBundle is not allowed; keep the fragment minimal and let parent repair.',
+    evidence.length ? `Relevant EvidenceTail:\n${evidence.join('\n\n')}` : 'Relevant EvidenceTail: none selected for this slice.',
+    'Protocol reminder from parent stable prefix is already applied. Dynamic sibling context is intentionally omitted.',
+    `Parent dynamic context hash hint: ${stableHash(prompt.dynamicSuffix).slice(0, 16)}`,
+  ].filter(Boolean).join('\n\n');
+}
+
+function subAgentSlicePayload(
+  state: SessionDriverLoopRunState,
+  mergeGroup: SubAgentMergeGroup,
+  slice: SubAgentTaskSlice,
+  status: ProjectionDelta['status']
+): Record<string, unknown> {
+  return {
+    runId: state.runId,
+    planId: state.acceptedImplementationPlan?.planId,
+    mergeGroupId: mergeGroup.mergeGroupId,
+    branchId: slice.branchId,
+    subAgentId: slice.subAgentId,
+    sliceId: slice.sliceId,
+    taskIds: [slice.task.taskId],
+    taskId: slice.task.taskId,
+    title: slice.task.title ?? slice.task.taskId,
+    role: slice.role,
+    targets: slice.task.targets,
+    capability: slice.task.capability,
+    status,
+    hardDependencies: slice.hardDependencies,
+    softOrderAfter: slice.softOrderAfter,
+    conflictKeys: slice.conflictKeys,
+    summary: slice.task.title ?? slice.task.taskId,
+  };
+}
+
+function subAgentBranchDiagnostic(branch: SubAgentBranchState): SubAgentBranchDiagnostic {
+  return {
+    branchId: branch.slice.branchId,
+    subAgentId: branch.slice.subAgentId,
+    taskId: branch.slice.task.taskId,
+    title: branch.slice.task.title,
+    targets: branch.slice.task.targets,
+    reason: branch.error ?? 'branch did not return an actionBundle fragment',
+  };
+}
+
+function relevantResourceEvidenceForTargets(
+  packets: ResourcePacket[],
+  targets: string[]
+): string[] {
+  const normalizedTargets = targets.map(normalizePlanScope).filter(Boolean);
+  const items = packets.flatMap((packet) => packet.items ?? [])
+    .filter((item) => item.status === 'resolved' || item.status === 'provided')
+    .filter((item) => !normalizedTargets.length || resourcePacketItemMatchesAnyTarget(item, normalizedTargets));
+  return items.slice(-6).map((item) => {
+    const path = item.path ?? item.absolutePath ?? item.manifestEntryId;
+    const kind = item.contentKind ?? 'resource';
+    const body = resourcePacketItemEvidenceText(item);
+    return [
+      `ResourceEvidence kind=${kind}${path ? ` path=${path}` : ''}`,
+      body ? clip(body, 2400) : item.contentSummary ?? 'no text evidence',
+    ].join('\n');
+  });
+}
+
+function mergeSubAgentFragments(
+  state: SessionDriverLoopRunState,
+  mergeGroup: SubAgentMergeGroup,
+  fragments: SubAgentFragment[]
+): Record<string, unknown> {
+  const codeBlocks: Record<string, unknown>[] = [];
+  const commandBlocks: Record<string, unknown>[] = [];
+  const actions: Record<string, unknown>[] = [];
+  const validationExpectations: unknown[] = [];
+  const reviewExpectations: unknown[] = [];
+  const expectedValidation: string[] = [];
+  const reviewGuide: string[] = [];
+  const userPlans: string[] = [];
+
+  for (const fragment of fragments) {
+    const payload = objectRecord(fragment.proposal.payload) ?? {};
+    const actionBundle = readActionBundle(fragment.proposal);
+    const rewritten = rewriteSubAgentFragmentIds(fragment, payload, actionBundle);
+    codeBlocks.push(...rewritten.codeBlocks);
+    commandBlocks.push(...rewritten.commandBlocks);
+    actions.push(...rewritten.actions);
+    validationExpectations.push(...rewritten.validationExpectations);
+    reviewExpectations.push(...rewritten.reviewExpectations);
+    const expected = stringValue(payload.expectedValidation);
+    if (expected) expectedValidation.push(`[${fragment.branchId}] ${expected}`);
+    const guide = stringValue(payload.reviewGuide);
+    if (guide) reviewGuide.push(`[${fragment.branchId}] ${guide}`);
+    const userPlan = stringValue(payload.userPlan);
+    if (userPlan) userPlans.push(`### ${fragment.branchId}\n${userPlan}`);
+  }
+
+  const accepted = state.acceptedImplementationPlan;
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind: 'actionBundle',
+    proposalId: `${mergeGroup.mergeGroupId}-proposal`,
+    runId: state.runId,
+    sessionId: state.sessionId,
+    userPlanMarkdown: userPlans.length
+      ? userPlans.join('\n\n')
+      : `# Accepted plan parallel batch\n\nMerged ${fragments.length} independent task slices.`,
+    codeBlocks,
+    commandBlocks,
+    actionBundle: {
+      version: '1',
+      id: `${mergeGroup.mergeGroupId}-action-bundle`,
+      goal: accepted?.summary ?? accepted?.title ?? 'Merged accepted implementation plan batch',
+      actions,
+      continuationExpectations: [],
+      validationExpectations,
+      reviewExpectations,
+      metadata: {
+        mergeGroupId: mergeGroup.mergeGroupId,
+        branchIds: fragments.map((fragment) => fragment.branchId),
+        subAgentMode: state.subAgentMode,
+      },
+    },
+    expectedValidation: expectedValidation.join('\n') || 'Kernel records WorkUnit/tool facts for every merged sub-agent fragment.',
+    reviewGuide: reviewGuide.join('\n') || 'Review the unified Kernel facts and changed paths after the merged batch completes.',
+  };
+}
+
+function rewriteSubAgentFragmentIds(
+  fragment: SubAgentFragment,
+  payload: Record<string, unknown>,
+  actionBundle?: ActionBundleDraft
+): {
+  codeBlocks: Record<string, unknown>[];
+  commandBlocks: Record<string, unknown>[];
+  actions: Record<string, unknown>[];
+  validationExpectations: unknown[];
+  reviewExpectations: unknown[];
+} {
+  const prefix = fragment.branchId;
+  const blockIdMap = new Map<string, string>();
+  const codeBlocks = recordArray(payload.codeBlocks).map((block, index) => {
+    const currentId = stringValue(block.blockId) ?? stringValue(block.id) ?? `code-block-${index + 1}`;
+    const nextId = `${prefix}-${safeSegment(currentId)}`;
+    blockIdMap.set(currentId, nextId);
+    return {
+      ...block,
+      id: nextId,
+      blockId: nextId,
+    };
+  });
+  const commandBlocks = recordArray(payload.commandBlocks).map((block, index) => {
+    const currentId = stringValue(block.commandId) ?? stringValue(block.id) ?? `command-${index + 1}`;
+    const nextId = `${prefix}-${safeSegment(currentId)}`;
+    return {
+      ...block,
+      id: nextId,
+      commandId: nextId,
+    };
+  });
+  const actions = (actionBundle?.actions ?? []).map((action, index) => {
+    const record = { ...(action as unknown as Record<string, unknown>) };
+    const currentId = stringValue(record.actionId) ?? stringValue(record.id) ?? `action-${index + 1}`;
+    const nextId = `${prefix}-${safeSegment(currentId)}`;
+    const sourceBlockId = stringValue(record.sourceBlockId);
+    const replacementBlockId = stringValue(record.replacementBlockId);
+    return {
+      ...record,
+      id: nextId,
+      actionId: nextId,
+      ...(sourceBlockId && blockIdMap.has(sourceBlockId) ? { sourceBlockId: blockIdMap.get(sourceBlockId) } : {}),
+      ...(replacementBlockId && blockIdMap.has(replacementBlockId) ? { replacementBlockId: blockIdMap.get(replacementBlockId) } : {}),
+      metadata: {
+        ...(objectRecord(record.metadata) ?? {}),
+        branchId: fragment.branchId,
+        subAgentId: fragment.subAgentId,
+      },
+    };
+  });
+  return {
+    codeBlocks,
+    commandBlocks,
+    actions,
+    validationExpectations: Array.isArray(actionBundle?.validationExpectations) ? actionBundle.validationExpectations : [],
+    reviewExpectations: Array.isArray(actionBundle?.reviewExpectations) ? actionBundle.reviewExpectations : [],
+  };
+}
+
+function recordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+    : [];
+}
+
 function acceptedPlanComplete(accepted: AcceptedImplementationPlanContext): boolean {
   if (!accepted.tasks.length) return true;
   const completed = new Set(accepted.completedTaskIds);
@@ -5156,6 +6318,22 @@ function normalizePlanScope(value: string): string {
     .replace(/^\.\//, '')
     .replace(/\/+/g, '/')
     .trim();
+}
+
+function executionSliceRoleValue(value: unknown): ExecutionSliceRole | undefined {
+  const role = stringValue(value);
+  if (
+    role === 'sourceCode' ||
+    role === 'infra' ||
+    role === 'script' ||
+    role === 'test' ||
+    role === 'docs' ||
+    role === 'config' ||
+    role === 'review'
+  ) {
+    return role;
+  }
+  return undefined;
 }
 
 function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted: AcceptedImplementationPlanContext): string[] {
@@ -5266,8 +6444,8 @@ function sessionRunStateEvent(input: {
   sessionId: string;
   runId: string;
   phase: SessionTurnPhase;
-  status?: 'waiting' | 'running' | 'completed' | 'cancelled';
-  reason: 'requirement' | 'plan_review' | 'permission' | 'review' | 'accepted_plan_execution';
+  status?: SessionRunStateStatus;
+  reason: SessionRunStateReason;
   decisionOwner: DecisionOwnerRef;
   ts: string;
   id: string;
@@ -5295,10 +6473,12 @@ function sessionRunStateEvent(input: {
 }
 
 function sessionRunStateSummary(
-  reason: 'requirement' | 'plan_review' | 'permission' | 'review' | 'accepted_plan_execution',
-  status: 'waiting' | 'running' | 'completed' | 'cancelled'
+  reason: SessionRunStateReason,
+  status: SessionRunStateStatus
 ): string {
   if (status === 'cancelled') return '用户已忽略当前介入点，本轮会话已中止。';
+  if (status === 'failed' && reason === 'work_unit_failed') return 'Kernel work unit 执行失败，本轮 accepted plan 自动推进已停止。';
+  if (status === 'failed') return 'Session run failed.';
   if (status === 'completed' && reason === 'review') return 'Review 已通过，本次计划执行完成。';
   if (status === 'completed') return 'Session run is completed.';
   if (reason === 'accepted_plan_execution') return 'Session run is executing the accepted implementation plan.';
@@ -5350,6 +6530,153 @@ function acceptedPlanBatchCheckpointEvent(
       presentation: 'collapsible',
     },
   };
+}
+
+function acceptedPlanNormalizationFailureEvents(
+  sessionId: string,
+  runId: string,
+  accepted: AcceptedImplementationPlanContext,
+  reasons: string[],
+  ts: string,
+  id: string
+): AgentEvent[] {
+  const summary = `Accepted plan actionBatch 提交前规范化失败，Session 未提交 Kernel：${reasons.join('；')}`;
+  return [
+    {
+      id,
+      sessionId,
+      ts,
+      kind: 'error',
+      payload: {
+        message: summary,
+        code: 'accepted_plan_batch_normalization_failed',
+        runId,
+        planId: accepted.planId,
+        reasons,
+        channel: 'error',
+        visibility: 'conversation',
+      },
+    },
+    sessionRunStateEvent({
+      sessionId,
+      runId,
+      phase: 'failed',
+      status: 'failed',
+      reason: 'work_unit_failed',
+      decisionOwner: {
+        kind: 'plan',
+        runId,
+        targetId: accepted.planId,
+        planId: accepted.planId,
+      },
+      ts,
+      id: `${id}-state`,
+    }),
+  ];
+}
+
+function acceptedPlanExecutionFailureEvents(
+  sessionId: string,
+  runId: string,
+  accepted: AcceptedImplementationPlanContext,
+  kernelEvents: unknown[],
+  ts: string,
+  id: string
+): AgentEvent[] {
+  const failures = actionBatchFailureDetails(kernelEvents);
+  const summary = failures.length
+    ? `Accepted plan 执行批次失败，Session 已停止自动推进：${failures.map(failureDetailSummary).join('；')}`
+    : 'Accepted plan 执行批次失败或阻塞，Session 已停止自动推进。';
+  return [
+    {
+      id,
+      sessionId,
+      ts,
+      kind: 'workflow_stage',
+      payload: {
+        stage: 'accepted_plan.batch_failed',
+        status: 'failed',
+        summary,
+        runId,
+        planId: accepted.planId,
+        batchIndex: accepted.batchIndex,
+        failures,
+        channel: 'progress',
+        visibility: 'conversation',
+        presentation: 'collapsible',
+      },
+    },
+    sessionRunStateEvent({
+      sessionId,
+      runId,
+      phase: 'failed',
+      status: 'failed',
+      reason: 'work_unit_failed',
+      decisionOwner: {
+        kind: 'plan',
+        runId,
+        targetId: accepted.planId,
+        planId: accepted.planId,
+      },
+      ts,
+      id: `${id}-state`,
+    }),
+  ];
+}
+
+interface ActionBatchFailureDetail {
+  status: 'failed' | 'blocked';
+  workUnitId?: string;
+  actionId?: string;
+  message?: string;
+  code?: string;
+  writeSet: string[];
+}
+
+function actionBatchFailureDetails(kernelEvents: unknown[]): ActionBatchFailureDetail[] {
+  const workUnits = new Map<string, { actionId?: string; writeSet: string[] }>();
+  const details: ActionBatchFailureDetail[] = [];
+  for (const event of kernelEvents) {
+    const record = objectRecord(event);
+    if (!record) continue;
+    if (record.kind === 'work_unit.queued' || record.kind === 'work_unit.started') {
+      const workUnit = objectRecord(record.workUnit);
+      const id = stringValue(workUnit?.id) ?? stringValue(record.workUnitId);
+      if (!id) continue;
+      const prior = workUnits.get(id);
+      workUnits.set(id, {
+        actionId: stringValue(workUnit?.actionId) ?? stringValue(record.actionId) ?? prior?.actionId,
+        writeSet: stringArrayValue(workUnit?.writeSet).length ? stringArrayValue(workUnit?.writeSet) : prior?.writeSet ?? [],
+      });
+      continue;
+    }
+    if (record.kind !== 'work_unit.failed' && record.kind !== 'work_unit.blocked') continue;
+    const status = record.kind === 'work_unit.failed' ? 'failed' : 'blocked';
+    const workUnitId = stringValue(record.workUnitId) ?? stringValue(objectRecord(record.workUnit)?.id);
+    const indexed = workUnitId ? workUnits.get(workUnitId) : undefined;
+    const error = objectRecord(record.error);
+    const message = stringValue(record.message) ?? stringValue(error?.message) ?? stringValue(record.reason);
+    details.push({
+      status,
+      workUnitId,
+      actionId: stringValue(record.actionId) ?? indexed?.actionId,
+      message,
+      code: stringValue(record.code) ?? stringValue(error?.code),
+      writeSet: stringArrayValue(record.writeSet).length ? stringArrayValue(record.writeSet) : indexed?.writeSet ?? [],
+    });
+  }
+  return details;
+}
+
+function failureDetailSummary(detail: ActionBatchFailureDetail): string {
+  const parts = [
+    detail.workUnitId ? `workUnit=${detail.workUnitId}` : undefined,
+    detail.actionId ? `action=${detail.actionId}` : undefined,
+    detail.code ? `code=${detail.code}` : undefined,
+    detail.message,
+    detail.writeSet.length ? `writeSet=${detail.writeSet.join(',')}` : undefined,
+  ].filter((item): item is string => Boolean(item));
+  return parts.length ? parts.join(' ') : detail.status;
 }
 
 function temporaryGrantsForPlan(plan: SessionPlanContext): Record<string, unknown>[] {
@@ -5410,6 +6737,14 @@ function concreteFileOperationTarget(value: string): string | undefined {
   if (normalized.includes('*')) return undefined;
   if (normalized.endsWith('/')) return undefined;
   return normalized;
+}
+
+function acceptedPlanConcreteFileOperationTarget(
+  value: string,
+  accepted?: AcceptedImplementationPlanContext
+): string | undefined {
+  const normalized = accepted ? normalizeAcceptedPlanTargetScope(value, accepted) : normalizePlanScope(value);
+  return concreteFileOperationTarget(normalized);
 }
 
 function planAcceptedAutoGrantCapability(capability: string): boolean {
@@ -5916,6 +7251,8 @@ function implementationPlanExecutionRequest(
     '用户已接受 implementationPlan。现在进入 Edit 阶段，生成下一批可自动执行 actionBundle。',
     'implementationPlan 是 intent/checklist，不是执行事实；不得声称文件已创建、测试已通过或权限已授予。',
     '选择当前任务清单中的下一组相关工作，允许在同一个 actionBundle 中输出多个相关文件或动作；不要一次性输出整个大型项目。',
+    '任务依赖约定：hardDependencies 才代表必须等待的真实阻塞依赖；softOrderAfter / legacy dependencies 只是展示顺序，不应阻止独立任务草稿并行。不要把普通工程顺序写成 hard dependency。',
+    '每个计划任务应尽量携带 targets、capability、conflictKeys、canDraftInParallel、role；sourceCode / infra / script / docs / config / test 等互不冲突切片可以并行生成草稿，由 parent Session 合并后交给 Kernel。',
     currentTask
       ? `当前任务：taskId=${currentTask.taskId}; title=${currentTask.title ?? '未命名'}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}。`
       : '当前任务无法从 batchIndex 唯一定位；请输出最小合规 actionBundle，或返回 decisionRequest/implementationPlan 修订。',
@@ -7231,6 +8568,9 @@ function parseProviderPartFrame(raw: string): AgentStreamPartFrame | null {
     draftId: stringValue(record.draftId),
     frameId: stringValue(record.frameId),
     runId: stringValue(record.runId),
+    branchId: stringValue(record.branchId),
+    subAgentId: stringValue(record.subAgentId),
+    mergeGroupId: stringValue(record.mergeGroupId),
     targetPath: stringValue(record.targetPath),
     language: stringValue(record.language),
     capability: stringValue(record.capability),

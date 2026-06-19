@@ -87,6 +87,15 @@ function normalizeImplementationPlan(value: Record<string, unknown>, proposalId:
         dependencies: optionalStringArray(record, 'dependencies').length
           ? optionalStringArray(record, 'dependencies')
           : optionalStringArray(record, 'dependsOn'),
+        hardDependencies: optionalStringArray(record, 'hardDependencies').length
+          ? optionalStringArray(record, 'hardDependencies')
+          : optionalStringArray(record, 'hardDependsOn'),
+        softOrderAfter: optionalStringArray(record, 'softOrderAfter').length
+          ? optionalStringArray(record, 'softOrderAfter')
+          : optionalStringArray(record, 'softDependencies'),
+        conflictKeys: optionalStringArray(record, 'conflictKeys'),
+        canDraftInParallel: typeof record.canDraftInParallel === 'boolean' ? record.canDraftInParallel : undefined,
+        role: optionalString(record, 'role'),
         capability: optionalString(record, 'capability') ?? '',
         acceptanceCriteria: optionalStringArray(record, 'acceptanceCriteria'),
         failureCriteria: optionalStringArray(record, 'failureCriteria'),

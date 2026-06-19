@@ -231,6 +231,9 @@ export interface KernelDraftLedgerFrame {
   draftId?: string;
   frameId?: string;
   runId?: string;
+  branchId?: string;
+  subAgentId?: string;
+  mergeGroupId?: string;
   targetPath?: string;
   capability?: string;
   chunk?: string;

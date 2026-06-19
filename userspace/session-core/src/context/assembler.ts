@@ -141,6 +141,10 @@ export interface ContextAssemblyRecord {
   partitionTokenEstimates: ContextAssemblyPartitionTokenEstimates;
   resourceEvidenceTailCount: number;
   traceArchiveMode: 'compact-provider-trace';
+  subAgentMode?: 'auto' | 'off';
+  sliceCount?: number;
+  mergeGroupId?: string;
+  branchContextCharCounts?: Record<string, number>;
   redactionNote: string;
 }
 
@@ -165,6 +169,12 @@ export interface ContextAssemblyInput {
   templateVersion?: string;
   contextAssemblyId?: string;
   userGuidance?: UserGuidanceEvent[];
+  subAgentTelemetry?: {
+    mode: 'auto' | 'off';
+    sliceCount?: number;
+    mergeGroupId?: string;
+    branchContextCharCounts?: Record<string, number>;
+  };
   auditOnly?: PromptEnvelopeBuilderInput['auditOnly'];
 }
 
@@ -257,6 +267,10 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     partitionTokenEstimates: contextAssemblyPartitionTokenEstimates(partitionCharCounts),
     resourceEvidenceTailCount: resourcePromptContext.resourceBlocks.length,
     traceArchiveMode: 'compact-provider-trace',
+    subAgentMode: input.subAgentTelemetry?.mode,
+    sliceCount: input.subAgentTelemetry?.sliceCount,
+    mergeGroupId: input.subAgentTelemetry?.mergeGroupId,
+    branchContextCharCounts: input.subAgentTelemetry?.branchContextCharCounts,
     redactionNote: 'Segment previews and provider traces are compacted for inspection; raw provider token deltas and full prompt messages are not stored in transcript.',
   };
   return {
