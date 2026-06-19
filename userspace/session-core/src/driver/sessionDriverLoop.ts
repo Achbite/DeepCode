@@ -1064,7 +1064,8 @@ export class SessionDriverLoop {
       });
     }
 
-    const accepted = reviewDecisionEvent(input.sessionId, review, 'accepted', acceptedReviewContent(review), false, this.ts(), this.id('review-accepted'));
+    const terminalAcceptedPlan = reviewIsTerminalAcceptedPlan(events, review);
+    const accepted = reviewDecisionEvent(input.sessionId, review, 'accepted', acceptedReviewContent(review, terminalAcceptedPlan), false, this.ts(), this.id('review-accepted'));
     let result = await this.append(input.sessionId, [accepted]);
     const decisionReply = await this.kernel({
       command: {
@@ -1101,7 +1102,7 @@ export class SessionDriverLoop {
     result = await this.appendProjectedKernelEvents(input.sessionId, gateReply) ?? result;
 
     const continuationMode = input.reviewContinuationMode ?? 'auto';
-    if (!review.continuations.length || continuationMode === 'off') {
+    if (terminalAcceptedPlan || !review.continuations.length || continuationMode === 'off') {
       if (kernelReviewGateStatus(gateReply.events) === 'accepted') {
         result = await this.append(input.sessionId, [
           sessionRunStateEvent({
@@ -1760,7 +1761,7 @@ export class SessionDriverLoop {
     const actionBundle = readActionBundle(proposal);
     if (!accepted || !actionBundle) return fallback;
 
-    const validation = validateAcceptedImplementationPlanActionBundle(accepted, proposal);
+    const validation = validateAcceptedImplementationPlanActionBundle(accepted, proposal, state.resourcePackets);
     if (!validation.ok) {
       if (!state.acceptedPlanScopeRepairAttempted) {
         state.acceptedPlanScopeRepairAttempted = true;
@@ -1776,6 +1777,45 @@ export class SessionDriverLoop {
           const repaired = await this.repairAcceptedPlanScope(input, state, prompt, proposal, validation);
           if (repaired.kind === 'actionBundle') {
             return this.submitAcceptedPlanActionProposal(input, state, prompt, repaired, fallback);
+          }
+          if (repaired.kind === 'resourceRequest') {
+            const subset = manifestForResourceRequest(state.manifest, repaired.payload as ResourceRequestDraft, state.conversationRoots);
+            if (!subset.manifest.entries.length) {
+              return this.append(state.sessionId, [
+                finalDiagnosticEvent(
+                  state.sessionId,
+                  `自动执行批次需要补充资源证据，但 repair 后的 resourceRequest 无法定位：${resourceResolutionDiagnostic(subset)}`,
+                  this.ts(),
+                  this.id('accepted-plan-scope-repair-resource-invalid')
+                ),
+              ]);
+            }
+            const packet = await this.resolveResources(state, subset.manifest);
+            state.resourcePackets.push(packet);
+            addDiscoveredManifestEntries(state.manifest, packet);
+            const result = await this.append(state.sessionId, [
+              resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-repair-resource-context')),
+            ]) ?? fallback;
+            return this.runUserTurn({
+              sessionId: input.sessionId,
+              content: implementationPlanExecutionRequest(
+                acceptedPlanExecutionContext(state, proposal, {}),
+                accepted,
+                'Session 已补充当前修改所需的只读 search/read 证据；请基于 ResourcePacket 输出同一 accepted implementationPlan 范围内的下一批 actionBundle。'
+              ),
+              attachments: accepted.executionRoot ? [accepted.executionRoot.attachment] : [],
+              existingEvents: result.events,
+              workspaceBinding: input.workspaceBinding,
+              projectWorkingDirectory: input.projectWorkingDirectory,
+              profileId: input.profileId,
+              workflow: input.workflow,
+              appendUserMessage: false,
+              requirementConfirmationMode: 'off',
+              reviewContinuationMode: input.reviewContinuationMode,
+              interventionLevel: input.interventionLevel,
+              resumeResourcePackets: true,
+              acceptedImplementationPlan: accepted,
+            });
           }
           if (repaired.kind === 'decisionRequest') {
             const requirement = requirementRecordFromProposal(repaired, input, state, this.ts());
@@ -3184,6 +3224,22 @@ function manifestForResourceRequest(
   };
 
   for (const item of request.items ?? []) {
+    const searchQuery = item.query?.trim();
+    if (item.kind === 'search' || searchQuery) {
+      const synthesized = synthesizeManifestEntryForSearch(roots, item);
+      if (synthesized.kind === 'entry') {
+        manifest.entries.push(synthesized.entry);
+        pushEntry(synthesized.entry, item);
+        continue;
+      }
+      if (synthesized.kind === 'ambiguous') {
+        ambiguous.push(`${item.id} (${synthesized.reason})`);
+        continue;
+      }
+      unresolved.push(`${item.id} (${synthesized.reason})`);
+      continue;
+    }
+
     const exactId = item.manifestEntryId?.trim();
     if (exactId) {
       const exact = manifest.entries.find((entry) => entry.id === exactId);
@@ -3301,6 +3357,51 @@ function synthesizeManifestEntryForPath(
     reason: reason || `Requested path under conversation root ${resolved.root.rootId}.`,
   };
   return { kind: 'entry', entry };
+}
+
+function synthesizeManifestEntryForSearch(
+  roots: ConversationResourceRoot[],
+  item: ResourceRequestDraft['items'][number]
+): SynthesizedManifestEntryResult {
+  const query = item.query?.trim();
+  if (!query) return { kind: 'unresolved', reason: 'search request requires query' };
+  const root = searchRootForRequest(item.rootId, roots);
+  if (root.kind !== 'resolved') return root;
+  const include = stringArrayValue(item.include);
+  const contextLines = normalizedNonNegativeInteger(item.contextLines);
+  const maxResults = normalizedPositiveInteger(item.maxResults);
+  const resourceRef = root.root.absolutePath ?? root.root.displayPath;
+  return {
+    kind: 'entry',
+    entry: {
+      id: `search-${sanitizeId(root.root.rootId)}-${sanitizeId(item.id)}`,
+      kind: 'search',
+      label: `Search ${query}`,
+      resourceRef,
+      readPolicy: 'autoRead',
+      reason: item.reason || `Search under conversation root ${root.root.rootId}.`,
+      query,
+      ...(include.length ? { include } : {}),
+      ...(typeof contextLines === 'number' ? { contextLines } : {}),
+      ...(typeof maxResults === 'number' ? { maxResults } : {}),
+    },
+  };
+}
+
+function searchRootForRequest(
+  rootId: string | undefined,
+  roots: ConversationResourceRoot[]
+): { kind: 'resolved'; root: ConversationResourceRoot } | { kind: 'ambiguous'; reason: string } | { kind: 'unresolved'; reason: string } {
+  if (!roots.length) return { kind: 'unresolved', reason: 'no available conversation root' };
+  if (rootId) {
+    const root = roots.find((item) => item.rootId === rootId);
+    if (!root) return { kind: 'unresolved', reason: `unknown rootId ${rootId}` };
+    return { kind: 'resolved', root };
+  }
+  const primary = roots.find((item) => item.primary);
+  if (primary) return { kind: 'resolved', root: primary };
+  if (roots.length === 1) return { kind: 'resolved', root: roots[0]! };
+  return { kind: 'ambiguous', reason: 'search request must include rootId when multiple roots are available' };
 }
 
 type ResolvedRequestPath =
@@ -3571,6 +3672,7 @@ function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePa
     : nodes
       ? JSON.stringify(nodes, null, 2)
       : undefined;
+  const promptContent = content ?? (typeof item.promptContent === 'string' ? item.promptContent : undefined);
   return {
     ...(item as unknown as Record<string, unknown>),
     requestItemId: typeof item.requestItemId === 'string' ? item.requestItemId : 'item',
@@ -3579,7 +3681,7 @@ function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePa
     status,
     contentKind: typeof item.contentKind === 'string' ? item.contentKind as ResourcePacketItem['contentKind'] : undefined,
     contentSummary: typeof item.contentSummary === 'string' ? item.contentSummary : typeof item.message === 'string' ? item.message : undefined,
-    promptContent: content,
+    promptContent,
     truncated: Boolean(item.truncated),
     originalBytes: typeof item.originalBytes === 'number'
       ? item.originalBytes
@@ -4028,8 +4130,11 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
     if (isPatchAction && !(replacementBlockId || action.sourceBlockId?.trim())) {
       throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] patch action must include replacementBlockId or sourceBlockId.`);
     }
-    if (isPatchAction && !objectRecord(action.patchSpec)) {
-      throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] patch action must include patchSpec.`);
+    if (isPatchAction) {
+      const patchSpecError = patchActionSpecError(action);
+      if (patchSpecError) {
+        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${patchSpecError}`);
+      }
     }
     if (action.sourceBlockId && !codeBlockIds.has(action.sourceBlockId)) {
       throw new AgentPlanParseError(
@@ -4099,6 +4204,26 @@ function deleteActionTargetError(action: ActionBundleDraft['actions'][number]): 
   }
   if (normalized.endsWith('/')) {
     return 'workspace.delete target must name concrete files, not a directory root.';
+  }
+  return undefined;
+}
+
+function patchActionSpecError(action: ActionBundleDraft['actions'][number]): string | undefined {
+  const patchSpec = objectRecord(action.patchSpec);
+  if (!patchSpec) {
+    return 'patch action must include patchSpec.';
+  }
+  const match = objectRecord(patchSpec.match);
+  if (!match) {
+    return 'patch action must include patchSpec.match.';
+  }
+  const matchKind = stringValue(match.kind);
+  if (matchKind !== 'exactBlock') {
+    return 'patchSpec.match.kind must be "exactBlock".';
+  }
+  const text = stringValue(match.text);
+  if (!text) {
+    return 'patchSpec.match.text must be a non-empty exact block from current ResourcePacket evidence.';
   }
   return undefined;
 }
@@ -4688,7 +4813,8 @@ function acceptedPlanExecutionContext(
 
 function validateAcceptedImplementationPlanActionBundle(
   accepted: AcceptedImplementationPlanContext,
-  proposal: ProposalEnvelope
+  proposal: ProposalEnvelope,
+  resourcePackets: ResourcePacket[] = []
 ): AcceptedPlanBatchValidationResult {
   const actionBundle = readActionBundle(proposal);
   if (!actionBundle) return { ok: false, reasons: ['当前 provider 输出不包含 actionBundle，无法按已确认计划自动执行。'] };
@@ -4722,7 +4848,80 @@ function validateAcceptedImplementationPlanActionBundle(
       }
     }
   }
+  reasons.push(...patchEvidenceValidationReasons(proposal, resourcePackets));
   return { ok: reasons.length === 0, reasons: [...new Set(reasons)] };
+}
+
+function patchEvidenceValidationReasons(
+  proposal: ProposalEnvelope,
+  resourcePackets: ResourcePacket[]
+): string[] {
+  const actionBundle = readActionBundle(proposal);
+  const reasons: string[] = [];
+  for (const [index, action] of (actionBundle?.actions ?? []).entries()) {
+    const actionKind = stringValue(action.kind);
+    if (!['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(actionKind ?? '')) continue;
+    const match = objectRecord(objectRecord(action.patchSpec)?.match);
+    const matchText = stringValue(match?.text);
+    if (!matchText) continue;
+    const targets = actionPlanTargetScopes(action, proposal).map(normalizePlanScope).filter(Boolean);
+    if (!resourceEvidenceContainsExactBlock(resourcePackets, targets, matchText)) {
+      const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
+      reasons.push(`patch action ${action.id || action.title || index} 缺少当前文件/search 证据：patchSpec.match.text 必须来自最近 ResourcePacket 的 fileText/searchResults（target=${targetLabel}）。请先返回 resourceRequest kind="search" 或读取目标文件/range。`);
+    }
+  }
+  return reasons;
+}
+
+function resourceEvidenceContainsExactBlock(
+  packets: ResourcePacket[],
+  targets: string[],
+  matchText: string
+): boolean {
+  if (!packets.length) return false;
+  const normalizedMatch = normalizeLineEndings(matchText);
+  const normalizedTargets = targets.map(normalizePlanScope).filter(Boolean);
+  const candidateItems = packets.flatMap((packet) => packet.items ?? [])
+    .filter((item) => item.status === 'resolved' || item.status === 'provided');
+  const pathMatchedItems = normalizedTargets.length
+    ? candidateItems.filter((item) => resourcePacketItemMatchesAnyTarget(item, normalizedTargets))
+    : candidateItems;
+  const items = pathMatchedItems.length ? pathMatchedItems : candidateItems;
+  return items.some((item) => {
+    const evidence = resourcePacketItemEvidenceText(item);
+    if (!evidence) return false;
+    return normalizeLineEndings(evidence).includes(normalizedMatch);
+  });
+}
+
+function resourcePacketItemMatchesAnyTarget(item: ResourcePacketItem, targets: string[]): boolean {
+  const candidates = [
+    item.path,
+    item.absolutePath,
+  ]
+    .map((value) => typeof value === 'string' ? normalizePlanScope(value) : '')
+    .filter(Boolean);
+  if (!candidates.length) return false;
+  return targets.some((target) =>
+    candidates.some((candidate) =>
+      candidate === target ||
+      candidate.endsWith(`/${target}`) ||
+      target.endsWith(`/${candidate}`)
+    )
+  );
+}
+
+function resourcePacketItemEvidenceText(item: ResourcePacketItem): string {
+  const parts = [
+    item.promptContent,
+    item.contentSummary,
+    Array.isArray(item.matches) ? JSON.stringify(item.matches) : '',
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  return parts.join('\n');
+}
+
+function normalizeLineEndings(value: string): string {
+  return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
 function acceptedPlanProposalTargetScopes(
@@ -5639,7 +5838,7 @@ function reviewDecisionEvent(
   };
 }
 
-function acceptedReviewContent(review: SessionReviewContext): string {
+function acceptedReviewContent(review: SessionReviewContext, terminalAcceptedPlan = false): string {
   const lines = [
     '## Review 已通过',
     '',
@@ -5647,7 +5846,9 @@ function acceptedReviewContent(review: SessionReviewContext): string {
     '',
     '### 后续意图',
   ];
-  if (!review.continuations.length) {
+  if (terminalAcceptedPlan) {
+    lines.push('- 已确认 implementationPlan 的任务清单已经完成；即使旧 actionBundle 带有 continuationExpectations，本次 Review 通过也会结束当前 run，不会自动发起新 Plan。');
+  } else if (!review.continuations.length) {
     lines.push('- 当前计划没有登记后续批次。');
   } else {
     lines.push(`- 当前计划登记了 ${review.continuations.length} 个后续意图。Review 通过会按 agent.reviewContinuationMode 设置决定是否生成下一批 Plan；新 Plan 仍需确认，确认后的合规 actionBundle 会自动提交 Kernel 执行。`);
@@ -5655,6 +5856,21 @@ function acceptedReviewContent(review: SessionReviewContext): string {
   }
   lines.push('', '### 决策边界', '- Review 通过只关闭当前批次。', '- 后续批次只能重新生成 Plan；新 Plan 经用户确认后，范围内 actionBundle 由 Session 自动提交 Kernel 执行。');
   return lines.join('\n');
+}
+
+function reviewIsTerminalAcceptedPlan(events: AgentEvent[], review: SessionReviewContext): boolean {
+  for (const event of [...events].reverse()) {
+    if (event.kind !== 'workflow_stage') continue;
+    const payload = objectRecord(event.payload);
+    if (!payload || stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
+    if (stringValue(payload.runId) !== review.runId) continue;
+    const planId = stringValue(payload.planId);
+    if (review.sourcePlanId && planId && planId !== review.sourcePlanId) continue;
+    const remaining = Array.isArray(payload.remainingTaskIds) ? payload.remainingTaskIds : [];
+    const status = stringValue(payload.status);
+    return status === 'completed' && remaining.length === 0;
+  }
+  return false;
 }
 
 function kernelReviewGateStatus(kernelEvents: unknown[] | undefined): string | undefined {
@@ -5680,9 +5896,9 @@ function reviewContinuationRequest(review: SessionReviewContext): string {
     continuations.length ? `后续批次意图：\n${continuations.map((item) => `- ${item}`).join('\n')}` : '后续批次意图：当前没有登记后续批次。',
     [
       '下一步要求：',
-      '- 如需基于现有代码继续修改，先用 resourceRequest 读取相关文件事实。',
+      '- 如需基于现有代码继续修改，先用 resourceRequest kind="search" 或 file/range 读取相关文件事实。',
       '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
-      '- 每个 workspace.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId。',
+      '- 每个 workspace.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId；patch 必须包含 patchSpec.match.kind="exactBlock" 和当前 ResourcePacket 证据中的 exact text。',
       '- workspace.delete action 必须使用 kind="delete"、capability="workspace.delete"、明确相对文件 targetPath/resourceScope；不得使用 codeBlocks/sourceBlockId、空内容写入或 workspace.write 伪装删除。',
       '- 新 Plan 必须等待用户确认，不要假定已经执行。',
     ].join('\n'),
@@ -5713,6 +5929,7 @@ function implementationPlanExecutionRequest(
     '不要重新询问 implementationPlan 中已经确认的技术路线、目录结构、Docker/script workflow、模块拆分或验证策略。',
     '如果发现必须新增 target/capability，或缺少关键技术选择，请返回 kind="decisionRequest" 或 kind="implementationPlan" 修订，而不是输出超范围 actionBundle。',
     '本轮 actionBundle 必须包含具体 codeBlocks/commandBlocks（如需要）和 Kernel 可审查的 validationExpectations/reviewExpectations。',
+    '修改已有文件时，先使用 resourceRequest kind="search" 或 file/range 读取当前锚点；patch action 必须包含 patchSpec.match.kind="exactBlock" 和从当前 ResourcePacket fileText/searchResults 复制的非空 patchSpec.match.text。',
     '删除文件时必须输出 workspace.delete action：kind="delete"、capability="workspace.delete"、targetPath/resourceScope 为已确认任务范围内的相对文件路径；删除 action 不需要也不得引用 codeBlocks/sourceBlockId。',
     '不要一次性输出整个项目源码；剩余任务放入 actionBundle.continuationExpectations，Session 会在 Kernel facts 返回后继续后续 checkpoint。',
     guidance?.trim() ? `用户确认计划时补充的 guidance：\n${guidance.trim()}` : '',
@@ -5733,9 +5950,9 @@ function reviewRevisionRequest(review: SessionReviewContext, guidance?: string):
     continuations.length ? `上一批 continuation intent：\n${continuations.map((item) => `- ${item}`).join('\n')}` : '',
     [
       '下一步要求：',
-      '- 如需基于现有代码继续修改，先用 resourceRequest 读取相关文件事实，例如构建脚本、入口源码、头文件、测试或容器配置。',
+      '- 如需基于现有代码继续修改，先用 resourceRequest kind="search" 或 file/range 读取相关文件事实，例如构建脚本、入口源码、头文件、测试或容器配置。',
       '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
-      '- 每个 workspace.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId。',
+      '- 每个 workspace.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId；patch 必须包含 patchSpec.match.kind="exactBlock" 和当前 ResourcePacket 证据中的 exact text。',
       '- workspace.delete action 必须使用 kind="delete"、capability="workspace.delete"、明确相对文件 targetPath/resourceScope；不得使用 codeBlocks/sourceBlockId、空内容写入或 workspace.write 伪装删除。',
       '- 新 Plan 等待用户确认，不要假定已经执行。',
     ].join('\n'),
@@ -6177,7 +6394,7 @@ function actionBundleCompactionRepairMessages(
         'If proposing executable work, return kind="actionBundle" for only the next small reviewable implementation batch.',
         `Batch budget: at most ${MAX_ACTION_BUNDLE_CODE_BLOCKS} codeBlocks, at most ${MAX_ACTION_BUNDLE_ACTIONS} actions, at most ${MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES} bytes total codeBlock content, and at most ${MAX_ACTION_BUNDLE_CODE_BLOCK_BYTES} bytes per codeBlock.`,
         'Put remaining work into actionBundle.continuationExpectations; do not emit the full implementation in one response.',
-        'If current facts are insufficient, return kind="resourceRequest" using manifestEntryId or rootId+path under the listed conversation roots.',
+        'If current facts are insufficient, return kind="resourceRequest" using manifestEntryId, rootId+path, or kind="search" with a non-empty query under the listed conversation roots.',
         'Do not claim execution, permissions, tests passed, or task completion.',
       ].join('\n'),
     },
@@ -6261,7 +6478,7 @@ function resourceRequestRepairMessages(
         'You are the DeepCode Agent Protocol v3 resource request repair step.',
         'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
         'Use kind="answer" if the available ResourcePacket facts are enough.',
-        'Use kind="resourceRequest" only when requesting manifestEntryId or root-relative path under the listed conversation roots.',
+        'Use kind="resourceRequest" only when requesting manifestEntryId, root-relative path, or kind="search" with a non-empty query under the listed conversation roots.',
         'Do not invent arbitrary absolute local paths.',
       ].join('\n'),
     },
@@ -6334,8 +6551,9 @@ function acceptedPlanScopeRepairMessages(
         'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
         'A user has already accepted an implementationPlan. Repair the current batch so it stays inside the accepted task targets and capabilities.',
         'If executable work is still valid, return kind="actionBundle" with one related implementation batch. Multiple related files are allowed when all targets are inside the accepted plan.',
+        'If a patch needs current file evidence, return kind="resourceRequest" with kind="search" or a focused file/range read under the conversation roots; Session will resolve it and resume the accepted plan.',
+        'Patch actions must use patchSpec.match.kind="exactBlock" and patchSpec.match.text copied from current ResourcePacket fileText/searchResults evidence.',
         'If the accepted plan is missing a required target, capability, or material technical choice, return kind="decisionRequest" or kind="implementationPlan" revision.',
-        'Do not return resourceRequest in this repair step.',
         'Do not claim execution, permissions, tests passed, or task completion.',
       ].join('\n'),
     },
@@ -6355,7 +6573,7 @@ function acceptedPlanScopeRepairMessages(
         'Session validation reasons:',
         fenced(validation.reasons.map((reason) => `- ${reason}`).join('\n')),
         'Repair requirement:',
-        fenced('Return a corrected actionBundle within the accepted plan scope, or return decisionRequest/implementationPlan revision if scope expansion is truly required.'),
+        fenced('Return a corrected actionBundle within the accepted plan scope. If current patch evidence is missing, return resourceRequest search/read first. Return decisionRequest/implementationPlan revision only if scope expansion is truly required.'),
       ].join('\n\n'),
     },
   ];

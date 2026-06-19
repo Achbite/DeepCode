@@ -53,6 +53,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopTerminalAnswerGuidanceRevision();
   await assertSessionDriverLoopTerminalGuidanceRevisionFallback();
   await assertSessionDriverLoopPathResourceRequest();
+  await assertSessionDriverLoopSearchResourceRequest();
   await assertSessionDriverLoopRejectsOutsidePath();
   await assertSessionDriverLoopUsesRecentAttachmentRoot();
   await assertSessionDriverLoopReadOnlyRequestsContinueWithoutBudgetDecision();
@@ -75,6 +76,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedImplementationPlanRejectsAttachmentRootTarget();
   await assertSessionDriverLoopAcceptedImplementationPlanProjectsWorkUnitFailureReason();
   await assertSessionDriverLoopAcceptedImplementationPlanRejectsOutOfScopeBatch();
+  await assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence();
   await assertSessionDriverLoopPlanAcceptGroupsWorkspaceWriteGrants();
   assertWorkflowStagePermissionProjectsPendingDecision();
   await assertSessionDriverLoopReviewRevisionReturnsToPlanning();
@@ -204,6 +206,37 @@ function assertV3Parser(): void {
   assertEqual(rangedPayload.items[0].offsetBytes, 12000, 'v3 resourceRequest preserves offsetBytes');
   assertEqual(rangedPayload.items[0].limitBytes, 6000, 'v3 resourceRequest preserves limitBytes');
 
+  const searchResourceRequest = parseProposalEnvelope({
+    runId: 'run-generic',
+    sessionId: 'session-generic',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'resourceRequest',
+      outputLanguage: 'en-US',
+      resourceRequest: {
+        version: '1',
+        id: 'request-generic-search',
+        reason: 'Need generic search evidence.',
+        items: [{
+          id: 'search-item',
+          kind: 'search',
+          rootId: 'root-generic',
+          query: 'generic anchor',
+          include: ['src/'],
+          contextLines: 2,
+          maxResults: 25,
+          reason: 'Find generic edit anchor.',
+        }],
+      },
+    }),
+  });
+  const searchPayload = searchResourceRequest.payload as any;
+  assertEqual(searchPayload.items[0].kind, 'search', 'v3 resourceRequest search item parses');
+  assertEqual(searchPayload.items[0].query, 'generic anchor', 'v3 resourceRequest preserves search query');
+  assertEqual(searchPayload.items[0].include[0], 'src/', 'v3 resourceRequest preserves include filter');
+  assertEqual(searchPayload.items[0].contextLines, 2, 'v3 resourceRequest preserves contextLines');
+  assertEqual(searchPayload.items[0].maxResults, 25, 'v3 resourceRequest preserves maxResults');
+
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic',
     raw: JSON.stringify({
@@ -224,7 +257,7 @@ function assertV3Parser(): void {
         items: [{ id: 'missing-target', reason: 'Missing manifestEntryId and path.' }],
       },
     }),
-  }), 'manifestEntryId or path');
+  }), 'manifestEntryId, path, or kind="search"');
 }
 
 function assertActionBundleProtocolFields(): void {
@@ -1702,6 +1735,118 @@ async function assertSessionDriverLoopPathResourceRequest(): Promise<void> {
   const secondEntry = resourceResolveManifests[1].entries[0];
   assertEqual(secondEntry.kind, 'resource', 'path resourceRequest is synthesized as a Kernel-resolved resource');
   assertEqual(secondEntry.resourceRef, '/tmp/generic-project/src/main.txt', 'path resourceRequest stays under the attached directory');
+}
+
+async function assertSessionDriverLoopSearchResourceRequest(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const resourceResolveManifests: Array<Record<string, any>> = [];
+  let llmCalls = 0;
+  const session: AgentSession = {
+    id: 'session-search-resource',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'resourceResolve') {
+        const manifest = command.request?.manifest as any;
+        resourceResolveManifests.push(manifest);
+        const entry = manifest?.entries?.[0] ?? {};
+        return {
+          ok: true,
+          events: [{
+            kind: 'resource.packet_produced',
+            packet: {
+              id: `packet-${resourceResolveManifests.length}`,
+              requestId: command.requestId,
+              items: [{
+                requestItemId: 'search-item',
+                manifestEntryId: entry.id ?? 'search-entry',
+                status: 'resolved',
+                readPolicy: 'explicit-manifest-readonly',
+                sourceKind: entry.kind,
+                resolvedKind: entry.kind,
+                contentKind: entry.kind === 'search' ? 'searchResults' : 'directoryTree',
+                path: entry.path ?? entry.resourceRef,
+                absolutePath: entry.resourceRef,
+                query: entry.query,
+                include: entry.include,
+                matches: entry.kind === 'search'
+                  ? [{ path: 'src/generic.txt', line: 2, preview: 'generic anchor line' }]
+                  : undefined,
+                returnedMatches: entry.kind === 'search' ? 1 : undefined,
+                truncated: false,
+                promptContent: entry.kind === 'search'
+                  ? JSON.stringify({ matches: [{ path: 'src/generic.txt', line: 2, preview: 'generic anchor line' }] })
+                  : undefined,
+                nodes: entry.kind === 'search' ? undefined : [{ type: 'file', path: 'src/generic.txt' }],
+                evidenceRefs: ['evidence-search'],
+              }],
+            },
+          }],
+        };
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls === 1) {
+        return jsonLlmResponse({
+          schemaVersion: 'deepcode.agent.protocol.v3',
+          kind: 'resourceRequest',
+          outputLanguage: 'en-US',
+          resourceRequest: {
+            version: '1',
+            id: 'need-generic-search',
+            reason: 'Need generic search evidence.',
+            items: [{
+              id: 'search-anchor',
+              kind: 'search',
+              query: 'generic anchor',
+              include: ['src/'],
+              contextLines: 2,
+              maxResults: 10,
+              reason: 'Find a generic anchor.',
+            }],
+          },
+        });
+      }
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'answer',
+        outputLanguage: 'en-US',
+        answer: { format: 'markdown', content: 'Generic search evidence was resolved.' },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-search-resource',
+    content: 'Find a generic anchor before editing.',
+    attachments: [{
+      kind: 'directory',
+      path: 'generic-project',
+      absolutePath: '/tmp/generic-project',
+      source: 'userSelected',
+      scope: 'message',
+    }],
+  });
+  assertEqual(result.events.some((event) => event.kind === 'assistant_msg'), true, 'search resourceRequest reaches final answer');
+  assert(resourceResolveManifests.length >= 2, 'search resourceRequest triggers Kernel ResourceResolve');
+  const secondEntry = resourceResolveManifests[1].entries[0];
+  assertEqual(secondEntry.kind, 'search', 'search resourceRequest is synthesized as a Kernel search entry');
+  assertEqual(secondEntry.query, 'generic anchor', 'search manifest carries query');
+  assertEqual(secondEntry.include[0], 'src/', 'search manifest carries include filter');
+  assertEqual(secondEntry.contextLines, 2, 'search manifest carries contextLines');
+  assertEqual(secondEntry.maxResults, 10, 'search manifest carries maxResults');
 }
 
 async function assertSessionDriverLoopRejectsOutsidePath(): Promise<void> {
@@ -3480,6 +3625,175 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRejectsOutOfScop
   );
 }
 
+async function assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence(): Promise<void> {
+  const planEvent = acceptedImplementationPlanCardEvent('session-accepted-plan-patch-evidence', 'run-accepted-plan-patch-evidence');
+  const planPayload = planEvent.payload as any;
+  planPayload.planId = 'impl-generic-patch';
+  planPayload.implementationPlan.id = 'impl-generic-patch';
+  planPayload.implementationPlan.tasks = [{
+    taskId: 'task-generic-patch',
+    title: 'Patch generic file',
+    target: ['generic-patch.txt'],
+    scope: 'Patch one generic file with exact ResourcePacket evidence.',
+    dependencies: [],
+    capability: 'workspace.write',
+    acceptanceCriteria: ['Kernel records the generic patch work unit fact.'],
+    failureCriteria: ['Stop if the patch lacks current exact-block evidence.'],
+  }];
+  const root = '/workspace/generic-project';
+  const events = [
+    userMessageWithDirectoryAttachmentEvent('session-accepted-plan-patch-evidence', root),
+    planEvent,
+  ];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-patch-evidence',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  let resourceSearchRequests = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'resourceResolve') {
+        const entry = command.request?.manifest?.entries?.[0] ?? {};
+        if (entry.kind === 'search') resourceSearchRequests += 1;
+        return {
+          ok: true,
+          events: [{
+            kind: 'resource.packet_produced',
+            packet: {
+              id: `packet-generic-${resourceSearchRequests}`,
+              requestId: command.requestId,
+              items: [{
+                requestItemId: 'search-item',
+                manifestEntryId: entry.id ?? 'search-entry',
+                status: 'resolved',
+                readPolicy: 'explicit-manifest-readonly',
+                sourceKind: entry.kind,
+                resolvedKind: entry.kind,
+                contentKind: entry.kind === 'search' ? 'searchResults' : 'directoryTree',
+                path: entry.kind === 'search' ? 'generic-patch.txt' : entry.resourceRef,
+                absolutePath: entry.resourceRef,
+                query: entry.query,
+                matches: entry.kind === 'search'
+                  ? [{ path: 'generic-patch.txt', line: 1, preview: 'old generic line' }]
+                  : undefined,
+                returnedMatches: entry.kind === 'search' ? 1 : undefined,
+                promptContent: entry.kind === 'search'
+                  ? JSON.stringify({ matches: [{ path: 'generic-patch.txt', line: 1, preview: 'old generic line' }] })
+                  : undefined,
+                nodes: entry.kind === 'search' ? undefined : [{ type: 'file', path: 'generic-patch.txt' }],
+                evidenceRefs: ['evidence-generic-patch'],
+              }],
+            },
+          }],
+        };
+      }
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.queued',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnit: { id: 'work-unit-generic-patch', actionId: 'patch-generic-output', status: 'queued', writeSet: ['generic-patch.txt'] },
+            },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: 'work-unit-generic-patch',
+              output: { path: 'generic-patch.txt' },
+            },
+            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls === 1) return jsonLlmResponse(genericPatchProposal());
+      if (llmCalls === 2) {
+        return jsonLlmResponse({
+          schemaVersion: 'deepcode.agent.protocol.v3',
+          kind: 'resourceRequest',
+          outputLanguage: 'en-US',
+          resourceRequest: {
+            version: '1',
+            id: 'need-generic-patch-anchor',
+            reason: 'Need current exact-block evidence before patching.',
+            items: [{
+              id: 'search-generic-patch-anchor',
+              kind: 'search',
+              query: 'old generic line',
+              include: ['generic-patch.txt'],
+              contextLines: 1,
+              maxResults: 5,
+              reason: 'Find the generic exact patch anchor.',
+            }],
+          },
+        });
+      }
+      return jsonLlmResponse(genericPatchProposal());
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + actionBatchSubmits + resourceSearchRequests + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-patch-evidence',
+    targetId: 'impl-generic-patch',
+    existingEvents: events,
+    projectWorkingDirectory: {
+      rootId: 'project-root-generic',
+      kind: 'directory',
+      label: 'Generic project',
+      displayPath: root,
+      absolutePath: root,
+      source: 'projectWorkingDirectory',
+    } as any,
+    interventionLevel: 'medium',
+  });
+
+  assertEqual(resourceSearchRequests, 1, 'patch without evidence is repaired through one search ResourceResolve');
+  assertEqual(proposalSubmits, 1, 'patch action reaches Kernel PlanReview only after ResourcePacket evidence exists');
+  assertEqual(actionBatchSubmits, 1, 'patch action executes after exact-block evidence is available');
+  assertEqual(result.events.some((event) => event.kind === 'tool_result'), true, 'search ResourcePacket is committed before patch execution');
+}
+
 async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promise<void> {
   const events: AgentEvent[] = [{
     id: 'review-waiting-accept-generic',
@@ -4377,6 +4691,67 @@ function absoluteTargetWriteProposal(targetPath: string): Record<string, unknown
   (proposal.actionBundle as any).actions[0].resourceScope = [targetPath];
   (proposal.actionBundle as any).actions[0].targetPath = targetPath;
   return proposal;
+}
+
+function genericPatchProposal(): Record<string, unknown> {
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind: 'actionBundle',
+    outputLanguage: 'en-US',
+    userPlan: [
+      '# Plan',
+      '',
+      '## Summary',
+      'Patch one previously reviewed generic file using an exact block copied from current ResourcePacket evidence.',
+      '',
+      '## Key Changes',
+      '- Replace a single generic text block instead of rewriting the whole file.',
+      '- Keep the edit anchored by patchSpec.match so Kernel can apply the change fail-closed.',
+      '',
+      '## Interfaces',
+      '- Use workspace.write with kind=replaceBlock and replacementBlockId.',
+      '- Use patchSpec.match.kind=exactBlock with text from current file or search evidence.',
+      '',
+      '## Test Plan',
+      '- Kernel should record a patch work unit for the target file.',
+      '- User review should inspect the patch target and generated replacement.',
+      '',
+      '## Assumptions',
+      '- The target file is within the already accepted implementation plan scope.',
+      '- The exact match block is present in the latest ResourcePacket evidence.',
+    ].join('\n'),
+    codeBlocks: [{
+      id: 'generic-patch-replacement',
+      path: 'generic-patch.txt',
+      operation: 'replaceBlock',
+      content: 'new generic line',
+    }],
+    actionBundle: {
+      version: '1',
+      id: 'generic-patch-bundle',
+      goal: 'Patch a generic file with exact evidence.',
+      actions: [{
+        id: 'patch-generic-output',
+        title: 'Patch generic output',
+        capability: 'workspace.write',
+        kind: 'replaceBlock',
+        resourceScope: ['generic-patch.txt'],
+        targetPath: 'generic-patch.txt',
+        replacementBlockId: 'generic-patch-replacement',
+        patchSpec: {
+          match: {
+            kind: 'exactBlock',
+            text: 'old generic line',
+          },
+        },
+      }],
+      continuationExpectations: [],
+      validationExpectations: [{ id: 'generic-patch-evidence', description: 'Kernel records the patch fact for the generic file.' }],
+      reviewExpectations: [{ id: 'generic-patch-review', description: 'User reviews the generic patch scope.' }],
+    },
+    expectedValidation: 'Kernel records patch facts for the generic file.',
+    reviewGuide: 'Review the generic patch target and replacement before approval.',
+  };
 }
 
 function relativeTargetWriteProposal(targetPath: string, blockId: string, actionId: string): Record<string, unknown> {

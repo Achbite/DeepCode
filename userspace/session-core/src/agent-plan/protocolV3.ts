@@ -198,23 +198,40 @@ function normalizeResourceRequest(value: Record<string, unknown>): Record<string
   const normalizedItems = items.map((item, index) => {
     const record = requireObject(item, `Agent Protocol v3.resourceRequest.items[${index}]`);
     const id = optionalString(record, 'id') ?? `item-${index}`;
+    const kind = optionalString(record, 'kind');
     const manifestEntryId = optionalString(record, 'manifestEntryId');
     const path = optionalString(record, 'path');
     const rootId = optionalString(record, 'rootId');
+    const query = optionalString(record, 'query');
+    const include = optionalStringArray(record, 'include');
+    const contextLines = optionalNonNegativeInteger(record, 'contextLines');
+    const maxResults = optionalPositiveInteger(record, 'maxResults');
     const offsetBytes = optionalNonNegativeInteger(record, 'offsetBytes');
     const limitBytes = optionalPositiveInteger(record, 'limitBytes');
     const reason = optionalString(record, 'reason') ?? 'Resolve additional context.';
-    if (!manifestEntryId && !path) {
+    const isSearch = kind === 'search' || Boolean(query);
+    if (isSearch && !query) {
       throw new AgentPlanParseError(
         'invalid_resource_request_item',
-        `Agent Protocol v3.resourceRequest.items[${index}] must include manifestEntryId or path`
+        `Agent Protocol v3.resourceRequest.items[${index}] search item must include query`
+      );
+    }
+    if (!isSearch && !manifestEntryId && !path) {
+      throw new AgentPlanParseError(
+        'invalid_resource_request_item',
+        `Agent Protocol v3.resourceRequest.items[${index}] must include manifestEntryId, path, or kind="search" with query`
       );
     }
     return {
       id,
+      ...(isSearch ? { kind: 'search' } : (kind ? { kind } : {})),
       ...(manifestEntryId ? { manifestEntryId } : {}),
       ...(path ? { path } : {}),
       ...(rootId ? { rootId } : {}),
+      ...(query ? { query } : {}),
+      ...(include.length ? { include } : {}),
+      ...(typeof contextLines === 'number' ? { contextLines } : {}),
+      ...(typeof maxResults === 'number' ? { maxResults } : {}),
       ...(typeof offsetBytes === 'number' ? { offsetBytes } : {}),
       ...(typeof limitBytes === 'number' ? { limitBytes } : {}),
       reason,

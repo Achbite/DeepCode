@@ -112,9 +112,14 @@ export interface ReviewGuide {
 
 export interface ResourceRequestDraftItem {
   id: string;
+  kind?: 'file' | 'directory' | 'resource' | 'search';
   manifestEntryId?: string;
   path?: string;
   rootId?: string;
+  query?: string;
+  include?: string[];
+  contextLines?: number;
+  maxResults?: number;
   offsetBytes?: number;
   limitBytes?: number;
   reason: string;

@@ -24,6 +24,10 @@ export interface ResourceManifestEntry {
   reason: string;
   offsetBytes?: number;
   limitBytes?: number;
+  query?: string;
+  include?: string[];
+  contextLines?: number;
+  maxResults?: number;
 }
 
 export interface ResourceManifestBudget {
@@ -68,9 +72,14 @@ export interface InitialContextPacket {
 
 export interface ResourceRequestItem {
   id: string;
+  kind?: 'file' | 'directory' | 'resource' | 'search';
   manifestEntryId?: string;
   path?: string;
   rootId?: string;
+  query?: string;
+  include?: string[];
+  contextLines?: number;
+  maxResults?: number;
   offsetBytes?: number;
   limitBytes?: number;
   reason: string;
@@ -91,8 +100,12 @@ export interface ResourcePacketItem {
   contentKind?: 'directoryTree' | 'fileText' | 'searchResults' | 'summary' | 'text' | 'json';
   contentSummary?: string;
   promptContent?: string;
+  query?: string;
+  include?: string[];
+  matches?: Array<Record<string, unknown>>;
   truncated?: boolean;
   originalBytes?: number;
+  returnedMatches?: number;
   offsetBytes?: number;
   limitBytes?: number;
   returnedBytes?: number;

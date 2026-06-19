@@ -159,7 +159,7 @@ function renderResourcePromptContext(
       lines.push(`- rootId=${root.rootId} source=${root.source} path=${root.displayPath}${root.primary ? ' primary=true' : ''}`);
       lines.push(`  label=${root.label}`);
     }
-    lines.push('ResourceRequest path rule: use {"rootId":"<rootId>","path":"<relative path>"} for files or directories under these roots.');
+    lines.push('ResourceRequest path rule: use {"rootId":"<rootId>","path":"<relative path>"} for files or directories under these roots, or {"kind":"search","rootId":"<rootId>","query":"literal text","include":["optional/path/filter"],"contextLines":2,"maxResults":50} for targeted search evidence before patching.');
     const primary = input.conversationRoots.find((root) => root.primary);
     if (primary) {
       lines.push(`Primary conversation workspace root: rootId=${primary.rootId} path=${primary.displayPath}`);
