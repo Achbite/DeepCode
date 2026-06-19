@@ -13,6 +13,7 @@ interface DeepCodeAgentPanelProps {
   language: UiLanguage;
   forceHome?: boolean;
   homeProjectTitle?: string | null;
+  suppressPendingDecision?: boolean;
   onBeforeSend?: () => Promise<boolean | void> | boolean | void;
   onAfterSend?: () => Promise<void> | void;
 }
@@ -29,6 +30,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   language,
   forceHome = false,
   homeProjectTitle,
+  suppressPendingDecision = false,
   onBeforeSend,
   onAfterSend,
 }) => {
@@ -105,14 +107,16 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
   const hasTimelineTurns = (timeline?.turns.length ?? 0) > 0;
-  const pendingDecision = findPendingComposerDecision({
-    events,
-    pendingPermission: pendingPermission?.request ?? null,
-    resolvingRequirement,
-    resolvingPlan,
-    resolvingReview,
-    resolvingPermission,
-  });
+  const pendingDecision = suppressPendingDecision
+    ? null
+    : findPendingComposerDecision({
+      events,
+      pendingPermission: pendingPermission?.request ?? null,
+      resolvingRequirement,
+      resolvingPlan,
+      resolvingReview,
+      resolvingPermission,
+    });
   const showHome = forceHome || (
     !sessionRunning && !pendingDecision && !errorMessage && !timelineError
     && events.length === 0 && !hasTimelineTurns

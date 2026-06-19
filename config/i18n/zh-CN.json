@@ -444,7 +444,7 @@
     "deepcodeGui.timeline.kernelStateEntered": "已进入 Kernel 状态契约。",
     "deepcodeGui.timeline.driverRequestProduced": "Kernel 已生成 Session DriverRequest。",
     "deepcodeGui.timeline.operationEvidence": "操作证据",
-    "deepcodeGui.timeline.thinking": "思考",
+    "deepcodeGui.timeline.thinking": "推理过程",
     "deepcodeGui.progress.title": "进度",
     "deepcodeGui.progress.heartbeat": "心跳",
     "deepcodeGui.context.title": "上下文",

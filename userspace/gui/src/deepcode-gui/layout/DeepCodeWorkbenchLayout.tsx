@@ -97,6 +97,7 @@ interface PendingProjectSession {
 }
 
 const DEEPCODE_GUI_PROJECTS_STORAGE_KEY = 'deepcode-gui.projects.v1';
+const EMPTY_AGENT_EVENTS: AgentEvent[] = [];
 
 const DeepCodeSidebarIcon: React.FC<{ name: DeepCodeSidebarIconName; className?: string }> = ({
   name,
@@ -829,25 +830,27 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const lastHeartbeatText = lastHeartbeatAt
     ? new Date(lastHeartbeatAt).toLocaleTimeString()
     : t(language, 'deepcodeGui.status.pending');
+  const projectDraftActive = Boolean(draftTargetProjectId);
+  const projectionEvents = projectDraftActive ? EMPTY_AGENT_EVENTS : events;
   const taskItems = useMemo(
     () => deriveTaskItems(
-      events,
+      projectionEvents,
       language,
-      Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id)),
-      activeSession?.id
+      !projectDraftActive && Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id)),
+      projectDraftActive ? undefined : activeSession?.id
     ),
-    [activeSession?.id, events, language, runningSessionIds]
+    [activeSession?.id, projectionEvents, language, projectDraftActive, runningSessionIds]
   );
   const timelineProjection = useMemo(
     () => buildNarrativeTimelineProjection({
-      sessionId: activeSession?.id ?? events[0]?.sessionId ?? 'session',
-      events,
+      sessionId: projectDraftActive ? 'project-draft' : activeSession?.id ?? projectionEvents[0]?.sessionId ?? 'session',
+      events: projectionEvents,
     }),
-    [activeSession?.id, events]
+    [activeSession?.id, projectDraftActive, projectionEvents]
   );
   const cacheHitSummary = useMemo(
-    () => deriveCacheHitSummary(events, language, timelineProjection.tokenUsageProjection),
-    [events, language, timelineProjection.tokenUsageProjection]
+    () => deriveCacheHitSummary(projectionEvents, language, timelineProjection.tokenUsageProjection),
+    [projectionEvents, language, timelineProjection.tokenUsageProjection]
   );
   const activeProject = useMemo(
     () => projectRecords.find((project) => project.id === activeProjectId) ?? null,
@@ -878,7 +881,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     return Array.from(byId.values());
   }, [activeSession, events.length, knownSessions, sessions]);
   const activeSessionRunning = Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id));
-  const projectDraftActive = Boolean(draftTargetProjectId);
   const highlightedSessionId = projectDraftActive ? null : activeSession?.id ?? null;
   const isHome = projectDraftActive
     || (events.length === 0 && !loadingSession && !activeSessionRunning);
@@ -1376,6 +1378,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             language={language}
             forceHome={projectDraftActive}
             homeProjectTitle={draftProject?.title ?? activeProject?.title ?? null}
+            suppressPendingDecision={projectDraftActive}
             onBeforeSend={prepareProjectDraftSession}
             onAfterSend={commitDraftProjectSession}
           />
