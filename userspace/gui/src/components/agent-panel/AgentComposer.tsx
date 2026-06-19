@@ -126,7 +126,6 @@ function composerDecisionText(decision: AgentComposerPendingDecision, language: 
   if (decision.kind === 'plan') {
     return {
       title: t(language, 'agent.composer.decision.planQuestion'),
-      summary: decision.summary,
     };
   }
   const fallbackTitle = decision.kind === 'requirement'

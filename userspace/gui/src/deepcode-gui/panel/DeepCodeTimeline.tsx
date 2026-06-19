@@ -534,6 +534,7 @@ const TimelineBlock: React.FC<{
     return (
       <ThinkingBlock
         block={block}
+        language={language}
         animate={animateAssistant}
         collapseCompletedThinking={collapseCompletedThinking}
         onLiveContentChange={onLiveContentChange}
@@ -550,15 +551,15 @@ const TimelineBlock: React.FC<{
     <details className={`deepcode-gui-block deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}`} open={open}>
       <summary>
         <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
-        <span className="deepcode-gui-block__title">{block.title}</span>
-        <span className="deepcode-gui-block__summary">{block.summary}</span>
+        <span className="deepcode-gui-block__title">{localizedTimelineText(language, block.title)}</span>
+        <span className="deepcode-gui-block__summary">{localizedTimelineText(language, block.summary)}</span>
       </summary>
       <div className="deepcode-gui-block__details">
         {block.bodyMarkdown && <MarkdownContent content={block.bodyMarkdown} />}
         {block.narrativeKind === 'review' && (
           <DeepCodeGitReviewDiffDetails gitReview={gitReviewFromBlock(block)} language={language} />
         )}
-        <EventList events={block.events} />
+        <EventList events={block.events} language={language} />
       </div>
     </details>
   );
@@ -572,6 +573,8 @@ const OperationEvidenceBlock: React.FC<{
     fallbackTitle: block.title,
     fallbackSummary: block.summary,
   });
+  const title = localizedTimelineText(language, evidence.title);
+  const summary = localizedTimelineText(language, evidence.summary ?? '');
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
   const status = evidence.status === 'completed' ? block.status : evidence.status;
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
@@ -584,13 +587,13 @@ const OperationEvidenceBlock: React.FC<{
     >
       <summary>
         <span className={`deepcode-gui-block__status deepcode-gui-block__status--${status}`} />
-        <span className="deepcode-gui-block__title">{evidence.title}</span>
-        {evidence.summary && <span className="deepcode-gui-block__summary">{evidence.summary}</span>}
+        <span className="deepcode-gui-block__title">{title}</span>
+        {summary && <span className="deepcode-gui-block__summary">{summary}</span>}
       </summary>
       <div className="deepcode-gui-block__details">
         {block.bodyMarkdown && <MarkdownContent content={block.bodyMarkdown} />}
         <ToolEvidenceDetails evidence={evidence} language={language} />
-        {evidence.items.length === 0 && <EventList events={block.events} />}
+        {evidence.items.length === 0 && <EventList events={block.events} language={language} />}
       </div>
     </details>
   );
@@ -636,10 +639,11 @@ const DeepCodeGitReviewDiffDetails: React.FC<{ gitReview: unknown; language: UiL
 
 const ThinkingBlock: React.FC<{
   block: AgentTimelineBlock;
+  language: UiLanguage;
   animate?: boolean;
   collapseCompletedThinking?: boolean;
   onLiveContentChange?: () => void;
-}> = ({ block, animate = false, collapseCompletedThinking = true, onLiveContentChange = () => undefined }) => {
+}> = ({ block, language, animate = false, collapseCompletedThinking = true, onLiveContentChange = () => undefined }) => {
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   const completedThinkingOpen = block.status === 'completed' && !collapseCompletedThinking;
@@ -651,7 +655,7 @@ const ThinkingBlock: React.FC<{
     <details className={`deepcode-gui-block deepcode-gui-block--thinking${narrativeClass}${densityClass}`} open={open}>
       <summary>
         <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
-        <span className="deepcode-gui-block__title">{block.title}</span>
+        <span className="deepcode-gui-block__title">{localizedTimelineText(language, block.title)}</span>
         {summary && <span className="deepcode-gui-block__summary">{summary}</span>}
       </summary>
       <div className="deepcode-gui-block__details deepcode-gui-block__details--thinking">
@@ -671,6 +675,7 @@ const PlanBlock: React.FC<{
   language: UiLanguage;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
 }> = ({ block, language, onPlanResolve }) => {
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const reviewEvent = block.events.find((event) => event.kind === 'plan_review');
   const payload = isRecord(reviewEvent?.payload) ? reviewEvent.payload : {};
   const runId = stringField(payload, 'runId');
@@ -680,6 +685,15 @@ const PlanBlock: React.FC<{
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
+  const markdown = planBlockMarkdown(block);
+  const copyPlan = async () => {
+    try {
+      await copyText(markdown);
+      setCopyStatus('copied');
+    } catch {
+      setCopyStatus('error');
+    }
+  };
 
   return (
     <details
@@ -689,11 +703,26 @@ const PlanBlock: React.FC<{
       <summary>
         <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
         <span className="deepcode-gui-block__title">{block.title}</span>
-        <span className="deepcode-gui-block__summary">{block.summary}</span>
+        <button
+          type="button"
+          className={`deepcode-gui-plan-copy deepcode-gui-plan-copy--${copyStatus}`}
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            void copyPlan();
+          }}
+          title={t(language, 'deepcodeGui.plan.copyMarkdown')}
+          aria-label={t(language, 'deepcodeGui.plan.copyMarkdown')}
+        >
+          <DeepCodeTurnActionIcon name="copy" />
+        </button>
       </summary>
       <div className="deepcode-gui-block__details">
         <MarkdownContent content={block.bodyMarkdown ?? block.summary} />
-        <EventList events={block.events} compact />
         {confirmable && (
           <div className="deepcode-gui-plan-actions deepcode-gui-plan-actions--composer">
             {t(language, 'deepcodeGui.plan.useComposer')}
@@ -747,12 +776,12 @@ const TypewriterMarkdown: React.FC<{
   return <MarkdownContent content={renderedContent} />;
 };
 
-const EventList: React.FC<{ events: AgentEvent[]; compact?: boolean }> = ({ events, compact }) => (
+const EventList: React.FC<{ events: AgentEvent[]; compact?: boolean; language: UiLanguage }> = ({ events, compact, language }) => (
   <div className={`deepcode-gui-event-list ${compact ? 'deepcode-gui-event-list--compact' : ''}`}>
     {events.map((event) => (
       <div key={event.id} className="deepcode-gui-event">
-        <span className="deepcode-gui-event__kind">{event.kind}</span>
-        <span className="deepcode-gui-event__text">{eventSummary(event)}</span>
+        <span className="deepcode-gui-event__kind">{localizedEventKind(language, event.kind)}</span>
+        <span className="deepcode-gui-event__text">{localizedEventSummary(language, event)}</span>
       </div>
     ))}
   </div>
@@ -815,6 +844,47 @@ function fallbackBlockStatus(event: AgentEvent): AgentTimelineBlock['status'] {
 
 function eventSummary(event: AgentEvent): string {
   return eventText(event) || event.kind;
+}
+
+function localizedEventKind(language: UiLanguage, kind: string): string {
+  if (language !== 'zh-CN') return kind;
+  if (kind === 'workflow_stage') return t(language, 'deepcodeGui.timeline.workflowStage');
+  if (kind === 'workflow_decision') return t(language, 'deepcodeGui.timeline.workflowDecision');
+  if (kind === 'plan_card') return t(language, 'deepcodeGui.tasks.plan');
+  if (kind === 'plan_review') return t(language, 'deepcodeGui.tasks.plan');
+  if (kind === 'tool_call') return t(language, 'deepcodeGui.tasks.tool');
+  if (kind === 'tool_result') return t(language, 'deepcodeGui.tasks.tool');
+  if (kind === 'permission_request' || kind === 'permission_result') return t(language, 'deepcodeGui.tasks.permission');
+  if (kind === 'requirement_confirmation' || kind === 'requirement_decision') return t(language, 'deepcodeGui.tasks.requirement');
+  return kind;
+}
+
+function localizedEventSummary(language: UiLanguage, event: AgentEvent): string {
+  return localizedTimelineText(language, eventSummary(event));
+}
+
+function localizedTimelineText(language: UiLanguage, text: string): string {
+  if (!text) return '';
+  if (language !== 'zh-CN') return text;
+  const replacements: Array<[string, string]> = [
+    ['Kernel state contract entered.', t(language, 'deepcodeGui.timeline.kernelStateEntered')],
+    ['Session DriverRequest produced by Kernel.', t(language, 'deepcodeGui.timeline.driverRequestProduced')],
+    ['Operation evidence', t(language, 'deepcodeGui.timeline.operationEvidence')],
+    ['Thinking', t(language, 'deepcodeGui.timeline.thinking')],
+    ['User guidance', t(language, 'deepcodeGui.tasks.guidance')],
+  ];
+  let result = text;
+  for (const [source, target] of replacements) {
+    result = result.split(source).join(target);
+  }
+  return result;
+}
+
+function planBlockMarkdown(block: AgentTimelineBlock): string {
+  const body = (block.bodyMarkdown ?? block.summary ?? '').trim();
+  const title = block.title.trim();
+  if (!title || body.startsWith('#')) return body;
+  return [`# ${title}`, body].filter(Boolean).join('\n\n');
 }
 
 function thinkingMarkdown(block: AgentTimelineBlock): string {

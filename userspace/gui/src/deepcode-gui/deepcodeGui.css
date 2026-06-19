@@ -611,6 +611,10 @@ button {
   list-style: none;
 }
 
+.deepcode-gui-block--plan summary {
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+}
+
 .deepcode-gui-block summary::-webkit-details-marker {
   display: none;
 }
@@ -651,6 +655,32 @@ button {
 
 .deepcode-gui-block__summary {
   color: var(--muted);
+}
+
+.deepcode-gui-plan-copy {
+  width: 24px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.deepcode-gui-plan-copy:hover {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--text);
+}
+
+.deepcode-gui-plan-copy--copied {
+  color: var(--accent);
+}
+
+.deepcode-gui-plan-copy--error {
+  color: var(--danger);
 }
 
 .deepcode-gui-block__details {

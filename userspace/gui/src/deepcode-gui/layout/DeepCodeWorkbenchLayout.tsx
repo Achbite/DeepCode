@@ -679,13 +679,13 @@ function deriveTaskItems(
     events,
   });
   const latestTurn = projection.turns[projection.turns.length - 1];
-  const latestTaskBlockIds = new Set(
+  const latestPlanBlockIds = new Set(
     latestTurn?.blocks
-      .filter((block) => block.displayHints?.showInTaskList)
+      .filter((block) => block.narrativeKind === 'plan')
       .map((block) => block.id) ?? []
   );
   const projectedItems = (projection.taskProjection?.items ?? [])
-    .filter((item) => latestTaskBlockIds.has(item.blockId));
+    .filter((item) => item.narrativeKind === 'plan' && latestPlanBlockIds.has(item.blockId));
 
   if (projectedItems.length > 0) {
     return dedupeTaskItems(
