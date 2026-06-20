@@ -103,6 +103,7 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
 function chooseRetention(item: ResourcePacketItem, content: string, latestPacket: boolean): ResourceBlockRetention {
   if (item.status === 'denied' || item.status === 'needsUserApproval') return 'denied';
   if (item.status === 'error') return 'error';
+  if (item.status === 'skipped') return 'handleOnly';
   if (!content.trim()) return 'handleOnly';
   if (item.contentKind === 'directoryTree' || item.contentKind === 'searchResults') return 'summary';
   if (latestPacket && !item.truncated && content.length <= FULL_TEXT_CHAR_LIMIT) return 'full';
@@ -127,6 +128,7 @@ function resourceHandle(item: ResourcePacketItem, displayRef: string): string {
 function resourceSummary(item: ResourcePacketItem, content: string, retention: ResourceBlockRetention): string {
   if (retention === 'denied') return item.denialReason ?? 'Resource is not available without user approval.';
   if (retention === 'error') return item.denialReason ?? 'Resource read failed.';
+  if (item.status === 'skipped') return item.skipMessage ?? item.contentSummary ?? 'Resource was skipped by Kernel content policy.';
   if (retention === 'handleOnly') return item.contentSummary ?? 'Resource handle only; request a focused range if full content is needed.';
   if (isInformativeSummary(item.contentSummary)) return item.contentSummary!.trim();
   const normalized = normalizeContent(content);

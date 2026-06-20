@@ -8,6 +8,7 @@ pub mod builtin;
 pub mod catalog;
 pub mod executor;
 pub mod external;
+pub mod file_content;
 pub mod hash;
 pub mod manifest;
 pub mod mcp;

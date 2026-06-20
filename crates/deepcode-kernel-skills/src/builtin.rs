@@ -1,3 +1,4 @@
+use crate::file_content::{lightweight_file_classification, read_text_file_for_llm};
 use crate::{
     builtin, SkillDescriptor, SkillExecutionContext, SkillExecutor, SkillInvocation, SkillResult,
 };
@@ -121,8 +122,13 @@ impl SkillExecutor for FsReadExecutor {
         if !target.is_file() {
             return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
         }
-        let content = fs::read_to_string(&target)
-            .map_err(|error| KernelError::Other(format!("read {path}: {error}")))?;
+        let read = read_text_file_for_llm(&target).map_err(|skip| {
+            KernelError::InvalidCommand(format!(
+                "unsupported_file_content: {} ({})",
+                skip.message, skip.reason
+            ))
+        })?;
+        let content = read.content;
         Ok(ok(
             invocation.id,
             serde_json::json!({
@@ -130,7 +136,8 @@ impl SkillExecutor for FsReadExecutor {
                 "path": normalize_relative_path(&path),
                 "content": content,
                 "sizeBytes": content.len(),
-                "binary": false
+                "binary": false,
+                "fileClassification": read.classification
             }),
         ))
     }
@@ -202,8 +209,14 @@ impl SkillExecutor for FsPatchExecutor {
         if !target.is_file() {
             return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
         }
-        let original = fs::read_to_string(&target)
-            .map_err(|error| KernelError::Other(format!("read {path}: {error}")))?;
+        let original = read_text_file_for_llm(&target)
+            .map_err(|skip| {
+                KernelError::InvalidCommand(format!(
+                    "unsupported_file_content: {} ({})",
+                    skip.message, skip.reason
+                ))
+            })?
+            .content;
         let replacement = get_string(&invocation.input, "replacement").unwrap_or_default();
         let patch_spec = invocation.input.get("patchSpec").ok_or_else(|| {
             KernelError::InvalidCommand("fs.patch requires patchSpec".to_string())
@@ -289,7 +302,14 @@ impl SkillExecutor for FsDiffExecutor {
         let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
         let target = resolve_workspace_path(&root, &path)?;
-        let old_content = fs::read_to_string(&target).unwrap_or_default();
+        let old_content = read_text_file_for_llm(&target)
+            .map_err(|skip| {
+                KernelError::InvalidCommand(format!(
+                    "unsupported_file_content: {} ({})",
+                    skip.message, skip.reason
+                ))
+            })?
+            .content;
         let new_content = get_string(&invocation.input, "newContent").unwrap_or_default();
         Ok(ok(
             invocation.id,
@@ -350,6 +370,10 @@ impl SkillExecutor for CodeSearchExecutor {
                 "maxResults": result.max_results,
                 "returnedMatches": returned_matches,
                 "truncated": result.truncated,
+                "visitedFiles": result.visited_files,
+                "skippedFiles": result.skipped_files,
+                "skippedBinaryFiles": result.skipped_binary_files,
+                "skippedExecutableFiles": result.skipped_executable_files,
                 "matches": result.matches
             }),
         ))
@@ -1471,6 +1495,11 @@ fn list_nodes(path: &Path, root: &Path, depth: u32) -> KernelResult<Vec<Value>> 
             "kind": kind,
             "sizeBytes": metadata.len()
         });
+        if metadata.is_file() {
+            node["fileClassification"] =
+                serde_json::to_value(lightweight_file_classification(&entry_path, &metadata))
+                    .unwrap_or(Value::Null);
+        }
         if metadata.is_dir() && depth > 1 {
             node["children"] = Value::Array(list_nodes(&entry_path, root, depth - 1)?);
         }
@@ -1503,6 +1532,10 @@ struct CodeSearchResult {
     truncated: bool,
     context_lines: usize,
     max_results: usize,
+    visited_files: usize,
+    skipped_files: usize,
+    skipped_binary_files: usize,
+    skipped_executable_files: usize,
 }
 
 fn search_workspace_with_options(
@@ -1516,6 +1549,9 @@ fn search_workspace_with_options(
     let context_lines = (context_lines as usize).min(CODE_SEARCH_MAX_CONTEXT_LINES);
     let max_results = (max_results as usize).clamp(1, CODE_SEARCH_MAX_RESULTS);
     let mut visited_files = 0_usize;
+    let mut skipped_files = 0_usize;
+    let mut skipped_binary_files = 0_usize;
+    let mut skipped_executable_files = 0_usize;
     let truncated = search_dir(
         root,
         root,
@@ -1524,6 +1560,9 @@ fn search_workspace_with_options(
         context_lines,
         max_results,
         &mut visited_files,
+        &mut skipped_files,
+        &mut skipped_binary_files,
+        &mut skipped_executable_files,
         &mut matches,
     )?;
     Ok(CodeSearchResult {
@@ -1531,6 +1570,10 @@ fn search_workspace_with_options(
         truncated,
         context_lines,
         max_results,
+        visited_files,
+        skipped_files,
+        skipped_binary_files,
+        skipped_executable_files,
     })
 }
 
@@ -1542,6 +1585,9 @@ fn search_dir(
     context_lines: usize,
     max_results: usize,
     visited_files: &mut usize,
+    skipped_files: &mut usize,
+    skipped_binary_files: &mut usize,
+    skipped_executable_files: &mut usize,
     matches: &mut Vec<Value>,
 ) -> KernelResult<bool> {
     for entry in fs::read_dir(dir)
@@ -1561,6 +1607,9 @@ fn search_dir(
                 context_lines,
                 max_results,
                 visited_files,
+                skipped_files,
+                skipped_binary_files,
+                skipped_executable_files,
                 matches,
             )? {
                 return Ok(true);
@@ -1582,8 +1631,18 @@ fn search_dir(
         if *visited_files > CODE_SEARCH_MAX_VISITED_FILES {
             return Ok(true);
         }
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
+        let content = match read_text_file_for_llm(&path) {
+            Ok(read) => read.content,
+            Err(skip) => {
+                *skipped_files += 1;
+                if skip.classification.binary {
+                    *skipped_binary_files += 1;
+                }
+                if skip.classification.executable {
+                    *skipped_executable_files += 1;
+                }
+                continue;
+            }
         };
         let lines = content.lines().collect::<Vec<_>>();
         for (line_index, line) in lines.iter().enumerate() {

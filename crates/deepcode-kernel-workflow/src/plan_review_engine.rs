@@ -40,6 +40,71 @@ pub struct RequiredFileOperation {
     pub outside_workspace: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionBundle {
+    pub id: String,
+    pub capability: String,
+    pub resource_kind: String,
+    #[serde(default)]
+    pub resource_path: Option<String>,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub operation_ids: Vec<String>,
+    pub risk_level: String,
+    pub summary: String,
+    pub grant_mode: String,
+    pub expires_after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateInterventionRequired {
+    pub id: String,
+    pub intervention_kind: String,
+    pub status: String,
+    #[serde(default)]
+    pub capability: Option<String>,
+    #[serde(default)]
+    pub permission_bundle_id: Option<String>,
+    pub summary: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelExecutionOperation {
+    pub id: String,
+    pub title: String,
+    pub operation: String,
+    pub capability: String,
+    pub target_path: String,
+    #[serde(default)]
+    pub target_ref: Option<FileTargetRef>,
+    pub target_kind: String,
+    pub outside_workspace: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelExecutionContract {
+    pub id: String,
+    pub plan_id: String,
+    pub status: String,
+    pub source: String,
+    pub user_approval_required: bool,
+    #[serde(default)]
+    pub operations: Vec<KernelExecutionOperation>,
+    #[serde(default)]
+    pub permission_bundles: Vec<PermissionBundle>,
+    #[serde(default)]
+    pub interventions: Vec<GateInterventionRequired>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanReviewInput {
@@ -63,6 +128,12 @@ pub struct PlanReviewReport {
     #[serde(default)]
     pub required_file_operations: Vec<RequiredFileOperation>,
     #[serde(default)]
+    pub permission_bundles: Vec<PermissionBundle>,
+    #[serde(default)]
+    pub interventions: Vec<GateInterventionRequired>,
+    #[serde(default)]
+    pub execution_contract: Option<KernelExecutionContract>,
+    #[serde(default)]
     pub hard_floor_hits: Vec<String>,
     #[serde(default)]
     pub denied_reasons: Vec<String>,
@@ -85,6 +156,9 @@ impl PlanReviewReport {
             required_permissions: Vec::new(),
             permission_gaps: Vec::new(),
             required_file_operations: Vec::new(),
+            permission_bundles: Vec::new(),
+            interventions: Vec::new(),
+            execution_contract: None,
             hard_floor_hits: Vec::new(),
             denied_reasons: vec![reason.clone()],
             blocked_reasons: vec![reason],
@@ -102,6 +176,9 @@ impl PlanReviewReport {
             required_permissions: Vec::new(),
             permission_gaps: Vec::new(),
             required_file_operations: Vec::new(),
+            permission_bundles: Vec::new(),
+            interventions: Vec::new(),
+            execution_contract: None,
             hard_floor_hits: Vec::new(),
             denied_reasons: Vec::new(),
             blocked_reasons: vec![
@@ -209,14 +286,33 @@ fn review_structured_plan(input: PlanReviewInput) -> PlanReviewReport {
         .iter()
         .map(|capability| format!("temporaryGrant:{capability}"))
         .collect::<Vec<_>>();
+    let permission_bundles =
+        permission_bundles_for_review(&input.plan.id, &permission_gaps, &required_file_operations);
+    let interventions =
+        gate_interventions_for_review(&permission_bundles, &hard_floor_hits, &denied_reasons);
     let blocked_reasons = denied_reasons
         .iter()
         .cloned()
         .chain(findings.iter().map(|finding| finding.message.clone()))
         .collect::<Vec<_>>();
 
+    let plan_id = input.plan.id;
+    let status_name_text = status_name(&status).to_string();
+    let execution_contract = Some(execution_contract_for_review(
+        &plan_id,
+        &status_name_text,
+        &required_file_operations,
+        &permission_bundles,
+        &interventions,
+        &blocked_reasons,
+        matches!(
+            status,
+            PlanReviewStatus::AwaitingTemporaryGrant | PlanReviewStatus::AwaitingUserApproval
+        ),
+    ));
+
     PlanReviewReport {
-        plan_id: input.plan.id,
+        plan_id,
         kernel_generated_permission_summary: permission_summary(
             &status,
             &required_capabilities,
@@ -228,10 +324,245 @@ fn review_structured_plan(input: PlanReviewInput) -> PlanReviewReport {
         required_permissions,
         permission_gaps,
         required_file_operations,
+        permission_bundles,
+        interventions,
+        execution_contract,
         hard_floor_hits,
         denied_reasons,
         blocked_reasons,
         findings,
+    }
+}
+
+fn execution_contract_for_review(
+    plan_id: &str,
+    status: &str,
+    required_file_operations: &[RequiredFileOperation],
+    permission_bundles: &[PermissionBundle],
+    interventions: &[GateInterventionRequired],
+    diagnostics: &[String],
+    user_approval_required: bool,
+) -> KernelExecutionContract {
+    KernelExecutionContract {
+        id: format!("contract-{}", safe_contract_segment(plan_id)),
+        plan_id: plan_id.to_string(),
+        status: status.to_string(),
+        source: "kernelPlanReview".to_string(),
+        user_approval_required,
+        operations: required_file_operations
+            .iter()
+            .map(|operation| KernelExecutionOperation {
+                id: operation.action_id.clone(),
+                title: format!("{} {}", operation.operation, operation.target_path),
+                operation: operation.operation.clone(),
+                capability: operation.capability.clone(),
+                target_path: operation.target_path.clone(),
+                target_ref: operation.target_ref.clone(),
+                target_kind: operation.target_kind.clone(),
+                outside_workspace: operation.outside_workspace,
+            })
+            .collect(),
+        permission_bundles: permission_bundles.to_vec(),
+        interventions: interventions.to_vec(),
+        diagnostics: diagnostics.to_vec(),
+    }
+}
+
+fn permission_bundles_for_review(
+    plan_id: &str,
+    permission_gaps: &[String],
+    required_file_operations: &[RequiredFileOperation],
+) -> Vec<PermissionBundle> {
+    let gap_set = permission_gaps.iter().cloned().collect::<BTreeSet<_>>();
+    let mut grouped: std::collections::BTreeMap<
+        (String, String, Option<String>),
+        Vec<&RequiredFileOperation>,
+    > = std::collections::BTreeMap::new();
+    for operation in required_file_operations {
+        if !gap_set.contains(&operation.capability) {
+            continue;
+        }
+        let resource_kind = if operation.outside_workspace {
+            "externalFile".to_string()
+        } else {
+            "workspaceFile".to_string()
+        };
+        let resource_path = if operation.outside_workspace {
+            Some(operation.target_path.clone())
+        } else {
+            None
+        };
+        grouped
+            .entry((operation.capability.clone(), resource_kind, resource_path))
+            .or_default()
+            .push(operation);
+    }
+
+    let mut output = Vec::new();
+    for (capability, resource_kind, resource_path) in permission_gaps
+        .iter()
+        .filter(|capability| {
+            !required_file_operations
+                .iter()
+                .any(|operation| &operation.capability == *capability)
+        })
+        .map(|capability| {
+            (
+                capability.clone(),
+                resource_kind_for_capability(capability).to_string(),
+                None,
+            )
+        })
+    {
+        output.push(permission_bundle(
+            plan_id,
+            &capability,
+            &resource_kind,
+            resource_path,
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+
+    for ((capability, resource_kind, resource_path), operations) in grouped {
+        let targets = operations
+            .iter()
+            .map(|operation| operation.target_path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let operation_ids = operations
+            .iter()
+            .map(|operation| operation.action_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        output.push(permission_bundle(
+            plan_id,
+            &capability,
+            &resource_kind,
+            resource_path,
+            targets,
+            operation_ids,
+        ));
+    }
+    output
+}
+
+fn permission_bundle(
+    plan_id: &str,
+    capability: &str,
+    resource_kind: &str,
+    resource_path: Option<String>,
+    targets: Vec<String>,
+    operation_ids: Vec<String>,
+) -> PermissionBundle {
+    let id = format!(
+        "permission-{}-{}-{}",
+        safe_contract_segment(plan_id),
+        safe_contract_segment(capability),
+        resource_path
+            .as_deref()
+            .map(safe_contract_segment)
+            .unwrap_or_else(|| resource_kind.to_string())
+    );
+    let target_summary = if targets.is_empty() {
+        "batch scope".to_string()
+    } else {
+        targets.join(", ")
+    };
+    PermissionBundle {
+        id,
+        capability: capability.to_string(),
+        resource_kind: resource_kind.to_string(),
+        resource_path,
+        targets,
+        operation_ids,
+        risk_level: risk_level_for_capability(capability).to_string(),
+        summary: format!("Kernel gate requires {capability} permission for {target_summary}."),
+        grant_mode: "userDecision".to_string(),
+        expires_after: "reviewOrTerminalWorkUnit".to_string(),
+    }
+}
+
+fn gate_interventions_for_review(
+    permission_bundles: &[PermissionBundle],
+    hard_floor_hits: &[String],
+    denied_reasons: &[String],
+) -> Vec<GateInterventionRequired> {
+    let mut output = permission_bundles
+        .iter()
+        .map(|bundle| GateInterventionRequired {
+            id: format!("gate-{}", bundle.id),
+            intervention_kind: "permission".to_string(),
+            status: "requiresUserDecision".to_string(),
+            capability: Some(bundle.capability.clone()),
+            permission_bundle_id: Some(bundle.id.clone()),
+            summary: bundle.summary.clone(),
+            options: vec![
+                "approve".to_string(),
+                "reject".to_string(),
+                "revise".to_string(),
+            ],
+        })
+        .collect::<Vec<_>>();
+    for capability in hard_floor_hits {
+        output.push(GateInterventionRequired {
+            id: format!("gate-hard-floor-{}", safe_contract_segment(capability)),
+            intervention_kind: "hardFloor".to_string(),
+            status: "blocked".to_string(),
+            capability: Some(capability.clone()),
+            permission_bundle_id: None,
+            summary: format!("Kernel hard floor blocks capability {capability}."),
+            options: vec!["revise".to_string(), "abort".to_string()],
+        });
+    }
+    for (index, reason) in denied_reasons.iter().enumerate() {
+        output.push(GateInterventionRequired {
+            id: format!("gate-denied-{}", index + 1),
+            intervention_kind: "diagnostic".to_string(),
+            status: "blocked".to_string(),
+            capability: None,
+            permission_bundle_id: None,
+            summary: reason.clone(),
+            options: vec!["revise".to_string(), "abort".to_string()],
+        });
+    }
+    output
+}
+
+fn resource_kind_for_capability(capability: &str) -> &'static str {
+    match capability {
+        "fs.write" | "fs.patch" | "fs.delete" => "workspaceFile",
+        "process.exec" => "process",
+        "network.egress" | "web.search" => "network",
+        "git.write" | "git.push" => "git",
+        "browser.control" => "browser",
+        "secret.read" => "secret",
+        _ => "capability",
+    }
+}
+
+fn risk_level_for_capability(capability: &str) -> &'static str {
+    match capability {
+        "fs.delete" | "git.push" | "secret.read" => "high",
+        "fs.write" | "fs.patch" | "process.exec" | "git.write" | "network.egress"
+        | "browser.control" => "medium",
+        _ => "low",
+    }
+}
+
+fn safe_contract_segment(value: &str) -> String {
+    let segment = value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if segment.is_empty() {
+        "scope".to_string()
+    } else {
+        segment
     }
 }
 
@@ -709,6 +1040,67 @@ mod tests {
                 && operation.target_kind == "workspaceRelative"
                 && !operation.outside_workspace
         }));
+        let contract = report
+            .execution_contract
+            .as_ref()
+            .expect("kernel execution contract");
+        assert_eq!(contract.operations.len(), 2);
+        assert_eq!(report.permission_bundles.len(), 2);
+        assert_eq!(report.interventions.len(), 2);
+        assert!(report
+            .permission_bundles
+            .iter()
+            .any(|bundle| bundle.capability == "fs.delete"
+                && bundle.resource_kind == "workspaceFile"
+                && bundle.targets == vec!["generic-obsolete.tmp"]));
+    }
+
+    #[test]
+    fn action_bundle_review_groups_same_capability_file_operations_into_one_permission_bundle() {
+        let mut plan = PlanContract::low_risk_direct("plan-delete-many", "delete many files");
+        plan.completion_criteria[0]
+            .evidence_required
+            .push("tool fact".to_string());
+        let bundle = ActionBundleDraft {
+            id: "bundle-delete-many".to_string(),
+            goal: "delete generic files".to_string(),
+            actions: (0..7)
+                .map(|index| PlannedAction {
+                    id: format!("delete-generic-{index}"),
+                    title: format!("Delete generic file {index}"),
+                    kind: Some("delete".to_string()),
+                    capability: "fs.delete".to_string(),
+                    target_ref: None,
+                    target_path: Some(format!("generic-{index}.tmp")),
+                    resource_scope: Vec::new(),
+                    can_parallelize: false,
+                    conflict_keys: Vec::new(),
+                    purpose: None,
+                })
+                .collect(),
+            validation_expectations: Vec::new(),
+            review_expectations: Vec::new(),
+        };
+
+        let report = DefaultPlanReviewEngine.review_input(PlanReviewInput {
+            plan,
+            action_bundle: Some(bundle),
+        });
+
+        assert_eq!(report.status, PlanReviewStatus::AwaitingTemporaryGrant);
+        assert_eq!(report.required_file_operations.len(), 7);
+        assert_eq!(report.permission_bundles.len(), 1);
+        let bundle = &report.permission_bundles[0];
+        assert_eq!(bundle.capability, "fs.delete");
+        assert_eq!(bundle.resource_kind, "workspaceFile");
+        assert_eq!(bundle.targets.len(), 7);
+        assert_eq!(report.interventions.len(), 1);
+        let contract = report
+            .execution_contract
+            .as_ref()
+            .expect("kernel execution contract");
+        assert_eq!(contract.operations.len(), 7);
+        assert_eq!(contract.permission_bundles.len(), 1);
     }
 
     #[test]

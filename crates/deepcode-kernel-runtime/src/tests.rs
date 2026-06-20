@@ -369,6 +369,132 @@ fn proposal_submit_plan_review_extracts_code_block_file_targets() {
 }
 
 #[test]
+fn action_batch_submit_rejects_file_operation_outside_execution_contract() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create-contract".to_string()),
+            session_id: Some(SessionId("session-contract".to_string())),
+            input: UserInput {
+                text: "Review a generic file update.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let proposal_events = runtime
+        .dispatch(KernelCommand::ProposalSubmit {
+            request_id: RequestId("req-proposal-contract".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-contract".to_string())),
+            proposal: ProposalEnvelope {
+                schema_version: "deepcode.agent.protocol.v3".to_string(),
+                proposal_id: "proposal-contract".to_string(),
+                run_id: RunId("run-1".to_string()),
+                session_id: Some(SessionId("session-contract".to_string())),
+                source: deepcode_kernel_abi::ProposalEnvelopeSource::Llm,
+                kind: deepcode_kernel_abi::ProposalEnvelopeKind::ActionBundle,
+                payload: serde_json::json!({
+                    "codeBlocks": [
+                        {
+                            "id": "code-generic-output",
+                            "targetPath": "generic-output.txt",
+                            "content": "generic output\n"
+                        }
+                    ],
+                    "actionBundle": {
+                        "id": "bundle-contract",
+                        "goal": "Write one generic output file.",
+                        "actions": [
+                            {
+                                "id": "write-generic-output",
+                                "title": "Write generic output",
+                                "kind": "write",
+                                "capability": "fs.write",
+                                "targetPath": "generic-output.txt",
+                                "resourceScope": ["generic-output.txt"],
+                                "sourceBlockId": "code-generic-output"
+                            }
+                        ],
+                        "validationExpectations": [
+                            { "id": "validation-generic", "description": "Kernel records file write facts." }
+                        ],
+                        "reviewExpectations": [
+                            { "id": "review-generic", "description": "User reviews the generated file." }
+                        ]
+                    }
+                }),
+                referenced_resource_packet_refs: vec![],
+                referenced_evidence_refs: vec![],
+                parser_diagnostics: None,
+            },
+        })
+        .expect("actionBundle proposal command succeeds");
+    let contract_id = proposal_events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::ProposalReviewed { report, .. } => report
+                .get("executionContract")
+                .and_then(|contract| contract.get("id"))
+                .and_then(Value::as_str),
+            _ => None,
+        })
+        .expect("execution contract id");
+
+    let batch_events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-contract".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-contract".to_string())),
+            batch: serde_json::json!({
+                "planId": "bundle-contract",
+                "contractId": contract_id,
+                "codeBlocks": [
+                    {
+                        "id": "code-generic-output",
+                        "targetPath": "other-output.txt",
+                        "content": "other output\n"
+                    }
+                ],
+                "actionBundle": {
+                    "id": "bundle-contract",
+                    "goal": "Write one generic output file.",
+                    "actions": [
+                        {
+                            "id": "write-generic-output",
+                            "title": "Write generic output elsewhere",
+                            "kind": "write",
+                            "capability": "fs.write",
+                            "targetPath": "other-output.txt",
+                            "resourceScope": ["other-output.txt"],
+                            "sourceBlockId": "code-generic-output"
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("contract mismatch returns structured event");
+
+    let error = batch_events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::WorkUnitFailed { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("contract mismatch fails a work unit");
+    assert_eq!(error.code, "execution_contract_mismatch");
+    assert!(error.message.contains("outside Kernel execution contract"));
+    assert!(
+        !temp.join("other-output.txt").exists(),
+        "Kernel must not write a target outside the accepted execution contract"
+    );
+}
+
+#[test]
 fn proposal_submit_plan_review_accepts_matching_action_id_alias() {
     let (mut runtime, _temp) = runtime_with_workspace();
     runtime
@@ -662,6 +788,152 @@ fn resource_resolve_reads_explicit_file_and_directory_manifest_entries() {
 }
 
 #[test]
+fn resource_resolve_skips_binary_file_without_text_read_error() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    fs::write(
+        temp.join("binary.out"),
+        b"\x7FELF\x02\x01\x01\0generic payload",
+    )
+    .expect("write binary fixture");
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create-binary-resource".to_string()),
+            session_id: Some(SessionId("session-binary-resource".to_string())),
+            input: UserInput {
+                text: "Resolve generic binary resource.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    let manifest = serde_json::json!({
+        "id": "manifest-binary",
+        "entries": [
+            {
+                "id": "entry-binary",
+                "kind": "file",
+                "resourceRef": temp.join("binary.out").to_string_lossy(),
+                "offsetBytes": 1,
+                "limitBytes": 4,
+                "reason": "explicit binary file"
+            }
+        ]
+    });
+    let events = runtime
+        .dispatch(KernelCommand::ResourceResolve {
+            request_id: RequestId("req-resource-binary".to_string()),
+            run_id: Some(RunId("run-1".to_string())),
+            session_id: Some(SessionId("session-binary-resource".to_string())),
+            request: ResourceResolveRequest { manifest },
+        })
+        .expect("resource resolve succeeds");
+
+    let packet = events
+        .iter()
+        .find_map(|event| {
+            if let KernelEvent::ResourcePacketProduced { packet, .. } = event {
+                Some(packet)
+            } else {
+                None
+            }
+        })
+        .expect("resource packet event");
+    let item = packet
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .expect("binary item");
+    assert_eq!(item.get("status").and_then(Value::as_str), Some("skipped"));
+    assert_eq!(
+        item.get("contentKind").and_then(Value::as_str),
+        Some("fileSkipped")
+    );
+    assert!(item.get("content").is_none());
+    assert_eq!(
+        item.get("skipReason").and_then(Value::as_str),
+        Some("binary_magic")
+    );
+}
+
+#[test]
+fn workspace_read_rejects_binary_and_reads_executable_text_script() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    fs::write(
+        temp.join("binary.out"),
+        b"\x7FELF\x02\x01\x01\0generic payload",
+    )
+    .expect("write binary fixture");
+    fs::write(temp.join("script.sh"), "#!/bin/sh\necho generic\n").expect("write script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = temp.join("script.sh");
+        let mut permissions = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod script");
+    }
+
+    let binary_events = runtime
+        .dispatch(KernelCommand::WorkspaceRead {
+            request_id: RequestId("req-read-binary".to_string()),
+            folder_id: None,
+            path: "binary.out".to_string(),
+        })
+        .expect("workspace read dispatch succeeds");
+    let binary_result = binary_events
+        .iter()
+        .find_map(|event| {
+            if let KernelEvent::WorkspaceResult { ok, error, .. } = event {
+                Some((*ok, error))
+            } else {
+                None
+            }
+        })
+        .expect("workspace result");
+    assert!(!binary_result.0);
+    let error = serde_json::to_string(binary_result.1).expect("error json");
+    assert!(error.contains("unsupported_file_content"));
+    assert!(!error.contains("read binary.out"));
+
+    let script_events = runtime
+        .dispatch(KernelCommand::WorkspaceRead {
+            request_id: RequestId("req-read-script".to_string()),
+            folder_id: None,
+            path: "script.sh".to_string(),
+        })
+        .expect("workspace read dispatch succeeds");
+    let output = script_events
+        .iter()
+        .find_map(|event| {
+            if let KernelEvent::WorkspaceResult { ok, output, .. } = event {
+                assert!(*ok);
+                output.as_ref()
+            } else {
+                None
+            }
+        })
+        .expect("script output");
+    assert_eq!(
+        output.get("content").and_then(Value::as_str),
+        Some("#!/bin/sh\necho generic\n")
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        output
+            .get("fileClassification")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str),
+        Some("textExecutableScript")
+    );
+}
+
+#[test]
 fn resource_resolve_returns_search_results_manifest_entries() {
     let (mut runtime, temp) = runtime_with_workspace();
     fs::write(
@@ -669,6 +941,11 @@ fn resource_resolve_returns_search_results_manifest_entries() {
         "before\nneedle generic anchor\nafter\n",
     )
     .expect("write searchable file");
+    fs::write(
+        temp.join("nested").join("binary.out"),
+        b"\x7FELF\x02\x01\x01\0needle generic anchor",
+    )
+    .expect("write binary fixture");
     runtime
         .dispatch(KernelCommand::RunCreate {
             request_id: RequestId("req-run-create-search".to_string()),
@@ -732,6 +1009,12 @@ fn resource_resolve_returns_search_results_manifest_entries() {
     );
     assert_eq!(
         search_item.get("returnedMatches").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        search_item
+            .get("skippedBinaryFiles")
+            .and_then(Value::as_u64),
         Some(1)
     );
     let matches = search_item

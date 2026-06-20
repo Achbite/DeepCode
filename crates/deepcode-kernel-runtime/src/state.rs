@@ -13,6 +13,7 @@ pub(crate) struct RuntimeState {
     pub(crate) records_by_session: BTreeMap<String, RuntimeRunRecord>,
     pub(crate) pending_tools: BTreeMap<String, PendingKernelTool>,
     pub(crate) draft_ledger_keys: BTreeSet<String>,
+    pub(crate) execution_contracts_by_run: BTreeMap<String, BTreeMap<String, Value>>,
     pub(crate) temporary_grants_by_run: BTreeMap<String, Vec<TemporaryGrantEnvelope>>,
     pub(crate) change_operations_by_run: BTreeMap<String, Vec<ChangeOperation>>,
     pub(crate) validations_by_run: BTreeMap<String, Vec<ValidationResult>>,

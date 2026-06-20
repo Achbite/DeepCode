@@ -552,6 +552,9 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                     "requiredPermissions": report.get("requiredPermissions").cloned().unwrap_or_else(|| json!([])),
                     "permissionGaps": report.get("permissionGaps").cloned().unwrap_or_else(|| json!([])),
                     "requiredFileOperations": report.get("requiredFileOperations").cloned().unwrap_or_else(|| json!([])),
+                    "permissionBundles": report.get("permissionBundles").cloned().unwrap_or_else(|| json!([])),
+                    "interventions": report.get("interventions").cloned().unwrap_or_else(|| json!([])),
+                    "executionContract": report.get("executionContract").cloned().unwrap_or_else(|| json!(null)),
                     "report": report,
                     "facts": plan_review_facts(report),
                     "channel": "progress",
@@ -737,7 +740,7 @@ fn plan_review_facts(report: &Value) -> Vec<String> {
         format!("权限缺口：{}", report_array_text(report, "permissionGaps")),
         format!("文件操作范围：{}", required_file_operations_text(report)),
         format!("拒绝原因：{}", report_array_text(report, "deniedReasons")),
-        "用户确认计划后才会进入执行；权限缺口会在执行前由 PermissionGate 请求。".to_string(),
+        "用户确认的是 Kernel 执行合约；权限缺口由 Kernel permission bundle / gate intervention 驱动。".to_string(),
     ]
 }
 

@@ -94,10 +94,10 @@ export interface ResourcePacketItem {
   requestItemId: string;
   manifestEntryId: string;
   readPolicy: ResourceReadPolicy;
-  status: 'provided' | 'resolved' | 'needsUserApproval' | 'denied' | 'error';
+  status: 'provided' | 'resolved' | 'skipped' | 'needsUserApproval' | 'denied' | 'error';
   path?: string;
   absolutePath?: string;
-  contentKind?: 'directoryTree' | 'fileText' | 'searchResults' | 'summary' | 'text' | 'json';
+  contentKind?: 'directoryTree' | 'fileText' | 'fileSkipped' | 'searchResults' | 'summary' | 'text' | 'json';
   contentSummary?: string;
   promptContent?: string;
   query?: string;
@@ -111,6 +111,9 @@ export interface ResourcePacketItem {
   returnedBytes?: number;
   rangeComplete?: boolean;
   denialReason?: string;
+  skipReason?: string;
+  skipMessage?: string;
+  fileClassification?: Record<string, unknown>;
   evidenceRefs?: string[];
   sourceKind?: 'kernelResource' | 'manifestOnly';
 }

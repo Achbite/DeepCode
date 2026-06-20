@@ -311,6 +311,52 @@ export interface KernelRequiredFileOperation {
   outsideWorkspace?: boolean;
 }
 
+export interface KernelPermissionBundle {
+  id: string;
+  capability: string;
+  resourceKind: string;
+  resourcePath?: string;
+  targets?: string[];
+  operationIds?: string[];
+  riskLevel: string;
+  summary: string;
+  grantMode: string;
+  expiresAfter: string;
+}
+
+export interface KernelGateInterventionRequired {
+  id: string;
+  interventionKind: string;
+  status: string;
+  capability?: string;
+  permissionBundleId?: string;
+  summary: string;
+  options?: string[];
+}
+
+export interface KernelExecutionOperation {
+  id: string;
+  title: string;
+  operation: string;
+  capability: string;
+  targetPath: string;
+  targetRef?: KernelFileTargetRef;
+  targetKind: 'workspaceRelative' | 'rootRelative' | 'absolutePath' | string;
+  outsideWorkspace: boolean;
+}
+
+export interface KernelExecutionContract {
+  id: string;
+  planId: string;
+  status: KernelPlanReviewStatus | string;
+  source: string;
+  userApprovalRequired: boolean;
+  operations?: KernelExecutionOperation[];
+  permissionBundles?: KernelPermissionBundle[];
+  interventions?: KernelGateInterventionRequired[];
+  diagnostics?: string[];
+}
+
 export interface KernelPlanReviewReport {
   planId: string;
   status: KernelPlanReviewStatus;
@@ -318,6 +364,9 @@ export interface KernelPlanReviewReport {
   requiredPermissions: string[];
   permissionGaps?: string[];
   requiredFileOperations?: KernelRequiredFileOperation[];
+  permissionBundles?: KernelPermissionBundle[];
+  interventions?: KernelGateInterventionRequired[];
+  executionContract?: KernelExecutionContract;
   hardFloorHits: string[];
   deniedReasons?: string[];
   blockedReasons: string[];

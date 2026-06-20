@@ -268,6 +268,21 @@ impl DeepCodeKernelRuntime {
             let report = proposal_action_bundle_review_report(&proposal);
             let report_value =
                 serde_json::to_value(&report).unwrap_or_else(|_| serde_json::Value::Null);
+            if let Some(contract) = report_value
+                .get("executionContract")
+                .and_then(serde_json::Value::as_object)
+            {
+                if let Some(contract_id) = contract.get("id").and_then(serde_json::Value::as_str) {
+                    self.state
+                        .execution_contracts_by_run
+                        .entry(run_id.0.clone())
+                        .or_default()
+                        .insert(
+                            contract_id.to_string(),
+                            serde_json::Value::Object(contract.clone()),
+                        );
+                }
+            }
             let report_session_id = events
                 .iter()
                 .find_map(|event| {
@@ -1147,8 +1162,10 @@ fn resolve_resource_manifest_entry(
     }
 
     if metadata.is_file() {
-        match fs::read_to_string(&path) {
+        match deepcode_kernel_skills::file_content::read_text_file_for_llm(&path) {
             Ok(content) => {
+                let classification = content.classification;
+                let content = content.content;
                 let offset_bytes = resource_entry_u64(entry, "offsetBytes");
                 let limit_bytes = resource_entry_u64(entry, "limitBytes");
                 if offset_bytes.is_some() || limit_bytes.is_some() {
@@ -1161,6 +1178,7 @@ fn resolve_resource_manifest_entry(
                         &content,
                         offset_bytes,
                         limit_bytes,
+                        &classification,
                         &evidence_ref,
                     );
                 }
@@ -1182,18 +1200,21 @@ fn resolve_resource_manifest_entry(
                     "returnedBytes": clipped.len(),
                     "truncated": truncated,
                     "rangeComplete": !truncated,
+                    "fileClassification": classification,
                     "contentSummary": entry.get("summary").and_then(Value::as_str).unwrap_or("File text resolved by Kernel ResourceResolve."),
                     "evidenceRef": evidence_ref,
                     "evidenceRefs": [evidence_ref]
                 });
             }
-            Err(error) => {
-                return resource_packet_error_item(
+            Err(skip) => {
+                return resource_packet_skipped_item(
                     &request_item_id,
                     &manifest_entry_id,
                     source_kind,
-                    "read_failed",
-                    &format!("read {}: {error}", path.display()),
+                    &path,
+                    entry,
+                    &skip,
+                    &evidence_ref,
                 );
             }
         }
@@ -1208,6 +1229,35 @@ fn resolve_resource_manifest_entry(
     )
 }
 
+fn resource_packet_skipped_item(
+    request_item_id: &str,
+    manifest_entry_id: &str,
+    source_kind: &str,
+    path: &Path,
+    entry: &Value,
+    skip: &deepcode_kernel_skills::file_content::FileContentSkip,
+    evidence_ref: &str,
+) -> Value {
+    serde_json::json!({
+        "requestItemId": request_item_id,
+        "manifestEntryId": manifest_entry_id,
+        "status": "skipped",
+        "readPolicy": "explicit-manifest-readonly",
+        "sourceKind": source_kind,
+        "resolvedKind": "file",
+        "path": resource_entry_display_path(entry, path),
+        "absolutePath": path.to_string_lossy(),
+        "contentKind": "fileSkipped",
+        "skipReason": &skip.reason,
+        "skipMessage": &skip.message,
+        "fileClassification": &skip.classification,
+        "sizeBytes": skip.classification.size_bytes,
+        "contentSummary": entry.get("summary").and_then(Value::as_str).unwrap_or("File was skipped by Kernel content policy before LLM context assembly."),
+        "evidenceRef": evidence_ref,
+        "evidenceRefs": [evidence_ref]
+    })
+}
+
 fn resource_packet_file_range_item(
     request_item_id: &str,
     manifest_entry_id: &str,
@@ -1217,6 +1267,7 @@ fn resource_packet_file_range_item(
     content: &str,
     offset_bytes: Option<u64>,
     limit_bytes: Option<u64>,
+    classification: &deepcode_kernel_skills::file_content::FileContentClassification,
     evidence_ref: &str,
 ) -> Value {
     let total_bytes = content.len();
@@ -1279,6 +1330,7 @@ fn resource_packet_file_range_item(
         "returnedBytes": segment.len(),
         "truncated": start > 0 || end < total_bytes,
         "rangeComplete": end >= total_bytes,
+        "fileClassification": classification,
         "contentSummary": entry.get("summary").and_then(Value::as_str).unwrap_or("File text range resolved by Kernel ResourceResolve."),
         "evidenceRef": evidence_ref,
         "evidenceRefs": [evidence_ref]
@@ -1320,6 +1372,10 @@ fn resource_packet_search_item(
                 "maxResults": result.max_results,
                 "returnedMatches": returned_matches,
                 "truncated": result.truncated,
+                "visitedFiles": result.visited_files,
+                "skippedFiles": result.skipped_files,
+                "skippedBinaryFiles": result.skipped_binary_files,
+                "skippedExecutableFiles": result.skipped_executable_files,
                 "matches": &result.matches
             }))
             .unwrap_or_else(|_| "[]".to_string());
@@ -1338,6 +1394,10 @@ fn resource_packet_search_item(
                 "matches": result.matches,
                 "returnedMatches": returned_matches,
                 "truncated": result.truncated,
+                "visitedFiles": result.visited_files,
+                "skippedFiles": result.skipped_files,
+                "skippedBinaryFiles": result.skipped_binary_files,
+                "skippedExecutableFiles": result.skipped_executable_files,
                 "promptContent": prompt_content,
                 "contentSummary": entry.get("summary").and_then(Value::as_str).unwrap_or("Search results resolved by Kernel ResourceResolve."),
                 "evidenceRef": evidence_ref,

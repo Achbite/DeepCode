@@ -361,7 +361,6 @@ type NativeToolHandlingResult =
 const RESOURCE_BUDGET_REQUIREMENT_PREFIX = 'resource-budget';
 const MAX_DERIVED_MANIFEST_ENTRIES = 240;
 const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
-const MAX_ACTION_BUNDLE_ACTIONS = 6;
 const MAX_ACTION_BUNDLE_CODE_BLOCKS = 4;
 const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 12 * 1024;
 const MAX_ACTION_BUNDLE_CODE_BLOCK_BYTES = 6 * 1024;
@@ -918,6 +917,7 @@ export class SessionDriverLoop {
       ]) ?? result;
       const batch: Record<string, unknown> = {
         planId: plan.planId,
+        contractId: kernelExecutionContractId(plan.planReviewReport),
         actionBundle: plan.actionBundle,
         codeBlocks: plan.codeBlocks,
         commandBlocks: plan.commandBlocks,
@@ -4970,7 +4970,7 @@ function recentResourcePackets(events: unknown[]): ResourcePacket[] {
 }
 
 function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePacketItem {
-  const status = item.status === 'resolved' || item.status === 'provided'
+  const status = item.status === 'resolved' || item.status === 'provided' || item.status === 'skipped'
     ? item.status
     : item.status === 'denied'
       ? 'denied'
@@ -5004,6 +5004,9 @@ function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePa
     returnedBytes: typeof item.returnedBytes === 'number' ? item.returnedBytes : undefined,
     rangeComplete: typeof item.rangeComplete === 'boolean' ? item.rangeComplete : undefined,
     denialReason: typeof item.reason === 'string' ? item.reason : typeof item.message === 'string' ? item.message : undefined,
+    skipReason: typeof item.skipReason === 'string' ? item.skipReason : undefined,
+    skipMessage: typeof item.skipMessage === 'string' ? item.skipMessage : undefined,
+    fileClassification: objectRecord(item.fileClassification) ?? undefined,
     evidenceRefs: Array.isArray(item.evidenceRefs)
       ? item.evidenceRefs.filter((value): value is string => typeof value === 'string')
       : [],
@@ -5037,6 +5040,9 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
         requiredPermissions: Array.isArray(report.requiredPermissions) ? report.requiredPermissions : [],
         permissionGaps: Array.isArray(report.permissionGaps) ? report.permissionGaps : [],
         requiredFileOperations: requiredFileOperationsFromReport(report),
+        permissionBundles: permissionBundlesFromReport(report),
+        interventions: gateInterventionsFromReport(report),
+        executionContract: objectRecord(report.executionContract) ?? undefined,
         facts: planReviewFacts(report),
         channel: 'trace',
         visibility: 'debug',
@@ -5784,12 +5790,6 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
   if (!Array.isArray(bundle.actions) || bundle.actions.length === 0) {
     throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle.actions must not be empty.');
   }
-  if (bundle.actions.length > MAX_ACTION_BUNDLE_ACTIONS) {
-    throw new AgentPlanParseError(
-      'action_bundle_budget_exceeded',
-      `ActionBundle has ${bundle.actions.length} actions; output only the next implementation batch with at most ${MAX_ACTION_BUNDLE_ACTIONS} actions.`
-    );
-  }
   const codeBlocks = Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [];
   if (codeBlocks.length > MAX_ACTION_BUNDLE_CODE_BLOCKS) {
     throw new AgentPlanParseError(
@@ -5995,6 +5995,7 @@ function actionBundlePlanCardEvent(
   const status = stringValue(report?.status) ?? 'pending';
   const planId = actionBundle?.id ?? proposal.proposalId;
   const confirmable = planReviewStatusAwaitingUser(status);
+  const kernelPlan = renderKernelExecutionContractPlan(userPlan, report);
   const overlayPayload = interactionOverlayProjection(state.interactionOverlay);
   return {
     id,
@@ -6003,8 +6004,8 @@ function actionBundlePlanCardEvent(
     kind: 'plan_card',
     payload: {
       title: 'Plan',
-      summary: userPlan,
-      content: userPlan,
+      summary: kernelPlan.summary,
+      content: kernelPlan.content,
       runId: proposal.runId,
       planId,
       proposalId: proposal.proposalId,
@@ -6026,6 +6027,9 @@ function actionBundlePlanCardEvent(
       reviewGuide: typeof payload.reviewGuide === 'string' ? payload.reviewGuide : '',
       planReviewReport: report,
       requiredFileOperations: requiredFileOperationsFromReport(report),
+      executionContract: objectRecord(report?.executionContract) ?? undefined,
+      permissionBundles: permissionBundlesFromReport(report),
+      interventions: gateInterventionsFromReport(report),
       channel: 'action',
       visibility: 'conversation',
       presentation: 'body',
@@ -6246,6 +6250,159 @@ function planReviewFacts(report: Record<string, unknown> | undefined): string[] 
     facts.push(`fileOperation: ${operation.operation} ${operation.targetPath} (${operation.capability})`);
   }
   return facts;
+}
+
+function renderKernelExecutionContractPlan(
+  userPlan: string,
+  report: Record<string, unknown> | undefined
+): { summary: string; content: string } {
+  const status = stringValue(report?.status) ?? 'pending';
+  const kernelSummary = stringValue(report?.kernelGeneratedPermissionSummary)
+    ?? `Kernel gate status=${status}.`;
+  const contract = objectRecord(report?.executionContract);
+  const operations = kernelExecutionOperationsFromReport(report);
+  const bundles = permissionBundlesFromReport(report);
+  const interventions = gateInterventionsFromReport(report);
+  const diagnostics = [
+    ...stringArrayValue(contract?.diagnostics),
+    ...stringArrayValue(report?.blockedReasons),
+    ...stringArrayValue(report?.deniedReasons),
+  ];
+  const sections = [
+    '# Kernel 执行合约',
+    '',
+    '## 门禁状态',
+    `- 状态：${status}`,
+    `- 摘要：${kernelSummary}`,
+    contract?.id ? `- 合约：${String(contract.id)}` : undefined,
+    '',
+    '## 将发生的操作',
+    operations.length
+      ? operations.map((operation) => `- ${operation.operation} ${operation.targetPath} (${operation.capability})`).join('\n')
+      : '- 当前 Kernel report 未列出可执行文件操作。',
+    '',
+    '## 权限门禁',
+    bundles.length
+      ? bundles.map((bundle) => {
+        const targets = bundle.targets.length ? `；目标：${bundle.targets.join(', ')}` : '';
+        return `- ${bundle.capability} / ${bundle.resourceKind} / ${bundle.riskLevel}${targets}`;
+      }).join('\n')
+      : '- 当前合约没有额外权限 bundle。',
+    '',
+    '## 用户介入',
+    interventions.length
+      ? interventions.map((item) => `- ${item.interventionKind}: ${item.summary}`).join('\n')
+      : '- 无额外用户介入项。',
+    diagnostics.length
+      ? '\n## Kernel 诊断\n' + [...new Set(diagnostics)].map((item) => `- ${item}`).join('\n')
+      : undefined,
+    '',
+    '## LLM 说明',
+    userPlan,
+  ].filter((item): item is string => typeof item === 'string');
+  return {
+    summary: kernelSummary,
+    content: sections.join('\n'),
+  };
+}
+
+interface KernelExecutionOperationProjection {
+  operation: string;
+  targetPath: string;
+  capability: string;
+}
+
+function kernelExecutionOperationsFromReport(
+  report: Record<string, unknown> | undefined
+): KernelExecutionOperationProjection[] {
+  const contract = objectRecord(report?.executionContract);
+  const operations = Array.isArray(contract?.operations) ? contract.operations : [];
+  const fromContract = operations.flatMap((item): KernelExecutionOperationProjection[] => {
+    const record = objectRecord(item);
+    if (!record) return [];
+    const operation = stringValue(record.operation);
+    const targetPath = stringValue(record.targetPath);
+    const capability = stringValue(record.capability);
+    return operation && targetPath && capability ? [{ operation, targetPath, capability }] : [];
+  });
+  return fromContract.length ? fromContract : requiredFileOperationsFromReport(report);
+}
+
+interface PermissionBundleProjection {
+  id: string;
+  capability: string;
+  resourceKind: string;
+  resourcePath?: string;
+  targets: string[];
+  operationIds: string[];
+  riskLevel: string;
+  summary: string;
+  expiresAfter?: string;
+}
+
+function permissionBundlesFromReport(
+  report: Record<string, unknown> | undefined
+): PermissionBundleProjection[] {
+  const direct = Array.isArray(report?.permissionBundles) ? report.permissionBundles : [];
+  const contract = objectRecord(report?.executionContract);
+  const contractBundles = Array.isArray(contract?.permissionBundles) ? contract.permissionBundles : [];
+  const source = direct.length ? direct : contractBundles;
+  return source.flatMap((item): PermissionBundleProjection[] => {
+    const record = objectRecord(item);
+    if (!record) return [];
+    const id = stringValue(record.id);
+    const capability = stringValue(record.capability);
+    const resourceKind = stringValue(record.resourceKind);
+    if (!id || !capability || !resourceKind) return [];
+    return [{
+      id,
+      capability,
+      resourceKind,
+      resourcePath: stringValue(record.resourcePath),
+      targets: stringArrayValue(record.targets),
+      operationIds: stringArrayValue(record.operationIds),
+      riskLevel: stringValue(record.riskLevel) ?? 'unknown',
+      summary: stringValue(record.summary) ?? `Kernel requires ${capability}.`,
+      expiresAfter: stringValue(record.expiresAfter),
+    }];
+  });
+}
+
+interface GateInterventionProjection {
+  id: string;
+  interventionKind: string;
+  status: string;
+  summary: string;
+  capability?: string;
+  permissionBundleId?: string;
+  options: string[];
+}
+
+function gateInterventionsFromReport(
+  report: Record<string, unknown> | undefined
+): GateInterventionProjection[] {
+  const direct = Array.isArray(report?.interventions) ? report.interventions : [];
+  const contract = objectRecord(report?.executionContract);
+  const contractInterventions = Array.isArray(contract?.interventions) ? contract.interventions : [];
+  const source = direct.length ? direct : contractInterventions;
+  return source.flatMap((item): GateInterventionProjection[] => {
+    const record = objectRecord(item);
+    if (!record) return [];
+    const id = stringValue(record.id);
+    const interventionKind = stringValue(record.interventionKind);
+    const status = stringValue(record.status);
+    const summary = stringValue(record.summary);
+    if (!id || !interventionKind || !status || !summary) return [];
+    return [{
+      id,
+      interventionKind,
+      status,
+      summary,
+      capability: stringValue(record.capability),
+      permissionBundleId: stringValue(record.permissionBundleId),
+      options: stringArrayValue(record.options),
+    }];
+  });
 }
 
 interface SessionPlanContext {
@@ -6684,6 +6841,7 @@ type NormalizedAcceptedPlanKernelBatch =
     ok: true;
     batch: {
     planId: string;
+    contractId?: string;
     actionBundle: Record<string, unknown>;
     codeBlocks: unknown[];
     commandBlocks: unknown[];
@@ -6797,6 +6955,7 @@ function normalizeAcceptedPlanKernelBatch(
     reasons: [],
     batch: {
       planId,
+      contractId: kernelExecutionContractId(plan.planReviewReport),
       actionBundle: {
         ...(actionBundle ?? {}),
         actions: normalizedActions,
@@ -7701,6 +7860,9 @@ function planReviewDecisionEvent(
       confirmable: false,
       facts: planReviewFacts(plan.planReviewReport),
       requiredFileOperations: requiredFileOperationsFromReport(plan.planReviewReport),
+      permissionBundles: permissionBundlesFromReport(plan.planReviewReport),
+      interventions: gateInterventionsFromReport(plan.planReviewReport),
+      executionContract: objectRecord(plan.planReviewReport?.executionContract) ?? undefined,
       ...overlayPayload,
       channel: status === 'accepted' ? 'progress' : 'final',
       visibility: 'conversation',
@@ -8352,6 +8514,12 @@ function failureDetailSummary(detail: ActionBatchFailureDetail): string {
 
 function temporaryGrantsForPlan(plan: SessionPlanContext): Record<string, unknown>[] {
   const report = plan.planReviewReport ?? {};
+  const bundles = permissionBundlesFromReport(report);
+  if (bundles.length) {
+    return bundles
+      .filter((bundle) => planAcceptedAutoGrantCapability(bundle.capability))
+      .map((bundle) => temporaryGrantForPermissionBundle(plan, bundle));
+  }
   const gaps = Array.isArray(report.permissionGaps)
     ? report.permissionGaps.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     : [];
@@ -8374,6 +8542,29 @@ function temporaryGrantsForPlan(plan: SessionPlanContext): Record<string, unknow
     grants.push(temporaryGrant(plan, capability, targetPath, resourceKind));
   }
   return grants;
+}
+
+function temporaryGrantForPermissionBundle(
+  plan: SessionPlanContext,
+  bundle: PermissionBundleProjection
+): Record<string, unknown> {
+  return {
+    id: `grant-${safeSegment(plan.planId)}-${safeSegment(bundle.id)}`,
+    capability: bundle.capability,
+    resourceKind: bundle.resourceKind,
+    resourcePath: bundle.resourcePath,
+    reason: `Plan ${plan.planId} accepted by user; Kernel-derived permission bundle ${bundle.id} is scoped to this batch contract and expires after review or terminal work unit.`,
+    permissionBundle: {
+      source: 'kernelExecutionContract',
+      planId: plan.planId,
+      contractId: kernelExecutionContractId(plan.planReviewReport),
+      bundleId: bundle.id,
+      capability: bundle.capability,
+      targets: bundle.targets,
+      operationIds: bundle.operationIds,
+      expiresAfter: bundle.expiresAfter,
+    },
+  };
 }
 
 interface RequiredFileOperationProjection {
@@ -8441,6 +8632,11 @@ function acceptedPlanConcreteFileOperationTarget(
 
 function planAcceptedAutoGrantCapability(capability: string): boolean {
   return ['fs.write', 'fs.patch', 'fs.delete'].includes(capability);
+}
+
+function kernelExecutionContractId(report: Record<string, unknown> | undefined): string | undefined {
+  const contract = objectRecord(report?.executionContract);
+  return stringValue(contract?.id);
 }
 
 function temporaryGrant(
@@ -9428,7 +9624,7 @@ function actionBundleCompactionRepairMessages(
         'You are the DeepCode Agent Protocol v3 implementation batch repair step.',
         'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
         'If proposing executable work, return kind="actionBundle" for only the next small reviewable implementation batch.',
-        `Batch budget: at most ${MAX_ACTION_BUNDLE_CODE_BLOCKS} codeBlocks, at most ${MAX_ACTION_BUNDLE_ACTIONS} actions, at most ${MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES} bytes total codeBlock content, and at most ${MAX_ACTION_BUNDLE_CODE_BLOCK_BYTES} bytes per codeBlock.`,
+        `Batch budget: at most ${MAX_ACTION_BUNDLE_CODE_BLOCKS} codeBlocks, at most ${MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES} bytes total codeBlock content, and at most ${MAX_ACTION_BUNDLE_CODE_BLOCK_BYTES} bytes per codeBlock. Keep actions concrete and reviewable; Kernel will group permission bundles by capability and scope.`,
         'Put remaining work into actionBundle.continuationExpectations; do not emit the full implementation in one response.',
         'If current facts are insufficient, return kind="resourceRequest" using manifestEntryId, rootId+path, or kind="search" with a non-empty query under the listed conversation roots.',
         'Do not claim execution, permissions, tests passed, or task completion.',

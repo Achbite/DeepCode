@@ -91,6 +91,28 @@ impl DeepCodeKernelRuntime {
             return Ok(events);
         }
 
+        if let Err(error) = validate_operations_against_execution_contract(
+            &self.state,
+            &run_id_text,
+            &batch,
+            &operations,
+        ) {
+            let work_unit_id = format!("work-unit-{}-contract", safe_work_unit_segment(&plan_id));
+            events.push(self.work_unit_failed_envelope_event(
+                &request_id,
+                &run_id_text,
+                &session_id_text,
+                &work_unit_id,
+                KernelErrorEnvelope {
+                    code: "execution_contract_mismatch".to_string(),
+                    message: error.to_string(),
+                    message_key: None,
+                    args: None,
+                },
+            )?);
+            return Ok(events);
+        }
+
         let work_unit_graph = WorkUnitGraph::from_operations(&operations);
         let graph_sequence = self.ledger.next_sequence(&run_id_text)?;
         self.append_ledger(
@@ -718,6 +740,98 @@ fn compiled_tool_summary(compiled: &CompiledWorkspaceAction) -> Value {
         "query": compiled.arguments.get("query").and_then(Value::as_str),
         "argsPreview": redact_tool_arguments(&compiled.tool_name, &compiled.arguments)
     })
+}
+
+fn validate_operations_against_execution_contract(
+    state: &RuntimeState,
+    run_id: &str,
+    batch: &Value,
+    operations: &[PlannedOperation],
+) -> KernelResult<()> {
+    let Some(contract_id) = batch
+        .get("contractId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let contract = state
+        .execution_contracts_by_run
+        .get(run_id)
+        .and_then(|contracts| contracts.get(contract_id))
+        .ok_or_else(|| {
+            KernelError::InvalidCommand(format!(
+                "action batch references unknown Kernel execution contract {contract_id}"
+            ))
+        })?;
+    let contract_operations = contract
+        .get("operations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if contract_operations.is_empty() {
+        return Ok(());
+    }
+    for operation in operations {
+        if !matches!(
+            operation.capability.as_str(),
+            "fs.write" | "fs.patch" | "fs.delete"
+        ) {
+            continue;
+        }
+        let Some(contract_operation) = contract_operations.iter().find(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == operation.id)
+        }) else {
+            return Err(KernelError::InvalidCommand(format!(
+                "action {} is not listed in Kernel execution contract {contract_id}",
+                operation.id
+            )));
+        };
+        let contract_capability = contract_operation
+            .get("capability")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if contract_capability != operation.capability {
+            return Err(KernelError::InvalidCommand(format!(
+                "action {} capability {} does not match Kernel execution contract capability {}",
+                operation.id, operation.capability, contract_capability
+            )));
+        }
+        let contract_target = contract_operation
+            .get("targetPath")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let targets = if operation.write_set.is_empty() {
+            &operation.read_set
+        } else {
+            &operation.write_set
+        };
+        if !targets
+            .iter()
+            .any(|target| contract_paths_match(target, contract_target))
+        {
+            return Err(KernelError::InvalidCommand(format!(
+                "action {} target {:?} is outside Kernel execution contract target {}",
+                operation.id, targets, contract_target
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn contract_paths_match(left: &str, right: &str) -> bool {
+    normalize_contract_path(left) == normalize_contract_path(right)
+}
+
+fn normalize_contract_path(value: &str) -> String {
+    let mut normalized = value.trim().replace('\\', "/");
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped.to_string();
+    }
+    normalized.trim_end_matches('/').to_string()
 }
 
 fn operation_compile_debug_json(

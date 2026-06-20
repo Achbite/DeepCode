@@ -61,6 +61,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopProjectsDecisionRequest();
   await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
   await assertSessionDriverLoopRepairsInvalidSourceBlock();
+  await assertSessionDriverLoopAllowsManyNoCodeActionsWithoutBatchRepair();
   await assertSessionDriverLoopRepairsOversizedActionBundle();
   await assertSessionDriverLoopRepairsEmptyActionBundleResponse();
   await assertSessionDriverLoopAcceptsLocalizedStructuredPlan();
@@ -2484,6 +2485,44 @@ async function assertSessionDriverLoopRepairsInvalidSourceBlock(): Promise<void>
     'repaired actionBundle sourceBlockId matches a code block'
   );
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired sourceBlockId plan renders a plan card');
+}
+
+async function assertSessionDriverLoopAllowsManyNoCodeActionsWithoutBatchRepair(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const submittedPlans: Array<Record<string, any>> = [];
+  const repairRequests: LlmChatRequest[] = [];
+  let llmCalls = 0;
+  const session: AgentSession = {
+    id: 'session-many-delete-actions',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-many-delete-actions', submittedPlans),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls > 1) repairRequests.push(request);
+      return jsonLlmResponse(manyDeleteActionsProposal());
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + repairRequests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-many-delete-actions',
+    content: 'Delete several generic obsolete files in one reviewed batch.',
+    requirementConfirmationMode: 'off',
+  });
+  assertEqual(llmCalls, 1, 'many no-code actions do not trigger implementation batch repair');
+  assertEqual(repairRequests.length, 0, 'many no-code actions do not ask the provider to shrink by action count');
+  assertEqual(submittedPlans.length, 1, 'many delete actions reach Kernel PlanReview once');
+  assertEqual(submittedPlans[0].payload?.actionBundle?.actions?.length, 7, 'all delete actions remain in the Kernel-reviewed proposal');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'many delete action plan renders a Kernel-reviewed plan card');
 }
 
 async function assertSessionDriverLoopRepairsOversizedActionBundle(): Promise<void> {
@@ -6654,6 +6693,22 @@ function deleteActionBundleProposal(targetPath: string): Record<string, unknown>
     expectedValidation: 'Kernel records delete facts for the generic obsolete file.',
     reviewGuide: 'Review the generic delete target before approval.',
   };
+}
+
+function manyDeleteActionsProposal(): Record<string, unknown> {
+  const proposal = deleteActionBundleProposal('generic-0.tmp');
+  (proposal.actionBundle as any).id = 'bundle-many-generic-delete';
+  (proposal.actionBundle as any).goal = 'Delete several generic obsolete files.';
+  (proposal.actionBundle as any).actions = Array.from({ length: 7 }, (_item, index) => ({
+    id: `delete-generic-${index}`,
+    title: `Delete generic obsolete file ${index}`,
+    kind: 'delete',
+    capability: 'fs.delete',
+    resourceScope: [`generic-${index}.tmp`],
+    targetPath: `generic-${index}.tmp`,
+    permissionLabels: ['fs.delete'],
+  }));
+  return proposal;
 }
 
 function localizedGenericWriteProposal(): Record<string, unknown> {

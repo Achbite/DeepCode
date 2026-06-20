@@ -1,4 +1,7 @@
 use super::*;
+use deepcode_kernel_skills::file_content::{
+    lightweight_file_classification, read_text_file_for_llm,
+};
 
 impl DeepCodeKernelRuntime {
     pub(crate) fn workspace_open(
@@ -95,15 +98,21 @@ impl DeepCodeKernelRuntime {
             if !target.is_file() {
                 return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
             }
-            let content = fs::read_to_string(&target)
-                .map_err(|error| KernelError::Other(format!("read {path}: {error}")))?;
+            let read = read_text_file_for_llm(&target).map_err(|skip| {
+                KernelError::InvalidCommand(format!(
+                    "unsupported_file_content: {} ({})",
+                    skip.message, skip.reason
+                ))
+            })?;
+            let content = read.content;
             let size_bytes = content.len();
             Ok(serde_json::json!({
                 "folderId": "wf-0",
                 "path": normalize_relative_path(&path),
                 "content": content,
                 "sizeBytes": size_bytes,
-                "binary": false
+                "binary": false,
+                "fileClassification": read.classification
             }))
         })();
         self.workspace_result(request_id, "fs.read", result)
@@ -327,6 +336,9 @@ impl DeepCodeKernelRuntime {
                 "returnedMatches": returned_matches,
                 "truncated": result.truncated,
                 "visitedFiles": result.visited_files,
+                "skippedFiles": result.skipped_files,
+                "skippedBinaryFiles": result.skipped_binary_files,
+                "skippedExecutableFiles": result.skipped_executable_files,
                 "matches": result.matches
             }))
         })();
@@ -558,12 +570,21 @@ pub(crate) fn list_nodes(path: &Path, root: &Path, depth: u32) -> KernelResult<V
             } else {
                 None
             };
-            Ok(serde_json::json!({
+            let mut node = serde_json::json!({
                 "name": entry.file_name().to_string_lossy(),
                 "path": relative,
                 "type": if file_type.is_dir() { "directory" } else { "file" },
                 "children": children
-            }))
+            });
+            if file_type.is_file() {
+                let metadata = entry.metadata().map_err(|error| {
+                    KernelError::Other(format!("metadata {}: {error}", entry_path.display()))
+                })?;
+                node["fileClassification"] =
+                    serde_json::to_value(lightweight_file_classification(&entry_path, &metadata))
+                        .unwrap_or(Value::Null);
+            }
+            Ok(node)
         })
         .collect()
 }
@@ -606,6 +627,9 @@ pub(crate) struct WorkspaceSearchResult {
     pub(crate) visited_files: usize,
     pub(crate) context_lines: usize,
     pub(crate) max_results: usize,
+    pub(crate) skipped_files: usize,
+    pub(crate) skipped_binary_files: usize,
+    pub(crate) skipped_executable_files: usize,
 }
 
 pub(crate) fn search_workspace_with_options(
@@ -618,6 +642,9 @@ pub(crate) fn search_workspace_with_options(
     let mut matches = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     let mut visited_files = 0_usize;
+    let mut skipped_files = 0_usize;
+    let mut skipped_binary_files = 0_usize;
+    let mut skipped_executable_files = 0_usize;
     let context_lines = (context_lines as usize).min(WORKSPACE_SEARCH_MAX_CONTEXT_LINES);
     let max_results = (max_results as usize).clamp(1, WORKSPACE_SEARCH_MAX_RESULTS);
     let mut truncated = false;
@@ -655,8 +682,18 @@ pub(crate) fn search_workspace_with_options(
                 truncated = true;
                 break;
             }
-            let Ok(content) = fs::read_to_string(&entry_path) else {
-                continue;
+            let content = match read_text_file_for_llm(&entry_path) {
+                Ok(read) => read.content,
+                Err(skip) => {
+                    skipped_files += 1;
+                    if skip.classification.binary {
+                        skipped_binary_files += 1;
+                    }
+                    if skip.classification.executable {
+                        skipped_executable_files += 1;
+                    }
+                    continue;
+                }
             };
             let lines = content.lines().collect::<Vec<_>>();
             for (index, line) in lines.iter().enumerate() {
@@ -699,6 +736,9 @@ pub(crate) fn search_workspace_with_options(
                             visited_files,
                             context_lines,
                             max_results,
+                            skipped_files,
+                            skipped_binary_files,
+                            skipped_executable_files,
                         });
                     }
                 }
@@ -711,6 +751,9 @@ pub(crate) fn search_workspace_with_options(
         visited_files,
         context_lines,
         max_results,
+        skipped_files,
+        skipped_binary_files,
+        skipped_executable_files,
     })
 }
 
