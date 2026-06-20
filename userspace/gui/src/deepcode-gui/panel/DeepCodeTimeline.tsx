@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
+  AgentConversationActivity,
   AgentContextAttachment,
   AgentEvent,
   AgentTimelineBlock,
@@ -50,9 +51,10 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     () => normalizeNarrativeTimeline(timeline ?? fallbackTimeline),
     [fallbackTimeline, timeline]
   );
+  const coalescedActiveDeltas = useCoalescedProjectionDeltas(activeDeltas, 50);
   const viewWithActive = useMemo(
-    () => appendActiveDeltaTurn(view, activeDeltas, language),
-    [activeDeltas, language, view]
+    () => appendActiveDeltaTurn(view, coalescedActiveDeltas, language),
+    [coalescedActiveDeltas, language, view]
   );
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
@@ -221,7 +223,8 @@ function appendActiveDeltaTurn(
   const turnId = active.find((delta) => delta.turnId)?.turnId ?? `active-${runId}`;
   const status = activeTimelineStatus(active);
   const parentDeltas = active.filter((delta) => !isBranchDelta(delta));
-  const branchDeltas = active.filter(isBranchDelta);
+  const committedActivityIds = collectCommittedActivityIds(view);
+  const activeActivities = groupedActiveActivities(active, committedActivityIds);
   const reasoningMarkdown = parentDeltas
     .filter((delta) => delta.type === 'reasoning_delta' && typeof delta.delta === 'string')
     .map((delta) => delta.delta)
@@ -230,9 +233,10 @@ function appendActiveDeltaTurn(
     .filter((delta) => delta.type === 'assistant_delta' && typeof delta.delta === 'string')
     .map((delta) => delta.delta)
     .join('');
-  const branchReasoning = groupedBranchReasoning(branchDeltas);
   const progressLines = active
     .filter((delta) => delta.type !== 'reasoning_delta')
+    .filter((delta) => !delta.activity)
+    .filter((delta) => !isBranchDelta(delta))
     .filter((delta) => !parentTextDelta(delta))
     .map((delta) => activeDeltaProgressLine(delta))
     .filter((line): line is string => Boolean(line))
@@ -244,7 +248,7 @@ function appendActiveDeltaTurn(
       id: `active-thinking-${runId}`,
       kind: 'thinking',
       narrativeKind: 'thinking',
-      title: language === 'zh-CN' ? '思考中' : 'Thinking',
+      title: t(language, 'deepcodeGui.timeline.thinking'),
       summary: language === 'zh-CN' ? 'Provider 正在输出 reasoning。' : 'Provider reasoning is streaming.',
       status,
       defaultCollapsed: false,
@@ -254,26 +258,6 @@ function appendActiveDeltaTurn(
         typewriterSpeed: 'slow',
         initialOpen: true,
         replaceOnComplete: true,
-      },
-      events: [],
-    });
-  }
-  for (const branch of branchReasoning) {
-    blocks.push({
-      id: `active-thinking-${runId}-${safeActiveBlockId(branch.key)}`,
-      kind: 'thinking',
-      narrativeKind: 'thinking',
-      title: language === 'zh-CN' ? `子代理思考 ${branch.label}` : `Sub-agent Thinking ${branch.label}`,
-      summary: language === 'zh-CN' ? '子代理正在生成任务草稿。' : 'A sub-agent branch is drafting a task fragment.',
-      status,
-      defaultCollapsed: true,
-      bodyMarkdown: branch.markdown,
-      displayHints: {
-        renderMode: 'typewriter',
-        typewriterSpeed: 'slow',
-        initialOpen: false,
-        replaceOnComplete: true,
-        density: 'compact',
       },
       events: [],
     });
@@ -295,6 +279,9 @@ function appendActiveDeltaTurn(
       },
       events: [],
     });
+  }
+  for (const activity of activeActivities) {
+    blocks.push(activityBlockFromActivity(activity, language, true));
   }
   if (progressLines.length > 0) {
     blocks.push({
@@ -334,27 +321,101 @@ function appendActiveDeltaTurn(
   };
 }
 
+function collectCommittedActivityIds(view: AgentTimelineResult): Set<string> {
+  const ids = new Set<string>();
+  for (const turn of view.turns) {
+    for (const block of turn.blocks) {
+      const activityId = block.activity?.activityId;
+      if (activityId) ids.add(activityId);
+    }
+  }
+  return ids;
+}
+
+function groupedActiveActivities(
+  deltas: ProjectionDelta[],
+  committedActivityIds: Set<string>
+): AgentConversationActivity[] {
+  const byId = new Map<string, AgentConversationActivity>();
+  for (const delta of deltas) {
+    const activity = delta.activity;
+    if (!activity || committedActivityIds.has(activity.activityId)) continue;
+    if (!isMainTimelineActivity(activity)) continue;
+    byId.set(activity.activityId, activity);
+  }
+  return [...byId.values()];
+}
+
+function isMainTimelineActivity(activity: AgentConversationActivity): boolean {
+  return activity.kind !== 'providerThinking'
+    && activity.kind !== 'subagentBranch'
+    && activity.kind !== 'subagentMerge';
+}
+
+function activityBlockFromActivity(
+  activity: AgentConversationActivity,
+  language: UiLanguage,
+  live: boolean
+): AgentTimelineBlock {
+  return {
+    id: `${live ? 'active-' : ''}activity-${safeActiveBlockId(activity.activityId)}`,
+    kind: activityBlockKind(activity),
+    narrativeKind: activity.kind === 'diagnostic' ? 'diagnostic' : 'operationEvidence',
+    activity,
+    title: activity.title || activityKindLabel(language, activity.kind),
+    summary: activity.summary,
+    status: activity.status,
+    defaultCollapsed: activity.status !== 'running' && activity.status !== 'waiting' && activity.status !== 'failed',
+    bodyMarkdown: activityBodyMarkdown(activity, language),
+    displayHints: {
+      renderMode: 'instant',
+      density: 'compact',
+      evidenceMode: activity.status === 'failed' ? 'inline' : 'collapsed',
+      replaceOnComplete: live,
+    },
+    events: [],
+  };
+}
+
+function activityBlockKind(activity: AgentConversationActivity): AgentTimelineBlock['kind'] {
+  if (activity.kind === 'diagnostic' || activity.status === 'failed') return 'error';
+  if (activity.kind === 'reviewCheckpoint') return 'review';
+  if (activity.kind === 'toolExecution') return 'toolBatch';
+  return 'stage';
+}
+
+function activityKindLabel(language: UiLanguage, kind: AgentConversationActivity['kind']): string {
+  return t(language, `deepcodeGui.activity.kind.${kind}`);
+}
+
+function activityBodyMarkdown(activity: AgentConversationActivity, language: UiLanguage): string {
+  const rows: string[] = [];
+  const summary = (activity.summary ?? '').trim();
+  if (summary) rows.push(summary);
+  if (activity.targets?.length) {
+    rows.push(`${t(language, 'deepcodeGui.activity.targets')}: ${activity.targets.join(', ')}`);
+  }
+  if (activity.toolName) {
+    rows.push(`${t(language, 'deepcodeGui.activity.tool')}: ${activity.toolName}`);
+  }
+  if (activity.actionIds?.length) {
+    rows.push(`${t(language, 'deepcodeGui.activity.actions')}: ${activity.actionIds.join(', ')}`);
+  }
+  if (activity.workUnitIds?.length) {
+    rows.push(`${t(language, 'deepcodeGui.activity.workUnits')}: ${activity.workUnitIds.join(', ')}`);
+  }
+  if (activity.errorCode || activity.errorMessage) {
+    rows.push(`${t(language, 'deepcodeGui.activity.error')}: ${[activity.errorCode, activity.errorMessage].filter(Boolean).join(' - ')}`);
+  }
+  return rows.map((line) => `- ${line}`).join('\n');
+}
+
 function isBranchDelta(delta: ProjectionDelta): boolean {
   return Boolean(delta.branchId || delta.subAgentId);
 }
 
 function parentTextDelta(delta: ProjectionDelta): boolean {
   return !isBranchDelta(delta) && (delta.type === 'reasoning_delta' || delta.type === 'assistant_delta');
-}
-
-function groupedBranchReasoning(deltas: ProjectionDelta[]): Array<{ key: string; label: string; markdown: string }> {
-  const groups = new Map<string, { key: string; label: string; parts: string[] }>();
-  for (const delta of deltas) {
-    if (delta.type !== 'reasoning_delta' || typeof delta.delta !== 'string') continue;
-    const key = delta.branchId ?? delta.subAgentId ?? 'branch';
-    const label = delta.subAgentId ?? delta.branchId ?? key;
-    const group = groups.get(key) ?? { key, label, parts: [] };
-    group.parts.push(delta.delta);
-    groups.set(key, group);
-  }
-  return [...groups.values()]
-    .map((group) => ({ key: group.key, label: group.label, markdown: group.parts.join('') }))
-    .filter((group) => group.markdown.trim().length > 0);
 }
 
 function safeActiveBlockId(value: string): string {
@@ -470,6 +531,31 @@ function useTypewriterBlockIds(
 
     return new Set(typewriterBlockIdsRef.current);
   }, [loading, view]);
+}
+
+function useCoalescedProjectionDeltas(deltas: ProjectionDelta[], delayMs: number): ProjectionDelta[] {
+  const [coalesced, setCoalesced] = useState(deltas);
+  const latestRef = useRef(deltas);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    latestRef.current = deltas;
+    if (timerRef.current !== null) return undefined;
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      setCoalesced(latestRef.current);
+    }, delayMs);
+    return undefined;
+  }, [deltas, delayMs]);
+
+  useEffect(() => () => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  return coalesced;
 }
 
 function collectTypewriterBlockIds(view: AgentTimelineResult): string[] {
@@ -742,6 +828,10 @@ const TimelineBlock: React.FC<{
     );
   }
 
+  if (block.activity) {
+    return <ActivityBlock block={block} language={language} />;
+  }
+
   if (block.narrativeKind === 'operationEvidence' || block.narrativeKind === 'verification') {
     return <OperationEvidenceBlock block={block} language={language} />;
   }
@@ -764,6 +854,78 @@ const TimelineBlock: React.FC<{
     </details>
   );
 };
+
+const ActivityBlock: React.FC<{
+  block: AgentTimelineBlock;
+  language: UiLanguage;
+}> = ({ block, language }) => {
+  const activity = block.activity;
+  if (!activity) return null;
+  const title = localizedTimelineText(language, activity.title || block.title || activityKindLabel(language, activity.kind));
+  const summary = localizedTimelineText(language, activity.summary || block.summary || '');
+  const open = !block.defaultCollapsed || activity.status === 'running' || activity.status === 'waiting' || activity.status === 'failed';
+  const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
+  const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
+  const meta = activityMetaItems(activity, language);
+
+  return (
+    <details
+      className={`deepcode-gui-block deepcode-gui-block--activity deepcode-gui-block--activity-${activity.kind} deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}`}
+      open={open}
+    >
+      <summary>
+        <span className={`deepcode-gui-block__status deepcode-gui-block__status--${activity.status}`} />
+        <span className="deepcode-gui-block__title">{title}</span>
+        {summary && <span className="deepcode-gui-block__summary">{summary}</span>}
+      </summary>
+      <div className="deepcode-gui-block__details deepcode-gui-activity">
+        <div className="deepcode-gui-activity__head">
+          <span className={`deepcode-gui-activity__kind deepcode-gui-activity__kind--${activity.kind}`}>
+            {activityKindLabel(language, activity.kind)}
+          </span>
+          <span className={`deepcode-gui-activity__status deepcode-gui-activity__status--${activity.status}`}>
+            {timelineStatusLabel(language, activity.status)}
+          </span>
+        </div>
+        {block.bodyMarkdown && <MarkdownContent content={block.bodyMarkdown} />}
+        {meta.length > 0 && (
+          <div className="deepcode-gui-activity__meta">
+            {meta.map((item) => (
+              <span key={`${item.label}:${item.value}`} className="deepcode-gui-activity__chip" title={item.value}>
+                <strong>{item.label}</strong>
+                <span>{item.value}</span>
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    </details>
+  );
+};
+
+function activityMetaItems(
+  activity: AgentConversationActivity,
+  language: UiLanguage
+): Array<{ label: string; value: string }> {
+  const items: Array<{ label: string; value: string }> = [];
+  if (activity.toolName) items.push({ label: t(language, 'deepcodeGui.activity.tool'), value: activity.toolName });
+  if (activity.targets?.length) {
+    items.push({ label: t(language, 'deepcodeGui.activity.targets'), value: activity.targets.join(', ') });
+  }
+  if (activity.actionIds?.length) {
+    items.push({ label: t(language, 'deepcodeGui.activity.actions'), value: activity.actionIds.join(', ') });
+  }
+  if (activity.workUnitIds?.length) {
+    items.push({ label: t(language, 'deepcodeGui.activity.workUnits'), value: activity.workUnitIds.join(', ') });
+  }
+  if (activity.errorCode || activity.errorMessage) {
+    items.push({
+      label: t(language, 'deepcodeGui.activity.error'),
+      value: [activity.errorCode, activity.errorMessage].filter(Boolean).join(' - '),
+    });
+  }
+  return items;
+}
 
 const OperationEvidenceBlock: React.FC<{
   block: AgentTimelineBlock;
@@ -1184,7 +1346,8 @@ function turnCopyText(
 function blockCopyText(block: AgentTimelineBlock, language: UiLanguage): string[] {
   if (block.kind === 'turnActions') return [];
   const title = blockCopyTitle(block, language);
-  const body = (block.bodyMarkdown ?? block.summary ?? '').trim();
+  const activityBody = block.activity ? activityBodyMarkdown(block.activity, language) : '';
+  const body = (block.bodyMarkdown ?? block.summary ?? activityBody).trim();
   const attachmentText = block.kind === 'user'
     ? attachmentCopyText(blockAttachments(block), language)
     : '';

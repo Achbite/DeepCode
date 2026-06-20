@@ -1,11 +1,14 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  AgentConversationActivity,
   AgentContextAttachment,
   AgentEvent,
   AgentSession,
+  AgentTimelineResult,
   BrowseEntry,
   BrowsePathResult,
   InitialLocation,
+  ProjectionDelta,
 } from '@deepcode/protocol';
 import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
 import WindowControls from '../../components/window-controls/WindowControls';
@@ -37,6 +40,20 @@ interface DeepCodeTaskItem {
   title: string;
   summary: string;
   status: string;
+}
+
+interface DeepCodeSubAgentWorkItem {
+  id: string;
+  title: string;
+  summary: string;
+  status: string;
+  branchId?: string;
+  subAgentId?: string;
+  mergeGroupId?: string;
+  targets: string[];
+  error?: string;
+  thinkingPreview?: string;
+  progressSummary?: string;
 }
 
 interface DeepCodeCacheHitSummary {
@@ -735,6 +752,123 @@ function deriveCacheHitSummary(
   return { label, title };
 }
 
+function isSubAgentActivity(activity: AgentConversationActivity): boolean {
+  return activity.kind === 'subagentBranch' || activity.kind === 'subagentMerge';
+}
+
+function subAgentWorkItemFromActivity(activity: AgentConversationActivity): DeepCodeSubAgentWorkItem {
+  return {
+    id: activity.activityId,
+    title: activity.title,
+    summary: activity.summary,
+    status: activity.status,
+    branchId: activity.branchId,
+    subAgentId: activity.subAgentId,
+    mergeGroupId: activity.mergeGroupId,
+    targets: activity.targets ?? [],
+    error: [activity.errorCode, activity.errorMessage].filter(Boolean).join(' - ') || undefined,
+  };
+}
+
+function subAgentDeltaKey(delta: ProjectionDelta): string | null {
+  return delta.branchId ?? delta.subAgentId ?? delta.mergeGroupId ?? null;
+}
+
+function safeSubAgentWorkId(value: string): string {
+  const safe = value.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return safe || 'branch';
+}
+
+function subAgentDeltaStatus(delta: ProjectionDelta): string {
+  if (delta.status === 'failed' || delta.type === 'error') return 'failed';
+  if (delta.status === 'completed') return 'completed';
+  if (delta.status === 'waiting' || delta.status === 'skipped' || delta.status === 'discarded') return 'blocked';
+  if (delta.status === 'queued') return 'queued';
+  return 'running';
+}
+
+function findSubAgentWorkItem(
+  byId: Map<string, DeepCodeSubAgentWorkItem>,
+  delta: ProjectionDelta
+): DeepCodeSubAgentWorkItem | null {
+  for (const item of byId.values()) {
+    if (delta.branchId && item.branchId === delta.branchId) return item;
+    if (delta.subAgentId && item.subAgentId === delta.subAgentId) return item;
+    if (delta.mergeGroupId && item.mergeGroupId === delta.mergeGroupId) return item;
+  }
+  return null;
+}
+
+function mergeSubAgentDelta(
+  byId: Map<string, DeepCodeSubAgentWorkItem>,
+  delta: ProjectionDelta,
+  language: UiLanguage
+): void {
+  const key = subAgentDeltaKey(delta);
+  if (!key) return;
+  const existing = findSubAgentWorkItem(byId, delta);
+  const item = existing ?? {
+    id: `active-subagent-${safeSubAgentWorkId(key)}`,
+    title: delta.subAgentId ?? delta.branchId ?? t(language, 'deepcodeGui.subagents.branchFallback'),
+    summary: delta.summary ?? t(language, 'deepcodeGui.subagents.streaming'),
+    status: subAgentDeltaStatus(delta),
+    branchId: delta.branchId,
+    subAgentId: delta.subAgentId,
+    mergeGroupId: delta.mergeGroupId,
+    targets: delta.targetPath ? [delta.targetPath] : [],
+  };
+  item.status = subAgentDeltaStatus(delta);
+  if (delta.summary) item.progressSummary = delta.summary;
+  if (delta.targetPath && !item.targets.includes(delta.targetPath)) {
+    item.targets = [...item.targets, delta.targetPath];
+  }
+  if (delta.type === 'reasoning_delta' && typeof delta.delta === 'string') {
+    const next = `${item.thinkingPreview ?? ''}${delta.delta}`;
+    item.thinkingPreview = next.length > 360 ? next.slice(-360) : next;
+  } else if ((delta.type === 'assistant_delta' || delta.type === 'draft_delta' || delta.type === 'part_delta') && typeof delta.delta === 'string') {
+    const next = `${item.progressSummary ?? ''}${delta.delta}`;
+    item.progressSummary = next.length > 240 ? next.slice(-240) : next;
+  }
+  byId.set(item.id, item);
+}
+
+function deriveSubAgentWorkItems(
+  projection: AgentTimelineResult,
+  activeDeltas: ProjectionDelta[],
+  language: UiLanguage,
+  sessionId?: string
+): DeepCodeSubAgentWorkItem[] {
+  const byId = new Map<string, DeepCodeSubAgentWorkItem>();
+  for (const turn of projection.turns) {
+    for (const block of turn.blocks) {
+      const activity = block.activity;
+      if (activity && isSubAgentActivity(activity)) {
+        byId.set(activity.activityId, subAgentWorkItemFromActivity(activity));
+      }
+    }
+  }
+  for (const delta of activeDeltas) {
+    if (delta.type === 'committed') continue;
+    if (sessionId && delta.sessionId !== sessionId) continue;
+    const activity = delta.activity;
+    if (activity && isSubAgentActivity(activity)) {
+      byId.set(activity.activityId, subAgentWorkItemFromActivity(activity));
+      continue;
+    }
+    mergeSubAgentDelta(byId, delta, language);
+  }
+  return [...byId.values()].slice(-8);
+}
+
+function compactSubAgentMeta(item: DeepCodeSubAgentWorkItem): string[] {
+  return [
+    item.subAgentId,
+    item.branchId,
+    item.mergeGroupId,
+    ...item.targets.slice(0, 3),
+  ].filter((value): value is string => Boolean(value && value.trim()));
+}
+
 const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   apiStatus,
   wsStatus,
@@ -763,6 +897,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const loadingSession = useAgentSessionStore((s) => s.loading);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
   const events = useAgentSessionStore((s) => s.events);
+  const activeDeltas = useAgentSessionStore((s) => s.activeDeltas);
   const createNewSession = useAgentSessionStore((s) => s.createNewSession);
   const activateSession = useAgentSessionStore((s) => s.activateSession);
   const renameSession = useAgentSessionStore((s) => s.renameSession);
@@ -847,6 +982,12 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       events: projectionEvents,
     }),
     [activeSession?.id, projectDraftActive, projectionEvents]
+  );
+  const subAgentWorkItems = useMemo(
+    () => projectDraftActive
+      ? []
+      : deriveSubAgentWorkItems(timelineProjection, activeDeltas, language, activeSession?.id),
+    [activeDeltas, activeSession?.id, language, projectDraftActive, timelineProjection]
   );
   const cacheHitSummary = useMemo(
     () => deriveCacheHitSummary(projectionEvents, language, timelineProjection.tokenUsageProjection),
@@ -1404,6 +1545,55 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               </div>
             )}
           </section>
+
+          {subAgentWorkItems.length > 0 && (
+            <section className="deepcode-gui-subagent-work-card">
+              <div className="deepcode-gui-subagent-work-card__title">
+                {t(language, 'deepcodeGui.subagents.title')}
+              </div>
+              <div className="deepcode-gui-subagent-work-list">
+                {subAgentWorkItems.map((item) => {
+                  const meta = compactSubAgentMeta(item);
+                  return (
+                    <div
+                      key={item.id}
+                      className={`deepcode-gui-subagent-work-item deepcode-gui-subagent-work-item--${item.status}`}
+                    >
+                      <span className="deepcode-gui-subagent-work-item__dot" />
+                      <div className="deepcode-gui-subagent-work-item__body">
+                        <div className="deepcode-gui-subagent-work-item__topline">
+                          <span className="deepcode-gui-subagent-work-item__title">{item.title}</span>
+                          <strong>{statusLabel(language, item.status)}</strong>
+                        </div>
+                        {item.summary && (
+                          <div className="deepcode-gui-subagent-work-item__summary">{item.summary}</div>
+                        )}
+                        {item.progressSummary && item.progressSummary !== item.summary && (
+                          <div className="deepcode-gui-subagent-work-item__summary">{item.progressSummary}</div>
+                        )}
+                        {item.thinkingPreview && (
+                          <div className="deepcode-gui-subagent-work-item__thinking">
+                            <strong>{t(language, 'deepcodeGui.subagents.reasoning')}</strong>
+                            <span>{item.thinkingPreview}</span>
+                          </div>
+                        )}
+                        {item.error && (
+                          <div className="deepcode-gui-subagent-work-item__error">{item.error}</div>
+                        )}
+                        {meta.length > 0 && (
+                          <div className="deepcode-gui-subagent-work-item__meta">
+                            {meta.map((value) => (
+                              <span key={value} title={value}>{value}</span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
         </aside>
       </div>
 

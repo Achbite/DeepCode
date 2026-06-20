@@ -1841,6 +1841,7 @@ button {
 .deepcode-gui-block--thinking,
 .deepcode-gui-block--stage,
 .deepcode-gui-block--toolBatch,
+.deepcode-gui-block--activity,
 .deepcode-gui-block--turnActions {
   background: #f8f6ef;
 }
@@ -3174,14 +3175,100 @@ button {
   padding: 0;
 }
 
+.deepcode-gui-block--activity {
+  padding: 0;
+}
+
 .deepcode-gui-block--narrative-operationEvidence summary,
-.deepcode-gui-block--narrative-verification summary {
+.deepcode-gui-block--narrative-verification summary,
+.deepcode-gui-block--activity summary {
   min-height: 36px;
 }
 
 .deepcode-gui-block--narrative-operationEvidence .deepcode-gui-block__details,
-.deepcode-gui-block--narrative-verification .deepcode-gui-block__details {
+.deepcode-gui-block--narrative-verification .deepcode-gui-block__details,
+.deepcode-gui-block--activity .deepcode-gui-block__details {
   padding-bottom: 9px;
+}
+
+.deepcode-gui-activity {
+  gap: 9px;
+}
+
+.deepcode-gui-activity__head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.deepcode-gui-activity__kind,
+.deepcode-gui-activity__status {
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #eceff3;
+  color: #59616c;
+  font-size: 10px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deepcode-gui-activity__kind--editFileFailed,
+.deepcode-gui-activity__kind--diagnostic,
+.deepcode-gui-activity__status--failed {
+  background: #fff0ef;
+  color: #b3342e;
+}
+
+.deepcode-gui-activity__kind--editFileCompleted,
+.deepcode-gui-activity__status--completed {
+  background: #edf8f3;
+  color: #217452;
+}
+
+.deepcode-gui-activity__kind--editBatchQueued,
+.deepcode-gui-activity__kind--editFileStarted,
+.deepcode-gui-activity__status--running {
+  background: #eef4ff;
+  color: #1e5bb8;
+}
+
+.deepcode-gui-activity__meta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.deepcode-gui-activity__chip {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border: 1px solid #e2e6ec;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #656d78;
+  font-size: 10px;
+}
+
+.deepcode-gui-activity__chip strong {
+  flex: 0 0 auto;
+  color: #3c434d;
+  font-weight: 640;
+}
+
+.deepcode-gui-activity__chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .deepcode-gui-block__label {
@@ -3261,7 +3348,8 @@ button {
 }
 
 .deepcode-gui-task-list-card,
-.deepcode-gui-progress-card {
+.deepcode-gui-progress-card,
+.deepcode-gui-subagent-work-card {
   display: grid;
   gap: 12px;
   padding: 16px;
@@ -3276,7 +3364,8 @@ button {
 }
 
 .deepcode-gui-task-list-card__title,
-.deepcode-gui-progress-card__title {
+.deepcode-gui-progress-card__title,
+.deepcode-gui-subagent-work-card__title {
   color: #7b7f87;
   font-size: 12px;
   font-weight: 560;
@@ -3353,6 +3442,147 @@ button {
   color: #8a8f98;
   font-size: 10px;
   font-weight: 560;
+}
+
+.deepcode-gui-subagent-work-list {
+  display: grid;
+  gap: 8px;
+}
+
+.deepcode-gui-subagent-work-item {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #e5e9ef;
+  border-radius: 12px;
+  background: #fbfcff;
+}
+
+.deepcode-gui-subagent-work-item__dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: #a2a8b0;
+}
+
+.deepcode-gui-subagent-work-item--running .deepcode-gui-subagent-work-item__dot {
+  background: #2f80ed;
+}
+
+.deepcode-gui-subagent-work-item--waiting,
+.deepcode-gui-subagent-work-item--queued,
+.deepcode-gui-subagent-work-item--blocked {
+  background: #fffaf1;
+  border-color: #eee4cf;
+}
+
+.deepcode-gui-subagent-work-item--waiting .deepcode-gui-subagent-work-item__dot,
+.deepcode-gui-subagent-work-item--queued .deepcode-gui-subagent-work-item__dot,
+.deepcode-gui-subagent-work-item--blocked .deepcode-gui-subagent-work-item__dot {
+  background: #c87d16;
+}
+
+.deepcode-gui-subagent-work-item--completed .deepcode-gui-subagent-work-item__dot {
+  background: #2f9e6d;
+}
+
+.deepcode-gui-subagent-work-item--failed {
+  border-color: #f0d1ce;
+  background: #fff7f6;
+}
+
+.deepcode-gui-subagent-work-item--failed .deepcode-gui-subagent-work-item__dot {
+  background: #c2413a;
+}
+
+.deepcode-gui-subagent-work-item__body {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.deepcode-gui-subagent-work-item__topline {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.deepcode-gui-subagent-work-item__title {
+  min-width: 0;
+  overflow: hidden;
+  color: #2f3337;
+  font-size: 12px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deepcode-gui-subagent-work-item__topline strong {
+  color: #8a8f98;
+  font-size: 10px;
+  font-weight: 560;
+}
+
+.deepcode-gui-subagent-work-item__summary,
+.deepcode-gui-subagent-work-item__error,
+.deepcode-gui-subagent-work-item__thinking {
+  min-width: 0;
+  overflow: hidden;
+  color: #828891;
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deepcode-gui-subagent-work-item__error {
+  color: #b3342e;
+}
+
+.deepcode-gui-subagent-work-item__thinking {
+  display: grid;
+  gap: 2px;
+  padding: 6px 7px;
+  border-radius: 8px;
+  background: #f3f5f8;
+  white-space: normal;
+}
+
+.deepcode-gui-subagent-work-item__thinking strong {
+  color: #59616c;
+  font-size: 10px;
+  font-weight: 640;
+}
+
+.deepcode-gui-subagent-work-item__thinking span {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.deepcode-gui-subagent-work-item__meta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.deepcode-gui-subagent-work-item__meta span {
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #eef1f5;
+  color: #6d7480;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .deepcode-gui-progress-row {

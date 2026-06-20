@@ -661,7 +661,10 @@ impl TuiApp {
                 let now = Instant::now();
                 self.cards.push(CardModel::stage(
                     "Run",
-                    format!("run id: {}\nstatus: {}", result.run.run_id, result.run.status),
+                    format!(
+                        "run id: {}\nstatus: {}",
+                        result.run.run_id, result.run.status
+                    ),
                 ));
                 self.pending_run = Some(PendingRun {
                     operation,
@@ -1195,7 +1198,10 @@ fn looks_like_command(line: &str) -> bool {
 
 fn latest_pending_decision(events: &[Value]) -> Option<PendingDecision> {
     for event in events.iter().rev() {
-        let kind = event.get("kind").and_then(Value::as_str).unwrap_or_default();
+        let kind = event
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let payload = event.get("payload").and_then(Value::as_object);
         let Some(payload) = payload else {
             continue;
@@ -1303,10 +1309,7 @@ fn decision_request_options(value: Option<&Value>) -> Vec<PendingDecisionOption>
                 .get("id")
                 .and_then(Value::as_str)
                 .or_else(|| item.get("label").and_then(Value::as_str))?;
-            let label = item
-                .get("label")
-                .and_then(Value::as_str)
-                .unwrap_or(id);
+            let label = item.get("label").and_then(Value::as_str).unwrap_or(id);
             Some(PendingDecisionOption {
                 id: id.to_string(),
                 label: label.to_string(),
@@ -1336,14 +1339,21 @@ fn parse_pending_decision_input(line: &str, pending: &PendingDecision) -> Parsed
     }
     let trimmed = line.trim();
     let lower = trimmed.to_ascii_lowercase();
-    if trimmed.is_empty() || lower == "1" || lower == "accept" || trimmed == "确认" || trimmed == "同意" {
+    if trimmed.is_empty()
+        || lower == "1"
+        || lower == "accept"
+        || trimmed == "确认"
+        || trimmed == "同意"
+    {
         return ParsedDecisionInput {
             decision: "accept".to_string(),
             guidance: None,
         };
     }
-    if matches!(lower.as_str(), "3" | "end" | "stop" | "reject" | "/reject" | "/end" | "/stop")
-        || matches!(trimmed, "结束" | "拒绝")
+    if matches!(
+        lower.as_str(),
+        "3" | "end" | "stop" | "reject" | "/reject" | "/end" | "/stop"
+    ) || matches!(trimmed, "结束" | "拒绝")
     {
         return ParsedDecisionInput {
             decision: "reject".to_string(),
@@ -1366,8 +1376,10 @@ fn parse_pending_decision_input(line: &str, pending: &PendingDecision) -> Parsed
 fn parse_technical_choice_input(line: &str, pending: &PendingDecision) -> ParsedDecisionInput {
     let trimmed = line.trim();
     let lower = trimmed.to_ascii_lowercase();
-    if matches!(lower.as_str(), "end" | "stop" | "reject" | "/reject" | "/end" | "/stop")
-        || matches!(trimmed, "结束" | "拒绝")
+    if matches!(
+        lower.as_str(),
+        "end" | "stop" | "reject" | "/reject" | "/end" | "/stop"
+    ) || matches!(trimmed, "结束" | "拒绝")
     {
         return ParsedDecisionInput {
             decision: "reject".to_string(),
@@ -1384,10 +1396,7 @@ fn parse_technical_choice_input(line: &str, pending: &PendingDecision) -> Parsed
             pending.options.get(index).unwrap_or(default),
             tail.filter(|value| !value.is_empty()),
         )
-    } else if trimmed.is_empty()
-        || lower == "accept"
-        || trimmed == "确认"
-        || trimmed == "同意"
+    } else if trimmed.is_empty() || lower == "accept" || trimmed == "确认" || trimmed == "同意"
     {
         (default, None)
     } else {
