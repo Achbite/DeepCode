@@ -26,16 +26,15 @@ export const DEFAULT_PERMISSION_AUTO_APPROVAL_POLICY: PermissionAutoApprovalPoli
 };
 
 export function capabilityTier(capability: string): CapabilityTier {
-  if (capability === 'workspace.read' || capability === 'code.search' || capability.endsWith('.read')) return 'read';
-  if (capability === 'workspace.delete' || capability.endsWith('.delete')) return 'delete';
+  if (capability === 'fs.read' || capability === 'code.search' || capability.endsWith('.read')) return 'read';
+  if (capability === 'fs.delete' || capability.endsWith('.delete')) return 'delete';
   if (capability === 'process.exec' || capability === 'shell.exec') return 'process';
   if (capability === 'network.egress' || capability.startsWith('network.')) return 'network';
   if (capability === 'secret.read' || capability.startsWith('secret.')) return 'secret';
   if (capability === 'kernel.modify' || capability.startsWith('kernel.')) return 'kernel';
   if (
-    capability === 'workspace.write' ||
-    capability === 'workspace.create' ||
-    capability === 'workspace.rename' ||
+    capability === 'fs.write' ||
+    capability === 'fs.patch' ||
     capability.endsWith('.write') ||
     capability.endsWith('.create') ||
     capability.endsWith('.rename')

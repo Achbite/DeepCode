@@ -166,8 +166,9 @@ function normalizePlannedActions(value: unknown, label: string): Array<Record<st
     const id = optionalString(record, 'id') ?? optionalString(record, 'actionId') ?? `${label}-${index + 1}`;
     const capability = optionalString(record, 'capability') ?? '';
     const targetPath = optionalString(record, 'targetPath');
+    const targetRefPath = optionalTargetRefPath(record.targetRef);
     const resourceScope = optionalStringArray(record, 'resourceScope');
-    const normalizedScope = resourceScope.length ? resourceScope : (targetPath ? [targetPath] : []);
+    const normalizedScope = resourceScope.length ? resourceScope : (targetPath ? [targetPath] : (targetRefPath ? [targetRefPath] : []));
     const conflictKeys = optionalStringArray(record, 'conflictKeys');
     return {
       ...record,
@@ -185,6 +186,15 @@ function normalizePlannedActions(value: unknown, label: string): Array<Record<st
       dependsOn: optionalStringArray(record, 'dependsOn'),
     };
   });
+}
+
+function optionalTargetRefPath(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : undefined;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  return optionalString(value as Record<string, unknown>, 'path') ?? optionalString(value as Record<string, unknown>, 'targetPath');
 }
 
 function normalizeExpectations(value: unknown, label: string): Array<Record<string, unknown>> {

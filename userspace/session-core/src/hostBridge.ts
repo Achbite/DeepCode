@@ -530,6 +530,7 @@ function inferHostRunLifecycle(
   events: unknown[],
   finalText: string
 ): Pick<HostBridgeResult, 'runStatus' | 'decisionKind' | 'targetId' | 'terminalReason'> {
+  const consumedOwners = collectConsumedInteractionOwners(events);
   for (const event of [...events].reverse()) {
     const record = objectRecord(event);
     const kind = stringField(record, 'kind');
@@ -557,8 +558,18 @@ function inferHostRunLifecycle(
           terminalReason: stringField(payload, 'summary') ?? 'Session run is cancelled.',
         };
       }
+      if (status === 'running') {
+        return {
+          runStatus: 'failed',
+          terminalReason: stringField(payload, 'summary') ??
+            `Session bridge returned before ${stringField(payload, 'reason') ?? 'running'} reached a terminal checkpoint.`,
+        };
+      }
       if (status === 'waiting') {
         const owner = objectRecord(payload.decisionOwner);
+        if (waitingOwnerWasConsumed('session_run_state', payload, consumedOwners)) {
+          continue;
+        }
         return {
           runStatus: 'waiting',
           decisionKind: stringField(payload, 'decisionKind') ?? stringField(owner, 'kind'),
@@ -587,6 +598,9 @@ function inferHostRunLifecycle(
     }
 
     if (kind === 'requirement_confirmation' && stringField(payload, 'status') === 'waitingUserConfirmation') {
+      if (waitingOwnerWasConsumed(kind, payload, consumedOwners)) {
+        continue;
+      }
       return {
         runStatus: 'waiting',
         decisionKind: 'requirement',
@@ -596,6 +610,9 @@ function inferHostRunLifecycle(
     }
 
     if (kind === 'plan_card' && planCardAwaitingDecision(payload)) {
+      if (waitingOwnerWasConsumed(kind, payload, consumedOwners)) {
+        continue;
+      }
       return {
         runStatus: 'waiting',
         decisionKind: 'plan',
@@ -609,6 +626,133 @@ function inferHostRunLifecycle(
     runStatus: finalText ? 'completed' : 'completed',
     terminalReason: finalText ? 'final_answer' : 'session_run_returned',
   };
+}
+
+interface ConsumedInteractionOwners {
+  readonly plans: Set<string>;
+  readonly requirements: Set<string>;
+  readonly reviews: Set<string>;
+  readonly permissions: Set<string>;
+}
+
+function collectConsumedInteractionOwners(events: unknown[]): ConsumedInteractionOwners {
+  const consumed: ConsumedInteractionOwners = {
+    plans: new Set<string>(),
+    requirements: new Set<string>(),
+    reviews: new Set<string>(),
+    permissions: new Set<string>(),
+  };
+  for (const event of events) {
+    const record = objectRecord(event);
+    const kind = stringField(record, 'kind');
+    const payload = objectRecord(record?.payload);
+    if (!kind || !payload) continue;
+
+    if (kind === 'requirement_decision') {
+      addStrings(consumed.requirements,
+        stringField(payload, 'requirementId'),
+        stringField(payload, 'interactionId'),
+        stringField(payload, 'sourceInteractionId'),
+        stringField(payload, 'targetId'));
+      continue;
+    }
+
+    if (kind === 'plan_review') {
+      const status = stringField(payload, 'status')?.toLowerCase();
+      if (status === 'accepted' || status === 'rejected' || status === 'needsrevision') {
+        addStrings(consumed.plans,
+          stringField(payload, 'planId'),
+          stringField(payload, 'interactionId'),
+          stringField(payload, 'sourceInteractionId'),
+          stringField(payload, 'targetId'));
+      }
+      continue;
+    }
+
+    if (kind === 'review_summary') {
+      const status = stringField(payload, 'status')?.toLowerCase();
+      if (status && status !== 'waitinguserreview' && status !== 'pending') {
+        addStrings(consumed.reviews,
+          stringField(payload, 'reviewId'),
+          stringField(payload, 'interactionId'),
+          stringField(payload, 'sourceInteractionId'),
+          stringField(payload, 'targetId'));
+      }
+      continue;
+    }
+
+    if (kind === 'permission_decision') {
+      addStrings(consumed.permissions,
+        stringField(payload, 'permissionId'),
+        stringField(payload, 'interactionId'),
+        stringField(payload, 'sourceInteractionId'),
+        stringField(payload, 'targetId'));
+      continue;
+    }
+
+    if (kind === 'session_run_state') {
+      const status = stringField(payload, 'status');
+      const reason = stringField(payload, 'reason');
+      if (status === 'running' && reason === 'accepted_plan_execution') {
+        const owner = objectRecord(payload.decisionOwner);
+        addStrings(consumed.plans,
+          stringField(payload, 'planId'),
+          stringField(payload, 'targetId'),
+          stringField(owner, 'targetId'),
+          stringField(owner, 'planId'));
+      }
+    }
+  }
+  return consumed;
+}
+
+function waitingOwnerWasConsumed(
+  kind: string,
+  payload: Record<string, unknown>,
+  consumed: ConsumedInteractionOwners
+): boolean {
+  if (kind === 'plan_card') {
+    return hasAny(consumed.plans,
+      stringField(payload, 'planId'),
+      stringField(payload, 'targetId'),
+      stringField(payload, 'interactionId'),
+      stringField(payload, 'sourceInteractionId'));
+  }
+  if (kind === 'requirement_confirmation') {
+    return hasAny(consumed.requirements,
+      stringField(payload, 'requirementId'),
+      stringField(payload, 'targetId'),
+      stringField(payload, 'interactionId'),
+      stringField(payload, 'sourceInteractionId'));
+  }
+  if (kind === 'session_run_state') {
+    const owner = objectRecord(payload.decisionOwner);
+    const decisionKind = stringField(payload, 'decisionKind') ?? stringField(owner, 'kind');
+    const targetId = stringField(payload, 'targetId') ?? stringField(owner, 'targetId');
+    if (decisionKind === 'plan') {
+      return hasAny(consumed.plans, targetId, stringField(payload, 'planId'), stringField(owner, 'planId'));
+    }
+    if (decisionKind === 'requirement') {
+      return hasAny(consumed.requirements, targetId, stringField(payload, 'requirementId'), stringField(owner, 'requirementId'));
+    }
+    if (decisionKind === 'review') {
+      return hasAny(consumed.reviews, targetId, stringField(payload, 'reviewId'), stringField(owner, 'reviewId'));
+    }
+    if (decisionKind === 'permission') {
+      return hasAny(consumed.permissions, targetId, stringField(payload, 'permissionId'), stringField(owner, 'permissionId'));
+    }
+  }
+  return false;
+}
+
+function addStrings(target: Set<string>, ...values: Array<string | undefined>): void {
+  for (const value of values) {
+    if (value) target.add(value);
+  }
+}
+
+function hasAny(target: Set<string>, ...values: Array<string | undefined>): boolean {
+  return values.some((value) => Boolean(value && target.has(value)));
 }
 
 function planCardAwaitingDecision(payload: Record<string, unknown>): boolean {

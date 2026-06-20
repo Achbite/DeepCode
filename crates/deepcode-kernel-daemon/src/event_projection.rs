@@ -708,8 +708,9 @@ pub(crate) fn stage_status_for_gui(status: &deepcode_kernel_abi::StageStatus) ->
 
 pub(crate) fn tool_name_for_capability(capability: &str) -> &str {
     match capability {
-        "workspace.write" | "cap.fs.write" => "fs.write",
-        "workspace.delete" | "cap.fs.delete" => "fs.delete",
+        "cap.fs.write" => "fs.write",
+        "cap.fs.patch" => "fs.patch",
+        "cap.fs.delete" => "fs.delete",
         "process.exec" | "cap.shell.exec" => "shell.exec",
         "network.egress" => "web.fetch",
         "git.write" => "git.commit",
@@ -753,10 +754,24 @@ fn required_file_operations_text(report: &Value) -> String {
             let operation = item.get("operation").and_then(Value::as_str)?;
             let target_path = item.get("targetPath").and_then(Value::as_str)?;
             let capability = item.get("capability").and_then(Value::as_str).unwrap_or("");
+            let target_kind = item
+                .get("targetKind")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let outside_workspace = item
+                .get("outsideWorkspace")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let suffix = match (target_kind, outside_workspace) {
+                (Some(kind), true) => format!(",{kind},outsideWorkspace"),
+                (Some(kind), false) => format!(",{kind}"),
+                (None, true) => ",outsideWorkspace".to_string(),
+                (None, false) => String::new(),
+            };
             Some(if capability.is_empty() {
-                format!("{operation}:{target_path}")
+                format!("{operation}:{target_path}{suffix}")
             } else {
-                format!("{operation}:{target_path}({capability})")
+                format!("{operation}:{target_path}({capability}{suffix})")
             })
         })
         .collect::<Vec<_>>();

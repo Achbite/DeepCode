@@ -1,5 +1,6 @@
 import type {
   AgentContextAttachment,
+  AgentConversationActivity,
   AgentEvent,
   AgentSessionResult,
   AgentStreamPartFrame,
@@ -13,6 +14,8 @@ import type {
   ProjectionDelta,
   ToolCall,
   ToolDefinition,
+  KernelToolCatalogSnapshot,
+  KernelToolCatalogTool,
 } from '@deepcode/protocol';
 import { listDefaultAgentTools } from '@deepcode/protocol';
 import { parseProposalEnvelope } from '../agent-plan/protocolV3.js';
@@ -79,6 +82,7 @@ export interface SessionDriverLoopInput {
   subAgentMaxParallel?: number;
   resumeResourcePackets?: boolean;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  interactionOverlay?: InteractionOverlayContext;
 }
 
 export type RequirementConfirmationMode = 'auto' | 'always' | 'off';
@@ -102,6 +106,7 @@ export interface SessionDecisionResolverInput {
   interventionLevel?: InterventionLevel;
   subAgentMode?: SubAgentMode;
   subAgentMaxParallel?: number;
+  interactionOverlay?: InteractionOverlayContext;
 }
 
 interface SessionDriverLoopRunState {
@@ -124,9 +129,11 @@ interface SessionDriverLoopRunState {
   implementationBatch: ImplementationBatchContext;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   resourceRequestRepairAttempted: boolean;
+  actionBundleAdmissionRepairAttempted: boolean;
   planReviewRepairAttempted: boolean;
   acceptedPlanScopeRepairAttempted: boolean;
   subAgentMergeAttempted: boolean;
+  subAgentParentFallbackRepairAttempted: boolean;
   subAgentMode: SubAgentMode;
   subAgentMaxParallel: number;
   subAgentTelemetry?: {
@@ -137,6 +144,7 @@ interface SessionDriverLoopRunState {
   };
   terminalGuidanceRevisionAttempted: boolean;
   activeTurn?: ActiveTurnState;
+  interactionOverlay?: InteractionOverlayContext;
 }
 
 type SessionTurnPhase =
@@ -159,6 +167,15 @@ interface DecisionOwnerRef {
   requirementId?: string;
   reviewId?: string;
   permissionId?: string;
+}
+
+interface InteractionOverlayContext {
+  parentRunId: string;
+  parentPhase: SessionTurnPhase;
+  interactionRunId: string;
+  interactionId: string;
+  sourceInteractionId?: string;
+  resumedFromDecisionId?: string;
 }
 
 interface ImplementationBatchContext {
@@ -350,10 +367,9 @@ const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 12 * 1024;
 const MAX_ACTION_BUNDLE_CODE_BLOCK_BYTES = 6 * 1024;
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
 const SIDE_EFFECT_CAPABILITIES = new Set([
-  'workspace.write',
-  'workspace.create',
-  'workspace.delete',
-  'workspace.rename',
+  'fs.write',
+  'fs.patch',
+  'fs.delete',
   'process.exec',
   'network.egress',
   'git.write',
@@ -455,12 +471,15 @@ export class SessionDriverLoop {
       implementationBatch,
       acceptedImplementationPlan,
       resourceRequestRepairAttempted: false,
+      actionBundleAdmissionRepairAttempted: false,
       planReviewRepairAttempted: false,
       acceptedPlanScopeRepairAttempted: false,
       subAgentMergeAttempted: false,
+      subAgentParentFallbackRepairAttempted: false,
       subAgentMode,
       subAgentMaxParallel,
       terminalGuidanceRevisionAttempted: false,
+      interactionOverlay: input.interactionOverlay,
     };
 
     if (state.manifest.entries.length > 0 && !input.resumeResourcePackets) {
@@ -523,7 +542,7 @@ export class SessionDriverLoop {
           'actionBundle',
           'diagnostic',
         ],
-        capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
+        capabilityCatalogSummary: capabilityCatalogSummaryForState(state),
         memoryDocument: state.memoryDocument,
         extraMemoryHints: implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
         interventionLevel: input.interventionLevel,
@@ -571,6 +590,13 @@ export class SessionDriverLoop {
       }
       if (proposal.kind === 'decisionRequest') {
         const requirement = requirementRecordFromProposal(proposal, input, state, this.ts());
+        const interactionOverlay: InteractionOverlayContext = {
+          parentRunId: state.interactionOverlay?.parentRunId ?? state.runId,
+          parentPhase: state.phase,
+          interactionRunId: state.runId,
+          interactionId: requirement.requirementId,
+          sourceInteractionId: requirement.requirementId,
+        };
         const confirmation = requirementConfirmationEvent({
             sessionId,
             runId: state.runId,
@@ -578,6 +604,7 @@ export class SessionDriverLoop {
             proposal,
             originalUserRequest: input.content,
             attachments: input.attachments ?? [],
+            interactionOverlay,
             ts: this.ts(),
             id: this.id('decision-request'),
           });
@@ -595,6 +622,7 @@ export class SessionDriverLoop {
               targetId: requirement.requirementId,
               requirementId: requirement.requirementId,
             },
+            interactionOverlay,
             ts: this.ts(),
             id: this.id('session-run-waiting-requirement'),
           }),
@@ -700,6 +728,7 @@ export class SessionDriverLoop {
     }
 
     const decisionEvent = requirementDecisionEvent(input.sessionId, confirmation, input.decision, input.guidance, this.ts(), this.id('requirement-decision'));
+    const interactionOverlay = interactionOverlayFromRequirementDecision(confirmation, decisionEvent);
     let result = await this.append(input.sessionId, [decisionEvent]);
     if (input.decision === 'reject') {
       const payload = objectRecord(decisionEvent.payload) ?? {};
@@ -718,6 +747,7 @@ export class SessionDriverLoop {
             targetId: resolvedRequirementId,
             requirementId: resolvedRequirementId,
           },
+          interactionOverlay,
           ts: this.ts(),
           id: this.id('session-run-cancelled-requirement'),
         }),
@@ -740,6 +770,7 @@ export class SessionDriverLoop {
         requirementConfirmationMode: 'off',
         interventionLevel: input.interventionLevel,
         resumeResourcePackets: true,
+        interactionOverlay,
       });
     }
 
@@ -759,6 +790,7 @@ export class SessionDriverLoop {
       confirmedRequirement: input.decision === 'accept' ? requirementRecordFromEvent(confirmation, 'confirmed') : undefined,
       requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
       interventionLevel: input.interventionLevel,
+      interactionOverlay,
     });
 
     if (input.decision !== 'accept') return next;
@@ -771,6 +803,7 @@ export class SessionDriverLoop {
       targetId: plan.planId,
       runId: plan.runId,
       existingEvents: next.events,
+      interactionOverlay,
     });
   }
 
@@ -821,6 +854,7 @@ export class SessionDriverLoop {
               targetId: plan.planId,
               planId: plan.planId,
             },
+            interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
             ts: this.ts(),
             id: this.id('session-run-cancelled-plan'),
           }),
@@ -851,116 +885,199 @@ export class SessionDriverLoop {
         subAgentMode: input.subAgentMode,
         subAgentMaxParallel: input.subAgentMaxParallel,
         acceptedImplementationPlan: acceptedPlan,
+        interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
       });
     }
-    const decisionReply = await this.kernel({
-      command: {
-        kind: 'userDecisionSubmit',
-        requestId: this.id('user-decision-plan'),
-        runId: plan.runId,
-        sessionId: input.sessionId,
-        decision: {
-          decisionId: this.id('decision-plan'),
-          decisionKind: 'plan',
-          targetId: plan.planId,
-          payload: {
-            decision: input.decision,
-            guidance: input.guidance,
+    return this.executeAcceptedActionBundlePlan(input, plan, result);
+  }
+
+  private async executeAcceptedActionBundlePlan(
+    input: SessionDecisionResolverInput,
+    plan: SessionPlanContext,
+    initialResult: AgentSessionResult
+  ): Promise<AgentSessionResult> {
+    let result = initialResult;
+    try {
+      result = await this.append(input.sessionId, [
+        sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId: plan.runId,
+          phase: 'executing_accepted_plan',
+          status: 'running',
+          reason: 'accepted_plan_execution',
+          decisionOwner: {
+            kind: 'plan',
+            runId: plan.runId,
+            targetId: plan.planId,
+            planId: plan.planId,
+          },
+          interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+          ts: this.ts(),
+          id: this.id('session-run-accepted-action-plan-execution'),
+        }),
+      ]) ?? result;
+      const batch: Record<string, unknown> = {
+        planId: plan.planId,
+        actionBundle: plan.actionBundle,
+        codeBlocks: plan.codeBlocks,
+        commandBlocks: plan.commandBlocks,
+      };
+      result = await this.append(input.sessionId, [
+        acceptedPlanActionBatchPreflightEvent(
+          input.sessionId,
+          plan,
+          batch,
+          this.ts(),
+          this.id('accepted-action-plan-preflight')
+        ),
+      ]) ?? result;
+      const deletePreflightReasons = acceptedPlanDeletePreflightReasons(batch, recentResourcePackets(result.events));
+      if (deletePreflightReasons.length) {
+        return this.append(input.sessionId, planActionBundlePreflightFailureEvents(
+          input.sessionId,
+          plan,
+          deletePreflightReasons,
+          this.ts(),
+          this.id('accepted-action-plan-preflight-failed')
+        )) ?? result;
+      }
+      const decisionReply = await this.kernel({
+        command: {
+          kind: 'userDecisionSubmit',
+          requestId: this.id('user-decision-plan'),
+          runId: plan.runId,
+          sessionId: input.sessionId,
+          decision: {
+            decisionId: this.id('decision-plan'),
+            decisionKind: 'plan',
+            targetId: plan.planId,
+            payload: {
+              decision: input.decision,
+              guidance: input.guidance,
+            },
           },
         },
-      },
-    });
-    result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
+      });
+      assertKernelReplyOk(decisionReply, 'accepted_plan_user_decision_failed', 'Kernel plan decision submit failed');
+      result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply) ?? result;
 
-    const grantEvents: unknown[] = [];
-    for (const grant of temporaryGrantsForPlan(plan)) {
-      const grantReply = await this.kernel({
+      const grantEvents: unknown[] = [];
+      for (const grant of temporaryGrantsForPlan(plan)) {
+        const grantReply = await this.kernel({
+          command: {
+            kind: 'permissionGrantTemporary',
+            requestId: this.id('plan-temp-grant'),
+            runId: plan.runId,
+            grant,
+          },
+        });
+        assertKernelReplyOk(grantReply, 'accepted_plan_grant_failed', 'Kernel temporary grant failed');
+        grantEvents.push(...(grantReply.events ?? []));
+      }
+      if (grantEvents.length) {
+        result = await this.appendProjectedKernelEvents(input.sessionId, { ok: true, events: grantEvents }) ?? result;
+      }
+
+      const batchReply = await this.kernel({
         command: {
-          kind: 'permissionGrantTemporary',
-          requestId: this.id('plan-temp-grant'),
+          kind: 'actionBatchSubmit',
+          requestId: this.id('action-batch-submit'),
           runId: plan.runId,
-          grant,
+          sessionId: input.sessionId,
+          batch,
         },
       });
-      grantEvents.push(...(grantReply.events ?? []));
-    }
-    if (grantEvents.length) {
-      result = await this.appendProjectedKernelEvents(input.sessionId, { ok: true, events: grantEvents });
-    }
-
-    const batchReply = await this.kernel({
-      command: {
-        kind: 'actionBatchSubmit',
-        requestId: this.id('action-batch-submit'),
-        runId: plan.runId,
-        sessionId: input.sessionId,
-        batch: {
-          planId: plan.planId,
-          actionBundle: plan.actionBundle,
-          codeBlocks: plan.codeBlocks,
-          commandBlocks: plan.commandBlocks,
-        },
-      },
-    });
-    result = await this.appendProjectedKernelEvents(input.sessionId, batchReply);
-    if (!actionBatchReadyForReview(batchReply.events ?? [])) {
-      if (kernelEventsContainPermissionRequest(batchReply.events ?? [])) {
-        const permissionId = permissionIdFromKernelEvents(batchReply.events ?? []);
-        return this.append(input.sessionId, [
-          sessionRunStateEvent({
-            sessionId: input.sessionId,
-            runId: plan.runId,
-            phase: 'waiting_permission',
-            reason: 'permission',
-            decisionOwner: {
-              kind: 'permission',
-              runId: plan.runId,
-              targetId: permissionId,
-              permissionId,
-              planId: plan.planId,
-            },
-            ts: this.ts(),
-            id: this.id('session-run-waiting-permission'),
-          }),
-        ]) ?? result;
+      result = await this.appendProjectedKernelEvents(input.sessionId, batchReply) ?? result;
+      const batchEvents = batchReply.events ?? [];
+      if (!batchReply.ok && batchEvents.length === 0) {
+        throw new SessionDriverLoopError(
+          'accepted_plan_action_batch_submit_failed',
+          kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed without execution facts')
+        );
       }
-      return result;
-    }
-    const factsReply = await this.kernel({
-      command: {
-        kind: 'reviewFactsGet',
-        requestId: this.id('review-facts-get'),
-        runId: plan.runId,
-        sessionId: input.sessionId,
-      },
-    });
-    result = await this.appendProjectedKernelEvents(input.sessionId, factsReply);
-    const review = reviewSummaryEvent(
-      input.sessionId,
-      plan,
-      [...(batchReply.events ?? []), ...(factsReply.events ?? [])],
-      this.ts(),
-      this.id('review-summary')
-    );
-    const reviewPayload = objectRecord(review.payload) ?? {};
-    return this.append(input.sessionId, [
-      review,
-      sessionRunStateEvent({
-        sessionId: input.sessionId,
-        runId: plan.runId,
-        phase: 'waiting_review',
-        reason: 'review',
-        decisionOwner: {
-          kind: 'review',
+      if (actionBatchHasFailureOrBlocker(batchEvents)) {
+        return this.append(input.sessionId, planActionBundleExecutionFailureEvents(
+          input.sessionId,
+          plan,
+          batchEvents,
+          batch,
+          this.ts(),
+          this.id('accepted-action-plan-batch-failed')
+        )) ?? result;
+      }
+      if (!actionBatchReadyForReview(batchEvents)) {
+        if (kernelEventsContainPermissionRequest(batchEvents)) {
+          const permissionId = permissionIdFromKernelEvents(batchEvents);
+          return this.append(input.sessionId, [
+            sessionRunStateEvent({
+              sessionId: input.sessionId,
+              runId: plan.runId,
+              phase: 'waiting_permission',
+              reason: 'permission',
+              decisionOwner: {
+                kind: 'permission',
+                runId: plan.runId,
+                targetId: permissionId,
+                permissionId,
+                planId: plan.planId,
+              },
+              interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+              ts: this.ts(),
+              id: this.id('session-run-waiting-permission'),
+            }),
+          ]) ?? result;
+        }
+        return result;
+      }
+      const factsReply = await this.kernel({
+        command: {
+          kind: 'reviewFactsGet',
+          requestId: this.id('review-facts-get'),
           runId: plan.runId,
-          targetId: stringValue(reviewPayload.reviewId) ?? plan.runId,
-          reviewId: stringValue(reviewPayload.reviewId) ?? plan.runId,
-          planId: plan.planId,
+          sessionId: input.sessionId,
         },
-        ts: this.ts(),
-        id: this.id('session-run-waiting-review'),
-      }),
-    ]) ?? result;
+      });
+      assertKernelReplyOk(factsReply, 'accepted_plan_review_facts_failed', 'Kernel reviewFactsGet failed');
+      result = await this.appendProjectedKernelEvents(input.sessionId, factsReply) ?? result;
+      const review = reviewSummaryEvent(
+        input.sessionId,
+        plan,
+        [...batchEvents, ...(factsReply.events ?? [])],
+        this.ts(),
+        this.id('review-summary')
+      );
+      const reviewPayload = objectRecord(review.payload) ?? {};
+      return this.append(input.sessionId, [
+        review,
+        sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId: plan.runId,
+          phase: 'waiting_review',
+          reason: 'review',
+          decisionOwner: {
+            kind: 'review',
+            runId: plan.runId,
+            targetId: stringValue(reviewPayload.reviewId) ?? plan.runId,
+            reviewId: stringValue(reviewPayload.reviewId) ?? plan.runId,
+            planId: plan.planId,
+          },
+          interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+          ts: this.ts(),
+          id: this.id('session-run-waiting-review'),
+        }),
+      ]) ?? result;
+    } catch (error) {
+      const message = error instanceof SessionDriverLoopError ? error.message : String(error);
+      const code = error instanceof SessionDriverLoopError ? error.code : 'accepted_plan_execution_failed';
+      return this.append(input.sessionId, planActionBundleExecutionExceptionEvents(
+        input.sessionId,
+        plan,
+        message,
+        code,
+        this.ts(),
+        this.id('accepted-action-plan-execution-failed')
+      )) ?? result;
+    }
   }
 
   private async resolvePermissionDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
@@ -1262,7 +1379,7 @@ export class SessionDriverLoop {
       contextAssemblyId: this.id('context-assembly'),
       workflowState: 'needDecisionRequest',
       allowedProposals: ['decisionRequest'],
-      capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
+      capabilityCatalogSummary: capabilityCatalogSummaryForState(state),
       memoryDocument: state.memoryDocument,
       extraMemoryHints: state.memoryHints,
       interventionLevel: input.interventionLevel,
@@ -1338,7 +1455,7 @@ export class SessionDriverLoop {
       contextAssemblyId: this.id('context-assembly-guidance-revision'),
       workflowState: 'guidanceRevision',
       allowedProposals: ['answer'],
-      capabilityCatalogSummary: (state.stateContract?.capabilityProjection ?? []).join('\n'),
+      capabilityCatalogSummary: capabilityCatalogSummaryForState(state),
       memoryDocument: state.memoryDocument,
       extraMemoryHints: implementationBatchHints(state.implementationBatch),
       interventionLevel: input.interventionLevel,
@@ -1891,18 +2008,166 @@ export class SessionDriverLoop {
       { role: 'system', content: prompt.stablePrefix },
       { role: 'user', content: `${prompt.dynamicSuffix}\n\n${reason}` },
     ]);
-    if (typeof providerResult !== 'string') return providerResult;
+    if (typeof providerResult !== 'string') {
+      return this.acceptOrRepairSubAgentParentFallbackProposal(
+        input,
+        state,
+        prompt,
+        mergeGroup,
+        diagnostics,
+        providerResult,
+        'parent provider returned a native proposal envelope',
+        true
+      );
+    }
     try {
-      return parseAndValidateProposal({
+      const proposal = parseAndValidateProposal({
         raw: providerResult,
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
       });
+      return this.acceptOrRepairSubAgentParentFallbackProposal(
+        input,
+        state,
+        prompt,
+        mergeGroup,
+        diagnostics,
+        proposal,
+        'parent provider returned a parsed proposal envelope',
+        true
+      );
+    } catch (error) {
+      return this.repairSubAgentParentFallbackProposal(
+        input,
+        state,
+        prompt,
+        mergeGroup,
+        diagnostics,
+        `parent provider 输出无法解析：${normalizeParseError(error).message}`
+      );
+    }
+  }
+
+  private async acceptOrRepairSubAgentParentFallbackProposal(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    mergeGroup: SubAgentMergeGroup,
+    diagnostics: SubAgentBranchDiagnostic[],
+    proposal: ProposalEnvelope,
+    sourceSummary: string,
+    allowRepair: boolean
+  ): Promise<ProposalEnvelope> {
+    const problem = subAgentParentFallbackProposalProblem(state, proposal);
+    if (!problem) return proposal;
+    if (!allowRepair) {
+      throw new SessionDriverLoopError(
+        'subagent_discard_parent_repair_failed',
+        `子代理草稿丢弃后 parent provider repair 后仍无效：${problem}`
+      );
+    }
+    return this.repairSubAgentParentFallbackProposal(
+      input,
+      state,
+      prompt,
+      mergeGroup,
+      diagnostics,
+      `${sourceSummary}，但不能继续 accepted implementationPlan：${problem}`
+    );
+  }
+
+  private async repairSubAgentParentFallbackProposal(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    mergeGroup: SubAgentMergeGroup,
+    diagnostics: SubAgentBranchDiagnostic[],
+    problemSummary: string
+  ): Promise<ProposalEnvelope> {
+    if (state.subAgentParentFallbackRepairAttempted) {
+      throw new SessionDriverLoopError(
+        'subagent_discard_parent_repair_failed',
+        `子代理草稿丢弃后 parent provider 输出仍不可用，且 repair 已尝试过一次：${problemSummary}`
+      );
+    }
+    state.subAgentParentFallbackRepairAttempted = true;
+    const guidanceMessages = await this.consumeQueuedGuidanceForProviderResume(state, 'subagent_parent_fallback_repair_guidance');
+    if (guidanceMessages.length) {
+      return this.parentProviderCheckpointAfterSubAgentGuidance(
+        input,
+        state,
+        prompt,
+        'subagent_parent_fallback_repair_guidance',
+        guidanceMessages,
+        'Session 在 parent fallback repair 前发现新的用户引导；不会继续使用已丢弃的子代理草稿，将由 parent provider 重新决策。'
+      );
+    }
+    const repairPrompt = [
+      'Session 子代理并行草稿已经丢弃；parent fallback 的上一份输出仍不能继续执行。',
+      `通用错误原因：${problemSummary}`,
+      '请只基于当前 accepted implementationPlan、Kernel facts、ResourcePacket 和已确认 target/capability 范围继续。',
+      '如果要删除文件，fs.delete 必须使用 kind="delete"、capability="fs.delete"，并指向具体文件 targetPath/resourceScope；workspace 内默认使用相对路径，用户明确要求的外部文件可使用绝对文件路径交由 Kernel PlanReview 申请临时授权；不得使用目录、空目录清理、通配符、根目录、递归删除或空路径。',
+      '如果当前证据不足以枚举具体文件，请返回 resourceRequest 读取/列出必要资源；如果需要用户重新确认范围，请返回 decisionRequest 或 implementationPlan 修订。',
+      'repair 只能输出一个合规 proposal：actionBundle、resourceRequest、decisionRequest 或 implementationPlan。',
+      diagnostics.length
+        ? `已丢弃的子代理诊断摘要：\n${diagnostics.map((item) =>
+          `- branch=${item.branchId}; subAgent=${item.subAgentId}; task=${item.taskId}; targets=${item.targets.join(',') || 'none'}; reason=${item.reason}`
+        ).join('\n')}`
+        : '已丢弃的子代理诊断摘要：无。',
+    ].join('\n\n');
+    await this.emitProjectionDelta(state, {
+      type: 'stage_delta',
+      stage: 'subagent_parent_fallback.repairing',
+      status: 'running',
+      channel: 'progress',
+      source: 'session',
+      summary: 'Session 正在修复 parent fallback 输出，避免把子代理草稿失败升级为计划失败。',
+      payload: {
+        mergeGroupId: mergeGroup.mergeGroupId,
+        planId: state.acceptedImplementationPlan?.planId,
+        reason: 'parent_fallback_invalid',
+        problemSummary,
+        diagnostics,
+      },
+    });
+    const providerResult = await this.callProviderWithNativeTools(input, state, prompt, [
+      { role: 'system', content: prompt.stablePrefix },
+      { role: 'user', content: `${prompt.dynamicSuffix}\n\n${repairPrompt}` },
+    ]);
+    if (typeof providerResult !== 'string') {
+      return this.acceptOrRepairSubAgentParentFallbackProposal(
+        input,
+        state,
+        prompt,
+        mergeGroup,
+        diagnostics,
+        providerResult,
+        'parent fallback repair returned a native proposal envelope',
+        false
+      );
+    }
+    try {
+      const proposal = parseAndValidateProposal({
+        raw: providerResult,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+      });
+      return this.acceptOrRepairSubAgentParentFallbackProposal(
+        input,
+        state,
+        prompt,
+        mergeGroup,
+        diagnostics,
+        proposal,
+        'parent fallback repair returned a parsed proposal envelope',
+        false
+      );
     } catch (error) {
       throw new SessionDriverLoopError(
         'subagent_discard_parent_repair_failed',
-        `子代理草稿丢弃后 parent provider 输出无法解析：${normalizeParseError(error).message}`
+        `子代理草稿丢弃后 parent provider repair 输出无法解析：${normalizeParseError(error).message}`
       );
     }
   }
@@ -1928,6 +2193,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'session',
       summary: providerStageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
+      activity: providerActivity(state, stage, 'running'),
     }, deltaContext);
     const request: LlmChatRequest = {
       profileId,
@@ -1956,6 +2222,15 @@ export class SessionDriverLoop {
         channel: 'progress',
         source: 'provider',
         summary: result.message ?? result.error ?? 'LLM provider request failed.',
+        activity: conversationActivity({
+          activityId: `provider-${stage}-failed`,
+          kind: 'diagnostic',
+          status: 'failed',
+          title: 'Provider call failed',
+          summary: result.message ?? result.error ?? 'LLM provider request failed.',
+          source: 'provider',
+          runId: state.runId,
+        }),
       }, deltaContext);
       throw new SessionDriverLoopError(
         'subagent_llm_chat_failed',
@@ -1975,6 +2250,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'provider',
       summary: providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
+      activity: providerActivity(state, stage, 'completed'),
     }, deltaContext);
     const content = stripProviderPartFrames(result.data.assistantMessage?.content
       ?? result.data.chunks
@@ -2048,6 +2324,16 @@ export class SessionDriverLoop {
         channel: 'progress',
         source: 'session',
         summary: 'native_tool_checkpoint',
+        activity: conversationActivity({
+          activityId: `native-tool-round-${round + 1}`,
+          kind: 'toolExecution',
+          status: 'running',
+          title: 'Native tool checkpoint',
+          summary: 'Provider requested read-only native tools. Session is routing them through Kernel resource boundaries.',
+          source: 'session',
+          runId: state.runId,
+          itemCount: turn.toolCalls.length,
+        }),
         payload: {
           visibility: 'task',
           nativeToolRound: round,
@@ -2075,6 +2361,16 @@ export class SessionDriverLoop {
         source: 'session',
         itemId: toolCall.callId,
         summary: nativeToolResolveRunningSummary(toolCall.name, language),
+        activity: conversationActivity({
+          activityId: `native-tool-${toolCall.callId}`,
+          kind: 'toolExecution',
+          status: 'running',
+          title: 'Resolving native read tool',
+          summary: nativeToolResolveRunningSummary(toolCall.name, language),
+          source: 'session',
+          runId: state.runId,
+          toolName: toolCall.name,
+        }),
         payload: {
           callId: toolCall.callId,
           name: toolCall.name,
@@ -2096,6 +2392,7 @@ export class SessionDriverLoop {
         source: 'kernel',
         itemId: toolCall.callId,
         summary: nativeToolResolveCompletedSummary(toolCall.name, language),
+        activity: resourcePacketActivity(packet, `native-tool-resource-${toolCall.callId}`, state.runId),
         payload: {
           callId: toolCall.callId,
           packetId: packet.id,
@@ -2135,6 +2432,16 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'session',
       summary: 'side_effect_native_tool_blocked',
+      activity: conversationActivity({
+        activityId: `native-tool-side-effect-${toolCall.callId}`,
+        kind: 'diagnostic',
+        status: 'failed',
+        title: 'Native tool blocked',
+        summary: 'Provider requested a side-effect tool. Session is converting it back through the plan/permission path.',
+        source: 'session',
+        runId: state.runId,
+        toolName: toolCall.name,
+      }),
       payload: {
         visibility: 'task',
         callId: toolCall.callId,
@@ -2221,6 +2528,163 @@ export class SessionDriverLoop {
     }
   }
 
+  private async repairActionBundleAdmission(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    proposal: ProposalEnvelope,
+    reasons: string[],
+    fallback: AgentSessionResult
+  ): Promise<AgentSessionResult> {
+    if (state.actionBundleAdmissionRepairAttempted) {
+      return this.append(state.sessionId, actionBundleAdmissionFailureEvents(
+        state.sessionId,
+        state.runId,
+        proposal,
+        reasons,
+        this.ts(),
+        this.id('action-bundle-admission-failed')
+      )) ?? fallback;
+    }
+    state.actionBundleAdmissionRepairAttempted = true;
+    let result = await this.append(state.sessionId, [
+      actionBundleAdmissionRepairingEvent(
+        state.sessionId,
+        state.runId,
+        proposal,
+        reasons,
+        this.ts(),
+        this.id('action-bundle-admission-repairing')
+      ),
+    ]) ?? fallback;
+
+    let repaired: ProposalEnvelope;
+    try {
+      const raw = await this.llm(input.profileId, state, 'action_bundle_admission_repair', actionBundleAdmissionRepairMessages(prompt, state, proposal, reasons));
+      repaired = parseAndValidateProposal({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+      });
+    } catch (error) {
+      const message = error instanceof SessionDriverLoopError ? error.message : normalizeParseError(error).message;
+      return this.append(state.sessionId, actionBundleAdmissionFailureEvents(
+        state.sessionId,
+        state.runId,
+        proposal,
+        [`actionBundle admission repair failed: ${message}`],
+        this.ts(),
+        this.id('action-bundle-admission-repair-failed')
+      )) ?? result;
+    }
+
+    if (repaired.kind === 'actionBundle') {
+      return this.submitActionProposal(input, state, prompt, repaired, result);
+    }
+    if (repaired.kind === 'resourceRequest') {
+      const subset = manifestForResourceRequest(state.manifest, repaired.payload as ResourceRequestDraft, state.conversationRoots);
+      if (!subset.manifest.entries.length) {
+        return this.append(state.sessionId, actionBundleAdmissionFailureEvents(
+          state.sessionId,
+          state.runId,
+          proposal,
+          [`actionBundle admission repair returned resourceRequest that cannot be resolved: ${resourceResolutionDiagnostic(subset)}`],
+          this.ts(),
+          this.id('action-bundle-admission-resource-invalid')
+        )) ?? result;
+      }
+      const packet = await this.resolveResources(state, subset.manifest);
+      state.resourcePackets.push(packet);
+      addDiscoveredManifestEntries(state.manifest, packet);
+      result = await this.append(state.sessionId, [
+        resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('action-bundle-admission-resource-context')),
+      ]) ?? result;
+      return this.runUserTurn({
+        sessionId: input.sessionId,
+        content: actionBundleAdmissionResourceFollowupRequest(state, reasons),
+        attachments: input.attachments ?? [],
+        existingEvents: result.events,
+        workspaceBinding: input.workspaceBinding,
+        projectWorkingDirectory: input.projectWorkingDirectory,
+        profileId: input.profileId,
+        workflow: input.workflow,
+        appendUserMessage: false,
+        requirementConfirmationMode: 'off',
+        reviewContinuationMode: input.reviewContinuationMode,
+        interventionLevel: input.interventionLevel,
+        subAgentMode: input.subAgentMode,
+        subAgentMaxParallel: input.subAgentMaxParallel,
+        resumeResourcePackets: true,
+      });
+    }
+    if (repaired.kind === 'decisionRequest') {
+      const requirement = requirementRecordFromProposal(repaired, input, state, this.ts());
+      const confirmation = requirementConfirmationEvent({
+        sessionId: state.sessionId,
+        runId: state.runId,
+        requirement,
+        proposal: repaired,
+        originalUserRequest: input.content,
+        attachments: input.attachments ?? [],
+        ts: this.ts(),
+        id: this.id('action-bundle-admission-decision'),
+      });
+      state.phase = 'waiting_plan_review';
+      return this.append(state.sessionId, [
+        confirmation,
+        sessionRunStateEvent({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          phase: 'waiting_plan_review',
+          reason: 'requirement',
+          decisionOwner: {
+            kind: 'requirement',
+            runId: state.runId,
+            targetId: requirement.requirementId,
+            requirementId: requirement.requirementId,
+          },
+          ts: this.ts(),
+          id: this.id('session-run-waiting-action-bundle-admission-decision'),
+        }),
+      ]) ?? result;
+    }
+    if (repaired.kind === 'implementationPlan') {
+      const planId = stringValue(objectRecord(repaired.payload)?.id) ?? repaired.proposalId;
+      state.phase = 'waiting_plan_review';
+      return this.append(state.sessionId, [
+        implementationPlanCardEvent(state, repaired, this.ts(), this.id('action-bundle-admission-plan')),
+        sessionRunStateEvent({
+          sessionId: state.sessionId,
+          runId: state.runId,
+          phase: 'waiting_plan_review',
+          reason: 'plan_review',
+          decisionOwner: {
+            kind: 'plan',
+            runId: state.runId,
+            targetId: planId,
+            planId,
+          },
+          ts: this.ts(),
+          id: this.id('session-run-waiting-action-bundle-admission-plan'),
+        }),
+      ]) ?? result;
+    }
+    if (repaired.kind === 'answer') {
+      return this.append(state.sessionId, [answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]) ?? result;
+    }
+    if (repaired.kind === 'diagnostic') {
+      const diagnostic = objectRecord(repaired.payload) ?? {};
+      const summary = stringValue(diagnostic.summary)
+        ?? stringValue(diagnostic.details)
+        ?? 'actionBundle admission repair returned a diagnostic instead of a file-level plan.';
+      return this.append(state.sessionId, [
+        finalDiagnosticEvent(state.sessionId, summary, this.ts(), this.id('action-bundle-admission-diagnostic')),
+      ]) ?? result;
+    }
+    return this.submitNonExecutableProposal(state, repaired, result);
+  }
+
   private async resolveResources(
     state: SessionDriverLoopRunState,
     manifest: ResourceManifest
@@ -2251,6 +2715,13 @@ export class SessionDriverLoop {
     const actionBundle = readActionBundle(proposal);
     if (actionBundle && state.acceptedImplementationPlan) {
       return this.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback);
+    }
+    if (actionBundle) {
+      const admissionBatch = proposalActionBundleAdmissionBatch(proposal);
+      const admissionReasons = acceptedPlanDeletePreflightReasons(admissionBatch, state.resourcePackets);
+      if (admissionReasons.length) {
+        return this.repairActionBundleAdmission(input, state, prompt, proposal, admissionReasons, fallback);
+      }
     }
     const proposalReply = await this.kernel({
       command: {
@@ -2613,6 +3084,41 @@ export class SessionDriverLoop {
         this.id('accepted-plan-batch-normalization-failed')
       )) ?? result;
     }
+    const batch = normalizedBatch.batch;
+    const deletePreflightReasons = acceptedPlanDeletePreflightReasons(batch, state.resourcePackets);
+    if (deletePreflightReasons.length) {
+      return this.append(state.sessionId, acceptedPlanNormalizationFailureEvents(
+        state.sessionId,
+        state.runId,
+        accepted,
+        deletePreflightReasons,
+        this.ts(),
+        this.id('accepted-plan-delete-preflight-failed')
+      )) ?? result;
+    }
+    await this.appendProviderTrace(state, 'accepted_plan.action_batch_preflight', {
+      planId: accepted.planId,
+      batchIndex: accepted.batchIndex,
+      audit: acceptedPlanBatchPreflightAudit(batch),
+    });
+
+    await this.emitProjectionDelta(state, {
+      type: 'stage_delta',
+      stage: 'accepted_plan.action_batch_submit',
+      status: 'running',
+      channel: 'progress',
+      source: 'session',
+      summary: acceptedPlanBatchActivitySummary(batch),
+      activity: acceptedPlanBatchActivity(accepted, batch, 'running'),
+      payload: {
+        visibility: 'task',
+        planId: accepted.planId,
+        batchIndex: accepted.batchIndex,
+        actionCount: Array.isArray((batch as Record<string, unknown>).actions)
+          ? ((batch as Record<string, unknown>).actions as unknown[]).length
+          : undefined,
+      },
+    });
 
     const batchReply = await this.kernel({
       command: {
@@ -2620,9 +3126,10 @@ export class SessionDriverLoop {
         requestId: this.id('accepted-plan-action-batch-submit'),
         runId: state.runId,
         sessionId: state.sessionId,
-        batch: normalizedBatch.batch,
+        batch,
       },
     });
+    await this.emitKernelActivityDeltas(state, batchReply.events ?? [], 'accepted_plan.action_batch_submit');
     result = await this.appendProjectedKernelEvents(state.sessionId, batchReply) ?? result;
     const batchEvents = batchReply.events ?? [];
     if (actionBatchHasFailureOrBlocker(batchEvents)) {
@@ -2631,6 +3138,7 @@ export class SessionDriverLoop {
         state.runId,
         accepted,
         batchEvents,
+        batch,
         this.ts(),
         this.id('accepted-plan-batch-failed')
       )) ?? result;
@@ -3005,6 +3513,7 @@ export class SessionDriverLoop {
         source: 'provider',
         itemId: chunk.callId,
         delta: chunk.content,
+        activity: providerActivity(state, stage, 'running'),
         payload: chunk.rawProvider,
       }, deltaContext);
       return;
@@ -3023,6 +3532,18 @@ export class SessionDriverLoop {
         summary: chunk.toolCallDelta?.name
           ? providerToolCallPreparingSummary(chunk.toolCallDelta.name, language)
           : providerToolCallStreamingSummary(language),
+        activity: conversationActivity({
+          activityId: `provider-tool-${chunk.callId ?? chunk.index ?? 0}`,
+          kind: 'toolExecution',
+          status: 'running',
+          title: 'Provider tool call',
+          summary: chunk.toolCallDelta?.name
+            ? providerToolCallPreparingSummary(chunk.toolCallDelta.name, language)
+            : providerToolCallStreamingSummary(language),
+          source: 'provider',
+          runId: state.runId,
+          toolName: chunk.toolCallDelta?.name,
+        }),
         payload: {
           index: chunk.index,
           callId: chunk.callId,
@@ -3053,6 +3574,15 @@ export class SessionDriverLoop {
         channel: 'progress',
         source: 'provider',
         summary: event.error ?? chunk?.error ?? 'Provider stream error.',
+        activity: conversationActivity({
+          activityId: `provider-${stage}-stream-error`,
+          kind: 'diagnostic',
+          status: 'failed',
+          title: 'Provider stream error',
+          summary: event.error ?? chunk?.error ?? 'Provider stream error.',
+          source: 'provider',
+          runId: state.runId,
+        }),
         payload: event.rawProvider ?? chunk?.rawProvider,
       }, deltaContext);
     }
@@ -3072,14 +3602,47 @@ export class SessionDriverLoop {
     activeTurn.seq += 1;
     activeTurn.stage = delta.stage ?? activeTurn.stage;
     state.activeTurn = activeTurn;
+    const activity = delta.activity ?? projectionDeltaActivity(state, delta, deltaContext);
     await this.ports.onProjectionDelta({
       ...delta,
       ...deltaContext,
+      activity,
       sessionId: state.sessionId,
       runId: state.runId,
       turnId: activeTurn.turnId,
       seq: activeTurn.seq,
     });
+  }
+
+  private async emitKernelActivityDeltas(
+    state: SessionDriverLoopRunState,
+    kernelEvents: unknown[],
+    stage: string,
+    deltaContext?: ProjectionDeltaBranchContext
+  ): Promise<void> {
+    const workUnitFacts = indexKernelWorkUnitFacts(kernelEvents);
+    for (let index = 0; index < kernelEvents.length; index += 1) {
+      const record = objectRecord(kernelEvents[index]);
+      if (!record) continue;
+      const enriched = enrichKernelWorkUnitRecord(record, workUnitFacts);
+      const activity = kernelEventActivity(enriched, `kernel-activity-${index}`, state.runId);
+      if (!activity) continue;
+      await this.emitProjectionDelta(state, {
+        type: kernelActivityDeltaType(enriched),
+        stage,
+        status: projectionStatusForActivity(activity),
+        channel: kernelActivityChannel(activity),
+        source: 'kernel',
+        itemId: activity.workUnitIds?.[0] ?? activity.actionIds?.[0] ?? activity.toolName ?? activity.activityId,
+        targetPath: activity.targets?.[0],
+        summary: activity.summary,
+        activity,
+        payload: {
+          kernelEvent: enriched,
+          activity,
+        },
+      }, deltaContext);
+    }
   }
 
   private consumeProviderPartFrames(
@@ -3297,7 +3860,12 @@ export class SessionDriverLoop {
   }
 
   private async appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult> {
-    const events = (reply.events ?? []).map((event) => projectKernelEvent(sessionId, event, this.ts(), this.id('kernel')));
+    const workUnitFacts = indexKernelWorkUnitFacts(reply.events ?? []);
+    const events = (reply.events ?? []).map((event) => {
+      const record = objectRecord(event);
+      const projected = record ? enrichKernelWorkUnitRecord(record, workUnitFacts) : event;
+      return projectKernelEvent(sessionId, projected, this.ts(), this.id('kernel'));
+    });
     if (events.length === 0) {
       return this.ports.appendEvents(sessionId, []);
     }
@@ -3321,6 +3889,19 @@ export class SessionDriverLoop {
   private ts(): string {
     return this.ports.now?.() ?? new Date().toISOString();
   }
+}
+
+function assertKernelReplyOk(reply: KernelReply, code: string, fallback: string): void {
+  if (reply.ok) return;
+  if ((reply.events ?? []).length > 0) return;
+  throw new SessionDriverLoopError(code, kernelReplyErrorMessage(reply, fallback));
+}
+
+function kernelReplyErrorMessage(reply: KernelReply, fallback: string): string {
+  const message = reply.error?.message?.trim();
+  const code = reply.error?.code?.trim();
+  if (message && code) return `${code}: ${message}`;
+  return message || code || fallback;
 }
 
 export class SessionDriverLoopError extends Error {
@@ -3463,6 +4044,64 @@ function nativeToolCallToProtocol(toolCall: NativeToolCallProposal): ToolCall {
   };
 }
 
+function toolCatalogSnapshotForState(state: SessionDriverLoopRunState): KernelToolCatalogSnapshot | undefined {
+  return state.stateContract?.toolCatalogSnapshot ?? state.driverRequest?.stateContract?.toolCatalogSnapshot;
+}
+
+function capabilityCatalogSummaryForState(state: SessionDriverLoopRunState): string {
+  const snapshot = toolCatalogSnapshotForState(state);
+  if (snapshot?.tools?.length) {
+    const lines = snapshot.tools
+      .slice()
+      .sort((left, right) => left.toolId.localeCompare(right.toolId))
+      .map((tool) => {
+        const kind = tool.operationKind ? ` kind=${tool.operationKind}` : '';
+        return `- ${tool.toolId}: capability=${tool.capability}${kind} risk=${tool.risk} permission=${tool.permissionMode} pathScope=${tool.pathScopePolicy}`;
+      });
+    return [
+      `KernelToolCatalog ${snapshot.catalogVersion} hash=${snapshot.catalogHash}`,
+      ...lines,
+      'Use Kernel capabilities in actionBundle. Executor tool names are runtime facts, not permission grants.',
+    ].join('\n');
+  }
+  const capabilities = state.stateContract?.capabilityProjection ?? state.driverRequest?.stateContract?.capabilityProjection ?? [];
+  return capabilities.join('\n');
+}
+
+function providerToolDefinitionFromCatalogTool(
+  tool: KernelToolCatalogTool,
+  snapshot: KernelToolCatalogSnapshot
+): ToolDefinition {
+  return {
+    name: tool.toolId,
+    description: `Kernel tool ${tool.toolId} (${tool.capability}).`,
+    inputSchema: tool.providerSchema,
+    riskLevel: tool.risk === 'critical' ? 'critical' : tool.risk === 'high' ? 'high' : tool.risk === 'medium' ? 'medium' : 'low',
+    needsApproval: tool.permissionMode !== 'allow',
+    allowedModes: ['readOnly', 'plan', 'askBeforeWrite'],
+    capability: tool.capability,
+    family: tool.family,
+    operationKind: tool.operationKind,
+    permissionMode: tool.permissionMode,
+    pathScopePolicy: tool.pathScopePolicy,
+    executionMode: tool.executionMode,
+    readOnly: tool.readOnly,
+    catalogVersion: snapshot.catalogVersion,
+    catalogHash: snapshot.catalogHash,
+  };
+}
+
+function catalogProviderToolsForState(state: SessionDriverLoopRunState, names: Set<string>): ToolDefinition[] {
+  const snapshot = toolCatalogSnapshotForState(state);
+  if (!snapshot?.tools?.length) {
+    return listDefaultAgentTools('askBeforeWrite').filter((tool) => names.has(tool.name));
+  }
+  return snapshot.tools
+    .filter((tool) => names.has(tool.toolId))
+    .filter((tool) => tool.executionMode === 'execute')
+    .map((tool) => providerToolDefinitionFromCatalogTool(tool, snapshot));
+}
+
 function nativeProviderToolsForState(state: SessionDriverLoopRunState): ToolDefinition[] {
   const allowed = state.stateContract?.allowedProposals ?? state.driverRequest?.stateContract?.allowedProposals ?? [];
   const allowResources = allowed.length === 0 || allowed.includes('resourceRequest') || allowed.includes('answer');
@@ -3472,7 +4111,7 @@ function nativeProviderToolsForState(state: SessionDriverLoopRunState): ToolDefi
     names.add('fs.list');
   }
   if (names.size === 0) return [];
-  return listDefaultAgentTools('askBeforeWrite').filter((tool) => names.has(tool.name));
+  return catalogProviderToolsForState(state, names);
 }
 
 function canResolveNativeToolReadOnly(toolCall: NativeToolCallProposal): boolean {
@@ -3864,8 +4503,8 @@ function implementationBatchHints(
       `Accepted implementationPlan capabilities: ${acceptedPlan.capabilities.length ? acceptedPlan.capabilities.join(', ') : 'none'}.`,
       `Accepted implementationPlan target scopes: ${acceptedPlan.targetScopes.length ? acceptedPlan.targetScopes.join(', ') : 'none'}.`,
       acceptedPlan.executionRoot
-        ? `Accepted implementationPlan primary root: ${acceptedPlan.executionRoot.ref}. All actionBundle targetPath/codeBlock paths must be relative to this root and must not include the root directory name.`
-        : 'Accepted implementationPlan primary root is not explicit; use relative target paths from the authorized workspace root only.',
+        ? `Accepted implementationPlan primary root: ${acceptedPlan.executionRoot.ref}. Workspace actionBundle targetPath/codeBlock paths must be relative to this root and must not include the root directory name. Absolute paths are allowed only for outside-workspace targets already reviewed in the accepted plan.`
+        : 'Accepted implementationPlan primary root is not explicit; use relative target paths from the authorized workspace root unless the accepted plan explicitly contains outside-workspace absolute file targets.',
       'Do not ask the user to reconfirm routine implementation batches already covered by the accepted implementationPlan. If new targets, capabilities, or material technical choices are needed, return decisionRequest or implementationPlan revision instead of an out-of-scope actionBundle.'
     );
   }
@@ -4410,7 +5049,7 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
   if (kind === 'permission.requested') {
     const request = objectRecord(record.request) ?? {};
     const permissionId = stringValue(request.id) ?? stringValue(record.permissionId) ?? stringValue(record.toolCallId) ?? id;
-    const capability = stringValue(request.capability) ?? stringValue(record.capability) ?? 'workspace.write';
+    const capability = stringValue(request.capability) ?? stringValue(record.capability) ?? 'fs.write';
     const toolName = stringValue(record.toolName) ?? stringValue(request.toolName) ?? capability;
     return {
       id,
@@ -4452,6 +5091,7 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
     };
   }
   if (kind === 'proposal.rejected' || kind === 'work_unit.failed') {
+    const activity = kernelEventActivity(record, id);
     return {
       id,
       sessionId,
@@ -4461,10 +5101,12 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
         message: kernelFailureMessage(kind, record),
         channel: 'error',
         visibility: 'conversation',
+        activity,
         kernelEvent: record,
       },
     };
   }
+  const activity = kernelEventActivity(record, id);
   return {
     id,
     sessionId,
@@ -4477,6 +5119,7 @@ function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: s
       channel: 'progress',
       visibility: 'conversation',
       presentation: 'collapsible',
+      activity,
       kernelEvent: record,
     },
   };
@@ -4513,6 +5156,7 @@ function kernelEventSummary(kind: string, record: Record<string, unknown>): stri
 }
 
 function resourcePacketEvent(sessionId: string, packet: ResourcePacket, ts: string, id: string): AgentEvent {
+  const activity = resourcePacketActivity(packet, id);
   return {
     id,
     sessionId,
@@ -4526,8 +5170,414 @@ function resourcePacketEvent(sessionId: string, packet: ResourcePacket, ts: stri
       channel: 'tool',
       visibility: 'conversation',
       presentation: 'collapsible',
+      activity,
     },
   };
+}
+
+function conversationActivity(input: AgentConversationActivity): AgentConversationActivity {
+  return {
+    ...input,
+    targets: uniqueStrings(input.targets ?? []),
+    actionIds: uniqueStrings(input.actionIds ?? []),
+    workUnitIds: uniqueStrings(input.workUnitIds ?? []),
+  };
+}
+
+function providerActivity(
+  state: SessionDriverLoopRunState,
+  stage: string,
+  status: 'running' | 'completed'
+): AgentConversationActivity {
+  return conversationActivity({
+    activityId: `provider-${stage}-${status}`,
+    kind: 'providerThinking',
+    status,
+    title: status === 'running' ? 'Provider call running' : 'Provider call completed',
+    summary: providerStageSummary(stage, status === 'running' ? 'request' : 'response', visibleLanguageForRequest(state.userRequest)),
+    source: 'provider',
+    runId: state.runId,
+  });
+}
+
+function resourcePacketActivity(packet: ResourcePacket, activityId: string, runId?: string): AgentConversationActivity {
+  const failed = packet.items.some((item) => item.status === 'error' || item.status === 'denied');
+  const search = packet.items.some((item) => item.contentKind === 'searchResults');
+  return conversationActivity({
+    activityId,
+    kind: search ? 'resourceSearch' : 'resourceRead',
+    status: failed ? 'failed' : 'completed',
+    title: search ? 'Search results resolved' : 'Resource context resolved',
+    summary: `Kernel resolved ${packet.items.length} resource item(s).`,
+    source: 'kernel',
+    runId,
+    targets: packet.items.flatMap((item) => [
+      item.path,
+      item.manifestEntryId,
+    ]).filter((item): item is string => Boolean(item)),
+    itemCount: packet.items.length,
+  });
+}
+
+function acceptedPlanBatchActivity(
+  accepted: AcceptedImplementationPlanContext,
+  batch: unknown,
+  status: 'running' | 'completed'
+): AgentConversationActivity {
+  const actions = batchActionRecords(batch);
+  return conversationActivity({
+    activityId: `accepted-plan-batch-${accepted.planId}-${accepted.batchIndex}-${status}`,
+    kind: 'editBatchQueued',
+    status,
+    title: status === 'running' ? 'Submitting accepted-plan batch' : 'Accepted-plan batch submitted',
+    summary: acceptedPlanBatchActivitySummary(batch),
+    source: 'session',
+    runId: accepted.runId,
+    planId: accepted.planId,
+    targets: actions.flatMap(actionTargetCandidates),
+    actionIds: actions.flatMap((action) => stringValue(action.actionId) ?? stringValue(action.id) ?? []),
+    itemCount: actions.length,
+  });
+}
+
+function acceptedPlanBatchActivitySummary(batch: unknown): string {
+  const actions = batchActionRecords(batch);
+  const targetCount = uniqueStrings(actions.flatMap(actionTargetCandidates)).length;
+  return `Session is submitting ${actions.length} accepted-plan action(s) for ${targetCount} target(s).`;
+}
+
+function batchActionRecords(batch: unknown): Record<string, unknown>[] {
+  const record = objectRecord(batch);
+  const nested = objectRecord(record?.actionBundle);
+  const actions = Array.isArray(record?.actions)
+    ? record.actions
+    : Array.isArray(nested?.actions)
+      ? nested.actions
+      : [];
+  return actions.flatMap((item) => objectRecord(item) ? [objectRecord(item) as Record<string, unknown>] : []);
+}
+
+function actionTargetCandidates(action: Record<string, unknown>): string[] {
+  return uniqueStrings([
+    stringValue(action.targetPath),
+    ...stringArrayValue(action.resourceScope),
+  ]);
+}
+
+interface KernelWorkUnitFact {
+  actionId?: string;
+  writeSet: string[];
+  deleteSet: string[];
+}
+
+function indexKernelWorkUnitFacts(events: unknown[]): Map<string, KernelWorkUnitFact> {
+  const facts = new Map<string, KernelWorkUnitFact>();
+  for (const event of events) {
+    const record = objectRecord(event);
+    if (record?.kind !== 'work_unit.queued') continue;
+    const workUnit = objectRecord(record.workUnit);
+    const id = stringValue(workUnit?.id) ?? stringValue(record.workUnitId);
+    if (!id) continue;
+    const writeSet = uniqueStrings([
+      ...stringArrayValue(record.writeSet),
+      ...stringArrayValue(workUnit?.writeSet),
+    ]);
+    const deleteSet = uniqueStrings([
+      ...stringArrayValue(record.deleteSet),
+      ...stringArrayValue(workUnit?.deleteSet),
+    ]);
+    const fallbackTargets = kernelEventTargets(record);
+    facts.set(id, {
+      actionId: stringValue(record.actionId) ?? stringValue(workUnit?.actionId),
+      writeSet: writeSet.length ? writeSet : fallbackTargets,
+      deleteSet,
+    });
+  }
+  return facts;
+}
+
+function enrichKernelWorkUnitRecord(
+  record: Record<string, unknown>,
+  facts: Map<string, KernelWorkUnitFact>
+): Record<string, unknown> {
+  const kind = stringValue(record.kind);
+  if (!kind?.startsWith('work_unit.') || kind === 'work_unit.queued') return record;
+  if (kernelEventTargets(record).length > 0) return record;
+  const workUnit = objectRecord(record.workUnit);
+  const workUnitId = stringValue(record.workUnitId) ?? stringValue(workUnit?.id);
+  const fact = workUnitId ? facts.get(workUnitId) : undefined;
+  if (!fact || (fact.writeSet.length === 0 && fact.deleteSet.length === 0 && !fact.actionId)) return record;
+  const enrichedWorkUnit = {
+    ...(workUnit ?? {}),
+    ...(workUnitId ? { id: workUnitId } : {}),
+    ...(fact.actionId && !stringValue(workUnit?.actionId) ? { actionId: fact.actionId } : {}),
+    ...(fact.writeSet.length && stringArrayValue(workUnit?.writeSet).length === 0 ? { writeSet: fact.writeSet } : {}),
+    ...(fact.deleteSet.length && stringArrayValue(workUnit?.deleteSet).length === 0 ? { deleteSet: fact.deleteSet } : {}),
+  };
+  return {
+    ...record,
+    ...(!stringValue(record.actionId) && fact.actionId ? { actionId: fact.actionId } : {}),
+    ...(stringArrayValue(record.writeSet).length === 0 && fact.writeSet.length ? { writeSet: fact.writeSet } : {}),
+    ...(stringArrayValue(record.deleteSet).length === 0 && fact.deleteSet.length ? { deleteSet: fact.deleteSet } : {}),
+    workUnit: enrichedWorkUnit,
+  };
+}
+
+function kernelEventActivity(
+  record: Record<string, unknown>,
+  activityId: string,
+  fallbackRunId?: string
+): AgentConversationActivity | undefined {
+  const kind = stringValue(record.kind);
+  if (!kind) return undefined;
+  const runId = stringValue(record.runId) ?? fallbackRunId;
+  const workUnit = objectRecord(record.workUnit);
+  const tool = objectRecord(record.tool);
+  const targets = kernelEventTargets(record);
+  const workUnitIds = uniqueStrings([
+    stringValue(record.workUnitId),
+    stringValue(workUnit?.id),
+  ]);
+  const actionIds = uniqueStrings([
+    stringValue(record.actionId),
+    stringValue(workUnit?.actionId),
+  ]);
+  const toolName = stringValue(record.toolName) ?? stringValue(tool?.name) ?? stringValue(record.name);
+  if (kind === 'work_unit.queued' || kind === 'action_batch.accepted') {
+    return conversationActivity({
+      activityId,
+      kind: 'editBatchQueued',
+      status: 'queued',
+      title: 'Edit work queued',
+      summary: kernelEventSummary(kind, record),
+      source: 'kernel',
+      runId,
+      targets,
+      actionIds,
+      workUnitIds,
+      itemCount: targets.length || actionIds.length || workUnitIds.length || undefined,
+    });
+  }
+  if (kind === 'work_unit.started') {
+    return conversationActivity({
+      activityId,
+      kind: 'editFileStarted',
+      status: 'running',
+      title: 'Editing target',
+      summary: kernelEventSummary(kind, record),
+      source: 'kernel',
+      runId,
+      targets,
+      actionIds,
+      workUnitIds,
+      itemCount: targets.length || undefined,
+    });
+  }
+  if (kind === 'work_unit.completed' || kind === 'workspace.result') {
+    return conversationActivity({
+      activityId,
+      kind: 'editFileCompleted',
+      status: 'completed',
+      title: 'Edit completed',
+      summary: kernelEventSummary(kind, record),
+      source: 'kernel',
+      runId,
+      targets,
+      actionIds,
+      workUnitIds,
+      itemCount: targets.length || undefined,
+    });
+  }
+  if (kind === 'work_unit.failed' || kind === 'work_unit.blocked' || kind === 'proposal.rejected') {
+    const error = objectRecord(record.error);
+    const message = stringValue(record.message) ?? stringValue(error?.message) ?? stringValue(record.reason) ?? kernelFailureMessage(kind, record);
+    return conversationActivity({
+      activityId,
+      kind: 'editFileFailed',
+      status: kind === 'work_unit.blocked' ? 'blocked' : 'failed',
+      title: kind === 'work_unit.blocked' ? 'Edit blocked' : 'Edit failed',
+      summary: message,
+      source: 'kernel',
+      runId,
+      targets,
+      actionIds,
+      workUnitIds,
+      errorCode: stringValue(record.code) ?? stringValue(error?.code),
+      errorMessage: message,
+    });
+  }
+  if (kind === 'tool.completed' || kind === 'tool.failed') {
+    const failed = kind === 'tool.failed';
+    const error = objectRecord(record.error);
+    const message = stringValue(record.summary) ?? stringValue(error?.message) ?? kind;
+    return conversationActivity({
+      activityId,
+      kind: 'toolExecution',
+      status: failed ? 'failed' : 'completed',
+      title: failed ? 'Tool failed' : 'Tool completed',
+      summary: message,
+      source: 'kernel',
+      runId,
+      targets,
+      actionIds,
+      workUnitIds,
+      toolName,
+      errorCode: failed ? stringValue(record.code) ?? stringValue(error?.code) : undefined,
+      errorMessage: failed ? message : undefined,
+    });
+  }
+  if (kind === 'resource.packet_produced') {
+    return conversationActivity({
+      activityId,
+      kind: 'resourceRead',
+      status: 'completed',
+      title: 'Resource context resolved',
+      summary: kernelEventSummary(kind, record),
+      source: 'kernel',
+      runId,
+      targets,
+      itemCount: targets.length || undefined,
+    });
+  }
+  return undefined;
+}
+
+function kernelEventTargets(record: Record<string, unknown>): string[] {
+  const output = objectRecord(record.output);
+  const result = objectRecord(record.result);
+  const workUnit = objectRecord(record.workUnit);
+  const compiledTool = objectRecord(workUnit?.compiledTool) ?? objectRecord(record.compiledTool);
+  return uniqueStrings([
+    stringValue(record.path),
+    stringValue(record.targetPath),
+    stringValue(record.normalizedTargetPath),
+    stringValue(record.resourcePath),
+    ...stringArrayValue(record.writeSet),
+    ...stringArrayValue(record.deleteSet),
+    stringValue(compiledTool?.path),
+    stringValue(output?.path),
+    stringValue(output?.targetPath),
+    stringValue(output?.normalizedTargetPath),
+    stringValue(output?.absolutePath),
+    stringValue(result?.path),
+    stringValue(result?.targetPath),
+    stringValue(result?.normalizedTargetPath),
+    ...stringArrayValue(workUnit?.writeSet),
+    ...stringArrayValue(workUnit?.deleteSet),
+  ]);
+}
+
+function kernelActivityDeltaType(record: Record<string, unknown>): ProjectionDelta['type'] {
+  const kind = stringValue(record.kind) ?? '';
+  if (kind.startsWith('work_unit.') || kind === 'workspace.result') return 'workunit_delta';
+  if (kind.startsWith('tool.')) return 'tool_call_delta';
+  if (kind.startsWith('resource.')) return 'resource_delta';
+  return 'stage_delta';
+}
+
+function kernelActivityChannel(activity: AgentConversationActivity): ProjectionDelta['channel'] {
+  if (activity.kind === 'resourceRead' || activity.kind === 'resourceSearch') return 'resource';
+  if (activity.kind === 'toolExecution') return 'tool';
+  if (activity.kind.startsWith('edit')) return 'workunit';
+  if (activity.kind === 'providerThinking') return 'reasoning';
+  return 'progress';
+}
+
+function projectionStatusForActivity(activity: AgentConversationActivity): ProjectionDelta['status'] {
+  return activity.status === 'blocked' ? 'failed' : activity.status;
+}
+
+function projectionDeltaActivity(
+  state: SessionDriverLoopRunState,
+  delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>,
+  deltaContext?: ProjectionDeltaBranchContext
+): AgentConversationActivity | undefined {
+  const status = activityStatusFromDelta(delta.status);
+  if (!status) return undefined;
+  const stage = delta.stage ?? delta.type;
+  const base = {
+    activityId: `${stage}-${delta.itemId ?? deltaContext?.branchId ?? deltaContext?.mergeGroupId ?? status}`,
+    status,
+    title: delta.summary ?? stage,
+    summary: delta.summary ?? stage,
+    source: activitySourceFromDelta(delta.source),
+    runId: state.runId,
+    branchId: delta.branchId ?? deltaContext?.branchId,
+    subAgentId: delta.subAgentId ?? deltaContext?.subAgentId,
+    mergeGroupId: delta.mergeGroupId ?? deltaContext?.mergeGroupId,
+    draftId: delta.draftId ?? deltaContext?.draftId,
+    targets: uniqueStrings([delta.targetPath, deltaContext?.targetPath]),
+  };
+  if (stage.startsWith('subagent_branch.')) {
+    return conversationActivity({
+      ...base,
+      kind: 'subagentBranch',
+      title: subAgentActivityTitle(stage),
+    });
+  }
+  if (stage.startsWith('subagent_merge.') || stage === 'subagent_skipped' || stage === 'subagent_plan.created') {
+    return conversationActivity({
+      ...base,
+      kind: 'subagentMerge',
+      title: subAgentActivityTitle(stage),
+    });
+  }
+  if (delta.type === 'resource_delta') {
+    return conversationActivity({
+      ...base,
+      kind: stage.includes('search') ? 'resourceSearch' : 'resourceRead',
+      title: delta.summary ?? 'Resource activity',
+    });
+  }
+  if (delta.type === 'workunit_delta') {
+    return conversationActivity({
+      ...base,
+      kind: status === 'failed' ? 'editFileFailed' : status === 'completed' ? 'editFileCompleted' : 'editFileStarted',
+      title: delta.summary ?? 'Workspace edit activity',
+    });
+  }
+  if (delta.type === 'draft_delta' || delta.type === 'part_delta') {
+    return conversationActivity({
+      ...base,
+      kind: 'toolExecution',
+      title: delta.summary ?? 'Draft activity',
+    });
+  }
+  return undefined;
+}
+
+function activitySourceFromDelta(source: ProjectionDelta['source'] | undefined): AgentConversationActivity['source'] {
+  if (source === 'kernel' || source === 'provider' || source === 'llm') return source;
+  return 'session';
+}
+
+function activityStatusFromDelta(status: ProjectionDelta['status'] | undefined): AgentConversationActivity['status'] | undefined {
+  if (status === 'queued' || status === 'running' || status === 'waiting' || status === 'completed' || status === 'failed') return status;
+  if (status === 'streaming') return 'running';
+  if (status === 'draftReady') return 'completed';
+  if (status === 'discarded' || status === 'skipped') return 'blocked';
+  return undefined;
+}
+
+function subAgentActivityTitle(stage: string): string {
+  if (stage === 'subagent_plan.created') return 'Sub-agent plan created';
+  if (stage === 'subagent_skipped') return 'Sub-agent skipped';
+  if (stage.startsWith('subagent_merge.')) return 'Sub-agent merge';
+  if (stage.startsWith('subagent_branch.')) return 'Sub-agent branch';
+  return 'Sub-agent activity';
+}
+
+function uniqueStrings(values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const value of values) {
+    if (!value) continue;
+    const trimmed = value.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    output.push(trimmed);
+  }
+  return output;
 }
 
 function answerEvent(
@@ -4693,6 +5743,17 @@ function readActionBundle(proposal: ProposalEnvelope): ActionBundleDraft | undef
   return actionBundle as unknown as ActionBundleDraft | undefined;
 }
 
+function proposalActionBundleAdmissionBatch(proposal: ProposalEnvelope): Record<string, unknown> {
+  const payload = objectRecord(proposal.payload) ?? {};
+  const actionBundle = objectRecord(payload.actionBundle) ?? {};
+  return {
+    planId: stringValue(actionBundle.id) ?? proposal.proposalId,
+    actionBundle,
+    codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
+    commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
+  };
+}
+
 function parseAndValidateProposal(input: {
   raw: string | Record<string, unknown>;
   runId: string;
@@ -4783,20 +5844,21 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
       throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}].resourceScope must be an array.`);
     }
     const actionKind = typeof action.kind === 'string' ? action.kind : '';
-    const isPatchAction = ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(actionKind);
+    const effectiveActionKind = actionKind || (action.capability === 'fs.patch' ? 'patch' : '');
+    const isPatchAction = ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(effectiveActionKind);
     const replacementBlockId = typeof action.replacementBlockId === 'string'
       ? action.replacementBlockId.trim()
       : '';
-    if (action.capability === 'workspace.delete') {
+    if (action.capability === 'fs.delete') {
       const deleteTargetError = deleteActionTargetError(action);
       if (deleteTargetError) {
         throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${deleteTargetError}`);
       }
       if (action.sourceBlockId?.trim() || replacementBlockId) {
-        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] workspace.delete must not reference codeBlocks/sourceBlockId.`);
+        throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] fs.delete must not reference codeBlocks/sourceBlockId.`);
       }
     }
-    if ((action.capability === 'workspace.write' || action.capability === 'workspace.create') && !isPatchAction && !action.sourceBlockId?.trim()) {
+    if (action.capability === 'fs.write' && !isPatchAction && !action.sourceBlockId?.trim()) {
       throw new AgentPlanParseError('invalid_action_bundle', `actionBundle.actions[${index}] ${action.capability} must include sourceBlockId.`);
     }
     if (isPatchAction && !(replacementBlockId || action.sourceBlockId?.trim())) {
@@ -4855,27 +5917,24 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
 function deleteActionTargetError(action: ActionBundleDraft['actions'][number]): string | undefined {
   const kind = stringValue(action.kind);
   if (kind !== 'delete') {
-    return 'workspace.delete must use kind="delete".';
+    return 'fs.delete must use kind="delete".';
   }
-  const target = stringValue(action.targetPath) ?? stringArrayValue(action.resourceScope)[0];
+  const target = actionFileTargetPath(action);
   if (!target) {
-    return 'workspace.delete must include a concrete targetPath or resourceScope[0].';
+    return 'fs.delete must include a concrete targetPath or resourceScope[0].';
   }
   const normalized = normalizeSlashes(target);
   if (!normalized || normalized === '.' || normalized === './') {
-    return 'workspace.delete target cannot be empty or the workspace root.';
-  }
-  if (isAbsolutePath(normalized)) {
-    return 'workspace.delete target must be relative to the primary workspace root.';
+    return 'fs.delete target cannot be empty or the workspace root.';
   }
   if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) {
-    return 'workspace.delete target cannot escape the primary workspace root.';
+    return 'fs.delete target cannot escape the primary workspace root.';
   }
   if (normalized.includes('*')) {
-    return 'workspace.delete target must name concrete files; wildcard cleanup is not allowed.';
+    return 'fs.delete target must name concrete files; wildcard cleanup is not allowed.';
   }
   if (normalized.endsWith('/')) {
-    return 'workspace.delete target must name concrete files, not a directory root.';
+    return 'fs.delete target must name concrete files, not a directory root.';
   }
   return undefined;
 }
@@ -4936,6 +5995,7 @@ function actionBundlePlanCardEvent(
   const status = stringValue(report?.status) ?? 'pending';
   const planId = actionBundle?.id ?? proposal.proposalId;
   const confirmable = planReviewStatusAwaitingUser(status);
+  const overlayPayload = interactionOverlayProjection(state.interactionOverlay);
   return {
     id,
     sessionId: state.sessionId,
@@ -4958,6 +6018,7 @@ function actionBundlePlanCardEvent(
         source: 'plan_card',
       },
       implementationBatch: state.implementationBatch,
+      ...overlayPayload,
       actionBundle,
       codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
       commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
@@ -4984,6 +6045,7 @@ function implementationPlanCardEvent(
   const title = stringValue(implementationPlan.title) ?? localizedImplementationPlanHeading(language, 'title');
   const summary = stringValue(implementationPlan.summary) ?? title;
   const content = renderImplementationPlanMarkdown(implementationPlan, summary, language);
+  const overlayPayload = interactionOverlayProjection(state.interactionOverlay);
   return {
     id,
     sessionId: state.sessionId,
@@ -5006,6 +6068,7 @@ function implementationPlanCardEvent(
         source: 'plan_card',
       },
       implementationBatch: state.implementationBatch,
+      ...overlayPayload,
       implementationPlan,
       actionBundle: {
         version: '1',
@@ -5198,6 +6261,7 @@ interface SessionPlanContext {
   reviewGuide: string;
   planReviewReport?: Record<string, unknown>;
   implementationPlan?: Record<string, unknown>;
+  interactionOverlay?: InteractionOverlayContext;
 }
 
 interface SessionReviewContext {
@@ -5329,7 +6393,69 @@ function planContextFromEvent(event: AgentEvent, payload: Record<string, unknown
     reviewGuide: stringValue(payload.reviewGuide) ?? '',
     planReviewReport: objectRecord(payload.planReviewReport) ?? undefined,
     implementationPlan,
+    interactionOverlay: interactionOverlayFromPayload(payload),
   };
+}
+
+function interactionOverlayFromRequirementDecision(confirmation: AgentEvent, decision: AgentEvent): InteractionOverlayContext | undefined {
+  const confirmationPayload = objectRecord(confirmation.payload) ?? {};
+  const overlay = interactionOverlayFromPayload(confirmationPayload);
+  if (!overlay) return undefined;
+  return {
+    ...overlay,
+    resumedFromDecisionId: decision.id,
+  };
+}
+
+function interactionOverlayFromPayload(payload: Record<string, unknown> | undefined): InteractionOverlayContext | undefined {
+  if (!payload || payload.interactionOverlay !== true) return undefined;
+  const parentRunId = stringValue(payload.parentRunId);
+  const parentPhase = sessionTurnPhaseValue(payload.parentPhase);
+  const interactionRunId = stringValue(payload.interactionRunId) ?? stringValue(payload.runId);
+  const interactionId = stringValue(payload.interactionId)
+    ?? stringValue(payload.requirementId)
+    ?? stringValue(payload.targetId);
+  if (!parentRunId || !parentPhase || !interactionRunId || !interactionId) return undefined;
+  return {
+    parentRunId,
+    parentPhase,
+    interactionRunId,
+    interactionId,
+    sourceInteractionId: stringValue(payload.sourceInteractionId) ?? interactionId,
+    resumedFromDecisionId: stringValue(payload.resumedFromDecisionId),
+  };
+}
+
+function interactionOverlayProjection(overlay: InteractionOverlayContext | undefined): Record<string, unknown> {
+  if (!overlay) return {};
+  return {
+    interactionOverlay: true,
+    parentRunId: overlay.parentRunId,
+    parentPhase: overlay.parentPhase,
+    interactionRunId: overlay.interactionRunId,
+    interactionId: overlay.interactionId,
+    sourceInteractionId: overlay.sourceInteractionId ?? overlay.interactionId,
+    resumedFromDecisionId: overlay.resumedFromDecisionId,
+  };
+}
+
+function sessionTurnPhaseValue(value: unknown): SessionTurnPhase | undefined {
+  const phase = stringValue(value);
+  if (
+    phase === 'context_reading' ||
+    phase === 'provider_proposing' ||
+    phase === 'waiting_plan_review' ||
+    phase === 'waiting_permission' ||
+    phase === 'executing_accepted_plan' ||
+    phase === 'executing' ||
+    phase === 'waiting_review' ||
+    phase === 'completed' ||
+    phase === 'failed' ||
+    phase === 'cancelled'
+  ) {
+    return phase;
+  }
+  return undefined;
 }
 
 function planAliases(plan: SessionPlanContext): Set<string> {
@@ -5344,7 +6470,7 @@ function planAliases(plan: SessionPlanContext): Set<string> {
 
 function planAlreadyResolved(events: AgentEvent[], plan: SessionPlanContext): boolean {
   const aliases = planAliases(plan);
-  return events.some((event) => {
+  return events.some((event, index) => {
     if (event.kind !== 'plan_review') return false;
     const payload = objectRecord(event.payload);
     if (!payload) return false;
@@ -5352,8 +6478,57 @@ function planAlreadyResolved(events: AgentEvent[], plan: SessionPlanContext): bo
     if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return false;
     const runId = stringValue(payload.runId);
     const planId = stringValue(payload.planId);
-    return runId === plan.runId && (!planId || aliases.has(planId));
+    if (runId !== plan.runId || (planId && !aliases.has(planId))) return false;
+    if (status === 'rejected' || status === 'needsRevision') return true;
+    return acceptedPlanExecutionConsumed(events, plan, aliases, index);
   });
+}
+
+function acceptedPlanExecutionConsumed(
+  events: AgentEvent[],
+  plan: SessionPlanContext,
+  aliases: Set<string>,
+  acceptedIndex: number
+): boolean {
+  for (let index = acceptedIndex + 1; index < events.length; index += 1) {
+    const event = events[index];
+    const payload = objectRecord(event.payload) ?? {};
+    const kernelEvent = objectRecord(payload.kernelEvent);
+    const runId = stringValue(payload.runId) ?? stringValue(kernelEvent?.runId);
+    if (runId && runId !== plan.runId) continue;
+    const owner = objectRecord(payload.decisionOwner);
+    const batch = objectRecord(kernelEvent?.batch);
+    const planId = stringValue(payload.planId)
+      ?? stringValue(owner?.planId)
+      ?? stringValue(kernelEvent?.planId)
+      ?? stringValue(batch?.planId);
+    if (planId && !aliases.has(planId)) continue;
+
+    if (event.kind === 'review_summary') return true;
+    if (event.kind === 'permission_request') return true;
+    if (event.kind === 'error') return true;
+
+    if (event.kind === 'session_run_state') {
+      const status = stringValue(payload.status);
+      const reason = stringValue(payload.reason);
+      if (status === 'failed' || status === 'cancelled' || status === 'completed') return true;
+      if (reason === 'permission' || reason === 'review' || reason === 'work_unit_failed') return true;
+      continue;
+    }
+
+    const stage = stringValue(payload.stage);
+    if (stage === 'accepted_plan.action_batch_submit' || stage === 'accepted_plan.batch_failed') return true;
+
+    const kernelKind = stringValue(kernelEvent?.kind) ?? stringValue(payload.kind);
+    if (
+      kernelKind === 'action_batch.accepted' ||
+      kernelKind === 'permission.requested' ||
+      kernelKind?.startsWith('work_unit.')
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function planAutoExecutableAfterRequirement(plan: SessionPlanContext): boolean {
@@ -5504,16 +6679,21 @@ function acceptedPlanExecutionContext(
   };
 }
 
-interface NormalizedAcceptedPlanKernelBatch {
-  ok: boolean;
-  batch?: {
+type NormalizedAcceptedPlanKernelBatch =
+  | {
+    ok: true;
+    batch: {
     planId: string;
     actionBundle: Record<string, unknown>;
     codeBlocks: unknown[];
     commandBlocks: unknown[];
+    };
+    reasons: [];
+  }
+  | {
+    ok: false;
+    reasons: string[];
   };
-  reasons: string[];
-}
 
 function normalizeAcceptedPlanKernelBatch(
   planId: string,
@@ -5555,25 +6735,25 @@ function normalizeAcceptedPlanKernelBatch(
     const next = { ...record };
     const capability = stringValue(next.capability);
     const kind = stringValue(next.kind);
-    if (capability === 'workspace.delete') {
+    if (capability === 'fs.delete') {
       next.kind = kind ?? 'delete';
-      const target = acceptedPlanConcreteFileOperationTarget(
-        stringValue(next.targetPath) ?? stringArrayValue(next.resourceScope)[0] ?? '',
-        accepted
-      );
-      if (target) {
+      const target = acceptedPlanConcreteFileOperationTarget(actionFileTargetPath(next) ?? '', accepted);
+      if (!target) {
+        reasons.push(`actionBundle.actions[${index}] fs.delete 缺少可执行的具体文件 targetPath/resourceScope。`);
+      } else {
         next.targetPath = target;
-        next.resourceScope = stringArrayValue(next.resourceScope).length ? stringArrayValue(next.resourceScope) : [target];
+        next.resourceScope = [target];
+        next.targetRef = objectRecord(next.targetRef) ?? fileTargetRefFromPath(target);
       }
       return next;
     }
 
-    if (capability !== 'workspace.write' && capability !== 'workspace.create') {
+    if (capability !== 'fs.write' && capability !== 'fs.patch') {
       return next;
     }
 
-    const patchLike = ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(kind ?? '');
-    next.kind = kind ?? (capability === 'workspace.create' ? 'create' : 'write');
+    next.kind = kind ?? (capability === 'fs.patch' ? 'patch' : 'write');
+    const patchLike = ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(String(next.kind));
     const blockRef = stringValue(next.replacementBlockId) ?? stringValue(next.sourceBlockId);
     if (!blockRef) {
       reasons.push(`actionBundle.actions[${index}] ${capability} 缺少 sourceBlockId/replacementBlockId。`);
@@ -5585,8 +6765,7 @@ function normalizeAcceptedPlanKernelBatch(
       return next;
     }
     const target = acceptedPlanConcreteFileOperationTarget(
-      stringValue(next.targetPath) ??
-      stringArrayValue(next.resourceScope)[0] ??
+      actionFileTargetPath(next) ??
       stringValue(block.targetPath) ??
       stringValue(block.path) ??
       '',
@@ -5597,6 +6776,7 @@ function normalizeAcceptedPlanKernelBatch(
       return next;
     }
     next.targetPath = target;
+    next.targetRef = objectRecord(next.targetRef) ?? fileTargetRefFromPath(target);
     const existingScope = stringArrayValue(next.resourceScope)
       .map((scope) => acceptedPlanConcreteFileOperationTarget(scope, accepted))
       .filter((scope): scope is string => Boolean(scope));
@@ -5625,6 +6805,76 @@ function normalizeAcceptedPlanKernelBatch(
       commandBlocks,
     },
   };
+}
+
+function acceptedPlanBatchPreflightAudit(batch: Record<string, unknown>): Record<string, unknown> {
+  return {
+    actionCount: batchActionRecords(batch).length,
+    actions: batchActionRecords(batch).map((action) => ({
+      actionId: stringValue(action.actionId) ?? stringValue(action.id),
+      capability: stringValue(action.capability),
+      kind: stringValue(action.kind),
+      targetRef: objectRecord(action.targetRef) ?? stringValue(action.targetRef),
+      targetPath: stringValue(action.targetPath),
+      resourceScope: stringArrayValue(action.resourceScope),
+      sourceBlockId: stringValue(action.sourceBlockId),
+      replacementBlockId: stringValue(action.replacementBlockId),
+    })),
+  };
+}
+
+function acceptedPlanDeletePreflightReasons(
+  batch: Record<string, unknown>,
+  resourcePackets: ResourcePacket[] = []
+): string[] {
+  const reasons: string[] = [];
+  for (const [index, action] of batchActionRecords(batch).entries()) {
+    if (stringValue(action.capability) !== 'fs.delete') continue;
+    const kind = stringValue(action.kind);
+    const target = actionFileTargetPath(action);
+    if (kind !== 'delete') {
+      reasons.push(`actionBatch.actions[${index}] fs.delete 必须以 kind="delete" 提交给 Kernel。`);
+    }
+    const normalized = target ? normalizePlanScope(target) : undefined;
+    if (!normalized || normalized === '.' || normalized === './') {
+      reasons.push(`actionBatch.actions[${index}] fs.delete 缺少具体文件 targetPath/resourceScope。`);
+    } else if (normalized.endsWith('/')) {
+      reasons.push(`actionBatch.actions[${index}] fs.delete 不能以目录根作为 target。`);
+    } else if (resourcePacketsContainDirectoryPath(resourcePackets, normalized)) {
+      reasons.push(`actionBatch.actions[${index}] fs.delete target ${normalized} 是 ResourcePacket 中的目录，不是具体文件。`);
+    }
+    if (stringValue(action.sourceBlockId) || stringValue(action.replacementBlockId)) {
+      reasons.push(`actionBatch.actions[${index}] fs.delete 不得引用 codeBlock。`);
+    }
+  }
+  return [...new Set(reasons)];
+}
+
+function resourcePacketsContainDirectoryPath(resourcePackets: ResourcePacket[], targetPath: string): boolean {
+  const target = normalizePlanScope(targetPath);
+  if (!target) return false;
+  for (const packet of resourcePackets) {
+    const items = Array.isArray(packet.items) ? packet.items : [];
+    for (const item of items) {
+      const record = objectRecord(item);
+      if (!record) continue;
+      if (resourceNodeListContainsDirectoryPath(record.nodes, target)) return true;
+    }
+  }
+  return false;
+}
+
+function resourceNodeListContainsDirectoryPath(value: unknown, targetPath: string): boolean {
+  if (!Array.isArray(value)) return false;
+  for (const item of value) {
+    const node = objectRecord(item);
+    if (!node) continue;
+    if (stringValue(node.type) === 'directory' && normalizePlanScope(stringValue(node.path) ?? '') === targetPath) {
+      return true;
+    }
+    if (resourceNodeListContainsDirectoryPath(node.children, targetPath)) return true;
+  }
+  return false;
 }
 
 function validateAcceptedImplementationPlanActionBundle(
@@ -5666,6 +6916,24 @@ function validateAcceptedImplementationPlanActionBundle(
   }
   reasons.push(...patchEvidenceValidationReasons(proposal, resourcePackets));
   return { ok: reasons.length === 0, reasons: [...new Set(reasons)] };
+}
+
+function subAgentParentFallbackProposalProblem(
+  state: SessionDriverLoopRunState,
+  proposal: ProposalEnvelope
+): string | undefined {
+  if (proposal.kind === 'actionBundle') {
+    const accepted = state.acceptedImplementationPlan;
+    if (!accepted) return 'parent fallback returned actionBundle without an accepted implementationPlan context.';
+    const validation = validateAcceptedImplementationPlanActionBundle(accepted, proposal, state.resourcePackets);
+    return validation.ok ? undefined : validation.reasons.join('; ');
+  }
+  if (proposal.kind === 'resourceRequest'
+    || proposal.kind === 'decisionRequest'
+    || proposal.kind === 'implementationPlan') {
+    return undefined;
+  }
+  return `parent fallback returned ${proposal.kind}; expected actionBundle, resourceRequest, decisionRequest, or implementationPlan.`;
 }
 
 function patchEvidenceValidationReasons(
@@ -5783,14 +7051,10 @@ function acceptedPlanRelativeTargetError(
   }
   const rootRef = accepted.executionRoot?.ref;
   if (isAbsolutePath(raw)) {
-    if (!rootRef) {
-      return `目标 ${raw} 必须是相对 workspace root 的路径；当前没有可归一化的 attachment root。`;
-    }
-    const root = comparablePath(rootRef);
-    const candidate = comparablePath(raw);
-    if (candidate !== root && !candidate.startsWith(`${root}/`)) {
-      return `目标 ${raw} 是绝对路径，但不在已确认 primary root ${rootRef} 内。`;
-    }
+    return undefined;
+  }
+  if (isAbsolutePath(normalized)) {
+    return undefined;
   }
   if (rootRef) {
     const rootName = basename(rootRef);
@@ -5977,7 +7241,7 @@ function subAgentTaskConflictKeys(task: AcceptedImplementationPlanTaskContext): 
 }
 
 function subAgentParallelSafeCapability(capability: string): boolean {
-  return ['workspace.read', 'workspace.write', 'workspace.create', 'workspace.delete', 'workspace.rename'].includes(capability);
+  return ['fs.read', 'fs.write', 'fs.patch', 'fs.delete'].includes(capability);
 }
 
 function subAgentSkippedReasonFromCounts(input: {
@@ -6032,7 +7296,7 @@ function subAgentTaskSlicePrompt(
     accepted ? `Accepted plan summary: ${accepted.summary ?? accepted.title ?? accepted.planId}` : '',
     accepted ? `Accepted plan id: ${accepted.planId}` : '',
     `Slice role: ${slice.role ?? 'sourceCode'}; hardDependencies=${slice.hardDependencies.join(', ') || 'none'}; softOrderAfter=${slice.softOrderAfter.join(', ') || 'none'}; conflictKeys=${slice.conflictKeys.join(', ') || 'none'}.`,
-    'Allowed output: kind="actionBundle" only. Use relative targetPath/resourceScope under the accepted primary root. Keep all action/codeBlock ids unique and include the branch id if practical.',
+    'Allowed output: kind="actionBundle" only. Use workspace-relative targetPath/resourceScope under the accepted primary root; use absolute targetPath only for outside-workspace files already present in the accepted plan. Keep all action/codeBlock ids unique and include the branch id if practical.',
     'If modifying an existing file, use exactBlock patch only when current ResourcePacket evidence below contains the exact match text. If evidence is insufficient, return a diagnostic actionBundle is not allowed; keep the fragment minimal and let parent repair.',
     evidence.length ? `Relevant EvidenceTail:\n${evidence.join('\n\n')}` : 'Relevant EvidenceTail: none selected for this slice.',
     'Protocol reminder from parent stable prefix is already applied. Dynamic sibling context is intentionally omitted.',
@@ -6267,11 +7531,10 @@ function normalizeAcceptedPlanTargetScope(
 
 function acceptedPlanAutoExecutableCapability(capability: string): boolean {
   return [
-    'workspace.read',
-    'workspace.write',
-    'workspace.create',
-    'workspace.delete',
-    'workspace.rename',
+    'fs.read',
+    'fs.write',
+    'fs.patch',
+    'fs.delete',
     'process.exec',
     'network.egress',
     'git.read',
@@ -6283,8 +7546,10 @@ function acceptedPlanAutoExecutableCapability(capability: string): boolean {
   ].includes(capability);
 }
 
-function actionPlanTargetScopes(action: { resourceScope?: unknown; targetPath?: unknown; sourceBlockId?: unknown; replacementBlockId?: unknown }, proposal: ProposalEnvelope): string[] {
+function actionPlanTargetScopes(action: { resourceScope?: unknown; targetPath?: unknown; targetRef?: unknown; sourceBlockId?: unknown; replacementBlockId?: unknown }, proposal: ProposalEnvelope): string[] {
   const scopes = stringArrayValue(action.resourceScope).concat(stringArrayValue(action.targetPath));
+  const targetRefPath = fileTargetRefPath(action.targetRef);
+  if (targetRefPath) scopes.push(targetRefPath);
   const payload = objectRecord(proposal.payload) ?? {};
   const codeBlocks = Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [];
   const blockIds = new Set([
@@ -6307,9 +7572,12 @@ function scopeCoveredByAcceptedPlan(scope: string, acceptedScopes: string[]): bo
 
 function planScopeCovers(accepted: string, candidate: string): boolean {
   if (!accepted || !candidate) return false;
-  if (accepted === candidate) return true;
-  const acceptedDir = accepted.endsWith('/') ? accepted : `${accepted}/`;
-  return candidate.startsWith(acceptedDir);
+  const acceptedNormalized = normalizePlanScope(accepted);
+  const candidateNormalized = normalizePlanScope(candidate);
+  if (acceptedNormalized === candidateNormalized) return true;
+  if (isAbsolutePath(acceptedNormalized) || isAbsolutePath(candidateNormalized)) return false;
+  const acceptedDir = acceptedNormalized.endsWith('/') ? acceptedNormalized : `${acceptedNormalized}/`;
+  return candidateNormalized.startsWith(acceptedDir);
 }
 
 function normalizePlanScope(value: string): string {
@@ -6418,6 +7686,7 @@ function planReviewDecisionEvent(
   ts: string,
   id: string
 ): AgentEvent {
+  const overlayPayload = interactionOverlayProjection(plan.interactionOverlay);
   return {
     id,
     sessionId,
@@ -6432,6 +7701,7 @@ function planReviewDecisionEvent(
       confirmable: false,
       facts: planReviewFacts(plan.planReviewReport),
       requiredFileOperations: requiredFileOperationsFromReport(plan.planReviewReport),
+      ...overlayPayload,
       channel: status === 'accepted' ? 'progress' : 'final',
       visibility: 'conversation',
       presentation: 'body',
@@ -6447,10 +7717,12 @@ function sessionRunStateEvent(input: {
   status?: SessionRunStateStatus;
   reason: SessionRunStateReason;
   decisionOwner: DecisionOwnerRef;
+  interactionOverlay?: InteractionOverlayContext;
   ts: string;
   id: string;
 }): AgentEvent {
   const status = input.status ?? 'waiting';
+  const overlayPayload = interactionOverlayProjection(input.interactionOverlay);
   return {
     id: input.id,
     sessionId: input.sessionId,
@@ -6464,6 +7736,7 @@ function sessionRunStateEvent(input: {
       decisionKind: input.decisionOwner.kind,
       targetId: input.decisionOwner.targetId,
       decisionOwner: input.decisionOwner,
+      ...overlayPayload,
       summary: sessionRunStateSummary(input.reason, status),
       channel: 'task',
       visibility: 'debug',
@@ -6528,8 +7801,330 @@ function acceptedPlanBatchCheckpointEvent(
       channel: 'progress',
       visibility: 'conversation',
       presentation: 'collapsible',
+      activity: conversationActivity({
+        activityId: id,
+        kind: complete ? 'reviewCheckpoint' : failedOrBlocked ? 'diagnostic' : 'editBatchQueued',
+        status: failedOrBlocked ? 'blocked' : 'completed',
+        title: complete ? 'Accepted plan complete' : failedOrBlocked ? 'Accepted plan batch blocked' : 'Accepted plan batch completed',
+        summary,
+        source: 'session',
+        runId,
+        planId: accepted.planId,
+        targets: progress.targetPaths,
+        actionIds: progress.actionIds,
+        workUnitIds: progress.workUnitIds,
+      }),
     },
   };
+}
+
+function acceptedPlanActionBatchPreflightEvent(
+  sessionId: string,
+  plan: SessionPlanContext,
+  batch: Record<string, unknown>,
+  ts: string,
+  id: string
+): AgentEvent {
+  const audit = acceptedPlanBatchPreflightAudit(batch);
+  const summary = `Session 已完成已确认计划 actionBatch 提交前审计：${Array.isArray(audit.actions) ? audit.actions.length : 0} 个 action。`;
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'workflow_stage',
+    payload: {
+      stage: 'accepted_plan.action_batch_preflight',
+      status: 'completed',
+      summary,
+      runId: plan.runId,
+      planId: plan.planId,
+      audit,
+      channel: 'progress',
+      visibility: 'debug',
+      presentation: 'collapsible',
+      activity: conversationActivity({
+        activityId: id,
+        kind: 'diagnostic',
+        status: 'completed',
+        title: 'Accepted plan action batch preflight',
+        summary,
+        source: 'session',
+        runId: plan.runId,
+        planId: plan.planId,
+      }),
+    },
+  };
+}
+
+function actionBundleAdmissionRepairingEvent(
+  sessionId: string,
+  runId: string,
+  proposal: ProposalEnvelope,
+  reasons: string[],
+  ts: string,
+  id: string
+): AgentEvent {
+  const batch = proposalActionBundleAdmissionBatch(proposal);
+  const audit = acceptedPlanBatchPreflightAudit(batch);
+  const summary = `ActionBundle 进入 Plan 卡前需要修订：${reasons.join('；')}`;
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'workflow_stage',
+    payload: {
+      stage: 'action_bundle_admission.repairing',
+      status: 'running',
+      summary,
+      runId,
+      proposalId: proposal.proposalId,
+      reasons,
+      audit,
+      channel: 'progress',
+      visibility: 'conversation',
+      presentation: 'collapsible',
+      activity: conversationActivity({
+        activityId: id,
+        kind: 'diagnostic',
+        status: 'running',
+        title: 'ActionBundle admission repair',
+        summary,
+        source: 'session',
+        runId,
+        targets: audit.actions && Array.isArray(audit.actions)
+          ? audit.actions.flatMap((item) => stringArrayValue(objectRecord(item)?.resourceScope).concat(stringValue(objectRecord(item)?.targetPath) ?? []))
+          : [],
+      }),
+    },
+  };
+}
+
+function actionBundleAdmissionFailureEvents(
+  sessionId: string,
+  runId: string,
+  proposal: ProposalEnvelope,
+  reasons: string[],
+  ts: string,
+  id: string
+): AgentEvent[] {
+  const summary = `ActionBundle 未进入 Plan 确认卡，Session 已停止当前计划生成：${reasons.join('；')}`;
+  return [
+    {
+      id,
+      sessionId,
+      ts,
+      kind: 'error',
+      payload: {
+        message: summary,
+        code: 'action_bundle_admission_failed',
+        runId,
+        proposalId: proposal.proposalId,
+        reasons,
+        channel: 'error',
+        visibility: 'conversation',
+        activity: conversationActivity({
+          activityId: id,
+          kind: 'diagnostic',
+          status: 'failed',
+          title: 'ActionBundle admission failed',
+          summary,
+          source: 'session',
+          runId,
+          errorCode: 'action_bundle_admission_failed',
+          errorMessage: summary,
+        }),
+      },
+    },
+    sessionRunStateEvent({
+      sessionId,
+      runId,
+      phase: 'failed',
+      status: 'failed',
+      reason: 'plan_review',
+      decisionOwner: {
+        kind: 'plan',
+        runId,
+        targetId: proposal.proposalId,
+        planId: proposal.proposalId,
+      },
+      ts,
+      id: `${id}-state`,
+    }),
+  ];
+}
+
+function planActionBundlePreflightFailureEvents(
+  sessionId: string,
+  plan: SessionPlanContext,
+  reasons: string[],
+  ts: string,
+  id: string
+): AgentEvent[] {
+  const summary = `已确认计划 actionBatch 提交前审计失败，Session 未提交 Kernel：${reasons.join('；')}`;
+  return [
+    {
+      id,
+      sessionId,
+      ts,
+      kind: 'error',
+      payload: {
+        message: summary,
+        code: 'accepted_plan_action_batch_preflight_failed',
+        runId: plan.runId,
+        planId: plan.planId,
+        reasons,
+        channel: 'error',
+        visibility: 'conversation',
+        activity: conversationActivity({
+          activityId: id,
+          kind: 'diagnostic',
+          status: 'failed',
+          title: 'Accepted plan action batch preflight failed',
+          summary,
+          source: 'session',
+          runId: plan.runId,
+          planId: plan.planId,
+          errorCode: 'accepted_plan_action_batch_preflight_failed',
+          errorMessage: summary,
+        }),
+      },
+    },
+    sessionRunStateEvent({
+      sessionId,
+      runId: plan.runId,
+      phase: 'failed',
+      status: 'failed',
+      reason: 'work_unit_failed',
+      decisionOwner: {
+        kind: 'plan',
+        runId: plan.runId,
+        targetId: plan.planId,
+        planId: plan.planId,
+      },
+      interactionOverlay: plan.interactionOverlay,
+      ts,
+      id: `${id}-state`,
+    }),
+  ];
+}
+
+function planActionBundleExecutionExceptionEvents(
+  sessionId: string,
+  plan: SessionPlanContext,
+  message: string,
+  code: string,
+  ts: string,
+  id: string
+): AgentEvent[] {
+  const summary = `已确认计划执行链路失败，Session 已停止自动推进：${message}`;
+  return [
+    {
+      id,
+      sessionId,
+      ts,
+      kind: 'error',
+      payload: {
+        message: summary,
+        code,
+        runId: plan.runId,
+        planId: plan.planId,
+        channel: 'error',
+        visibility: 'conversation',
+        activity: conversationActivity({
+          activityId: id,
+          kind: 'diagnostic',
+          status: 'failed',
+          title: 'Accepted plan execution failed',
+          summary,
+          source: 'session',
+          runId: plan.runId,
+          planId: plan.planId,
+          errorCode: code,
+          errorMessage: message,
+        }),
+      },
+    },
+    sessionRunStateEvent({
+      sessionId,
+      runId: plan.runId,
+      phase: 'failed',
+      status: 'failed',
+      reason: 'work_unit_failed',
+      decisionOwner: {
+        kind: 'plan',
+        runId: plan.runId,
+        targetId: plan.planId,
+        planId: plan.planId,
+      },
+      interactionOverlay: plan.interactionOverlay,
+      ts,
+      id: `${id}-state`,
+    }),
+  ];
+}
+
+function planActionBundleExecutionFailureEvents(
+  sessionId: string,
+  plan: SessionPlanContext,
+  kernelEvents: unknown[],
+  batch: Record<string, unknown>,
+  ts: string,
+  id: string
+): AgentEvent[] {
+  const failures = actionBatchFailureDetails(kernelEvents, batch);
+  const summary = failures.length
+    ? `已确认计划执行批次失败，Session 已停止自动推进：${failures.map(failureDetailSummary).join('；')}`
+    : '已确认计划执行批次失败或阻塞，Session 已停止自动推进。';
+  return [
+    {
+      id,
+      sessionId,
+      ts,
+      kind: 'workflow_stage',
+      payload: {
+        stage: 'accepted_plan.batch_failed',
+        status: 'failed',
+        summary,
+        runId: plan.runId,
+        planId: plan.planId,
+        failures,
+        channel: 'progress',
+        visibility: 'conversation',
+        presentation: 'collapsible',
+        activity: conversationActivity({
+          activityId: id,
+          kind: 'diagnostic',
+          status: 'failed',
+          title: 'Accepted plan batch failed',
+          summary,
+          source: 'session',
+          runId: plan.runId,
+          planId: plan.planId,
+          targets: failures.flatMap((failure) => failure.writeSet),
+          actionIds: failures.flatMap((failure) => failure.actionId ? [failure.actionId] : []),
+          workUnitIds: failures.flatMap((failure) => failure.workUnitId ? [failure.workUnitId] : []),
+          errorCode: failures.find((failure) => failure.code)?.code,
+          errorMessage: failures.find((failure) => failure.message)?.message,
+        }),
+      },
+    },
+    sessionRunStateEvent({
+      sessionId,
+      runId: plan.runId,
+      phase: 'failed',
+      status: 'failed',
+      reason: 'work_unit_failed',
+      decisionOwner: {
+        kind: 'plan',
+        runId: plan.runId,
+        targetId: plan.planId,
+        planId: plan.planId,
+      },
+      interactionOverlay: plan.interactionOverlay,
+      ts,
+      id: `${id}-state`,
+    }),
+  ];
 }
 
 function acceptedPlanNormalizationFailureEvents(
@@ -6555,6 +8150,18 @@ function acceptedPlanNormalizationFailureEvents(
         reasons,
         channel: 'error',
         visibility: 'conversation',
+        activity: conversationActivity({
+          activityId: id,
+          kind: 'diagnostic',
+          status: 'failed',
+          title: 'Accepted plan batch normalization failed',
+          summary,
+          source: 'session',
+          runId,
+          planId: accepted.planId,
+          errorCode: 'accepted_plan_batch_normalization_failed',
+          errorMessage: summary,
+        }),
       },
     },
     sessionRunStateEvent({
@@ -6580,10 +8187,11 @@ function acceptedPlanExecutionFailureEvents(
   runId: string,
   accepted: AcceptedImplementationPlanContext,
   kernelEvents: unknown[],
+  batch: Record<string, unknown> | undefined,
   ts: string,
   id: string
 ): AgentEvent[] {
-  const failures = actionBatchFailureDetails(kernelEvents);
+  const failures = actionBatchFailureDetails(kernelEvents, batch);
   const summary = failures.length
     ? `Accepted plan 执行批次失败，Session 已停止自动推进：${failures.map(failureDetailSummary).join('；')}`
     : 'Accepted plan 执行批次失败或阻塞，Session 已停止自动推进。';
@@ -6604,6 +8212,21 @@ function acceptedPlanExecutionFailureEvents(
         channel: 'progress',
         visibility: 'conversation',
         presentation: 'collapsible',
+        activity: conversationActivity({
+          activityId: id,
+          kind: 'diagnostic',
+          status: 'failed',
+          title: 'Accepted plan batch failed',
+          summary,
+          source: 'session',
+          runId,
+          planId: accepted.planId,
+          targets: failures.flatMap((failure) => failure.writeSet),
+          actionIds: failures.flatMap((failure) => failure.actionId ? [failure.actionId] : []),
+          workUnitIds: failures.flatMap((failure) => failure.workUnitId ? [failure.workUnitId] : []),
+          errorCode: failures.find((failure) => failure.code)?.code,
+          errorMessage: failures.find((failure) => failure.message)?.message,
+        }),
       },
     },
     sessionRunStateEvent({
@@ -6630,11 +8253,17 @@ interface ActionBatchFailureDetail {
   actionId?: string;
   message?: string;
   code?: string;
+  kernelCode?: string;
+  classification?: string;
   writeSet: string[];
 }
 
-function actionBatchFailureDetails(kernelEvents: unknown[]): ActionBatchFailureDetail[] {
+function actionBatchFailureDetails(
+  kernelEvents: unknown[],
+  batch?: Record<string, unknown>
+): ActionBatchFailureDetail[] {
   const workUnits = new Map<string, { actionId?: string; writeSet: string[] }>();
+  const actionIndex = actionBatchActionIndex(batch);
   const details: ActionBatchFailureDetail[] = [];
   for (const event of kernelEvents) {
     const record = objectRecord(event);
@@ -6656,16 +8285,57 @@ function actionBatchFailureDetails(kernelEvents: unknown[]): ActionBatchFailureD
     const indexed = workUnitId ? workUnits.get(workUnitId) : undefined;
     const error = objectRecord(record.error);
     const message = stringValue(record.message) ?? stringValue(error?.message) ?? stringValue(record.reason);
+    const actionId = stringValue(record.actionId) ?? indexed?.actionId;
+    const writeSet = stringArrayValue(record.writeSet).length ? stringArrayValue(record.writeSet) : indexed?.writeSet ?? [];
+    const action = (actionId ? actionIndex.get(actionId) : undefined)
+      ?? actionBatchDeleteActionForWriteSet(actionIndex, writeSet);
+    const kernelCode = stringValue(record.code) ?? stringValue(error?.code);
+    const classification = actionBatchFailureClassification(action, message);
     details.push({
       status,
       workUnitId,
-      actionId: stringValue(record.actionId) ?? indexed?.actionId,
+      actionId,
       message,
-      code: stringValue(record.code) ?? stringValue(error?.code),
-      writeSet: stringArrayValue(record.writeSet).length ? stringArrayValue(record.writeSet) : indexed?.writeSet ?? [],
+      code: classification ?? kernelCode,
+      kernelCode,
+      classification,
+      writeSet,
     });
   }
   return details;
+}
+
+function actionBatchActionIndex(batch?: Record<string, unknown>): Map<string, Record<string, unknown>> {
+  const index = new Map<string, Record<string, unknown>>();
+  for (const action of batchActionRecords(batch)) {
+    for (const id of [stringValue(action.actionId), stringValue(action.id)]) {
+      if (id) index.set(id, action);
+    }
+  }
+  return index;
+}
+
+function actionBatchDeleteActionForWriteSet(
+  actionIndex: Map<string, Record<string, unknown>>,
+  writeSet: string[]
+): Record<string, unknown> | undefined {
+  const targets = new Set(writeSet.map(normalizePlanScope).filter(Boolean));
+  if (!targets.size) return undefined;
+  for (const action of actionIndex.values()) {
+    if (stringValue(action.capability) !== 'fs.delete') continue;
+    const actionTargets = actionTargetCandidates(action).map(normalizePlanScope).filter(Boolean);
+    if (actionTargets.some((target) => targets.has(target))) return action;
+  }
+  return undefined;
+}
+
+function actionBatchFailureClassification(
+  action: Record<string, unknown> | undefined,
+  message: string | undefined
+): string | undefined {
+  if (!action || stringValue(action.capability) !== 'fs.delete') return undefined;
+  if (!message?.includes('fs.write target path is empty')) return undefined;
+  return 'kernel_delete_compile_mismatch';
 }
 
 function failureDetailSummary(detail: ActionBatchFailureDetail): string {
@@ -6673,6 +8343,7 @@ function failureDetailSummary(detail: ActionBatchFailureDetail): string {
     detail.workUnitId ? `workUnit=${detail.workUnitId}` : undefined,
     detail.actionId ? `action=${detail.actionId}` : undefined,
     detail.code ? `code=${detail.code}` : undefined,
+    detail.kernelCode && detail.kernelCode !== detail.code ? `kernelCode=${detail.kernelCode}` : undefined,
     detail.message,
     detail.writeSet.length ? `writeSet=${detail.writeSet.join(',')}` : undefined,
   ].filter((item): item is string => Boolean(item));
@@ -6692,12 +8363,15 @@ function temporaryGrantsForPlan(plan: SessionPlanContext): Record<string, unknow
     const capability = operation.capability;
     if (!gapSet.has(capability)) continue;
     if (!planAcceptedAutoGrantCapability(capability)) continue;
-    const targetPath = concreteFileOperationTarget(operation.targetPath);
+    const targetPath = concreteFileOperationTarget(operation.targetPath ?? operation.targetRefPath ?? '');
     if (!targetPath) continue;
-    const key = `${capability}\0${targetPath}`;
+    const resourceKind = operation.outsideWorkspace || isAbsolutePath(targetPath)
+      ? 'externalFile'
+      : undefined;
+    const key = `${capability}\0${resourceKind ?? 'default'}\0${targetPath}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    grants.push(temporaryGrant(plan, capability, targetPath));
+    grants.push(temporaryGrant(plan, capability, targetPath, resourceKind));
   }
   return grants;
 }
@@ -6705,8 +8379,11 @@ function temporaryGrantsForPlan(plan: SessionPlanContext): Record<string, unknow
 interface RequiredFileOperationProjection {
   operation: string;
   targetPath: string;
+  targetRefPath?: string;
   capability: string;
   actionId?: string;
+  targetKind?: string;
+  outsideWorkspace?: boolean;
 }
 
 function requiredFileOperationsFromReport(report: Record<string, unknown> | undefined): RequiredFileOperationProjection[] {
@@ -6717,14 +8394,17 @@ function requiredFileOperationsFromReport(report: Record<string, unknown> | unde
     const record = objectRecord(item);
     if (!record) continue;
     const operation = stringValue(record.operation);
-    const targetPath = concreteFileOperationTarget(stringValue(record.targetPath) ?? '');
+    const targetRefPath = fileTargetRefPath(record.targetRef);
+    const targetPath = concreteFileOperationTarget(stringValue(record.targetPath) ?? targetRefPath ?? '');
     const capability = stringValue(record.capability);
     if (!operation || !targetPath || !capability) continue;
     const actionId = stringValue(record.actionId);
+    const targetKind = stringValue(record.targetKind);
+    const outsideWorkspace = Boolean(record.outsideWorkspace) || isAbsolutePath(targetPath);
     const key = `${operation}\0${capability}\0${targetPath}\0${actionId ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    output.push({ operation, targetPath, capability, actionId });
+    output.push({ operation, targetPath, targetRefPath, capability, actionId, targetKind, outsideWorkspace });
   }
   return output;
 }
@@ -6732,10 +8412,22 @@ function requiredFileOperationsFromReport(report: Record<string, unknown> | unde
 function concreteFileOperationTarget(value: string): string | undefined {
   const normalized = normalizePlanScope(value);
   if (!normalized || normalized === '.' || normalized === './') return undefined;
-  if (isAbsolutePath(normalized)) return undefined;
+  if (isAbsolutePath(normalized)) return concreteAbsoluteFileOperationTarget(normalized);
   if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) return undefined;
   if (normalized.includes('*')) return undefined;
   if (normalized.endsWith('/')) return undefined;
+  return normalized;
+}
+
+function concreteAbsoluteFileOperationTarget(value: string): string | undefined {
+  const normalized = normalizeSlashes(value);
+  if (!isAbsolutePath(normalized)) return undefined;
+  if (!normalized || normalized === '/' || /^[a-zA-Z]:\/?$/.test(normalized)) return undefined;
+  if (normalized.includes('*')) return undefined;
+  if (normalized.includes('/../') || normalized.endsWith('/..')) return undefined;
+  if (normalized.endsWith('/')) return undefined;
+  const base = basename(normalized);
+  if (!base || base === '.' || base === '..') return undefined;
   return normalized;
 }
 
@@ -6748,14 +8440,19 @@ function acceptedPlanConcreteFileOperationTarget(
 }
 
 function planAcceptedAutoGrantCapability(capability: string): boolean {
-  return ['workspace.write', 'workspace.create', 'workspace.delete', 'workspace.rename'].includes(capability);
+  return ['fs.write', 'fs.patch', 'fs.delete'].includes(capability);
 }
 
-function temporaryGrant(plan: SessionPlanContext, capability: string, resourcePath?: string): Record<string, unknown> {
+function temporaryGrant(
+  plan: SessionPlanContext,
+  capability: string,
+  resourcePath?: string,
+  resourceKind?: string
+): Record<string, unknown> {
   return {
     id: `grant-${safeSegment(plan.planId)}-${safeSegment(capability)}-${resourcePath ? safeSegment(resourcePath) : 'run'}`,
     capability,
-    resourceKind: resourceKindForCapability(capability),
+    resourceKind: resourceKind ?? resourceKindForCapability(capability),
     resourcePath,
     reason: resourcePath
       ? `Plan ${plan.planId} accepted by user through Session DecisionResolver; Kernel-reviewed file operation grant is scoped to ${resourcePath} and expires when ReviewGate closes.`
@@ -6770,7 +8467,7 @@ function temporaryGrant(plan: SessionPlanContext, capability: string, resourcePa
 }
 
 function resourceKindForCapability(capability: string): string {
-  if (['workspace.write', 'workspace.delete', 'workspace.rename', 'workspace.create'].includes(capability)) return 'workspaceFile';
+  if (['fs.write', 'fs.patch', 'fs.delete'].includes(capability)) return 'workspaceFile';
   if (capability === 'git.write' || capability === 'git.push') return 'git';
   if (capability === 'config.modify') return 'config';
   if (capability === 'process.exec') return 'process';
@@ -7233,8 +8930,8 @@ function reviewContinuationRequest(review: SessionReviewContext): string {
       '下一步要求：',
       '- 如需基于现有代码继续修改，先用 resourceRequest kind="search" 或 file/range 读取相关文件事实。',
       '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
-      '- 每个 workspace.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId；patch 必须包含 patchSpec.match.kind="exactBlock" 和当前 ResourcePacket 证据中的 exact text。',
-      '- workspace.delete action 必须使用 kind="delete"、capability="workspace.delete"、明确相对文件 targetPath/resourceScope；不得使用 codeBlocks/sourceBlockId、空内容写入或 workspace.write 伪装删除。',
+      '- 每个 fs.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId；patch 必须包含 patchSpec.match.kind="exactBlock" 和当前 ResourcePacket 证据中的 exact text。',
+      '- fs.delete action 必须使用 kind="delete"、capability="fs.delete"、明确相对文件 targetPath/resourceScope；不得使用 codeBlocks/sourceBlockId、空内容写入、fs.write 伪装删除、目录、通配符或递归删除。',
       '- 新 Plan 必须等待用户确认，不要假定已经执行。',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
@@ -7260,14 +8957,15 @@ function implementationPlanExecutionRequest(
       ? `已完成 taskId：${acceptedPlan.completedTaskIds.join(', ')}。不要重复生成已完成任务，除非 Kernel facts 显示失败或用户要求修订。`
       : '当前 accepted implementationPlan 尚无已完成任务。',
     acceptedPlan.executionRoot
-      ? `primary root：${acceptedPlan.executionRoot.ref}。所有 targetPath、resourceScope、codeBlock.path/codeBlock.targetPath 必须相对该 root，例如 include/MemoryPool.h；禁止绝对路径、禁止包含 root 目录名、禁止 ../。`
-      : '所有 targetPath、resourceScope、codeBlock.path/codeBlock.targetPath 必须是相对 workspace root 的路径，禁止绝对路径和 ../。',
+      ? `primary root：${acceptedPlan.executionRoot.ref}。workspace 内 targetPath、resourceScope、codeBlock.path/codeBlock.targetPath 必须相对该 root，例如 include/MemoryPool.h；禁止包含 root 目录名和 ../。只有已确认计划中的外部文件目标可以使用绝对文件路径。`
+      : 'workspace 内 targetPath、resourceScope、codeBlock.path/codeBlock.targetPath 必须是相对 workspace root 的路径；只有已确认计划中的外部文件目标可以使用绝对文件路径，禁止 ../。',
     '该 actionBundle 如果落在 accepted implementationPlan 的 target/capability 范围内，会由 Session 直接提交 Kernel 执行，不会再次展示 Plan 确认卡。',
     '不要重新询问 implementationPlan 中已经确认的技术路线、目录结构、Docker/script workflow、模块拆分或验证策略。',
     '如果发现必须新增 target/capability，或缺少关键技术选择，请返回 kind="decisionRequest" 或 kind="implementationPlan" 修订，而不是输出超范围 actionBundle。',
     '本轮 actionBundle 必须包含具体 codeBlocks/commandBlocks（如需要）和 Kernel 可审查的 validationExpectations/reviewExpectations。',
     '修改已有文件时，先使用 resourceRequest kind="search" 或 file/range 读取当前锚点；patch action 必须包含 patchSpec.match.kind="exactBlock" 和从当前 ResourcePacket fileText/searchResults 复制的非空 patchSpec.match.text。',
-    '删除文件时必须输出 workspace.delete action：kind="delete"、capability="workspace.delete"、targetPath/resourceScope 为已确认任务范围内的相对文件路径；删除 action 不需要也不得引用 codeBlocks/sourceBlockId。',
+    '删除文件时必须输出 fs.delete action：kind="delete"、capability="fs.delete"、targetPath/resourceScope 为已确认任务范围内的具体文件路径；workspace 文件用相对路径，已确认的外部文件可用绝对文件路径；删除 action 不需要也不得引用 codeBlocks/sourceBlockId。',
+    '清理目录时必须先根据 ResourcePacket directoryTree 展开为具体文件级 target；目录、空目录、通配符、根目录和递归删除不能作为 fs.delete action。',
     '不要一次性输出整个项目源码；剩余任务放入 actionBundle.continuationExpectations，Session 会在 Kernel facts 返回后继续后续 checkpoint。',
     guidance?.trim() ? `用户确认计划时补充的 guidance：\n${guidance.trim()}` : '',
     `Accepted implementationPlan:\n${planJson}`,
@@ -7289,8 +8987,8 @@ function reviewRevisionRequest(review: SessionReviewContext, guidance?: string):
       '下一步要求：',
       '- 如需基于现有代码继续修改，先用 resourceRequest kind="search" 或 file/range 读取相关文件事实，例如构建脚本、入口源码、头文件、测试或容器配置。',
       '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
-      '- 每个 workspace.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId；patch 必须包含 patchSpec.match.kind="exactBlock" 和当前 ResourcePacket 证据中的 exact text。',
-      '- workspace.delete action 必须使用 kind="delete"、capability="workspace.delete"、明确相对文件 targetPath/resourceScope；不得使用 codeBlocks/sourceBlockId、空内容写入或 workspace.write 伪装删除。',
+      '- 每个 fs.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId；patch 必须包含 patchSpec.match.kind="exactBlock" 和当前 ResourcePacket 证据中的 exact text。',
+      '- fs.delete action 必须使用 kind="delete"、capability="fs.delete"、明确相对文件 targetPath/resourceScope；不得使用 codeBlocks/sourceBlockId、空内容写入、fs.write 伪装删除、目录、通配符或递归删除。',
       '- 新 Plan 等待用户确认，不要假定已经执行。',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
@@ -7432,7 +9130,6 @@ function findLatestActivePlanInteraction(events: AgentEvent[]): DriverInteractio
     if (event.kind !== 'plan_review' && event.kind !== 'plan_card') continue;
     const payload = objectRecord(event.payload);
     if (!payload) continue;
-    if (hasLaterTerminalInteraction(events, index)) continue;
     const waiting = event.kind === 'plan_card'
       ? planCardAwaitingDecision(payload)
       : planReviewEventAwaitingDecision(payload);
@@ -7540,6 +9237,7 @@ function requirementDecisionEvent(
     : undefined;
   const language = visibleLanguageForRequest(stringValue(payload.originalUserRequest) ?? '');
   const summary = requirementDecisionSummary(decision, selectedOption, language);
+  const overlayPayload = interactionOverlayProjection(interactionOverlayFromPayload(payload));
   return {
     id,
     sessionId,
@@ -7554,6 +9252,7 @@ function requirementDecisionEvent(
       decision,
       guidance,
       selectedOption,
+      ...overlayPayload,
       channel: 'progress',
       visibility: 'conversation',
       presentation: 'body',
@@ -7763,7 +9462,7 @@ function sideEffectNativeToolRepairMessages(
   const afterAcceptedPlan = Boolean(state.acceptedImplementationPlan) || state.implementationBatch.batchIndex > 1;
   const requestedKind = afterAcceptedPlan ? 'actionBundle' : 'decisionRequest-or-implementationPlan';
   const guardrail = afterAcceptedPlan
-    ? 'A plan has already been accepted. Return kind="actionBundle" for the next related automatically executable batch within the accepted plan scope. Multiple related files are allowed when all target paths stay in scope. Use relative target paths only.'
+    ? 'A plan has already been accepted. Return kind="actionBundle" for the next related automatically executable batch within the accepted plan scope. Multiple related files are allowed when all target paths stay in scope. Use workspace-relative target paths by default; absolute paths are allowed only for outside-workspace files already reviewed in the accepted plan.'
     : 'No implementation plan has been accepted for this side-effect work. Return kind="decisionRequest" if a material engineering choice needs user selection; otherwise return kind="implementationPlan".';
   return [
     {
@@ -7816,7 +9515,7 @@ function resourceRequestRepairMessages(
         'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
         'Use kind="answer" if the available ResourcePacket facts are enough.',
         'Use kind="resourceRequest" only when requesting manifestEntryId, root-relative path, or kind="search" with a non-empty query under the listed conversation roots.',
-        'Do not invent arbitrary absolute local paths.',
+        'Do not invent arbitrary absolute local paths. Absolute file paths are only for user-provided outside-workspace targets that require Kernel PlanReview/permission.',
       ].join('\n'),
     },
     {
@@ -7872,6 +9571,62 @@ function planReviewRepairMessages(
       ].join('\n\n'),
     },
   ];
+}
+
+function actionBundleAdmissionRepairMessages(
+  prompt: PromptEnvelope,
+  state: SessionDriverLoopRunState,
+  proposal: ProposalEnvelope,
+  reasons: string[]
+): LlmChatRequest['messages'] {
+  return [
+    {
+      role: 'system',
+      content: [
+        'You are the DeepCode Agent Protocol v3 actionBundle admission repair step.',
+        'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
+        'The current actionBundle is not allowed to become a confirmable plan card because Session detected non-file-level delete targets.',
+        'fs.delete is file-level only: use kind="delete", capability="fs.delete", and concrete file targetPath/resourceScope entries. Workspace files should use relative paths; user-confirmed outside files may use absolute paths.',
+        'Do not output directory delete actions, recursive delete actions, empty-directory cleanup, wildcard cleanup, workspace root cleanup, or fs.write disguised as delete.',
+        'If the user intent mentions clearing a directory, expand it using ResourcePacket directoryTree evidence into specific file targets. Omit empty directory removal.',
+        'If current evidence is insufficient to enumerate concrete files, return kind="resourceRequest" for a directoryTree/file/search read instead of guessing.',
+        'If the deletion scope is ambiguous or needs a user choice, return kind="decisionRequest".',
+        'Do not claim execution, permissions, tests passed, or task completion.',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: [
+        'Original stable prompt:',
+        fenced(prompt.stablePrefix),
+        'Original dynamic prompt:',
+        fenced(prompt.dynamicSuffix),
+        'ResourcePacket facts:',
+        fenced(JSON.stringify(state.resourcePackets, null, 2)),
+        'Invalid ProposalEnvelope:',
+        fenced(JSON.stringify(proposal, null, 2)),
+        'Session admission reasons:',
+        fenced(reasons.map((reason) => `- ${reason}`).join('\n')),
+        'Repair requirement:',
+        fenced('Return a corrected file-level actionBundle, or return resourceRequest/decisionRequest if evidence or user confirmation is required. Do not return a confirmable plan with directory delete targets.'),
+      ].join('\n\n'),
+    },
+  ];
+}
+
+function actionBundleAdmissionResourceFollowupRequest(
+  state: SessionDriverLoopRunState,
+  reasons: string[]
+): string {
+  return [
+    'Session 已补充 actionBundle admission 所需的只读资源证据。',
+    '请继续生成同一用户请求的可确认计划，但必须满足文件级删除约束。',
+    'fs.delete 只能列出具体文件；workspace 文件使用相对路径，已确认的外部文件使用绝对文件路径；不得输出目录、空目录清理、通配符、根目录或递归目录删除。',
+    '如果 ResourcePacket 显示某个目标是目录，请展开为其中具体文件；如果目录为空，不要为该目录生成 delete action。',
+    '如果仍无法确认具体文件范围，请返回 decisionRequest，而不是输出不可执行 actionBundle。',
+    reasons.length ? `上一次 admission 拒绝原因：\n${reasons.map((reason) => `- ${reason}`).join('\n')}` : '',
+    `当前 runId: ${state.runId}`,
+  ].filter(Boolean).join('\n\n');
 }
 
 function acceptedPlanScopeRepairMessages(
@@ -7974,6 +9729,7 @@ function requirementConfirmationEvent(input: {
   proposal: ProposalEnvelope;
   originalUserRequest: string;
   attachments: AgentContextAttachment[];
+  interactionOverlay?: InteractionOverlayContext;
   ts: string;
   id: string;
 }): AgentEvent {
@@ -7983,6 +9739,7 @@ function requirementConfirmationEvent(input: {
     ? renderDecisionRequestMarkdown(decisionRequest, language)
     : renderRequirementConfirmationMarkdown(input.requirement);
   const summary = decisionRequestSummary(decisionRequest) ?? requirementSummary(input.requirement);
+  const overlayPayload = interactionOverlayProjection(input.interactionOverlay);
   return {
     id: input.id,
     sessionId: input.sessionId,
@@ -8001,6 +9758,7 @@ function requirementConfirmationEvent(input: {
       proposalId: input.proposal.proposalId,
       originalUserRequest: input.originalUserRequest,
       attachments: input.attachments,
+      ...overlayPayload,
       channel: 'action',
       visibility: 'conversation',
       presentation: 'body',
@@ -8084,6 +9842,24 @@ function stringArrayValue(value: unknown): string[] {
   return value
     .map((item) => stringValue(item))
     .filter((item): item is string => Boolean(item));
+}
+
+function actionFileTargetPath(action: { targetRef?: unknown; targetPath?: unknown; resourceScope?: unknown }): string | undefined {
+  return fileTargetRefPath(action.targetRef) ?? stringValue(action.targetPath) ?? stringArrayValue(action.resourceScope)[0];
+}
+
+function fileTargetRefPath(value: unknown): string | undefined {
+  const direct = stringValue(value);
+  if (direct) return direct;
+  const record = objectRecord(value);
+  return stringValue(record?.path) ?? stringValue(record?.targetPath);
+}
+
+function fileTargetRefFromPath(path: string): Record<string, unknown> {
+  return {
+    kind: isAbsolutePath(path) ? 'absolutePath' : 'workspaceRelative',
+    path,
+  };
 }
 
 function normalizeParseError(error: unknown): { code: string; message: string } {

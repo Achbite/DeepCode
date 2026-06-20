@@ -1,4 +1,4 @@
-import type { AgentContextAttachment } from '@deepcode/protocol';
+import type { AgentContextAttachment, KernelToolCatalogSnapshot } from '@deepcode/protocol';
 import type { ProposalEnvelope } from '../agent-plan/types.js';
 import type { PromptEnvelope } from '../prompt/types.js';
 
@@ -20,6 +20,8 @@ export interface KernelStateContractRef {
   proposalSchemaRefs: string[];
   capabilityProjection: string[];
   toolCatalogRef?: string;
+  toolCatalogHash?: string;
+  toolCatalogSnapshot?: KernelToolCatalogSnapshot;
 }
 
 export interface DriverRequestRef {

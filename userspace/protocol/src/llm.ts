@@ -1,3 +1,4 @@
+import type { AgentConversationActivity } from './agent.js';
 import type { ToolCall, ToolDefinition } from './tools.js';
 
 export type LlmProviderKind =
@@ -209,6 +210,7 @@ export interface ProjectionDelta {
   source?: 'session' | 'driver' | 'llm' | 'kernel' | 'provider';
   delta?: string;
   summary?: string;
+  activity?: AgentConversationActivity;
   payload?: unknown;
   committedEventIds?: string[];
 }

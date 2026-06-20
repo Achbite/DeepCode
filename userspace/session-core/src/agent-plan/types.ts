@@ -45,6 +45,11 @@ export interface PlannedActionDraft {
   title: string;
   capability: string;
   kind?: ActionKind;
+  targetRef?: {
+    kind: 'workspaceRelative' | 'rootRelative' | 'absolutePath' | string;
+    path: string;
+    rootId?: string;
+  };
   resourceScope: string[];
   canParallelize: boolean;
   conflictKeys: string[];

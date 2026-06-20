@@ -994,14 +994,38 @@ fn finish_run_from_bridge_output(
         return;
     }
 
-    if result.get("runStatus").and_then(Value::as_str) == Some("waiting") {
-        let message = result
-            .get("terminalReason")
-            .and_then(Value::as_str)
-            .unwrap_or("Session run is waiting for user input.")
-            .to_string();
-        let _ = set_run_terminal(state, run_id, "waiting", Some(message), None);
-        return;
+    if let Some(run_status) = result.get("runStatus").and_then(Value::as_str) {
+        match run_status {
+            "waiting" => {
+                let message = result
+                    .get("terminalReason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Session run is waiting for user input.")
+                    .to_string();
+                let _ = set_run_terminal(state, run_id, "waiting", Some(message), None);
+                return;
+            }
+            "failed" => {
+                let message = result
+                    .get("terminalReason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Session run failed.")
+                    .to_string();
+                let _ = set_run_terminal(state, run_id, "failed", Some(message), None);
+                return;
+            }
+            "cancelled" => {
+                let message = result
+                    .get("terminalReason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Session run is cancelled.")
+                    .to_string();
+                let _ = set_run_terminal(state, run_id, "cancelled", Some(message), None);
+                return;
+            }
+            "completed" => {}
+            _ => {}
+        }
     }
 
     let final_text = result
@@ -1030,6 +1054,7 @@ fn finish_run_from_projection(state: &AppState, run_id: &str, lifecycle: RunProj
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum RunProjectionLifecycle {
     Completed(Option<String>),
     Waiting(String),
@@ -1043,6 +1068,13 @@ fn projection_lifecycle(
     start_event_count: usize,
 ) -> Option<RunProjectionLifecycle> {
     let events = session_projection(state, session_id);
+    projection_lifecycle_from_events(&events, start_event_count)
+}
+
+fn projection_lifecycle_from_events(
+    events: &[Value],
+    start_event_count: usize,
+) -> Option<RunProjectionLifecycle> {
     let mut lifecycle = None;
     for event in events.iter().skip(start_event_count) {
         if event.get("kind").and_then(Value::as_str) == Some("error") {
@@ -1063,11 +1095,47 @@ fn projection_lifecycle(
             lifecycle = Some(RunProjectionLifecycle::Cancelled(message));
             continue;
         }
+        if event_consumes_waiting_lifecycle(event) {
+            lifecycle = None;
+            continue;
+        }
         if waiting_for_user_message(event).is_some() {
             lifecycle = waiting_for_user_message(event).map(RunProjectionLifecycle::Waiting);
         }
     }
     lifecycle
+}
+
+fn event_consumes_waiting_lifecycle(event: &Value) -> bool {
+    match event.get("kind").and_then(Value::as_str) {
+        Some("requirement_decision") | Some("permission_decision") => true,
+        Some("session_run_state") => {
+            event
+                .get("payload")
+                .and_then(|payload| payload.get("status"))
+                .and_then(Value::as_str)
+                == Some("running")
+        }
+        Some("plan_review") => event
+            .get("payload")
+            .and_then(|payload| payload.get("status"))
+            .and_then(Value::as_str)
+            .map(|status| {
+                let status = status.to_ascii_lowercase();
+                status == "accepted" || status == "rejected" || status == "needsrevision"
+            })
+            .unwrap_or(false),
+        Some("review_summary") => event
+            .get("payload")
+            .and_then(|payload| payload.get("status"))
+            .and_then(Value::as_str)
+            .map(|status| {
+                let status = status.to_ascii_lowercase();
+                status != "waitinguserreview" && status != "pending"
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 fn session_run_completed(event: &Value) -> bool {
@@ -1272,11 +1340,15 @@ fn run_belongs_to_session(state: &AppState, session_id: &str, run_id: &str) -> b
 
 fn normalize_run_delta(session_id: &str, host_run_id: &str, mut delta: Value) -> Value {
     if let Value::Object(object) = &mut delta {
-        object.entry("sessionId".to_string()).or_insert_with(|| json!(session_id));
+        object
+            .entry("sessionId".to_string())
+            .or_insert_with(|| json!(session_id));
         object
             .entry("hostRunId".to_string())
             .or_insert_with(|| json!(host_run_id));
-        object.entry("receivedAt".to_string()).or_insert_with(|| json!(now_text()));
+        object
+            .entry("receivedAt".to_string())
+            .or_insert_with(|| json!(now_text()));
     }
     delta
 }
@@ -1299,7 +1371,9 @@ fn pending_permission_message(events: &[Value]) -> Option<String> {
 
 fn sse_bytes(event: &str, payload: Value) -> Result<bytes::Bytes, std::convert::Infallible> {
     let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-    Ok(bytes::Bytes::from(format!("event: {event}\ndata: {data}\n\n")))
+    Ok(bytes::Bytes::from(format!(
+        "event: {event}\ndata: {data}\n\n"
+    )))
 }
 
 fn run_cancelled(state: &AppState, run_id: &str) -> bool {
@@ -1486,6 +1560,7 @@ pub(crate) async fn agent_workflow_config_patch(
 }
 
 pub(crate) async fn agent_tools(State(state): State<AppState>) -> Json<ApiResponse> {
+    let tool_catalog_snapshot = deepcode_kernel_runtime::kernel_tool_catalog_snapshot();
     match dispatch_skill(
         &state.runtime,
         KernelCommand::SkillDiscover {
@@ -1498,22 +1573,35 @@ pub(crate) async fn agent_tools(State(state): State<AppState>) -> Json<ApiRespon
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let tools = skills
+            let tools = tool_catalog_snapshot
+                .tools
                 .iter()
-                .map(|skill| {
+                .map(|tool| {
                     json!({
-                        "name": skill.get("id").or_else(|| skill.get("name")).cloned().unwrap_or(Value::Null),
-                        "description": skill.get("description").cloned().unwrap_or_else(|| json!("Kernel skill")),
-                        "inputSchema": skill.get("inputSchema").cloned().unwrap_or_else(|| json!({ "type": "object" })),
-                        "riskLevel": skill.get("riskLevel").cloned().unwrap_or_else(|| json!("low")),
-                        "needsApproval": skill.get("requiresApproval").cloned().unwrap_or_else(|| json!(false)),
-                        "allowedModes": ["readOnly", "plan", "askBeforeWrite"]
+                        "name": tool.tool_id,
+                        "description": format!("Kernel tool {} ({})", tool.tool_id, tool.capability),
+                        "inputSchema": &tool.provider_schema,
+                        "riskLevel": tool.risk.as_str(),
+                        "needsApproval": tool.permission_mode.as_str() != "allow",
+                        "allowedModes": ["readOnly", "plan", "askBeforeWrite"],
+                        "capability": tool.capability,
+                        "family": tool.family,
+                        "operationKind": tool.operation_kind,
+                        "permissionMode": tool.permission_mode,
+                        "pathScopePolicy": tool.path_scope_policy,
+                        "executionMode": tool.execution_mode,
+                        "readOnly": tool.read_only,
+                        "catalogVersion": tool_catalog_snapshot.catalog_version,
+                        "catalogHash": &tool_catalog_snapshot.catalog_hash
                     })
                 })
                 .collect::<Vec<_>>();
             ApiResponse::ok(json!({
                 "skills": skills,
-                "tools": tools
+                "tools": tools,
+                "catalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
+                "catalogHash": &tool_catalog_snapshot.catalog_hash,
+                "toolCatalog": tool_catalog_snapshot
             }))
         }
         Err(error) => ApiResponse::error(error.code, error.message),
@@ -1921,6 +2009,86 @@ mod tests {
         });
         assert!(!session_run_completed(&event));
         assert_eq!(waiting_for_user_message(&event), None);
+    }
+
+    #[test]
+    fn running_state_consumes_prior_waiting_lifecycle() {
+        let events = vec![
+            json!({
+                "kind": "session_run_state",
+                "payload": {
+                    "status": "waiting",
+                    "reason": "requirement",
+                    "summary": "Session run is waiting for requirement confirmation."
+                }
+            }),
+            json!({
+                "kind": "requirement_decision",
+                "payload": {
+                    "requirementId": "requirement-1",
+                    "decision": "accept"
+                }
+            }),
+            json!({
+                "kind": "plan_card",
+                "payload": {
+                    "planId": "plan-1",
+                    "status": "awaitingTemporaryGrant",
+                    "confirmable": true
+                }
+            }),
+            json!({
+                "kind": "plan_review",
+                "payload": {
+                    "planId": "plan-1",
+                    "status": "accepted",
+                    "confirmable": false
+                }
+            }),
+            json!({
+                "kind": "session_run_state",
+                "payload": {
+                    "status": "running",
+                    "reason": "accepted_plan_execution",
+                    "summary": "Accepted plan execution started."
+                }
+            }),
+        ];
+        assert_eq!(projection_lifecycle_from_events(&events, 0), None);
+    }
+
+    #[test]
+    fn overlay_decision_allows_later_plan_waiting_lifecycle() {
+        let events = vec![
+            json!({
+                "kind": "requirement_confirmation",
+                "payload": {
+                    "requirementId": "requirement-1",
+                    "status": "waitingUserConfirmation"
+                }
+            }),
+            json!({
+                "kind": "requirement_decision",
+                "payload": {
+                    "requirementId": "requirement-1",
+                    "decision": "accept"
+                }
+            }),
+            json!({
+                "kind": "plan_card",
+                "payload": {
+                    "planId": "plan-1",
+                    "status": "awaitingTemporaryGrant",
+                    "confirmable": true
+                }
+            }),
+        ];
+        assert_eq!(
+            projection_lifecycle_from_events(&events, 0),
+            Some(RunProjectionLifecycle::Waiting(
+                "Session run is waiting for plan review.".to_string()
+            ))
+        );
     }
 
     #[test]

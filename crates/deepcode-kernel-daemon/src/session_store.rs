@@ -1388,7 +1388,10 @@ fn conversation_context_assemblies_markdown(
         ));
         if let Some(blocks) = assembly.get("resourceBlocks").and_then(Value::as_array) {
             lines.push(String::new());
-            lines.push("| Resource block | Retention | Status | Hash | Chars | Volatile stripped |".to_string());
+            lines.push(
+                "| Resource block | Retention | Status | Hash | Chars | Volatile stripped |"
+                    .to_string(),
+            );
             lines.push("| --- | --- | --- | --- | ---: | --- |".to_string());
             for block in blocks {
                 let block_key = block
@@ -1411,10 +1414,7 @@ fn conversation_context_assemblies_markdown(
                     .get("contentHash")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                let chars = block
-                    .get("charLength")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                let chars = block.get("charLength").and_then(Value::as_u64).unwrap_or(0);
                 let stripped = block
                     .get("volatileFieldStripped")
                     .and_then(Value::as_bool)

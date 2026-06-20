@@ -444,7 +444,7 @@ export interface AgentWorkspaceBinding {
 export interface PermissionRequest {
   id: string;
   toolName: string;
-  riskLevel: 'low' | 'medium' | 'high';
+  riskLevel: 'low' | 'medium' | 'high' | 'critical';
   summary: string;
   diff?: string;
   argumentsPreview: unknown;
@@ -497,6 +497,42 @@ export type AgentTimelineStatus =
   | 'blocked'
   | 'completed'
   | 'failed';
+
+export type AgentConversationActivityKind =
+  | 'providerThinking'
+  | 'resourceSearch'
+  | 'resourceRead'
+  | 'editBatchQueued'
+  | 'editFileStarted'
+  | 'editFileCompleted'
+  | 'editFileFailed'
+  | 'toolExecution'
+  | 'subagentBranch'
+  | 'subagentMerge'
+  | 'reviewCheckpoint'
+  | 'diagnostic';
+
+export interface AgentConversationActivity {
+  activityId: string;
+  kind: AgentConversationActivityKind;
+  status: AgentTimelineStatus;
+  title: string;
+  summary: string;
+  source: 'session' | 'kernel' | 'provider' | 'llm';
+  runId?: string;
+  planId?: string;
+  branchId?: string;
+  subAgentId?: string;
+  mergeGroupId?: string;
+  draftId?: string;
+  targets?: string[];
+  actionIds?: string[];
+  workUnitIds?: string[];
+  toolName?: string;
+  itemCount?: number;
+  errorCode?: string;
+  errorMessage?: string;
+}
 
 export interface AgentTimelineDisplayHints {
   density?: 'normal' | 'compact' | 'debug';
@@ -557,6 +593,7 @@ export interface AgentTimelineBlock {
   id: string;
   kind: AgentTimelineBlockKind;
   narrativeKind?: AgentTimelineNarrativeKind;
+  activity?: AgentConversationActivity;
   title: string;
   summary: string;
   status: AgentTimelineStatus;

@@ -6,14 +6,19 @@ use crate::*;
 
 pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
     let workspace = current_workspace_json(&state.runtime).unwrap_or(Value::Null);
+    let tool_catalog_snapshot = deepcode_kernel_runtime::kernel_tool_catalog_snapshot();
+    let build_info = packaged_build_info().unwrap_or(Value::Null);
     ApiResponse::ok(json!({
         "service": "deepcode-kernel-daemon",
         "status": "ok",
         "kernel": "ready",
         "buildCommit": build_commit(),
+        "buildInfo": build_info,
         "protocolVersion": deepcode_kernel_runtime::AGENT_PROTOCOL_VERSION,
         "toolCatalogVersion": deepcode_kernel_runtime::TOOL_CATALOG_VERSION,
         "toolCatalogCount": deepcode_kernel_runtime::kernel_visible_tool_catalog_count(),
+        "toolCatalogHash": &tool_catalog_snapshot.catalog_hash,
+        "toolCatalogSnapshot": tool_catalog_snapshot,
         "workspace": workspace
     }))
 }
@@ -28,6 +33,17 @@ fn build_commit() -> String {
 }
 
 fn read_packaged_build_commit() -> Option<String> {
+    packaged_build_info()
+        .and_then(|value| {
+            value
+                .get("buildCommit")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|commit| !commit.trim().is_empty())
+}
+
+fn packaged_build_info() -> Option<Value> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from))?;
@@ -36,11 +52,7 @@ fn read_packaged_build_commit() -> Option<String> {
         exe_dir.join("..").join("build-info.json"),
     ] {
         let value = read_json_file(&path)?;
-        if let Some(commit) = value.get("buildCommit").and_then(Value::as_str) {
-            if !commit.trim().is_empty() {
-                return Some(commit.to_string());
-            }
-        }
+        return Some(value);
     }
     None
 }

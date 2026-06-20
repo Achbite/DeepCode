@@ -302,10 +302,7 @@ fn openai_compatible_message(message: Value) -> Value {
     let Some(record) = message.as_object() else {
         return message;
     };
-    let role = record
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or("user");
+    let role = record.get("role").and_then(Value::as_str).unwrap_or("user");
     match role {
         "assistant" => openai_compatible_assistant_message(record),
         "tool" => openai_compatible_tool_message(record),
@@ -395,7 +392,10 @@ fn tool_arguments_string(value: Option<&Value>) -> String {
     }
 }
 
-pub(crate) fn llm_stream_response(profile: ResolvedLlmProfile, request_envelope: Value) -> Response {
+pub(crate) fn llm_stream_response(
+    profile: ResolvedLlmProfile,
+    request_envelope: Value,
+) -> Response {
     let stream = async_stream::stream! {
         if profile.kind.as_str() != "openaiCompatible" {
             yield Ok::<Bytes, Infallible>(Bytes::from(sse_json_event(
@@ -619,7 +619,10 @@ fn is_zhipu_profile(profile: &ResolvedLlmProfile) -> bool {
     let base_url = profile.base_url.as_deref().unwrap_or_default();
     let model = profile.model.to_ascii_lowercase();
     let base = base_url.to_ascii_lowercase();
-    model.contains("glm") || model.contains("zhipu") || base.contains("bigmodel") || base.contains("zhipu")
+    model.contains("glm")
+        || model.contains("zhipu")
+        || base.contains("bigmodel")
+        || base.contains("zhipu")
 }
 
 fn provider_tool_name(name: &str) -> String {
@@ -1118,9 +1121,8 @@ impl OpenAiCompatibleStreamAccumulator {
                 let arguments = if buffer.arguments.trim().is_empty() {
                     json!({})
                 } else {
-                    serde_json::from_str(&buffer.arguments).unwrap_or_else(|_| {
-                        json!({ "rawArguments": buffer.arguments })
-                    })
+                    serde_json::from_str(&buffer.arguments)
+                        .unwrap_or_else(|_| json!({ "rawArguments": buffer.arguments }))
                 };
                 Some(LlmToolCall {
                     id: buffer
@@ -1210,7 +1212,10 @@ fn openai_stream_events_from_value(
         .unwrap_or_default();
     for choice in choices {
         let index = choice.get("index").and_then(Value::as_i64).unwrap_or(0);
-        let finish_reason = choice.get("finish_reason").and_then(Value::as_str).map(str::to_string);
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
         if let Some(reasoning) = delta
             .get("reasoning_content")
@@ -1267,8 +1272,15 @@ fn openai_stream_events_from_value(
             if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
                 buffer.id = Some(id.to_string());
             }
-            let function = tool_call.get("function").cloned().unwrap_or_else(|| json!({}));
-            if let Some(name) = function.get("name").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            let function = tool_call
+                .get("function")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if let Some(name) = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
                 buffer.name = Some(name.to_string());
             }
             let arguments_delta = function
@@ -1666,8 +1678,14 @@ mod tests {
             })),
         });
 
-        assert_eq!(payload["usage"]["prompt_cache_hit_tokens"].as_u64(), Some(80));
-        assert_eq!(payload["usage"]["prompt_cache_miss_tokens"].as_u64(), Some(20));
+        assert_eq!(
+            payload["usage"]["prompt_cache_hit_tokens"].as_u64(),
+            Some(80)
+        );
+        assert_eq!(
+            payload["usage"]["prompt_cache_miss_tokens"].as_u64(),
+            Some(20)
+        );
         assert_eq!(payload["usage"]["prompt_tokens"].as_u64(), Some(100));
         assert_eq!(payload["usage"]["completion_tokens"].as_u64(), Some(12));
         assert_eq!(payload["usage"]["total_tokens"].as_u64(), Some(112));
@@ -1707,6 +1725,9 @@ data: [DONE]
         assert_eq!(output.tool_calls.len(), 1);
         assert_eq!(output.tool_calls[0].id, "call-generic");
         assert_eq!(output.tool_calls[0].name, "fs.read");
-        assert_eq!(output.tool_calls[0].arguments["path"].as_str(), Some("generic.txt"));
+        assert_eq!(
+            output.tool_calls[0].arguments["path"].as_str(),
+            Some("generic.txt")
+        );
     }
 }

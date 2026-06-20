@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  AgentConversationActivity,
   AgentTimelineBlock,
   AgentTimelineBlockKind,
   AgentTimelineNarrativeKind,
@@ -668,14 +669,16 @@ function narrativeBlockFromEvents(
   const first = events[0];
   const narrativeKind = forcedNarrativeKind ?? narrativeKindForEvent(first);
   const legacyKind = forcedKind ?? legacyKindForNarrative(narrativeKind);
-  const status = narrativeStatus(events);
-  const title = narrativeTitle(events, narrativeKind);
-  const summary = summarizeAgentEvents(events);
+  const activity = narrativeActivity(events);
+  const status = activity?.status ?? narrativeStatus(events);
+  const title = activity?.title ?? narrativeTitle(events, narrativeKind);
+  const summary = activity?.summary ?? summarizeAgentEvents(events);
   const body = narrativeBody(events, narrativeKind);
   return {
     id: existingId ?? `${narrativeKind}-${first.id || index}`,
     kind: legacyKind,
     narrativeKind,
+    activity,
     title,
     summary,
     status,
@@ -934,6 +937,64 @@ function firstNonEmpty(events: AgentEvent[], keys: string[]): string | undefined
       if (value) return value;
     }
   }
+  return undefined;
+}
+
+function narrativeActivity(events: AgentEvent[]): AgentConversationActivity | undefined {
+  for (const event of [...events].reverse()) {
+    const payload = isRecordPayload(event.payload) ? event.payload : undefined;
+    const activity = payload ? activityFromValue(payload.activity) : undefined;
+    if (activity) return activity;
+  }
+  return undefined;
+}
+
+function activityFromValue(value: unknown): AgentConversationActivity | undefined {
+  if (!isRecordPayload(value)) return undefined;
+  const kind = stringField(value, 'kind');
+  const status = activityStatus(stringField(value, 'status'));
+  const title = stringField(value, 'title');
+  const summary = stringField(value, 'summary');
+  const source = activitySource(stringField(value, 'source'));
+  const activityId = stringField(value, 'activityId');
+  if (!kind || !status || !title || !summary || !source || !activityId) return undefined;
+  return {
+    activityId,
+    kind: kind as AgentConversationActivity['kind'],
+    status,
+    title,
+    summary,
+    source,
+    runId: stringField(value, 'runId'),
+    planId: stringField(value, 'planId'),
+    branchId: stringField(value, 'branchId'),
+    subAgentId: stringField(value, 'subAgentId'),
+    mergeGroupId: stringField(value, 'mergeGroupId'),
+    draftId: stringField(value, 'draftId'),
+    targets: stringArrayField(value, 'targets'),
+    actionIds: stringArrayField(value, 'actionIds'),
+    workUnitIds: stringArrayField(value, 'workUnitIds'),
+    toolName: stringField(value, 'toolName'),
+    itemCount: numberField(value, 'itemCount'),
+    errorCode: stringField(value, 'errorCode'),
+    errorMessage: stringField(value, 'errorMessage'),
+  };
+}
+
+function activityStatus(value: string | undefined): AgentTimelineStatus | undefined {
+  if (
+    value === 'queued' ||
+    value === 'running' ||
+    value === 'waiting' ||
+    value === 'blocked' ||
+    value === 'completed' ||
+    value === 'failed'
+  ) return value;
+  return undefined;
+}
+
+function activitySource(value: string | undefined): AgentConversationActivity['source'] | undefined {
+  if (value === 'session' || value === 'kernel' || value === 'provider' || value === 'llm') return value;
   return undefined;
 }
 
@@ -1338,11 +1399,11 @@ function permissionRequestFromKernelWorkflowStage(event: AgentEvent): Permission
     ? request.capability
     : typeof kernelEvent.capability === 'string'
       ? kernelEvent.capability
-      : 'workspace.write';
+      : 'fs.write';
   return {
     id,
     toolName: typeof kernelEvent.toolName === 'string' ? kernelEvent.toolName : capability,
-    riskLevel: request.riskLevel === 'low' || request.riskLevel === 'medium' || request.riskLevel === 'high'
+    riskLevel: request.riskLevel === 'low' || request.riskLevel === 'medium' || request.riskLevel === 'high' || request.riskLevel === 'critical'
       ? request.riskLevel
       : 'medium',
     summary: typeof request.summary === 'string'
