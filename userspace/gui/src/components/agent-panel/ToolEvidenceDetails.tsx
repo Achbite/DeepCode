@@ -32,8 +32,10 @@ const ToolEvidenceDetails: React.FC<ToolEvidenceDetailsProps> = ({
           {item.detail && <span className="agent-evidence-item__detail">{item.detail}</span>}
           {item.kind === 'command' && (
             <div className="agent-evidence-item__meta">
-              {typeof item.exitCode === 'number' && <span>exit {item.exitCode}</span>}
-              {item.cwd && <span>cwd {item.cwd}</span>}
+              {typeof item.exitCode === 'number' && (
+                <span>{language === 'zh-CN' ? `退出码 ${item.exitCode}` : `exit ${item.exitCode}`}</span>
+              )}
+              {item.cwd && <span>{language === 'zh-CN' ? `目录 ${item.cwd}` : `cwd ${item.cwd}`}</span>}
               {formatDurationMs(item.durationMs) && <span>{formatDurationMs(item.durationMs)}</span>}
               {item.truncated && <span>{language === 'zh-CN' ? '已截断' : 'truncated'}</span>}
             </div>

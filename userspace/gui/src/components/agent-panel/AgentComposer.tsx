@@ -28,6 +28,7 @@ interface AgentModifiedFileView {
 
 const MODIFIED_FILES: AgentModifiedFileView[] = [];
 const LAST_ATTACHMENT_DIRECTORY_KEY_PREFIX = 'deepcode.agent.lastAttachmentDirectory';
+const PRIMARY_DECISION_OPTION_ID = '__primary__';
 
 function attachmentLabel(attachment: AgentContextAttachment, language: UiLanguage): string {
   if (attachment.kind === 'directory') {
@@ -120,7 +121,6 @@ function composerDecisionText(decision: AgentComposerPendingDecision, language: 
   if (isTechnicalChoiceDecision(decision)) {
     return {
       title: decision.title || t(language, 'agent.composer.decision.choice'),
-      summary: decision.decisionRequest.summary || decision.decisionRequest.reason || decision.summary,
     };
   }
   if (decision.kind === 'plan') {
@@ -135,7 +135,7 @@ function composerDecisionText(decision: AgentComposerPendingDecision, language: 
       : t(language, 'agent.composer.decision.permission');
   return {
     title: decision.title || fallbackTitle,
-    summary: decision.summary,
+    summary: decision.kind === 'permission' ? decision.summary : undefined,
   };
 }
 
@@ -244,6 +244,23 @@ function decisionChoiceCount(options: AgentComposerDecisionOption[], language: U
   return t(language, 'agent.composer.decision.choiceCount', { count: options.length });
 }
 
+function decisionCopyText(decision: AgentComposerPendingDecision, language: UiLanguage): string {
+  const text = composerDecisionText(decision, language);
+  const lines = [text.title];
+  if (decision.summary) lines.push('', decision.summary);
+  if (isTechnicalChoiceDecision(decision)) {
+    const request = decision.decisionRequest;
+    if (request.summary || request.reason) {
+      lines.push('', request.summary ?? request.reason ?? '');
+    }
+    for (const option of request.options) {
+      lines.push('', `- ${option.label}${option.recommended ? ` (${t(language, 'agent.composer.decision.recommended')})` : ''}`);
+      if (option.description) lines.push(`  ${option.description}`);
+    }
+  }
+  return lines.filter((line) => line !== undefined).join('\n').trim();
+}
+
 function decisionChoiceGuidance(
   option: AgentComposerDecisionOption,
   supplement: string | undefined,
@@ -283,6 +300,21 @@ function decisionInstanceKey(decision: AgentComposerPendingDecision | null | und
   return `${decision.kind}:${decision.requestId}`;
 }
 
+async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  document.body.removeChild(textarea);
+}
+
 const AgentComposer: React.FC<AgentComposerProps> = ({
   messageAttachments,
   sessionAttachments,
@@ -300,10 +332,13 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   const [selectedChoiceId, setSelectedChoiceId] = useState<string | null>(null);
   const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
   const [changesOpen, setChangesOpen] = useState(true);
+  const [decisionCopyStatus, setDecisionCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const [lastAttachmentDirectory, setLastAttachmentDirectory] = useState<string | null>(() =>
     readLastAttachmentDirectory()
   );
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const defaultDecisionOptionRef = useRef<HTMLButtonElement | null>(null);
+  const focusedOptionClickConfirmRef = useRef<string | null>(null);
   const activeFolder = useWorkspaceStore((s) => s.getActiveFolder());
   const activeWorkspaceRoot = activeFolder?.absolutePath;
   const previewEditor = String(
@@ -326,6 +361,8 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
 
   useEffect(() => {
     setSelectedChoiceId(defaultChoice?.id ?? null);
+    setDecisionCopyStatus('idle');
+    focusedOptionClickConfirmRef.current = null;
   }, [decisionKey, defaultChoice?.id]);
 
   const send = () => {
@@ -361,7 +398,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     if (!pendingDecision || pendingDecision.resolving) return;
     setValue('');
     const frame = window.requestAnimationFrame(() => {
-      textareaRef.current?.focus();
+      defaultDecisionOptionRef.current?.focus();
     });
     return () => window.cancelAnimationFrame(frame);
   }, [decisionKey]);
@@ -454,10 +491,46 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   };
 
   const dialogInitialDirectory = lastAttachmentDirectory ?? activeFolder?.absolutePath ?? null;
+  const armFocusedOptionClick = (
+    event: React.MouseEvent<HTMLButtonElement>,
+    optionId: string
+  ) => {
+    focusedOptionClickConfirmRef.current = document.activeElement === event.currentTarget
+      ? optionId
+      : null;
+  };
+
   const selectTechnicalChoice = (option: AgentComposerDecisionOption) => {
     if (!pendingDecision || pendingDecision.resolving) return;
+    if (focusedOptionClickConfirmRef.current === option.id) {
+      send();
+      return;
+    }
     setSelectedChoiceId(option.id);
-    textareaRef.current?.focus();
+    focusedOptionClickConfirmRef.current = null;
+  };
+
+  const focusTechnicalChoice = (option: AgentComposerDecisionOption) => {
+    if (!pendingDecision || pendingDecision.resolving) return;
+    setSelectedChoiceId(option.id);
+  };
+
+  const activatePrimaryDecisionOption = () => {
+    if (!pendingDecision || pendingDecision.resolving) return;
+    if (focusedOptionClickConfirmRef.current === PRIMARY_DECISION_OPTION_ID) {
+      send();
+    }
+    focusedOptionClickConfirmRef.current = null;
+  };
+
+  const copyDecision = async () => {
+    if (!pendingDecision) return;
+    try {
+      await copyText(decisionCopyText(pendingDecision, language));
+      setDecisionCopyStatus('copied');
+    } catch {
+      setDecisionCopyStatus('error');
+    }
   };
   const renderDecisionInput = () => (
     <div className="agent-composer-decision__input-row">
@@ -490,6 +563,16 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
         <div className="agent-composer-decision" onKeyDown={handleDecisionShortcut}>
           <div className="agent-composer-decision__header">
             <div className="agent-composer-decision__title">{decisionText.title}</div>
+            <button
+              type="button"
+              className={`agent-composer-decision__copy agent-composer-decision__copy--${decisionCopyStatus}`}
+              onClick={() => void copyDecision()}
+              disabled={decisionResolving}
+              title={t(language, 'agent.composer.decision.copy')}
+              aria-label={t(language, 'agent.composer.decision.copy')}
+            >
+              ⧉
+            </button>
             {technicalChoiceOptions.length > 0 && (
               <div className="agent-composer-decision__count">
                 {decisionChoiceCount(technicalChoiceOptions, language)}
@@ -515,6 +598,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
                     type="button"
                     disabled={decisionResolving}
                     title={option.description}
+                    ref={option.id === defaultChoice?.id ? defaultDecisionOptionRef : undefined}
+                    onMouseDown={(event) => armFocusedOptionClick(event, option.id)}
+                    onFocus={() => focusTechnicalChoice(option)}
                     onClick={() => selectTechnicalChoice(option)}
                   >
                     <span className="agent-composer-decision__number">{index + 1}</span>
@@ -538,7 +624,9 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
                     type="button"
                     disabled={decisionResolving}
                     title={decisionSubmitTitle(pendingDecision!, '', language)}
-                    onClick={send}
+                    ref={defaultDecisionOptionRef}
+                    onMouseDown={(event) => armFocusedOptionClick(event, PRIMARY_DECISION_OPTION_ID)}
+                    onClick={activatePrimaryDecisionOption}
                   >
                     <span className="agent-composer-decision__number">1</span>
                     <span className="agent-composer-decision__option-body">

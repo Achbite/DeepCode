@@ -1075,11 +1075,41 @@ button {
 }
 
 .agent-composer-decision__title {
+  flex: 1 1 auto;
   min-width: 0;
   font-size: 15px;
   font-weight: 720;
   color: var(--text);
   overflow-wrap: anywhere;
+}
+
+.agent-composer-decision__copy {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #8a919c;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.agent-composer-decision__copy:hover {
+  border-color: #dfe4ec;
+  background: #f6f8fb;
+  color: #38404a;
+}
+
+.agent-composer-decision__copy--copied {
+  color: #2563eb;
+}
+
+.agent-composer-decision__copy--error {
+  color: #b3342e;
 }
 
 .agent-composer-decision__count {

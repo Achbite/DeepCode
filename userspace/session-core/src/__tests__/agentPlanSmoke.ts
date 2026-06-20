@@ -1099,6 +1099,13 @@ function assertNarrativeTimelineProjection(): void {
       payload: { channel: 'reasoning', status: 'running', content: 'Need generic context.' },
     },
     {
+      id: 'event-thinking-continued',
+      sessionId: 'session-narrative',
+      ts: '2026-01-01T00:00:01.100Z',
+      kind: 'assistant_msg',
+      payload: { channel: 'reasoning', status: 'running', content: ' Continue with generic constraints.' },
+    },
+    {
       id: 'event-progress',
       sessionId: 'session-narrative',
       ts: '2026-01-01T00:00:01.500Z',
@@ -1285,6 +1292,11 @@ function assertNarrativeTimelineProjection(): void {
   assertEqual(narrationBlock?.displayHints?.renderMode, 'typewriter', 'assistant narration uses typewriter projection hints');
   assertEqual(narrationBlock?.displayHints?.checkpointKind, 'llmProposal', 'assistant narration is tied to an LLM proposal checkpoint');
   const thinkingBlock = projection.turns[0].blocks.find((block) => block.narrativeKind === 'thinking');
+  assertEqual(
+    thinkingBlock?.bodyMarkdown,
+    'Need generic context. Continue with generic constraints.',
+    'adjacent reasoning events are projected as one complete thinking body'
+  );
   assertEqual(Boolean(thinkingBlock?.displayHints?.replaceOnComplete), true, 'thinking exposes replacement/collapse projection hints');
   assertEqual(thinkingBlock?.displayHints?.typewriterSpeed, 'slow', 'running thinking uses a slower typewriter speed');
   const guidanceBlock = projection.turns[0].blocks.find((block) => block.events.some((event) => event.kind === 'user_guidance'));

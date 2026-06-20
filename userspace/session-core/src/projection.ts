@@ -834,7 +834,7 @@ function narrativeTitle(events: AgentEvent[], kind: AgentTimelineNarrativeKind):
   if (kind === 'plan') return firstNonEmpty(events, ['title', 'summary']) ?? 'Plan';
   if (kind === 'permission') return firstNonEmpty(events, ['summary', 'toolName']) ?? 'Permission';
   if (kind === 'verification') return firstNonEmpty(events, ['summary']) ?? 'Verification';
-  if (kind === 'review') return firstNonEmpty(events, ['title', 'summary']) ?? 'Review';
+  if (kind === 'review') return firstNonEmpty(events, ['title']) ?? 'Review';
   return firstNonEmpty([first], ['summary', 'message', 'details']) ?? 'Diagnostic';
 }
 
@@ -849,8 +849,45 @@ function summarizeAgentEvents(events: AgentEvent[]): string {
 
 function narrativeBody(events: AgentEvent[], kind: AgentTimelineNarrativeKind): string | undefined {
   if (kind === 'operationEvidence') return undefined;
+  if (kind === 'thinking') {
+    const reasoning = events.map(reasoningEventBody).join('').trim();
+    return reasoning || undefined;
+  }
+  if (kind === 'review') {
+    const text = trimReviewFooter(events.map(reviewEventBody).filter(Boolean).join('\n\n')).trim();
+    return text || undefined;
+  }
   const text = firstNonEmpty(events, ['content', 'message', 'summary', 'details']);
   return text?.trim() ? text : undefined;
+}
+
+function reasoningEventBody(event: AgentEvent): string {
+  if (typeof event.payload === 'string') return event.payload;
+  if (!isRecordPayload(event.payload)) return '';
+  for (const key of ['content', 'message', 'details']) {
+    const value = event.payload[key];
+    if (typeof value === 'string') return value;
+  }
+  return '';
+}
+
+function reviewEventBody(event: AgentEvent): string {
+  if (typeof event.payload === 'string') return event.payload;
+  if (!isRecordPayload(event.payload)) return '';
+  for (const key of ['content', 'message', 'details']) {
+    const value = event.payload[key];
+    if (typeof value === 'string') return value;
+  }
+  return '';
+}
+
+function trimReviewFooter(markdown: string): string {
+  const lines = markdown.split(/\r?\n/);
+  const footerStart = lines.findIndex((line) =>
+    /^#{2,6}\s*(后续意图|后续决策|决策边界)\s*$/.test(line.trim())
+  );
+  const visibleLines = footerStart >= 0 ? lines.slice(0, footerStart) : lines;
+  return visibleLines.join('\n').trim();
 }
 
 function narrativeDefaultCollapsed(kind: AgentTimelineNarrativeKind, status: AgentTimelineStatus): boolean {
@@ -916,6 +953,7 @@ function narrativeRenderMode(
   if (kind === 'assistantNarration') return 'typewriter';
   if (kind === 'assistantText') return 'typewriter';
   if (kind === 'thinking') return status === 'running' || status === 'waiting' ? 'typewriter' : 'static';
+  if ((kind === 'plan' || kind === 'review') && (status === 'running' || status === 'waiting')) return 'typewriter';
   return 'static';
 }
 

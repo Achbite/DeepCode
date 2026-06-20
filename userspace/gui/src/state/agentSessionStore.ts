@@ -245,6 +245,110 @@ function mergeEventsById(existing: AgentEvent[], incoming: AgentEvent[]): AgentE
   return [...byId.values()].sort((left, right) => (left.ts ?? '').localeCompare(right.ts ?? ''));
 }
 
+const MAX_ACTIVE_PROGRESS_DELTAS = 240;
+
+function isActiveTextDelta(delta: ProjectionDelta): boolean {
+  return (
+    delta.type === 'reasoning_delta' ||
+    delta.type === 'assistant_delta' ||
+    delta.type === 'draft_delta' ||
+    delta.type === 'part_delta'
+  ) && typeof delta.delta === 'string';
+}
+
+function activeDeltaMergeKey(delta: ProjectionDelta): string {
+  const activityId = delta.activity?.activityId;
+  if (activityId) return `activity:${delta.sessionId}:${activityId}`;
+  const branchKey = delta.branchId ?? delta.subAgentId ?? delta.mergeGroupId ?? 'parent';
+  return [
+    delta.sessionId,
+    delta.runId ?? '',
+    delta.turnId ?? '',
+    branchKey,
+    delta.type,
+    delta.draftId ?? '',
+    delta.itemId ?? '',
+    delta.targetPath ?? '',
+    delta.stage ?? '',
+    delta.channel ?? '',
+  ].join('|');
+}
+
+function committedDeltaMatchesActive(committed: ProjectionDelta, active: ProjectionDelta): boolean {
+  if (committed.sessionId !== active.sessionId) return false;
+  if (committed.runId && active.runId !== committed.runId) return false;
+  if (committed.turnId && active.turnId !== committed.turnId) return false;
+  return true;
+}
+
+function mergeActiveDelta(existing: ProjectionDelta, incoming: ProjectionDelta): ProjectionDelta {
+  if (isActiveTextDelta(existing) && isActiveTextDelta(incoming)) {
+    return {
+      ...existing,
+      ...incoming,
+      delta: `${existing.delta ?? ''}${incoming.delta ?? ''}`,
+    };
+  }
+  return {
+    ...existing,
+    ...incoming,
+    activity: incoming.activity ?? existing.activity,
+  };
+}
+
+function trimActiveDeltas(deltas: ProjectionDelta[]): ProjectionDelta[] {
+  const stable = deltas.filter((delta) => delta.activity || isActiveTextDelta(delta));
+  const progress = deltas.filter((delta) => !delta.activity && !isActiveTextDelta(delta)).slice(-MAX_ACTIVE_PROGRESS_DELTAS);
+  return [...stable, ...progress].sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
+}
+
+function mergeActiveProjectionDelta(existing: ProjectionDelta[], incoming: ProjectionDelta): ProjectionDelta[] {
+  if (incoming.type === 'committed') {
+    return existing.filter((delta) => !committedDeltaMatchesActive(incoming, delta));
+  }
+  const byKey = new Map<string, ProjectionDelta>();
+  for (const delta of existing) byKey.set(activeDeltaMergeKey(delta), delta);
+  const key = activeDeltaMergeKey(incoming);
+  const current = byKey.get(key);
+  byKey.set(key, current ? mergeActiveDelta(current, incoming) : incoming);
+  return trimActiveDeltas([...byKey.values()]);
+}
+
+function eventPayloadRecord(event: AgentEvent): Record<string, unknown> | null {
+  return isRecord(event.payload) ? event.payload : null;
+}
+
+function eventStringField(event: AgentEvent, key: string): string | undefined {
+  const value = eventPayloadRecord(event)?.[key];
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function eventActivityId(event: AgentEvent): string | undefined {
+  const activity = eventPayloadRecord(event)?.activity;
+  return isRecord(activity) && typeof activity.activityId === 'string' ? activity.activityId : undefined;
+}
+
+function pruneActiveDeltasForCommittedEvents(existing: ProjectionDelta[], events: AgentEvent[]): ProjectionDelta[] {
+  if (events.length === 0 || existing.length === 0) return existing;
+  const sessionIds = new Set(events.map((event) => event.sessionId));
+  const activityIds = new Set(events.map(eventActivityId).filter((id): id is string => Boolean(id)));
+  const committedTextTypes = new Set<ProjectionDelta['type']>();
+  for (const event of events) {
+    if (event.kind !== 'assistant_msg') continue;
+    const channel = eventStringField(event, 'channel');
+    if (channel === 'reasoning') committedTextTypes.add('reasoning_delta');
+    if (channel === 'final') committedTextTypes.add('assistant_delta');
+  }
+  if (activityIds.size === 0 && committedTextTypes.size === 0) return existing;
+  return existing.filter((delta) => {
+    if (!sessionIds.has(delta.sessionId)) return true;
+    const activityId = delta.activity?.activityId;
+    if (activityId && activityIds.has(activityId)) return false;
+    if (committedTextTypes.has(delta.type)) return false;
+    return true;
+  });
+}
+
 function streamHandlersForSession(sessionId: string): {
   onDelta: (delta: ProjectionDelta) => void;
   onEvents: (events: AgentEvent[]) => void;
@@ -255,7 +359,7 @@ function streamHandlersForSession(sessionId: string): {
       const activeSession = useAgentSessionStore.getState().session;
       if (activeSession?.id !== sessionId) return;
       useAgentSessionStore.setState((state) => ({
-        activeDeltas: [...state.activeDeltas, delta].slice(-1200),
+        activeDeltas: mergeActiveProjectionDelta(state.activeDeltas, delta),
       }));
     },
     onEvents: (events) => {
@@ -268,6 +372,7 @@ function streamHandlersForSession(sessionId: string): {
         return {
           events: merged,
           pendingPermission: findLatestPendingPermission(merged),
+          activeDeltas: pruneActiveDeltasForCommittedEvents(state.activeDeltas, events),
         };
       });
     },

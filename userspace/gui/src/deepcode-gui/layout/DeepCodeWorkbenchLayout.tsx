@@ -809,7 +809,7 @@ function mergeSubAgentDelta(
   const existing = findSubAgentWorkItem(byId, delta);
   const item = existing ?? {
     id: `active-subagent-${safeSubAgentWorkId(key)}`,
-    title: delta.subAgentId ?? delta.branchId ?? t(language, 'deepcodeGui.subagents.branchFallback'),
+    title: t(language, 'deepcodeGui.subagents.branchFallback'),
     summary: delta.summary ?? t(language, 'deepcodeGui.subagents.streaming'),
     status: subAgentDeltaStatus(delta),
     branchId: delta.branchId,
@@ -860,15 +860,6 @@ function deriveSubAgentWorkItems(
   return [...byId.values()].slice(-8);
 }
 
-function compactSubAgentMeta(item: DeepCodeSubAgentWorkItem): string[] {
-  return [
-    item.subAgentId,
-    item.branchId,
-    item.mergeGroupId,
-    ...item.targets.slice(0, 3),
-  ].filter((value): value is string => Boolean(value && value.trim()));
-}
-
 const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   apiStatus,
   wsStatus,
@@ -889,7 +880,9 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const [projectCreateMenu, setProjectCreateMenu] = useState<DeepCodeProjectCreateMenu | null>(null);
   const [projectFolderDialogOpen, setProjectFolderDialogOpen] = useState(false);
   const [textDialog, setTextDialog] = useState<DeepCodeTextInputDialog | null>(null);
+  const [sidebarPendingAction, setSidebarPendingAction] = useState<string | null>(null);
   const pendingProjectSendRef = useRef<PendingProjectSession | null>(null);
+  const sidebarPendingActionRef = useRef<string | null>(null);
   const workspace = useWorkspaceStore((s) => s.current);
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
   const sessions = useAgentSessionStore((s) => s.sessions);
@@ -1086,6 +1079,22 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     const nextSession = await createNewSession({ reuseEmpty: false });
     if (nextSession?.id) {
       upsertKnownSession(nextSession);
+    }
+  };
+
+  const runSidebarAction = async (key: string, action: () => Promise<void> | void) => {
+    if (sidebarPendingActionRef.current === key) return;
+    const activeElement = document.activeElement;
+    if (activeElement instanceof HTMLElement) activeElement.blur();
+    sidebarPendingActionRef.current = key;
+    setSidebarPendingAction(key);
+    try {
+      await action();
+    } finally {
+      if (sidebarPendingActionRef.current === key) {
+        sidebarPendingActionRef.current = null;
+        setSidebarPendingAction(null);
+      }
     }
   };
 
@@ -1346,8 +1355,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             <button
               type="button"
               className="deepcode-gui-sidebar-action deepcode-gui-sidebar-action--primary"
-              onClick={() => void handleCreateSession(null)}
-              disabled={loadingSession}
+              onClick={() => void runSidebarAction('create:normal:primary', () => handleCreateSession(null))}
+              disabled={sidebarPendingAction === 'create:normal:primary'}
             >
               <DeepCodeSidebarIcon name="compose" className="deepcode-gui-sidebar-icon" />
               <span>{t(language, 'deepcodeGui.nav.newChat')}</span>
@@ -1361,7 +1370,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                 type="button"
                 className="deepcode-gui-sidebar-text-action"
                 onClick={openProjectCreateMenu}
-                disabled={loadingSession}
                 aria-haspopup="menu"
                 aria-expanded={Boolean(projectCreateMenu)}
               >
@@ -1383,6 +1391,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                     group.projectId
                     && (group.projectId === activeProjectId || group.projectId === draftTargetProjectId)
                   );
+                  const projectCreateActionKey = group.projectId ? `create:project:${group.projectId}` : '';
                   return (
                     <div
                       key={group.key}
@@ -1415,9 +1424,10 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                             className="deepcode-gui-project-archive-group__compose"
                             onClick={(event) => {
                               event.stopPropagation();
-                              void handleCreateSession(group.projectId);
+                              if (!group.projectId) return;
+                              void runSidebarAction(projectCreateActionKey, () => handleCreateSession(group.projectId));
                             }}
-                            disabled={loadingSession}
+                            disabled={Boolean(projectCreateActionKey && sidebarPendingAction === projectCreateActionKey)}
                             aria-label={t(language, 'deepcodeGui.project.newChat')}
                             title={t(language, 'deepcodeGui.project.newChat')}
                           >
@@ -1430,20 +1440,23 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                         <div className="deepcode-gui-project-archive-group__sessions">
                           {group.sessions.slice(0, 4).map((item, itemIndex) => {
                             const shortcutIndex = groupIndex + itemIndex + 1;
+                            const activateActionKey = `activate:project:${item.id}`;
                             return (
                               <button
                                 key={item.id}
                                 type="button"
                                 className={item.id === highlightedSessionId ? 'active' : ''}
                                 onClick={() => {
-                                  pendingProjectSendRef.current = null;
-                                  setActiveProjectId(group.projectId ?? null);
-                                  setDraftTargetProjectId(null);
-                                  setFixedContextAttachments(projectFixedContextAttachments(projectRecord));
-                                  void activateSession(item.id);
+                                  void runSidebarAction(activateActionKey, async () => {
+                                    pendingProjectSendRef.current = null;
+                                    setActiveProjectId(group.projectId ?? null);
+                                    setDraftTargetProjectId(null);
+                                    setFixedContextAttachments(projectFixedContextAttachments(projectRecord));
+                                    await activateSession(item.id);
+                                  });
                                 }}
                                 onContextMenu={(event) => openSessionContextMenu(event, item)}
-                                disabled={loadingSession}
+                                disabled={sidebarPendingAction === activateActionKey}
                                 title={item.title || item.id}
                               >
                                 <span>{displaySessionTitle(language, item.title)}</span>
@@ -1468,8 +1481,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               <button
                 type="button"
                 className="deepcode-gui-sidebar-new-chat"
-                onClick={() => void handleCreateSession(null)}
-                disabled={loadingSession}
+                onClick={() => void runSidebarAction('create:normal:nested', () => handleCreateSession(null))}
+                disabled={sidebarPendingAction === 'create:normal:nested'}
                 aria-label={t(language, 'deepcodeGui.nav.newChat')}
                 title={t(language, 'deepcodeGui.nav.newChat')}
               >
@@ -1479,23 +1492,30 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             {visibleSessions.length > 0 && (
               <div className="deepcode-gui-session-list">
                 {visibleSessions.slice(0, 8).map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    className={item.id === highlightedSessionId ? 'active' : ''}
-                    onClick={() => {
-                      pendingProjectSendRef.current = null;
-                      setActiveProjectId(null);
-                      setDraftTargetProjectId(null);
-                      setFixedContextAttachments([]);
-                      void activateSession(item.id);
-                    }}
-                    onContextMenu={(event) => openSessionContextMenu(event, item)}
-                    disabled={loadingSession}
-                    title={item.title || item.id}
-                  >
-                    <span>{displaySessionTitle(language, item.title)}</span>
-                  </button>
+                  (() => {
+                    const activateActionKey = `activate:chat:${item.id}`;
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className={item.id === highlightedSessionId ? 'active' : ''}
+                        onClick={() => {
+                          void runSidebarAction(activateActionKey, async () => {
+                            pendingProjectSendRef.current = null;
+                            setActiveProjectId(null);
+                            setDraftTargetProjectId(null);
+                            setFixedContextAttachments([]);
+                            await activateSession(item.id);
+                          });
+                        }}
+                        onContextMenu={(event) => openSessionContextMenu(event, item)}
+                        disabled={sidebarPendingAction === activateActionKey}
+                        title={item.title || item.id}
+                      >
+                        <span>{displaySessionTitle(language, item.title)}</span>
+                      </button>
+                    );
+                  })()
                 ))}
               </div>
             )}
@@ -1552,9 +1572,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                 {t(language, 'deepcodeGui.subagents.title')}
               </div>
               <div className="deepcode-gui-subagent-work-list">
-                {subAgentWorkItems.map((item) => {
-                  const meta = compactSubAgentMeta(item);
-                  return (
+                {subAgentWorkItems.map((item) => (
                     <div
                       key={item.id}
                       className={`deepcode-gui-subagent-work-item deepcode-gui-subagent-work-item--${item.status}`}
@@ -1580,17 +1598,9 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                         {item.error && (
                           <div className="deepcode-gui-subagent-work-item__error">{item.error}</div>
                         )}
-                        {meta.length > 0 && (
-                          <div className="deepcode-gui-subagent-work-item__meta">
-                            {meta.map((value) => (
-                              <span key={value} title={value}>{value}</span>
-                            ))}
-                          </div>
-                        )}
                       </div>
                     </div>
-                  );
-                })}
+                ))}
               </div>
             </section>
           )}
