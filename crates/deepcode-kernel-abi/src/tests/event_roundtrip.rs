@@ -4,7 +4,7 @@ use super::*;
 fn syscall_result_events_are_locale_neutral() {
     let event = KernelEvent::WorkspaceResult {
         request_id: RequestId("req-list".to_string()),
-        operation: "workspace.list".to_string(),
+        operation: "fs.list".to_string(),
         ok: true,
         output: Some(serde_json::json!({ "nodes": [] })),
         error: None,
@@ -13,7 +13,7 @@ fn syscall_result_events_are_locale_neutral() {
 
     let encoded = serde_json::to_value(&event).expect("serialize workspace result");
     assert_eq!(encoded["kind"], "workspace.result");
-    assert_eq!(encoded["operation"], "workspace.list");
+    assert_eq!(encoded["operation"], "fs.list");
     assert_eq!(encoded["ok"], true);
 }
 
@@ -81,8 +81,10 @@ fn driver_loop_v3_events_round_trip() {
         allowed_proposals: vec!["answer".to_string()],
         proposal_schema_refs: vec!["deepcode.agent.protocol.v3".to_string()],
         required_user_decision: None,
-        capability_projection: vec!["workspace.read".to_string()],
+        capability_projection: vec!["fs.read".to_string()],
         tool_catalog_ref: Some("catalog-v1".to_string()),
+        tool_catalog_hash: Some("hash-catalog".to_string()),
+        tool_catalog_snapshot: None,
         transition_predicates: vec![],
         fail_closed_rules: vec![],
     };
@@ -170,7 +172,7 @@ fn plan_command_and_checkpoint_event_round_trip() {
         run_id: RunId("run-1".to_string()),
         grant: TemporaryGrantEnvelope {
             id: "grant-1".to_string(),
-            capability: "workspace.write".to_string(),
+            capability: "fs.write".to_string(),
             resource_kind: "workspaceFile".to_string(),
             resource_path: Some("src/main.rs".to_string()),
             expires_after_sequence: Some(10),

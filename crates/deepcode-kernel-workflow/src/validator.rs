@@ -307,14 +307,13 @@ fn hook_looks_executable(hook: &str) -> bool {
 
 fn known_capabilities() -> BTreeSet<String> {
     [
-        "workspace.read",
-        "workspace.preview_diff",
-        "workspace.write",
-        "workspace.create",
-        "workspace.delete",
-        "workspace.rename",
-        "workspace.list",
-        "workspace.search",
+        "fs.read",
+        "fs.diff",
+        "fs.write",
+        "fs.patch",
+        "fs.delete",
+        "fs.list",
+        "code.search",
         "git.read",
         "git.write",
         "git.push",

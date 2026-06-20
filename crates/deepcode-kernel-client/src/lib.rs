@@ -1220,7 +1220,10 @@ impl Drop for KernelStartLock {
     }
 }
 
-fn acquire_kernel_start_lock(host: &str, port: &str) -> KernelClientResult<Option<KernelStartLock>> {
+fn acquire_kernel_start_lock(
+    host: &str,
+    port: &str,
+) -> KernelClientResult<Option<KernelStartLock>> {
     let path = std::env::temp_dir().join(format!(
         "deepcode-kernel-start-{}-{}.lock",
         sanitize_lock_component(host),

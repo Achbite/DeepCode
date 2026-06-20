@@ -333,7 +333,7 @@ mod tests {
         assert!(decision.authorized);
         let audit = decision.audit_projection();
         assert_eq!(audit["method"], "kernel.fs.read");
-        assert_eq!(audit["capability"], "workspace.read");
+        assert_eq!(audit["capability"], "fs.read");
         assert!(audit.get("arguments").is_none());
     }
 

@@ -11,7 +11,7 @@
     "args": ["transform.py"],
     "scriptPath": "transform.py"
   },
-  "requestedCapabilities": ["workspace.read"],
+  "requestedCapabilities": ["fs.read"],
   "effects": ["readsWorkspace"],
   "envAllowlist": ["DEEPCODE_TEXT_SKILL_MODE"],
   "workspaceAccess": "readOnly",

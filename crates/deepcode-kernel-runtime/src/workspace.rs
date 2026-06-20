@@ -79,7 +79,7 @@ impl DeepCodeKernelRuntime {
                 "nodes": nodes
             }))
         })();
-        self.workspace_result(request_id, "workspace.list", result)
+        self.workspace_result(request_id, "fs.list", result)
     }
 
     pub(crate) fn workspace_read(
@@ -106,7 +106,7 @@ impl DeepCodeKernelRuntime {
                 "binary": false
             }))
         })();
-        self.workspace_result(request_id, "workspace.read", result)
+        self.workspace_result(request_id, "fs.read", result)
     }
 
     pub(crate) fn workspace_write(
@@ -143,7 +143,7 @@ impl DeepCodeKernelRuntime {
                 "sizeBytes": size_bytes
             }))
         })();
-        self.workspace_result(request_id, "workspace.write", result)
+        self.workspace_result(request_id, "fs.write", result)
     }
 
     pub(crate) fn workspace_create(
@@ -180,7 +180,7 @@ impl DeepCodeKernelRuntime {
                 "sizeBytes": size_bytes
             }))
         })();
-        self.workspace_result(request_id, "workspace.create", result)
+        self.workspace_result(request_id, "fs.write", result)
     }
 
     pub(crate) fn workspace_create_folder(
@@ -207,7 +207,7 @@ impl DeepCodeKernelRuntime {
                 "created": true
             }))
         })();
-        self.workspace_result(request_id, "workspace.create_folder", result)
+        self.workspace_result(request_id, "fs.mkdir", result)
     }
 
     pub(crate) fn workspace_rename(
@@ -237,7 +237,7 @@ impl DeepCodeKernelRuntime {
                 "renamed": true
             }))
         })();
-        self.workspace_result(request_id, "workspace.rename", result)
+        self.workspace_result(request_id, "fs.rename", result)
     }
 
     pub(crate) fn workspace_delete(
@@ -251,14 +251,14 @@ impl DeepCodeKernelRuntime {
             validate_folder_id(folder_id.as_deref())?;
             if normalize_relative_path(&path) == "." {
                 return Err(KernelError::PermissionDenied(
-                    "workspace.delete cannot remove the workspace root".to_string(),
+                    "fs.delete cannot remove the workspace root".to_string(),
                 ));
             }
             deny_protected_deepcode_mutation(&path)?;
             let target = self.resolve_workspace_path(&path)?;
             if target == workspace.root {
                 return Err(KernelError::PermissionDenied(
-                    "workspace.delete cannot remove the workspace root".to_string(),
+                    "fs.delete cannot remove the workspace root".to_string(),
                 ));
             }
             let metadata = fs::symlink_metadata(&target)
@@ -283,7 +283,7 @@ impl DeepCodeKernelRuntime {
                 "kind": kind
             }))
         })();
-        self.workspace_result(request_id, "workspace.delete", result)
+        self.workspace_result(request_id, "fs.delete", result)
     }
 
     pub(crate) fn workspace_search(
@@ -300,7 +300,7 @@ impl DeepCodeKernelRuntime {
             let workspace = self.current_workspace()?;
             validate_folder_id(folder_id.as_deref())?;
             if is_regex {
-                return Err(KernelError::NotImplemented("workspace.search.regex"));
+                return Err(KernelError::NotImplemented("code.search.regex"));
             }
             if query.trim().is_empty() {
                 return Err(KernelError::InvalidCommand(
@@ -330,7 +330,7 @@ impl DeepCodeKernelRuntime {
                 "matches": result.matches
             }))
         })();
-        self.workspace_result(request_id, "workspace.search", result)
+        self.workspace_result(request_id, "code.search", result)
     }
 
     pub(crate) fn current_workspace(&self) -> KernelResult<&RuntimeWorkspace> {

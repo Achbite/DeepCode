@@ -431,6 +431,45 @@ impl DeepCodeKernelRuntime {
         arguments: &Value,
     ) -> KernelResult<Option<String>> {
         if let Some(root) = arguments
+            .get("kernelExecutionRoot")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !matches!(
+                tool_name,
+                "fs.write"
+                    | "fs.patch"
+                    | "fs.delete"
+                    | "fs.read"
+                    | "fs.list"
+                    | "code.search"
+                    | "git.status"
+                    | "git.diff"
+                    | "git.stage"
+                    | "git.unstage"
+                    | "git.commit"
+                    | "git.push"
+            ) {
+                return Err(KernelError::PermissionDenied(
+                    "kernelExecutionRoot is only allowed for Kernel-compiled workspace tools"
+                        .to_string(),
+                ));
+            }
+            if arguments.get("kernelContext").is_none() {
+                return Err(KernelError::PermissionDenied(
+                    "kernelExecutionRoot requires Kernel actionBatch context".to_string(),
+                ));
+            }
+            let root_path = PathBuf::from(root);
+            if !root_path.is_dir() {
+                return Err(KernelError::InvalidCommand(format!(
+                    "kernelExecutionRoot is not a directory: {root}"
+                )));
+            }
+            return Ok(Some(root.to_string()));
+        }
+        if let Some(root) = arguments
             .get("attachmentRoot")
             .and_then(Value::as_str)
             .map(str::trim)
@@ -494,9 +533,15 @@ impl DeepCodeKernelRuntime {
             return Ok(());
         }
         let diagnostic_root = arguments
-            .get("attachmentRoot")
+            .get("kernelExecutionRoot")
             .and_then(Value::as_str)
             .map(PathBuf::from)
+            .or_else(|| {
+                arguments
+                    .get("attachmentRoot")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+            })
             .or_else(|| {
                 self.state
                     .current_workspace

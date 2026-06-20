@@ -489,7 +489,7 @@ mod tests {
     fn high_risk_plan_waits_for_temporary_grant() {
         let controller = WorkflowController::default();
         let plan = PlanContract {
-            required_capabilities: vec!["workspace.write".to_string()],
+            required_capabilities: vec!["fs.write".to_string()],
             risk_level: PlanRiskLevel::High,
             ..PlanContract::low_risk_direct("plan-2", "modify workspace")
         };

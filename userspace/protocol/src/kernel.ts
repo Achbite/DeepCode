@@ -104,6 +104,7 @@ export type KernelResourceScopeKind =
   | 'workspaceConfigAsset'
   | 'managedReference'
   | 'externalReadOnlyFile'
+  | 'externalFile'
   | 'tempArtifact'
   | 'process'
   | 'git'
@@ -294,11 +295,20 @@ export type KernelPlanReviewStatus =
 
 export type KernelProposalReviewStatus = KernelPlanReviewStatus;
 
+export interface KernelFileTargetRef {
+  kind: 'workspaceRelative' | 'rootRelative' | 'absolutePath' | string;
+  path: string;
+  rootId?: string;
+}
+
 export interface KernelRequiredFileOperation {
   operation: 'write' | 'create' | 'delete' | 'rename' | string;
   targetPath: string;
   capability: string;
   actionId?: string;
+  targetRef?: KernelFileTargetRef;
+  targetKind?: 'workspaceRelative' | 'rootRelative' | 'absolutePath' | string;
+  outsideWorkspace?: boolean;
 }
 
 export interface KernelPlanReviewReport {

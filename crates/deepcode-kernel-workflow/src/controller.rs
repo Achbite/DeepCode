@@ -70,8 +70,8 @@ impl Default for WorkflowController {
     fn default() -> Self {
         Self {
             high_risk_capabilities: vec![
-                "workspace.write".to_string(),
-                "workspace.delete".to_string(),
+                "fs.write".to_string(),
+                "fs.delete".to_string(),
                 "process.exec".to_string(),
                 "network.egress".to_string(),
                 "secret.read".to_string(),

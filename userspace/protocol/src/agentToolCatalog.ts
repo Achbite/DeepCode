@@ -4,12 +4,14 @@ import type { ToolDefinition } from './tools.js';
 export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'fs.read',
-    description: 'Read a text file from the active workspace.',
+    description: 'Read a text file. Use workspace-relative path by default, rootId+path for a specific conversation root, or absolutePath only for an explicitly authorized outside-workspace file.',
     inputSchema: {
       type: 'object',
       required: ['path'],
       properties: {
         path: { type: 'string' },
+        rootId: { type: 'string' },
+        absolutePath: { type: 'string' },
         folderId: { type: 'string' },
       },
     },
@@ -19,11 +21,13 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'fs.list',
-    description: 'List a workspace directory tree with a bounded depth.',
+    description: 'List a directory tree with bounded depth. Use workspace-relative path by default, rootId+path for a specific conversation root, or absolutePath only for an explicitly authorized outside-workspace directory.',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string' },
+        rootId: { type: 'string' },
+        absolutePath: { type: 'string' },
         folderId: { type: 'string' },
         depth: { type: 'number' },
       },
@@ -34,12 +38,14 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'fs.diff',
-    description: 'Preview a file diff without writing content.',
+    description: 'Preview a file diff without writing content. Use workspace-relative path by default, rootId+path for a specific conversation root, or absolutePath only for an explicitly authorized outside-workspace file.',
     inputSchema: {
       type: 'object',
       required: ['path', 'newContent'],
       properties: {
         path: { type: 'string' },
+        rootId: { type: 'string' },
+        absolutePath: { type: 'string' },
         folderId: { type: 'string' },
         newContent: { type: 'string' },
       },
@@ -50,7 +56,7 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'code.search',
-    description: 'Search text across the workspace with bounded results.',
+    description: 'Search text with bounded results. Use workspace-relative include filters by default, rootId for a specific conversation root, or absolutePath only for an explicitly authorized outside-workspace root.',
     inputSchema: {
       type: 'object',
       required: ['query'],
@@ -58,6 +64,8 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
         query: { type: 'string' },
         isRegex: { type: 'boolean' },
         include: { type: 'array', items: { type: 'string' } },
+        rootId: { type: 'string' },
+        absolutePath: { type: 'string' },
         folderId: { type: 'string' },
       },
     },
@@ -99,12 +107,14 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'fs.write',
-    description: 'Write a text file after an explicit permission approval.',
+    description: 'Write a text file after explicit permission approval. Use workspace-relative path by default, rootId+path for a specific conversation root, or absolutePath only when Kernel PlanReview granted that outside-workspace file.',
     inputSchema: {
       type: 'object',
       required: ['path', 'content'],
       properties: {
         path: { type: 'string' },
+        rootId: { type: 'string' },
+        absolutePath: { type: 'string' },
         content: { type: 'string' },
         folderId: { type: 'string' },
       },
@@ -114,18 +124,39 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
     allowedModes: ['askBeforeWrite'],
   },
   {
+    name: 'fs.patch',
+    description: 'Patch a text file after exact-block evidence and explicit permission approval. Use workspace-relative path by default, rootId+path for a specific conversation root, or absolutePath only when Kernel PlanReview granted that outside-workspace file.',
+    inputSchema: {
+      type: 'object',
+      required: ['path', 'patchSpec', 'replacement'],
+      properties: {
+        path: { type: 'string' },
+        rootId: { type: 'string' },
+        absolutePath: { type: 'string' },
+        patchSpec: { type: 'object' },
+        replacement: { type: 'string' },
+        folderId: { type: 'string' },
+      },
+    },
+    riskLevel: 'high',
+    needsApproval: true,
+    allowedModes: ['askBeforeWrite'],
+  },
+  {
     name: 'fs.delete',
-    description: 'Delete a workspace file after explicit high-risk permission approval.',
+    description: 'Delete a concrete file after explicit high-risk permission approval. Use workspace-relative path by default, rootId+path for a specific conversation root, or absolutePath only when Kernel PlanReview granted that outside-workspace file.',
     inputSchema: {
       type: 'object',
       required: ['path'],
       properties: {
         path: { type: 'string' },
+        rootId: { type: 'string' },
+        absolutePath: { type: 'string' },
         folderId: { type: 'string' },
         reason: { type: 'string' },
       },
     },
-    riskLevel: 'high',
+    riskLevel: 'critical',
     needsApproval: true,
     allowedModes: ['askBeforeWrite'],
   },
@@ -169,11 +200,12 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'git.diff',
-    description: 'Read workspace Git diff.',
+    description: 'Read Git diff for workspace-relative paths.',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string' },
+        rootId: { type: 'string' },
         staged: { type: 'boolean' },
       },
     },
@@ -189,6 +221,7 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
       properties: {
         path: { type: 'string' },
         paths: { type: 'array', items: { type: 'string' } },
+        rootId: { type: 'string' },
       },
     },
     riskLevel: 'high',
@@ -203,6 +236,7 @@ export const DEFAULT_AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
       properties: {
         path: { type: 'string' },
         paths: { type: 'array', items: { type: 'string' } },
+        rootId: { type: 'string' },
       },
     },
     riskLevel: 'high',

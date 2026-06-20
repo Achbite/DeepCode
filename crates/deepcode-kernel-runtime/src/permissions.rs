@@ -49,7 +49,7 @@ impl DeepCodeKernelRuntime {
                                 .get("toolName")
                                 .and_then(Value::as_str)
                                 .map(capability_for_tool)
-                                .unwrap_or("workspace.write")
+                                .unwrap_or("fs.write")
                         })
                         .to_string(),
                     risk_level: event
@@ -501,7 +501,7 @@ impl DeepCodeKernelRuntime {
                             .grant_scope_contains_argument(run_id, tool_name, arguments, path)
                             .unwrap_or(false)
                 })
-                .unwrap_or(true)
+                .unwrap_or_else(|| unscoped_grant_allows_arguments(&grant.resource_kind, arguments))
         }))
     }
 
@@ -540,6 +540,40 @@ impl DeepCodeKernelRuntime {
                 || argument_display.starts_with(&format!("{grant_display}/")))
         {
             return Ok(true);
+        }
+        if let Some(path_normalization) = arguments.get("pathNormalization") {
+            if let Some(original_path) = path_normalization
+                .get("originalPath")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let original_display = original_path.replace('\\', "/");
+                if original_display == grant_display
+                    || original_display.starts_with(&format!("{grant_display}/"))
+                {
+                    return Ok(true);
+                }
+            }
+            if let Some(prefixes) = path_normalization
+                .get("strippedPathPrefixes")
+                .and_then(Value::as_array)
+            {
+                for prefix in prefixes.iter().filter_map(Value::as_str) {
+                    let prefix = prefix.trim();
+                    if prefix.is_empty() {
+                        continue;
+                    }
+                    let candidate = PathBuf::from(prefix).join(raw_argument_path);
+                    let candidate = candidate.canonicalize().unwrap_or(candidate);
+                    let grant_candidate = grant_path.trim();
+                    let grant_path_buf = PathBuf::from(grant_candidate);
+                    let grant_path_buf = grant_path_buf.canonicalize().unwrap_or(grant_path_buf);
+                    if candidate == grant_path_buf || candidate.starts_with(&grant_path_buf) {
+                        return Ok(true);
+                    }
+                }
+            }
         }
         let grant_path = PathBuf::from(grant_path);
         let grant_path = grant_path.canonicalize().unwrap_or(grant_path);
@@ -606,4 +640,20 @@ fn argument_resource_matches(tool_name: &str, arguments: &Value, path: &str) -> 
             .unwrap_or(false);
     }
     false
+}
+
+fn unscoped_grant_allows_arguments(resource_kind: &str, arguments: &Value) -> bool {
+    match resource_kind {
+        "workspace" | "workspaceFile" => !argument_uses_external_absolute_file(arguments),
+        "externalFile" => false,
+        _ => true,
+    }
+}
+
+fn argument_uses_external_absolute_file(arguments: &Value) -> bool {
+    arguments
+        .get("pathNormalization")
+        .and_then(|value| value.get("rootSource"))
+        .and_then(Value::as_str)
+        == Some("absolutePath")
 }

@@ -32,6 +32,16 @@ pub enum ToolPermissionMode {
     Deny,
 }
 
+impl ToolPermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OperationExecutionMode {
@@ -67,6 +77,30 @@ pub struct KernelToolDescriptor {
     pub read_only: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelToolCatalogSnapshot {
+    pub catalog_version: &'static str,
+    pub catalog_hash: String,
+    pub tools: Vec<KernelToolCatalogTool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelToolCatalogTool {
+    pub tool_id: &'static str,
+    pub capability: &'static str,
+    pub family: ToolFamily,
+    pub operation_kind: Option<&'static str>,
+    pub provider_schema: Value,
+    pub risk: ToolRiskLevel,
+    pub permission_mode: ToolPermissionMode,
+    pub path_scope_policy: &'static str,
+    pub execution_mode: OperationExecutionMode,
+    pub needs_workspace: bool,
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct KernelToolRegistry {
     descriptors: BTreeMap<&'static str, KernelToolDescriptor>,
@@ -93,6 +127,36 @@ impl KernelToolRegistry {
 
     pub fn all(&self) -> impl Iterator<Item = &KernelToolDescriptor> {
         self.descriptors.values()
+    }
+
+    pub fn snapshot(&self) -> KernelToolCatalogSnapshot {
+        let mut tools = self
+            .all()
+            .map(|descriptor| KernelToolCatalogTool {
+                tool_id: descriptor.tool_id,
+                capability: descriptor.capability,
+                family: descriptor.family,
+                operation_kind: operation_kind_for_tool(descriptor.tool_id),
+                provider_schema: provider_schema_for_tool(descriptor.tool_id),
+                risk: descriptor.risk,
+                permission_mode: descriptor.permission_mode,
+                path_scope_policy: path_scope_policy_for_descriptor(descriptor),
+                execution_mode: descriptor.execution_mode,
+                needs_workspace: descriptor.needs_workspace,
+                read_only: descriptor.read_only,
+            })
+            .collect::<Vec<_>>();
+        tools.sort_by(|left, right| left.tool_id.cmp(right.tool_id));
+        let hash_payload = serde_json::json!({
+            "catalogVersion": TOOL_REGISTRY_VERSION,
+            "tools": &tools
+        });
+        let catalog_hash = fnv1a64_hex(&serde_json::to_string(&hash_payload).unwrap_or_default());
+        KernelToolCatalogSnapshot {
+            catalog_version: TOOL_REGISTRY_VERSION,
+            catalog_hash,
+            tools,
+        }
     }
 
     pub fn capability_for_tool(&self, tool_id: &str) -> &'static str {
@@ -144,6 +208,192 @@ impl KernelToolRegistry {
     }
 }
 
+fn fnv1a64_hex(input: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn path_scope_policy_for_descriptor(descriptor: &KernelToolDescriptor) -> &'static str {
+    if !descriptor.needs_workspace {
+        return "none";
+    }
+    if descriptor.read_only {
+        "workspace-read-scope"
+    } else {
+        "workspace-path-scoped-grant"
+    }
+}
+
+fn operation_kind_for_tool(tool_id: &str) -> Option<&'static str> {
+    match tool_id {
+        "fs.read" => Some("read"),
+        "fs.list" => Some("list"),
+        "fs.diff" => Some("diff"),
+        "code.search" => Some("search"),
+        "fs.write" => Some("write"),
+        "fs.patch" => Some("patch"),
+        "fs.delete" => Some("delete"),
+        "git.status" => Some("status"),
+        "git.diff" => Some("diff"),
+        "git.stage" => Some("stage"),
+        "git.unstage" => Some("unstage"),
+        "git.commit" => Some("commit"),
+        "git.push" => Some("push"),
+        "shell.exec" => Some("exec"),
+        "web.search" => Some("search"),
+        "web.fetch" => Some("fetch"),
+        "browser.open" => Some("open"),
+        "browser.reload" => Some("reload"),
+        "browser.snapshot" => Some("snapshot"),
+        "browser.inspect" => Some("inspect"),
+        "browser.click" => Some("click"),
+        "browser.type" => Some("type"),
+        "browser.scroll" => Some("scroll"),
+        "provider.call" => Some("egress"),
+        _ => None,
+    }
+}
+
+fn provider_schema_for_tool(tool_id: &str) -> Value {
+    match tool_id {
+        "fs.read" | "fs.list" | "fs.diff" | "fs.delete" => serde_json::json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "code.search" => serde_json::json!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": { "type": "string" },
+                "include": { "type": "array", "items": { "type": "string" } },
+                "contextLines": { "type": "number" },
+                "maxResults": { "type": "number" }
+            },
+            "additionalProperties": false
+        }),
+        "fs.write" => serde_json::json!({
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "fs.patch" => serde_json::json!({
+            "type": "object",
+            "required": ["path", "patchSpec", "replacement"],
+            "properties": {
+                "path": { "type": "string" },
+                "patchSpec": { "type": "object" },
+                "replacement": { "type": "string" }
+            },
+            "additionalProperties": true
+        }),
+        "git.status" => {
+            serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+        "git.diff" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "staged": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        }),
+        "git.stage" | "git.unstage" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "paths": { "type": "array", "items": { "type": "string" } }
+            },
+            "additionalProperties": false
+        }),
+        "git.commit" => serde_json::json!({
+            "type": "object",
+            "required": ["message"],
+            "properties": {
+                "message": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "git.push" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "remote": { "type": "string" },
+                "branch": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "shell.exec" => serde_json::json!({
+            "type": "object",
+            "required": ["argv"],
+            "properties": {
+                "argv": { "type": "array", "items": { "type": "string" } },
+                "cwd": { "type": "string" },
+                "timeoutMs": { "type": "number" }
+            },
+            "additionalProperties": false
+        }),
+        "web.search" => serde_json::json!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": { "type": "string" },
+                "limit": { "type": "number" }
+            },
+            "additionalProperties": false
+        }),
+        "web.fetch" | "browser.open" => serde_json::json!({
+            "type": "object",
+            "required": ["url"],
+            "properties": {
+                "url": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "browser.click" | "browser.inspect" | "browser.snapshot" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "selector": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "browser.type" => serde_json::json!({
+            "type": "object",
+            "required": ["selector", "text"],
+            "properties": {
+                "selector": { "type": "string" },
+                "text": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "browser.scroll" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "deltaY": { "type": "number" }
+            },
+            "additionalProperties": false
+        }),
+        "browser.reload" | "provider.call" => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+        }),
+        _ => {
+            serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": true })
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannedOperation {
@@ -151,11 +401,67 @@ pub struct PlannedOperation {
     pub title: String,
     pub capability: String,
     pub permission_labels: Vec<String>,
+    #[serde(default)]
+    pub target_ref: Option<FileTargetRef>,
     pub read_set: Vec<String>,
     pub write_set: Vec<String>,
     pub conflict_keys: Vec<String>,
     pub execution_mode: OperationExecutionMode,
     pub operation: PlannedOperationKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTargetRef {
+    pub kind: FileTargetRefKind,
+    pub path: String,
+    #[serde(default)]
+    pub root_id: Option<String>,
+}
+
+impl FileTargetRef {
+    pub fn from_legacy_path(path: impl Into<String>) -> Self {
+        let path = path.into();
+        let kind = if std::path::Path::new(&path).is_absolute() {
+            FileTargetRefKind::AbsolutePath
+        } else {
+            FileTargetRefKind::WorkspaceRelative
+        };
+        Self {
+            kind,
+            path,
+            root_id: None,
+        }
+    }
+
+    pub fn raw_path(&self) -> String {
+        match self.kind {
+            FileTargetRefKind::WorkspaceRelative | FileTargetRefKind::AbsolutePath => {
+                self.path.clone()
+            }
+            FileTargetRefKind::RootRelative => self
+                .root_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|root_id| {
+                    if self.path.trim().is_empty() {
+                        root_id.to_string()
+                    } else {
+                        format!("{}/{}", root_id.trim_end_matches('/'), self.path)
+                    }
+                })
+                .unwrap_or_else(|| self.path.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FileTargetRefKind {
+    WorkspaceRelative,
+    RootRelative,
+    AbsolutePath,
 }
 
 impl PlannedOperation {
@@ -248,6 +554,12 @@ pub struct WorkspaceOperation {
     pub allow_empty_content: bool,
     #[serde(default)]
     pub query: Option<String>,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub context_lines: Option<u64>,
+    #[serde(default)]
+    pub max_results: Option<u64>,
     #[serde(default)]
     pub rename_to: Option<String>,
 }
@@ -350,7 +662,7 @@ pub enum OperationCompileError {
     EmptyActions,
     #[error("action {action_id} is missing capability")]
     MissingCapability { action_id: String },
-    #[error("workspace.write action {action_id} requires sourceBlockId")]
+    #[error("fs.write action {action_id} requires sourceBlockId")]
     MissingSourceBlock { action_id: String },
     #[error("codeBlock {source_block_id} was not provided for action {action_id}")]
     MissingCodeBlock {
@@ -361,13 +673,13 @@ pub enum OperationCompileError {
     MissingCodeContent { source_block_id: String },
     #[error("codeBlock {source_block_id} has empty content; use allowEmptyContent with a createEmpty or patch operation to make that explicit")]
     EmptyCodeContent { source_block_id: String },
-    #[error("workspace action {action_id} requires target path")]
+    #[error("fs action {action_id} requires target path")]
     MissingTargetPath { action_id: String },
-    #[error("workspace.delete action {action_id} requires targetPath or resourceScope")]
+    #[error("fs.delete action {action_id} requires targetPath or resourceScope")]
     MissingDeleteTarget { action_id: String },
-    #[error("workspace.delete cannot remove workspace root")]
+    #[error("fs.delete cannot remove workspace root")]
     DeleteWorkspaceRoot { action_id: String },
-    #[error("workspace.search action {action_id} requires query")]
+    #[error("code.search action {action_id} requires query")]
     MissingSearchQuery { action_id: String },
     #[error("unsupported capability {capability}")]
     UnsupportedCapability { capability: String },
@@ -463,12 +775,13 @@ impl OperationCompiler {
             .map(str::to_string)
             .collect::<Vec<_>>();
         match capability.as_str() {
-            capability if capability.starts_with("workspace.") => self.compile_workspace_action(
+            "fs.read" | "fs.list" | "fs.diff" | "code.search" | "fs.write" | "fs.patch"
+            | "fs.delete" => self.compile_workspace_action(
                 action,
                 code_blocks,
                 id,
                 title,
-                capability,
+                &capability,
                 permission_labels,
             ),
             "git.read" | "git.write" | "git.push" => {
@@ -516,7 +829,11 @@ impl OperationCompiler {
         permission_labels: Vec<String>,
     ) -> Result<PlannedOperation, OperationCompileError> {
         let kind = workspace_kind_for_action(action, capability)?;
-        let mut target_path = get_string(action, &["targetPath", "path"]);
+        let mut target_ref = file_target_ref_from_action(action);
+        let mut target_path = target_ref
+            .as_ref()
+            .map(FileTargetRef::raw_path)
+            .or_else(|| get_string(action, &["targetPath", "path"]));
         let mut source_block_id = get_string(action, &["sourceBlockId"]);
         let mut replacement_block_id = get_string(action, &["replacementBlockId"]);
         let mut content = None;
@@ -557,6 +874,11 @@ impl OperationCompiler {
             }
             content = Some(block_content);
             target_path = target_path.or_else(|| block.target_path.clone());
+            if target_ref.is_none() {
+                target_ref = target_path
+                    .as_ref()
+                    .map(|path| FileTargetRef::from_legacy_path(path.clone()));
+            }
             if kind == WorkspaceOperationKind::Patch {
                 replacement_block_id = Some(block_id.clone());
                 source_block_id = source_block_id.or_else(|| Some(block_id));
@@ -575,6 +897,11 @@ impl OperationCompiler {
             }
         }
         target_path = target_path.or_else(|| first_resource_scope(action));
+        if target_ref.is_none() {
+            target_ref = target_path
+                .as_ref()
+                .map(|path| FileTargetRef::from_legacy_path(path.clone()));
+        }
         if kind == WorkspaceOperationKind::Delete {
             let path = target_path
                 .as_ref()
@@ -598,6 +925,7 @@ impl OperationCompiler {
         ) && target_path.is_none()
         {
             target_path = Some(".".to_string());
+            target_ref = Some(FileTargetRef::from_legacy_path("."));
         }
 
         let mut read_set = Vec::new();
@@ -635,6 +963,7 @@ impl OperationCompiler {
             title,
             capability: capability.to_string(),
             permission_labels,
+            target_ref,
             read_set,
             write_set,
             conflict_keys,
@@ -651,6 +980,9 @@ impl OperationCompiler {
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 query,
+                include: get_string_array(action, "include").unwrap_or_default(),
+                context_lines: action.get("contextLines").and_then(Value::as_u64),
+                max_results: action.get("maxResults").and_then(Value::as_u64),
                 rename_to: get_string(action, &["renameTo", "toPath", "newPath"]),
             }),
         })
@@ -739,6 +1071,7 @@ impl OperationCompiler {
             title,
             capability: capability.to_string(),
             permission_labels,
+            target_ref: None,
             read_set,
             write_set,
             conflict_keys,
@@ -861,7 +1194,7 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
     vec![
         workspace_tool(
             "fs.read",
-            "workspace.read",
+            "fs.read",
             ToolRiskLevel::Low,
             ToolPermissionMode::Allow,
             true,
@@ -869,7 +1202,7 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
         ),
         workspace_tool(
             "fs.list",
-            "workspace.read",
+            "fs.list",
             ToolRiskLevel::Low,
             ToolPermissionMode::Allow,
             true,
@@ -877,7 +1210,7 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
         ),
         workspace_tool(
             "fs.diff",
-            "workspace.preview_diff",
+            "fs.diff",
             ToolRiskLevel::Low,
             ToolPermissionMode::Allow,
             true,
@@ -885,7 +1218,7 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
         ),
         workspace_tool(
             "code.search",
-            "workspace.search",
+            "code.search",
             ToolRiskLevel::Low,
             ToolPermissionMode::Allow,
             true,
@@ -893,7 +1226,7 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
         ),
         workspace_tool(
             "fs.write",
-            "workspace.write",
+            "fs.write",
             ToolRiskLevel::Medium,
             ToolPermissionMode::Ask,
             true,
@@ -901,7 +1234,7 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
         ),
         workspace_tool(
             "fs.patch",
-            "workspace.write",
+            "fs.patch",
             ToolRiskLevel::Medium,
             ToolPermissionMode::Ask,
             true,
@@ -909,7 +1242,7 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
         ),
         workspace_tool(
             "fs.delete",
-            "workspace.delete",
+            "fs.delete",
             ToolRiskLevel::High,
             ToolPermissionMode::Ask,
             true,
@@ -1183,6 +1516,55 @@ fn first_resource_scope(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn file_target_ref_from_action(value: &Value) -> Option<FileTargetRef> {
+    let target_ref = value.get("targetRef")?;
+    if let Some(path) = target_ref
+        .as_str()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return Some(FileTargetRef::from_legacy_path(path.to_string()));
+    }
+    let object = target_ref.as_object()?;
+    let path = object
+        .get("path")
+        .or_else(|| object.get("targetPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?
+        .to_string();
+    let kind = object
+        .get("kind")
+        .or_else(|| object.get("targetKind"))
+        .or_else(|| object.get("type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_else(|| {
+            if std::path::Path::new(&path).is_absolute() {
+                "absolutePath"
+            } else {
+                "workspaceRelative"
+            }
+        });
+    let kind = match kind {
+        "absolutePath" => FileTargetRefKind::AbsolutePath,
+        "rootRelative" => FileTargetRefKind::RootRelative,
+        _ => FileTargetRefKind::WorkspaceRelative,
+    };
+    let root_id = object
+        .get("rootId")
+        .or_else(|| object.get("root"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(str::to_string);
+    Some(FileTargetRef {
+        kind,
+        path,
+        root_id,
+    })
+}
+
 fn get_string_array(value: &Value, key: &str) -> Option<Vec<String>> {
     value
         .get(key)
@@ -1205,14 +1587,13 @@ fn workspace_kind_for_action(
     capability: &str,
 ) -> Result<WorkspaceOperationKind, OperationCompileError> {
     let raw = get_string(action, &["kind"]).unwrap_or_else(|| match capability {
-        "workspace.read" => "read".to_string(),
-        "workspace.list" => "list".to_string(),
-        "workspace.search" => "search".to_string(),
-        "workspace.diff" | "workspace.preview_diff" => "diff".to_string(),
-        "workspace.write" => "write".to_string(),
-        "workspace.create" => "create".to_string(),
-        "workspace.delete" => "delete".to_string(),
-        "workspace.rename" => "rename".to_string(),
+        "fs.read" => "read".to_string(),
+        "fs.list" => "list".to_string(),
+        "code.search" => "search".to_string(),
+        "fs.diff" => "diff".to_string(),
+        "fs.write" => "write".to_string(),
+        "fs.patch" => "patch".to_string(),
+        "fs.delete" => "delete".to_string(),
         _ => "write".to_string(),
     });
     match raw.as_str() {
@@ -1275,7 +1656,16 @@ fn operation_execution_mode(
         .and_then(|tool_id| registry.get(tool_id))
         .map(|descriptor| descriptor.execution_mode)
         .unwrap_or_else(|| {
-            if capability.starts_with("workspace.") {
+            if matches!(
+                capability,
+                "fs.read"
+                    | "fs.list"
+                    | "fs.diff"
+                    | "code.search"
+                    | "fs.write"
+                    | "fs.patch"
+                    | "fs.delete"
+            ) {
                 OperationExecutionMode::Blocked
             } else {
                 OperationExecutionMode::PreviewOnly
@@ -1325,6 +1715,7 @@ fn external_process_operation(
         title,
         capability,
         permission_labels,
+        target_ref: None,
         read_set: Vec::new(),
         write_set: vec!["process".to_string()],
         conflict_keys: vec!["process".to_string()],
@@ -1355,6 +1746,7 @@ fn external_network_operation(
         title,
         capability,
         permission_labels,
+        target_ref: None,
         read_set: Vec::new(),
         write_set: vec!["network.egress".to_string()],
         conflict_keys: vec!["network.egress".to_string()],
@@ -1388,6 +1780,7 @@ fn external_browser_operation(
         title,
         capability,
         permission_labels,
+        target_ref: None,
         read_set: Vec::new(),
         write_set: vec!["browser.control".to_string()],
         conflict_keys: vec!["browser.control".to_string()],
@@ -1412,6 +1805,7 @@ fn external_provider_operation(
         title,
         capability,
         permission_labels,
+        target_ref: None,
         read_set: Vec::new(),
         write_set: vec!["provider.egress".to_string()],
         conflict_keys: vec!["provider.egress".to_string()],
@@ -1430,8 +1824,8 @@ mod tests {
     #[test]
     fn registry_covers_core_tool_families() {
         let registry = KernelToolRegistry::default();
-        assert_eq!(registry.capability_for_tool("fs.write"), "workspace.write");
-        assert_eq!(registry.capability_for_tool("fs.patch"), "workspace.write");
+        assert_eq!(registry.capability_for_tool("fs.write"), "fs.write");
+        assert_eq!(registry.capability_for_tool("fs.patch"), "fs.patch");
         assert_eq!(registry.capability_for_tool("git.status"), "git.read");
         assert_eq!(registry.capability_for_tool("shell.exec"), "process.exec");
         assert_eq!(registry.capability_for_tool("web.fetch"), "network.egress");
@@ -1446,12 +1840,28 @@ mod tests {
     }
 
     #[test]
+    fn registry_snapshot_exposes_canonical_delete_tool() {
+        let snapshot = KernelToolRegistry::default().snapshot();
+        assert_eq!(snapshot.catalog_version, TOOL_REGISTRY_VERSION);
+        assert!(snapshot.catalog_hash.starts_with("fnv1a64:"));
+        let delete = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.tool_id == "fs.delete")
+            .expect("fs.delete tool descriptor is present");
+        assert_eq!(delete.capability, "fs.delete");
+        assert_eq!(delete.operation_kind, Some("delete"));
+        assert_eq!(delete.path_scope_policy, "workspace-path-scoped-grant");
+        assert_eq!(delete.provider_schema["required"][0], "path");
+    }
+
+    #[test]
     fn compiler_requires_write_source_block() {
         let compiler = OperationCompiler::default();
         let batch = serde_json::json!({
             "actions": [{
                 "id": "write-1",
-                "capability": "workspace.write",
+                "capability": "fs.write",
                 "targetPath": "src/lib.rs"
             }]
         });
@@ -1468,7 +1878,7 @@ mod tests {
             "actions": [{
                 "id": "write-1",
                 "title": "Write file",
-                "capability": "workspace.write",
+                "capability": "fs.write",
                 "targetPath": "src/lib.rs",
                 "sourceBlockId": "block-1"
             }],
@@ -1498,10 +1908,10 @@ mod tests {
                 "id": "delete-1",
                 "title": "Delete file",
                 "kind": "delete",
-                "capability": "workspace.delete",
+                "capability": "fs.delete",
                 "targetPath": "generated/obsolete.txt",
                 "resourceScope": ["generated/obsolete.txt"],
-                "permissionLabels": ["workspace.delete"]
+                "permissionLabels": ["fs.delete"]
             }]
         });
         let operations = compiler.compile_batch(&batch).unwrap();
@@ -1517,6 +1927,31 @@ mod tests {
     }
 
     #[test]
+    fn compiler_builds_workspace_delete_operation_from_target_ref() {
+        let compiler = OperationCompiler::default();
+        let batch = serde_json::json!({
+            "actions": [{
+                "id": "delete-1",
+                "title": "Delete file",
+                "kind": "delete",
+                "capability": "fs.delete",
+                "targetRef": {
+                    "kind": "workspaceRelative",
+                    "path": "generated/obsolete.txt"
+                },
+                "permissionLabels": ["fs.delete"]
+            }]
+        });
+        let operations = compiler.compile_batch(&batch).unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].write_set, vec!["generated/obsolete.txt"]);
+        assert!(operations[0].target_ref.as_ref().is_some_and(|target| {
+            target.kind == FileTargetRefKind::WorkspaceRelative
+                && target.path == "generated/obsolete.txt"
+        }));
+    }
+
+    #[test]
     fn compiler_rejects_workspace_delete_without_target() {
         let compiler = OperationCompiler::default();
         let batch = serde_json::json!({
@@ -1524,9 +1959,9 @@ mod tests {
                 "id": "delete-1",
                 "title": "Delete file",
                 "kind": "delete",
-                "capability": "workspace.delete",
+                "capability": "fs.delete",
                 "resourceScope": [],
-                "permissionLabels": ["workspace.delete"]
+                "permissionLabels": ["fs.delete"]
             }]
         });
         assert!(matches!(
@@ -1543,10 +1978,10 @@ mod tests {
                 "id": "delete-1",
                 "title": "Delete root",
                 "kind": "delete",
-                "capability": "workspace.delete",
+                "capability": "fs.delete",
                 "targetPath": ".",
                 "resourceScope": ["."],
-                "permissionLabels": ["workspace.delete"]
+                "permissionLabels": ["fs.delete"]
             }]
         });
         assert!(matches!(
@@ -1562,7 +1997,7 @@ mod tests {
             "actions": [{
                 "id": "write-1",
                 "title": "Write file",
-                "capability": "workspace.write",
+                "capability": "fs.write",
                 "targetPath": "src/lib.rs",
                 "sourceBlockId": "block-1"
             }],
@@ -1586,7 +2021,7 @@ mod tests {
                 "id": "patch-1",
                 "title": "Patch file",
                 "kind": "replaceBlock",
-                "capability": "workspace.write",
+                "capability": "fs.patch",
                 "targetPath": "src/lib.rs",
                 "replacementBlockId": "block-1",
                 "patchSpec": {
@@ -1616,8 +2051,9 @@ mod tests {
             PlannedOperation {
                 id: "read".to_string(),
                 title: "Read".to_string(),
-                capability: "workspace.read".to_string(),
+                capability: "fs.read".to_string(),
                 permission_labels: Vec::new(),
+                target_ref: Some(FileTargetRef::from_legacy_path("src/lib.rs")),
                 read_set: vec!["src/lib.rs".to_string()],
                 write_set: Vec::new(),
                 conflict_keys: vec!["src/lib.rs".to_string()],
@@ -1631,14 +2067,18 @@ mod tests {
                     patch_spec: None,
                     allow_empty_content: false,
                     query: None,
+                    include: Vec::new(),
+                    context_lines: None,
+                    max_results: None,
                     rename_to: None,
                 }),
             },
             PlannedOperation {
                 id: "write".to_string(),
                 title: "Write".to_string(),
-                capability: "workspace.write".to_string(),
+                capability: "fs.write".to_string(),
                 permission_labels: Vec::new(),
+                target_ref: Some(FileTargetRef::from_legacy_path("src/lib.rs")),
                 read_set: Vec::new(),
                 write_set: vec!["src/lib.rs".to_string()],
                 conflict_keys: vec!["src/lib.rs".to_string()],
@@ -1652,6 +2092,9 @@ mod tests {
                     patch_spec: None,
                     allow_empty_content: false,
                     query: None,
+                    include: Vec::new(),
+                    context_lines: None,
+                    max_results: None,
                     rename_to: None,
                 }),
             },

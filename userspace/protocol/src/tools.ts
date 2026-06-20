@@ -4,9 +4,38 @@ export interface ToolDefinition {
   name: string;
   description: string;
   inputSchema: object;
-  riskLevel: 'low' | 'medium' | 'high';
+  riskLevel: 'low' | 'medium' | 'high' | 'critical';
   needsApproval: boolean;
   allowedModes: AgentMode[];
+  capability?: string;
+  family?: 'workspace' | 'git' | 'process' | 'network' | 'browser' | 'provider' | string;
+  operationKind?: string;
+  permissionMode?: 'allow' | 'ask' | 'deny' | string;
+  pathScopePolicy?: string;
+  executionMode?: 'execute' | 'previewOnly' | 'blocked' | string;
+  readOnly?: boolean;
+  catalogVersion?: string;
+  catalogHash?: string;
+}
+
+export interface KernelToolCatalogTool {
+  toolId: string;
+  capability: string;
+  family: 'workspace' | 'git' | 'process' | 'network' | 'browser' | 'provider' | string;
+  operationKind?: string;
+  providerSchema: object;
+  risk: 'low' | 'medium' | 'high' | 'critical' | string;
+  permissionMode: 'allow' | 'ask' | 'deny' | string;
+  pathScopePolicy: string;
+  executionMode: 'execute' | 'previewOnly' | 'blocked' | string;
+  needsWorkspace: boolean;
+  readOnly: boolean;
+}
+
+export interface KernelToolCatalogSnapshot {
+  catalogVersion: string;
+  catalogHash: string;
+  tools: KernelToolCatalogTool[];
 }
 
 export interface ToolCall {
@@ -36,6 +65,10 @@ export interface PermissionEvaluationRequest {
 
 export interface ListToolsResult {
   tools: ToolDefinition[];
+  catalogVersion?: string;
+  catalogHash?: string;
+  toolCatalog?: KernelToolCatalogSnapshot;
+  skills?: unknown[];
 }
 
 export interface FsReadInput {

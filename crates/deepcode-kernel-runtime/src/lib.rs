@@ -25,9 +25,10 @@ use deepcode_kernel_skills::{
     SkillTrustMode, SkillTrustRecord,
 };
 use deepcode_kernel_tools::{
-    GitOperation, GitOperationKind, KernelToolRegistry, OperationCompileError, OperationCompiler,
-    OperationExecutionMode, PlannedOperation, PlannedOperationKind, ToolPermissionMode,
-    WorkUnitGraph, WorkspaceOperation, WorkspaceOperationKind,
+    GitOperation, GitOperationKind, KernelToolCatalogSnapshot, KernelToolRegistry,
+    OperationCompileError, OperationCompiler, OperationExecutionMode, PlannedOperation,
+    PlannedOperationKind, ToolPermissionMode, WorkUnitGraph, WorkspaceOperation,
+    WorkspaceOperationKind,
 };
 use deepcode_kernel_workflow::{
     ActionBundleDraft, BuiltinWorkflowMachine, CompletionCriteria, DefaultPlanReviewEngine,
@@ -60,6 +61,14 @@ pub const TOOL_CATALOG_VERSION: &str = "deepcode.tool_catalog.session-v3.v1";
 
 pub fn kernel_visible_tool_catalog_count() -> usize {
     KernelToolRegistry::default().all().count()
+}
+
+pub fn kernel_tool_catalog_snapshot() -> KernelToolCatalogSnapshot {
+    KernelToolRegistry::default().snapshot()
+}
+
+pub fn kernel_tool_catalog_hash() -> String {
+    kernel_tool_catalog_snapshot().catalog_hash
 }
 
 pub struct DeepCodeKernelRuntime {

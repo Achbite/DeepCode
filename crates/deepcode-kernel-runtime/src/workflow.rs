@@ -887,6 +887,7 @@ fn empty_workspace_binding() -> WorkspaceBinding {
 
 impl DeepCodeKernelRuntime {
     fn state_contract_for_record(&self, record: &RuntimeRunRecord) -> KernelStateContract {
+        let tool_catalog_snapshot = kernel_tool_catalog_snapshot();
         KernelStateContract {
             run_id: RunId(record.run_id.clone()),
             workflow_ref: Some(WorkflowRef {
@@ -911,10 +912,13 @@ impl DeepCodeKernelRuntime {
             proposal_schema_refs: vec!["deepcode.agent.protocol.v3".to_string()],
             required_user_decision: None,
             capability_projection: vec![
-                "workspace.read".to_string(),
-                "workspace.search".to_string(),
-                "workspace.write".to_string(),
-                "workspace.delete".to_string(),
+                "fs.read".to_string(),
+                "fs.list".to_string(),
+                "fs.diff".to_string(),
+                "code.search".to_string(),
+                "fs.write".to_string(),
+                "fs.patch".to_string(),
+                "fs.delete".to_string(),
                 "process.exec".to_string(),
                 "network.egress".to_string(),
                 "git.read".to_string(),
@@ -925,6 +929,10 @@ impl DeepCodeKernelRuntime {
                 "provider.egress".to_string(),
             ],
             tool_catalog_ref: Some(TOOL_CATALOG_VERSION.to_string()),
+            tool_catalog_hash: Some(tool_catalog_snapshot.catalog_hash.clone()),
+            tool_catalog_snapshot: Some(
+                serde_json::to_value(&tool_catalog_snapshot).unwrap_or(Value::Null),
+            ),
             transition_predicates: vec![
                 "proposal must match allowed proposals".to_string(),
                 "side effects require Kernel permission gates".to_string(),

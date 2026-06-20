@@ -28,8 +28,8 @@ pub fn builtin_plan_check_complete_review() -> WorkflowDescriptor {
                 id: "plan".to_string(),
                 kind: WorkflowStateKind::Llm,
                 allowed_capabilities: vec![
-                    "workspace.read".to_string(),
-                    "workspace.search".to_string(),
+                    "fs.read".to_string(),
+                    "code.search".to_string(),
                     "web.search".to_string(),
                     "context.assemble".to_string(),
                 ],
@@ -69,11 +69,11 @@ pub fn builtin_plan_check_complete_review() -> WorkflowDescriptor {
                 id: "complete".to_string(),
                 kind: WorkflowStateKind::LlmTool,
                 allowed_capabilities: vec![
-                    "workspace.read".to_string(),
-                    "workspace.search".to_string(),
-                    "workspace.write".to_string(),
-                    "workspace.create".to_string(),
-                    "workspace.delete".to_string(),
+                    "fs.read".to_string(),
+                    "code.search".to_string(),
+                    "fs.write".to_string(),
+                    "fs.patch".to_string(),
+                    "fs.delete".to_string(),
                     "process.exec".to_string(),
                 ],
                 allowed_proposals: vec![
@@ -93,7 +93,7 @@ pub fn builtin_plan_check_complete_review() -> WorkflowDescriptor {
                 id: "review".to_string(),
                 kind: WorkflowStateKind::KernelReview,
                 allowed_capabilities: vec![
-                    "workspace.read".to_string(),
+                    "fs.read".to_string(),
                     "evidence.query".to_string(),
                     "validation.read".to_string(),
                     "reviewgate.evaluate".to_string(),

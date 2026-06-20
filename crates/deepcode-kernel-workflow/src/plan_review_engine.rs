@@ -1,4 +1,4 @@
-use crate::{ActionBundleDraft, PlanContract, PlannedAction};
+use crate::{ActionBundleDraft, FileTargetRef, FileTargetRefKind, PlanContract, PlannedAction};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Component;
@@ -32,6 +32,12 @@ pub struct RequiredFileOperation {
     pub target_path: String,
     pub capability: String,
     pub action_id: String,
+    #[serde(default)]
+    pub target_ref: Option<FileTargetRef>,
+    #[serde(default)]
+    pub target_kind: String,
+    #[serde(default)]
+    pub outside_workspace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -280,12 +286,22 @@ fn required_file_operations_for_input(
         let Some(operation) = mutation_operation_for_action(action) else {
             continue;
         };
-        let raw_target = action.target_path.as_deref().or_else(|| {
-            action
-                .resource_scope
-                .iter()
-                .find_map(|scope| concrete_target(scope))
-        });
+        let raw_target = action
+            .target_ref
+            .as_ref()
+            .map(file_target_ref_raw_path)
+            .or_else(|| {
+                action
+                    .target_path
+                    .as_deref()
+                    .map(str::to_string)
+                    .or_else(|| {
+                        action
+                            .resource_scope
+                            .iter()
+                            .find_map(|scope| concrete_target(scope).map(str::to_string))
+                    })
+            });
         let Some(raw_target) = raw_target else {
             findings.push(file_operation_finding(
                 "file_operation_target_required",
@@ -294,18 +310,21 @@ fn required_file_operations_for_input(
             ));
             continue;
         };
-        match normalize_file_operation_target(raw_target) {
-            Ok(target_path) => {
+        match normalize_file_operation_target(&raw_target) {
+            Ok(target) => {
                 let key = format!(
                     "{}:{}:{}:{}",
-                    operation, action.capability, action.id, target_path
+                    operation, action.capability, action.id, target.target_path
                 );
                 if seen.insert(key) {
                     operations.push(RequiredFileOperation {
                         operation: operation.to_string(),
-                        target_path,
+                        target_path: target.target_path,
                         capability: action.capability.clone(),
                         action_id: action.id.clone(),
+                        target_ref: Some(target.target_ref),
+                        target_kind: target.target_kind.to_string(),
+                        outside_workspace: target.outside_workspace,
                     });
                 }
             }
@@ -345,15 +364,42 @@ fn mutation_operation_for_action(action: &PlannedAction) -> Option<&'static str>
 
 fn mutation_operation_for_capability(capability: &str) -> Option<&'static str> {
     match capability {
-        "workspace.write" => Some("write"),
-        "workspace.create" => Some("create"),
-        "workspace.delete" => Some("delete"),
-        "workspace.rename" => Some("rename"),
+        "fs.write" => Some("write"),
+        "fs.patch" => Some("write"),
+        "fs.delete" => Some("delete"),
         _ => None,
     }
 }
 
-fn normalize_file_operation_target(raw: &str) -> Result<String, String> {
+struct NormalizedFileOperationTarget {
+    target_path: String,
+    target_ref: FileTargetRef,
+    target_kind: &'static str,
+    outside_workspace: bool,
+}
+
+fn file_target_ref_raw_path(target_ref: &FileTargetRef) -> String {
+    match target_ref.kind {
+        FileTargetRefKind::WorkspaceRelative | FileTargetRefKind::AbsolutePath => {
+            target_ref.path.clone()
+        }
+        FileTargetRefKind::RootRelative => target_ref
+            .root_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .map(|root| {
+                if target_ref.path.trim().is_empty() {
+                    root.to_string()
+                } else {
+                    format!("{}/{}", root.trim_end_matches('/'), target_ref.path)
+                }
+            })
+            .unwrap_or_else(|| target_ref.path.clone()),
+    }
+}
+
+fn normalize_file_operation_target(raw: &str) -> Result<NormalizedFileOperationTarget, String> {
     let normalized = raw.trim().replace('\\', "/");
     if normalized.is_empty() || normalized == "." || normalized == "./" {
         return Err("target must be a concrete file path, not the workspace root".to_string());
@@ -363,7 +409,32 @@ fn normalize_file_operation_target(raw: &str) -> Result<String, String> {
     }
     let path = std::path::Path::new(&normalized);
     if path.is_absolute() {
-        return Err("target must be relative to the authorized workspace root".to_string());
+        let mut has_file_component = false;
+        for component in path.components() {
+            match component {
+                Component::Normal(_) => has_file_component = true,
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err("absolute target must not contain parent traversal".to_string())
+                }
+                Component::RootDir | Component::Prefix(_) => {}
+            }
+        }
+        if !has_file_component || normalized.ends_with('/') {
+            return Err(
+                "absolute target must be a concrete file path, not a directory".to_string(),
+            );
+        }
+        return Ok(NormalizedFileOperationTarget {
+            target_path: normalized.clone(),
+            target_ref: FileTargetRef {
+                kind: FileTargetRefKind::AbsolutePath,
+                path: normalized,
+                root_id: None,
+            },
+            target_kind: "absolutePath",
+            outside_workspace: true,
+        });
     }
     let mut components = Vec::new();
     for component in path.components() {
@@ -374,7 +445,10 @@ fn normalize_file_operation_target(raw: &str) -> Result<String, String> {
                 return Err("target must not escape the authorized workspace root".to_string())
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err("target must be relative to the authorized workspace root".to_string())
+                return Err(
+                    "target must be workspace-relative or a concrete absolute file path"
+                        .to_string(),
+                )
             }
         }
     }
@@ -385,14 +459,23 @@ fn normalize_file_operation_target(raw: &str) -> Result<String, String> {
     if target.ends_with('/') {
         return Err("target must be a concrete file path, not a directory".to_string());
     }
-    Ok(target)
+    Ok(NormalizedFileOperationTarget {
+        target_path: target.clone(),
+        target_ref: FileTargetRef {
+            kind: FileTargetRefKind::WorkspaceRelative,
+            path: target,
+            root_id: None,
+        },
+        target_kind: "workspaceRelative",
+        outside_workspace: false,
+    })
 }
 
 fn file_operation_finding(code: &str, action: &PlannedAction, reason: &str) -> PlanReviewFinding {
     PlanReviewFinding {
         code: code.to_string(),
         message: format!(
-            "workspace mutation action {} ({}) {}",
+            "file operation action {} ({}) {}",
             action.id, action.capability, reason
         ),
     }
@@ -401,14 +484,12 @@ fn file_operation_finding(code: &str, action: &PlannedAction, reason: &str) -> P
 fn known_capability(capability: &str) -> bool {
     matches!(
         capability,
-        "workspace.read"
-            | "workspace.preview_diff"
-            | "workspace.write"
-            | "workspace.create"
-            | "workspace.delete"
-            | "workspace.rename"
-            | "workspace.list"
-            | "workspace.search"
+        "fs.read"
+            | "fs.diff"
+            | "fs.write"
+            | "fs.patch"
+            | "fs.delete"
+            | "fs.list"
             | "code.search"
             | "git.read"
             | "git.write"
@@ -434,10 +515,9 @@ fn known_capability(capability: &str) -> bool {
 fn permission_gap_capability(capability: &str) -> bool {
     matches!(
         capability,
-        "workspace.write"
-            | "workspace.create"
-            | "workspace.delete"
-            | "workspace.rename"
+        "fs.write"
+            | "fs.patch"
+            | "fs.delete"
             | "git.write"
             | "git.push"
             | "browser.control"
@@ -463,7 +543,7 @@ mod tests {
 
         assert_eq!(report.plan_id, "plan-1");
         assert_eq!(report.status, PlanReviewStatus::AutoAccepted);
-        assert_eq!(report.required_capabilities, vec!["workspace.read"]);
+        assert_eq!(report.required_capabilities, vec!["fs.read"]);
         assert!(report.permission_gaps.is_empty());
         assert!(report
             .kernel_generated_permission_summary
@@ -472,12 +552,7 @@ mod tests {
 
     #[test]
     fn write_process_network_and_secret_create_permission_gaps() {
-        for capability in [
-            "workspace.write",
-            "process.exec",
-            "network.egress",
-            "secret.read",
-        ] {
+        for capability in ["fs.write", "process.exec", "network.egress", "secret.read"] {
             let mut plan = PlanContract::low_risk_direct("plan-gap", "gap");
             plan.required_capabilities = vec![capability.to_string()];
             let report = DefaultPlanReviewEngine.review_plan(&plan);
@@ -539,7 +614,8 @@ mod tests {
                 id: "action-1".to_string(),
                 title: "LLM says admin permission is needed".to_string(),
                 kind: None,
-                capability: "workspace.write".to_string(),
+                capability: "fs.write".to_string(),
+                target_ref: None,
                 target_path: None,
                 resource_scope: vec!["src".to_string()],
                 can_parallelize: false,
@@ -559,7 +635,7 @@ mod tests {
         });
 
         assert_eq!(report.status, PlanReviewStatus::AwaitingTemporaryGrant);
-        assert_eq!(report.permission_gaps, vec!["workspace.write"]);
+        assert_eq!(report.permission_gaps, vec!["fs.write"]);
         assert!(!report
             .kernel_generated_permission_summary
             .contains("admin permission"));
@@ -579,7 +655,8 @@ mod tests {
                     id: "write-generic".to_string(),
                     title: "Write generic output".to_string(),
                     kind: Some("write".to_string()),
-                    capability: "workspace.write".to_string(),
+                    capability: "fs.write".to_string(),
+                    target_ref: None,
                     target_path: Some("./generic-output.txt".to_string()),
                     resource_scope: Vec::new(),
                     can_parallelize: false,
@@ -590,7 +667,8 @@ mod tests {
                     id: "delete-generic".to_string(),
                     title: "Delete generic obsolete file".to_string(),
                     kind: Some("delete".to_string()),
-                    capability: "workspace.delete".to_string(),
+                    capability: "fs.delete".to_string(),
+                    target_ref: None,
                     target_path: None,
                     resource_scope: vec!["generic-obsolete.tmp".to_string()],
                     can_parallelize: false,
@@ -611,13 +689,110 @@ mod tests {
         assert_eq!(report.required_file_operations.len(), 2);
         assert!(report.required_file_operations.iter().any(|operation| {
             operation.operation == "write"
-                && operation.capability == "workspace.write"
+                && operation.capability == "fs.write"
                 && operation.target_path == "generic-output.txt"
+                && operation.target_ref.as_ref().is_some_and(|target| {
+                    target.kind == FileTargetRefKind::WorkspaceRelative
+                        && target.path == "generic-output.txt"
+                })
+                && operation.target_kind == "workspaceRelative"
+                && !operation.outside_workspace
         }));
         assert!(report.required_file_operations.iter().any(|operation| {
             operation.operation == "delete"
-                && operation.capability == "workspace.delete"
+                && operation.capability == "fs.delete"
                 && operation.target_path == "generic-obsolete.tmp"
+                && operation.target_ref.as_ref().is_some_and(|target| {
+                    target.kind == FileTargetRefKind::WorkspaceRelative
+                        && target.path == "generic-obsolete.tmp"
+                })
+                && operation.target_kind == "workspaceRelative"
+                && !operation.outside_workspace
+        }));
+    }
+
+    #[test]
+    fn action_bundle_review_reports_absolute_file_targets_as_outside_workspace() {
+        let plan = PlanContract::low_risk_direct("plan-absolute-file-op", "absolute file op");
+        let absolute_target = std::env::temp_dir()
+            .join(format!("deepcode-plan-review-{}.txt", std::process::id()))
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bundle = ActionBundleDraft {
+            id: "bundle-absolute-file-op".to_string(),
+            goal: "update outside file".to_string(),
+            actions: vec![PlannedAction {
+                id: "write-absolute".to_string(),
+                title: "Write outside file".to_string(),
+                kind: Some("write".to_string()),
+                capability: "fs.write".to_string(),
+                target_ref: None,
+                target_path: Some(absolute_target.clone()),
+                resource_scope: Vec::new(),
+                can_parallelize: false,
+                conflict_keys: Vec::new(),
+                purpose: None,
+            }],
+            validation_expectations: Vec::new(),
+            review_expectations: Vec::new(),
+        };
+
+        let report = DefaultPlanReviewEngine.review_input(PlanReviewInput {
+            plan,
+            action_bundle: Some(bundle),
+        });
+
+        assert_eq!(report.status, PlanReviewStatus::AwaitingTemporaryGrant);
+        assert_eq!(report.required_file_operations.len(), 1);
+        let operation = &report.required_file_operations[0];
+        assert_eq!(operation.operation, "write");
+        assert_eq!(operation.capability, "fs.write");
+        assert_eq!(operation.target_path, absolute_target);
+        assert!(operation.target_ref.as_ref().is_some_and(|target| {
+            target.kind == FileTargetRefKind::AbsolutePath && target.path == absolute_target
+        }));
+        assert_eq!(operation.target_kind, "absolutePath");
+        assert!(operation.outside_workspace);
+    }
+
+    #[test]
+    fn action_bundle_review_accepts_canonical_target_ref() {
+        let plan = PlanContract::low_risk_direct("plan-target-ref", "target ref file op");
+        let bundle = ActionBundleDraft {
+            id: "bundle-target-ref".to_string(),
+            goal: "delete target ref file".to_string(),
+            actions: vec![PlannedAction {
+                id: "delete-target-ref".to_string(),
+                title: "Delete target ref file".to_string(),
+                kind: Some("delete".to_string()),
+                capability: "fs.delete".to_string(),
+                target_ref: Some(FileTargetRef {
+                    kind: FileTargetRefKind::WorkspaceRelative,
+                    path: "generic-target-ref.tmp".to_string(),
+                    root_id: None,
+                }),
+                target_path: None,
+                resource_scope: Vec::new(),
+                can_parallelize: false,
+                conflict_keys: Vec::new(),
+                purpose: None,
+            }],
+            validation_expectations: Vec::new(),
+            review_expectations: Vec::new(),
+        };
+
+        let report = DefaultPlanReviewEngine.review_input(PlanReviewInput {
+            plan,
+            action_bundle: Some(bundle),
+        });
+
+        assert_eq!(report.status, PlanReviewStatus::AwaitingTemporaryGrant);
+        assert_eq!(report.required_file_operations.len(), 1);
+        let operation = &report.required_file_operations[0];
+        assert_eq!(operation.target_path, "generic-target-ref.tmp");
+        assert!(operation.target_ref.as_ref().is_some_and(|target| {
+            target.kind == FileTargetRefKind::WorkspaceRelative
+                && target.path == "generic-target-ref.tmp"
         }));
     }
 
@@ -631,7 +806,8 @@ mod tests {
                 id: "delete-root".to_string(),
                 title: "Delete root".to_string(),
                 kind: Some("delete".to_string()),
-                capability: "workspace.delete".to_string(),
+                capability: "fs.delete".to_string(),
+                target_ref: None,
                 target_path: Some(".".to_string()),
                 resource_scope: Vec::new(),
                 can_parallelize: false,

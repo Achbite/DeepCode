@@ -282,7 +282,7 @@ fn extract_tool_path(
     error: &Option<deepcode_kernel_abi::KernelErrorEnvelope>,
 ) -> Option<String> {
     match tool_name {
-        "fs.list" | "fs.read" | "fs.write" | "fs.delete" | "code.search" => output
+        "fs.list" | "fs.read" | "fs.write" | "fs.patch" | "fs.delete" | "code.search" => output
             .as_ref()
             .and_then(|value| {
                 [

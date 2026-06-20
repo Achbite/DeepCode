@@ -1,5 +1,5 @@
 use crate::{
-    SkillDescriptor, SkillExecutionContext, SkillExecutor, SkillInvocation, SkillResult, builtin,
+    builtin, SkillDescriptor, SkillExecutionContext, SkillExecutor, SkillInvocation, SkillResult,
 };
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use deepcode_kernel_policy::{Capability, CapabilityEffect, RiskLevel, WorkspaceBoundary};

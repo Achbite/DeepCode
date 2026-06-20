@@ -114,30 +114,68 @@ impl DeepCodeKernelRuntime {
             );
             let capability = operation.capability.as_str();
             let kind = operation_kind_name(operation);
-            let work_unit = serde_json::json!({
+            let mut compiled_result = if operation.execution_mode == OperationExecutionMode::Execute
+            {
+                match compile_operation(self, &record, operation)
+                    .and_then(|compiled| validate_compiled_operation(operation, compiled))
+                {
+                    Ok(compiled) => Some(Ok(compiled)),
+                    Err(error) => Some(Err(error)),
+                }
+            } else {
+                None
+            };
+            let compiled_tool = compiled_result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map(compiled_tool_summary);
+            let compile_error = compiled_result
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(|error| KernelErrorEnvelope::from(error));
+            let mut work_unit = serde_json::json!({
                 "id": &work_unit_id,
                 "planId": &plan_id,
                 "actionId": &action_id,
                 "title": &operation.title,
                 "capability": capability,
                 "kind": kind,
+                "targetRef": &operation.target_ref,
                 "readSet": &operation.read_set,
                 "writeSet": &operation.write_set,
                 "conflictKeys": &operation.conflict_keys,
                 "executionMode": operation.execution_mode,
                 "status": "queued"
             });
+            if matches!(
+                &operation.operation,
+                PlannedOperationKind::Workspace(WorkspaceOperation {
+                    kind: WorkspaceOperationKind::Delete,
+                    ..
+                })
+            ) {
+                if let Some(object) = work_unit.as_object_mut() {
+                    object.insert(
+                        "deleteSet".to_string(),
+                        serde_json::json!(&operation.write_set),
+                    );
+                }
+            }
+            if let Some(compiled_tool) = compiled_tool {
+                if let Some(object) = work_unit.as_object_mut() {
+                    object.insert("compiledTool".to_string(), compiled_tool);
+                }
+            }
+            if let Some(compile_error) = compile_error {
+                if let Some(object) = work_unit.as_object_mut() {
+                    object.insert("compileError".to_string(), serde_json::json!(compile_error));
+                }
+            }
             events.push(self.work_unit_queued_event(
                 &request_id,
                 &run_id_text,
                 &session_id_text,
                 work_unit,
-            )?);
-            events.push(self.work_unit_started_event(
-                &request_id,
-                &run_id_text,
-                &session_id_text,
-                &work_unit_id,
             )?);
 
             if operation.execution_mode != OperationExecutionMode::Execute {
@@ -153,7 +191,10 @@ impl DeepCodeKernelRuntime {
                 continue;
             }
 
-            let mut compiled = match compile_operation(self, &record, operation) {
+            let mut compiled = match compiled_result
+                .take()
+                .expect("execute work unit compiles before it is queued")
+            {
                 Ok(compiled) => compiled,
                 Err(error) => {
                     events.push(self.work_unit_failed_event(
@@ -166,6 +207,12 @@ impl DeepCodeKernelRuntime {
                     continue;
                 }
             };
+            events.push(self.work_unit_started_event(
+                &request_id,
+                &run_id_text,
+                &session_id_text,
+                &work_unit_id,
+            )?);
             attach_kernel_context_to_arguments(
                 &mut compiled.arguments,
                 &plan_id,
@@ -175,14 +222,25 @@ impl DeepCodeKernelRuntime {
             );
 
             if let Some(root) = compiled.workspace_root.as_ref() {
-                let mut workspace_events = self.workspace_open(
-                    RequestId(format!(
-                        "action-batch-workspace-{}",
-                        safe_work_unit_segment(&work_unit_id)
-                    )),
-                    root.to_string_lossy().to_string(),
-                )?;
-                events.append(&mut workspace_events);
+                if !root.is_dir() {
+                    events.push(self.work_unit_failed_event(
+                        &request_id,
+                        &run_id_text,
+                        &session_id_text,
+                        &work_unit_id,
+                        &KernelError::InvalidCommand(format!(
+                            "kernel execution root is not a directory: {}",
+                            root.to_string_lossy()
+                        )),
+                    )?);
+                    continue;
+                }
+                if let Some(object) = compiled.arguments.as_object_mut() {
+                    object.insert(
+                        "kernelExecutionRoot".to_string(),
+                        Value::String(root.to_string_lossy().to_string()),
+                    );
+                }
             }
 
             let tool_call_id = format!(
@@ -294,6 +352,7 @@ impl DeepCodeKernelRuntime {
                 continue;
             }
 
+            let executed_tool_name = compiled.tool_name.clone();
             let tool_event = self.execute_bound_tool(
                 &run_id_text,
                 &session_id_text,
@@ -323,8 +382,10 @@ impl DeepCodeKernelRuntime {
                 )?);
             } else {
                 let error = tool_error.unwrap_or_else(|| KernelErrorEnvelope {
-                    code: "workspace_write_failed".to_string(),
-                    message: "workspace.write did not produce a successful tool result".to_string(),
+                    code: format!("{}_failed", executed_tool_name.replace('.', "_")),
+                    message: format!(
+                        "{executed_tool_name} did not produce a successful tool result"
+                    ),
                     message_key: None,
                     args: None,
                 });
@@ -554,6 +615,22 @@ fn operation_kind_name(operation: &PlannedOperation) -> &'static str {
     }
 }
 
+fn fs_tool_name_for_workspace_operation(operation: &PlannedOperation) -> &'static str {
+    match &operation.operation {
+        PlannedOperationKind::Workspace(WorkspaceOperation { kind, .. }) => match kind {
+            WorkspaceOperationKind::Patch => "fs.patch",
+            WorkspaceOperationKind::Delete => "fs.delete",
+            WorkspaceOperationKind::Search => "code.search",
+            WorkspaceOperationKind::Read => "fs.read",
+            WorkspaceOperationKind::List => "fs.list",
+            WorkspaceOperationKind::Diff => "fs.diff",
+            WorkspaceOperationKind::Write | WorkspaceOperationKind::Create => "fs.write",
+            WorkspaceOperationKind::Rename => "fs.rename",
+        },
+        _ => operation_kind_name(operation),
+    }
+}
+
 fn compile_operation(
     runtime: &DeepCodeKernelRuntime,
     record: &RuntimeRunRecord,
@@ -561,26 +638,9 @@ fn compile_operation(
 ) -> KernelResult<CompiledWorkspaceAction> {
     match &operation.operation {
         PlannedOperationKind::Workspace(workspace) => {
-            let (action, code_blocks) = workspace_operation_to_legacy_action(operation, workspace);
-            compile_workspace_action(
-                runtime,
-                record,
-                &action,
-                &code_blocks,
-                &operation.capability,
-                operation_kind_name(operation),
-            )
+            compile_workspace_operation(runtime, record, operation, workspace)
         }
-        PlannedOperationKind::Git(git) => {
-            let action = git_operation_to_legacy_action(git);
-            compile_git_action(
-                runtime,
-                record,
-                &action,
-                &operation.capability,
-                operation_kind_name(operation),
-            )
-        }
+        PlannedOperationKind::Git(git) => compile_git_operation(runtime, record, operation, git),
         PlannedOperationKind::Process(_)
         | PlannedOperationKind::Network(_)
         | PlannedOperationKind::Browser(_)
@@ -591,156 +651,139 @@ fn compile_operation(
     }
 }
 
-fn workspace_operation_to_legacy_action(
+fn validate_compiled_operation(
     operation: &PlannedOperation,
-    workspace: &WorkspaceOperation,
-) -> (Value, std::collections::BTreeMap<String, Value>) {
-    let mut action = serde_json::json!({
-        "id": &operation.id,
-        "title": &operation.title,
-        "capability": &operation.capability,
-        "kind": operation_kind_name(operation),
-        "resourceScope": workspace
-            .target_path
-            .as_ref()
-            .map(|path| serde_json::json!([path]))
-            .unwrap_or_else(|| serde_json::json!([]))
-    });
-    if let Some(path) = workspace.target_path.as_ref() {
-        action["targetPath"] = Value::String(path.clone());
+    compiled: CompiledWorkspaceAction,
+) -> KernelResult<CompiledWorkspaceAction> {
+    if let PlannedOperationKind::Workspace(workspace) = &operation.operation {
+        let expected_tool = fs_tool_name_for_workspace_operation(operation);
+        if compiled.tool_name != expected_tool {
+            return Err(KernelError::InvalidCommand(format!(
+                "compiled workspace operation mismatch: action {} kind {} expected {} but got {}",
+                operation.id,
+                operation_kind_name(operation),
+                expected_tool,
+                compiled.tool_name
+            )));
+        }
+        match workspace.kind {
+            WorkspaceOperationKind::Search => {
+                if compiled
+                    .arguments
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    return Err(KernelError::InvalidCommand(format!(
+                        "{} action {} requires non-empty query",
+                        expected_tool, operation.id
+                    )));
+                }
+            }
+            WorkspaceOperationKind::Read
+            | WorkspaceOperationKind::List
+            | WorkspaceOperationKind::Diff
+            | WorkspaceOperationKind::Write
+            | WorkspaceOperationKind::Create
+            | WorkspaceOperationKind::Patch
+            | WorkspaceOperationKind::Delete
+            | WorkspaceOperationKind::Rename => {
+                if compiled
+                    .arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    return Err(KernelError::InvalidCommand(format!(
+                        "{} action {} requires non-empty path; operation={}",
+                        expected_tool,
+                        operation.id,
+                        operation_compile_debug_json(operation, workspace)
+                    )));
+                }
+            }
+        }
     }
-    if let Some(query) = workspace.query.as_ref() {
-        action["query"] = Value::String(query.clone());
-    }
-    if let Some(patch_spec) = workspace.patch_spec.as_ref() {
-        action["patchSpec"] = patch_spec.clone();
-    }
-    if let Some(replacement_block_id) = workspace.replacement_block_id.as_ref() {
-        action["replacementBlockId"] = Value::String(replacement_block_id.clone());
-    }
-    let mut code_blocks = std::collections::BTreeMap::new();
-    if let (Some(source_block_id), Some(content)) = (
-        workspace.source_block_id.as_ref(),
-        workspace.content.as_ref(),
-    ) {
-        action["sourceBlockId"] = Value::String(source_block_id.clone());
-        code_blocks.insert(
-            source_block_id.clone(),
-            serde_json::json!({
-                "id": source_block_id,
-                "path": workspace.target_path.clone(),
-                "targetPath": workspace.target_path.clone(),
-                "content": content
-            }),
-        );
-    }
-    if let (Some(replacement_block_id), Some(content)) = (
-        workspace.replacement_block_id.as_ref(),
-        workspace.content.as_ref(),
-    ) {
-        code_blocks.insert(
-            replacement_block_id.clone(),
-            serde_json::json!({
-                "id": replacement_block_id,
-                "path": workspace.target_path.clone(),
-                "targetPath": workspace.target_path.clone(),
-                "content": content
-            }),
-        );
-    }
-    (action, code_blocks)
+    Ok(compiled)
 }
 
-fn git_operation_to_legacy_action(git: &GitOperation) -> Value {
-    let mut action = serde_json::json!({
-        "toolArgs": {
-            "paths": &git.paths,
-            "staged": git.staged
-        }
-    });
-    if let Some(path) = git.paths.first() {
-        action["path"] = Value::String(path.clone());
-        action["targetPath"] = Value::String(path.clone());
-    }
-    if let Some(message) = git.message.as_ref() {
-        action["message"] = Value::String(message.clone());
-        action["toolArgs"]["message"] = Value::String(message.clone());
-    }
-    if let Some(remote) = git.remote.as_ref() {
-        action["remote"] = Value::String(remote.clone());
-        action["toolArgs"]["remote"] = Value::String(remote.clone());
-    }
-    if let Some(branch) = git.branch.as_ref() {
-        action["branch"] = Value::String(branch.clone());
-        action["toolArgs"]["branch"] = Value::String(branch.clone());
-    }
-    action
-}
-
-fn action_bundle_value(batch: &Value) -> Option<&Value> {
-    batch.get("actionBundle").or_else(|| {
-        if batch.get("actions").is_some() {
-            Some(batch)
-        } else {
-            None
-        }
+fn compiled_tool_summary(compiled: &CompiledWorkspaceAction) -> Value {
+    serde_json::json!({
+        "toolName": &compiled.tool_name,
+        "path": compiled.arguments.get("path").and_then(Value::as_str),
+        "query": compiled.arguments.get("query").and_then(Value::as_str),
+        "argsPreview": redact_tool_arguments(&compiled.tool_name, &compiled.arguments)
     })
 }
 
-fn compile_workspace_action(
+fn operation_compile_debug_json(
+    operation: &PlannedOperation,
+    workspace: &WorkspaceOperation,
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "actionId": &operation.id,
+        "kind": operation_kind_name(operation),
+        "capability": &operation.capability,
+        "targetRef": &operation.target_ref,
+        "workspaceTargetPath": &workspace.target_path,
+        "writeSet": &operation.write_set,
+        "readSet": &operation.read_set,
+        "conflictKeys": &operation.conflict_keys
+    }))
+    .unwrap_or_else(|_| "<operation-debug-unavailable>".to_string())
+}
+
+fn compile_workspace_operation(
     runtime: &DeepCodeKernelRuntime,
     record: &RuntimeRunRecord,
-    action: &Value,
-    code_blocks: &std::collections::BTreeMap<String, Value>,
-    capability: &str,
-    kind: &str,
+    operation: &PlannedOperation,
+    workspace: &WorkspaceOperation,
 ) -> KernelResult<CompiledWorkspaceAction> {
-    if !capability.starts_with("workspace.") {
-        return Err(KernelError::InvalidCommand(format!(
-            "unsupported action capability: {capability}"
-        )));
-    }
-    match kind {
-        "write" | "create" => workspace_write_from_action(runtime, record, action, code_blocks),
-        "patch" => workspace_patch_from_action(runtime, record, action, code_blocks),
-        "read" => workspace_path_tool_action(runtime, record, action, "fs.read"),
-        "list" => workspace_path_tool_action(runtime, record, action, "fs.list"),
-        "diff" => workspace_path_tool_action(runtime, record, action, "fs.diff"),
-        "delete" => workspace_delete_tool_action(runtime, record, action),
-        "search" => workspace_search_tool_action(action),
-        "rename" => Err(KernelError::NotImplemented("workspace.rename.work_unit")),
-        other => Err(KernelError::InvalidCommand(format!(
-            "unsupported workspace action kind: {other}"
-        ))),
+    match workspace.kind {
+        WorkspaceOperationKind::Write | WorkspaceOperationKind::Create => {
+            workspace_write_from_operation(runtime, record, operation, workspace)
+        }
+        WorkspaceOperationKind::Patch => {
+            workspace_patch_from_operation(runtime, record, operation, workspace)
+        }
+        WorkspaceOperationKind::Read => {
+            workspace_path_tool_operation(runtime, record, workspace, "fs.read")
+        }
+        WorkspaceOperationKind::List => {
+            workspace_path_tool_operation(runtime, record, workspace, "fs.list")
+        }
+        WorkspaceOperationKind::Diff => {
+            workspace_path_tool_operation(runtime, record, workspace, "fs.diff")
+        }
+        WorkspaceOperationKind::Delete => {
+            workspace_delete_tool_operation(runtime, record, operation, workspace)
+        }
+        WorkspaceOperationKind::Search => workspace_search_tool_operation(workspace),
+        WorkspaceOperationKind::Rename => Err(KernelError::NotImplemented("fs.rename.work_unit")),
     }
 }
 
-fn compile_git_action(
+fn compile_git_operation(
     runtime: &DeepCodeKernelRuntime,
     record: &RuntimeRunRecord,
-    action: &Value,
-    capability: &str,
-    kind: &str,
+    operation: &PlannedOperation,
+    git: &GitOperation,
 ) -> KernelResult<CompiledWorkspaceAction> {
-    let args = action.get("toolArgs").and_then(Value::as_object);
     let workspace_root = git_workspace_root(runtime, record);
-    match (capability, kind) {
-        ("git.read", "status") | ("git.read", "read") => Ok(CompiledWorkspaceAction {
+    match git.kind {
+        GitOperationKind::Status => Ok(CompiledWorkspaceAction {
             tool_name: "git.status".to_string(),
             arguments: serde_json::json!({}),
             workspace_root,
         }),
-        ("git.read", "diff") => {
-            let path = git_optional_path_from_action(action);
-            let staged = args
-                .and_then(|object| object.get("staged"))
-                .or_else(|| action.get("staged"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let mut arguments = serde_json::json!({ "staged": staged });
-            if let Some(path) = path {
-                let normalized = git_relative_path(runtime, record, &path)?;
-                arguments["path"] = Value::String(normalized);
+        GitOperationKind::Diff => {
+            let mut arguments = serde_json::json!({ "staged": git.staged });
+            if let Some(path) = git.paths.first() {
+                arguments["path"] = Value::String(git_relative_path(runtime, record, path)?);
             }
             Ok(CompiledWorkspaceAction {
                 tool_name: "git.diff".to_string(),
@@ -748,22 +791,21 @@ fn compile_git_action(
                 workspace_root,
             })
         }
-        ("git.write", "stage") => Ok(CompiledWorkspaceAction {
+        GitOperationKind::Stage => Ok(CompiledWorkspaceAction {
             tool_name: "git.stage".to_string(),
-            arguments: git_paths_arguments(runtime, record, action)?,
+            arguments: git_paths_arguments_from_operation(runtime, record, operation, git)?,
             workspace_root,
         }),
-        ("git.write", "unstage") => Ok(CompiledWorkspaceAction {
+        GitOperationKind::Unstage => Ok(CompiledWorkspaceAction {
             tool_name: "git.unstage".to_string(),
-            arguments: git_paths_arguments(runtime, record, action)?,
+            arguments: git_paths_arguments_from_operation(runtime, record, operation, git)?,
             workspace_root,
         }),
-        ("git.write", "commit") => {
-            let message = args
-                .and_then(|object| object.get("message"))
-                .or_else(|| action.get("message"))
-                .and_then(Value::as_str)
-                .map(str::trim)
+        GitOperationKind::Commit => {
+            let message = git
+                .message
+                .as_ref()
+                .map(|value| value.trim())
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
                     KernelError::InvalidCommand(
@@ -776,22 +818,20 @@ fn compile_git_action(
                 workspace_root,
             })
         }
-        ("git.push", "push") | ("git.write", "push") => {
-            let remote = args
-                .and_then(|object| object.get("remote"))
-                .or_else(|| action.get("remote"))
-                .and_then(Value::as_str)
+        GitOperationKind::Push => {
+            let remote = git
+                .remote
+                .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("origin");
-            let branch = args
-                .and_then(|object| object.get("branch"))
-                .or_else(|| action.get("branch"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
             let mut arguments = serde_json::json!({ "remote": remote });
-            if let Some(branch) = branch {
+            if let Some(branch) = git
+                .branch
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
                 arguments["branch"] = Value::String(branch.to_string());
             }
             Ok(CompiledWorkspaceAction {
@@ -800,182 +840,50 @@ fn compile_git_action(
                 workspace_root,
             })
         }
-        ("git.read", other) => Err(KernelError::InvalidCommand(format!(
-            "unsupported git.read action kind: {other}"
-        ))),
-        ("git.write", other) => Err(KernelError::InvalidCommand(format!(
-            "unsupported git.write action kind: {other}"
-        ))),
-        ("git.push", other) => Err(KernelError::InvalidCommand(format!(
-            "unsupported git.push action kind: {other}"
-        ))),
-        _ => Err(KernelError::InvalidCommand(format!(
-            "unsupported git action capability: {capability}"
-        ))),
     }
 }
 
-fn git_workspace_root(
+fn action_bundle_value(batch: &Value) -> Option<&Value> {
+    batch.get("actionBundle").or_else(|| {
+        if batch.get("actions").is_some() {
+            Some(batch)
+        } else {
+            None
+        }
+    })
+}
+
+fn workspace_write_from_operation(
     runtime: &DeepCodeKernelRuntime,
     record: &RuntimeRunRecord,
-) -> Option<PathBuf> {
-    if let Some(root) = runtime
-        .state
-        .current_workspace
-        .as_ref()
-        .map(|workspace| workspace.root.clone())
-    {
-        return Some(root);
-    }
-    if let Some(open_path) = record.workspace_binding.open_path.as_ref() {
-        return Some(PathBuf::from(open_path));
-    }
-    let roots = record
-        .attachments
-        .iter()
-        .filter(|attachment| attachment.get("kind").and_then(Value::as_str) == Some("directory"))
-        .filter_map(explicit_attachment_root)
-        .collect::<Vec<_>>();
-    if roots.len() == 1 {
-        roots.into_iter().next()
-    } else {
-        None
-    }
-}
-
-fn git_optional_path_from_action(action: &Value) -> Option<String> {
-    let args = action.get("toolArgs").and_then(Value::as_object);
-    args.and_then(|object| object.get("path"))
-        .or_else(|| action.get("path"))
-        .or_else(|| action.get("targetPath"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != "workspace")
-        .map(str::to_string)
-        .or_else(|| {
-            action
-                .get("resourceScope")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .find(|value| !value.is_empty() && *value != "workspace" && !value.contains('*'))
-                .map(str::to_string)
-        })
-}
-
-fn git_paths_arguments(
-    runtime: &DeepCodeKernelRuntime,
-    record: &RuntimeRunRecord,
-    action: &Value,
-) -> KernelResult<Value> {
-    let args = action.get("toolArgs").and_then(Value::as_object);
-    let raw_paths = args
-        .and_then(|object| object.get("paths"))
-        .or_else(|| action.get("paths"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .or_else(|| {
-            args.and_then(|object| object.get("path"))
-                .or_else(|| action.get("path"))
-                .or_else(|| action.get("targetPath"))
-                .and_then(Value::as_str)
-                .map(|path| vec![path.to_string()])
-        })
-        .or_else(|| {
-            action
-                .get("resourceScope")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .filter(|value| !value.trim().is_empty() && *value != "workspace")
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-        })
-        .unwrap_or_default();
-    if raw_paths.is_empty() {
-        return Err(KernelError::InvalidCommand(
-            "git stage/unstage action requires toolArgs.path, toolArgs.paths, targetPath, or resourceScope".to_string(),
-        ));
-    }
-    let paths = raw_paths
-        .into_iter()
-        .map(|path| git_relative_path(runtime, record, &path))
-        .collect::<KernelResult<Vec<_>>>()?;
-    Ok(serde_json::json!({ "paths": paths }))
-}
-
-fn git_relative_path(
-    runtime: &DeepCodeKernelRuntime,
-    record: &RuntimeRunRecord,
-    raw_path: &str,
-) -> KernelResult<String> {
-    if raw_path.trim() == "." {
-        return Ok(".".to_string());
-    }
-    let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
-    Ok(normalized.relative_path)
-}
-
-fn workspace_write_from_action(
-    runtime: &DeepCodeKernelRuntime,
-    record: &RuntimeRunRecord,
-    action: &Value,
-    code_blocks: &std::collections::BTreeMap<String, Value>,
+    operation: &PlannedOperation,
+    workspace: &WorkspaceOperation,
 ) -> KernelResult<CompiledWorkspaceAction> {
-    let source_block_id = action
-        .get("sourceBlockId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            KernelError::InvalidCommand("workspace.write action requires sourceBlockId".to_string())
-        })?;
-    let block = code_blocks.get(source_block_id).ok_or_else(|| {
-        KernelError::InvalidCommand(format!("codeBlock {source_block_id} was not provided"))
+    let content = workspace.content.clone().ok_or_else(|| {
+        KernelError::InvalidCommand(format!(
+            "{} action {} requires canonical content",
+            fs_tool_name_for_workspace_operation(operation),
+            operation.id
+        ))
     })?;
-    let content = block
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            KernelError::InvalidCommand(format!("codeBlock {source_block_id} has no content"))
-        })?
-        .to_string();
-    if content.is_empty() && !block_explicitly_allows_empty_content(block) {
+    if content.is_empty() && !workspace.allow_empty_content {
         return Err(KernelError::InvalidCommand(format!(
-            "codeBlock {source_block_id} has empty content; use allowEmptyContent with createEmpty to make this explicit"
+            "{} action {} has empty content; use allowEmptyContent to make this explicit",
+            fs_tool_name_for_workspace_operation(operation),
+            operation.id
         )));
     }
-    let raw_path = block
-        .get("path")
-        .or_else(|| block.get("targetPath"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            action
-                .get("targetPath")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-        })
-        .or_else(|| {
-            action
-                .get("resourceScope")
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-        })
+    let raw_path = workspace
+        .target_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            KernelError::InvalidCommand(format!("codeBlock {source_block_id} has no write path"))
+            KernelError::InvalidCommand(format!(
+                "{} action {} requires targetPath or resourceScope",
+                fs_tool_name_for_workspace_operation(operation),
+                operation.id
+            ))
         })?;
     let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
     Ok(CompiledWorkspaceAction {
@@ -990,64 +898,40 @@ fn workspace_write_from_action(
     })
 }
 
-fn workspace_patch_from_action(
+fn workspace_patch_from_operation(
     runtime: &DeepCodeKernelRuntime,
     record: &RuntimeRunRecord,
-    action: &Value,
-    code_blocks: &std::collections::BTreeMap<String, Value>,
+    operation: &PlannedOperation,
+    workspace: &WorkspaceOperation,
 ) -> KernelResult<CompiledWorkspaceAction> {
-    let replacement_block_id = action
-        .get("replacementBlockId")
-        .or_else(|| action.get("sourceBlockId"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            KernelError::InvalidCommand(
-                "workspace.patch action requires replacementBlockId or sourceBlockId".to_string(),
-            )
-        })?;
-    let block = code_blocks.get(replacement_block_id).ok_or_else(|| {
-        KernelError::InvalidCommand(format!("codeBlock {replacement_block_id} was not provided"))
+    let replacement = workspace.content.clone().ok_or_else(|| {
+        KernelError::InvalidCommand(format!(
+            "fs.patch action {} requires canonical replacement content",
+            operation.id
+        ))
     })?;
-    let replacement = block
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            KernelError::InvalidCommand(format!("codeBlock {replacement_block_id} has no content"))
-        })?
-        .to_string();
-    if replacement.is_empty() && !block_explicitly_allows_empty_content(block) {
+    if replacement.is_empty() && !workspace.allow_empty_content {
         return Err(KernelError::InvalidCommand(format!(
-            "codeBlock {replacement_block_id} has empty content; use allowEmptyContent with a patch operation to make this explicit"
+            "fs.patch action {} has empty replacement; use allowEmptyContent to make this explicit",
+            operation.id
         )));
     }
-    let raw_path = action
-        .get("targetPath")
-        .or_else(|| action.get("path"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            block
-                .get("path")
-                .or_else(|| block.get("targetPath"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-        })
-        .or_else(|| {
-            action
-                .get("resourceScope")
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-        })
+    let raw_path = workspace
+        .target_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             KernelError::InvalidCommand(format!(
-                "codeBlock {replacement_block_id} has no patch target path"
+                "fs.patch action {} requires targetPath or resourceScope",
+                operation.id
             ))
         })?;
-    let patch_spec = action.get("patchSpec").cloned().ok_or_else(|| {
-        KernelError::InvalidCommand("workspace.patch action requires patchSpec".to_string())
+    let patch_spec = workspace.patch_spec.clone().ok_or_else(|| {
+        KernelError::InvalidCommand(format!(
+            "fs.patch action {} requires patchSpec",
+            operation.id
+        ))
     })?;
     let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
     Ok(CompiledWorkspaceAction {
@@ -1062,39 +946,17 @@ fn workspace_patch_from_action(
     })
 }
 
-fn block_explicitly_allows_empty_content(block: &Value) -> bool {
-    let operation = block
-        .get("operation")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    block
-        .get("allowEmptyContent")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && matches!(
-            operation,
-            "createEmpty" | "patch" | "replaceBlock" | "insertBefore" | "insertAfter"
-        )
-}
-
-fn workspace_path_tool_action(
+fn workspace_path_tool_operation(
     runtime: &DeepCodeKernelRuntime,
     record: &RuntimeRunRecord,
-    action: &Value,
+    workspace: &WorkspaceOperation,
     tool_name: &str,
 ) -> KernelResult<CompiledWorkspaceAction> {
-    let raw_path = action
-        .get("targetPath")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            action
-                .get("resourceScope")
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-        })
+    let raw_path = workspace
+        .target_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .unwrap_or(".");
     let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
     Ok(CompiledWorkspaceAction {
@@ -1107,53 +969,64 @@ fn workspace_path_tool_action(
     })
 }
 
-fn workspace_delete_tool_action(
+fn workspace_delete_tool_operation(
     runtime: &DeepCodeKernelRuntime,
     record: &RuntimeRunRecord,
-    action: &Value,
+    operation: &PlannedOperation,
+    workspace: &WorkspaceOperation,
 ) -> KernelResult<CompiledWorkspaceAction> {
-    let raw_path = action
-        .get("targetPath")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            action
-                .get("resourceScope")
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-        })
+    let canonical_target = operation
+        .target_ref
+        .as_ref()
+        .map(|target| target.raw_path());
+    let raw_path = canonical_target
+        .as_deref()
+        .into_iter()
+        .chain(operation.write_set.iter().map(String::as_str))
+        .chain(workspace.target_path.as_deref())
+        .map(str::trim)
+        .find(|value| !value.is_empty())
         .ok_or_else(|| {
-            KernelError::InvalidCommand(
-                "workspace.delete action requires targetPath or resourceScope".to_string(),
-            )
+            KernelError::InvalidCommand(format!(
+                "fs.delete action {} requires targetRef, targetPath, or resourceScope; operation={}",
+                operation.id,
+                operation_compile_debug_json(operation, workspace)
+            ))
         })?;
-    let trimmed = raw_path.trim();
-    if trimmed == "." || trimmed == "./" {
+    if raw_path == "." || raw_path == "./" {
         return Err(KernelError::InvalidCommand(
-            "workspace.delete cannot remove workspace root".to_string(),
+            "fs.delete cannot remove workspace root".to_string(),
         ));
     }
-    if trimmed.contains('*') {
+    if raw_path.contains('*') {
         return Err(KernelError::InvalidCommand(
-            "workspace.delete target must be a concrete path".to_string(),
+            "fs.delete target must be a concrete path".to_string(),
         ));
     }
-    let normalized = match workspace_relative_write_path(runtime, record, trimmed) {
+    let normalized = match workspace_relative_write_path(runtime, record, raw_path) {
         Ok(normalized) => normalized,
         Err(KernelError::InvalidCommand(message))
-            if message.contains("workspace.write target resolves to an attachment directory") =>
+            if message.contains("fs.write target resolves to an attachment directory") =>
         {
             return Err(KernelError::InvalidCommand(
-                "workspace.delete cannot remove workspace root".to_string(),
+                "fs.delete cannot remove workspace root".to_string(),
+            ));
+        }
+        Err(KernelError::InvalidCommand(message)) => {
+            return Err(KernelError::InvalidCommand(
+                message.replace("fs.write", "fs.delete"),
             ));
         }
         Err(KernelError::PermissionDenied(message))
-            if message.contains("workspace.write target is outside") =>
+            if message.contains("fs.write target is outside") =>
         {
             return Err(KernelError::PermissionDenied(
-                message.replace("workspace.write", "workspace.delete"),
+                message.replace("fs.write", "fs.delete"),
+            ));
+        }
+        Err(KernelError::PermissionDenied(message)) => {
+            return Err(KernelError::PermissionDenied(
+                message.replace("fs.write", "fs.delete"),
             ));
         }
         Err(error) => return Err(error),
@@ -1163,46 +1036,117 @@ fn workspace_delete_tool_action(
         || normalized.relative_path == "./"
     {
         return Err(KernelError::InvalidCommand(
-            "workspace.delete cannot remove workspace root".to_string(),
+            "fs.delete cannot remove workspace root".to_string(),
         ));
     }
-    Ok(CompiledWorkspaceAction {
+    let action = CompiledWorkspaceAction {
         tool_name: "fs.delete".to_string(),
         arguments: serde_json::json!({
             "path": normalized.relative_path,
             "pathNormalization": path_normalization_json(&normalized)
         }),
         workspace_root: normalized.workspace_root,
-    })
+    };
+    if action
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(KernelError::InvalidCommand(format!(
+            "fs.delete compile lost target path for action {} despite canonical operation={}",
+            operation.id,
+            operation_compile_debug_json(operation, workspace)
+        )));
+    }
+    Ok(action)
 }
 
-fn workspace_search_tool_action(action: &Value) -> KernelResult<CompiledWorkspaceAction> {
-    let query = action
-        .get("query")
-        .or_else(|| action.get("targetPath"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            action
-                .get("resourceScope")
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-        })
+fn workspace_search_tool_operation(
+    workspace: &WorkspaceOperation,
+) -> KernelResult<CompiledWorkspaceAction> {
+    let query = workspace
+        .query
+        .as_deref()
+        .or(workspace.target_path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            KernelError::InvalidCommand("workspace.search action requires query".to_string())
+            KernelError::InvalidCommand("code.search action requires query".to_string())
         })?;
     Ok(CompiledWorkspaceAction {
         tool_name: "code.search".to_string(),
         arguments: serde_json::json!({
             "query": query,
-            "include": action.get("include").cloned().unwrap_or(Value::Null),
-            "contextLines": action.get("contextLines").cloned().unwrap_or(Value::Null),
-            "maxResults": action.get("maxResults").cloned().unwrap_or(Value::Null)
+            "include": &workspace.include,
+            "contextLines": workspace.context_lines,
+            "maxResults": workspace.max_results
         }),
         workspace_root: None,
     })
+}
+
+fn git_paths_arguments_from_operation(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    operation: &PlannedOperation,
+    git: &GitOperation,
+) -> KernelResult<Value> {
+    if git.paths.is_empty() {
+        return Err(KernelError::InvalidCommand(format!(
+            "git {} action {} requires at least one path",
+            operation_kind_name(operation),
+            operation.id
+        )));
+    }
+    let paths = git
+        .paths
+        .iter()
+        .map(|path| git_relative_path(runtime, record, path))
+        .collect::<KernelResult<Vec<_>>>()?;
+    Ok(serde_json::json!({ "paths": paths }))
+}
+
+fn git_workspace_root(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+) -> Option<PathBuf> {
+    if let Some(open_path) = record.workspace_binding.open_path.as_ref() {
+        return Some(PathBuf::from(open_path));
+    }
+    if let Some(root) = runtime
+        .state
+        .current_workspace
+        .as_ref()
+        .map(|workspace| workspace.root.clone())
+    {
+        return Some(root);
+    }
+    let roots = record
+        .attachments
+        .iter()
+        .filter(|attachment| attachment.get("kind").and_then(Value::as_str) == Some("directory"))
+        .filter_map(explicit_attachment_root)
+        .collect::<Vec<_>>();
+    if roots.len() == 1 {
+        roots.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn git_relative_path(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    raw_path: &str,
+) -> KernelResult<String> {
+    if raw_path.trim() == "." {
+        return Ok(".".to_string());
+    }
+    let normalized = workspace_relative_write_path(runtime, record, raw_path)?;
+    Ok(normalized.relative_path)
 }
 
 fn workspace_relative_write_path(
@@ -1258,11 +1202,6 @@ fn workspace_relative_write_path(
             original_path: raw_path.to_string(),
         });
     }
-    if has_explicit_attachment_roots(record) {
-        return Err(KernelError::PermissionDenied(format!(
-            "workspace.write target is outside workspace binding and explicit attachments: {raw_path}"
-        )));
-    }
     if let Some(root) = runtime
         .state
         .current_workspace
@@ -1295,9 +1234,81 @@ fn workspace_relative_write_path(
             });
         }
     }
-    Err(KernelError::PermissionDenied(format!(
-        "workspace.write target is outside workspace binding and explicit attachments: {raw_path}"
-    )))
+    if has_explicit_attachment_roots(record)
+        && !has_external_file_target_grant(runtime, record, &target)
+    {
+        return Err(KernelError::PermissionDenied(format!(
+            "fs.write target is outside workspace binding and explicit attachments: {raw_path}"
+        )));
+    }
+    external_absolute_file_write_target(&target, raw_path)
+}
+
+fn has_external_file_target_grant(
+    runtime: &DeepCodeKernelRuntime,
+    record: &RuntimeRunRecord,
+    target: &Path,
+) -> bool {
+    let target = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    runtime
+        .state
+        .temporary_grants_by_run
+        .get(&record.run_id)
+        .map(|grants| {
+            grants.iter().any(|grant| {
+                if grant.resource_kind != "externalFile" {
+                    return false;
+                }
+                let Some(resource_path) = grant.resource_path.as_ref() else {
+                    return false;
+                };
+                let grant_path = PathBuf::from(resource_path);
+                let grant_path = grant_path.canonicalize().unwrap_or(grant_path);
+                target == grant_path
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn external_absolute_file_write_target(
+    target: &Path,
+    raw_path: &str,
+) -> KernelResult<NormalizedWorkspacePath> {
+    if target == Path::new("/") {
+        return Err(KernelError::InvalidCommand(
+            "fs.write target must be a concrete file path, not a filesystem root".to_string(),
+        ));
+    }
+    let file_name = target
+        .file_name()
+        .map(|value| value.to_string_lossy().replace('\\', "/"))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            KernelError::InvalidCommand(
+                "fs.write target must be a concrete file path, not a directory".to_string(),
+            )
+        })?;
+    if file_name == "." || file_name == ".." {
+        return Err(KernelError::InvalidCommand(
+            "fs.write target must be a concrete file path".to_string(),
+        ));
+    }
+    let parent = target.parent().ok_or_else(|| {
+        KernelError::InvalidCommand("fs.write absolute target has no parent directory".to_string())
+    })?;
+    let root = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    Ok(NormalizedWorkspacePath {
+        relative_path: file_name,
+        workspace_root: Some(root.clone()),
+        root_source: Some("absolutePath"),
+        stripped_prefixes: vec![root.to_string_lossy().to_string()],
+        duplicate_root_path_detected: false,
+        original_path: raw_path.to_string(),
+    })
 }
 
 fn strip_root(target: &Path, root: &Path) -> Option<String> {
@@ -1328,8 +1339,7 @@ fn attachment_root_for_target(
             .unwrap_or("file");
         if kind == "directory" && target == root {
             return Err(KernelError::InvalidCommand(
-                "workspace.write target resolves to an attachment directory, not a file"
-                    .to_string(),
+                "fs.write target resolves to an attachment directory, not a file".to_string(),
             ));
         }
         let allowed = if kind == "directory" {
@@ -1389,8 +1399,7 @@ fn single_directory_attachment_write_target(
         Ok(None)
     } else {
         Err(KernelError::InvalidCommand(
-            "workspace.write has a relative path but multiple attachment roots are available"
-                .to_string(),
+            "fs.write has a relative path but multiple attachment roots are available".to_string(),
         ))
     }
 }
@@ -1429,7 +1438,7 @@ fn relative_file_attachment_write_target(
         }
     }
     Err(KernelError::PermissionDenied(format!(
-        "workspace.write target is outside workspace binding and explicit attachments: {raw_path}"
+        "fs.write target is outside workspace binding and explicit attachments: {raw_path}"
     )))
 }
 
@@ -1448,8 +1457,7 @@ fn normalize_attachment_relative_write_path(
             if normalized == *prefix {
                 stripped_prefixes.push(prefix.clone());
                 return Err(KernelError::InvalidCommand(
-                    "workspace.write target resolves to an attachment directory, not a file"
-                        .to_string(),
+                    "fs.write target resolves to an attachment directory, not a file".to_string(),
                 ));
             }
             if let Some(relative) = normalized.strip_prefix(&format!("{prefix}/")) {
@@ -1465,7 +1473,7 @@ fn normalize_attachment_relative_write_path(
     }
     if normalized.is_empty() || normalized == "." {
         return Err(KernelError::InvalidCommand(
-            "workspace.write target resolves to an attachment directory, not a file".to_string(),
+            "fs.write target resolves to an attachment directory, not a file".to_string(),
         ));
     }
     Ok(NormalizedWorkspacePath {
@@ -1507,10 +1515,15 @@ fn attachment_prefix_candidates(attachment: &Value, index: usize) -> KernelResul
 }
 
 fn push_attachment_prefix(prefixes: &mut Vec<String>, value: &str) -> KernelResult<()> {
+    let trimmed = value.trim().replace('\\', "/");
+    let trimmed = trimmed.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "." {
+        return Ok(());
+    }
     match normalize_write_relative_path(value) {
         Ok(normalized) => push_normalized_prefix(prefixes, &normalized),
         Err(KernelError::InvalidCommand(message))
-            if message.starts_with("workspace.write target must be relative:") =>
+            if message.starts_with("fs.write target must be relative:") =>
         {
             Ok(())
         }
@@ -1595,13 +1608,13 @@ fn normalize_write_relative_path(raw_path: &str) -> KernelResult<String> {
     let normalized = raw_path.trim().replace('\\', "/");
     if normalized.is_empty() {
         return Err(KernelError::InvalidCommand(
-            "workspace.write target path is empty".to_string(),
+            "fs.write target path is empty".to_string(),
         ));
     }
     let path = Path::new(&normalized);
     if path.is_absolute() {
         return Err(KernelError::InvalidCommand(format!(
-            "workspace.write target must be relative: {raw_path}"
+            "fs.write target must be relative: {raw_path}"
         )));
     }
 
@@ -1617,19 +1630,19 @@ fn normalize_write_relative_path(raw_path: &str) -> KernelResult<String> {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 return Err(KernelError::PermissionDenied(format!(
-                    "workspace.write target cannot contain parent traversal: {raw_path}"
+                    "fs.write target cannot contain parent traversal: {raw_path}"
                 )));
             }
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 return Err(KernelError::InvalidCommand(format!(
-                    "workspace.write target must be relative: {raw_path}"
+                    "fs.write target must be relative: {raw_path}"
                 )));
             }
         }
     }
     if parts.is_empty() {
         return Err(KernelError::InvalidCommand(
-            "workspace.write target path is empty".to_string(),
+            "fs.write target path is empty".to_string(),
         ));
     }
     Ok(parts.join("/"))
@@ -1679,6 +1692,7 @@ fn summarize_action(action: &Value) -> Value {
         "title": action.get("title").and_then(Value::as_str),
         "capability": action.get("capability").and_then(Value::as_str),
         "kind": action.get("kind").and_then(Value::as_str),
+        "targetPath": action.get("targetPath").and_then(Value::as_str),
         "resourceScope": action.get("resourceScope").cloned().unwrap_or_else(|| serde_json::json!([])),
         "sourceBlockId": action.get("sourceBlockId").and_then(Value::as_str),
         "toolArgs": action.get("toolArgs").cloned().unwrap_or(Value::Null)
@@ -1714,4 +1728,163 @@ fn safe_work_unit_segment(value: &str) -> String {
         out = out.replace("--", "-");
     }
     out.trim_matches('-').chars().take(80).collect::<String>()
+}
+
+#[cfg(test)]
+mod action_batch_internal_tests {
+    use super::*;
+    use deepcode_kernel_tools::FileTargetRef;
+
+    fn runtime_record_for_compile_test() -> (DeepCodeKernelRuntime, RuntimeRunRecord, PathBuf) {
+        let temp = std::env::temp_dir().join(format!(
+            "deepcode-action-batch-compile-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).expect("create temp workspace");
+        fs::write(temp.join("generic-delete-target.txt"), "delete me\n")
+            .expect("write delete target");
+        let mut runtime = DeepCodeKernelRuntime::new();
+        runtime
+            .dispatch(KernelCommand::WorkspaceOpen {
+                request_id: RequestId("req-workspace-open".to_string()),
+                path: temp.to_string_lossy().to_string(),
+            })
+            .expect("workspace opens");
+        runtime
+            .dispatch(KernelCommand::RunCreate {
+                request_id: RequestId("req-run-create".to_string()),
+                session_id: Some(SessionId("session-generic".to_string())),
+                input: UserInput {
+                    text: "Delete a generic file.".to_string(),
+                    attachments: vec![],
+                },
+                workspace_binding: Some(WorkspaceBinding {
+                    workspace_id: None,
+                    workspace_hash: None,
+                    open_path: Some(temp.to_string_lossy().to_string()),
+                    active_folder_id: None,
+                    folder_hash: None,
+                }),
+                profile_ref: None,
+                workflow_ref: None,
+                run_overrides: None,
+            })
+            .expect("runCreate succeeds");
+        let record = runtime
+            .record_by_run("run-1")
+            .expect("run record exists")
+            .clone();
+        (runtime, record, temp)
+    }
+
+    #[test]
+    fn delete_compile_uses_write_set_when_target_path_is_empty() {
+        let (runtime, record, temp) = runtime_record_for_compile_test();
+        let workspace = WorkspaceOperation {
+            kind: WorkspaceOperationKind::Delete,
+            target_path: Some(String::new()),
+            source_block_id: None,
+            replacement_block_id: None,
+            content: None,
+            patch_spec: None,
+            allow_empty_content: false,
+            query: None,
+            include: Vec::new(),
+            context_lines: None,
+            max_results: None,
+            rename_to: None,
+        };
+        let operation = PlannedOperation {
+            id: "delete-generic-target".to_string(),
+            title: "Delete generic target".to_string(),
+            capability: "fs.delete".to_string(),
+            permission_labels: vec!["fs.delete".to_string()],
+            target_ref: Some(FileTargetRef::from_legacy_path("generic-delete-target.txt")),
+            read_set: Vec::new(),
+            write_set: vec!["generic-delete-target.txt".to_string()],
+            conflict_keys: vec!["generic-delete-target.txt".to_string()],
+            execution_mode: OperationExecutionMode::Execute,
+            operation: PlannedOperationKind::Workspace(workspace.clone()),
+        };
+
+        let compiled = workspace_delete_tool_operation(&runtime, &record, &operation, &workspace)
+            .expect("delete compiles from writeSet when targetPath is empty");
+
+        assert_eq!(compiled.tool_name, "fs.delete");
+        assert_eq!(
+            compiled.arguments.get("path").and_then(Value::as_str),
+            Some("generic-delete-target.txt")
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn delete_compile_uses_absolute_write_set_as_external_file_root() {
+        let (runtime, record, temp) = runtime_record_for_compile_test();
+        let external_dir = std::env::temp_dir().join(format!(
+            "deepcode-action-batch-external-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&external_dir);
+        fs::create_dir_all(&external_dir).expect("create external temp root");
+        let external_file = external_dir.join("external-delete-target.txt");
+        fs::write(&external_file, "delete me\n").expect("write external delete target");
+        let workspace = WorkspaceOperation {
+            kind: WorkspaceOperationKind::Delete,
+            target_path: None,
+            source_block_id: None,
+            replacement_block_id: None,
+            content: None,
+            patch_spec: None,
+            allow_empty_content: false,
+            query: None,
+            include: Vec::new(),
+            context_lines: None,
+            max_results: None,
+            rename_to: None,
+        };
+        let operation = PlannedOperation {
+            id: "delete-external-target".to_string(),
+            title: "Delete external target".to_string(),
+            capability: "fs.delete".to_string(),
+            permission_labels: vec!["fs.delete".to_string()],
+            target_ref: Some(FileTargetRef::from_legacy_path(
+                external_file.to_string_lossy().to_string(),
+            )),
+            read_set: Vec::new(),
+            write_set: vec![external_file.to_string_lossy().to_string()],
+            conflict_keys: vec![external_file.to_string_lossy().to_string()],
+            execution_mode: OperationExecutionMode::Execute,
+            operation: PlannedOperationKind::Workspace(workspace.clone()),
+        };
+
+        let compiled = workspace_delete_tool_operation(&runtime, &record, &operation, &workspace)
+            .expect("delete compiles absolute writeSet into an external file root");
+
+        assert_eq!(compiled.tool_name, "fs.delete");
+        assert_eq!(
+            compiled.arguments.get("path").and_then(Value::as_str),
+            Some("external-delete-target.txt")
+        );
+        assert_eq!(compiled.workspace_root, Some(external_dir.clone()));
+        assert_eq!(
+            compiled
+                .arguments
+                .get("pathNormalization")
+                .and_then(|value| value.get("rootSource"))
+                .and_then(Value::as_str),
+            Some("absolutePath")
+        );
+        let _ = fs::remove_dir_all(temp);
+        let _ = fs::remove_dir_all(external_dir);
+    }
 }

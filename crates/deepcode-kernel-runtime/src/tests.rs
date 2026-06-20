@@ -31,14 +31,31 @@ fn grant_workspace_write(runtime: &mut DeepCodeKernelRuntime) {
             run_id: RunId("run-1".to_string()),
             grant: deepcode_kernel_abi::TemporaryGrantEnvelope {
                 id: "grant-workspace-write".to_string(),
-                capability: "workspace.write".to_string(),
+                capability: "fs.write".to_string(),
                 resource_kind: "workspace".to_string(),
                 resource_path: None,
                 expires_after_sequence: None,
                 reason: Some("test grants explicit workspace write permission".to_string()),
             },
         })
-        .expect("temporary workspace.write grant succeeds");
+        .expect("temporary fs.write grant succeeds");
+}
+
+fn grant_workspace_patch(runtime: &mut DeepCodeKernelRuntime) {
+    runtime
+        .dispatch(KernelCommand::PermissionGrantTemporary {
+            request_id: RequestId("req-grant-workspace-patch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            grant: deepcode_kernel_abi::TemporaryGrantEnvelope {
+                id: "grant-workspace-patch".to_string(),
+                capability: "fs.patch".to_string(),
+                resource_kind: "workspace".to_string(),
+                resource_path: None,
+                expires_after_sequence: None,
+                reason: Some("test grants explicit workspace patch permission".to_string()),
+            },
+        })
+        .expect("temporary fs.patch grant succeeds");
 }
 
 fn grant_workspace_delete(runtime: &mut DeepCodeKernelRuntime) {
@@ -48,14 +65,14 @@ fn grant_workspace_delete(runtime: &mut DeepCodeKernelRuntime) {
             run_id: RunId("run-1".to_string()),
             grant: deepcode_kernel_abi::TemporaryGrantEnvelope {
                 id: "grant-workspace-delete".to_string(),
-                capability: "workspace.delete".to_string(),
+                capability: "fs.delete".to_string(),
                 resource_kind: "workspace".to_string(),
                 resource_path: None,
                 expires_after_sequence: None,
                 reason: Some("test grants explicit workspace delete permission".to_string()),
             },
         })
-        .expect("temporary workspace.delete grant succeeds");
+        .expect("temporary fs.delete grant succeeds");
 }
 
 fn grant_workspace_delete_path(runtime: &mut DeepCodeKernelRuntime, resource_path: &str) {
@@ -65,14 +82,57 @@ fn grant_workspace_delete_path(runtime: &mut DeepCodeKernelRuntime, resource_pat
             run_id: RunId("run-1".to_string()),
             grant: deepcode_kernel_abi::TemporaryGrantEnvelope {
                 id: format!("grant-workspace-delete-{resource_path}"),
-                capability: "workspace.delete".to_string(),
+                capability: "fs.delete".to_string(),
                 resource_kind: "workspace".to_string(),
                 resource_path: Some(resource_path.to_string()),
                 expires_after_sequence: None,
                 reason: Some("test grants path-scoped workspace delete permission".to_string()),
             },
         })
-        .expect("temporary path-scoped workspace.delete grant succeeds");
+        .expect("temporary path-scoped fs.delete grant succeeds");
+}
+
+fn grant_external_delete_path(runtime: &mut DeepCodeKernelRuntime, resource_path: &Path) {
+    runtime
+        .dispatch(KernelCommand::PermissionGrantTemporary {
+            request_id: RequestId("req-grant-external-delete".to_string()),
+            run_id: RunId("run-1".to_string()),
+            grant: deepcode_kernel_abi::TemporaryGrantEnvelope {
+                id: "grant-external-delete".to_string(),
+                capability: "fs.delete".to_string(),
+                resource_kind: "externalFile".to_string(),
+                resource_path: Some(resource_path.to_string_lossy().to_string()),
+                expires_after_sequence: None,
+                reason: Some("test grants path-scoped external delete permission".to_string()),
+            },
+        })
+        .expect("temporary path-scoped external fs.delete grant succeeds");
+}
+
+fn compiled_tool_value(events: &[KernelEvent], action_id: &str, field: &str) -> Option<String> {
+    events.iter().find_map(|event| match event {
+        KernelEvent::WorkUnitQueued { work_unit, .. }
+            if work_unit.get("actionId").and_then(Value::as_str) == Some(action_id) =>
+        {
+            work_unit
+                .get("compiledTool")
+                .and_then(|value| value.get(field))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
+        _ => None,
+    })
+}
+
+fn queued_work_unit_value(events: &[KernelEvent], action_id: &str, field: &str) -> Option<Value> {
+    events.iter().find_map(|event| match event {
+        KernelEvent::WorkUnitQueued { work_unit, .. }
+            if work_unit.get("actionId").and_then(Value::as_str) == Some(action_id) =>
+        {
+            work_unit.get(field).cloned()
+        }
+        _ => None,
+    })
 }
 
 #[test]
@@ -99,16 +159,12 @@ fn run_create_produces_state_contract_and_driver_request() {
         })
         .expect("runCreate succeeds");
 
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::StateEntered { .. }))
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::DriverRequestProduced { .. }))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::StateEntered { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::DriverRequestProduced { .. })));
 }
 
 #[test]
@@ -150,16 +206,12 @@ fn draft_ledger_submit_records_open_and_chunk_without_workspace_write() {
         })
         .expect("draft ledger submit succeeds");
 
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::DraftOpen { .. }))
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::DraftChunk { .. }))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::DraftOpen { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::DraftChunk { .. })));
     assert!(
         !temp.join("src").join("generated.txt").exists(),
         "draft ledger chunks must not directly write workspace files"
@@ -206,11 +258,9 @@ fn proposal_submit_accepts_only_protocol_v3() {
             },
         })
         .expect("v3 proposal command succeeds");
-    assert!(
-        accepted
-            .iter()
-            .any(|event| matches!(event, KernelEvent::ProposalAccepted { .. }))
-    );
+    assert!(accepted
+        .iter()
+        .any(|event| matches!(event, KernelEvent::ProposalAccepted { .. })));
 
     let rejected = runtime
         .dispatch(KernelCommand::ProposalSubmit {
@@ -231,11 +281,9 @@ fn proposal_submit_accepts_only_protocol_v3() {
             },
         })
         .expect("invalid proposal returns rejection event");
-    assert!(
-        rejected
-            .iter()
-            .any(|event| matches!(event, KernelEvent::ProposalRejected { .. }))
-    );
+    assert!(rejected
+        .iter()
+        .any(|event| matches!(event, KernelEvent::ProposalRejected { .. })));
 }
 
 #[test]
@@ -284,7 +332,7 @@ fn proposal_submit_plan_review_extracts_code_block_file_targets() {
                                 "actionId": "write-generic-output",
                                 "description": "Write generic output",
                                 "kind": "write",
-                                "capability": "workspace.write",
+                                "capability": "fs.write",
                                 "resourceScope": [],
                                 "sourceBlockId": "code-generic-output"
                             }
@@ -315,7 +363,7 @@ fn proposal_submit_plan_review_extracts_code_block_file_targets() {
         .expect("required file operations are present");
     assert!(required_file_operations.iter().any(|operation| {
         operation.get("operation").and_then(Value::as_str) == Some("write")
-            && operation.get("capability").and_then(Value::as_str) == Some("workspace.write")
+            && operation.get("capability").and_then(Value::as_str) == Some("fs.write")
             && operation.get("targetPath").and_then(Value::as_str) == Some("generic-output.txt")
     }));
 }
@@ -361,7 +409,7 @@ fn proposal_submit_plan_review_accepts_matching_action_id_alias() {
                                 "title": "Delete generic target",
                                 "description": "Delete generic target",
                                 "kind": "delete",
-                                "capability": "workspace.delete",
+                                "capability": "fs.delete",
                                 "resourceScope": ["generic-target.tmp"],
                                 "targetPath": "generic-target.tmp"
                             }
@@ -387,12 +435,10 @@ fn proposal_submit_plan_review_accepts_matching_action_id_alias() {
         })
         .expect("proposal reviewed report is emitted");
     assert_ne!(report.get("status").and_then(Value::as_str), Some("denied"));
-    assert!(
-        report
-            .get("requiredFileOperations")
-            .and_then(Value::as_array)
-            .is_some_and(|operations| !operations.is_empty())
-    );
+    assert!(report
+        .get("requiredFileOperations")
+        .and_then(Value::as_array)
+        .is_some_and(|operations| !operations.is_empty()));
 }
 
 #[test]
@@ -434,7 +480,7 @@ fn proposal_submit_plan_review_accepts_continuation_action_aliases() {
                                 "id": "write-generic-target",
                                 "title": "Write generic target",
                                 "kind": "write",
-                                "capability": "workspace.write",
+                                "capability": "fs.write",
                                 "resourceScope": ["generic-output.txt"],
                                 "targetPath": "generic-output.txt"
                             }
@@ -444,7 +490,7 @@ fn proposal_submit_plan_review_accepts_continuation_action_aliases() {
                                 "actionId": "write-generic-follow-up",
                                 "description": "Write generic follow-up",
                                 "kind": "write",
-                                "capability": "workspace.write",
+                                "capability": "fs.write",
                                 "resourceScope": ["generic-follow-up.txt"],
                                 "targetPath": "generic-follow-up.txt"
                             }
@@ -512,7 +558,7 @@ fn proposal_submit_plan_review_rejects_conflicting_action_id_alias() {
                                 "actionId": "action-b",
                                 "title": "Conflicting generic action",
                                 "description": "Conflicting generic action",
-                                "capability": "workspace.write",
+                                "capability": "fs.write",
                                 "resourceScope": ["generic-output.txt"],
                                 "targetPath": "generic-output.txt"
                             }
@@ -538,16 +584,14 @@ fn proposal_submit_plan_review_rejects_conflicting_action_id_alias() {
         })
         .expect("proposal reviewed report is emitted");
     assert_eq!(report.get("status").and_then(Value::as_str), Some("denied"));
-    assert!(
-        report
-            .get("deniedReasons")
-            .and_then(Value::as_array)
-            .is_some_and(|reasons| reasons.iter().any(|reason| {
-                reason
-                    .as_str()
-                    .is_some_and(|text| text.contains("id/actionId conflict"))
-            }))
-    );
+    assert!(report
+        .get("deniedReasons")
+        .and_then(Value::as_array)
+        .is_some_and(|reasons| reasons.iter().any(|reason| {
+            reason
+                .as_str()
+                .is_some_and(|text| text.contains("id/actionId conflict"))
+        })));
 }
 
 #[test]
@@ -609,16 +653,12 @@ fn resource_resolve_reads_explicit_file_and_directory_manifest_entries() {
         .and_then(Value::as_array)
         .expect("items");
     assert_eq!(items.len(), 2);
-    assert!(
-        items
-            .iter()
-            .any(|item| item.get("contentKind").and_then(Value::as_str) == Some("fileText"))
-    );
-    assert!(
-        items
-            .iter()
-            .any(|item| item.get("contentKind").and_then(Value::as_str) == Some("directoryTree"))
-    );
+    assert!(items
+        .iter()
+        .any(|item| item.get("contentKind").and_then(Value::as_str) == Some("fileText")));
+    assert!(items
+        .iter()
+        .any(|item| item.get("contentKind").and_then(Value::as_str) == Some("directoryTree")));
 }
 
 #[test]
@@ -905,7 +945,7 @@ fn action_batch_submit_requests_permission_for_workspace_write_without_grant() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": ["generated/output.txt"],
                             "sourceBlockId": "block-generic"
@@ -920,7 +960,7 @@ fn action_batch_submit_requests_permission_for_workspace_write_without_grant() {
         matches!(
             event,
             KernelEvent::PermissionRequested { request, .. }
-                if request.capability == "workspace.write"
+                if request.capability == "fs.write"
         )
     }));
     assert!(!events.iter().any(|event| {
@@ -989,7 +1029,7 @@ fn action_batch_permission_accept_executes_pending_workspace_write_and_enters_re
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": ["generated/output.txt"],
                             "sourceBlockId": "block-generic"
@@ -1006,7 +1046,7 @@ fn action_batch_permission_accept_executes_pending_workspace_write_and_enters_re
             KernelEvent::PermissionRequested { request, .. } => Some(request.id.clone()),
             _ => None,
         })
-        .expect("workspace.write permission requested");
+        .expect("fs.write permission requested");
 
     let accepted = runtime
         .dispatch(KernelCommand::PermissionResolve {
@@ -1026,11 +1066,9 @@ fn action_batch_permission_accept_executes_pending_workspace_write_and_enters_re
             } if tool_name == "fs.write"
         )
     }));
-    assert!(
-        accepted
-            .iter()
-            .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. }))
-    );
+    assert!(accepted
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
     assert!(accepted.iter().any(|event| {
         matches!(
             event,
@@ -1107,7 +1145,7 @@ fn action_batch_submit_executes_minimal_workspace_write() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": ["generated/output.txt"],
                             "sourceBlockId": "block-generic"
@@ -1118,21 +1156,15 @@ fn action_batch_submit_executes_minimal_workspace_write() {
         })
         .expect("action batch succeeds");
 
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::ActionBatchAccepted { .. }))
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::WorkUnitQueued { .. }))
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::WorkUnitStarted { .. }))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::ActionBatchAccepted { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitQueued { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitStarted { .. })));
     assert!(events.iter().any(|event| {
         matches!(
             event,
@@ -1143,11 +1175,9 @@ fn action_batch_submit_executes_minimal_workspace_write() {
             } if tool_name == "fs.write"
         )
     }));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. }))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
     assert_eq!(
         fs::read_to_string(temp.join("generated").join("output.txt")).expect("written file"),
         "generic generated content\n"
@@ -1194,11 +1224,11 @@ fn action_batch_submit_executes_workspace_delete_with_grant() {
                         {
                             "id": "delete-generic",
                             "title": "Delete generic file",
-                            "capability": "workspace.delete",
+                            "capability": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["input.txt"],
                             "targetPath": "input.txt",
-                            "permissionLabels": ["workspace.delete"]
+                            "permissionLabels": ["fs.delete"]
                         }
                     ]
                 }
@@ -1206,6 +1236,92 @@ fn action_batch_submit_executes_workspace_delete_with_grant() {
         })
         .expect("action batch delete succeeds");
 
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "toolName").as_deref(),
+        Some("fs.delete")
+    );
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "path").as_deref(),
+        Some("input.txt")
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok: true,
+                ..
+            } if tool_name == "fs.delete"
+        )
+    }));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
+    assert!(
+        !temp.join("input.txt").exists(),
+        "fs.delete removes the targeted file"
+    );
+}
+
+#[test]
+fn action_batch_submit_executes_workspace_delete_without_kind_with_grant() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Delete a generic file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_delete(&mut runtime);
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-delete-without-kind".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic-delete",
+                "actionBundle": {
+                    "id": "bundle-generic-delete",
+                    "goal": "Delete a generic file.",
+                    "actions": [
+                        {
+                            "id": "delete-generic",
+                            "title": "Delete generic file",
+                            "capability": "fs.delete",
+                            "resourceScope": ["input.txt"],
+                            "targetPath": "input.txt",
+                            "permissionLabels": ["fs.delete"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch delete succeeds");
+
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "toolName").as_deref(),
+        Some("fs.delete")
+    );
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "path").as_deref(),
+        Some("input.txt")
+    );
     assert!(events.iter().any(|event| {
         matches!(
             event,
@@ -1217,13 +1333,596 @@ fn action_batch_submit_executes_workspace_delete_with_grant() {
         )
     }));
     assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. }))
+        !temp.join("input.txt").exists(),
+        "fs.delete without kind still removes the targeted file"
+    );
+}
+
+#[test]
+fn action_batch_submit_executes_workspace_delete_from_resource_scope_only() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Delete a generic file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_delete(&mut runtime);
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-delete-resource-scope".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic-delete",
+                "actionBundle": {
+                    "id": "bundle-generic-delete",
+                    "goal": "Delete a generic file.",
+                    "actions": [
+                        {
+                            "id": "delete-generic",
+                            "title": "Delete generic file",
+                            "capability": "fs.delete",
+                            "kind": "delete",
+                            "resourceScope": ["input.txt"],
+                            "permissionLabels": ["fs.delete"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch delete succeeds");
+
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "toolName").as_deref(),
+        Some("fs.delete")
+    );
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "path").as_deref(),
+        Some("input.txt")
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok: true,
+                ..
+            } if tool_name == "fs.delete"
+        )
+    }));
+    assert!(
+        !temp.join("input.txt").exists(),
+        "fs.delete can derive its path from resourceScope"
+    );
+}
+
+#[test]
+fn action_batch_submit_executes_workspace_delete_from_target_ref() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Delete a generic file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_delete(&mut runtime);
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-delete-target-ref".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic-delete",
+                "actionBundle": {
+                    "id": "bundle-generic-delete",
+                    "goal": "Delete a generic file.",
+                    "actions": [
+                        {
+                            "id": "delete-generic",
+                            "title": "Delete generic file",
+                            "capability": "fs.delete",
+                            "kind": "delete",
+                            "targetRef": {
+                                "kind": "workspaceRelative",
+                                "path": "input.txt"
+                            },
+                            "permissionLabels": ["fs.delete"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch delete succeeds");
+
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "toolName").as_deref(),
+        Some("fs.delete")
+    );
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "path").as_deref(),
+        Some("input.txt")
+    );
+    let target_ref = queued_work_unit_value(&events, "delete-generic", "targetRef")
+        .expect("queued work unit exposes targetRef");
+    assert_eq!(
+        target_ref.get("kind").and_then(Value::as_str),
+        Some("workspaceRelative")
+    );
+    assert_eq!(
+        target_ref.get("path").and_then(Value::as_str),
+        Some("input.txt")
     );
     assert!(
         !temp.join("input.txt").exists(),
-        "workspace.delete removes the targeted file"
+        "fs.delete can derive its path from targetRef"
+    );
+}
+
+#[test]
+fn action_batch_submit_deletes_relative_file_under_dot_directory_attachment() {
+    let attached_root = std::env::temp_dir().join(format!(
+        "deepcode-runtime-v3-dot-attachment-delete-{}-{}",
+        std::process::id(),
+        TEMP_INDEX.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = fs::remove_dir_all(&attached_root);
+    fs::create_dir_all(&attached_root).expect("create attached root");
+    fs::write(attached_root.join("target.txt"), "delete me\n").expect("write target file");
+    let mut runtime = DeepCodeKernelRuntime::new();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Delete a generic file from the selected directory.".to_string(),
+                attachments: vec![serde_json::json!({
+                    "kind": "directory",
+                    "path": ".",
+                    "absolutePath": attached_root.to_string_lossy(),
+                    "source": "userSelected",
+                    "scope": "session"
+                })],
+            },
+            workspace_binding: None,
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_delete(&mut runtime);
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-delete-dot-attachment".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic-delete",
+                "actionBundle": {
+                    "id": "bundle-generic-delete",
+                    "goal": "Delete a generic file from the selected directory.",
+                    "actions": [
+                        {
+                            "id": "delete-generic",
+                            "title": "Delete generic file",
+                            "capability": "fs.delete",
+                            "kind": "delete",
+                            "targetPath": "target.txt",
+                            "resourceScope": ["target.txt"],
+                            "permissionLabels": ["fs.delete"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch delete succeeds");
+
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "toolName").as_deref(),
+        Some("fs.delete")
+    );
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "path").as_deref(),
+        Some("target.txt")
+    );
+    assert!(
+        !attached_root.join("target.txt").exists(),
+        "fs.delete removes a workspace-relative file under the selected directory attachment"
+    );
+}
+
+#[test]
+fn action_batch_compile_error_does_not_start_work_unit() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Delete an invalid generic path.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_delete(&mut runtime);
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-delete-root".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-invalid-delete",
+                "actionBundle": {
+                    "id": "bundle-invalid-delete",
+                    "goal": "Delete an invalid generic path.",
+                    "actions": [
+                        {
+                            "id": "delete-invalid-root",
+                            "title": "Delete invalid root",
+                            "capability": "fs.delete",
+                            "kind": "delete",
+                            "targetRef": {
+                                "kind": "absolutePath",
+                                "path": "/"
+                            },
+                            "permissionLabels": ["fs.delete"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch returns compile failure event");
+
+    let compile_error = queued_work_unit_value(&events, "delete-invalid-root", "compileError")
+        .expect("queued work unit exposes compileError");
+    assert_eq!(
+        compile_error.get("code").and_then(Value::as_str),
+        Some("invalid_command")
+    );
+    assert!(!events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::WorkUnitStarted { work_unit_id, .. }
+                if work_unit_id == "work-unit-plan-invalid-delete-delete-invalid-root"
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::WorkUnitFailed { work_unit_id, .. }
+                if work_unit_id == "work-unit-plan-invalid-delete-delete-invalid-root"
+        )
+    }));
+}
+
+#[test]
+fn action_batch_submit_executes_external_absolute_delete_with_scoped_grant() {
+    let (mut runtime, workspace_root) = runtime_with_workspace();
+    let external_root = std::env::temp_dir().join(format!(
+        "deepcode-runtime-external-delete-{}-{}",
+        std::process::id(),
+        TEMP_INDEX.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = fs::remove_dir_all(&external_root);
+    fs::create_dir_all(&external_root).expect("create external root");
+    let external_file = external_root.join("delete-target.txt");
+    fs::write(&external_file, "delete me\n").expect("write external file");
+
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Delete an explicitly reviewed outside file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(workspace_root.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_external_delete_path(&mut runtime, &external_file);
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-delete-external".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-external-delete",
+                "actionBundle": {
+                    "id": "bundle-external-delete",
+                    "goal": "Delete an explicitly reviewed outside file.",
+                    "actions": [
+                        {
+                            "id": "delete-external",
+                            "title": "Delete external file",
+                            "capability": "fs.delete",
+                            "kind": "delete",
+                            "targetPath": external_file.to_string_lossy(),
+                            "resourceScope": [external_file.to_string_lossy()],
+                            "permissionLabels": ["fs.delete"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("external delete action batch succeeds");
+
+    assert_eq!(
+        compiled_tool_value(&events, "delete-external", "toolName").as_deref(),
+        Some("fs.delete")
+    );
+    assert_eq!(
+        compiled_tool_value(&events, "delete-external", "path").as_deref(),
+        Some("delete-target.txt")
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok: true,
+                ..
+            } if tool_name == "fs.delete"
+        )
+    }));
+    assert!(
+        !external_file.exists(),
+        "external absolute fs.delete removes only the reviewed file"
+    );
+    assert_eq!(
+        runtime
+            .state
+            .current_workspace
+            .as_ref()
+            .map(|workspace| workspace.root.clone()),
+        Some(
+            workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.clone())
+        ),
+        "external file execution must not replace the current workspace root"
+    );
+    let _ = fs::remove_dir_all(workspace_root);
+    let _ = fs::remove_dir_all(external_root);
+}
+
+#[test]
+fn action_batch_submit_executes_workspace_delete_when_target_path_is_empty() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Delete a generic file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_delete(&mut runtime);
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-delete-empty-target".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic-delete",
+                "actionBundle": {
+                    "id": "bundle-generic-delete",
+                    "goal": "Delete a generic file.",
+                    "actions": [
+                        {
+                            "id": "delete-generic",
+                            "title": "Delete generic file",
+                            "capability": "fs.delete",
+                            "kind": "delete",
+                            "targetPath": "",
+                            "resourceScope": ["input.txt"],
+                            "permissionLabels": ["fs.delete"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch delete succeeds");
+
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "toolName").as_deref(),
+        Some("fs.delete")
+    );
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "path").as_deref(),
+        Some("input.txt")
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::WorkUnitQueued { work_unit, .. }
+                if work_unit.get("deleteSet").and_then(Value::as_array).map(|items| {
+                    items.iter().filter_map(Value::as_str).collect::<Vec<_>>()
+                }) == Some(vec!["input.txt"])
+        )
+    }));
+    assert!(
+        !temp.join("input.txt").exists(),
+        "fs.delete ignores an empty targetPath and derives its path from resourceScope/writeSet"
+    );
+}
+
+#[test]
+fn action_batch_submit_mixed_write_and_delete_keep_distinct_fs_tools() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Update one generic file and delete another.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_write(&mut runtime);
+    grant_workspace_delete(&mut runtime);
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-mixed-fs".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic-mixed-fs",
+                "codeBlocks": [
+                    {
+                        "id": "write-generic-block",
+                        "path": "generated/output.txt",
+                        "operation": "create",
+                        "content": "generic output\n"
+                    }
+                ],
+                "actionBundle": {
+                    "id": "bundle-generic-mixed-fs",
+                    "goal": "Write one generic file and delete another.",
+                    "actions": [
+                        {
+                            "id": "write-generic",
+                            "title": "Write generic file",
+                            "capability": "fs.write",
+                            "kind": "create",
+                            "resourceScope": ["generated/output.txt"],
+                            "targetPath": "generated/output.txt",
+                            "sourceBlockId": "write-generic-block",
+                            "permissionLabels": ["fs.write"]
+                        },
+                        {
+                            "id": "delete-generic",
+                            "title": "Delete generic file",
+                            "capability": "fs.delete",
+                            "kind": "delete",
+                            "resourceScope": ["input.txt"],
+                            "targetPath": "input.txt",
+                            "permissionLabels": ["fs.delete"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("mixed action batch succeeds");
+
+    assert_eq!(
+        compiled_tool_value(&events, "write-generic", "toolName").as_deref(),
+        Some("fs.write")
+    );
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic", "toolName").as_deref(),
+        Some("fs.delete")
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok: true,
+                ..
+            } if tool_name == "fs.write"
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok: true,
+                ..
+            } if tool_name == "fs.delete"
+        )
+    }));
+    assert_eq!(
+        fs::read_to_string(temp.join("generated").join("output.txt")).expect("written file"),
+        "generic output\n"
+    );
+    assert!(
+        !temp.join("input.txt").exists(),
+        "mixed batch delete removes the targeted file"
     );
 }
 
@@ -1267,11 +1966,11 @@ fn action_batch_submit_workspace_delete_path_grant_does_not_cover_other_files() 
                         {
                             "id": "delete-other-generic",
                             "title": "Delete another generic file",
-                            "capability": "workspace.delete",
+                            "capability": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["nested/child.txt"],
                             "targetPath": "nested/child.txt",
-                            "permissionLabels": ["workspace.delete"]
+                            "permissionLabels": ["fs.delete"]
                         }
                     ]
                 }
@@ -1283,12 +1982,12 @@ fn action_batch_submit_workspace_delete_path_grant_does_not_cover_other_files() 
         matches!(
             event,
             KernelEvent::PermissionRequested { request, .. }
-                if request.capability == "workspace.delete"
+                if request.capability == "fs.delete"
         )
     }));
     assert!(
         temp.join("nested").join("child.txt").exists(),
-        "path-scoped workspace.delete grant must not delete ungranted files"
+        "path-scoped fs.delete grant must not delete ungranted files"
     );
 }
 
@@ -1324,10 +2023,10 @@ fn action_batch_submit_workspace_delete_requires_target_without_write_error() {
                         {
                             "id": "delete-generic",
                             "title": "Delete generic file",
-                            "capability": "workspace.delete",
+                            "capability": "fs.delete",
                             "kind": "delete",
                             "resourceScope": [],
-                            "permissionLabels": ["workspace.delete"]
+                            "permissionLabels": ["fs.delete"]
                         }
                     ]
                 }
@@ -1343,14 +2042,13 @@ fn action_batch_submit_workspace_delete_requires_target_without_write_error() {
         })
         .expect("work unit failed");
     assert!(
-        error_message.contains(
-            "workspace.delete action delete-generic requires targetPath or resourceScope"
-        ),
+        error_message
+            .contains("fs.delete action delete-generic requires targetPath or resourceScope"),
         "missing delete target should be reported as a delete compile error"
     );
     assert!(
-        !error_message.contains("workspace.write target path is empty"),
-        "missing delete target must not be reported as a workspace.write path error"
+        !error_message.contains("fs.write target path is empty"),
+        "missing delete target must not be reported as a fs.write path error"
     );
 }
 
@@ -1386,11 +2084,11 @@ fn action_batch_submit_workspace_delete_rejects_workspace_root_without_write_err
                         {
                             "id": "delete-generic",
                             "title": "Delete generic target",
-                            "capability": "workspace.delete",
+                            "capability": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["."],
                             "targetPath": ".",
-                            "permissionLabels": ["workspace.delete"]
+                            "permissionLabels": ["fs.delete"]
                         }
                     ]
                 }
@@ -1406,12 +2104,89 @@ fn action_batch_submit_workspace_delete_rejects_workspace_root_without_write_err
         })
         .expect("work unit failed");
     assert!(
-        error_message.contains("workspace.delete cannot remove workspace root"),
+        error_message.contains("fs.delete cannot remove workspace root"),
         "root delete target should be rejected as a delete operation"
     );
     assert!(
-        !error_message.contains("workspace.write target path is empty"),
-        "root delete target must not be reported as a workspace.write path error"
+        !error_message.contains("fs.write target path is empty"),
+        "root delete target must not be reported as a fs.write path error"
+    );
+}
+
+#[test]
+fn action_batch_submit_workspace_delete_rejects_directory_without_write_error() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Delete a generic directory.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_delete(&mut runtime);
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-delete-directory".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic-delete-directory",
+                "actionBundle": {
+                    "id": "bundle-generic-delete-directory",
+                    "goal": "Delete a generic directory.",
+                    "actions": [
+                        {
+                            "id": "delete-generic-directory",
+                            "title": "Delete generic directory",
+                            "capability": "fs.delete",
+                            "kind": "delete",
+                            "resourceScope": ["nested"],
+                            "targetPath": "nested",
+                            "permissionLabels": ["fs.delete"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch returns delete failure event");
+
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic-directory", "toolName").as_deref(),
+        Some("fs.delete")
+    );
+    let error_message = events
+        .iter()
+        .find_map(|event| match event {
+            KernelEvent::WorkUnitFailed { error, .. } => Some(error.message.as_str()),
+            _ => None,
+        })
+        .expect("work unit failed");
+    assert!(
+        error_message.contains("fs.delete only accepts files"),
+        "directory delete target should be rejected as a delete operation"
+    );
+    assert!(
+        !error_message.contains("fs.write target path is empty"),
+        "directory delete target must not be reported as a fs.write path error"
+    );
+    assert!(
+        temp.join("nested").exists(),
+        "directory delete is fail-closed"
     );
 }
 
@@ -1439,7 +2214,7 @@ fn action_batch_submit_executes_exact_block_patch() {
         })
         .expect("runCreate succeeds");
 
-    grant_workspace_write(&mut runtime);
+    grant_workspace_patch(&mut runtime);
 
     let events = runtime
         .dispatch(KernelCommand::ActionBatchSubmit {
@@ -1463,7 +2238,7 @@ fn action_batch_submit_executes_exact_block_patch() {
                         {
                             "id": "patch-generic",
                             "title": "Patch generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.patch",
                             "kind": "replaceBlock",
                             "resourceScope": ["input.txt"],
                             "targetPath": "input.txt",
@@ -1491,11 +2266,9 @@ fn action_batch_submit_executes_exact_block_patch() {
             } if tool_name == "fs.patch"
         )
     }));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. }))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { .. })));
     assert_eq!(
         fs::read_to_string(temp.join("input.txt")).expect("patched file"),
         "patched generic input\n"
@@ -1606,7 +2379,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": ["generated/output.txt"],
                             "sourceBlockId": "block-generic"
@@ -1614,7 +2387,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-prefixed",
                             "title": "Write prefixed generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": ["project-root/prefixed.txt"],
                             "sourceBlockId": "block-prefixed"
@@ -1622,7 +2395,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-root-id",
                             "title": "Write root id generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": ["primary-root-generic/root-id.txt"],
                             "sourceBlockId": "block-root-id"
@@ -1630,7 +2403,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-manifest-id",
                             "title": "Write manifest id generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": ["attachment-0-project-root/manifest-id.txt"],
                             "sourceBlockId": "block-manifest-id"
@@ -1638,7 +2411,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-basename",
                             "title": "Write basename generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": ["project-root/basename.txt"],
                             "sourceBlockId": "block-basename"
@@ -1646,7 +2419,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-repeated",
                             "title": "Write repeated root generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": ["project-root/project-root/repeated.txt"],
                             "sourceBlockId": "block-repeated"
@@ -1732,13 +2505,11 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
         })
         .expect("review facts produced");
     assert_eq!(facts["generatedArtifacts"].as_array().unwrap().len(), 6);
-    assert!(
-        facts["pathNormalizationDiagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["duplicateRootPathDetected"].as_bool() == Some(true))
-    );
+    assert!(facts["pathNormalizationDiagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["duplicateRootPathDetected"].as_bool() == Some(true)));
 }
 
 #[test]
@@ -1804,7 +2575,7 @@ fn action_batch_submit_normalizes_absolute_child_under_attachment_root() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": [target.to_string_lossy()],
                             "sourceBlockId": "block-generic"
@@ -1909,7 +2680,7 @@ fn action_batch_submit_rejects_attachment_directory_as_write_target() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": [attached_root.to_string_lossy()],
                             "sourceBlockId": "block-generic"
@@ -1928,8 +2699,7 @@ fn action_batch_submit_rejects_attachment_directory_as_write_target() {
         })
         .expect("work unit failed");
     assert!(
-        error_message
-            .contains("workspace.write target resolves to an attachment directory, not a file"),
+        error_message.contains("fs.write target resolves to an attachment directory, not a file"),
         "directory target failure should explain that the target is not a file"
     );
 }
@@ -2006,7 +2776,7 @@ fn action_batch_submit_absolute_path_disambiguates_multiple_attachment_roots() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": [target.to_string_lossy()],
                             "sourceBlockId": "block-generic"
@@ -2096,7 +2866,7 @@ fn action_batch_submit_file_attachment_allows_only_the_attached_file() {
                         {
                             "id": "write-allowed",
                             "title": "Write attached file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": [attached_file.to_string_lossy()],
                             "sourceBlockId": "block-allowed"
@@ -2104,7 +2874,7 @@ fn action_batch_submit_file_attachment_allows_only_the_attached_file() {
                         {
                             "id": "write-sibling",
                             "title": "Write sibling file",
-                            "capability": "workspace.write",
+                            "capability": "fs.write",
                             "kind": "write",
                             "resourceScope": [sibling_file.to_string_lossy()],
                             "sourceBlockId": "block-sibling"
@@ -2323,14 +3093,10 @@ fn action_batch_submit_blocks_unsupported_capability() {
         })
         .expect("action batch succeeds");
 
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::WorkUnitBlocked { .. }))
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, KernelEvent::ToolCompleted { .. }))
-    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::WorkUnitBlocked { .. })));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, KernelEvent::ToolCompleted { .. })));
 }

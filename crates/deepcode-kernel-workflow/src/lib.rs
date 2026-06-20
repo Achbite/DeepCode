@@ -15,9 +15,9 @@ pub mod template;
 pub mod validator;
 
 pub use contract::{
-    ActionBundleDraft, CompletionCriteria, PlanContract, PlanRiskLevel, PlannedAction,
-    ProposalContract, ProposalRiskLevel, ProposedAction, ReviewExpectation, ReviewPolicy,
-    ValidationExpectation,
+    ActionBundleDraft, CompletionCriteria, FileTargetRef, FileTargetRefKind, PlanContract,
+    PlanRiskLevel, PlannedAction, ProposalContract, ProposalRiskLevel, ProposedAction,
+    ReviewExpectation, ReviewPolicy, ValidationExpectation,
 };
 pub use controller::{
     PhaseWorkflowDescriptor, PhaseWorkflowTransitionDescriptor, PlanAcceptanceStatus,

@@ -15,6 +15,10 @@ pub struct KernelStateContract {
     pub required_user_decision: Option<String>,
     pub capability_projection: Vec<String>,
     pub tool_catalog_ref: Option<String>,
+    #[serde(default)]
+    pub tool_catalog_hash: Option<String>,
+    #[serde(default)]
+    pub tool_catalog_snapshot: Option<Value>,
     pub transition_predicates: Vec<String>,
     pub fail_closed_rules: Vec<String>,
 }

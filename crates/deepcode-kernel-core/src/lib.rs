@@ -71,6 +71,9 @@ impl Kernel {
             KernelCommand::ResourceResolve { request_id, .. } => {
                 self.not_implemented(request_id, "resource.resolve")
             }
+            KernelCommand::ArtifactRegister { request_id, .. } => {
+                self.not_implemented(request_id, "artifact.register")
+            }
             KernelCommand::DraftLedgerSubmit { request_id, .. } => {
                 self.not_implemented(request_id, "draft_ledger.submit")
             }
@@ -96,28 +99,28 @@ impl Kernel {
                 self.not_implemented(request_id, "workspace.current")
             }
             KernelCommand::WorkspaceList { request_id, .. } => {
-                self.not_implemented(request_id, "workspace.list")
+                self.not_implemented(request_id, "fs.list")
             }
             KernelCommand::WorkspaceRead { request_id, .. } => {
-                self.not_implemented(request_id, "workspace.read")
+                self.not_implemented(request_id, "fs.read")
             }
             KernelCommand::WorkspaceWrite { request_id, .. } => {
-                self.not_implemented(request_id, "workspace.write")
+                self.not_implemented(request_id, "fs.write")
             }
             KernelCommand::WorkspaceCreate { request_id, .. } => {
-                self.not_implemented(request_id, "workspace.create")
+                self.not_implemented(request_id, "fs.write")
             }
             KernelCommand::WorkspaceCreateFolder { request_id, .. } => {
-                self.not_implemented(request_id, "workspace.create_folder")
+                self.not_implemented(request_id, "fs.mkdir")
             }
             KernelCommand::WorkspaceRename { request_id, .. } => {
-                self.not_implemented(request_id, "workspace.rename")
+                self.not_implemented(request_id, "fs.rename")
             }
             KernelCommand::WorkspaceDelete { request_id, .. } => {
-                self.not_implemented(request_id, "workspace.delete")
+                self.not_implemented(request_id, "fs.delete")
             }
             KernelCommand::WorkspaceSearch { request_id, .. } => {
-                self.not_implemented(request_id, "workspace.search")
+                self.not_implemented(request_id, "code.search")
             }
             KernelCommand::ToolInvoke { request_id, .. } => {
                 self.not_implemented(request_id, "tool.invoke")
