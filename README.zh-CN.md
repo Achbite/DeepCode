@@ -181,8 +181,8 @@ conversation root 下的路径：
 - 最终回答和 review 总结跟随用户语言，默认中文。
 - `resourceRequest.items[]` 必须包含 `manifestEntryId` 或 `path` 二选一。存在多个 conversation root 时，`path` 应搭配 `rootId`。
 - `path` 只由 Session 在显式附件、项目默认工作目录或已证明的 conversation roots 内解析，然后提交 Kernel `ResourceResolve`；LLM 自行生成的任意本地绝对路径无效。
-- `actionBundle.actions[].capability` 使用 capability namespace，如 `workspace.write`、`workspace.delete`、`network.egress`。
-- executor tool name 如 `fs.write`、`fs.delete`、`web.search` 只属于 complete 阶段工具调用。
+- `actionBundle.actions[].capability` 使用 Kernel catalog id，如 `fs.write`、`fs.patch`、`fs.delete`、`network.egress`。
+- 文件操作必须使用 `fs.*` catalog id；`workspace` 只表示已授权的 scope/root 概念，不再是工具命名空间。
 - 写入草案通过 top-level `codeBlocks` 表达，action 通过 `sourceBlockId` 引用。
 - v3 parser 保持 fail-closed；解析失败只允许 Session 中的一次受控 LLM repair。Kernel 只验证结构化 proposal，不组装 prompt，也不 repair 模型输出。
 

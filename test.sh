@@ -28,8 +28,9 @@ elif [ -f /.dockerenv ] && { [ -z "${TMPDIR:-}" ] || [ "${TMPDIR%/}" = "/tmp" ];
 fi
 mkdir -p "${CARGO_TARGET_DIR:-$ROOT_DIR/target}" "${TMPDIR:-/tmp}"
 
-TEST_PORT="${DEEPCODE_TEST_PORT:-31246}"
-PROXY_PORT="${DEEPCODE_PROXY_TEST_PORT:-31247}"
+DEFAULT_TEST_PORT="$((31000 + RANDOM % 20000))"
+TEST_PORT="${DEEPCODE_TEST_PORT:-$DEFAULT_TEST_PORT}"
+PROXY_PORT="${DEEPCODE_PROXY_TEST_PORT:-$((TEST_PORT + 1))}"
 CONFIG_DIR=""
 DAEMON_LOG=""
 DAEMON_PID=""
@@ -341,7 +342,7 @@ test ! -f crates/deepcode-kernel-runtime/src/temp_artifacts.rs \
   || fail "legacy temp_artifacts runtime module must not return"
 for daemon_module in \
   prelude api_response state ipc static_assets kernel_api workspace_api settings_api \
-  session_store agent_api event_projection llm_transport terminal_api \
+  session_store agent_api event_projection llm_transport terminal_api routes \
   browser_api skill_api utils
 do
   test -f "crates/deepcode-kernel-daemon/src/${daemon_module}.rs" \
@@ -367,7 +368,7 @@ search "fn user_settings_get|fn llm_profiles_get" crates/deepcode-kernel-daemon/
 search "fn append_session_projection_jsonl|fn session_store_projection_append" crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
 search "conversation_archives_dir|conversationArchiveRoot|fn session_store_archive_get|fn session_store_archive_file_get|ArchiveFileQuery|fn append_conversation_archive_projection|fn append_conversation_archive_transcript|fn read_conversation_archive_manifests|fn safe_archive_relative_path|fn redact_archive_value" crates/deepcode-kernel-daemon/src/state.rs crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
 search "manifest.json|projection.jsonl|transcript.jsonl|exports/complete.md|exports/debug.json|projection-events.jsonl|transcript-events.jsonl|action-bundle-drafts.jsonl|plan-review-reports.jsonl|review-packets.jsonl|permission-tool-facts.jsonl|llm-provider-errors.jsonl" crates/deepcode-kernel-daemon/src/session_store.rs >/dev/null
-search "/api/session-store/:session_id/archive|/api/session-store/:session_id/archive/file" crates/deepcode-kernel-daemon/src/main.rs >/dev/null
+search "/api/session-store/:session_id/archive|/api/session-store/:session_id/archive/file" crates/deepcode-kernel-daemon/src/routes.rs >/dev/null
 ! search "conversation-archives" userspace/gui/dist shells/tauri/dist shells/tauri/src-tauri/tauri.conf.json 2>/dev/null \
   || fail "conversation archives must stay in user config data, not GUI/Tauri dist resources"
 search "fn call_openai_compatible_profile|fn call_anthropic_profile|fn call_ollama_profile" crates/deepcode-kernel-daemon/src/llm_transport.rs >/dev/null
@@ -442,7 +443,7 @@ search "struct PredicateRegistry|proposal.kind.in|llm_says_done|model_claims_tes
 search "struct DescriptorValidator|unknown_capability|unsafe_hook|forbidden_predicate|unbounded_self_loop|dead_end_state|terminal_unreachable" crates/deepcode-kernel-workflow/src/validator.rs >/dev/null
 search "struct SafeInterpreter|evaluate_transition|validate_proposal|TransitionDecision|ProposalValidationDecision" crates/deepcode-kernel-workflow/src/interpreter.rs >/dev/null
 search "PLAN_CHECK_COMPLETE_REVIEW_TEMPLATE|builtin_plan_check_complete_review|load_builtin_plan_check_complete_review" crates/deepcode-kernel-workflow/src/template.rs >/dev/null
-search "schema_version: \"1.0.0\"|id: plan-check-complete-review|workspace.read|plan.review|permission.preflight|reviewgate.evaluate|ActionBundleDraft" crates/deepcode-kernel-workflow/templates/plan-check-complete-review.yaml >/dev/null
+search "schema_version: \"1.0.0\"|id: plan-check-complete-review|fs.read|plan.review|permission.preflight|reviewgate.evaluate|ActionBundleDraft" crates/deepcode-kernel-workflow/templates/plan-check-complete-review.yaml >/dev/null
 search "with_descriptor|descriptor_transition_decision|SafeInterpreter|TransitionInput" crates/deepcode-kernel-workflow/src/machine.rs >/dev/null
 search "rejects_script_hook|rejects_forbidden_predicate|rejects_unbounded_self_loop|unknown_proposal_kind_fails_to_parse|allows_review_to_complete_user_replan_loop" crates/deepcode-kernel-workflow/src/validator.rs >/dev/null
 search "invalid_proposal_stays_without_transition|plan_draft_advances_to_check|action_bundle_draft_advances_to_check|complete_to_review_requires_all_predicates" crates/deepcode-kernel-workflow/src/interpreter.rs >/dev/null
@@ -532,6 +533,7 @@ assert_json_expr "$snapshot" 'data["ok"] is True and data["snapshot"] is not Non
 
 session_store_index="$(json_get "http://127.0.0.1:${TEST_PORT}/api/session-store/index")"
 assert_json_expr "$session_store_index" 'data["ok"] is True and data["data"]["conversationArchiveRoot"].endswith("conversation-archives")' "session store exposes conversation archive root"
+assert_json_expr "$session_store_index" "data[\"ok\"] is True and data[\"data\"][\"conversationArchiveRoot\"] == \"$CONFIG_DIR/conversation-archives\"" "session store uses isolated config root"
 archive_session_create="$(json_post "http://127.0.0.1:${TEST_PORT}/api/agent/sessions" '{"title":"Archive Smoke","workspaceId":"wf-archive","workspaceHash":"hash-archive"}')"
 archive_session_id="$(
   python3 - "$archive_session_create" <<'PY'

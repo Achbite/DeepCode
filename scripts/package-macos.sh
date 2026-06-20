@@ -9,6 +9,20 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 BUILD_COMMIT="${DEEPCODE_BUILD_COMMIT:-$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || printf 'unknown')}"
+BUILD_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+SOURCE_STATUS_HASH="$(
+  git -C "$ROOT_DIR" status --porcelain=v1 2>/dev/null \
+    | shasum -a 256 2>/dev/null \
+    | awk '{ print $1 }'
+)"
+SOURCE_STATUS_HASH="${SOURCE_STATUS_HASH:-unknown}"
+if git -C "$ROOT_DIR" diff --quiet --ignore-submodules -- 2>/dev/null \
+  && git -C "$ROOT_DIR" diff --cached --quiet --ignore-submodules -- 2>/dev/null \
+  && [ -z "$(git -C "$ROOT_DIR" ls-files --others --exclude-standard 2>/dev/null)" ]; then
+  SOURCE_DIRTY=0
+else
+  SOURCE_DIRTY=1
+fi
 PRODUCT="${DEEPCODE_MACOS_PRODUCT:-DeepCode}"
 case "$PRODUCT" in
   DeepCode)
@@ -1026,6 +1040,9 @@ write_build_info() {
   cat > "$dst" <<JSON
 {
   "buildCommit": "$BUILD_COMMIT",
+  "buildTimeUtc": "$BUILD_TIME_UTC",
+  "sourceDirty": $SOURCE_DIRTY,
+  "sourceStatusHash": "$SOURCE_STATUS_HASH",
   "protocolVersion": "deepcode.agent.protocol.v3",
   "toolCatalogVersion": "deepcode.tool_catalog.session-v3.v1",
   "product": "$product"

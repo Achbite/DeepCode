@@ -22,6 +22,7 @@
 #   ./build.sh --stage tauri    # Windows DeepCode.exe Tauri thin shell
 #   ./build.sh --stage deepcode-gui-tauri # Windows DeepCode-GUI.exe Tauri shell
 #   ./build.sh --stage package  # 复制已有构建产物到 bin/
+#   ./build.sh --stage verify-package-runtime # 只读检查已打包 runtime 是否齐全
 #   ./build.sh --stage all      # 等价默认完整构建
 #
 # 缓存开关：
@@ -118,7 +119,7 @@ mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./build.sh [--stage all|gui|deepcode-gui|deepcode-gui-tauri|macos-package-service|package-macos|package-macos-deepcode-gui|macos-deepcode-gui|daemon|cli|tui|kernel|tauri|package]...
+  ./build.sh [--stage all|gui|deepcode-gui|deepcode-gui-tauri|macos-package-service|package-macos|package-macos-deepcode-gui|macos-deepcode-gui|daemon|cli|tui|kernel|tauri|package|verify-package-runtime]...
   ./build.sh --stage macos-package-service
   ./build.sh --full
   ./build.sh --stage package-macos --clean-cache
@@ -248,6 +249,7 @@ run_tui=0
 run_tauri=0
 run_deepcode_gui_tauri=0
 run_package=0
+run_verify_package_runtime=0
 SCCACHE_SERVER_RESET_DONE=0
 
 enable_stage() {
@@ -312,6 +314,9 @@ enable_stage() {
     package)
       run_package=1
       ;;
+    verify-package-runtime)
+      run_verify_package_runtime=1
+      ;;
     *)
       echo "==[build][error]== unsupported stage: $1" >&2
       usage >&2
@@ -340,7 +345,7 @@ echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
 echo "==[build]== PNPM_REGISTRY=$PNPM_REGISTRY"
 echo "==[build]== DEEPCODE_BUILD_LINUX_TAURI_SHELL=$BUILD_LINUX_TAURI_SHELL"
 echo "==[build]== clean-cache=$clean_cache"
-echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui deepcode-gui-tauri=$run_deepcode_gui_tauri package-macos=$run_package_macos package-macos-deepcode-gui=$run_package_macos_deepcode_gui macos-package-service=$run_macos_package_service daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package"
+echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui deepcode-gui-tauri=$run_deepcode_gui_tauri package-macos=$run_package_macos package-macos-deepcode-gui=$run_package_macos_deepcode_gui macos-package-service=$run_macos_package_service daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package verify-package-runtime=$run_verify_package_runtime"
 mkdir -p "$STAGE_STAMP_DIR"
 
 is_docker_environment() {
@@ -513,7 +518,7 @@ if [ "$run_macos_package_service" = "1" ]; then
   if [ "$host_macos_stage_count" -gt 0 ] || [ "$run_deps" = "1" ] || [ "$run_gui" = "1" ] || \
     [ "$run_deepcode_gui" = "1" ] || [ "$run_daemon" = "1" ] || [ "$run_cli" = "1" ] || \
     [ "$run_tui" = "1" ] || [ "$run_tauri" = "1" ] || [ "$run_deepcode_gui_tauri" = "1" ] || \
-    [ "$run_package" = "1" ]; then
+    [ "$run_package" = "1" ] || [ "$run_verify_package_runtime" = "1" ]; then
     echo "==[build][error]== macos-package-service must run by itself." >&2
     exit 2
   fi
@@ -528,7 +533,8 @@ if [ "$host_macos_stage_count" -gt 0 ]; then
   fi
   if [ "$run_deps" = "1" ] || [ "$run_gui" = "1" ] || [ "$run_deepcode_gui" = "1" ] || \
     [ "$run_daemon" = "1" ] || [ "$run_cli" = "1" ] || [ "$run_tui" = "1" ] || \
-    [ "$run_tauri" = "1" ] || [ "$run_deepcode_gui_tauri" = "1" ] || [ "$run_package" = "1" ]; then
+    [ "$run_tauri" = "1" ] || [ "$run_deepcode_gui_tauri" = "1" ] || [ "$run_package" = "1" ] || \
+    [ "$run_verify_package_runtime" = "1" ]; then
     echo "==[build][error]== macOS package stages are host orchestration stages; run them by themselves." >&2
     exit 2
   fi
@@ -554,7 +560,10 @@ if [ "$clean_cache" = "1" ]; then
   exit 2
 fi
 
-require_docker_build_environment
+docker_build_stage_count=$((run_deps + run_gui + run_deepcode_gui + run_daemon + run_cli + run_tui + run_tauri + run_deepcode_gui_tauri + run_package))
+if [ "$docker_build_stage_count" -gt 0 ]; then
+  require_docker_build_environment
+fi
 
 configure_sccache() {
   if [ "${DEEPCODE_DISABLE_SCCACHE:-0}" = "1" ]; then
@@ -1020,6 +1029,132 @@ validate_package_inputs() {
   fi
 }
 
+verify_runtime_file() {
+  local path="$1"
+  local label="$2"
+  if [ ! -f "$path" ]; then
+    echo "==[build][verify-package-runtime][error]== missing $label: $path" >&2
+    return 1
+  fi
+  echo "==[build][verify-package-runtime]== ok $label: $path"
+}
+
+verify_runtime_executable() {
+  local path="$1"
+  local label="$2"
+  if [ ! -x "$path" ]; then
+    echo "==[build][verify-package-runtime][error]== missing executable $label: $path" >&2
+    return 1
+  fi
+  echo "==[build][verify-package-runtime]== ok $label: $path"
+}
+
+verify_frontend_package_assets() {
+  local dist_dir="$1"
+  local label="$2"
+  verify_runtime_file "$dist_dir/index.html" "$label index.html" || return 1
+  if ! grep -q '<script[^>]*type="module"[^>]*assets/' "$dist_dir/index.html"; then
+    echo "==[build][verify-package-runtime][error]== $label index.html has no production module entry: $dist_dir/index.html" >&2
+    return 1
+  fi
+  echo "==[build][verify-package-runtime]== ok $label production assets"
+}
+
+verify_linux_package_runtime() {
+  local missing=0
+  [ -d "$LINUX_DIR" ] || return 2
+  echo "==[build][verify-package-runtime]== check linux-x64 package"
+  verify_runtime_executable "$LINUX_DIR/deepcode-kernel" "linux kernel" || missing=1
+  verify_runtime_executable "$LINUX_DIR/deepcode-cli" "linux cli" || missing=1
+  verify_runtime_executable "$LINUX_DIR/deepcode-tui" "linux tui" || missing=1
+  verify_frontend_package_assets "$LINUX_DIR/web" "linux editor web" || missing=1
+  verify_frontend_package_assets "$LINUX_DIR/web-deepcode-gui" "linux DeepCode-GUI web" || missing=1
+  return "$missing"
+}
+
+verify_windows_package_runtime() {
+  local missing=0
+  [ -d "$WIN_DIR" ] || return 2
+  echo "==[build][verify-package-runtime]== check win64 package"
+  verify_runtime_file "$WIN_DIR/deepcode-kernel.exe" "windows kernel" || missing=1
+  verify_runtime_file "$WIN_DIR/deepcode-cli.exe" "windows cli" || missing=1
+  verify_runtime_file "$WIN_DIR/deepcode-tui.exe" "windows tui" || missing=1
+  verify_runtime_file "$WIN_DIR/DeepCode.exe" "windows editor shell" || missing=1
+  verify_runtime_file "$WIN_DIR/DeepCode-GUI.exe" "windows DeepCode-GUI shell" || missing=1
+  verify_runtime_file "$WIN_DIR/WebView2Loader.dll" "windows WebView2 loader" || missing=1
+  verify_frontend_package_assets "$WIN_DIR/web" "windows editor web" || missing=1
+  verify_frontend_package_assets "$WIN_DIR/web-deepcode-gui" "windows DeepCode-GUI web" || missing=1
+  return "$missing"
+}
+
+verify_macos_package_runtime() {
+  local macos_dir="$BIN_ROOT/macos-arm64"
+  local missing=0
+  local checked_app=0
+  [ -d "$macos_dir" ] || return 2
+  echo "==[build][verify-package-runtime]== check macos-arm64 package"
+  verify_runtime_executable "$macos_dir/deepcode-kernel" "macOS shared kernel" || missing=1
+  verify_runtime_file "$macos_dir/session-core/hostBridge.js" "macOS session bridge" || missing=1
+  verify_runtime_file "$macos_dir/node_modules/@deepcode/protocol/dist/index.js" "macOS protocol runtime" || missing=1
+  verify_runtime_executable "$macos_dir/node/bin/node" "macOS packaged node" || missing=1
+
+  if [ -d "$macos_dir/DeepCode.app" ]; then
+    checked_app=1
+    verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/DeepCode" "macOS DeepCode app shell" || missing=1
+    verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode bundled kernel" || missing=1
+    verify_frontend_package_assets "$macos_dir/DeepCode.app/Contents/MacOS/web" "macOS DeepCode bundled web" || missing=1
+  fi
+  if [ -d "$macos_dir/DeepCode-GUI.app" ]; then
+    checked_app=1
+    verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/DeepCode-GUI" "macOS DeepCode-GUI app shell" || missing=1
+    verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode-GUI bundled kernel" || missing=1
+    verify_frontend_package_assets "$macos_dir/DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui" "macOS DeepCode-GUI bundled web" || missing=1
+  fi
+  if [ "$checked_app" = "0" ]; then
+    echo "==[build][verify-package-runtime][error]== macOS package root exists but no .app bundle was found in $macos_dir" >&2
+    missing=1
+  fi
+  return "$missing"
+}
+
+verify_package_runtime() {
+  local checked=0
+  local missing=0
+  if verify_linux_package_runtime; then
+    checked=1
+  else
+    case "$?" in
+      2) ;;
+      *) checked=1; missing=1 ;;
+    esac
+  fi
+  if verify_windows_package_runtime; then
+    checked=1
+  else
+    case "$?" in
+      2) ;;
+      *) checked=1; missing=1 ;;
+    esac
+  fi
+  if verify_macos_package_runtime; then
+    checked=1
+  else
+    case "$?" in
+      2) ;;
+      *) checked=1; missing=1 ;;
+    esac
+  fi
+
+  if [ "$checked" = "0" ]; then
+    echo "==[build][verify-package-runtime][error]== no package directory found under $BIN_ROOT" >&2
+    echo "==[build][verify-package-runtime][error]== run ./build.sh --stage package or ./build.sh --stage package-macos first" >&2
+    exit 1
+  fi
+  if [ "$missing" = "1" ]; then
+    exit 1
+  fi
+}
+
 write_readme() {
   local dist_dir="$1"
   local platform="$2"
@@ -1254,6 +1389,10 @@ fi
 if [ "$run_package" = "1" ]; then
   package_distribution
   auto_submit_macos_package_request
+fi
+
+if [ "$run_verify_package_runtime" = "1" ]; then
+  verify_package_runtime
 fi
 
 echo ""
