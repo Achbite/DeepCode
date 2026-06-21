@@ -88,6 +88,8 @@ pub struct ActionBundleDraft {
     #[serde(default)]
     pub actions: Vec<PlannedAction>,
     #[serde(default)]
+    pub access_scopes: Vec<AccessScopeDraft>,
+    #[serde(default)]
     pub validation_expectations: Vec<ValidationExpectation>,
     #[serde(default)]
     pub review_expectations: Vec<ReviewExpectation>,
@@ -156,6 +158,8 @@ pub struct PlannedAction {
     pub conflict_keys: Vec<String>,
     #[serde(default)]
     pub purpose: Option<String>,
+    #[serde(default)]
+    pub access_scopes: Vec<AccessScopeDraft>,
 }
 
 pub type ProposedAction = PlannedAction;
@@ -167,6 +171,25 @@ pub struct FileTargetRef {
     pub path: String,
     #[serde(default)]
     pub root_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessScopeDraft {
+    pub scope_kind: String,
+    pub path: String,
+    #[serde(default)]
+    pub capability: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub operations: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub dependency_depth: Option<u8>,
+    #[serde(default)]
+    pub source_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,7 +277,9 @@ mod tests {
                 can_parallelize: true,
                 conflict_keys: Vec::new(),
                 purpose: Some("collect evidence".to_string()),
+                access_scopes: Vec::new(),
             }],
+            access_scopes: Vec::new(),
             validation_expectations: vec![ValidationExpectation {
                 id: "validation-1".to_string(),
                 description: "Evidence is present.".to_string(),
@@ -291,7 +316,9 @@ mod tests {
                 can_parallelize: false,
                 conflict_keys: vec!["src/out.txt".to_string()],
                 purpose: None,
+                access_scopes: Vec::new(),
             }],
+            access_scopes: Vec::new(),
             validation_expectations: vec![ValidationExpectation {
                 id: "check-1".to_string(),
                 description: "Generated file exists.".to_string(),

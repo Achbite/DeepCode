@@ -92,6 +92,28 @@ fn grant_workspace_delete_path(runtime: &mut DeepCodeKernelRuntime, resource_pat
         .expect("temporary path-scoped fs.delete grant succeeds");
 }
 
+fn grant_workspace_scope(
+    runtime: &mut DeepCodeKernelRuntime,
+    capability: &str,
+    resource_kind: &str,
+    resource_path: &str,
+) {
+    runtime
+        .dispatch(KernelCommand::PermissionGrantTemporary {
+            request_id: RequestId(format!("req-grant-{capability}-{resource_kind}")),
+            run_id: RunId("run-1".to_string()),
+            grant: deepcode_kernel_abi::TemporaryGrantEnvelope {
+                id: format!("grant-{capability}-{resource_kind}"),
+                capability: capability.to_string(),
+                resource_kind: resource_kind.to_string(),
+                resource_path: Some(resource_path.to_string()),
+                expires_after_sequence: None,
+                reason: Some("test grants path-scoped workspace module permission".to_string()),
+            },
+        })
+        .expect("temporary workspace scope grant succeeds");
+}
+
 fn grant_external_delete_path(runtime: &mut DeepCodeKernelRuntime, resource_path: &Path) {
     runtime
         .dispatch(KernelCommand::PermissionGrantTemporary {
@@ -1265,6 +1287,213 @@ fn action_batch_submit_requests_permission_for_workspace_write_without_grant() {
         !temp.join("generated").join("output.txt").exists(),
         "permission-gated write must not touch disk before the user grants permission"
     );
+}
+
+#[test]
+fn action_batch_submit_workspace_module_grant_allows_write_under_scope() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    fs::create_dir_all(temp.join("module")).expect("create generic module dir");
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Create a generic module file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_scope(&mut runtime, "fs.write", "workspaceModule", "module");
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic",
+                "codeBlocks": [
+                    {
+                        "id": "block-generic",
+                        "path": "module/output.txt",
+                        "content": "generic module content\n"
+                    }
+                ],
+                "actionBundle": {
+                    "id": "bundle-generic",
+                    "goal": "Create a generic module file.",
+                    "actions": [
+                        {
+                            "id": "write-module-file",
+                            "title": "Write generic module file",
+                            "capability": "fs.write",
+                            "kind": "write",
+                            "resourceScope": ["module/output.txt"],
+                            "sourceBlockId": "block-generic"
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch succeeds");
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::ToolCompleted {
+                tool_name,
+                ok: true,
+                ..
+            } if tool_name == "fs.write"
+        )
+    }));
+    assert_eq!(
+        fs::read_to_string(temp.join("module").join("output.txt")).expect("written file"),
+        "generic module content\n"
+    );
+}
+
+#[test]
+fn action_batch_submit_workspace_module_grant_does_not_cover_sibling() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    fs::create_dir_all(temp.join("module")).expect("create generic module dir");
+    fs::create_dir_all(temp.join("sibling")).expect("create generic sibling dir");
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Create a generic sibling file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_scope(&mut runtime, "fs.write", "workspaceModule", "module");
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic",
+                "codeBlocks": [
+                    {
+                        "id": "block-generic",
+                        "path": "sibling/output.txt",
+                        "content": "generic sibling content\n"
+                    }
+                ],
+                "actionBundle": {
+                    "id": "bundle-generic",
+                    "goal": "Create a generic sibling file.",
+                    "actions": [
+                        {
+                            "id": "write-sibling-file",
+                            "title": "Write generic sibling file",
+                            "capability": "fs.write",
+                            "kind": "write",
+                            "resourceScope": ["sibling/output.txt"],
+                            "sourceBlockId": "block-generic"
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch succeeds");
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::PermissionRequested { request, .. }
+                if request.capability == "fs.write"
+        )
+    }));
+    assert!(!temp.join("sibling").join("output.txt").exists());
+}
+
+#[test]
+fn action_batch_submit_workspace_module_grant_does_not_allow_delete() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    fs::create_dir_all(temp.join("module")).expect("create generic module dir");
+    fs::write(temp.join("module").join("obsolete.txt"), "obsolete\n").expect("write obsolete file");
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Delete a generic module file.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_scope(&mut runtime, "fs.delete", "workspaceModule", "module");
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic",
+                "actionBundle": {
+                    "id": "bundle-generic",
+                    "goal": "Delete a generic module file.",
+                    "actions": [
+                        {
+                            "id": "delete-module-file",
+                            "title": "Delete generic module file",
+                            "capability": "fs.delete",
+                            "kind": "delete",
+                            "resourceScope": ["module/obsolete.txt"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch succeeds");
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KernelEvent::PermissionRequested { request, .. }
+                if request.capability == "fs.delete"
+        )
+    }));
+    assert!(temp.join("module").join("obsolete.txt").exists());
 }
 
 #[test]

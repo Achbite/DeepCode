@@ -552,6 +552,7 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
                     "requiredPermissions": report.get("requiredPermissions").cloned().unwrap_or_else(|| json!([])),
                     "permissionGaps": report.get("permissionGaps").cloned().unwrap_or_else(|| json!([])),
                     "requiredFileOperations": report.get("requiredFileOperations").cloned().unwrap_or_else(|| json!([])),
+                    "requiredAccessScopes": report.get("requiredAccessScopes").cloned().unwrap_or_else(|| json!([])),
                     "permissionBundles": report.get("permissionBundles").cloned().unwrap_or_else(|| json!([])),
                     "interventions": report.get("interventions").cloned().unwrap_or_else(|| json!([])),
                     "executionContract": report.get("executionContract").cloned().unwrap_or_else(|| json!(null)),

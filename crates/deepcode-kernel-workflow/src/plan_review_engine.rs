@@ -1,4 +1,7 @@
-use crate::{ActionBundleDraft, FileTargetRef, FileTargetRefKind, PlanContract, PlannedAction};
+use crate::{
+    AccessScopeDraft, ActionBundleDraft, FileTargetRef, FileTargetRefKind, PlanContract,
+    PlannedAction,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Component;
@@ -36,6 +39,22 @@ pub struct RequiredFileOperation {
     pub target_ref: Option<FileTargetRef>,
     #[serde(default)]
     pub target_kind: String,
+    #[serde(default)]
+    pub outside_workspace: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequiredAccessScope {
+    pub scope_kind: String,
+    pub path: String,
+    pub capability: String,
+    #[serde(default)]
+    pub operations: Vec<String>,
+    pub reason: String,
+    pub dependency_depth: u8,
+    #[serde(default)]
+    pub source_action_id: Option<String>,
     #[serde(default)]
     pub outside_workspace: bool,
 }
@@ -98,6 +117,8 @@ pub struct KernelExecutionContract {
     #[serde(default)]
     pub operations: Vec<KernelExecutionOperation>,
     #[serde(default)]
+    pub access_scopes: Vec<RequiredAccessScope>,
+    #[serde(default)]
     pub permission_bundles: Vec<PermissionBundle>,
     #[serde(default)]
     pub interventions: Vec<GateInterventionRequired>,
@@ -128,6 +149,8 @@ pub struct PlanReviewReport {
     #[serde(default)]
     pub required_file_operations: Vec<RequiredFileOperation>,
     #[serde(default)]
+    pub required_access_scopes: Vec<RequiredAccessScope>,
+    #[serde(default)]
     pub permission_bundles: Vec<PermissionBundle>,
     #[serde(default)]
     pub interventions: Vec<GateInterventionRequired>,
@@ -156,6 +179,7 @@ impl PlanReviewReport {
             required_permissions: Vec::new(),
             permission_gaps: Vec::new(),
             required_file_operations: Vec::new(),
+            required_access_scopes: Vec::new(),
             permission_bundles: Vec::new(),
             interventions: Vec::new(),
             execution_contract: None,
@@ -176,6 +200,7 @@ impl PlanReviewReport {
             required_permissions: Vec::new(),
             permission_gaps: Vec::new(),
             required_file_operations: Vec::new(),
+            required_access_scopes: Vec::new(),
             permission_bundles: Vec::new(),
             interventions: Vec::new(),
             execution_contract: None,
@@ -231,7 +256,7 @@ fn review_structured_plan(input: PlanReviewInput) -> PlanReviewReport {
             capabilities.insert(action.capability.clone());
         }
     }
-    let required_capabilities = sorted(capabilities.into_iter());
+    let mut required_capabilities = sorted(capabilities.into_iter());
 
     let mut hard_floor_hits = Vec::new();
     let mut denied_reasons = Vec::new();
@@ -269,6 +294,20 @@ fn review_structured_plan(input: PlanReviewInput) -> PlanReviewReport {
     let (required_file_operations, file_operation_findings) =
         required_file_operations_for_input(&input);
     findings.extend(file_operation_findings);
+    let (required_access_scopes, access_scope_findings) = required_access_scopes_for_input(&input);
+    findings.extend(access_scope_findings);
+    for scope in &required_access_scopes {
+        if !required_capabilities.contains(&scope.capability) {
+            required_capabilities.push(scope.capability.clone());
+        }
+        if permission_gap_capability(&scope.capability)
+            && !permission_gaps.contains(&scope.capability)
+        {
+            permission_gaps.push(scope.capability.clone());
+        }
+    }
+    required_capabilities.sort();
+    permission_gaps.sort();
 
     let status = if !denied_reasons.is_empty() || !hard_floor_hits.is_empty() {
         PlanReviewStatus::Denied
@@ -286,8 +325,12 @@ fn review_structured_plan(input: PlanReviewInput) -> PlanReviewReport {
         .iter()
         .map(|capability| format!("temporaryGrant:{capability}"))
         .collect::<Vec<_>>();
-    let permission_bundles =
-        permission_bundles_for_review(&input.plan.id, &permission_gaps, &required_file_operations);
+    let permission_bundles = permission_bundles_for_review(
+        &input.plan.id,
+        &permission_gaps,
+        &required_file_operations,
+        &required_access_scopes,
+    );
     let interventions =
         gate_interventions_for_review(&permission_bundles, &hard_floor_hits, &denied_reasons);
     let blocked_reasons = denied_reasons
@@ -302,6 +345,7 @@ fn review_structured_plan(input: PlanReviewInput) -> PlanReviewReport {
         &plan_id,
         &status_name_text,
         &required_file_operations,
+        &required_access_scopes,
         &permission_bundles,
         &interventions,
         &blocked_reasons,
@@ -324,6 +368,7 @@ fn review_structured_plan(input: PlanReviewInput) -> PlanReviewReport {
         required_permissions,
         permission_gaps,
         required_file_operations,
+        required_access_scopes,
         permission_bundles,
         interventions,
         execution_contract,
@@ -338,6 +383,7 @@ fn execution_contract_for_review(
     plan_id: &str,
     status: &str,
     required_file_operations: &[RequiredFileOperation],
+    required_access_scopes: &[RequiredAccessScope],
     permission_bundles: &[PermissionBundle],
     interventions: &[GateInterventionRequired],
     diagnostics: &[String],
@@ -362,6 +408,7 @@ fn execution_contract_for_review(
                 outside_workspace: operation.outside_workspace,
             })
             .collect(),
+        access_scopes: required_access_scopes.to_vec(),
         permission_bundles: permission_bundles.to_vec(),
         interventions: interventions.to_vec(),
         diagnostics: diagnostics.to_vec(),
@@ -372,6 +419,7 @@ fn permission_bundles_for_review(
     plan_id: &str,
     permission_gaps: &[String],
     required_file_operations: &[RequiredFileOperation],
+    required_access_scopes: &[RequiredAccessScope],
 ) -> Vec<PermissionBundle> {
     let gap_set = permission_gaps.iter().cloned().collect::<BTreeSet<_>>();
     let mut grouped: std::collections::BTreeMap<
@@ -397,6 +445,22 @@ fn permission_bundles_for_review(
             .or_default()
             .push(operation);
     }
+    for scope in required_access_scopes {
+        if !gap_set.contains(&scope.capability) {
+            continue;
+        }
+        grouped
+            .entry((
+                scope.capability.clone(),
+                if scope.scope_kind == "oneHopDependency" {
+                    "workspaceDependency".to_string()
+                } else {
+                    "workspaceModule".to_string()
+                },
+                Some(scope.path.clone()),
+            ))
+            .or_default();
+    }
 
     let mut output = Vec::new();
     for (capability, resource_kind, resource_path) in permission_gaps
@@ -405,6 +469,9 @@ fn permission_bundles_for_review(
             !required_file_operations
                 .iter()
                 .any(|operation| &operation.capability == *capability)
+                && !required_access_scopes
+                    .iter()
+                    .any(|scope| &scope.capability == *capability)
         })
         .map(|capability| {
             (
@@ -669,6 +736,184 @@ fn required_file_operations_for_input(
     (operations, findings)
 }
 
+fn required_access_scopes_for_input(
+    input: &PlanReviewInput,
+) -> (Vec<RequiredAccessScope>, Vec<PlanReviewFinding>) {
+    let mut scopes = Vec::new();
+    let mut findings = Vec::new();
+    let mut seen = BTreeSet::new();
+    let Some(bundle) = &input.action_bundle else {
+        return (scopes, findings);
+    };
+    for scope in &bundle.access_scopes {
+        collect_required_access_scope(scope, None, &mut scopes, &mut findings, &mut seen);
+    }
+    for action in &bundle.actions {
+        for scope in &action.access_scopes {
+            collect_required_access_scope(
+                scope,
+                Some(action),
+                &mut scopes,
+                &mut findings,
+                &mut seen,
+            );
+        }
+    }
+    (scopes, findings)
+}
+
+fn collect_required_access_scope(
+    scope: &AccessScopeDraft,
+    action: Option<&PlannedAction>,
+    output: &mut Vec<RequiredAccessScope>,
+    findings: &mut Vec<PlanReviewFinding>,
+    seen: &mut BTreeSet<String>,
+) {
+    let scope_kind = scope.scope_kind.trim();
+    if !matches!(scope_kind, "workspaceModule" | "oneHopDependency") {
+        findings.push(access_scope_finding(
+            "access_scope_kind_invalid",
+            action,
+            scope,
+            "scopeKind must be workspaceModule or oneHopDependency",
+        ));
+        return;
+    }
+    let dependency_depth = scope
+        .dependency_depth
+        .unwrap_or(if scope_kind == "oneHopDependency" {
+            1
+        } else {
+            0
+        });
+    if dependency_depth > 1 {
+        findings.push(access_scope_finding(
+            "access_scope_dependency_depth_invalid",
+            action,
+            scope,
+            "dependencyDepth must be 0 or 1; recursive dependency expansion is not allowed",
+        ));
+        return;
+    }
+    let path = match normalize_access_scope_path(&scope.path) {
+        Ok(path) => path,
+        Err(reason) => {
+            findings.push(access_scope_finding(
+                "access_scope_path_invalid",
+                action,
+                scope,
+                &reason,
+            ));
+            return;
+        }
+    };
+    let mut capabilities = scope.capabilities.clone();
+    if let Some(capability) = scope
+        .capability
+        .as_ref()
+        .filter(|capability| !capability.trim().is_empty())
+    {
+        capabilities.push(capability.clone());
+    }
+    if capabilities.is_empty() {
+        capabilities.push("fs.write".to_string());
+        capabilities.push("fs.patch".to_string());
+    }
+    for capability in sorted(capabilities.into_iter()) {
+        if !matches!(capability.as_str(), "fs.write" | "fs.patch") {
+            findings.push(access_scope_finding(
+                "access_scope_capability_invalid",
+                action,
+                scope,
+                "accessScopes may only grant fs.write/fs.patch; use exact file operations for delete/rename or other capabilities",
+            ));
+            continue;
+        }
+        let operations = if scope.operations.is_empty() {
+            operations_for_access_scope_capability(&capability)
+        } else {
+            scope.operations.clone()
+        };
+        let source_action_id = action
+            .map(|action| action.id.clone())
+            .or_else(|| scope.source_task_id.clone());
+        let key = format!("{scope_kind}:{path}:{capability}:{dependency_depth}");
+        if !seen.insert(key) {
+            continue;
+        }
+        output.push(RequiredAccessScope {
+            scope_kind: scope_kind.to_string(),
+            path: path.clone(),
+            capability,
+            operations,
+            reason: scope.reason.clone().unwrap_or_else(|| {
+                "Kernel-reviewed workspace module scope requested by plan.".to_string()
+            }),
+            dependency_depth,
+            source_action_id,
+            outside_workspace: false,
+        });
+    }
+}
+
+fn normalize_access_scope_path(raw: &str) -> Result<String, String> {
+    let normalized = raw.trim().replace('\\', "/");
+    if normalized.is_empty() || normalized == "." || normalized == "./" {
+        return Err("access scope must not be the workspace root".to_string());
+    }
+    if normalized.contains('*') {
+        return Err("access scope must not contain wildcards".to_string());
+    }
+    let path = std::path::Path::new(&normalized);
+    if path.is_absolute() {
+        return Err("access scope must be workspace-relative; outside-workspace paths require exact file operations".to_string());
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => components.push(value.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err("access scope must not escape the authorized workspace root".to_string())
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("access scope must be workspace-relative".to_string())
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err("access scope must not be the workspace root".to_string());
+    }
+    Ok(components.join("/"))
+}
+
+fn operations_for_access_scope_capability(capability: &str) -> Vec<String> {
+    match capability {
+        "fs.write" => vec!["create".to_string(), "write".to_string()],
+        "fs.patch" => vec!["patch".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+fn access_scope_finding(
+    code: &str,
+    action: Option<&PlannedAction>,
+    scope: &AccessScopeDraft,
+    reason: &str,
+) -> PlanReviewFinding {
+    let owner = action
+        .map(|action| format!("action {}", action.id))
+        .or_else(|| scope.source_task_id.as_ref().map(|id| format!("task {id}")))
+        .unwrap_or_else(|| "actionBundle".to_string());
+    PlanReviewFinding {
+        code: code.to_string(),
+        message: format!(
+            "{owner} access scope {} ({}) {reason}",
+            scope.path, scope.scope_kind
+        ),
+    }
+}
+
 fn concrete_target(value: &String) -> Option<&str> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -865,7 +1110,7 @@ fn hard_floor_capability(capability: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ActionBundleDraft, PlannedAction, ValidationExpectation};
+    use crate::{AccessScopeDraft, ActionBundleDraft, PlannedAction, ValidationExpectation};
 
     #[test]
     fn default_plan_review_engine_auto_accepts_read_only_plan() {
@@ -952,7 +1197,9 @@ mod tests {
                 can_parallelize: false,
                 conflict_keys: Vec::new(),
                 purpose: None,
+                access_scopes: Vec::new(),
             }],
+            access_scopes: Vec::new(),
             validation_expectations: vec![ValidationExpectation {
                 id: "check-1".to_string(),
                 description: "file exists".to_string(),
@@ -993,6 +1240,7 @@ mod tests {
                     can_parallelize: false,
                     conflict_keys: Vec::new(),
                     purpose: None,
+                    access_scopes: Vec::new(),
                 },
                 PlannedAction {
                     id: "delete-generic".to_string(),
@@ -1005,8 +1253,10 @@ mod tests {
                     can_parallelize: false,
                     conflict_keys: Vec::new(),
                     purpose: None,
+                    access_scopes: Vec::new(),
                 },
             ],
+            access_scopes: Vec::new(),
             validation_expectations: Vec::new(),
             review_expectations: Vec::new(),
         };
@@ -1076,8 +1326,10 @@ mod tests {
                     can_parallelize: false,
                     conflict_keys: Vec::new(),
                     purpose: None,
+                    access_scopes: Vec::new(),
                 })
                 .collect(),
+            access_scopes: Vec::new(),
             validation_expectations: Vec::new(),
             review_expectations: Vec::new(),
         };
@@ -1104,6 +1356,72 @@ mod tests {
     }
 
     #[test]
+    fn action_bundle_review_reports_workspace_module_access_scopes() {
+        let mut plan = PlanContract::low_risk_direct("plan-module-scope", "module scope");
+        plan.completion_criteria[0]
+            .evidence_required
+            .push("tool fact".to_string());
+        let bundle = ActionBundleDraft {
+            id: "bundle-module-scope".to_string(),
+            goal: "edit module files".to_string(),
+            actions: Vec::new(),
+            access_scopes: vec![
+                AccessScopeDraft {
+                    scope_kind: "workspaceModule".to_string(),
+                    path: "src/module".to_string(),
+                    capability: Some("fs.write".to_string()),
+                    capabilities: Vec::new(),
+                    operations: vec!["create".to_string(), "write".to_string()],
+                    reason: Some("module implementation".to_string()),
+                    dependency_depth: Some(0),
+                    source_task_id: Some("task-module".to_string()),
+                },
+                AccessScopeDraft {
+                    scope_kind: "oneHopDependency".to_string(),
+                    path: "src/common".to_string(),
+                    capability: Some("fs.patch".to_string()),
+                    capabilities: Vec::new(),
+                    operations: vec!["patch".to_string()],
+                    reason: Some("direct dependency".to_string()),
+                    dependency_depth: Some(1),
+                    source_task_id: Some("task-module".to_string()),
+                },
+            ],
+            validation_expectations: Vec::new(),
+            review_expectations: Vec::new(),
+        };
+
+        let report = DefaultPlanReviewEngine.review_input(PlanReviewInput {
+            plan,
+            action_bundle: Some(bundle),
+        });
+
+        assert_eq!(report.status, PlanReviewStatus::AwaitingTemporaryGrant);
+        assert_eq!(report.required_access_scopes.len(), 2);
+        assert!(report.required_access_scopes.iter().any(|scope| {
+            scope.scope_kind == "workspaceModule"
+                && scope.path == "src/module"
+                && scope.capability == "fs.write"
+                && scope.dependency_depth == 0
+        }));
+        assert!(report.required_access_scopes.iter().any(|scope| {
+            scope.scope_kind == "oneHopDependency"
+                && scope.path == "src/common"
+                && scope.capability == "fs.patch"
+                && scope.dependency_depth == 1
+        }));
+        assert!(report.permission_bundles.iter().any(|bundle| {
+            bundle.resource_kind == "workspaceModule"
+                && bundle.resource_path.as_deref() == Some("src/module")
+        }));
+        let contract = report
+            .execution_contract
+            .as_ref()
+            .expect("kernel execution contract");
+        assert_eq!(contract.access_scopes.len(), 2);
+    }
+
+    #[test]
     fn action_bundle_review_reports_absolute_file_targets_as_outside_workspace() {
         let plan = PlanContract::low_risk_direct("plan-absolute-file-op", "absolute file op");
         let absolute_target = std::env::temp_dir()
@@ -1124,7 +1442,9 @@ mod tests {
                 can_parallelize: false,
                 conflict_keys: Vec::new(),
                 purpose: None,
+                access_scopes: Vec::new(),
             }],
+            access_scopes: Vec::new(),
             validation_expectations: Vec::new(),
             review_expectations: Vec::new(),
         };
@@ -1168,7 +1488,9 @@ mod tests {
                 can_parallelize: false,
                 conflict_keys: Vec::new(),
                 purpose: None,
+                access_scopes: Vec::new(),
             }],
+            access_scopes: Vec::new(),
             validation_expectations: Vec::new(),
             review_expectations: Vec::new(),
         };
@@ -1205,7 +1527,9 @@ mod tests {
                 can_parallelize: false,
                 conflict_keys: Vec::new(),
                 purpose: None,
+                access_scopes: Vec::new(),
             }],
+            access_scopes: Vec::new(),
             validation_expectations: Vec::new(),
             review_expectations: Vec::new(),
         };

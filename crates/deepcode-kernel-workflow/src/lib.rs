@@ -15,9 +15,9 @@ pub mod template;
 pub mod validator;
 
 pub use contract::{
-    ActionBundleDraft, CompletionCriteria, FileTargetRef, FileTargetRefKind, PlanContract,
-    PlanRiskLevel, PlannedAction, ProposalContract, ProposalRiskLevel, ProposedAction,
-    ReviewExpectation, ReviewPolicy, ValidationExpectation,
+    AccessScopeDraft, ActionBundleDraft, CompletionCriteria, FileTargetRef, FileTargetRefKind,
+    PlanContract, PlanRiskLevel, PlannedAction, ProposalContract, ProposalRiskLevel,
+    ProposedAction, ReviewExpectation, ReviewPolicy, ValidationExpectation,
 };
 pub use controller::{
     PhaseWorkflowDescriptor, PhaseWorkflowTransitionDescriptor, PlanAcceptanceStatus,
@@ -39,7 +39,7 @@ pub use plan_review_engine::{
     DefaultPlanReviewEngine, DefaultProposalReviewEngine, PlanReviewEngine, PlanReviewFinding,
     PlanReviewInput, PlanReviewReport, PlanReviewStatus, ProposalReviewEngine,
     ProposalReviewFinding, ProposalReviewInput, ProposalReviewReport, ProposalReviewStatus,
-    RequiredFileOperation,
+    RequiredAccessScope, RequiredFileOperation,
 };
 pub use predicate::{PredicateExpr, PredicateId, PredicateRegistry};
 pub use proposal::{InvalidProposalPolicy, ProposalEnvelope, ProposalKind};

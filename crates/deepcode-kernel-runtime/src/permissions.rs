@@ -492,6 +492,22 @@ impl DeepCodeKernelRuntime {
             {
                 return false;
             }
+            if matches!(
+                grant.resource_kind.as_str(),
+                "workspaceModule" | "workspaceDependency"
+            ) {
+                if !matches!(capability, "fs.write" | "fs.patch") {
+                    return false;
+                }
+                return grant
+                    .resource_path
+                    .as_deref()
+                    .map(|path| {
+                        self.grant_scope_contains_argument(run_id, tool_name, arguments, path)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+            }
             grant
                 .resource_path
                 .as_deref()
@@ -645,6 +661,7 @@ fn argument_resource_matches(tool_name: &str, arguments: &Value, path: &str) -> 
 fn unscoped_grant_allows_arguments(resource_kind: &str, arguments: &Value) -> bool {
     match resource_kind {
         "workspace" | "workspaceFile" => !argument_uses_external_absolute_file(arguments),
+        "workspaceModule" | "workspaceDependency" => false,
         "externalFile" => false,
         _ => true,
     }
