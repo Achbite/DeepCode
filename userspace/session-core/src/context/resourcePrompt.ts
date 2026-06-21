@@ -165,7 +165,7 @@ function renderResourcePromptContext(
     const primary = input.conversationRoots.find((root) => root.primary);
     if (primary) {
       lines.push(`Primary conversation workspace root: rootId=${primary.rootId} path=${primary.displayPath}`);
-      lines.push('Write path rule: actionBundle targetPath/codeBlocks targetPath must be relative to the primary root, such as "main.cpp" or "src/main.cpp". Do not include rootId, manifestEntryId, display path, basename, or absolute path prefixes in write targets.');
+      lines.push('Write path rule: actionBundle targetPath/codeBlocks targetPath must be a concrete file path relative to the primary root. Do not include rootId, manifestEntryId, display path, basename, or absolute path prefixes in write targets.');
     }
   }
 

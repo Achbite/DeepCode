@@ -21,6 +21,7 @@ import {
   buildPromptEnvelope,
   buildResourcePromptContext,
   buildSessionMemoryDocument,
+  buildSessionMemorySnapshot,
   buildSessionTaskGraph,
   collectUserGuidanceEvents,
   createResourcePacket,
@@ -35,6 +36,7 @@ import {
 
 async function main(): Promise<void> {
   assertV3Parser();
+  assertImplementationPlanFileOperationAndAccessScopeCompatibility();
   assertActionBundleProtocolFields();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -62,6 +64,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
   await assertSessionDriverLoopRepairsInvalidSourceBlock();
   await assertSessionDriverLoopAllowsManyNoCodeActionsWithoutBatchRepair();
+  await assertSessionDriverLoopAllowsManyCodeBlocksWithoutBatchRepair();
   await assertSessionDriverLoopRepairsOversizedActionBundle();
   await assertSessionDriverLoopRepairsEmptyActionBundleResponse();
   await assertSessionDriverLoopAcceptsLocalizedStructuredPlan();
@@ -76,6 +79,8 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedScopeRejectsDirectoryDeleteFromResourceEvidence();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatch();
   await assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteBatchForKernel();
+  await assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPathOverRootResourceScope();
+  await assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanReviewRootAccessScope();
   await assertSessionDriverLoopAcceptedImplementationPlanPreservesExecutionRoot();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMultiTargetBatch();
   await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsMergeIndependentTasks();
@@ -108,6 +113,8 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept();
   await assertSessionDriverLoopNativeReadToolStreamsThroughResourceResolve();
   await assertSessionDriverLoopNativeReadToolLoopHasNoFourRoundLimit();
+  await assertSessionDriverLoopNativeReadToolDuplicateLoopRepairsToProposal();
+  await assertSessionDriverLoopNativeReadToolDuplicateProposalWinsOverToolCall();
   await assertSessionDriverLoopNativeWriteToolTriggersImplementationPlanRepair();
 }
 
@@ -172,6 +179,132 @@ async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
     'decisionRequest options are not copied into requirement checklist tasks'
   );
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'decisionRequest does not generate a plan before user decision');
+}
+
+function assertImplementationPlanFileOperationAndAccessScopeCompatibility(): void {
+  const canonical = parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    sessionId: 'session-generic-plan',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'implementationPlan',
+      outputLanguage: 'en-US',
+      implementationPlan: {
+        version: '1',
+        id: 'impl-generic-canonical',
+        title: 'Generic plan',
+        summary: 'Plan generic workspace edits.',
+        tasks: [{
+          taskId: 'task-generic-canonical',
+          title: 'Create generic module files',
+          target: ['src/generic'],
+          scope: 'Create generic module files.',
+          capability: 'fs.write',
+          fileOperations: [{
+            operation: 'create',
+            capability: 'fs.write',
+            targetPath: 'src/generic/output.hpp',
+            reason: 'Create a generic header.',
+          }],
+          accessScopes: [{
+            scopeKind: 'workspaceModule',
+            path: 'src/generic',
+            capabilities: ['fs.write', 'fs.patch'],
+            operations: ['create', 'write', 'patch'],
+            reason: 'Generic module edit scope.',
+            dependencyDepth: 0,
+          }],
+          acceptanceCriteria: ['Kernel can review the generic file operation.'],
+          failureCriteria: ['Stop if the target is outside scope.'],
+        }],
+        risks: [],
+        reviewCheckpoints: ['Review generic plan before execution.'],
+      },
+    }),
+  });
+  const canonicalTask = ((canonical.payload as any).tasks ?? [])[0];
+  assertEqual(canonicalTask.fileOperations[0].targetPath, 'src/generic/output.hpp', 'canonical fileOperations object parses');
+  assertEqual(canonicalTask.accessScopes[0].scopeKind, 'workspaceModule', 'canonical accessScopes object parses');
+
+  const shorthand = parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    sessionId: 'session-generic-plan',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'implementationPlan',
+      outputLanguage: 'en-US',
+      implementationPlan: {
+        version: '1',
+        id: 'impl-generic-shorthand',
+        title: 'Generic shorthand plan',
+        summary: 'Plan generic shorthand workspace edits.',
+        tasks: [{
+          taskId: 'task-generic-shorthand',
+          title: 'Create generic shorthand files',
+          target: ['src/generic'],
+          scope: 'Create generic files with shorthand compatibility.',
+          capability: 'fs.write',
+          fileOperations: ['create src/generic/output.cpp', 'write scripts/generic.sh'],
+          accessScopes: ['src/generic'],
+          acceptanceCriteria: ['Kernel can review the generic shorthand operation.'],
+          failureCriteria: ['Stop if the shorthand target is invalid.'],
+        }],
+        risks: [],
+        reviewCheckpoints: ['Review generic shorthand plan before execution.'],
+      },
+    }),
+  });
+  const shorthandTask = ((shorthand.payload as any).tasks ?? [])[0];
+  assertEqual(shorthandTask.fileOperations[0].operation, 'create', 'fileOperations string shorthand maps operation');
+  assertEqual(shorthandTask.fileOperations[0].capability, 'fs.write', 'fileOperations string shorthand maps capability');
+  assertEqual(shorthandTask.fileOperations[0].targetPath, 'src/generic/output.cpp', 'fileOperations string shorthand maps path');
+  assertEqual(shorthandTask.fileOperations[1].operation, 'write', 'second fileOperations shorthand parses');
+  assertEqual(shorthandTask.accessScopes[0].scopeKind, 'workspaceModule', 'accessScopes string shorthand maps workspace module');
+  assertEqual(shorthandTask.accessScopes[0].path, 'src/generic', 'accessScopes string shorthand maps path');
+  assertEqual(shorthandTask.accessScopes[0].capabilities.includes('fs.write'), true, 'accessScopes string shorthand grants write scope');
+
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    raw: JSON.stringify(genericImplementationPlanWithTask({
+      fileOperations: [''],
+      accessScopes: [{ scopeKind: 'workspaceModule', path: 'src/generic' }],
+    })),
+  }), 'string shorthand must be non-empty');
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    raw: JSON.stringify(genericImplementationPlanWithTask({
+      fileOperations: [{ operation: 'create', capability: 'fs.write' }],
+      accessScopes: [{ scopeKind: 'workspaceModule', path: 'src/generic' }],
+    })),
+  }), 'must include targetPath or targetRef.path');
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    raw: JSON.stringify(genericImplementationPlanWithTask({
+      fileOperations: [{ capability: 'fs.write', targetPath: 'src/generic/output.cpp' }],
+      accessScopes: [{ scopeKind: 'workspaceModule', path: 'src/generic' }],
+    })),
+  }), 'must include operation');
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    raw: JSON.stringify(genericImplementationPlanWithTask({
+      fileOperations: [{ operation: 'compile', capability: 'process.exec', targetPath: 'src/generic/output.cpp' }],
+      accessScopes: [{ scopeKind: 'workspaceModule', path: 'src/generic' }],
+    })),
+  }), 'operation must be one of');
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    raw: JSON.stringify(genericImplementationPlanWithTask({
+      fileOperations: [{ operation: 'create', capability: 'fs.write', targetPath: 'src/generic/output.cpp' }],
+      accessScopes: [{ scopeKind: 'workspaceRoot', path: 'src/generic' }],
+    })),
+  }), 'scopeKind must be');
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    raw: JSON.stringify(genericImplementationPlanWithTask({
+      fileOperations: [{ operation: 'create', capability: 'fs.write', targetPath: 'src/generic/output.cpp' }],
+      accessScopes: [{ scopeKind: 'workspaceModule' }],
+    })),
+  }), 'must include path');
 }
 
 function assertV3Parser(): void {
@@ -280,6 +413,15 @@ function assertV3Parser(): void {
       },
     }),
   }), 'manifestEntryId, path, or kind="search"');
+
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'reviewSummary',
+      reviewSummary: { status: 'accepted', content: 'not provider output' },
+    }),
+  }), 'unsupported');
 }
 
 function assertActionBundleProtocolFields(): void {
@@ -301,6 +443,72 @@ function assertActionBundleProtocolFields(): void {
   assertEqual(payload.actionBundle.actions[0].title, 'Write generic output', 'Session parser maps description to action title');
   assertEqual(payload.actionBundle.actions[0].canParallelize, false, 'Session parser fills canParallelize default');
   assertEqual(payload.actionBundle.actions[0].conflictKeys[0], 'generic-output.txt', 'Session parser derives conflict key from resource scope');
+
+  const wrappedRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  const wrappedProposal = parseProposalEnvelope({
+    runId: 'run-actionbundle-payload-wrapper',
+    sessionId: 'session-actionbundle-payload-wrapper',
+    raw: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'actionBundle',
+      outputLanguage: 'en-US',
+      narration: 'Prepare a generic write batch.',
+      payload: {
+        userPlanMarkdown: wrappedRaw.userPlan,
+        codeBlocks: wrappedRaw.codeBlocks,
+        commandBlocks: wrappedRaw.commandBlocks ?? [],
+        actionBundle: wrappedRaw.actionBundle,
+        expectedValidation: wrappedRaw.expectedValidation,
+        reviewGuide: wrappedRaw.reviewGuide,
+      },
+    },
+  });
+  const wrappedPayload = wrappedProposal.payload as any;
+  assertEqual(wrappedPayload.actionBundle.actions[0].targetPath, 'generic-output.txt', 'payload-wrapped actionBundle is canonicalized to the normal internal payload');
+  assertEqual(wrappedPayload.codeBlocks[0].targetPath, 'generic-output.txt', 'payload-wrapped codeBlocks are preserved');
+
+  const compatibilityRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  compatibilityRaw.actionBundle = {
+    ...compatibilityRaw.actionBundle,
+    validationExpectations: 'Kernel records a generic validation fact.',
+    reviewExpectations: ['User reviews the generic action scope.'],
+  };
+  const compatibilityProposal = parseProposalEnvelope({
+    runId: 'run-expectation-compat',
+    sessionId: 'session-expectation-compat',
+    raw: compatibilityRaw,
+  });
+  const compatibilityBundle = (compatibilityProposal.payload as any).actionBundle;
+  assertEqual(
+    compatibilityBundle.validationExpectations[0].description,
+    'Kernel records a generic validation fact.',
+    'string validationExpectation is canonicalized to object form'
+  );
+  assertEqual(
+    compatibilityBundle.reviewExpectations[0].description,
+    'User reviews the generic action scope.',
+    'string[] reviewExpectations are canonicalized to object form'
+  );
+
+  const emptyExpectationRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  emptyExpectationRaw.actionBundle = {
+    ...emptyExpectationRaw.actionBundle,
+    validationExpectations: [''],
+  };
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-empty-expectation',
+    raw: emptyExpectationRaw,
+  }), 'string value must be non-empty');
+
+  const missingDescriptionRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  missingDescriptionRaw.actionBundle = {
+    ...missingDescriptionRaw.actionBundle,
+    reviewExpectations: [{ id: 'review-without-description' }],
+  };
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-missing-expectation-description',
+    raw: missingDescriptionRaw,
+  }), 'description must be a non-empty string');
 }
 
 function assertPromptEnvelope(): void {
@@ -372,10 +580,20 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('Conversation roots'), 'prompt exposes conversation roots');
   assert(prompt.dynamicSuffix.includes('primary=true'), 'prompt marks the primary conversation root');
   assert(prompt.dynamicSuffix.includes('Primary conversation workspace root'), 'prompt exposes the primary workspace root');
-  assert(prompt.dynamicSuffix.includes('targetPath/codeBlocks targetPath must be relative to the primary root'), 'prompt tells the model to avoid root-prefixed write paths');
-  assert(prompt.stablePrefix.includes('"path":"relative/path.ext"'), 'prompt documents path-based resourceRequest');
+  assert(prompt.dynamicSuffix.includes('targetPath/codeBlocks targetPath must be a concrete file path relative to the primary root'), 'prompt tells the model to avoid root-prefixed write paths');
+  assert(prompt.stablePrefix.includes('rootId+path'), 'prompt documents path-based resourceRequest without long JSON examples');
   assert(prompt.stablePrefix.includes('optional top-level narration'), 'prompt documents model-generated narration');
-  assert(prompt.stablePrefix.includes('Implementation batch budget'), 'prompt documents incremental implementation budget');
+  assert(prompt.stablePrefix.includes('reviewSummary is Session-generated'), 'prompt excludes reviewSummary from provider proposal kinds');
+  assert(prompt.stablePrefix.includes('Implementation payload budget'), 'prompt documents payload-based implementation budget');
+  assert(prompt.stablePrefix.includes('fileOperations shape'), 'prompt documents implementationPlan fileOperations object shape');
+  assert(prompt.stablePrefix.includes('accessScopes shape'), 'prompt documents implementationPlan accessScopes object shape');
+  assert(prompt.stablePrefix.includes('fileOperations items must be objects'), 'prompt schema digest tells provider fileOperations are object items');
+  assert(prompt.stablePrefix.includes('accessScopes items must be objects'), 'prompt schema digest tells provider accessScopes are object items');
+  assert(prompt.stablePrefix.includes('Do not add a generic payload wrapper'), 'prompt tells provider not to wrap proposals in payload');
+  assert(prompt.stablePrefix.includes('actionBundle proposal top-level fields'), 'prompt documents actionBundle top-level fields');
+  assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
+  assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
+  assert(!prompt.stablePrefix.includes('at most 4 codeBlocks'), 'prompt does not impose a codeBlock count limit');
   assert(prompt.stablePrefix.includes('<systemStructure'), 'prompt includes the system structure layer');
   assert(prompt.stablePrefix.includes('black-box validation'), 'prompt treats tests as black-box validation');
   assert(prompt.stablePrefix.includes('Do not optimize for known tests'), 'prompt rejects test-specific optimization');
@@ -387,6 +605,7 @@ function assertPromptEnvelope(): void {
   assert(prompt.stableLayerNames[0] === 'protectedStablePrefix', 'protected stable prefix is the first stable layer');
   assert(!prompt.stablePrefix.includes('Current workflow state'), 'stable prefix excludes current workflow state');
   assert(!prompt.stablePrefix.includes('Recent user turn'), 'stable prefix excludes session-local memory hints');
+  assert(!prompt.stablePrefix.includes('zh-CN'), 'stable prefix excludes localized JSON example payloads');
   assert(prompt.dynamicSuffix.includes('Current workflow state: needProposal'), 'dynamic suffix carries current workflow state');
   assert(prompt.dynamicSuffix.includes('Allowed proposals: answer, resourceRequest, actionBundle'), 'dynamic suffix carries allowed proposals');
   assert(prompt.dynamicSuffix.includes('fs.read'), 'dynamic suffix carries capability projection');
@@ -488,19 +707,50 @@ function assertContextAssemblerCachePlan(): void {
   assertEqual(base.contextAssembly.userGuidanceCount, 1, 'context assembly records provider-checkpoint user guidance count');
   assertEqual(base.contextAssembly.consumedUserGuidanceIds[0], 'guidance-generic', 'context assembly records consumed user guidance ids');
   assertEqual(base.contextAssembly.schemaVersion, 'deepcode.session.context-assembly.v3', 'context assembly records v3 partitioned cache debug schema');
+  assertEqual(base.contextAssembly.promptPolicyVersion, 'deepcode.prompt-policy.v1', 'context assembly records the prompt policy version without bumping schema');
   assertEqual(base.contextAssembly.cacheAffectsCorrectness, false, 'context assembly cache telemetry is observability only');
+  assertEqual(base.contextAssembly.catalogHash, followUp.contextAssembly.catalogHash, 'same capability catalog keeps catalog hash stable');
+  assert(base.contextAssembly.stateContractHash === followUp.contextAssembly.stateContractHash, 'same workflow state and allowed proposals keep state contract hash stable');
   assertEqual(base.contextAssembly.budgetPlan.contextWindowTokens, 1_000_000, 'context assembly records 1M soft context budget');
   assertEqual(base.contextAssembly.budgetPlan.maxOutputTokens, 384_000, 'context assembly records 384K output reserve');
+  assertEqual(base.contextAssembly.reservedOutputTokens, 384_000, 'context assembly records reserved output tokens');
   assertEqual(base.contextAssembly.budgetPlan.projectMemoryBudgetTokens, 128_000, 'context assembly records 128K project memory soft cap');
   assertEqual(base.contextAssembly.budgetPlan.sessionMemoryBudgetTokens, 256_000, 'context assembly records 256K session memory soft cap');
+  assertEqual(base.contextAssembly.memoryCompressionMode, 'memory-v3-soft-cap-lines', 'context assembly records current memory compression mode');
+  assertEqual(base.contextAssembly.evidenceFreshnessMode, 'resource-evidence-tail-v1', 'context assembly records current evidence freshness mode');
   assertEqual(base.contextAssembly.traceArchiveMode, 'compact-provider-trace', 'context assembly records compact trace archive mode');
   assertEqual(base.contextAssembly.resourceBlocks.length, 0, 'simple chat path has no resource blocks');
   assertEqual(base.contextAssembly.resourceFullTextCharCount, 0, 'simple chat path has no full resource text');
   assertEqual(base.contextAssembly.resourceEvidenceTailCount, 0, 'simple chat path has no resource evidence tail entries');
+  assertEqual(base.contextAssembly.providerVisibleTokenEstimate, base.contextAssembly.partitionTokenEstimates.providerVisibleTotal, 'provider visible token estimate mirrors partition total');
   assert(base.contextAssembly.partitionCharCounts.protectedPrefix > 0, 'context assembly records protected prefix partition');
   assert(base.contextAssembly.partitionCharCounts.projectMemory > 0, 'context assembly records project memory partition');
   assert(base.contextAssembly.partitionCharCounts.sessionMemory > 0, 'context assembly records session memory partition');
   assert(base.contextAssembly.partitionCharCounts.intentMemory > 0, 'context assembly records intent/memory partition');
+  const partitionNames = base.contextAssembly.partitionRecords.map((partition) => partition.name);
+  assertEqual(partitionNames.join(','), [
+    'PlatformProtocolContract',
+    'AgentOperatingContract',
+    'StaticToolCatalogDigest',
+    'UserRulerAndProjectInstructions',
+    'ProjectMemory',
+    'SessionMemory',
+    'CurrentRunStateAndRequest',
+    'EvidenceTail',
+    'AuditOnly',
+  ].join(','), 'context assembly records the formal prompt partitions in stable order');
+  assert(
+    base.contextAssembly.partitionRecords.find((partition) => partition.name === 'PlatformProtocolContract')?.segmentNames.includes('protocolContract') === true,
+    'platform protocol partition contains the protocol contract segment'
+  );
+  assert(
+    base.contextAssembly.partitionRecords.find((partition) => partition.name === 'EvidenceTail')?.segmentNames.includes('reusableResourceContext') === true,
+    'evidence tail partition contains reusable resource context'
+  );
+  assert(
+    base.contextAssembly.partitionRecords.find((partition) => partition.name === 'AuditOnly')?.providerVisible === false,
+    'audit-only partition is not provider visible'
+  );
   assert(base.contextAssembly.segments.find((segment) => segment.name === 'reusableResourceContext')?.charLength ?? 0 < 1200, 'empty resource context stays small');
   assertEqual(
     base.contextAssembly.segments.some((segment) => segment.cacheClass === 'globalStable' && segment.stablePrefix),
@@ -698,11 +948,32 @@ function assertSessionMemoryDocument(): void {
   assert(document.resourceContext.some((item) => item.includes('Attached resource')), 'memory records reusable attachment facts');
   assert(document.longTermContext.some((item) => item.includes('Attached resource')), 'stable memory records reusable attachment facts');
   assert(document.shortTermContext.some((item) => item.includes('Plan intent')), 'short-term memory records active planning intent');
-  assert(document.projectMemoryContext.some((item) => item.includes('Project resource index')), 'project memory records reusable project resource indexes');
-  assert(document.sessionMemoryContext.some((item) => item.includes('Session intent')), 'session memory records active session intent');
+  assert(document.projectMemoryItems.length > 0, 'project memory is backed by MemoryItemV4 items');
+  assert(document.sessionMemoryItems.length > 0, 'session memory is backed by MemoryItemV4 items');
+  assert(document.projectMemoryItems.every((item) => item.scope === 'project'), 'project memory items keep project scope');
+  assert(document.sessionMemoryItems.every((item) => item.scope === 'session'), 'session memory items keep session scope');
+  assert(document.projectMemoryItems.some((item) => item.authority === 'resourcePacket'), 'project memory records resourcePacket authority');
+  assert(document.sessionMemoryItems.some((item) => item.kind === 'intent'), 'session memory records active session intent items');
+  assert(document.projectMemoryContext.some((item) => item.includes('MemoryItemV4') && item.includes('authority=')), 'project memory renders MemoryItemV4 authority');
+  assert(document.sessionMemoryContext.some((item) => item.includes('sourceRefs=') && item.includes('compression=')), 'session memory renders source refs and compression');
   assert(document.shortTermContext.some((item) => item.includes('Assistant final summary')), 'assistant finals are summarized as short-term context');
   assertEqual(document.intentContext.some((item) => item.includes('Assistant final')), false, 'assistant final text is not promoted as stable intent');
   assertEqual(document.factContext.some((item) => item.includes('Plan intent')), false, 'plan intent does not enter factContext');
+
+  const snapshot = buildSessionMemorySnapshot([
+    {
+      id: 'memory-user',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_msg',
+      payload: { content: 'Analyze a generic attachment.' },
+    },
+  ], { sessionId: 'session-memory', generatedAt: '2026-01-01T00:00:10.000Z' });
+  assertEqual(snapshot.schemaVersion, 'deepcode.session.memory-snapshot.v1', 'memory snapshot has a read-model schema');
+  assertEqual(snapshot.sessionId, 'session-memory', 'memory snapshot records the source session id');
+  assertEqual(snapshot.softCaps.projectMemoryTokens, 128000, 'project memory snapshot exposes project soft cap');
+  assertEqual(snapshot.softCaps.sessionMemoryTokens, 256000, 'session memory snapshot exposes session soft cap');
+  assertEqual(snapshot.metadata.freshnessMode, 'derivedFromSessionEvents', 'memory snapshot is derived from session events');
 
   const guidance = collectUserGuidanceEvents([
     {
@@ -841,19 +1112,31 @@ function assertSessionTaskGraphProjection(): void {
 }
 
 function assertDeepSeekCacheStrategyDoesNotInjectRequestParameter(): void {
-  const result = applyProviderCacheStrategy({
-    provider: 'deepseek',
-    model: 'deepseek-chat',
-    prefixHash: 'fnv1a32:generic',
-    requestBody: {
-      model: 'deepseek-chat',
-      messages: [{ role: 'user', content: 'generic' }],
-    },
-  });
+  const result = cacheStrategyResult('deepseek', 'deepseek-chat');
   assertEqual(result.semanticMode, 'deepseek-openai', 'DeepSeek keeps OpenAI-compatible semantic mode');
   assertEqual(result.serverPromptCacheSupported, true, 'DeepSeek server prompt cache is marked as supported');
   assertEqual(Object.prototype.hasOwnProperty.call(result.requestBody, 'prompt_cache_key'), false, 'DeepSeek request body does not include prompt_cache_key');
   assertEqual(Object.prototype.hasOwnProperty.call(result.requestBody, 'cache_control'), false, 'DeepSeek request body does not include cache_control');
+  const openai = cacheStrategyResult('openai', 'gpt-generic');
+  assertEqual(openai.semanticMode, 'openai', 'OpenAI keeps OpenAI semantic mode');
+  assertEqual(Object.prototype.hasOwnProperty.call(openai.requestBody, 'prompt_cache_key'), false, 'OpenAI request body does not include prompt_cache_key');
+  assertEqual(Object.prototype.hasOwnProperty.call(openai.requestBody, 'cache_control'), false, 'OpenAI request body does not include cache_control');
+  const anthropic = cacheStrategyResult('anthropic-native', 'claude-generic');
+  assertEqual(anthropic.semanticMode, 'anthropic-native', 'Anthropic native keeps Anthropic semantic mode');
+  assertEqual(Object.prototype.hasOwnProperty.call(anthropic.requestBody, 'prompt_cache_key'), false, 'Anthropic request body does not include prompt_cache_key');
+  assertEqual(Object.prototype.hasOwnProperty.call(anthropic.requestBody, 'cache_control'), false, 'Anthropic request body does not include cache_control');
+}
+
+function cacheStrategyResult(provider: string, model: string): ReturnType<typeof applyProviderCacheStrategy> {
+  return applyProviderCacheStrategy({
+    provider,
+    model,
+    prefixHash: 'fnv1a32:generic',
+    requestBody: {
+      model,
+      messages: [{ role: 'user', content: 'generic' }],
+    },
+  });
 }
 
 async function assertProviderCacheTelemetryNormalizesBigModelUsage(): Promise<void> {
@@ -2537,6 +2820,44 @@ async function assertSessionDriverLoopAllowsManyNoCodeActionsWithoutBatchRepair(
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'many delete action plan renders a Kernel-reviewed plan card');
 }
 
+async function assertSessionDriverLoopAllowsManyCodeBlocksWithoutBatchRepair(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const submittedPlans: Array<Record<string, any>> = [];
+  const repairRequests: LlmChatRequest[] = [];
+  let llmCalls = 0;
+  const session: AgentSession = {
+    id: 'session-many-codeblocks',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-many-codeblocks', submittedPlans),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls > 1) repairRequests.push(request);
+      return jsonLlmResponse(manyCodeBlockWriteProposal());
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + repairRequests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-many-codeblocks',
+    content: 'Create several generic files in one reviewed batch.',
+    requirementConfirmationMode: 'off',
+  });
+  assertEqual(llmCalls, 1, 'many codeBlocks under payload budget do not trigger repair');
+  assertEqual(repairRequests.length, 0, 'many codeBlocks do not ask the provider to shrink by count');
+  assertEqual(submittedPlans.length, 1, 'many codeBlocks reach Kernel PlanReview once');
+  assertEqual(submittedPlans[0].payload?.codeBlocks?.length, 7, 'all codeBlocks remain in the Kernel-reviewed proposal');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'many codeBlock plan renders a plan card');
+}
+
 async function assertSessionDriverLoopRepairsOversizedActionBundle(): Promise<void> {
   const events: AgentEvent[] = [];
   const submittedPlans: Array<Record<string, any>> = [];
@@ -2570,7 +2891,7 @@ async function assertSessionDriverLoopRepairsOversizedActionBundle(): Promise<vo
     requirementConfirmationMode: 'off',
   });
   assertEqual(llmCalls, 2, 'oversized actionBundle triggers one implementation batch repair');
-  assert(repairRequests.some((request) => request.messages.some((message) => message.content.includes('next small reviewable implementation batch'))), 'repair prompt requests a smaller implementation batch');
+  assert(repairRequests.some((request) => request.messages.some((message) => message.content.includes('module, file section, class, function'))), 'repair prompt requests semantic payload splitting');
   assertEqual(submittedPlans.length, 1, 'repaired oversized actionBundle reaches Kernel plan review once');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired oversized plan renders a plan card');
   const planCard = result.events.find((event) => event.kind === 'plan_card');
@@ -2748,8 +3069,8 @@ async function assertSessionDriverLoopReviewRevisionReturnsToPlanning(): Promise
   assert(promptText.includes('Add a generic script and document how to run it.'), 'review guidance enters the next PromptEnvelope');
   assert(promptText.includes('ProjectMemory document'), 'structured project memory is included');
   assert(promptText.includes('SessionMemory document'), 'structured session memory is included');
-  assert(promptText.includes('Project fact index'), 'kernel facts are separated into project fact indexes');
-  assert(promptText.includes('Session intent'), 'plans and continuations are separated into session intent context');
+  assert(promptText.includes('MemoryItemV4 scope=project') && promptText.includes('content=Review fact'), 'review facts are separated into project MemoryItemV4 indexes');
+  assert(promptText.includes('MemoryItemV4 scope=session') && promptText.includes('kind=intent'), 'plans and continuations are separated into session MemoryItemV4 intent context');
 }
 
 async function assertSessionDriverLoopReviewRevisionContinuesWhenAuditRunInactive(): Promise<void> {
@@ -3983,6 +4304,282 @@ async function assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteB
   assertEqual(block.blockId, 'generic-block', 'codeBlock also carries blockId compatibility field before Kernel submit');
   assertEqual(block.path, 'generic-output.txt', 'codeBlock keeps path before Kernel submit');
   assertEqual(block.targetPath, 'generic-output.txt', 'codeBlock carries targetPath before Kernel submit');
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPathOverRootResourceScope(): Promise<void> {
+  const events = [acceptedImplementationPlanCardEvent('session-root-scope-targetpath', 'run-root-scope-targetpath')];
+  const planPayload = events[0].payload as any;
+  planPayload.planId = 'impl-root-file-write';
+  planPayload.implementationPlan.id = 'impl-root-file-write';
+  planPayload.implementationPlan.title = 'Generic root file write plan';
+  planPayload.implementationPlan.summary = 'Create one generic root-level workspace file.';
+  planPayload.implementationPlan.tasks = [{
+    taskId: 'task-root-file-write',
+    title: 'Create root-level script',
+    target: ['root-output.sh'],
+    scope: 'Create one generic root-level file already listed in the accepted plan.',
+    dependencies: [],
+    capability: 'fs.write',
+    fileOperations: [{
+      operation: 'create',
+      capability: 'fs.write',
+      targetPath: 'root-output.sh',
+      reason: 'Create the accepted root-level file.',
+    }],
+    acceptanceCriteria: ['Kernel records the root-level write fact.'],
+    failureCriteria: ['Stop if the action tries to write the workspace root instead of the file.'],
+  }];
+  const session: AgentSession = {
+    id: 'session-root-scope-targetpath',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const repairRequests: LlmChatRequest[] = [];
+  let llmCalls = 0;
+  let actionBatchSubmits = 0;
+  let proposalSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        const actionBundle = command.proposal?.payload?.actionBundle ?? {};
+        assertEqual(Array.isArray(actionBundle.accessScopes), false, 'invalid root actionBundle accessScopes are removed before Kernel PlanReview');
+        assertEqual(
+          JSON.stringify(actionBundle.actions ?? []).includes('"accessScopes"'),
+          false,
+          'invalid root action accessScopes are removed before Kernel PlanReview'
+        );
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: command.runId, sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: command.runId,
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(actionBundle),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.queued',
+              runId: command.runId,
+              sessionId: session.id,
+              workUnit: { id: 'work-unit-root-output', actionId: 'write-root-output', status: 'queued', writeSet: ['root-output.sh'] },
+            },
+            {
+              kind: 'work_unit.completed',
+              runId: command.runId,
+              sessionId: session.id,
+              workUnitId: 'work-unit-root-output',
+              output: { path: 'root-output.sh' },
+            },
+            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls > 1) repairRequests.push(request);
+      const proposal = genericWriteProposal(false);
+      proposal.codeBlocks = [{
+        id: 'root-output-block',
+        blockId: 'root-output-block',
+        targetPath: 'root-output.sh',
+        language: 'bash',
+        operation: 'create',
+        content: '#!/bin/sh\necho generic\n',
+        permissionLabels: ['fs.write'],
+      }];
+      (proposal.actionBundle as any).id = 'bundle-root-output';
+      (proposal.actionBundle as any).goal = 'Create the accepted root-level file.';
+      (proposal.actionBundle as any).accessScopes = [{
+        scopeKind: 'workspaceModule',
+        path: '.',
+        capabilities: ['fs.write'],
+        operations: ['write'],
+        reason: 'invalid root scope emitted by provider',
+      }];
+      (proposal.actionBundle as any).actions = [{
+        id: 'write-root-output',
+        actionId: 'write-root-output',
+        title: 'Write root output',
+        kind: 'write',
+        capability: 'fs.write',
+        resourceScope: ['.'],
+        targetPath: 'root-output.sh',
+        sourceBlockId: 'root-output-block',
+        permissionLabels: ['fs.write'],
+        accessScopes: [{
+          scopeKind: 'workspaceModule',
+          path: '.',
+          capabilities: ['fs.write'],
+          operations: ['write'],
+          reason: 'invalid root scope emitted by provider',
+        }],
+      }];
+      return jsonLlmResponse(proposal);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + repairRequests.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-root-scope-targetpath',
+    targetId: 'impl-root-file-write',
+    existingEvents: events,
+  });
+
+  assertEqual(actionBatchSubmits, 1, 'accepted plan root-level write uses targetPath before root resourceScope');
+  assertEqual(proposalSubmits, 1, 'accepted plan batch still goes through Kernel PlanReview after scope narrowing');
+  assertEqual(repairRequests.length, 0, 'root resourceScope does not trigger accepted-plan scope repair when targetPath is concrete');
+  assertEqual(
+    events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'accepted_plan.access_scope_canonicalized'
+    ),
+    true,
+    'invalid execution-batch accessScopes are audited as narrowed scope'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanReviewRootAccessScope(): Promise<void> {
+  const events = [acceptedImplementationPlanCardEvent('session-planreview-root-scope-repair', 'run-planreview-root-scope-repair')];
+  const session: AgentSession = {
+    id: 'session-planreview-root-scope-repair',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const repairRequests: LlmChatRequest[] = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        const actionBundle = command.proposal?.payload?.actionBundle ?? {};
+        if (proposalSubmits === 1) {
+          return {
+            ok: true,
+            events: [
+              { kind: 'proposal.accepted', runId: command.runId, sessionId: session.id, proposal: command.proposal },
+              {
+                kind: 'proposal.reviewed',
+                runId: command.runId,
+                sessionId: session.id,
+                proposalId: command.proposal?.proposalId,
+                report: {
+                  ...proposalReviewReport(actionBundle),
+                  status: 'needsRevision',
+                  blockedReasons: ['actionBundle access scope . (workspaceModule) access scope must not be the workspace root'],
+                  findings: [{ code: 'access_scope_root', message: 'access scope must not be the workspace root' }],
+                  kernelGeneratedPermissionSummary: 'Kernel preflight: status=needsRevision; root access scope rejected.',
+                },
+              },
+            ],
+          };
+        }
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: command.runId, sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: command.runId,
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(actionBundle),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.completed',
+              runId: command.runId,
+              sessionId: session.id,
+              workUnitId: 'work-unit-generic',
+              actionId: 'write-generic-output',
+              output: { path: 'generic-output.txt' },
+            },
+            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      if (llmCalls > 1) repairRequests.push(request);
+      const proposal = genericWriteProposal(false);
+      if (llmCalls === 1) {
+        (proposal.actionBundle as any).accessScopes = [{
+          scopeKind: 'workspaceModule',
+          path: '.',
+          capabilities: ['fs.write'],
+          operations: ['write'],
+          reason: 'invalid root scope emitted by provider',
+        }];
+      }
+      return jsonLlmResponse(proposal);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + actionBatchSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-planreview-root-scope-repair',
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+  });
+
+  assertEqual(proposalSubmits, 2, 'root access scope needsRevision triggers one automatic PlanReview repair');
+  assertEqual(actionBatchSubmits, 1, 'repaired accepted-plan batch continues to actionBatchSubmit');
+  assertEqual(repairRequests.length, 1, 'Session asks provider for one controlled PlanReview repair');
+  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'repairable root access scope does not trigger user intervention');
+  assert(
+    JSON.stringify(repairRequests[0].messages).includes('remove actionBundle.accessScopes'),
+    'PlanReview repair prompt tells provider to remove root accessScopes'
+  );
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanPreservesExecutionRoot(): Promise<void> {
@@ -5424,6 +6021,7 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
   };
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
+  let llmCalls = 0;
   const outOfScopeProposal = genericWriteProposal(false);
   (outOfScopeProposal.codeBlocks as any[])[0].path = 'outside-output.txt';
   (outOfScopeProposal.actionBundle as any).actions[0].resourceScope = ['outside-output.txt'];
@@ -5437,15 +6035,47 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
       const command = request.command as Record<string, any>;
       if (command.kind === 'proposalSubmit') {
         proposalSubmits += 1;
-        return { ok: true, events: [] };
+        const actionBundle = command.proposal?.payload?.actionBundle ?? {};
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: command.runId, sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: command.runId,
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(actionBundle),
+            },
+          ],
+        };
       }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
       if (command.kind === 'actionBatchSubmit') {
         actionBatchSubmits += 1;
-        return { ok: true, events: [] };
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.completed',
+              runId: command.runId,
+              sessionId: session.id,
+              workUnitId: 'work-unit-generic',
+              actionId: 'write-generic-output',
+              output: { path: 'generic-output.txt' },
+            },
+            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+          ],
+        };
       }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
       return fakeKernel(request);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(outOfScopeProposal),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return jsonLlmResponse(llmCalls <= 2 ? outOfScopeProposal : genericWriteProposal(false));
+    },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
   });
@@ -5464,14 +6094,43 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
   assertEqual(actionBatchSubmits, 0, 'out-of-scope accepted implementationPlan batch is not executed');
   assertEqual(result.events.filter((event) => event.kind === 'plan_card').length, 1, 'out-of-scope batch does not create another plan card');
   assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), true, 'out-of-scope batch becomes one user intervention request');
+  const confirmation = result.events.find((event) => event.kind === 'requirement_confirmation');
+  const confirmationPayload = confirmation?.payload as any;
+  assertEqual(confirmationPayload?.interactionOverlay, true, 'accepted-plan scope intervention is marked as an overlay');
+  assertEqual(confirmationPayload?.parentPhase, 'executing_accepted_plan', 'accepted-plan scope intervention records the parent phase');
+  assertEqual(confirmationPayload?.decisionRequest?.decisionScope, 'acceptedPlanBatchOutOfScope', 'accepted-plan scope decision is identifiable');
   assertEqual(
     result.events.some((event) =>
       event.kind === 'session_run_state' &&
       (event.payload as any)?.status === 'waiting' &&
-      (event.payload as any)?.reason === 'requirement'
+      (event.payload as any)?.reason === 'requirement' &&
+      (event.payload as any)?.interactionOverlay === true
     ),
     true,
-    'out-of-scope batch records waiting requirement session state'
+    'out-of-scope batch records waiting requirement overlay session state'
+  );
+
+  const resumed = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'requirement',
+    decision: 'accept',
+    runId: confirmationPayload?.runId,
+    targetId: confirmationPayload?.requirementId,
+    guidance: '- id: regenerate-in-scope',
+    existingEvents: result.events,
+    interventionLevel: 'medium',
+  });
+
+  assertEqual(proposalSubmits, 1, 'accepted-plan scope decision resumes provider checkpoint and submits repaired batch');
+  assertEqual(actionBatchSubmits, 1, 'accepted-plan scope decision continues to actionBatchSubmit after in-scope regeneration');
+  assertEqual(
+    resumed.events.some((event) =>
+      event.kind === 'requirement_decision' &&
+      (event.payload as any)?.interactionOverlay === true &&
+      (event.payload as any)?.parentPhase === 'executing_accepted_plan'
+    ),
+    true,
+    'accepted-plan scope decision remains attached to the parent execution overlay'
   );
 }
 
@@ -6380,6 +7039,203 @@ async function assertSessionDriverLoopNativeReadToolLoopHasNoFourRoundLimit(): P
   assertEqual(deltas.some((delta) => (delta as any).type === 'tool_call_delta'), true, 'high-round native tool deltas remain visible');
 }
 
+async function assertSessionDriverLoopNativeReadToolDuplicateLoopRepairsToProposal(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const resourceResolveManifests: Array<Record<string, any>> = [];
+  const streamRequests: LlmChatRequest[] = [];
+  const session: AgentSession = {
+    id: 'session-native-read-duplicate',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'resourceResolve') {
+        resourceResolveManifests.push(command.request.manifest);
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      throw new Error('native duplicate read smoke should use streaming provider path');
+    },
+    llmChatStream: async (request, onEvent): Promise<ApiResponse<LlmChatResult>> => {
+      streamRequests.push(request);
+      if (request.tools?.length) {
+        const callId = `call-duplicate-read-${streamRequests.length}`;
+        const chunk: LlmChatResult['chunks'][number] = {
+          type: 'tool_call',
+          index: 0,
+          callId,
+          toolCallDelta: {
+            id: callId,
+            index: 0,
+            name: 'fs.read',
+            argumentsDelta: JSON.stringify({ path: 'generic-duplicate.txt' }),
+          },
+        };
+        await onEvent({ type: 'provider_tool_call_delta', chunk });
+        return {
+          ok: true,
+          data: {
+            chunks: [chunk, { type: 'done' }],
+            assistantMessage: {
+              role: 'assistant',
+              content: streamRequests.length > 1 ? 'I already have the file and should answer now.' : '',
+              toolCalls: [{
+                id: callId,
+                name: 'fs.read',
+                arguments: { path: 'generic-duplicate.txt' },
+              }],
+            },
+          },
+        };
+      }
+      assertEqual(request.tools?.length ?? 0, 0, 'duplicate read repair disables provider-native tools');
+      assert(
+        request.messages.some((message) => message.role === 'user' && String(message.content).includes('Duplicate native read targets')),
+        'duplicate read repair prompt includes duplicate target facts'
+      );
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'answer',
+        outputLanguage: 'en-US',
+        answer: {
+          format: 'markdown',
+          content: 'The repeated read was stopped and the existing resource facts were used.',
+        },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + streamRequests.length + resourceResolveManifests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-native-read-duplicate',
+    content: 'Read a generic file if needed, then answer.',
+    attachments: [{ kind: 'directory', path: '.', absolutePath: '/tmp/generic-workspace', source: 'userSelected', scope: 'session' }],
+  });
+
+  const nativeResourceResolveManifests = resourceResolveManifests.filter((manifest) =>
+    Array.isArray(manifest.entries) && manifest.entries.some((entry: any) => String(entry?.id ?? '').startsWith('native-'))
+  );
+  assertEqual(nativeResourceResolveManifests.length, 1, 'duplicate native read does not repeatedly call Kernel ResourceResolve');
+  assertEqual(streamRequests.length, 4, 'duplicate native read gets one cached resume and one no-tool repair call');
+  assertEqual(
+    result.events.some((event) => event.kind === 'assistant_msg' && String((event.payload as any)?.content ?? '').includes('repeated read was stopped')),
+    true,
+    'duplicate native read repair returns a final answer'
+  );
+}
+
+async function assertSessionDriverLoopNativeReadToolDuplicateProposalWinsOverToolCall(): Promise<void> {
+  const events: AgentEvent[] = [];
+  const resourceResolveManifests: Array<Record<string, any>> = [];
+  const streamRequests: LlmChatRequest[] = [];
+  const session: AgentSession = {
+    id: 'session-native-read-duplicate-proposal',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'resourceResolve') {
+        resourceResolveManifests.push(command.request.manifest);
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      throw new Error('native duplicate proposal smoke should use streaming provider path');
+    },
+    llmChatStream: async (request, onEvent): Promise<ApiResponse<LlmChatResult>> => {
+      streamRequests.push(request);
+      const callId = `call-duplicate-proposal-${streamRequests.length}`;
+      const chunk: LlmChatResult['chunks'][number] = {
+        type: 'tool_call',
+        index: 0,
+        callId,
+        toolCallDelta: {
+          id: callId,
+          index: 0,
+          name: 'fs.read',
+          argumentsDelta: JSON.stringify({ path: 'generic-proposal.txt' }),
+        },
+      };
+      await onEvent({ type: 'provider_tool_call_delta', chunk });
+      if (streamRequests.length === 1) {
+        return {
+          ok: true,
+          data: {
+            chunks: [chunk, { type: 'done' }],
+            assistantMessage: {
+              role: 'assistant',
+              content: '',
+              toolCalls: [{
+                id: callId,
+                name: 'fs.read',
+                arguments: { path: 'generic-proposal.txt' },
+              }],
+            },
+          },
+        };
+      }
+      return {
+        ok: true,
+        data: {
+          chunks: [chunk, { type: 'done' }],
+          assistantMessage: {
+            role: 'assistant',
+            content: JSON.stringify({
+              schemaVersion: 'deepcode.agent.protocol.v3',
+              kind: 'answer',
+              outputLanguage: 'en-US',
+              answer: {
+                format: 'markdown',
+                content: 'The proposal content is accepted even when a duplicate read tool call is present.',
+              },
+            }),
+            toolCalls: [{
+              id: callId,
+              name: 'fs.read',
+              arguments: { path: 'generic-proposal.txt' },
+            }],
+          },
+        },
+      };
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + streamRequests.length + resourceResolveManifests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-native-read-duplicate-proposal',
+    content: 'Read a generic file if needed, then answer.',
+    attachments: [{ kind: 'directory', path: '.', absolutePath: '/tmp/generic-workspace', source: 'userSelected', scope: 'session' }],
+  });
+
+  const nativeResourceResolveManifests = resourceResolveManifests.filter((manifest) =>
+    Array.isArray(manifest.entries) && manifest.entries.some((entry: any) => String(entry?.id ?? '').startsWith('native-'))
+  );
+  assertEqual(nativeResourceResolveManifests.length, 1, 'duplicate proposal path does not call Kernel ResourceResolve twice');
+  assertEqual(streamRequests.length, 2, 'valid proposal content stops native tool resume despite duplicate tool call');
+  assertEqual(
+    result.events.some((event) => event.kind === 'assistant_msg' && String((event.payload as any)?.content ?? '').includes('proposal content is accepted')),
+    true,
+    'valid proposal content wins over duplicate native read tool call'
+  );
+}
+
 async function assertSessionDriverLoopNativeWriteToolTriggersImplementationPlanRepair(): Promise<void> {
   const events: AgentEvent[] = [];
   const submittedPlans: Array<Record<string, any>> = [];
@@ -6476,6 +7332,32 @@ async function assertSessionDriverLoopNativeWriteToolTriggersImplementationPlanR
   assert(String(payload?.content ?? '').includes('## 边界'), 'Chinese plan card localizes boundary heading');
   assert(!String(payload?.content ?? '').includes('This plan is not execution'), 'Chinese plan card does not keep English boundary text');
   assertEqual(result.events.some((event) => event.kind === 'tool_result'), false, 'native write is not executed as an immediate tool result');
+}
+
+function genericImplementationPlanWithTask(taskFields: Record<string, unknown>): Record<string, unknown> {
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind: 'implementationPlan',
+    outputLanguage: 'en-US',
+    implementationPlan: {
+      version: '1',
+      id: 'impl-generic-invalid',
+      title: 'Generic invalid plan',
+      summary: 'Plan a generic workspace change.',
+      tasks: [{
+        taskId: 'task-generic-invalid',
+        title: 'Generic task',
+        target: ['src/generic'],
+        scope: 'Generic workspace task.',
+        capability: 'fs.write',
+        acceptanceCriteria: ['Kernel can review generic evidence.'],
+        failureCriteria: ['Stop on generic invalid scope.'],
+        ...taskFields,
+      }],
+      risks: [],
+      reviewCheckpoints: ['Review the generic plan before execution.'],
+    },
+  };
 }
 
 function genericWriteProposal(missingEvidence: boolean): Record<string, unknown> {
@@ -6753,10 +7635,30 @@ function localizedGenericWriteProposal(): Record<string, unknown> {
 
 function oversizedGenericWriteProposal(): Record<string, unknown> {
   const proposal = genericWriteProposal(false);
-  proposal.codeBlocks = Array.from({ length: 5 }, (_item, index) => ({
+  proposal.codeBlocks = [{
+    id: 'generic-oversized-block',
+    path: 'generic-oversized-output.txt',
+    content: 'x'.repeat(385 * 1024),
+  }];
+  (proposal.actionBundle as any).actions[0].sourceBlockId = 'generic-oversized-block';
+  (proposal.actionBundle as any).actions[0].resourceScope = ['generic-oversized-output.txt'];
+  return proposal;
+}
+
+function manyCodeBlockWriteProposal(): Record<string, unknown> {
+  const proposal = genericWriteProposal(false);
+  proposal.codeBlocks = Array.from({ length: 7 }, (_item, index) => ({
     id: `generic-block-${index}`,
     path: `generic-output-${index}.txt`,
     content: `generic content ${index}`,
+  }));
+  (proposal.actionBundle as any).actions = Array.from({ length: 7 }, (_item, index) => ({
+    id: `write-generic-output-${index}`,
+    title: `Write generic output ${index}`,
+    capability: 'fs.write',
+    kind: 'write',
+    resourceScope: [`generic-output-${index}.txt`],
+    sourceBlockId: `generic-block-${index}`,
   }));
   return proposal;
 }
@@ -6852,6 +7754,7 @@ function proposalReviewReport(actionBundle: Record<string, any>, attachmentRoot?
   const capabilities = [...new Set(actions.map((action) => action.capability).filter(Boolean))].sort();
   const permissionGaps = capabilities.filter((capability) => capability !== 'fs.read' && capability !== 'git.read');
   const requiredFileOperations = requiredFileOperationsFromActionBundle(actionBundle, attachmentRoot);
+  const requiredAccessScopes = requiredAccessScopesFromActionBundle(actionBundle);
   return {
     planId: actionBundle.id ?? 'bundle-generic',
     status: 'awaitingUserApproval',
@@ -6859,12 +7762,43 @@ function proposalReviewReport(actionBundle: Record<string, any>, attachmentRoot?
     requiredPermissions: permissionGaps.map((capability) => `temporaryGrant:${capability}`),
     permissionGaps,
     requiredFileOperations,
+    requiredAccessScopes,
     hardFloorHits: [],
     deniedReasons: [],
     blockedReasons: [],
     findings: [],
     kernelGeneratedPermissionSummary: `Kernel preflight: status=awaitingUserApproval; capabilities=${capabilities.join(',')}; permissionGaps=${permissionGaps.length ? permissionGaps.join(',') : 'none'}; hardFloor=none.`,
   };
+}
+
+function requiredAccessScopesFromActionBundle(actionBundle: Record<string, any>): Array<Record<string, any>> {
+  const scopes: Array<Record<string, any>> = [];
+  const source = [
+    ...(Array.isArray(actionBundle.accessScopes) ? actionBundle.accessScopes : []),
+    ...((Array.isArray(actionBundle.actions) ? actionBundle.actions : []).flatMap((action: any) =>
+      Array.isArray(action?.accessScopes) ? action.accessScopes : []
+    )),
+  ];
+  for (const item of source) {
+    if (!item || typeof item !== 'object') continue;
+    const path = typeof item.path === 'string' ? item.path.replace(/\\/g, '/').replace(/\/+$/, '') : '';
+    if (!path || path === '.' || path.includes('*') || path.startsWith('../') || path.includes('/../')) continue;
+    const capability = typeof item.capability === 'string'
+      ? item.capability
+      : Array.isArray(item.capabilities) && typeof item.capabilities[0] === 'string'
+        ? item.capabilities[0]
+        : 'fs.write';
+    scopes.push({
+      scopeKind: typeof item.scopeKind === 'string' ? item.scopeKind : 'workspaceModule',
+      path,
+      capability,
+      operations: Array.isArray(item.operations) ? item.operations : (capability === 'fs.patch' ? ['patch'] : ['create', 'write']),
+      reason: typeof item.reason === 'string' ? item.reason : 'generic access scope',
+      dependencyDepth: typeof item.dependencyDepth === 'number' ? item.dependencyDepth : 0,
+      outsideWorkspace: false,
+    });
+  }
+  return scopes;
 }
 
 function requiredFileOperationsFromActionBundle(actionBundle: Record<string, any>, attachmentRoot?: string): Array<Record<string, any>> {

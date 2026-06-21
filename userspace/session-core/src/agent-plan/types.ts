@@ -61,6 +61,30 @@ export interface PlannedActionDraft {
   toolArgs?: Record<string, unknown>;
   permissionLabels?: string[];
   dependsOn?: string[];
+  accessScopes?: AccessScopeDraft[];
+}
+
+export interface FileOperationDraft {
+  operation: 'write' | 'create' | 'patch' | 'delete' | 'rename' | string;
+  capability: string;
+  targetRef?: {
+    kind: 'workspaceRelative' | 'rootRelative' | 'absolutePath' | string;
+    path: string;
+    rootId?: string;
+  };
+  targetPath?: string;
+  reason?: string;
+}
+
+export interface AccessScopeDraft {
+  scopeKind: 'workspaceModule' | 'oneHopDependency' | string;
+  path: string;
+  capability?: string;
+  capabilities?: string[];
+  operations?: string[];
+  reason?: string;
+  dependencyDepth?: number;
+  sourceTaskId?: string;
 }
 
 export interface CommandBlockDraft {
@@ -103,6 +127,7 @@ export interface ActionBundleDraft {
   validationExpectations: ValidationExpectationDraft[];
   reviewExpectations: ReviewExpectationDraft[];
   repairPolicy?: RepairPolicyDraft;
+  accessScopes?: AccessScopeDraft[];
 }
 
 export interface ExpectedValidation {
@@ -179,6 +204,8 @@ export interface ImplementationPlanTaskDraft {
   canDraftInParallel?: boolean;
   role?: 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review';
   capability: string;
+  fileOperations?: FileOperationDraft[];
+  accessScopes?: AccessScopeDraft[];
   acceptanceCriteria: string[];
   failureCriteria: string[];
 }

@@ -97,6 +97,8 @@ function normalizeImplementationPlan(value: Record<string, unknown>, proposalId:
         canDraftInParallel: typeof record.canDraftInParallel === 'boolean' ? record.canDraftInParallel : undefined,
         role: optionalString(record, 'role'),
         capability: optionalString(record, 'capability') ?? '',
+        fileOperations: normalizeFileOperations(record.fileOperations, `Agent Protocol v3.implementationPlan.tasks[${index}].fileOperations`),
+        accessScopes: normalizeAccessScopes(record.accessScopes, `Agent Protocol v3.implementationPlan.tasks[${index}].accessScopes`),
         acceptanceCriteria: optionalStringArray(record, 'acceptanceCriteria'),
         failureCriteria: optionalStringArray(record, 'failureCriteria'),
       };
@@ -105,14 +107,15 @@ function normalizeImplementationPlan(value: Record<string, unknown>, proposalId:
 }
 
 function normalizeActionBundlePayload(envelope: Record<string, unknown>, proposalId: string): Record<string, unknown> {
-  const actionBundle = requireObject(envelope.actionBundle, 'Agent Protocol v3.actionBundle');
+  const payload = optionalObjectRecord(envelope.actionBundle) ? envelope : (optionalObjectRecord(envelope.payload) ?? envelope);
+  const actionBundle = requireObject(payload.actionBundle, 'Agent Protocol v3.actionBundle');
   return {
-    userPlan: optionalString(envelope, 'userPlanMarkdown') ?? optionalString(envelope, 'userPlan'),
-    codeBlocks: normalizeCodeBlocks(envelope.codeBlocks),
-    commandBlocks: normalizeCommandBlocks(envelope.commandBlocks),
+    userPlan: optionalString(payload, 'userPlanMarkdown') ?? optionalString(payload, 'userPlan'),
+    codeBlocks: normalizeCodeBlocks(payload.codeBlocks),
+    commandBlocks: normalizeCommandBlocks(payload.commandBlocks),
     actionBundle: normalizeActionBundle(actionBundle, proposalId),
-    expectedValidation: optionalString(envelope, 'expectedValidation'),
-    reviewGuide: optionalString(envelope, 'reviewGuide'),
+    expectedValidation: optionalString(payload, 'expectedValidation'),
+    reviewGuide: optionalString(payload, 'reviewGuide'),
   };
 }
 
@@ -156,6 +159,7 @@ function normalizeActionBundle(value: Record<string, unknown>, proposalId: strin
     continuationExpectations: normalizePlannedActions(value.continuationExpectations, 'continuationExpectations'),
     validationExpectations: normalizeExpectations(value.validationExpectations, 'validationExpectations'),
     reviewExpectations: normalizeExpectations(value.reviewExpectations, 'reviewExpectations'),
+    accessScopes: normalizeAccessScopes(value.accessScopes, 'Agent Protocol v3.actionBundle.accessScopes'),
   };
 }
 
@@ -184,8 +188,161 @@ function normalizePlannedActions(value: unknown, label: string): Array<Record<st
         ? optionalStringArray(record, 'permissionLabels')
         : (capability ? [capability] : []),
       dependsOn: optionalStringArray(record, 'dependsOn'),
+      accessScopes: normalizeAccessScopes(record.accessScopes, `Agent Protocol v3.actionBundle.${label}[${index}].accessScopes`),
     };
   });
+}
+
+function normalizeFileOperations(value: unknown, label: string): Array<Record<string, unknown>> {
+  if (value === undefined || value === null) return [];
+  if (typeof value === 'string') {
+    return [normalizeFileOperationShorthand(value, `${label}[0]`)];
+  }
+  if (!Array.isArray(value)) {
+    throw new AgentPlanParseError(
+      'invalid_implementation_plan_file_operations',
+      `${label} must be an array of { operation, capability, targetRef|targetPath, reason? } objects.`
+    );
+  }
+  return value.map((item, index) => {
+    if (typeof item === 'string') {
+      return normalizeFileOperationShorthand(item, `${label}[${index}]`);
+    }
+    const record = requireObject(item, `${label}[${index}]`);
+    const operation = optionalString(record, 'operation') ?? optionalString(record, 'kind') ?? '';
+    const capability = optionalString(record, 'capability') ?? '';
+    const targetPath = optionalString(record, 'targetPath') ?? optionalTargetRefPath(record.targetRef);
+    if (!operation) {
+      throw new AgentPlanParseError(
+        'invalid_implementation_plan_file_operations',
+        `${label}[${index}] must include operation. Minimal shape: { "operation": "create", "capability": "fs.write", "targetPath": "relative/file.ext", "reason": "..." }.`
+      );
+    }
+    if (!targetPath) {
+      throw new AgentPlanParseError(
+        'invalid_implementation_plan_file_operations',
+        `${label}[${index}] must include targetPath or targetRef.path. Minimal shape: { "operation": "create", "capability": "fs.write", "targetPath": "relative/file.ext", "reason": "..." }.`
+      );
+    }
+    if (operation && !fileOperationAllowed(operation)) {
+      throw new AgentPlanParseError(
+        'invalid_implementation_plan_file_operations',
+        `${label}[${index}].operation must be one of create, write, patch, delete, rename.`
+      );
+    }
+    return {
+      ...record,
+      operation,
+      capability: capability || capabilityForFileOperation(operation),
+      targetPath,
+      reason: optionalString(record, 'reason') ?? optionalString(record, 'purpose'),
+    };
+  });
+}
+
+function normalizeAccessScopes(value: unknown, label: string): Array<Record<string, unknown>> {
+  if (value === undefined || value === null) return [];
+  if (typeof value === 'string') {
+    return [normalizeAccessScopeShorthand(value, `${label}[0]`)];
+  }
+  if (!Array.isArray(value)) {
+    throw new AgentPlanParseError(
+      'invalid_access_scopes',
+      `${label} must be an array of { scopeKind, path, capability?|capabilities?, operations?, reason?, dependencyDepth? } objects.`
+    );
+  }
+  return value.map((item, index) => {
+    if (typeof item === 'string') {
+      return normalizeAccessScopeShorthand(item, `${label}[${index}]`);
+    }
+    const record = requireObject(item, `${label}[${index}]`);
+    const scopeKind = optionalString(record, 'scopeKind') ?? optionalString(record, 'kind') ?? 'workspaceModule';
+    const path = optionalString(record, 'path') ?? optionalString(record, 'targetPath') ?? '';
+    if (!path) {
+      throw new AgentPlanParseError(
+        'invalid_access_scopes',
+        `${label}[${index}] must include path. Minimal shape: { "scopeKind": "workspaceModule", "path": "relative/module", "capabilities": ["fs.write","fs.patch"], "reason": "..." }.`
+      );
+    }
+    if (!['workspaceModule', 'oneHopDependency'].includes(scopeKind)) {
+      throw new AgentPlanParseError(
+        'invalid_access_scopes',
+        `${label}[${index}].scopeKind must be "workspaceModule" or "oneHopDependency".`
+      );
+    }
+    return {
+      ...record,
+      scopeKind,
+      path,
+      capability: optionalString(record, 'capability'),
+      capabilities: optionalStringArray(record, 'capabilities'),
+      operations: optionalStringArray(record, 'operations'),
+      reason: optionalString(record, 'reason') ?? optionalString(record, 'purpose'),
+      dependencyDepth: typeof record.dependencyDepth === 'number' ? record.dependencyDepth : undefined,
+      sourceTaskId: optionalString(record, 'sourceTaskId') ?? optionalString(record, 'taskId'),
+    };
+  });
+}
+
+function normalizeFileOperationShorthand(value: string, label: string): Record<string, unknown> {
+  const text = value.trim();
+  if (!text) {
+    throw new AgentPlanParseError(
+      'invalid_implementation_plan_file_operations',
+      `${label} string shorthand must be non-empty; use "create relative/file.ext" or { "operation": "create", "capability": "fs.write", "targetPath": "relative/file.ext" }.`
+    );
+  }
+  const match = /^(create|write|patch|delete|rename)\s+(.+)$/i.exec(text);
+  if (!match) {
+    throw new AgentPlanParseError(
+      'invalid_implementation_plan_file_operations',
+      `${label} string shorthand must start with create, write, patch, delete, or rename followed by a concrete path.`
+    );
+  }
+  const operation = match[1].toLowerCase();
+  const targetPath = match[2].trim();
+  if (!targetPath) {
+    throw new AgentPlanParseError(
+      'invalid_implementation_plan_file_operations',
+      `${label} string shorthand must include a concrete target path.`
+    );
+  }
+  return {
+    operation,
+    capability: capabilityForFileOperation(operation),
+    targetPath,
+    reason: text,
+  };
+}
+
+function normalizeAccessScopeShorthand(value: string, label: string): Record<string, unknown> {
+  const text = value.trim();
+  if (!text) {
+    throw new AgentPlanParseError(
+      'invalid_access_scopes',
+      `${label} string shorthand must be non-empty; use "relative/module" or { "scopeKind": "workspaceModule", "path": "relative/module", "capabilities": ["fs.write","fs.patch"] }.`
+    );
+  }
+  return {
+    scopeKind: 'workspaceModule',
+    path: text,
+    capabilities: ['fs.write', 'fs.patch'],
+    operations: ['create', 'write', 'patch'],
+    reason: text,
+    dependencyDepth: 0,
+  };
+}
+
+function fileOperationAllowed(operation: string): boolean {
+  return ['create', 'write', 'patch', 'delete', 'rename'].includes(operation);
+}
+
+function capabilityForFileOperation(operation: string): string {
+  if (operation === 'delete') return 'fs.delete';
+  if (operation === 'rename') return 'fs.rename';
+  if (operation === 'patch') return 'fs.patch';
+  if (operation === 'create' || operation === 'write') return 'fs.write';
+  return '';
 }
 
 function optionalTargetRefPath(value: unknown): string | undefined {
@@ -198,13 +355,46 @@ function optionalTargetRefPath(value: unknown): string | undefined {
 }
 
 function normalizeExpectations(value: unknown, label: string): Array<Record<string, unknown>> {
-  if (!Array.isArray(value)) return [];
+  if (value === undefined || value === null) return [];
+  if (typeof value === 'string') {
+    const description = value.trim();
+    if (!description) {
+      throw new AgentPlanParseError(
+        'invalid_action_bundle_expectation',
+        `Agent Protocol v3.actionBundle.${label} string value must be non-empty; use [{ "id": "${label}-1", "description": "..." }].`
+      );
+    }
+    return [{ id: `${label}-1`, description }];
+  }
+  if (!Array.isArray(value)) {
+    throw new AgentPlanParseError(
+      'invalid_action_bundle_expectation',
+      `Agent Protocol v3.actionBundle.${label} must be an array of { id, description } objects; string and string[] are accepted only as compatibility input.`
+    );
+  }
   return value.map((item, index) => {
+    if (typeof item === 'string') {
+      const description = item.trim();
+      if (!description) {
+        throw new AgentPlanParseError(
+          'invalid_action_bundle_expectation',
+          `Agent Protocol v3.actionBundle.${label}[${index}] string value must be non-empty; use { "id": "${label}-${index + 1}", "description": "..." }.`
+        );
+      }
+      return { id: `${label}-${index + 1}`, description };
+    }
     const record = requireObject(item, `Agent Protocol v3.actionBundle.${label}[${index}]`);
+    const description = optionalString(record, 'description');
+    if (!description) {
+      throw new AgentPlanParseError(
+        'invalid_action_bundle_expectation',
+        `Agent Protocol v3.actionBundle.${label}[${index}].description must be a non-empty string; minimal shape is { "id": "${label}-${index + 1}", "description": "..." }.`
+      );
+    }
     return {
       ...record,
       id: optionalString(record, 'id') ?? `${label}-${index + 1}`,
-      description: optionalString(record, 'description') ?? '',
+      description,
     };
   });
 }
@@ -329,6 +519,12 @@ function requireObject(value: unknown, label: string): Record<string, unknown> {
     throw new AgentPlanParseError('invalid_object', `${label} must be an object`);
   }
   return value as Record<string, unknown>;
+}
+
+function optionalObjectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function requireString(value: Record<string, unknown>, key: string, label: string): string {

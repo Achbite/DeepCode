@@ -25,14 +25,14 @@ export function applyProviderCacheStrategy(input: ProviderCacheStrategyInput): P
   if (provider.includes('openai')) {
     return {
       semanticMode: 'openai',
-      requestBody: { ...input.requestBody, prompt_cache_key: input.prefixHash },
+      requestBody: { ...input.requestBody },
       serverPromptCacheSupported: true,
     };
   }
   if (provider.includes('anthropic-native')) {
     return {
       semanticMode: 'anthropic-native',
-      requestBody: { ...input.requestBody, cache_control: { type: 'ephemeral' } },
+      requestBody: { ...input.requestBody },
       serverPromptCacheSupported: true,
     };
   }

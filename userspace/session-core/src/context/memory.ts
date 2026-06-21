@@ -1,8 +1,46 @@
 import type { AgentEvent } from '@deepcode/protocol';
 
+export type MemoryItemScope = 'project' | 'session';
+export type MemoryItemKind = 'fact' | 'intent' | 'decision' | 'resource' | 'habit' | 'risk' | 'checkpoint';
+export type MemoryItemAuthority = 'kernelFact' | 'resourcePacket' | 'userDecision' | 'userRuler' | 'summary';
+export type MemoryCompressionMode = 'raw' | 'summary' | 'handleOnly';
+
+export interface MemoryItemV4 {
+  id: string;
+  scope: MemoryItemScope;
+  kind: MemoryItemKind;
+  authority: MemoryItemAuthority;
+  content: string;
+  freshness: {
+    workspaceScopeKey?: string;
+    path?: string;
+    range?: { offsetBytes?: number; limitBytes?: number };
+    symbol?: string;
+    query?: string;
+    sourceHash?: string;
+    contentHash?: string;
+    lastVerifiedAt?: string;
+    staleAfter?: string;
+  };
+  sourceRefs: {
+    eventIds: string[];
+    resourcePacketIds?: string[];
+    resourceBlockKeys?: string[];
+    ledgerRefs?: string[];
+    auditRefs?: string[];
+  };
+  compression?: {
+    mode: MemoryCompressionMode;
+    reason?: string;
+    originalCharCount?: number;
+  };
+}
+
 export interface SessionMemoryDocument {
   schemaVersion: '3';
   sourceEventCount: number;
+  projectMemoryItems: MemoryItemV4[];
+  sessionMemoryItems: MemoryItemV4[];
   projectMemoryContext: string[];
   sessionMemoryContext: string[];
   longTermContext: string[];
@@ -14,12 +52,65 @@ export interface SessionMemoryDocument {
   resourceContext: string[];
 }
 
+export interface SessionMemorySnapshot {
+  schemaVersion: 'deepcode.session.memory-snapshot.v1';
+  sessionId?: string;
+  generatedAt: string;
+  sourceEventCount: number;
+  softCaps: {
+    projectMemoryTokens: 128000;
+    sessionMemoryTokens: 256000;
+  };
+  projectMemoryItems: MemoryItemV4[];
+  sessionMemoryItems: MemoryItemV4[];
+  metadata: {
+    projectItemCount: number;
+    sessionItemCount: number;
+    compressionModes: MemoryCompressionMode[];
+    freshnessMode: 'derivedFromSessionEvents';
+  };
+}
+
+export interface BuildSessionMemorySnapshotOptions {
+  sessionId?: string;
+  generatedAt?: string;
+}
+
 export interface UserGuidanceEvent {
   id: string;
   ts?: string;
   content: string;
   source: 'user' | 'decision' | 'review' | 'system';
   checkpointKind: 'llmProposal' | 'resourcePacket' | 'permission' | 'review' | 'nextProviderCall';
+}
+
+export function buildSessionMemorySnapshot(
+  events: AgentEvent[],
+  options: BuildSessionMemorySnapshotOptions = {}
+): SessionMemorySnapshot {
+  const document = buildSessionMemoryDocument(events);
+  const compressionModes = new Set<MemoryCompressionMode>();
+  for (const item of [...document.projectMemoryItems, ...document.sessionMemoryItems]) {
+    compressionModes.add(item.compression?.mode ?? 'raw');
+  }
+  return {
+    schemaVersion: 'deepcode.session.memory-snapshot.v1',
+    sessionId: options.sessionId,
+    generatedAt: options.generatedAt ?? new Date().toISOString(),
+    sourceEventCount: document.sourceEventCount,
+    softCaps: {
+      projectMemoryTokens: 128000,
+      sessionMemoryTokens: 256000,
+    },
+    projectMemoryItems: document.projectMemoryItems,
+    sessionMemoryItems: document.sessionMemoryItems,
+    metadata: {
+      projectItemCount: document.projectMemoryItems.length,
+      sessionItemCount: document.sessionMemoryItems.length,
+      compressionModes: [...compressionModes],
+      freshnessMode: 'derivedFromSessionEvents',
+    },
+  };
 }
 
 export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryDocument {
@@ -209,21 +300,27 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
     }
   }
 
+  const projectMemoryItems = capMemoryItems(dedupeMemoryItems([
+    ...longTermContext.map((content) => memoryItem('project', 'checkpoint', 'summary', content)),
+    ...resourceContext.map((content) => memoryItem('project', 'resource', 'resourcePacket', content)),
+    ...factContext.map((content) => memoryItem('project', 'fact', factAuthority(content), content)),
+    ...decisionContext.map((content) => memoryItem('project', 'decision', 'userDecision', content)),
+  ], 40), 128_000);
+  const sessionMemoryItems = capMemoryItems(dedupeMemoryItems([
+    ...shortTermContext.map((content) => memoryItem('session', 'checkpoint', 'summary', content)),
+    ...intentContext.map((content) => memoryItem('session', 'intent', 'summary', content)),
+    ...guidanceContext.map((content) => memoryItem('session', 'decision', 'userDecision', content)),
+    ...decisionContext.map((content) => memoryItem('session', 'decision', 'userDecision', content)),
+    ...factContext.slice(-8).map((content) => memoryItem('session', 'fact', factAuthority(content), content)),
+  ], 48), 256_000);
+
   return {
     schemaVersion: '3',
     sourceEventCount: events.length,
-    projectMemoryContext: capMemoryLines(dedupeKeepLast([
-      ...longTermContext,
-      ...resourceContext.map((item) => `Project resource index: ${item}`),
-      ...factContext.map((item) => `Project fact index: ${item}`),
-      ...decisionContext.map((item) => `Cross-session decision index: ${item}`),
-    ], 40), 128_000),
-    sessionMemoryContext: capMemoryLines(dedupeKeepLast([
-      ...shortTermContext,
-      ...intentContext.map((item) => `Session intent: ${item}`),
-      ...guidanceContext.map((item) => `Session guidance: ${item}`),
-      ...decisionContext.map((item) => `Session decision: ${item}`),
-    ], 48), 256_000),
+    projectMemoryItems,
+    sessionMemoryItems,
+    projectMemoryContext: projectMemoryItems.map(renderMemoryItemLine),
+    sessionMemoryContext: sessionMemoryItems.map(renderMemoryItemLine),
     longTermContext: dedupeKeepLast(longTermContext, 18),
     shortTermContext: dedupeKeepLast(shortTermContext, 12),
     guidanceContext: dedupeKeepLast(guidanceContext, 10),
@@ -250,6 +347,103 @@ export function renderProjectMemoryHints(document: SessionMemoryDocument): strin
       ? `projectMemoryContext:\n${capMemoryLines(lines, 128_000).map((item) => `- ${item}`).join('\n')}`
       : 'projectMemoryContext: none',
   ];
+}
+
+function memoryItem(
+  scope: MemoryItemScope,
+  kind: MemoryItemKind,
+  authority: MemoryItemAuthority,
+  content: string
+): MemoryItemV4 {
+  const clipped = clip(content, scope === 'project' ? 520 : 640);
+  const contentHash = memoryHash(clipped);
+  return {
+    id: `memory-v4:${scope}:${kind}:${authority}:${contentHash}`,
+    scope,
+    kind,
+    authority,
+    content: clipped,
+    freshness: {
+      path: pathFromMemoryContent(clipped),
+      contentHash,
+    },
+    sourceRefs: {
+      eventIds: [],
+    },
+    compression: {
+      mode: content.length === clipped.length ? 'raw' : 'summary',
+      reason: content.length === clipped.length ? 'within memory item budget' : 'clipped for memory soft cap rendering',
+      originalCharCount: content.length,
+    },
+  };
+}
+
+function factAuthority(content: string): MemoryItemAuthority {
+  if (content.startsWith('ToolCompleted fact') || content.startsWith('WorkUnit fact')) return 'kernelFact';
+  if (content.startsWith('ResourcePacket fact') || content.startsWith('Agent-generated artifact fact')) return 'resourcePacket';
+  return 'summary';
+}
+
+function renderMemoryItemLine(item: MemoryItemV4): string {
+  const freshness = [
+    item.freshness.path ? `path=${item.freshness.path}` : '',
+    item.freshness.contentHash ? `hash=${item.freshness.contentHash}` : '',
+  ].filter(Boolean).join(' ');
+  const compression = item.compression
+    ? `compression=${item.compression.mode}${item.compression.reason ? ` reason=${item.compression.reason}` : ''}`
+    : 'compression=raw';
+  return [
+    `MemoryItemV4 scope=${item.scope}`,
+    `kind=${item.kind}`,
+    `authority=${item.authority}`,
+    freshness || 'freshness=none',
+    `sourceRefs=${item.sourceRefs.eventIds.length ? item.sourceRefs.eventIds.join(',') : 'none'}`,
+    compression,
+    `content=${item.content}`,
+  ].join(' | ');
+}
+
+function dedupeMemoryItems(values: MemoryItemV4[], maxItems: number): MemoryItemV4[] {
+  const seen = new Set<string>();
+  const result: MemoryItemV4[] = [];
+  for (const value of [...values].reverse()) {
+    const key = `${value.scope}:${value.kind}:${value.authority}:${value.content}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+    if (result.length >= maxItems) break;
+  }
+  return result.reverse();
+}
+
+function capMemoryItems(values: MemoryItemV4[], softTokenCap: number): MemoryItemV4[] {
+  const maxChars = softTokenCap * 4;
+  const result: MemoryItemV4[] = [];
+  let total = 0;
+  for (const value of values) {
+    const rendered = renderMemoryItemLine(value);
+    const nextLength = rendered.length + 3;
+    if (total + nextLength > maxChars) break;
+    result.push(value);
+    total += nextLength;
+  }
+  return result;
+}
+
+function pathFromMemoryContent(content: string): string | undefined {
+  const match = content.match(/(?:path=|attachments=|Attached resource: |ResourcePacket fact: [^ ]+ |Agent-generated artifact fact: )([^,;\s]+)/);
+  const value = match?.[1]?.trim();
+  if (!value || value.includes('://')) return undefined;
+  return value;
+}
+
+function memoryHash(content: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < content.length; index += 1) {
+    hash ^= content.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 }
 
 export function renderSessionScopedMemoryHints(document: SessionMemoryDocument): string[] {

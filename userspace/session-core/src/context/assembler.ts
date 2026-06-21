@@ -20,6 +20,10 @@ import {
 } from './memory.js';
 import type { AgentEvent } from '@deepcode/protocol';
 
+const PROMPT_POLICY_VERSION = 'deepcode.prompt-policy.v1';
+const MEMORY_COMPRESSION_MODE = 'memory-v3-soft-cap-lines';
+const EVIDENCE_FRESHNESS_MODE = 'resource-evidence-tail-v1';
+
 export interface PromptCachePlan {
   contextAssemblyId: string;
   provider: string;
@@ -111,19 +115,47 @@ export interface ContextAssemblyPartitionTokenEstimates {
   providerVisibleTotal: number;
 }
 
+export type ContextAssemblyPartitionName =
+  | 'PlatformProtocolContract'
+  | 'AgentOperatingContract'
+  | 'StaticToolCatalogDigest'
+  | 'UserRulerAndProjectInstructions'
+  | 'ProjectMemory'
+  | 'SessionMemory'
+  | 'CurrentRunStateAndRequest'
+  | 'EvidenceTail'
+  | 'AuditOnly';
+
+export interface ContextAssemblyPartitionRecord {
+  name: ContextAssemblyPartitionName;
+  segmentIds: string[];
+  segmentNames: PromptSegment['name'][];
+  cacheClasses: PromptSegment['cacheClass'][];
+  stablePrefix: boolean;
+  auditOnly: boolean;
+  providerVisible: boolean;
+  contentHash: string;
+  charLength: number;
+  tokenEstimate: number;
+}
+
 export interface ContextAssemblyRecord {
   schemaVersion: 'deepcode.session.context-assembly.v3';
   contextAssemblyId: string;
   provider: string;
   model: string;
   templateVersion: string;
+  promptPolicyVersion: string;
   stablePrefixHash: string;
   dynamicSuffixHash: string;
   cacheHash: string;
   auditHash: string;
+  catalogHash: string;
+  stateContractHash: string;
   cacheAffectsCorrectness: false;
   segmentOrder: string[];
   segments: ContextAssemblySegmentRecord[];
+  partitionRecords: ContextAssemblyPartitionRecord[];
   resourceBlocks: ContextAssemblyResourceBlockRecord[];
   resourceFullTextCharCount: number;
   resourceSummaryCharCount: number;
@@ -139,6 +171,10 @@ export interface ContextAssemblyRecord {
   budgetPlan: ContextAssemblyBudgetPlan;
   partitionCharCounts: ContextAssemblyPartitionCharCounts;
   partitionTokenEstimates: ContextAssemblyPartitionTokenEstimates;
+  providerVisibleTokenEstimate: number;
+  reservedOutputTokens: number;
+  memoryCompressionMode: 'memory-v3-soft-cap-lines';
+  evidenceFreshnessMode: 'resource-evidence-tail-v1';
   resourceEvidenceTailCount: number;
   traceArchiveMode: 'compact-provider-trace';
   subAgentMode?: 'auto' | 'off';
@@ -227,19 +263,38 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     templateVersion,
   });
   const partitionCharCounts = contextAssemblyPartitionCharCounts(prompt.segments);
+  const partitionTokenEstimates = contextAssemblyPartitionTokenEstimates(partitionCharCounts);
+  const budgetPlan: ContextAssemblyBudgetPlan = {
+    policy: 'softCapReserveOutput',
+    contextWindowTokens: 1_000_000,
+    maxOutputTokens: 384_000,
+    protectedPrefixBudgetTokens: 64_000,
+    projectMemoryBudgetTokens: 128_000,
+    sessionMemoryBudgetTokens: 256_000,
+    intentMemoryBudgetTokens: 256_000,
+    evidenceTailBudgetTokens: 256_000,
+    auditOnlyBudgetTokens: 8_000,
+  };
   const contextAssembly: ContextAssemblyRecord = {
     schemaVersion: 'deepcode.session.context-assembly.v3',
     contextAssemblyId,
     provider,
     model,
     templateVersion,
+    promptPolicyVersion: PROMPT_POLICY_VERSION,
     stablePrefixHash: canonical.stablePrefixHash,
     dynamicSuffixHash: canonical.dynamicSuffixHash,
     cacheHash: canonical.cacheHash,
     auditHash: canonical.auditHash,
+    catalogHash: stableHash(input.capabilityCatalogSummary || 'none'),
+    stateContractHash: stableHash([
+      input.workflowState,
+      ...input.allowedProposals,
+    ].join('\n')),
     cacheAffectsCorrectness: false,
     segmentOrder: prompt.segments.map((segment) => segment.id),
     segments: prompt.segments.map(contextAssemblySegment),
+    partitionRecords: contextAssemblyPartitionRecords(prompt.segments),
     resourceBlocks: resourcePromptContext.resourceBlocks.map(contextAssemblyResourceBlock),
     resourceFullTextCharCount: resourcePromptContext.resourceFullTextCharCount,
     resourceSummaryCharCount: resourcePromptContext.resourceSummaryCharCount,
@@ -252,19 +307,13 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     resourcePacketCount: input.resourcePackets?.length ?? 0,
     userGuidanceCount: userGuidance.length,
     consumedUserGuidanceIds: userGuidance.map((item) => item.id),
-    budgetPlan: {
-      policy: 'softCapReserveOutput',
-      contextWindowTokens: 1_000_000,
-      maxOutputTokens: 384_000,
-      protectedPrefixBudgetTokens: 64_000,
-      projectMemoryBudgetTokens: 128_000,
-      sessionMemoryBudgetTokens: 256_000,
-      intentMemoryBudgetTokens: 256_000,
-      evidenceTailBudgetTokens: 256_000,
-      auditOnlyBudgetTokens: 8_000,
-    },
+    budgetPlan,
     partitionCharCounts,
-    partitionTokenEstimates: contextAssemblyPartitionTokenEstimates(partitionCharCounts),
+    partitionTokenEstimates,
+    providerVisibleTokenEstimate: partitionTokenEstimates.providerVisibleTotal,
+    reservedOutputTokens: budgetPlan.maxOutputTokens,
+    memoryCompressionMode: MEMORY_COMPRESSION_MODE,
+    evidenceFreshnessMode: EVIDENCE_FRESHNESS_MODE,
     resourceEvidenceTailCount: resourcePromptContext.resourceBlocks.length,
     traceArchiveMode: 'compact-provider-trace',
     subAgentMode: input.subAgentTelemetry?.mode,
@@ -356,6 +405,76 @@ function contextAssemblyPartitionTokenEstimates(
     auditOnly: estimateTokens(counts.auditOnly),
     providerVisibleTotal: estimateTokens(counts.providerVisibleTotal),
   };
+}
+
+function contextAssemblyPartitionRecords(segments: PromptSegment[]): ContextAssemblyPartitionRecord[] {
+  const partitionOrder: ContextAssemblyPartitionName[] = [
+    'PlatformProtocolContract',
+    'AgentOperatingContract',
+    'StaticToolCatalogDigest',
+    'UserRulerAndProjectInstructions',
+    'ProjectMemory',
+    'SessionMemory',
+    'CurrentRunStateAndRequest',
+    'EvidenceTail',
+    'AuditOnly',
+  ];
+  return partitionOrder.map((name) => contextAssemblyPartitionRecord(name, segments));
+}
+
+function contextAssemblyPartitionRecord(
+  name: ContextAssemblyPartitionName,
+  segments: PromptSegment[]
+): ContextAssemblyPartitionRecord {
+  const selected = segments.filter((segment) => contextAssemblyPartitionName(segment) === name);
+  const content = selected.map((segment) => segment.content).join('\n---partition-segment---\n');
+  const cacheClasses = [...new Set(selected.map((segment) => segment.cacheClass))];
+  return {
+    name,
+    segmentIds: selected.map((segment) => segment.id),
+    segmentNames: selected.map((segment) => segment.name),
+    cacheClasses,
+    stablePrefix: selected.length > 0 && selected.every((segment) => segment.stable),
+    auditOnly: selected.length > 0 && selected.every((segment) => segment.auditOnly),
+    providerVisible: selected.some((segment) => !segment.auditOnly),
+    contentHash: stableHash(content || `empty:${name}`),
+    charLength: selected.reduce((total, segment) => total + segment.content.length, 0),
+    tokenEstimate: estimateTokens(selected.reduce((total, segment) => total + segment.content.length, 0)),
+  };
+}
+
+function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPartitionName {
+  switch (segment.name) {
+    case 'protectedStablePrefix':
+    case 'protocolContract':
+      return 'PlatformProtocolContract';
+    case 'builtinSystemPrompt':
+    case 'systemStructure':
+    case 'agentInterventionPolicy':
+      return 'AgentOperatingContract';
+    case 'capabilityProjection':
+      return 'StaticToolCatalogDigest';
+    case 'rulerContext':
+    case 'authoritativeDocExcerpts':
+      return 'UserRulerAndProjectInstructions';
+    case 'projectMemory':
+      return 'ProjectMemory';
+    case 'sessionMemory':
+    case 'requirementTranscript':
+    case 'userGuidance':
+      return 'SessionMemory';
+    case 'currentWorkflowState':
+    case 'currentRequirement':
+    case 'currentUserOverlay':
+      return 'CurrentRunStateAndRequest';
+    case 'reusableResourceContext':
+    case 'currentResourceResults':
+      return 'EvidenceTail';
+    case 'auditOnlyContext':
+      return 'AuditOnly';
+    default:
+      return 'CurrentRunStateAndRequest';
+  }
 }
 
 function estimateTokens(chars: number): number {
