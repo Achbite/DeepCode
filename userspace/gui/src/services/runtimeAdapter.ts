@@ -64,6 +64,7 @@ import type {
   TerminalWarmupStatus,
   WorkspaceState,
 } from '@deepcode/protocol';
+import { buildSessionMemorySnapshot, type SessionMemorySnapshot } from '@deepcode/session-core';
 
 import * as api from './apiClient';
 
@@ -480,6 +481,23 @@ export function appendAgentEvents(
 
 export function getAgentSession(sessionId: string): Promise<ApiResponse<AgentSessionResult>> {
   return api.getAgentSession(sessionId);
+}
+
+export async function getAgentSessionMemorySnapshot(
+  sessionId: string
+): Promise<ApiResponse<SessionMemorySnapshot>> {
+  const result = await getAgentSession(sessionId);
+  if (!result.ok || !result.data) {
+    return {
+      ok: false,
+      error: result.error,
+      message: result.message ?? 'Agent session events are unavailable.',
+    };
+  }
+  return {
+    ok: true,
+    data: buildSessionMemorySnapshot(result.data.events, { sessionId }),
+  };
 }
 
 export function startAgentRun(

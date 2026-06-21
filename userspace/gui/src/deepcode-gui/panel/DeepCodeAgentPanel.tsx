@@ -62,6 +62,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const workspaceRevision = useWorkspaceStore((s) => s.treeRevision);
   const [timeline, setTimeline] = useState<AgentTimelineResult | null>(null);
   const [timelineError, setTimelineError] = useState<string | null>(null);
+  const [timelineTypewriterActive, setTimelineTypewriterActive] = useState(false);
+  const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const sessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
 
   useEffect(() => {
@@ -118,8 +120,24 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       resolvingReview,
       resolvingPermission,
     });
+  const pendingDecisionKey = pendingDecisionIdentity(pendingDecision);
+  useEffect(() => {
+    if (!pendingDecisionKey) {
+      setRevealedPendingDecisionKey(null);
+      return;
+    }
+    if (!timelineTypewriterActive) {
+      setRevealedPendingDecisionKey(pendingDecisionKey);
+    }
+  }, [pendingDecisionKey, timelineTypewriterActive]);
+  const decisionReadyForComposer = Boolean(
+    pendingDecisionKey &&
+    revealedPendingDecisionKey === pendingDecisionKey &&
+    !timelineTypewriterActive
+  );
+  const composerPendingDecision = decisionReadyForComposer ? pendingDecision : null;
   const showHome = forceHome || (
-    !sessionRunning && !pendingDecision && !errorMessage && !timelineError
+    !sessionRunning && !composerPendingDecision && !errorMessage && !timelineError
     && events.length === 0 && !hasTimelineTurns
   );
   const composerRunning = forceHome ? false : sessionRunning;
@@ -142,46 +160,46 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       onStop={() => void cancelCurrentRun()}
       onAddAttachment={addAttachment}
       onRemoveAttachment={removeAttachment}
-      pendingDecision={pendingDecision}
+      pendingDecision={composerPendingDecision}
       onDecisionSubmit={(guidance, action) => {
-        if (!pendingDecision) return;
+        if (!composerPendingDecision) return;
         const decision = action ?? (guidance ? 'revise' : 'accept');
-        if (pendingDecision.kind === 'requirement') {
+        if (composerPendingDecision.kind === 'requirement') {
           void resolveRequirement(
-            pendingDecision.runId,
-            pendingDecision.requirementId,
+            composerPendingDecision.runId,
+            composerPendingDecision.requirementId,
             decision,
             guidance
           );
           return;
         }
-        if (pendingDecision.kind === 'plan') {
+        if (composerPendingDecision.kind === 'plan') {
           void resolvePlan(
-            pendingDecision.runId,
-            pendingDecision.planId,
+            composerPendingDecision.runId,
+            composerPendingDecision.planId,
             decision,
             guidance
           );
           return;
         }
-        if (pendingDecision.kind === 'review') {
-          void resolveReview(pendingDecision.runId, decision, guidance);
+        if (composerPendingDecision.kind === 'review') {
+          void resolveReview(composerPendingDecision.runId, decision, guidance);
           return;
         }
         void acceptPermission();
       }}
       onDecisionReject={() => {
-        if (!pendingDecision) return;
-        if (pendingDecision.kind === 'requirement') {
-          void resolveRequirement(pendingDecision.runId, pendingDecision.requirementId, 'reject');
+        if (!composerPendingDecision) return;
+        if (composerPendingDecision.kind === 'requirement') {
+          void resolveRequirement(composerPendingDecision.runId, composerPendingDecision.requirementId, 'reject');
           return;
         }
-        if (pendingDecision.kind === 'plan') {
-          void resolvePlan(pendingDecision.runId, pendingDecision.planId, 'reject');
+        if (composerPendingDecision.kind === 'plan') {
+          void resolvePlan(composerPendingDecision.runId, composerPendingDecision.planId, 'reject');
           return;
         }
-        if (pendingDecision.kind === 'review') {
-          void resolveReview(pendingDecision.runId, 'reject');
+        if (composerPendingDecision.kind === 'review') {
+          void resolveReview(composerPendingDecision.runId, 'reject');
           return;
         }
         void rejectPermission();
@@ -216,12 +234,13 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         loading={sessionRunning}
         language={language}
         activeDeltas={activeDeltas}
+        onTypewriterActiveChange={setTimelineTypewriterActive}
         onPlanResolve={(runId, planId, decision, guidance) =>
           void resolvePlan(runId, planId, decision, guidance)
         }
       />
 
-      {pendingPermission && (
+      {!timelineTypewriterActive && pendingPermission && (
         <PermissionRequestBubble
           request={pendingPermission.request}
           language={language}
@@ -244,5 +263,21 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     </div>
   );
 };
+
+function pendingDecisionIdentity(
+  decision: ReturnType<typeof findPendingComposerDecision>
+): string | null {
+  if (!decision) return null;
+  if (decision.kind === 'requirement') {
+    return `${decision.kind}:${decision.runId}:${decision.requirementId}`;
+  }
+  if (decision.kind === 'plan') {
+    return `${decision.kind}:${decision.runId}:${decision.planId}`;
+  }
+  if (decision.kind === 'review') {
+    return `${decision.kind}:${decision.runId}`;
+  }
+  return `${decision.kind}:${decision.requestId}`;
+}
 
 export default DeepCodeAgentPanel;

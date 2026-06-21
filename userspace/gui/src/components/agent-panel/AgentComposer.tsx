@@ -339,6 +339,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const defaultDecisionOptionRef = useRef<HTMLButtonElement | null>(null);
   const focusedOptionClickConfirmRef = useRef<string | null>(null);
+  const focusedDecisionOptionIdRef = useRef<string | null>(null);
   const activeFolder = useWorkspaceStore((s) => s.getActiveFolder());
   const activeWorkspaceRoot = activeFolder?.absolutePath;
   const previewEditor = String(
@@ -363,16 +364,20 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     setSelectedChoiceId(defaultChoice?.id ?? null);
     setDecisionCopyStatus('idle');
     focusedOptionClickConfirmRef.current = null;
+    focusedDecisionOptionIdRef.current = defaultChoice?.id ?? PRIMARY_DECISION_OPTION_ID;
   }, [decisionKey, defaultChoice?.id]);
 
   const send = () => {
     const nextValue = value;
     if (pendingDecision) {
       if (pendingDecision.resolving) return;
-      if (isTechnicalChoiceDecision(pendingDecision) && selectedChoice) {
-        const parsed = parseTechnicalChoiceInput(nextValue, selectedChoice);
+      const focusedChoice = technicalChoiceOptions.find((option) => option.id === focusedDecisionOptionIdRef.current)
+        ?? selectedChoice;
+      if (isTechnicalChoiceDecision(pendingDecision) && focusedChoice) {
+        const parsed = parseTechnicalChoiceInput(nextValue, focusedChoice);
         setValue('');
         setSelectedChoiceId(parsed.option.id);
+        focusedDecisionOptionIdRef.current = parsed.option.id;
         if (parsed.action === 'reject') {
           void onDecisionReject?.();
           return;
@@ -495,31 +500,40 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
     event: React.MouseEvent<HTMLButtonElement>,
     optionId: string
   ) => {
-    focusedOptionClickConfirmRef.current = document.activeElement === event.currentTarget
+    focusedOptionClickConfirmRef.current = focusedDecisionOptionIdRef.current === optionId
       ? optionId
       : null;
   };
 
-  const selectTechnicalChoice = (option: AgentComposerDecisionOption) => {
+  const selectTechnicalChoice = (
+    event: React.MouseEvent<HTMLButtonElement>,
+    option: AgentComposerDecisionOption
+  ) => {
     if (!pendingDecision || pendingDecision.resolving) return;
     if (focusedOptionClickConfirmRef.current === option.id) {
       send();
       return;
     }
+    event.currentTarget.focus();
     setSelectedChoiceId(option.id);
+    focusedDecisionOptionIdRef.current = option.id;
     focusedOptionClickConfirmRef.current = null;
   };
 
   const focusTechnicalChoice = (option: AgentComposerDecisionOption) => {
     if (!pendingDecision || pendingDecision.resolving) return;
     setSelectedChoiceId(option.id);
+    focusedDecisionOptionIdRef.current = option.id;
   };
 
-  const activatePrimaryDecisionOption = () => {
+  const activatePrimaryDecisionOption = (event: React.MouseEvent<HTMLButtonElement>) => {
     if (!pendingDecision || pendingDecision.resolving) return;
     if (focusedOptionClickConfirmRef.current === PRIMARY_DECISION_OPTION_ID) {
       send();
+      return;
     }
+    event.currentTarget.focus();
+    focusedDecisionOptionIdRef.current = PRIMARY_DECISION_OPTION_ID;
     focusedOptionClickConfirmRef.current = null;
   };
 
@@ -601,7 +615,7 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
                     ref={option.id === defaultChoice?.id ? defaultDecisionOptionRef : undefined}
                     onMouseDown={(event) => armFocusedOptionClick(event, option.id)}
                     onFocus={() => focusTechnicalChoice(option)}
-                    onClick={() => selectTechnicalChoice(option)}
+                    onClick={(event) => selectTechnicalChoice(event, option)}
                   >
                     <span className="agent-composer-decision__number">{index + 1}</span>
                     <span className="agent-composer-decision__option-body">

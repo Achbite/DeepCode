@@ -1,0 +1,183 @@
+.agent-memory-viewer {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  color: var(--text-main, #ededed);
+}
+
+.agent-memory-viewer__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.agent-memory-viewer__header h3 {
+  margin: 0;
+  color: var(--text-strong, #fff);
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.agent-memory-viewer__header p {
+  margin: 4px 0 0;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.agent-memory-viewer__actions,
+.agent-memory-viewer__toolbar,
+.agent-memory-viewer__tabs,
+.agent-memory-viewer__summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.agent-memory-viewer__actions button,
+.agent-memory-viewer__tabs button {
+  min-height: 30px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.1));
+  border-radius: var(--radius-md, 6px);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-main, #ededed);
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.agent-memory-viewer__actions button:hover:not(:disabled),
+.agent-memory-viewer__tabs button:hover:not(:disabled),
+.agent-memory-viewer__tabs button.active {
+  border-color: var(--accent, #0a84ff);
+  background: var(--accent-soft, rgba(10, 132, 255, 0.16));
+}
+
+.agent-memory-viewer__summary span {
+  border: 1px solid var(--line-soft, rgba(255, 255, 255, 0.06));
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-muted, #a1a1aa);
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.agent-memory-viewer__toolbar {
+  justify-content: space-between;
+}
+
+.agent-memory-viewer__search {
+  min-width: min(260px, 100%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+}
+
+.agent-memory-viewer__search input {
+  width: 100%;
+  min-height: 30px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.1));
+  border-radius: var(--radius-md, 6px);
+  background: rgba(0, 0, 0, 0.18);
+  color: var(--text-main, #ededed);
+  padding: 0 9px;
+  outline: none;
+}
+
+.agent-memory-viewer__sessions {
+  border: 1px solid var(--line-soft, rgba(255, 255, 255, 0.06));
+  border-radius: var(--radius-md, 6px);
+  padding: 8px 10px;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 12px;
+}
+
+.agent-memory-viewer__sessions ul {
+  display: grid;
+  gap: 5px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-memory-viewer__sessions li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.agent-memory-viewer__items {
+  display: grid;
+  gap: 10px;
+  max-height: min(440px, 58vh);
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.agent-memory-viewer__empty,
+.agent-memory-viewer__status {
+  border: 1px dashed var(--line-strong, rgba(255, 255, 255, 0.14));
+  border-radius: var(--radius-md, 6px);
+  color: var(--text-muted, #a1a1aa);
+  padding: 12px;
+  font-size: 12px;
+}
+
+.agent-memory-viewer__status--error {
+  border-color: rgba(255, 69, 58, 0.36);
+  color: var(--danger, #ff6b6b);
+}
+
+.agent-memory-item {
+  border: 1px solid var(--line-soft, rgba(255, 255, 255, 0.06));
+  border-radius: var(--radius-md, 6px);
+  background: rgba(255, 255, 255, 0.035);
+  padding: 10px 12px;
+}
+
+.agent-memory-item__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.agent-memory-item__meta span {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-muted, #a1a1aa);
+  padding: 3px 7px;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.agent-memory-item p {
+  margin: 0;
+  color: var(--text-main, #ededed);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.agent-memory-item dl {
+  display: grid;
+  gap: 4px;
+  margin: 9px 0 0;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+}
+
+.agent-memory-item dl div {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.agent-memory-item dt,
+.agent-memory-item dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}

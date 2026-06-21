@@ -22,6 +22,7 @@ interface DeepCodeTimelineProps {
   loading: boolean;
   language: UiLanguage;
   activeDeltas?: ProjectionDelta[];
+  onTypewriterActiveChange?: (active: boolean) => void;
   onPlanResolve?: (
     runId: string,
     planId: string,
@@ -31,6 +32,7 @@ interface DeepCodeTimelineProps {
 }
 
 type TypewriterSpeed = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']>;
+type TimelineFollowMode = 'following' | 'detached';
 
 const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   timeline,
@@ -38,6 +40,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   loading,
   language,
   activeDeltas = [],
+  onTypewriterActiveChange,
   onPlanResolve,
 }) => {
   const fallbackTimeline = useMemo(
@@ -57,12 +60,15 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     [coalescedActiveDeltas, language, view]
   );
   const timelineRef = useRef<HTMLDivElement | null>(null);
+  const timelineContentRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLElement | null>(null);
-  const shouldFollowRef = useRef(true);
+  const followModeRef = useRef<TimelineFollowMode>('following');
   const userScrollIntentRef = useRef(false);
   const suppressScrollEventsUntilRef = useRef(0);
   const liveScrollFrameRef = useRef<number | null>(null);
+  const liveScrollTimeoutRef = useRef<number | null>(null);
+  const lastScrollTopRef = useRef(0);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const scrollSignature = useMemo(
     () => timelineScrollSignature(viewWithActive, loading),
@@ -78,15 +84,67 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     Boolean(s.effectiveSettings['gui.collapseCompletedThinking'] ?? true)
   );
   const typewriterBlockIds = useTypewriterBlockIds(viewWithActive, loading && typewriterEnabled);
+  const typewriterBlockLengths = useMemo(
+    () => collectTypewriterBlockLengths(viewWithActive, typewriterBlockIds),
+    [typewriterBlockIds, viewWithActive]
+  );
+  const typewriterBlockLengthSignature = useMemo(
+    () => [...typewriterBlockLengths.entries()]
+      .map(([blockId, textLength]) => `${blockId}:${textLength}`)
+      .sort()
+      .join('|'),
+    [typewriterBlockLengths]
+  );
+  const [completedTypewriterBlockLengths, setCompletedTypewriterBlockLengths] = useState<Map<string, number>>(
+    () => new Map()
+  );
   const timelineDensityClass = timelineDensity === 'compact' ? ' deepcode-gui-timeline--compact' : '';
+  const hasPendingTypewriter = useMemo(() => {
+    for (const [blockId, textLength] of typewriterBlockLengths) {
+      if ((completedTypewriterBlockLengths.get(blockId) ?? 0) < textLength) return true;
+    }
+    return false;
+  }, [completedTypewriterBlockLengths, typewriterBlockLengths]);
 
-  const setShouldFollow = useCallback((shouldFollow: boolean) => {
-    shouldFollowRef.current = shouldFollow;
-    userScrollIntentRef.current = !shouldFollow;
-    setShowJumpToLatest((visible) => {
-      const nextVisible = !shouldFollow;
-      return visible === nextVisible ? visible : nextVisible;
+  useEffect(() => {
+    setCompletedTypewriterBlockLengths((current) => {
+      let changed = false;
+      const next = new Map<string, number>();
+      for (const [blockId, completedLength] of current) {
+        if (typewriterBlockLengths.get(blockId) === completedLength) {
+          next.set(blockId, completedLength);
+        } else {
+          changed = true;
+        }
+      }
+      return changed || next.size !== current.size ? next : current;
     });
+  }, [typewriterBlockLengthSignature, typewriterBlockLengths]);
+
+  useEffect(() => {
+    onTypewriterActiveChange?.(hasPendingTypewriter);
+  }, [hasPendingTypewriter, onTypewriterActiveChange]);
+
+  useEffect(() => () => {
+    onTypewriterActiveChange?.(false);
+  }, [onTypewriterActiveChange]);
+
+  const markTypewriterComplete = useCallback((blockId: string, textLength: number) => {
+    setCompletedTypewriterBlockLengths((current) => {
+      if ((current.get(blockId) ?? 0) >= textLength) return current;
+      const next = new Map(current);
+      next.set(blockId, textLength);
+      return next;
+    });
+  }, []);
+
+  const setFollowMode = useCallback((mode: TimelineFollowMode) => {
+    followModeRef.current = mode;
+    if (mode === 'following') {
+      userScrollIntentRef.current = false;
+    } else {
+      setShowJumpToLatest(true);
+    }
   }, []);
 
   const resolveScrollContainer = useCallback(() => {
@@ -97,63 +155,105 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     return container;
   }, []);
 
-  const scrollToTimelineEnd = useCallback(() => {
+  const syncJumpToLatestVisibility = useCallback((container: HTMLElement | null) => {
+    if (!container) return;
+    const nextVisible = followModeRef.current === 'detached' || !isAtScrollEnd(container);
+    setShowJumpToLatest((visible) => visible === nextVisible ? visible : nextVisible);
+  }, []);
+
+  const scrollToTimelineEndNow = useCallback(() => {
     const container = resolveScrollContainer();
     if (!container) return;
 
-    setShouldFollow(true);
-    suppressScrollEventsUntilRef.current = window.performance.now() + 160;
-    container.scrollTop = container.scrollHeight;
-    timelineEndRef.current?.scrollIntoView({
-      block: 'end',
-      behavior: 'auto',
-    });
-    window.requestAnimationFrame(() => {
-      container.scrollTop = container.scrollHeight;
-      timelineEndRef.current?.scrollIntoView({
-        block: 'end',
-        behavior: 'auto',
-      });
-    });
-  }, [resolveScrollContainer, setShouldFollow]);
+    suppressScrollEventsUntilRef.current = window.performance.now() + 220;
+    container.scrollTop = maxScrollTop(container);
+    lastScrollTopRef.current = container.scrollTop;
+    syncJumpToLatestVisibility(container);
+  }, [resolveScrollContainer, syncJumpToLatestVisibility]);
 
-  const scrollToTimelineEndIfFollowing = useCallback(() => {
-    if (!shouldFollowRef.current || liveScrollFrameRef.current !== null) return;
+  const scrollToTimelineEnd = useCallback((options?: { requireFollowing?: boolean }) => {
+    const run = () => {
+      if (options?.requireFollowing && followModeRef.current !== 'following') return;
+      scrollToTimelineEndNow();
+    };
+
+    run();
+    if (liveScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(liveScrollFrameRef.current);
+    }
     liveScrollFrameRef.current = window.requestAnimationFrame(() => {
       liveScrollFrameRef.current = null;
-      if (shouldFollowRef.current) {
-        scrollToTimelineEnd();
-      }
+      run();
+      window.requestAnimationFrame(run);
     });
+    if (liveScrollTimeoutRef.current !== null) {
+      window.clearTimeout(liveScrollTimeoutRef.current);
+    }
+    liveScrollTimeoutRef.current = window.setTimeout(() => {
+      liveScrollTimeoutRef.current = null;
+      run();
+    }, 80);
+  }, [scrollToTimelineEndNow]);
+
+  const enableFollowAndJumpToLatest = useCallback(() => {
+    setFollowMode('following');
+    scrollToTimelineEnd({ requireFollowing: true });
+  }, [scrollToTimelineEnd, setFollowMode]);
+
+  const scrollToTimelineEndIfFollowing = useCallback(() => {
+    if (followModeRef.current !== 'following') return;
+    scrollToTimelineEnd({ requireFollowing: true });
   }, [scrollToTimelineEnd]);
 
   useEffect(() => () => {
     if (liveScrollFrameRef.current !== null) {
       window.cancelAnimationFrame(liveScrollFrameRef.current);
     }
+    if (liveScrollTimeoutRef.current !== null) {
+      window.clearTimeout(liveScrollTimeoutRef.current);
+    }
   }, []);
 
-  const markUserScrollIntent = useCallback(() => {
+  const markUserScrollIntent = useCallback((event?: Event) => {
+    if (event instanceof WheelEvent) {
+      userScrollIntentRef.current = true;
+      if (event.deltaY < 0) {
+        setFollowMode('detached');
+      }
+      return;
+    }
     if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
     userScrollIntentRef.current = true;
-  }, []);
+  }, [setFollowMode]);
 
   useEffect(() => {
     const scrollContainer = resolveScrollContainer();
     if (!scrollContainer) return undefined;
+    lastScrollTopRef.current = scrollContainer.scrollTop;
 
     const updateShouldFollow = () => {
+      const currentScrollTop = scrollContainer.scrollTop;
+      const scrollingUp = currentScrollTop < lastScrollTopRef.current - 2;
+      lastScrollTopRef.current = currentScrollTop;
+      if (scrollingUp) {
+        userScrollIntentRef.current = true;
+        setFollowMode('detached');
+        return;
+      }
       if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
-      const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
-      const distanceFromBottom = maxScrollTop - scrollContainer.scrollTop;
-      const nearBottom = distanceFromBottom < 180;
-      if (nearBottom) {
-        userScrollIntentRef.current = false;
-        setShouldFollow(true);
+      if (isNearScrollBottom(scrollContainer)) {
+        if (userScrollIntentRef.current || followModeRef.current === 'following') {
+          setFollowMode('following');
+          scrollToTimelineEnd({ requireFollowing: true });
+        } else {
+          syncJumpToLatestVisibility(scrollContainer);
+        }
         return;
       }
       if (userScrollIntentRef.current) {
-        setShouldFollow(false);
+        setFollowMode('detached');
+      } else {
+        syncJumpToLatestVisibility(scrollContainer);
       }
     };
 
@@ -168,66 +268,68 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
       scrollContainer.removeEventListener('pointerdown', markUserScrollIntent);
       scrollContainer.removeEventListener('scroll', updateShouldFollow);
     };
-  }, [markUserScrollIntent, resolveScrollContainer, setShouldFollow]);
+  }, [markUserScrollIntent, resolveScrollContainer, scrollToTimelineEnd, setFollowMode, syncJumpToLatestVisibility]);
 
   useLayoutEffect(() => {
-    userScrollIntentRef.current = false;
-    scrollToTimelineEnd();
-  }, [scrollToTimelineEnd, viewWithActive.sessionId]);
+    enableFollowAndJumpToLatest();
+  }, [enableFollowAndJumpToLatest, viewWithActive.sessionId]);
 
   useLayoutEffect(() => {
-    if (!shouldFollowRef.current) return;
-    scrollToTimelineEnd();
+    if (followModeRef.current !== 'following') return;
+    scrollToTimelineEnd({ requireFollowing: true });
   }, [loading, scrollSignature, scrollToTimelineEnd]);
 
   useEffect(() => {
-    const target = timelineRef.current;
+    const target = timelineContentRef.current;
     if (!target || typeof ResizeObserver === 'undefined') return undefined;
     const observer = new ResizeObserver(() => {
-      if (shouldFollowRef.current) {
-        scrollToTimelineEnd();
+      if (followModeRef.current === 'following') {
+        scrollToTimelineEndIfFollowing();
       }
     });
     observer.observe(target);
     return () => observer.disconnect();
-  }, [scrollToTimelineEnd]);
+  }, [scrollToTimelineEndIfFollowing]);
 
   return (
     <div className={`deepcode-gui-timeline${timelineDensityClass}`} ref={timelineRef}>
-      {viewWithActive.turns.length === 0 && !loading && (
-        <div className="deepcode-gui-empty">
-          <div className="deepcode-gui-empty__title">{t(language, 'deepcodeGui.status.ready')}</div>
-        </div>
-      )}
-      {viewWithActive.turns.map((turn) => (
-        <TurnCard
-          key={turn.id}
-          turn={turn}
-          language={language}
-          typewriterBlockIds={typewriterBlockIds}
-          collapseCompletedThinking={collapseCompletedThinking}
-          onLiveContentChange={scrollToTimelineEndIfFollowing}
-          onPlanResolve={onPlanResolve}
-        />
-      ))}
-      {loading && (
-        <div className="deepcode-gui-live-indicator">
-          <span className="deepcode-gui-live-indicator__dot" />
-          {t(language, 'deepcodeGui.status.running')}
-        </div>
-      )}
+      <div className="deepcode-gui-timeline__content" ref={timelineContentRef}>
+        {viewWithActive.turns.length === 0 && !loading && (
+          <div className="deepcode-gui-empty">
+            <div className="deepcode-gui-empty__title">{t(language, 'deepcodeGui.status.ready')}</div>
+          </div>
+        )}
+        {viewWithActive.turns.map((turn) => (
+          <TurnCard
+            key={turn.id}
+            turn={turn}
+            language={language}
+            typewriterBlockIds={typewriterBlockIds}
+            collapseCompletedThinking={collapseCompletedThinking}
+            onLiveContentChange={scrollToTimelineEndIfFollowing}
+            onTypewriterComplete={markTypewriterComplete}
+            onPlanResolve={onPlanResolve}
+          />
+        ))}
+        {loading && (
+          <div className="deepcode-gui-live-indicator">
+            <span className="deepcode-gui-live-indicator__dot" />
+            {t(language, 'deepcodeGui.status.running')}
+          </div>
+        )}
+        <div ref={timelineEndRef} className="deepcode-gui-timeline__end" aria-hidden="true" />
+      </div>
       {showJumpToLatest && (
         <button
           type="button"
           className="deepcode-gui-timeline-jump-latest"
           aria-label="跳转到最新内容"
           title="跳转到最新内容"
-          onClick={scrollToTimelineEnd}
+          onClick={enableFollowAndJumpToLatest}
         >
           ↓
         </button>
       )}
-      <div ref={timelineEndRef} className="deepcode-gui-timeline__end" aria-hidden="true" />
     </div>
   );
 };
@@ -247,57 +349,92 @@ function appendActiveDeltaTurn(
   const status = activeTimelineStatus(active);
   const parentDeltas = active.filter((delta) => !isBranchDelta(delta));
   const committedActivityIds = collectCommittedActivityIds(view);
-  const activeActivities = groupedActiveActivities(active, committedActivityIds);
-  const reasoningMarkdown = parentDeltas
-    .filter((delta) => delta.type === 'reasoning_delta' && typeof delta.delta === 'string')
-    .map((delta) => delta.delta)
-    .join('');
-  const assistantMarkdown = parentDeltas
-    .filter((delta) => delta.type === 'assistant_delta' && typeof delta.delta === 'string')
-    .map((delta) => delta.delta)
-    .join('');
 
   const blocks: AgentTimelineBlock[] = [];
-  if (reasoningMarkdown.trim()) {
-    blocks.push({
-      id: `active-thinking-${runId}`,
-      kind: 'thinking',
-      narrativeKind: 'thinking',
-      title: t(language, 'deepcodeGui.timeline.thinking'),
-      summary: language === 'zh-CN' ? 'Provider 正在输出 reasoning。' : 'Provider reasoning is streaming.',
-      status,
-      defaultCollapsed: false,
-      bodyMarkdown: reasoningMarkdown,
-      displayHints: {
-        renderMode: 'typewriter',
-        typewriterSpeed: 'slow',
-        initialOpen: true,
-        replaceOnComplete: true,
-      },
-      events: [],
-    });
+  let textSegmentKind: 'thinking' | 'assistant' | null = null;
+  let textSegmentStartKey = '';
+  let textSegmentBody = '';
+
+  const flushTextSegment = () => {
+    if (!textSegmentKind || !textSegmentBody.trim()) {
+      textSegmentKind = null;
+      textSegmentStartKey = '';
+      textSegmentBody = '';
+      return;
+    }
+    if (textSegmentKind === 'thinking') {
+      blocks.push({
+        id: `active-thinking-${safeActiveBlockId(runId)}-${textSegmentStartKey}`,
+        kind: 'thinking',
+        narrativeKind: 'thinking',
+        title: t(language, 'deepcodeGui.timeline.thinking'),
+        summary: language === 'zh-CN' ? 'Provider 正在输出 reasoning。' : 'Provider reasoning is streaming.',
+        status,
+        defaultCollapsed: false,
+        bodyMarkdown: textSegmentBody,
+        displayHints: {
+          renderMode: 'typewriter',
+          typewriterSpeed: 'slow',
+          initialOpen: true,
+          replaceOnComplete: true,
+        },
+        events: [],
+      });
+    } else {
+      blocks.push({
+        id: `active-assistant-${safeActiveBlockId(runId)}-${textSegmentStartKey}`,
+        kind: 'assistant',
+        narrativeKind: 'assistantText',
+        title: 'DeepCode',
+        summary: language === 'zh-CN' ? 'DeepCode 正在回复。' : 'DeepCode is responding.',
+        status,
+        defaultCollapsed: false,
+        bodyMarkdown: textSegmentBody,
+        displayHints: {
+          renderMode: 'typewriter',
+          typewriterSpeed: 'normal',
+          replaceOnComplete: true,
+        },
+        events: [],
+      });
+    }
+    textSegmentKind = null;
+    textSegmentStartKey = '';
+    textSegmentBody = '';
+  };
+
+  const appendTextSegment = (
+    kind: 'thinking' | 'assistant',
+    delta: ProjectionDelta,
+    index: number
+  ) => {
+    if (textSegmentKind && textSegmentKind !== kind) {
+      flushTextSegment();
+    }
+    if (!textSegmentKind) {
+      textSegmentKind = kind;
+      textSegmentStartKey = activeDeltaSegmentKey(delta, index);
+    }
+    textSegmentBody += delta.delta ?? '';
+  };
+
+  for (let index = 0; index < parentDeltas.length; index += 1) {
+    const delta = parentDeltas[index];
+    const activity = delta.activity;
+    if (activity && !committedActivityIds.has(activity.activityId) && isMainTimelineActivity(activity)) {
+      flushTextSegment();
+      blocks.push(activityBlockFromActivity(activity, language, true));
+      continue;
+    }
+    if (delta.type === 'reasoning_delta' && typeof delta.delta === 'string') {
+      appendTextSegment('thinking', delta, index);
+      continue;
+    }
+    if (delta.type === 'assistant_delta' && typeof delta.delta === 'string') {
+      appendTextSegment('assistant', delta, index);
+    }
   }
-  if (assistantMarkdown.trim()) {
-    blocks.push({
-      id: `active-assistant-${runId}`,
-      kind: 'assistant',
-      narrativeKind: 'assistantText',
-      title: 'DeepCode',
-      summary: language === 'zh-CN' ? 'DeepCode 正在回复。' : 'DeepCode is responding.',
-      status,
-      defaultCollapsed: false,
-      bodyMarkdown: assistantMarkdown,
-      displayHints: {
-        renderMode: 'typewriter',
-        typewriterSpeed: 'normal',
-        replaceOnComplete: true,
-      },
-      events: [],
-    });
-  }
-  for (const activity of activeActivities) {
-    blocks.push(activityBlockFromActivity(activity, language, true));
-  }
+  flushTextSegment();
   if (blocks.length === 0) return view;
 
   return {
@@ -326,20 +463,6 @@ function collectCommittedActivityIds(view: AgentTimelineResult): Set<string> {
     }
   }
   return ids;
-}
-
-function groupedActiveActivities(
-  deltas: ProjectionDelta[],
-  committedActivityIds: Set<string>
-): AgentConversationActivity[] {
-  const byId = new Map<string, AgentConversationActivity>();
-  for (const delta of deltas) {
-    const activity = delta.activity;
-    if (!activity || committedActivityIds.has(activity.activityId)) continue;
-    if (!isMainTimelineActivity(activity)) continue;
-    byId.set(activity.activityId, activity);
-  }
-  return [...byId.values()];
 }
 
 function isMainTimelineActivity(activity: AgentConversationActivity): boolean {
@@ -426,6 +549,11 @@ function isBranchDelta(delta: ProjectionDelta): boolean {
   return Boolean(delta.branchId || delta.subAgentId);
 }
 
+function activeDeltaSegmentKey(delta: ProjectionDelta, index: number): string {
+  const seqKey = typeof delta.seq === 'number' ? String(delta.seq) : `idx-${index}`;
+  return safeActiveBlockId(seqKey);
+}
+
 function safeActiveBlockId(value: string): string {
   const safe = value.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
   return safe || 'branch';
@@ -458,6 +586,18 @@ function findTimelineScrollContainer(timelineElement: HTMLElement | null): HTMLE
   }
 
   return firstScrollableStyleElement ?? timelineElement;
+}
+
+function maxScrollTop(container: HTMLElement): number {
+  return Math.max(0, container.scrollHeight - container.clientHeight);
+}
+
+function isAtScrollEnd(container: HTMLElement, thresholdPx = 8): boolean {
+  return maxScrollTop(container) - container.scrollTop <= thresholdPx;
+}
+
+function isNearScrollBottom(container: HTMLElement, thresholdPx = 140): boolean {
+  return maxScrollTop(container) - container.scrollTop <= thresholdPx;
 }
 
 function timelineScrollSignature(view: AgentTimelineResult, loading: boolean): string {
@@ -538,15 +678,35 @@ function useCoalescedProjectionDeltas(deltas: ProjectionDelta[], delayMs: number
 function collectTypewriterBlockIds(view: AgentTimelineResult): string[] {
   return view.turns.flatMap((turn) =>
     turn.blocks
-      .filter((block) =>
-        block.displayHints?.renderMode === 'typewriter' ||
-        block.displayHints?.renderMode === 'accelerated' ||
-        block.narrativeKind === 'assistantText' ||
-        (!block.narrativeKind && block.kind === 'assistant')
-      )
+      .filter(shouldAnimateTimelineBlock)
       .filter((block) => visibleTypewriterMarkdown(block).length > 0)
       .map((block) => block.id)
   );
+}
+
+function collectTypewriterBlockLengths(
+  view: AgentTimelineResult,
+  blockIds: Set<string>
+): Map<string, number> {
+  const lengths = new Map<string, number>();
+  for (const turn of view.turns) {
+    for (const block of turn.blocks) {
+      if (!blockIds.has(block.id)) continue;
+      const textLength = visibleTypewriterMarkdown(block).length;
+      if (textLength > 0) lengths.set(block.id, textLength);
+    }
+  }
+  return lengths;
+}
+
+function shouldAnimateTimelineBlock(block: AgentTimelineBlock): boolean {
+  return block.displayHints?.renderMode === 'typewriter' ||
+    block.displayHints?.renderMode === 'accelerated' ||
+    block.narrativeKind === 'assistantText' ||
+    block.narrativeKind === 'requirement' ||
+    block.kind === 'plan' ||
+    block.kind === 'review' ||
+    (!block.narrativeKind && block.kind === 'assistant');
 }
 
 function normalizeNarrativeTimeline(view: AgentTimelineResult): AgentTimelineResult {
@@ -566,8 +726,9 @@ const TurnCard: React.FC<{
   typewriterBlockIds: Set<string>;
   collapseCompletedThinking: boolean;
   onLiveContentChange: () => void;
+  onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ turn, language, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onPlanResolve }) => {
+}> = ({ turn, language, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
   const blocks = turn.blocks;
 
@@ -587,6 +748,7 @@ const TurnCard: React.FC<{
             animateAssistant={typewriterBlockIds.has(block.id)}
             collapseCompletedThinking={collapseCompletedThinking}
             onLiveContentChange={onLiveContentChange}
+            onTypewriterComplete={onTypewriterComplete}
             onPlanResolve={onPlanResolve}
           />
         ))}
@@ -748,8 +910,9 @@ const TimelineBlock: React.FC<{
   animateAssistant?: boolean;
   collapseCompletedThinking?: boolean;
   onLiveContentChange: () => void;
+  onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ block, language, animateAssistant = false, collapseCompletedThinking = true, onLiveContentChange, onPlanResolve }) => {
+}> = ({ block, language, animateAssistant = false, collapseCompletedThinking = true, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   if (block.kind === 'user') {
@@ -771,6 +934,7 @@ const TimelineBlock: React.FC<{
           animate={animateAssistant}
           speed={block.displayHints?.typewriterSpeed}
           onVisibleContentChange={onLiveContentChange}
+          onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
         />
       </article>
     );
@@ -784,6 +948,7 @@ const TimelineBlock: React.FC<{
           animate={animateAssistant}
           speed={block.displayHints?.typewriterSpeed}
           onVisibleContentChange={onLiveContentChange}
+          onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
         />
       </article>
     );
@@ -796,6 +961,7 @@ const TimelineBlock: React.FC<{
         language={language}
         animate={animateAssistant}
         onLiveContentChange={onLiveContentChange}
+        onTypewriterComplete={onTypewriterComplete}
         onPlanResolve={onPlanResolve}
       />
     );
@@ -809,6 +975,7 @@ const TimelineBlock: React.FC<{
         animate={animateAssistant}
         collapseCompletedThinking={collapseCompletedThinking}
         onLiveContentChange={onLiveContentChange}
+        onTypewriterComplete={onTypewriterComplete}
       />
     );
   }
@@ -824,6 +991,7 @@ const TimelineBlock: React.FC<{
         language={language}
         animate={animateAssistant}
         onLiveContentChange={onLiveContentChange}
+        onTypewriterComplete={onTypewriterComplete}
       />
     );
   }
@@ -833,6 +1001,7 @@ const TimelineBlock: React.FC<{
   }
 
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
+  const detailEvents = visibleFallbackDetailEvents(block);
   return (
     <details className={`deepcode-gui-block deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}`} open={open}>
       <summary>
@@ -843,12 +1012,13 @@ const TimelineBlock: React.FC<{
         {block.bodyMarkdown && (
           <TypewriterMarkdown
             content={block.bodyMarkdown}
-            animate={animateAssistant && block.displayHints?.renderMode === 'typewriter'}
+            animate={animateAssistant && shouldAnimateTimelineBlock(block)}
             speed={block.displayHints?.typewriterSpeed}
             onVisibleContentChange={onLiveContentChange}
+            onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
           />
         )}
-        <EventList events={block.events} language={language} />
+        {detailEvents.length > 0 && <EventList events={detailEvents} language={language} />}
       </div>
     </details>
   );
@@ -894,7 +1064,8 @@ const ReviewBlock: React.FC<{
   language: UiLanguage;
   animate: boolean;
   onLiveContentChange: () => void;
-}> = ({ block, language, animate, onLiveContentChange }) => {
+  onTypewriterComplete: (blockId: string, textLength: number) => void;
+}> = ({ block, language, animate, onLiveContentChange, onTypewriterComplete }) => {
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting' || block.status === 'blocked';
@@ -912,9 +1083,10 @@ const ReviewBlock: React.FC<{
         {markdown && (
           <TypewriterMarkdown
             content={markdown}
-            animate={animate && block.displayHints?.renderMode === 'typewriter'}
+            animate={animate && shouldAnimateTimelineBlock(block)}
             speed={block.displayHints?.typewriterSpeed}
             onVisibleContentChange={onLiveContentChange}
+            onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
           />
         )}
         <DeepCodeGitReviewDiffDetails gitReview={gitReviewFromBlock(block)} language={language} />
@@ -996,7 +1168,8 @@ const ThinkingBlock: React.FC<{
   animate?: boolean;
   collapseCompletedThinking?: boolean;
   onLiveContentChange?: () => void;
-}> = ({ block, language, animate = false, collapseCompletedThinking = true, onLiveContentChange = () => undefined }) => {
+  onTypewriterComplete: (blockId: string, textLength: number) => void;
+}> = ({ block, language, animate = false, collapseCompletedThinking = true, onLiveContentChange = () => undefined, onTypewriterComplete }) => {
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   const completedThinkingOpen = block.status === 'completed' && !collapseCompletedThinking;
@@ -1016,6 +1189,7 @@ const ThinkingBlock: React.FC<{
             animate={animate}
             speed={block.displayHints?.typewriterSpeed}
             onVisibleContentChange={onLiveContentChange}
+            onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
           />
         )}
       </div>
@@ -1028,8 +1202,9 @@ const PlanBlock: React.FC<{
   language: UiLanguage;
   animate: boolean;
   onLiveContentChange: () => void;
+  onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
-}> = ({ block, language, animate, onLiveContentChange, onPlanResolve }) => {
+}> = ({ block, language, animate, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const reviewEvent = block.events.find((event) => event.kind === 'plan_review');
   const payload = isRecord(reviewEvent?.payload) ? reviewEvent.payload : {};
@@ -1080,9 +1255,10 @@ const PlanBlock: React.FC<{
         {block.bodyMarkdown && (
           <TypewriterMarkdown
             content={block.bodyMarkdown}
-            animate={animate && block.displayHints?.renderMode === 'typewriter'}
+            animate={animate && shouldAnimateTimelineBlock(block)}
             speed={block.displayHints?.typewriterSpeed}
             onVisibleContentChange={onLiveContentChange}
+            onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
           />
         )}
         {confirmable && (
@@ -1100,9 +1276,11 @@ const TypewriterMarkdown: React.FC<{
   animate: boolean;
   speed?: TypewriterSpeed;
   onVisibleContentChange: () => void;
-}> = ({ content, animate, speed = 'normal', onVisibleContentChange }) => {
+  onAnimationComplete?: () => void;
+}> = ({ content, animate, speed = 'normal', onVisibleContentChange, onAnimationComplete }) => {
   const [visible, setVisible] = useState(() => (animate ? '' : content));
   const visibleRef = useRef(visible);
+  const onAnimationCompleteRef = useRef(onAnimationComplete);
   const renderedContent = animate ? visible : content;
 
   useLayoutEffect(() => {
@@ -1114,13 +1292,21 @@ const TypewriterMarkdown: React.FC<{
   }, [visible]);
 
   useEffect(() => {
+    onAnimationCompleteRef.current = onAnimationComplete;
+  }, [onAnimationComplete]);
+
+  useEffect(() => {
     if (!animate) {
       setVisible(content);
+      onAnimationCompleteRef.current?.();
       return undefined;
     }
     const startIndex = content.startsWith(visibleRef.current) ? visibleRef.current.length : 0;
     setVisible(content.slice(0, startIndex));
-    if (!content) return;
+    if (!content || startIndex >= content.length) {
+      onAnimationCompleteRef.current?.();
+      return undefined;
+    }
     let index = startIndex;
     const step = speed === 'fast' ? 12 : speed === 'slow' ? 2 : 4;
     const delayMs = speed === 'fast' ? 8 : speed === 'slow' ? 20 : 12;
@@ -1130,6 +1316,7 @@ const TypewriterMarkdown: React.FC<{
       window.requestAnimationFrame(onVisibleContentChange);
       if (index >= content.length) {
         window.clearInterval(id);
+        onAnimationCompleteRef.current?.();
       }
     }, delayMs);
     return () => window.clearInterval(id);
@@ -1229,6 +1416,8 @@ function localizedTimelineText(language: UiLanguage, text: string): string {
   if (!text) return '';
   if (language !== 'zh-CN') return text;
   const replacements: Array<[string, string]> = [
+    ['Requirement decision', t(language, 'deepcodeGui.timeline.requirementDecision')],
+    ['Requirement confirmation', t(language, 'deepcodeGui.timeline.requirementConfirmation')],
     ['Kernel state contract entered.', t(language, 'deepcodeGui.timeline.kernelStateEntered')],
     ['Session DriverRequest produced by Kernel.', t(language, 'deepcodeGui.timeline.driverRequestProduced')],
     ['Resource context resolved', t(language, 'deepcodeGui.timeline.resourceContextResolved')],
@@ -1243,6 +1432,15 @@ function localizedTimelineText(language: UiLanguage, text: string): string {
     result = result.split(source).join(target);
   }
   return result;
+}
+
+function visibleFallbackDetailEvents(block: AgentTimelineBlock): AgentEvent[] {
+  if ((block.bodyMarkdown ?? '').trim()) return [];
+  return block.events.filter((event) => !isRedundantFallbackEvent(event));
+}
+
+function isRedundantFallbackEvent(event: AgentEvent): boolean {
+  return event.kind === 'requirement_confirmation' || event.kind === 'requirement_decision';
 }
 
 function planBlockMarkdown(block: AgentTimelineBlock): string {

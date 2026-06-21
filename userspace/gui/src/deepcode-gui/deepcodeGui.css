@@ -457,6 +457,10 @@ button {
   padding: 18px 16px 22px;
 }
 
+.deepcode-gui-timeline__content {
+  min-height: 100%;
+}
+
 .deepcode-gui-timeline__end {
   width: 100%;
   height: 1px;
@@ -3819,6 +3823,37 @@ button {
   padding: 32px;
   background: rgba(32, 33, 36, 0.18);
   backdrop-filter: blur(8px);
+}
+
+.deepcode-gui-memory-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 101;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: rgba(32, 33, 36, 0.18);
+  backdrop-filter: blur(8px);
+}
+
+.deepcode-gui-memory-sheet {
+  width: min(860px, calc(100vw - 64px));
+  max-height: min(760px, calc(100vh - 64px));
+  overflow: auto;
+  border: 1px solid #e4e1d8;
+  border-radius: 18px;
+  background: #ffffff;
+  box-shadow: 0 24px 70px rgba(32, 33, 36, 0.2);
+  padding: 18px;
+  --text-main: #30343a;
+  --text-strong: #202124;
+  --text-muted: #7c838d;
+  --line: #e8e5dc;
+  --line-soft: #efede7;
+  --line-strong: #d7d2c7;
+  --accent: #0a84ff;
+  --accent-soft: rgba(10, 132, 255, 0.1);
+  --radius-md: 8px;
 }
 
 .deepcode-gui-settings-sheet {

@@ -292,6 +292,7 @@ function mergeActiveDelta(existing: ProjectionDelta, incoming: ProjectionDelta):
   return {
     ...existing,
     ...incoming,
+    seq: existing.seq ?? incoming.seq,
     activity: incoming.activity ?? existing.activity,
   };
 }
@@ -305,6 +306,9 @@ function trimActiveDeltas(deltas: ProjectionDelta[]): ProjectionDelta[] {
 function mergeActiveProjectionDelta(existing: ProjectionDelta[], incoming: ProjectionDelta): ProjectionDelta[] {
   if (incoming.type === 'committed') {
     return existing.filter((delta) => !committedDeltaMatchesActive(incoming, delta));
+  }
+  if (isActiveTextDelta(incoming)) {
+    return trimActiveDeltas([...existing, incoming]);
   }
   const byKey = new Map<string, ProjectionDelta>();
   for (const delta of existing) byKey.set(activeDeltaMergeKey(delta), delta);

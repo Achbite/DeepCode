@@ -572,6 +572,45 @@
   justify-content: flex-end;
 }
 
+.settings-memory-session-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft, rgba(255, 255, 255, 0.04));
+}
+
+.settings-memory-session-list__title {
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.settings-memory-session-list button {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-md, 6px);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-main, #ededed);
+  padding: 0 10px;
+  text-align: left;
+}
+
+.settings-memory-session-list button.active,
+.settings-memory-session-list button:hover {
+  border-color: var(--accent, #0a84ff);
+  background: var(--accent-soft, rgba(10, 132, 255, 0.14));
+}
+
+.settings-memory-session-list small {
+  color: var(--text-muted, #a1a1aa);
+}
+
 .settings-source-note {
   margin-left: 8px;
 }

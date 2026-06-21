@@ -1,5 +1,12 @@
-import React, { useState } from 'react';
-import { getConversationArchive } from '../../../services/runtimeAdapter';
+import React, { useMemo, useState } from 'react';
+import type { AgentSession } from '@deepcode/protocol';
+import { createWorkspaceScope, type SessionMemorySnapshot } from '@deepcode/session-core';
+import AgentMemoryViewer from '../../agent-memory/AgentMemoryViewer';
+import {
+  getAgentSessionMemorySnapshot,
+  getConversationArchive,
+  listAgentSessions,
+} from '../../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../../state/agentSessionStore';
 import { useWorkspaceStore } from '../../../state/workspaceStore';
 import { useUiStore } from '../../../state/uiStore';
@@ -26,6 +33,22 @@ const WorkspaceSection: React.FC = () => {
 
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [archiveMessage, setArchiveMessage] = useState<{ kind: 'info' | 'error'; text: string } | null>(null);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [memoryLoading, setMemoryLoading] = useState(false);
+  const [memoryError, setMemoryError] = useState<string | null>(null);
+  const [memorySessions, setMemorySessions] = useState<AgentSession[]>([]);
+  const [memorySnapshots, setMemorySnapshots] = useState<SessionMemorySnapshot[]>([]);
+  const [selectedMemorySessionId, setSelectedMemorySessionId] = useState<string | null>(null);
+  const memorySessionLabels = useMemo(() => {
+    const labels: Record<string, string> = {};
+    for (const session of memorySessions) {
+      labels[session.id] = session.title?.trim() || session.id;
+    }
+    return labels;
+  }, [memorySessions]);
+  const displayedMemorySnapshots = selectedMemorySessionId
+    ? memorySnapshots.filter((snapshot) => snapshot.sessionId === selectedMemorySessionId)
+    : memorySnapshots;
 
   const handleWorkspaceSettingChange = (key: string, value: UserSettingValue) => {
     void patchWorkspaceSetting(key, value);
@@ -63,6 +86,39 @@ const WorkspaceSection: React.FC = () => {
       kind: 'info',
       text: t(language, 'workspace.archiveCopied', { path: archivePath }),
     });
+  };
+
+  const loadWorkspaceMemory = async (sessionId?: string) => {
+    setMemoryOpen(true);
+    setMemoryLoading(true);
+    setMemoryError(null);
+    setSelectedMemorySessionId(sessionId ?? null);
+    const scope = createWorkspaceScope(workspace);
+    const list = await listAgentSessions({ ...scope, includeArchived: true });
+    if (!list.ok || !list.data) {
+      setMemoryError(list.message ?? list.error ?? t(language, 'memory.loadFailed'));
+      setMemoryLoading(false);
+      return;
+    }
+    const scopedSessions = list.data.sessions;
+    setMemorySessions(scopedSessions);
+    const targetSessions = sessionId
+      ? scopedSessions.filter((session) => session.id === sessionId)
+      : scopedSessions.filter((session) => !session.archivedAt);
+    const fallbackSessionIds = targetSessions.length
+      ? targetSessions.map((session) => session.id)
+      : (sessionId ? [sessionId] : currentAgentSessionId ? [currentAgentSessionId] : []);
+    const snapshots: SessionMemorySnapshot[] = [];
+    for (const targetSessionId of fallbackSessionIds) {
+      const result = await getAgentSessionMemorySnapshot(targetSessionId);
+      if (result.ok && result.data) {
+        snapshots.push(result.data);
+      } else if (sessionId) {
+        setMemoryError(result.message ?? result.error ?? t(language, 'memory.loadFailed'));
+      }
+    }
+    setMemorySnapshots(snapshots);
+    setMemoryLoading(false);
   };
 
   if (!workspace) {
@@ -211,6 +267,60 @@ const WorkspaceSection: React.FC = () => {
         <div className="settings-card__body">
           {t(language, 'workspace.archiveBody')}
         </div>
+      </div>
+
+      <div className="settings-card">
+        <div className="settings-card__header-row">
+          <h3 className="settings-card__title">
+            {t(language, 'workspace.memoryTitle')}
+          </h3>
+          <button
+            className="settings-action-button"
+            onClick={() => void loadWorkspaceMemory()}
+            type="button"
+            disabled={memoryLoading}
+          >
+            {t(language, 'workspace.memoryOpen')}
+          </button>
+        </div>
+        <div className="settings-card__body">
+          {t(language, 'workspace.memoryBody')}
+        </div>
+        {memoryOpen && (
+          <div className="settings-card__inline-placeholder">
+            <AgentMemoryViewer
+              language={language}
+              title={selectedMemorySessionId ? t(language, 'memory.sessionMemory') : t(language, 'memory.workspaceMemory')}
+              subtitle={selectedMemorySessionId
+                ? t(language, 'memory.sessionSubtitle')
+                : t(language, 'memory.workspaceSubtitle')}
+              snapshots={displayedMemorySnapshots}
+              defaultScope={selectedMemorySessionId ? 'session' : 'project'}
+              loading={memoryLoading}
+              error={memoryError}
+              sessionLabels={memorySessionLabels}
+              onRefresh={() => void loadWorkspaceMemory(selectedMemorySessionId ?? undefined)}
+            />
+            {memorySessions.length > 0 && (
+              <div className="settings-memory-session-list">
+                <div className="settings-memory-session-list__title">
+                  {t(language, 'memory.sessionList')}
+                </div>
+                {memorySessions.filter((session) => !session.archivedAt).slice(0, 12).map((session) => (
+                  <button
+                    key={session.id}
+                    type="button"
+                    className={selectedMemorySessionId === session.id ? 'active' : ''}
+                    onClick={() => void loadWorkspaceMemory(session.id)}
+                  >
+                    <span>{session.title?.trim() || session.id}</span>
+                    <small>{session.eventCount ?? 0}</small>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="settings-card">
