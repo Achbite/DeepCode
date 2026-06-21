@@ -110,12 +110,12 @@ If `/api/health` does not include `buildCommit`, `protocolVersion`, or `toolCata
 
 DeepCode currently has four formal UI package forms:
 
-| Name | Definition | Current Priority |
-| --- | --- | --- |
-| Editor / DeepCode Editor | Full packaged GUI workbench with an editor | First target for Git, internal browser, and workbench components |
-| DeepCode-GUI / GUI | Concise conversational GUI | Reuses the same component flow after Editor stabilizes |
-| CLI | Scriptable Host Shell | Automation and integration |
-| TUI | Ratatui/Crossterm terminal UI | Lightweight local usage |
+| Name                          | Definition                                 | Current Priority                                                 |
+| ----------------------------- | ------------------------------------------ | ---------------------------------------------------------------- |
+| Editor / DeepCode Editor      | Full packaged GUI workbench with an editor | First target for Git, internal browser, and workbench components |
+| DeepCode-GUI / GUI(Recommend) | Concise conversational GUI                 | Reuses the same component flow after Editor stabilizes           |
+| CLI                           | Scriptable Host Shell                      | Automation and integration                                       |
+| TUI                           | Ratatui/Crossterm terminal UI              | Lightweight local usage                                          |
 
 UI shells do not own a second Kernel, session truth, tool execution path, permission model, or user-preference store. Functional components, permissions, and tool calls are provided by Kernel/session. Conversation orchestration, context assembly, prompt envelopes, provider lifecycle, protocol parsing, and repair are owned by userspace Session DriverLoop. UI layers only own rendering, input, and interaction differences.
 

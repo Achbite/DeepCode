@@ -106,12 +106,12 @@ bin/macos-arm64/
 
 DeepCode 当前区分四套正式 UI 封装：
 
-| 名称 | 定义 | 当前优先级 |
-| --- | --- | --- |
-| Editor / DeepCode Editor | 带编辑器的完整 GUI 打包态 | 优先承接 Git、内部浏览器、工作台组件 |
-| DeepCode-GUI / GUI | 简洁对话式 GUI | 等 Editor 稳定后复用同一套组件流 |
-| CLI | 脚本化 Host Shell | 面向自动化和集成 |
-| TUI | Ratatui/Crossterm 终端交互 | 面向轻量本地使用 |
+| 名称                     | 定义                       | 当前优先级                           |
+| ------------------------ | -------------------------- | ------------------------------------ |
+| Editor / DeepCode Editor | 带编辑器的完整 GUI 打包态  | 优先承接 Git、内部浏览器、工作台组件 |
+| DeepCode-GUI / GUI(推荐) | 简洁对话式 GUI             | 等 Editor 稳定后复用同一套组件流     |
+| CLI                      | 脚本化 Host Shell          | 面向自动化和集成                     |
+| TUI                      | Ratatui/Crossterm 终端交互 | 面向轻量本地使用                     |
 
 UI shell 不拥有第二套 Kernel、Session truth、tool execution、permission 或用户偏好存储。功能组件、权限和工具调用由 Kernel/session 提供。会话编排、上下文组装、PromptEnvelope、provider lifecycle、协议解析和 repair 由 userspace Session DriverLoop 负责，UI 只负责展示、输入和交互差异。
 
