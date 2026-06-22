@@ -238,6 +238,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     const updateShouldFollow = () => {
       const currentScrollTop = scrollContainer.scrollTop;
       const scrollingUp = currentScrollTop < lastScrollTopRef.current - 2;
+      const scrollingDown = currentScrollTop > lastScrollTopRef.current + 2;
       lastScrollTopRef.current = currentScrollTop;
       if (scrollingUp) {
         userScrollIntentRef.current = true;
@@ -245,6 +246,11 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
         return;
       }
       if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
+      if (scrollingDown && userDetachedFromLatestRef.current && isAtScrollEnd(scrollContainer)) {
+        setFollowMode('following');
+        scrollToTimelineEnd({ requireFollowing: true });
+        return;
+      }
       if (isNearScrollBottom(scrollContainer)) {
         syncJumpToLatestVisibility(scrollContainer);
         return;
