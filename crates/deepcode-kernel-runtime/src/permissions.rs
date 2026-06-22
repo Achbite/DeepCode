@@ -661,8 +661,8 @@ fn argument_resource_matches(tool_name: &str, arguments: &Value, path: &str) -> 
 fn unscoped_grant_allows_arguments(resource_kind: &str, arguments: &Value) -> bool {
     match resource_kind {
         "workspace" | "workspaceFile" => !argument_uses_external_absolute_file(arguments),
-        "workspaceModule" | "workspaceDependency" => false,
-        "externalFile" => false,
+        "workspaceModule" | "workspaceDependency" | "workspaceDirectory" => false,
+        "externalFile" | "externalDirectory" => false,
         _ => true,
     }
 }

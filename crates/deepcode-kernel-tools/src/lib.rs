@@ -260,11 +260,22 @@ fn operation_kind_for_tool(tool_id: &str) -> Option<&'static str> {
 
 fn provider_schema_for_tool(tool_id: &str) -> Value {
     match tool_id {
-        "fs.read" | "fs.list" | "fs.diff" | "fs.delete" => serde_json::json!({
+        "fs.read" | "fs.list" | "fs.diff" => serde_json::json!({
             "type": "object",
             "required": ["path"],
             "properties": {
                 "path": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "fs.delete" => serde_json::json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" },
+                "targetKind": { "type": "string", "enum": ["file", "directory"] },
+                "targetResourceKind": { "type": "string", "enum": ["file", "directory"] },
+                "recursive": { "type": "boolean" }
             },
             "additionalProperties": false
         }),
@@ -544,6 +555,12 @@ pub enum WorkspaceOperationKind {
 pub struct WorkspaceOperation {
     pub kind: WorkspaceOperationKind,
     pub target_path: Option<String>,
+    #[serde(default)]
+    pub target_kind: Option<String>,
+    #[serde(default)]
+    pub target_resource_kind: Option<String>,
+    #[serde(default)]
+    pub recursive: bool,
     pub source_block_id: Option<String>,
     #[serde(default)]
     pub replacement_block_id: Option<String>,
@@ -829,6 +846,24 @@ impl OperationCompiler {
         permission_labels: Vec<String>,
     ) -> Result<PlannedOperation, OperationCompileError> {
         let kind = workspace_kind_for_action(action, capability)?;
+        let tool_args = action.get("toolArgs").and_then(Value::as_object);
+        let target_kind = get_string(action, &["targetKind", "targetResourceKind"]).or_else(|| {
+            tool_args
+                .and_then(|object| {
+                    object
+                        .get("targetKind")
+                        .or_else(|| object.get("targetResourceKind"))
+                })
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+        let recursive = get_bool(action, "recursive")
+            || tool_args
+                .and_then(|object| object.get("recursive"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         let mut target_ref = file_target_ref_from_action(action);
         let mut target_path = target_ref
             .as_ref()
@@ -971,6 +1006,9 @@ impl OperationCompiler {
             operation: PlannedOperationKind::Workspace(WorkspaceOperation {
                 kind,
                 target_path,
+                target_kind: target_kind.clone(),
+                target_resource_kind: target_kind,
+                recursive,
                 source_block_id,
                 replacement_block_id,
                 content,
@@ -1505,6 +1543,10 @@ fn get_string(value: &Value, keys: &[&str]) -> Option<String> {
         .map(str::to_string)
 }
 
+fn get_bool(value: &Value, key: &str) -> bool {
+    value.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
 fn first_resource_scope(value: &Value) -> Option<String> {
     value
         .get("resourceScope")
@@ -1927,6 +1969,39 @@ mod tests {
     }
 
     #[test]
+    fn compiler_preserves_workspace_directory_delete_metadata() {
+        let compiler = OperationCompiler::default();
+        let batch = serde_json::json!({
+            "actions": [{
+                "id": "delete-directory",
+                "title": "Delete directory",
+                "kind": "delete",
+                "capability": "fs.delete",
+                "targetPath": "generated",
+                "targetKind": "directory",
+                "recursive": true,
+                "permissionLabels": ["fs.delete"]
+            }]
+        });
+        let operations = compiler.compile_batch(&batch).unwrap();
+        assert_eq!(operations.len(), 1);
+        match &operations[0].operation {
+            PlannedOperationKind::Workspace(WorkspaceOperation {
+                kind: WorkspaceOperationKind::Delete,
+                target_kind,
+                target_resource_kind,
+                recursive,
+                ..
+            }) => {
+                assert_eq!(target_kind.as_deref(), Some("directory"));
+                assert_eq!(target_resource_kind.as_deref(), Some("directory"));
+                assert!(*recursive);
+            }
+            other => panic!("expected workspace delete operation, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn compiler_builds_workspace_delete_operation_from_target_ref() {
         let compiler = OperationCompiler::default();
         let batch = serde_json::json!({
@@ -2061,6 +2136,9 @@ mod tests {
                 operation: PlannedOperationKind::Workspace(WorkspaceOperation {
                     kind: WorkspaceOperationKind::Read,
                     target_path: Some("src/lib.rs".to_string()),
+                    target_kind: None,
+                    target_resource_kind: None,
+                    recursive: false,
                     source_block_id: None,
                     replacement_block_id: None,
                     content: None,
@@ -2086,6 +2164,9 @@ mod tests {
                 operation: PlannedOperationKind::Workspace(WorkspaceOperation {
                     kind: WorkspaceOperationKind::Write,
                     target_path: Some("src/lib.rs".to_string()),
+                    target_kind: None,
+                    target_resource_kind: None,
+                    recursive: false,
                     source_block_id: Some("block".to_string()),
                     replacement_block_id: None,
                     content: Some("x".to_string()),

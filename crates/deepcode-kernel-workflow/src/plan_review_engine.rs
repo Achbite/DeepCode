@@ -40,6 +40,10 @@ pub struct RequiredFileOperation {
     #[serde(default)]
     pub target_kind: String,
     #[serde(default)]
+    pub target_resource_kind: String,
+    #[serde(default)]
+    pub recursive: bool,
+    #[serde(default)]
     pub outside_workspace: bool,
 }
 
@@ -103,6 +107,10 @@ pub struct KernelExecutionOperation {
     #[serde(default)]
     pub target_ref: Option<FileTargetRef>,
     pub target_kind: String,
+    #[serde(default)]
+    pub target_resource_kind: String,
+    #[serde(default)]
+    pub recursive: bool,
     pub outside_workspace: bool,
 }
 
@@ -405,6 +413,8 @@ fn execution_contract_for_review(
                 target_path: operation.target_path.clone(),
                 target_ref: operation.target_ref.clone(),
                 target_kind: operation.target_kind.clone(),
+                target_resource_kind: operation.target_resource_kind.clone(),
+                recursive: operation.recursive,
                 outside_workspace: operation.outside_workspace,
             })
             .collect(),
@@ -430,12 +440,14 @@ fn permission_bundles_for_review(
         if !gap_set.contains(&operation.capability) {
             continue;
         }
-        let resource_kind = if operation.outside_workspace {
-            "externalFile".to_string()
-        } else {
-            "workspaceFile".to_string()
+        let is_directory = operation.target_resource_kind == "directory";
+        let resource_kind = match (operation.outside_workspace, is_directory) {
+            (true, true) => "externalDirectory".to_string(),
+            (true, false) => "externalFile".to_string(),
+            (false, true) => "workspaceDirectory".to_string(),
+            (false, false) => "workspaceFile".to_string(),
         };
-        let resource_path = if operation.outside_workspace {
+        let resource_path = if operation.outside_workspace || is_directory {
             Some(operation.target_path.clone())
         } else {
             None
@@ -704,11 +716,22 @@ fn required_file_operations_for_input(
             findings.push(file_operation_finding(
                 "file_operation_target_required",
                 action,
-                "requires targetPath or resourceScope with a concrete file path",
+                "requires targetPath or resourceScope with a concrete path",
             ));
             continue;
         };
-        match normalize_file_operation_target(&raw_target) {
+        let target_resource_kind = action_target_resource_kind(action, &raw_target);
+        let recursive = action.recursive
+            || (target_resource_kind == "directory" && raw_target.trim().ends_with('/'));
+        if operation == "delete" && target_resource_kind == "directory" && !recursive {
+            findings.push(file_operation_finding(
+                "file_operation_target_invalid",
+                action,
+                "directory delete requires targetKind=\"directory\" and recursive=true",
+            ));
+            continue;
+        }
+        match normalize_file_operation_target(&raw_target, target_resource_kind, recursive) {
             Ok(target) => {
                 let key = format!(
                     "{}:{}:{}:{}",
@@ -722,6 +745,8 @@ fn required_file_operations_for_input(
                         action_id: action.id.clone(),
                         target_ref: Some(target.target_ref),
                         target_kind: target.target_kind.to_string(),
+                        target_resource_kind: target.target_resource_kind.to_string(),
+                        recursive: target.recursive,
                         outside_workspace: target.outside_workspace,
                     });
                 }
@@ -947,10 +972,26 @@ fn mutation_operation_for_capability(capability: &str) -> Option<&'static str> {
     }
 }
 
+fn action_target_resource_kind(action: &PlannedAction, raw_target: &str) -> &'static str {
+    let explicit = action
+        .target_resource_kind
+        .as_deref()
+        .or(action.target_kind.as_deref())
+        .map(str::trim);
+    match explicit {
+        Some("directory") | Some("dir") => "directory",
+        Some("file") => "file",
+        _ if raw_target.trim().ends_with('/') => "directory",
+        _ => "file",
+    }
+}
+
 struct NormalizedFileOperationTarget {
     target_path: String,
     target_ref: FileTargetRef,
     target_kind: &'static str,
+    target_resource_kind: &'static str,
+    recursive: bool,
     outside_workspace: bool,
 }
 
@@ -975,20 +1016,32 @@ fn file_target_ref_raw_path(target_ref: &FileTargetRef) -> String {
     }
 }
 
-fn normalize_file_operation_target(raw: &str) -> Result<NormalizedFileOperationTarget, String> {
+fn normalize_file_operation_target(
+    raw: &str,
+    target_resource_kind: &'static str,
+    recursive: bool,
+) -> Result<NormalizedFileOperationTarget, String> {
     let normalized = raw.trim().replace('\\', "/");
     if normalized.is_empty() || normalized == "." || normalized == "./" {
-        return Err("target must be a concrete file path, not the workspace root".to_string());
+        return Err("target must be a concrete path, not the workspace root".to_string());
     }
     if normalized.contains('*') {
-        return Err("target must be a concrete file path, not a wildcard".to_string());
+        return Err("target must be a concrete path, not a wildcard".to_string());
+    }
+    let normalized = if target_resource_kind == "directory" {
+        normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized
+    };
+    if normalized.is_empty() || normalized == "." || normalized == "./" {
+        return Err("target must be a concrete path, not the workspace root".to_string());
     }
     let path = std::path::Path::new(&normalized);
     if path.is_absolute() {
-        let mut has_file_component = false;
+        let mut has_normal_component = false;
         for component in path.components() {
             match component {
-                Component::Normal(_) => has_file_component = true,
+                Component::Normal(_) => has_normal_component = true,
                 Component::CurDir => {}
                 Component::ParentDir => {
                     return Err("absolute target must not contain parent traversal".to_string())
@@ -996,10 +1049,11 @@ fn normalize_file_operation_target(raw: &str) -> Result<NormalizedFileOperationT
                 Component::RootDir | Component::Prefix(_) => {}
             }
         }
-        if !has_file_component || normalized.ends_with('/') {
-            return Err(
-                "absolute target must be a concrete file path, not a directory".to_string(),
-            );
+        if !has_normal_component {
+            return Err("absolute target must be a concrete path, not a root".to_string());
+        }
+        if target_resource_kind != "directory" && raw.trim().ends_with('/') {
+            return Err("file target must not end with a directory separator".to_string());
         }
         return Ok(NormalizedFileOperationTarget {
             target_path: normalized.clone(),
@@ -1009,6 +1063,8 @@ fn normalize_file_operation_target(raw: &str) -> Result<NormalizedFileOperationT
                 root_id: None,
             },
             target_kind: "absolutePath",
+            target_resource_kind,
+            recursive,
             outside_workspace: true,
         });
     }
@@ -1029,11 +1085,13 @@ fn normalize_file_operation_target(raw: &str) -> Result<NormalizedFileOperationT
         }
     }
     if components.is_empty() {
-        return Err("target must be a concrete file path, not the workspace root".to_string());
+        return Err("target must be a concrete path, not the workspace root".to_string());
     }
     let target = components.join("/");
-    if target.ends_with('/') {
-        return Err("target must be a concrete file path, not a directory".to_string());
+    if target_resource_kind != "directory" && raw.trim().ends_with('/') {
+        return Err(
+            "directory targets must set targetKind=\"directory\" and recursive=true".to_string(),
+        );
     }
     Ok(NormalizedFileOperationTarget {
         target_path: target.clone(),
@@ -1043,6 +1101,8 @@ fn normalize_file_operation_target(raw: &str) -> Result<NormalizedFileOperationT
             root_id: None,
         },
         target_kind: "workspaceRelative",
+        target_resource_kind,
+        recursive,
         outside_workspace: false,
     })
 }
@@ -1193,6 +1253,9 @@ mod tests {
                 capability: "fs.write".to_string(),
                 target_ref: None,
                 target_path: None,
+                target_kind: None,
+                target_resource_kind: None,
+                recursive: false,
                 resource_scope: vec!["src".to_string()],
                 can_parallelize: false,
                 conflict_keys: Vec::new(),
@@ -1236,6 +1299,9 @@ mod tests {
                     capability: "fs.write".to_string(),
                     target_ref: None,
                     target_path: Some("./generic-output.txt".to_string()),
+                    target_kind: None,
+                    target_resource_kind: None,
+                    recursive: false,
                     resource_scope: Vec::new(),
                     can_parallelize: false,
                     conflict_keys: Vec::new(),
@@ -1249,6 +1315,9 @@ mod tests {
                     capability: "fs.delete".to_string(),
                     target_ref: None,
                     target_path: None,
+                    target_kind: None,
+                    target_resource_kind: None,
+                    recursive: false,
                     resource_scope: vec!["generic-obsolete.tmp".to_string()],
                     can_parallelize: false,
                     conflict_keys: Vec::new(),
@@ -1306,6 +1375,63 @@ mod tests {
     }
 
     #[test]
+    fn action_bundle_review_reports_required_directory_delete_operation() {
+        let mut plan = PlanContract::low_risk_direct("plan-directory-delete", "directory delete");
+        plan.completion_criteria[0]
+            .evidence_required
+            .push("tool fact".to_string());
+        let bundle = ActionBundleDraft {
+            id: "bundle-directory-delete".to_string(),
+            goal: "delete generic directory".to_string(),
+            actions: vec![PlannedAction {
+                id: "delete-generic-directory".to_string(),
+                title: "Delete generic directory".to_string(),
+                kind: Some("delete".to_string()),
+                capability: "fs.delete".to_string(),
+                target_ref: None,
+                target_path: Some("generic-directory".to_string()),
+                target_kind: None,
+                target_resource_kind: Some("directory".to_string()),
+                recursive: true,
+                resource_scope: Vec::new(),
+                can_parallelize: false,
+                conflict_keys: Vec::new(),
+                purpose: None,
+                access_scopes: Vec::new(),
+            }],
+            access_scopes: Vec::new(),
+            validation_expectations: Vec::new(),
+            review_expectations: Vec::new(),
+        };
+
+        let report = DefaultPlanReviewEngine.review_input(PlanReviewInput {
+            plan,
+            action_bundle: Some(bundle),
+        });
+
+        assert_eq!(report.status, PlanReviewStatus::AwaitingTemporaryGrant);
+        assert_eq!(report.required_file_operations.len(), 1);
+        let operation = &report.required_file_operations[0];
+        assert_eq!(operation.operation, "delete");
+        assert_eq!(operation.capability, "fs.delete");
+        assert_eq!(operation.target_path, "generic-directory");
+        assert_eq!(operation.target_kind, "workspaceRelative");
+        assert_eq!(operation.target_resource_kind, "directory");
+        assert!(operation.recursive);
+        assert!(report.permission_bundles.iter().any(|bundle| {
+            bundle.capability == "fs.delete"
+                && bundle.resource_kind == "workspaceDirectory"
+                && bundle.targets == vec!["generic-directory"]
+        }));
+        let contract = report
+            .execution_contract
+            .as_ref()
+            .expect("kernel execution contract");
+        assert_eq!(contract.operations[0].target_resource_kind, "directory");
+        assert!(contract.operations[0].recursive);
+    }
+
+    #[test]
     fn action_bundle_review_groups_same_capability_file_operations_into_one_permission_bundle() {
         let mut plan = PlanContract::low_risk_direct("plan-delete-many", "delete many files");
         plan.completion_criteria[0]
@@ -1322,6 +1448,9 @@ mod tests {
                     capability: "fs.delete".to_string(),
                     target_ref: None,
                     target_path: Some(format!("generic-{index}.tmp")),
+                    target_kind: None,
+                    target_resource_kind: None,
+                    recursive: false,
                     resource_scope: Vec::new(),
                     can_parallelize: false,
                     conflict_keys: Vec::new(),
@@ -1438,6 +1567,9 @@ mod tests {
                 capability: "fs.write".to_string(),
                 target_ref: None,
                 target_path: Some(absolute_target.clone()),
+                target_kind: None,
+                target_resource_kind: None,
+                recursive: false,
                 resource_scope: Vec::new(),
                 can_parallelize: false,
                 conflict_keys: Vec::new(),
@@ -1484,6 +1616,9 @@ mod tests {
                     root_id: None,
                 }),
                 target_path: None,
+                target_kind: None,
+                target_resource_kind: None,
+                recursive: false,
                 resource_scope: Vec::new(),
                 can_parallelize: false,
                 conflict_keys: Vec::new(),
@@ -1523,6 +1658,9 @@ mod tests {
                 capability: "fs.delete".to_string(),
                 target_ref: None,
                 target_path: Some(".".to_string()),
+                target_kind: None,
+                target_resource_kind: None,
+                recursive: false,
                 resource_scope: Vec::new(),
                 can_parallelize: false,
                 conflict_keys: Vec::new(),

@@ -737,6 +737,8 @@ fn compiled_tool_summary(compiled: &CompiledWorkspaceAction) -> Value {
     serde_json::json!({
         "toolName": &compiled.tool_name,
         "path": compiled.arguments.get("path").and_then(Value::as_str),
+        "targetKind": compiled.arguments.get("targetKind").and_then(Value::as_str),
+        "recursive": compiled.arguments.get("recursive").and_then(Value::as_bool),
         "query": compiled.arguments.get("query").and_then(Value::as_str),
         "argsPreview": redact_tool_arguments(&compiled.tool_name, &compiled.arguments)
     })
@@ -1153,10 +1155,27 @@ fn workspace_delete_tool_operation(
             "fs.delete cannot remove workspace root".to_string(),
         ));
     }
+    let explicit_target_kind = workspace
+        .target_resource_kind
+        .as_deref()
+        .or(workspace.target_kind.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let target_kind = match explicit_target_kind {
+        Some("directory") | Some("dir") => "directory",
+        Some("file") => "file",
+        _ if raw_path.trim().ends_with('/') => "directory",
+        _ => "file",
+    };
+    let recursive =
+        workspace.recursive || (target_kind == "directory" && raw_path.trim().ends_with('/'));
     let action = CompiledWorkspaceAction {
         tool_name: "fs.delete".to_string(),
         arguments: serde_json::json!({
             "path": normalized.relative_path,
+            "targetKind": target_kind,
+            "targetResourceKind": target_kind,
+            "recursive": recursive,
             "pathNormalization": path_normalization_json(&normalized)
         }),
         workspace_root: normalized.workspace_root,
@@ -1902,6 +1921,9 @@ mod action_batch_internal_tests {
         let workspace = WorkspaceOperation {
             kind: WorkspaceOperationKind::Delete,
             target_path: Some(String::new()),
+            target_kind: None,
+            target_resource_kind: None,
+            recursive: false,
             source_block_id: None,
             replacement_block_id: None,
             content: None,
@@ -1955,6 +1977,9 @@ mod action_batch_internal_tests {
         let workspace = WorkspaceOperation {
             kind: WorkspaceOperationKind::Delete,
             target_path: None,
+            target_kind: None,
+            target_resource_kind: None,
+            recursive: false,
             source_block_id: None,
             replacement_block_id: None,
             content: None,

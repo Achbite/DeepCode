@@ -260,11 +260,47 @@ impl SkillExecutor for FsDeleteExecutor {
     ) -> KernelResult<SkillResult> {
         let root = workspace_root(&context)?;
         let path = get_string(&invocation.input, "path").unwrap_or_default();
+        let target_kind = get_string(&invocation.input, "targetKind")
+            .or_else(|| get_string(&invocation.input, "targetResourceKind"))
+            .unwrap_or_else(|| "file".to_string());
+        let target_kind = match target_kind.trim() {
+            "directory" | "dir" => "directory",
+            _ => "file",
+        };
+        let recursive = invocation
+            .input
+            .get("recursive")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         WorkspaceBoundary::assert_mutable_config_asset(&path)?;
         let target = resolve_workspace_path(&root, &path)?;
         if target.is_dir() {
+            if target_kind != "directory" {
+                return Err(KernelError::PermissionDenied(
+                    "fs.delete directory target requires targetKind=directory".to_string(),
+                ));
+            }
+            let result = if recursive {
+                fs::remove_dir_all(&target)
+            } else {
+                fs::remove_dir(&target)
+            };
+            result
+                .map_err(|error| KernelError::Other(format!("delete directory {path}: {error}")))?;
+            return Ok(ok(
+                invocation.id,
+                serde_json::json!({
+                    "folderId": "wf-0",
+                    "path": normalize_relative_path(&path),
+                    "deleted": true,
+                    "kind": "directory",
+                    "recursive": recursive
+                }),
+            ));
+        }
+        if target_kind == "directory" {
             return Err(KernelError::PermissionDenied(
-                "fs.delete only accepts files".to_string(),
+                "fs.delete targetKind=directory requires an existing directory target".to_string(),
             ));
         }
         fs::remove_file(&target)

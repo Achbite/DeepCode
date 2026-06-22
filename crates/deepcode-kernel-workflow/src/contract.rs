@@ -151,6 +151,12 @@ pub struct PlannedAction {
     #[serde(default)]
     pub target_path: Option<String>,
     #[serde(default)]
+    pub target_kind: Option<String>,
+    #[serde(default)]
+    pub target_resource_kind: Option<String>,
+    #[serde(default)]
+    pub recursive: bool,
+    #[serde(default)]
     pub resource_scope: Vec<String>,
     #[serde(default)]
     pub can_parallelize: bool,
@@ -273,6 +279,9 @@ mod tests {
                 capability: "fs.read".to_string(),
                 target_ref: None,
                 target_path: None,
+                target_kind: None,
+                target_resource_kind: None,
+                recursive: false,
                 resource_scope: vec![".".to_string()],
                 can_parallelize: true,
                 conflict_keys: Vec::new(),
@@ -312,6 +321,9 @@ mod tests {
                 capability: "fs.write".to_string(),
                 target_ref: None,
                 target_path: None,
+                target_kind: None,
+                target_resource_kind: None,
+                recursive: false,
                 resource_scope: vec!["src".to_string()],
                 can_parallelize: false,
                 conflict_keys: vec!["src/out.txt".to_string()],

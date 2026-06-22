@@ -2626,7 +2626,7 @@ fn action_batch_submit_workspace_delete_rejects_workspace_root_without_write_err
 }
 
 #[test]
-fn action_batch_submit_workspace_delete_rejects_directory_without_write_error() {
+fn action_batch_submit_workspace_delete_rejects_directory_without_target_kind() {
     let (mut runtime, temp) = runtime_with_workspace();
     runtime
         .dispatch(KernelCommand::RunCreate {
@@ -2649,7 +2649,7 @@ fn action_batch_submit_workspace_delete_rejects_directory_without_write_error() 
         })
         .expect("runCreate succeeds");
 
-    grant_workspace_delete(&mut runtime);
+    grant_workspace_scope(&mut runtime, "fs.delete", "workspaceDirectory", "nested");
 
     let events = runtime
         .dispatch(KernelCommand::ActionBatchSubmit {
@@ -2689,8 +2689,8 @@ fn action_batch_submit_workspace_delete_rejects_directory_without_write_error() 
         })
         .expect("work unit failed");
     assert!(
-        error_message.contains("fs.delete only accepts files"),
-        "directory delete target should be rejected as a delete operation"
+        error_message.contains("fs.delete directory target requires targetKind=directory"),
+        "directory delete target should require an explicit directory marker"
     );
     assert!(
         !error_message.contains("fs.write target path is empty"),
@@ -2699,6 +2699,80 @@ fn action_batch_submit_workspace_delete_rejects_directory_without_write_error() 
     assert!(
         temp.join("nested").exists(),
         "directory delete is fail-closed"
+    );
+}
+
+#[test]
+fn action_batch_submit_workspace_delete_removes_confirmed_directory() {
+    let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            input: UserInput {
+                text: "Delete a generic directory.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: Some(temp.to_string_lossy().to_string()),
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
+
+    grant_workspace_scope(&mut runtime, "fs.delete", "workspaceDirectory", "nested");
+
+    let events = runtime
+        .dispatch(KernelCommand::ActionBatchSubmit {
+            request_id: RequestId("req-action-batch-delete-directory-confirmed".to_string()),
+            run_id: RunId("run-1".to_string()),
+            session_id: Some(SessionId("session-generic".to_string())),
+            batch: serde_json::json!({
+                "planId": "plan-generic-delete-directory-confirmed",
+                "actionBundle": {
+                    "id": "bundle-generic-delete-directory-confirmed",
+                    "goal": "Delete a generic directory.",
+                    "actions": [
+                        {
+                            "id": "delete-generic-directory-confirmed",
+                            "title": "Delete generic directory",
+                            "capability": "fs.delete",
+                            "kind": "delete",
+                            "resourceScope": ["nested"],
+                            "targetPath": "nested",
+                            "targetKind": "directory",
+                            "recursive": true,
+                            "permissionLabels": ["fs.delete"]
+                        }
+                    ]
+                }
+            }),
+        })
+        .expect("action batch deletes directory");
+
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic-directory-confirmed", "toolName").as_deref(),
+        Some("fs.delete")
+    );
+    assert_eq!(
+        compiled_tool_value(&events, "delete-generic-directory-confirmed", "targetKind").as_deref(),
+        Some("directory")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::WorkUnitCompleted { work_unit_id, .. } if work_unit_id.contains("delete-generic-directory-confirmed"))),
+        "confirmed directory delete completes"
+    );
+    assert!(
+        !temp.join("nested").exists(),
+        "confirmed directory delete removes the directory tree"
     );
 }
 
