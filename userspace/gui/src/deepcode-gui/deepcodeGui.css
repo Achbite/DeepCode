@@ -808,6 +808,14 @@ button {
   white-space: pre-wrap;
 }
 
+.agent-evidence-output__list {
+  margin: 7px 0 0;
+  padding-left: 18px;
+  color: #777f88;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .agent-evidence-list__more {
   color: #777f88;
   font-size: 11px;

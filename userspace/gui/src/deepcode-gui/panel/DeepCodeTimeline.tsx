@@ -22,6 +22,7 @@ interface DeepCodeTimelineProps {
   loading: boolean;
   language: UiLanguage;
   activeDeltas?: ProjectionDelta[];
+  followLatestSignal?: number;
   onTypewriterActiveChange?: (active: boolean) => void;
   onPlanResolve?: (
     runId: string,
@@ -40,6 +41,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   loading,
   language,
   activeDeltas = [],
+  followLatestSignal = 0,
   onTypewriterActiveChange,
   onPlanResolve,
 }) => {
@@ -64,6 +66,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLElement | null>(null);
   const followModeRef = useRef<TimelineFollowMode>('following');
+  const userDetachedFromLatestRef = useRef(false);
   const userScrollIntentRef = useRef(false);
   const suppressScrollEventsUntilRef = useRef(0);
   const liveScrollFrameRef = useRef<number | null>(null);
@@ -141,8 +144,10 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   const setFollowMode = useCallback((mode: TimelineFollowMode) => {
     followModeRef.current = mode;
     if (mode === 'following') {
+      userDetachedFromLatestRef.current = false;
       userScrollIntentRef.current = false;
     } else {
+      userDetachedFromLatestRef.current = true;
       setShowJumpToLatest(true);
     }
   }, []);
@@ -157,7 +162,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 
   const syncJumpToLatestVisibility = useCallback((container: HTMLElement | null) => {
     if (!container) return;
-    const nextVisible = followModeRef.current === 'detached' || !isAtScrollEnd(container);
+    const nextVisible = userDetachedFromLatestRef.current || !isAtScrollEnd(container);
     setShowJumpToLatest((visible) => visible === nextVisible ? visible : nextVisible);
   }, []);
 
@@ -216,14 +221,13 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 
   const markUserScrollIntent = useCallback((event?: Event) => {
     if (event instanceof WheelEvent) {
-      userScrollIntentRef.current = true;
       if (event.deltaY < 0) {
+        userScrollIntentRef.current = true;
         setFollowMode('detached');
       }
       return;
     }
     if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
-    userScrollIntentRef.current = true;
   }, [setFollowMode]);
 
   useEffect(() => {
@@ -242,12 +246,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
       }
       if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
       if (isNearScrollBottom(scrollContainer)) {
-        if (userScrollIntentRef.current || followModeRef.current === 'following') {
-          setFollowMode('following');
-          scrollToTimelineEnd({ requireFollowing: true });
-        } else {
-          syncJumpToLatestVisibility(scrollContainer);
-        }
+        syncJumpToLatestVisibility(scrollContainer);
         return;
       }
       if (userScrollIntentRef.current) {
@@ -259,13 +258,9 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 
     updateShouldFollow();
     scrollContainer.addEventListener('wheel', markUserScrollIntent, { passive: true });
-    scrollContainer.addEventListener('touchmove', markUserScrollIntent, { passive: true });
-    scrollContainer.addEventListener('pointerdown', markUserScrollIntent, { passive: true });
     scrollContainer.addEventListener('scroll', updateShouldFollow, { passive: true });
     return () => {
       scrollContainer.removeEventListener('wheel', markUserScrollIntent);
-      scrollContainer.removeEventListener('touchmove', markUserScrollIntent);
-      scrollContainer.removeEventListener('pointerdown', markUserScrollIntent);
       scrollContainer.removeEventListener('scroll', updateShouldFollow);
     };
   }, [markUserScrollIntent, resolveScrollContainer, scrollToTimelineEnd, setFollowMode, syncJumpToLatestVisibility]);
@@ -273,6 +268,10 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   useLayoutEffect(() => {
     enableFollowAndJumpToLatest();
   }, [enableFollowAndJumpToLatest, viewWithActive.sessionId]);
+
+  useLayoutEffect(() => {
+    enableFollowAndJumpToLatest();
+  }, [enableFollowAndJumpToLatest, followLatestSignal]);
 
   useLayoutEffect(() => {
     if (followModeRef.current !== 'following') return;
@@ -355,13 +354,14 @@ function appendActiveDeltaTurn(
   let textSegmentStartKey = '';
   let textSegmentBody = '';
 
-  const flushTextSegment = () => {
+  const flushTextSegment = (completed = false) => {
     if (!textSegmentKind || !textSegmentBody.trim()) {
       textSegmentKind = null;
       textSegmentStartKey = '';
       textSegmentBody = '';
       return;
     }
+    const segmentStatus = completed ? 'completed' : status;
     if (textSegmentKind === 'thinking') {
       blocks.push({
         id: `active-thinking-${safeActiveBlockId(runId)}-${textSegmentStartKey}`,
@@ -369,13 +369,13 @@ function appendActiveDeltaTurn(
         narrativeKind: 'thinking',
         title: t(language, 'deepcodeGui.timeline.thinking'),
         summary: language === 'zh-CN' ? 'Provider 正在输出 reasoning。' : 'Provider reasoning is streaming.',
-        status,
-        defaultCollapsed: false,
+        status: segmentStatus,
+        defaultCollapsed: completed,
         bodyMarkdown: textSegmentBody,
         displayHints: {
           renderMode: 'typewriter',
           typewriterSpeed: 'slow',
-          initialOpen: true,
+          initialOpen: !completed,
           replaceOnComplete: true,
         },
         events: [],
@@ -387,7 +387,7 @@ function appendActiveDeltaTurn(
         narrativeKind: 'assistantText',
         title: 'DeepCode',
         summary: language === 'zh-CN' ? 'DeepCode 正在回复。' : 'DeepCode is responding.',
-        status,
+        status: segmentStatus,
         defaultCollapsed: false,
         bodyMarkdown: textSegmentBody,
         displayHints: {
@@ -409,7 +409,7 @@ function appendActiveDeltaTurn(
     index: number
   ) => {
     if (textSegmentKind && textSegmentKind !== kind) {
-      flushTextSegment();
+      flushTextSegment(true);
     }
     if (!textSegmentKind) {
       textSegmentKind = kind;
@@ -422,7 +422,7 @@ function appendActiveDeltaTurn(
     const delta = parentDeltas[index];
     const activity = delta.activity;
     if (activity && !committedActivityIds.has(activity.activityId) && isMainTimelineActivity(activity)) {
-      flushTextSegment();
+      flushTextSegment(true);
       blocks.push(activityBlockFromActivity(activity, language, true));
       continue;
     }
@@ -511,11 +511,12 @@ function activityBodyMarkdown(activity: AgentConversationActivity, language: UiL
   const rows: string[] = [];
   const summary = visibleActivitySummary(activity);
   if (summary) rows.push(summary);
-  if (activity.targets?.length) {
-    rows.push(`**${activityTargetsLabel(activity, language)}**: ${activity.targets.join(', ')}`);
+  const targets = visibleActivityTargets(activity.targets ?? []);
+  if (targets.length) {
+    rows.push(`**${activityTargetsLabel(activity, language)}**: ${targets.join(', ')}`);
   }
   if (activity.toolName) {
-    rows.push(`**${t(language, 'deepcodeGui.activity.tool')}**: ${activity.toolName}`);
+    rows.push(`**${t(language, 'deepcodeGui.activity.tool')}**: ${displayToolName(activity.toolName)}`);
   }
   if (activity.errorCode || activity.errorMessage) {
     rows.push(`**${t(language, 'deepcodeGui.activity.error')}**: ${[activity.errorCode, activity.errorMessage].filter(Boolean).join(' - ')}`);
@@ -529,10 +530,27 @@ function visibleActivitySummary(activity: AgentConversationActivity): string {
   if (activity.kind === 'diagnostic' || activity.status === 'failed') {
     return summary;
   }
-  if (!activity.targets?.length && !activity.toolName && !activity.errorCode && !activity.errorMessage) {
-    return summary;
-  }
   return '';
+}
+
+function visibleActivityTargets(targets: string[]): string[] {
+  const visible: string[] = [];
+  for (const target of targets) {
+    const normalized = target.trim();
+    if (!normalized || isInternalDisplayToken(normalized)) continue;
+    if (visible.includes(normalized)) continue;
+    visible.push(normalized);
+  }
+  return visible;
+}
+
+function isInternalDisplayToken(value: string): boolean {
+  return /^(native-call|attachment|work-unit|resource-request|resource-item|kernel-activity)[_-]/i.test(value) ||
+    /^turn-[a-z_]+-/i.test(value);
+}
+
+function displayToolName(toolName: string): string {
+  return toolName.replace(/__/g, '.').trim();
 }
 
 function activityTargetsLabel(activity: AgentConversationActivity, language: UiLanguage): string {
@@ -1030,10 +1048,18 @@ const ActivityBlock: React.FC<{
 }> = ({ block, language }) => {
   const activity = block.activity;
   if (!activity) return null;
-  const title = localizedTimelineText(language, activity.title || block.title || activityKindLabel(language, activity.kind));
+  const evidence = formatToolEvidence(block.events, language, {
+    fallbackTitle: activity.title || block.title,
+  });
+  const hasEvidence = evidence.items.length > 0;
+  const title = localizedTimelineText(
+    language,
+    hasEvidence ? evidence.title : activity.title || block.title || activityKindLabel(language, activity.kind)
+  );
   const open = !block.defaultCollapsed || activity.status === 'running' || activity.status === 'waiting' || activity.status === 'failed';
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
+  const markdown = hasEvidence ? '' : block.bodyMarkdown;
 
   return (
     <details
@@ -1053,7 +1079,8 @@ const ActivityBlock: React.FC<{
             {timelineStatusLabel(language, activity.status)}
           </span>
         </div>
-        {block.bodyMarkdown && <MarkdownContent content={block.bodyMarkdown} />}
+        {markdown && <MarkdownContent content={markdown} />}
+        {hasEvidence && <ToolEvidenceDetails evidence={evidence} language={language} />}
       </div>
     </details>
   );
@@ -1107,6 +1134,7 @@ const OperationEvidenceBlock: React.FC<{
   const status = evidence.status === 'completed' ? block.status : evidence.status;
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
+  const markdown = evidence.items.length > 0 ? '' : block.bodyMarkdown;
 
   return (
     <details
@@ -1118,7 +1146,7 @@ const OperationEvidenceBlock: React.FC<{
         <span className="deepcode-gui-block__title">{title}</span>
       </summary>
       <div className="deepcode-gui-block__details">
-        {block.bodyMarkdown && <MarkdownContent content={block.bodyMarkdown} />}
+        {markdown && <MarkdownContent content={markdown} />}
         <ToolEvidenceDetails evidence={evidence} language={language} />
       </div>
     </details>

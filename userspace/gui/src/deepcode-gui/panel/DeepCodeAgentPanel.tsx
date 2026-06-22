@@ -64,6 +64,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const [timelineError, setTimelineError] = useState<string | null>(null);
   const [timelineTypewriterActive, setTimelineTypewriterActive] = useState(false);
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
+  const [followLatestSignal, setFollowLatestSignal] = useState(0);
   const sessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
 
   useEffect(() => {
@@ -144,6 +145,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const homePrompt = homeProjectTitle
     ? t(language, 'deepcodeGui.home.projectPrompt', { project: homeProjectTitle })
     : t(language, 'deepcodeGui.home.prompt');
+  const requestFollowLatest = () => setFollowLatestSignal((value) => value + 1);
 
   const composer = (
     <AgentComposer
@@ -152,6 +154,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       language={language}
       loading={composerRunning}
       onSend={async (content) => {
+        requestFollowLatest();
         const shouldContinue = await onBeforeSend?.();
         if (shouldContinue === false) return;
         await sendMessage(content);
@@ -163,6 +166,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       pendingDecision={composerPendingDecision}
       onDecisionSubmit={(guidance, action) => {
         if (!composerPendingDecision) return;
+        requestFollowLatest();
         const decision = action ?? (guidance ? 'revise' : 'accept');
         if (composerPendingDecision.kind === 'requirement') {
           void resolveRequirement(
@@ -190,6 +194,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
       }}
       onDecisionReject={() => {
         if (!composerPendingDecision) return;
+        requestFollowLatest();
         if (composerPendingDecision.kind === 'requirement') {
           void resolveRequirement(composerPendingDecision.runId, composerPendingDecision.requirementId, 'reject');
           return;
@@ -234,6 +239,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         loading={sessionRunning}
         language={language}
         activeDeltas={activeDeltas}
+        followLatestSignal={followLatestSignal}
         onTypewriterActiveChange={setTimelineTypewriterActive}
         onPlanResolve={(runId, planId, decision, guidance) =>
           void resolvePlan(runId, planId, decision, guidance)
@@ -250,8 +256,14 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
               ? resolvingPermission.decision
               : null
           }
-          onAccept={() => void acceptPermission()}
-          onReject={() => void rejectPermission()}
+          onAccept={() => {
+            requestFollowLatest();
+            void acceptPermission();
+          }}
+          onReject={() => {
+            requestFollowLatest();
+            void rejectPermission();
+          }}
         />
       )}
 

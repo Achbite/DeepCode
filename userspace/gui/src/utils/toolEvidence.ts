@@ -10,6 +10,8 @@ export interface ToolEvidenceItem {
   action: string;
   label: string;
   detail?: string;
+  preview?: string;
+  matches?: string[];
   status: ToolEvidenceStatus;
   exitCode?: number | null;
   cwd?: string;
@@ -138,8 +140,8 @@ function itemsForEvent(event: AgentEvent, language: UiLanguage): ToolEvidenceIte
     id: event.id,
     kind: 'tool',
     action: language === 'zh-CN' ? '工具' : 'Tool',
-    label: toolName,
-    detail: stringValue(payload, 'summary') ?? stringValue(payload, 'message'),
+    label: displayToolName(toolName, language),
+    detail: readableToolDetail(toolName, payload),
     status,
     error: stringValue(payload, 'error'),
   }];
@@ -152,20 +154,25 @@ function resourceItem(
   language: UiLanguage,
   status: ToolEvidenceStatus
 ): ToolEvidenceItem {
-  const path = stringValue(item, 'path') ??
-    stringValue(item, 'absolutePath') ??
-    stringValue(item, 'manifestEntryId') ??
-    stringValue(item, 'requestItemId') ??
-    `resource-${index + 1}`;
+  const path = readablePath(stringValue(item, 'path')) ??
+    readablePath(stringValue(item, 'absolutePath')) ??
+    (language === 'zh-CN' ? `资源 ${index + 1}` : `Resource ${index + 1}`);
   const resolvedKind = stringValue(item, 'resolvedKind') ?? stringValue(item, 'contentKind') ?? '';
   const directory = resolvedKind.includes('directory') || resolvedKind.includes('tree');
   const truncated = booleanValue(item, 'truncated');
-  const sizeBytes = numberValue(item, 'sizeBytes');
+  const sizeBytes = numberValue(item, 'returnedBytes') ??
+    numberValue(item, 'originalBytes') ??
+    numberValue(item, 'sizeBytes');
   const nodes = Array.isArray(item.nodes) ? item.nodes.length : undefined;
+  const matches = readableMatches(item);
+  const summary = readableSummary(item);
+  const preview = readablePreview(item, matches.length > 0);
   const detailParts = [
     sizeBytes !== undefined ? formatBytes(sizeBytes) : undefined,
     nodes !== undefined ? (language === 'zh-CN' ? `${nodes} 项` : `${nodes} entries`) : undefined,
+    matches.length > 0 ? (language === 'zh-CN' ? `${matches.length} 处命中` : `${matches.length} matches`) : undefined,
     truncated ? (language === 'zh-CN' ? '已截断' : 'truncated') : undefined,
+    summary,
   ].filter(Boolean);
 
   return {
@@ -175,7 +182,9 @@ function resourceItem(
       ? (language === 'zh-CN' ? '列出' : 'Listed')
       : (language === 'zh-CN' ? '读取' : 'Read'),
     label: path,
-    detail: detailParts.join(' · ') || stringValue(item, 'contentSummary'),
+    detail: detailParts.join(' · ') || undefined,
+    preview,
+    matches,
     status,
     truncated,
   };
@@ -203,6 +212,17 @@ function evidenceTitle(
     return language === 'zh-CN'
       ? `读取/列出 ${fileCount + directoryCount} 个资源`
       : `Resolved ${fileCount + directoryCount} resource${fileCount + directoryCount === 1 ? '' : 's'}`;
+  }
+  const toolCount = items.filter((item) => item.kind === 'tool').length;
+  if (toolCount > 0 && toolCount === items.length) {
+    if (items.length === 1) {
+      const item = items[0];
+      if (item.label === (language === 'zh-CN' ? '工具执行' : 'Tool execution')) {
+        return item.label;
+      }
+      return language === 'zh-CN' ? `执行 ${item.label}` : `Run ${item.label}`;
+    }
+    return language === 'zh-CN' ? `工具操作 ${items.length} 项` : `${items.length} tool operations`;
   }
   return fallbackTitle || (language === 'zh-CN' ? `工具操作 ${items.length} 项` : `${items.length} tool operation${items.length === 1 ? '' : 's'}`);
 }
@@ -284,12 +304,13 @@ function pathFor(
   output?: Record<string, unknown>,
   args?: Record<string, unknown>
 ): string | undefined {
-  const keys = ['path', 'absolutePath', 'filePath', 'targetPath', 'cwd'];
+  const keys = ['path', 'filePath', 'targetPath', 'absolutePath'];
   for (const source of [output, args, payload]) {
     if (!source) continue;
     for (const key of keys) {
       const value = stringValue(source, key);
-      if (value) return value;
+      const path = readablePath(value);
+      if (path) return path;
     }
   }
   return undefined;
@@ -330,7 +351,7 @@ function commandDetail(
   const parts = [
     exitCode !== undefined ? (language === 'zh-CN' ? `退出码 ${exitCode}` : `exit ${exitCode}`) : undefined,
     duration,
-    cwd ? `cwd ${cwd}` : undefined,
+    cwd ? (language === 'zh-CN' ? `目录 ${cwd}` : `cwd ${cwd}`) : undefined,
   ].filter(Boolean);
   return parts.join(' · ') || undefined;
 }
@@ -340,6 +361,75 @@ function formatBytes(value: number): string {
   if (value < 1024) return `${Math.round(value)} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function readableSummary(item: Record<string, unknown>): string | undefined {
+  return clipInline(stringValue(item, 'contentSummary') ?? stringValue(item, 'summary'), 180);
+}
+
+function readablePreview(item: Record<string, unknown>, hasMatches: boolean): string | undefined {
+  if (hasMatches) return undefined;
+  const content = stringValue(item, 'promptContent') ?? stringValue(item, 'preview');
+  return clipBlock(content, 900);
+}
+
+function readableMatches(item: Record<string, unknown>): string[] {
+  const matches = Array.isArray(item.matches) ? item.matches.filter(isRecord) : [];
+  return matches
+    .map((match, index) => {
+      const path = readablePath(stringValue(match, 'path')) ?? readablePath(stringValue(match, 'filePath'));
+      const line = numberValue(match, 'line') ?? numberValue(match, 'lineNumber');
+      const preview = clipInline(stringValue(match, 'preview') ?? stringValue(match, 'text'), 220);
+      const location = [
+        path,
+        line !== undefined ? `:${line}` : undefined,
+      ].filter(Boolean).join('');
+      const label = location || `match ${index + 1}`;
+      return preview ? `${label} ${preview}` : label;
+    })
+    .filter((value) => value.trim().length > 0)
+    .slice(0, 8);
+}
+
+function readablePath(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized || isInternalDisplayToken(normalized)) return undefined;
+  return normalized;
+}
+
+function readableToolDetail(
+  toolName: string,
+  payload: Record<string, unknown> | undefined
+): string | undefined {
+  if (isInternalDisplayToken(toolName)) return undefined;
+  return clipInline(stringValue(payload, 'summary') ?? stringValue(payload, 'message'), 180);
+}
+
+function isInternalDisplayToken(value: string): boolean {
+  return /^(native-call|attachment|work-unit|resource-request|resource-item|kernel-activity)[_-]/i.test(value) ||
+    /^turn-[a-z_]+-/i.test(value);
+}
+
+function displayToolName(toolName: string, language: UiLanguage): string {
+  const normalized = toolName.replace(/__/g, '.').trim();
+  if (!normalized || isInternalDisplayToken(normalized)) {
+    return language === 'zh-CN' ? '工具执行' : 'Tool execution';
+  }
+  return normalized;
+}
+
+function clipInline(value: string | undefined, maxLength: number): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) return undefined;
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
+}
+
+function clipBlock(value: string | undefined, maxLength: number): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  if (!normalized) return undefined;
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
 }
 
 function stringValue(recordValue: unknown, key: string): string | undefined {

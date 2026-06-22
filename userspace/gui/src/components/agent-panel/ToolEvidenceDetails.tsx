@@ -30,6 +30,22 @@ const ToolEvidenceDetails: React.FC<ToolEvidenceDetailsProps> = ({
             {item.label}
           </span>
           {item.detail && <span className="agent-evidence-item__detail">{item.detail}</span>}
+          {item.matches && item.matches.length > 0 && (
+            <details className="agent-evidence-output">
+              <summary>{language === 'zh-CN' ? '命中' : 'Matches'}</summary>
+              <ul className="agent-evidence-output__list">
+                {item.matches.map((match, index) => (
+                  <li key={`${item.id}:match:${index}`}>{match}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+          {item.preview && (
+            <details className="agent-evidence-output">
+              <summary>{language === 'zh-CN' ? '片段' : 'Preview'}</summary>
+              <pre>{item.preview}</pre>
+            </details>
+          )}
           {item.kind === 'command' && (
             <div className="agent-evidence-item__meta">
               {typeof item.exitCode === 'number' && (
