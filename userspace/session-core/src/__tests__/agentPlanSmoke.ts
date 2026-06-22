@@ -70,6 +70,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptsLocalizedStructuredPlan();
   await assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview();
   await assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan();
+  await assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutTaskTargets();
   await assertSessionDriverLoopAcceptedExecutionExceptionClosesRun();
   await assertSessionDriverLoopAcceptedExecutionKernelErrorClosesRun();
   await assertSessionDriverLoopAcceptedDecisionRecoversUnconsumedExecution();
@@ -77,6 +78,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopActionBundleAdmissionRepairsDirectoryDeleteBeforePlanCard();
   await assertSessionDriverLoopActionBundleAdmissionRejectsRepeatedDirectoryDelete();
   await assertSessionDriverLoopAcceptedScopeRejectsDirectoryDeleteFromResourceEvidence();
+  await assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDelete();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatch();
   await assertSessionDriverLoopAcceptedImplementationPlanNormalizesWriteBatchForKernel();
   await assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPathOverRootResourceScope();
@@ -3530,6 +3532,107 @@ async function assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan()
   );
 }
 
+async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutTaskTargets(): Promise<void> {
+  const proposal = deleteActionBundleProposal('generic-obsolete.txt') as any;
+  const actionBundle = proposal.actionBundle as Record<string, any>;
+  const report = proposalReviewReport(actionBundle);
+  const planCard = deleteAcceptedImplementationPlanCardEvent('session-reviewed-delete-no-targets', 'run-reviewed-delete-no-targets');
+  const planPayload = planCard.payload as any;
+  planPayload.planId = 'impl-reviewed-delete-no-targets';
+  planPayload.implementationPlan.id = 'impl-reviewed-delete-no-targets';
+  planPayload.implementationPlan.tasks[0].target = [];
+  delete planPayload.implementationPlan.tasks[0].fileOperations;
+  planPayload.planReviewReport = report;
+  planPayload.requiredFileOperations = report.requiredFileOperations;
+  const events: AgentEvent[] = [planCard];
+  const session: AgentSession = {
+    id: 'session-reviewed-delete-no-targets',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const temporaryGrants: Array<Record<string, any>> = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: command.runId, sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: command.runId,
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report,
+            },
+          ],
+        };
+      }
+      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
+      if (command.kind === 'permissionGrantTemporary') {
+        temporaryGrants.push(command.grant);
+        return { ok: true, events: [] };
+      }
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.completed',
+              runId: command.runId,
+              sessionId: session.id,
+              workUnitId: 'work-unit-reviewed-delete-no-targets',
+              output: { path: 'generic-obsolete.txt' },
+            },
+            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return jsonLlmResponse(deleteActionBundleProposal('generic-obsolete.txt'));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + actionBatchSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-reviewed-delete-no-targets',
+    targetId: 'impl-reviewed-delete-no-targets',
+    existingEvents: events,
+  });
+
+  assertEqual(llmCalls, 1, 'reviewed delete exact grant does not trigger scope repair when task target scopes are empty');
+  assertEqual(proposalSubmits, 1, 'reviewed delete exact grant still goes through Kernel PlanReview for the execution batch');
+  assertEqual(actionBatchSubmits, 1, 'reviewed delete exact grant submits actionBatch even when implementationPlan task targets are empty');
+  assertEqual(temporaryGrants.length, 1, 'reviewed delete exact grant receives one temporary grant');
+  assertEqual(temporaryGrants[0]?.resourcePath, 'generic-obsolete.txt', 'reviewed delete exact grant keeps the file-scoped grant target');
+  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'reviewed delete exact grant does not ask for user intervention');
+  assertEqual(
+    result.events.some((event) => event.kind === 'session_run_state' && (event.payload as any)?.status === 'failed'),
+    false,
+    'reviewed delete exact grant does not fail Session admission'
+  );
+}
+
 async function assertSessionDriverLoopAcceptedExecutionExceptionClosesRun(): Promise<void> {
   const proposal = deleteActionBundleProposal('generic-stale.txt') as any;
   const actionBundle = proposal.actionBundle as Record<string, any>;
@@ -4118,6 +4221,104 @@ async function assertSessionDriverLoopAcceptedScopeRejectsDirectoryDeleteFromRes
     result.events.some((event) => event.kind === 'session_run_state' && (event.payload as any).status === 'failed'),
     true,
     'directory delete preflight closes the run with failed lifecycle'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDelete(): Promise<void> {
+  const deleteProposal = deleteActionBundleProposal('generic-dir') as any;
+  const actionBundle = deleteProposal.actionBundle as Record<string, any>;
+  actionBundle.actions[0].targetKind = 'directory';
+  actionBundle.actions[0].targetResourceKind = 'directory';
+  actionBundle.actions[0].recursive = true;
+  const planReviewReport = proposalReviewReport(actionBundle);
+  const events: AgentEvent[] = [
+    genericDirectoryResourceEvent('session-delete-directory-reviewed', 'generic-dir', ['generic-dir/inside.txt']),
+    {
+      id: 'plan-delete-directory-reviewed',
+      sessionId: 'session-delete-directory-reviewed',
+      ts: '2026-01-01T00:00:01.000Z',
+      kind: 'plan_card',
+      payload: {
+        runId: 'run-delete-directory-reviewed',
+        planId: 'bundle-generic-delete',
+        proposalId: 'proposal-delete-directory-reviewed',
+        title: 'Generic delete plan',
+        summary: 'Delete a generic directory after review.',
+        content: '# Plan\n\n## Summary\nDelete a generic directory after review.',
+        actionBundle,
+        codeBlocks: [],
+        commandBlocks: [],
+        planReviewReport,
+        requiredFileOperations: planReviewReport.requiredFileOperations,
+        confirmable: true,
+      },
+    },
+  ];
+  const session: AgentSession = {
+    id: 'session-delete-directory-reviewed',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let userDecisionSubmits = 0;
+  let actionBatchSubmits = 0;
+  const temporaryGrants: Array<Record<string, any>> = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'userDecisionSubmit') {
+        userDecisionSubmits += 1;
+        return { ok: true, events: [] };
+      }
+      if (command.kind === 'permissionGrantTemporary') {
+        temporaryGrants.push(command.grant);
+        return { ok: true, events: [] };
+      }
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: command.batch },
+            {
+              kind: 'work_unit.completed',
+              runId: command.runId,
+              sessionId: session.id,
+              workUnitId: 'work-unit-generic-directory-delete',
+              output: { path: 'generic-dir', kind: 'directory', recursive: true },
+            },
+          ],
+        };
+      }
+      return { ok: true, events: [] };
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + userDecisionSubmits + actionBatchSubmits + temporaryGrants.length + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-delete-directory-reviewed',
+    targetId: 'bundle-generic-delete',
+    existingEvents: events,
+  });
+
+  assertEqual(userDecisionSubmits, 1, 'reviewed directory delete submits the plan decision');
+  assertEqual(actionBatchSubmits, 1, 'reviewed directory delete submits an action batch');
+  assertEqual(temporaryGrants.length, 1, 'reviewed directory delete receives one scoped temporary grant');
+  assertEqual(temporaryGrants[0]?.resourceKind, 'workspaceDirectory', 'reviewed directory delete uses a directory scoped grant');
+  assertEqual(temporaryGrants[0]?.resourcePath, 'generic-dir', 'reviewed directory delete grant is scoped to the confirmed directory');
+  assertEqual(
+    result.events.some((event) => event.kind === 'error' && (event.payload as any).code === 'accepted_plan_action_batch_preflight_failed'),
+    false,
+    'reviewed directory delete does not fail Session preflight'
   );
 }
 
@@ -7809,12 +8010,18 @@ function requiredFileOperationsFromActionBundle(actionBundle: Record<string, any
     const capability = typeof action.capability === 'string' ? action.capability : '';
     const operation = fileOperationForAction(action, capability);
     if (!operation) continue;
+    const targetResourceKind = action.targetResourceKind === 'directory' || action.targetKind === 'directory'
+      ? 'directory'
+      : typeof action.targetPath === 'string' && action.targetPath.trim().endsWith('/')
+        ? 'directory'
+        : 'file';
+    const rawTarget = typeof action.targetPath === 'string'
+      ? action.targetPath
+      : Array.isArray(action.resourceScope) && typeof action.resourceScope[0] === 'string'
+        ? action.resourceScope[0]
+        : '';
     const target = concreteTestTarget(
-      typeof action.targetPath === 'string'
-        ? action.targetPath
-        : Array.isArray(action.resourceScope) && typeof action.resourceScope[0] === 'string'
-          ? action.resourceScope[0]
-          : '',
+      targetResourceKind === 'directory' ? rawTarget.replace(/\/+$/, '') : rawTarget,
       attachmentRoot
     );
     if (!target) continue;
@@ -7825,6 +8032,8 @@ function requiredFileOperationsFromActionBundle(actionBundle: Record<string, any
       capability,
       actionId: typeof action.id === 'string' ? action.id : typeof action.actionId === 'string' ? action.actionId : '',
       targetKind: outsideWorkspace ? 'absolutePath' : 'workspaceRelative',
+      targetResourceKind,
+      recursive: action.recursive === true || (targetResourceKind === 'directory' && rawTarget.trim().endsWith('/')),
       outsideWorkspace,
     });
   }

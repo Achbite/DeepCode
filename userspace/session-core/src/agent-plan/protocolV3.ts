@@ -188,6 +188,9 @@ function normalizePlannedActions(value: unknown, label: string): Array<Record<st
         ? optionalStringArray(record, 'permissionLabels')
         : (capability ? [capability] : []),
       dependsOn: optionalStringArray(record, 'dependsOn'),
+      targetKind: optionalString(record, 'targetKind') ?? optionalString(record, 'targetResourceKind'),
+      targetResourceKind: optionalString(record, 'targetResourceKind') ?? optionalString(record, 'targetKind'),
+      recursive: typeof record.recursive === 'boolean' ? record.recursive : optionalBoolean(optionalObjectRecord(record.toolArgs), 'recursive'),
       accessScopes: normalizeAccessScopes(record.accessScopes, `Agent Protocol v3.actionBundle.${label}[${index}].accessScopes`),
     };
   });
@@ -235,6 +238,9 @@ function normalizeFileOperations(value: unknown, label: string): Array<Record<st
       operation,
       capability: capability || capabilityForFileOperation(operation),
       targetPath,
+      targetKind: optionalString(record, 'targetKind') ?? optionalString(record, 'targetResourceKind'),
+      targetResourceKind: optionalString(record, 'targetResourceKind') ?? optionalString(record, 'targetKind'),
+      recursive: typeof record.recursive === 'boolean' ? record.recursive : undefined,
       reason: optionalString(record, 'reason') ?? optionalString(record, 'purpose'),
     };
   });
@@ -544,4 +550,9 @@ function optionalStringArray(value: Record<string, unknown>, key: string): strin
   const raw = value[key];
   if (!Array.isArray(raw)) return [];
   return raw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+}
+
+function optionalBoolean(value: Record<string, unknown> | undefined, key: string): boolean | undefined {
+  const raw = value?.[key];
+  return typeof raw === 'boolean' ? raw : undefined;
 }

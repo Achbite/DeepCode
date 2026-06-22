@@ -57,6 +57,8 @@ export interface PlannedActionDraft {
   sourceBlockId?: string;
   replacementBlockId?: string;
   targetPath?: string;
+  targetKind?: 'file' | 'directory' | string;
+  recursive?: boolean;
   patchSpec?: Record<string, unknown>;
   toolArgs?: Record<string, unknown>;
   permissionLabels?: string[];
@@ -73,6 +75,8 @@ export interface FileOperationDraft {
     rootId?: string;
   };
   targetPath?: string;
+  targetKind?: 'file' | 'directory' | string;
+  recursive?: boolean;
   reason?: string;
 }
 

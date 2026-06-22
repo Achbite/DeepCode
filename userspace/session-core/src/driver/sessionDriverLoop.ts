@@ -213,6 +213,7 @@ interface AcceptedImplementationPlanContext {
   tasks: AcceptedImplementationPlanTaskContext[];
   capabilities: string[];
   targetScopes: string[];
+  exactOperationGrants: AcceptedPlanExactOperationGrant[];
   accessScopes: AcceptedPlanAccessScope[];
   executionRoot?: AcceptedImplementationPlanExecutionRoot;
   interventionLevel?: InterventionLevel;
@@ -312,6 +313,19 @@ interface AcceptedPlanAccessScope {
   operations: string[];
   reason?: string;
   dependencyDepth?: number;
+  sourceTaskId?: string;
+  outsideWorkspace?: boolean;
+  source: 'kernelPlanReview' | 'implementationPlan';
+}
+
+interface AcceptedPlanExactOperationGrant {
+  operation: string;
+  targetPath: string;
+  targetRefPath?: string;
+  targetResourceKind?: 'file' | 'directory';
+  recursive?: boolean;
+  capability: string;
+  actionId?: string;
   sourceTaskId?: string;
   outsideWorkspace?: boolean;
   source: 'kernelPlanReview' | 'implementationPlan';
@@ -2235,8 +2249,8 @@ export class SessionDriverLoop {
       'Session 子代理并行草稿已经丢弃；parent fallback 的上一份输出仍不能继续执行。',
       `通用错误原因：${problemSummary}`,
       '请只基于当前 accepted implementationPlan、Kernel facts、ResourcePacket 和已确认 target/capability 范围继续。',
-      '如果要删除文件，fs.delete 必须使用 kind="delete"、capability="fs.delete"，并指向具体文件 targetPath/resourceScope；workspace 内默认使用相对路径，用户明确要求的外部文件可使用绝对文件路径交由 Kernel PlanReview 申请临时授权；不得使用目录、空目录清理、通配符、根目录、递归删除或空路径。',
-      '如果当前证据不足以枚举具体文件，请返回 resourceRequest 读取/列出必要资源；如果需要用户重新确认范围，请返回 decisionRequest 或 implementationPlan 修订。',
+      '如果要删除文件或已确认目录，fs.delete 必须使用 kind="delete"、capability="fs.delete"，并指向具体 targetPath/resourceScope；workspace 内默认使用相对路径，用户明确要求的外部目标可使用绝对路径交由 Kernel PlanReview 申请临时授权。目录删除只能在 accepted PlanReview 展示 exact directory scope 后输出，并必须设置 targetKind="directory"、recursive=true；不得使用通配符、根目录或空路径。',
+      '如果当前证据不足以枚举具体目标，请返回 resourceRequest 读取/列出必要资源；如果需要用户重新确认范围，请返回 decisionRequest 或 implementationPlan 修订。',
       'repair 只能输出一个合规 proposal：actionBundle、resourceRequest、decisionRequest 或 implementationPlan。',
       diagnostics.length
         ? `已丢弃的子代理诊断摘要：\n${diagnostics.map((item) =>
@@ -4865,9 +4879,13 @@ function implementationBatchHints(
         : 'Current accepted implementationPlan task could not be inferred from batchIndex; keep the next batch minimal and in scope.',
       `Accepted implementationPlan capabilities: ${acceptedPlan.capabilities.length ? acceptedPlan.capabilities.join(', ') : 'none'}.`,
       `Accepted implementationPlan target scopes: ${acceptedPlan.targetScopes.length ? acceptedPlan.targetScopes.join(', ') : 'none'}.`,
+      acceptedPlan.exactOperationGrants.length
+        ? `Accepted implementationPlan exact operation grants: ${acceptedPlan.exactOperationGrants.map((grant) => `${grant.operation}:${grant.capability}:${grant.targetPath}`).join(', ')}.`
+        : 'Accepted implementationPlan exact operation grants: none.',
       acceptedPlan.accessScopes.length
         ? `Accepted implementationPlan access scopes: ${acceptedPlan.accessScopes.map((scope) => `${scope.scopeKind}:${scope.path}:${scope.capabilities.join('|')}:depth${scope.dependencyDepth ?? 0}`).join(', ')}.`
         : 'Accepted implementationPlan access scopes: none.',
+      'Exact file operations such as fs.delete/fs.rename are authorized by exact operation grants, not by actionBundle.accessScopes. accessScopes are only for workspace module or one-hop dependency fs.write/fs.patch batches.',
       acceptedPlan.executionRoot
         ? `Accepted implementationPlan primary root: ${acceptedPlan.executionRoot.ref}. Workspace actionBundle targetPath/codeBlock paths must be relative to this root and must not include the root directory name. Absolute paths are allowed only for outside-workspace targets already reviewed in the accepted plan.`
         : 'Accepted implementationPlan primary root is not explicit; use relative target paths from the authorized workspace root unless the accepted plan explicitly contains outside-workspace absolute file targets.',
@@ -6288,10 +6306,36 @@ function deleteActionTargetError(action: ActionBundleDraft['actions'][number]): 
   if (normalized.includes('*')) {
     return 'fs.delete target must name concrete files; wildcard cleanup is not allowed.';
   }
+  if (deleteActionTargetResourceKind(action) === 'directory') {
+    if (!deleteActionRecursive(action) && normalized.endsWith('/')) {
+      return 'fs.delete directory target with trailing slash must set recursive=true or use the normalized directory path.';
+    }
+    return undefined;
+  }
   if (normalized.endsWith('/')) {
-    return 'fs.delete target must name concrete files, not a directory root.';
+    return 'fs.delete directory target must set targetKind="directory" and recursive=true when deleting a directory tree.';
   }
   return undefined;
+}
+
+function deleteActionTargetResourceKind(action: {
+  targetResourceKind?: unknown;
+  targetKind?: unknown;
+  toolArgs?: unknown;
+}): 'file' | 'directory' | undefined {
+  const toolArgs = objectRecord(action.toolArgs);
+  const value = stringValue(action.targetResourceKind)
+    ?? stringValue(action.targetKind)
+    ?? stringValue(toolArgs?.targetResourceKind)
+    ?? stringValue(toolArgs?.targetKind);
+  if (value === 'directory' || value === 'dir') return 'directory';
+  if (value === 'file') return 'file';
+  return undefined;
+}
+
+function deleteActionRecursive(action: { recursive?: unknown; toolArgs?: unknown }): boolean {
+  const toolArgs = objectRecord(action.toolArgs);
+  return action.recursive === true || toolArgs?.recursive === true;
 }
 
 function patchActionSpecError(action: ActionBundleDraft['actions'][number]): string | undefined {
@@ -7129,12 +7173,17 @@ function acceptedImplementationPlanContext(
   });
   const capabilities = [...new Set(taskContexts.map((task) => task.capability).filter((item): item is string => Boolean(item)))];
   const targetScopes = [...new Set(taskContexts.flatMap((task) => task.targets).filter(Boolean))];
+  const exactOperationGrants = [
+    ...exactOperationGrantsFromImplementationPlan(rawPlan, executionRoot),
+    ...exactOperationGrantsFromPlanReviewReport(plan.planReviewReport, executionRoot),
+  ];
   const accessScopes = [
     ...accessScopesFromImplementationPlan(rawPlan),
     ...requiredAccessScopesFromReport(plan.planReviewReport),
   ];
   const acceptedCapabilities = [...new Set([
     ...capabilities,
+    ...exactOperationGrants.map((grant) => grant.capability),
     ...accessScopes.flatMap((scope) => scope.capabilities),
   ].filter(Boolean))];
   return {
@@ -7145,6 +7194,7 @@ function acceptedImplementationPlanContext(
     tasks: taskContexts,
     capabilities: acceptedCapabilities,
     targetScopes,
+    exactOperationGrants,
     accessScopes,
     executionRoot,
     interventionLevel,
@@ -7294,13 +7344,24 @@ function normalizeAcceptedPlanKernelBatch(
     const kind = stringValue(next.kind);
     if (capability === 'fs.delete') {
       next.kind = kind ?? 'delete';
-      const target = acceptedPlanConcreteFileOperationTarget(actionFileTargetPath(next) ?? '', accepted);
+      const deleteGrant = acceptedPlanExactOperationGrantForAction(next, accepted);
+      const target = acceptedPlanConcreteDeleteOperationTarget(
+        actionFileTargetPath(next) ?? '',
+        accepted,
+        deleteGrant
+      );
       if (!target) {
-        reasons.push(`actionBundle.actions[${index}] fs.delete 缺少可执行的具体文件 targetPath/resourceScope。`);
+        reasons.push(`actionBundle.actions[${index}] fs.delete 缺少可执行的具体目标 targetPath/resourceScope。`);
       } else {
         next.targetPath = target;
         next.resourceScope = [target];
         next.targetRef = objectRecord(next.targetRef) ?? fileTargetRefFromPath(target);
+        const targetResourceKind = deleteActionTargetResourceKind(next) ?? deleteGrant?.targetResourceKind;
+        if (targetResourceKind === 'directory') {
+          next.targetKind = 'directory';
+          next.targetResourceKind = 'directory';
+          next.recursive = deleteActionRecursive(next) || deleteGrant?.recursive === true;
+        }
       }
       return next;
     }
@@ -7374,6 +7435,8 @@ function acceptedPlanBatchPreflightAudit(batch: Record<string, unknown>): Record
       kind: stringValue(action.kind),
       targetRef: objectRecord(action.targetRef) ?? stringValue(action.targetRef),
       targetPath: stringValue(action.targetPath),
+      targetKind: stringValue(action.targetKind) ?? stringValue(action.targetResourceKind),
+      recursive: action.recursive === true,
       resourceScope: stringArrayValue(action.resourceScope),
       sourceBlockId: stringValue(action.sourceBlockId),
       replacementBlockId: stringValue(action.replacementBlockId),
@@ -7395,11 +7458,16 @@ function acceptedPlanDeletePreflightReasons(
     }
     const normalized = target ? normalizePlanScope(target) : undefined;
     if (!normalized || normalized === '.' || normalized === './') {
-      reasons.push(`actionBatch.actions[${index}] fs.delete 缺少具体文件 targetPath/resourceScope。`);
-    } else if (normalized.endsWith('/')) {
-      reasons.push(`actionBatch.actions[${index}] fs.delete 不能以目录根作为 target。`);
-    } else if (resourcePacketsContainDirectoryPath(resourcePackets, normalized)) {
-      reasons.push(`actionBatch.actions[${index}] fs.delete target ${normalized} 是 ResourcePacket 中的目录，不是具体文件。`);
+      reasons.push(`actionBatch.actions[${index}] fs.delete 缺少具体目标 targetPath/resourceScope。`);
+    } else {
+      const targetResourceKind = deleteActionTargetResourceKind(action);
+      const normalizedDirectory = normalizePlanScope(normalized).replace(/\/+$/, '');
+      const resourcePacketSaysDirectory = resourcePacketsContainDirectoryPath(resourcePackets, normalizedDirectory);
+      if ((normalized.endsWith('/') || resourcePacketSaysDirectory) && targetResourceKind !== 'directory') {
+        reasons.push(`actionBatch.actions[${index}] fs.delete target ${normalizedDirectory} 是目录；目录删除必须显式设置 targetKind="directory"。`);
+      } else if (targetResourceKind === 'directory' && !deleteActionRecursive(action)) {
+        reasons.push(`actionBatch.actions[${index}] fs.delete directory target ${normalizedDirectory} 必须显式设置 recursive=true，或改为删除空目录语义。`);
+      }
     }
     if (stringValue(action.sourceBlockId) || stringValue(action.replacementBlockId)) {
       reasons.push(`actionBatch.actions[${index}] fs.delete 不得引用 codeBlock。`);
@@ -8240,12 +8308,12 @@ function workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[] {
   return [...ids];
 }
 
-function normalizeAcceptedPlanTargetScope(
+function normalizePlanTargetForExecutionRoot(
   value: string,
-  accepted: AcceptedImplementationPlanContext
+  executionRoot?: AcceptedImplementationPlanExecutionRoot
 ): string {
   const normalized = normalizePlanScope(value);
-  const rootRef = accepted.executionRoot?.ref;
+  const rootRef = executionRoot?.ref;
   if (!rootRef) return normalized;
   const root = comparablePath(rootRef);
   const candidate = comparablePath(value);
@@ -8260,6 +8328,13 @@ function normalizeAcceptedPlanTargetScope(
     return normalizePlanScope(normalized.slice(rootName.length + 1));
   }
   return normalized;
+}
+
+function normalizeAcceptedPlanTargetScope(
+  value: string,
+  accepted: AcceptedImplementationPlanContext
+): string {
+  return normalizePlanTargetForExecutionRoot(value, accepted.executionRoot);
 }
 
 function acceptedPlanAutoExecutableCapability(capability: string): boolean {
@@ -8310,6 +8385,8 @@ function scopeCoveredByAcceptedPlanForCapability(
 ): boolean {
   const normalized = normalizePlanScope(scope);
   if (!normalized) return false;
+  if (exactOperationGrantCoversAcceptedPlanTarget(normalized, capability, accepted)) return true;
+  if (capability === 'fs.delete' || capability === 'fs.rename') return false;
   const acceptedScopes = accepted.targetScopes.map(normalizePlanScope).filter(Boolean);
   if (scopeCoveredByAcceptedPlan(normalized, acceptedScopes)) return true;
   return accepted.accessScopes.some((accessScope) => {
@@ -8317,6 +8394,32 @@ function scopeCoveredByAcceptedPlanForCapability(
     if (!accessScopeCapabilityMatches(accessScope, capability)) return false;
     return planScopeCovers(accessScope.path, normalized);
   });
+}
+
+function exactOperationGrantCoversAcceptedPlanTarget(
+  scope: string,
+  capability: string | undefined,
+  accepted: AcceptedImplementationPlanContext
+): boolean {
+  const normalized = normalizePlanScope(scope);
+  if (!normalized || !capability) return false;
+  return accepted.exactOperationGrants.some((grant) => {
+    if (!exactOperationGrantCapabilityMatches(grant, capability)) return false;
+    return normalizePlanScope(grant.targetPath) === normalized;
+  });
+}
+
+function exactOperationGrantCapabilityMatches(
+  grant: AcceptedPlanExactOperationGrant,
+  capability: string | undefined
+): boolean {
+  if (!capability) return false;
+  if (grant.capability === capability) return true;
+  if (capability === 'fs.write' && ['create', 'write'].includes(grant.operation)) return true;
+  if (capability === 'fs.patch' && grant.operation === 'patch') return true;
+  if (capability === 'fs.delete' && grant.operation === 'delete') return true;
+  if (capability === 'fs.rename' && grant.operation === 'rename') return true;
+  return false;
 }
 
 function accessScopeCapabilityMatches(scope: AcceptedPlanAccessScope, capability: string | undefined): boolean {
@@ -8429,7 +8532,10 @@ function acceptedPlanOutOfScopeDecisionProposal(
         ],
       allowsFreeform: true,
       risks: reasons,
-      affectedAreas: accepted?.targetScopes ?? [],
+      affectedAreas: uniqueStrings([
+        ...(accepted?.targetScopes ?? []),
+        ...((accepted?.exactOperationGrants ?? []).map((grant) => grant.targetPath)),
+      ]),
       constraints: [
         'Accepted implementationPlan controls automatic batch execution scope.',
         'Kernel permissions remain authoritative.',
@@ -9130,11 +9236,13 @@ function temporaryGrantsForPlan(plan: SessionPlanContext): Record<string, unknow
     const capability = operation.capability;
     if (!gapSet.has(capability)) continue;
     if (!planAcceptedAutoGrantCapability(capability)) continue;
-    const targetPath = concreteFileOperationTarget(operation.targetPath ?? operation.targetRefPath ?? '');
+    const targetPath = operation.targetResourceKind === 'directory'
+      ? concreteDirectoryOperationTarget(operation.targetPath ?? operation.targetRefPath ?? '')
+      : concreteFileOperationTarget(operation.targetPath ?? operation.targetRefPath ?? '');
     if (!targetPath) continue;
-    const resourceKind = operation.outsideWorkspace || isAbsolutePath(targetPath)
-      ? 'externalFile'
-      : undefined;
+    const resourceKind = operation.targetResourceKind === 'directory'
+      ? (operation.outsideWorkspace || isAbsolutePath(targetPath) ? 'externalDirectory' : 'workspaceDirectory')
+      : (operation.outsideWorkspace || isAbsolutePath(targetPath) ? 'externalFile' : undefined);
     const key = `${capability}\0${resourceKind ?? 'default'}\0${targetPath}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -9196,6 +9304,8 @@ interface RequiredFileOperationProjection {
   capability: string;
   actionId?: string;
   targetKind?: string;
+  targetResourceKind?: 'file' | 'directory';
+  recursive?: boolean;
   outsideWorkspace?: boolean;
 }
 
@@ -9208,18 +9318,153 @@ function requiredFileOperationsFromReport(report: Record<string, unknown> | unde
     if (!record) continue;
     const operation = stringValue(record.operation);
     const targetRefPath = fileTargetRefPath(record.targetRef);
-    const targetPath = concreteFileOperationTarget(stringValue(record.targetPath) ?? targetRefPath ?? '');
+    const rawTargetPath = stringValue(record.targetPath) ?? targetRefPath ?? '';
     const capability = stringValue(record.capability);
+    const targetResourceKindValue = stringValue(record.targetResourceKind);
+    const targetResourceKind = targetResourceKindValue === 'directory' || targetResourceKindValue === 'dir'
+      ? 'directory'
+      : 'file';
+    const targetPath = targetResourceKind === 'directory'
+      ? concreteDirectoryOperationTarget(rawTargetPath)
+      : concreteFileOperationTarget(rawTargetPath);
     if (!operation || !targetPath || !capability) continue;
     const actionId = stringValue(record.actionId);
     const targetKind = stringValue(record.targetKind);
+    const recursive = record.recursive === true;
     const outsideWorkspace = Boolean(record.outsideWorkspace) || isAbsolutePath(targetPath);
     const key = `${operation}\0${capability}\0${targetPath}\0${actionId ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    output.push({ operation, targetPath, targetRefPath, capability, actionId, targetKind, outsideWorkspace });
+    output.push({ operation, targetPath, targetRefPath, capability, actionId, targetKind, targetResourceKind, recursive, outsideWorkspace });
   }
   return output;
+}
+
+function exactOperationGrantsFromPlanReviewReport(
+  report: Record<string, unknown> | undefined,
+  executionRoot?: AcceptedImplementationPlanExecutionRoot
+): AcceptedPlanExactOperationGrant[] {
+  return normalizeAcceptedPlanExactOperationGrants(
+    requiredFileOperationsFromReport(report).map((operation) => ({
+      ...operation,
+      source: 'kernelPlanReview' as const,
+    })),
+    executionRoot
+  );
+}
+
+function exactOperationGrantsFromImplementationPlan(
+  plan: Record<string, unknown> | undefined,
+  executionRoot?: AcceptedImplementationPlanExecutionRoot
+): AcceptedPlanExactOperationGrant[] {
+  const grants: AcceptedPlanExactOperationGrant[] = [];
+  const topLevelOperations = Array.isArray(plan?.fileOperations) ? plan.fileOperations : [];
+  for (const operation of topLevelOperations) {
+    const grant = exactOperationGrantFromRawOperation(operation, undefined, executionRoot);
+    if (grant) grants.push(grant);
+  }
+  const tasks = Array.isArray(plan?.tasks) ? plan.tasks : [];
+  for (const item of tasks) {
+    const task = objectRecord(item);
+    if (!task) continue;
+    const sourceTaskId = stringValue(task.taskId) ?? stringValue(task.id);
+    const taskCapability = stringValue(task.capability);
+    const fileOperations = Array.isArray(task.fileOperations) ? task.fileOperations : [];
+    for (const operation of fileOperations) {
+      const grant = exactOperationGrantFromRawOperation(operation, {
+        capability: taskCapability,
+        sourceTaskId,
+      }, executionRoot);
+      if (grant) grants.push(grant);
+    }
+    if (taskCapability === 'fs.delete' || taskCapability === 'fs.rename') {
+      for (const target of stringArrayValue(task.target)) {
+        const grant = exactOperationGrantFromRawOperation({
+          operation: taskCapability === 'fs.delete' ? 'delete' : 'rename',
+          capability: taskCapability,
+          targetPath: target,
+        }, { capability: taskCapability, sourceTaskId }, executionRoot);
+        if (grant) grants.push(grant);
+      }
+    }
+  }
+  return normalizeAcceptedPlanExactOperationGrants(grants, executionRoot);
+}
+
+function exactOperationGrantFromRawOperation(
+  value: unknown,
+  fallback: { capability?: string; sourceTaskId?: string } | undefined,
+  executionRoot?: AcceptedImplementationPlanExecutionRoot
+): AcceptedPlanExactOperationGrant | undefined {
+  const record = objectRecord(value);
+  if (!record) return undefined;
+  const operation = stringValue(record.operation);
+  const capability = stringValue(record.capability) ?? fallback?.capability;
+  const rawTarget = stringValue(record.targetPath) ?? fileTargetRefPath(record.targetRef);
+  const targetResourceKind = fileOperationTargetResourceKind(record, rawTarget);
+  const targetPath = rawTarget
+    ? targetResourceKind === 'directory'
+      ? concreteDirectoryOperationTarget(normalizePlanTargetForExecutionRoot(rawTarget, executionRoot))
+      : concreteFileOperationTarget(normalizePlanTargetForExecutionRoot(rawTarget, executionRoot))
+    : undefined;
+  if (!operation || !capability || !targetPath) return undefined;
+  if (!planAcceptedAutoGrantCapability(capability)) return undefined;
+  return {
+    operation,
+    targetPath,
+    targetRefPath: fileTargetRefPath(record.targetRef),
+    targetResourceKind,
+    recursive: fileOperationRecursive(record, targetResourceKind, rawTarget),
+    capability,
+    actionId: stringValue(record.actionId),
+    sourceTaskId: fallback?.sourceTaskId ?? stringValue(record.sourceTaskId) ?? stringValue(record.taskId),
+    outsideWorkspace: Boolean(record.outsideWorkspace) || isAbsolutePath(targetPath),
+    source: 'implementationPlan',
+  };
+}
+
+function normalizeAcceptedPlanExactOperationGrants(
+  grants: AcceptedPlanExactOperationGrant[],
+  executionRoot?: AcceptedImplementationPlanExecutionRoot
+): AcceptedPlanExactOperationGrant[] {
+  const output: AcceptedPlanExactOperationGrant[] = [];
+  const seen = new Set<string>();
+  for (const grant of grants) {
+    const targetPath = grant.targetResourceKind === 'directory'
+      ? concreteDirectoryOperationTarget(normalizePlanTargetForExecutionRoot(grant.targetPath, executionRoot))
+      : concreteFileOperationTarget(normalizePlanTargetForExecutionRoot(grant.targetPath, executionRoot));
+    if (!grant.operation || !grant.capability || !targetPath) continue;
+    if (!planAcceptedAutoGrantCapability(grant.capability)) continue;
+    const key = `${grant.operation}\0${grant.capability}\0${targetPath}\0${grant.actionId ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push({
+      ...grant,
+      targetPath,
+      targetResourceKind: grant.targetResourceKind ?? 'file',
+      outsideWorkspace: Boolean(grant.outsideWorkspace) || isAbsolutePath(targetPath),
+    });
+  }
+  return output;
+}
+
+function fileOperationTargetResourceKind(
+  record: Record<string, unknown>,
+  rawTarget: string | undefined
+): 'file' | 'directory' {
+  const value = stringValue(record.targetResourceKind) ?? stringValue(record.targetKind);
+  if (value === 'directory' || value === 'dir') return 'directory';
+  if (value === 'file') return 'file';
+  return rawTarget?.trim().endsWith('/') ? 'directory' : 'file';
+}
+
+function fileOperationRecursive(
+  record: Record<string, unknown>,
+  targetResourceKind: 'file' | 'directory',
+  rawTarget: string | undefined
+): boolean {
+  if (record.recursive === true) return true;
+  return targetResourceKind === 'directory' && Boolean(rawTarget?.trim().endsWith('/'));
 }
 
 function requiredAccessScopesFromReport(report: Record<string, unknown> | undefined): AcceptedPlanAccessScope[] {
@@ -9239,21 +9484,6 @@ function accessScopesFromImplementationPlan(plan: Record<string, unknown> | unde
       sourceTaskId: stringValue((objectRecord(scope) ?? {})?.sourceTaskId) ?? stringValue(task.taskId) ?? stringValue(task.id),
       capability: stringValue((objectRecord(scope) ?? {})?.capability) ?? stringValue(task.capability),
     })));
-    for (const operation of Array.isArray(task.fileOperations) ? task.fileOperations : []) {
-      const record = objectRecord(operation);
-      if (!record) continue;
-      const targetPath = stringValue(record.targetPath) ?? fileTargetRefPath(record.targetRef);
-      if (!targetPath) continue;
-      scopes.push({
-        scopeKind: 'exactFile',
-        path: targetPath,
-        capability: stringValue(record.capability) ?? stringValue(task.capability),
-        operations: [stringValue(record.operation) ?? 'write'].filter(Boolean),
-        reason: stringValue(record.reason),
-        dependencyDepth: 0,
-        sourceTaskId: stringValue(task.taskId) ?? stringValue(task.id),
-      });
-    }
   }
   return normalizeAcceptedPlanAccessScopes(scopes, 'implementationPlan');
 }
@@ -9334,6 +9564,15 @@ function concreteFileOperationTarget(value: string): string | undefined {
   return normalized;
 }
 
+function concreteDirectoryOperationTarget(value: string): string | undefined {
+  const normalized = normalizePlanScope(value).replace(/\/+$/, '');
+  if (!normalized || normalized === '.' || normalized === './') return undefined;
+  if (isAbsolutePath(normalized)) return concreteAbsoluteDirectoryOperationTarget(normalized);
+  if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) return undefined;
+  if (normalized.includes('*')) return undefined;
+  return normalized;
+}
+
 function concreteAbsoluteFileOperationTarget(value: string): string | undefined {
   const normalized = normalizeSlashes(value);
   if (!isAbsolutePath(normalized)) return undefined;
@@ -9346,12 +9585,50 @@ function concreteAbsoluteFileOperationTarget(value: string): string | undefined 
   return normalized;
 }
 
+function concreteAbsoluteDirectoryOperationTarget(value: string): string | undefined {
+  const normalized = normalizeSlashes(value).replace(/\/+$/, '');
+  if (!isAbsolutePath(normalized)) return undefined;
+  if (!normalized || normalized === '/' || /^[a-zA-Z]:\/?$/.test(normalized)) return undefined;
+  if (normalized.includes('*')) return undefined;
+  if (normalized.includes('/../') || normalized.endsWith('/..')) return undefined;
+  const base = basename(normalized);
+  if (!base || base === '.' || base === '..') return undefined;
+  return normalized;
+}
+
 function acceptedPlanConcreteFileOperationTarget(
   value: string,
   accepted?: AcceptedImplementationPlanContext
 ): string | undefined {
   const normalized = accepted ? normalizeAcceptedPlanTargetScope(value, accepted) : normalizePlanScope(value);
   return concreteFileOperationTarget(normalized);
+}
+
+function acceptedPlanConcreteDeleteOperationTarget(
+  value: string,
+  accepted: AcceptedImplementationPlanContext | undefined,
+  grant?: AcceptedPlanExactOperationGrant
+): string | undefined {
+  const normalized = accepted ? normalizeAcceptedPlanTargetScope(value, accepted) : normalizePlanScope(value);
+  if (grant?.targetResourceKind === 'directory') {
+    return concreteDirectoryOperationTarget(normalized);
+  }
+  return concreteFileOperationTarget(normalized) ?? concreteDirectoryOperationTarget(normalized);
+}
+
+function acceptedPlanExactOperationGrantForAction(
+  action: Record<string, unknown>,
+  accepted?: AcceptedImplementationPlanContext
+): AcceptedPlanExactOperationGrant | undefined {
+  if (!accepted) return undefined;
+  const capability = stringValue(action.capability);
+  const rawTarget = actionFileTargetPath(action);
+  if (!capability || !rawTarget) return undefined;
+  const normalized = normalizeAcceptedPlanTargetScope(rawTarget, accepted).replace(/\/+$/, '');
+  return accepted.exactOperationGrants.find((grant) =>
+    exactOperationGrantCapabilityMatches(grant, capability) &&
+    normalizePlanScope(grant.targetPath).replace(/\/+$/, '') === normalized
+  );
 }
 
 function planAcceptedAutoGrantCapability(capability: string): boolean {
@@ -9851,7 +10128,7 @@ function reviewContinuationRequest(review: SessionReviewContext): string {
       '- 如需基于现有代码继续修改，先用 resourceRequest kind="search" 或 file/range 读取相关文件事实。',
       '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
       '- 每个 fs.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId；patch 必须包含 patchSpec.match.kind="exactBlock" 和当前 ResourcePacket 证据中的 exact text。',
-      '- fs.delete action 必须使用 kind="delete"、capability="fs.delete"、明确相对文件 targetPath/resourceScope；不得使用 codeBlocks/sourceBlockId、空内容写入、fs.write 伪装删除、目录、通配符或递归删除。',
+      '- fs.delete action 必须使用 kind="delete"、capability="fs.delete"、明确相对文件 targetPath/resourceScope；已确认目录删除必须额外设置 targetKind="directory"、recursive=true；不得使用 codeBlocks/sourceBlockId、空内容写入、fs.write 伪装删除、通配符或根目录。',
       '- 新 Plan 必须等待用户确认，不要假定已经执行。',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
@@ -9885,8 +10162,8 @@ function implementationPlanExecutionRequest(
     '如果发现必须新增 target/capability，或缺少关键技术选择，请返回 kind="decisionRequest" 或 kind="implementationPlan" 修订，而不是输出超范围 actionBundle。',
     '本轮 actionBundle 必须包含具体 codeBlocks/commandBlocks（如需要）和 Kernel 可审查的 validationExpectations/reviewExpectations；validationExpectations 使用 [{id,description,command?}]，reviewExpectations 使用 [{id,description}]。',
     '修改已有文件时，先使用 resourceRequest kind="search" 或 file/range 读取当前锚点；patch action 必须包含 patchSpec.match.kind="exactBlock" 和从当前 ResourcePacket fileText/searchResults 复制的非空 patchSpec.match.text。',
-    '删除文件时必须输出 fs.delete action：kind="delete"、capability="fs.delete"、targetPath/resourceScope 为已确认任务范围内的具体文件路径；workspace 文件用相对路径，已确认的外部文件可用绝对文件路径；删除 action 不需要也不得引用 codeBlocks/sourceBlockId。',
-    '清理目录时必须先根据 ResourcePacket directoryTree 展开为具体文件级 target；目录、空目录、通配符、根目录和递归删除不能作为 fs.delete action。',
+    '删除文件或已确认目录时必须输出 fs.delete action：kind="delete"、capability="fs.delete"、targetPath/resourceScope 为已确认任务范围内的具体路径；workspace 目标用相对路径，已确认的外部目标可用绝对路径；删除 action 不需要也不得引用 codeBlocks/sourceBlockId。',
+    '目录删除只能在 accepted PlanReview 已展示 exact directory operation/grant 时使用；必须设置 targetKind="directory"、recursive=true。未确认目录、通配符、根目录和空路径不能作为 fs.delete action。',
     `总 codeBlock 内容必须控制在 ${MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES} bytes payload 预算内。新建文件优先一次性完整写入；已有文件大范围改写必须按模块、函数、类、文件 section、脚本段或配置段切片。continuationExpectations 只表示 payload/证据/依赖延后，不表示缩小 accepted plan 授权范围。`,
     guidance?.trim() ? `用户确认计划时补充的 guidance：\n${guidance.trim()}` : '',
     `Accepted implementationPlan:\n${planJson}`,
@@ -9909,7 +10186,7 @@ function reviewRevisionRequest(review: SessionReviewContext, guidance?: string):
       '- 如需基于现有代码继续修改，先用 resourceRequest kind="search" 或 file/range 读取相关文件事实，例如构建脚本、入口源码、头文件、测试或容器配置。',
       '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
       '- 每个 fs.write/create/patch action 必须引用本轮 codeBlocks 的 sourceBlockId 或 replacementBlockId；patch 必须包含 patchSpec.match.kind="exactBlock" 和当前 ResourcePacket 证据中的 exact text。',
-      '- fs.delete action 必须使用 kind="delete"、capability="fs.delete"、明确相对文件 targetPath/resourceScope；不得使用 codeBlocks/sourceBlockId、空内容写入、fs.write 伪装删除、目录、通配符或递归删除。',
+      '- fs.delete action 必须使用 kind="delete"、capability="fs.delete"、明确相对文件 targetPath/resourceScope；已确认目录删除必须额外设置 targetKind="directory"、recursive=true；不得使用 codeBlocks/sourceBlockId、空内容写入、fs.write 伪装删除、通配符或根目录。',
       '- 新 Plan 等待用户确认，不要假定已经执行。',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
@@ -10601,10 +10878,10 @@ function actionBundleAdmissionRepairMessages(
       content: [
         'You are the DeepCode Agent Protocol v3 actionBundle admission repair step.',
         'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
-        'The current actionBundle is not allowed to become a confirmable plan card because Session detected non-file-level delete targets.',
-        'fs.delete is file-level only: use kind="delete", capability="fs.delete", and concrete file targetPath/resourceScope entries. Workspace files should use relative paths; user-confirmed outside files may use absolute paths.',
-        'Do not output directory delete actions, recursive delete actions, empty-directory cleanup, wildcard cleanup, workspace root cleanup, or fs.write disguised as delete.',
-        'If the user intent mentions clearing a directory, expand it using ResourcePacket directoryTree evidence into specific file targets. Omit empty directory removal.',
+        'The current actionBundle is not allowed to become a confirmable plan card because Session detected delete targets that are not concrete enough for Kernel review.',
+        'fs.delete must use kind="delete", capability="fs.delete", and concrete targetPath/resourceScope entries. Workspace targets should use relative paths; user-confirmed outside targets may use absolute paths.',
+        'Directory delete actions are allowed only when the provider explicitly requests a concrete directory target with targetKind="directory" and recursive=true so Kernel PlanReview can show that exact sensitive operation on the plan card.',
+        'Do not output wildcard cleanup, workspace root cleanup, empty target cleanup, or fs.write disguised as delete. If the user intent mentions clearing a directory but you cannot identify the exact directory target, return resourceRequest/decisionRequest instead of guessing.',
         'If current evidence is insufficient to enumerate concrete files, return kind="resourceRequest" for a directoryTree/file/search read instead of guessing.',
         'If the deletion scope is ambiguous or needs a user choice, return kind="decisionRequest".',
         'Do not claim execution, permissions, tests passed, or task completion.',
@@ -10624,7 +10901,7 @@ function actionBundleAdmissionRepairMessages(
         'Session admission reasons:',
         fenced(reasons.map((reason) => `- ${reason}`).join('\n')),
         'Repair requirement:',
-        fenced('Return a corrected file-level actionBundle, or return resourceRequest/decisionRequest if evidence or user confirmation is required. Do not return a confirmable plan with directory delete targets.'),
+        fenced('Return a corrected actionBundle with concrete file targets or explicit directory targets shaped {kind:"delete",capability:"fs.delete",targetPath:"relative/dir",targetKind:"directory",recursive:true}. Return resourceRequest/decisionRequest if evidence or user confirmation is required. Do not return workspace root, wildcard, empty target, or ambiguous directory cleanup.'),
       ].join('\n\n'),
     },
   ];
@@ -10636,9 +10913,9 @@ function actionBundleAdmissionResourceFollowupRequest(
 ): string {
   return [
     'Session 已补充 actionBundle admission 所需的只读资源证据。',
-    '请继续生成同一用户请求的可确认计划，但必须满足文件级删除约束。',
-    'fs.delete 只能列出具体文件；workspace 文件使用相对路径，已确认的外部文件使用绝对文件路径；不得输出目录、空目录清理、通配符、根目录或递归目录删除。',
-    '如果 ResourcePacket 显示某个目标是目录，请展开为其中具体文件；如果目录为空，不要为该目录生成 delete action。',
+    '请继续生成同一用户请求的可确认计划，但必须满足具体目标删除约束。',
+    'fs.delete 必须列出具体文件或显式目录；workspace 目标使用相对路径，已确认的外部目标使用绝对路径。目录删除必须写成 targetKind="directory"、recursive=true，供 Kernel PlanReview 展示并申请用户确认；不得输出通配符、根目录或空目标。',
+    '如果 ResourcePacket 显示某个目标是目录，且用户意图确实是删除该目录，可以保留该目录 target 并显式 targetKind="directory"/recursive=true；如果目录范围不确定，请返回 decisionRequest。',
     '如果仍无法确认具体文件范围，请返回 decisionRequest，而不是输出不可执行 actionBundle。',
     reasons.length ? `上一次 admission 拒绝原因：\n${reasons.map((reason) => `- ${reason}`).join('\n')}` : '',
     `当前 runId: ${state.runId}`,
@@ -10662,9 +10939,10 @@ function acceptedPlanScopeRepairMessages(
         'For kind="actionBundle", put userPlanMarkdown, codeBlocks, commandBlocks, actionBundle, expectedValidation, and reviewGuide directly on the top-level JSON object. Do not wrap them in a payload object.',
         'Accepted-plan execution batches should not request workspace root, ".", module root, wildcard, or traversal accessScopes. The accepted PlanReview scope is already the authorization source; list concrete targetPath/targetRef/codeBlock.targetPath instead.',
         'If an action already has a concrete target such as targetPath="build.sh", remove redundant root accessScopes instead of asking for broader scope.',
+        'Do not represent exact file operations as accessScopes.scopeKind="exactFile". Delete and rename authorization comes from accepted fileOperations/requiredFileOperations exact grants.',
         'If a patch needs current file evidence, return kind="resourceRequest" with kind="search" or a focused file/range read under the conversation roots; Session will resolve it and resume the accepted plan.',
         'Patch actions must use patchSpec.match.kind="exactBlock" and patchSpec.match.text copied from current ResourcePacket fileText/searchResults evidence.',
-        'If the accepted plan is missing a required target, capability, or material technical choice, return kind="decisionRequest" or kind="implementationPlan" revision.',
+        'If the accepted plan is missing a required exact file target, capability, or material technical choice, return kind="decisionRequest" or kind="implementationPlan" revision that adds implementationPlan.tasks[].fileOperations for concrete files; do not add exactFile accessScopes.',
         'Do not claim execution, permissions, tests passed, or task completion.',
       ].join('\n'),
     },
