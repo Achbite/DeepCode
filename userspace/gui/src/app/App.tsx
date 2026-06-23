@@ -22,7 +22,7 @@ import {
 import { getTabId, useEditorStore } from '../state/editorStore';
 import WindowControls from '../components/window-controls/WindowControls';
 import type { ConfirmDialogAction, ConfirmDialogData } from '../types/ui';
-import { t } from '../i18n';
+import { activeT, getActiveUiLanguage, normalizeUiLanguage, setActiveUiLanguage, t } from '../i18n';
 import './app.css';
 
 const WorkbenchLayout = lazy(() => import('./layout/WorkbenchLayout'));
@@ -87,15 +87,15 @@ function scheduleIdle(task: () => void, timeout = 1200): () => void {
 }
 
 const BootShellFallback: React.FC = () => (
-  <div className="app-boot-shell" aria-label={t('zh-CN', 'app.startingAria')}>
+  <div className="app-boot-shell" aria-label={activeT('app.startingAria')}>
     <div className="app-boot-shell__header" data-tauri-drag-region>
       <span>DeepCode</span>
-      <WindowControls language="zh-CN" />
+      <WindowControls language={getActiveUiLanguage()} />
     </div>
     <div className="app-boot-shell__body">
       <div className="app-boot-shell__rail" />
       <div className="app-boot-shell__side" />
-      <div className="app-boot-shell__center">{t('zh-CN', 'app.starting')}</div>
+      <div className="app-boot-shell__center">{activeT('app.starting')}</div>
       <div className="app-boot-shell__agent" />
     </div>
     <div className="app-boot-shell__status" />
@@ -123,6 +123,7 @@ const App: React.FC = () => {
   const syncWorkspaceSettings = useSettingsStore((s) => s.syncWorkspaceSettings);
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const colorTheme = String(effectiveSettings['workbench.colorTheme'] ?? 'vs-dark');
+  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const autoSave = String(effectiveSettings['files.autoSave'] ?? 'off');
   const autoSaveDelay = asNumber(effectiveSettings['files.autoSaveDelay'], 1000);
   const hotExit = asBoolean(effectiveSettings['files.hotExit'], true);
@@ -172,7 +173,7 @@ const App: React.FC = () => {
 
     const actions: ConfirmDialogAction[] = [
       {
-        label: '保存并退出',
+        label: t(language, 'app.closeConfirm.saveAndExit'),
         variant: 'primary',
         onClick: async () => {
           const ok = await saveAllDirtyFiles();
@@ -182,7 +183,7 @@ const App: React.FC = () => {
         },
       },
       {
-        label: '不保存',
+        label: t(language, 'app.closeConfirm.discard'),
         variant: 'danger',
         onClick: () => {
           discardAllDirtyFiles();
@@ -190,7 +191,7 @@ const App: React.FC = () => {
         },
       },
       {
-        label: '取消',
+        label: t(language, 'app.closeConfirm.cancel'),
         variant: 'secondary',
         onClick: closeConfirmDialog,
       },
@@ -198,12 +199,12 @@ const App: React.FC = () => {
 
     setConfirmDialog({
       open: true,
-      title: '保存更改',
-      message: '当前有未保存的文件。退出前是否保存这些更改？',
-      detail: '选择“不保存”会放弃当前编辑器中的未保存内容；选择“取消”将返回 DeepCode。',
+      title: t(language, 'app.closeConfirm.title'),
+      message: t(language, 'app.closeConfirm.message'),
+      detail: t(language, 'app.closeConfirm.detail'),
       actions,
     });
-  }, [closeConfirmDialog]);
+  }, [closeConfirmDialog, language]);
 
   const requestWindowClose = useCallback(() => {
     if (useEditorStore.getState().hasAnyDirtyFile()) {
@@ -240,6 +241,12 @@ const App: React.FC = () => {
     document.documentElement.dataset.theme = colorTheme;
   }, [colorTheme]);
 
+  useEffect(() => {
+    setActiveUiLanguage(language);
+    document.documentElement.lang = language;
+    window.localStorage.setItem('deepcode.ui.language', language);
+  }, [language]);
+
   // ---- 2. Runtime status + API health ----
   useEffect(() => {
     let cancelled = false;
@@ -256,7 +263,7 @@ const App: React.FC = () => {
         setServerVersion(healthVersion(result.data));
       } else {
         setApiStatus('error');
-        setErrorMessage(result.message || 'API unavailable');
+        setErrorMessage(result.message || t(language, 'app.apiUnavailable'));
       }
     };
 
@@ -273,8 +280,7 @@ const App: React.FC = () => {
       cancelFirstPaint();
       if (interval !== null) clearInterval(interval);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [language, setApiStatus, setErrorMessage, setServerVersion]);
 
   // ---- 3. Heartbeat ----
   useEffect(() => {

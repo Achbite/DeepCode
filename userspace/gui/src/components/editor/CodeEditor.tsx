@@ -13,7 +13,8 @@
 import React, { useRef, useCallback, useEffect, useState } from 'react';
 import Editor, { OnMount } from '@monaco-editor/react';
 import type { editor as MonacoEditor } from 'monaco-editor';
-import { useEditorOptions } from '../../state/settingsStore';
+import { useEditorOptions, useSettingsStore } from '../../state/settingsStore';
+import { normalizeUiLanguage, t } from '../../i18n';
 import { registerModel } from './modelRegistry';
 import './codeEditor.css';
 
@@ -118,6 +119,9 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
   const [cursorCol, setCursorCol] = useState(1);
   const [monacoLanguage, setMonacoLanguage] = useState('plaintext');
   const editorOptions = useEditorOptions();
+  const language = normalizeUiLanguage(
+    useSettingsStore((s) => s.effectiveSettings['workbench.language'])
+  );
 
   useEffect(() => {
     setMonacoLanguage(inferLanguageId(filePath));
@@ -202,9 +206,9 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
       <div className="code-editor code-editor--empty">
         <div className="code-editor__empty-inner">
           <div className="code-editor__empty-icon">📄</div>
-          <div>打开一个文件开始编辑</div>
+          <div>{t(language, 'editor.empty.title')}</div>
           <div className="code-editor__empty-hint">
-            使用左侧文件树选择文件
+            {t(language, 'editor.empty.hint')}
           </div>
         </div>
       </div>
@@ -216,12 +220,12 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     return (
       <div className="code-editor code-editor--readonly">
         <div className="code-editor__notice">
-          <div className="code-editor__notice-title">二进制文件</div>
+          <div className="code-editor__notice-title">{t(language, 'editor.notice.binaryTitle')}</div>
           <div className="code-editor__notice-body">
-            {filePath} 为二进制文件，当前阶段不在编辑器中展示。
+            {t(language, 'editor.notice.binaryBody', { filePath })}
           </div>
           <div className="code-editor__notice-hint">
-            大小：{sizeBytes.toLocaleString()} 字节
+            {t(language, 'editor.notice.sizeBytes', { size: sizeBytes.toLocaleString() })}
           </div>
         </div>
       </div>
@@ -233,14 +237,16 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     return (
       <div className="code-editor code-editor--readonly">
         <div className="code-editor__notice">
-          <div className="code-editor__notice-title">超大文件</div>
+          <div className="code-editor__notice-title">{t(language, 'editor.notice.largeTitle')}</div>
           <div className="code-editor__notice-body">
-            {filePath} 大小为 {sizeBytes.toLocaleString()} 字节，超过{' '}
-            {(LARGE_FILE_HARD_THRESHOLD / 1024 / 1024).toFixed(0)} MiB 阈值，
-            当前以只读提示方式展示，不在编辑器中打开。
+            {t(language, 'editor.notice.largeBody', {
+              filePath,
+              size: sizeBytes.toLocaleString(),
+              threshold: (LARGE_FILE_HARD_THRESHOLD / 1024 / 1024).toFixed(0),
+            })}
           </div>
           <div className="code-editor__notice-hint">
-            提示：Monaco 打开大文件可能导致性能问题
+            {t(language, 'editor.notice.largeHint')}
           </div>
         </div>
       </div>
@@ -252,7 +258,9 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     <div className="code-editor">
       {sizeBytes > LARGE_FILE_WARNING_THRESHOLD && (
         <div className="code-editor__large-file-warning">
-          文件超过 4 MiB，编辑与保存可能略有延迟。
+          {t(language, 'editor.notice.largeWarning', {
+            threshold: (LARGE_FILE_WARNING_THRESHOLD / 1024 / 1024).toFixed(0),
+          })}
         </div>
       )}
       <div className="code-editor__body">
@@ -286,14 +294,14 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
       {/* ---- 底部状态栏 ---- */}
       <div className="code-editor__statusbar">
         <div className="code-editor__statusbar-left">
-          <span>行 {cursorLine}, 列 {cursorCol}</span>
+          <span>{t(language, 'editor.status.cursor', { line: cursorLine, column: cursorCol })}</span>
           <span>UTF-8</span>
           <span>{sizeBytes.toLocaleString()} B</span>
         </div>
         <div className="code-editor__statusbar-right">
           <span>{editorOptions.insertSpaces ? 'Spaces' : 'Tab'}: {editorOptions.tabSize}</span>
           <span>{monacoLanguage}</span>
-          {isDirty && <span className="code-editor__dirty-flag">未保存</span>}
+          {isDirty && <span className="code-editor__dirty-flag">{t(language, 'editor.status.unsaved')}</span>}
         </div>
       </div>
     </div>

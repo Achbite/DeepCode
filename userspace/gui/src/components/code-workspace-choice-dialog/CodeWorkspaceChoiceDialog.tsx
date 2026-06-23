@@ -13,6 +13,8 @@ import React from 'react';
 import { useUiStore } from '../../state/uiStore';
 import { useEditorStore } from '../../state/editorStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
+import { useSettingsStore } from '../../state/settingsStore';
+import { normalizeUiLanguage, t } from '../../i18n';
 import './codeWorkspaceChoiceDialog.css';
 
 const CodeWorkspaceChoiceDialog: React.FC = () => {
@@ -21,6 +23,9 @@ const CodeWorkspaceChoiceDialog: React.FC = () => {
   const openFile = useEditorStore((s) => s.openFile);
   const openWorkspace = useWorkspaceStore((s) => s.openWorkspace);
   const getActiveFolder = useWorkspaceStore((s) => s.getActiveFolder);
+  const language = normalizeUiLanguage(
+    useSettingsStore((s) => s.effectiveSettings['workbench.language'])
+  );
 
   if (!target) return null;
 
@@ -57,12 +62,12 @@ const CodeWorkspaceChoiceDialog: React.FC = () => {
         aria-labelledby="cwc-dialog-title"
       >
         <div id="cwc-dialog-title" className="cwc-dialog__title">
-          打开 .code-workspace 文件
+          {t(language, 'codeWorkspaceChoice.title')}
         </div>
         <div className="cwc-dialog__body">
           <p className="cwc-dialog__file">{fileName}</p>
           <p className="cwc-dialog__hint">
-            该文件是 VS Code-style 工作区描述文件。你希望如何处理它？
+            {t(language, 'codeWorkspaceChoice.hint')}
           </p>
         </div>
         <div className="cwc-dialog__actions">
@@ -70,21 +75,21 @@ const CodeWorkspaceChoiceDialog: React.FC = () => {
             className="cwc-dialog__btn cwc-dialog__btn--text"
             onClick={hide}
           >
-            取消
+            {t(language, 'codeWorkspaceChoice.cancel')}
           </button>
           <button
             className="cwc-dialog__btn cwc-dialog__btn--secondary"
             onClick={handleOpenAsJson}
-            title="作为 JSON 文件在编辑器中编辑"
+            title={t(language, 'codeWorkspaceChoice.openAsJsonTitle')}
           >
-            作为 JSON 编辑
+            {t(language, 'codeWorkspaceChoice.openAsJson')}
           </button>
           <button
             className="cwc-dialog__btn cwc-dialog__btn--primary"
             onClick={handleOpenAsWorkspace}
-            title="把该文件作为工作区打开（替换当前工作区）"
+            title={t(language, 'codeWorkspaceChoice.openAsWorkspaceTitle')}
           >
-            作为工作区打开
+            {t(language, 'codeWorkspaceChoice.openAsWorkspace')}
           </button>
         </div>
       </div>

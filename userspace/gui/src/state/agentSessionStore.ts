@@ -39,6 +39,7 @@ import {
 } from '../services/runtimeAdapter';
 import type { AgentRunResult, StartAgentRunRequest } from '../services/apiClient';
 import { useSettingsStore } from './settingsStore';
+import { activeT } from '../i18n';
 import { findActiveSessionInteraction } from './sessionInteractions';
 import { useWorkspaceStore } from './workspaceStore';
 
@@ -50,6 +51,10 @@ type PermissionResolution = {
   id: string;
   decision: 'accept' | 'reject';
 };
+
+function agentSessionMessage(key: string, variables?: Record<string, string | number | boolean | null | undefined>): string {
+  return activeT(key, variables);
+}
 
 type PlanResolution = {
   runId: string;
@@ -970,7 +975,7 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         createLocalEvent(session.id, 'workflow_stage', {
           stage: 'session_run',
           status: 'cancelled',
-          summary: '当前 Agent 请求已请求停止。',
+          summary: agentSessionMessage('agent.run.cancelled'),
           channel: 'task',
           visibility: 'task',
         }),

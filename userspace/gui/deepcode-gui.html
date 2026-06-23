@@ -51,11 +51,38 @@
     <div id="root">
       <div class="deepcode-gui-boot">
         <div class="deepcode-gui-boot__card">
-          <div class="deepcode-gui-boot__title">DeepCode-GUI 正在启动</div>
-          <div class="deepcode-gui-boot__body">正在加载本地工作台...</div>
+          <div class="deepcode-gui-boot__title" data-i18n-text="deepcodeGui.boot.startingTitle">DeepCode-GUI</div>
+          <div class="deepcode-gui-boot__body" data-i18n-text="deepcodeGui.boot.loadingWorkbench">Loading local workbench...</div>
         </div>
       </div>
     </div>
+    <script>
+      const BOOT_I18N = {
+        "zh-CN": {
+          "deepcodeGui.boot.startingTitle": "DeepCode-GUI 正在启动",
+          "deepcodeGui.boot.loadingWorkbench": "正在加载本地工作台..."
+        },
+        "en-US": {
+          "deepcodeGui.boot.startingTitle": "DeepCode-GUI is starting",
+          "deepcodeGui.boot.loadingWorkbench": "Loading local workbench..."
+        }
+      };
+
+      function bootLanguage() {
+        try {
+          return window.localStorage.getItem("deepcode.ui.language") === "en-US" ? "en-US" : "zh-CN";
+        } catch {
+          return "zh-CN";
+        }
+      }
+
+      const language = bootLanguage();
+      document.documentElement.lang = language;
+      document.querySelectorAll("[data-i18n-text]").forEach((node) => {
+        const key = node.getAttribute("data-i18n-text");
+        node.textContent = BOOT_I18N[language]?.[key] ?? BOOT_I18N["zh-CN"][key] ?? key;
+      });
+    </script>
     <script type="module" src="/src/deepcode-gui/main.tsx"></script>
   </body>
 </html>

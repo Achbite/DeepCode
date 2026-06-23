@@ -142,40 +142,89 @@
       <div class="boot-shell">
         <div class="boot-shell__header" data-tauri-drag-region>
           <span>DeepCode</span>
-          <span class="window-controls" aria-label="窗口控制">
+          <span class="window-controls" data-i18n-aria="window.controls" aria-label="Window controls">
             <button
               id="boot-minimize"
               class="window-control window-control--minimize"
               type="button"
-              aria-label="最小化"
-              title="最小化"
+              data-i18n-aria="window.minimize"
+              data-i18n-title="window.minimize"
+              aria-label="Minimize"
+              title="Minimize"
             ></button>
             <button
               id="boot-maximize"
               class="window-control window-control--maximize"
               type="button"
-              aria-label="最大化或还原"
-              title="最大化或还原"
+              data-i18n-aria="window.maximize"
+              data-i18n-title="window.maximize"
+              aria-label="Maximize or restore"
+              title="Maximize or restore"
             ></button>
             <button
               id="boot-close"
               class="window-control window-control--close"
               type="button"
-              aria-label="关闭"
-              title="关闭"
+              data-i18n-aria="window.close"
+              data-i18n-title="window.close"
+              aria-label="Close"
+              title="Close"
             ></button>
           </span>
         </div>
         <div class="boot-shell__body">
           <div class="boot-shell__rail"></div>
           <div class="boot-shell__side"></div>
-          <div class="boot-shell__center">Starting DeepCode...</div>
+          <div class="boot-shell__center" data-i18n-text="app.starting">Starting DeepCode...</div>
           <div class="boot-shell__agent"></div>
         </div>
         <div class="boot-shell__status"></div>
       </div>
     </div>
     <script>
+      const BOOT_I18N = {
+        "zh-CN": {
+          "app.starting": "DeepCode 启动中...",
+          "window.controls": "窗口控制",
+          "window.minimize": "最小化",
+          "window.maximize": "最大化或还原",
+          "window.close": "关闭"
+        },
+        "en-US": {
+          "app.starting": "Starting DeepCode...",
+          "window.controls": "Window controls",
+          "window.minimize": "Minimize",
+          "window.maximize": "Maximize or restore",
+          "window.close": "Close"
+        }
+      };
+
+      function bootLanguage() {
+        try {
+          return window.localStorage.getItem("deepcode.ui.language") === "en-US" ? "en-US" : "zh-CN";
+        } catch {
+          return "zh-CN";
+        }
+      }
+
+      function bootText(language, key) {
+        return BOOT_I18N[language]?.[key] ?? BOOT_I18N["zh-CN"][key] ?? key;
+      }
+
+      function applyBootI18n() {
+        const language = bootLanguage();
+        document.documentElement.lang = language;
+        document.querySelectorAll("[data-i18n-text]").forEach((node) => {
+          node.textContent = bootText(language, node.getAttribute("data-i18n-text"));
+        });
+        document.querySelectorAll("[data-i18n-title]").forEach((node) => {
+          node.setAttribute("title", bootText(language, node.getAttribute("data-i18n-title")));
+        });
+        document.querySelectorAll("[data-i18n-aria]").forEach((node) => {
+          node.setAttribute("aria-label", bootText(language, node.getAttribute("data-i18n-aria")));
+        });
+      }
+
       function runBootWindowCommand(commandName, command) {
         try {
           const result = command();
@@ -209,6 +258,7 @@
           );
       }
 
+      applyBootI18n();
       bindBootWindowControls();
     </script>
     <script type="module" src="/src/main.tsx"></script>

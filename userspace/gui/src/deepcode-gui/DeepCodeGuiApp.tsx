@@ -3,6 +3,7 @@ import useAppStatusStore from '../state/appStatusStore';
 import { useEditorStore, getTabId } from '../state/editorStore';
 import { useSettingsStore } from '../state/settingsStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
+import { normalizeUiLanguage, setActiveUiLanguage, t } from '../i18n';
 import {
   APP_CLOSE_REQUEST_EVENT,
   closeAppWindow,
@@ -42,10 +43,10 @@ function isEditableTarget(target: EventTarget | null): boolean {
 
 const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
 
-const BootFallback: React.FC = () => (
+const BootFallback: React.FC<{ language: ReturnType<typeof normalizeUiLanguage> }> = ({ language }) => (
   <div className="deepcode-gui-boot-shell">
     <div className="deepcode-gui-boot-shell__title">DeepCode-GUI</div>
-    <div className="deepcode-gui-boot-shell__body">Starting DeepCode-GUI...</div>
+    <div className="deepcode-gui-boot-shell__body">{t(language, 'deepcodeGui.boot.starting')}</div>
   </div>
 );
 
@@ -64,6 +65,7 @@ const DeepCodeGuiApp: React.FC = () => {
   const loadUserSettings = useSettingsStore((s) => s.loadUserSettings);
   const syncWorkspaceSettings = useSettingsStore((s) => s.syncWorkspaceSettings);
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
+  const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const connectedReloadDoneRef = useRef(false);
   const [kernelStartBusy, setKernelStartBusy] = useState(false);
   const [kernelStartMessage, setKernelStartMessage] = useState<string | null>(null);
@@ -89,8 +91,9 @@ const DeepCodeGuiApp: React.FC = () => {
     const start = await startKernelAfterPermission();
     if (!start.ok) {
       setApiStatus('error');
-      setErrorMessage(start.message || 'Kernel start failed');
-      setKernelStartMessage(start.message || 'Kernel start failed');
+      const message = start.message || t(language, 'deepcodeGui.kernelStart.failed');
+      setErrorMessage(message);
+      setKernelStartMessage(message);
       setKernelStartBusy(false);
       return;
     }
@@ -114,12 +117,12 @@ const DeepCodeGuiApp: React.FC = () => {
       await new Promise((resolve) => window.setTimeout(resolve, 500));
     }
 
-    const message = start.data?.message || 'Kernel start requested, waiting for API health.';
+    const message = start.data?.message || t(language, 'deepcodeGui.kernelStart.waitingHealth');
     setApiStatus('error');
     setErrorMessage(message);
     setKernelStartMessage(message);
     setKernelStartBusy(false);
-  }, [setApiStatus, setErrorMessage, setServerVersion]);
+  }, [language, setApiStatus, setErrorMessage, setServerVersion]);
 
   useEffect(() => {
     document.documentElement.dataset.product = 'deepcode-gui';
@@ -147,6 +150,12 @@ const DeepCodeGuiApp: React.FC = () => {
   }, [effectiveSettings]);
 
   useEffect(() => {
+    setActiveUiLanguage(language);
+    document.documentElement.lang = language;
+    window.localStorage.setItem('deepcode.ui.language', language);
+  }, [language]);
+
+  useEffect(() => {
     let cancelled = false;
     let interval: ReturnType<typeof setInterval> | null = null;
     const check = async () => {
@@ -159,7 +168,7 @@ const DeepCodeGuiApp: React.FC = () => {
         setServerVersion(healthVersion(result.data));
       } else {
         setApiStatus('error');
-        setErrorMessage(result.message || 'API unavailable');
+        setErrorMessage(result.message || t(language, 'app.apiUnavailable'));
       }
     };
     const cancelFirstPaint = afterFirstPaint(() => {
@@ -171,7 +180,7 @@ const DeepCodeGuiApp: React.FC = () => {
       cancelFirstPaint();
       if (interval) clearInterval(interval);
     };
-  }, [setApiStatus, setErrorMessage, setServerVersion]);
+  }, [language, setApiStatus, setErrorMessage, setServerVersion]);
 
   useEffect(() => {
     let disconnect: (() => void) | null = null;
@@ -238,7 +247,7 @@ const DeepCodeGuiApp: React.FC = () => {
   }, []);
 
   return (
-    <Suspense fallback={<BootFallback />}>
+    <Suspense fallback={<BootFallback language={language} />}>
       <DeepCodeWorkbenchLayout
         apiStatus={apiStatus}
         wsStatus={wsStatus}

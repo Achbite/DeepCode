@@ -373,8 +373,8 @@ function eventBatchId(event: AgentEvent): string | undefined {
   return stringField(event.payload, 'batchId');
 }
 
-function eventBatchLabel(event: AgentEvent): string {
-  return stringField(event.payload, 'batchLabel') ?? '执行工具';
+function eventBatchLabel(event: AgentEvent, language: UiLanguage): string {
+  return stringField(event.payload, 'batchLabel') ?? t(language, 'agent.archive.batchLabel');
 }
 
 function eventStageRunId(event: AgentEvent): string | undefined {
@@ -625,13 +625,13 @@ function traceGroupRunning(groupEvents: AgentEvent[], turnEvents: AgentEvent[], 
   });
 }
 
-function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[] {
+function createRenderItems(events: AgentEvent[], loading: boolean, language: UiLanguage): RenderItem[] {
   if (events.length === 0) return [];
   const projection = buildNarrativeTimelineProjection({
     sessionId: events[0]?.sessionId ?? 'session',
     events,
   });
-  if (projection.turns.length === 0) return createLegacyRenderItems(events, loading);
+  if (projection.turns.length === 0) return createLegacyRenderItems(events, loading, language);
 
   const items: RenderItem[] = [];
 
@@ -698,10 +698,10 @@ function createRenderItems(events: AgentEvent[], loading: boolean): RenderItem[]
     }
   }
 
-  return items.length > 0 ? items : createLegacyRenderItems(events, loading);
+  return items.length > 0 ? items : createLegacyRenderItems(events, loading, language);
 }
 
-function createLegacyRenderItems(events: AgentEvent[], loading: boolean): RenderItem[] {
+function createLegacyRenderItems(events: AgentEvent[], loading: boolean, language: UiLanguage): RenderItem[] {
   const items: RenderItem[] = [];
   let index = 0;
 
@@ -787,7 +787,7 @@ function createLegacyRenderItems(events: AgentEvent[], loading: boolean): Render
             type: 'toolBatch',
             group: {
               id: `tool-batch-${event.id}-${batchId ?? batchEvents[0]?.id}`,
-              label: eventBatchLabel(turnEvent),
+              label: eventBatchLabel(turnEvent, language),
               events: batchEvents,
               autoOpen: batchEvents.some((batchEvent, batchEventIndex) =>
                 batchEvent.kind === 'tool_call' && !hasLaterResult(batchEvents, batchEventIndex)
@@ -968,10 +968,10 @@ function archiveTimestamp(record: Record<string, unknown>): string | undefined {
   );
 }
 
-function archiveProjectionTitle(kind: string): string {
+function archiveProjectionTitle(kind: string, language: UiLanguage): string {
   switch (kind) {
     case 'user_msg':
-      return '用户';
+      return t(language, 'agent.archive.kind.user');
     case 'assistant_msg':
       return 'Agent';
     case 'user_guidance':
@@ -983,25 +983,25 @@ function archiveProjectionTitle(kind: string): string {
     case 'review_summary':
       return 'Review';
     case 'tool_call':
-      return '工具调用';
+      return t(language, 'agent.archive.kind.toolCall');
     case 'tool_result':
-      return '工具结果';
+      return t(language, 'agent.archive.kind.toolResult');
     case 'permission_request':
-      return '权限请求';
+      return t(language, 'agent.archive.kind.permissionRequest');
     case 'permission_result':
-      return '权限结果';
+      return t(language, 'agent.archive.kind.permissionResult');
     case 'workflow_stage':
       return 'Workflow Stage';
     case 'workflow_decision':
       return 'Workflow Decision';
     case 'error':
-      return '错误';
+      return t(language, 'agent.archive.kind.error');
     default:
       return kind || 'Projection';
   }
 }
 
-function buildChronologicalArchiveMarkdown(debugExport: ArchiveDebugExport): string {
+function buildChronologicalArchiveMarkdown(debugExport: ArchiveDebugExport, language: UiLanguage): string {
   const projection = Array.isArray(debugExport.projection) ? debugExport.projection : [];
   const transcript = Array.isArray(debugExport.transcript) ? debugExport.transcript : [];
   const entries = [
@@ -1012,7 +1012,7 @@ function buildChronologicalArchiveMarkdown(debugExport: ArchiveDebugExport): str
         return {
           order: index,
           timestamp: archiveTimestamp(entry) ?? '',
-          heading: `Projection / ${archiveProjectionTitle(kind)}`,
+          heading: `Projection / ${archiveProjectionTitle(kind, language)}`,
           body: archiveRecordText(entry),
         };
       }),
@@ -1076,13 +1076,13 @@ async function readSessionArchiveFile(sessionId: string, path: string): Promise<
   return result.data.content;
 }
 
-async function readChronologicalArchiveMarkdown(sessionId: string): Promise<string> {
+async function readChronologicalArchiveMarkdown(sessionId: string, language: UiLanguage): Promise<string> {
   try {
     return await readSessionArchiveFile(sessionId, 'exports/chronological.md');
   } catch {
     const content = await readLatestArchiveFile(sessionId, 'exports/debug.json');
     const parsed = JSON.parse(content) as ArchiveDebugExport;
-    return buildChronologicalArchiveMarkdown(parsed);
+    return buildChronologicalArchiveMarkdown(parsed, language);
   }
 }
 
@@ -1443,7 +1443,7 @@ function GitReviewDiffDetails({
             const path = stringField(file, 'path') ?? `file-${index + 1}`;
             return <li key={`${path}-${index}`}><code>{path}</code></li>;
           })}
-          {files.length > 12 && <li>{language === 'zh-CN' ? `另有 ${files.length - 12} 个文件` : `${files.length - 12} more files`}</li>}
+          {files.length > 12 && <li>{t(language, 'common.moreFiles', { count: files.length - 12 })}</li>}
         </ul>
       )}
       {diffBlocks.map((block, index) => {
@@ -1454,7 +1454,7 @@ function GitReviewDiffDetails({
           <details key={`${title}-${index}`} className="agent-flow-card__details agent-flow-card__details--diff">
             <summary>
               {title}
-              {truncated ? (language === 'zh-CN' ? '（已截断）' : ' (truncated)') : ''}
+              {truncated ? t(language, 'common.truncatedSuffix') : ''}
             </summary>
             <pre className="agent-review-diff"><code>{diff}</code></pre>
           </details>
@@ -1802,7 +1802,7 @@ function TurnActions({
           <button
             type="button"
             disabled={status === 'working' || !sessionId}
-            onClick={() => void runCopyAction(t(language, 'agent.message.copyChronological'), () => readChronologicalArchiveMarkdown(requireSessionId()))}
+            onClick={() => void runCopyAction(t(language, 'agent.message.copyChronological'), () => readChronologicalArchiveMarkdown(requireSessionId(), language))}
           >
             {t(language, 'agent.message.copyChronological')}
           </button>
@@ -1965,7 +1965,10 @@ const MessageList: React.FC<MessageListProps> = ({
     () => buildPlanConfirmationState(events, resolvingPlan),
     [events, resolvingPlan]
   );
-  const renderItems = React.useMemo(() => createRenderItems(events, loading), [events, loading]);
+  const renderItems = React.useMemo(
+    () => createRenderItems(events, loading, language),
+    [events, language, loading]
+  );
 
   return (
     <div className="agent-message-list">

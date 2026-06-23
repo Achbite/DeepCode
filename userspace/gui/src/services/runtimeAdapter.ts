@@ -63,6 +63,7 @@ import type {
 import { buildSessionMemorySnapshot, type SessionMemorySnapshot } from '@deepcode/session-core';
 
 import * as api from './apiClient';
+import { activeT } from '../i18n';
 
 export type RuntimeType = 'web';
 
@@ -261,7 +262,7 @@ export async function pickWorkspacePath(): Promise<ApiResponse<string>> {
   return {
     ok: false,
     error: 'not_supported',
-    message: '当前统一 GUI Host 通过 Rust Kernel Web Host 访问工作区，请使用浏览对话框选择路径。',
+    message: activeT('runtime.workspacePickerUnsupported'),
   };
 }
 

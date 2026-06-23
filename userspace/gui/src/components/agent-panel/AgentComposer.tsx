@@ -266,23 +266,14 @@ function decisionChoiceGuidance(
   supplement: string | undefined,
   language: UiLanguage
 ): string {
-  const lines = language === 'zh-CN'
-    ? [
-      '用户已选择技术方案：',
-      `- id: ${normalizeGuidanceLine(option.id)}`,
-      `- label: ${normalizeGuidanceLine(option.label)}`,
-      option.description ? `- description: ${normalizeGuidanceLine(option.description)}` : '',
-      supplement ? '用户补充信息：' : '',
-      supplement ? supplement.trim() : '',
-    ]
-    : [
-      'User selected technical option:',
-      `- id: ${normalizeGuidanceLine(option.id)}`,
-      `- label: ${normalizeGuidanceLine(option.label)}`,
-      option.description ? `- description: ${normalizeGuidanceLine(option.description)}` : '',
-      supplement ? 'User supplemental guidance:' : '',
-      supplement ? supplement.trim() : '',
-    ];
+  const lines = [
+    t(language, 'agent.composer.choiceGuidance.selected'),
+    `- id: ${normalizeGuidanceLine(option.id)}`,
+    `- label: ${normalizeGuidanceLine(option.label)}`,
+    option.description ? `- description: ${normalizeGuidanceLine(option.description)}` : '',
+    supplement ? t(language, 'agent.composer.choiceGuidance.supplement') : '',
+    supplement ? supplement.trim() : '',
+  ];
   return lines.filter(Boolean).join('\n');
 }
 

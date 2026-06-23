@@ -18,6 +18,7 @@ import type {
   WorkspaceFolderSpec,
   WorkspaceSpec,
 } from '@deepcode/protocol';
+import { activeT } from '../i18n';
 
 interface WorkspaceStateData {
   /** 当前工作区；首次启动 loadCurrent 之前为 null */
@@ -60,6 +61,10 @@ interface WorkspaceDerived {
 
 type WorkspaceStore = WorkspaceStateData & WorkspaceActions & WorkspaceDerived;
 
+function workspaceMessage(key: string, variables?: Record<string, string | number | boolean | null | undefined>): string {
+  return activeT(key, variables);
+}
+
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   current: null,
   fallbackUsed: false,
@@ -100,7 +105,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             return;
           }
           set({
-            lastError: opened.message ?? '默认工作区打开失败',
+            lastError: opened.message ?? workspaceMessage('workspace.error.defaultOpen'),
             loading: false,
           });
           return;
@@ -116,7 +121,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }));
     } else {
       set({
-        lastError: result.message ?? '工作区加载失败',
+        lastError: result.message ?? workspaceMessage('workspace.error.load'),
         loading: false,
       });
     }
@@ -137,7 +142,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }));
       return { ok: true };
     }
-    const message = result.message ?? '打开工作区失败';
+    const message = result.message ?? workspaceMessage('workspace.error.open');
     set({
       lastError: message,
       loading: false,
@@ -148,7 +153,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   saveWorkspaceFile: async (fileName?: string) => {
     const folderId = get().activeFolderId ?? get().current?.folders[0]?.id;
     if (!folderId) {
-      const message = '当前没有可保存的 workspace folder';
+      const message = workspaceMessage('workspace.error.noSavableFolder');
       set({ lastError: message });
       return { ok: false, message };
     }
@@ -168,7 +173,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       return { ok: true, path: result.data.workspaceFilePath };
     }
 
-    const message = result.message ?? '保存 workspace 文件失败';
+    const message = result.message ?? workspaceMessage('workspace.error.saveFile');
     set({
       lastError: message,
       loading: false,

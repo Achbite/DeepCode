@@ -328,8 +328,8 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
         <button
           type="button"
           className="deepcode-gui-timeline-jump-latest"
-          aria-label="跳转到最新内容"
-          title="跳转到最新内容"
+          aria-label={t(language, 'deepcodeGui.timeline.jumpLatest')}
+          title={t(language, 'deepcodeGui.timeline.jumpLatest')}
           onClick={enableFollowAndJumpToLatest}
         >
           ↓
@@ -374,7 +374,7 @@ function appendActiveDeltaTurn(
         kind: 'thinking',
         narrativeKind: 'thinking',
         title: t(language, 'deepcodeGui.timeline.thinking'),
-        summary: language === 'zh-CN' ? 'Provider 正在输出 reasoning。' : 'Provider reasoning is streaming.',
+        summary: t(language, 'deepcodeGui.timeline.reasoningStreaming'),
         status: segmentStatus,
         defaultCollapsed: completed,
         bodyMarkdown: textSegmentBody,
@@ -392,7 +392,7 @@ function appendActiveDeltaTurn(
         kind: 'assistant',
         narrativeKind: 'assistantText',
         title: 'DeepCode',
-        summary: language === 'zh-CN' ? 'DeepCode 正在回复。' : 'DeepCode is responding.',
+        summary: t(language, 'deepcodeGui.timeline.responding'),
         status: segmentStatus,
         defaultCollapsed: false,
         bodyMarkdown: textSegmentBody,
@@ -1175,7 +1175,7 @@ const DeepCodeGitReviewDiffDetails: React.FC<{ gitReview: unknown; language: UiL
             const path = stringField(file, 'path') ?? `file-${index + 1}`;
             return <code key={`${path}-${index}`}>{path}</code>;
           })}
-          {files.length > 12 && <span>{language === 'zh-CN' ? `另有 ${files.length - 12} 个文件` : `${files.length - 12} more files`}</span>}
+          {files.length > 12 && <span>{t(language, 'common.moreFiles', { count: files.length - 12 })}</span>}
         </div>
       )}
       {diffBlocks.map((block, index) => {
@@ -1186,7 +1186,7 @@ const DeepCodeGitReviewDiffDetails: React.FC<{ gitReview: unknown; language: UiL
           <details key={`${title}-${index}`} className="deepcode-gui-git-review__diff">
             <summary>
               {title}
-              {truncated ? (language === 'zh-CN' ? '（已截断）' : ' (truncated)') : ''}
+              {truncated ? t(language, 'common.truncatedSuffix') : ''}
             </summary>
             <pre><code>{diff}</code></pre>
           </details>

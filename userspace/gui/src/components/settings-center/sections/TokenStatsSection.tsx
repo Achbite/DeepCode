@@ -166,7 +166,7 @@ const TokenDetails: React.FC<{ stats: TokenUsageStats }> = ({ stats }) => {
             <td>{formatTokenCount(stats.totalTokens)}</td>
           </tr>
           <tr>
-            <td>{language === 'zh-CN' ? 'Provider 调用' : 'Provider calls'}</td>
+            <td>{t(language, 'settings.token.providerCalls')}</td>
             <td>{formatTokenCount(stats.providerCallCount)}</td>
           </tr>
           <tr>
@@ -188,7 +188,7 @@ const TokenRequestBreakdown: React.FC<{ stats: TokenUsageStats }> = ({ stats }) 
   return (
     <div className="settings-card">
       <h3 className="settings-card__title">
-        {language === 'zh-CN' ? '请求消耗' : 'Request usage'}
+        {t(language, 'settings.token.requestUsage')}
       </h3>
       <div className="settings-token-requests">
         {stats.requests.map((request, index) => (
@@ -233,7 +233,7 @@ const TokenRequestRow: React.FC<{
       </div>
       <div className="settings-token-request__meta">
         <span>{providerLabel}</span>
-        <span>{language === 'zh-CN' ? `调用 ${request.providerCallCount} 次` : `${request.providerCallCount} calls`}</span>
+        <span>{t(language, 'settings.token.providerCallCount', { count: request.providerCallCount })}</span>
         <span>{formatPercent(request.cacheHitRate)}</span>
         {timeLabel && <span>{timeLabel}</span>}
       </div>

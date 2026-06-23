@@ -202,7 +202,7 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
   };
 
   const showHostMutationDisabled = () => {
-    const message = '文件修改需通过 Agent 计划确认后由 Kernel 执行。';
+    const message = t(language, 'explorer.error.hostMutationDisabled');
     setPendingError(message);
     showNotice(message);
   };

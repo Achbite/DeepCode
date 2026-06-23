@@ -60,6 +60,7 @@ import type {
   PanelSnapshotResult,
   AttachPanelSnapshotResult,
 } from '@deepcode/protocol';
+import { activeT } from '../i18n';
 import { getKernelApiBase } from './hostTarget';
 
 const API_BASE = getKernelApiBase();
@@ -262,7 +263,7 @@ function toErrorResponse(err: unknown): ApiResponse<never> {
     return {
       ok: false,
       error: 'network_error',
-      message: `网络不可达: ${message}`,
+      message: activeT('api.error.networkUnavailable', { message }),
     };
   }
   return {

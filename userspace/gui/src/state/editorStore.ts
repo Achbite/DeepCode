@@ -12,6 +12,7 @@ import { create } from 'zustand';
 import { readFile } from '../services/runtimeAdapter';
 import { closeModel } from '../components/editor/modelRegistry';
 import { useWorkspaceStore } from './workspaceStore';
+import { activeT } from '../i18n';
 
 // ---- Tab 模型 ----
 
@@ -20,6 +21,10 @@ export type EditorTabKind = 'file' | 'settings';
 
 /** Settings Tab 的虚拟唯一 ID */
 export const SETTINGS_TAB_ID = '__deepcode_settings__';
+
+function editorMessage(key: string, variables?: Record<string, string | number | boolean | null | undefined>): string {
+  return activeT(key, variables);
+}
 
 /** 单个文件 Tab 的内容描述 */
 export interface OpenFile {
@@ -224,7 +229,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const targetFolderId =
       folderIdArg ?? useWorkspaceStore.getState().getActiveFolder()?.id;
     if (!targetFolderId) {
-      set({ saveMessage: '❌ 当前没有可用的 workspace folder' });
+      set({ saveMessage: editorMessage('editor.save.noWorkspace') });
       return;
     }
 
@@ -240,7 +245,11 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
     const result = await readFile(filePath, targetFolderId);
     if (!result.ok || !result.data) {
-      set({ saveMessage: `❌ 打开失败: ${result.message ?? '未知错误'}` });
+      set({
+        saveMessage: editorMessage('editor.save.openFailed', {
+          message: result.message ?? editorMessage('editor.save.unknownError'),
+        }),
+      });
       return;
     }
 
@@ -325,7 +334,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     if (!tab || tab.kind !== 'file') return false;
 
     set({
-      saveMessage: '❌ 保存失败: 文件修改需通过 Agent 计划确认后由 Kernel 执行',
+      saveMessage: editorMessage('editor.save.blocked'),
     });
     return false;
   },
@@ -388,7 +397,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       return {
         tabs,
         activeTabId: nextActiveTabId,
-        saveMessage: `已重命名: ${oldPath.split('/').pop()} → ${newPath.split('/').pop()}`,
+        saveMessage: editorMessage('editor.save.renamed', {
+          oldName: oldPath.split('/').pop() ?? oldPath,
+          newName: newPath.split('/').pop() ?? newPath,
+        }),
       };
     });
   },

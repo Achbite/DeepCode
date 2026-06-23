@@ -4,6 +4,7 @@
  */
 import type { HeartbeatServerEvent } from '@deepcode/protocol';
 import useAppStatusStore from '../state/appStatusStore';
+import { activeT } from '../i18n';
 import { getKernelWsBase } from './hostTarget';
 
 const HEARTBEAT_INTERVAL_MS = 5000; // 5秒发送一次 ping
@@ -15,6 +16,10 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let shouldReconnect = false;
 let reconnectAttempts = 0;
+
+function heartbeatMessage(key: string): string {
+  return activeT(key);
+}
 
 /**
  * 建立心跳 WebSocket 连接
@@ -43,7 +48,7 @@ export function connectHeartbeat(): void {
       parsed = JSON.parse(event.data as string);
     } catch {
       store.setWsStatus('error');
-      store.setErrorMessage('WebSocket 消息解析失败');
+      store.setErrorMessage(heartbeatMessage('heartbeat.error.parse'));
       return;
     }
 
@@ -74,7 +79,7 @@ export function connectHeartbeat(): void {
 
   ws.onerror = () => {
     store.setWsStatus('error');
-    store.setErrorMessage('WebSocket 连接错误');
+    store.setErrorMessage(heartbeatMessage('heartbeat.error.connection'));
   };
 
   ws.onclose = () => {

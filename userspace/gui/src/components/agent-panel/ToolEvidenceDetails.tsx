@@ -1,5 +1,5 @@
 import React from 'react';
-import type { UiLanguage } from '../../i18n';
+import { t, type UiLanguage } from '../../i18n';
 import type { ToolEvidenceSummary } from '../../utils/toolEvidence';
 import { formatDurationMs } from '../../utils/toolEvidence';
 
@@ -30,9 +30,9 @@ const ToolEvidenceDetails: React.FC<ToolEvidenceDetailsProps> = ({
             {item.label}
           </span>
           {item.detail && <span className="agent-evidence-item__detail">{item.detail}</span>}
-          {item.matches && item.matches.length > 0 && (
+            {item.matches && item.matches.length > 0 && (
             <details className="agent-evidence-output">
-              <summary>{language === 'zh-CN' ? '命中' : 'Matches'}</summary>
+              <summary>{t(language, 'agent.toolEvidence.details.matches')}</summary>
               <ul className="agent-evidence-output__list">
                 {item.matches.map((match, index) => (
                   <li key={`${item.id}:match:${index}`}>{match}</li>
@@ -42,23 +42,23 @@ const ToolEvidenceDetails: React.FC<ToolEvidenceDetailsProps> = ({
           )}
           {item.preview && (
             <details className="agent-evidence-output">
-              <summary>{language === 'zh-CN' ? '片段' : 'Preview'}</summary>
+              <summary>{t(language, 'agent.toolEvidence.details.preview')}</summary>
               <pre>{item.preview}</pre>
             </details>
           )}
           {item.kind === 'command' && (
             <div className="agent-evidence-item__meta">
               {typeof item.exitCode === 'number' && (
-                <span>{language === 'zh-CN' ? `退出码 ${item.exitCode}` : `exit ${item.exitCode}`}</span>
+                <span>{t(language, 'agent.toolEvidence.exitCode', { code: item.exitCode })}</span>
               )}
-              {item.cwd && <span>{language === 'zh-CN' ? `目录 ${item.cwd}` : `cwd ${item.cwd}`}</span>}
+              {item.cwd && <span>{t(language, 'agent.toolEvidence.cwd', { cwd: item.cwd })}</span>}
               {formatDurationMs(item.durationMs) && <span>{formatDurationMs(item.durationMs)}</span>}
-              {item.truncated && <span>{language === 'zh-CN' ? '已截断' : 'truncated'}</span>}
+              {item.truncated && <span>{t(language, 'common.truncated')}</span>}
             </div>
           )}
           {(item.stdout || item.stderr || item.error) && (
             <details className="agent-evidence-output">
-              <summary>{language === 'zh-CN' ? '输出' : 'Output'}</summary>
+              <summary>{t(language, 'agent.toolEvidence.details.output')}</summary>
               {item.stdout && <pre>{item.stdout}</pre>}
               {item.stderr && <pre>{item.stderr}</pre>}
               {item.error && <pre>{item.error}</pre>}
@@ -68,7 +68,7 @@ const ToolEvidenceDetails: React.FC<ToolEvidenceDetailsProps> = ({
       ))}
       {hiddenCount > 0 && (
         <div className="agent-evidence-list__more">
-          {language === 'zh-CN' ? `另有 ${hiddenCount} 项` : `+${hiddenCount} more`}
+          {t(language, 'common.moreItems', { count: hiddenCount })}
         </div>
       )}
     </div>

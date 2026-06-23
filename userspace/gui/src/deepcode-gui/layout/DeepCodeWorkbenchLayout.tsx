@@ -753,18 +753,17 @@ function deriveCacheHitSummary(
 ): DeepCodeCacheHitSummary | null {
   const stats = deriveTokenUsageStats(events, tokenUsageProjection);
   const percent = formatPercent(stats.cacheHitRate);
-  const label = language === 'zh-CN' ? `缓存 ${percent}` : `Cache ${percent}`;
+  const label = t(language, 'deepcodeGui.cache.label', { percent });
   if (!stats.hasCacheData) {
     return {
       label,
-      title: language === 'zh-CN'
-        ? '当前对话流程尚未收到缓存命中统计'
-        : 'No cache hit telemetry has been reported for this conversation flow yet',
+      title: t(language, 'deepcodeGui.cache.noTelemetryTitle'),
     };
   }
-  const title = language === 'zh-CN'
-    ? `当前对话流程累计缓存命中 ${formatTokenCount(stats.promptCacheHitTokens)} tokens，未命中 ${formatTokenCount(stats.promptCacheMissTokens)} tokens`
-    : `Current conversation flow cache hits ${formatTokenCount(stats.promptCacheHitTokens)} tokens, misses ${formatTokenCount(stats.promptCacheMissTokens)} tokens`;
+  const title = t(language, 'deepcodeGui.cache.telemetryTitle', {
+    hitTokens: formatTokenCount(stats.promptCacheHitTokens),
+    missTokens: formatTokenCount(stats.promptCacheMissTokens),
+  });
   return { label, title };
 }
 
@@ -1416,8 +1415,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               onClick={() => void onRetryKernelStart()}
             >
               {kernelStartBusy
-                ? (language === 'zh-CN' ? '启动中' : 'Starting')
-                : (language === 'zh-CN' ? '重试' : 'Retry')}
+                ? t(language, 'deepcodeGui.statusAction.starting')
+                : t(language, 'deepcodeGui.statusAction.retry')}
             </button>
           )}
           <span className={`deepcode-gui-status-pill deepcode-gui-status-pill--${apiStatus}`}>API {statusLabel(language, apiStatus)}</span>

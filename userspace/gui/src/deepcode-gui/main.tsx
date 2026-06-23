@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import DeepCodeGuiApp from './DeepCodeGuiApp';
 import { installNativeContextMenuGuard } from '../utils/nativeContextMenuGuard';
+import { activeT } from '../i18n';
 
 function formatBootstrapError(reason: unknown): string {
   if (reason instanceof Error) {
@@ -26,8 +27,8 @@ function renderBootstrapError(reason: unknown): void {
   shell.className = 'deepcode-gui-bootstrap-error';
   shell.innerHTML = `
     <div class="deepcode-gui-bootstrap-error__card">
-      <h1>DeepCode-GUI 启动失败</h1>
-      <p>前端工作台没有完成渲染。下面是启动阶段错误，便于定位打包白屏问题。</p>
+      <h1>${activeT('deepcodeGui.bootstrap.startFailedTitle')}</h1>
+      <p>${activeT('deepcodeGui.bootstrap.startFailedBody')}</p>
       <pre></pre>
     </div>
   `;
@@ -65,8 +66,8 @@ class ErrorBoundary extends React.Component<
       return (
         <div className="deepcode-gui-bootstrap-error">
           <div className="deepcode-gui-bootstrap-error__card">
-            <h1>DeepCode-GUI 渲染失败</h1>
-            <p>React 工作台启动后遇到异常。</p>
+            <h1>{activeT('deepcodeGui.bootstrap.renderFailedTitle')}</h1>
+            <p>{activeT('deepcodeGui.bootstrap.renderFailedBody')}</p>
             <pre>{this.state.error.stack ?? this.state.error.message}</pre>
           </div>
         </div>

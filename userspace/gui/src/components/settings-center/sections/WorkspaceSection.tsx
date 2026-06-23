@@ -58,10 +58,10 @@ const WorkspaceSection: React.FC = () => {
     setSaveMessage(null);
     const result = await saveWorkspaceFile();
     if (result.ok) {
-      setSaveMessage(`已保存: ${result.path}`);
+      setSaveMessage(t(language, 'workspace.saved', { path: result.path ?? '' }));
       return;
     }
-    setSaveMessage(result.message ?? '保存 workspace 文件失败');
+    setSaveMessage(result.message ?? t(language, 'workspace.error.saveFile'));
   };
 
   const handleCopyArchivePath = async () => {

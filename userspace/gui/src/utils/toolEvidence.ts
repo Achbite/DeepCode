@@ -1,5 +1,5 @@
 import type { AgentEvent } from '@deepcode/protocol';
-import type { UiLanguage } from '../i18n';
+import { t, type UiLanguage } from '../i18n';
 
 export type ToolEvidenceStatus = 'running' | 'completed' | 'failed' | 'waiting';
 export type ToolEvidenceItemKind = 'file' | 'directory' | 'command' | 'search' | 'tool';
@@ -95,7 +95,7 @@ function itemsForEvent(event: AgentEvent, language: UiLanguage): ToolEvidenceIte
     return [{
       id: `${event.id}:command`,
       kind: 'command',
-      action: language === 'zh-CN' ? '执行' : 'Run',
+      action: t(language, 'agent.toolEvidence.action.run'),
       label: command,
       detail: commandDetail(output, args, language),
       status: exitCode !== undefined && exitCode !== 0 ? 'failed' : status,
@@ -129,7 +129,7 @@ function itemsForEvent(event: AgentEvent, language: UiLanguage): ToolEvidenceIte
     return [{
       id: `${event.id}:search`,
       kind: 'search',
-      action: language === 'zh-CN' ? '搜索' : 'Search',
+      action: t(language, 'agent.toolEvidence.action.search'),
       label: query,
       detail: stringValue(output, 'summary') ?? stringValue(payload, 'summary'),
       status,
@@ -139,7 +139,7 @@ function itemsForEvent(event: AgentEvent, language: UiLanguage): ToolEvidenceIte
   return [{
     id: event.id,
     kind: 'tool',
-    action: language === 'zh-CN' ? '工具' : 'Tool',
+    action: t(language, 'agent.toolEvidence.action.tool'),
     label: displayToolName(toolName, language),
     detail: readableToolDetail(toolName, payload),
     status,
@@ -156,7 +156,7 @@ function resourceItem(
 ): ToolEvidenceItem {
   const path = readablePath(stringValue(item, 'path')) ??
     readablePath(stringValue(item, 'absolutePath')) ??
-    (language === 'zh-CN' ? `资源 ${index + 1}` : `Resource ${index + 1}`);
+    t(language, 'agent.toolEvidence.resourceLabel', { index: index + 1 });
   const resolvedKind = stringValue(item, 'resolvedKind') ?? stringValue(item, 'contentKind') ?? '';
   const directory = resolvedKind.includes('directory') || resolvedKind.includes('tree');
   const truncated = booleanValue(item, 'truncated');
@@ -169,9 +169,9 @@ function resourceItem(
   const preview = readablePreview(item, matches.length > 0);
   const detailParts = [
     sizeBytes !== undefined ? formatBytes(sizeBytes) : undefined,
-    nodes !== undefined ? (language === 'zh-CN' ? `${nodes} 项` : `${nodes} entries`) : undefined,
-    matches.length > 0 ? (language === 'zh-CN' ? `${matches.length} 处命中` : `${matches.length} matches`) : undefined,
-    truncated ? (language === 'zh-CN' ? '已截断' : 'truncated') : undefined,
+    nodes !== undefined ? t(language, 'agent.toolEvidence.entries', { count: nodes }) : undefined,
+    matches.length > 0 ? t(language, 'agent.toolEvidence.matches', { count: matches.length }) : undefined,
+    truncated ? t(language, 'common.truncated') : undefined,
     summary,
   ].filter(Boolean);
 
@@ -179,8 +179,8 @@ function resourceItem(
     id: `${event.id}:resource:${index}`,
     kind: directory ? 'directory' : 'file',
     action: directory
-      ? (language === 'zh-CN' ? '列出' : 'Listed')
-      : (language === 'zh-CN' ? '读取' : 'Read'),
+      ? t(language, 'agent.toolEvidence.action.listed')
+      : t(language, 'agent.toolEvidence.action.read'),
     label: path,
     detail: detailParts.join(' · ') || undefined,
     preview,
@@ -195,36 +195,34 @@ function evidenceTitle(
   language: UiLanguage,
   fallbackTitle?: string
 ): string {
-  if (items.length === 0) return fallbackTitle || (language === 'zh-CN' ? '工具证据' : 'Tool evidence');
+  if (items.length === 0) return fallbackTitle || t(language, 'agent.toolEvidence.title.empty');
   const commandCount = items.filter((item) => item.kind === 'command').length;
   if (commandCount > 0 && commandCount === items.length) {
-    return language === 'zh-CN' ? `执行 ${commandCount} 条命令` : `Ran ${commandCount} command${commandCount === 1 ? '' : 's'}`;
+    return t(language, 'agent.toolEvidence.title.commands', { count: commandCount });
   }
   const fileCount = items.filter((item) => item.kind === 'file').length;
   const directoryCount = items.filter((item) => item.kind === 'directory').length;
   if (fileCount > 0 && directoryCount === 0) {
-    return language === 'zh-CN' ? `读取 ${fileCount} 个文件` : `Read ${fileCount} file${fileCount === 1 ? '' : 's'}`;
+    return t(language, 'agent.toolEvidence.title.files', { count: fileCount });
   }
   if (directoryCount > 0 && fileCount === 0) {
-    return language === 'zh-CN' ? `列出 ${directoryCount} 个目录` : `Listed ${directoryCount} director${directoryCount === 1 ? 'y' : 'ies'}`;
+    return t(language, 'agent.toolEvidence.title.directories', { count: directoryCount });
   }
   if (fileCount + directoryCount > 0) {
-    return language === 'zh-CN'
-      ? `读取/列出 ${fileCount + directoryCount} 个资源`
-      : `Resolved ${fileCount + directoryCount} resource${fileCount + directoryCount === 1 ? '' : 's'}`;
+    return t(language, 'agent.toolEvidence.title.resources', { count: fileCount + directoryCount });
   }
   const toolCount = items.filter((item) => item.kind === 'tool').length;
   if (toolCount > 0 && toolCount === items.length) {
     if (items.length === 1) {
       const item = items[0];
-      if (item.label === (language === 'zh-CN' ? '工具执行' : 'Tool execution')) {
+      if (item.label === t(language, 'agent.toolEvidence.toolExecution')) {
         return item.label;
       }
-      return language === 'zh-CN' ? `执行 ${item.label}` : `Run ${item.label}`;
+      return t(language, 'agent.toolEvidence.title.runLabel', { label: item.label });
     }
-    return language === 'zh-CN' ? `工具操作 ${items.length} 项` : `${items.length} tool operations`;
+    return t(language, 'agent.toolEvidence.title.toolOperations', { count: items.length });
   }
-  return fallbackTitle || (language === 'zh-CN' ? `工具操作 ${items.length} 项` : `${items.length} tool operation${items.length === 1 ? '' : 's'}`);
+  return fallbackTitle || t(language, 'agent.toolEvidence.title.operations', { count: items.length });
 }
 
 function evidenceSummary(
@@ -235,13 +233,15 @@ function evidenceSummary(
   if (items.length === 0) return fallbackSummary;
   const failed = items.filter((item) => item.status === 'failed').length;
   if (failed > 0) {
-    return language === 'zh-CN' ? `${failed} 项失败` : `${failed} failed`;
+    return t(language, 'agent.toolEvidence.summary.failed', { count: failed });
   }
   const first = items[0];
   if (items.length === 1) return first.label;
-  return language === 'zh-CN'
-    ? `${first.label} 等 ${items.length} 项`
-    : `${first.label} and ${items.length - 1} more`;
+  return t(language, 'agent.toolEvidence.summary.firstAndMore', {
+    label: first.label,
+    count: items.length,
+    more: items.length - 1,
+  });
 }
 
 function aggregateStatus(items: ToolEvidenceItem[]): ToolEvidenceStatus {
@@ -322,18 +322,18 @@ function pathKind(toolName: string, output?: Record<string, unknown>): ToolEvide
 }
 
 function toolAction(toolName: string, kind: ToolEvidenceItemKind, language: UiLanguage): string {
-  if (toolName.includes('write')) return language === 'zh-CN' ? '写入' : 'Write';
-  if (toolName.includes('delete')) return language === 'zh-CN' ? '删除' : 'Delete';
-  if (toolName.includes('diff')) return language === 'zh-CN' ? '预览差异' : 'Preview diff';
-  if (toolName.includes('search')) return language === 'zh-CN' ? '搜索' : 'Search';
-  if (toolName.includes('list') || kind === 'directory') return language === 'zh-CN' ? '列出' : 'List';
-  return language === 'zh-CN' ? '读取' : 'Read';
+  if (toolName.includes('write')) return t(language, 'agent.toolEvidence.action.write');
+  if (toolName.includes('delete')) return t(language, 'agent.toolEvidence.action.delete');
+  if (toolName.includes('diff')) return t(language, 'agent.toolEvidence.action.previewDiff');
+  if (toolName.includes('search')) return t(language, 'agent.toolEvidence.action.search');
+  if (toolName.includes('list') || kind === 'directory') return t(language, 'agent.toolEvidence.action.list');
+  return t(language, 'agent.toolEvidence.action.read');
 }
 
 function pathDetail(output: Record<string, unknown> | undefined, language: UiLanguage): string | undefined {
   const parts = [
     numberValue(output, 'sizeBytes') !== undefined ? formatBytes(numberValue(output, 'sizeBytes') ?? 0) : undefined,
-    booleanValue(output, 'truncated') ? (language === 'zh-CN' ? '已截断' : 'truncated') : undefined,
+    booleanValue(output, 'truncated') ? t(language, 'common.truncated') : undefined,
     stringValue(output, 'summary'),
   ].filter(Boolean);
   return parts.join(' · ') || undefined;
@@ -348,9 +348,9 @@ function commandDetail(
   const duration = formatDurationMs(numberValue(output, 'durationMs'));
   const cwd = stringValue(output, 'cwd') ?? stringValue(args, 'cwd');
   const parts = [
-    exitCode !== undefined ? (language === 'zh-CN' ? `退出码 ${exitCode}` : `exit ${exitCode}`) : undefined,
+    exitCode !== undefined ? t(language, 'agent.toolEvidence.exitCode', { code: exitCode }) : undefined,
     duration,
-    cwd ? (language === 'zh-CN' ? `目录 ${cwd}` : `cwd ${cwd}`) : undefined,
+    cwd ? t(language, 'agent.toolEvidence.cwd', { cwd }) : undefined,
   ].filter(Boolean);
   return parts.join(' · ') || undefined;
 }
@@ -412,7 +412,7 @@ function isInternalDisplayToken(value: string): boolean {
 function displayToolName(toolName: string, language: UiLanguage): string {
   const normalized = toolName.replace(/__/g, '.').trim();
   if (!normalized || isInternalDisplayToken(normalized)) {
-    return language === 'zh-CN' ? '工具执行' : 'Tool execution';
+    return t(language, 'agent.toolEvidence.toolExecution');
   }
   return normalized;
 }
