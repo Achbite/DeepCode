@@ -25,6 +25,7 @@ export interface CodeBlockDraft {
   id: string;
   path: string;
   content: string;
+  contentLines?: string[];
   language?: string;
   operation?:
     | 'create'
@@ -43,6 +44,9 @@ export interface CodeBlockDraft {
 export interface PlannedActionDraft {
   id: string;
   title: string;
+  actionId?: string;
+  toolId: string;
+  args?: Record<string, unknown>;
   capability: string;
   kind?: ActionKind;
   targetRef?: {
@@ -113,6 +117,14 @@ export interface ReviewExpectationDraft {
   description: string;
 }
 
+export interface ContinuationExpectationDraft {
+  id: string;
+  description: string;
+  target?: string[];
+  reason?: string;
+  dependsOn?: string[];
+}
+
 export interface RepairPolicyDraft {
   maxRounds: number;
   allowedFiles: string[];
@@ -127,7 +139,7 @@ export interface ActionBundleDraft {
   requirementId?: string;
   actions: PlannedActionDraft[];
   commandBlocks?: CommandBlockDraft[];
-  continuationExpectations?: PlannedActionDraft[];
+  continuationExpectations?: ContinuationExpectationDraft[];
   validationExpectations: ValidationExpectationDraft[];
   reviewExpectations: ReviewExpectationDraft[];
   repairPolicy?: RepairPolicyDraft;
@@ -258,6 +270,7 @@ export type ProposalEnvelopeKind =
   | 'answer'
   | 'resourceRequest'
   | 'decisionRequest'
+  | 'taskPlan'
   | 'implementationPlan'
   | 'actionBundle'
   | 'diagnostic';

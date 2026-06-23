@@ -272,6 +272,24 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
     }
 
     if (event.kind === 'workflow_stage') {
+      const stage = stringValue(record.stage);
+      if (stage === 'accepted_plan.task_savepoint') {
+        const summary = stringValue(record.summary) ?? '';
+        const taskId = stringValue(record.taskId);
+        const nodeId = stringValue(record.nodeId);
+        const nextReadyNodeIds = Array.isArray(record.nextReadyNodeIds)
+          ? record.nextReadyNodeIds.filter((item): item is string => typeof item === 'string')
+          : [];
+        const text = [
+          'Accepted task savepoint:',
+          taskId ? `task=${taskId}` : '',
+          nodeId ? `node=${nodeId}` : '',
+          summary ? clip(summary, 260) : '',
+          nextReadyNodeIds.length ? `nextReady=${nextReadyNodeIds.join(',')}` : '',
+        ].filter(Boolean).join(' ');
+        intentContext.push(text);
+        shortTermContext.push(text);
+      }
       const kernelEvent = objectRecord(record.kernelEvent);
       if (!kernelEvent) continue;
       const kind = stringValue(kernelEvent.kind);

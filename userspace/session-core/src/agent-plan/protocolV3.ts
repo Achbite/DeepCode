@@ -1,4 +1,5 @@
 import { AgentPlanParseError, type ProposalEnvelope, type ProposalEnvelopeSource } from './types.js';
+import { isKernelCatalogToolId } from './protocolContract.js';
 
 export const AGENT_PROTOCOL_V3_SCHEMA_VERSION = 'deepcode.agent.protocol.v3';
 
@@ -6,7 +7,7 @@ const V3_KINDS = new Set([
   'answer',
   'resourceRequest',
   'decisionRequest',
-  'implementationPlan',
+  'taskPlan',
   'actionBundle',
   'diagnostic',
 ]);
@@ -52,67 +53,104 @@ export function parseProposalEnvelope(input: ParseProposalEnvelopeInput): Propos
 function proposalPayload(envelope: Record<string, unknown>, kind: string, proposalId: string): unknown {
   if (kind === 'answer') return requireObject(envelope.answer, 'Agent Protocol v3.answer');
   if (kind === 'resourceRequest') return normalizeResourceRequest(requireObject(envelope.resourceRequest, 'Agent Protocol v3.resourceRequest'));
-  if (kind === 'decisionRequest') return normalizeDecisionRequest(requireObject(envelope.decisionRequest, 'Agent Protocol v3.decisionRequest'));
-  if (kind === 'implementationPlan') return normalizeImplementationPlan(requireObject(envelope.implementationPlan, 'Agent Protocol v3.implementationPlan'), proposalId);
+  if (kind === 'decisionRequest') return normalizeDecisionRequest(decisionRequestPayload(envelope));
+  if (kind === 'taskPlan') return normalizeTaskPlan(requireObject(envelope.taskPlan, 'Agent Protocol v3.taskPlan'));
   if (kind === 'diagnostic') return normalizeDiagnostic(requireObject(envelope.diagnostic, 'Agent Protocol v3.diagnostic'));
   return normalizeActionBundlePayload(envelope, proposalId);
 }
 
-function normalizeImplementationPlan(value: Record<string, unknown>, proposalId: string): Record<string, unknown> {
+function decisionRequestPayload(envelope: Record<string, unknown>): Record<string, unknown> {
+  const nested = optionalObjectRecord(envelope.decisionRequest);
+  if (nested) return nested;
+  const question = optionalString(envelope, 'question') ?? optionalString(envelope, 'reason') ?? optionalString(envelope, 'summary');
+  const options = envelope.options;
+  if (question || options !== undefined) {
+    return {
+      id: optionalString(envelope, 'id') ?? optionalString(envelope, 'decisionId'),
+      question,
+      reason: optionalString(envelope, 'reason') ?? question,
+      summary: optionalString(envelope, 'summary') ?? question,
+      options,
+      allowsFreeform: envelope.allowsFreeform,
+      decisionScope: envelope.decisionScope,
+      context: envelope.context,
+    };
+  }
+  return requireObject(envelope.decisionRequest, 'Agent Protocol v3.decisionRequest');
+}
+
+function normalizeTaskPlan(value: Record<string, unknown>): Record<string, unknown> {
+  for (const forbidden of ['actionBundle', 'codeBlocks', 'commandBlocks', 'fileOperations', 'accessScopes']) {
+    if (value[forbidden] !== undefined) {
+      throw new AgentPlanParseError(
+        'invalid_task_plan',
+        `Agent Protocol v3.taskPlan.${forbidden} is not allowed; taskPlan is a non-executable planning artifact.`
+      );
+    }
+  }
   const tasks = value.tasks;
-  if (!Array.isArray(tasks) || tasks.length === 0) {
-    throw new AgentPlanParseError('invalid_implementation_plan', 'Agent Protocol v3.implementationPlan.tasks must be a non-empty array');
+  if (!Array.isArray(tasks) || !tasks.length) {
+    throw new AgentPlanParseError('invalid_task_plan', 'Agent Protocol v3.taskPlan.tasks must be a non-empty array');
   }
   return {
     ...value,
     version: optionalString(value, 'version') ?? '1',
-    id: optionalString(value, 'id') ?? `${proposalId}-implementation-plan`,
-    title: optionalString(value, 'title') ?? optionalString(value, 'summary') ?? 'Implementation plan',
-    summary: optionalString(value, 'summary') ?? optionalString(value, 'title') ?? 'Implementation plan',
-    risks: optionalStringArray(value, 'risks'),
-    reviewCheckpoints: optionalStringArray(value, 'reviewCheckpoints'),
-    tasks: tasks.map((item, index) => {
-      const record = requireObject(item, `Agent Protocol v3.implementationPlan.tasks[${index}]`);
-      const taskId = optionalString(record, 'taskId') ?? optionalString(record, 'id') ?? `task-${index + 1}`;
-      const target = optionalStringArray(record, 'target').length
-        ? optionalStringArray(record, 'target')
-        : optionalStringArray(record, 'targets');
-      return {
-        ...record,
-        taskId,
-        id: optionalString(record, 'id') ?? taskId,
-        title: optionalString(record, 'title') ?? taskId,
-        target,
-        scope: optionalString(record, 'scope') ?? optionalString(record, 'intent') ?? '',
-        dependencies: optionalStringArray(record, 'dependencies').length
-          ? optionalStringArray(record, 'dependencies')
-          : optionalStringArray(record, 'dependsOn'),
-        hardDependencies: optionalStringArray(record, 'hardDependencies').length
-          ? optionalStringArray(record, 'hardDependencies')
-          : optionalStringArray(record, 'hardDependsOn'),
-        softOrderAfter: optionalStringArray(record, 'softOrderAfter').length
-          ? optionalStringArray(record, 'softOrderAfter')
-          : optionalStringArray(record, 'softDependencies'),
-        conflictKeys: optionalStringArray(record, 'conflictKeys'),
-        canDraftInParallel: typeof record.canDraftInParallel === 'boolean' ? record.canDraftInParallel : undefined,
-        role: optionalString(record, 'role'),
-        capability: optionalString(record, 'capability') ?? '',
-        fileOperations: normalizeFileOperations(record.fileOperations, `Agent Protocol v3.implementationPlan.tasks[${index}].fileOperations`),
-        accessScopes: normalizeAccessScopes(record.accessScopes, `Agent Protocol v3.implementationPlan.tasks[${index}].accessScopes`),
-        acceptanceCriteria: optionalStringArray(record, 'acceptanceCriteria'),
-        failureCriteria: optionalStringArray(record, 'failureCriteria'),
-      };
-    }),
+    id: optionalString(value, 'id') ?? 'task-plan',
+    title: optionalString(value, 'title') ?? 'Task plan',
+    summary: optionalString(value, 'summary') ?? optionalString(value, 'goal') ?? 'Task plan',
+    tasks: tasks.map((item, index) => normalizeTaskPlanTask(item, index)),
+    risks: normalizeStringList(value.risks),
+    reviewCheckpoints: normalizeStringList(value.reviewCheckpoints),
+  };
+}
+
+function normalizeTaskPlanTask(value: unknown, index: number): Record<string, unknown> {
+  const record = requireObject(value, `Agent Protocol v3.taskPlan.tasks[${index}]`);
+  for (const forbidden of ['actionBundle', 'codeBlocks', 'commandBlocks', 'fileOperations', 'accessScopes', 'sourceCode', 'patch']) {
+    if (record[forbidden] !== undefined) {
+      throw new AgentPlanParseError(
+        'invalid_task_plan',
+        `Agent Protocol v3.taskPlan.tasks[${index}].${forbidden} is not allowed; taskPlan tasks must not contain executable content.`
+      );
+    }
+  }
+  const taskId = optionalString(record, 'taskId') ?? optionalString(record, 'id') ?? `task-${index + 1}`;
+  const target = normalizeStringList(record.target).concat(normalizeStringList(record.targets));
+  return {
+    ...record,
+    taskId,
+    id: optionalString(record, 'id') ?? taskId,
+    title: optionalString(record, 'title') ?? taskId,
+    target: [...new Set(target)],
+    capability: optionalString(record, 'capability') ?? optionalString(record, 'toolId'),
+    dependencies: normalizeStringList(record.dependencies).concat(normalizeStringList(record.dependsOn)),
+    hardDependencies: normalizeStringList(record.hardDependencies).concat(normalizeStringList(record.hardDependsOn)),
+    softOrderAfter: normalizeStringList(record.softOrderAfter).concat(normalizeStringList(record.softDependencies)),
+    conflictKeys: normalizeStringList(record.conflictKeys),
+    canDraftInParallel: record.canDraftInParallel !== false,
+    acceptanceCriteria: normalizeStringList(record.acceptanceCriteria),
+    failureCriteria: normalizeStringList(record.failureCriteria),
   };
 }
 
 function normalizeActionBundlePayload(envelope: Record<string, unknown>, proposalId: string): Record<string, unknown> {
   const payload = optionalObjectRecord(envelope.actionBundle) ? envelope : (optionalObjectRecord(envelope.payload) ?? envelope);
+  if (payload !== envelope) {
+    throw new AgentPlanParseError(
+      'invalid_action_bundle',
+      'Agent Protocol v3.actionBundle must be a top-level field; generic payload wrappers are not accepted.'
+    );
+  }
+  if (payload.commandBlocks !== undefined) {
+    throw new AgentPlanParseError(
+      'invalid_action_bundle',
+      'Agent Protocol v3.commandBlocks is no longer provider-facing; represent command plans as actionBundle.actions[] with toolId="process.exec" and typed args.'
+    );
+  }
   const actionBundle = requireObject(payload.actionBundle, 'Agent Protocol v3.actionBundle');
   return {
     userPlan: optionalString(payload, 'userPlanMarkdown') ?? optionalString(payload, 'userPlan'),
     codeBlocks: normalizeCodeBlocks(payload.codeBlocks),
-    commandBlocks: normalizeCommandBlocks(payload.commandBlocks),
     actionBundle: normalizeActionBundle(actionBundle, proposalId),
     expectedValidation: optionalString(payload, 'expectedValidation'),
     reviewGuide: optionalString(payload, 'reviewGuide'),
@@ -123,241 +161,198 @@ function normalizeCodeBlocks(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) return [];
   return value.map((item, index) => {
     const record = requireObject(item, `Agent Protocol v3.codeBlocks[${index}]`);
+    for (const forbidden of ['permissionLabels']) {
+      if (record[forbidden] !== undefined) {
+        throw new AgentPlanParseError(
+          'invalid_action_bundle',
+          `Agent Protocol v3.codeBlocks[${index}].${forbidden} is not provider-facing; Kernel derives permissions from tool actions.`
+        );
+      }
+    }
     const id = optionalString(record, 'id') ?? optionalString(record, 'blockId') ?? `code-block-${index + 1}`;
     const path = optionalString(record, 'path') ?? optionalString(record, 'targetPath') ?? '';
+    const contentLines = optionalStringArray(record, 'contentLines');
+    const legacyContent = optionalString(record, 'content');
+    if (!contentLines.length && typeof legacyContent === 'string' && (legacyContent.includes('\n') || legacyContent.length > 200)) {
+      throw new AgentPlanParseError(
+        'invalid_action_bundle',
+        `Agent Protocol v3.codeBlocks[${index}] must use contentLines for source content; do not return large or multiline codeBlocks.content strings.`
+      );
+    }
+    const content = contentLines.length ? contentLines.join('\n') : legacyContent;
     return {
       ...record,
       id,
       blockId: optionalString(record, 'blockId') ?? id,
       path,
       targetPath: optionalString(record, 'targetPath') ?? path,
-      permissionLabels: optionalStringArray(record, 'permissionLabels'),
-    };
-  });
-}
-
-function normalizeCommandBlocks(value: unknown): Array<Record<string, unknown>> {
-  if (!Array.isArray(value)) return [];
-  return value.map((item, index) => {
-    const record = requireObject(item, `Agent Protocol v3.commandBlocks[${index}]`);
-    return {
-      ...record,
-      commandId: optionalString(record, 'commandId') ?? optionalString(record, 'id') ?? `command-${index + 1}`,
-      capability: optionalString(record, 'capability') ?? 'process.exec',
-      permissionLabels: optionalStringArray(record, 'permissionLabels'),
+      content,
+      contentLines: contentLines.length ? contentLines : undefined,
     };
   });
 }
 
 function normalizeActionBundle(value: Record<string, unknown>, proposalId: string): Record<string, unknown> {
+  if (value.commandBlocks !== undefined) {
+    throw new AgentPlanParseError(
+      'invalid_action_bundle',
+      'Agent Protocol v3.actionBundle.commandBlocks is no longer accepted; use actionBundle.actions[] with toolId="process.exec" and typed args.'
+    );
+  }
+  if (value.accessScopes !== undefined) {
+    throw new AgentPlanParseError(
+      'invalid_action_bundle',
+      'Agent Protocol v3.actionBundle.accessScopes is not provider-facing; Kernel derives permissions from toolId and typed args.'
+    );
+  }
   return {
     ...value,
     version: optionalString(value, 'version') ?? '1',
     id: optionalString(value, 'id') ?? `${proposalId}-action-bundle`,
-    actions: normalizePlannedActions(value.actions, 'actions'),
-    commandBlocks: normalizeCommandBlocks(value.commandBlocks),
-    continuationExpectations: normalizePlannedActions(value.continuationExpectations, 'continuationExpectations'),
+    actions: normalizeToolActions(value.actions, 'actions'),
+    continuationExpectations: normalizeContinuationExpectations(value.continuationExpectations),
     validationExpectations: normalizeExpectations(value.validationExpectations, 'validationExpectations'),
     reviewExpectations: normalizeExpectations(value.reviewExpectations, 'reviewExpectations'),
-    accessScopes: normalizeAccessScopes(value.accessScopes, 'Agent Protocol v3.actionBundle.accessScopes'),
   };
 }
 
-function normalizePlannedActions(value: unknown, label: string): Array<Record<string, unknown>> {
+function normalizeToolActions(value: unknown, label: string): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) return [];
   return value.map((item, index) => {
     const record = requireObject(item, `Agent Protocol v3.actionBundle.${label}[${index}]`);
     const id = optionalString(record, 'id') ?? optionalString(record, 'actionId') ?? `${label}-${index + 1}`;
-    const capability = optionalString(record, 'capability') ?? '';
-    const targetPath = optionalString(record, 'targetPath');
-    const targetRefPath = optionalTargetRefPath(record.targetRef);
-    const resourceScope = optionalStringArray(record, 'resourceScope');
-    const normalizedScope = resourceScope.length ? resourceScope : (targetPath ? [targetPath] : (targetRefPath ? [targetRefPath] : []));
+    for (const forbidden of [
+      'capability',
+      'permissionLabels',
+      'accessScopes',
+      'resourceScope',
+      'targetPath',
+      'targetRef',
+      'sourceBlockId',
+      'replacementBlockId',
+      'patchSpec',
+      'targetKind',
+      'targetResourceKind',
+      'recursive',
+      'kind',
+    ]) {
+      if (record[forbidden] !== undefined) {
+        throw new AgentPlanParseError(
+          'invalid_action_bundle',
+          `Agent Protocol v3.actionBundle.${label}[${index}].${forbidden} is not provider-facing; use toolId plus typed args and let Kernel derive permissions and operation metadata.`
+        );
+      }
+    }
+    const toolId = optionalString(record, 'toolId');
+    if (!toolId) {
+      throw new AgentPlanParseError(
+        'invalid_action_bundle',
+        `Agent Protocol v3.actionBundle.${label}[${index}].toolId must be a non-empty Kernel catalog toolId.`
+      );
+    }
+    if (!isKernelCatalogToolId(toolId)) {
+      throw new AgentPlanParseError(
+        'invalid_action_bundle',
+        `Agent Protocol v3.actionBundle.${label}[${index}].toolId is not in the Kernel catalog: ${toolId}`
+      );
+    }
+    const args = optionalObjectRecord(record.args) ?? {};
+    const targetPath = optionalString(args, 'path') ?? optionalString(args, 'targetPath');
+    const normalizedScope = targetPath ? [targetPath] : [];
     const conflictKeys = optionalStringArray(record, 'conflictKeys');
+    const sourceBlockId = optionalString(args, 'sourceBlockId');
+    const replacementBlockId = optionalString(args, 'replacementBlockId');
+    const patchSpec = args.patchSpec;
     return {
       ...record,
       id,
       actionId: optionalString(record, 'actionId') ?? id,
       title: optionalString(record, 'title') ?? optionalString(record, 'description') ?? id,
-      capability,
+      toolId,
+      args,
+      toolArgs: args,
+      capability: kernelCapabilityForToolId(toolId),
+      targetPath,
       resourceScope: normalizedScope,
       canParallelize: typeof record.canParallelize === 'boolean' ? record.canParallelize : false,
       conflictKeys: conflictKeys.length ? conflictKeys : normalizedScope,
       purpose: optionalString(record, 'purpose') ?? optionalString(record, 'description'),
-      permissionLabels: optionalStringArray(record, 'permissionLabels').length
-        ? optionalStringArray(record, 'permissionLabels')
-        : (capability ? [capability] : []),
       dependsOn: optionalStringArray(record, 'dependsOn'),
-      targetKind: optionalString(record, 'targetKind') ?? optionalString(record, 'targetResourceKind'),
-      targetResourceKind: optionalString(record, 'targetResourceKind') ?? optionalString(record, 'targetKind'),
-      recursive: typeof record.recursive === 'boolean' ? record.recursive : optionalBoolean(optionalObjectRecord(record.toolArgs), 'recursive'),
-      accessScopes: normalizeAccessScopes(record.accessScopes, `Agent Protocol v3.actionBundle.${label}[${index}].accessScopes`),
+      sourceBlockId,
+      replacementBlockId,
+      patchSpec,
+      targetKind: optionalString(record, 'targetKind') ?? optionalString(record, 'targetResourceKind') ?? optionalString(args, 'targetKind') ?? optionalString(args, 'targetResourceKind'),
+      targetResourceKind: optionalString(record, 'targetResourceKind') ?? optionalString(record, 'targetKind') ?? optionalString(args, 'targetResourceKind') ?? optionalString(args, 'targetKind'),
+      recursive: typeof record.recursive === 'boolean' ? record.recursive : optionalBoolean(args, 'recursive'),
     };
   });
 }
 
-function normalizeFileOperations(value: unknown, label: string): Array<Record<string, unknown>> {
+function normalizeContinuationExpectations(value: unknown): Array<Record<string, unknown>> {
   if (value === undefined || value === null) return [];
   if (typeof value === 'string') {
-    return [normalizeFileOperationShorthand(value, `${label}[0]`)];
+    const description = value.trim();
+    if (!description) {
+      throw new AgentPlanParseError(
+        'invalid_action_bundle_continuation',
+        'Agent Protocol v3.actionBundle.continuationExpectations string value must be non-empty; use [{ "id": "continuation-1", "description": "..." }].'
+      );
+    }
+    return [{ id: 'continuation-1', description }];
   }
   if (!Array.isArray(value)) {
     throw new AgentPlanParseError(
-      'invalid_implementation_plan_file_operations',
-      `${label} must be an array of { operation, capability, targetRef|targetPath, reason? } objects.`
+      'invalid_action_bundle_continuation',
+      'Agent Protocol v3.actionBundle.continuationExpectations must be an array of { id, description, target?, reason?, dependsOn? } objects; string and string[] are accepted only as compatibility input.'
     );
   }
   return value.map((item, index) => {
     if (typeof item === 'string') {
-      return normalizeFileOperationShorthand(item, `${label}[${index}]`);
+      const description = item.trim();
+      if (!description) {
+        throw new AgentPlanParseError(
+          'invalid_action_bundle_continuation',
+          `Agent Protocol v3.actionBundle.continuationExpectations[${index}] string value must be non-empty; use { "id": "continuation-${index + 1}", "description": "..." }.`
+        );
+      }
+      return { id: `continuation-${index + 1}`, description };
     }
-    const record = requireObject(item, `${label}[${index}]`);
-    const operation = optionalString(record, 'operation') ?? optionalString(record, 'kind') ?? '';
-    const capability = optionalString(record, 'capability') ?? '';
-    const targetPath = optionalString(record, 'targetPath') ?? optionalTargetRefPath(record.targetRef);
-    if (!operation) {
+    const record = requireObject(item, `Agent Protocol v3.actionBundle.continuationExpectations[${index}]`);
+    const description = optionalString(record, 'description') ?? optionalString(record, 'summary') ?? optionalString(record, 'title');
+    if (!description) {
       throw new AgentPlanParseError(
-        'invalid_implementation_plan_file_operations',
-        `${label}[${index}] must include operation. Minimal shape: { "operation": "create", "capability": "fs.write", "targetPath": "relative/file.ext", "reason": "..." }.`
+        'invalid_action_bundle_continuation',
+        `Agent Protocol v3.actionBundle.continuationExpectations[${index}].description must be a non-empty string; minimal shape is { "id": "continuation-${index + 1}", "description": "..." }.`
       );
     }
-    if (!targetPath) {
-      throw new AgentPlanParseError(
-        'invalid_implementation_plan_file_operations',
-        `${label}[${index}] must include targetPath or targetRef.path. Minimal shape: { "operation": "create", "capability": "fs.write", "targetPath": "relative/file.ext", "reason": "..." }.`
-      );
-    }
-    if (operation && !fileOperationAllowed(operation)) {
-      throw new AgentPlanParseError(
-        'invalid_implementation_plan_file_operations',
-        `${label}[${index}].operation must be one of create, write, patch, delete, rename.`
-      );
-    }
+    const target = normalizeStringList(record.target).concat(normalizeStringList(record.targets));
+    const args = optionalObjectRecord(record.args) ?? {};
+    const argsPath = optionalString(args, 'path') ?? optionalString(args, 'targetPath');
+    const resourceScope = normalizeStringList(record.resourceScope);
+    const normalizedScope = target.length
+      ? target
+      : (resourceScope.length ? resourceScope : (argsPath ? [argsPath] : []));
     return {
       ...record,
-      operation,
-      capability: capability || capabilityForFileOperation(operation),
-      targetPath,
-      targetKind: optionalString(record, 'targetKind') ?? optionalString(record, 'targetResourceKind'),
-      targetResourceKind: optionalString(record, 'targetResourceKind') ?? optionalString(record, 'targetKind'),
-      recursive: typeof record.recursive === 'boolean' ? record.recursive : undefined,
-      reason: optionalString(record, 'reason') ?? optionalString(record, 'purpose'),
+      id: optionalString(record, 'id') ?? optionalString(record, 'continuationId') ?? `continuation-${index + 1}`,
+      title: optionalString(record, 'title') ?? description,
+      description,
+      reason: optionalString(record, 'reason'),
+      target: target.length ? target : undefined,
+      resourceScope: normalizedScope,
+      dependsOn: optionalStringArray(record, 'dependsOn'),
     };
   });
 }
 
-function normalizeAccessScopes(value: unknown, label: string): Array<Record<string, unknown>> {
-  if (value === undefined || value === null) return [];
-  if (typeof value === 'string') {
-    return [normalizeAccessScopeShorthand(value, `${label}[0]`)];
+function kernelCapabilityForToolId(toolId: string): string {
+  if (toolId.startsWith('git.')) {
+    return toolId === 'git.status' || toolId === 'git.diff' ? 'git.read' : (toolId === 'git.push' ? 'git.push' : 'git.write');
   }
-  if (!Array.isArray(value)) {
-    throw new AgentPlanParseError(
-      'invalid_access_scopes',
-      `${label} must be an array of { scopeKind, path, capability?|capabilities?, operations?, reason?, dependencyDepth? } objects.`
-    );
-  }
-  return value.map((item, index) => {
-    if (typeof item === 'string') {
-      return normalizeAccessScopeShorthand(item, `${label}[${index}]`);
-    }
-    const record = requireObject(item, `${label}[${index}]`);
-    const scopeKind = optionalString(record, 'scopeKind') ?? optionalString(record, 'kind') ?? 'workspaceModule';
-    const path = optionalString(record, 'path') ?? optionalString(record, 'targetPath') ?? '';
-    if (!path) {
-      throw new AgentPlanParseError(
-        'invalid_access_scopes',
-        `${label}[${index}] must include path. Minimal shape: { "scopeKind": "workspaceModule", "path": "relative/module", "capabilities": ["fs.write","fs.patch"], "reason": "..." }.`
-      );
-    }
-    if (!['workspaceModule', 'oneHopDependency'].includes(scopeKind)) {
-      throw new AgentPlanParseError(
-        'invalid_access_scopes',
-        `${label}[${index}].scopeKind must be "workspaceModule" or "oneHopDependency".`
-      );
-    }
-    return {
-      ...record,
-      scopeKind,
-      path,
-      capability: optionalString(record, 'capability'),
-      capabilities: optionalStringArray(record, 'capabilities'),
-      operations: optionalStringArray(record, 'operations'),
-      reason: optionalString(record, 'reason') ?? optionalString(record, 'purpose'),
-      dependencyDepth: typeof record.dependencyDepth === 'number' ? record.dependencyDepth : undefined,
-      sourceTaskId: optionalString(record, 'sourceTaskId') ?? optionalString(record, 'taskId'),
-    };
-  });
-}
-
-function normalizeFileOperationShorthand(value: string, label: string): Record<string, unknown> {
-  const text = value.trim();
-  if (!text) {
-    throw new AgentPlanParseError(
-      'invalid_implementation_plan_file_operations',
-      `${label} string shorthand must be non-empty; use "create relative/file.ext" or { "operation": "create", "capability": "fs.write", "targetPath": "relative/file.ext" }.`
-    );
-  }
-  const match = /^(create|write|patch|delete|rename)\s+(.+)$/i.exec(text);
-  if (!match) {
-    throw new AgentPlanParseError(
-      'invalid_implementation_plan_file_operations',
-      `${label} string shorthand must start with create, write, patch, delete, or rename followed by a concrete path.`
-    );
-  }
-  const operation = match[1].toLowerCase();
-  const targetPath = match[2].trim();
-  if (!targetPath) {
-    throw new AgentPlanParseError(
-      'invalid_implementation_plan_file_operations',
-      `${label} string shorthand must include a concrete target path.`
-    );
-  }
-  return {
-    operation,
-    capability: capabilityForFileOperation(operation),
-    targetPath,
-    reason: text,
-  };
-}
-
-function normalizeAccessScopeShorthand(value: string, label: string): Record<string, unknown> {
-  const text = value.trim();
-  if (!text) {
-    throw new AgentPlanParseError(
-      'invalid_access_scopes',
-      `${label} string shorthand must be non-empty; use "relative/module" or { "scopeKind": "workspaceModule", "path": "relative/module", "capabilities": ["fs.write","fs.patch"] }.`
-    );
-  }
-  return {
-    scopeKind: 'workspaceModule',
-    path: text,
-    capabilities: ['fs.write', 'fs.patch'],
-    operations: ['create', 'write', 'patch'],
-    reason: text,
-    dependencyDepth: 0,
-  };
-}
-
-function fileOperationAllowed(operation: string): boolean {
-  return ['create', 'write', 'patch', 'delete', 'rename'].includes(operation);
-}
-
-function capabilityForFileOperation(operation: string): string {
-  if (operation === 'delete') return 'fs.delete';
-  if (operation === 'rename') return 'fs.rename';
-  if (operation === 'patch') return 'fs.patch';
-  if (operation === 'create' || operation === 'write') return 'fs.write';
-  return '';
-}
-
-function optionalTargetRefPath(value: unknown): string | undefined {
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    return trimmed ? trimmed : undefined;
-  }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  return optionalString(value as Record<string, unknown>, 'path') ?? optionalString(value as Record<string, unknown>, 'targetPath');
+  if (toolId === 'web.search' || toolId === 'web.fetch') return 'network.egress';
+  if (toolId.startsWith('browser.')) return 'browser.control';
+  if (toolId === 'provider.call') return 'provider.egress';
+  return toolId;
 }
 
 function normalizeExpectations(value: unknown, label: string): Array<Record<string, unknown>> {
@@ -406,14 +401,25 @@ function normalizeExpectations(value: unknown, label: string): Array<Record<stri
 }
 
 function normalizeResourceRequest(value: Record<string, unknown>): Record<string, unknown> {
-  const items = value.items;
+  const items = Array.isArray(value.items)
+    ? value.items
+    : Array.isArray(value.resources)
+      ? value.resources
+      : Array.isArray(value.resourceRequests)
+        ? value.resourceRequests
+        : undefined;
   if (!Array.isArray(items)) {
-    throw new AgentPlanParseError('invalid_resource_request', 'Agent Protocol v3.resourceRequest.items must be an array');
+    throw new AgentPlanParseError('invalid_resource_request', 'Agent Protocol v3.resourceRequest.items must be an array; compatibility aliases resources[]/resourceRequests[] are accepted only during parser canonicalization');
   }
   const normalizedItems = items.map((item, index) => {
     const record = requireObject(item, `Agent Protocol v3.resourceRequest.items[${index}]`);
     const id = optionalString(record, 'id') ?? `item-${index}`;
-    const kind = optionalString(record, 'kind');
+    const resourceType = optionalString(record, 'resourceType');
+    const kind = optionalString(record, 'kind') ?? (
+      resourceType === 'file' || resourceType === 'directory' || resourceType === 'resource' || resourceType === 'search'
+        ? resourceType
+        : undefined
+    );
     const manifestEntryId = optionalString(record, 'manifestEntryId');
     const path = optionalString(record, 'path');
     const rootId = optionalString(record, 'rootId');
@@ -474,6 +480,13 @@ function optionalPositiveInteger(record: Record<string, unknown>, key: string): 
 }
 
 function normalizeDecisionRequest(value: Record<string, unknown>): Record<string, unknown> {
+  const question = optionalString(value, 'question') ?? optionalString(value, 'summary') ?? optionalString(value, 'reason');
+  if (!question) {
+    throw new AgentPlanParseError(
+      'invalid_decision_request',
+      'Agent Protocol v3.decisionRequest.question must be a non-empty string'
+    );
+  }
   const options = value.options;
   if (!Array.isArray(options) || options.length < 2 || options.length > 3) {
     throw new AgentPlanParseError(
@@ -485,8 +498,9 @@ function normalizeDecisionRequest(value: Record<string, unknown>): Record<string
     ...value,
     version: optionalString(value, 'version') ?? '1',
     id: optionalString(value, 'id') ?? 'decision-request',
-    reason: optionalString(value, 'reason') ?? 'User intervention is required.',
-    summary: optionalString(value, 'summary') ?? optionalString(value, 'reason') ?? '需要用户介入确认。',
+    question,
+    reason: optionalString(value, 'reason') ?? question,
+    summary: optionalString(value, 'summary') ?? question,
     allowsFreeform: typeof value.allowsFreeform === 'boolean' ? value.allowsFreeform : true,
     options: options.map((item, index) => {
       const record = requireObject(item, `Agent Protocol v3.decisionRequest.options[${index}]`);
@@ -550,6 +564,12 @@ function optionalStringArray(value: Record<string, unknown>, key: string): strin
   const raw = value[key];
   if (!Array.isArray(raw)) return [];
   return raw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+}
+
+function normalizeStringList(value: unknown): string[] {
+  if (typeof value === 'string' && value.trim()) return [value.trim()];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
 }
 
 function optionalBoolean(value: Record<string, unknown> | undefined, key: string): boolean | undefined {

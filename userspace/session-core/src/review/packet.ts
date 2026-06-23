@@ -48,7 +48,7 @@ function kernelFactsFromSelfCheckInput(input: BuildReviewPacketInput): ReviewKer
 }
 
 function commandResults(results: ReviewToolResult[]): ReviewToolResult[] {
-  return results.filter((result) => result.toolName === 'shell.exec' || result.toolName === 'process.exec');
+  return results.filter((result) => result.toolName === 'process.exec');
 }
 
 function validationResultsFromCandidates(input: BuildReviewPacketInput): ReviewValidationFact[] {

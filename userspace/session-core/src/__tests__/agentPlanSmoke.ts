@@ -36,7 +36,7 @@ import {
 
 async function main(): Promise<void> {
   assertV3Parser();
-  assertImplementationPlanFileOperationAndAccessScopeCompatibility();
+  assertLegacyProviderShapesAreRejected();
   assertActionBundleProtocolFields();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -61,6 +61,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopReadOnlyRequestsContinueWithoutBudgetDecision();
   await assertSessionDriverLoopOldResourceBudgetDecisionStillResumes();
   await assertSessionDriverLoopProjectsDecisionRequest();
+  await assertSessionDriverLoopProjectsTaskPlanBeforeComplete();
   await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
   await assertSessionDriverLoopRepairsInvalidSourceBlock();
   await assertSessionDriverLoopAllowsManyNoCodeActionsWithoutBatchRepair();
@@ -85,15 +86,24 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanReviewRootAccessScope();
   await assertSessionDriverLoopAcceptedImplementationPlanPreservesExecutionRoot();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMultiTargetBatch();
+  await assertSessionDriverLoopAcceptedImplementationPlanKeepsContinuationNonExecutable();
   await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsMergeIndependentTasks();
+  await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsScheduleExplicitDag();
+  await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsStreamPartFrames();
+  await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsStalledBranchFallback();
   await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsDiscardFailedBranchAndFallback();
+  await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsSerialFallbackProviderFailure();
   await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsRepairInvalidParentFallback();
   await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsTreatLegacyDependenciesAsSoftOrder();
+  await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsSkipSingleModule();
   await assertSessionDriverLoopAcceptedImplementationPlanSubAgentsSkipHardDependency();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDeleteAction();
   await assertSessionDriverLoopAcceptedImplementationRejectsDeleteRootTarget();
   await assertSessionDriverLoopAcceptedImplementationPlanClassifiesDeleteCompileMismatch();
   await assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTasksComplete();
+  await assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedArtifactEvidence();
+  await assertSessionDriverLoopAcceptedImplementationPlanResumesFromResourceCursor();
+  await assertSessionDriverLoopAcceptedImplementationPlanInheritsSubAgentOffSetting();
   await assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedProcessExecPermissionGate();
   await assertSessionDriverLoopAcceptedImplementationPlanAllowsAbsoluteAttachmentChildTarget();
   await assertSessionDriverLoopAcceptedImplementationRejectsAttachmentRootTarget();
@@ -118,6 +128,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopNativeReadToolDuplicateLoopRepairsToProposal();
   await assertSessionDriverLoopNativeReadToolDuplicateProposalWinsOverToolCall();
   await assertSessionDriverLoopNativeWriteToolTriggersImplementationPlanRepair();
+  await assertSessionDriverLoopAcceptedPlanNativeWriteToolUsesProposalOnlyRepair();
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
@@ -183,8 +194,49 @@ async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'decisionRequest does not generate a plan before user decision');
 }
 
-function assertImplementationPlanFileOperationAndAccessScopeCompatibility(): void {
-  const canonical = parseProposalEnvelope({
+async function assertSessionDriverLoopProjectsTaskPlanBeforeComplete(): Promise<void> {
+  const events: AgentEvent[] = [];
+  let llmCalls = 0;
+  let proposalSubmits = 0;
+  const session: AgentSession = {
+    id: 'session-task-plan',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') proposalSubmits += 1;
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return jsonLlmResponse(genericTaskPlanProposal());
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: 'session-task-plan',
+    content: 'Create a generic multi-file workspace change.',
+  });
+  const planCard = result.events.find((event) => event.kind === 'plan_card');
+  const payload = planCard?.payload as Record<string, any> | undefined;
+  assertEqual(llmCalls, 1, 'taskPlan is produced by provider once');
+  assertEqual(proposalSubmits, 0, 'taskPlan does not submit executable Kernel ProposalSubmit before user confirmation');
+  assertEqual(Boolean(payload?.taskPlan), true, 'taskPlan projects to a confirmable plan card');
+  assertEqual(Array.isArray(payload?.codeBlocks) && payload.codeBlocks.length === 0, true, 'taskPlan plan card carries no source code');
+  assertEqual(Boolean(payload?.actionBundle?.actions?.length), false, 'taskPlan plan card carries no executable actions');
+}
+
+function assertLegacyProviderShapesAreRejected(): void {
+  assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic-plan',
     sessionId: 'session-generic-plan',
     raw: JSON.stringify({
@@ -196,117 +248,82 @@ function assertImplementationPlanFileOperationAndAccessScopeCompatibility(): voi
         id: 'impl-generic-canonical',
         title: 'Generic plan',
         summary: 'Plan generic workspace edits.',
-        tasks: [{
-          taskId: 'task-generic-canonical',
-          title: 'Create generic module files',
-          target: ['src/generic'],
-          scope: 'Create generic module files.',
-          capability: 'fs.write',
-          fileOperations: [{
-            operation: 'create',
-            capability: 'fs.write',
-            targetPath: 'src/generic/output.hpp',
-            reason: 'Create a generic header.',
-          }],
-          accessScopes: [{
-            scopeKind: 'workspaceModule',
-            path: 'src/generic',
-            capabilities: ['fs.write', 'fs.patch'],
-            operations: ['create', 'write', 'patch'],
-            reason: 'Generic module edit scope.',
-            dependencyDepth: 0,
-          }],
-          acceptanceCriteria: ['Kernel can review the generic file operation.'],
-          failureCriteria: ['Stop if the target is outside scope.'],
-        }],
-        risks: [],
-        reviewCheckpoints: ['Review generic plan before execution.'],
+        tasks: [],
       },
     }),
-  });
-  const canonicalTask = ((canonical.payload as any).tasks ?? [])[0];
-  assertEqual(canonicalTask.fileOperations[0].targetPath, 'src/generic/output.hpp', 'canonical fileOperations object parses');
-  assertEqual(canonicalTask.accessScopes[0].scopeKind, 'workspaceModule', 'canonical accessScopes object parses');
+  }), 'unsupported: implementationPlan');
 
-  const shorthand = parseProposalEnvelope({
+  assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic-plan',
     sessionId: 'session-generic-plan',
     raw: JSON.stringify({
       schemaVersion: 'deepcode.agent.protocol.v3',
-      kind: 'implementationPlan',
+      kind: 'actionBundle',
       outputLanguage: 'en-US',
-      implementationPlan: {
+      userPlanMarkdown: '# Plan\n\n## Summary\nGeneric plan.',
+      codeBlocks: [],
+      actionBundle: {
         version: '1',
-        id: 'impl-generic-shorthand',
-        title: 'Generic shorthand plan',
-        summary: 'Plan generic shorthand workspace edits.',
-        tasks: [{
-          taskId: 'task-generic-shorthand',
-          title: 'Create generic shorthand files',
-          target: ['src/generic'],
-          scope: 'Create generic files with shorthand compatibility.',
+        id: 'bundle-legacy-capability',
+        goal: 'Generic workspace edit.',
+        actions: [{
+          actionId: 'write-generic',
           capability: 'fs.write',
-          fileOperations: ['create src/generic/output.cpp', 'write scripts/generic.sh'],
-          accessScopes: ['src/generic'],
-          acceptanceCriteria: ['Kernel can review the generic shorthand operation.'],
-          failureCriteria: ['Stop if the shorthand target is invalid.'],
+          resourceScope: ['generic/output.txt'],
+          description: 'Legacy capability action.',
         }],
-        risks: [],
-        reviewCheckpoints: ['Review generic shorthand plan before execution.'],
+        validationExpectations: [{ id: 'validation-generic', description: 'Kernel records the proposed validation.' }],
+        reviewExpectations: [{ id: 'review-generic', description: 'User reviews the scoped change.' }],
       },
     }),
-  });
-  const shorthandTask = ((shorthand.payload as any).tasks ?? [])[0];
-  assertEqual(shorthandTask.fileOperations[0].operation, 'create', 'fileOperations string shorthand maps operation');
-  assertEqual(shorthandTask.fileOperations[0].capability, 'fs.write', 'fileOperations string shorthand maps capability');
-  assertEqual(shorthandTask.fileOperations[0].targetPath, 'src/generic/output.cpp', 'fileOperations string shorthand maps path');
-  assertEqual(shorthandTask.fileOperations[1].operation, 'write', 'second fileOperations shorthand parses');
-  assertEqual(shorthandTask.accessScopes[0].scopeKind, 'workspaceModule', 'accessScopes string shorthand maps workspace module');
-  assertEqual(shorthandTask.accessScopes[0].path, 'src/generic', 'accessScopes string shorthand maps path');
-  assertEqual(shorthandTask.accessScopes[0].capabilities.includes('fs.write'), true, 'accessScopes string shorthand grants write scope');
+  }), 'capability is not provider-facing');
 
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic-plan',
-    raw: JSON.stringify(genericImplementationPlanWithTask({
-      fileOperations: [''],
-      accessScopes: [{ scopeKind: 'workspaceModule', path: 'src/generic' }],
-    })),
-  }), 'string shorthand must be non-empty');
+    sessionId: 'session-generic-plan',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'actionBundle',
+      outputLanguage: 'en-US',
+      userPlanMarkdown: '# Plan\n\n## Summary\nGeneric plan.',
+      codeBlocks: [{
+        blockId: 'block-generic',
+        targetPath: 'generic/output.txt',
+        content: 'line 1\nline 2',
+      }],
+      actionBundle: {
+        version: '1',
+        id: 'bundle-legacy-content',
+        goal: 'Generic workspace edit.',
+        actions: [{
+          actionId: 'write-generic',
+          toolId: 'fs.write',
+          args: { path: 'generic/output.txt', sourceBlockId: 'block-generic' },
+          description: 'Canonical action.',
+        }],
+        validationExpectations: [{ id: 'validation-generic', description: 'Kernel records the proposed validation.' }],
+        reviewExpectations: [{ id: 'review-generic', description: 'User reviews the scoped change.' }],
+      },
+    }),
+  }), 'must use contentLines');
+
+  const taskPlan = parseProposalEnvelope({
+    runId: 'run-generic-plan',
+    sessionId: 'session-generic-plan',
+    raw: JSON.stringify(genericTaskPlanProposal()),
+  });
+  assertEqual(taskPlan.kind, 'taskPlan', 'taskPlan is the provider-facing non-executable plan kind');
+  const taskPlanPayload = taskPlan.payload as Record<string, any>;
+  assertEqual(Array.isArray(taskPlanPayload.tasks) && taskPlanPayload.tasks.length === 1, true, 'taskPlan carries task slices');
+  assertEqual(Boolean(taskPlanPayload.actionBundle), false, 'taskPlan does not carry executable actionBundle');
+
+  const invalidTaskPlan = genericTaskPlanProposal();
+  (invalidTaskPlan.taskPlan as any).codeBlocks = [{ blockId: 'block-generic', contentLines: ['x'] }];
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic-plan',
-    raw: JSON.stringify(genericImplementationPlanWithTask({
-      fileOperations: [{ operation: 'create', capability: 'fs.write' }],
-      accessScopes: [{ scopeKind: 'workspaceModule', path: 'src/generic' }],
-    })),
-  }), 'must include targetPath or targetRef.path');
-  assertThrows(() => parseProposalEnvelope({
-    runId: 'run-generic-plan',
-    raw: JSON.stringify(genericImplementationPlanWithTask({
-      fileOperations: [{ capability: 'fs.write', targetPath: 'src/generic/output.cpp' }],
-      accessScopes: [{ scopeKind: 'workspaceModule', path: 'src/generic' }],
-    })),
-  }), 'must include operation');
-  assertThrows(() => parseProposalEnvelope({
-    runId: 'run-generic-plan',
-    raw: JSON.stringify(genericImplementationPlanWithTask({
-      fileOperations: [{ operation: 'compile', capability: 'process.exec', targetPath: 'src/generic/output.cpp' }],
-      accessScopes: [{ scopeKind: 'workspaceModule', path: 'src/generic' }],
-    })),
-  }), 'operation must be one of');
-  assertThrows(() => parseProposalEnvelope({
-    runId: 'run-generic-plan',
-    raw: JSON.stringify(genericImplementationPlanWithTask({
-      fileOperations: [{ operation: 'create', capability: 'fs.write', targetPath: 'src/generic/output.cpp' }],
-      accessScopes: [{ scopeKind: 'workspaceRoot', path: 'src/generic' }],
-    })),
-  }), 'scopeKind must be');
-  assertThrows(() => parseProposalEnvelope({
-    runId: 'run-generic-plan',
-    raw: JSON.stringify(genericImplementationPlanWithTask({
-      fileOperations: [{ operation: 'create', capability: 'fs.write', targetPath: 'src/generic/output.cpp' }],
-      accessScopes: [{ scopeKind: 'workspaceModule' }],
-    })),
-  }), 'must include path');
+    sessionId: 'session-generic-plan',
+    raw: JSON.stringify(invalidTaskPlan),
+  }), 'codeBlocks is not allowed');
 }
 
 function assertV3Parser(): void {
@@ -343,6 +360,25 @@ function assertV3Parser(): void {
   assertEqual(resourceRequest.kind, 'resourceRequest', 'v3 resourceRequest path item parses');
   const resourcePayload = resourceRequest.payload as any;
   assertEqual(resourcePayload.items[0].path, 'src/generic.txt', 'v3 resourceRequest keeps root-relative path');
+
+  const aliasResourceRequest = parseProposalEnvelope({
+    runId: 'run-generic',
+    sessionId: 'session-generic',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'resourceRequest',
+      outputLanguage: 'en-US',
+      resourceRequest: {
+        version: '1',
+        id: 'request-generic-alias',
+        reason: 'Need a generic file using compatibility aliases.',
+        resources: [{ id: 'alias-item', resourceType: 'file', rootId: 'root-generic', path: 'src/alias.txt', reason: 'Read alias source.' }],
+      },
+    }),
+  });
+  const aliasPayload = aliasResourceRequest.payload as any;
+  assertEqual(aliasPayload.items[0].path, 'src/alias.txt', 'v3 resourceRequest resources[] alias canonicalizes to items[]');
+  assertEqual(aliasPayload.items[0].kind, 'file', 'v3 resourceRequest resourceType alias canonicalizes to kind');
 
   const rangedResourceRequest = parseProposalEnvelope({
     runId: 'run-generic',
@@ -393,6 +429,33 @@ function assertV3Parser(): void {
   assertEqual(searchPayload.items[0].include[0], 'src/', 'v3 resourceRequest preserves include filter');
   assertEqual(searchPayload.items[0].contextLines, 2, 'v3 resourceRequest preserves contextLines');
   assertEqual(searchPayload.items[0].maxResults, 25, 'v3 resourceRequest preserves maxResults');
+
+  const shorthandDecisionRequest = parseProposalEnvelope({
+    runId: 'run-generic',
+    sessionId: 'session-generic',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'decisionRequest',
+      outputLanguage: 'en-US',
+      reason: 'Need user choice for a generic boundary.',
+      options: [
+        { id: 'retry', label: 'Retry', description: 'Retry with the current accepted scope.' },
+        { id: 'revise', label: 'Revise', description: 'Ask the user to revise the scope.' },
+      ],
+    }),
+  });
+  const decisionPayload = shorthandDecisionRequest.payload as any;
+  assertEqual(decisionPayload.question, 'Need user choice for a generic boundary.', 'v3 decisionRequest shorthand is canonicalized to a question');
+  assertEqual(decisionPayload.options.length, 2, 'v3 decisionRequest shorthand preserves valid options');
+
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-generic',
+    raw: JSON.stringify({
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'decisionRequest',
+      reason: 'Missing options should fail closed.',
+    }),
+  }), 'options must include 2-3 options');
 
   assertThrows(() => parseProposalEnvelope({
     runId: 'run-generic',
@@ -446,8 +509,48 @@ function assertActionBundleProtocolFields(): void {
   assertEqual(payload.actionBundle.actions[0].canParallelize, false, 'Session parser fills canParallelize default');
   assertEqual(payload.actionBundle.actions[0].conflictKeys[0], 'generic-output.txt', 'Session parser derives conflict key from resource scope');
 
+  const missingToolActionRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  missingToolActionRaw.actionBundle = {
+    ...missingToolActionRaw.actionBundle,
+    actions: [{ actionId: 'missing-tool-action', description: 'Missing executable tool id.', args: { path: 'generic-output.txt' } }],
+  };
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-action-missing-tool',
+    raw: missingToolActionRaw,
+  }), 'actions[0].toolId must be a non-empty Kernel catalog toolId');
+
+  const continuationStringRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  continuationStringRaw.actionBundle = {
+    ...continuationStringRaw.actionBundle,
+    continuationExpectations: ['Continue with the next generic accepted slice.'],
+  };
+  const continuationStringProposal = parseProposalEnvelope({
+    runId: 'run-continuation-string',
+    sessionId: 'session-continuation-string',
+    raw: continuationStringRaw,
+  });
+  assertEqual(
+    ((continuationStringProposal.payload as any).actionBundle.continuationExpectations[0] as any).description,
+    'Continue with the next generic accepted slice.',
+    'string continuationExpectation is canonicalized to non-executable object form'
+  );
+
+  const continuationObjectRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  continuationObjectRaw.actionBundle = {
+    ...continuationObjectRaw.actionBundle,
+    continuationExpectations: [{ id: 'next-generic-slice', description: 'Continue with another generic target.', target: ['generic-next.txt'] }],
+  };
+  const continuationObjectProposal = parseProposalEnvelope({
+    runId: 'run-continuation-object',
+    sessionId: 'session-continuation-object',
+    raw: continuationObjectRaw,
+  });
+  const continuationObject = ((continuationObjectProposal.payload as any).actionBundle.continuationExpectations[0] as any);
+  assertEqual(continuationObject.description, 'Continue with another generic target.', 'object continuationExpectation does not require toolId');
+  assertEqual(continuationObject.resourceScope[0], 'generic-next.txt', 'object continuationExpectation keeps target as review-only scope hint');
+
   const wrappedRaw = providerFacingWriteProposalWithoutMachineIds() as any;
-  const wrappedProposal = parseProposalEnvelope({
+  assertThrows(() => parseProposalEnvelope({
     runId: 'run-actionbundle-payload-wrapper',
     sessionId: 'session-actionbundle-payload-wrapper',
     raw: {
@@ -464,10 +567,7 @@ function assertActionBundleProtocolFields(): void {
         reviewGuide: wrappedRaw.reviewGuide,
       },
     },
-  });
-  const wrappedPayload = wrappedProposal.payload as any;
-  assertEqual(wrappedPayload.actionBundle.actions[0].targetPath, 'generic-output.txt', 'payload-wrapped actionBundle is canonicalized to the normal internal payload');
-  assertEqual(wrappedPayload.codeBlocks[0].targetPath, 'generic-output.txt', 'payload-wrapped codeBlocks are preserved');
+  }), 'top-level field');
 
   const compatibilityRaw = providerFacingWriteProposalWithoutMachineIds() as any;
   compatibilityRaw.actionBundle = {
@@ -511,6 +611,26 @@ function assertActionBundleProtocolFields(): void {
     runId: 'run-missing-expectation-description',
     raw: missingDescriptionRaw,
   }), 'description must be a non-empty string');
+
+  const emptyContinuationRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  emptyContinuationRaw.actionBundle = {
+    ...emptyContinuationRaw.actionBundle,
+    continuationExpectations: [''],
+  };
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-empty-continuation',
+    raw: emptyContinuationRaw,
+  }), 'continuationExpectations[0] string value must be non-empty');
+
+  const missingContinuationDescriptionRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  missingContinuationDescriptionRaw.actionBundle = {
+    ...missingContinuationDescriptionRaw.actionBundle,
+    continuationExpectations: [{ id: 'continuation-without-description' }],
+  };
+  assertThrows(() => parseProposalEnvelope({
+    runId: 'run-missing-continuation-description',
+    raw: missingContinuationDescriptionRaw,
+  }), 'continuationExpectations[0].description must be a non-empty string');
 }
 
 function assertPromptEnvelope(): void {
@@ -587,10 +707,11 @@ function assertPromptEnvelope(): void {
   assert(prompt.stablePrefix.includes('optional top-level narration'), 'prompt documents model-generated narration');
   assert(prompt.stablePrefix.includes('reviewSummary is Session-generated'), 'prompt excludes reviewSummary from provider proposal kinds');
   assert(prompt.stablePrefix.includes('Implementation payload budget'), 'prompt documents payload-based implementation budget');
-  assert(prompt.stablePrefix.includes('fileOperations shape'), 'prompt documents implementationPlan fileOperations object shape');
-  assert(prompt.stablePrefix.includes('accessScopes shape'), 'prompt documents implementationPlan accessScopes object shape');
-  assert(prompt.stablePrefix.includes('fileOperations items must be objects'), 'prompt schema digest tells provider fileOperations are object items');
-  assert(prompt.stablePrefix.includes('accessScopes items must be objects'), 'prompt schema digest tells provider accessScopes are object items');
+  assert(!prompt.stablePrefix.includes('implementationPlan top-level field'), 'prompt no longer documents implementationPlan as a provider kind');
+  assert(prompt.stablePrefix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description,dependsOn?}'), 'prompt documents canonical action shape');
+  assert(prompt.stablePrefix.includes('actionBundle.continuationExpectations[] are non-executable continuation notes shaped {id,description,target?,reason?,dependsOn?}'), 'prompt documents continuation as non-executable intent');
+  assert(prompt.stablePrefix.includes('contentLines is the only provider-facing source-code content carrier'), 'prompt requires contentLines for source code');
+  assert(prompt.stablePrefix.includes('Do not output capability, permissionLabels, accessScopes, or resourceScope'), 'prompt forbids provider-declared permissions');
   assert(prompt.stablePrefix.includes('Do not add a generic payload wrapper'), 'prompt tells provider not to wrap proposals in payload');
   assert(prompt.stablePrefix.includes('actionBundle proposal top-level fields'), 'prompt documents actionBundle top-level fields');
   assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
@@ -3170,8 +3291,8 @@ async function assertSessionDriverLoopAcceptedDecisionGroupsWorkspaceWriteGrants
         content: '# Plan\n\n## Summary\nWrite multiple generic files.',
         actionBundle,
         codeBlocks: [
-          { id: 'code-one', targetPath: 'generic-one.txt', content: 'one' },
-          { id: 'code-two', targetPath: 'generic-two.txt', content: 'two' },
+          { id: 'code-one', blockId: 'code-one', targetPath: 'generic-one.txt', content: 'one', contentLines: ['one'] },
+          { id: 'code-two', blockId: 'code-two', targetPath: 'generic-two.txt', content: 'two', contentLines: ['two'] },
         ],
         commandBlocks: [],
         planReviewReport: proposalReviewReport(actionBundle),
@@ -4550,11 +4671,11 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPat
       if (command.kind === 'proposalSubmit') {
         proposalSubmits += 1;
         const actionBundle = command.proposal?.payload?.actionBundle ?? {};
-        assertEqual(Array.isArray(actionBundle.accessScopes), false, 'invalid root actionBundle accessScopes are removed before Kernel PlanReview');
+        assertEqual(Array.isArray(actionBundle.accessScopes), false, 'canonical root actionBundle does not submit provider accessScopes');
         assertEqual(
           JSON.stringify(actionBundle.actions ?? []).includes('"accessScopes"'),
           false,
-          'invalid root action accessScopes are removed before Kernel PlanReview'
+          'canonical root action does not submit provider accessScopes'
         );
         return {
           ok: true,
@@ -4603,40 +4724,19 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPat
       if (llmCalls > 1) repairRequests.push(request);
       const proposal = genericWriteProposal(false);
       proposal.codeBlocks = [{
-        id: 'root-output-block',
         blockId: 'root-output-block',
         targetPath: 'root-output.sh',
         language: 'bash',
         operation: 'create',
-        content: '#!/bin/sh\necho generic\n',
-        permissionLabels: ['fs.write'],
+        contentLines: ['#!/bin/sh', 'echo generic'],
       }];
       (proposal.actionBundle as any).id = 'bundle-root-output';
       (proposal.actionBundle as any).goal = 'Create the accepted root-level file.';
-      (proposal.actionBundle as any).accessScopes = [{
-        scopeKind: 'workspaceModule',
-        path: '.',
-        capabilities: ['fs.write'],
-        operations: ['write'],
-        reason: 'invalid root scope emitted by provider',
-      }];
       (proposal.actionBundle as any).actions = [{
-        id: 'write-root-output',
         actionId: 'write-root-output',
-        title: 'Write root output',
-        kind: 'write',
-        capability: 'fs.write',
-        resourceScope: ['.'],
-        targetPath: 'root-output.sh',
-        sourceBlockId: 'root-output-block',
-        permissionLabels: ['fs.write'],
-        accessScopes: [{
-          scopeKind: 'workspaceModule',
-          path: '.',
-          capabilities: ['fs.write'],
-          operations: ['write'],
-          reason: 'invalid root scope emitted by provider',
-        }],
+        toolId: 'fs.write',
+        args: { path: 'root-output.sh', sourceBlockId: 'root-output-block' },
+        description: 'Write root output',
       }];
       return jsonLlmResponse(proposal);
     },
@@ -4656,14 +4756,6 @@ async function assertSessionDriverLoopAcceptedImplementationPlanPrefersTargetPat
   assertEqual(actionBatchSubmits, 1, 'accepted plan root-level write uses targetPath before root resourceScope');
   assertEqual(proposalSubmits, 1, 'accepted plan batch still goes through Kernel PlanReview after scope narrowing');
   assertEqual(repairRequests.length, 0, 'root resourceScope does not trigger accepted-plan scope repair when targetPath is concrete');
-  assertEqual(
-    events.some((event) =>
-      event.kind === 'workflow_stage' &&
-      (event.payload as any)?.stage === 'accepted_plan.access_scope_canonicalized'
-    ),
-    true,
-    'invalid execution-batch accessScopes are audited as narrowed scope'
-  );
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanReviewRootAccessScope(): Promise<void> {
@@ -4748,17 +4840,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanRevie
     llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       if (llmCalls > 1) repairRequests.push(request);
-      const proposal = genericWriteProposal(false);
-      if (llmCalls === 1) {
-        (proposal.actionBundle as any).accessScopes = [{
-          scopeKind: 'workspaceModule',
-          path: '.',
-          capabilities: ['fs.write'],
-          operations: ['write'],
-          reason: 'invalid root scope emitted by provider',
-        }];
-      }
-      return jsonLlmResponse(proposal);
+      return jsonLlmResponse(genericWriteProposal(false));
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + actionBatchSubmits + 1}`,
@@ -4773,13 +4855,14 @@ async function assertSessionDriverLoopAcceptedImplementationPlanRepairsPlanRevie
     existingEvents: events,
   });
 
-  assertEqual(proposalSubmits, 2, 'root access scope needsRevision triggers one automatic PlanReview repair');
+  assertEqual(proposalSubmits, 2, 'Kernel needsRevision triggers one automatic ProposalReview repair');
   assertEqual(actionBatchSubmits, 1, 'repaired accepted-plan batch continues to actionBatchSubmit');
   assertEqual(repairRequests.length, 1, 'Session asks provider for one controlled PlanReview repair');
-  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'repairable root access scope does not trigger user intervention');
+  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'repairable ProposalReview issue does not trigger user intervention');
   assert(
-    JSON.stringify(repairRequests[0].messages).includes('remove actionBundle.accessScopes'),
-    'PlanReview repair prompt tells provider to remove root accessScopes'
+    JSON.stringify(repairRequests[0].messages).includes('contentLines') &&
+      JSON.stringify(repairRequests[0].messages).includes('toolId'),
+    'PlanReview repair prompt uses canonical toolId/contentLines protocol'
   );
 }
 
@@ -4955,6 +5038,106 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesMult
   );
 }
 
+async function assertSessionDriverLoopAcceptedImplementationPlanKeepsContinuationNonExecutable(): Promise<void> {
+  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-continuation', 'run-accepted-plan-continuation')];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-continuation',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  let submittedActionCount = 0;
+  let submittedContinuationCount = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        const actionBundle = command.batch?.actionBundle as Record<string, any> | undefined;
+        submittedActionCount = Array.isArray(actionBundle?.actions) ? actionBundle.actions.length : 0;
+        submittedContinuationCount = Array.isArray(actionBundle?.continuationExpectations)
+          ? actionBundle.continuationExpectations.length
+          : 0;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.queued',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnit: { id: 'work-unit-resource-resume', actionId: 'write-generic-output', status: 'queued', writeSet: ['generic-output.txt'] },
+            },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: 'work-unit-continuation-current',
+              actionId: 'write-continuation-current',
+              output: { path: 'generic-output.txt' },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      const proposal = singleTargetWriteProposal('generic-output.txt', 'continuation-current') as any;
+      proposal.actionBundle = {
+        ...proposal.actionBundle,
+        actions: [{
+          actionId: 'write-continuation-current',
+          toolId: 'fs.write',
+          args: { path: 'generic-output.txt', sourceBlockId: 'code-continuation-current' },
+          description: 'Write current generic output.',
+        }],
+        continuationExpectations: ['Continue with another generic target after review.'],
+      };
+      return jsonLlmResponse(proposal);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-continuation',
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+  });
+
+  assertEqual(proposalSubmits, 1, 'continuation smoke submits current actionBundle to Kernel PlanReview once');
+  assertEqual(actionBatchSubmits, 1, 'continuation smoke submits current action batch once');
+  assertEqual(submittedActionCount, 1, 'continuation smoke keeps executable actions limited to the current action');
+  assertEqual(submittedContinuationCount, 1, 'continuation smoke preserves one non-executable continuation note');
+}
+
 async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsMergeIndependentTasks(): Promise<void> {
   const events = [independentMultiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-subagents', 'run-accepted-plan-subagents')];
   const deltas: unknown[] = [];
@@ -5000,6 +5183,12 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsMergeIn
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
             {
+              kind: 'work_unit.queued',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnit: { id: 'work-unit-resource-resume', actionId: 'write-generic-output', status: 'queued', writeSet: ['generic-output.txt'] },
+            },
+            {
               kind: 'work_unit.completed',
               runId: 'run-generic',
               sessionId: session.id,
@@ -5023,8 +5212,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsMergeIn
       llmCalls += 1;
       const deepcode = request.providerOptions?.deepcode as any;
       const targetPath = deepcode?.subAgent?.targetPath;
-      if (targetPath === 'generic-one.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-one.txt', 'one'));
-      if (targetPath === 'generic-two.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-two.txt', 'two'));
+      if (targetPath === 'generic-one.txt') return jsonLlmResponse(singleTargetModuleDraft('generic-one.txt', 'one'));
+      if (targetPath === 'generic-two.txt') return jsonLlmResponse(singleTargetModuleDraft('generic-two.txt', 'two'));
       throw new Error('sub-agent merge smoke expected only sliced provider calls');
     },
     onProjectionDelta: async (delta) => {
@@ -5054,10 +5243,21 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsMergeIn
   assertEqual(actionBatchSubmits, 1, 'merged sub-agent fragments are submitted to Kernel once');
   assertEqual(
     deltas.some((delta) => (delta as any).type === 'stage_delta' && (delta as any).stage === 'subagent_plan.created') &&
+      deltas.some((delta) => (delta as any).type === 'stage_delta' && (delta as any).stage === 'subagent_dispatch.announced') &&
       deltas.some((delta) => (delta as any).type === 'stage_delta' && (delta as any).stage === 'subagent_merge.started') &&
       deltas.some((delta) => (delta as any).type === 'stage_delta' && (delta as any).stage === 'subagent_merge.completed'),
     true,
     'sub-agent merge emits stable parent progress deltas'
+  );
+  assertEqual(
+    deltas.filter((delta) => (delta as any).type === 'stage_delta' && (delta as any).stage === 'subagent_branch.request_sent').length,
+    2,
+    'sub-agent branch lifecycle records provider request dispatch for each slice'
+  );
+  assertEqual(
+    deltas.filter((delta) => (delta as any).type === 'stage_delta' && (delta as any).stage === 'subagent_branch.waiting_merge').length,
+    2,
+    'sub-agent branch lifecycle records merge-barrier waiting for each slice'
   );
   assertEqual(
     deltas.filter((delta) => (delta as any).branchId && (delta as any).subAgentId).length >= 2,
@@ -5067,6 +5267,382 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsMergeIn
   const actionBundle = submittedPlans[0]?.payload?.actionBundle;
   assertEqual(Array.isArray(actionBundle?.actions) && actionBundle.actions.length, 2, 'merged actionBundle contains both independent task actions');
   assertEqual(typeof submittedPlans[0]?.payload?.narration, 'undefined', 'merged sub-agent batch does not create a formal assistant narration');
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsScheduleExplicitDag(): Promise<void> {
+  const events = [explicitDagAcceptedImplementationPlanCardEvent('session-accepted-plan-subagents-dag', 'run-accepted-plan-subagents-dag')];
+  const deltas: unknown[] = [];
+  const providerTargets: string[] = [];
+  const providerPrompts: string[] = [];
+  const submittedPlans: Array<Record<string, any>> = [];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-subagents-dag',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        submittedPlans.push(command.proposal);
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            { kind: 'work_unit.completed', runId: 'run-generic', sessionId: session.id, workUnitId: 'work-unit-dag-alpha', output: { path: 'generic-alpha/output.txt' } },
+            { kind: 'work_unit.completed', runId: 'run-generic', sessionId: session.id, workUnitId: 'work-unit-dag-beta', output: { path: 'generic-beta/output.txt' } },
+            { kind: 'work_unit.completed', runId: 'run-generic', sessionId: session.id, workUnitId: 'work-unit-dag-gamma', output: { path: 'generic-gamma/output.txt' } },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      const deepcode = request.providerOptions?.deepcode as any;
+      const targetPath = String(deepcode?.subAgent?.targetPath ?? '');
+      providerTargets.push(targetPath);
+      const userMessage = request.messages.find((message) => message.role === 'user')?.content ?? '';
+      providerPrompts.push(userMessage);
+      assert(userMessage.includes('Sub-agent file-node packet'), 'sub-agent request uses file-node packet contract');
+      assert(userMessage.includes('ExecutionFlowGraph file pipeline'), 'sub-agent request includes the DAG file pipeline summary');
+      assert(userMessage.includes('Assigned file node:'), 'sub-agent request identifies the assigned file node');
+      assert(!userMessage.includes('Prompt envelope size summary'), 'sub-agent request omits full parent dynamic prompt');
+      if (targetPath === 'generic-alpha/output.txt') return jsonLlmResponse(singleTargetModuleDraft(targetPath, 'dag-alpha'));
+      if (targetPath === 'generic-beta/output.txt') return jsonLlmResponse(singleTargetModuleDraft(targetPath, 'dag-beta'));
+      if (targetPath === 'generic-gamma/output.txt') return jsonLlmResponse(singleTargetModuleDraft(targetPath, 'dag-gamma'));
+      throw new Error(`unexpected DAG target: ${targetPath}`);
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + providerTargets.length + deltas.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-subagents-dag',
+    targetId: 'impl-generic-dag',
+    existingEvents: events,
+    subAgentMode: 'auto',
+    subAgentMaxParallel: 2,
+  });
+
+  assertEqual(providerTargets.length, 3, 'explicit DAG schedules all three ready/unlocked nodes');
+  assertEqual(new Set(providerTargets.slice(0, 2)).size, 2, 'first scheduler window starts two independent nodes');
+  assert(providerTargets.slice(0, 2).includes('generic-alpha/output.txt'), 'first scheduler window includes the first independent node');
+  assert(providerTargets.slice(0, 2).includes('generic-beta/output.txt'), 'first scheduler window includes the second independent node');
+  assertEqual(providerTargets[2], 'generic-gamma/output.txt', 'dependent node starts only after predecessors complete');
+  assert(providerPrompts.some((prompt) => prompt.includes('"nodeId": "node-generic-gamma"')), 'DAG prompt includes downstream node context');
+  const nodeStageIndex = (stage: string, nodeId: string): number => deltas.findIndex((delta) =>
+    (delta as any).type === 'stage_delta' &&
+    (delta as any).stage === stage &&
+    (delta as any).payload?.nodeId === nodeId
+  );
+  const alphaCompleted = nodeStageIndex('subagent_node.completed', 'node-generic-alpha');
+  const betaCompleted = nodeStageIndex('subagent_node.completed', 'node-generic-beta');
+  const gammaStarted = nodeStageIndex('subagent_node.started', 'node-generic-gamma');
+  const alphaReady = nodeStageIndex('subagent_node.ready', 'node-generic-alpha');
+  const betaReady = nodeStageIndex('subagent_node.ready', 'node-generic-beta');
+  assert(alphaReady >= 0 && betaReady >= 0, 'DAG file nodes emit ready projection before queued/start');
+  assert(alphaCompleted >= 0 && betaCompleted >= 0 && gammaStarted >= 0, 'DAG node lifecycle emits completed and started node events');
+  assert(gammaStarted > alphaCompleted && gammaStarted > betaCompleted, 'dependent node projection starts after predecessor completion');
+  assertEqual(proposalSubmits, 1, 'DAG module drafts are merged into one Parent PlanReview submission');
+  assertEqual(actionBatchSubmits, 1, 'DAG module drafts reach Kernel through one Parent actionBatch');
+  const actionBundle = submittedPlans[0]?.payload?.actionBundle;
+  assertEqual(Array.isArray(actionBundle?.actions) && actionBundle.actions.length, 3, 'DAG merge submits all completed node draft files');
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsStreamPartFrames(): Promise<void> {
+  const events = [independentMultiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-subagents-stream', 'run-accepted-plan-subagents-stream')];
+  const deltas: unknown[] = [];
+  const draftFrames: Array<Record<string, unknown>> = [];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-subagents-stream',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let streamCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'draftLedgerSubmit') {
+        draftFrames.push(command.frame);
+        return {
+          ok: true,
+          events: [
+            {
+              kind: 'draft.chunk',
+              runId: command.runId,
+              sessionId: command.sessionId,
+              draft: { draftId: command.frame.draftId, status: 'draft.chunk', frame: command.frame },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            { kind: 'work_unit.completed', runId: 'run-generic', sessionId: session.id, workUnitId: 'work-unit-stream-one', output: { path: 'generic-one.txt' } },
+            { kind: 'work_unit.completed', runId: 'run-generic', sessionId: session.id, workUnitId: 'work-unit-stream-two', output: { path: 'generic-two.txt' } },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      throw new Error('sub-agent streaming smoke should use llmChatStream');
+    },
+    llmChatStream: async (request, onEvent): Promise<ApiResponse<LlmChatResult>> => {
+      const deepcode = request.providerOptions?.deepcode as any;
+      const branch = deepcode?.subAgent as Record<string, string> | undefined;
+      if (!branch?.targetPath) throw new Error('sub-agent streaming smoke expected branch metadata');
+      streamCalls += 1;
+      const frame = {
+        schemaVersion: 'deepcode.agent.stream.part.v1',
+        partKind: streamCalls % 2 === 1 ? 'thinkingDelta' : 'actionDraftChunk',
+        draftId: `draft-${branch.branchId}`,
+        frameId: `frame-${branch.branchId}`,
+        branchId: branch.branchId,
+        subAgentId: branch.subAgentId,
+        mergeGroupId: branch.mergeGroupId,
+        targetPath: branch.targetPath,
+        capability: 'fs.write',
+        sequence: 1,
+        chunk: `generic progress for ${branch.targetPath}`,
+      };
+      await onEvent({ type: 'provider_delta', chunk: { type: 'delta', content: `<deepcode-part>${JSON.stringify(frame)}</deepcode-part>` } });
+      return jsonLlmResponse(singleTargetModuleDraft(branch.targetPath, `streamed-${streamCalls}`));
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + streamCalls + proposalSubmits + actionBatchSubmits + deltas.length + draftFrames.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-subagents-stream',
+    targetId: 'impl-generic-independent',
+    existingEvents: events,
+    subAgentMode: 'auto',
+    subAgentMaxParallel: 2,
+  });
+
+  assertEqual(streamCalls, 2, 'sub-agent streaming path calls provider once per independent slice');
+  assertEqual(draftFrames.length, 2, 'sub-agent part frames are submitted to Kernel draft ledger');
+  assertEqual(proposalSubmits, 1, 'streamed sub-agent fragments are merged into one Kernel PlanReview submission');
+  assertEqual(actionBatchSubmits, 1, 'streamed sub-agent fragments are executed as one merged batch');
+  assertEqual(
+    deltas.filter((delta) => (delta as any).type === 'stage_delta' && (delta as any).stage === 'subagent_branch.first_delta').length,
+    2,
+    'sub-agent streaming emits first-delta lifecycle events'
+  );
+  assertEqual(
+    deltas.some((delta) => (delta as any).type === 'part_delta' && (delta as any).branchId && (delta as any).subAgentId),
+    true,
+    'sub-agent structured part frames stay branch-scoped'
+  );
+  assertEqual(
+    deltas.some((delta) => (delta as any).type === 'assistant_delta' && (delta as any).branchId),
+    false,
+    'sub-agent raw assistant deltas are not exposed as branch assistant text'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsStalledBranchFallback(): Promise<void> {
+  const events = [independentMultiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-subagents-stalled', 'run-accepted-plan-subagents-stalled')];
+  const deltas: unknown[] = [];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-subagents-stalled',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let parentStreamCalls = 0;
+  let subAgentStreamCalls = 0;
+  let serialFallbackCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const submittedPlans: Array<Record<string, any>> = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        submittedPlans.push(command.proposal);
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            { kind: 'work_unit.completed', runId: 'run-generic', sessionId: session.id, workUnitId: 'work-unit-stalled-fallback-one', output: { path: 'generic-one.txt' } },
+            { kind: 'work_unit.completed', runId: 'run-generic', sessionId: session.id, workUnitId: 'work-unit-stalled-fallback-two', output: { path: 'generic-two.txt' } },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      throw new Error('stalled sub-agent smoke should use streaming provider path');
+    },
+    llmChatStream: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      const deepcode = request.providerOptions?.deepcode as any;
+      const branch = deepcode?.subAgent as Record<string, string> | undefined;
+      if (branch?.targetPath) {
+        subAgentStreamCalls += 1;
+        if (subAgentStreamCalls === 1) {
+          return jsonLlmResponse(singleTargetModuleDraft(branch.targetPath, 'stalled-smoke-first-branch'));
+        }
+        return new Promise<ApiResponse<LlmChatResult>>(() => {
+          // Intentionally unresolved; the Session no-delta timeout owns this branch failure.
+        });
+      }
+      parentStreamCalls += 1;
+      serialFallbackCalls += 1;
+      return jsonLlmResponse(singleTargetWriteProposal('generic-two.txt', 'stalled-serial-fallback'));
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + parentStreamCalls + subAgentStreamCalls + proposalSubmits + actionBatchSubmits + deltas.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-subagents-stalled',
+    targetId: 'impl-generic-independent',
+    existingEvents: events,
+    subAgentMode: 'auto',
+    subAgentMaxParallel: 2,
+    subAgentNoDeltaTimeoutMs: 1,
+    subAgentTotalTimeoutMs: 50,
+  });
+
+  assertEqual(subAgentStreamCalls, 2, 'stalled smoke starts both sub-agent branches');
+  assertEqual(parentStreamCalls, 1, 'stalled branch is reclaimed through one compact parent serial fallback provider call');
+  assertEqual(serialFallbackCalls, 1, 'stalled branch uses the serial slice fallback path once');
+  assertEqual(proposalSubmits, 1, 'stalled branch serial fallback submits one Parent proposal');
+  assertEqual(actionBatchSubmits, 1, 'stalled branch serial fallback reaches Kernel execution');
+  const actionBundle = submittedPlans[0]?.payload?.actionBundle;
+  assertEqual(Array.isArray(actionBundle?.actions) && actionBundle.actions.length, 1, 'stalled branch submits only the Parent fallback action');
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_branch.stalled' &&
+      (delta as any).status === 'failed'
+    ),
+    true,
+    'no-delta timeout projects a stalled branch before failure'
+  );
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_node.reclaimed' &&
+      (delta as any).payload?.reason
+    ),
+    true,
+    'stalled branch is reclaimed for parent serial handling'
+  );
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_serial_fallback.completed'
+    ),
+    true,
+    'stalled branch reaches the compact serial fallback path'
+  );
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      String((delta as any).stage ?? '').startsWith('subagent_parent_fallback')
+    ),
+    false,
+    'stalled branch does not use broad parent fallback'
+  );
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsDiscardFailedBranchAndFallback(): Promise<void> {
@@ -5088,6 +5664,106 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsDiscard
       },
     })
   );
+  await runSubAgentFailureFallbackSmoke(
+    'action-bundle-violation',
+    () => jsonLlmResponse(singleTargetWriteProposal('generic-two.txt', 'subagent-action-bundle-violation'))
+  );
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsSerialFallbackProviderFailure(): Promise<void> {
+  const events = [independentMultiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-subagents-fallback-provider-failure', 'run-accepted-plan-subagents-fallback-provider-failure')];
+  const deltas: unknown[] = [];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-subagents-fallback-provider-failure',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let parentLlmCalls = 0;
+  let subAgentLlmCalls = 0;
+  let serialFallbackCalls = 0;
+  let broadParentFallbackCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        return fakeKernel(request);
+      }
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return fakeKernel(request);
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      const deepcode = request.providerOptions?.deepcode as any;
+      const targetPath = deepcode?.subAgent?.targetPath;
+      if (deepcode?.subAgent) {
+        subAgentLlmCalls += 1;
+        if (targetPath === 'generic-one.txt' || targetPath === 'generic-two.txt') {
+          return jsonLlmResponse(genericDiagnosticProposal('generic branch diagnostic provider failure'));
+        }
+        throw new Error(`unexpected sub-agent target in provider failure smoke: ${targetPath}`);
+      }
+      parentLlmCalls += 1;
+      const promptText = request.messages.map((message) => message.content).join('\n');
+      if (promptText.includes('DeepCode serial slice fallback')) serialFallbackCalls += 1;
+      if (promptText.includes('compact parent fallback step')) broadParentFallbackCalls += 1;
+      assert(promptText.includes('DeepCode serial slice fallback'), 'serial fallback provider request uses the compact slice contract');
+      return {
+        ok: false,
+        message: 'LLM provider returned HTTP 400',
+        error: 'LLM provider returned HTTP 400',
+      };
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + parentLlmCalls + subAgentLlmCalls + proposalSubmits + actionBatchSubmits + deltas.length + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-subagents-fallback-provider-failure',
+    targetId: 'impl-generic-independent',
+    existingEvents: events,
+    subAgentMode: 'auto',
+    subAgentMaxParallel: 2,
+  });
+
+  assertEqual(subAgentLlmCalls, 2, 'provider failure smoke attempts both independent sub-agent branches');
+  assertEqual(parentLlmCalls, 1, 'provider failure smoke attempts the parent fallback provider once');
+  assertEqual(serialFallbackCalls, 1, 'provider failure smoke uses one serial fallback provider request');
+  assertEqual(broadParentFallbackCalls, 0, 'provider failure smoke does not use broad parent fallback');
+  assertEqual(proposalSubmits, 0, 'provider failure smoke does not submit fallback work to Kernel PlanReview');
+  assertEqual(actionBatchSubmits, 0, 'provider failure smoke does not submit fallback work to Kernel execution');
+  assertEqual(result.events.some((event) => event.kind === 'error'), false, 'provider failure smoke does not emit an unhandled Session error event');
+  assert(
+    result.events.some((event) =>
+      event.kind === 'assistant_msg' &&
+      (event.payload as any)?.diagnostic === true &&
+      String((event.payload as any)?.content ?? (event.payload as any)?.summary ?? '').includes('Sub-agent serial fallback provider call failed')
+    ),
+    'provider failure smoke emits a terminal diagnostic with the provider failure reason'
+  );
+  assert(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_serial_fallback.failed' &&
+      (delta as any).status === 'failed'
+    ),
+    'provider failure smoke projects the parent fallback failure'
+  );
 }
 
 async function runSubAgentFailureFallbackSmoke(
@@ -5104,6 +5780,8 @@ async function runSubAgentFailureFallbackSmoke(
   };
   let parentLlmCalls = 0;
   let subAgentLlmCalls = 0;
+  let serialFallbackCalls = 0;
+  let broadParentFallbackCalls = 0;
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
   const submittedPlans: Array<Record<string, any>> = [];
@@ -5139,10 +5817,22 @@ async function runSubAgentFailureFallbackSmoke(
           events: [
             { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
             {
+              kind: 'work_unit.queued',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnit: {
+                id: 'work-unit-resource-resume',
+                actionId: 'write-generic-output',
+                status: 'queued',
+                writeSet: ['generic-output.txt'],
+              },
+            },
+            {
               kind: 'work_unit.completed',
               runId: 'run-generic',
               sessionId: session.id,
               workUnitId: 'work-unit-fallback-one',
+              actionId: `write-reclaimed-${caseName}`,
               output: { path: 'generic-one.txt' },
             },
             {
@@ -5150,6 +5840,7 @@ async function runSubAgentFailureFallbackSmoke(
               runId: 'run-generic',
               sessionId: session.id,
               workUnitId: 'work-unit-fallback-two',
+              actionId: `write-reclaimed-${caseName}`,
               output: { path: 'generic-two.txt' },
             },
             { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
@@ -5164,15 +5855,16 @@ async function runSubAgentFailureFallbackSmoke(
       const targetPath = deepcode?.subAgent?.targetPath;
       if (deepcode?.subAgent) {
         subAgentLlmCalls += 1;
-        if (targetPath === 'generic-one.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-one.txt', `fallback-${caseName}-one`));
+        if (targetPath === 'generic-one.txt') return jsonLlmResponse(singleTargetModuleDraft('generic-one.txt', `fallback-${caseName}-one`));
         if (targetPath === 'generic-two.txt') return failedBranchResponse();
         throw new Error(`unexpected sub-agent target in fallback smoke: ${targetPath}`);
       }
       parentLlmCalls += 1;
       const promptText = request.messages.map((message) => message.content).join('\n');
-      assert(promptText.includes('子代理并行草稿已全部丢弃'), 'parent fallback prompt explains discarded sub-agent drafts');
-      assert(promptText.includes('不得把未提交草稿当成已执行事实'), 'parent fallback prompt prevents treating failed drafts as facts');
-      return jsonLlmResponse(multiWriteProposal());
+      if (promptText.includes('DeepCode serial slice fallback')) serialFallbackCalls += 1;
+      if (promptText.includes('compact parent fallback step')) broadParentFallbackCalls += 1;
+      assert(!promptText.includes('Prompt envelope size summary'), 'reclaimed node parent checkpoint does not reuse broad repair context');
+      return jsonLlmResponse(singleTargetWriteProposal('generic-two.txt', `reclaimed-${caseName}`));
     },
     onProjectionDelta: async (delta) => {
       deltas.push(delta);
@@ -5193,9 +5885,11 @@ async function runSubAgentFailureFallbackSmoke(
   });
 
   assertEqual(subAgentLlmCalls, 2, `${caseName}: sub-agent path attempts both independent slices once`);
-  assertEqual(parentLlmCalls, 1, `${caseName}: failed branch falls back to one parent provider checkpoint`);
-  assertEqual(proposalSubmits, 1, `${caseName}: only parent fallback actionBundle reaches Kernel PlanReview`);
-  assertEqual(actionBatchSubmits, 1, `${caseName}: only parent fallback actionBundle reaches Kernel execution`);
+  assertEqual(parentLlmCalls >= 1, true, `${caseName}: failed node is reclaimed by parent linear checkpoint`);
+  assertEqual(serialFallbackCalls, 1, `${caseName}: failed node uses one compact serial fallback checkpoint`);
+  assertEqual(broadParentFallbackCalls, 0, `${caseName}: failed node does not use broad parent fallback`);
+  assertEqual(proposalSubmits, 2, `${caseName}: successful draft and reclaimed node each reach Kernel PlanReview once`);
+  assertEqual(actionBatchSubmits, 2, `${caseName}: successful draft and reclaimed node each reach Kernel execution once`);
   assertEqual(result.events.some((event) => event.kind === 'error'), false, `${caseName}: branch failure does not become a terminal Session error event`);
   assertEqual(
     deltas.some((delta) =>
@@ -5209,39 +5903,33 @@ async function runSubAgentFailureFallbackSmoke(
   assertEqual(
     deltas.some((delta) =>
       (delta as any).type === 'stage_delta' &&
-      (delta as any).stage === 'subagent_merge.discarded' &&
-      (delta as any).payload?.reason === 'branch_failed' &&
-      Array.isArray((delta as any).payload?.failedBranchIds) &&
-      (delta as any).payload.failedBranchIds.length === 1
+      (delta as any).stage === 'subagent_node.reclaimed' &&
+      (delta as any).payload?.reason
     ),
     true,
-    `${caseName}: failed branch discards the merge group with diagnostics`
+    `${caseName}: failed branch is reclaimed with diagnostics`
   );
   assertEqual(
     deltas.some((delta) =>
       (delta as any).type === 'stage_delta' &&
-      (delta as any).stage === 'subagent_parent_fallback'
+      (delta as any).stage === 'subagent_serial_fallback.completed'
     ),
     true,
-    `${caseName}: parent fallback checkpoint is visible`
+    `${caseName}: failed branch reaches compact serial fallback`
   );
   const actionBundle = submittedPlans[0]?.payload?.actionBundle;
-  assertEqual(Array.isArray(actionBundle?.actions) && actionBundle.actions.length, 2, `${caseName}: parent fallback submits the full merged batch`);
+  const submittedActionCount = submittedPlans.reduce((count, plan) =>
+    count + (Array.isArray(plan?.payload?.actionBundle?.actions) ? plan.payload.actionBundle.actions.length : 0), 0);
+  assertEqual(Array.isArray(actionBundle?.actions) && actionBundle.actions.length, 1, `${caseName}: first Parent submission contains the compact fallback action`);
+  assertEqual(submittedActionCount >= 1, true, `${caseName}: reclaimed node produces executable Parent action(s)`);
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsRepairInvalidParentFallback(): Promise<void> {
-  await runSubAgentInvalidParentFallbackRepairSmoke('repair-success', () => jsonLlmResponse(multiWriteProposal()), {
-    expectExecution: true,
-  });
-  await runSubAgentInvalidParentFallbackRepairSmoke('repair-invalid', () => jsonLlmResponse(deleteActionBundleProposal('generic-folder/')), {
-    expectExecution: false,
-  });
+  await runSubAgentInvalidParentFallbackRepairSmoke('serial-invalid');
 }
 
 async function runSubAgentInvalidParentFallbackRepairSmoke(
-  caseName: string,
-  repairResponse: () => ApiResponse<LlmChatResult>,
-  expectations: { expectExecution: boolean }
+  caseName: string
 ): Promise<void> {
   const events = [independentMultiTargetAcceptedImplementationPlanCardEvent(`session-accepted-plan-subagents-fallback-repair-${caseName}`, `run-accepted-plan-subagents-fallback-repair-${caseName}`)];
   const deltas: unknown[] = [];
@@ -5253,6 +5941,8 @@ async function runSubAgentInvalidParentFallbackRepairSmoke(
   };
   let parentLlmCalls = 0;
   let subAgentLlmCalls = 0;
+  let serialFallbackCalls = 0;
+  let broadParentFallbackCalls = 0;
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
   const loop = new SessionDriverLoop({
@@ -5299,19 +5989,18 @@ async function runSubAgentInvalidParentFallbackRepairSmoke(
       const targetPath = deepcode?.subAgent?.targetPath;
       if (deepcode?.subAgent) {
         subAgentLlmCalls += 1;
-        if (targetPath === 'generic-one.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-one.txt', `fallback-repair-${caseName}-one`));
-        if (targetPath === 'generic-two.txt') return jsonLlmResponse(genericDiagnosticProposal(`generic branch diagnostic ${caseName}`));
+        if (targetPath === 'generic-one.txt' || targetPath === 'generic-two.txt') {
+          return jsonLlmResponse(genericDiagnosticProposal(`generic branch diagnostic ${caseName}`));
+        }
         throw new Error(`unexpected sub-agent target in fallback repair smoke: ${targetPath}`);
       }
       parentLlmCalls += 1;
       const promptText = request.messages.map((message) => message.content).join('\n');
-      if (parentLlmCalls === 1) {
-        assert(promptText.includes('子代理并行草稿已全部丢弃'), `${caseName}: first parent fallback explains discarded branches`);
-        return jsonLlmResponse(deleteActionBundleProposal('generic-folder/'));
-      }
-      assert(promptText.includes('通用错误原因'), `${caseName}: repair prompt carries the fallback validation reason`);
-      assert(promptText.includes('fs.delete'), `${caseName}: repair prompt keeps the generic delete contract`);
-      return repairResponse();
+      if (promptText.includes('DeepCode serial slice fallback')) serialFallbackCalls += 1;
+      if (promptText.includes('compact parent fallback step')) broadParentFallbackCalls += 1;
+      assert(promptText.includes('DeepCode serial slice fallback'), `${caseName}: serial fallback explains the retry contract`);
+      assert(!promptText.includes('Prompt envelope size summary'), `${caseName}: serial fallback stays compact`);
+      return jsonLlmResponse(deleteActionBundleProposal('generic-folder/'));
     },
     onProjectionDelta: async (delta) => {
       deltas.push(delta);
@@ -5332,32 +6021,28 @@ async function runSubAgentInvalidParentFallbackRepairSmoke(
   });
 
   assertEqual(subAgentLlmCalls, 2, `${caseName}: sub-agent path attempts both independent slices once`);
-  assertEqual(parentLlmCalls, 2, `${caseName}: invalid parent fallback receives one controlled repair attempt`);
+  assertEqual(parentLlmCalls, 1, `${caseName}: invalid fallback is attempted once`);
+  assertEqual(serialFallbackCalls, 1, `${caseName}: invalid fallback uses serial slice path`);
+  assertEqual(broadParentFallbackCalls, 0, `${caseName}: invalid fallback does not use broad parent fallback`);
   assertEqual(
     deltas.some((delta) =>
       (delta as any).type === 'stage_delta' &&
-      (delta as any).stage === 'subagent_parent_fallback.repairing' &&
-      (delta as any).payload?.reason === 'parent_fallback_invalid'
+      (delta as any).stage === 'subagent_serial_fallback.failed'
     ),
     true,
-    `${caseName}: parent fallback repair is projected`
+    `${caseName}: invalid serial fallback is projected as failed`
   );
-  if (expectations.expectExecution) {
-    assertEqual(proposalSubmits, 1, `${caseName}: repaired fallback reaches Kernel PlanReview once`);
-    assertEqual(actionBatchSubmits, 1, `${caseName}: repaired fallback reaches Kernel execution once`);
-    assertEqual(result.events.some((event) => event.kind === 'error'), false, `${caseName}: invalid first fallback is not terminal after successful repair`);
-  } else {
-    assertEqual(proposalSubmits, 0, `${caseName}: invalid repair does not reach Kernel PlanReview`);
-    assertEqual(actionBatchSubmits, 0, `${caseName}: invalid repair does not reach Kernel execution`);
-    assert(
-      result.events.some((event) =>
-        event.kind === 'assistant_msg' &&
-        (event.payload as any)?.diagnostic === true &&
-        String((event.payload as any)?.content ?? (event.payload as any)?.summary ?? '').includes('parent provider repair 输出无法解析')
-      ),
-      `${caseName}: invalid repair produces a terminal diagnostic with the real parse reason`
-    );
-  }
+  assertEqual(proposalSubmits, 0, `${caseName}: invalid serial fallback does not reach Kernel PlanReview`);
+  assertEqual(actionBatchSubmits, 0, `${caseName}: invalid serial fallback does not reach Kernel execution`);
+  assertEqual(result.events.some((event) => event.kind === 'error'), false, `${caseName}: invalid serial fallback is handled as diagnostic`);
+  assert(
+    result.events.some((event) =>
+      event.kind === 'assistant_msg' &&
+      (event.payload as any)?.diagnostic === true &&
+      String((event.payload as any)?.content ?? (event.payload as any)?.summary ?? '').includes('serial')
+    ),
+    `${caseName}: invalid serial fallback produces a terminal diagnostic with the real reason`
+  );
 }
 
 async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsTreatLegacyDependenciesAsSoftOrder(): Promise<void> {
@@ -5413,8 +6098,8 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsTreatLe
       llmCalls += 1;
       const deepcode = request.providerOptions?.deepcode as any;
       const targetPath = deepcode?.subAgent?.targetPath;
-      if (targetPath === 'generic-one.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-one.txt', 'soft-one'));
-      if (targetPath === 'generic-two.txt') return jsonLlmResponse(singleTargetWriteProposal('generic-two.txt', 'soft-two'));
+      if (targetPath === 'generic-one.txt') return jsonLlmResponse(singleTargetModuleDraft('generic-one.txt', 'soft-one'));
+      if (targetPath === 'generic-two.txt') return jsonLlmResponse(singleTargetModuleDraft('generic-two.txt', 'soft-two'));
       throw new Error('legacy soft-order smoke expected sliced provider calls');
     },
     onProjectionDelta: async (delta) => {
@@ -5453,6 +6138,99 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsTreatLe
     ),
     true,
     'soft-order sub-agent path emits branch draft-ready facts'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsSkipSingleModule(): Promise<void> {
+  const events = [singleModuleAcceptedImplementationPlanCardEvent('session-accepted-plan-subagents-single-module', 'run-accepted-plan-subagents-single-module')];
+  const deltas: unknown[] = [];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-subagents-single-module',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let parentLlmCalls = 0;
+  let subAgentLlmCalls = 0;
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            { kind: 'work_unit.completed', runId: 'run-generic', sessionId: session.id, workUnitId: `work-unit-single-module-${actionBatchSubmits}`, output: { path: actionBatchSubmits === 1 ? 'generic-module/header.txt' : 'generic-module/source.txt' } },
+            { kind: 'stage.changed', runId: 'run-generic', sessionId: session.id, phase: 'review' },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      const deepcode = request.providerOptions?.deepcode as any;
+      if (deepcode?.subAgent) {
+        subAgentLlmCalls += 1;
+        throw new Error('single module tasks must stay on the parent linear path');
+      }
+      parentLlmCalls += 1;
+      return jsonLlmResponse(
+        singleTargetWriteProposal(
+          parentLlmCalls === 1 ? 'generic-module/header.txt' : 'generic-module/source.txt',
+          `single-module-${parentLlmCalls}`
+        )
+      );
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + parentLlmCalls + subAgentLlmCalls + actionBatchSubmits + deltas.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-subagents-single-module',
+    targetId: 'impl-generic-single-module',
+    existingEvents: events,
+    subAgentMode: 'auto',
+    subAgentMaxParallel: 2,
+  });
+
+  assertEqual(subAgentLlmCalls, 0, 'single module accepted plan does not start sub-agent branches');
+  assert(parentLlmCalls >= 1, 'single module accepted plan continues through the parent provider');
+  assertEqual(
+    deltas.some((delta) =>
+      (delta as any).type === 'stage_delta' &&
+      (delta as any).stage === 'subagent_skipped'
+    ),
+    true,
+    'single module plan emits a sub-agent skip instead of dispatching branches'
   );
 }
 
@@ -5509,7 +6287,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsSkipHar
       } else {
         parentLlmCalls += 1;
       }
-      return jsonLlmResponse(singleTargetWriteProposal('generic-one.txt', 'hard-parent'));
+      return jsonLlmResponse(singleTargetWriteProposal('generic-one/output.txt', 'hard-parent'));
     },
     onProjectionDelta: async (delta) => {
       deltas.push(delta);
@@ -5535,10 +6313,10 @@ async function assertSessionDriverLoopAcceptedImplementationPlanSubAgentsSkipHar
     deltas.some((delta) =>
       (delta as any).type === 'stage_delta' &&
       (delta as any).stage === 'subagent_skipped' &&
-      (delta as any).payload?.reason === 'hard_dependency_blocked'
+      (delta as any).payload?.reason === 'flow_graph_blocked'
     ),
     true,
-    'hard dependency skip emits explicit subagent_skipped reason'
+    'hard dependency chain emits explicit DAG ready-width skip reason'
   );
 }
 
@@ -5880,6 +6658,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedPro
 
 async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTasksComplete(): Promise<void> {
   const events = [multiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-continue', 'run-accepted-plan-continue')];
+  const deltas: unknown[] = [];
   const session: AgentSession = {
     id: 'session-accepted-plan-continue',
     mode: 'plan',
@@ -5891,6 +6670,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
     relativeTargetWriteProposal('generic-two.txt', 'code-two', 'write-generic-two'),
   ];
   let llmCalls = 0;
+  let subAgentLlmCalls = 0;
   let actionBatchSubmits = 0;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
@@ -5943,10 +6723,17 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
       if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
       return fakeKernel(request);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      if ((request.providerOptions?.deepcode as any)?.subAgent) {
+        subAgentLlmCalls += 1;
+        throw new Error('subAgentMode=off must not start sub-agent provider calls');
+      }
       const proposal = proposals[Math.min(llmCalls, proposals.length - 1)];
       llmCalls += 1;
       return jsonLlmResponse(proposal);
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + 1}`,
@@ -5963,7 +6750,18 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
   });
 
   assertEqual(llmCalls, 2, 'accepted implementationPlan automatically requests the second provider batch');
+  assertEqual(subAgentLlmCalls, 0, 'subAgentMode=off never starts sub-agent provider calls');
   assertEqual(actionBatchSubmits, 2, 'accepted implementationPlan executes both in-scope batches');
+  assertEqual(
+    deltas.some((delta) =>
+      String((delta as any).stage ?? '').startsWith('subagent_branch.') ||
+      (delta as any).stage === 'subagent_plan.created' ||
+      (delta as any).stage === 'subagent_dispatch.announced' ||
+      String((delta as any).stage ?? '').startsWith('subagent_merge.')
+    ),
+    false,
+    'subAgentMode=off does not emit sub-agent branch, dispatch, plan, or merge deltas'
+  );
   assertEqual(result.events.filter((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview').length, 1, 'accepted implementationPlan produces only one terminal review');
   assertEqual(
     result.events.some((event) =>
@@ -5974,6 +6772,391 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
     ),
     true,
     'first accepted-plan checkpoint keeps the remaining task queued'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedArtifactEvidence(): Promise<void> {
+  const events = [generatedArtifactAcceptedImplementationPlanCardEvent('session-generated-artifact-evidence', 'run-generated-artifact-evidence')];
+  const session: AgentSession = {
+    id: 'session-generated-artifact-evidence',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const proposals = [
+    singleTargetWriteProposal('generic-generated/input.txt', 'generated-input'),
+    {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'resourceRequest',
+      outputLanguage: 'en-US',
+      resourceRequest: {
+        version: '1',
+        id: 'request-generated-input',
+        reason: 'Read the file generated by the previous accepted batch.',
+        items: [{
+          id: 'generated-input',
+          kind: 'file',
+          rootId: 'stale-root-id',
+          path: 'generic-generated/input.txt',
+          reason: 'Use the current run generated artifact as evidence for the next batch.',
+        }],
+      },
+    },
+    singleTargetWriteProposal('generic-generated/output.txt', 'generated-output'),
+  ];
+  let llmCalls = 0;
+  let actionBatchSubmits = 0;
+  let resourceResolveCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'resourceResolve') {
+        resourceResolveCalls += 1;
+        return { ok: true, events: [] };
+      }
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        const action = command.batch?.actionBundle?.actions?.[0] ?? {};
+        const actionId = action.id ?? action.actionId ?? `write-generated-${actionBatchSubmits}`;
+        const path = action.targetPath ?? action.resourceScope?.[0] ?? `generic-generated/${actionBatchSubmits}.txt`;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.queued',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnit: { id: `work-unit-generated-${actionBatchSubmits}`, actionId, status: 'queued', writeSet: [path] },
+            },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: `work-unit-generated-${actionBatchSubmits}`,
+              actionId,
+              output: { actionId, path },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      const proposal = proposals[Math.min(llmCalls, proposals.length - 1)];
+      llmCalls += 1;
+      return jsonLlmResponse(proposal);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + resourceResolveCalls + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-generated-artifact-evidence',
+    targetId: 'impl-generated-artifact',
+    existingEvents: events,
+    subAgentMode: 'off',
+  });
+
+  assertEqual(llmCalls, 3, 'provider resumes after generated artifact resourceRequest');
+  assertEqual(actionBatchSubmits, 2, 'generated artifact evidence allows the dependent batch to execute');
+  assertEqual(resourceResolveCalls, 0, 'generated artifact resourceRequest is satisfied without stale Kernel ResourceResolve');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'tool_result' &&
+      (event.payload as any)?.toolName === 'kernel.resourceResolve' &&
+      Array.isArray((event.payload as any)?.output?.items) &&
+      (event.payload as any).output.items.some((item: any) =>
+        item.path === 'generic-generated/input.txt' &&
+        Array.isArray(item.evidenceRefs) &&
+        item.evidenceRefs.includes('generatedArtifactEvidence') &&
+        typeof item.promptContent === 'string' &&
+        item.promptContent.includes('generated-input')
+      )
+    ),
+    true,
+    'generated file content is projected as run-local generated artifact evidence'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResourceCursor(): Promise<void> {
+  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-resource-resume', 'run-accepted-plan-resource-resume')];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-resource-resume',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const providerPrompts: string[] = [];
+  let llmCalls = 0;
+  let actionBatchSubmits = 0;
+  let resourceResolveCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'resourceResolve') {
+        resourceResolveCalls += 1;
+        return fakeKernel(request);
+      }
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.queued',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnit: {
+                id: 'work-unit-resource-resume',
+                actionId: 'write-generic-output',
+                status: 'queued',
+                writeSet: ['generic-output.txt'],
+              },
+            },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: 'work-unit-resource-resume',
+              actionId: 'write-generic-output',
+              output: { path: 'generic-output.txt' },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      const userMessage = request.messages.find((message) => message.role === 'user')?.content ?? '';
+      providerPrompts.push(userMessage);
+      if (llmCalls === 1) {
+        return jsonLlmResponse({
+          schemaVersion: 'deepcode.agent.protocol.v3',
+          kind: 'resourceRequest',
+          outputLanguage: 'en-US',
+          resourceRequest: {
+            version: '1',
+            id: 'request-current-generic-output',
+            reason: 'Read the current generic output evidence before writing.',
+            items: [{
+              id: 'current-generic-output',
+              kind: 'file',
+              path: 'generic-output.txt',
+              reason: 'Use current file evidence for the accepted task.',
+            }],
+          },
+        });
+      }
+      assert(userMessage.includes('Accepted-plan resource resume checkpoint'), 'second provider call uses compact resource resume checkpoint');
+      assert(userMessage.includes('TaskExecutionCursor'), 'resource resume prompt includes the task cursor');
+      assert(userMessage.includes('CurrentTaskGoal'), 'resource resume prompt includes the current task goal');
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + resourceResolveCalls + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-resource-resume',
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+    projectWorkingDirectory: {
+      rootId: 'root-generic-workspace',
+      label: 'Generic workspace',
+      displayPath: '/tmp/generic-workspace',
+      absolutePath: '/tmp/generic-workspace',
+      source: 'projectWorkingDirectory',
+    },
+    subAgentMode: 'off',
+  });
+
+  assertEqual(llmCalls, 2, 'accepted-plan resourceRequest resumes through one compact provider call');
+  assertEqual(actionBatchSubmits, 1, 'compact resource resume actionBundle is submitted to Kernel');
+  assertEqual(resourceResolveCalls >= 1, true, 'resource resume resolves current evidence through Kernel ResourceResolve');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'accepted_plan.resource_resume' &&
+      typeof (event.payload as any)?.taskCursorId === 'string'
+    ),
+    true,
+    'accepted-plan resource resume writes cursor projection'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'accepted_plan.task_savepoint'
+    ),
+    true,
+    'accepted-plan execution writes a task savepoint after the resumed batch'
+  );
+  assert(providerPrompts[0] && !providerPrompts[0].includes('Accepted-plan resource resume checkpoint'), 'first call remains the normal accepted-plan provider call');
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanInheritsSubAgentOffSetting(): Promise<void> {
+  const events = [
+    independentMultiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-inherit-off', 'run-accepted-plan-inherit-off'),
+    {
+      id: 'agent-runtime-settings-inherit-off',
+      sessionId: 'session-accepted-plan-inherit-off',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'workflow_stage' as const,
+      payload: {
+        stage: 'agent_runtime_settings',
+        status: 'completed',
+        runId: 'run-accepted-plan-inherit-off',
+        subAgentMode: 'off',
+        subAgentMaxParallel: 2,
+        source: 'request',
+      },
+    },
+  ];
+  const deltas: unknown[] = [];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-inherit-off',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let parentLlmCalls = 0;
+  let subAgentLlmCalls = 0;
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        const action = command.batch?.actionBundle?.actions?.[0] ?? {};
+        const path = action.targetPath ?? action.resourceScope?.[0] ?? `generic-${actionBatchSubmits}.txt`;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: `work-unit-inherit-${actionBatchSubmits}`,
+              output: { path },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      if ((request.providerOptions?.deepcode as any)?.subAgent) {
+        subAgentLlmCalls += 1;
+        throw new Error('inherited subAgentMode=off must not start sub-agent provider calls');
+      }
+      parentLlmCalls += 1;
+      return jsonLlmResponse(multiWriteProposal());
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + parentLlmCalls + subAgentLlmCalls + actionBatchSubmits + deltas.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-inherit-off',
+    targetId: 'impl-generic-independent',
+    existingEvents: events,
+  });
+
+  assertEqual(parentLlmCalls, 1, 'inherited subAgentMode=off uses the parent provider path');
+  assertEqual(subAgentLlmCalls, 0, 'inherited subAgentMode=off blocks sub-agent calls');
+  assertEqual(actionBatchSubmits, 1, 'inherited subAgentMode=off submits the parent actionBundle without branch execution');
+  assertEqual(
+    events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'agent_runtime_settings' &&
+      (event.payload as any)?.subAgentMode === 'off' &&
+      (event.payload as any)?.source === 'runtimeSnapshot'
+    ),
+    true,
+    'inherited off mode is recorded in the runtime settings snapshot'
+  );
+  assertEqual(
+    deltas.some((delta) => String((delta as any).stage ?? '').startsWith('subagent_branch.')),
+    false,
+    'inherited subAgentMode=off emits no branch deltas'
   );
 }
 
@@ -6224,9 +7407,8 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
   let actionBatchSubmits = 0;
   let llmCalls = 0;
   const outOfScopeProposal = genericWriteProposal(false);
-  (outOfScopeProposal.codeBlocks as any[])[0].path = 'outside-output.txt';
-  (outOfScopeProposal.actionBundle as any).actions[0].resourceScope = ['outside-output.txt'];
-  (outOfScopeProposal.actionBundle as any).actions[0].targetPath = 'outside-output.txt';
+  (outOfScopeProposal.codeBlocks as any[])[0].targetPath = 'outside-output.txt';
+  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: 'outside-output.txt', sourceBlockId: 'generic-block' };
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -7298,10 +8480,21 @@ async function assertSessionDriverLoopNativeReadToolDuplicateLoopRepairsToPropos
         };
       }
       assertEqual(request.tools?.length ?? 0, 0, 'duplicate read repair disables provider-native tools');
-      assert(
-        request.messages.some((message) => message.role === 'user' && String(message.content).includes('Duplicate native read targets')),
-        'duplicate read repair prompt includes duplicate target facts'
+      const duplicateRepairPrompt = request.messages.some((message) =>
+        message.role === 'user' && String(message.content).includes('Duplicate native read targets')
       );
+      if (!duplicateRepairPrompt) {
+        return jsonLlmResponse({
+          schemaVersion: 'deepcode.agent.protocol.v3',
+          kind: 'answer',
+          outputLanguage: 'en-US',
+          answer: {
+            format: 'markdown',
+            content: 'The repeated read was stopped and the existing resource facts were used.',
+          },
+        });
+      }
+      assert(duplicateRepairPrompt, 'duplicate read repair prompt includes duplicate target facts');
       return jsonLlmResponse({
         schemaVersion: 'deepcode.agent.protocol.v3',
         kind: 'answer',
@@ -7461,30 +8654,7 @@ async function assertSessionDriverLoopNativeWriteToolTriggersImplementationPlanR
       streamRequests.push(request);
       if (!request.tools?.length) {
         repairCalls += 1;
-        return jsonLlmResponse({
-          schemaVersion: 'deepcode.agent.protocol.v3',
-          kind: 'implementationPlan',
-          outputLanguage: 'zh-CN',
-          narration: '我先把写入任务拆成可审查的计划，确认后再进入编辑。',
-          implementationPlan: {
-            version: '1',
-            id: 'impl-generic-native-write',
-            title: 'Generic write plan',
-            summary: 'Plan a write task without executing native side-effect tools.',
-            tasks: [{
-              taskId: 'task-generic-write',
-              title: 'Prepare generic output',
-              target: ['generic-output.txt'],
-              scope: 'Prepare a reviewed file write through the Plan/Edit path.',
-              dependencies: [],
-              capability: 'fs.write',
-              acceptanceCriteria: ['A later accepted edit batch carries codeBlocks and Kernel write facts.'],
-              failureCriteria: ['Stop if the target cannot be resolved under the workspace.'],
-            }],
-            risks: ['Workspace write requires user review.'],
-            reviewCheckpoints: ['Review before edit batch generation.'],
-          },
-        });
+        return jsonLlmResponse(genericTaskPlanProposal());
       }
       const chunk: LlmChatResult['chunks'][number] = {
         type: 'tool_call',
@@ -7525,40 +8695,135 @@ async function assertSessionDriverLoopNativeWriteToolTriggersImplementationPlanR
 
   assertEqual(streamRequests.length, 2, 'native write is followed by one streaming protocol repair');
   assertEqual(repairCalls, 1, 'native write side effect triggers one protocol repair');
-  assertEqual(submittedPlans.length, 0, 'native write is not submitted to Kernel PlanReview as an actionBundle');
+  assertEqual(submittedPlans.length, 0, 'native write repair does not submit executable work before taskPlan acceptance');
   const planCard = result.events.find((event) => event.kind === 'plan_card');
   const payload = planCard?.payload as any;
-  assertEqual(Boolean(payload?.implementationPlan), true, 'native write repair produces an implementationPlan card');
-  assertEqual(Array.isArray(payload?.codeBlocks) && payload.codeBlocks.length === 0, true, 'implementationPlan repair does not carry codeBlocks');
-  assert(String(payload?.content ?? '').includes('## 边界'), 'Chinese plan card localizes boundary heading');
-  assert(!String(payload?.content ?? '').includes('This plan is not execution'), 'Chinese plan card does not keep English boundary text');
+  assertEqual(Boolean(payload?.taskPlan), true, 'native write repair produces a taskPlan card');
+  assertEqual(Array.isArray(payload?.codeBlocks) && payload.codeBlocks.length === 0, true, 'taskPlan repair does not carry codeBlocks');
   assertEqual(result.events.some((event) => event.kind === 'tool_result'), false, 'native write is not executed as an immediate tool result');
 }
 
-function genericImplementationPlanWithTask(taskFields: Record<string, unknown>): Record<string, unknown> {
-  return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    kind: 'implementationPlan',
-    outputLanguage: 'en-US',
-    implementationPlan: {
-      version: '1',
-      id: 'impl-generic-invalid',
-      title: 'Generic invalid plan',
-      summary: 'Plan a generic workspace change.',
-      tasks: [{
-        taskId: 'task-generic-invalid',
-        title: 'Generic task',
-        target: ['src/generic'],
-        scope: 'Generic workspace task.',
-        capability: 'fs.write',
-        acceptanceCriteria: ['Kernel can review generic evidence.'],
-        failureCriteria: ['Stop on generic invalid scope.'],
-        ...taskFields,
-      }],
-      risks: [],
-      reviewCheckpoints: ['Review the generic plan before execution.'],
-    },
+async function assertSessionDriverLoopAcceptedPlanNativeWriteToolUsesProposalOnlyRepair(): Promise<void> {
+  const events = [acceptedImplementationPlanCardEvent('session-accepted-plan-native-write-tool', 'run-accepted-plan-native-write-tool')];
+  const deltas: unknown[] = [];
+  const streamRequests: LlmChatRequest[] = [];
+  const session: AgentSession = {
+    id: 'session-accepted-plan-native-write-tool',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
   };
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: 'run-generic', sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: 'run-generic', sessionId: session.id, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.completed',
+              runId: 'run-generic',
+              sessionId: session.id,
+              workUnitId: 'work-unit-native-write-tool-repair',
+              output: { path: 'generic-output.txt' },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      throw new Error('accepted-plan native tool violation smoke should use streaming provider path');
+    },
+    llmChatStream: async (request, onEvent): Promise<ApiResponse<LlmChatResult>> => {
+      streamRequests.push(request);
+      assertEqual(Boolean(request.tools?.length), false, 'accepted-plan Complete stage uses proposal-only provider calls');
+      if (streamRequests.length === 1) {
+        const chunk: LlmChatResult['chunks'][number] = {
+          type: 'tool_call',
+          index: 0,
+          callId: 'call-generic-complete-write',
+          toolCallDelta: {
+            id: 'call-generic-complete-write',
+            index: 0,
+            name: 'fs.write',
+            argumentsDelta: '{"path":"generic-output.txt","content":"generic content"}',
+          },
+        };
+        await onEvent({ type: 'provider_tool_call_delta', chunk });
+        return {
+          ok: true,
+          data: {
+            chunks: [chunk, { type: 'done' }],
+            assistantMessage: {
+              role: 'assistant',
+              content: '',
+              toolCalls: [{
+                id: 'call-generic-complete-write',
+                name: 'fs.write',
+                arguments: { path: 'generic-output.txt', content: 'generic content' },
+              }],
+            },
+          },
+        };
+      }
+      return jsonLlmResponse(singleTargetWriteProposal('generic-output.txt', 'native-tool-violation-repair'));
+    },
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + streamRequests.length + proposalSubmits + actionBatchSubmits + deltas.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: 'run-accepted-plan-native-write-tool',
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+  });
+
+  assertEqual(streamRequests.length, 2, 'Complete-stage native tool violation is retried once with proposal-only contract');
+  assertEqual(proposalSubmits, 1, 'proposal-only repair returns an actionBundle for Kernel PlanReview');
+  assertEqual(actionBatchSubmits, 1, 'proposal-only repair reaches Kernel execution path');
+  assertEqual(
+    deltas.some((delta) => (delta as any).stage === 'accepted_plan.provider_tool_violation'),
+    true,
+    'Complete-stage native tool request is surfaced as a Session violation'
+  );
+  assertEqual(
+    deltas.some((delta) => (delta as any).stage === 'native_tool_side_effect_blocked'),
+    false,
+    'accepted-plan Complete stage does not use native side-effect tool repair'
+  );
 }
 
 function genericWriteProposal(missingEvidence: boolean): Record<string, unknown> {
@@ -7589,21 +8854,19 @@ function genericWriteProposal(missingEvidence: boolean): Record<string, unknown>
       '- Follow-up batches, if any, require review before continuation.',
     ].join('\n'),
     codeBlocks: [{
-      id: 'generic-block',
-      path: 'generic-output.txt',
-      content: 'generic content',
+      blockId: 'generic-block',
+      targetPath: 'generic-output.txt',
+      contentLines: ['generic content'],
     }],
     actionBundle: {
       version: '1',
       id: 'generic-write-bundle',
       goal: 'Create a generic scaffold.',
       actions: [{
-        id: 'write-generic-output',
-        title: 'Write generic output',
-        capability: 'fs.write',
-        kind: 'write',
-        resourceScope: ['generic-output.txt'],
-        sourceBlockId: 'generic-block',
+        actionId: 'write-generic-output',
+        toolId: 'fs.write',
+        args: { path: 'generic-output.txt', sourceBlockId: 'generic-block' },
+        description: 'Write generic output.',
       }],
       continuationExpectations: [],
       validationExpectations: missingEvidence
@@ -7618,16 +8881,45 @@ function genericWriteProposal(missingEvidence: boolean): Record<string, unknown>
   };
 }
 
+function genericTaskPlanProposal(): Record<string, unknown> {
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind: 'taskPlan',
+    outputLanguage: 'en-US',
+    taskPlan: {
+      version: '1',
+      id: 'task-plan-generic',
+      title: 'Generic task plan',
+      summary: 'Plan a generic workspace change before implementation.',
+      tasks: [
+        {
+          taskId: 'task-generic-write',
+          title: 'Prepare generic workspace output',
+          target: ['generic-output.txt'],
+          capability: 'fs.write',
+          dependencies: [],
+          hardDependencies: [],
+          softOrderAfter: [],
+          conflictKeys: ['generic-output.txt'],
+          canDraftInParallel: true,
+          acceptanceCriteria: ['Kernel facts show the accepted target was updated after Complete stage.'],
+          failureCriteria: ['Stop if implementation needs targets outside the accepted task plan.'],
+        },
+      ],
+      risks: ['Workspace writes remain under Kernel permission policy.'],
+      reviewCheckpoints: ['Review Kernel facts after Complete stage execution.'],
+    },
+  };
+}
+
 function absoluteTargetWriteProposal(targetPath: string): Record<string, unknown> {
   const proposal = genericWriteProposal(false);
   proposal.codeBlocks = [{
-    id: 'generic-block',
-    path: targetPath,
+    blockId: 'generic-block',
     targetPath,
-    content: 'generic content',
+    contentLines: ['generic content'],
   }];
-  (proposal.actionBundle as any).actions[0].resourceScope = [targetPath];
-  (proposal.actionBundle as any).actions[0].targetPath = targetPath;
+  (proposal.actionBundle as any).actions[0].args = { path: targetPath, sourceBlockId: 'generic-block' };
   return proposal;
 }
 
@@ -7659,29 +8951,29 @@ function genericPatchProposal(): Record<string, unknown> {
       '- The exact match block is present in the latest ResourcePacket evidence.',
     ].join('\n'),
     codeBlocks: [{
-      id: 'generic-patch-replacement',
-      path: 'generic-patch.txt',
+      blockId: 'generic-patch-replacement',
+      targetPath: 'generic-patch.txt',
       operation: 'replaceBlock',
-      content: 'new generic line',
+      contentLines: ['new generic line'],
     }],
     actionBundle: {
       version: '1',
       id: 'generic-patch-bundle',
       goal: 'Patch a generic file with exact evidence.',
       actions: [{
-        id: 'patch-generic-output',
-        title: 'Patch generic output',
-        capability: 'fs.write',
-        kind: 'replaceBlock',
-        resourceScope: ['generic-patch.txt'],
-        targetPath: 'generic-patch.txt',
-        replacementBlockId: 'generic-patch-replacement',
-        patchSpec: {
-          match: {
-            kind: 'exactBlock',
-            text: 'old generic line',
+        actionId: 'patch-generic-output',
+        toolId: 'fs.patch',
+        args: {
+          path: 'generic-patch.txt',
+          replacementBlockId: 'generic-patch-replacement',
+          patchSpec: {
+            match: {
+              kind: 'exactBlock',
+              text: 'old generic line',
+            },
           },
         },
+        description: 'Patch generic output.',
       }],
       continuationExpectations: [],
       validationExpectations: [{ id: 'generic-patch-evidence', description: 'Kernel records the patch fact for the generic file.' }],
@@ -7695,16 +8987,14 @@ function genericPatchProposal(): Record<string, unknown> {
 function relativeTargetWriteProposal(targetPath: string, blockId: string, actionId: string): Record<string, unknown> {
   const proposal = genericWriteProposal(false);
   proposal.codeBlocks = [{
-    id: blockId,
+    blockId,
     targetPath,
-    content: `content for ${targetPath}`,
+    contentLines: [`content for ${targetPath}`],
   }];
   (proposal.actionBundle as any).id = `bundle-${actionId}`;
-  (proposal.actionBundle as any).actions[0].id = actionId;
-  (proposal.actionBundle as any).actions[0].title = `Write ${targetPath}`;
-  (proposal.actionBundle as any).actions[0].resourceScope = [targetPath];
-  (proposal.actionBundle as any).actions[0].targetPath = targetPath;
-  (proposal.actionBundle as any).actions[0].sourceBlockId = blockId;
+  (proposal.actionBundle as any).actions[0].actionId = actionId;
+  (proposal.actionBundle as any).actions[0].description = `Write ${targetPath}`;
+  (proposal.actionBundle as any).actions[0].args = { path: targetPath, sourceBlockId: blockId };
   return proposal;
 }
 
@@ -7773,13 +9063,10 @@ function deleteActionBundleProposal(targetPath: string): Record<string, unknown>
       id: 'bundle-generic-delete',
       goal: 'Delete a generic obsolete file.',
       actions: [{
-        id: 'delete-generic-obsolete',
-        title: 'Delete generic obsolete file',
-        kind: 'delete',
-        capability: 'fs.delete',
-        resourceScope: [targetPath],
-        targetPath,
-        permissionLabels: ['fs.delete'],
+        actionId: 'delete-generic-obsolete',
+        toolId: 'fs.delete',
+        args: { path: targetPath },
+        description: 'Delete generic obsolete file.',
       }],
       continuationExpectations: [],
       validationExpectations: [{ id: 'generic-delete-evidence', description: 'Kernel records the delete fact for the generic obsolete file.' }],
@@ -7795,13 +9082,10 @@ function manyDeleteActionsProposal(): Record<string, unknown> {
   (proposal.actionBundle as any).id = 'bundle-many-generic-delete';
   (proposal.actionBundle as any).goal = 'Delete several generic obsolete files.';
   (proposal.actionBundle as any).actions = Array.from({ length: 7 }, (_item, index) => ({
-    id: `delete-generic-${index}`,
-    title: `Delete generic obsolete file ${index}`,
-    kind: 'delete',
-    capability: 'fs.delete',
-    resourceScope: [`generic-${index}.tmp`],
-    targetPath: `generic-${index}.tmp`,
-    permissionLabels: ['fs.delete'],
+    actionId: `delete-generic-${index}`,
+    toolId: 'fs.delete',
+    args: { path: `generic-${index}.tmp` },
+    description: `Delete generic obsolete file ${index}.`,
   }));
   return proposal;
 }
@@ -7837,29 +9121,26 @@ function localizedGenericWriteProposal(): Record<string, unknown> {
 function oversizedGenericWriteProposal(): Record<string, unknown> {
   const proposal = genericWriteProposal(false);
   proposal.codeBlocks = [{
-    id: 'generic-oversized-block',
-    path: 'generic-oversized-output.txt',
-    content: 'x'.repeat(385 * 1024),
+    blockId: 'generic-oversized-block',
+    targetPath: 'generic-oversized-output.txt',
+    contentLines: ['x'.repeat(385 * 1024)],
   }];
-  (proposal.actionBundle as any).actions[0].sourceBlockId = 'generic-oversized-block';
-  (proposal.actionBundle as any).actions[0].resourceScope = ['generic-oversized-output.txt'];
+  (proposal.actionBundle as any).actions[0].args = { path: 'generic-oversized-output.txt', sourceBlockId: 'generic-oversized-block' };
   return proposal;
 }
 
 function manyCodeBlockWriteProposal(): Record<string, unknown> {
   const proposal = genericWriteProposal(false);
   proposal.codeBlocks = Array.from({ length: 7 }, (_item, index) => ({
-    id: `generic-block-${index}`,
-    path: `generic-output-${index}.txt`,
-    content: `generic content ${index}`,
+    blockId: `generic-block-${index}`,
+    targetPath: `generic-output-${index}.txt`,
+    contentLines: [`generic content ${index}`],
   }));
   (proposal.actionBundle as any).actions = Array.from({ length: 7 }, (_item, index) => ({
-    id: `write-generic-output-${index}`,
-    title: `Write generic output ${index}`,
-    capability: 'fs.write',
-    kind: 'write',
-    resourceScope: [`generic-output-${index}.txt`],
-    sourceBlockId: `generic-block-${index}`,
+    actionId: `write-generic-output-${index}`,
+    toolId: 'fs.write',
+    args: { path: `generic-output-${index}.txt`, sourceBlockId: `generic-block-${index}` },
+    description: `Write generic output ${index}.`,
   }));
   return proposal;
 }
@@ -7872,18 +9153,14 @@ function providerFacingWriteProposalWithoutMachineIds(): Record<string, unknown>
     targetPath: 'generic-output.txt',
     language: 'text',
     operation: 'create',
-    content: 'generic content',
-    permissionLabels: ['fs.write'],
+    contentLines: ['generic content'],
   }];
   (proposal.actionBundle as any).actions = [{
     actionId: 'write-generic-output',
     description: 'Write generic output',
-    capability: 'fs.write',
-    resourceScope: ['generic-output.txt'],
-    targetPath: 'generic-output.txt',
-    sourceBlockId: 'generic-block',
+    toolId: 'fs.write',
+    args: { path: 'generic-output.txt', sourceBlockId: 'generic-block' },
     dependsOn: [],
-    permissionLabels: ['fs.write'],
   }];
   return proposal;
 }
@@ -7952,7 +9229,7 @@ function planKernel(
 
 function proposalReviewReport(actionBundle: Record<string, any>, attachmentRoot?: string): Record<string, any> {
   const actions = Array.isArray(actionBundle.actions) ? actionBundle.actions : [];
-  const capabilities = [...new Set(actions.map((action) => action.capability).filter(Boolean))].sort();
+  const capabilities = [...new Set(actions.map((action) => actionCapability(action)).filter(Boolean))].sort();
   const permissionGaps = capabilities.filter((capability) => capability !== 'fs.read' && capability !== 'git.read');
   const requiredFileOperations = requiredFileOperationsFromActionBundle(actionBundle, attachmentRoot);
   const requiredAccessScopes = requiredAccessScopesFromActionBundle(actionBundle);
@@ -8007,10 +9284,12 @@ function requiredFileOperationsFromActionBundle(actionBundle: Record<string, any
   const operations: Array<Record<string, any>> = [];
   for (const action of actions) {
     if (!action || typeof action !== 'object') continue;
-    const capability = typeof action.capability === 'string' ? action.capability : '';
+    const capability = actionCapability(action);
     const operation = fileOperationForAction(action, capability);
     if (!operation) continue;
-    const targetResourceKind = action.targetResourceKind === 'directory' || action.targetKind === 'directory'
+    const args = action && typeof action.args === 'object' && !Array.isArray(action.args) ? action.args : {};
+    const targetKind = typeof args.targetKind === 'string' ? args.targetKind : action.targetKind;
+    const targetResourceKind = action.targetResourceKind === 'directory' || targetKind === 'directory'
       ? 'directory'
       : typeof action.targetPath === 'string' && action.targetPath.trim().endsWith('/')
         ? 'directory'
@@ -8019,6 +9298,8 @@ function requiredFileOperationsFromActionBundle(actionBundle: Record<string, any
       ? action.targetPath
       : Array.isArray(action.resourceScope) && typeof action.resourceScope[0] === 'string'
         ? action.resourceScope[0]
+        : typeof args.path === 'string'
+          ? args.path
         : '';
     const target = concreteTestTarget(
       targetResourceKind === 'directory' ? rawTarget.replace(/\/+$/, '') : rawTarget,
@@ -8030,14 +9311,25 @@ function requiredFileOperationsFromActionBundle(actionBundle: Record<string, any
       operation,
       targetPath: target,
       capability,
-      actionId: typeof action.id === 'string' ? action.id : typeof action.actionId === 'string' ? action.actionId : '',
+      actionId: typeof action.actionId === 'string' ? action.actionId : typeof action.id === 'string' ? action.id : '',
       targetKind: outsideWorkspace ? 'absolutePath' : 'workspaceRelative',
       targetResourceKind,
-      recursive: action.recursive === true || (targetResourceKind === 'directory' && rawTarget.trim().endsWith('/')),
+      recursive: action.recursive === true || args.recursive === true || (targetResourceKind === 'directory' && rawTarget.trim().endsWith('/')),
       outsideWorkspace,
     });
   }
   return operations;
+}
+
+function actionCapability(action: Record<string, any>): string {
+  if (typeof action.capability === 'string' && action.capability) return action.capability;
+  const toolId = typeof action.toolId === 'string' ? action.toolId : '';
+  if (!toolId) return '';
+  if (toolId.startsWith('git.')) return toolId === 'git.status' || toolId === 'git.diff' ? 'git.read' : (toolId === 'git.push' ? 'git.push' : 'git.write');
+  if (toolId === 'web.search' || toolId === 'web.fetch') return 'network.egress';
+  if (toolId.startsWith('browser.')) return 'browser.control';
+  if (toolId === 'provider.call') return 'provider.egress';
+  return toolId;
 }
 
 function fileOperationForAction(action: Record<string, any>, capability: string): string | undefined {
@@ -8085,6 +9377,8 @@ function genericActionBundle(): ActionBundleDraft {
       {
         id: 'read-generic',
         title: 'Read generic resource',
+        toolId: 'fs.read',
+        args: { path: 'generic/input.txt' },
         kind: 'read',
         capability: 'fs.read',
         resourceScope: ['generic/input.txt'],
@@ -8094,6 +9388,8 @@ function genericActionBundle(): ActionBundleDraft {
       {
         id: 'write-generic',
         title: 'Write generic resource',
+        toolId: 'fs.write',
+        args: { path: 'generic/output.txt', sourceBlockId: 'code-generic' },
         kind: 'write',
         capability: 'fs.write',
         resourceScope: ['generic/output.txt'],
@@ -8152,6 +9448,39 @@ function acceptedImplementationPlanCardEvent(sessionId: string, runId: string): 
       commandBlocks: [],
     },
   };
+}
+
+function generatedArtifactAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+  const payload = event.payload as any;
+  payload.planId = 'impl-generated-artifact';
+  payload.implementationPlan.id = 'impl-generated-artifact';
+  payload.implementationPlan.title = 'Generic generated artifact implementation plan';
+  payload.implementationPlan.summary = 'Write one file, then read it as current evidence for a dependent write.';
+  payload.implementationPlan.tasks = [
+    {
+      taskId: 'task-generated-input',
+      title: 'Write generated input',
+      target: ['generic-generated/input.txt'],
+      scope: 'Create a generic input artifact inside the accepted workspace scope.',
+      dependencies: [],
+      capability: 'fs.write',
+      acceptanceCriteria: ['Kernel records the generated input write fact.'],
+      failureCriteria: ['Stop if the write leaves the accepted target scope.'],
+    },
+    {
+      taskId: 'task-generated-output',
+      title: 'Write generated output',
+      target: ['generic-generated/output.txt'],
+      scope: 'Read the generated input evidence, then create a dependent output artifact.',
+      dependencies: ['task-generated-input'],
+      hardDependencies: ['task-generated-input'],
+      capability: 'fs.write',
+      acceptanceCriteria: ['Kernel records the generated output write fact.'],
+      failureCriteria: ['Stop if the generated input evidence cannot be resolved.'],
+    },
+  ];
+  return event;
 }
 
 function userMessageWithDirectoryAttachmentEvent(sessionId: string, root: string): AgentEvent {
@@ -8214,15 +9543,145 @@ function independentMultiTargetAcceptedImplementationPlanCardEvent(sessionId: st
   return event;
 }
 
+function explicitDagAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+  const payload = event.payload as any;
+  payload.planId = 'impl-generic-dag';
+  payload.implementationPlan.id = 'impl-generic-dag';
+  payload.implementationPlan.title = 'Generic DAG implementation plan';
+  payload.implementationPlan.summary = 'Generate two independent module drafts, then a dependent module draft.';
+  payload.implementationPlan.tasks = [
+    {
+      taskId: 'task-generic-alpha',
+      title: 'Write generic alpha output',
+      target: ['generic-alpha/output.txt'],
+      scope: 'Write a generic alpha output file.',
+      dependencies: [],
+      capability: 'fs.write',
+      acceptanceCriteria: ['Kernel records the generic alpha write fact.'],
+      failureCriteria: ['Stop if the alpha write leaves accepted scope.'],
+    },
+    {
+      taskId: 'task-generic-beta',
+      title: 'Write generic beta output',
+      target: ['generic-beta/output.txt'],
+      scope: 'Write a generic beta output file.',
+      dependencies: [],
+      capability: 'fs.write',
+      acceptanceCriteria: ['Kernel records the generic beta write fact.'],
+      failureCriteria: ['Stop if the beta write leaves accepted scope.'],
+    },
+    {
+      taskId: 'task-generic-gamma',
+      title: 'Write generic gamma output',
+      target: ['generic-gamma/output.txt'],
+      scope: 'Write a generic gamma output after alpha and beta drafts are ready.',
+      dependencies: ['task-generic-alpha', 'task-generic-beta'],
+      hardDependencies: ['task-generic-alpha', 'task-generic-beta'],
+      capability: 'fs.write',
+      acceptanceCriteria: ['Kernel records the generic gamma write fact.'],
+      failureCriteria: ['Stop if the gamma write leaves accepted scope.'],
+    },
+  ];
+  payload.implementationPlan.executionFlowGraph = {
+    graphId: 'flow-generic-dag',
+    nodes: [
+      {
+        nodeId: 'node-generic-alpha',
+        moduleId: 'module-generic-alpha',
+        modulePath: 'generic-alpha',
+        taskIds: ['task-generic-alpha'],
+        targets: ['generic-alpha/output.txt'],
+        capabilities: ['fs.write'],
+        prerequisites: [],
+        outputs: ['generic-alpha/output.txt'],
+        dependsOn: [],
+        unlocks: ['node-generic-gamma'],
+        conflictKeys: ['generic-alpha/output.txt'],
+        evidenceNeeds: [],
+      },
+      {
+        nodeId: 'node-generic-beta',
+        moduleId: 'module-generic-beta',
+        modulePath: 'generic-beta',
+        taskIds: ['task-generic-beta'],
+        targets: ['generic-beta/output.txt'],
+        capabilities: ['fs.write'],
+        prerequisites: [],
+        outputs: ['generic-beta/output.txt'],
+        dependsOn: [],
+        unlocks: ['node-generic-gamma'],
+        conflictKeys: ['generic-beta/output.txt'],
+        evidenceNeeds: [],
+      },
+      {
+        nodeId: 'node-generic-gamma',
+        moduleId: 'module-generic-gamma',
+        modulePath: 'generic-gamma',
+        taskIds: ['task-generic-gamma'],
+        targets: ['generic-gamma/output.txt'],
+        capabilities: ['fs.write'],
+        prerequisites: ['node-generic-alpha draft ready', 'node-generic-beta draft ready'],
+        outputs: ['generic-gamma/output.txt'],
+        dependsOn: ['node-generic-alpha', 'node-generic-beta'],
+        unlocks: [],
+        conflictKeys: ['generic-gamma/output.txt'],
+        evidenceNeeds: ['direct predecessor draft summaries'],
+      },
+    ],
+  };
+  return event;
+}
+
+function singleModuleAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
+  const event = multiTargetAcceptedImplementationPlanCardEvent(sessionId, runId);
+  const payload = event.payload as any;
+  payload.planId = 'impl-generic-single-module';
+  payload.implementationPlan.id = 'impl-generic-single-module';
+  payload.implementationPlan.tasks = [
+    {
+      taskId: 'task-generic-module-header',
+      title: 'Write generic module header',
+      target: ['generic-module/header.txt'],
+      scope: 'Write the first file in one generic module.',
+      dependencies: [],
+      hardDependencies: [],
+      softOrderAfter: [],
+      conflictKeys: ['generic-module/header.txt'],
+      canDraftInParallel: true,
+      capability: 'fs.write',
+      acceptanceCriteria: ['Kernel records the first module file write fact.'],
+      failureCriteria: ['Stop if the first module file leaves the accepted target scope.'],
+    },
+    {
+      taskId: 'task-generic-module-source',
+      title: 'Write generic module source',
+      target: ['generic-module/source.txt'],
+      scope: 'Write the second file in the same generic module after the first file.',
+      dependencies: [],
+      hardDependencies: ['task-generic-module-header'],
+      softOrderAfter: [],
+      conflictKeys: ['generic-module/source.txt'],
+      canDraftInParallel: true,
+      capability: 'fs.write',
+      acceptanceCriteria: ['Kernel records the second module file write fact.'],
+      failureCriteria: ['Stop if the second module file leaves the accepted target scope.'],
+    },
+  ];
+  return event;
+}
+
 function hardDependencyAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
   const event = multiTargetAcceptedImplementationPlanCardEvent(sessionId, runId);
   const payload = event.payload as any;
   payload.planId = 'impl-generic-hard';
   payload.implementationPlan.id = 'impl-generic-hard';
   payload.implementationPlan.tasks[0].role = 'sourceCode';
+  payload.implementationPlan.tasks[0].target = ['generic-one/output.txt'];
   payload.implementationPlan.tasks[0].conflictKeys = ['generic-one.txt'];
   payload.implementationPlan.tasks[0].canDraftInParallel = true;
   payload.implementationPlan.tasks[1].role = 'sourceCode';
+  payload.implementationPlan.tasks[1].target = ['generic-two/output.txt'];
   payload.implementationPlan.tasks[1].dependencies = [];
   payload.implementationPlan.tasks[1].hardDependencies = ['task-generic-one'];
   payload.implementationPlan.tasks[1].softOrderAfter = [];
@@ -8279,28 +9738,44 @@ function singleTargetWriteProposal(targetPath: string, contentSuffix: string): R
       '- The target belongs to the accepted implementationPlan file scope.',
     ].join('\n'),
     codeBlocks: [
-      { id: blockId, blockId, targetPath, content: `generic ${contentSuffix}` },
+      { blockId, targetPath, contentLines: [`generic ${contentSuffix}`] },
     ],
     actionBundle: {
       version: '1',
       id: `bundle-${contentSuffix}`,
       goal: `Write ${targetPath}.`,
       actions: [{
-        id: actionId,
         actionId,
-        title: `Write ${targetPath}`,
-        kind: 'write',
-        capability: 'fs.write',
-        resourceScope: [targetPath],
-        targetPath,
-        sourceBlockId: blockId,
-        permissionLabels: ['fs.write'],
+        toolId: 'fs.write',
+        args: { path: targetPath, sourceBlockId: blockId },
+        description: `Write ${targetPath}`,
       }],
       validationExpectations: [{ id: `validation-${contentSuffix}`, description: `Kernel records ${targetPath}.` }],
       reviewExpectations: [{ id: `review-${contentSuffix}`, description: `Review ${targetPath}.` }],
     },
     expectedValidation: `Kernel records ${targetPath}.`,
     reviewGuide: `Review ${targetPath}.`,
+  };
+}
+
+function singleTargetModuleDraft(targetPath: string, contentSuffix: string): Record<string, unknown> {
+  return {
+    schemaVersion: 'deepcode.subagent.module-draft.v1',
+    kind: 'subAgentModuleDraft',
+    moduleId: `module-${contentSuffix}`,
+    targets: [targetPath],
+    draftFiles: [
+      {
+        targetPath,
+        operation: 'write',
+        language: 'text',
+        contentLines: [`generic ${contentSuffix}`],
+        summary: `Draft ${targetPath}`,
+      },
+    ],
+    evidenceSummary: [`Prepared a candidate draft for ${targetPath}.`],
+    assumptions: ['Parent Session validates, merges, and submits the final actionBundle.'],
+    diagnostics: [],
   };
 }
 
@@ -8355,24 +9830,20 @@ function multiWriteActionBundle(): Record<string, any> {
     goal: 'Write multiple generic files in one reviewed batch.',
     actions: [
       {
-        id: 'write-generic-one',
-        title: 'Write generic file one',
-        kind: 'write',
-        capability: 'fs.write',
-        resourceScope: ['generic-one.txt'],
+        actionId: 'write-generic-one',
+        toolId: 'fs.write',
+        args: { path: 'generic-one.txt', sourceBlockId: 'code-one' },
+        description: 'Write generic file one.',
         canParallelize: false,
         conflictKeys: ['generic-one.txt'],
-        sourceBlockId: 'code-one',
       },
       {
-        id: 'write-generic-two',
-        title: 'Write generic file two',
-        kind: 'write',
-        capability: 'fs.write',
-        resourceScope: ['generic-two.txt'],
+        actionId: 'write-generic-two',
+        toolId: 'fs.write',
+        args: { path: 'generic-two.txt', sourceBlockId: 'code-two' },
+        description: 'Write generic file two.',
         canParallelize: false,
         conflictKeys: ['generic-two.txt'],
-        sourceBlockId: 'code-two',
       },
     ],
     validationExpectations: [{ id: 'validation-multi', description: 'Kernel records file write facts.' }],
@@ -8392,11 +9863,11 @@ function processExecProposal(): Record<string, unknown> {
       'Run the generic validation command already listed in the accepted implementation plan.',
       '',
       '## Key Changes',
-      '- Submit one planned process execution action connected to a command block.',
+      '- Submit one planned process execution action with typed command args.',
       '- Keep the command inside the accepted target and capability scope.',
       '',
       '## Interfaces',
-      '- Use process.exec with a commandBlockId so Kernel owns permission and execution.',
+      '- Use process.exec with argv/cwd args so Kernel owns permission and execution.',
       '',
       '## Test Plan',
       '- Kernel should either request permission or record command execution facts.',
@@ -8404,28 +9875,22 @@ function processExecProposal(): Record<string, unknown> {
       '## Assumptions',
       '- The command target was already included in the accepted implementation plan.',
     ].join('\n'),
-    commandBlocks: [{
-      commandId: 'cmd-generic-validate',
-      capability: 'process.exec',
-      cwd: '.',
-      argv: ['bash', 'scripts/validate.sh'],
-      timeoutMs: 30000,
-      envPolicy: 'inheritSafe',
-      expectedOutput: 'generic validation output',
-      permissionLabels: ['process.exec'],
-    }],
     actionBundle: {
       version: '1',
       id: 'bundle-generic-exec',
       goal: 'Run generic validation.',
       actions: [{
-        id: 'run-generic-validation',
-        title: 'Run generic validation',
-        kind: 'command',
-        capability: 'process.exec',
-        resourceScope: ['scripts/validate.sh'],
-        commandBlockId: 'cmd-generic-validate',
-        permissionLabels: ['process.exec'],
+        actionId: 'run-generic-validation',
+        toolId: 'process.exec',
+        args: {
+          cwd: '.',
+          argv: ['bash', 'scripts/validate.sh'],
+          timeoutMs: 30000,
+          envPolicy: 'inheritSafe',
+          expectedOutput: 'generic validation output',
+          targetPath: 'scripts/validate.sh',
+        },
+        description: 'Run generic validation',
       }],
       validationExpectations: [{ id: 'validation-exec', description: 'Kernel records permission or command facts for the generic validation.' }],
       reviewExpectations: [{ id: 'review-exec', description: 'User can inspect Kernel permission and command facts.' }],
@@ -8438,6 +9903,7 @@ function processExecProposal(): Record<string, unknown> {
 function fakeKernel(request: KernelCommandEnvelope): KernelReply {
   const command = request.command as Record<string, any>;
   if (command.kind === 'runCreate') {
+    const toolCatalogSnapshot = genericToolCatalogSnapshot();
     return {
       ok: true,
       events: [
@@ -8453,6 +9919,7 @@ function fakeKernel(request: KernelCommandEnvelope): KernelReply {
             allowedProposals: ['answer', 'resourceRequest', 'actionBundle'],
             proposalSchemaRefs: ['deepcode.agent.protocol.v3'],
             capabilityProjection: ['fs.read', 'fs.write'],
+            toolCatalogSnapshot,
           },
         },
         {
@@ -8473,6 +9940,7 @@ function fakeKernel(request: KernelCommandEnvelope): KernelReply {
               allowedProposals: ['answer', 'resourceRequest', 'actionBundle'],
               proposalSchemaRefs: ['deepcode.agent.protocol.v3'],
               capabilityProjection: ['fs.read', 'fs.write'],
+              toolCatalogSnapshot,
             },
           },
         },
@@ -8508,6 +9976,58 @@ function fakeKernel(request: KernelCommandEnvelope): KernelReply {
     };
   }
   return { ok: true, events: [] };
+}
+
+function genericToolCatalogSnapshot(): Record<string, unknown> {
+  const base = {
+    family: 'workspace',
+    risk: 'low',
+    permissionMode: 'allow',
+    pathScopePolicy: 'workspace',
+    executionMode: 'execute',
+    needsWorkspace: true,
+    readOnly: true,
+  };
+  return {
+    catalogVersion: 'test-v1',
+    catalogHash: 'test-tool-catalog',
+    tools: [
+      {
+        ...base,
+        toolId: 'fs.read',
+        capability: 'fs.read',
+        operationKind: 'read',
+        providerSchema: {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+          required: ['path'],
+        },
+      },
+      {
+        ...base,
+        toolId: 'fs.list',
+        capability: 'fs.read',
+        operationKind: 'list',
+        providerSchema: {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+        },
+      },
+      {
+        ...base,
+        toolId: 'fs.write',
+        capability: 'fs.write',
+        operationKind: 'write',
+        permissionMode: 'ask',
+        readOnly: false,
+        providerSchema: {
+          type: 'object',
+          properties: { path: { type: 'string' }, sourceBlockId: { type: 'string' } },
+          required: ['path', 'sourceBlockId'],
+        },
+      },
+    ],
+  };
 }
 
 function fakeLlm(_request: LlmChatRequest): ApiResponse<LlmChatResult> {

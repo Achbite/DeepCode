@@ -177,7 +177,13 @@ export interface ContextAssemblyRecord {
   evidenceFreshnessMode: 'resource-evidence-tail-v1';
   resourceEvidenceTailCount: number;
   traceArchiveMode: 'compact-provider-trace';
+  currentTaskGoalHash?: string;
+  currentTaskContextHash?: string;
+  taskCursorId?: string;
+  lastTaskSavepointId?: string;
   subAgentMode?: 'auto' | 'off';
+  effectiveSubAgentMode?: 'auto' | 'off';
+  subAgentModeSource?: 'request' | 'runtimeSnapshot' | 'default';
   sliceCount?: number;
   mergeGroupId?: string;
   branchContextCharCounts?: Record<string, number>;
@@ -205,8 +211,15 @@ export interface ContextAssemblyInput {
   templateVersion?: string;
   contextAssemblyId?: string;
   userGuidance?: UserGuidanceEvent[];
+  currentTaskGoal?: string;
+  currentTaskContext?: unknown;
+  taskCursor?: {
+    cursorId?: string;
+    lastSavepointId?: string;
+  };
   subAgentTelemetry?: {
     mode: 'auto' | 'off';
+    modeSource?: 'request' | 'runtimeSnapshot' | 'default';
     sliceCount?: number;
     mergeGroupId?: string;
     branchContextCharCounts?: Record<string, number>;
@@ -316,7 +329,13 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     evidenceFreshnessMode: EVIDENCE_FRESHNESS_MODE,
     resourceEvidenceTailCount: resourcePromptContext.resourceBlocks.length,
     traceArchiveMode: 'compact-provider-trace',
+    currentTaskGoalHash: input.currentTaskGoal ? stableHash(input.currentTaskGoal) : undefined,
+    currentTaskContextHash: input.currentTaskContext ? stableHash(JSON.stringify(input.currentTaskContext)) : undefined,
+    taskCursorId: input.taskCursor?.cursorId,
+    lastTaskSavepointId: input.taskCursor?.lastSavepointId,
     subAgentMode: input.subAgentTelemetry?.mode,
+    effectiveSubAgentMode: input.subAgentTelemetry?.mode,
+    subAgentModeSource: input.subAgentTelemetry?.modeSource,
     sliceCount: input.subAgentTelemetry?.sliceCount,
     mergeGroupId: input.subAgentTelemetry?.mergeGroupId,
     branchContextCharCounts: input.subAgentTelemetry?.branchContextCharCounts,
@@ -352,7 +371,7 @@ function contextAssemblyPartitionCharCounts(segments: PromptSegment[]): ContextA
     'protocolContract',
     'builtinSystemPrompt',
     'systemStructure',
-    'capabilityProjection',
+    'toolCatalogSummary',
     'rulerContext',
     'authoritativeDocExcerpts',
   ]);
@@ -452,7 +471,7 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
     case 'systemStructure':
     case 'agentInterventionPolicy':
       return 'AgentOperatingContract';
-    case 'capabilityProjection':
+    case 'toolCatalogSummary':
       return 'StaticToolCatalogDigest';
     case 'rulerContext':
     case 'authoritativeDocExcerpts':
