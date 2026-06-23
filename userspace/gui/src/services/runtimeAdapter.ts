@@ -21,12 +21,9 @@ import type {
   CodeSearchInput,
   CodeSearchResult,
   CreateAgentSessionRequest,
-  CreateFolderResult,
   CreateTerminalSessionRequest,
-  DeleteEntryResult,
   FileReadResult,
   FileTreeNode,
-  FileWriteResult,
   GetAgentEventSnapshotResult,
   GetAgentWorkflowConfigResult,
   GetUserSettingsResult,
@@ -46,7 +43,6 @@ import type {
   PatchUserSettingsResult,
   PatchWorkspaceSettingsResult,
   RenameAgentSessionRequest,
-  RenameEntryResult,
   ResolveAgentPermissionRequest,
   ResolveAgentPlanRequest,
   ResolveAgentReviewRequest,
@@ -281,44 +277,6 @@ export function readFile(
   folderId?: string
 ): Promise<ApiResponse<FileReadResult>> {
   return api.readFile(filePath, folderId);
-}
-
-export function writeFile(
-  filePath: string,
-  content: string,
-  folderId?: string
-): Promise<ApiResponse<FileWriteResult>> {
-  return api.writeFile(filePath, content, folderId);
-}
-
-export function createFile(
-  filePath: string,
-  content?: string,
-  folderId?: string
-): Promise<ApiResponse<FileWriteResult>> {
-  return api.createFile(filePath, content, folderId);
-}
-
-export function createFolder(
-  folderPath: string,
-  folderId?: string
-): Promise<ApiResponse<CreateFolderResult>> {
-  return api.createFolder(folderPath, folderId);
-}
-
-export function renameEntry(
-  oldPath: string,
-  newPath: string,
-  folderId?: string
-): Promise<ApiResponse<RenameEntryResult>> {
-  return api.renameEntry(oldPath, newPath, folderId);
-}
-
-export function deleteEntry(
-  filePath: string,
-  folderId?: string
-): Promise<ApiResponse<DeleteEntryResult>> {
-  return api.deleteEntry(filePath, folderId);
 }
 
 export function getShellEnvironment(): Promise<ApiResponse<ShellEnvironmentStatus>> {

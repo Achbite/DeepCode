@@ -131,9 +131,6 @@ function actionText(action: Record<string, unknown>, language: UiLanguage): stri
   if (type === 'shell.propose') {
     return t(language, 'agent.action.shellPropose', { command: command ?? '(missing command)' });
   }
-  if (type === 'shell.exec') {
-    return t(language, 'agent.action.shellExec', { command: command ?? '(missing command)' });
-  }
   return result ? result.trim() : t(language, 'agent.action.parsed', { type });
 }
 function parseActionObject(value: unknown): Record<string, unknown>[] {

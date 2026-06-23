@@ -294,8 +294,7 @@ function isShellTool(
   output?: Record<string, unknown>,
   args?: Record<string, unknown>
 ): boolean {
-  return toolName === 'shell.exec' ||
-    toolName === 'process.exec' ||
+  return toolName === 'process.exec' ||
     Boolean(stringValue(output, 'command') ?? stringValue(args, 'command'));
 }
 

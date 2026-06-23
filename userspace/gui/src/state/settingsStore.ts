@@ -502,7 +502,7 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
   {
     key: 'agent.shell.autoExecuteCommands',
     label: 'Auto Execute Commands',
-    description: 'Allow non-blacklisted shell.exec requests to run automatically when shell execution is enabled.',
+    description: 'Allow approved process.exec requests to run automatically when process execution is enabled.',
     group: 'agent',
     control: 'boolean',
   },

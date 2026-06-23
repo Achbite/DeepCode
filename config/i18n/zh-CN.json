@@ -999,7 +999,7 @@
     },
     "agent.shell.autoExecuteCommands": {
       "label": "自动执行命令",
-      "description": "启用 shell 执行后，允许非黑名单 shell.exec 请求自动运行。"
+      "description": "启用进程执行后，允许已授权的 process.exec 请求自动运行。"
     },
     "agent.shell.commandBlacklist": {
       "label": "命令黑名单",

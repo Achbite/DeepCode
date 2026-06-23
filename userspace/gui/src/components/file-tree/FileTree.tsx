@@ -8,20 +8,10 @@
  *   - 文件树右键可把文件 / 文件夹添加到当前 Agent 对话。
  */
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import {
-  getFileTree,
-  createFile,
-  createFolder,
-  renameEntry,
-  deleteEntry,
-} from '../../services/runtimeAdapter';
+import { getFileTree } from '../../services/runtimeAdapter';
 import type { FileTreeNode } from '@deepcode/protocol';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useUiStore } from '../../state/uiStore';
-import {
-  useEditorStore,
-  buildFileTabId,
-} from '../../state/editorStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import {
   ChevronRightIcon,
@@ -70,28 +60,10 @@ function getDepthClass(depth: number): string {
   return `file-tree__row--depth-${Math.max(0, Math.min(depth, 12))}`;
 }
 
-function basename(path: string): string {
-  if (!path) return '';
-  return path.split('/').filter(Boolean).pop() ?? path;
-}
-
 function parentPathOf(path: string): string {
   const parts = path.split('/').filter(Boolean);
   parts.pop();
   return parts.join('/');
-}
-
-function joinPath(parentPath: string, name: string): string {
-  const trimmed = name.trim().replace(/^\/+|\/+$/g, '');
-  return parentPath ? `${parentPath}/${trimmed}` : trimmed;
-}
-
-function replacePathPrefix(path: string, oldPath: string, newPath: string): string {
-  if (path === oldPath) return newPath;
-  if (path.startsWith(`${oldPath}/`)) {
-    return `${newPath}/${path.slice(oldPath.length + 1)}`;
-  }
-  return path;
 }
 
 function absolutePathForTarget(rootPath: string, relativePath: string): string {
@@ -126,9 +98,6 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
   const bumpTreeRevision = useWorkspaceStore((s) => s.bumpTreeRevision);
   const getActiveFolder = useWorkspaceStore((s) => s.getActiveFolder);
   const showWorkspaceOpenDialog = useUiStore((s) => s.showWorkspaceOpenDialog);
-  const renamePathInTabs = useEditorStore((s) => s.renamePathInTabs);
-  const closeTab = useEditorStore((s) => s.closeTab);
-  const getOpenFiles = useEditorStore((s) => s.getOpenFiles);
   const addAgentAttachment = useAgentSessionStore((s) => s.addAttachment);
 
   const [tree, setTree] = useState<FileTreeNode[]>([]);
@@ -141,7 +110,6 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
   const [notice, setNotice] = useState<string | null>(null);
   const [selectedResource, setSelectedResource] = useState<ResourceTarget | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
-  const [deletingPath, setDeletingPath] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
   const treeLoadInFlightRef = useRef(false);
 
@@ -233,6 +201,12 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
     noticeTimerRef.current = window.setTimeout(() => setNotice(null), 1800);
   };
 
+  const showHostMutationDisabled = () => {
+    const message = '文件修改需通过 Agent 计划确认后由 Kernel 执行。';
+    setPendingError(message);
+    showNotice(message);
+  };
+
   const getCreateParentPath = (): string => {
     if (!selectedResource) return '';
     return selectedResource.kind === 'directory'
@@ -276,34 +250,10 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
         cancelInlineEdit();
         return;
       }
-      const target = joinPath(pendingCreate.parentPath, trimmed);
-      const result =
-        pendingCreate.kind === 'file'
-          ? await createFile(target, '', activeFolderId)
-          : await createFolder(target, activeFolderId);
-
-      if (result.ok) {
-        setPendingCreate(null);
-        setPendingError(null);
-        bumpTreeRevision();
-        if (pendingCreate.kind === 'file') {
-          void onFileSelect(target, activeFolderId);
-        } else {
-          setExpandedDirs((prev) => new Set(prev).add(target));
-          setSelectedResource({
-            kind: 'directory',
-            path: target,
-            name: basename(target),
-            folderId: activeFolderId,
-          });
-        }
-      } else if (result.error === 'file_already_exists') {
-        setPendingError(t(language, 'explorer.error.exists', { name: trimmed }));
-      } else {
-        setPendingError(result.message || t(language, 'explorer.error.create'));
-      }
+      setPendingCreate(null);
+      showHostMutationDisabled();
     },
-    [pendingCreate, activeFolderId, bumpTreeRevision, onFileSelect, language]
+    [pendingCreate, activeFolderId]
   );
 
   const submitRename = useCallback(
@@ -318,37 +268,13 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
         setPendingError(t(language, 'explorer.error.renameSeparator'));
         return;
       }
-      const { target } = pendingRename;
-      const nextPath = joinPath(parentPathOf(target.path), trimmed);
-      if (nextPath === target.path) {
+      if (trimmed === pendingRename.target.name) {
         cancelInlineEdit();
         return;
       }
-      const result = await renameEntry(target.path, nextPath, target.folderId);
-      if (result.ok && result.data) {
-        setExpandedDirs((prev) => {
-          const next = new Set<string>();
-          for (const path of prev) {
-            next.add(replacePathPrefix(path, target.path, nextPath));
-          }
-          return next;
-        });
-        renamePathInTabs(target.folderId, target.path, nextPath);
-        setSelectedResource({
-          ...target,
-          path: nextPath,
-          name: trimmed,
-        });
-        setPendingRename(null);
-        setPendingError(null);
-        bumpTreeRevision();
-      } else if (result.error === 'file_already_exists') {
-        setPendingError(t(language, 'explorer.error.exists', { name: trimmed }));
-      } else {
-        setPendingError(result.message || t(language, 'explorer.error.rename'));
-      }
+      showHostMutationDisabled();
     },
-    [pendingRename, renamePathInTabs, bumpTreeRevision, language]
+    [pendingRename, language]
   );
 
   const submitDelete = useCallback(
@@ -370,51 +296,10 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
 
       setPendingCreate(null);
       setPendingRename(null);
-      setPendingError(null);
-      setDeletingPath(target.path);
-      showNotice(t(language, 'explorer.delete.inProgress', { name: target.name }));
-      try {
-        const result = await deleteEntry(target.path, target.folderId);
-        if (result.ok && result.data) {
-          const isNested = (path: string) =>
-            path === target.path || path.startsWith(`${target.path}/`);
-          for (const file of getOpenFiles()) {
-            if (file.folderId === target.folderId && isNested(file.path)) {
-              closeTab(buildFileTabId(file.folderId, file.path));
-            }
-          }
-          setExpandedDirs((prev) => {
-            const next = new Set<string>();
-            for (const path of prev) {
-              if (!isNested(path)) next.add(path);
-            }
-            return next;
-          });
-          if (
-            selectedResource?.folderId === target.folderId &&
-            isNested(selectedResource.path)
-          ) {
-            setSelectedResource(null);
-          }
-          setPendingError(null);
-          showNotice(t(language, 'explorer.delete.done', { name: target.name }));
-          bumpTreeRevision();
-          void loadTree({ silent: true });
-        } else {
-          const message = result.message || t(language, 'explorer.error.delete');
-          setPendingError(message);
-          showNotice(message);
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : t(language, 'explorer.error.delete');
-        setPendingError(message);
-        showNotice(message);
-      } finally {
-        setDeletingPath(null);
-        setContextMenu(null);
-      }
+      showHostMutationDisabled();
+      setContextMenu(null);
     },
-    [bumpTreeRevision, closeTab, getOpenFiles, language, loadTree, selectedResource]
+    [language]
   );
 
   const toggleDir = (dirPath: string) => {
@@ -702,7 +587,7 @@ const FileTree: React.FC<FileTreeProps> = ({ onFileSelect, selectedTabId, langua
           onCopyAbsolutePath={() => void copyAbsolutePath(contextMenu.target)}
           onAddToAgent={() => addToAgent(contextMenu.target, 'message')}
           onAddToAgentSession={() => addToAgent(contextMenu.target, 'session')}
-          deleting={deletingPath === contextMenu.target.path}
+          deleting={false}
           language={language}
         />
       )}

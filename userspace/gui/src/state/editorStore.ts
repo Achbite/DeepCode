@@ -9,7 +9,7 @@
  * 下相同相对路径冲突；切换工作区时由调用方自行决定是否清理旧 Tab。
  */
 import { create } from 'zustand';
-import { readFile, writeFile } from '../services/runtimeAdapter';
+import { readFile } from '../services/runtimeAdapter';
 import { closeModel } from '../components/editor/modelRegistry';
 import { useWorkspaceStore } from './workspaceStore';
 
@@ -324,36 +324,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const tab = get().tabs.find((t) => getTabId(t) === tabId);
     if (!tab || tab.kind !== 'file') return false;
 
-    const result = await writeFile(tab.path, tab.content, tab.folderId);
-    if (result.ok && result.data) {
-      removeDraft(tabId);
-      set((state) => ({
-        tabs: state.tabs.map((t) => {
-          if (t.kind !== 'file' || getTabId(t) !== tabId) return t;
-          return {
-            ...t,
-            originalContent: tab.content,
-            isDirty: false,
-            version: t.version + 1,
-            sizeBytes: result.data!.sizeBytes,
-          };
-        }),
-        saveMessage: `✅ ${tab.path.split('/').pop()} 已保存`,
-      }));
-
-      setTimeout(() => {
-        const cur = get().saveMessage;
-        if (cur && cur.startsWith('✅')) {
-          set({ saveMessage: null });
-        }
-      }, 3000);
-      return true;
-    } else {
-      set({
-        saveMessage: `❌ 保存失败: ${result.message ?? '未知错误'}`,
-      });
-      return false;
-    }
+    set({
+      saveMessage: '❌ 保存失败: 文件修改需通过 Agent 计划确认后由 Kernel 执行',
+    });
+    return false;
   },
 
   saveAllDirtyFiles: async () => {

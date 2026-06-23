@@ -9,10 +9,6 @@ import type {
   HealthStatus,
   FileTreeNode,
   FileReadResult,
-  FileWriteResult,
-  CreateFolderResult,
-  RenameEntryResult,
-  DeleteEntryResult,
   WorkspaceState,
   OpenWorkspaceResult,
   SaveWorkspaceFileRequest,
@@ -488,64 +484,6 @@ export function readFile(
 ): Promise<ApiResponse<FileReadResult>> {
   const qs = buildQuery({ folderId, path: filePath });
   return getJson<FileReadResult>(`${API_BASE}/files/read${qs}`);
-}
-
-export function writeFile(
-  filePath: string,
-  content: string,
-  folderId?: string
-): Promise<ApiResponse<FileWriteResult>> {
-  return sendJson<FileWriteResult>(
-    `${API_BASE}/files/write`,
-    'POST',
-    { folderId, path: filePath, content }
-  );
-}
-
-export function createFile(
-  filePath: string,
-  content?: string,
-  folderId?: string
-): Promise<ApiResponse<FileWriteResult>> {
-  return sendJson<FileWriteResult>(
-    `${API_BASE}/files/create`,
-    'POST',
-    { folderId, path: filePath, content: content ?? '' }
-  );
-}
-
-export function createFolder(
-  folderPath: string,
-  folderId?: string
-): Promise<ApiResponse<CreateFolderResult>> {
-  return sendJson<CreateFolderResult>(
-    `${API_BASE}/folders/create`,
-    'POST',
-    { folderId, path: folderPath }
-  );
-}
-
-export function renameEntry(
-  oldPath: string,
-  newPath: string,
-  folderId?: string
-): Promise<ApiResponse<RenameEntryResult>> {
-  return sendJson<RenameEntryResult>(
-    `${API_BASE}/files/rename`,
-    'POST',
-    { folderId, oldPath, newPath }
-  );
-}
-
-export function deleteEntry(
-  filePath: string,
-  folderId?: string
-): Promise<ApiResponse<DeleteEntryResult>> {
-  return sendJson<DeleteEntryResult>(
-    `${API_BASE}/files/delete`,
-    'POST',
-    { folderId, path: filePath }
-  );
 }
 
 // ---- 用户设置（阶段 4 / S4-4）----
@@ -1041,9 +979,6 @@ export function attachPanelSnapshotToAgent(): Promise<ApiResponse<AttachPanelSna
 export type {
   FileTreeNode,
   FileReadResult,
-  FileWriteResult,
-  CreateFolderResult,
-  RenameEntryResult,
   WorkspaceState,
   OpenWorkspaceResult,
   BrowsePathResult,
