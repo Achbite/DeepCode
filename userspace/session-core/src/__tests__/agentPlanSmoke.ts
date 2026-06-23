@@ -61,6 +61,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopReadOnlyRequestsContinueWithoutBudgetDecision();
   await assertSessionDriverLoopOldResourceBudgetDecisionStillResumes();
   await assertSessionDriverLoopProjectsDecisionRequest();
+  await assertSessionDriverLoopRequirementChoiceEntersResumePrompt();
   await assertSessionDriverLoopProjectsTaskPlanBeforeComplete();
   await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
   await assertSessionDriverLoopRepairsInvalidSourceBlock();
@@ -69,6 +70,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopRepairsOversizedActionBundle();
   await assertSessionDriverLoopRepairsEmptyActionBundleResponse();
   await assertSessionDriverLoopAcceptsLocalizedStructuredPlan();
+  await assertSessionDriverLoopPlanRevisionReturnsToPlanning();
   await assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview();
   await assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan();
   await assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutTaskTargets();
@@ -192,6 +194,79 @@ async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
     'decisionRequest options are not copied into requirement checklist tasks'
   );
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'decisionRequest does not generate a plan before user decision');
+}
+
+async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Promise<void> {
+  const events: AgentEvent[] = [{
+    id: 'requirement-choice-waiting',
+    sessionId: 'session-requirement-choice',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'requirement_confirmation',
+    payload: {
+      title: 'Requirement confirmation',
+      summary: 'Choose a generic test branch.',
+      content: 'Choose a generic test branch.',
+      originalUserRequest: 'Create a generic user intervention test.',
+      runId: 'run-requirement-choice',
+      requirementId: 'requirement-choice',
+      status: 'waitingUserConfirmation',
+      confirmable: true,
+      decisionRequest: {
+        id: 'decision-choice',
+        question: 'Choose a generic branch.',
+        options: [
+          { id: 'alpha', label: 'Alpha branch', description: 'Continue with the first generic branch.', recommended: true },
+          { id: 'beta', label: 'Beta branch', description: 'Continue with the second generic branch.' },
+        ],
+        allowsFreeform: true,
+      },
+    },
+  }];
+  const session: AgentSession = {
+    id: 'session-requirement-choice',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const llmRequests: LlmChatRequest[] = [];
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'answer',
+        outputLanguage: 'en-US',
+        answer: { format: 'markdown', content: 'Generic choice was received.' },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmRequests.length + 1}`,
+  });
+
+  await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'requirement',
+    decision: 'accept',
+    guidance: [
+      'Selected option:',
+      '- id: alpha',
+      '- label: Alpha branch',
+    ].join('\n'),
+    runId: 'run-requirement-choice',
+    targetId: 'requirement-choice',
+    existingEvents: events,
+  });
+
+  assertEqual(llmRequests.length, 1, 'accepted requirement choice resumes provider once');
+  const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
+  assert(promptText.includes('用户已完成用户介入选择'), 'resume prompt states that the user already selected an option');
+  assert(promptText.includes('Alpha branch'), 'resume prompt includes the selected option label');
+  assert(promptText.includes('不要重复输出同一个 decisionRequest'), 'resume prompt guards against repeating the same decision request');
 }
 
 async function assertSessionDriverLoopProjectsTaskPlanBeforeComplete(): Promise<void> {
@@ -3096,6 +3171,65 @@ async function assertSessionDriverLoopAcceptsLocalizedStructuredPlan(): Promise<
   });
   assertEqual(submittedPlans.length, 1, 'localized structured plan reaches Kernel without heading repair');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'localized structured plan renders a plan card');
+}
+
+async function assertSessionDriverLoopPlanRevisionReturnsToPlanning(): Promise<void> {
+  const events = [acceptedImplementationPlanCardEvent('session-plan-revision', 'run-plan-revision')];
+  const session: AgentSession = {
+    id: 'session-plan-revision',
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const llmRequests: LlmChatRequest[] = [];
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'actionBatchSubmit') actionBatchSubmits += 1;
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericTaskPlanProposal());
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmRequests.length + actionBatchSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'revise',
+    guidance: 'Adjust the generic plan to stay as a reply-only planning exercise.',
+    runId: 'run-plan-revision',
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+  });
+
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'plan_review' &&
+      (event.payload as any)?.status === 'needsRevision' &&
+      (event.payload as any)?.planId === 'impl-generic-auto'
+    ),
+    true,
+    'plan revise records a needsRevision decision for the pending plan'
+  );
+  assertEqual(
+    result.events.filter((event) => event.kind === 'plan_card').length >= 2,
+    true,
+    'plan revise starts a new planning turn with a new plan card'
+  );
+  assertEqual(llmRequests.length, 1, 'plan revise calls provider once for replanning');
+  assertEqual(actionBatchSubmits, 0, 'plan revise does not execute the old plan');
+  const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
+  assert(promptText.includes('reply-only planning exercise'), 'plan revision guidance enters the next PromptEnvelope');
+  assert(promptText.includes('Do not execute work'), 'plan revision prompt keeps the revised plan non-executable');
 }
 
 function assertWorkflowStagePermissionProjectsPendingDecision(): void {

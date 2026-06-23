@@ -1029,12 +1029,10 @@ export class SessionDriverLoop {
       return this.resolveAcceptedPlanScopeRequirementDecision(input, confirmation, decisionEvent, interactionOverlay, result);
     }
 
-    const originalRequest = requirementOriginalRequest(confirmation);
+    const originalRequest = requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
     const next = await this.runUserTurn({
       sessionId: input.sessionId,
-      content: input.decision === 'revise' && input.guidance
-        ? `${originalRequest}\n\n用户修订意见：${input.guidance}`
-        : originalRequest,
+      content: originalRequest,
       attachments: requirementAttachments(confirmation),
       existingEvents: result.events,
       workspaceBinding: input.workspaceBinding,
@@ -1174,6 +1172,25 @@ export class SessionDriverLoop {
       let result = await this.append(input.sessionId, [
         planReviewDecisionEvent(input.sessionId, plan, status, input.guidance, this.ts(), this.id('plan-decision')),
       ]);
+      if (input.decision === 'revise') {
+        return this.runUserTurn({
+          sessionId: input.sessionId,
+          content: planRevisionRequest(plan, input.guidance),
+          attachments: [],
+          existingEvents: result.events,
+          workspaceBinding: input.workspaceBinding,
+          projectWorkingDirectory: input.projectWorkingDirectory,
+          profileId: input.profileId,
+          workflow: input.workflow,
+          appendUserMessage: false,
+          requirementConfirmationMode: 'off',
+          reviewContinuationMode: input.reviewContinuationMode,
+          interventionLevel: input.interventionLevel,
+          subAgentMode: input.subAgentMode,
+          subAgentMaxParallel: input.subAgentMaxParallel,
+          interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+        });
+      }
       if (input.decision === 'reject') {
         result = await this.append(input.sessionId, [
           sessionRunStateEvent({
@@ -12879,6 +12896,25 @@ function acceptedPlanResourceResumePrompt(
   ].filter(Boolean).join('\n\n');
 }
 
+function planRevisionRequest(plan: SessionPlanContext, guidance?: string): string {
+  const report = plan.planReviewReport ? clipJson(plan.planReviewReport, 4_000) : '';
+  return [
+    'The user revised the pending plan card. Generate a new reviewable taskPlan from the same user goal and the revision guidance.',
+    'This is plan revision, not plan acceptance. Do not execute work, do not output actionBundle, and do not claim any files were changed.',
+    guidance?.trim() ? `User plan revision guidance:\n${guidance.trim()}` : 'User plan revision guidance: revise the pending plan before execution.',
+    plan.userPlan ? `Previous plan card content:\n${clip(plan.userPlan, 6_000)}` : '',
+    report ? `Previous Kernel PlanReview report, clipped:\n${report}` : '',
+    [
+      'Next proposal requirements:',
+      '- Prefer kind="taskPlan" with a complete non-executable plan that waits for user confirmation.',
+      '- If more read-only evidence is required before planning, return resourceRequest.',
+      '- If a material user choice is still required, return decisionRequest.',
+      '- Do not return actionBundle until the revised plan is explicitly accepted.',
+      '- Keep targets and capabilities concrete enough for Kernel PlanReview, but do not include codeBlocks or executable tool actions in taskPlan.',
+    ].join('\n'),
+  ].filter(Boolean).join('\n\n');
+}
+
 function reviewRevisionRequest(review: SessionReviewContext, guidance?: string): string {
   const continuations = review.continuations.map(continuationSummary).filter(Boolean);
   return [
@@ -13287,6 +13323,41 @@ function requirementRecordFromEvent(event: AgentEvent, status: RequirementRecord
 function requirementOriginalRequest(event: AgentEvent): string {
   const payload = objectRecord(event.payload);
   return stringValue(payload?.originalUserRequest) ?? requirementRecordFromEvent(event, 'confirmed')?.initialUserRequest ?? '';
+}
+
+function requirementDecisionResumeRequest(
+  confirmation: AgentEvent,
+  decisionEvent: AgentEvent,
+  decision: 'accept' | 'reject' | 'revise',
+  guidance?: string
+): string {
+  const originalRequest = requirementOriginalRequest(confirmation);
+  if (decision === 'revise') {
+    return guidance?.trim()
+      ? `${originalRequest}\n\n用户修订意见：${guidance.trim()}`
+      : `${originalRequest}\n\n用户要求修订当前用户介入请求。`;
+  }
+  if (decision !== 'accept') return originalRequest;
+  const payload = objectRecord(decisionEvent.payload);
+  const selectedOption = objectRecord(payload?.selectedOption);
+  const lines = [
+    originalRequest,
+    '',
+    '用户已完成用户介入选择，请基于该选择继续当前父流程；不要重复输出同一个 decisionRequest，除非后续出现新的独立决策点。',
+  ];
+  const id = stringValue(selectedOption?.id);
+  const label = stringValue(selectedOption?.label);
+  const description = stringValue(selectedOption?.description);
+  if (id || label || description) {
+    lines.push('', '已选择的选项：');
+    if (id) lines.push(`- id: ${id}`);
+    if (label) lines.push(`- label: ${label}`);
+    if (description) lines.push(`- description: ${description}`);
+  }
+  if (guidance?.trim()) {
+    lines.push('', '用户补充信息：', guidance.trim());
+  }
+  return lines.join('\n');
 }
 
 function requirementAttachments(event: AgentEvent): AgentContextAttachment[] {
