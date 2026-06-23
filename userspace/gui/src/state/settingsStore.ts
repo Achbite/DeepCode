@@ -349,7 +349,7 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
   {
     key: 'agent.subagents.mode',
     label: 'Sub-agents',
-    description: 'Conservative parallel draft generation for independent accepted-plan tasks. Parent Session still validates and submits all work.',
+    description: 'Experimental parallel draft generation for independent accepted-plan tasks. It is disabled by default until the orchestration path is fully stable.',
     group: 'agent',
     control: 'select',
     options: [
