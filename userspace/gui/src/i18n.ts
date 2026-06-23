@@ -29,6 +29,26 @@ export function normalizeUiLanguage(value: unknown): UiLanguage {
   return value === 'en-US' ? 'en-US' : DEFAULT_LANGUAGE;
 }
 
+function initialActiveLanguage(): UiLanguage {
+  if (typeof window === 'undefined') return DEFAULT_LANGUAGE;
+  try {
+    return normalizeUiLanguage(window.localStorage.getItem('deepcode.ui.language'));
+  } catch {
+    return DEFAULT_LANGUAGE;
+  }
+}
+
+let activeLanguage: UiLanguage = initialActiveLanguage();
+
+export function setActiveUiLanguage(value: unknown): UiLanguage {
+  activeLanguage = normalizeUiLanguage(value);
+  return activeLanguage;
+}
+
+export function getActiveUiLanguage(): UiLanguage {
+  return activeLanguage;
+}
+
 function formatMessage(template: string, variables: I18nVariables = {}): string {
   return template.replace(/\{([A-Za-z0-9_.-]+)\}/g, (match, key) => {
     const value = variables[key];
@@ -41,6 +61,10 @@ export function t(language: UiLanguage, key: string, variables?: I18nVariables):
   const fallbackPack = PACKS[DEFAULT_LANGUAGE];
   const template = pack.messages?.[key] ?? fallbackPack.messages?.[key] ?? key;
   return formatMessage(template, variables);
+}
+
+export function activeT(key: string, variables?: I18nVariables): string {
+  return t(activeLanguage, key, variables);
 }
 
 export function settingText(language: UiLanguage, key: string): SettingText | undefined {
