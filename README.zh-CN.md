@@ -2,7 +2,9 @@
 
 > English default version: [README.md](README.md)
 
-DeepCode v0.5.2 是一个本地优先的 AI 编程工作台稳定基线版本，目标是把 Agent 会话协议、Kernel 工具执行、权限审计、上下文压缩、Editor/GUI/CLI/TUI 多入口封装在同一套后端事实源上。本版本稳定了 DeepCode-GUI 项目会话流程、从文件夹创建项目后的固定目录上下文交接、介入卡片交互，以及共享语言设置入口，同时保留可复现的本地构建 / 打包流程和 provider、工具、Session、Kernel、UI shell 的清晰职责边界。
+DeepCode v0.5.23 是一个本地优先的 AI 编程工作台稳定基线版本，目标是把 Agent 会话协议、Kernel 工具执行、权限审计、上下文压缩、Editor/GUI/CLI/TUI 多入口封装在同一套后端事实源上。本版本稳定了 Session 协议 / parser、accepted-plan 执行、文件节点编排门禁、生成产物证据回填和 Review 前审查链路，同时保留可复现的本地构建 / 打包流程和 provider、工具、Session、Kernel、UI shell 的清晰职责边界。
+
+v0.5.23 中子代理仍属于实验能力。由于并行草稿编排路径还不够稳定，默认设置已改为关闭；用户仍可在 Agent 设置中手动启用子代理做定向实验。Parent Session 仍是唯一负责校验草稿并提交 Kernel action 的权威路径。
 
 ## 构建与发布模式
 
@@ -191,7 +193,7 @@ conversation root 下的路径：
 当前 Kernel-visible tool catalog 包含：
 
 - 文件与搜索：`fs.list`、`fs.read`、`fs.diff`、`fs.write`、`fs.delete`、`code.search`
-- Shell：`shell.propose`、`shell.exec`
+- 进程：`process.exec`（当前版本为阻断 / 权限预览）
 - 联网证据：`web.search`、`web.fetch`
 - Git：`git.status`、`git.diff`、`git.stage`、`git.unstage`、`git.commit`
 - 内部浏览器：`browser.open`、`browser.reload`、`browser.snapshot`、`browser.inspect`、`browser.click`、`browser.type`、`browser.scroll`
