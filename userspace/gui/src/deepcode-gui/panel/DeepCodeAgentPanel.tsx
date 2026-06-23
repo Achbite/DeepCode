@@ -65,6 +65,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const [timelineTypewriterActive, setTimelineTypewriterActive] = useState(false);
   const [revealedPendingDecisionKey, setRevealedPendingDecisionKey] = useState<string | null>(null);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
+  const [bottomChromeElement, setBottomChromeElement] = useState<HTMLDivElement | null>(null);
   const sessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
 
   useEffect(() => {
@@ -240,38 +241,42 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
         language={language}
         activeDeltas={activeDeltas}
         followLatestSignal={followLatestSignal}
+        scrollWatchElement={bottomChromeElement}
         onTypewriterActiveChange={setTimelineTypewriterActive}
-        onPlanResolve={(runId, planId, decision, guidance) =>
-          void resolvePlan(runId, planId, decision, guidance)
-        }
+        onPlanResolve={(runId, planId, decision, guidance) => {
+          requestFollowLatest();
+          void resolvePlan(runId, planId, decision, guidance);
+        }}
       />
 
-      {!timelineTypewriterActive && pendingPermission && (
-        <PermissionRequestBubble
-          request={pendingPermission.request}
-          language={language}
-          disabled={Boolean(resolvingPermission)}
-          resolvingDecision={
-            resolvingPermission?.id === pendingPermission.request.id
-              ? resolvingPermission.decision
-              : null
-          }
-          onAccept={() => {
-            requestFollowLatest();
-            void acceptPermission();
-          }}
-          onReject={() => {
-            requestFollowLatest();
-            void rejectPermission();
-          }}
-        />
-      )}
+      <div ref={setBottomChromeElement}>
+        {!timelineTypewriterActive && pendingPermission && (
+          <PermissionRequestBubble
+            request={pendingPermission.request}
+            language={language}
+            disabled={Boolean(resolvingPermission)}
+            resolvingDecision={
+              resolvingPermission?.id === pendingPermission.request.id
+                ? resolvingPermission.decision
+                : null
+            }
+            onAccept={() => {
+              requestFollowLatest();
+              void acceptPermission();
+            }}
+            onReject={() => {
+              requestFollowLatest();
+              void rejectPermission();
+            }}
+          />
+        )}
 
-      {(errorMessage || timelineError) && (
-        <div className="deepcode-gui-agent-panel__error">{errorMessage ?? timelineError}</div>
-      )}
+        {(errorMessage || timelineError) && (
+          <div className="deepcode-gui-agent-panel__error">{errorMessage ?? timelineError}</div>
+        )}
 
-      {composer}
+        {composer}
+      </div>
     </div>
   );
 };

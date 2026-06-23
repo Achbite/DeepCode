@@ -23,6 +23,7 @@ interface DeepCodeTimelineProps {
   language: UiLanguage;
   activeDeltas?: ProjectionDelta[];
   followLatestSignal?: number;
+  scrollWatchElement?: HTMLElement | null;
   onTypewriterActiveChange?: (active: boolean) => void;
   onPlanResolve?: (
     runId: string,
@@ -42,6 +43,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   language,
   activeDeltas = [],
   followLatestSignal = 0,
+  scrollWatchElement = null,
   onTypewriterActiveChange,
   onPlanResolve,
 }) => {
@@ -72,6 +74,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   const liveScrollFrameRef = useRef<number | null>(null);
   const liveScrollTimeoutRef = useRef<number | null>(null);
   const lastScrollTopRef = useRef(0);
+  const lastTouchYRef = useRef<number | null>(null);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const scrollSignature = useMemo(
     () => timelineScrollSignature(viewWithActive, loading),
@@ -219,16 +222,45 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     }
   }, []);
 
+  const detachFromLatestForUserScroll = useCallback(() => {
+    userScrollIntentRef.current = true;
+    setFollowMode('detached');
+  }, [setFollowMode]);
+
   const markUserScrollIntent = useCallback((event?: Event) => {
     if (event instanceof WheelEvent) {
       if (event.deltaY < 0) {
-        userScrollIntentRef.current = true;
-        setFollowMode('detached');
+        detachFromLatestForUserScroll();
+      }
+      return;
+    }
+    if (typeof TouchEvent !== 'undefined' && event instanceof TouchEvent) {
+      if (event.type === 'touchend' || event.type === 'touchcancel') {
+        lastTouchYRef.current = null;
+        return;
+      }
+      const touch = event.touches[0];
+      if (!touch) return;
+      if (event.type === 'touchstart') {
+        lastTouchYRef.current = touch.clientY;
+        return;
+      }
+      const previousY = lastTouchYRef.current;
+      lastTouchYRef.current = touch.clientY;
+      if (previousY !== null && touch.clientY > previousY + 2) {
+        detachFromLatestForUserScroll();
+      }
+      return;
+    }
+    if (event instanceof KeyboardEvent) {
+      if (isEditableKeyboardTarget(event.target)) return;
+      if (event.key === 'ArrowUp' || event.key === 'PageUp' || event.key === 'Home') {
+        detachFromLatestForUserScroll();
       }
       return;
     }
     if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
-  }, [setFollowMode]);
+  }, [detachFromLatestForUserScroll]);
 
   useEffect(() => {
     const scrollContainer = resolveScrollContainer();
@@ -237,15 +269,12 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 
     const updateShouldFollow = () => {
       const currentScrollTop = scrollContainer.scrollTop;
-      const scrollingUp = currentScrollTop < lastScrollTopRef.current - 2;
       const scrollingDown = currentScrollTop > lastScrollTopRef.current + 2;
       lastScrollTopRef.current = currentScrollTop;
-      if (scrollingUp) {
-        userScrollIntentRef.current = true;
-        setFollowMode('detached');
+      if (window.performance.now() < suppressScrollEventsUntilRef.current) {
+        syncJumpToLatestVisibility(scrollContainer);
         return;
       }
-      if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
       if (scrollingDown && userDetachedFromLatestRef.current && isAtScrollEnd(scrollContainer)) {
         setFollowMode('following');
         scrollToTimelineEnd({ requireFollowing: true });
@@ -264,9 +293,19 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
 
     updateShouldFollow();
     scrollContainer.addEventListener('wheel', markUserScrollIntent, { passive: true });
+    scrollContainer.addEventListener('touchstart', markUserScrollIntent, { passive: true });
+    scrollContainer.addEventListener('touchmove', markUserScrollIntent, { passive: true });
+    scrollContainer.addEventListener('touchend', markUserScrollIntent, { passive: true });
+    scrollContainer.addEventListener('touchcancel', markUserScrollIntent, { passive: true });
+    scrollContainer.addEventListener('keydown', markUserScrollIntent, { passive: true });
     scrollContainer.addEventListener('scroll', updateShouldFollow, { passive: true });
     return () => {
       scrollContainer.removeEventListener('wheel', markUserScrollIntent);
+      scrollContainer.removeEventListener('touchstart', markUserScrollIntent);
+      scrollContainer.removeEventListener('touchmove', markUserScrollIntent);
+      scrollContainer.removeEventListener('touchend', markUserScrollIntent);
+      scrollContainer.removeEventListener('touchcancel', markUserScrollIntent);
+      scrollContainer.removeEventListener('keydown', markUserScrollIntent);
       scrollContainer.removeEventListener('scroll', updateShouldFollow);
     };
   }, [markUserScrollIntent, resolveScrollContainer, scrollToTimelineEnd, setFollowMode, syncJumpToLatestVisibility]);
@@ -285,16 +324,19 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   }, [loading, scrollSignature, scrollToTimelineEnd]);
 
   useEffect(() => {
-    const target = timelineContentRef.current;
-    if (!target || typeof ResizeObserver === 'undefined') return undefined;
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const targets = [timelineContentRef.current, scrollWatchElement]
+      .filter((target): target is HTMLElement => Boolean(target));
+    const uniqueTargets = Array.from(new Set(targets));
+    if (uniqueTargets.length === 0) return undefined;
     const observer = new ResizeObserver(() => {
       if (followModeRef.current === 'following') {
         scrollToTimelineEndIfFollowing();
       }
     });
-    observer.observe(target);
+    uniqueTargets.forEach((target) => observer.observe(target));
     return () => observer.disconnect();
-  }, [scrollToTimelineEndIfFollowing]);
+  }, [scrollToTimelineEndIfFollowing, scrollWatchElement]);
 
   return (
     <div className={`deepcode-gui-timeline${timelineDensityClass}`} ref={timelineRef}>
@@ -622,6 +664,13 @@ function isAtScrollEnd(container: HTMLElement, thresholdPx = 8): boolean {
 
 function isNearScrollBottom(container: HTMLElement, thresholdPx = 140): boolean {
   return maxScrollTop(container) - container.scrollTop <= thresholdPx;
+}
+
+function isEditableKeyboardTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tagName = target.tagName.toLowerCase();
+  return tagName === 'input' || tagName === 'textarea' || tagName === 'select';
 }
 
 function timelineScrollSignature(view: AgentTimelineResult, loading: boolean): string {

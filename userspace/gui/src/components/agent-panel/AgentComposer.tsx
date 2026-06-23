@@ -149,7 +149,11 @@ function decisionPlaceholder(decision: AgentComposerPendingDecision, language: U
 
 function decisionSubmitLabel(decision: AgentComposerPendingDecision, value: string, language: UiLanguage): string {
   if (decision.kind === 'permission') return t(language, 'agent.permission.accept');
-  if (isTechnicalChoiceDecision(decision)) return t(language, 'agent.composer.decision.submitChoice');
+  if (isTechnicalChoiceDecision(decision)) {
+    return technicalChoiceInputIsFreeform(decision, value)
+      ? t(language, 'agent.requirement.submitRevision')
+      : t(language, 'agent.composer.decision.submitChoice');
+  }
   if (decision.kind === 'requirement') {
     return value.trim()
       ? t(language, 'agent.requirement.submitRevision')
@@ -218,12 +222,26 @@ function recommendedChoice(options: AgentComposerDecisionOption[]): AgentCompose
   return options.find((option) => option.recommended) ?? options[0] ?? null;
 }
 
+type TechnicalChoiceInput =
+  | { action: 'accept'; option: AgentComposerDecisionOption; supplement?: string }
+  | { action: 'revise'; guidance: string }
+  | { action: 'reject'; option?: AgentComposerDecisionOption };
+
+function technicalChoiceInputIsFreeform(decision: AgentComposerPendingDecision, value: string): boolean {
+  if (!isTechnicalChoiceDecision(decision)) return false;
+  const fallback = recommendedChoice(decision.decisionRequest.options);
+  if (!fallback) return false;
+  return parseTechnicalChoiceInput(value, decision.decisionRequest.options, fallback).action === 'revise';
+}
+
 function parseTechnicalChoiceInput(
   value: string,
+  options: AgentComposerDecisionOption[],
   fallback: AgentComposerDecisionOption
-): { action: 'accept' | 'reject'; option: AgentComposerDecisionOption; supplement?: string } {
+): TechnicalChoiceInput {
   const trimmed = value.trim();
   const lower = trimmed.toLowerCase();
+  if (!trimmed) return { action: 'accept', option: fallback };
   if (
     lower === 'end' ||
     lower === 'stop' ||
@@ -233,10 +251,33 @@ function parseTechnicalChoiceInput(
   ) {
     return { action: 'reject', option: fallback };
   }
+  if (lower === 'accept' || trimmed === '确认' || trimmed === '同意') {
+    return { action: 'accept', option: fallback };
+  }
+  const numbered = trimmed.match(/^(\d+)(?:[\s.)、:：-]+([\s\S]*))?$/);
+  if (numbered) {
+    const option = options[Number(numbered[1]) - 1];
+    if (option) {
+      const supplement = numbered[2]?.trim();
+      return { action: 'accept', option, supplement: supplement || undefined };
+    }
+  }
+  for (const option of options) {
+    const id = option.id.toLowerCase();
+    const label = option.label.toLowerCase();
+    if (lower === id || lower === label) return { action: 'accept', option };
+    if (lower.startsWith(`${id} `)) {
+      const supplement = trimmed.slice(option.id.length).trim();
+      return { action: 'accept', option, supplement: supplement || undefined };
+    }
+    if (lower.startsWith(`${label} `)) {
+      const supplement = trimmed.slice(option.label.length).trim();
+      return { action: 'accept', option, supplement: supplement || undefined };
+    }
+  }
   return {
-    action: 'accept',
-    option: fallback,
-    supplement: trimmed || undefined,
+    action: 'revise',
+    guidance: trimmed,
   };
 }
 
@@ -365,12 +406,18 @@ const AgentComposer: React.FC<AgentComposerProps> = ({
       const focusedChoice = technicalChoiceOptions.find((option) => option.id === focusedDecisionOptionIdRef.current)
         ?? selectedChoice;
       if (isTechnicalChoiceDecision(pendingDecision) && focusedChoice) {
-        const parsed = parseTechnicalChoiceInput(nextValue, focusedChoice);
+        const parsed = parseTechnicalChoiceInput(nextValue, technicalChoiceOptions, focusedChoice);
         setValue('');
-        setSelectedChoiceId(parsed.option.id);
-        focusedDecisionOptionIdRef.current = parsed.option.id;
+        if (parsed.action !== 'revise' && parsed.option) {
+          setSelectedChoiceId(parsed.option.id);
+          focusedDecisionOptionIdRef.current = parsed.option.id;
+        }
         if (parsed.action === 'reject') {
           void onDecisionReject?.();
+          return;
+        }
+        if (parsed.action === 'revise') {
+          void onDecisionSubmit?.(parsed.guidance, 'revise');
           return;
         }
         void onDecisionSubmit?.(decisionChoiceGuidance(parsed.option, parsed.supplement, language), 'accept');
