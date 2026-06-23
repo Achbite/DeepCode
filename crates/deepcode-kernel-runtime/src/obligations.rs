@@ -102,7 +102,7 @@ impl DeepCodeKernelRuntime {
             )?;
             return Ok(());
         }
-        if tool_name != "shell.exec" {
+        if tool_name != "process.exec" {
             return Ok(());
         }
         let command = output

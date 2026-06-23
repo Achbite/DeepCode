@@ -1,8 +1,5 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
 
 use crate::prelude::*;
-use crate::*;
 
 pub(crate) const LARGE_JSON_BODY_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 

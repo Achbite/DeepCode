@@ -100,80 +100,9 @@ impl DeepCodeKernelRuntime {
                 self.workspace_open(request_id, path)
             }
             KernelCommand::WorkspaceCurrent { request_id } => self.workspace_current(request_id),
-            KernelCommand::WorkspaceList {
-                request_id,
-                folder_id,
-                path,
-                depth,
-            } => self.workspace_list(request_id, folder_id, path, depth),
-            KernelCommand::WorkspaceRead {
-                request_id,
-                folder_id,
-                path,
-            } => self.workspace_read(request_id, folder_id, path),
-            KernelCommand::WorkspaceWrite {
-                request_id,
-                folder_id,
-                path,
-                content,
-                create,
-            } => self.workspace_write(request_id, folder_id, path, content, create),
-            KernelCommand::WorkspaceCreate {
-                request_id,
-                folder_id,
-                path,
-                content,
-            } => self.workspace_create(request_id, folder_id, path, content),
-            KernelCommand::WorkspaceCreateFolder {
-                request_id,
-                folder_id,
-                path,
-            } => self.workspace_create_folder(request_id, folder_id, path),
-            KernelCommand::WorkspaceRename {
-                request_id,
-                folder_id,
-                old_path,
-                new_path,
-            } => self.workspace_rename(request_id, folder_id, old_path, new_path),
-            KernelCommand::WorkspaceDelete {
-                request_id,
-                folder_id,
-                path,
-            } => self.workspace_delete(request_id, folder_id, path),
-            KernelCommand::WorkspaceSearch {
-                request_id,
-                folder_id,
-                query,
-                include,
-                context_lines,
-                max_results,
-                is_regex,
-            } => self.workspace_search(
-                request_id,
-                folder_id,
-                query,
-                include,
-                context_lines,
-                max_results,
-                is_regex,
-            ),
-            KernelCommand::ToolInvoke {
-                request_id,
-                run_id,
-                session_id,
-                tool_call_id,
-                tool_name,
-                arguments,
-                workspace_binding,
-            } => self.tool_invoke(
-                request_id,
-                run_id,
-                session_id,
-                tool_call_id,
-                tool_name,
-                arguments,
-                workspace_binding,
-            ),
+            KernelCommand::HostResourceQuery { request_id, query } => {
+                self.host_resource_query(request_id, query)
+            }
             KernelCommand::SkillDiscover { request_id } => self.skill_discover(request_id),
             KernelCommand::SkillInvoke {
                 request_id,

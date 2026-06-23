@@ -22,7 +22,6 @@ pub fn builtin_executors() -> Vec<Box<dyn SkillExecutor>> {
         Box::new(FsDeleteExecutor),
         Box::new(CodeSearchExecutor),
         Box::new(ShellProposeExecutor),
-        Box::new(ShellExecExecutor),
         Box::new(WebSearchExecutor),
         Box::new(WebFetchExecutor),
         Box::new(GitStatusExecutor),
@@ -49,7 +48,6 @@ struct FsPatchExecutor;
 struct FsDeleteExecutor;
 struct CodeSearchExecutor;
 struct ShellProposeExecutor;
-struct ShellExecExecutor;
 struct WebSearchExecutor;
 struct WebFetchExecutor;
 struct GitStatusExecutor;
@@ -383,6 +381,11 @@ impl SkillExecutor for CodeSearchExecutor {
             ));
         }
         let includes = string_array(&invocation.input, "include");
+        let excludes = string_array(&invocation.input, "exclude");
+        let strategy = get_string(&invocation.input, "strategy").unwrap_or_else(|| "literal".to_string());
+        if strategy != "literal" {
+            return Err(KernelError::NotImplemented("code.search.strategy"));
+        }
         let context_lines = invocation
             .input
             .get("contextLines")
@@ -394,14 +397,16 @@ impl SkillExecutor for CodeSearchExecutor {
             .and_then(Value::as_u64)
             .unwrap_or(CODE_SEARCH_DEFAULT_MAX_RESULTS as u64) as u32;
         let result =
-            search_workspace_with_options(&root, &query, &includes, context_lines, max_results)?;
+            search_workspace_with_options(&root, &query, &includes, &excludes, context_lines, max_results)?;
         let returned_matches = result.matches.len();
         Ok(ok(
             invocation.id,
             serde_json::json!({
                 "folderId": "wf-0",
                 "query": query,
+                "strategy": strategy,
                 "include": includes,
+                "exclude": excludes,
                 "contextLines": result.context_lines,
                 "maxResults": result.max_results,
                 "returnedMatches": returned_matches,
@@ -440,72 +445,6 @@ impl SkillExecutor for ShellProposeExecutor {
                 "dryRun": true,
                 "executed": false,
                 "command": get_string(&invocation.input, "command")
-            }),
-        ))
-    }
-}
-
-impl SkillExecutor for ShellExecExecutor {
-    fn descriptor(&self) -> SkillDescriptor {
-        descriptor(
-            "shell.exec",
-            "skill.shell.exec.description",
-            Capability::process_exec(),
-            RiskLevel::High,
-            vec![CapabilityEffect::RunsProcess],
-            vec!["complete"],
-            true,
-        )
-    }
-
-    fn invoke(
-        &self,
-        invocation: SkillInvocation,
-        context: SkillExecutionContext,
-    ) -> KernelResult<SkillResult> {
-        let root = workspace_root(&context)?;
-        let command = get_string(&invocation.input, "command").unwrap_or_default();
-        if command.trim().is_empty() {
-            return Err(KernelError::InvalidCommand(
-                "shell.exec command is required".to_string(),
-            ));
-        }
-        if command.contains("rm -rf") || command.contains("git reset --hard") {
-            return Err(KernelError::PermissionDenied(
-                "destructive shell command is blocked by Kernel policy".to_string(),
-            ));
-        }
-        let started = now_millis();
-        let output = if cfg!(windows) {
-            std::process::Command::new("wsl.exe")
-                .arg("sh")
-                .arg("-lc")
-                .arg(&command)
-                .current_dir(&root)
-                .output()
-        } else {
-            std::process::Command::new("bash")
-                .arg("-lc")
-                .arg(&command)
-                .current_dir(&root)
-                .output()
-        }
-        .map_err(|error| {
-            KernelError::Other(format!("failed to start kernel controlled shell: {error}"))
-        })?;
-        Ok(ok(
-            invocation.id,
-            serde_json::json!({
-                "command": command,
-                "cwd": root.to_string_lossy(),
-                "executed": true,
-                "exitCode": output.status.code(),
-                "stdout": limit_text(&String::from_utf8_lossy(&output.stdout), 16 * 1024),
-                "stderr": limit_text(&String::from_utf8_lossy(&output.stderr), 16 * 1024),
-                "durationMs": now_millis().saturating_sub(started),
-                "truncated": output.stdout.len() > 16 * 1024 || output.stderr.len() > 16 * 1024,
-                "tempSessionId": format!("kernel-shell-{}", started),
-                "cleanupStatus": "alreadyExited"
             }),
         ))
     }
@@ -1578,6 +1517,7 @@ fn search_workspace_with_options(
     root: &Path,
     query: &str,
     includes: &[String],
+    excludes: &[String],
     context_lines: u32,
     max_results: u32,
 ) -> KernelResult<CodeSearchResult> {
@@ -1593,6 +1533,7 @@ fn search_workspace_with_options(
         root,
         query,
         includes,
+        excludes,
         context_lines,
         max_results,
         &mut visited_files,
@@ -1618,6 +1559,7 @@ fn search_dir(
     dir: &Path,
     query: &str,
     includes: &[String],
+    excludes: &[String],
     context_lines: usize,
     max_results: usize,
     visited_files: &mut usize,
@@ -1640,6 +1582,7 @@ fn search_dir(
                 &path,
                 query,
                 includes,
+                excludes,
                 context_lines,
                 max_results,
                 visited_files,
@@ -1661,6 +1604,9 @@ fn search_dir(
             .to_string_lossy()
             .replace('\\', "/");
         if !includes.is_empty() && !includes.iter().any(|pattern| relative.contains(pattern)) {
+            continue;
+        }
+        if excludes.iter().any(|pattern| relative.contains(pattern)) {
             continue;
         }
         *visited_files += 1;
@@ -1740,12 +1686,6 @@ fn limit_text(value: &str, max_bytes: usize) -> String {
     format!("{}…[truncated]", &value[..end])
 }
 
-fn now_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
-}
 
 #[cfg(test)]
 mod tests {

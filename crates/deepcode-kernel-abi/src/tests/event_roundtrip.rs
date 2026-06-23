@@ -2,18 +2,21 @@ use super::*;
 
 #[test]
 fn syscall_result_events_are_locale_neutral() {
-    let event = KernelEvent::WorkspaceResult {
-        request_id: RequestId("req-list".to_string()),
-        operation: "fs.list".to_string(),
+    let event = KernelEvent::ToolCompleted {
+        run_id: None,
+        session_id: None,
+        turn_id: None,
+        tool_call_id: "req-list".to_string(),
+        tool_name: "fs.list".to_string(),
         ok: true,
         output: Some(serde_json::json!({ "nodes": [] })),
         error: None,
         sequence: Some(1),
     };
 
-    let encoded = serde_json::to_value(&event).expect("serialize workspace result");
-    assert_eq!(encoded["kind"], "workspace.result");
-    assert_eq!(encoded["operation"], "fs.list");
+    let encoded = serde_json::to_value(&event).expect("serialize tool result");
+    assert_eq!(encoded["kind"], "tool.completed");
+    assert_eq!(encoded["toolName"], "fs.list");
     assert_eq!(encoded["ok"], true);
 }
 

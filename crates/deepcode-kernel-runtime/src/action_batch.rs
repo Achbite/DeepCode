@@ -663,8 +663,8 @@ fn compile_operation(
             compile_workspace_operation(runtime, record, operation, workspace)
         }
         PlannedOperationKind::Git(git) => compile_git_operation(runtime, record, operation, git),
+        PlannedOperationKind::Network(network) => compile_network_operation(operation, network),
         PlannedOperationKind::Process(_)
-        | PlannedOperationKind::Network(_)
         | PlannedOperationKind::Browser(_)
         | PlannedOperationKind::Provider(_) => Err(KernelError::PermissionDenied(format!(
             "operation is blocked by Kernel policy: {}",
@@ -1214,11 +1214,57 @@ fn workspace_search_tool_operation(
         arguments: serde_json::json!({
             "query": query,
             "include": &workspace.include,
+            "exclude": &workspace.exclude,
+            "strategy": workspace.strategy.as_deref().unwrap_or("literal"),
             "contextLines": workspace.context_lines,
             "maxResults": workspace.max_results
         }),
         workspace_root: None,
     })
+}
+
+fn compile_network_operation(
+    operation: &PlannedOperation,
+    network: &deepcode_kernel_tools::NetworkOperation,
+) -> KernelResult<CompiledWorkspaceAction> {
+    match network.kind {
+        deepcode_kernel_tools::NetworkOperationKind::Search => {
+            let query = network
+                .query
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    KernelError::InvalidCommand(format!(
+                        "web.search action {} requires query",
+                        operation.id
+                    ))
+                })?;
+            Ok(CompiledWorkspaceAction {
+                tool_name: "web.search".to_string(),
+                arguments: serde_json::json!({ "query": query }),
+                workspace_root: None,
+            })
+        }
+        deepcode_kernel_tools::NetworkOperationKind::Fetch => {
+            let url = network
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    KernelError::InvalidCommand(format!(
+                        "web.fetch action {} requires url",
+                        operation.id
+                    ))
+                })?;
+            Ok(CompiledWorkspaceAction {
+                tool_name: "web.fetch".to_string(),
+                arguments: serde_json::json!({ "url": url }),
+                workspace_root: None,
+            })
+        }
+    }
 }
 
 fn git_paths_arguments_from_operation(
@@ -1931,6 +1977,8 @@ mod action_batch_internal_tests {
             allow_empty_content: false,
             query: None,
             include: Vec::new(),
+            exclude: Vec::new(),
+            strategy: None,
             context_lines: None,
             max_results: None,
             rename_to: None,
@@ -1987,6 +2035,8 @@ mod action_batch_internal_tests {
             allow_empty_content: false,
             query: None,
             include: Vec::new(),
+            exclude: Vec::new(),
+            strategy: None,
             context_lines: None,
             max_results: None,
             rename_to: None,

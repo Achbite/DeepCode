@@ -135,7 +135,6 @@ pub fn capability_for_broker_method(method: &str) -> Option<Capability> {
         "kernel.code.search" => Some(Capability::workspace_search()),
         "kernel.network.fetch" => Some(Capability::network_egress()),
         "kernel.secret.read" => Some(Capability::secret_read()),
-        "kernel.shell.exec" => Some(Capability::process_exec()),
         "kernel.context.attach" => Some(Capability::workspace_read()),
         "kernel.temp.create" => Some(Capability::workspace_create()),
         _ => None,

@@ -98,32 +98,8 @@ impl Kernel {
             KernelCommand::WorkspaceCurrent { request_id } => {
                 self.not_implemented(request_id, "workspace.current")
             }
-            KernelCommand::WorkspaceList { request_id, .. } => {
-                self.not_implemented(request_id, "fs.list")
-            }
-            KernelCommand::WorkspaceRead { request_id, .. } => {
-                self.not_implemented(request_id, "fs.read")
-            }
-            KernelCommand::WorkspaceWrite { request_id, .. } => {
-                self.not_implemented(request_id, "fs.write")
-            }
-            KernelCommand::WorkspaceCreate { request_id, .. } => {
-                self.not_implemented(request_id, "fs.write")
-            }
-            KernelCommand::WorkspaceCreateFolder { request_id, .. } => {
-                self.not_implemented(request_id, "fs.mkdir")
-            }
-            KernelCommand::WorkspaceRename { request_id, .. } => {
-                self.not_implemented(request_id, "fs.rename")
-            }
-            KernelCommand::WorkspaceDelete { request_id, .. } => {
-                self.not_implemented(request_id, "fs.delete")
-            }
-            KernelCommand::WorkspaceSearch { request_id, .. } => {
-                self.not_implemented(request_id, "code.search")
-            }
-            KernelCommand::ToolInvoke { request_id, .. } => {
-                self.not_implemented(request_id, "tool.invoke")
+            KernelCommand::HostResourceQuery { request_id, .. } => {
+                self.not_implemented(request_id, "host_resource.query")
             }
             KernelCommand::SkillDiscover { request_id } => {
                 self.not_implemented(request_id, "skill.discover")

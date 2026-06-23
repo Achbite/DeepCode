@@ -139,20 +139,22 @@ fn driver_loop_v3_commands_round_trip() {
 
 #[test]
 fn workspace_and_skill_syscalls_round_trip() {
-    let command = KernelCommand::WorkspaceWrite {
-        request_id: RequestId("req-write".to_string()),
-        folder_id: Some("wf-0".to_string()),
-        path: "managed-syscall-resource".to_string(),
-        content: "hello".to_string(),
-        create: true,
+    let command = KernelCommand::HostResourceQuery {
+        request_id: RequestId("req-host-resource".to_string()),
+        query: serde_json::json!({
+            "kind": "read",
+            "folderId": "wf-0",
+            "path": "managed-syscall-resource"
+        }),
     };
 
-    let encoded = serde_json::to_value(&command).expect("serialize workspace write");
-    assert_eq!(encoded["kind"], "workspaceWrite");
-    assert_eq!(encoded["path"], "managed-syscall-resource");
+    let encoded = serde_json::to_value(&command).expect("serialize host resource query");
+    assert_eq!(encoded["kind"], "hostResourceQuery");
+    assert_eq!(encoded["query"]["kind"], "read");
+    assert_eq!(encoded["query"]["path"], "managed-syscall-resource");
 
     let decoded: KernelCommand =
-        serde_json::from_value(encoded).expect("deserialize workspace write");
+        serde_json::from_value(encoded).expect("deserialize host resource query");
     assert_eq!(decoded, command);
 
     let command = KernelCommand::SkillInvoke {

@@ -1,136 +1,6 @@
 use super::*;
 
 impl DeepCodeKernelRuntime {
-    pub(crate) fn tool_invoke(
-        &mut self,
-        request_id: RequestId,
-        run_id: Option<RunId>,
-        session_id: Option<SessionId>,
-        tool_call_id: String,
-        tool_name: String,
-        arguments: Value,
-        workspace_binding: Option<WorkspaceBinding>,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        if needs_workspace_tool(&tool_name) {
-            if let Some(binding) = workspace_binding {
-                if let Some(open_path) = binding.open_path {
-                    if self.state.current_workspace.is_none() {
-                        self.workspace_open(
-                            RequestId("tool-workspace-open".to_string()),
-                            open_path,
-                        )?;
-                    }
-                }
-            }
-            self.current_workspace()?;
-        }
-        if permission_action_for_kernel_tool(&tool_name) == PermissionAction::Deny {
-            return Err(KernelError::PermissionDenied(format!(
-                "tool {tool_name} is not allowed"
-            )));
-        }
-
-        let (run_id, session_id) = self.resolve_run_session(run_id, session_id)?;
-        let permission_action =
-            self.effective_permission_action_for_tool(&run_id, &tool_name, &arguments)?;
-        let request_sequence = self.ledger.next_sequence(&run_id)?;
-        let requested = KernelEvent::ToolRequested {
-            run_id: Some(RunId(run_id.clone())),
-            session_id: Some(SessionId(session_id.clone())),
-            turn_id: None,
-            tool_call_id: tool_call_id.clone(),
-            tool_name: tool_name.clone(),
-            args_preview: redact_tool_arguments(&tool_name, &arguments),
-            sequence: Some(request_sequence),
-        };
-        self.append_ledger(
-            &run_id,
-            &session_id,
-            "tool.requested",
-            request_sequence,
-            serde_json::json!({
-                "summary": format!("Tool requested: {tool_name}"),
-                "toolCallId": &tool_call_id,
-                "toolName": &tool_name,
-                "argsPreview": redact_tool_arguments(&tool_name, &arguments)
-            }),
-        )?;
-
-        if permission_action == PermissionAction::Ask {
-            let permission_id = tool_call_id.clone();
-            let pending_tool_call_id = tool_call_id.clone();
-            let pending_arguments = arguments.clone();
-            self.state.pending_tools.insert(
-                permission_id.clone(),
-                PendingKernelTool {
-                    run_id: run_id.clone(),
-                    session_id: session_id.clone(),
-                    tool_name: tool_name.clone(),
-                    arguments: pending_arguments.clone(),
-                    request_id: Some(request_id.0.clone()),
-                    work_unit_id: None,
-                    action_id: None,
-                    plan_id: None,
-                    operation_kind: None,
-                    read_set: Vec::new(),
-                    write_set: Vec::new(),
-                },
-            );
-            let permission_sequence = self.ledger.next_sequence(&run_id)?;
-            let permission = KernelEvent::PermissionRequested {
-                run_id: Some(RunId(run_id.clone())),
-                session_id: SessionId(session_id.clone()),
-                request: deepcode_kernel_abi::PermissionRequestEnvelope {
-                    id: permission_id.clone(),
-                    capability: capability_for_tool(&tool_name).to_string(),
-                    risk_level: risk_for_tool(&tool_name).to_string(),
-                    summary: format!("Allow {tool_name} to access workspace resources?"),
-                    args_preview: redact_tool_arguments(&tool_name, &pending_arguments),
-                },
-                sequence: Some(permission_sequence),
-            };
-            {
-                let record = self.record_by_run_mut(&run_id)?;
-                let permission_phase = record.phase.as_str().to_string();
-                record
-                    .decision_state
-                    .apply_event(&permission, &permission_phase);
-            }
-            self.append_ledger(
-                &run_id,
-                &session_id,
-                "permission.requested",
-                permission_sequence,
-                serde_json::json!({
-                    "summary": format!("Permission requested for {tool_name}."),
-                    "permissionId": permission_id,
-                    "toolCallId": pending_tool_call_id,
-                    "toolName": tool_name,
-                    "capability": capability_for_tool(&tool_name),
-                    "riskLevel": risk_for_tool(&tool_name),
-                    "argsPreview": redact_tool_arguments(&tool_name, &pending_arguments),
-                    "argumentsRef": {
-                        "storage": "runtime.pendingTools",
-                        "permissionId": permission_id,
-                        "redaction": "raw arguments are kept in memory only and are not persisted to permission ledger"
-                    }
-                }),
-            )?;
-            return Ok(vec![requested, permission]);
-        }
-
-        let completed =
-            self.execute_bound_tool(&run_id, &session_id, tool_call_id, tool_name, arguments)?;
-        let mut events = vec![requested, completed];
-        events.push(self.workflow_decision_event(
-            request_id,
-            &run_id,
-            &session_id,
-            "tool.completed",
-        )?);
-        Ok(events)
-    }
-
     pub(crate) fn execute_bound_tool(
         &mut self,
         run_id: &str,
@@ -919,7 +789,6 @@ impl DeepCodeKernelRuntime {
             "kernel.fs.write"
             | "kernel.network.fetch"
             | "kernel.secret.read"
-            | "kernel.shell.exec"
             | "kernel.temp.create" => Err(KernelError::PermissionDenied(
                 "broker request requires run/session permission continuation and is fail-closed in stage 13"
                     .to_string(),
@@ -1273,10 +1142,6 @@ pub(crate) fn permission_action_for_kernel_tool(tool_id: &str) -> PermissionActi
     }
 }
 
-pub(crate) fn needs_workspace_tool(tool_name: &str) -> bool {
-    KernelToolRegistry::default().needs_workspace(tool_name)
-}
-
 fn explicit_attachment_allows_target(attachment: &Value, root: &Path, target: &Path) -> bool {
     let source = attachment
         .get("source")
@@ -1320,7 +1185,7 @@ pub(crate) fn deny_kernel_shell_command(
     tool_name: &str,
     arguments: &Value,
 ) -> Option<KernelCommandDeny> {
-    if !matches!(tool_name, "shell.exec" | "shell.propose") {
+    if tool_name != "shell.propose" {
         return None;
     }
     let command = arguments
@@ -1401,26 +1266,31 @@ fn contains_unmanaged_shell_redirection(command: &str) -> bool {
         || command.starts_with("tee ")
 }
 
-#[allow(dead_code)]
 fn broker_workspace_output(events: Vec<KernelEvent>) -> KernelResult<Value> {
-    match events.into_iter().next() {
-        Some(KernelEvent::WorkspaceResult {
+    let mut last_unexpected = None;
+    for event in events {
+        match event {
+            KernelEvent::ToolCompleted {
             ok: true,
             output: Some(output),
             ..
-        }) => Ok(output),
-        Some(KernelEvent::WorkspaceResult {
+            } => return Ok(output),
+            KernelEvent::ToolCompleted {
             ok: false,
             error: Some(error),
             ..
-        }) => Err(KernelError::Other(error.message)),
-        Some(other) => Err(KernelError::Other(format!(
-            "unexpected broker workspace event {other:?}"
-        ))),
-        None => Err(KernelError::Other(
-            "broker workspace request produced no event".to_string(),
-        )),
+            } => return Err(KernelError::Other(error.message)),
+            other => last_unexpected = Some(other),
+        }
     }
+    if let Some(other) = last_unexpected {
+        return Err(KernelError::Other(format!(
+            "unexpected broker workspace event {other:?}"
+        )));
+    }
+    Err(KernelError::Other(
+        "broker workspace request produced no event".to_string(),
+    ))
 }
 
 fn runtime_audit_segment_id() -> &'static str {
@@ -1447,7 +1317,7 @@ pub(crate) fn risk_for_tool(tool_id: &str) -> &'static str {
 
 pub(crate) fn redact_tool_arguments(tool_id: &str, arguments: &Value) -> Value {
     match tool_id {
-        "shell.exec" | "shell.propose" => {
+        "shell.propose" => {
             let command = arguments
                 .get("command")
                 .and_then(Value::as_str)

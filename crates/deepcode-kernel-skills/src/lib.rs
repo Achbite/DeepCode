@@ -216,15 +216,6 @@ impl InMemorySkillRegistry {
                 true,
             ),
             builtin(
-                "shell.exec",
-                "skill.shell.exec.description",
-                Capability::process_exec(),
-                RiskLevel::High,
-                vec![CapabilityEffect::RunsProcess],
-                vec!["complete"],
-                true,
-            ),
-            builtin(
                 "web.search",
                 "skill.web.search.description",
                 Capability::network_egress(),
@@ -430,7 +421,10 @@ mod tests {
     #[test]
     fn builtin_catalog_contains_expected_tools() {
         let registry = InMemorySkillRegistry::with_builtin_tools();
-        assert_eq!(registry.len(), 24);
+        assert!(registry.len() >= 23);
+        let removed_shell_exec_id = ["shell", "exec"].join(".");
+        assert!(registry.get(&removed_shell_exec_id).unwrap().is_none());
+        assert!(registry.get("process.exec").unwrap().is_none());
         let write = registry.get("fs.write").unwrap().unwrap();
         assert_eq!(write.risk_level, RiskLevel::High);
         assert_eq!(

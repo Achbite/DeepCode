@@ -354,7 +354,7 @@ fn proposal_submit_plan_review_extracts_code_block_file_targets() {
                                 "actionId": "write-generic-output",
                                 "description": "Write generic output",
                                 "kind": "write",
-                                "capability": "fs.write",
+                                "toolId": "fs.write",
                                 "resourceScope": [],
                                 "sourceBlockId": "code-generic-output"
                             }
@@ -436,7 +436,7 @@ fn action_batch_submit_rejects_file_operation_outside_execution_contract() {
                                 "id": "write-generic-output",
                                 "title": "Write generic output",
                                 "kind": "write",
-                                "capability": "fs.write",
+                                "toolId": "fs.write",
                                 "targetPath": "generic-output.txt",
                                 "resourceScope": ["generic-output.txt"],
                                 "sourceBlockId": "code-generic-output"
@@ -490,7 +490,7 @@ fn action_batch_submit_rejects_file_operation_outside_execution_contract() {
                             "id": "write-generic-output",
                             "title": "Write generic output elsewhere",
                             "kind": "write",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "targetPath": "other-output.txt",
                             "resourceScope": ["other-output.txt"],
                             "sourceBlockId": "code-generic-output"
@@ -557,7 +557,7 @@ fn proposal_submit_plan_review_accepts_matching_action_id_alias() {
                                 "title": "Delete generic target",
                                 "description": "Delete generic target",
                                 "kind": "delete",
-                                "capability": "fs.delete",
+                                "toolId": "fs.delete",
                                 "resourceScope": ["generic-target.tmp"],
                                 "targetPath": "generic-target.tmp"
                             }
@@ -628,7 +628,7 @@ fn proposal_submit_plan_review_accepts_continuation_action_aliases() {
                                 "id": "write-generic-target",
                                 "title": "Write generic target",
                                 "kind": "write",
-                                "capability": "fs.write",
+                                "toolId": "fs.write",
                                 "resourceScope": ["generic-output.txt"],
                                 "targetPath": "generic-output.txt"
                             }
@@ -638,7 +638,7 @@ fn proposal_submit_plan_review_accepts_continuation_action_aliases() {
                                 "actionId": "write-generic-follow-up",
                                 "description": "Write generic follow-up",
                                 "kind": "write",
-                                "capability": "fs.write",
+                                "toolId": "fs.write",
                                 "resourceScope": ["generic-follow-up.txt"],
                                 "targetPath": "generic-follow-up.txt"
                             }
@@ -706,7 +706,7 @@ fn proposal_submit_plan_review_rejects_conflicting_action_id_alias() {
                                 "actionId": "action-b",
                                 "title": "Conflicting generic action",
                                 "description": "Conflicting generic action",
-                                "capability": "fs.write",
+                                "toolId": "fs.write",
                                 "resourceScope": ["generic-output.txt"],
                                 "targetPath": "generic-output.txt"
                             }
@@ -884,6 +884,26 @@ fn resource_resolve_skips_binary_file_without_text_read_error() {
 #[test]
 fn workspace_read_rejects_binary_and_reads_executable_text_script() {
     let (mut runtime, temp) = runtime_with_workspace();
+    runtime
+        .dispatch(KernelCommand::RunCreate {
+            request_id: RequestId("req-run-create-read".to_string()),
+            session_id: Some(SessionId("session-read".to_string())),
+            input: UserInput {
+                text: "Read generic workspace files.".to_string(),
+                attachments: vec![],
+            },
+            workspace_binding: Some(WorkspaceBinding {
+                workspace_id: None,
+                workspace_hash: None,
+                open_path: None,
+                active_folder_id: None,
+                folder_hash: None,
+            }),
+            profile_ref: None,
+            workflow_ref: None,
+            run_overrides: None,
+        })
+        .expect("runCreate succeeds");
     fs::write(
         temp.join("binary.out"),
         b"\x7FELF\x02\x01\x01\0generic payload",
@@ -902,40 +922,26 @@ fn workspace_read_rejects_binary_and_reads_executable_text_script() {
     }
 
     let binary_events = runtime
-        .dispatch(KernelCommand::WorkspaceRead {
+        .dispatch(KernelCommand::HostResourceQuery {
             request_id: RequestId("req-read-binary".to_string()),
-            folder_id: None,
-            path: "binary.out".to_string(),
+            query: serde_json::json!({ "kind": "read", "path": "binary.out" }),
         })
-        .expect("workspace read dispatch succeeds");
-    let binary_result = binary_events
-        .iter()
-        .find_map(|event| {
-            if let KernelEvent::WorkspaceResult { ok, error, .. } = event {
-                Some((*ok, error))
-            } else {
-                None
-            }
-        })
-        .expect("workspace result");
-    assert!(!binary_result.0);
-    let error = serde_json::to_string(binary_result.1).expect("error json");
+        .expect_err("binary host read is rejected");
+    let error = binary_events.to_string();
     assert!(error.contains("unsupported_file_content"));
     assert!(!error.contains("read binary.out"));
 
     let script_events = runtime
-        .dispatch(KernelCommand::WorkspaceRead {
+        .dispatch(KernelCommand::HostResourceQuery {
             request_id: RequestId("req-read-script".to_string()),
-            folder_id: None,
-            path: "script.sh".to_string(),
+            query: serde_json::json!({ "kind": "read", "path": "script.sh" }),
         })
-        .expect("workspace read dispatch succeeds");
+        .expect("host read dispatch succeeds");
     let output = script_events
         .iter()
         .find_map(|event| {
-            if let KernelEvent::WorkspaceResult { ok, output, .. } = event {
-                assert!(*ok);
-                output.as_ref()
+            if let KernelEvent::ResourcePacketProduced { packet, .. } = event {
+                packet.get("output")
             } else {
                 None
             }
@@ -1250,7 +1256,7 @@ fn action_batch_submit_requests_permission_for_workspace_write_without_grant() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["generated/output.txt"],
                             "sourceBlockId": "block-generic"
@@ -1337,7 +1343,7 @@ fn action_batch_submit_workspace_module_grant_allows_write_under_scope() {
                         {
                             "id": "write-module-file",
                             "title": "Write generic module file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["module/output.txt"],
                             "sourceBlockId": "block-generic"
@@ -1413,7 +1419,7 @@ fn action_batch_submit_workspace_module_grant_does_not_cover_sibling() {
                         {
                             "id": "write-sibling-file",
                             "title": "Write generic sibling file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["sibling/output.txt"],
                             "sourceBlockId": "block-generic"
@@ -1476,7 +1482,7 @@ fn action_batch_submit_workspace_module_grant_does_not_allow_delete() {
                         {
                             "id": "delete-module-file",
                             "title": "Delete generic module file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["module/obsolete.txt"]
                         }
@@ -1541,7 +1547,7 @@ fn action_batch_permission_accept_executes_pending_workspace_write_and_enters_re
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["generated/output.txt"],
                             "sourceBlockId": "block-generic"
@@ -1657,7 +1663,7 @@ fn action_batch_submit_executes_minimal_workspace_write() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["generated/output.txt"],
                             "sourceBlockId": "block-generic"
@@ -1736,7 +1742,7 @@ fn action_batch_submit_executes_workspace_delete_with_grant() {
                         {
                             "id": "delete-generic",
                             "title": "Delete generic file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["input.txt"],
                             "targetPath": "input.txt",
@@ -1815,7 +1821,7 @@ fn action_batch_submit_executes_workspace_delete_without_kind_with_grant() {
                         {
                             "id": "delete-generic",
                             "title": "Delete generic file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "resourceScope": ["input.txt"],
                             "targetPath": "input.txt",
                             "permissionLabels": ["fs.delete"]
@@ -1890,7 +1896,7 @@ fn action_batch_submit_executes_workspace_delete_from_resource_scope_only() {
                         {
                             "id": "delete-generic",
                             "title": "Delete generic file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["input.txt"],
                             "permissionLabels": ["fs.delete"]
@@ -1965,7 +1971,7 @@ fn action_batch_submit_executes_workspace_delete_from_target_ref() {
                         {
                             "id": "delete-generic",
                             "title": "Delete generic file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "targetRef": {
                                 "kind": "workspaceRelative",
@@ -2051,7 +2057,7 @@ fn action_batch_submit_deletes_relative_file_under_dot_directory_attachment() {
                         {
                             "id": "delete-generic",
                             "title": "Delete generic file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "targetPath": "target.txt",
                             "resourceScope": ["target.txt"],
@@ -2117,7 +2123,7 @@ fn action_batch_compile_error_does_not_start_work_unit() {
                         {
                             "id": "delete-invalid-root",
                             "title": "Delete invalid root",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "targetRef": {
                                 "kind": "absolutePath",
@@ -2203,7 +2209,7 @@ fn action_batch_submit_executes_external_absolute_delete_with_scoped_grant() {
                         {
                             "id": "delete-external",
                             "title": "Delete external file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "targetPath": external_file.to_string_lossy(),
                             "resourceScope": [external_file.to_string_lossy()],
@@ -2294,7 +2300,7 @@ fn action_batch_submit_executes_workspace_delete_when_target_path_is_empty() {
                         {
                             "id": "delete-generic",
                             "title": "Delete generic file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "targetPath": "",
                             "resourceScope": ["input.txt"],
@@ -2378,7 +2384,7 @@ fn action_batch_submit_mixed_write_and_delete_keep_distinct_fs_tools() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "create",
                             "resourceScope": ["generated/output.txt"],
                             "targetPath": "generated/output.txt",
@@ -2388,7 +2394,7 @@ fn action_batch_submit_mixed_write_and_delete_keep_distinct_fs_tools() {
                         {
                             "id": "delete-generic",
                             "title": "Delete generic file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["input.txt"],
                             "targetPath": "input.txt",
@@ -2478,7 +2484,7 @@ fn action_batch_submit_workspace_delete_path_grant_does_not_cover_other_files() 
                         {
                             "id": "delete-other-generic",
                             "title": "Delete another generic file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["nested/child.txt"],
                             "targetPath": "nested/child.txt",
@@ -2535,7 +2541,7 @@ fn action_batch_submit_workspace_delete_requires_target_without_write_error() {
                         {
                             "id": "delete-generic",
                             "title": "Delete generic file",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "resourceScope": [],
                             "permissionLabels": ["fs.delete"]
@@ -2596,7 +2602,7 @@ fn action_batch_submit_workspace_delete_rejects_workspace_root_without_write_err
                         {
                             "id": "delete-generic",
                             "title": "Delete generic target",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["."],
                             "targetPath": ".",
@@ -2665,7 +2671,7 @@ fn action_batch_submit_workspace_delete_rejects_directory_without_target_kind() 
                         {
                             "id": "delete-generic-directory",
                             "title": "Delete generic directory",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["nested"],
                             "targetPath": "nested",
@@ -2742,7 +2748,7 @@ fn action_batch_submit_workspace_delete_removes_confirmed_directory() {
                         {
                             "id": "delete-generic-directory-confirmed",
                             "title": "Delete generic directory",
-                            "capability": "fs.delete",
+                            "toolId": "fs.delete",
                             "kind": "delete",
                             "resourceScope": ["nested"],
                             "targetPath": "nested",
@@ -2824,7 +2830,7 @@ fn action_batch_submit_executes_exact_block_patch() {
                         {
                             "id": "patch-generic",
                             "title": "Patch generic file",
-                            "capability": "fs.patch",
+                            "toolId": "fs.patch",
                             "kind": "replaceBlock",
                             "resourceScope": ["input.txt"],
                             "targetPath": "input.txt",
@@ -2965,7 +2971,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["generated/output.txt"],
                             "sourceBlockId": "block-generic"
@@ -2973,7 +2979,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-prefixed",
                             "title": "Write prefixed generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["project-root/prefixed.txt"],
                             "sourceBlockId": "block-prefixed"
@@ -2981,7 +2987,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-root-id",
                             "title": "Write root id generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["primary-root-generic/root-id.txt"],
                             "sourceBlockId": "block-root-id"
@@ -2989,7 +2995,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-manifest-id",
                             "title": "Write manifest id generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["attachment-0-project-root/manifest-id.txt"],
                             "sourceBlockId": "block-manifest-id"
@@ -2997,7 +3003,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-basename",
                             "title": "Write basename generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["project-root/basename.txt"],
                             "sourceBlockId": "block-basename"
@@ -3005,7 +3011,7 @@ fn action_batch_submit_prefers_single_directory_attachment_for_relative_write() 
                         {
                             "id": "write-repeated",
                             "title": "Write repeated root generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": ["project-root/project-root/repeated.txt"],
                             "sourceBlockId": "block-repeated"
@@ -3161,7 +3167,7 @@ fn action_batch_submit_normalizes_absolute_child_under_attachment_root() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": [target.to_string_lossy()],
                             "sourceBlockId": "block-generic"
@@ -3266,7 +3272,7 @@ fn action_batch_submit_rejects_attachment_directory_as_write_target() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": [attached_root.to_string_lossy()],
                             "sourceBlockId": "block-generic"
@@ -3362,7 +3368,7 @@ fn action_batch_submit_absolute_path_disambiguates_multiple_attachment_roots() {
                         {
                             "id": "write-generic",
                             "title": "Write generic file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": [target.to_string_lossy()],
                             "sourceBlockId": "block-generic"
@@ -3452,7 +3458,7 @@ fn action_batch_submit_file_attachment_allows_only_the_attached_file() {
                         {
                             "id": "write-allowed",
                             "title": "Write attached file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": [attached_file.to_string_lossy()],
                             "sourceBlockId": "block-allowed"
@@ -3460,7 +3466,7 @@ fn action_batch_submit_file_attachment_allows_only_the_attached_file() {
                         {
                             "id": "write-sibling",
                             "title": "Write sibling file",
-                            "capability": "fs.write",
+                            "toolId": "fs.write",
                             "kind": "write",
                             "resourceScope": [sibling_file.to_string_lossy()],
                             "sourceBlockId": "block-sibling"
@@ -3542,7 +3548,7 @@ fn action_batch_submit_executes_git_status_as_read_only() {
                         {
                             "id": "git-status-generic",
                             "title": "Read generic git status",
-                            "capability": "git.read",
+                            "toolId": "git.status",
                             "resourceScope": ["workspace"]
                         }
                     ]
@@ -3570,7 +3576,7 @@ fn action_batch_submit_executes_git_status_as_read_only() {
 }
 
 #[test]
-fn action_batch_submit_blocks_git_push_until_phase9_policy() {
+fn action_batch_submit_requests_critical_permission_for_git_push() {
     let (mut runtime, temp) = runtime_with_workspace();
     runtime
         .dispatch(KernelCommand::RunCreate {
@@ -3608,7 +3614,7 @@ fn action_batch_submit_blocks_git_push_until_phase9_policy() {
                         {
                             "id": "git-push-generic",
                             "title": "Push generic git update",
-                            "capability": "git.push",
+                            "toolId": "git.push",
                             "kind": "push",
                             "resourceScope": ["workspace"],
                             "toolArgs": {
@@ -3625,7 +3631,8 @@ fn action_batch_submit_blocks_git_push_until_phase9_policy() {
     assert!(events.iter().any(|event| {
         matches!(
             event,
-            KernelEvent::WorkUnitBlocked { reason, .. } if reason.contains("git.push")
+            KernelEvent::PermissionRequested { request, .. }
+                if request.capability == "git.push" && request.risk_level == "critical"
         )
     }));
     assert!(!events.iter().any(|event| {
@@ -3669,7 +3676,7 @@ fn action_batch_submit_blocks_unsupported_capability() {
                         {
                             "id": "exec-generic",
                             "title": "Run generic command",
-                            "capability": "process.exec",
+                            "toolId": "process.exec",
                             "kind": "command",
                             "resourceScope": ["workspace"]
                         }

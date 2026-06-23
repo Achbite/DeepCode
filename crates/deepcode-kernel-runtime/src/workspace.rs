@@ -35,54 +35,61 @@ impl DeepCodeKernelRuntime {
         };
         let output = workspace_json(&workspace);
         self.state.current_workspace = Some(workspace);
-        Ok(vec![KernelEvent::WorkspaceResult {
+        self.workspace_result(
             request_id,
-            operation: "workspace.open".to_string(),
-            ok: true,
-            output: Some(serde_json::json!({ "workspace": output })),
-            error: None,
-            sequence: None,
-        }])
+            "workspace.open",
+            Ok(serde_json::json!({ "workspace": output })),
+        )
     }
 
     pub(crate) fn workspace_current(
         &self,
         request_id: RequestId,
     ) -> KernelResult<Vec<KernelEvent>> {
-        Ok(vec![KernelEvent::WorkspaceResult {
+        self.workspace_result(
             request_id,
-            operation: "workspace.current".to_string(),
-            ok: true,
-            output: Some(serde_json::json!({
+            "workspace.current",
+            Ok(serde_json::json!({
                 "current": self.state.current_workspace.as_ref().map(workspace_json),
                 "fallbackUsed": false,
                 "lastError": null
             })),
-            error: None,
-            sequence: None,
-        }])
+        )
     }
 
-    pub(crate) fn workspace_list(
+    pub(crate) fn host_resource_query(
         &self,
         request_id: RequestId,
-        folder_id: Option<String>,
-        path: Option<String>,
-        depth: Option<u32>,
+        query: Value,
     ) -> KernelResult<Vec<KernelEvent>> {
-        let result = (|| {
-            let workspace = self.current_workspace()?;
-            validate_folder_id(folder_id.as_deref())?;
-            let relative = path.unwrap_or_else(|| ".".to_string());
-            let target = self.resolve_workspace_path(&relative)?;
-            let nodes = list_nodes(&target, &workspace.root, depth.unwrap_or(2).min(5))?;
-            Ok(serde_json::json!({
-                "folderId": "wf-0",
-                "path": normalize_relative_path(&relative),
-                "nodes": nodes
-            }))
-        })();
-        self.workspace_result(request_id, "fs.list", result)
+        let query_kind = query
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                KernelError::InvalidCommand("host resource query requires kind".to_string())
+            })?;
+        let output = match query_kind {
+            "browse" => host_browse_output(&query),
+            "list" => self.host_list_output(&query),
+            "read" => self.host_read_output(&query),
+            "search" => self.host_search_output(&query),
+            other => Err(KernelError::InvalidCommand(format!(
+                "unsupported host resource query kind {other}"
+            ))),
+        }?;
+        Ok(vec![KernelEvent::ResourcePacketProduced {
+            request_id: Some(request_id),
+            run_id: None,
+            session_id: None,
+            packet: serde_json::json!({
+                "source": "hostProjection",
+                "queryKind": query_kind,
+                "output": output
+            }),
+            sequence: None,
+        }])
     }
 
     pub(crate) fn workspace_read(
@@ -116,183 +123,6 @@ impl DeepCodeKernelRuntime {
             }))
         })();
         self.workspace_result(request_id, "fs.read", result)
-    }
-
-    pub(crate) fn workspace_write(
-        &self,
-        request_id: RequestId,
-        folder_id: Option<String>,
-        path: String,
-        content: String,
-        create: bool,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let result = (|| {
-            let _workspace = self.current_workspace()?;
-            validate_folder_id(folder_id.as_deref())?;
-            deny_protected_deepcode_mutation(&path)?;
-            let target = self.resolve_workspace_path(&path)?;
-            if !create && !target.exists() {
-                return Err(KernelError::InvalidCommand(format!(
-                    "{path} does not exist"
-                )));
-            }
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| KernelError::Other(format!("create parent: {error}")))?;
-            }
-            fs::write(&target, content)
-                .map_err(|error| KernelError::Other(format!("write {path}: {error}")))?;
-            let size_bytes = fs::metadata(&target)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            Ok(serde_json::json!({
-                "folderId": "wf-0",
-                "path": normalize_relative_path(&path),
-                "saved": true,
-                "sizeBytes": size_bytes
-            }))
-        })();
-        self.workspace_result(request_id, "fs.write", result)
-    }
-
-    pub(crate) fn workspace_create(
-        &self,
-        request_id: RequestId,
-        folder_id: Option<String>,
-        path: String,
-        content: Option<String>,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let result = (|| {
-            let _workspace = self.current_workspace()?;
-            validate_folder_id(folder_id.as_deref())?;
-            deny_protected_deepcode_mutation(&path)?;
-            let target = self.resolve_workspace_path(&path)?;
-            if target.exists() {
-                return Err(KernelError::InvalidCommand(format!(
-                    "{path} already exists"
-                )));
-            }
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| KernelError::Other(format!("create parent: {error}")))?;
-            }
-            fs::write(&target, content.unwrap_or_default())
-                .map_err(|error| KernelError::Other(format!("create {path}: {error}")))?;
-            let size_bytes = fs::metadata(&target)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            Ok(serde_json::json!({
-                "folderId": "wf-0",
-                "path": normalize_relative_path(&path),
-                "created": true,
-                "saved": true,
-                "sizeBytes": size_bytes
-            }))
-        })();
-        self.workspace_result(request_id, "fs.write", result)
-    }
-
-    pub(crate) fn workspace_create_folder(
-        &self,
-        request_id: RequestId,
-        folder_id: Option<String>,
-        path: String,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let result = (|| {
-            let _workspace = self.current_workspace()?;
-            validate_folder_id(folder_id.as_deref())?;
-            deny_protected_deepcode_mutation(&path)?;
-            let target = self.resolve_workspace_path(&path)?;
-            if target.exists() && !target.is_dir() {
-                return Err(KernelError::InvalidCommand(format!(
-                    "{path} already exists and is not a directory"
-                )));
-            }
-            fs::create_dir_all(&target)
-                .map_err(|error| KernelError::Other(format!("create folder {path}: {error}")))?;
-            Ok(serde_json::json!({
-                "folderId": "wf-0",
-                "path": normalize_relative_path(&path),
-                "created": true
-            }))
-        })();
-        self.workspace_result(request_id, "fs.mkdir", result)
-    }
-
-    pub(crate) fn workspace_rename(
-        &self,
-        request_id: RequestId,
-        folder_id: Option<String>,
-        old_path: String,
-        new_path: String,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let result = (|| {
-            let _workspace = self.current_workspace()?;
-            validate_folder_id(folder_id.as_deref())?;
-            deny_protected_deepcode_mutation(&old_path)?;
-            deny_protected_deepcode_mutation(&new_path)?;
-            let old_target = self.resolve_workspace_path(&old_path)?;
-            let new_target = self.resolve_workspace_path(&new_path)?;
-            if let Some(parent) = new_target.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| KernelError::Other(format!("create parent: {error}")))?;
-            }
-            fs::rename(&old_target, &new_target)
-                .map_err(|error| KernelError::Other(format!("rename {old_path}: {error}")))?;
-            Ok(serde_json::json!({
-                "folderId": "wf-0",
-                "oldPath": normalize_relative_path(&old_path),
-                "newPath": normalize_relative_path(&new_path),
-                "renamed": true
-            }))
-        })();
-        self.workspace_result(request_id, "fs.rename", result)
-    }
-
-    pub(crate) fn workspace_delete(
-        &self,
-        request_id: RequestId,
-        folder_id: Option<String>,
-        path: String,
-    ) -> KernelResult<Vec<KernelEvent>> {
-        let result = (|| {
-            let workspace = self.current_workspace()?;
-            validate_folder_id(folder_id.as_deref())?;
-            if normalize_relative_path(&path) == "." {
-                return Err(KernelError::PermissionDenied(
-                    "fs.delete cannot remove the workspace root".to_string(),
-                ));
-            }
-            deny_protected_deepcode_mutation(&path)?;
-            let target = self.resolve_workspace_path(&path)?;
-            if target == workspace.root {
-                return Err(KernelError::PermissionDenied(
-                    "fs.delete cannot remove the workspace root".to_string(),
-                ));
-            }
-            let metadata = fs::symlink_metadata(&target)
-                .map_err(|error| KernelError::Other(format!("stat {path}: {error}")))?;
-            let kind = if metadata.file_type().is_dir() {
-                "directory"
-            } else {
-                "file"
-            };
-            if metadata.file_type().is_dir() {
-                fs::remove_dir_all(&target).map_err(|error| {
-                    KernelError::Other(format!("delete directory {path}: {error}"))
-                })?;
-            } else {
-                fs::remove_file(&target)
-                    .map_err(|error| KernelError::Other(format!("delete file {path}: {error}")))?;
-            }
-            Ok(serde_json::json!({
-                "folderId": "wf-0",
-                "path": normalize_relative_path(&path),
-                "deleted": true,
-                "kind": kind
-            }))
-        })();
-        self.workspace_result(request_id, "fs.delete", result)
     }
 
     pub(crate) fn workspace_search(
@@ -357,21 +187,191 @@ impl DeepCodeKernelRuntime {
         WorkspaceBoundary::new(&workspace.root).resolve(relative_path)
     }
 
+    fn host_list_output(&self, query: &Value) -> KernelResult<Value> {
+        let workspace = self.current_workspace()?;
+        validate_folder_id(query.get("folderId").and_then(Value::as_str))?;
+        let path = query
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or(".")
+            .trim();
+        let depth = query
+            .get("depth")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(8) as u32)
+            .unwrap_or(2);
+        let target = self.resolve_workspace_path(if path.is_empty() { "." } else { path })?;
+        if !target.is_dir() {
+            return Err(KernelError::InvalidCommand(format!(
+                "{} is not a directory",
+                target.display()
+            )));
+        }
+        Ok(serde_json::json!({
+            "nodes": list_nodes(&target, &workspace.root, depth)?
+        }))
+    }
+
+    fn host_read_output(&self, query: &Value) -> KernelResult<Value> {
+        validate_folder_id(query.get("folderId").and_then(Value::as_str))?;
+        let path = query
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| KernelError::InvalidCommand("host read requires path".to_string()))?;
+        let target = self.resolve_workspace_path(path)?;
+        if !target.is_file() {
+            return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
+        }
+        let read = read_text_file_for_llm(&target).map_err(|skip| {
+            KernelError::InvalidCommand(format!(
+                "unsupported_file_content: {} ({})",
+                skip.message, skip.reason
+            ))
+        })?;
+        let content = read.content;
+        let size_bytes = content.len();
+        Ok(serde_json::json!({
+            "folderId": "wf-0",
+            "path": normalize_relative_path(path),
+            "content": content,
+            "sizeBytes": size_bytes,
+            "binary": false,
+            "fileClassification": read.classification
+        }))
+    }
+
+    fn host_search_output(&self, query: &Value) -> KernelResult<Value> {
+        let workspace = self.current_workspace()?;
+        validate_folder_id(query.get("folderId").and_then(Value::as_str))?;
+        let search = query
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                KernelError::InvalidCommand("host search requires query".to_string())
+            })?;
+        let includes = query
+            .get("include")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let context_lines = query
+            .get("contextLines")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .unwrap_or(0);
+        let max_results = query
+            .get("maxResults")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .unwrap_or(WORKSPACE_SEARCH_DEFAULT_MAX_RESULTS as u32);
+        let is_regex = query
+            .get("isRegex")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_regex {
+            return Err(KernelError::NotImplemented("code.search.regex"));
+        }
+        let result = search_workspace_with_options(
+            &workspace.root,
+            search,
+            &includes,
+            context_lines,
+            max_results,
+        )?;
+        let returned_matches = result.matches.len();
+        Ok(serde_json::json!({
+            "folderId": "wf-0",
+            "query": search,
+            "include": includes,
+            "contextLines": result.context_lines,
+            "maxResults": result.max_results,
+            "returnedMatches": returned_matches,
+            "truncated": result.truncated,
+            "visitedFiles": result.visited_files,
+            "skippedFiles": result.skipped_files,
+            "skippedBinaryFiles": result.skipped_binary_files,
+            "skippedExecutableFiles": result.skipped_executable_files,
+            "matches": result.matches
+        }))
+    }
+
     pub(crate) fn workspace_result(
         &self,
         request_id: RequestId,
         operation: &str,
         result: KernelResult<Value>,
     ) -> KernelResult<Vec<KernelEvent>> {
-        Ok(vec![KernelEvent::WorkspaceResult {
-            request_id,
-            operation: operation.to_string(),
+        Ok(vec![KernelEvent::ToolCompleted {
+            run_id: None,
+            session_id: None,
+            turn_id: None,
+            tool_call_id: request_id.0,
+            tool_name: operation.to_string(),
             ok: result.is_ok(),
             output: result.as_ref().ok().cloned(),
             error: result.as_ref().err().map(Into::into),
             sequence: None,
         }])
     }
+}
+
+fn host_browse_output(query: &Value) -> KernelResult<Value> {
+    let path = query
+        .get("path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(host_home_dir)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let target = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"))
+    };
+    let mut entries = fs::read_dir(&target)
+        .map_err(|error| KernelError::Other(format!("browse {}: {error}", target.display())))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| KernelError::Other(format!("browse {}: {error}", target.display())))?;
+    entries.sort_by(compare_dir_entries);
+    let entries = entries
+        .into_iter()
+        .take(500)
+        .map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = path.is_dir();
+            serde_json::json!({
+                "name": name,
+                "absolutePath": path.to_string_lossy(),
+                "type": if is_dir { "directory" } else { "file" },
+                "isCodeWorkspace": path.extension().and_then(|ext| ext.to_str()) == Some("code-workspace"),
+                "hidden": name.starts_with('.')
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "absolutePath": target.to_string_lossy(),
+        "parentPath": target.parent().map(|path| path.to_string_lossy().to_string()),
+        "entries": entries
+    }))
+}
+
+fn host_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
 }
 
 #[derive(Debug)]
@@ -510,30 +510,6 @@ pub(crate) fn normalize_relative_path(path: &str) -> String {
     }
 }
 
-pub(crate) fn deny_protected_deepcode_mutation(path: &str) -> KernelResult<()> {
-    WorkspaceBoundary::assert_mutable_config_asset(path)?;
-    let normalized = path.replace('\\', "/").trim_matches('/').to_string();
-    if normalized.is_empty() || normalized == "." {
-        return Ok(());
-    }
-    let protected_prefixes = [
-        "bin/macos-arm64/config",
-        "bin/macos-arm64/sessions",
-        "bin/macos-arm64/conversation-archives",
-        "bin/macos-arm64/kernel",
-    ];
-    if protected_prefixes.iter().any(|prefix| {
-        normalized == *prefix
-            || normalized.starts_with(&format!("{prefix}/"))
-            || prefix.starts_with(&format!("{normalized}/"))
-    }) {
-        return Err(KernelError::PermissionDenied(
-            "workspace mutation cannot modify package-local DeepCode runtime data".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn preflight_workspace_root_readable(root: &Path) -> KernelResult<()> {
     list_nodes(root, root, 1).map(|_| ()).map_err(|error| {
         KernelError::WorkspaceRootUnreadable(format!(
@@ -621,7 +597,7 @@ const WORKSPACE_SEARCH_MAX_RESULTS: usize = 500;
 const WORKSPACE_SEARCH_MAX_VISITED_FILES: usize = 500;
 const WORKSPACE_SEARCH_MAX_CONTEXT_LINES: usize = 5;
 
-pub(crate) struct WorkspaceSearchResult {
+pub(crate) struct CodeSearchResult {
     pub(crate) matches: Vec<Value>,
     pub(crate) truncated: bool,
     pub(crate) visited_files: usize,
@@ -638,7 +614,7 @@ pub(crate) fn search_workspace_with_options(
     includes: &[String],
     context_lines: u32,
     max_results: u32,
-) -> KernelResult<WorkspaceSearchResult> {
+) -> KernelResult<CodeSearchResult> {
     let mut matches = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     let mut visited_files = 0_usize;
@@ -730,7 +706,7 @@ pub(crate) fn search_workspace_with_options(
                     matches.push(item);
                     if matches.len() >= max_results {
                         truncated = true;
-                        return Ok(WorkspaceSearchResult {
+                        return Ok(CodeSearchResult {
                             matches,
                             truncated,
                             visited_files,
@@ -745,7 +721,7 @@ pub(crate) fn search_workspace_with_options(
             }
         }
     }
-    Ok(WorkspaceSearchResult {
+    Ok(CodeSearchResult {
         matches,
         truncated,
         visited_files,

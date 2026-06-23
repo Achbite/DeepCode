@@ -42,11 +42,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/api/skills/scan-mount", post(skill_mount_scan))
         .route("/api/files/tree", get(file_tree))
         .route("/api/files/read", get(file_read))
-        .route("/api/files/write", post(file_write))
-        .route("/api/files/create", post(file_create))
-        .route("/api/files/delete", post(file_delete))
-        .route("/api/files/rename", post(file_rename))
-        .route("/api/folders/create", post(folder_create))
         .route(
             "/api/user-settings",
             get(user_settings_get).patch(user_settings_patch),

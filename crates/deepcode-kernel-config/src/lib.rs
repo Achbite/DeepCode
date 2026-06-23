@@ -512,9 +512,9 @@ mod tests {
         assert_eq!(fallback.fallback_used.as_deref(), Some("en-US"));
 
         let missing = resolver
-            .render("zh-CN", "capability.shell.exec", serde_json::json!({}))
+            .render("zh-CN", "capability.unknown.sample", serde_json::json!({}))
             .expect("render missing key");
-        assert_eq!(missing.text, "capability.shell.exec");
+        assert_eq!(missing.text, "capability.unknown.sample");
         assert!(missing.missing);
     }
 }

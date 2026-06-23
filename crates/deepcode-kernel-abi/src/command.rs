@@ -103,63 +103,9 @@ pub enum KernelCommand {
     WorkspaceCurrent {
         request_id: RequestId,
     },
-    WorkspaceList {
+    HostResourceQuery {
         request_id: RequestId,
-        folder_id: Option<String>,
-        path: Option<String>,
-        depth: Option<u32>,
-    },
-    WorkspaceRead {
-        request_id: RequestId,
-        folder_id: Option<String>,
-        path: String,
-    },
-    WorkspaceWrite {
-        request_id: RequestId,
-        folder_id: Option<String>,
-        path: String,
-        content: String,
-        create: bool,
-    },
-    WorkspaceCreate {
-        request_id: RequestId,
-        folder_id: Option<String>,
-        path: String,
-        content: Option<String>,
-    },
-    WorkspaceCreateFolder {
-        request_id: RequestId,
-        folder_id: Option<String>,
-        path: String,
-    },
-    WorkspaceRename {
-        request_id: RequestId,
-        folder_id: Option<String>,
-        old_path: String,
-        new_path: String,
-    },
-    WorkspaceDelete {
-        request_id: RequestId,
-        folder_id: Option<String>,
-        path: String,
-    },
-    WorkspaceSearch {
-        request_id: RequestId,
-        folder_id: Option<String>,
-        query: String,
-        include: Option<Vec<String>>,
-        context_lines: Option<u32>,
-        max_results: Option<u32>,
-        is_regex: bool,
-    },
-    ToolInvoke {
-        request_id: RequestId,
-        run_id: Option<RunId>,
-        session_id: Option<SessionId>,
-        tool_call_id: String,
-        tool_name: String,
-        arguments: Value,
-        workspace_binding: Option<WorkspaceBinding>,
+        query: Value,
     },
     SkillDiscover {
         request_id: RequestId,

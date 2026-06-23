@@ -1,9 +1,6 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
 
 use crate::prelude::*;
-use crate::*;
-
+use crate::{now_millis, now_text, AppState, SharedRuntime};
 pub(crate) fn record_kernel_events(state: &AppState, events: &[KernelEvent]) {
     if events.is_empty() {
         return;
@@ -48,34 +45,6 @@ pub(crate) fn kernel_event_session_id(event: &KernelEvent) -> Option<String> {
                 .map(str::to_string),
             _ => None,
         })
-}
-
-pub(crate) fn dispatch_workspace(
-    runtime: &SharedRuntime,
-    command: KernelCommand,
-) -> Result<Value, KernelErrorEnvelope> {
-    let mut runtime = runtime.lock().expect("kernel runtime lock");
-    let events = runtime
-        .dispatch(command)
-        .map_err(|error| KernelErrorEnvelope::from(&error))?;
-    match events.into_iter().next() {
-        Some(KernelEvent::WorkspaceResult {
-            ok: true,
-            output: Some(output),
-            ..
-        }) => Ok(output),
-        Some(KernelEvent::WorkspaceResult {
-            ok: false,
-            error: Some(error),
-            ..
-        }) => Err(error),
-        other => Err(KernelErrorEnvelope {
-            code: "unexpected_event".to_string(),
-            message: format!("expected workspace result, got {other:?}"),
-            message_key: None,
-            args: None,
-        }),
-    }
 }
 
 pub(crate) fn dispatch_skill(
@@ -715,7 +684,7 @@ pub(crate) fn tool_name_for_capability(capability: &str) -> &str {
         "cap.fs.write" => "fs.write",
         "cap.fs.patch" => "fs.patch",
         "cap.fs.delete" => "fs.delete",
-        "process.exec" | "cap.shell.exec" => "shell.exec",
+        "process.exec" => "process.exec",
         "network.egress" => "web.fetch",
         "git.write" => "git.commit",
         "git.push" => "git.push",

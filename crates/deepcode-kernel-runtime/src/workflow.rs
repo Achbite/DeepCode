@@ -859,35 +859,6 @@ impl DeepCodeKernelRuntime {
         })
     }
 
-    pub(crate) fn workflow_decision_event(
-        &self,
-        request_id: RequestId,
-        run_id: &str,
-        session_id: &str,
-        observed_kind: &str,
-    ) -> KernelResult<KernelEvent> {
-        let record = self.record_by_run(run_id)?;
-        let decision = record.decision_state.decide(record.phase.as_str());
-        let sequence = self.ledger.next_sequence(run_id)?;
-        self.append_ledger(
-            run_id,
-            session_id,
-            "workflow.decision_made",
-            sequence,
-            serde_json::json!({
-                "summary": decision.summary,
-                "observedKind": observed_kind,
-                "decision": decision
-            }),
-        )?;
-        Ok(KernelEvent::WorkflowDecisionMade {
-            request_id: Some(request_id),
-            run_id: RunId(run_id.to_string()),
-            session_id: Some(SessionId(session_id.to_string())),
-            decision,
-            sequence: Some(sequence),
-        })
-    }
 }
 
 fn empty_workspace_binding() -> WorkspaceBinding {
@@ -1652,6 +1623,19 @@ fn canonical_action_identifiers(
             action_object.insert("title".to_string(), Value::String(description));
         }
     }
+    if json_string_field(action_object, "capability").is_none() {
+        if let Some(tool_id) = json_string_field(action_object, "toolId") {
+            let capability = KernelToolRegistry::default()
+                .get(&tool_id)
+                .map(|descriptor| descriptor.capability)
+                .ok_or_else(|| {
+                    format!(
+                        "actionBundle.{array_key}[{index}] toolId is not in Kernel catalog: {tool_id}"
+                    )
+                })?;
+            action_object.insert("capability".to_string(), Value::String(capability.to_string()));
+        }
+    }
     Ok(())
 }
 
@@ -2118,7 +2102,6 @@ pub(crate) fn kernel_event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::WorkflowCheckpointed { .. } => "workflow.checkpointed",
         KernelEvent::WorkflowResumed { .. } => "workflow.resumed",
         KernelEvent::WorkflowDecisionMade { .. } => "workflow.decision_made",
-        KernelEvent::WorkspaceResult { .. } => "workspace.result",
         KernelEvent::SkillResult { .. } => "skill.result",
         KernelEvent::SkillTrustRequested { .. } => "skill.trust_requested",
         KernelEvent::SkillTrustGranted { .. } => "skill.trust_granted",
@@ -2174,7 +2157,6 @@ pub(crate) fn kernel_event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::WorkflowCheckpointed { sequence, .. }
         | KernelEvent::WorkflowResumed { sequence, .. }
         | KernelEvent::WorkflowDecisionMade { sequence, .. }
-        | KernelEvent::WorkspaceResult { sequence, .. }
         | KernelEvent::SkillResult { sequence, .. }
         | KernelEvent::SkillTrustRequested { sequence, .. }
         | KernelEvent::SkillTrustGranted { sequence, .. }

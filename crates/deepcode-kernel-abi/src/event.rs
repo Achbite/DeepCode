@@ -321,15 +321,6 @@ pub enum KernelEvent {
         decision: WorkflowDecision,
         sequence: Option<u64>,
     },
-    #[serde(rename = "workspace.result")]
-    WorkspaceResult {
-        request_id: RequestId,
-        operation: String,
-        ok: bool,
-        output: Option<Value>,
-        error: Option<KernelErrorEnvelope>,
-        sequence: Option<u64>,
-    },
     #[serde(rename = "skill.result")]
     SkillResult {
         request_id: RequestId,

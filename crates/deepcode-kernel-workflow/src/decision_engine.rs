@@ -301,7 +301,7 @@ fn extract_tool_path(
                     .as_ref()
                     .and_then(|envelope| envelope.message.split('\'').nth(1).map(str::to_string))
             }),
-        "shell.exec" => output.as_ref().and_then(|value| {
+        "process.exec" => output.as_ref().and_then(|value| {
             value
                 .get("command")
                 .and_then(Value::as_str)
@@ -359,7 +359,6 @@ fn event_kind(event: &KernelEvent) -> &'static str {
         KernelEvent::WorkflowCheckpointed { .. } => "workflow.checkpointed",
         KernelEvent::WorkflowResumed { .. } => "workflow.resumed",
         KernelEvent::WorkflowDecisionMade { .. } => "workflow.decision_made",
-        KernelEvent::WorkspaceResult { .. } => "workspace.result",
         KernelEvent::SkillResult { .. } => "skill.result",
         KernelEvent::SkillTrustRequested { .. } => "skill.trust_requested",
         KernelEvent::SkillTrustGranted { .. } => "skill.trust_granted",
@@ -415,7 +414,6 @@ fn event_sequence(event: &KernelEvent) -> Option<u64> {
         | KernelEvent::WorkflowCheckpointed { sequence, .. }
         | KernelEvent::WorkflowResumed { sequence, .. }
         | KernelEvent::WorkflowDecisionMade { sequence, .. }
-        | KernelEvent::WorkspaceResult { sequence, .. }
         | KernelEvent::SkillResult { sequence, .. }
         | KernelEvent::SkillTrustRequested { sequence, .. }
         | KernelEvent::SkillTrustGranted { sequence, .. }

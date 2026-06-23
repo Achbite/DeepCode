@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
 use crate::prelude::*;
 use crate::*;
 
@@ -19,48 +16,12 @@ pub(crate) struct FileQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct FileWriteRequest {
-    pub(crate) folder_id: Option<String>,
-    pub(crate) path: String,
-    pub(crate) content: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FileCreateRequest {
-    pub(crate) folder_id: Option<String>,
-    pub(crate) path: String,
-    pub(crate) content: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FolderCreateRequest {
-    pub(crate) folder_id: Option<String>,
-    pub(crate) path: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FileDeleteRequest {
-    pub(crate) folder_id: Option<String>,
-    pub(crate) path: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct FileRenameRequest {
-    pub(crate) folder_id: Option<String>,
-    pub(crate) old_path: String,
-    pub(crate) new_path: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct SearchRequest {
     pub(crate) folder_id: Option<String>,
     pub(crate) query: String,
     pub(crate) include: Option<Vec<String>>,
+    pub(crate) exclude: Option<Vec<String>>,
+    pub(crate) strategy: Option<String>,
     pub(crate) context_lines: Option<u32>,
     pub(crate) max_results: Option<u32>,
     pub(crate) is_regex: Option<bool>,
@@ -230,42 +191,23 @@ pub(crate) async fn fs_initial_locations(State(state): State<AppState>) -> Json<
     }))
 }
 
-pub(crate) async fn fs_browse(Query(query): Query<FileQuery>) -> Json<ApiResponse> {
-    let path = query
-        .path
-        .map(PathBuf::from)
-        .or_else(home_dir)
-        .unwrap_or_else(|| PathBuf::from("/"));
-    let target = if path.is_dir() {
-        path
-    } else {
-        path.parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"))
-    };
-    let entries = match sorted_dir_entries(&target) {
-        Ok(entries) => entries
-            .into_iter()
-            .map(|entry| {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                let is_dir = path.is_dir();
-                json!({
-                    "name": name,
-                    "absolutePath": path.to_string_lossy(),
-                    "type": if is_dir { "directory" } else { "file" },
-                    "isCodeWorkspace": path.extension().and_then(|ext| ext.to_str()) == Some("code-workspace"),
-                    "hidden": name.starts_with('.')
-                })
-            })
-            .collect::<Vec<_>>(),
-        Err(error) => return ApiResponse::error("browse_failed", format!("browse {}: {error}", target.display())),
-    };
-    ApiResponse::ok(json!({
-        "absolutePath": target.to_string_lossy(),
-        "parentPath": target.parent().map(|path| path.to_string_lossy().to_string()),
-        "entries": entries
-    }))
+pub(crate) async fn fs_browse(
+    State(state): State<AppState>,
+    Query(query): Query<FileQuery>,
+) -> Json<ApiResponse> {
+    match dispatch_workspace(
+        &state.runtime,
+        KernelCommand::HostResourceQuery {
+            request_id: rid("host-browse"),
+            query: json!({
+                "kind": "browse",
+                "path": query.path
+            }),
+        },
+    ) {
+        Ok(output) => ApiResponse::ok(output),
+        Err(error) => ApiResponse::error(error.code, error.message),
+    }
 }
 
 pub(crate) async fn file_tree(
@@ -274,11 +216,14 @@ pub(crate) async fn file_tree(
 ) -> Json<ApiResponse> {
     match dispatch_workspace(
         &state.runtime,
-        KernelCommand::WorkspaceList {
+        KernelCommand::HostResourceQuery {
             request_id: rid("workspace-list"),
-            folder_id: query.folder_id,
-            path: query.path,
-            depth: Some(2),
+            query: json!({
+                "kind": "list",
+                "path": query.path.unwrap_or_else(|| ".".to_string()),
+                "folderId": query.folder_id,
+                "depth": 2
+            }),
         },
     ) {
         Ok(output) => {
@@ -301,99 +246,13 @@ pub(crate) async fn file_read(
     };
     match dispatch_workspace(
         &state.runtime,
-        KernelCommand::WorkspaceRead {
+        KernelCommand::HostResourceQuery {
             request_id: rid("workspace-read"),
-            folder_id: query.folder_id,
-            path,
-        },
-    ) {
-        Ok(output) => ApiResponse::ok(output),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
-pub(crate) async fn file_write(
-    State(state): State<AppState>,
-    Json(body): Json<FileWriteRequest>,
-) -> Json<ApiResponse> {
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::WorkspaceWrite {
-            request_id: rid("workspace-write"),
-            folder_id: body.folder_id,
-            path: body.path,
-            content: body.content,
-            create: true,
-        },
-    ) {
-        Ok(output) => ApiResponse::ok(output),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
-pub(crate) async fn file_create(
-    State(state): State<AppState>,
-    Json(body): Json<FileCreateRequest>,
-) -> Json<ApiResponse> {
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::WorkspaceCreate {
-            request_id: rid("workspace-create"),
-            folder_id: body.folder_id,
-            path: body.path,
-            content: body.content,
-        },
-    ) {
-        Ok(output) => ApiResponse::ok(output),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
-pub(crate) async fn folder_create(
-    State(state): State<AppState>,
-    Json(body): Json<FolderCreateRequest>,
-) -> Json<ApiResponse> {
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::WorkspaceCreateFolder {
-            request_id: rid("workspace-create-folder"),
-            folder_id: body.folder_id,
-            path: body.path,
-        },
-    ) {
-        Ok(output) => ApiResponse::ok(output),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
-pub(crate) async fn file_delete(
-    State(state): State<AppState>,
-    Json(body): Json<FileDeleteRequest>,
-) -> Json<ApiResponse> {
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::WorkspaceDelete {
-            request_id: rid("workspace-delete"),
-            folder_id: body.folder_id,
-            path: body.path,
-        },
-    ) {
-        Ok(output) => ApiResponse::ok(output),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
-pub(crate) async fn file_rename(
-    State(state): State<AppState>,
-    Json(body): Json<FileRenameRequest>,
-) -> Json<ApiResponse> {
-    match dispatch_workspace(
-        &state.runtime,
-        KernelCommand::WorkspaceRename {
-            request_id: rid("workspace-rename"),
-            folder_id: body.folder_id,
-            old_path: body.old_path,
-            new_path: body.new_path,
+            query: json!({
+                "kind": "read",
+                "path": path,
+                "folderId": query.folder_id
+            }),
         },
     ) {
         Ok(output) => ApiResponse::ok(output),
@@ -407,14 +266,19 @@ pub(crate) async fn code_search(
 ) -> Json<ApiResponse> {
     match dispatch_workspace(
         &state.runtime,
-        KernelCommand::WorkspaceSearch {
+        KernelCommand::HostResourceQuery {
             request_id: rid("workspace-search"),
-            folder_id: body.folder_id,
-            query: body.query,
-            include: body.include,
-            context_lines: body.context_lines,
-            max_results: body.max_results,
-            is_regex: body.is_regex.unwrap_or(false),
+            query: json!({
+                "kind": "search",
+                "query": body.query,
+                "include": body.include,
+                "exclude": body.exclude,
+                "strategy": body.strategy.unwrap_or_else(|| "literal".to_string()),
+                "contextLines": body.context_lines,
+                "maxResults": body.max_results,
+                "isRegex": body.is_regex.unwrap_or(false),
+                "folderId": body.folder_id
+            }),
         },
     ) {
         Ok(output) => ApiResponse::ok(output),
@@ -430,24 +294,32 @@ pub(crate) fn dispatch_workspace(
     let events = runtime
         .dispatch(command)
         .map_err(|error| KernelErrorEnvelope::from(&error))?;
-    match events.into_iter().next() {
-        Some(KernelEvent::WorkspaceResult {
+    for event in events {
+        match event {
+            KernelEvent::ToolCompleted {
             ok: true,
             output: Some(output),
             ..
-        }) => Ok(output),
-        Some(KernelEvent::WorkspaceResult {
+        } => return Ok(output),
+            KernelEvent::ToolCompleted {
             ok: false,
             error: Some(error),
             ..
-        }) => Err(error),
-        other => Err(KernelErrorEnvelope {
+        } => return Err(error),
+            KernelEvent::ResourcePacketProduced { packet, .. } => {
+                if packet.get("source").and_then(Value::as_str) == Some("hostProjection") {
+                    return Ok(packet.get("output").cloned().unwrap_or(Value::Null));
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(KernelErrorEnvelope {
             code: "unexpected_event".to_string(),
-            message: format!("expected workspace result, got {other:?}"),
+            message: "expected workspace host projection result".to_string(),
             message_key: None,
             args: None,
-        }),
-    }
+        })
 }
 
 pub(crate) fn ensure_workspace_binding(
@@ -490,23 +362,5 @@ pub(crate) fn current_workspace_json(
         KernelCommand::WorkspaceCurrent {
             request_id: rid("workspace-current"),
         },
-    )
-}
-
-pub(crate) fn needs_workspace(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "fs.list"
-            | "fs.read"
-            | "fs.write"
-            | "fs.diff"
-            | "fs.delete"
-            | "code.search"
-            | "git.status"
-            | "git.diff"
-            | "git.stage"
-            | "git.unstage"
-            | "git.commit"
-            | "git.push"
     )
 }

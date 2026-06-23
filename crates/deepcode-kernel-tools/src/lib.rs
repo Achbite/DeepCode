@@ -77,6 +77,86 @@ pub struct KernelToolDescriptor {
     pub read_only: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionBackendKind {
+    Builtin,
+    Cli,
+    Broker,
+    ExternalProcess,
+    Mcp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolInputContract {
+    pub schema: Value,
+    #[serde(default)]
+    pub forbidden_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceContract {
+    pub path_scope_policy: &'static str,
+    pub needs_workspace: bool,
+    pub read_only: bool,
+    #[serde(default)]
+    pub read_set_source: &'static str,
+    #[serde(default)]
+    pub write_set_source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionContract {
+    pub mode: ToolPermissionMode,
+    pub risk: ToolRiskLevel,
+    pub capability: &'static str,
+    pub bundle_key: &'static str,
+    pub grant_lifetime: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionContract {
+    pub backend: ExecutionBackendKind,
+    pub executor_ref: &'static str,
+    pub execution_mode: OperationExecutionMode,
+    #[serde(default)]
+    pub shell_allowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FactContract {
+    pub evidence_kind: &'static str,
+    #[serde(default)]
+    pub untrusted_evidence: bool,
+    #[serde(default)]
+    pub validation_kind: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupContract {
+    pub policy: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelToolTemplate {
+    pub tool_id: &'static str,
+    pub family: ToolFamily,
+    pub operation_kind: Option<&'static str>,
+    pub input: ToolInputContract,
+    pub resource: ResourceContract,
+    pub permission: PermissionContract,
+    pub execution: ExecutionContract,
+    pub fact: FactContract,
+    pub cleanup: CleanupContract,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernelToolCatalogSnapshot {
@@ -129,21 +209,29 @@ impl KernelToolRegistry {
         self.descriptors.values()
     }
 
+    pub fn template(&self, tool_id: &str) -> Option<KernelToolTemplate> {
+        self.get(tool_id).map(tool_template_for_descriptor)
+    }
+
+    pub fn templates(&self) -> impl Iterator<Item = KernelToolTemplate> + '_ {
+        self.all().map(tool_template_for_descriptor)
+    }
+
     pub fn snapshot(&self) -> KernelToolCatalogSnapshot {
         let mut tools = self
-            .all()
-            .map(|descriptor| KernelToolCatalogTool {
-                tool_id: descriptor.tool_id,
-                capability: descriptor.capability,
-                family: descriptor.family,
-                operation_kind: operation_kind_for_tool(descriptor.tool_id),
-                provider_schema: provider_schema_for_tool(descriptor.tool_id),
-                risk: descriptor.risk,
-                permission_mode: descriptor.permission_mode,
-                path_scope_policy: path_scope_policy_for_descriptor(descriptor),
-                execution_mode: descriptor.execution_mode,
-                needs_workspace: descriptor.needs_workspace,
-                read_only: descriptor.read_only,
+            .templates()
+            .map(|template| KernelToolCatalogTool {
+                tool_id: template.tool_id,
+                capability: template.permission.capability,
+                family: template.family,
+                operation_kind: template.operation_kind,
+                provider_schema: template.input.schema,
+                risk: template.permission.risk,
+                permission_mode: template.permission.mode,
+                path_scope_policy: template.resource.path_scope_policy,
+                execution_mode: template.execution.execution_mode,
+                needs_workspace: template.resource.needs_workspace,
+                read_only: template.resource.read_only,
             })
             .collect::<Vec<_>>();
         tools.sort_by(|left, right| left.tool_id.cmp(right.tool_id));
@@ -228,6 +316,156 @@ fn path_scope_policy_for_descriptor(descriptor: &KernelToolDescriptor) -> &'stat
     }
 }
 
+fn tool_template_for_descriptor(descriptor: &KernelToolDescriptor) -> KernelToolTemplate {
+    KernelToolTemplate {
+        tool_id: descriptor.tool_id,
+        family: descriptor.family,
+        operation_kind: operation_kind_for_tool(descriptor.tool_id),
+        input: ToolInputContract {
+            schema: provider_schema_for_tool(descriptor.tool_id),
+            forbidden_fields: forbidden_fields_for_tool(descriptor.tool_id),
+        },
+        resource: ResourceContract {
+            path_scope_policy: path_scope_policy_for_descriptor(descriptor),
+            needs_workspace: descriptor.needs_workspace,
+            read_only: descriptor.read_only,
+            read_set_source: read_set_source_for_tool(descriptor.tool_id),
+            write_set_source: write_set_source_for_tool(descriptor.tool_id),
+        },
+        permission: PermissionContract {
+            mode: descriptor.permission_mode,
+            risk: descriptor.risk,
+            capability: descriptor.capability,
+            bundle_key: permission_bundle_key_for_tool(descriptor.tool_id),
+            grant_lifetime: grant_lifetime_for_tool(descriptor),
+        },
+        execution: ExecutionContract {
+            backend: backend_for_tool(descriptor),
+            executor_ref: descriptor.executor_ref,
+            execution_mode: descriptor.execution_mode,
+            shell_allowed: false,
+        },
+        fact: FactContract {
+            evidence_kind: fact_kind_for_tool(descriptor.tool_id),
+            untrusted_evidence: matches!(descriptor.family, ToolFamily::Network | ToolFamily::Browser | ToolFamily::Provider),
+            validation_kind: validation_kind_for_tool(descriptor.tool_id),
+        },
+        cleanup: CleanupContract {
+            policy: cleanup_policy_for_tool(descriptor.tool_id),
+        },
+    }
+}
+
+fn backend_for_tool(descriptor: &KernelToolDescriptor) -> ExecutionBackendKind {
+    match descriptor.family {
+        ToolFamily::Workspace => ExecutionBackendKind::Builtin,
+        ToolFamily::Git => ExecutionBackendKind::Cli,
+        ToolFamily::Process => ExecutionBackendKind::Cli,
+        ToolFamily::Network | ToolFamily::Browser | ToolFamily::Provider => {
+            ExecutionBackendKind::Broker
+        }
+    }
+}
+
+fn forbidden_fields_for_tool(tool_id: &str) -> Vec<String> {
+    let fields: &[&str] = match tool_id {
+        "fs.delete" => &["content", "sourceBlockId", "replacementBlockId", "codeBlocks"],
+        "process.exec" => &["command"],
+        _ => &[],
+    };
+    fields.iter().map(|field| (*field).to_string()).collect()
+}
+
+fn read_set_source_for_tool(tool_id: &str) -> &'static str {
+    match tool_id {
+        "fs.read" | "fs.list" | "fs.diff" | "code.search" => "path-or-query",
+        "git.status" => "git-workspace",
+        "git.diff" => "git-paths",
+        "web.search" => "query",
+        "web.fetch" => "url",
+        "browser.snapshot" | "browser.inspect" => "browser-state",
+        "provider.call" => "provider-response",
+        _ => "none",
+    }
+}
+
+fn write_set_source_for_tool(tool_id: &str) -> &'static str {
+    match tool_id {
+        "fs.write" | "fs.patch" | "fs.delete" => "path",
+        "git.stage" | "git.unstage" => "git-paths",
+        "git.commit" => "git-index",
+        "git.push" => "git-remote",
+        "process.exec" => "process",
+        "browser.open" | "browser.reload" | "browser.click" | "browser.type" | "browser.scroll" => {
+            "browser-state"
+        }
+        _ => "none",
+    }
+}
+
+fn permission_bundle_key_for_tool(tool_id: &str) -> &'static str {
+    match tool_id {
+        "fs.write" | "fs.patch" => "workspace-write",
+        "fs.delete" => "workspace-delete",
+        "git.stage" | "git.unstage" | "git.commit" => "git-write",
+        "git.push" => "git-push",
+        "process.exec" => "process-exec",
+        "web.search" | "web.fetch" => "network-egress",
+        "browser.open" | "browser.reload" | "browser.snapshot" | "browser.inspect"
+        | "browser.click" | "browser.type" | "browser.scroll" => "browser-control",
+        "provider.call" => "provider-egress",
+        _ => "none",
+    }
+}
+
+fn grant_lifetime_for_tool(descriptor: &KernelToolDescriptor) -> &'static str {
+    if descriptor.permission_mode == ToolPermissionMode::Ask {
+        "run-batch-until-review"
+    } else {
+        "not-required"
+    }
+}
+
+fn fact_kind_for_tool(tool_id: &str) -> &'static str {
+    match tool_id {
+        "fs.read" => "fileText",
+        "fs.list" => "directoryTree",
+        "fs.diff" => "diffPreview",
+        "code.search" => "searchResults",
+        "fs.write" => "fileWrite",
+        "fs.patch" => "filePatch",
+        "fs.delete" => "fileDelete",
+        "git.status" => "gitStatus",
+        "git.diff" => "gitDiff",
+        "git.stage" | "git.unstage" => "gitIndexMutation",
+        "git.commit" => "gitCommit",
+        "git.push" => "gitPush",
+        "process.exec" => "processResult",
+        "web.search" => "webSearchEvidence",
+        "web.fetch" => "webFetchEvidence",
+        "provider.call" => "providerCall",
+        _ if tool_id.starts_with("browser.") => "browserEvidence",
+        _ => "toolResult",
+    }
+}
+
+fn validation_kind_for_tool(tool_id: &str) -> Option<&'static str> {
+    match tool_id {
+        "fs.write" => Some("readBack"),
+        "fs.patch" => Some("patchReadBack"),
+        "fs.delete" => Some("deleteVerified"),
+        _ => None,
+    }
+}
+
+fn cleanup_policy_for_tool(tool_id: &str) -> &'static str {
+    match tool_id {
+        "process.exec" => "kill-on-timeout",
+        "provider.call" => "close-provider-stream",
+        _ => "none",
+    }
+}
+
 fn operation_kind_for_tool(tool_id: &str) -> Option<&'static str> {
     match tool_id {
         "fs.read" => Some("read"),
@@ -243,7 +481,7 @@ fn operation_kind_for_tool(tool_id: &str) -> Option<&'static str> {
         "git.unstage" => Some("unstage"),
         "git.commit" => Some("commit"),
         "git.push" => Some("push"),
-        "shell.exec" => Some("exec"),
+        "process.exec" => Some("exec"),
         "web.search" => Some("search"),
         "web.fetch" => Some("fetch"),
         "browser.open" => Some("open"),
@@ -285,6 +523,8 @@ fn provider_schema_for_tool(tool_id: &str) -> Value {
             "properties": {
                 "query": { "type": "string" },
                 "include": { "type": "array", "items": { "type": "string" } },
+                "exclude": { "type": "array", "items": { "type": "string" } },
+                "strategy": { "type": "string", "enum": ["literal"] },
                 "contextLines": { "type": "number" },
                 "maxResults": { "type": "number" }
             },
@@ -344,7 +584,7 @@ fn provider_schema_for_tool(tool_id: &str) -> Value {
             },
             "additionalProperties": false
         }),
-        "shell.exec" => serde_json::json!({
+        "process.exec" => serde_json::json!({
             "type": "object",
             "required": ["argv"],
             "properties": {
@@ -482,7 +722,7 @@ impl PlannedOperation {
                 registry.tool_for_workspace_kind(operation.kind)
             }
             PlannedOperationKind::Git(operation) => registry.tool_for_git_kind(operation.kind),
-            PlannedOperationKind::Process(_) => Some("shell.exec"),
+            PlannedOperationKind::Process(_) => Some("process.exec"),
             PlannedOperationKind::Network(operation) => match operation.kind {
                 NetworkOperationKind::Search => Some("web.search"),
                 NetworkOperationKind::Fetch => Some("web.fetch"),
@@ -573,6 +813,10 @@ pub struct WorkspaceOperation {
     pub query: Option<String>,
     #[serde(default)]
     pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub strategy: Option<String>,
     #[serde(default)]
     pub context_lines: Option<u64>,
     #[serde(default)]
@@ -677,8 +921,8 @@ pub struct CodeBlock {
 pub enum OperationCompileError {
     #[error("action bundle has no actions")]
     EmptyActions,
-    #[error("action {action_id} is missing capability")]
-    MissingCapability { action_id: String },
+    #[error("action {action_id} is missing toolId")]
+    MissingToolId { action_id: String },
     #[error("fs.write action {action_id} requires sourceBlockId")]
     MissingSourceBlock { action_id: String },
     #[error("codeBlock {source_block_id} was not provided for action {action_id}")]
@@ -698,10 +942,10 @@ pub enum OperationCompileError {
     DeleteWorkspaceRoot { action_id: String },
     #[error("code.search action {action_id} requires query")]
     MissingSearchQuery { action_id: String },
-    #[error("unsupported capability {capability}")]
-    UnsupportedCapability { capability: String },
-    #[error("unsupported operation kind {kind} for capability {capability}")]
-    UnsupportedKind { capability: String, kind: String },
+    #[error("unsupported toolId {tool_id}")]
+    UnsupportedToolId { tool_id: String },
+    #[error("unsupported operation kind {kind} for toolId {tool_id}")]
+    UnsupportedKind { tool_id: String, kind: String },
 }
 
 pub struct OperationCompiler {
@@ -777,11 +1021,18 @@ impl OperationCompiler {
     ) -> Result<PlannedOperation, OperationCompileError> {
         let id =
             get_string(action, &["id", "actionId"]).unwrap_or_else(|| format!("action-{index}"));
-        let capability = get_string(action, &["capability"]).ok_or_else(|| {
-            OperationCompileError::MissingCapability {
+        let tool_id = get_string(action, &["toolId"]).ok_or_else(|| {
+            OperationCompileError::MissingToolId {
                 action_id: id.clone(),
             }
         })?;
+        let descriptor = self
+            .registry
+            .get(&tool_id)
+            .ok_or_else(|| OperationCompileError::UnsupportedToolId {
+                tool_id: tool_id.clone(),
+            })?;
+        let capability = descriptor.capability.to_string();
         let title = get_string(action, &["title", "description"]).unwrap_or_else(|| id.clone());
         let permission_labels = action
             .get("permissionLabels")
@@ -791,48 +1042,58 @@ impl OperationCompiler {
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect::<Vec<_>>();
-        match capability.as_str() {
+        match tool_id.as_str() {
             "fs.read" | "fs.list" | "fs.diff" | "code.search" | "fs.write" | "fs.patch"
             | "fs.delete" => self.compile_workspace_action(
                 action,
                 code_blocks,
                 id,
                 title,
-                &capability,
+                &tool_id,
+                capability,
                 permission_labels,
             ),
-            "git.read" | "git.write" | "git.push" => {
-                self.compile_git_action(action, id, title, &capability, permission_labels)
+            "git.status" | "git.diff" | "git.stage" | "git.unstage" | "git.commit" | "git.push" => {
+                self.compile_git_action(action, id, title, &tool_id, capability, permission_labels)
             }
             "process.exec" => Ok(external_process_operation(
+                &self.registry,
                 action,
                 id,
                 title,
+                tool_id,
                 capability,
                 permission_labels,
             )),
-            "network.egress" => Ok(external_network_operation(
+            "web.search" | "web.fetch" => Ok(external_network_operation(
+                &self.registry,
                 action,
                 id,
                 title,
+                tool_id,
                 capability,
                 permission_labels,
             )),
-            "browser.control" => Ok(external_browser_operation(
+            "browser.open" | "browser.reload" | "browser.snapshot" | "browser.inspect"
+            | "browser.click" | "browser.type" | "browser.scroll" => Ok(external_browser_operation(
+                &self.registry,
                 action,
                 id,
                 title,
+                tool_id,
                 capability,
                 permission_labels,
             )),
-            "provider.egress" => Ok(external_provider_operation(
+            "provider.call" => Ok(external_provider_operation(
+                &self.registry,
                 action,
                 id,
                 title,
+                tool_id,
                 capability,
                 permission_labels,
             )),
-            _ => Err(OperationCompileError::UnsupportedCapability { capability }),
+            _ => Err(OperationCompileError::UnsupportedToolId { tool_id }),
         }
     }
 
@@ -842,10 +1103,11 @@ impl OperationCompiler {
         code_blocks: &BTreeMap<String, CodeBlock>,
         id: String,
         title: String,
-        capability: &str,
+        tool_id: &str,
+        capability: String,
         permission_labels: Vec<String>,
     ) -> Result<PlannedOperation, OperationCompileError> {
-        let kind = workspace_kind_for_action(action, capability)?;
+        let kind = workspace_kind_for_action(action, tool_id)?;
         let tool_args = action.get("toolArgs").and_then(Value::as_object);
         let target_kind = get_string(action, &["targetKind", "targetResourceKind"]).or_else(|| {
             tool_args
@@ -991,12 +1253,12 @@ impl OperationCompiler {
             }
         }
         let conflict_keys = conflict_keys_for_action(action, &read_set, &write_set);
-        let execution_mode = operation_execution_mode(&self.registry, capability, kind);
+        let execution_mode = operation_execution_mode(&self.registry, tool_id, kind);
 
         Ok(PlannedOperation {
             id,
             title,
-            capability: capability.to_string(),
+            capability,
             permission_labels,
             target_ref,
             read_set,
@@ -1019,6 +1281,8 @@ impl OperationCompiler {
                     .unwrap_or(false),
                 query,
                 include: get_string_array(action, "include").unwrap_or_default(),
+                exclude: get_string_array(action, "exclude").unwrap_or_default(),
+                strategy: get_string(action, &["strategy"]),
                 context_lines: action.get("contextLines").and_then(Value::as_u64),
                 max_results: action.get("maxResults").and_then(Value::as_u64),
                 rename_to: get_string(action, &["renameTo", "toPath", "newPath"]),
@@ -1031,10 +1295,11 @@ impl OperationCompiler {
         action: &Value,
         id: String,
         title: String,
-        capability: &str,
+        tool_id: &str,
+        capability: String,
         permission_labels: Vec<String>,
     ) -> Result<PlannedOperation, OperationCompileError> {
-        let kind = git_kind_for_action(action, capability)?;
+        let kind = git_kind_for_action(action, tool_id)?;
         let args = action.get("toolArgs").and_then(Value::as_object);
         let mut paths = get_string_array(action, "paths")
             .or_else(|| {
@@ -1107,7 +1372,7 @@ impl OperationCompiler {
         Ok(PlannedOperation {
             id,
             title,
-            capability: capability.to_string(),
+            capability,
             permission_labels,
             target_ref: None,
             read_set,
@@ -1345,10 +1610,10 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
             tool_id: "git.push",
             capability: "git.push",
             family: ToolFamily::Git,
-            risk: ToolRiskLevel::High,
+            risk: ToolRiskLevel::Critical,
             permission_mode: ToolPermissionMode::Ask,
             executor_ref: "kernel.skill.git.push",
-            execution_mode: OperationExecutionMode::PreviewOnly,
+            execution_mode: OperationExecutionMode::Execute,
             needs_workspace: true,
             read_only: false,
         },
@@ -1364,12 +1629,12 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
             read_only: true,
         },
         KernelToolDescriptor {
-            tool_id: "shell.exec",
+            tool_id: "process.exec",
             capability: "process.exec",
             family: ToolFamily::Process,
             risk: ToolRiskLevel::High,
             permission_mode: ToolPermissionMode::Ask,
-            executor_ref: "kernel.skill.shell.exec",
+            executor_ref: "kernel.skill.process.exec",
             execution_mode: OperationExecutionMode::Blocked,
             needs_workspace: false,
             read_only: false,
@@ -1381,7 +1646,7 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
             risk: ToolRiskLevel::High,
             permission_mode: ToolPermissionMode::Ask,
             executor_ref: "kernel.skill.web.search",
-            execution_mode: OperationExecutionMode::Blocked,
+            execution_mode: OperationExecutionMode::Execute,
             needs_workspace: false,
             read_only: true,
         },
@@ -1392,7 +1657,7 @@ fn builtin_tool_descriptors() -> Vec<KernelToolDescriptor> {
             risk: ToolRiskLevel::High,
             permission_mode: ToolPermissionMode::Ask,
             executor_ref: "kernel.skill.web.fetch",
-            execution_mode: OperationExecutionMode::Blocked,
+            execution_mode: OperationExecutionMode::Execute,
             needs_workspace: false,
             read_only: true,
         },
@@ -1626,9 +1891,9 @@ fn strings_from_array(items: &[Value]) -> Vec<String> {
 
 fn workspace_kind_for_action(
     action: &Value,
-    capability: &str,
+    tool_id: &str,
 ) -> Result<WorkspaceOperationKind, OperationCompileError> {
-    let raw = get_string(action, &["kind"]).unwrap_or_else(|| match capability {
+    let raw = get_string(action, &["kind"]).unwrap_or_else(|| match tool_id {
         "fs.read" => "read".to_string(),
         "fs.list" => "list".to_string(),
         "code.search" => "search".to_string(),
@@ -1638,21 +1903,22 @@ fn workspace_kind_for_action(
         "fs.delete" => "delete".to_string(),
         _ => "write".to_string(),
     });
-    match raw.as_str() {
-        "read" => Ok(WorkspaceOperationKind::Read),
-        "list" => Ok(WorkspaceOperationKind::List),
-        "search" => Ok(WorkspaceOperationKind::Search),
-        "diff" | "previewDiff" | "preview_diff" => Ok(WorkspaceOperationKind::Diff),
-        "write" => Ok(WorkspaceOperationKind::Write),
-        "create" => Ok(WorkspaceOperationKind::Create),
-        "patch" | "replaceBlock" | "insertBefore" | "insertAfter" => {
+    match (tool_id, raw.as_str()) {
+        ("fs.read", "read") => Ok(WorkspaceOperationKind::Read),
+        ("fs.list", "list") => Ok(WorkspaceOperationKind::List),
+        ("code.search", "search") => Ok(WorkspaceOperationKind::Search),
+        ("fs.diff", "diff" | "previewDiff" | "preview_diff") => {
+            Ok(WorkspaceOperationKind::Diff)
+        }
+        ("fs.write", "write") => Ok(WorkspaceOperationKind::Write),
+        ("fs.write", "create") => Ok(WorkspaceOperationKind::Create),
+        ("fs.patch", "patch" | "replaceBlock" | "insertBefore" | "insertAfter") => {
             Ok(WorkspaceOperationKind::Patch)
         }
-        "delete" => Ok(WorkspaceOperationKind::Delete),
-        "rename" => Ok(WorkspaceOperationKind::Rename),
+        ("fs.delete", "delete") => Ok(WorkspaceOperationKind::Delete),
         kind => Err(OperationCompileError::UnsupportedKind {
-            capability: capability.to_string(),
-            kind: kind.to_string(),
+            tool_id: tool_id.to_string(),
+            kind: kind.1.to_string(),
         }),
     }
 }
@@ -1667,30 +1933,34 @@ fn block_allows_empty_content(block: &CodeBlock) -> bool {
 
 fn git_kind_for_action(
     action: &Value,
-    capability: &str,
+    tool_id: &str,
 ) -> Result<GitOperationKind, OperationCompileError> {
-    let raw = get_string(action, &["kind"]).unwrap_or_else(|| match capability {
-        "git.read" => "status".to_string(),
+    let raw = get_string(action, &["kind"]).unwrap_or_else(|| match tool_id {
+        "git.status" => "status".to_string(),
+        "git.diff" => "diff".to_string(),
+        "git.stage" => "stage".to_string(),
+        "git.unstage" => "unstage".to_string(),
+        "git.commit" => "commit".to_string(),
         "git.push" => "push".to_string(),
         _ => "stage".to_string(),
     });
-    match raw.as_str() {
-        "status" | "read" => Ok(GitOperationKind::Status),
-        "diff" => Ok(GitOperationKind::Diff),
-        "stage" => Ok(GitOperationKind::Stage),
-        "unstage" => Ok(GitOperationKind::Unstage),
-        "commit" => Ok(GitOperationKind::Commit),
-        "push" => Ok(GitOperationKind::Push),
+    match (tool_id, raw.as_str()) {
+        ("git.status", "status" | "read") => Ok(GitOperationKind::Status),
+        ("git.diff", "diff") => Ok(GitOperationKind::Diff),
+        ("git.stage", "stage") => Ok(GitOperationKind::Stage),
+        ("git.unstage", "unstage") => Ok(GitOperationKind::Unstage),
+        ("git.commit", "commit") => Ok(GitOperationKind::Commit),
+        ("git.push", "push") => Ok(GitOperationKind::Push),
         kind => Err(OperationCompileError::UnsupportedKind {
-            capability: capability.to_string(),
-            kind: kind.to_string(),
+            tool_id: tool_id.to_string(),
+            kind: kind.1.to_string(),
         }),
     }
 }
 
 fn operation_execution_mode(
     registry: &KernelToolRegistry,
-    capability: &str,
+    tool_id: &str,
     kind: WorkspaceOperationKind,
 ) -> OperationExecutionMode {
     registry
@@ -1699,7 +1969,7 @@ fn operation_execution_mode(
         .map(|descriptor| descriptor.execution_mode)
         .unwrap_or_else(|| {
             if matches!(
-                capability,
+                tool_id,
                 "fs.read"
                     | "fs.list"
                     | "fs.diff"
@@ -1741,9 +2011,11 @@ fn conflict_keys_for_action(
 }
 
 fn external_process_operation(
+    registry: &KernelToolRegistry,
     action: &Value,
     id: String,
     title: String,
+    tool_id: String,
     capability: String,
     permission_labels: Vec<String>,
 ) -> PlannedOperation {
@@ -1761,7 +2033,7 @@ fn external_process_operation(
         read_set: Vec::new(),
         write_set: vec!["process".to_string()],
         conflict_keys: vec!["process".to_string()],
-        execution_mode: OperationExecutionMode::Blocked,
+        execution_mode: execution_mode_for_tool(registry, &tool_id),
         operation: PlannedOperationKind::Process(ProcessOperation {
             cwd: get_string(action, &["cwd"]),
             argv,
@@ -1772,16 +2044,17 @@ fn external_process_operation(
 }
 
 fn external_network_operation(
+    registry: &KernelToolRegistry,
     action: &Value,
     id: String,
     title: String,
+    tool_id: String,
     capability: String,
     permission_labels: Vec<String>,
 ) -> PlannedOperation {
-    let kind = if get_string(action, &["url"]).is_some() {
-        NetworkOperationKind::Fetch
-    } else {
-        NetworkOperationKind::Search
+    let kind = match tool_id.as_str() {
+        "web.fetch" => NetworkOperationKind::Fetch,
+        _ => NetworkOperationKind::Search,
     };
     PlannedOperation {
         id,
@@ -1792,7 +2065,7 @@ fn external_network_operation(
         read_set: Vec::new(),
         write_set: vec!["network.egress".to_string()],
         conflict_keys: vec!["network.egress".to_string()],
-        execution_mode: OperationExecutionMode::Blocked,
+        execution_mode: execution_mode_for_tool(registry, &tool_id),
         operation: PlannedOperationKind::Network(NetworkOperation {
             kind,
             url: get_string(action, &["url"]),
@@ -1802,19 +2075,21 @@ fn external_network_operation(
 }
 
 fn external_browser_operation(
+    registry: &KernelToolRegistry,
     action: &Value,
     id: String,
     title: String,
+    tool_id: String,
     capability: String,
     permission_labels: Vec<String>,
 ) -> PlannedOperation {
-    let kind = match get_string(action, &["kind"]).as_deref() {
-        Some("reload") => BrowserOperationKind::Reload,
-        Some("snapshot") => BrowserOperationKind::Snapshot,
-        Some("inspect") => BrowserOperationKind::Inspect,
-        Some("click") => BrowserOperationKind::Click,
-        Some("type") => BrowserOperationKind::Type,
-        Some("scroll") => BrowserOperationKind::Scroll,
+    let kind = match tool_id.as_str() {
+        "browser.reload" => BrowserOperationKind::Reload,
+        "browser.snapshot" => BrowserOperationKind::Snapshot,
+        "browser.inspect" => BrowserOperationKind::Inspect,
+        "browser.click" => BrowserOperationKind::Click,
+        "browser.type" => BrowserOperationKind::Type,
+        "browser.scroll" => BrowserOperationKind::Scroll,
         _ => BrowserOperationKind::Open,
     };
     PlannedOperation {
@@ -1826,7 +2101,7 @@ fn external_browser_operation(
         read_set: Vec::new(),
         write_set: vec!["browser.control".to_string()],
         conflict_keys: vec!["browser.control".to_string()],
-        execution_mode: OperationExecutionMode::Blocked,
+        execution_mode: execution_mode_for_tool(registry, &tool_id),
         operation: PlannedOperationKind::Browser(BrowserOperation {
             kind,
             target: get_string(action, &["target", "url", "selector"]),
@@ -1836,9 +2111,11 @@ fn external_browser_operation(
 }
 
 fn external_provider_operation(
+    registry: &KernelToolRegistry,
     action: &Value,
     id: String,
     title: String,
+    tool_id: String,
     capability: String,
     permission_labels: Vec<String>,
 ) -> PlannedOperation {
@@ -1851,12 +2128,22 @@ fn external_provider_operation(
         read_set: Vec::new(),
         write_set: vec!["provider.egress".to_string()],
         conflict_keys: vec!["provider.egress".to_string()],
-        execution_mode: OperationExecutionMode::Blocked,
+        execution_mode: execution_mode_for_tool(registry, &tool_id),
         operation: PlannedOperationKind::Provider(ProviderOperation {
             profile: get_string(action, &["profile", "profileRef"]),
             budget_ref: get_string(action, &["budgetRef"]),
         }),
     }
+}
+
+fn execution_mode_for_tool(
+    registry: &KernelToolRegistry,
+    tool_id: &str,
+) -> OperationExecutionMode {
+    registry
+        .get(tool_id)
+        .map(|descriptor| descriptor.execution_mode)
+        .unwrap_or(OperationExecutionMode::Blocked)
 }
 
 #[cfg(test)]
@@ -1869,7 +2156,7 @@ mod tests {
         assert_eq!(registry.capability_for_tool("fs.write"), "fs.write");
         assert_eq!(registry.capability_for_tool("fs.patch"), "fs.patch");
         assert_eq!(registry.capability_for_tool("git.status"), "git.read");
-        assert_eq!(registry.capability_for_tool("shell.exec"), "process.exec");
+        assert_eq!(registry.capability_for_tool("process.exec"), "process.exec");
         assert_eq!(registry.capability_for_tool("web.fetch"), "network.egress");
         assert_eq!(
             registry.capability_for_tool("browser.click"),
@@ -1903,7 +2190,7 @@ mod tests {
         let batch = serde_json::json!({
             "actions": [{
                 "id": "write-1",
-                "capability": "fs.write",
+                "toolId": "fs.write",
                 "targetPath": "src/lib.rs"
             }]
         });
@@ -1920,7 +2207,7 @@ mod tests {
             "actions": [{
                 "id": "write-1",
                 "title": "Write file",
-                "capability": "fs.write",
+                "toolId": "fs.write",
                 "targetPath": "src/lib.rs",
                 "sourceBlockId": "block-1"
             }],
@@ -1950,7 +2237,7 @@ mod tests {
                 "id": "delete-1",
                 "title": "Delete file",
                 "kind": "delete",
-                "capability": "fs.delete",
+                "toolId": "fs.delete",
                 "targetPath": "generated/obsolete.txt",
                 "resourceScope": ["generated/obsolete.txt"],
                 "permissionLabels": ["fs.delete"]
@@ -1976,7 +2263,7 @@ mod tests {
                 "id": "delete-directory",
                 "title": "Delete directory",
                 "kind": "delete",
-                "capability": "fs.delete",
+                "toolId": "fs.delete",
                 "targetPath": "generated",
                 "targetKind": "directory",
                 "recursive": true,
@@ -2009,7 +2296,7 @@ mod tests {
                 "id": "delete-1",
                 "title": "Delete file",
                 "kind": "delete",
-                "capability": "fs.delete",
+                "toolId": "fs.delete",
                 "targetRef": {
                     "kind": "workspaceRelative",
                     "path": "generated/obsolete.txt"
@@ -2034,7 +2321,7 @@ mod tests {
                 "id": "delete-1",
                 "title": "Delete file",
                 "kind": "delete",
-                "capability": "fs.delete",
+                "toolId": "fs.delete",
                 "resourceScope": [],
                 "permissionLabels": ["fs.delete"]
             }]
@@ -2053,7 +2340,7 @@ mod tests {
                 "id": "delete-1",
                 "title": "Delete root",
                 "kind": "delete",
-                "capability": "fs.delete",
+                "toolId": "fs.delete",
                 "targetPath": ".",
                 "resourceScope": ["."],
                 "permissionLabels": ["fs.delete"]
@@ -2072,7 +2359,7 @@ mod tests {
             "actions": [{
                 "id": "write-1",
                 "title": "Write file",
-                "capability": "fs.write",
+                "toolId": "fs.write",
                 "targetPath": "src/lib.rs",
                 "sourceBlockId": "block-1"
             }],
@@ -2096,7 +2383,7 @@ mod tests {
                 "id": "patch-1",
                 "title": "Patch file",
                 "kind": "replaceBlock",
-                "capability": "fs.patch",
+                "toolId": "fs.patch",
                 "targetPath": "src/lib.rs",
                 "replacementBlockId": "block-1",
                 "patchSpec": {
@@ -2146,6 +2433,8 @@ mod tests {
                     allow_empty_content: false,
                     query: None,
                     include: Vec::new(),
+                    exclude: Vec::new(),
+                    strategy: None,
                     context_lines: None,
                     max_results: None,
                     rename_to: None,
@@ -2174,6 +2463,8 @@ mod tests {
                     allow_empty_content: false,
                     query: None,
                     include: Vec::new(),
+                    exclude: Vec::new(),
+                    strategy: None,
                     context_lines: None,
                     max_results: None,
                     rename_to: None,

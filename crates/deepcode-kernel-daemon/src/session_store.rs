@@ -1,9 +1,6 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
 
 use crate::prelude::*;
 use crate::*;
-use std::collections::BTreeSet;
 
 const ARCHIVE_DEBUG_STREAMS: &[&str] = &[
     "parser-results.jsonl",
