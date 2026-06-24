@@ -110,6 +110,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedImplementationPlanClassifiesDeleteCompileMismatch();
   await assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchEvidenceMismatch();
   await assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTasksComplete();
+  await assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDecisionRequest();
   await assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedArtifactEvidence();
   await assertSessionDriverLoopAcceptedImplementationPlanResumesFromResourceCursor();
   await assertSessionDriverLoopAcceptedImplementationPlanDoesNotInheritSubAgentAutoSetting();
@@ -592,6 +593,25 @@ function assertActionBundleProtocolFields(): void {
   assertEqual(payload.actionBundle.actions[0].canParallelize, false, 'Session parser fills canParallelize default');
   assertEqual(payload.actionBundle.actions[0].conflictKeys[0], 'generic-output.txt', 'Session parser derives conflict key from resource scope');
 
+  const token = randomSmokeToken('goal');
+  const missingGoalRaw = providerFacingWriteProposalWithoutMachineIds() as any;
+  missingGoalRaw.userPlanMarkdown = `Write random accepted target ${token}.`;
+  delete missingGoalRaw.userPlan;
+  delete missingGoalRaw.actionBundle.goal;
+  missingGoalRaw.codeBlocks[0].targetPath = `${token}.txt`;
+  missingGoalRaw.actionBundle.actions[0].args = { path: `${token}.txt`, sourceBlockId: 'generic-block' };
+  const missingGoalProposal = parseProposalEnvelope({
+    runId: `run-${token}`,
+    sessionId: `session-${token}`,
+    raw: missingGoalRaw,
+  });
+  const missingGoalBundle = (missingGoalProposal.payload as any).actionBundle;
+  assertEqual(
+    missingGoalBundle.goal,
+    `Write random accepted target ${token}.`,
+    'Session parser derives missing actionBundle.goal from top-level userPlanMarkdown'
+  );
+
   const missingToolActionRaw = providerFacingWriteProposalWithoutMachineIds() as any;
   missingToolActionRaw.actionBundle = {
     ...missingToolActionRaw.actionBundle,
@@ -797,6 +817,8 @@ function assertPromptEnvelope(): void {
   assert(prompt.stablePrefix.includes('Do not output capability, permissionLabels, accessScopes, or resourceScope'), 'prompt forbids provider-declared permissions');
   assert(prompt.stablePrefix.includes('Do not add a generic payload wrapper'), 'prompt tells provider not to wrap proposals in payload');
   assert(prompt.stablePrefix.includes('actionBundle proposal top-level fields'), 'prompt documents actionBundle top-level fields');
+  assert(prompt.stablePrefix.includes('tasks[] is an ordered implementation checklist'), 'prompt treats taskPlan as ordered checklist');
+  assert(!prompt.stablePrefix.includes('Session can schedule sub-agent DAG nodes'), 'prompt no longer requires provider-facing DAG scheduling');
   assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
   assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
   assert(!prompt.stablePrefix.includes('at most 4 codeBlocks'), 'prompt does not impose a codeBlock count limit');
@@ -836,11 +858,13 @@ function assertSettingsCatalogBoundaries(): void {
   const agentConfigurableKeys = new Set(agentConfigurableSettingsIndex().map((entry) => entry.key));
 
   assertEqual(sharedAgentKeys.has('agent.permissions.gitPush'), true, 'Git push policy is a shared Agent setting');
+  assertEqual(sharedAgentKeys.has('agent.memory.projectMode'), true, 'Project memory mode is a shared Agent setting');
   assertEqual(agentConfigurableKeys.has('agent.permissions.gitPush'), true, 'Agent can request shared Agent setting changes through audited config flow');
   assertEqual(guiPreferenceKeys.has('gui.colorTheme'), true, 'GUI preferences use the gui namespace');
   assertEqual(guiPreferenceKeys.has('workbench.colorTheme'), false, 'GUI preference index does not include editor workbench theme');
   assertEqual(editorPreferenceKeys.has('gui.colorTheme'), false, 'Editor preference index does not include GUI theme');
   assertEqual(workspaceKeys.has('agent.permissions.gitPush'), false, 'workspace overrides cannot change Agent security gates');
+  assertEqual(workspaceKeys.has('agent.memory.projectMode'), true, 'workspace overrides can control project-scoped memory promotion mode');
   assertEqual(workspaceKeys.has('ruler.rules'), true, 'workspace overrides may provide project-level Ruler additions');
 }
 
@@ -1166,19 +1190,36 @@ function assertSessionMemoryDocument(): void {
   assert(document.archiveMetadata?.auditOnlyContext.some((item) => item.includes('Review raw facts retained in audit only')), 'raw review facts are retained as audit-only handles');
   assert(document.decisionContext.some((item) => item.includes('Review accepted')), 'memory records compact review decisions');
   assert(document.resourceContext.some((item) => item.includes('Project resource handle')), 'memory records reusable attachment facts');
-  assert(document.longTermContext.some((item) => item.includes('Project resource handle')), 'stable memory records reusable attachment facts');
+  assert(document.pendingProjectMemoryCandidates.some((item) => item.content.includes('Project resource handle')), 'confirm mode keeps reusable attachment facts as pending project candidates');
   assert(document.shortTermContext.some((item) => item.includes('Plan checkpoint')), 'short-term memory records active planning intent');
-  assert(document.projectMemoryItems.length > 0, 'project memory is backed by MemoryItemV4 items');
+  assertEqual(document.projectMemoryItems.length, 0, 'confirm mode does not auto-promote project memory candidates');
+  assert(document.pendingProjectMemoryCandidates.length > 0, 'project memory candidates are backed by MemoryItemV4 items');
   assert(document.sessionMemoryItems.length > 0, 'session memory is backed by MemoryItemV4 items');
-  assert(document.projectMemoryItems.every((item) => item.scope === 'project'), 'project memory items keep project scope');
+  assert(document.pendingProjectMemoryCandidates.every((item) => item.scope === 'project'), 'project memory candidate items keep project scope');
   assert(document.sessionMemoryItems.every((item) => item.scope === 'session'), 'session memory items keep session scope');
-  assert(document.projectMemoryItems.some((item) => item.authority === 'resourcePacket'), 'project memory records resourcePacket authority');
+  assert(document.pendingProjectMemoryCandidates.some((item) => item.authority === 'resourcePacket'), 'project memory candidates record resourcePacket authority');
+  assert(document.pendingProjectMemoryCandidates.every((item) => item.governance?.status === 'pending'), 'confirm mode marks project candidates pending');
   assert(document.sessionMemoryItems.some((item) => item.kind === 'intent'), 'session memory records active session intent items');
-  assert(document.projectMemoryContext.every((item) => item.includes('sourceRefs=') && !item.includes('sourceRefs=synthetic:none')), 'project memory items carry event source refs');
+  assert(document.pendingProjectMemoryCandidates.every((item) => item.sourceRefs.eventIds.length > 0), 'project memory candidates carry event source refs');
   assert(document.sessionMemoryContext.some((item) => item.includes('sourceRefs=') && item.includes('compression=')), 'session memory renders source refs and compression');
   assert(document.shortTermContext.some((item) => item.includes('Assistant final summary')), 'assistant finals are summarized as short-term context');
   assertEqual(document.intentContext.some((item) => item.includes('Assistant final')), false, 'assistant final text is not promoted as stable intent');
   assertEqual(document.factContext.some((item) => item.includes('Plan intent')), false, 'plan intent does not enter factContext');
+
+  const autoDocument = buildSessionMemoryDocument([
+    {
+      id: 'memory-user-auto',
+      sessionId: 'session-memory',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_msg',
+      payload: {
+        content: 'Analyze a generic attachment.',
+        attachments: [{ kind: 'directory', path: 'generic-auto-attachment', scope: 'message' }],
+      },
+    },
+  ], { projectMemoryMode: 'auto' });
+  assert(autoDocument.projectMemoryItems.some((item) => item.governance?.status === 'auto-promoted'), 'auto mode promotes low-risk project memory candidates');
+  assertEqual(autoDocument.pendingProjectMemoryCandidates.length, 0, 'auto mode does not leave low-risk candidates pending');
 
   const snapshot = buildSessionMemorySnapshot([
     {
@@ -1196,6 +1237,8 @@ function assertSessionMemoryDocument(): void {
   assertEqual(snapshot.metadata.freshnessMode, 'compiledFromSessionEvents', 'memory snapshot is compiled from session events');
   assertEqual(snapshot.metadata.archiveDescriptor.logicalSessionPath.includes('session-memory'), true, 'memory snapshot exposes user-visible session archive path');
   assertEqual(snapshot.metadata.archiveSidecar.schemaVersion, 'deepcode.session.memory-archive-sidecar.v1', 'memory snapshot exposes archive sidecar read model');
+  assertEqual(snapshot.metadata.projectMemoryMode, 'confirm', 'memory snapshot exposes default project memory confirm mode');
+  assert(snapshot.metadata.archiveSidecar.pendingProjectMemoryCandidates !== undefined, 'memory archive sidecar carries pending project candidates');
   assert(snapshot.metadata.sessionMarkdownPreview.includes('Session Memory'), 'memory snapshot exposes markdown preview');
 
   const guidance = collectUserGuidanceEvents([
@@ -7054,7 +7097,11 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
     appendTranscript: async (_sessionId, entry): Promise<void> => {
       transcripts.push(entry);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(deleteActionBundleProposal('generic-obsolete.txt')),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      const proposal = deleteActionBundleProposal('generic-obsolete.txt');
+      delete (proposal.actionBundle as any).goal;
+      return jsonLlmResponse(proposal);
+    },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
   });
@@ -7649,6 +7696,142 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
     ),
     true,
     'first accepted-plan checkpoint keeps the remaining task queued'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDecisionRequest(): Promise<void> {
+  const token = `resume-${Math.random().toString(36).slice(2, 10)}`;
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const events = [tripleTargetAcceptedImplementationPlanCardEvent(sessionId, runId, token)];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const targets = [
+    `generic-${token}-one.txt`,
+    `generic-${token}-two.txt`,
+    `generic-${token}-three.txt`,
+  ];
+  const proposals = [
+    relativeTargetWriteProposal(targets[0], `code-${token}-one`, `write-${token}-one`),
+    genericDecisionRequestProposal(`decision-${token}`),
+    relativeTargetWriteProposal(targets[1], `code-${token}-two`, `write-${token}-two`),
+    relativeTargetWriteProposal(targets[2], `code-${token}-three`, `write-${token}-three`),
+  ];
+  let llmCalls = 0;
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId, sessionId, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId,
+              sessionId,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        const action = command.batch?.actionBundle?.actions?.[0] ?? {};
+        const actionId = action.id ?? action.actionId ?? `write-${token}-${actionBatchSubmits}`;
+        const path = action.targetPath ?? action.args?.path ?? action.resourceScope?.[0] ?? `generic-${token}-${actionBatchSubmits}.txt`;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId, sessionId, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.queued',
+              runId,
+              sessionId,
+              workUnit: { id: `work-unit-${token}-${actionBatchSubmits}`, actionId, status: 'queued', writeSet: [path] },
+            },
+            {
+              kind: 'work_unit.completed',
+              runId,
+              sessionId,
+              workUnitId: `work-unit-${token}-${actionBatchSubmits}`,
+              output: { path },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      const proposal = proposals[Math.min(llmCalls, proposals.length - 1)];
+      llmCalls += 1;
+      return jsonLlmResponse(proposal);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + actionBatchSubmits + 1}`,
+  });
+
+  const waitingDecision = await loop.resolveDecision({
+    sessionId,
+    kind: 'plan',
+    decision: 'accept',
+    runId,
+    targetId: `impl-${token}`,
+    existingEvents: events,
+    subAgentMode: 'off',
+  });
+
+  const confirmation = waitingDecision.events.find((event) => event.kind === 'requirement_confirmation');
+  const confirmationPayload = confirmation?.payload as Record<string, any> | undefined;
+  assertEqual(Boolean(confirmation), true, 'accepted implementationPlan can pause at a normal decisionRequest');
+  assertEqual(confirmationPayload?.acceptedPlanId, `impl-${token}`, 'decision overlay keeps the parent accepted plan id');
+  assertEqual(confirmationPayload?.acceptedCurrentTaskId, `task-${token}-two`, 'decision overlay keeps the current accepted task cursor');
+  assertEqual(actionBatchSubmits, 1, 'first accepted task executes before the decision request');
+  assertEqual(
+    waitingDecision.events.some((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview'),
+    false,
+    'accepted plan does not enter final review while a decision request is waiting'
+  );
+
+  const final = await loop.resolveDecision({
+    sessionId,
+    kind: 'requirement',
+    decision: 'accept',
+    runId: String(confirmationPayload?.runId ?? runId),
+    targetId: String(confirmationPayload?.requirementId),
+    guidance: '- id: continue\n- label: Continue current accepted task',
+    existingEvents: waitingDecision.events,
+    subAgentMode: 'off',
+  });
+
+  assertEqual(llmCalls, 4, 'accepted plan resumes provider after decision and continues remaining tasks');
+  assertEqual(actionBatchSubmits, 3, 'accepted plan executes all queued tasks after decision');
+  assertEqual(
+    final.events.filter((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview').length,
+    1,
+    'accepted plan enters one final review only after all tasks complete'
+  );
+  assertEqual(
+    final.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'accepted_plan.batch_checkpoint' &&
+      Array.isArray((event.payload as any)?.remainingTaskIds) &&
+      (event.payload as any).remainingTaskIds.length === 0
+    ),
+    true,
+    'accepted-plan checkpoint records no remaining tasks after resume'
   );
 }
 
@@ -10000,6 +10183,25 @@ function relativeTargetWriteProposal(targetPath: string, blockId: string, action
   return proposal;
 }
 
+function genericDecisionRequestProposal(id: string): Record<string, unknown> {
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind: 'decisionRequest',
+    outputLanguage: 'en-US',
+    decisionRequest: {
+      version: '1',
+      id,
+      reason: 'A generic accepted-plan choice is needed before continuing the current task.',
+      summary: 'Choose how to continue the current accepted task.',
+      options: [
+        { id: 'continue', label: 'Continue', description: 'Continue the same accepted task cursor.', recommended: true },
+        { id: 'revise', label: 'Revise', description: 'Ask for revised guidance before continuing.' },
+      ],
+      allowsFreeform: true,
+    },
+  };
+}
+
 function genericDirectoryResourceEvent(sessionId: string, directoryPath: string, filePaths: string[]): AgentEvent {
   const normalizedDirectory = directoryPath.replace(/\\/g, '/').replace(/\/+$/, '');
   return {
@@ -10529,6 +10731,48 @@ function multiTargetAcceptedImplementationPlanCardEvent(sessionId: string, runId
       capability: 'fs.write',
       acceptanceCriteria: ['Kernel records the second generic write fact.'],
       failureCriteria: ['Stop if the second write leaves the accepted target scope.'],
+    },
+  ];
+  return event;
+}
+
+function tripleTargetAcceptedImplementationPlanCardEvent(sessionId: string, runId: string, token: string): AgentEvent {
+  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+  const payload = event.payload as any;
+  payload.planId = `impl-${token}`;
+  payload.implementationPlan.id = `impl-${token}`;
+  payload.implementationPlan.title = 'Generic ordered implementation plan';
+  payload.implementationPlan.summary = 'Write three generic targets in accepted task order.';
+  payload.implementationPlan.tasks = [
+    {
+      taskId: `task-${token}-one`,
+      title: 'Write first generic target',
+      target: [`generic-${token}-one.txt`],
+      scope: 'Write the first accepted generic target.',
+      dependencies: [],
+      capability: 'fs.write',
+      acceptanceCriteria: ['Kernel records the first generic write fact.'],
+      failureCriteria: ['Stop if the first write leaves the accepted target scope.'],
+    },
+    {
+      taskId: `task-${token}-two`,
+      title: 'Write second generic target',
+      target: [`generic-${token}-two.txt`],
+      scope: 'Write the second accepted generic target.',
+      dependencies: [`task-${token}-one`],
+      capability: 'fs.write',
+      acceptanceCriteria: ['Kernel records the second generic write fact.'],
+      failureCriteria: ['Stop if the second write leaves the accepted target scope.'],
+    },
+    {
+      taskId: `task-${token}-three`,
+      title: 'Write third generic target',
+      target: [`generic-${token}-three.txt`],
+      scope: 'Write the third accepted generic target.',
+      dependencies: [`task-${token}-two`],
+      capability: 'fs.write',
+      acceptanceCriteria: ['Kernel records the third generic write fact.'],
+      failureCriteria: ['Stop if the third write leaves the accepted target scope.'],
     },
   ];
   return event;

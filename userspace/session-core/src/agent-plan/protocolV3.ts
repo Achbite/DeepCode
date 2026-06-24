@@ -148,10 +148,11 @@ function normalizeActionBundlePayload(envelope: Record<string, unknown>, proposa
     );
   }
   const actionBundle = requireObject(payload.actionBundle, 'Agent Protocol v3.actionBundle');
+  const userPlan = optionalString(payload, 'userPlanMarkdown') ?? optionalString(payload, 'userPlan');
   return {
-    userPlan: optionalString(payload, 'userPlanMarkdown') ?? optionalString(payload, 'userPlan'),
+    userPlan,
     codeBlocks: normalizeCodeBlocks(payload.codeBlocks),
-    actionBundle: normalizeActionBundle(actionBundle, proposalId),
+    actionBundle: normalizeActionBundle(actionBundle, proposalId, userPlan),
     expectedValidation: optionalString(payload, 'expectedValidation'),
     reviewGuide: optionalString(payload, 'reviewGuide'),
   };
@@ -192,7 +193,7 @@ function normalizeCodeBlocks(value: unknown): Array<Record<string, unknown>> {
   });
 }
 
-function normalizeActionBundle(value: Record<string, unknown>, proposalId: string): Record<string, unknown> {
+function normalizeActionBundle(value: Record<string, unknown>, proposalId: string, userPlan?: string): Record<string, unknown> {
   if (value.commandBlocks !== undefined) {
     throw new AgentPlanParseError(
       'invalid_action_bundle',
@@ -209,11 +210,40 @@ function normalizeActionBundle(value: Record<string, unknown>, proposalId: strin
     ...value,
     version: optionalString(value, 'version') ?? '1',
     id: optionalString(value, 'id') ?? `${proposalId}-action-bundle`,
+    goal: deriveActionBundleGoal(value, proposalId, userPlan),
     actions: normalizeToolActions(value.actions, 'actions'),
     continuationExpectations: normalizeContinuationExpectations(value.continuationExpectations),
     validationExpectations: normalizeExpectations(value.validationExpectations, 'validationExpectations'),
     reviewExpectations: normalizeExpectations(value.reviewExpectations, 'reviewExpectations'),
   };
+}
+
+function deriveActionBundleGoal(value: Record<string, unknown>, proposalId: string, userPlan?: string): string {
+  return compactProtocolSummary(
+    optionalString(value, 'goal') ??
+      optionalString(value, 'summary') ??
+      optionalString(value, 'description') ??
+      userPlan ??
+      firstActionDescription(value.actions) ??
+      proposalId,
+  );
+}
+
+function firstActionDescription(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+  for (const item of value) {
+    const record = optionalObjectRecord(item);
+    const description = record
+      ? optionalString(record, 'description') ?? optionalString(record, 'title') ?? optionalString(record, 'purpose')
+      : undefined;
+    if (description) return description;
+  }
+  return undefined;
+}
+
+function compactProtocolSummary(value: string): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  return compact.length > 240 ? `${compact.slice(0, 237)}...` : compact;
 }
 
 function normalizeToolActions(value: unknown, label: string): Array<Record<string, unknown>> {

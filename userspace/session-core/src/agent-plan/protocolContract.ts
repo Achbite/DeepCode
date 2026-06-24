@@ -33,6 +33,7 @@ export function isKernelCatalogToolId(value: string): boolean {
 
 export function actionBundleProtocolShapeLines(): string[] {
   return [
+    'The nested actionBundle object must include {version,id,goal,actions,...}; goal is a short batch objective for review/audit text, not a permission grant or execution fact.',
     'actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description,dependsOn?}. toolId must be a Kernel catalog id.',
     'fs.write actions must use args={path,sourceBlockId}; sourceBlockId references the top-level codeBlocks[].blockId that carries the exact file content.',
     'Directory targets are planning scopes, not executable write actions. Do not create empty .gitkeep or placeholder files unless the user explicitly requested that concrete file.',

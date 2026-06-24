@@ -42,6 +42,7 @@ import {
   collectUserGuidanceEvents,
   type ContextAssemblyRecord,
   type PromptCachePlan,
+  type ProjectMemoryMode,
   type SessionMemoryDocument,
   type UserGuidanceEvent,
 } from '../context/index.js';
@@ -79,6 +80,7 @@ export interface SessionDriverLoopInput {
   requirementConfirmationMode?: RequirementConfirmationMode;
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
+  projectMemoryMode?: ProjectMemoryMode;
   subAgentMode?: SubAgentMode;
   subAgentMaxParallel?: number;
   subAgentNoDeltaTimeoutMs?: number;
@@ -107,6 +109,7 @@ export interface SessionDecisionResolverInput {
   workflow?: string;
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
+  projectMemoryMode?: ProjectMemoryMode;
   subAgentMode?: SubAgentMode;
   subAgentMaxParallel?: number;
   subAgentNoDeltaTimeoutMs?: number;
@@ -199,6 +202,10 @@ interface InteractionOverlayContext {
   interactionId: string;
   sourceInteractionId?: string;
   resumedFromDecisionId?: string;
+  acceptedPlanId?: string;
+  acceptedPlanRunId?: string;
+  acceptedCurrentTaskId?: string;
+  acceptedCompletedTaskIds?: string[];
 }
 
 interface ImplementationBatchContext {
@@ -628,7 +635,9 @@ export class SessionDriverLoop {
     const subAgentSettings = resolveEffectiveSubAgentSettings(input);
     const subAgentMode = subAgentSettings.mode;
     const subAgentMaxParallel = subAgentSettings.maxParallel;
-    const memoryDocument = buildSessionMemoryDocument(input.existingEvents ?? []);
+    const memoryDocument = buildSessionMemoryDocument(input.existingEvents ?? [], {
+      projectMemoryMode: input.projectMemoryMode,
+    });
     const restoredResourcePackets = input.resumeResourcePackets
       ? recentResourcePackets(input.existingEvents ?? [])
       : [];
@@ -763,6 +772,7 @@ export class SessionDriverLoop {
         ], state),
         capabilityCatalogSummary: capabilityCatalogSummaryForState(state),
         memoryDocument: state.memoryDocument,
+        projectMemoryMode: input.projectMemoryMode,
         extraMemoryHints: [
           ...currentTaskMemoryHints(state.currentTaskContext),
           ...implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
@@ -821,6 +831,10 @@ export class SessionDriverLoop {
           interactionRunId: state.runId,
           interactionId: requirement.requirementId,
           sourceInteractionId: requirement.requirementId,
+          acceptedPlanId: state.acceptedImplementationPlan?.planId,
+          acceptedPlanRunId: state.acceptedImplementationPlan?.runId,
+          acceptedCurrentTaskId: state.currentTaskContext?.taskId,
+          acceptedCompletedTaskIds: state.acceptedImplementationPlan?.completedTaskIds,
         };
         const confirmation = requirementConfirmationEvent({
             sessionId,
@@ -1024,6 +1038,7 @@ export class SessionDriverLoop {
         workflow: input.workflow,
         appendUserMessage: false,
         requirementConfirmationMode: 'off',
+        projectMemoryMode: input.projectMemoryMode,
         interventionLevel: input.interventionLevel,
         resumeResourcePackets: true,
         interactionOverlay,
@@ -1031,6 +1046,9 @@ export class SessionDriverLoop {
     }
     if (isAcceptedPlanScopeConfirmation(confirmation)) {
       return this.resolveAcceptedPlanScopeRequirementDecision(input, confirmation, decisionEvent, interactionOverlay, result);
+    }
+    if (isAcceptedPlanExecutionConfirmation(confirmation)) {
+      return this.resolveAcceptedPlanExecutionRequirementDecision(input, confirmation, decisionEvent, interactionOverlay, result);
     }
 
     const originalRequest = requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
@@ -1040,6 +1058,7 @@ export class SessionDriverLoop {
       attachments: requirementAttachments(confirmation),
       existingEvents: result.events,
       workspaceBinding: input.workspaceBinding,
+      projectMemoryMode: input.projectMemoryMode,
       projectWorkingDirectory: input.projectWorkingDirectory,
       profileId: input.profileId,
       workflow: input.workflow,
@@ -1085,6 +1104,7 @@ export class SessionDriverLoop {
         requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
+        projectMemoryMode: input.projectMemoryMode,
         subAgentMode: input.subAgentMode,
         subAgentMaxParallel: input.subAgentMaxParallel,
         resumeResourcePackets: true,
@@ -1124,10 +1144,59 @@ export class SessionDriverLoop {
       requirementConfirmationMode: 'off',
       reviewContinuationMode: input.reviewContinuationMode,
       interventionLevel: input.interventionLevel,
+      projectMemoryMode: input.projectMemoryMode,
       subAgentMode: input.subAgentMode,
       subAgentMaxParallel: input.subAgentMaxParallel,
       resumeResourcePackets: true,
       acceptedImplementationPlan: acceptedPlan,
+      interactionOverlay,
+    });
+  }
+
+  private async resolveAcceptedPlanExecutionRequirementDecision(
+    input: SessionDecisionResolverInput,
+    confirmation: AgentEvent,
+    decisionEvent: AgentEvent,
+    interactionOverlay: InteractionOverlayContext | undefined,
+    current: AgentSessionResult
+  ): Promise<AgentSessionResult> {
+    const acceptedContext = recoverAcceptedPlanFromOverlay(input, current.events, interactionOverlay);
+    if (!acceptedContext) {
+      return this.append(input.sessionId, [
+        finalDiagnosticEvent(
+          input.sessionId,
+          'Accepted-plan interaction decision could not recover the parent implementationPlan; Session will not start a detached requirement flow.',
+          this.ts(),
+          this.id('accepted-plan-interaction-missing-plan')
+        ),
+      ]) ?? current;
+    }
+    const guidance = acceptedPlanExecutionRequirementResumeRequest(
+      confirmation,
+      decisionEvent,
+      input.decision,
+      input.guidance
+    );
+    return this.runUserTurn({
+      sessionId: input.sessionId,
+      content: implementationPlanExecutionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
+      attachments: acceptedContext.acceptedPlan.executionRoot
+        ? [acceptedContext.acceptedPlan.executionRoot.attachment]
+        : requirementAttachments(confirmation),
+      existingEvents: current.events,
+      workspaceBinding: input.workspaceBinding,
+      projectWorkingDirectory: input.projectWorkingDirectory,
+      profileId: input.profileId,
+      workflow: input.workflow,
+      appendUserMessage: false,
+      requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
+      reviewContinuationMode: input.reviewContinuationMode,
+      interventionLevel: input.interventionLevel,
+      projectMemoryMode: input.projectMemoryMode,
+      subAgentMode: input.subAgentMode,
+      subAgentMaxParallel: input.subAgentMaxParallel,
+      resumeResourcePackets: true,
+      acceptedImplementationPlan: acceptedContext.acceptedPlan,
       interactionOverlay,
     });
   }
@@ -1179,6 +1248,7 @@ export class SessionDriverLoop {
           requirementConfirmationMode: 'off',
           reviewContinuationMode: input.reviewContinuationMode,
           interventionLevel: input.interventionLevel,
+          projectMemoryMode: input.projectMemoryMode,
           subAgentMode: input.subAgentMode,
           subAgentMaxParallel: input.subAgentMaxParallel,
           interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
@@ -1222,6 +1292,7 @@ export class SessionDriverLoop {
         projectWorkingDirectory: input.projectWorkingDirectory,
         profileId: input.profileId,
         workflow: input.workflow,
+        projectMemoryMode: input.projectMemoryMode,
         appendUserMessage: false,
         requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
@@ -1233,13 +1304,15 @@ export class SessionDriverLoop {
         interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
       });
     }
-    return this.executeAcceptedActionBundlePlan(input, plan, result);
+    const acceptedOverlay = recoverAcceptedPlanFromOverlay(input, result.events, plan.interactionOverlay ?? input.interactionOverlay);
+    return this.executeAcceptedActionBundlePlan(input, plan, result, acceptedOverlay);
   }
 
   private async executeAcceptedActionBundlePlan(
     input: SessionDecisionResolverInput,
     plan: SessionPlanContext,
-    initialResult: AgentSessionResult
+    initialResult: AgentSessionResult,
+    acceptedOverlay?: RecoveredAcceptedPlanContext
   ): Promise<AgentSessionResult> {
     let result = initialResult;
     try {
@@ -1374,6 +1447,65 @@ export class SessionDriverLoop {
           ]) ?? result;
         }
         return result;
+      }
+      if (acceptedOverlay) {
+        const progressProposal = proposalEnvelopeFromPlanContext(plan);
+        const progress = acceptedPlanBatchProgress(acceptedOverlay.acceptedPlan, progressProposal, batchEvents);
+        const nextAccepted = acceptedPlanAfterBatch(acceptedOverlay.acceptedPlan, progress.completedTaskIds);
+        const cursor = buildTaskExecutionCursor(acceptedOverlay.acceptedPlan, recentResourcePackets(result.events));
+        const context = buildCurrentTaskContext(acceptedOverlay.acceptedPlan, cursor);
+        const savepointId = this.id('accepted-plan-overlay-task-savepoint');
+        result = await this.append(input.sessionId, [
+          acceptedPlanBatchCheckpointEvent(
+            input.sessionId,
+            plan.runId,
+            acceptedOverlay.acceptedPlan,
+            progressProposal,
+            batchEvents,
+            progress,
+            this.ts(),
+            this.id('accepted-plan-overlay-batch-checkpoint')
+          ),
+          acceptedPlanTaskSavepointEvent(
+            input.sessionId,
+            plan.runId,
+            acceptedOverlay.acceptedPlan,
+            nextAccepted,
+            progress,
+            batchEvents,
+            cursor,
+            context,
+            this.ts(),
+            savepointId
+          ),
+        ]) ?? result;
+        if (!acceptedPlanComplete(nextAccepted)) {
+          return this.runUserTurn({
+            sessionId: input.sessionId,
+            content: implementationPlanExecutionRequest(acceptedOverlay.plan, nextAccepted),
+            attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
+            existingEvents: result.events,
+            workspaceBinding: input.workspaceBinding,
+            projectWorkingDirectory: input.projectWorkingDirectory,
+            profileId: input.profileId,
+            workflow: input.workflow,
+            appendUserMessage: false,
+            requirementConfirmationMode: 'off',
+            reviewContinuationMode: input.reviewContinuationMode,
+            interventionLevel: input.interventionLevel,
+            projectMemoryMode: input.projectMemoryMode,
+            subAgentMode: input.subAgentMode,
+            subAgentMaxParallel: input.subAgentMaxParallel,
+            resumeResourcePackets: true,
+            acceptedImplementationPlan: nextAccepted,
+            interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+          });
+        }
+        plan = {
+          ...plan,
+          planId: acceptedOverlay.acceptedPlan.planId,
+          implementationPlan: acceptedOverlay.acceptedPlan.rawPlan,
+        };
       }
       const staticReviewEvents: AgentEvent[] = [];
 
@@ -1634,6 +1766,7 @@ export class SessionDriverLoop {
         appendUserMessage: false,
         requirementConfirmationMode: 'off',
         interventionLevel: input.interventionLevel,
+        projectMemoryMode: input.projectMemoryMode,
       });
     }
 
@@ -1716,6 +1849,7 @@ export class SessionDriverLoop {
       requirementConfirmationMode: 'off',
       reviewContinuationMode: continuationMode,
       interventionLevel: input.interventionLevel,
+      projectMemoryMode: input.projectMemoryMode,
     });
   }
 
@@ -1729,6 +1863,7 @@ export class SessionDriverLoop {
       allowedProposals: ['decisionRequest'],
       capabilityCatalogSummary: capabilityCatalogSummaryForState(state),
       memoryDocument: state.memoryDocument,
+      projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: state.memoryHints,
       interventionLevel: input.interventionLevel,
       userGuidance: collectUserGuidanceEvents(input.existingEvents ?? [], state.runId),
@@ -1805,6 +1940,7 @@ export class SessionDriverLoop {
       allowedProposals: ['answer'],
       capabilityCatalogSummary: capabilityCatalogSummaryForState(state),
       memoryDocument: state.memoryDocument,
+      projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: implementationBatchHints(state.implementationBatch),
       interventionLevel: input.interventionLevel,
       userOverlay: guidanceRevisionOverlay(input.content, draftAnswer, guidance),
@@ -3776,6 +3912,7 @@ export class SessionDriverLoop {
         requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
+        projectMemoryMode: input.projectMemoryMode,
         subAgentMode: input.subAgentMode,
         subAgentMaxParallel: input.subAgentMaxParallel,
         resumeResourcePackets: true,
@@ -4056,6 +4193,7 @@ export class SessionDriverLoop {
               requirementConfirmationMode: 'off',
               reviewContinuationMode: input.reviewContinuationMode,
               interventionLevel: input.interventionLevel,
+              projectMemoryMode: input.projectMemoryMode,
               subAgentMode: input.subAgentMode,
               subAgentMaxParallel: input.subAgentMaxParallel,
               resumeResourcePackets: true,
@@ -4428,6 +4566,7 @@ export class SessionDriverLoop {
         requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
+        projectMemoryMode: input.projectMemoryMode,
         subAgentMode: input.subAgentMode,
         subAgentMaxParallel: input.subAgentMaxParallel,
         resumeResourcePackets: true,
@@ -6204,12 +6343,12 @@ function implementationBatchHints(
     'Authoritative generated-file facts come only from ResourcePacket contents, ToolCompleted(ok=true), or WorkUnitCompleted facts.',
   ];
   if (acceptedPlan) {
-    const currentTask = acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
+    const currentTask = acceptedPlan.tasks.find((task) => !acceptedPlan.completedTaskIds.includes(task.taskId));
     hints.push(
-      `Accepted taskPlan active: planId=${acceptedPlan.planId}; batchIndex=${acceptedPlan.batchIndex}; completedTasks=${acceptedPlan.completedTaskIds.length}/${acceptedPlan.tasks.length}. Automatic execution is allowed for related batches whose targets and capabilities stay inside the accepted plan.`,
+      `Accepted taskPlan active: planId=${acceptedPlan.planId}; taskCursor=${currentTask?.taskId ?? 'complete'}; completedTasks=${acceptedPlan.completedTaskIds.length}/${acceptedPlan.tasks.length}. Automatic execution is allowed for related batches whose targets and capabilities stay inside the accepted plan.`,
       currentTask
         ? `Current accepted taskPlan task: taskId=${currentTask.taskId}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}.`
-        : 'Current accepted taskPlan task could not be inferred from batchIndex; keep the next batch minimal and in scope.',
+        : 'Current accepted taskPlan task is complete or unavailable; return diagnostic or review-ready summary rather than expanding scope.',
       `Accepted taskPlan capabilities: ${acceptedPlan.capabilities.length ? acceptedPlan.capabilities.join(', ') : 'none'}.`,
       `Accepted taskPlan target scopes: ${acceptedPlan.targetScopes.length ? acceptedPlan.targetScopes.join(', ') : 'none'}.`,
       acceptedPlan.exactOperationGrants.length
@@ -6250,22 +6389,8 @@ function buildTaskExecutionCursor(
 ): TaskExecutionCursor | undefined {
   if (!acceptedPlan) return undefined;
   const completedTasks = new Set(acceptedPlan.completedTaskIds);
-  const completedNodes = new Set(
-    acceptedPlan.executionFlowGraph.nodes
-      .filter((node) => node.taskIds.length > 0 && node.taskIds.every((taskId) => completedTasks.has(taskId)))
-      .map((node) => node.nodeId)
-  );
-  const pendingNodes = acceptedPlan.executionFlowGraph.nodes
-    .filter((node) => !completedNodes.has(node.nodeId))
-    .map((node) => node.nodeId);
-  const readyNodes = acceptedPlan.executionFlowGraph.nodes
-    .filter((node) => pendingNodes.includes(node.nodeId) && node.dependsOn.every((dependency) => completedNodes.has(dependency)))
-    .map((node) => node.nodeId);
-  const currentTask = acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)]
-    ?? acceptedPlan.tasks.find((task) => !completedTasks.has(task.taskId));
-  const currentNode = acceptedPlan.executionFlowGraph.nodes.find((node) => currentTask && node.taskIds.includes(currentTask.taskId))
-    ?? acceptedPlan.executionFlowGraph.nodes.find((node) => readyNodes.includes(node.nodeId))
-    ?? acceptedPlan.executionFlowGraph.nodes.find((node) => pendingNodes.includes(node.nodeId));
+  const currentTask = acceptedPlan.tasks.find((task) => !completedTasks.has(task.taskId))
+    ?? acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
   const lastResourcePacketIds = resourcePackets
     .map((packet) => packet.id)
     .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
@@ -6273,9 +6398,7 @@ function buildTaskExecutionCursor(
   const cursorKey = [
     acceptedPlan.planId,
     currentTask?.taskId ?? 'none',
-    currentNode?.nodeId ?? 'none',
     acceptedPlan.completedTaskIds.join(','),
-    pendingNodes.join(','),
     lastResourcePacketIds.join(','),
     lastSavepointId ?? '',
   ].join('|');
@@ -6283,10 +6406,10 @@ function buildTaskExecutionCursor(
     cursorId: `task-cursor-${stableHash(cursorKey).slice(0, 16)}`,
     planId: acceptedPlan.planId,
     currentTaskId: currentTask?.taskId,
-    currentNodeId: currentNode?.nodeId,
+    currentNodeId: undefined,
     completedTaskIds: [...acceptedPlan.completedTaskIds],
-    pendingNodeIds: pendingNodes,
-    readyNodeIds: readyNodes,
+    pendingNodeIds: [],
+    readyNodeIds: [],
     lastResourcePacketIds,
     lastSavepointId,
   };
@@ -6299,32 +6422,27 @@ function buildCurrentTaskContext(
   if (!acceptedPlan || !cursor) return undefined;
   const task = acceptedPlan.tasks.find((item) => item.taskId === cursor.currentTaskId)
     ?? acceptedPlan.tasks.find((item) => !cursor.completedTaskIds.includes(item.taskId));
-  const node = acceptedPlan.executionFlowGraph.nodes.find((item) => item.nodeId === cursor.currentNodeId)
-    ?? acceptedPlan.executionFlowGraph.nodes.find((item) => task && item.taskIds.includes(task.taskId));
   const targets = [...new Set([
     ...(task?.targets ?? []),
-    ...(node?.targets ?? []),
   ].map((item) => item.trim()).filter(Boolean))];
   const capabilities = [...new Set([
     task?.capability,
-    ...(node?.capabilities ?? []),
   ].filter((item): item is string => Boolean(item && item.trim())))];
   const goalParts = [
     acceptedPlan.title ?? acceptedPlan.summary ?? acceptedPlan.planId,
     task ? `task=${task.taskId}${task.title ? ` ${task.title}` : ''}` : '',
-    node ? `node=${node.nodeId}` : '',
     targets.length ? `targets=${targets.join(', ')}` : '',
   ].filter(Boolean);
   return {
     goal: goalParts.join(' | '),
     taskId: task?.taskId,
-    nodeId: node?.nodeId,
+    nodeId: undefined,
     taskTitle: task?.title,
     targets,
     capabilities,
-    dependsOn: node?.dependsOn ?? task?.hardDependencies ?? [],
-    unlocks: node?.unlocks ?? [],
-    evidenceNeeds: node?.evidenceNeeds ?? [],
+    dependsOn: [],
+    unlocks: [],
+    evidenceNeeds: [],
     completedTaskIds: cursor.completedTaskIds,
     pendingNodeIds: cursor.pendingNodeIds,
     readyNodeIds: cursor.readyNodeIds,
@@ -6332,15 +6450,8 @@ function buildCurrentTaskContext(
 }
 
 function readyNodeIdsForAcceptedPlan(acceptedPlan: AcceptedImplementationPlanContext): string[] {
-  const completedTasks = new Set(acceptedPlan.completedTaskIds);
-  const completedNodes = new Set(
-    acceptedPlan.executionFlowGraph.nodes
-      .filter((node) => node.taskIds.length > 0 && node.taskIds.every((taskId) => completedTasks.has(taskId)))
-      .map((node) => node.nodeId)
-  );
-  return acceptedPlan.executionFlowGraph.nodes
-    .filter((node) => !completedNodes.has(node.nodeId) && node.dependsOn.every((dependency) => completedNodes.has(dependency)))
-    .map((node) => node.nodeId);
+  void acceptedPlan;
+  return [];
 }
 
 function currentTaskMemoryHints(context: CurrentTaskContext | undefined): string[] {
@@ -6348,7 +6459,7 @@ function currentTaskMemoryHints(context: CurrentTaskContext | undefined): string
   return [
     'CurrentTaskGoal:',
     context.goal,
-    `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; nodeId=${context.nodeId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; capabilities=${context.capabilities.join(', ') || 'none'}; dependsOn=${context.dependsOn.join(', ') || 'none'}; unlocks=${context.unlocks.join(', ') || 'none'}; evidenceNeeds=${context.evidenceNeeds.join(', ') || 'none'}; completedTasks=${context.completedTaskIds.length}; readyNodes=${context.readyNodeIds.join(', ') || 'none'}.`,
+    `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; capabilities=${context.capabilities.join(', ') || 'none'}; completedTasks=${context.completedTaskIds.length}.`,
   ];
 }
 
@@ -8499,6 +8610,11 @@ interface SessionPlanContext {
   interactionOverlay?: InteractionOverlayContext;
 }
 
+interface RecoveredAcceptedPlanContext {
+  plan: SessionPlanContext;
+  acceptedPlan: AcceptedImplementationPlanContext;
+}
+
 interface SessionReviewContext {
   sessionId: string;
   runId: string;
@@ -8622,6 +8738,30 @@ function findPlanCard(events: AgentEvent[], runId?: string, planId?: string): Se
   return null;
 }
 
+function recoverAcceptedPlanFromOverlay(
+  input: SessionDecisionResolverInput,
+  events: AgentEvent[],
+  overlay: InteractionOverlayContext | undefined
+): RecoveredAcceptedPlanContext | undefined {
+  const planId = overlay?.acceptedPlanId;
+  if (!planId) return undefined;
+  const plan = (overlay.acceptedPlanRunId ? findPlanCard(events, overlay.acceptedPlanRunId, planId) : null)
+    ?? findPlanCard(events, undefined, planId);
+  if (!plan?.implementationPlan) return undefined;
+  const executionRoot = acceptedPlanExecutionRootFromDecision(input, events);
+  let acceptedPlan = acceptedPlanWithLatestCheckpoint(
+    acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot),
+    events
+  );
+  const overlayCompletedTaskIds = overlay.acceptedCompletedTaskIds ?? [];
+  if (overlayCompletedTaskIds.length) {
+    acceptedPlan = acceptedPlanAfterBatch(acceptedPlan, [
+      ...new Set([...acceptedPlan.completedTaskIds, ...overlayCompletedTaskIds]),
+    ]);
+  }
+  return { plan, acceptedPlan };
+}
+
 function latestExecutablePlan(events: AgentEvent[], previousRunId?: string): SessionPlanContext | null {
   for (const event of [...events].reverse()) {
     if (event.kind !== 'plan_card') continue;
@@ -8666,6 +8806,28 @@ function planContextFromEvent(event: AgentEvent, payload: Record<string, unknown
   };
 }
 
+function proposalEnvelopeFromPlanContext(plan: SessionPlanContext): ProposalEnvelope {
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: plan.proposalId ?? plan.planId,
+    runId: plan.runId,
+    sessionId: plan.sessionId,
+    source: 'system',
+    kind: 'actionBundle',
+    narration: plan.userPlan,
+    payload: {
+      userPlan: plan.userPlan,
+      actionBundle: plan.actionBundle,
+      codeBlocks: plan.codeBlocks,
+      commandBlocks: plan.commandBlocks,
+      expectedValidation: plan.expectedValidation,
+      reviewGuide: plan.reviewGuide,
+    },
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  };
+}
+
 function interactionOverlayFromRequirementDecision(confirmation: AgentEvent, decision: AgentEvent): InteractionOverlayContext | undefined {
   const confirmationPayload = objectRecord(confirmation.payload) ?? {};
   const overlay = interactionOverlayFromPayload(confirmationPayload);
@@ -8692,6 +8854,10 @@ function interactionOverlayFromPayload(payload: Record<string, unknown> | undefi
     interactionId,
     sourceInteractionId: stringValue(payload.sourceInteractionId) ?? interactionId,
     resumedFromDecisionId: stringValue(payload.resumedFromDecisionId),
+    acceptedPlanId: stringValue(payload.acceptedPlanId),
+    acceptedPlanRunId: stringValue(payload.acceptedPlanRunId),
+    acceptedCurrentTaskId: stringValue(payload.acceptedCurrentTaskId),
+    acceptedCompletedTaskIds: stringArrayValue(payload.acceptedCompletedTaskIds),
   };
 }
 
@@ -8705,6 +8871,10 @@ function interactionOverlayProjection(overlay: InteractionOverlayContext | undef
     interactionId: overlay.interactionId,
     sourceInteractionId: overlay.sourceInteractionId ?? overlay.interactionId,
     resumedFromDecisionId: overlay.resumedFromDecisionId,
+    acceptedPlanId: overlay.acceptedPlanId,
+    acceptedPlanRunId: overlay.acceptedPlanRunId,
+    acceptedCurrentTaskId: overlay.acceptedCurrentTaskId,
+    acceptedCompletedTaskIds: overlay.acceptedCompletedTaskIds,
   };
 }
 
@@ -13356,18 +13526,19 @@ function implementationPlanExecutionRequest(
   guidance?: string
 ): string {
   const planJson = JSON.stringify(plan.implementationPlan ?? {}, null, 2);
-  const currentTask = acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
+  const currentTask = acceptedPlan.tasks.find((task) => !acceptedPlan.completedTaskIds.includes(task.taskId));
   return [
     '用户已接受 Kernel execution contract。现在进入 Edit 阶段，生成下一批可执行候选 actionBundle。',
     '已接受的计划/contract 是 intent/checklist，不是执行事实；不得声称文件已创建、测试已通过或权限已授予。',
     'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. Final workspace writes still come only from the complete actionBundle JSON.',
     'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
     '选择当前任务清单中的相关工作，允许在同一个 actionBundle 中输出多个相关文件或动作；文件数、任务数、codeBlock 数不是权限边界。',
-    '任务依赖约定：hardDependencies 才代表必须等待的真实阻塞依赖；softOrderAfter / legacy dependencies 只是展示顺序，不应阻止独立任务草稿并行。不要把普通工程顺序写成 hard dependency。',
+    '任务顺序约定：accepted plan 已按用户确认的 tasks[] 顺序执行。不要重新生成依赖图、ready nodes 或并行分支；如果后续任务依赖当前任务，请把它留到当前任务完成后的下一批。',
+    '嵌套 actionBundle 对象必须包含 version/id/goal/actions；goal 只是本批次目标摘要，不是权限授权、执行事实或完成声明。',
     'actionBundle.actions 必须使用 actionId、toolId、args、description、dependsOn；Kernel 会从 toolId 和 args 派生 capability、permission、readSet/writeSet/conflictKeys。',
     currentTask
       ? `当前任务：taskId=${currentTask.taskId}; title=${currentTask.title ?? '未命名'}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}。`
-      : '当前任务无法从 batchIndex 唯一定位；请输出最小合规 actionBundle，或返回 decisionRequest 要求用户重新确认范围。',
+      : '当前任务清单已完成或无法定位；请返回 diagnostic 或 review-ready summary，不要扩展新范围。',
     acceptedPlan.completedTaskIds.length
       ? `已完成 taskId：${acceptedPlan.completedTaskIds.join(', ')}。不要重复生成已完成任务，除非 Kernel facts 显示失败或用户要求修订。`
       : '当前 accepted contract 尚无已完成任务。',
@@ -13416,7 +13587,7 @@ function acceptedPlanResourceResumePrompt(
     resourceRequestProtocolShapeLine(),
     'Prefer actionBundle if the just-resolved evidence is sufficient for the current task. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
     accepted ? `Accepted plan: planId=${accepted.planId}; title=${accepted.title ?? accepted.summary ?? accepted.planId}; completedTasks=${accepted.completedTaskIds.join(', ') || 'none'}.` : '',
-    cursor ? `TaskExecutionCursor: cursorId=${cursor.cursorId}; currentTaskId=${cursor.currentTaskId ?? 'none'}; currentNodeId=${cursor.currentNodeId ?? 'none'}; pendingNodes=${cursor.pendingNodeIds.join(', ') || 'none'}; readyNodes=${cursor.readyNodeIds.join(', ') || 'none'}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
+    cursor ? `TaskExecutionCursor: cursorId=${cursor.cursorId}; currentTaskId=${cursor.currentTaskId ?? 'none'}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}. Deprecated graph node fields may appear in compatibility telemetry; do not plan around them.` : '',
     current ? `CurrentTaskGoal: ${current.goal}` : '',
     current ? `CurrentTaskContext: targets=${current.targets.join(', ') || 'none'}; capabilities=${current.capabilities.join(', ') || 'none'}; dependsOn=${current.dependsOn.join(', ') || 'none'}; unlocks=${current.unlocks.join(', ') || 'none'}; evidenceNeeds=${current.evidenceNeeds.join(', ') || 'none'}.` : '',
     `Original resourceRequest proposalId=${requestProposal.proposalId}; kind=${requestProposal.kind}.`,
@@ -13891,6 +14062,23 @@ function requirementDecisionResumeRequest(
   return lines.join('\n');
 }
 
+function acceptedPlanExecutionRequirementResumeRequest(
+  confirmation: AgentEvent,
+  decisionEvent: AgentEvent,
+  decision: 'accept' | 'reject' | 'revise',
+  guidance?: string
+): string {
+  return [
+    requirementDecisionResumeRequest(confirmation, decisionEvent, decision, guidance),
+    '',
+    'Accepted-plan continuation rule:',
+    '- This decision belongs to the current accepted implementationPlan execution checkpoint.',
+    '- Continue the same accepted taskPlan and current task cursor.',
+    '- Do not create a new standalone plan or final Review unless all accepted tasks are complete.',
+    '- If returning actionBundle, keep targets and capabilities inside the accepted plan scope.',
+  ].join('\n');
+}
+
 function requirementAttachments(event: AgentEvent): AgentContextAttachment[] {
   const payload = objectRecord(event.payload);
   return Array.isArray(payload?.attachments)
@@ -14015,7 +14203,7 @@ function protocolRepairShapeReference(errorCode: string): string {
     'Provider output must be one Agent Protocol v3 JSON object.',
     'Allowed proposal kinds: answer, resourceRequest, decisionRequest, taskPlan, actionBundle, diagnostic.',
     'reviewSummary is Session-generated and must not be returned by the provider.',
-    'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/executionFlowGraph/risks/reviewCheckpoints at the top level. executionFlowGraph.nodes must describe nodeId/moduleId/taskIds/targets/capabilities/prerequisites/outputs/dependsOn/unlocks/conflictKeys/evidenceNeeds for Session DAG scheduling. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.',
+    'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be an ordered engineering checklist; put prerequisite tasks earlier. Deprecated graph fields may be parsed for telemetry but are not required and must not be used for provider-facing scheduling. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.',
     'For kind="actionBundle", put userPlanMarkdown, codeBlocks, actionBundle, expectedValidation, and reviewGuide directly on the top-level JSON object. Do not wrap them in a payload object.',
     'For kind="decisionRequest", put decisionRequest:{id,question,reason?,summary?,options:[{id,label,description,recommended?}],allowsFreeform?} on the top-level JSON object. Do not return bare reason/options without decisionRequest.',
     'codeBlocks[] uses {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}; contentLines is the only source-code carrier.',
@@ -14125,7 +14313,7 @@ function sideEffectNativeToolRepairMessages(
         guardrail,
         'Never claim that files were written, commands ran, permissions were granted, or validation passed.',
         'If returning decisionRequest, ask one concise question with 2-3 mutually exclusive options, exactly one recommended option, impact descriptions, allowsFreeform=true, and user-visible text in the current user language.',
-        'If returning taskPlan, put taskPlan.version/id/title/summary/tasks/executionFlowGraph/risks/reviewCheckpoints directly on the top-level JSON object; executionFlowGraph.nodes describes nodeId/moduleId/taskIds/targets/capabilities/prerequisites/outputs/dependsOn/unlocks/conflictKeys/evidenceNeeds for Session DAG scheduling. taskPlan must not include source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
+        'If returning taskPlan, put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints directly on the top-level JSON object. tasks[] must be ordered by practical development sequence; deprecated graph fields may be parsed for telemetry but are not required. taskPlan must not include source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
         'If returning actionBundle after acceptedTaskPlan, put userPlanMarkdown, codeBlocks, actionBundle, expectedValidation, and reviewGuide directly on the top-level JSON object. Do not wrap them in a payload object.',
         ...actionBundleProtocolShapeLines(),
         'Command plans use actionBundle.actions[] with toolId="process.exec" and typed args; do not output commandBlocks.',
@@ -14490,6 +14678,12 @@ function isAcceptedPlanScopeConfirmation(event: AgentEvent): boolean {
   const payload = objectRecord(event.payload);
   const decisionRequest = objectRecord(payload?.decisionRequest);
   return stringValue(decisionRequest?.decisionScope) === 'acceptedPlanBatchOutOfScope';
+}
+
+function isAcceptedPlanExecutionConfirmation(event: AgentEvent): boolean {
+  const payload = objectRecord(event.payload);
+  const overlay = interactionOverlayFromPayload(payload);
+  return Boolean(overlay?.acceptedPlanId);
 }
 
 function selectedRequirementDecisionOptionId(event: AgentEvent): string | undefined {
