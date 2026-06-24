@@ -144,7 +144,15 @@ pub(crate) async fn agent_session_delete(
     Path(session_id): Path<String>,
 ) -> Json<ApiResponse> {
     let safe_session_id = safe_path_segment(&session_id);
-    let (sessions_dir, archive_root, response_scope_key, response_current_id, response_sessions) = {
+    let (
+        sessions_dir,
+        archive_root,
+        memory_root,
+        delete_scope_key,
+        response_scope_key,
+        response_current_id,
+        response_sessions,
+    ) = {
         let mut gui = state.gui.lock().expect("gui state lock");
         let Some(position) = gui.sessions.iter().position(|session| {
             session.get("id").and_then(Value::as_str) == Some(session_id.as_str())
@@ -171,6 +179,8 @@ pub(crate) async fn agent_session_delete(
         (
             gui.paths.sessions_dir.clone(),
             gui.paths.conversation_archives_dir.clone(),
+            gui.paths.memory_archives_dir.clone(),
+            scope_key.clone(),
             scope_key,
             response_current_id,
             response_sessions,
@@ -179,11 +189,18 @@ pub(crate) async fn agent_session_delete(
 
     remove_session_storage_dir(&sessions_dir, &safe_session_id);
     remove_conversation_archive_dirs(&archive_root, &safe_session_id);
+    let memory_cleanup = remove_session_memory_archive(
+        &memory_root,
+        &delete_scope_key,
+        &safe_session_id,
+        &session_id,
+    );
 
     ApiResponse::ok(json!({
         "sessions": response_sessions,
         "currentSessionId": response_current_id,
-        "workspaceScopeKey": response_scope_key
+        "workspaceScopeKey": response_scope_key,
+        "memoryCleanup": memory_cleanup
     }))
 }
 
@@ -1732,6 +1749,151 @@ pub(crate) fn remove_conversation_archive_dirs(archive_root: &FsPath, safe_sessi
     }
 }
 
+pub(crate) fn remove_session_memory_archive(
+    memory_root: &FsPath,
+    workspace_scope_key: &str,
+    safe_session_id: &str,
+    session_id: &str,
+) -> Value {
+    let safe_scope_key = safe_path_segment(workspace_scope_key);
+    let archive_dir = memory_root.join(&safe_scope_key);
+    let sessions_dir = archive_dir.join("sessions");
+    let targets = [
+        sessions_dir.join(format!("{safe_session_id}.md")),
+        sessions_dir.join(format!("{safe_session_id}.memory.json")),
+    ];
+    let mut removed_files = Vec::new();
+    let mut missing_files = Vec::new();
+    let mut errors = Vec::new();
+
+    for target in targets {
+        let display_path = target
+            .strip_prefix(memory_root)
+            .unwrap_or(target.as_path())
+            .to_string_lossy()
+            .to_string();
+        if !target.starts_with(&sessions_dir) {
+            errors.push(json!({
+                "path": display_path,
+                "code": "memory_cleanup_path_out_of_scope"
+            }));
+            continue;
+        }
+        if !target.exists() {
+            missing_files.push(json!(display_path));
+            continue;
+        }
+        match fs::remove_file(&target) {
+            Ok(()) => removed_files.push(json!(display_path)),
+            Err(error) => errors.push(json!({
+                "path": display_path,
+                "code": "memory_cleanup_remove_failed",
+                "message": error.to_string()
+            })),
+        }
+    }
+
+    let project_archive_needs_refresh = !removed_files.is_empty();
+    let manifest = append_session_memory_cleanup_manifest(
+        &archive_dir,
+        session_id,
+        safe_session_id,
+        &removed_files,
+        &missing_files,
+        &errors,
+        project_archive_needs_refresh,
+    );
+
+    json!({
+        "workspaceScopeKey": safe_scope_key,
+        "sessionId": session_id,
+        "safeSessionId": safe_session_id,
+        "removedFiles": removed_files,
+        "missingFiles": missing_files,
+        "errors": errors,
+        "projectArchiveNeedsRefresh": project_archive_needs_refresh,
+        "manifestUpdated": manifest.get("updated").and_then(Value::as_bool).unwrap_or(false),
+        "manifestError": manifest.get("error").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn append_session_memory_cleanup_manifest(
+    archive_dir: &FsPath,
+    session_id: &str,
+    safe_session_id: &str,
+    removed_files: &[Value],
+    missing_files: &[Value],
+    errors: &[Value],
+    project_archive_needs_refresh: bool,
+) -> Value {
+    if !archive_dir.exists() {
+        return json!({
+            "updated": false,
+            "error": null
+        });
+    }
+    let manifest_path = archive_dir.join("manifest.json");
+    let mut manifest = fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "schemaVersion": "deepcode.session.memory-archive-manifest.v1",
+                "archivePath": archive_dir.to_string_lossy()
+            })
+        });
+    if !manifest.is_object() {
+        manifest = json!({
+            "schemaVersion": "deepcode.session.memory-archive-manifest.v1",
+            "archivePath": archive_dir.to_string_lossy()
+        });
+    }
+
+    let cleanup_event = json!({
+        "event": "session_memory_removed",
+        "sessionId": session_id,
+        "safeSessionId": safe_session_id,
+        "removedAt": now_text(),
+        "removedFiles": removed_files,
+        "missingFiles": missing_files,
+        "errors": errors,
+        "projectArchiveNeedsRefresh": project_archive_needs_refresh
+    });
+
+    if let Some(object) = manifest.as_object_mut() {
+        object.insert(
+            "projectArchiveNeedsRefresh".to_string(),
+            json!(project_archive_needs_refresh),
+        );
+        if let Some(array) = object
+            .get_mut("cleanupEvents")
+            .and_then(Value::as_array_mut)
+        {
+            array.push(cleanup_event);
+        } else {
+            object.insert("cleanupEvents".to_string(), json!([cleanup_event]));
+        }
+        object.insert("updatedAt".to_string(), json!(now_text()));
+    }
+
+    match serde_json::to_string_pretty(&manifest) {
+        Ok(content) => match fs::write(&manifest_path, content) {
+            Ok(()) => json!({
+                "updated": true,
+                "error": null
+            }),
+            Err(error) => json!({
+                "updated": false,
+                "error": error.to_string()
+            }),
+        },
+        Err(error) => json!({
+            "updated": false,
+            "error": error.to_string()
+        }),
+    }
+}
+
 pub(crate) fn scope_key_from_query(query: &AgentSessionScopeQuery) -> String {
     scope_key_from_parts(
         query.workspace_id.as_deref(),
@@ -2253,6 +2415,101 @@ mod tests {
         );
         assert_eq!(delta.get("deltaSeq").and_then(Value::as_u64), Some(7));
         assert!(delta.get("receivedAt").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn session_memory_cleanup_removes_only_target_session_files() {
+        let root =
+            std::env::temp_dir().join(format!("deepcode-agent-memory-cleanup-{}", now_millis()));
+        let memory_root = root.join("memory").join("projects");
+        let scope_key = format!("workspace-{}", now_millis());
+        let session_id = format!("session-{}", now_millis());
+        let other_session_id = format!("session-{}-other", now_millis());
+        let safe_session = safe_path_segment(&session_id);
+        let safe_other_session = safe_path_segment(&other_session_id);
+        let archive_dir = memory_root.join(&scope_key);
+        let sessions_dir = archive_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create session memory dir");
+        fs::write(archive_dir.join("project.md"), "project memory").expect("project markdown");
+        fs::write(
+            archive_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&json!({
+                "schemaVersion": "deepcode.session.memory-archive-manifest.v1",
+                "workspaceScopeKey": scope_key,
+                "cleanupEvents": []
+            }))
+            .expect("manifest json"),
+        )
+        .expect("manifest");
+        fs::write(
+            sessions_dir.join(format!("{safe_session}.md")),
+            "session markdown",
+        )
+        .expect("session markdown");
+        fs::write(
+            sessions_dir.join(format!("{safe_session}.memory.json")),
+            "{}",
+        )
+        .expect("session sidecar");
+        fs::write(
+            sessions_dir.join(format!("{safe_other_session}.md")),
+            "other session markdown",
+        )
+        .expect("other session markdown");
+        fs::write(
+            sessions_dir.join(format!("{safe_other_session}.memory.json")),
+            "{}",
+        )
+        .expect("other session sidecar");
+
+        let cleanup =
+            remove_session_memory_archive(&memory_root, &scope_key, &safe_session, &session_id);
+        assert_eq!(
+            cleanup.get("workspaceScopeKey").and_then(Value::as_str),
+            Some(scope_key.as_str())
+        );
+        assert_eq!(
+            cleanup
+                .get("removedFiles")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            cleanup
+                .get("projectArchiveNeedsRefresh")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(!sessions_dir.join(format!("{safe_session}.md")).exists());
+        assert!(!sessions_dir
+            .join(format!("{safe_session}.memory.json"))
+            .exists());
+        assert!(sessions_dir
+            .join(format!("{safe_other_session}.md"))
+            .exists());
+        assert!(sessions_dir
+            .join(format!("{safe_other_session}.memory.json"))
+            .exists());
+
+        let manifest_content =
+            fs::read_to_string(archive_dir.join("manifest.json")).expect("manifest content");
+        let manifest: Value = serde_json::from_str(&manifest_content).expect("manifest json");
+        let cleanup_events = manifest
+            .get("cleanupEvents")
+            .and_then(Value::as_array)
+            .expect("cleanup events");
+        assert_eq!(cleanup_events.len(), 1);
+        assert_eq!(
+            cleanup_events[0].get("event").and_then(Value::as_str),
+            Some("session_memory_removed")
+        );
+        assert_eq!(
+            cleanup_events[0].get("sessionId").and_then(Value::as_str),
+            Some(session_id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
