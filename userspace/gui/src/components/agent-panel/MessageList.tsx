@@ -11,6 +11,8 @@ import { t, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
 import ToolEvidenceDetails from './ToolEvidenceDetails';
+import DiffCard from './DiffCard';
+import WorkMetaRow from './WorkMetaRow';
 import { compactDisplayText, sanitizeDisplayText } from './displayText';
 import { formatToolEvidence } from '../../utils/toolEvidence';
 import {
@@ -1477,6 +1479,13 @@ function GitReviewDiffDetails({
   const diffBlocks = Array.isArray(gitReview.diffBlocks) ? gitReview.diffBlocks.filter(isRecord) : [];
   const files = Array.isArray(gitReview.files) ? gitReview.files.filter(isRecord) : [];
   if (!diffBlocks.length && !files.length) return null;
+  const diffFiles = diffBlocks
+    .map((block, index) => ({
+      path: stringField(block, 'title') ?? `Diff ${index + 1}`,
+      patch: stringField(block, 'diff') ?? '',
+      truncated: block.truncated === true,
+    }))
+    .filter((file) => file.patch.trim().length > 0);
   return (
     <div className="agent-flow-card__section agent-flow-card__section--git-review">
       <div className="agent-flow-card__section-title">Git Diff</div>
@@ -1489,20 +1498,14 @@ function GitReviewDiffDetails({
           {files.length > 12 && <li>{t(language, 'common.moreFiles', { count: files.length - 12 })}</li>}
         </ul>
       )}
-      {diffBlocks.map((block, index) => {
-        const title = stringField(block, 'title') ?? `Diff ${index + 1}`;
-        const diff = stringField(block, 'diff') ?? '';
-        const truncated = block.truncated === true;
-        return (
-          <details key={`${title}-${index}`} className="agent-flow-card__details agent-flow-card__details--diff">
-            <summary>
-              {title}
-              {truncated ? t(language, 'common.truncatedSuffix') : ''}
-            </summary>
-            <pre className="agent-review-diff"><code>{diff}</code></pre>
-          </details>
-        );
-      })}
+      {diffFiles.length > 0 && (
+        <DiffCard
+          files={diffFiles}
+          label="Git Diff"
+          defaultOpen
+          truncatedSuffix={t(language, 'common.truncatedSuffix')}
+        />
+      )}
     </div>
   );
 }
@@ -1571,13 +1574,17 @@ function TraceGroupCard({ group, language }: { group: TraceGroup; language: UiLa
 
 function NarrativeThinkingCard({ block, language }: { block: AgentTimelineBlock; language: UiLanguage }) {
   const running = block.status === 'running' || block.status === 'waiting';
+  const markdown = thinkingMarkdown(block);
+  // 超长 reasoning（如执行阶段完整 CoT，可达上万字符）默认折叠且不随运行态自动展开，
+  // 避免主面板被一次性大段文本撑爆；标题摘要仍提供预览，用户可手动展开。
+  const longContent = markdown.length > 1600;
   const [expanded, setExpanded] = React.useState(
-    block.displayHints?.initialOpen ?? (running || !block.defaultCollapsed)
+    block.displayHints?.initialOpen ?? (longContent ? false : running || !block.defaultCollapsed)
   );
   const wasRunningRef = React.useRef(running);
 
   React.useEffect(() => {
-    if (running) {
+    if (running && !longContent) {
       setExpanded(true);
       wasRunningRef.current = true;
       return;
@@ -1586,9 +1593,8 @@ function NarrativeThinkingCard({ block, language }: { block: AgentTimelineBlock;
       setExpanded(false);
       wasRunningRef.current = false;
     }
-  }, [running]);
+  }, [running, longContent]);
 
-  const markdown = thinkingMarkdown(block);
   const summary = compactDisplayText(markdown, 140);
   const title = [block.title || t(language, 'agent.copy.thinking'), summary]
     .filter((part, index, parts) => Boolean(part && (index === 0 || part !== parts[0])))
@@ -1779,6 +1785,30 @@ async function copyMessage(text: string): Promise<void> {
   }
 }
 
+function flattenItemEvents(items: RenderContentItem[]): AgentEvent[] {
+  const events: AgentEvent[] = [];
+  for (const item of items) {
+    if (item.type === 'event') events.push(item.event);
+    else if (item.type === 'trace' || item.type === 'toolBatch') events.push(...item.group.events);
+    else events.push(...item.block.events);
+  }
+  return events;
+}
+
+function turnWorkMeta(items: RenderContentItem[]): { stepCount: number; durationMs?: number } {
+  const events = flattenItemEvents(items);
+  const stepCount = events.filter((event) => event.kind === 'tool_call').length;
+  const times = events
+    .map((event) => Date.parse(event.ts))
+    .filter((value) => Number.isFinite(value));
+  let durationMs: number | undefined;
+  if (times.length >= 2) {
+    const span = Math.max(...times) - Math.min(...times);
+    if (Number.isFinite(span) && span > 0) durationMs = span;
+  }
+  return { stepCount, durationMs };
+}
+
 function TurnActions({
   items,
   targetEvent,
@@ -1789,6 +1819,7 @@ function TurnActions({
   language: UiLanguage;
 }) {
   const [status, setStatus] = React.useState<'idle' | 'working' | 'done' | 'error'>('idle');
+  const { stepCount, durationMs } = turnWorkMeta(items);
   const [message, setMessage] = React.useState('');
   const [open, setOpen] = React.useState(false);
   const agentText = agentOutputCopyText(items, language) || workflowCopyText(items, language);
@@ -1827,6 +1858,7 @@ function TurnActions({
 
   return (
     <div className="agent-turn-actions" aria-label={t(language, 'agent.message.actions')}>
+      <WorkMetaRow stepCount={stepCount} durationMs={durationMs} />
       <details className="agent-turn-action-menu" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
         <summary title={t(language, 'agent.message.copyMenuTitle')}>
           {t(language, 'agent.message.copyMenu')}

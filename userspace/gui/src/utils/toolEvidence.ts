@@ -47,6 +47,10 @@ export function formatToolEvidence(
   );
   const items: ToolEvidenceItem[] = [];
 
+  // 先收集 workflow_stage 携带的文件活动（editFileStarted/editFileCompleted/toolExecution 等），
+  // 这些是 Kernel 执行文件读写时的真实事件来源，但不以 tool_call/tool_result 形态出现。
+  items.push(...collectActivityItems(events, language));
+
   events.forEach((event) => {
     if (event.kind !== 'tool_call' && event.kind !== 'tool_result') return;
     if (event.kind === 'tool_call') {
@@ -69,6 +73,110 @@ export function formatDurationMs(value: number | undefined): string | undefined 
   if (value === undefined || !Number.isFinite(value) || value < 0) return undefined;
   if (value < 1000) return `${Math.round(value)}ms`;
   return `${(value / 1000).toFixed(1)}s`;
+}
+
+// ---- workflow_stage 文件活动识别 ----
+// Kernel 执行文件读写时以 workflow_stage(activity=editFileStarted/toolExecution/editFileCompleted)
+// 形态出现，而非 tool_call/tool_result；此处把同一目标的活动合并为单条读写证据。
+const FILE_ACTIVITY_KINDS = new Set([
+  'editFileStarted',
+  'editFileCompleted',
+  'editFileFailed',
+  'toolExecution',
+  'resourceRead',
+  'resourceSearch',
+]);
+
+function activityRecord(event: AgentEvent): Record<string, unknown> | undefined {
+  const payload = record(event.payload);
+  return payload ? record(payload.activity) : undefined;
+}
+
+function pickActivityTarget(targets: string[]): string | undefined {
+  if (targets.length === 0) return undefined;
+  // 优先取相对路径（排除 UNC \\、盘符 X:\、\\?\ 前缀与 POSIX 绝对路径）
+  const relative = targets.find(
+    (value) =>
+      !/^\\\\/.test(value) &&
+      !/^[a-zA-Z]:[\\/]/.test(value) &&
+      !value.startsWith('\\\\?\\') &&
+      !value.startsWith('/'),
+  );
+  return readablePath(relative ?? targets[0]);
+}
+
+function activityStatusOf(activityKind: string): ToolEvidenceStatus {
+  if (activityKind === 'editFileStarted') return 'running';
+  if (activityKind === 'editFileFailed') return 'failed';
+  return 'completed';
+}
+
+function mergeActivityStatus(prev: ToolEvidenceStatus, next: ToolEvidenceStatus): ToolEvidenceStatus {
+  const rank: Record<ToolEvidenceStatus, number> = { waiting: 0, running: 1, completed: 2, failed: 3 };
+  return rank[next] > rank[prev] ? next : prev;
+}
+
+function activityItemKind(toolName: string | undefined): ToolEvidenceItemKind {
+  if (!toolName) return 'file';
+  if (toolName.includes('search')) return 'search';
+  if (toolName.includes('list')) return 'directory';
+  if (toolName === 'process.exec' || toolName.includes('exec')) return 'command';
+  return 'file';
+}
+
+function activityActionLabel(
+  activityKind: string,
+  toolName: string | undefined,
+  language: UiLanguage,
+): string {
+  const name = toolName ?? '';
+  if (name.includes('write') || activityKind === 'editFileStarted' || activityKind === 'editFileCompleted' || activityKind === 'editFileFailed') {
+    return t(language, 'agent.toolEvidence.action.write');
+  }
+  if (name.includes('delete')) return t(language, 'agent.toolEvidence.action.delete');
+  if (name.includes('search') || activityKind === 'resourceSearch') return t(language, 'agent.toolEvidence.action.search');
+  if (name.includes('list')) return t(language, 'agent.toolEvidence.action.list');
+  if (name.includes('read') || activityKind === 'resourceRead') return t(language, 'agent.toolEvidence.action.read');
+  return t(language, 'agent.toolEvidence.action.tool');
+}
+
+function collectActivityItems(events: AgentEvent[], language: UiLanguage): ToolEvidenceItem[] {
+  const byKey = new Map<string, ToolEvidenceItem>();
+  for (const event of events) {
+    if (event.kind !== 'workflow_stage' && event.kind !== 'workflow_decision') continue;
+    const activity = activityRecord(event);
+    if (!activity) continue;
+    const activityKind = stringValue(activity, 'kind');
+    if (!activityKind || !FILE_ACTIVITY_KINDS.has(activityKind)) continue;
+
+    const targets = Array.isArray(activity.targets)
+      ? activity.targets.filter((value): value is string => typeof value === 'string')
+      : [];
+    const toolName = stringValue(activity, 'toolName');
+    const label = pickActivityTarget(targets) ?? stringValue(activity, 'title') ?? toolName ?? 'operation';
+    const itemKind = activityItemKind(toolName);
+    const key = `${itemKind}:${label}`;
+    const status = activityStatusOf(activityKind);
+
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.status = mergeActivityStatus(existing.status, status);
+      if (toolName && !existing.detail) existing.detail = toolName;
+      if (toolName && (toolName.includes('write') || toolName.includes('delete'))) {
+        existing.action = activityActionLabel(activityKind, toolName, language);
+      }
+      continue;
+    }
+    byKey.set(key, {
+      id: `${event.id}:activity`,
+      kind: itemKind,
+      action: activityActionLabel(activityKind, toolName, language),
+      label,
+      detail: toolName,
+      status,
+    });
+  }
+  return [...byKey.values()];
 }
 
 function itemsForEvent(event: AgentEvent, language: UiLanguage): ToolEvidenceItem[] {

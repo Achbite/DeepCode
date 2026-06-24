@@ -1192,6 +1192,46 @@
   font-weight: 650;
 }
 
+/* ---- 卡片统一状态图标（cardStatus）---- */
+.agent-tool-bubble__lead {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.agent-status-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.agent-status-icon--completed {
+  color: var(--success, #30d158);
+}
+
+.agent-status-icon--failed {
+  color: var(--danger, #ff453a);
+}
+
+.agent-status-icon--waiting {
+  color: var(--warn, #ffcc00);
+}
+
+.agent-status-icon--blocked {
+  color: #ff9f0a;
+}
+
+.agent-status-icon--queued {
+  color: var(--text-muted, #a1a1aa);
+}
+
 .agent-tool-bubble__details {
   margin: 0;
 }
@@ -2305,4 +2345,195 @@
   padding: 10px;
   font-size: 12px;
   line-height: 1.45;
+}
+
+/* ============================================================
+ * DiffView 内联差异视图（agent-diff-view）
+ *
+ * 把 unified diff 渲染为 +/- 着色的人类可读视图，替代 raw <pre>。
+ * 设计：
+ *   - 顶部 bar 显示文件路径 + 聚合 +added/-removed 统计
+ *   - 行级着色：added 绿 / removed 红 / hunk 蓝 / meta 灰 / context 默认
+ *   - body 用 contentVisibility 跳过视口外渲染，缓解长 diff 卡顿
+ * ============================================================ */
+.agent-diff-view {
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-md, 6px);
+  background: var(--bg-elevated, rgba(0, 0, 0, 0.2));
+  overflow: hidden;
+}
+
+.agent-diff-view__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 9px;
+  border-bottom: 1px solid var(--line, rgba(255, 255, 255, 0.07));
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.agent-diff-view__path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-main, #ededed);
+  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
+  font-size: 11px;
+}
+
+.agent-diff-view__stat {
+  flex: 0 0 auto;
+  display: inline-flex;
+  gap: 8px;
+  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-diff-view__stat-added {
+  color: var(--success, #30d158);
+}
+
+.agent-diff-view__stat-removed {
+  color: var(--danger, #ff453a);
+}
+
+.agent-diff-view__body {
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 6px 0;
+  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.agent-diff-line {
+  padding: 0 9px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.agent-diff-line__text {
+  display: block;
+  min-height: 1.5em;
+}
+
+.agent-diff-line--added {
+  background: rgba(48, 209, 88, 0.12);
+  color: #b9f6ca;
+}
+
+.agent-diff-line--removed {
+  background: rgba(255, 69, 58, 0.12);
+  color: #ffcdd2;
+}
+
+.agent-diff-line--hunk {
+  color: var(--accent, #0a84ff);
+  background: rgba(10, 132, 255, 0.06);
+}
+
+.agent-diff-line--meta {
+  color: var(--text-muted, #a1a1aa);
+}
+
+.agent-diff-line--context {
+  color: var(--text-main, #ededed);
+}
+
+/* ============================================================
+ * DiffCard 多文件聚合差异卡（agent-diff-card）
+ * 头部聚合 +/- 统计，逐文件折叠，展开才挂载 DiffView。
+ * ============================================================ */
+.agent-diff-card {
+  margin-top: 8px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-md, 6px);
+  background: rgba(0, 0, 0, 0.14);
+  overflow: hidden;
+}
+
+.agent-diff-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line, rgba(255, 255, 255, 0.07));
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-muted, #a1a1aa);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.agent-diff-card__stat,
+.agent-diff-card__file-stat {
+  flex: 0 0 auto;
+  display: inline-flex;
+  gap: 8px;
+  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-diff-card__files {
+  display: grid;
+  gap: 1px;
+}
+
+.agent-diff-card__file-head {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text-main, #ededed);
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-diff-card__file-head:hover {
+  background: rgba(10, 132, 255, 0.06);
+}
+
+.agent-diff-card__file-chevron {
+  color: var(--text-muted, #a1a1aa);
+  font-size: 9px;
+}
+
+.agent-diff-card__file-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
+}
+
+.agent-diff-card__file-body {
+  padding: 0 10px 8px;
+}
+
+/* ---- WorkMetaRow turn 级处理摘要 ---- */
+.agent-work-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-work-meta__glyph {
+  opacity: 0.7;
+}
+
+.agent-work-meta__dot {
+  opacity: 0.5;
 }

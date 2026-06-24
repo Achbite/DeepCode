@@ -2,6 +2,8 @@ import React from 'react';
 import type { AgentEvent } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { compactDisplayText, sanitizeDisplayText } from './displayText';
+import { cardStatusDefaultOpen, cardStatusGlyph, cardStatusIsSpinning } from './cardStatus';
+import { projectToolCard, type ToolCardView } from './cardModel';
 
 interface ToolCallBubbleProps {
   event: AgentEvent;
@@ -13,70 +15,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() ? sanitizeDisplayText(value) : undefined;
-}
-
-function nestedRecord(payload: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
-  return isRecord(payload[key]) ? payload[key] as Record<string, unknown> : undefined;
-}
-
-function getArgs(payload: Record<string, unknown>): Record<string, unknown> {
-  const toolCall = nestedRecord(payload, 'toolCall');
-  return (
-    nestedRecord(payload, 'arguments') ??
-    (toolCall ? nestedRecord(toolCall, 'arguments') : undefined) ??
-    nestedRecord(payload, 'input') ??
-    nestedRecord(payload, 'argumentsPreview') ??
-    nestedRecord(payload, 'output') ??
-    payload
-  );
-}
-
-function getToolName(payload: unknown): string {
-  if (!isRecord(payload)) return 'tool';
-  const toolCall = nestedRecord(payload, 'toolCall');
-  return (
-    stringValue(payload.toolName) ??
-    stringValue(payload.name) ??
-    stringValue(toolCall?.name) ??
-    stringValue(payload.actionType) ??
-    'tool'
-  );
-}
-
-function getStatus(payload: unknown): string | undefined {
-  if (!isRecord(payload)) return undefined;
-  if (typeof payload.ok === 'boolean') return payload.ok ? 'ok' : 'error';
-  return stringValue(payload.status) ?? stringValue(payload.decision);
-}
-
-function getCommand(payload: unknown): string | undefined {
-  if (!isRecord(payload)) return undefined;
-  const args = getArgs(payload);
-  return stringValue(args.command) ?? stringValue(payload.command);
-}
-
-function getPath(payload: unknown): string | undefined {
-  if (!isRecord(payload)) return undefined;
-  const args = getArgs(payload);
-  return stringValue(args.path) ?? stringValue(args.cwd) ?? stringValue(payload.path);
-}
-
-function getOutputText(payload: unknown): string | undefined {
-  if (!isRecord(payload)) return undefined;
-  const output = nestedRecord(payload, 'output');
-  const stdout = stringValue(output?.stdout);
-  const stderr = stringValue(output?.stderr);
-  const error = stringValue(payload.error);
-  const summary = stringValue(payload.summary) ?? stringValue(payload.message);
-  return [stdout, stderr, error, summary].filter(Boolean).join('\n').trim() || undefined;
-}
-
-function eventLabel(event: AgentEvent, language: UiLanguage): string {
+function eventLabel(event: AgentEvent, view: ToolCardView, language: UiLanguage): string {
   if (event.kind === 'tool_call') {
-    const name = getToolName(event.payload);
-    return name.startsWith('shell.')
+    return view.toolName.startsWith('shell.')
       ? t(language, 'agent.tool.runCommand')
       : t(language, 'agent.tool.runTool');
   }
@@ -86,70 +27,79 @@ function eventLabel(event: AgentEvent, language: UiLanguage): string {
   return event.kind;
 }
 
-function cardTitle(event: AgentEvent): string {
-  const name = getToolName(event.payload);
-  const command = getCommand(event.payload);
-  const path = getPath(event.payload);
-  if (event.kind === 'tool_call' && command) return `${name} · ${command}`;
+function cardTitle(event: AgentEvent, view: ToolCardView): string {
+  const name = view.toolName;
+  if (event.kind === 'tool_call' && view.command) return `${name} · ${view.command}`;
   if (event.kind === 'permission_request') {
-    const summary = isRecord(event.payload) ? stringValue(event.payload.summary) : undefined;
+    const summary = isRecord(event.payload) && typeof event.payload.summary === 'string' ? event.payload.summary : undefined;
     return summary ?? name;
   }
-  if (command) return `${name} · ${command}`;
-  if (path) return `${name} · ${path}`;
+  if (view.command) return `${name} · ${view.command}`;
+  if (view.path) return `${name} · ${view.path}`;
   return name;
 }
 
-function renderDetails(event: AgentEvent, language: UiLanguage) {
-  const outputText = getOutputText(event.payload);
-  if (event.kind === 'tool_result' && outputText) {
+function renderDetails(event: AgentEvent, view: ToolCardView, language: UiLanguage) {
+  if (event.kind === 'tool_result' && view.output) {
     return (
       <div className="agent-tool-bubble__output">
         <div className="agent-tool-bubble__output-title">
           {t(language, 'agent.tool.output')}
         </div>
-        <pre>{sanitizeDisplayText(outputText)}</pre>
+        <pre>{sanitizeDisplayText(view.output)}</pre>
       </div>
     );
   }
   if (event.kind === 'permission_request') {
-    const risk = isRecord(event.payload) ? stringValue(event.payload.riskLevel) : undefined;
     return (
       <div className="agent-tool-bubble__summary">
-        {risk
-          ? t(language, 'agent.tool.riskLevel', { risk })
+        {view.riskLevel
+          ? t(language, 'agent.tool.riskLevel', { risk: view.riskLevel })
           : t(language, 'agent.tool.waitingApproval')}
       </div>
     );
   }
   if (event.kind === 'permission_result') {
-    const decision = isRecord(event.payload) ? stringValue(event.payload.decision) : undefined;
     return (
       <div className="agent-tool-bubble__summary">
-        {decision ?? t(language, 'agent.tool.permissionHandled')}
+        {view.rawStatus ?? t(language, 'agent.tool.permissionHandled')}
       </div>
     );
   }
-  return <div className="agent-tool-bubble__summary">{compactDisplayText(cardTitle(event), 220)}</div>;
+  return <div className="agent-tool-bubble__summary">{compactDisplayText(cardTitle(event, view), 220)}</div>;
 }
 
 const ToolCallBubble: React.FC<ToolCallBubbleProps> = ({ event, language, autoOpen = false }) => {
-  const status = getStatus(event.payload);
-  const title = sanitizeDisplayText(cardTitle(event));
+  const view = projectToolCard(event);
+  const spinning = cardStatusIsSpinning(view.status);
+  const glyph = cardStatusGlyph(view.status);
+  const title = sanitizeDisplayText(cardTitle(event, view));
+  const open = autoOpen || cardStatusDefaultOpen(view.status);
 
   return (
     <div className={`agent-tool-bubble agent-tool-bubble--${event.kind}`}>
-      <details className="agent-tool-bubble__details" open={autoOpen}>
+      <details className="agent-tool-bubble__details" open={open}>
         <summary>
-          <span className="agent-tool-bubble__label">{eventLabel(event, language)}</span>
+          <span className="agent-tool-bubble__lead">
+            {spinning ? (
+              <span className="agent-spinner" />
+            ) : (
+              glyph && <span className={`agent-status-icon agent-status-icon--${view.status}`}>{glyph}</span>
+            )}
+            <span className="agent-tool-bubble__label">{eventLabel(event, view, language)}</span>
+          </span>
           <span className="agent-tool-bubble__title" title={title}>{compactDisplayText(title, 260)}</span>
-          {status && <span className={`agent-tool-bubble__status agent-tool-bubble__status--${status}`}>{status}</span>}
+          {view.rawStatus && (
+            <span className={`agent-tool-bubble__status agent-tool-bubble__status--${view.rawStatus}`}>{view.rawStatus}</span>
+          )}
         </summary>
-        {renderDetails(event, language)}
-        <details className="agent-raw-details">
-          <summary>{t(language, 'agent.tool.rawPayload')}</summary>
-          <pre>{JSON.stringify(event.payload, null, 2)}</pre>
-        </details>
+        {renderDetails(event, view, language)}
+        {isRecord(event.payload) && (
+          <details className="agent-raw-details">
+            <summary>{t(language, 'agent.tool.rawPayload')}</summary>
+            <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+          </details>
+        )}
       </details>
     </div>
   );
