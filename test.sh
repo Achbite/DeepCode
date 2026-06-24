@@ -359,7 +359,7 @@ daemon_main_lines="$(wc -l < crates/deepcode-kernel-daemon/src/main.rs | tr -d '
 search "pub fn dispatch" crates/deepcode-kernel-runtime/src/dispatch.rs >/dev/null
 search "struct RuntimeState" crates/deepcode-kernel-runtime/src/state.rs >/dev/null
 search "fn workspace_open" crates/deepcode-kernel-runtime/src/workspace.rs >/dev/null
-search "fn tool_invoke" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
+search "fn execute_bound_tool" crates/deepcode-kernel-runtime/src/tools.rs >/dev/null
 search "fn run_create|fn state_contract_get|fn proposal_submit|fn resource_resolve" crates/deepcode-kernel-runtime/src/workflow.rs >/dev/null
 search "fn permission_resolve" crates/deepcode-kernel-runtime/src/permissions.rs >/dev/null
 search "fn record_change_operation_for_tool" crates/deepcode-kernel-runtime/src/obligations.rs >/dev/null

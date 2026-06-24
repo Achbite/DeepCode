@@ -382,7 +382,8 @@ impl SkillExecutor for CodeSearchExecutor {
         }
         let includes = string_array(&invocation.input, "include");
         let excludes = string_array(&invocation.input, "exclude");
-        let strategy = get_string(&invocation.input, "strategy").unwrap_or_else(|| "literal".to_string());
+        let strategy =
+            get_string(&invocation.input, "strategy").unwrap_or_else(|| "literal".to_string());
         if strategy != "literal" {
             return Err(KernelError::NotImplemented("code.search.strategy"));
         }
@@ -396,8 +397,14 @@ impl SkillExecutor for CodeSearchExecutor {
             .get("maxResults")
             .and_then(Value::as_u64)
             .unwrap_or(CODE_SEARCH_DEFAULT_MAX_RESULTS as u64) as u32;
-        let result =
-            search_workspace_with_options(&root, &query, &includes, &excludes, context_lines, max_results)?;
+        let result = search_workspace_with_options(
+            &root,
+            &query,
+            &includes,
+            &excludes,
+            context_lines,
+            max_results,
+        )?;
         let returned_matches = result.matches.len();
         Ok(ok(
             invocation.id,
@@ -1685,7 +1692,6 @@ fn limit_text(value: &str, max_bytes: usize) -> String {
     }
     format!("{}…[truncated]", &value[..end])
 }
-
 
 #[cfg(test)]
 mod tests {

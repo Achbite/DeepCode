@@ -347,7 +347,10 @@ fn tool_template_for_descriptor(descriptor: &KernelToolDescriptor) -> KernelTool
         },
         fact: FactContract {
             evidence_kind: fact_kind_for_tool(descriptor.tool_id),
-            untrusted_evidence: matches!(descriptor.family, ToolFamily::Network | ToolFamily::Browser | ToolFamily::Provider),
+            untrusted_evidence: matches!(
+                descriptor.family,
+                ToolFamily::Network | ToolFamily::Browser | ToolFamily::Provider
+            ),
             validation_kind: validation_kind_for_tool(descriptor.tool_id),
         },
         cleanup: CleanupContract {
@@ -369,7 +372,12 @@ fn backend_for_tool(descriptor: &KernelToolDescriptor) -> ExecutionBackendKind {
 
 fn forbidden_fields_for_tool(tool_id: &str) -> Vec<String> {
     let fields: &[&str] = match tool_id {
-        "fs.delete" => &["content", "sourceBlockId", "replacementBlockId", "codeBlocks"],
+        "fs.delete" => &[
+            "content",
+            "sourceBlockId",
+            "replacementBlockId",
+            "codeBlocks",
+        ],
         "process.exec" => &["command"],
         _ => &[],
     };
@@ -1026,12 +1034,11 @@ impl OperationCompiler {
                 action_id: id.clone(),
             }
         })?;
-        let descriptor = self
-            .registry
-            .get(&tool_id)
-            .ok_or_else(|| OperationCompileError::UnsupportedToolId {
+        let descriptor = self.registry.get(&tool_id).ok_or_else(|| {
+            OperationCompileError::UnsupportedToolId {
                 tool_id: tool_id.clone(),
-            })?;
+            }
+        })?;
         let capability = descriptor.capability.to_string();
         let title = get_string(action, &["title", "description"]).unwrap_or_else(|| id.clone());
         let permission_labels = action
@@ -1075,15 +1082,17 @@ impl OperationCompiler {
                 permission_labels,
             )),
             "browser.open" | "browser.reload" | "browser.snapshot" | "browser.inspect"
-            | "browser.click" | "browser.type" | "browser.scroll" => Ok(external_browser_operation(
-                &self.registry,
-                action,
-                id,
-                title,
-                tool_id,
-                capability,
-                permission_labels,
-            )),
+            | "browser.click" | "browser.type" | "browser.scroll" => {
+                Ok(external_browser_operation(
+                    &self.registry,
+                    action,
+                    id,
+                    title,
+                    tool_id,
+                    capability,
+                    permission_labels,
+                ))
+            }
             "provider.call" => Ok(external_provider_operation(
                 &self.registry,
                 action,
@@ -1907,9 +1916,7 @@ fn workspace_kind_for_action(
         ("fs.read", "read") => Ok(WorkspaceOperationKind::Read),
         ("fs.list", "list") => Ok(WorkspaceOperationKind::List),
         ("code.search", "search") => Ok(WorkspaceOperationKind::Search),
-        ("fs.diff", "diff" | "previewDiff" | "preview_diff") => {
-            Ok(WorkspaceOperationKind::Diff)
-        }
+        ("fs.diff", "diff" | "previewDiff" | "preview_diff") => Ok(WorkspaceOperationKind::Diff),
         ("fs.write", "write") => Ok(WorkspaceOperationKind::Write),
         ("fs.write", "create") => Ok(WorkspaceOperationKind::Create),
         ("fs.patch", "patch" | "replaceBlock" | "insertBefore" | "insertAfter") => {
@@ -2136,10 +2143,7 @@ fn external_provider_operation(
     }
 }
 
-fn execution_mode_for_tool(
-    registry: &KernelToolRegistry,
-    tool_id: &str,
-) -> OperationExecutionMode {
+fn execution_mode_for_tool(registry: &KernelToolRegistry, tool_id: &str) -> OperationExecutionMode {
     registry
         .get(tool_id)
         .map(|descriptor| descriptor.execution_mode)

@@ -250,9 +250,7 @@ impl DeepCodeKernelRuntime {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                KernelError::InvalidCommand("host search requires query".to_string())
-            })?;
+            .ok_or_else(|| KernelError::InvalidCommand("host search requires query".to_string()))?;
         let includes = query
             .get("include")
             .and_then(Value::as_array)

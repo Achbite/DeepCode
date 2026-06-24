@@ -1,4 +1,3 @@
-
 use crate::prelude::*;
 use crate::{now_millis, now_text, AppState, SharedRuntime};
 pub(crate) fn record_kernel_events(state: &AppState, events: &[KernelEvent]) {

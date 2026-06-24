@@ -1271,14 +1271,14 @@ fn broker_workspace_output(events: Vec<KernelEvent>) -> KernelResult<Value> {
     for event in events {
         match event {
             KernelEvent::ToolCompleted {
-            ok: true,
-            output: Some(output),
-            ..
+                ok: true,
+                output: Some(output),
+                ..
             } => return Ok(output),
             KernelEvent::ToolCompleted {
-            ok: false,
-            error: Some(error),
-            ..
+                ok: false,
+                error: Some(error),
+                ..
             } => return Err(KernelError::Other(error.message)),
             other => last_unexpected = Some(other),
         }

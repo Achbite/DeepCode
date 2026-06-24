@@ -858,7 +858,6 @@ impl DeepCodeKernelRuntime {
             sequence: Some(sequence),
         })
     }
-
 }
 
 fn empty_workspace_binding() -> WorkspaceBinding {
@@ -1633,7 +1632,10 @@ fn canonical_action_identifiers(
                         "actionBundle.{array_key}[{index}] toolId is not in Kernel catalog: {tool_id}"
                     )
                 })?;
-            action_object.insert("capability".to_string(), Value::String(capability.to_string()));
+            action_object.insert(
+                "capability".to_string(),
+                Value::String(capability.to_string()),
+            );
         }
     }
     Ok(())

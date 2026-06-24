@@ -1,4 +1,3 @@
-
 use crate::prelude::*;
 use crate::*;
 
@@ -24,6 +23,8 @@ pub(crate) struct AgentSessionRunRequest {
     pub(crate) requirement_confirmation_mode: Option<String>,
     pub(crate) review_continuation_mode: Option<String>,
     pub(crate) intervention_level: Option<String>,
+    pub(crate) sub_agent_mode: Option<Value>,
+    pub(crate) sub_agent_max_parallel: Option<Value>,
     pub(crate) title: Option<String>,
     pub(crate) decision_kind: Option<String>,
     pub(crate) decision: Option<String>,
@@ -301,7 +302,22 @@ pub(crate) async fn agent_session_run_start(
         .clone()
         .or_else(|| user_setting_string(&state, "agent.interventionLevel"))
         .or_else(|| Some("medium".to_string()));
-    let request = host_bridge_request(&session_id, &run_id, &body, intervention_level);
+    let sub_agent_mode = normalize_sub_agent_mode(
+        body.sub_agent_mode.clone(),
+        user_setting_string(&state, "agent.subagents.mode"),
+    );
+    let sub_agent_max_parallel = normalize_sub_agent_max_parallel(
+        body.sub_agent_max_parallel.clone(),
+        user_setting_string(&state, "agent.subagents.maxParallel"),
+    );
+    let request = host_bridge_request(
+        &session_id,
+        &run_id,
+        &body,
+        intervention_level,
+        sub_agent_mode,
+        sub_agent_max_parallel,
+    );
     let worker_state = state.clone();
     let worker_session_id = session_id.clone();
     let worker_run_id = run_id.clone();
@@ -705,6 +721,8 @@ fn host_bridge_request(
     host_run_id: &str,
     body: &AgentSessionRunRequest,
     intervention_level: Option<String>,
+    sub_agent_mode: String,
+    sub_agent_max_parallel: u64,
 ) -> Value {
     let op = body.op.as_deref().unwrap_or_else(|| {
         if body.decision_kind.is_some() {
@@ -735,6 +753,8 @@ fn host_bridge_request(
         "requirementConfirmationMode": body.requirement_confirmation_mode.clone(),
         "reviewContinuationMode": body.review_continuation_mode.clone(),
         "interventionLevel": intervention_level,
+        "subAgentMode": sub_agent_mode,
+        "subAgentMaxParallel": sub_agent_max_parallel,
         "decisionKind": body.decision_kind.clone(),
         "decision": body.decision.clone(),
         "guidance": body.guidance.clone(),
@@ -749,6 +769,34 @@ fn user_setting_string(state: &AppState, key: &str) -> Option<String> {
         .get(key)
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn normalize_sub_agent_mode(value: Option<Value>, setting: Option<String>) -> String {
+    let raw = value
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or(setting);
+    match raw.as_deref() {
+        Some("auto") => "auto".to_string(),
+        Some("off") => "off".to_string(),
+        _ => "off".to_string(),
+    }
+}
+
+fn normalize_sub_agent_max_parallel(value: Option<Value>, setting: Option<String>) -> u64 {
+    let numeric = value
+        .as_ref()
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .as_ref()
+                .and_then(Value::as_str)
+                .and_then(|item| item.parse::<u64>().ok())
+        })
+        .or_else(|| setting.and_then(|item| item.parse::<u64>().ok()))
+        .unwrap_or(2);
+    numeric.clamp(2, 2)
 }
 
 fn daemon_api_base() -> String {
@@ -2101,6 +2149,55 @@ mod tests {
             }
         });
         assert_eq!(waiting_for_user_message(&event), None);
+    }
+
+    #[test]
+    fn sub_agent_runtime_settings_are_forwarded_to_host_bridge() {
+        let body = AgentSessionRunRequest {
+            content: Some("test request".to_string()),
+            sub_agent_mode: Some(json!("auto")),
+            sub_agent_max_parallel: Some(json!("2")),
+            ..Default::default()
+        };
+        let request = host_bridge_request(
+            "session-subagent-forward",
+            "run-subagent-forward",
+            &body,
+            Some("medium".to_string()),
+            normalize_sub_agent_mode(body.sub_agent_mode.clone(), None),
+            normalize_sub_agent_max_parallel(body.sub_agent_max_parallel.clone(), None),
+        );
+        assert_eq!(
+            request.get("subAgentMode").and_then(Value::as_str),
+            Some("auto")
+        );
+        assert_eq!(
+            request.get("subAgentMaxParallel").and_then(Value::as_u64),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_sub_agent_mode_defaults_to_off() {
+        assert_eq!(normalize_sub_agent_mode(None, None), "off");
+        assert_eq!(
+            normalize_sub_agent_mode(Some(json!("invalid")), None),
+            "off"
+        );
+        assert_eq!(
+            normalize_sub_agent_mode(None, Some("auto".to_string())),
+            "auto"
+        );
+        assert_eq!(
+            normalize_sub_agent_mode(None, Some("off".to_string())),
+            "off"
+        );
+        assert_eq!(normalize_sub_agent_max_parallel(None, None), 2);
+        assert_eq!(
+            normalize_sub_agent_max_parallel(Some(json!("invalid")), None),
+            2
+        );
+        assert_eq!(normalize_sub_agent_max_parallel(Some(json!(16)), None), 2);
     }
 
     #[test]

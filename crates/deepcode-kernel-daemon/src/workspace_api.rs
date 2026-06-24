@@ -297,15 +297,15 @@ pub(crate) fn dispatch_workspace(
     for event in events {
         match event {
             KernelEvent::ToolCompleted {
-            ok: true,
-            output: Some(output),
-            ..
-        } => return Ok(output),
+                ok: true,
+                output: Some(output),
+                ..
+            } => return Ok(output),
             KernelEvent::ToolCompleted {
-            ok: false,
-            error: Some(error),
-            ..
-        } => return Err(error),
+                ok: false,
+                error: Some(error),
+                ..
+            } => return Err(error),
             KernelEvent::ResourcePacketProduced { packet, .. } => {
                 if packet.get("source").and_then(Value::as_str) == Some("hostProjection") {
                     return Ok(packet.get("output").cloned().unwrap_or(Value::Null));
@@ -315,11 +315,11 @@ pub(crate) fn dispatch_workspace(
         }
     }
     Err(KernelErrorEnvelope {
-            code: "unexpected_event".to_string(),
-            message: "expected workspace host projection result".to_string(),
-            message_key: None,
-            args: None,
-        })
+        code: "unexpected_event".to_string(),
+        message: "expected workspace host projection result".to_string(),
+        message_key: None,
+        args: None,
+    })
 }
 
 pub(crate) fn ensure_workspace_binding(
