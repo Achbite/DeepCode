@@ -1378,6 +1378,12 @@ function ReviewSummaryCard({
     Boolean(runId);
   const facts = payloadArray(event.payload, 'facts');
   const gitReview = isRecord(event.payload) ? event.payload.gitReview : undefined;
+  const readableReview = isRecord(event.payload) && isRecord(event.payload.readableReview)
+    ? event.payload.readableReview
+    : undefined;
+  const readableChangedFiles = Array.isArray(readableReview?.changedFiles)
+    ? readableReview.changedFiles.filter(isRecord)
+    : [];
   const continuationCount =
     isRecord(event.payload) && typeof event.payload.continuationCount === 'number'
       ? event.payload.continuationCount
@@ -1386,7 +1392,39 @@ function ReviewSummaryCard({
     <section key={event.id} className={`agent-flow-card agent-flow-card--review agent-flow-card--${status}`}>
       <div className="agent-flow-card__title">{title}</div>
       <div className="agent-flow-card__summary">{summary}</div>
-      {content && content !== summary && <MarkdownContent content={content} />}
+      {readableChangedFiles.length > 0 && (
+        <div className="agent-flow-card__section">
+          <div className="agent-flow-card__section-title">
+            {t(language, 'agent.review.changedFiles')}
+          </div>
+          <ul className="agent-flow-card__facts">
+            {readableChangedFiles.slice(0, 64).map((file, index) => {
+              const path = stringField(file, 'path') ?? `file-${index + 1}`;
+              const operation = stringField(file, 'operation') ?? 'modify';
+              const statusText = stringField(file, 'status') ?? 'unknown';
+              const reason = stringField(file, 'failureReason') || stringField(file, 'failureClassification');
+              return (
+                <li key={`${path}-${operation}-${index}`}>
+                  {t(language, 'review.changedFile', { path, operation, status: statusText })}
+                  {reason && (
+                    <span className="agent-flow-card__fact-detail">
+                      {' '}
+                      {t(language, 'review.changedFile.reason', { reason })}
+                    </span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+      {content && content !== summary && readableChangedFiles.length === 0 && <MarkdownContent content={content} />}
+      {content && content !== summary && readableChangedFiles.length > 0 && (
+        <details className="agent-flow-card__details">
+          <summary>{t(language, 'agent.review.markdownFallback')}</summary>
+          <MarkdownContent content={content} />
+        </details>
+      )}
       {continuationCount > 0 && (
         <div className="agent-flow-card__section">
           <div className="agent-flow-card__section-title">
@@ -1397,7 +1435,12 @@ function ReviewSummaryCard({
           </div>
         </div>
       )}
-      {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
+      {facts.length > 0 && (
+        <details className="agent-flow-card__details">
+          <summary>{t(language, 'agent.review.auditDetails')}</summary>
+          <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>
+        </details>
+      )}
       <GitReviewDiffDetails gitReview={gitReview} language={language} />
       {llmGuidance && llmGuidance !== summary && (
         <details className="agent-flow-card__details">

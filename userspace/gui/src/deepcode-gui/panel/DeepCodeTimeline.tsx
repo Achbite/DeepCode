@@ -398,7 +398,7 @@ function appendActiveDeltaTurn(
   const committedActivityIds = collectCommittedActivityIds(view);
 
   const blocks: AgentTimelineBlock[] = [];
-  let textSegmentKind: 'thinking' | 'assistant' | null = null;
+  let textSegmentKind: 'thinking' | 'assistant' | 'draft' | null = null;
   let textSegmentStartKey = '';
   let textSegmentBody = '';
 
@@ -428,13 +428,30 @@ function appendActiveDeltaTurn(
         },
         events: [],
       });
-    } else {
+    } else if (textSegmentKind === 'assistant') {
       blocks.push({
         id: `active-assistant-${safeActiveBlockId(runId)}-${textSegmentStartKey}`,
         kind: 'assistant',
         narrativeKind: 'assistantText',
         title: 'DeepCode',
         summary: t(language, 'deepcodeGui.timeline.responding'),
+        status: segmentStatus,
+        defaultCollapsed: false,
+        bodyMarkdown: textSegmentBody,
+        displayHints: {
+          renderMode: 'typewriter',
+          typewriterSpeed: 'normal',
+          replaceOnComplete: true,
+        },
+        events: [],
+      });
+    } else {
+      blocks.push({
+        id: `active-draft-${safeActiveBlockId(runId)}-${textSegmentStartKey}`,
+        kind: 'stage',
+        narrativeKind: 'operationEvidence',
+        title: t(language, 'deepcodeGui.timeline.editDraft'),
+        summary: t(language, 'deepcodeGui.timeline.editDraftStreaming'),
         status: segmentStatus,
         defaultCollapsed: false,
         bodyMarkdown: textSegmentBody,
@@ -452,7 +469,7 @@ function appendActiveDeltaTurn(
   };
 
   const appendTextSegment = (
-    kind: 'thinking' | 'assistant',
+    kind: 'thinking' | 'assistant' | 'draft',
     delta: ProjectionDelta,
     index: number
   ) => {
@@ -468,6 +485,18 @@ function appendActiveDeltaTurn(
 
   for (let index = 0; index < parentDeltas.length; index += 1) {
     const delta = parentDeltas[index];
+    if (delta.type === 'part_delta' && delta.channel === 'reasoning' && typeof delta.delta === 'string') {
+      appendTextSegment('thinking', delta, index);
+      continue;
+    }
+    if (
+      (delta.type === 'draft_delta' || delta.type === 'part_delta') &&
+      (delta.channel === 'draft' || !delta.channel) &&
+      typeof delta.delta === 'string'
+    ) {
+      appendTextSegment('draft', delta, index);
+      continue;
+    }
     const activity = delta.activity;
     if (activity && !committedActivityIds.has(activity.activityId) && isMainTimelineActivity(activity)) {
       flushTextSegment(true);

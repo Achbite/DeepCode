@@ -343,10 +343,20 @@ function pruneActiveDeltasForCommittedEvents(existing: ProjectionDelta[], events
   const activityIds = new Set(events.map(eventActivityId).filter((id): id is string => Boolean(id)));
   const committedTextTypes = new Set<ProjectionDelta['type']>();
   for (const event of events) {
-    if (event.kind !== 'assistant_msg') continue;
-    const channel = eventStringField(event, 'channel');
-    if (channel === 'reasoning') committedTextTypes.add('reasoning_delta');
-    if (channel === 'final') committedTextTypes.add('assistant_delta');
+    if (event.kind === 'assistant_msg') {
+      const channel = eventStringField(event, 'channel');
+      if (channel === 'reasoning') committedTextTypes.add('reasoning_delta');
+      if (channel === 'final') committedTextTypes.add('assistant_delta');
+    }
+    if (
+      event.kind === 'plan_card' ||
+      event.kind === 'review_summary' ||
+      event.kind === 'error' ||
+      (event.kind === 'workflow_stage' && (eventStringField(event, 'stage') ?? '').startsWith('accepted_plan.'))
+    ) {
+      committedTextTypes.add('draft_delta');
+      committedTextTypes.add('part_delta');
+    }
   }
   if (activityIds.size === 0 && committedTextTypes.size === 0) return existing;
   return existing.filter((delta) => {
