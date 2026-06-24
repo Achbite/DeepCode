@@ -491,6 +491,10 @@ interface ActiveTurnState {
   stage: string;
   providerCallId?: string;
   partFrameParser?: ProviderPartFrameParser;
+  providerJsonStreamProgress?: Record<string, {
+    receivedChars: number;
+    lastEmittedChars: number;
+  }>;
 }
 
 interface ProjectionDeltaBranchContext {
@@ -1235,6 +1239,7 @@ export class SessionDriverLoop {
         interventionLevel: input.interventionLevel,
         subAgentMode: input.subAgentMode,
         subAgentMaxParallel: input.subAgentMaxParallel,
+        resumeResourcePackets: true,
         acceptedImplementationPlan: acceptedPlan,
         interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
       });
@@ -1928,6 +1933,7 @@ export class SessionDriverLoop {
             runId: state.runId,
             sessionId: state.sessionId,
             source: 'llm',
+            allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
           });
         } catch (repairError) {
           throw new SessionDriverLoopError(
@@ -1944,6 +1950,7 @@ export class SessionDriverLoop {
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
+        allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
       });
     } catch (error) {
       const parseError = normalizeParseError(error);
@@ -1968,6 +1975,7 @@ export class SessionDriverLoop {
           runId: state.runId,
           sessionId: state.sessionId,
           source: 'llm',
+          allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
         });
       } catch (repairError) {
         throw new SessionDriverLoopError(
@@ -2006,6 +2014,7 @@ export class SessionDriverLoop {
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
+        allowBriefActionBundleUserPlan: true,
       });
     } catch (error) {
       const parseError = normalizeParseError(error);
@@ -2029,6 +2038,7 @@ export class SessionDriverLoop {
           runId: state.runId,
           sessionId: state.sessionId,
           source: 'llm',
+          allowBriefActionBundleUserPlan: true,
         });
       } catch (repairError) {
         throw new SessionDriverLoopError(
@@ -4569,6 +4579,7 @@ export class SessionDriverLoop {
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
+        allowBriefActionBundleUserPlan: true,
       });
     } catch (error) {
       throw new SessionDriverLoopError(
@@ -4755,6 +4766,8 @@ export class SessionDriverLoop {
           delta: chunk.content,
           payload: chunk.rawProvider,
         }, deltaContext);
+      } else if (providerStageEmitsJsonProgress(stage)) {
+        await this.emitProviderJsonStreamProgress(state, stage, chunk.content, deltaContext);
       }
       return;
     }
@@ -4895,6 +4908,49 @@ export class SessionDriverLoop {
       turnId: activeTurn.turnId,
       seq: activeTurn.seq,
     });
+  }
+
+  private async emitProviderJsonStreamProgress(
+    state: SessionDriverLoopRunState,
+    stage: string,
+    content: string,
+    deltaContext?: ProjectionDeltaBranchContext
+  ): Promise<void> {
+    const activeTurn = state.activeTurn ?? {
+      turnId: this.id('active-turn'),
+      seq: 0,
+      stage,
+    };
+    activeTurn.providerJsonStreamProgress ??= {};
+    const progress = activeTurn.providerJsonStreamProgress[stage] ?? {
+      receivedChars: 0,
+      lastEmittedChars: 0,
+    };
+    progress.receivedChars += content.length;
+    activeTurn.providerJsonStreamProgress[stage] = progress;
+    state.activeTurn = activeTurn;
+
+    const shouldEmit = progress.lastEmittedChars === 0 ||
+      progress.receivedChars - progress.lastEmittedChars >= 1_500;
+    if (!shouldEmit) return;
+    progress.lastEmittedChars = progress.receivedChars;
+    const language = visibleLanguageForRequest(state.userRequest);
+    const summary = providerJsonStreamProgressSummary(language, progress.receivedChars);
+    await this.emitProjectionDelta(state, {
+      type: 'stage_delta',
+      stage,
+      status: 'streaming',
+      channel: 'progress',
+      source: 'session',
+      itemId: `${stage}-provider-json-progress`,
+      summary,
+      payload: {
+        stage,
+        receivedChars: progress.receivedChars,
+        rawJsonHidden: true,
+        reason: 'proposal_json_stream_hidden_from_assistant',
+      },
+    }, deltaContext);
   }
 
   private async emitKernelActivityDeltas(
@@ -5837,6 +5893,21 @@ function nativeToolDuplicateResult(
 
 function providerStageExposesAssistantDelta(stage: string): boolean {
   return stage === 'answer_stream' || stage === 'review_final';
+}
+
+function providerStageEmitsJsonProgress(stage: string): boolean {
+  return stage === 'accepted_plan_provider_call' ||
+    stage === 'accepted_plan_resource_resume' ||
+    stage === 'accepted_plan_resource_resume_repair' ||
+    stage === 'accepted_plan_scope_repair' ||
+    stage === 'accepted_plan_parent_fallback' ||
+    stage === 'accepted_plan_parent_fallback_repair';
+}
+
+function providerJsonStreamProgressSummary(language: VisibleLanguage, receivedChars: number): string {
+  return language === 'en-US'
+    ? `Generating the executable actionBundle draft (${receivedChars} chars received).`
+    : `正在生成可执行 actionBundle 草稿（已接收 ${receivedChars} 字符）。`;
 }
 
 function parseNativeToolArguments(raw: string, toolName: string): Record<string, unknown> {
@@ -7151,6 +7222,7 @@ function batchActionRecords(batch: unknown): Record<string, unknown>[] {
 
 function actionTargetCandidates(action: Record<string, unknown>): string[] {
   return uniqueStrings([
+    actionFileTargetPath(action),
     stringValue(action.targetPath),
     ...stringArrayValue(action.resourceScope),
   ]);
@@ -7667,13 +7739,79 @@ function parseAndValidateProposal(input: {
   runId: string;
   sessionId?: string;
   source?: 'llm' | 'user' | 'system' | 'cache';
+  allowBriefActionBundleUserPlan?: boolean;
 }): ProposalEnvelope {
   const proposal = parseProposalEnvelope(input);
-  validateProposalSemantics(proposal);
+  canonicalizeWriteActionSourceBlockRefs(proposal);
+  validateProposalSemantics(proposal, {
+    allowBriefActionBundleUserPlan: input.allowBriefActionBundleUserPlan === true,
+  });
   return proposal;
 }
 
-function validateProposalSemantics(proposal: ProposalEnvelope): void {
+function canonicalizeWriteActionSourceBlockRefs(proposal: ProposalEnvelope): void {
+  if (proposal.kind !== 'actionBundle') return;
+  const payload = objectRecord(proposal.payload);
+  const bundle = objectRecord(payload?.actionBundle);
+  const codeBlocks = Array.isArray(payload?.codeBlocks) ? payload.codeBlocks : [];
+  const actions = Array.isArray(bundle?.actions) ? bundle.actions : [];
+  if (!payload || !bundle || !codeBlocks.length || !actions.length) return;
+
+  const blocks = codeBlocks.flatMap((block) => {
+    const record = objectRecord(block);
+    const id = stringValue(record?.id) ?? stringValue(record?.blockId);
+    const targetPath = stringValue(record?.targetPath) ?? stringValue(record?.path);
+    if (!id || !targetPath) return [];
+    return [{ id, targetPath: normalizePlanScope(targetPath) }];
+  });
+  if (!blocks.length) return;
+
+  const fixes: Array<Record<string, unknown>> = [];
+  for (const [index, action] of actions.entries()) {
+    const record = objectRecord(action);
+    if (!record) continue;
+    const capability = actionEffectiveCapability(record);
+    if (capability !== 'fs.write') continue;
+    const args = objectRecord(record.args) ?? objectRecord(record.toolArgs);
+    const existingSource = stringValue(record.sourceBlockId) ?? stringValue(args?.sourceBlockId);
+    if (existingSource) continue;
+    const actionKind = stringValue(record.kind);
+    if (['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(actionKind ?? '')) continue;
+    const targetPath = actionFileTargetPath(record);
+    if (!targetPath) continue;
+    const normalizedTarget = normalizePlanScope(targetPath);
+    const matches = blocks.filter((block) => block.targetPath === normalizedTarget);
+    if (matches.length !== 1) continue;
+
+    const nextArgs = { ...(args ?? {}) };
+    nextArgs.sourceBlockId = matches[0].id;
+    record.args = nextArgs;
+    record.toolArgs = nextArgs;
+    record.sourceBlockId = matches[0].id;
+    fixes.push({
+      kind: 'fs_write_sourceBlockId_canonicalized',
+      actionIndex: index,
+      actionId: stringValue(record.actionId) ?? stringValue(record.id),
+      path: normalizedTarget,
+      sourceBlockId: matches[0].id,
+      reason: 'unique_codeBlock_targetPath_match',
+    });
+  }
+
+  if (!fixes.length) return;
+  const diagnostics = objectRecord(proposal.parserDiagnostics);
+  proposal.parserDiagnostics = {
+    ...(diagnostics ?? {}),
+    canonicalizations: [
+      ...(Array.isArray(diagnostics?.canonicalizations) ? diagnostics.canonicalizations : []),
+      ...fixes,
+    ],
+  };
+}
+
+function validateProposalSemantics(proposal: ProposalEnvelope, options?: {
+  allowBriefActionBundleUserPlan?: boolean;
+}): void {
   if (proposal.kind !== 'actionBundle') return;
   const payload = objectRecord(proposal.payload) ?? {};
   const bundle = readActionBundle(proposal);
@@ -7710,7 +7848,7 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
     if (size === 0 && !(allowEmptyContent && ['createEmpty', 'patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(operation))) {
       throw new AgentPlanParseError(
         'invalid_action_bundle',
-        `codeBlocks[${index}].content must be non-empty unless allowEmptyContent is explicitly set for a createEmpty or patch operation.`
+        `codeBlocks[${index}].content must be non-empty. Empty content is allowed only with operation="createEmpty" for an explicit empty file or with patch/replace/insert operations; do not use empty .gitkeep or placeholder writes to create directories.`
       );
     }
   }
@@ -7787,7 +7925,9 @@ function validateProposalSemantics(proposal: ProposalEnvelope): void {
     }
   }
   const userPlan = typeof payload.userPlan === 'string' ? payload.userPlan.trim() : '';
-  validateDetailedUserPlan(userPlan);
+  if (!options?.allowBriefActionBundleUserPlan) {
+    validateDetailedUserPlan(userPlan);
+  }
   const validationExpectations = Array.isArray(bundle.validationExpectations) ? bundle.validationExpectations : [];
   const reviewExpectations = Array.isArray(bundle.reviewExpectations) ? bundle.reviewExpectations : [];
   if (!validationExpectations.some((item) => item?.description?.trim())) {
@@ -8385,6 +8525,32 @@ interface SessionReviewContext {
   facts: string[];
 }
 
+interface ReadableReviewChangedFile {
+  path: string;
+  operation: string;
+  status: 'completed' | 'failed' | 'blocked' | 'unknown';
+  actionId?: string;
+  workUnitId?: string;
+  toolFactIds?: string[];
+  failureClassification?: string;
+  failureReason?: string;
+  summary: string;
+  messageKey: 'review.changedFile';
+  messageArgs: Record<string, string>;
+  auditRef?: string;
+  diffRef?: string;
+}
+
+interface ReadableReviewSummary {
+  schemaVersion: 'deepcode.session.readable-review.v1';
+  changedFiles: ReadableReviewChangedFile[];
+  operationCounts: Record<string, number>;
+  auditRefs: string[];
+  developerDetailsAvailable: boolean;
+  messageKey: 'review.summary';
+  messageArgs: Record<string, string>;
+}
+
 interface PendingPermissionContext {
   id: string;
   runId?: string;
@@ -8655,6 +8821,61 @@ function planAutoExecutableAfterRequirement(plan: SessionPlanContext): boolean {
   return hardFloorHits.length === 0 && deniedReasons.length === 0 && blockedReasons.length === 0;
 }
 
+function acceptedPlanTaskTargets(record: Record<string, unknown>): string[] {
+  const rawTargets = [
+    ...stringArrayValue(record.target),
+    ...stringArrayValue(record.targets),
+    ...stringArrayValue(record.targetPath),
+    ...stringArrayValue(record.targetPaths),
+    ...acceptedPlanTaskFileOperationTargets(record),
+  ];
+  const seen = new Set<string>();
+  const targets: string[] = [];
+  for (const target of rawTargets.flatMap(expandAcceptedPlanTargetValue)) {
+    const normalized = normalizePlanScope(target);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    targets.push(normalized);
+  }
+  return targets;
+}
+
+function acceptedPlanTaskFileOperationTargets(record: Record<string, unknown>): string[] {
+  const operations = Array.isArray(record.fileOperations) ? record.fileOperations : [];
+  const targets: string[] = [];
+  for (const operation of operations) {
+    const item = objectRecord(operation);
+    if (!item) continue;
+    const target = stringValue(item.targetPath)
+      ?? stringValue(item.path)
+      ?? fileTargetRefPath(item.targetRef);
+    if (target) targets.push(target);
+  }
+  return targets;
+}
+
+function expandAcceptedPlanTargetValue(value: string): string[] {
+  const normalized = normalizePlanScope(value);
+  if (!normalized) return [];
+  if (!normalized.includes(',')) return [normalized];
+  const parts = normalized
+    .split(',')
+    .map((part) => normalizePlanScope(part))
+    .filter(Boolean);
+  if (parts.length <= 1) return [normalized];
+  if (!parts.every(acceptedPlanTargetListSegmentSafe)) return [normalized];
+  return parts;
+}
+
+function acceptedPlanTargetListSegmentSafe(value: string): boolean {
+  const normalized = normalizePlanScope(value).replace(/\/+$/, '');
+  if (!normalized || normalized === '.' || normalized === '..' || normalized === '/') return false;
+  if (normalized.includes(',') || normalized.includes('*')) return false;
+  if (normalized.startsWith('../') || normalized.includes('/../')) return false;
+  if (isAbsolutePath(normalized)) return normalized.replace(/\/+$/, '').length > 1;
+  return true;
+}
+
 function acceptedImplementationPlanContext(
   plan: SessionPlanContext,
   interventionLevel?: InterventionLevel,
@@ -8685,7 +8906,7 @@ function acceptedImplementationPlanContext(
       taskId,
       title: stringValue(record.title),
       capability: stringValue(record.capability),
-      targets: stringArrayValue(record.target).map(normalizePlanScope).filter(Boolean),
+      targets: acceptedPlanTaskTargets(record),
       dependencies: legacyDependencies,
       hardDependencies,
       softOrderAfter: [...new Set([...explicitSoftOrder, ...legacyDependencies.filter((dependency) => !hardDependencies.includes(dependency))])],
@@ -9641,7 +9862,7 @@ function resolveEffectiveSubAgentSettings(
   const parentRunId = input.interactionOverlay?.parentRunId ?? input.acceptedImplementationPlan?.runId;
   const inherited = subAgentRuntimeSettingsFromEvents(input.existingEvents ?? [], parentRunId)
     ?? subAgentRuntimeSettingsFromEvents(input.existingEvents ?? []);
-  if (inherited?.mode) {
+  if (inherited?.mode === 'off') {
     return {
       mode: inherited.mode,
       maxParallel: clampSubAgentMaxParallel(input.subAgentMaxParallel ?? inherited.maxParallel),
@@ -9650,7 +9871,7 @@ function resolveEffectiveSubAgentSettings(
     };
   }
   return {
-    mode: 'auto',
+    mode: 'off',
     maxParallel: clampSubAgentMaxParallel(input.subAgentMaxParallel),
     source: 'default',
   };
@@ -11890,7 +12111,13 @@ function actionBatchFailureClassification(
   action: Record<string, unknown> | undefined,
   message: string | undefined
 ): string | undefined {
-  if (!action || actionEffectiveCapability(action) !== 'fs.delete') return undefined;
+  if (!action) return undefined;
+  const capability = actionEffectiveCapability(action);
+  const normalizedMessage = (message ?? '').toLowerCase();
+  if (capability === 'fs.patch' && normalizedMessage.includes('patch match did not occur')) {
+    return 'patch_stale_or_mismatched_evidence';
+  }
+  if (capability !== 'fs.delete') return undefined;
   if (!message?.includes('fs.write target path is empty')) return undefined;
   return 'kernel_delete_compile_mismatch';
 }
@@ -12064,7 +12291,7 @@ function exactOperationGrantsFromImplementationPlan(
       if (grant) grants.push(grant);
     }
     if (taskCapability === 'fs.delete' || taskCapability === 'fs.rename') {
-      for (const target of stringArrayValue(task.target)) {
+      for (const target of acceptedPlanTaskTargets(task)) {
         const grant = exactOperationGrantFromRawOperation({
           operation: taskCapability === 'fs.delete' ? 'delete' : 'rename',
           capability: taskCapability,
@@ -12386,9 +12613,9 @@ function reviewSummaryEvent(
     ? arrayLength(reviewFacts.toolResults)
     : kernelEvents.filter((event) => objectRecord(event)?.kind === 'tool.completed').length;
   const continuations = concreteContinuationExpectations(plan.actionBundle.continuationExpectations);
-  const summary = failed || blocked
-    ? '当前批次已推进，但存在失败或阻塞项，请审查 Kernel facts 后决定是否修订。'
-    : '当前批次已执行，请审查 Kernel tool facts 与验证结果。';
+  const language = visibleLanguageForRequest(plan.userPlan);
+  const summary = reviewWaitingSummary(failed, blocked, language);
+  const readableReview = buildReadableReviewSummary(kernelEvents, reviewFacts);
   return {
     id,
     sessionId,
@@ -12397,7 +12624,14 @@ function reviewSummaryEvent(
     payload: {
       title: 'Review',
       summary,
-      content: waitingReviewContent(plan, facts, summary, completed, failed, blocked, toolResults, continuations, gitReview, reviewFacts),
+      messageKey: failed || blocked ? 'review.summary.needsAttention' : 'review.summary.waitingUserReview',
+      messageArgs: {
+        completed: String(completed),
+        failed: String(failed),
+        blocked: String(blocked),
+        toolResults: String(toolResults),
+      },
+      content: waitingReviewContent(plan, readableReview, summary, completed, failed, blocked, toolResults, continuations, gitReview, reviewFacts, language),
       status: 'waitingUserReview',
       runId: plan.runId,
       reviewId: `${plan.runId}:${plan.planId}`,
@@ -12409,6 +12643,13 @@ function reviewSummaryEvent(
       reviewExpectations: Array.isArray(plan.actionBundle.reviewExpectations) ? plan.actionBundle.reviewExpectations : [],
       reviewFacts,
       gitReview,
+      readableReview,
+      changedFiles: readableReview.changedFiles,
+      developerDetails: {
+        facts,
+        reviewFacts,
+        gitReview,
+      },
       facts,
       factCounts: {
         workUnitsCompleted: completed,
@@ -12488,7 +12729,7 @@ function runIdFromKernelEvents(kernelEvents: unknown[]): string | undefined {
 
 function waitingReviewContent(
   plan: SessionPlanContext,
-  facts: string[],
+  readableReview: ReadableReviewSummary,
   summary: string,
   completed: number,
   failed: number,
@@ -12496,56 +12737,339 @@ function waitingReviewContent(
   toolResults: number,
   continuations: unknown[],
   gitReview?: Record<string, unknown>,
-  reviewFacts?: Record<string, unknown>
+  reviewFacts?: Record<string, unknown>,
+  language: VisibleLanguage = 'zh-CN'
 ): string {
-  const reviewLines = reviewExpectationLines(plan);
-  const gitLines = gitReviewSummaryLines(gitReview);
-  const generatedLines = reviewGeneratedArtifactLines(reviewFacts);
-  const normalizationLines = reviewPathNormalizationLines(reviewFacts);
+  const reviewLines = reviewExpectationLines(plan, language);
+  const labels = reviewContentLabels(language);
+  const gitLines = gitReviewSummaryLines(gitReview, language);
+  const generatedLines = reviewGeneratedArtifactLines(reviewFacts, language);
+  const normalizationLines = reviewPathNormalizationLines(reviewFacts, language);
+  const changedFileLines = readableReviewChangedFileLines(readableReview, language);
   return [
     '## Review',
     '',
     summary,
     '',
-    '### 执行结果',
-    `- WorkUnit 完成：${completed}`,
-    `- WorkUnit 失败：${failed}`,
-    `- WorkUnit 阻塞：${blocked}`,
-    `- Tool facts：${toolResults}`,
+    `### ${labels.executionResult}`,
+    `- ${labels.workUnitsCompleted}：${completed}`,
+    `- ${labels.workUnitsFailed}：${failed}`,
+    `- ${labels.workUnitsBlocked}：${blocked}`,
+    `- ${labels.toolFacts}：${toolResults}`,
     '',
-    '### Kernel facts',
-    facts.length ? facts.join('\n') : '- 当前批次没有可展示的 Kernel facts。',
+    `### ${labels.changedFiles}`,
+    changedFileLines.length ? changedFileLines.join('\n') : `- ${labels.noChangedFiles}`,
     '',
-    '### 本轮 Agent 生成产物',
-    generatedLines.length ? generatedLines.join('\n') : '- 当前 ReviewFacts 没有记录 agentGenerated 产物。',
+    `### ${labels.generatedArtifacts}`,
+    generatedLines.length ? generatedLines.join('\n') : `- ${labels.noGeneratedArtifacts}`,
     '',
-    '### 路径归一化诊断',
-    normalizationLines.length ? normalizationLines.join('\n') : '- 当前没有路径前缀剥离或重复根路径诊断。',
+    `### ${labels.pathDiagnostics}`,
+    normalizationLines.length ? normalizationLines.join('\n') : `- ${labels.noPathDiagnostics}`,
     '',
-    '### Git 变更',
-    gitLines.length ? gitLines.join('\n') : '- 当前没有可展示的 Git 变更事实。',
+    `### ${labels.gitChanges}`,
+    gitLines.length ? gitLines.join('\n') : `- ${labels.noGitChanges}`,
     '',
-    '### 原计划摘要',
+    `### ${labels.auditDetails}`,
+    readableReview.developerDetailsAvailable
+      ? `- ${labels.auditDetailsAvailable}`
+      : `- ${labels.noAuditDetails}`,
+    readableReview.auditRefs.length ? `- auditRefs：${readableReview.auditRefs.slice(0, 12).join(', ')}` : '- auditRefs：none',
+    '',
+    `### ${labels.originalPlan}`,
     clip(plan.userPlan, 1200),
     '',
-    '### 验证与启动建议',
-    reviewLines.length ? reviewLines.join('\n') : '- 当前计划未提供可执行验证命令，需要下一轮补充。',
+    `### ${labels.validation}`,
+    reviewLines.length ? reviewLines.join('\n') : `- ${labels.noValidation}`,
     '',
-    '### 后续决策',
+    `### ${labels.nextDecision}`,
     failed || blocked
-      ? '- 空输入通过并结束当前批次，不会自动执行失败项；如需修复，请在输入框输入 Review 修改意见，系统会重新进入 Plan。'
-      : '- 空输入通过并结束当前批次；输入文字会作为 Review 修订意见，系统会重新进入 Plan。',
+      ? `- ${labels.failedDecisionHint}`
+      : `- ${labels.successDecisionHint}`,
     continuations.length
-      ? `- 当前计划登记了 ${continuations.length} 个后续意图；Review 通过后会按 agent.reviewContinuationMode 处理。自动模式会生成下一批 Plan；新 Plan 仍需确认，确认后的合规 actionBundle 会自动提交 Kernel 执行。`
-      : '- 当前计划没有登记后续批次。',
+      ? `- ${labels.continuationHint.replace('{count}', String(continuations.length))}`
+      : `- ${labels.noContinuation}`,
   ].join('\n');
 }
 
-function gitReviewSummaryLines(gitReview?: Record<string, unknown>): string[] {
+function reviewWaitingSummary(failed: number, blocked: number, language: VisibleLanguage): string {
+  if (language === 'en-US') {
+    return failed || blocked
+      ? 'The current batch progressed but has failed or blocked items. Review the facts and decide whether to revise.'
+      : 'The current batch has executed. Review the tool facts and validation results.';
+  }
+  return failed || blocked
+    ? '当前批次已推进，但存在失败或阻塞项，请审查事实后决定是否修订。'
+    : '当前批次已执行，请审查工具事实与验证结果。';
+}
+
+function reviewContentLabels(language: VisibleLanguage): Record<string, string> {
+  if (language === 'en-US') {
+    return {
+      executionResult: 'Execution Result',
+      workUnitsCompleted: 'WorkUnits completed',
+      workUnitsFailed: 'WorkUnits failed',
+      workUnitsBlocked: 'WorkUnits blocked',
+      toolFacts: 'Tool facts',
+      changedFiles: 'Files Changed In This Batch',
+      noChangedFiles: 'No file-level change summary was recorded for this batch.',
+      generatedArtifacts: 'Agent Generated Artifacts',
+      noGeneratedArtifacts: 'ReviewFacts did not record agentGenerated artifacts.',
+      pathDiagnostics: 'Path Normalization Diagnostics',
+      noPathDiagnostics: 'No path prefix stripping or duplicate-root diagnostics were recorded.',
+      gitChanges: 'Git Changes',
+      noGitChanges: 'No Git change facts are available.',
+      auditDetails: 'Audit Details',
+      auditDetailsAvailable: 'Raw Kernel facts, tool facts, and ReviewFacts are retained in developerDetails / audit refs. The main view does not expand full JSON.',
+      noAuditDetails: 'No developerDetails are available.',
+      originalPlan: 'Original Plan Summary',
+      validation: 'Validation And Startup Suggestions',
+      noValidation: 'The current plan did not provide an executable validation command; add one in a later turn if needed.',
+      nextDecision: 'Next Decision',
+      failedDecisionHint: 'Empty input accepts and closes the current batch without retrying failed items; type Review feedback to re-enter planning.',
+      successDecisionHint: 'Empty input accepts and closes the current batch; typed text is treated as Review revision feedback and re-enters planning.',
+      continuationHint: 'The current plan recorded {count} continuation intent(s). Review acceptance follows agent.reviewContinuationMode. Auto mode generates the next Plan only; the new Plan still requires confirmation.',
+      noContinuation: 'The current plan did not record continuation batches.',
+    };
+  }
+  return {
+    executionResult: '执行结果',
+    workUnitsCompleted: 'WorkUnit 完成',
+    workUnitsFailed: 'WorkUnit 失败',
+    workUnitsBlocked: 'WorkUnit 阻塞',
+    toolFacts: 'Tool facts',
+    changedFiles: '本轮实际改动文件',
+    noChangedFiles: '当前批次没有记录文件级变更摘要。',
+    generatedArtifacts: '本轮 Agent 生成产物',
+    noGeneratedArtifacts: '当前 ReviewFacts 没有记录 agentGenerated 产物。',
+    pathDiagnostics: '路径归一化诊断',
+    noPathDiagnostics: '当前没有路径前缀剥离或重复根路径诊断。',
+    gitChanges: 'Git 变更',
+    noGitChanges: '当前没有可展示的 Git 变更事实。',
+    auditDetails: '审计详情',
+    auditDetailsAvailable: '原始 Kernel facts、tool facts 与 ReviewFacts 已保留在 developerDetails / audit refs 中，主视图不展开完整 JSON。',
+    noAuditDetails: '当前没有可展开的 developerDetails。',
+    originalPlan: '原计划摘要',
+    validation: '验证与启动建议',
+    noValidation: '当前计划未提供可执行验证命令，需要下一轮补充。',
+    nextDecision: '后续决策',
+    failedDecisionHint: '空输入通过并结束当前批次，不会自动执行失败项；如需修复，请在输入框输入 Review 修改意见，系统会重新进入 Plan。',
+    successDecisionHint: '空输入通过并结束当前批次；输入文字会作为 Review 修订意见，系统会重新进入 Plan。',
+    continuationHint: '当前计划登记了 {count} 个后续意图；Review 通过后会按 agent.reviewContinuationMode 处理。自动模式会生成下一批 Plan；新 Plan 仍需确认，确认后的合规 actionBundle 会自动提交 Kernel 执行。',
+    noContinuation: '当前计划没有登记后续批次。',
+  };
+}
+
+function buildReadableReviewSummary(
+  kernelEvents: unknown[],
+  reviewFacts?: Record<string, unknown>
+): ReadableReviewSummary {
+  const changedFiles = new Map<string, ReadableReviewChangedFile>();
+  const auditRefs: string[] = [];
+  const generatedArtifacts = Array.isArray(reviewFacts?.generatedArtifacts) ? reviewFacts.generatedArtifacts : [];
+  for (const item of generatedArtifacts) {
+    const record = objectRecord(item);
+    if (!record) continue;
+    const path = reviewDisplayPath(record);
+    if (!path) continue;
+    const operation = reviewOperation(record);
+    const actionId = stringValue(record.actionId);
+    const key = `${path}:${operation}:${actionId ?? ''}`;
+    changedFiles.set(key, {
+      path,
+      operation,
+      status: 'completed',
+      actionId,
+      summary: `${path} operation=${operation}`,
+      messageKey: 'review.changedFile',
+      messageArgs: { path, operation, status: 'completed' },
+      auditRef: actionId,
+    });
+    if (actionId) auditRefs.push(actionId);
+  }
+
+  const completedWorkUnits = Array.isArray(reviewFacts?.completedWorkUnits) ? reviewFacts.completedWorkUnits : [];
+  const failedWorkUnits = Array.isArray(reviewFacts?.failedWorkUnits) ? reviewFacts.failedWorkUnits : [];
+  const blockedWorkUnits = Array.isArray(reviewFacts?.blockedWorkUnits) ? reviewFacts.blockedWorkUnits : [];
+  for (const item of completedWorkUnits) addReviewWorkUnitFile(changedFiles, auditRefs, item, 'completed');
+  for (const item of failedWorkUnits) addReviewWorkUnitFile(changedFiles, auditRefs, item, 'failed');
+  for (const item of blockedWorkUnits) addReviewWorkUnitFile(changedFiles, auditRefs, item, 'blocked');
+
+  const toolResults = Array.isArray(reviewFacts?.toolResults) ? reviewFacts.toolResults : [];
+  for (const item of toolResults) addReviewToolFile(changedFiles, auditRefs, item);
+
+  if (!changedFiles.size) {
+    for (const event of kernelEvents) {
+      const record = objectRecord(event);
+      if (!record) continue;
+      const kind = stringValue(record.kind);
+      if (kind === 'work_unit.completed') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'completed');
+      if (kind === 'work_unit.failed') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'failed');
+      if (kind === 'work_unit.blocked') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'blocked');
+      if (kind === 'tool.completed') addReviewToolFile(changedFiles, auditRefs, record);
+    }
+  }
+
+  const files = [...changedFiles.values()];
+  const operationCounts: Record<string, number> = {};
+  for (const file of files) operationCounts[file.operation] = (operationCounts[file.operation] ?? 0) + 1;
+  return {
+    schemaVersion: 'deepcode.session.readable-review.v1',
+    changedFiles: files,
+    operationCounts,
+    auditRefs: [...new Set(auditRefs.filter((item) => item.trim().length > 0))],
+    developerDetailsAvailable: Boolean(reviewFacts) || kernelEvents.length > 0,
+    messageKey: 'review.summary',
+    messageArgs: {
+      changedFiles: String(files.length),
+      auditRefs: String(auditRefs.length),
+    },
+  };
+}
+
+function addReviewWorkUnitFile(
+  changedFiles: Map<string, ReadableReviewChangedFile>,
+  auditRefs: string[],
+  value: unknown,
+  status: ReadableReviewChangedFile['status']
+): void {
+  const record = objectRecord(value);
+  if (!record) return;
+  const output = objectRecord(record.output);
+  const path = reviewDisplayPath(output) ?? reviewDisplayPath(record);
+  if (!path) return;
+  const actionId = stringValue(output?.actionId) ?? stringValue(record.actionId);
+  const workUnitId = stringValue(record.workUnitId);
+  const operation = reviewOperation(output ?? record);
+  const failure = status === 'failed' || status === 'blocked'
+    ? reviewFailureDetail(record, output)
+    : {};
+  const key = `${path}:${operation}:${workUnitId ?? actionId ?? status}`;
+  changedFiles.set(key, {
+    path,
+    operation,
+    status,
+    actionId,
+    workUnitId,
+    failureClassification: failure.classification,
+    failureReason: failure.reason,
+    summary: failure.reason
+      ? `${path} operation=${operation} status=${status} reason=${failure.reason}`
+      : `${path} operation=${operation} status=${status}`,
+    messageKey: 'review.changedFile',
+    messageArgs: { path, operation, status, reason: failure.reason ?? '' },
+    auditRef: workUnitId ?? actionId,
+  });
+  if (workUnitId) auditRefs.push(workUnitId);
+  if (actionId) auditRefs.push(actionId);
+}
+
+function addReviewToolFile(
+  changedFiles: Map<string, ReadableReviewChangedFile>,
+  auditRefs: string[],
+  value: unknown
+): void {
+  const record = objectRecord(value);
+  if (!record) return;
+  const output = objectRecord(record.output);
+  const path = reviewDisplayPath(output) ?? reviewDisplayPath(record);
+  if (!path) return;
+  const toolName = stringValue(record.toolName) ?? stringValue(output?.toolName);
+  const actionId = stringValue(output?.actionId) ?? stringValue(record.actionId);
+  const toolFactId = stringValue(record.toolCallId) ?? stringValue(record.factId);
+  const operation = reviewOperation(output ?? record, toolName);
+  const status = record.ok === false ? 'failed' : 'completed';
+  const key = `${path}:${operation}:${toolFactId ?? actionId ?? status}`;
+  const existing = changedFiles.get(key);
+  const failure = status === 'failed' ? reviewFailureDetail(record, output) : {};
+  changedFiles.set(key, {
+    path,
+    operation,
+    status,
+    actionId: actionId ?? existing?.actionId,
+    workUnitId: existing?.workUnitId,
+    toolFactIds: [...new Set([...(existing?.toolFactIds ?? []), toolFactId].filter((item): item is string => Boolean(item)))],
+    failureClassification: failure.classification ?? existing?.failureClassification,
+    failureReason: failure.reason ?? existing?.failureReason,
+    summary: failure.reason
+      ? `${path} operation=${operation} status=${status} reason=${failure.reason}`
+      : `${path} operation=${operation} status=${status}`,
+    messageKey: 'review.changedFile',
+    messageArgs: { path, operation, status, reason: failure.reason ?? existing?.failureReason ?? '' },
+    auditRef: toolFactId ?? actionId,
+  });
+  if (toolFactId) auditRefs.push(toolFactId);
+  if (actionId) auditRefs.push(actionId);
+}
+
+function readableReviewChangedFileLines(readableReview: ReadableReviewSummary, language: VisibleLanguage): string[] {
+  return readableReview.changedFiles.slice(0, 64).map((item) => {
+    const ids = [
+      item.actionId ? `action=${item.actionId}` : '',
+      item.workUnitId ? `workUnit=${item.workUnitId}` : '',
+      item.toolFactIds?.length ? `toolFacts=${item.toolFactIds.join(',')}` : '',
+    ].filter(Boolean).join(' ');
+    return `- \`${item.path}\` operation=${item.operation} status=${item.status}${ids ? ` ${ids}` : ''}`;
+  }).concat(readableReview.changedFiles.length > 64
+    ? [language === 'en-US'
+      ? `- ${readableReview.changedFiles.length - 64} additional file-level change(s) are not expanded.`
+      : `- 另有 ${readableReview.changedFiles.length - 64} 个文件级变更未展开。`]
+    : []);
+}
+
+function reviewDisplayPath(record?: Record<string, unknown> | null): string | undefined {
+  if (!record) return undefined;
+  return stringValue(record.path)
+    ?? stringValue(record.targetPath)
+    ?? stringValue(record.normalizedTargetPath)
+    ?? stringValue(objectRecord(record.pathNormalization)?.normalizedTargetPath)
+    ?? stringValue(record.absolutePath)
+    ?? stringArrayValue(record.writeSet)[0]
+    ?? stringArrayValue(record.deleteSet)[0];
+}
+
+function reviewFailureDetail(
+  record?: Record<string, unknown> | null,
+  output?: Record<string, unknown> | null
+): { classification?: string; reason?: string } {
+  const error = objectRecord(record?.error) ?? objectRecord(output?.error);
+  const reason = stringValue(record?.message)
+    ?? stringValue(record?.summary)
+    ?? stringValue(error?.message)
+    ?? stringValue(record?.reason)
+    ?? stringValue(output?.message);
+  const normalized = (reason ?? '').toLowerCase();
+  const classification = normalized.includes('patch match did not occur')
+    ? 'patch_stale_or_mismatched_evidence'
+    : stringValue(record?.classification)
+      ?? stringValue(output?.classification)
+      ?? stringValue(record?.code)
+      ?? stringValue(error?.code);
+  return { classification, reason };
+}
+
+function reviewOperation(record?: Record<string, unknown> | null, toolName?: string): string {
+  if (!record) return operationFromToolName(toolName);
+  return stringValue(record.operation)
+    ?? operationFromToolName(stringValue(record.toolName) ?? toolName)
+    ?? stringValue(record.kind)
+    ?? 'modify';
+}
+
+function operationFromToolName(toolName?: string): string {
+  if (!toolName) return 'modify';
+  if (toolName === 'fs.write') return 'write';
+  if (toolName === 'fs.patch') return 'patch';
+  if (toolName === 'fs.delete') return 'delete';
+  if (toolName === 'fs.rename') return 'rename';
+  if (toolName.startsWith('fs.')) return toolName.slice(3);
+  return toolName;
+}
+
+function gitReviewSummaryLines(gitReview?: Record<string, unknown>, language: VisibleLanguage = 'zh-CN'): string[] {
   if (!gitReview) return [];
   if (gitReview.available === false) {
     const reason = stringValue(gitReview.reason) ?? 'Git review is unavailable.';
-    return [`- Git diff 不可用：${reason}`];
+    return [language === 'en-US' ? `- Git diff unavailable: ${reason}` : `- Git diff 不可用：${reason}`];
   }
   const lines: string[] = [];
   const summary = stringValue(gitReview.summary);
@@ -12555,7 +13079,9 @@ function gitReviewSummaryLines(gitReview?: Record<string, unknown>): string[] {
   const stagedBytes = typeof stats?.stagedDiffBytes === 'number' ? stats.stagedDiffBytes : 0;
   const unstagedBytes = typeof stats?.unstagedDiffBytes === 'number' ? stats.unstagedDiffBytes : 0;
   if (changedFiles !== undefined) {
-    lines.push(`- 文件数：${changedFiles}；staged diff：${stagedBytes} bytes；unstaged diff：${unstagedBytes} bytes。`);
+    lines.push(language === 'en-US'
+      ? `- Files: ${changedFiles}; staged diff: ${stagedBytes} bytes; unstaged diff: ${unstagedBytes} bytes.`
+      : `- 文件数：${changedFiles}；staged diff：${stagedBytes} bytes；unstaged diff：${unstagedBytes} bytes。`);
   }
   const files = Array.isArray(gitReview.files) ? gitReview.files : [];
   for (const item of files.slice(0, 12)) {
@@ -12563,13 +13089,17 @@ function gitReviewSummaryLines(gitReview?: Record<string, unknown>): string[] {
     const path = stringValue(record?.path);
     if (path) lines.push(`- \`${path}\``);
   }
-  if (files.length > 12) lines.push(`- 另有 ${files.length - 12} 个文件未在摘要中展开。`);
+  if (files.length > 12) lines.push(language === 'en-US'
+    ? `- ${files.length - 12} additional file(s) are not expanded in the summary.`
+    : `- 另有 ${files.length - 12} 个文件未在摘要中展开。`);
   const diffBlocks = Array.isArray(gitReview.diffBlocks) ? gitReview.diffBlocks : [];
-  if (diffBlocks.length) lines.push('- 完整 diff 已附加为可折叠 Review 证据。');
+  if (diffBlocks.length) lines.push(language === 'en-US'
+    ? '- Full diff is attached as collapsible Review evidence.'
+    : '- 完整 diff 已附加为可折叠 Review 证据。');
   return lines;
 }
 
-function reviewGeneratedArtifactLines(reviewFacts?: Record<string, unknown>): string[] {
+function reviewGeneratedArtifactLines(reviewFacts?: Record<string, unknown>, language: VisibleLanguage = 'zh-CN'): string[] {
   const artifacts = Array.isArray(reviewFacts?.generatedArtifacts) ? reviewFacts.generatedArtifacts : [];
   return artifacts.slice(0, 24).map((item) => {
     const record = objectRecord(item) ?? {};
@@ -12577,10 +13107,14 @@ function reviewGeneratedArtifactLines(reviewFacts?: Record<string, unknown>): st
     const operation = stringValue(record.operation) ?? stringValue(record.toolName) ?? 'write';
     const hash = stringValue(record.contentHash);
     return `- \`${path}\` operation=${operation}${hash ? ` contentHash=${hash}` : ''}`;
-  }).concat(artifacts.length > 24 ? [`- 另有 ${artifacts.length - 24} 个 agentGenerated 产物未展开。`] : []);
+  }).concat(artifacts.length > 24
+    ? [language === 'en-US'
+      ? `- ${artifacts.length - 24} additional agentGenerated artifact(s) are not expanded.`
+      : `- 另有 ${artifacts.length - 24} 个 agentGenerated 产物未展开。`]
+    : []);
 }
 
-function reviewPathNormalizationLines(reviewFacts?: Record<string, unknown>): string[] {
+function reviewPathNormalizationLines(reviewFacts?: Record<string, unknown>, language: VisibleLanguage = 'zh-CN'): string[] {
   const diagnostics = Array.isArray(reviewFacts?.pathNormalizationDiagnostics)
     ? reviewFacts.pathNormalizationDiagnostics
     : [];
@@ -12595,7 +13129,11 @@ function reviewPathNormalizationLines(reviewFacts?: Record<string, unknown>): st
       : [];
     const duplicate = record.duplicateRootPathDetected === true || normalization.duplicateRootPathDetected === true;
     return `- \`${path}\`${original ? ` original=${original}` : ''}${normalized ? ` normalized=${normalized}` : ''}${stripped.length ? ` stripped=${stripped.join(', ')}` : ''}${duplicate ? ' duplicateRootPathDetected=true' : ''}`;
-  }).concat(diagnostics.length > 24 ? [`- 另有 ${diagnostics.length - 24} 条路径归一化诊断未展开。`] : []);
+  }).concat(diagnostics.length > 24
+    ? [language === 'en-US'
+      ? `- ${diagnostics.length - 24} additional path normalization diagnostic(s) are not expanded.`
+      : `- 另有 ${diagnostics.length - 24} 条路径归一化诊断未展开。`]
+    : []);
 }
 
 function reviewFactLines(kernelEvents: unknown[]): string[] {
@@ -12665,10 +13203,18 @@ function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
 }
 
-function reviewExpectationLines(plan: SessionPlanContext): string[] {
+function reviewExpectationLines(plan: SessionPlanContext, language: VisibleLanguage = 'zh-CN'): string[] {
   const lines: string[] = [];
-  if (plan.expectedValidation.trim()) lines.push(`- 验证要求：${plan.expectedValidation.trim()}`);
-  if (plan.reviewGuide.trim()) lines.push(`- Review 指引：${plan.reviewGuide.trim()}`);
+  if (plan.expectedValidation.trim()) {
+    lines.push(language === 'en-US'
+      ? `- Validation expectation: ${plan.expectedValidation.trim()}`
+      : `- 验证要求：${plan.expectedValidation.trim()}`);
+  }
+  if (plan.reviewGuide.trim()) {
+    lines.push(language === 'en-US'
+      ? `- Review guide: ${plan.reviewGuide.trim()}`
+      : `- Review 指引：${plan.reviewGuide.trim()}`);
+  }
   const expectations = Array.isArray(plan.actionBundle.reviewExpectations) ? plan.actionBundle.reviewExpectations : [];
   for (const item of expectations) {
     const record = objectRecord(item);
@@ -12835,6 +13381,8 @@ function implementationPlanExecutionRequest(
   return [
     '用户已接受 Kernel execution contract。现在进入 Edit 阶段，生成下一批可执行候选 actionBundle。',
     '已接受的计划/contract 是 intent/checklist，不是执行事实；不得声称文件已创建、测试已通过或权限已授予。',
+    'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. Final workspace writes still come only from the complete actionBundle JSON.',
+    'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
     '选择当前任务清单中的相关工作，允许在同一个 actionBundle 中输出多个相关文件或动作；文件数、任务数、codeBlock 数不是权限边界。',
     '任务依赖约定：hardDependencies 才代表必须等待的真实阻塞依赖；softOrderAfter / legacy dependencies 只是展示顺序，不应阻止独立任务草稿并行。不要把普通工程顺序写成 hard dependency。',
     'actionBundle.actions 必须使用 actionId、toolId、args、description、dependsOn；Kernel 会从 toolId 和 args 派生 capability、permission、readSet/writeSet/conflictKeys。',
@@ -12849,6 +13397,7 @@ function implementationPlanExecutionRequest(
       : 'workspace 内 args.path、codeBlocks.targetPath 必须是相对 workspace root 的路径；只有已确认计划中的外部文件目标可以使用绝对文件路径，禁止 ../。',
     '该 actionBundle 如果落在 accepted contract 的 target/tool 范围内，会由 Session 提交 Kernel 执行；新增 target/tool 必须返回 decisionRequest，而不是隐式扩展。',
     '执行批次不要携带 workspace root、"."、module root、通配符、accessScopes、resourceScope 或 capability；已确认 Kernel contract 才是授权来源。',
+    'accepted task target 如果是目录（例如 src/），它只是文件分组范围；不要输出目录创建 action、空 .gitkeep 占位写入或空 contentLines。请输出该目录下的具体文件 fs.write/fs.patch action；新文件写入时父目录由 Kernel 创建。',
     '不要重新询问已确认的技术路线、目录结构、Docker/script workflow、模块拆分或验证策略。',
     '如果发现必须新增 target/tool，或缺少关键技术选择，请返回 kind="decisionRequest"，而不是输出超范围 actionBundle。',
     '本轮 actionBundle 必须包含具体 codeBlocks（如需要）和 Kernel 可审查的 validationExpectations/reviewExpectations；validationExpectations 使用 [{id,description,command?}]，reviewExpectations 使用 [{id,description}]。',
@@ -12882,6 +13431,8 @@ function acceptedPlanResourceResumePrompt(
   return [
     'Accepted-plan resource resume checkpoint.',
     'You are resuming the same accepted taskPlan after Session resolved read-only evidence. Do not restart planning, do not ask for already-confirmed scope, and do not claim execution facts.',
+    'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. These frames are draft ledger previews only; final workspace writes still come only from the complete actionBundle JSON.',
+    'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
     'Return exactly one Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, or diagnostic.',
     resourceRequestProtocolShapeLine(),
     'Prefer actionBundle if the just-resolved evidence is sufficient for the current task. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
@@ -12893,6 +13444,7 @@ function acceptedPlanResourceResumePrompt(
     `Resolved ResourcePacket id=${packet.id}; itemCount=${packet.items.length}:`,
     fenced(clip(JSON.stringify(resourceItems, null, 2), 6_000)),
     'ActionBundle constraints: use concrete tool actions only; codeBlocks use contentLines; patch match text must come from the resolved ResourcePacket or another fresh ResourcePacket; new files may be complete writes if in accepted scope.',
+    'Directory targets are planning scopes only. Do not output empty .gitkeep or placeholder writes to create directories; write concrete files and let Kernel create parent directories.',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -13459,6 +14011,7 @@ function repairMessages(
         'For initial side-effect work, output taskPlan unless acceptedTaskPlan context is already present. For Complete stage work after acceptedTaskPlan, output a smaller actionBundle batch.',
         ...actionBundleProtocolShapeLines(),
         'Use codeBlocks[].contentLines for source code. Do not output large codeBlocks.content strings and do not manually escape multiline source code into JSON strings.',
+        'For fs.write, args.sourceBlockId must reference a top-level codeBlocks[].blockId for the same args.path. Directory targets are planning scopes; do not repair by creating empty .gitkeep or other placeholder files.',
         'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or payload wrapper fields.',
         'Repair once from the compact context only; do not rely on omitted prompt text.',
       ].join('\n'),
@@ -13487,6 +14040,9 @@ function protocolRepairShapeReference(errorCode: string): string {
     'For kind="actionBundle", put userPlanMarkdown, codeBlocks, actionBundle, expectedValidation, and reviewGuide directly on the top-level JSON object. Do not wrap them in a payload object.',
     'For kind="decisionRequest", put decisionRequest:{id,question,reason?,summary?,options:[{id,label,description,recommended?}],allowsFreeform?} on the top-level JSON object. Do not return bare reason/options without decisionRequest.',
     'codeBlocks[] uses {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}; contentLines is the only source-code carrier.',
+    'fs.write actions use args={path,sourceBlockId}; sourceBlockId must match the blockId of the codeBlock carrying that exact file content.',
+    'Directory targets such as src/ are planning scopes only. Do not create empty .gitkeep or placeholder files unless the user explicitly requested that concrete file. For new files, write the concrete file and let Kernel create parent directories.',
+    'Empty content is valid only for operation="createEmpty" on an explicit empty file, or for patch/replace/insert operations when the protocol explicitly permits it.',
     actionBundleProtocolShapeReference(),
     'Never output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, or legacy implementationPlan.',
   ];
@@ -13517,6 +14073,7 @@ function actionBundleCompactionRepairMessages(
         'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large/multiline codeBlocks.content strings.',
         `Payload budget: at most ${MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES} bytes total joined contentLines. File count, task count, and codeBlock count are not permission boundaries.`,
         'For new files, prefer one complete file write when it fits the payload budget. For large rewrites, split by module, file section, class, function, or script/config section. continuationExpectations may describe payload/dependency/evidence-delayed work, but must not reduce the accepted plan scope.',
+        'Directory targets are planning scopes only. Do not create empty .gitkeep or placeholder writes for directories; output concrete file writes and reference each file content with args.sourceBlockId.',
         'If current facts are insufficient, return kind="resourceRequest" using manifestEntryId, rootId+path, or kind="search" with a non-empty query under the listed conversation roots.',
         'Do not claim execution, permissions, tests passed, or task completion.',
       ].join('\n'),
@@ -13788,6 +14345,8 @@ function acceptedPlanScopeRepairMessages(
         'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
         'A user has already accepted an execution contract. Repair the current batch so it stays inside the accepted task targets and tool scope.',
         'If executable work is still valid, return kind="actionBundle" with one related implementation batch. Multiple related files are allowed when all targets are inside the accepted plan.',
+        'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. Final workspace writes still come only from the complete actionBundle JSON.',
+        'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
         'For kind="actionBundle", put userPlanMarkdown, codeBlocks, actionBundle, expectedValidation, and reviewGuide directly on the top-level JSON object. Do not wrap them in a payload object.',
         ...actionBundleProtocolShapeLines(),
         resourceRequestProtocolShapeLine(),

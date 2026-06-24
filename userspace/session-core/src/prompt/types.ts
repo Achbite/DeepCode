@@ -13,6 +13,7 @@ export interface PromptSystemLayer {
     | 'rulerContext'
     | 'authoritativeDocExcerpts'
     | 'projectMemory'
+    | 'projectMemoryRecall'
     | 'reusableResourceContext'
     | 'requirementTranscript'
     | 'sessionMemory'
@@ -59,6 +60,7 @@ export interface PromptEnvelopeBuilderInput {
   stableMemoryHints?: string[];
   dynamicMemoryHints?: string[];
   projectMemoryHints?: string[];
+  projectMemoryRecallHints?: string[];
   sessionMemoryHints?: string[];
   interventionLevel?: 'low' | 'medium' | 'high';
   userOverlay?: string;

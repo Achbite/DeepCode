@@ -1,5 +1,6 @@
 import type { RequirementRecord } from '../requirement/types.js';
 import { canonicalizePrompt, stableHash } from '../cache/canonicalizer.js';
+import type { ProviderCacheAttribution } from '../cache/types.js';
 import { buildPromptEnvelope } from '../prompt/builder.js';
 import type { PromptEnvelope, PromptEnvelopeBuilderInput, PromptSegment } from '../prompt/types.js';
 import type {
@@ -14,6 +15,7 @@ import {
   buildSessionMemoryDocument,
   collectUserGuidanceEvents,
   renderProjectMemoryHints,
+  renderProjectMemoryRecallHints,
   renderSessionScopedMemoryHints,
   type UserGuidanceEvent,
   type SessionMemoryDocument,
@@ -38,6 +40,7 @@ export interface PromptCachePlan {
     requestParameterRequired: false;
     strategy: 'maximize-identical-stable-prefix';
   };
+  providerCacheAttribution: ProviderCacheAttribution;
   cacheAffectsCorrectness: false;
 }
 
@@ -175,6 +178,11 @@ export interface ContextAssemblyRecord {
   reservedOutputTokens: number;
   memoryCompressionMode: 'memory-v3-soft-cap-lines';
   evidenceFreshnessMode: 'resource-evidence-tail-v1';
+  projectMemoryArchiveHash?: string;
+  sessionMemoryArchiveHash?: string;
+  expandedMemoryItemIds?: string[];
+  memoryDroppedReasonCounts?: Record<string, number>;
+  providerCacheAttribution: ProviderCacheAttribution;
   resourceEvidenceTailCount: number;
   traceArchiveMode: 'compact-provider-trace';
   currentTaskGoalHash?: string;
@@ -240,6 +248,7 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     allowedProposals: input.allowedProposals,
     capabilityCatalogSummary: input.capabilityCatalogSummary,
     projectMemoryHints: renderProjectMemoryHints(memoryDocument),
+    projectMemoryRecallHints: renderProjectMemoryRecallHints(memoryDocument),
     sessionMemoryHints: [
       ...renderSessionScopedMemoryHints(memoryDocument),
       ...(input.extraMemoryHints ?? []),
@@ -277,6 +286,16 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
   });
   const partitionCharCounts = contextAssemblyPartitionCharCounts(prompt.segments);
   const partitionTokenEstimates = contextAssemblyPartitionTokenEstimates(partitionCharCounts);
+  const partitionRecords = contextAssemblyPartitionRecords(prompt.segments);
+  const providerCacheAttribution = buildProviderCacheAttribution({
+    provider,
+    model,
+    templateVersion,
+    prompt,
+    partitionRecords,
+    stablePrefixHash: canonical.stablePrefixHash,
+    dynamicSuffixHash: canonical.dynamicSuffixHash,
+  });
   const budgetPlan: ContextAssemblyBudgetPlan = {
     policy: 'softCapReserveOutput',
     contextWindowTokens: 1_000_000,
@@ -307,7 +326,7 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     cacheAffectsCorrectness: false,
     segmentOrder: prompt.segments.map((segment) => segment.id),
     segments: prompt.segments.map(contextAssemblySegment),
-    partitionRecords: contextAssemblyPartitionRecords(prompt.segments),
+    partitionRecords,
     resourceBlocks: resourcePromptContext.resourceBlocks.map(contextAssemblyResourceBlock),
     resourceFullTextCharCount: resourcePromptContext.resourceFullTextCharCount,
     resourceSummaryCharCount: resourcePromptContext.resourceSummaryCharCount,
@@ -327,6 +346,11 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     reservedOutputTokens: budgetPlan.maxOutputTokens,
     memoryCompressionMode: MEMORY_COMPRESSION_MODE,
     evidenceFreshnessMode: EVIDENCE_FRESHNESS_MODE,
+    projectMemoryArchiveHash: memoryDocument.archiveMetadata?.projectMemoryArchiveHash,
+    sessionMemoryArchiveHash: memoryDocument.archiveMetadata?.sessionMemoryArchiveHash,
+    expandedMemoryItemIds: memoryDocument.archiveMetadata?.expandedMemoryItemIds,
+    memoryDroppedReasonCounts: memoryDocument.archiveMetadata?.memoryDroppedReasonCounts,
+    providerCacheAttribution,
     resourceEvidenceTailCount: resourcePromptContext.resourceBlocks.length,
     traceArchiveMode: 'compact-provider-trace',
     currentTaskGoalHash: input.currentTaskGoal ? stableHash(input.currentTaskGoal) : undefined,
@@ -360,9 +384,63 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
         requestParameterRequired: false,
         strategy: 'maximize-identical-stable-prefix',
       },
+      providerCacheAttribution,
       cacheAffectsCorrectness: false,
     },
   };
+}
+
+function buildProviderCacheAttribution(input: {
+  provider: string;
+  model: string;
+  templateVersion: string;
+  prompt: PromptEnvelope;
+  partitionRecords: ContextAssemblyPartitionRecord[];
+  stablePrefixHash: string;
+  dynamicSuffixHash: string;
+}): ProviderCacheAttribution {
+  const providerName = input.provider.toLowerCase();
+  const providerCacheMode: ProviderCacheAttribution['providerCacheMode'] =
+    providerName.includes('deepseek')
+      ? 'automatic-prefix-cache'
+      : providerName.includes('openai') || providerName.includes('anthropic')
+        ? 'provider-managed'
+        : providerName === 'unknown'
+          ? 'unknown'
+          : 'not-supported';
+  return {
+    provider: input.provider,
+    model: input.model,
+    providerCacheMode,
+    requestShapeHash: stableHash(JSON.stringify({
+      templateVersion: input.templateVersion,
+      stableLayerNames: input.prompt.stableLayerNames,
+      dynamicLayerNames: input.prompt.dynamicLayerNames,
+      auditOnlyLayerNames: input.prompt.auditOnlyLayerNames,
+    })),
+    stableMessageHash: input.stablePrefixHash,
+    dynamicMessageHash: input.dynamicSuffixHash,
+    cacheEligiblePrefixCharLength: input.prompt.stablePrefix.length,
+    cacheEligiblePrefixTokenEstimate: estimateTokens(input.prompt.stablePrefix.length),
+    changedPartitions: input.partitionRecords
+      .filter((partition) => partition.charLength > 0)
+      .map((partition) => ({
+        name: partition.name,
+        currentHash: partition.contentHash,
+        charDelta: partition.charLength,
+        reason: cachePartitionReason(partition),
+      })),
+  };
+}
+
+function cachePartitionReason(
+  partition: ContextAssemblyPartitionRecord
+): ProviderCacheAttribution['changedPartitions'][number]['reason'] {
+  if (partition.name === 'ProjectMemory') return 'project_archive_changed';
+  if (partition.name === 'SessionMemory' || partition.name === 'CurrentRunStateAndRequest') return 'session_state_changed';
+  if (partition.name === 'EvidenceTail') return 'evidence_tail_changed';
+  if (partition.name === 'AuditOnly') return 'audit_only_changed';
+  return partition.stablePrefix ? 'stable_policy_changed' : 'initial_or_no_previous_record';
 }
 
 function contextAssemblyPartitionCharCounts(segments: PromptSegment[]): ContextAssemblyPartitionCharCounts {
@@ -375,7 +453,7 @@ function contextAssemblyPartitionCharCounts(segments: PromptSegment[]): ContextA
     'rulerContext',
     'authoritativeDocExcerpts',
   ]);
-  const projectMemoryNames = new Set<PromptSegment['name']>(['projectMemory']);
+  const projectMemoryNames = new Set<PromptSegment['name']>(['projectMemory', 'projectMemoryRecall']);
   const sessionMemoryNames = new Set<PromptSegment['name']>([
     'sessionMemory',
     'agentInterventionPolicy',
@@ -477,6 +555,7 @@ function contextAssemblyPartitionName(segment: PromptSegment): ContextAssemblyPa
     case 'authoritativeDocExcerpts':
       return 'UserRulerAndProjectInstructions';
     case 'projectMemory':
+    case 'projectMemoryRecall':
       return 'ProjectMemory';
     case 'sessionMemory':
     case 'requirementTranscript':

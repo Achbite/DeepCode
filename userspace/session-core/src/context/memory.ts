@@ -1,4 +1,12 @@
 import type { AgentEvent } from '@deepcode/protocol';
+import {
+  buildMemoryArchiveDescriptor,
+  buildMemoryArchiveSidecar,
+  renderMemoryArchiveMarkdown,
+  type MemoryArchiveDescriptor,
+  type MemoryArchiveSidecar,
+} from './memoryArchive.js';
+import { compileSessionMemoryDocument } from './memoryCompiler.js';
 
 export type MemoryItemScope = 'project' | 'session';
 export type MemoryItemKind = 'fact' | 'intent' | 'decision' | 'resource' | 'habit' | 'risk' | 'checkpoint';
@@ -50,6 +58,13 @@ export interface SessionMemoryDocument {
   factContext: string[];
   decisionContext: string[];
   resourceContext: string[];
+  archiveMetadata?: {
+    projectMemoryArchiveHash: string;
+    sessionMemoryArchiveHash: string;
+    expandedMemoryItemIds: string[];
+    memoryDroppedReasonCounts: Record<string, number>;
+    auditOnlyContext: string[];
+  };
 }
 
 export interface SessionMemorySnapshot {
@@ -67,13 +82,20 @@ export interface SessionMemorySnapshot {
     projectItemCount: number;
     sessionItemCount: number;
     compressionModes: MemoryCompressionMode[];
-    freshnessMode: 'derivedFromSessionEvents';
+    freshnessMode: 'compiledFromSessionEvents';
+    archiveDescriptor: MemoryArchiveDescriptor;
+    archiveSidecar: MemoryArchiveSidecar;
+    projectMarkdownPreview: string;
+    sessionMarkdownPreview: string;
   };
 }
 
 export interface BuildSessionMemorySnapshotOptions {
   sessionId?: string;
   generatedAt?: string;
+  workspaceScopeKey?: string;
+  displayProjectName?: string;
+  displaySessionName?: string;
 }
 
 export interface UserGuidanceEvent {
@@ -93,6 +115,14 @@ export function buildSessionMemorySnapshot(
   for (const item of [...document.projectMemoryItems, ...document.sessionMemoryItems]) {
     compressionModes.add(item.compression?.mode ?? 'raw');
   }
+  const archiveDescriptor = buildMemoryArchiveDescriptor({
+    document,
+    workspaceScopeKey: options.workspaceScopeKey,
+    sessionId: options.sessionId,
+    displayProjectName: options.displayProjectName,
+    displaySessionName: options.displaySessionName,
+  });
+  const archiveSidecar = buildMemoryArchiveSidecar(document, archiveDescriptor);
   return {
     schemaVersion: 'deepcode.session.memory-snapshot.v1',
     sessionId: options.sessionId,
@@ -108,12 +138,20 @@ export function buildSessionMemorySnapshot(
       projectItemCount: document.projectMemoryItems.length,
       sessionItemCount: document.sessionMemoryItems.length,
       compressionModes: [...compressionModes],
-      freshnessMode: 'derivedFromSessionEvents',
+      freshnessMode: 'compiledFromSessionEvents',
+      archiveDescriptor,
+      archiveSidecar,
+      projectMarkdownPreview: renderMemoryArchiveMarkdown({ descriptor: archiveDescriptor, document, scope: 'project' }),
+      sessionMarkdownPreview: renderMemoryArchiveMarkdown({ descriptor: archiveDescriptor, document, scope: 'session' }),
     },
   };
 }
 
 export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryDocument {
+  return compileSessionMemoryDocument(events);
+}
+
+function buildLegacySessionMemoryDocument(events: AgentEvent[]): SessionMemoryDocument {
   const intentContext: string[] = [];
   const factContext: string[] = [];
   const decisionContext: string[] = [];
@@ -350,20 +388,26 @@ export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryD
 }
 
 export function renderProjectMemoryHints(document: SessionMemoryDocument): string[] {
-  const lines = document.projectMemoryContext.length
-    ? document.projectMemoryContext
-    : [
-      ...document.longTermContext,
-      ...document.resourceContext.map((item) => `Project resource index: ${item}`),
-      ...document.factContext.map((item) => `Project fact index: ${item}`),
-      ...document.decisionContext.map((item) => `Cross-session decision index: ${item}`),
-    ];
   return [
-    'ProjectMemory document (project-scoped, 128k soft cap):',
+    'ProjectMemoryIndexDigest (project-scoped, 128k emergency soft cap):',
     'Boundary: shared project memory stores durable norms, user preferences, historical gotchas, long-term planning summaries, and cross-session decision indexes. It is not Kernel authority and must be refreshed from ResourcePacket/tool facts when code may have changed.',
+    `archiveHash=${document.archiveMetadata?.projectMemoryArchiveHash ?? 'none'}`,
+    document.archiveMetadata?.expandedMemoryItemIds.length
+      ? `selectedItemIds=${document.archiveMetadata.expandedMemoryItemIds.filter((id) => id.includes(':project:')).slice(0, 24).join(', ')}`
+      : 'selectedItemIds=none',
+    document.archiveMetadata?.memoryDroppedReasonCounts
+      ? `dropReasons=${JSON.stringify(document.archiveMetadata.memoryDroppedReasonCounts)}`
+      : 'dropReasons=none',
+  ];
+}
+
+export function renderProjectMemoryRecallHints(document: SessionMemoryDocument): string[] {
+  const lines = document.projectMemoryItems.map(compactMemoryBullet);
+  return [
+    'ProjectMemoryRecall (dynamic selected project memory; refresh file facts before modifying files):',
     lines.length
-      ? `projectMemoryContext:\n${capMemoryLines(lines, 128_000).map((item) => `- ${item}`).join('\n')}`
-      : 'projectMemoryContext: none',
+      ? `selectedProjectMemory:\n${capMemoryLines(lines, 16_000).map((item) => `- ${item}`).join('\n')}`
+      : 'selectedProjectMemory: none',
   ];
 }
 
@@ -465,21 +509,38 @@ function memoryHash(content: string): string {
 }
 
 export function renderSessionScopedMemoryHints(document: SessionMemoryDocument): string[] {
-  const lines = document.sessionMemoryContext.length
-    ? document.sessionMemoryContext
-    : [
-      ...document.shortTermContext,
-      ...document.intentContext.map((item) => `Session intent: ${item}`),
-      ...document.guidanceContext.map((item) => `Session guidance: ${item}`),
-      ...document.decisionContext.map((item) => `Session decision: ${item}`),
-    ];
+  const lines = document.sessionMemoryItems.map(compactMemoryBullet);
   return [
-    'SessionMemory document (single-session, 256k soft cap):',
+    'SessionMemoryCompact (single-session, 256k emergency soft cap):',
     'Boundary: session memory stores the active task focus, accepted plan, user guidance, review decisions, and compressed local conversation summary. It must not crowd out current user input or EvidenceTail facts.',
+    `archiveHash=${document.archiveMetadata?.sessionMemoryArchiveHash ?? 'none'}`,
+    document.archiveMetadata?.expandedMemoryItemIds.length
+      ? `selectedItemIds=${document.archiveMetadata.expandedMemoryItemIds.filter((id) => id.includes(':session:')).slice(0, 32).join(', ')}`
+      : 'selectedItemIds=none',
     lines.length
-      ? `sessionMemoryContext:\n${capMemoryLines(lines, 256_000).map((item) => `- ${item}`).join('\n')}`
-      : 'sessionMemoryContext: none',
+      ? `selectedSessionMemory:\n${capMemoryLines(lines, 256_000).map((item) => `- ${item}`).join('\n')}`
+      : 'selectedSessionMemory: none',
   ];
+}
+
+function compactMemoryBullet(item: MemoryItemV4): string {
+  const sourceRefs = [
+    item.sourceRefs.eventIds.length ? `events=${item.sourceRefs.eventIds.join(',')}` : '',
+    item.sourceRefs.ledgerRefs?.length ? `ledger=${item.sourceRefs.ledgerRefs.join(',')}` : '',
+    item.sourceRefs.auditRefs?.length ? `audit=${item.sourceRefs.auditRefs.join(',')}` : '',
+  ].filter(Boolean).join(' ');
+  const freshness = [
+    item.freshness.path ? `path=${item.freshness.path}` : '',
+    item.freshness.contentHash ? `hash=${item.freshness.contentHash}` : '',
+  ].filter(Boolean).join(' ');
+  return [
+    `id=${item.id}`,
+    `kind=${item.kind}`,
+    `authority=${item.authority}`,
+    freshness || 'freshness=none',
+    `sourceRefs=${sourceRefs || 'synthetic:none'}`,
+    `content=${item.content}`,
+  ].join(' | ');
 }
 
 export function renderSessionMemoryHints(document: SessionMemoryDocument): string[] {
