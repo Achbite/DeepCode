@@ -47,14 +47,6 @@ pub(crate) struct LlmChatOutput {
 
 const OPENAI_COMPATIBLE_MAX_OUTPUT_TOKENS_CAP: u32 = 16_384;
 
-pub(crate) fn resolve_kernel_llm_profile(
-    state: &AppState,
-    profile_ref: Option<&deepcode_kernel_abi::ProfileRef>,
-) -> Result<ResolvedLlmProfile, String> {
-    let gui = state.gui.lock().expect("gui state lock");
-    resolve_llm_profile(&gui, profile_ref.map(|value| value.id.as_str()))
-}
-
 pub(crate) fn resolve_llm_profile(
     gui: &GuiState,
     profile_id: Option<&str>,
@@ -1109,6 +1101,7 @@ struct OpenAiCompatibleStreamAccumulator {
 }
 
 impl OpenAiCompatibleStreamAccumulator {
+    #[cfg(test)]
     fn output(&self) -> LlmChatOutput {
         let tool_calls = self
             .tool_calls
@@ -1140,6 +1133,7 @@ impl OpenAiCompatibleStreamAccumulator {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_openai_compatible_sse_text(text: &str) -> LlmChatOutput {
     let mut parser = SseDataParser::default();
     let mut accumulator = OpenAiCompatibleStreamAccumulator::default();

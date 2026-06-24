@@ -23,6 +23,7 @@ pub(crate) struct AgentSessionRunRequest {
     pub(crate) requirement_confirmation_mode: Option<String>,
     pub(crate) review_continuation_mode: Option<String>,
     pub(crate) intervention_level: Option<String>,
+    pub(crate) project_memory_mode: Option<Value>,
     pub(crate) sub_agent_mode: Option<Value>,
     pub(crate) sub_agent_max_parallel: Option<Value>,
     pub(crate) title: Option<String>,
@@ -293,18 +294,6 @@ pub(crate) async fn agent_session_append_events(
     session_result(&gui, &session_id)
 }
 
-pub(crate) async fn agent_session_send_message(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let _ = (state, session_id, body);
-    ApiResponse::error(
-        "agent_messages_endpoint_removed",
-        "Agent message sending is owned by userspace SessionDriverLoop. Use /api/kernel/commands, /api/llm/chat, and /api/agent/sessions/:id/events.",
-    )
-}
-
 pub(crate) async fn agent_session_run_start(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -326,6 +315,10 @@ pub(crate) async fn agent_session_run_start(
         .clone()
         .or_else(|| user_setting_string(&state, "agent.interventionLevel"))
         .or_else(|| Some("medium".to_string()));
+    let project_memory_mode = normalize_project_memory_mode(
+        body.project_memory_mode.clone(),
+        user_setting_string(&state, "agent.memory.projectMode"),
+    );
     let sub_agent_mode = normalize_sub_agent_mode(
         body.sub_agent_mode.clone(),
         user_setting_string(&state, "agent.subagents.mode"),
@@ -339,6 +332,7 @@ pub(crate) async fn agent_session_run_start(
         &run_id,
         &body,
         intervention_level,
+        project_memory_mode,
         sub_agent_mode,
         sub_agent_max_parallel,
     );
@@ -760,6 +754,7 @@ fn host_bridge_request(
     host_run_id: &str,
     body: &AgentSessionRunRequest,
     intervention_level: Option<String>,
+    project_memory_mode: String,
     sub_agent_mode: String,
     sub_agent_max_parallel: u64,
 ) -> Value {
@@ -792,6 +787,7 @@ fn host_bridge_request(
         "requirementConfirmationMode": body.requirement_confirmation_mode.clone(),
         "reviewContinuationMode": body.review_continuation_mode.clone(),
         "interventionLevel": intervention_level,
+        "projectMemoryMode": project_memory_mode,
         "subAgentMode": sub_agent_mode,
         "subAgentMaxParallel": sub_agent_max_parallel,
         "decisionKind": body.decision_kind.clone(),
@@ -820,6 +816,19 @@ fn normalize_sub_agent_mode(value: Option<Value>, setting: Option<String>) -> St
         Some("auto") => "auto".to_string(),
         Some("off") => "off".to_string(),
         _ => "off".to_string(),
+    }
+}
+
+fn normalize_project_memory_mode(value: Option<Value>, setting: Option<String>) -> String {
+    let raw = value
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or(setting);
+    match raw.as_deref() {
+        Some("auto") => "auto".to_string(),
+        Some("confirm") => "confirm".to_string(),
+        _ => "confirm".to_string(),
     }
 }
 
@@ -1593,32 +1602,6 @@ fn session_host_bridge_hint_daemon() -> &'static str {
     "run `pnpm --filter @deepcode/session-core build`, set DEEPCODE_SESSION_BRIDGE, set DEEPCODE_NODE, or use a packaged distribution that includes session-core/dist/hostBridge.js, node_modules/@deepcode/protocol, and node/bin/node"
 }
 
-pub(crate) fn latest_user_attachments_for_session(
-    state: &AppState,
-    session_id: &str,
-) -> Vec<Value> {
-    session_projection(state, session_id)
-        .into_iter()
-        .rev()
-        .find_map(|event| {
-            if event.get("kind").and_then(Value::as_str) != Some("user_msg") {
-                return None;
-            }
-            let attachments = event
-                .get("payload")
-                .and_then(|payload| payload.get("attachments"))
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if attachments.is_empty() {
-                None
-            } else {
-                Some(attachments)
-            }
-        })
-        .unwrap_or_default()
-}
-
 pub(crate) async fn agent_feedback() -> Json<ApiResponse> {
     ApiResponse::ok(json!({
         "accepted": true,
@@ -1978,39 +1961,6 @@ pub(crate) fn current_agent_session_id_for_scope(
     next_id
 }
 
-pub(crate) fn ensure_current_agent_session(
-    gui: &mut GuiState,
-    fallback_scope: Option<(Option<String>, Option<String>, Option<String>)>,
-) {
-    if let Some(next_id) = gui
-        .sessions
-        .iter()
-        .find(|session| !is_archived_session(session))
-        .and_then(|session| session.get("id").and_then(Value::as_str))
-        .map(ToOwned::to_owned)
-    {
-        gui.current_session_id = Some(next_id);
-        return;
-    }
-
-    let id = format!("session-{}", now_millis());
-    let now = now_text();
-    let (profile_id, workspace_id, workspace_hash) = fallback_scope.unwrap_or_default();
-    let session = create_agent_session_value(
-        &id,
-        &now,
-        "New Agent Session",
-        "plan",
-        profile_id.as_deref(),
-        workspace_id.as_deref(),
-        workspace_hash.as_deref(),
-    );
-    gui.current_session_id = Some(id.clone());
-    gui.session_projection_cache.insert(id.clone(), Vec::new());
-    gui.trace_events.insert(id.clone(), Vec::new());
-    gui.sessions.insert(0, session);
-}
-
 pub(crate) fn ensure_current_agent_session_for_scope(
     gui: &mut GuiState,
     scope_key: &str,
@@ -2347,6 +2297,7 @@ mod tests {
     fn sub_agent_runtime_settings_are_forwarded_to_host_bridge() {
         let body = AgentSessionRunRequest {
             content: Some("test request".to_string()),
+            project_memory_mode: Some(json!("auto")),
             sub_agent_mode: Some(json!("auto")),
             sub_agent_max_parallel: Some(json!("2")),
             ..Default::default()
@@ -2356,8 +2307,13 @@ mod tests {
             "run-subagent-forward",
             &body,
             Some("medium".to_string()),
+            normalize_project_memory_mode(body.project_memory_mode.clone(), None),
             normalize_sub_agent_mode(body.sub_agent_mode.clone(), None),
             normalize_sub_agent_max_parallel(body.sub_agent_max_parallel.clone(), None),
+        );
+        assert_eq!(
+            request.get("projectMemoryMode").and_then(Value::as_str),
+            Some("auto")
         );
         assert_eq!(
             request.get("subAgentMode").and_then(Value::as_str),
@@ -2372,6 +2328,15 @@ mod tests {
     #[test]
     fn missing_or_invalid_sub_agent_mode_defaults_to_off() {
         assert_eq!(normalize_sub_agent_mode(None, None), "off");
+        assert_eq!(normalize_project_memory_mode(None, None), "confirm");
+        assert_eq!(
+            normalize_project_memory_mode(Some(json!("invalid")), None),
+            "confirm"
+        );
+        assert_eq!(
+            normalize_project_memory_mode(None, Some("auto".to_string())),
+            "auto"
+        );
         assert_eq!(
             normalize_sub_agent_mode(Some(json!("invalid")), None),
             "off"

@@ -5,7 +5,7 @@ pub(crate) use axum::response::{IntoResponse, Response};
 pub(crate) use axum::routing::{any, get, patch, post};
 pub(crate) use axum::{Json, Router};
 pub(crate) use deepcode_kernel_abi::{
-    KernelCommand, KernelErrorEnvelope, KernelEvent, KernelSnapshot, RequestId, WorkspaceBinding,
+    KernelCommand, KernelErrorEnvelope, KernelEvent, KernelSnapshot, RequestId,
 };
 pub(crate) use deepcode_kernel_runtime::DeepCodeKernelRuntime;
 pub(crate) use serde::{Deserialize, Serialize};

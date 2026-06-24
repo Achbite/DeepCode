@@ -401,6 +401,7 @@ pub(crate) fn default_user_settings() -> Value {
     merge_object(
         &mut settings,
         &json!({
+            "agent.memory.projectMode": "confirm",
             "agent.permissions.gitPush": "ask",
             "agent.git.commitMessageMode": "generate",
             "agent.integrations.github.enabled": false,

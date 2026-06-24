@@ -322,38 +322,6 @@ pub(crate) fn dispatch_workspace(
     })
 }
 
-pub(crate) fn ensure_workspace_binding(
-    runtime: &SharedRuntime,
-    binding: Option<&WorkspaceBinding>,
-) -> Result<(), KernelErrorEnvelope> {
-    let current = current_workspace_json(runtime)?;
-    if current
-        .get("current")
-        .map(|value| !value.is_null())
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    let Some(open_path) = binding.and_then(|value| value.open_path.as_ref()) else {
-        return Err(KernelErrorEnvelope {
-            code: "no_workspace".to_string(),
-            message:
-                "current workspace is missing and no host workspaceBinding.openPath was provided"
-                    .to_string(),
-            message_key: None,
-            args: None,
-        });
-    };
-    dispatch_workspace(
-        runtime,
-        KernelCommand::WorkspaceOpen {
-            request_id: rid("workspace-restore"),
-            path: open_path.clone(),
-        },
-    )?;
-    Ok(())
-}
-
 pub(crate) fn current_workspace_json(
     runtime: &SharedRuntime,
 ) -> Result<Value, KernelErrorEnvelope> {
