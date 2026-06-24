@@ -81,7 +81,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedExecutionExceptionClosesRun();
   await assertSessionDriverLoopAcceptedExecutionKernelErrorClosesRun();
   await assertSessionDriverLoopAcceptedDecisionRecoversUnconsumedExecution();
-  await assertSessionDriverLoopRequirementAcceptedActionBundleContinuesAfterConfirmation();
+  await assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExplicitPlanConfirmation();
   await assertSessionDriverLoopActionBundleAdmissionRepairsDirectoryDeleteBeforePlanCard();
   await assertSessionDriverLoopActionBundleAdmissionRejectsRepeatedDirectoryDelete();
   await assertSessionDriverLoopAcceptedScopeRejectsDirectoryDeleteFromResourceEvidence();
@@ -4478,7 +4478,7 @@ async function assertSessionDriverLoopAcceptedDecisionRecoversUnconsumedExecutio
   assertEqual(actionBatchSubmits, 1, 'unconsumed accepted plan can retry into actionBatchSubmit');
 }
 
-async function assertSessionDriverLoopRequirementAcceptedActionBundleContinuesAfterConfirmation(): Promise<void> {
+async function assertSessionDriverLoopRequirementAcceptedActionBundleWaitsForExplicitPlanConfirmation(): Promise<void> {
   const events: AgentEvent[] = [
     {
       id: 'requirement-generic-auto-plan',
@@ -4595,16 +4595,29 @@ async function assertSessionDriverLoopRequirementAcceptedActionBundleContinuesAf
   });
 
   assertEqual(proposalSubmits, 1, 'requirement accept generates one actionBundle plan through provider');
-  assertEqual(userDecisionSubmits, 1, 'auto-accepted actionBundle plan submits a Kernel user decision');
-  assertEqual(actionBatchSubmits, 1, 'auto-accepted actionBundle plan continues into actionBatchSubmit');
-  assertEqual(reviewFactsRequests, 1, 'auto-accepted actionBundle plan reaches review facts after work units complete');
-  assertEqual(result.events.some((event) => event.kind === 'trace/plan_accept_noop'), false, 'auto-accepted actionBundle plan is not treated as stale');
-  assertEqual(result.events.some((event) => event.kind === 'session_run_state' && (event.payload as any).reason === 'accepted_plan_execution'), true, 'auto-accepted actionBundle plan emits running lifecycle');
+  assertEqual(userDecisionSubmits, 0, 'requirement accept does not submit a Kernel plan decision');
+  assertEqual(actionBatchSubmits, 0, 'requirement accept does not continue into actionBatchSubmit');
+  assertEqual(reviewFactsRequests, 0, 'requirement accept does not reach review facts before explicit plan confirmation');
+  assertEqual(result.events.some((event) => event.kind === 'trace/plan_accept_noop'), false, 'requirement accept generates a fresh plan instead of a stale noop');
+  assertEqual(result.events.some((event) => event.kind === 'session_run_state' && (event.payload as any).reason === 'accepted_plan_execution'), false, 'requirement accept does not emit accepted-plan execution lifecycle');
   const planCard = result.events.find((event) => event.kind === 'plan_card');
+  assertEqual(Boolean(planCard), true, 'requirement accept generates a confirmable actionBundle plan card');
   assertEqual((planCard?.payload as any)?.interactionOverlay, true, 'overlay requirement resume keeps plan card in the parent interaction flow');
   assertEqual((planCard?.payload as any)?.parentRunId, 'run-requirement-parent', 'overlay requirement resume keeps parentRunId on plan card');
-  const planAccepted = result.events.find((event) => event.kind === 'plan_review' && (event.payload as any)?.status === 'accepted');
-  assertEqual((planAccepted?.payload as any)?.parentRunId, 'run-requirement-parent', 'overlay requirement resume keeps parentRunId on plan decision');
+  assertEqual(
+    result.events.some((event) => event.kind === 'plan_review' && (event.payload as any)?.status === 'accepted'),
+    false,
+    'requirement accept does not auto-accept the generated plan'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.status === 'waiting' &&
+      (event.payload as any)?.reason === 'plan_review'
+    ),
+    true,
+    'generated plan waits for explicit plan confirmation'
+  );
 }
 
 async function assertSessionDriverLoopActionBundleAdmissionRepairsDirectoryDeleteBeforePlanCard(): Promise<void> {

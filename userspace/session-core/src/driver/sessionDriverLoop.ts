@@ -1052,18 +1052,7 @@ export class SessionDriverLoop {
       interactionOverlay,
     });
 
-    if (input.decision !== 'accept') return next;
-    const plan = latestExecutablePlan(next.events, input.runId);
-    if (!plan || !planAutoExecutableAfterRequirement(plan)) return next;
-    return this.resolvePlanDecision({
-      ...input,
-      kind: 'plan',
-      decision: 'accept',
-      targetId: plan.planId,
-      runId: plan.runId,
-      existingEvents: next.events,
-      interactionOverlay,
-    });
+    return next;
   }
 
   private async resolveAcceptedPlanScopeRequirementDecision(
@@ -8809,16 +8798,6 @@ function acceptedPlanExecutionConsumed(
     }
   }
   return false;
-}
-
-function planAutoExecutableAfterRequirement(plan: SessionPlanContext): boolean {
-  const report = plan.planReviewReport;
-  const status = stringValue(report?.status);
-  if (status === 'denied' || status === 'needsRevision' || status === 'interfaceOnly') return false;
-  const hardFloorHits = Array.isArray(report?.hardFloorHits) ? report?.hardFloorHits : [];
-  const deniedReasons = Array.isArray(report?.deniedReasons) ? report?.deniedReasons : [];
-  const blockedReasons = Array.isArray(report?.blockedReasons) ? report?.blockedReasons : [];
-  return hardFloorHits.length === 0 && deniedReasons.length === 0 && blockedReasons.length === 0;
 }
 
 function acceptedPlanTaskTargets(record: Record<string, unknown>): string[] {
