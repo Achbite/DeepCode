@@ -21,9 +21,12 @@ export interface MemoryArchiveSidecar {
   descriptor: MemoryArchiveDescriptor;
   projectMemoryItems: MemoryItemV4[];
   sessionMemoryItems: MemoryItemV4[];
+  pendingProjectMemoryCandidates: MemoryItemV4[];
   metadata: {
     projectItemCount: number;
     sessionItemCount: number;
+    pendingProjectCandidateCount: number;
+    projectMemoryMode?: string;
     sourceEventCount: number;
     compressionModes: string[];
     generatedFrom: 'sessionEvents';
@@ -65,7 +68,11 @@ export function buildMemoryArchiveSidecar(
   descriptor: MemoryArchiveDescriptor
 ): MemoryArchiveSidecar {
   const compressionModes = new Set<string>();
-  for (const item of [...document.projectMemoryItems, ...document.sessionMemoryItems]) {
+  for (const item of [
+    ...document.projectMemoryItems,
+    ...document.sessionMemoryItems,
+    ...document.pendingProjectMemoryCandidates,
+  ]) {
     compressionModes.add(item.compression?.mode ?? 'raw');
   }
   return {
@@ -73,9 +80,12 @@ export function buildMemoryArchiveSidecar(
     descriptor,
     projectMemoryItems: document.projectMemoryItems,
     sessionMemoryItems: document.sessionMemoryItems,
+    pendingProjectMemoryCandidates: document.pendingProjectMemoryCandidates,
     metadata: {
       projectItemCount: document.projectMemoryItems.length,
       sessionItemCount: document.sessionMemoryItems.length,
+      pendingProjectCandidateCount: document.pendingProjectMemoryCandidates.length,
+      projectMemoryMode: document.archiveMetadata?.projectMemoryMode,
       sourceEventCount: document.sourceEventCount,
       compressionModes: [...compressionModes],
       generatedFrom: 'sessionEvents',
@@ -91,6 +101,9 @@ export function renderMemoryArchiveMarkdown(input: {
   const items = input.scope === 'project'
     ? input.document.projectMemoryItems
     : input.document.sessionMemoryItems;
+  const pendingCandidates = input.scope === 'project'
+    ? input.document.pendingProjectMemoryCandidates
+    : [];
   const title = input.scope === 'project'
     ? `# ${input.descriptor.displayProjectName} Project Memory`
     : `# ${input.descriptor.displaySessionName} Session Memory`;
@@ -104,18 +117,31 @@ export function renderMemoryArchiveMarkdown(input: {
   ];
   if (!items.length) {
     lines.push('- No memory items selected.');
-    return lines.join('\n');
+  } else {
+    for (const item of items) {
+      lines.push(`## ${item.kind} / ${item.authority}`);
+      lines.push('');
+      lines.push(item.content);
+      lines.push('');
+      lines.push(`- id: ${item.id}`);
+      lines.push(`- freshness: ${item.freshness.path ? `path=${item.freshness.path} ` : ''}${item.freshness.contentHash ?? 'none'}`);
+      lines.push(`- sourceRefs: ${item.sourceRefs.eventIds.length ? item.sourceRefs.eventIds.join(', ') : 'synthetic:none'}`);
+      lines.push(`- compression: ${item.compression?.mode ?? 'raw'}`);
+      if (item.governance) {
+        lines.push(`- governance: status=${item.governance.status}; risk=${item.governance.riskClass}; confidence=${item.governance.confidence}; semanticKey=${item.governance.semanticKey}`);
+      }
+      lines.push('');
+    }
   }
-  for (const item of items) {
-    lines.push(`## ${item.kind} / ${item.authority}`);
+  if (pendingCandidates.length) {
+    lines.push('## Pending Project Memory Candidates');
     lines.push('');
-    lines.push(item.content);
-    lines.push('');
-    lines.push(`- id: ${item.id}`);
-    lines.push(`- freshness: ${item.freshness.path ? `path=${item.freshness.path} ` : ''}${item.freshness.contentHash ?? 'none'}`);
-    lines.push(`- sourceRefs: ${item.sourceRefs.eventIds.length ? item.sourceRefs.eventIds.join(', ') : 'synthetic:none'}`);
-    lines.push(`- compression: ${item.compression?.mode ?? 'raw'}`);
-    lines.push('');
+    for (const item of pendingCandidates) {
+      lines.push(`- ${item.kind}/${item.authority}: ${item.content}`);
+      lines.push(`  - id: ${item.id}`);
+      lines.push(`  - governance: status=${item.governance?.status ?? 'pending'}; risk=${item.governance?.riskClass ?? 'medium'}; confidence=${item.governance?.confidence ?? 0}`);
+      lines.push(`  - sourceRefs: ${item.sourceRefs.eventIds.length ? item.sourceRefs.eventIds.join(', ') : 'synthetic:none'}`);
+    }
   }
   return lines.join('\n');
 }

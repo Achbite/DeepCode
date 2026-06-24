@@ -421,6 +421,33 @@
     "memory.unknownSession": "Unknown session",
     "memory.freshness": "Freshness",
     "memory.sourceRefs": "Source refs",
+    "memory.pendingCandidates": "Pending candidates",
+    "memory.status.pending": "Pending",
+    "memory.status.auto-promoted": "Auto-promoted",
+    "memory.status.confirmed": "Confirmed",
+    "memory.status.rejected": "Rejected",
+    "memory.status.deprecated": "Deprecated",
+    "memory.status.superseded": "Superseded",
+    "memory.risk.low": "Low risk",
+    "memory.risk.medium": "Medium risk",
+    "memory.risk.high": "High risk",
+    "memory.scope.project": "Project",
+    "memory.scope.session": "Session",
+    "memory.kind.fact": "Fact",
+    "memory.kind.intent": "Intent",
+    "memory.kind.decision": "Decision",
+    "memory.kind.resource": "Resource",
+    "memory.kind.habit": "Habit",
+    "memory.kind.risk": "Risk",
+    "memory.kind.checkpoint": "Checkpoint",
+    "memory.authority.kernelFact": "Kernel fact",
+    "memory.authority.resourcePacket": "Resource evidence",
+    "memory.authority.userDecision": "User decision",
+    "memory.authority.userRuler": "User ruler",
+    "memory.authority.summary": "Summary",
+    "memory.compression.raw": "Raw",
+    "memory.compression.summary": "Summary",
+    "memory.compression.handleOnly": "Handle only",
     "memory.none": "None",
     "deepcodeGui.titlebar.sessionWorkbench": "Agent session workspace",
     "deepcodeGui.nav.newChat": "New chat",
@@ -992,6 +1019,14 @@
         "low": "Low",
         "medium": "Medium",
         "high": "High"
+      }
+    },
+    "agent.memory.projectMode": {
+      "label": "Project Memory Mode",
+      "description": "Controls whether project memory candidates require user confirmation before promotion.",
+      "options": {
+        "confirm": "Confirm Before Writing",
+        "auto": "Auto Low-risk Candidates"
       }
     },
     "agent.subagents.mode": {

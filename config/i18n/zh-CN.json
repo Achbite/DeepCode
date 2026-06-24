@@ -421,6 +421,33 @@
     "memory.unknownSession": "未知会话",
     "memory.freshness": "新鲜度",
     "memory.sourceRefs": "来源引用",
+    "memory.pendingCandidates": "待确认候选",
+    "memory.status.pending": "待确认",
+    "memory.status.auto-promoted": "自动提升",
+    "memory.status.confirmed": "已确认",
+    "memory.status.rejected": "已拒绝",
+    "memory.status.deprecated": "已废弃",
+    "memory.status.superseded": "已替换",
+    "memory.risk.low": "低风险",
+    "memory.risk.medium": "中风险",
+    "memory.risk.high": "高风险",
+    "memory.scope.project": "项目",
+    "memory.scope.session": "会话",
+    "memory.kind.fact": "事实",
+    "memory.kind.intent": "意图",
+    "memory.kind.decision": "决策",
+    "memory.kind.resource": "资源",
+    "memory.kind.habit": "习惯",
+    "memory.kind.risk": "风险",
+    "memory.kind.checkpoint": "检查点",
+    "memory.authority.kernelFact": "Kernel 事实",
+    "memory.authority.resourcePacket": "资源证据",
+    "memory.authority.userDecision": "用户决策",
+    "memory.authority.userRuler": "用户规则",
+    "memory.authority.summary": "摘要",
+    "memory.compression.raw": "原文",
+    "memory.compression.summary": "摘要",
+    "memory.compression.handleOnly": "仅引用",
     "memory.none": "无",
     "deepcodeGui.titlebar.sessionWorkbench": "Agent 会话工作台",
     "deepcodeGui.nav.newChat": "新对话",
@@ -992,6 +1019,14 @@
         "low": "低",
         "medium": "中",
         "high": "高"
+      }
+    },
+    "agent.memory.projectMode": {
+      "label": "项目记忆模式",
+      "description": "控制项目记忆候选是否需要用户确认后再提升为项目记忆。",
+      "options": {
+        "confirm": "确认后写入",
+        "auto": "自动低风险候选"
       }
     },
     "agent.subagents.mode": {

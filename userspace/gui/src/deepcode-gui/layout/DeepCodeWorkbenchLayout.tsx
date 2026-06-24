@@ -915,6 +915,9 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
+  const projectMemoryMode = useSettingsStore((s) =>
+    s.effectiveSettings['agent.memory.projectMode'] === 'auto' ? 'auto' : 'confirm'
+  );
 
   useEffect(() => {
     if (typeof performance === 'undefined') return;
@@ -1340,7 +1343,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     const snapshots: SessionMemorySnapshot[] = [];
     let error: string | null = null;
     for (const sessionId of basePanel.sessionIds) {
-      const result = await getAgentSessionMemorySnapshot(sessionId);
+      const result = await getAgentSessionMemorySnapshot(sessionId, { projectMemoryMode });
       if (result.ok && result.data) {
         snapshots.push(result.data);
       } else {

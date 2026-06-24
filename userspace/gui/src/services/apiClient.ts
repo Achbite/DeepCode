@@ -81,6 +81,7 @@ export interface StartAgentRunRequest {
   requirementConfirmationMode?: 'auto' | 'always' | 'off';
   reviewContinuationMode?: 'auto' | 'ask' | 'off';
   interventionLevel?: 'low' | 'medium' | 'high';
+  projectMemoryMode?: 'confirm' | 'auto';
   subAgentMode?: 'auto' | 'off';
   subAgentMaxParallel?: number;
   title?: string;

@@ -347,6 +347,17 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     ],
   },
   {
+    key: 'agent.memory.projectMode',
+    label: 'Project Memory Mode',
+    description: 'Controls whether project memory candidates require user confirmation before promotion.',
+    group: 'agent',
+    control: 'select',
+    options: [
+      { label: 'Confirm', value: 'confirm' },
+      { label: 'Auto', value: 'auto' },
+    ],
+  },
+  {
     key: 'agent.subagents.mode',
     label: 'Sub-agents',
     description: 'Experimental parallel draft generation for independent accepted-plan tasks. It is disabled by default until the orchestration path is fully stable.',

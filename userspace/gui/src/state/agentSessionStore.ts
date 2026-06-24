@@ -167,6 +167,10 @@ function settingInterventionLevel(value: unknown): 'low' | 'medium' | 'high' {
   return value === 'low' || value === 'high' ? value : 'medium';
 }
 
+function settingProjectMemoryMode(value: unknown): 'confirm' | 'auto' {
+  return value === 'auto' ? 'auto' : 'confirm';
+}
+
 function settingSubAgentMode(value: unknown): 'auto' | 'off' {
   return value === 'off' ? 'off' : 'auto';
 }
@@ -886,6 +890,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
+        projectMemoryMode: settingProjectMemoryMode(
+          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
+        ),
         subAgentMode: settingSubAgentMode(
           useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
         ),
@@ -1044,6 +1051,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
         ),
+        projectMemoryMode: settingProjectMemoryMode(
+          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
+        ),
         subAgentMode: settingSubAgentMode(
           useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
         ),
@@ -1122,6 +1132,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
+        ),
+        projectMemoryMode: settingProjectMemoryMode(
+          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
         ),
         subAgentMode: settingSubAgentMode(
           useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
@@ -1204,6 +1217,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
+        ),
+        projectMemoryMode: settingProjectMemoryMode(
+          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
         ),
         subAgentMode: settingSubAgentMode(
           useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
@@ -1288,6 +1304,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         profileId: get().profileId,
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
+        ),
+        projectMemoryMode: settingProjectMemoryMode(
+          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
         ),
         subAgentMode: settingSubAgentMode(
           useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
@@ -1374,6 +1393,9 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         ),
         interventionLevel: settingInterventionLevel(
           useSettingsStore.getState().effectiveSettings['agent.interventionLevel']
+        ),
+        projectMemoryMode: settingProjectMemoryMode(
+          useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
         ),
         subAgentMode: settingSubAgentMode(
           useSettingsStore.getState().effectiveSettings['agent.subagents.mode']

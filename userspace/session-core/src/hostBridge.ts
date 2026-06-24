@@ -43,6 +43,7 @@ interface HostBridgeRequest {
   requirementConfirmationMode?: 'off' | 'auto' | 'always';
   reviewContinuationMode?: 'auto' | 'ask' | 'off';
   interventionLevel?: 'low' | 'medium' | 'high';
+  projectMemoryMode?: 'confirm' | 'auto';
   subAgentMode?: 'auto' | 'off';
   subAgentMaxParallel?: number;
   title?: string;
@@ -108,7 +109,7 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
     subAgentMode: request.subAgentMode,
     subAgentMaxParallel: request.subAgentMaxParallel,
   });
-  await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session);
+  await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
   const timeline = await readTimeline(apiBase, result.session.id);
   const finalText = extractFinalText(timeline);
   const lifecycle = inferHostRunLifecycle(result.events, finalText);
@@ -147,10 +148,11 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
     workflow: request.workflow,
     reviewContinuationMode: request.reviewContinuationMode,
     interventionLevel: request.interventionLevel,
+    projectMemoryMode: request.projectMemoryMode,
     subAgentMode: request.subAgentMode,
     subAgentMaxParallel: request.subAgentMaxParallel,
   });
-  await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session);
+  await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session, request.projectMemoryMode);
   const timeline = await readTimeline(apiBase, result.session.id);
   const finalText = extractFinalText(timeline);
   const lifecycle = inferHostRunLifecycle(result.events, finalText);
@@ -170,7 +172,8 @@ async function persistMemoryArchive(
   sessionId: string,
   events: AgentEvent[],
   binding: AgentWorkspaceBinding | undefined,
-  session: unknown
+  session: unknown,
+  projectMemoryMode: 'confirm' | 'auto' | undefined
 ): Promise<void> {
   try {
     const client = new SessionStorageClient(apiBase);
@@ -179,6 +182,7 @@ async function persistMemoryArchive(
       workspaceScopeKey: binding?.workspaceHash ?? binding?.workspaceId,
       displayProjectName: binding?.openPath,
       displaySessionName: sessionTitle(session) ?? sessionId,
+      projectMemoryMode,
     });
     await client.persistMemoryArchive(sessionId, snapshot);
   } catch (error) {

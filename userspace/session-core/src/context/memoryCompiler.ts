@@ -1,10 +1,14 @@
 import type { AgentEvent } from '@deepcode/protocol';
 import type {
   MemoryCompressionMode,
+  MemoryCandidateCreatedBy,
+  MemoryCandidateStatus,
   MemoryItemAuthority,
   MemoryItemKind,
   MemoryItemScope,
   MemoryItemV4,
+  MemoryRiskClass,
+  ProjectMemoryMode,
   SessionMemoryDocument,
 } from './memory.js';
 
@@ -21,14 +25,32 @@ interface MemoryCandidate {
   ledgerRefs?: string[];
   auditRefs?: string[];
   compression?: MemoryItemV4['compression'];
+  status?: MemoryCandidateStatus;
+  riskClass?: MemoryRiskClass;
+  confidence?: number;
+  semanticKey?: string;
+  createdBy?: MemoryCandidateCreatedBy;
+  projectMemoryMode?: ProjectMemoryMode;
 }
 
-export function compileSessionMemoryDocument(events: AgentEvent[]): SessionMemoryDocument {
+export function compileSessionMemoryDocument(
+  events: AgentEvent[],
+  options: { projectMemoryMode?: ProjectMemoryMode } = {}
+): SessionMemoryDocument {
+  const projectMemoryMode = options.projectMemoryMode ?? 'confirm';
   const candidates = compileMemoryCandidates(events);
-  const projectMemoryItems = capMemoryItems(dedupeMemoryItems(
+  const projectCandidateItems = dedupeMemoryItems(
     candidates
       .filter((item) => item.lane === 'project')
-      .map(memoryItemFromCandidate),
+      .map((item) => memoryItemFromCandidate(applyProjectCandidateGovernance(item, projectMemoryMode))),
+    80
+  );
+  const projectMemoryItems = capMemoryItems(dedupeMemoryItems(
+    projectCandidateItems.filter((item) => item.governance?.status === 'auto-promoted' || item.governance?.status === 'confirmed'),
+    40
+  ), 128_000);
+  const pendingProjectMemoryCandidates = capMemoryItems(dedupeMemoryItems(
+    projectCandidateItems.filter((item) => item.governance?.status === 'pending'),
     40
   ), 128_000);
   const sessionMemoryItems = capMemoryItems(dedupeMemoryItems(
@@ -82,6 +104,7 @@ export function compileSessionMemoryDocument(events: AgentEvent[]): SessionMemor
     sourceEventCount: events.length,
     projectMemoryItems,
     sessionMemoryItems,
+    pendingProjectMemoryCandidates,
     projectMemoryContext: projectMemoryItems.map(renderMemoryItemLine),
     sessionMemoryContext: sessionMemoryItems.map(renderMemoryItemLine),
     longTermContext: projectMemoryItems.map((item) => item.content),
@@ -94,10 +117,12 @@ export function compileSessionMemoryDocument(events: AgentEvent[]): SessionMemor
     archiveMetadata: {
       projectMemoryArchiveHash: memoryItemsHash(projectMemoryItems),
       sessionMemoryArchiveHash: memoryItemsHash(sessionMemoryItems),
+      projectMemoryMode,
       expandedMemoryItemIds: [
         ...projectMemoryItems.map((item) => item.id),
         ...sessionMemoryItems.map((item) => item.id),
       ],
+      pendingProjectMemoryCandidateIds: pendingProjectMemoryCandidates.map((item) => item.id),
       memoryDroppedReasonCounts: droppedReasonCounts(candidates),
       auditOnlyContext,
     },
@@ -125,6 +150,9 @@ export function renderMemoryItemLine(item: MemoryItemV4): string {
     freshness || 'freshness=none',
     `sourceRefs=${refs || 'synthetic:none'}`,
     compression,
+    item.governance
+      ? `governance=status=${item.governance.status} risk=${item.governance.riskClass} confidence=${item.governance.confidence} semanticKey=${item.governance.semanticKey}`
+      : 'governance=none',
     `content=${item.content}`,
   ].join(' | ');
 }
@@ -418,7 +446,69 @@ function memoryItemFromCandidate(candidate: MemoryCandidate): MemoryItemV4 {
       auditRefs: candidate.auditRefs,
     },
     compression: candidate.compression ?? compressionFor(candidate.content, clipped.length),
+    governance: {
+      status: candidate.status ?? (candidate.scope === 'project' ? 'pending' : 'confirmed'),
+      riskClass: candidate.riskClass ?? riskClassForCandidate(candidate),
+      confidence: candidate.confidence ?? confidenceForCandidate(candidate),
+      semanticKey: candidate.semanticKey ?? semanticKeyForCandidate(candidate),
+      createdBy: candidate.createdBy ?? 'rule',
+      projectMemoryMode: candidate.scope === 'project' ? candidate.projectMemoryMode : undefined,
+      promotionReason: candidate.status === 'auto-promoted'
+        ? 'project memory auto mode promoted a low-risk non-permission candidate'
+        : undefined,
+      updatedAt: candidate.event.ts,
+    },
   };
+}
+
+function applyProjectCandidateGovernance(
+  candidate: MemoryCandidate,
+  projectMemoryMode: ProjectMemoryMode
+): MemoryCandidate {
+  const riskClass = candidate.riskClass ?? riskClassForCandidate(candidate);
+  const status: MemoryCandidateStatus = projectMemoryMode === 'auto' && isAutoPromotableProjectCandidate(candidate, riskClass)
+    ? 'auto-promoted'
+    : 'pending';
+  return {
+    ...candidate,
+    status,
+    riskClass,
+    confidence: candidate.confidence ?? confidenceForCandidate(candidate),
+    semanticKey: candidate.semanticKey ?? semanticKeyForCandidate(candidate),
+    createdBy: candidate.createdBy ?? 'rule',
+    projectMemoryMode,
+  };
+}
+
+function isAutoPromotableProjectCandidate(candidate: MemoryCandidate, riskClass: MemoryRiskClass): boolean {
+  if (riskClass !== 'low') return false;
+  if (candidate.authority === 'kernelFact' || candidate.kind === 'fact') return false;
+  if (candidate.content.match(/\b(delete|permission|grant|git push|network|secret|token|external path)\b/i)) return false;
+  return candidate.kind === 'resource' || candidate.kind === 'habit' || candidate.kind === 'risk';
+}
+
+function riskClassForCandidate(candidate: MemoryCandidate): MemoryRiskClass {
+  if (candidate.authority === 'kernelFact' || candidate.kind === 'fact') return 'high';
+  if (candidate.kind === 'decision' || candidate.kind === 'risk') return 'medium';
+  return 'low';
+}
+
+function confidenceForCandidate(candidate: MemoryCandidate): number {
+  if (candidate.authority === 'userDecision' || candidate.authority === 'userRuler') return 0.9;
+  if (candidate.authority === 'resourcePacket') return 0.78;
+  if (candidate.authority === 'kernelFact') return 0.95;
+  return 0.65;
+}
+
+function semanticKeyForCandidate(candidate: MemoryCandidate): string {
+  const basis = [
+    candidate.scope,
+    candidate.kind,
+    candidate.authority,
+    candidate.path ?? '',
+    candidate.content.toLowerCase().replace(/\s+/g, ' ').trim(),
+  ].join('\n');
+  return `semantic:${memoryHash(basis)}`;
 }
 
 function compactContinuation(record: Record<string, unknown>): string | null {
@@ -436,7 +526,9 @@ function droppedReasonCounts(candidates: MemoryCandidate[]): Record<string, numb
       ? 'audit_only'
       : candidate.lane === 'evidence'
         ? 'evidence_tail'
-        : 'retained';
+        : candidate.lane === 'project'
+          ? 'project_candidate'
+          : 'retained';
     counts[reason] = (counts[reason] ?? 0) + 1;
   }
   return counts;

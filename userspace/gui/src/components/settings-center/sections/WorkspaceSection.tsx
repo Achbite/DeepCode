@@ -30,6 +30,7 @@ const WorkspaceSection: React.FC = () => {
   const sources = useSettingsStore((s) => s.sources);
   const patchWorkspaceSetting = useSettingsStore((s) => s.patchWorkspaceSetting);
   const currentAgentSessionId = useAgentSessionStore((s) => s.session?.id);
+  const projectMemoryMode = effectiveSettings['agent.memory.projectMode'] === 'auto' ? 'auto' : 'confirm';
 
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [archiveMessage, setArchiveMessage] = useState<{ kind: 'info' | 'error'; text: string } | null>(null);
@@ -110,7 +111,7 @@ const WorkspaceSection: React.FC = () => {
       : (sessionId ? [sessionId] : currentAgentSessionId ? [currentAgentSessionId] : []);
     const snapshots: SessionMemorySnapshot[] = [];
     for (const targetSessionId of fallbackSessionIds) {
-      const result = await getAgentSessionMemorySnapshot(targetSessionId);
+      const result = await getAgentSessionMemorySnapshot(targetSessionId, { projectMemoryMode });
       if (result.ok && result.data) {
         snapshots.push(result.data);
       } else if (sessionId) {

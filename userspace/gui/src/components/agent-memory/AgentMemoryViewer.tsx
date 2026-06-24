@@ -33,7 +33,10 @@ const AgentMemoryViewer: React.FC<AgentMemoryViewerProps> = ({
   const [scope, setScope] = useState<MemoryScopeView>(defaultScope);
   const [query, setQuery] = useState('');
   const projectItems = useMemo(
-    () => dedupeMemoryItems(snapshots.flatMap((snapshot) => snapshot.projectMemoryItems)),
+    () => dedupeMemoryItems(snapshots.flatMap((snapshot) => [
+      ...snapshot.projectMemoryItems,
+      ...(snapshot.pendingProjectMemoryCandidates ?? []),
+    ])),
     [snapshots]
   );
   const sessionItems = useMemo(
@@ -126,10 +129,16 @@ const AgentMemoryViewer: React.FC<AgentMemoryViewerProps> = ({
           visibleItems.map((item) => (
             <article key={item.id} className="agent-memory-item">
               <div className="agent-memory-item__meta">
-                <span>{item.scope}</span>
-                <span>{item.kind}</span>
-                <span>{item.authority}</span>
-                <span>{item.compression?.mode ?? 'raw'}</span>
+                <span>{localizedMemoryValue(language, 'scope', item.scope)}</span>
+                <span>{localizedMemoryValue(language, 'kind', item.kind)}</span>
+                <span>{localizedMemoryValue(language, 'authority', item.authority)}</span>
+                <span>{localizedMemoryValue(language, 'compression', item.compression?.mode ?? 'raw')}</span>
+                {item.governance && (
+                  <>
+                    <span>{localizedMemoryValue(language, 'status', item.governance.status)}</span>
+                    <span>{localizedMemoryValue(language, 'risk', item.governance.riskClass)}</span>
+                  </>
+                )}
               </div>
               <p>{item.content}</p>
               <dl>
@@ -167,11 +176,21 @@ function memoryItemSearchText(item: MemoryItemV4): string {
     item.scope,
     item.kind,
     item.authority,
+    item.governance?.status,
+    item.governance?.riskClass,
     item.content,
     item.freshness.path,
     item.freshness.query,
     item.freshness.symbol,
   ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function localizedMemoryValue(
+  language: UiLanguage,
+  group: 'scope' | 'kind' | 'authority' | 'compression' | 'status' | 'risk',
+  value: string
+): string {
+  return t(language, `memory.${group}.${value}`);
 }
 
 function memoryFreshnessText(item: MemoryItemV4, language: UiLanguage): string {

@@ -17,6 +17,7 @@ import {
   renderProjectMemoryHints,
   renderProjectMemoryRecallHints,
   renderSessionScopedMemoryHints,
+  type ProjectMemoryMode,
   type UserGuidanceEvent,
   type SessionMemoryDocument,
 } from './memory.js';
@@ -180,6 +181,9 @@ export interface ContextAssemblyRecord {
   evidenceFreshnessMode: 'resource-evidence-tail-v1';
   projectMemoryArchiveHash?: string;
   sessionMemoryArchiveHash?: string;
+  projectMemoryMode?: ProjectMemoryMode;
+  pendingProjectMemoryCandidateCount?: number;
+  pendingProjectMemoryCandidateIds?: string[];
   expandedMemoryItemIds?: string[];
   memoryDroppedReasonCounts?: Record<string, number>;
   providerCacheAttribution: ProviderCacheAttribution;
@@ -209,6 +213,7 @@ export interface ContextAssemblyInput {
   conversationRoots?: ConversationResourceRoot[];
   requirement?: RequirementRecord;
   memoryDocument?: SessionMemoryDocument;
+  projectMemoryMode?: ProjectMemoryMode;
   extraMemoryHints?: string[];
   interventionLevel?: PromptEnvelopeBuilderInput['interventionLevel'];
   userOverlay?: string;
@@ -236,7 +241,9 @@ export interface ContextAssemblyInput {
 }
 
 export function assembleContext(input: ContextAssemblyInput): ContextAssemblyResult {
-  const memoryDocument = input.memoryDocument ?? buildSessionMemoryDocument(input.existingEvents ?? []);
+  const memoryDocument = input.memoryDocument ?? buildSessionMemoryDocument(input.existingEvents ?? [], {
+    projectMemoryMode: input.projectMemoryMode,
+  });
   const userGuidance = input.userGuidance ?? collectUserGuidanceEvents(input.existingEvents ?? []);
   const resourcePromptContext = buildResourcePromptContext({
     initialContext: input.initialContext,
@@ -348,6 +355,9 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     evidenceFreshnessMode: EVIDENCE_FRESHNESS_MODE,
     projectMemoryArchiveHash: memoryDocument.archiveMetadata?.projectMemoryArchiveHash,
     sessionMemoryArchiveHash: memoryDocument.archiveMetadata?.sessionMemoryArchiveHash,
+    projectMemoryMode: memoryDocument.archiveMetadata?.projectMemoryMode,
+    pendingProjectMemoryCandidateCount: memoryDocument.pendingProjectMemoryCandidates.length,
+    pendingProjectMemoryCandidateIds: memoryDocument.archiveMetadata?.pendingProjectMemoryCandidateIds,
     expandedMemoryItemIds: memoryDocument.archiveMetadata?.expandedMemoryItemIds,
     memoryDroppedReasonCounts: memoryDocument.archiveMetadata?.memoryDroppedReasonCounts,
     providerCacheAttribution,

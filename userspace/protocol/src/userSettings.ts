@@ -69,6 +69,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'agent.requirementConfirmationMode': 'auto',
   'agent.reviewContinuationMode': 'auto',
   'agent.interventionLevel': 'medium',
+  'agent.memory.projectMode': 'confirm',
   'agent.subagents.mode': 'off',
   'agent.subagents.maxParallel': 2,
   'agent.permissions.allowFileRead': true,
@@ -112,6 +113,7 @@ const SHARED_AGENT_KEY_PREFIXES = [
 ];
 
 const WORKSPACE_OVERRIDABLE_KEYS = new Set([
+  'agent.memory.projectMode',
   'skills.mounts',
   'mcp.servers',
   'ruler.rules',

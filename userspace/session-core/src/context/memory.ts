@@ -12,6 +12,10 @@ export type MemoryItemScope = 'project' | 'session';
 export type MemoryItemKind = 'fact' | 'intent' | 'decision' | 'resource' | 'habit' | 'risk' | 'checkpoint';
 export type MemoryItemAuthority = 'kernelFact' | 'resourcePacket' | 'userDecision' | 'userRuler' | 'summary';
 export type MemoryCompressionMode = 'raw' | 'summary' | 'handleOnly';
+export type ProjectMemoryMode = 'confirm' | 'auto';
+export type MemoryCandidateStatus = 'pending' | 'auto-promoted' | 'confirmed' | 'rejected' | 'deprecated' | 'superseded';
+export type MemoryRiskClass = 'low' | 'medium' | 'high';
+export type MemoryCandidateCreatedBy = 'rule' | 'llmCompression' | 'user';
 
 export interface MemoryItemV4 {
   id: string;
@@ -42,6 +46,16 @@ export interface MemoryItemV4 {
     reason?: string;
     originalCharCount?: number;
   };
+  governance?: {
+    status: MemoryCandidateStatus;
+    riskClass: MemoryRiskClass;
+    confidence: number;
+    semanticKey: string;
+    createdBy: MemoryCandidateCreatedBy;
+    projectMemoryMode?: ProjectMemoryMode;
+    promotionReason?: string;
+    updatedAt?: string;
+  };
 }
 
 export interface SessionMemoryDocument {
@@ -49,6 +63,7 @@ export interface SessionMemoryDocument {
   sourceEventCount: number;
   projectMemoryItems: MemoryItemV4[];
   sessionMemoryItems: MemoryItemV4[];
+  pendingProjectMemoryCandidates: MemoryItemV4[];
   projectMemoryContext: string[];
   sessionMemoryContext: string[];
   longTermContext: string[];
@@ -61,7 +76,9 @@ export interface SessionMemoryDocument {
   archiveMetadata?: {
     projectMemoryArchiveHash: string;
     sessionMemoryArchiveHash: string;
+    projectMemoryMode: ProjectMemoryMode;
     expandedMemoryItemIds: string[];
+    pendingProjectMemoryCandidateIds: string[];
     memoryDroppedReasonCounts: Record<string, number>;
     auditOnlyContext: string[];
   };
@@ -78,9 +95,12 @@ export interface SessionMemorySnapshot {
   };
   projectMemoryItems: MemoryItemV4[];
   sessionMemoryItems: MemoryItemV4[];
+  pendingProjectMemoryCandidates: MemoryItemV4[];
   metadata: {
     projectItemCount: number;
     sessionItemCount: number;
+    pendingProjectCandidateCount: number;
+    projectMemoryMode: ProjectMemoryMode;
     compressionModes: MemoryCompressionMode[];
     freshnessMode: 'compiledFromSessionEvents';
     archiveDescriptor: MemoryArchiveDescriptor;
@@ -96,6 +116,7 @@ export interface BuildSessionMemorySnapshotOptions {
   workspaceScopeKey?: string;
   displayProjectName?: string;
   displaySessionName?: string;
+  projectMemoryMode?: ProjectMemoryMode;
 }
 
 export interface UserGuidanceEvent {
@@ -110,9 +131,15 @@ export function buildSessionMemorySnapshot(
   events: AgentEvent[],
   options: BuildSessionMemorySnapshotOptions = {}
 ): SessionMemorySnapshot {
-  const document = buildSessionMemoryDocument(events);
+  const document = buildSessionMemoryDocument(events, {
+    projectMemoryMode: options.projectMemoryMode,
+  });
   const compressionModes = new Set<MemoryCompressionMode>();
-  for (const item of [...document.projectMemoryItems, ...document.sessionMemoryItems]) {
+  for (const item of [
+    ...document.projectMemoryItems,
+    ...document.sessionMemoryItems,
+    ...document.pendingProjectMemoryCandidates,
+  ]) {
     compressionModes.add(item.compression?.mode ?? 'raw');
   }
   const archiveDescriptor = buildMemoryArchiveDescriptor({
@@ -134,9 +161,12 @@ export function buildSessionMemorySnapshot(
     },
     projectMemoryItems: document.projectMemoryItems,
     sessionMemoryItems: document.sessionMemoryItems,
+    pendingProjectMemoryCandidates: document.pendingProjectMemoryCandidates,
     metadata: {
       projectItemCount: document.projectMemoryItems.length,
       sessionItemCount: document.sessionMemoryItems.length,
+      pendingProjectCandidateCount: document.pendingProjectMemoryCandidates.length,
+      projectMemoryMode: document.archiveMetadata?.projectMemoryMode ?? 'confirm',
       compressionModes: [...compressionModes],
       freshnessMode: 'compiledFromSessionEvents',
       archiveDescriptor,
@@ -147,8 +177,11 @@ export function buildSessionMemorySnapshot(
   };
 }
 
-export function buildSessionMemoryDocument(events: AgentEvent[]): SessionMemoryDocument {
-  return compileSessionMemoryDocument(events);
+export function buildSessionMemoryDocument(
+  events: AgentEvent[],
+  options: { projectMemoryMode?: ProjectMemoryMode } = {}
+): SessionMemoryDocument {
+  return compileSessionMemoryDocument(events, options);
 }
 
 function buildLegacySessionMemoryDocument(events: AgentEvent[]): SessionMemoryDocument {
@@ -375,6 +408,7 @@ function buildLegacySessionMemoryDocument(events: AgentEvent[]): SessionMemoryDo
     sourceEventCount: events.length,
     projectMemoryItems,
     sessionMemoryItems,
+    pendingProjectMemoryCandidates: [],
     projectMemoryContext: projectMemoryItems.map(renderMemoryItemLine),
     sessionMemoryContext: sessionMemoryItems.map(renderMemoryItemLine),
     longTermContext: dedupeKeepLast(longTermContext, 18),
@@ -384,6 +418,18 @@ function buildLegacySessionMemoryDocument(events: AgentEvent[]): SessionMemoryDo
     factContext: factContext.slice(-14),
     decisionContext: decisionContext.slice(-10),
     resourceContext: resourceContext.slice(-12),
+    archiveMetadata: {
+      projectMemoryArchiveHash: memoryHash(JSON.stringify(projectMemoryItems.map((item) => item.id))),
+      sessionMemoryArchiveHash: memoryHash(JSON.stringify(sessionMemoryItems.map((item) => item.id))),
+      projectMemoryMode: 'confirm',
+      expandedMemoryItemIds: [
+        ...projectMemoryItems.map((item) => item.id),
+        ...sessionMemoryItems.map((item) => item.id),
+      ],
+      pendingProjectMemoryCandidateIds: [],
+      memoryDroppedReasonCounts: { retained: projectMemoryItems.length + sessionMemoryItems.length },
+      auditOnlyContext: [],
+    },
   };
 }
 
@@ -391,10 +437,14 @@ export function renderProjectMemoryHints(document: SessionMemoryDocument): strin
   return [
     'ProjectMemoryIndexDigest (project-scoped, 128k emergency soft cap):',
     'Boundary: shared project memory stores durable norms, user preferences, historical gotchas, long-term planning summaries, and cross-session decision indexes. It is not Kernel authority and must be refreshed from ResourcePacket/tool facts when code may have changed.',
+    `mode=${document.archiveMetadata?.projectMemoryMode ?? 'confirm'}`,
     `archiveHash=${document.archiveMetadata?.projectMemoryArchiveHash ?? 'none'}`,
     document.archiveMetadata?.expandedMemoryItemIds.length
       ? `selectedItemIds=${document.archiveMetadata.expandedMemoryItemIds.filter((id) => id.includes(':project:')).slice(0, 24).join(', ')}`
       : 'selectedItemIds=none',
+    document.archiveMetadata?.pendingProjectMemoryCandidateIds.length
+      ? `pendingCandidateIds=${document.archiveMetadata.pendingProjectMemoryCandidateIds.slice(0, 24).join(', ')}`
+      : 'pendingCandidateIds=none',
     document.archiveMetadata?.memoryDroppedReasonCounts
       ? `dropReasons=${JSON.stringify(document.archiveMetadata.memoryDroppedReasonCounts)}`
       : 'dropReasons=none',
@@ -461,6 +511,9 @@ function renderMemoryItemLine(item: MemoryItemV4): string {
     freshness || 'freshness=none',
     `sourceRefs=${item.sourceRefs.eventIds.length ? item.sourceRefs.eventIds.join(',') : 'none'}`,
     compression,
+    item.governance
+      ? `governance=status=${item.governance.status} risk=${item.governance.riskClass} confidence=${item.governance.confidence} semanticKey=${item.governance.semanticKey}`
+      : 'governance=none',
     `content=${item.content}`,
   ].join(' | ');
 }
@@ -537,10 +590,12 @@ function compactMemoryBullet(item: MemoryItemV4): string {
     `id=${item.id}`,
     `kind=${item.kind}`,
     `authority=${item.authority}`,
+    item.governance ? `status=${item.governance.status}` : '',
+    item.governance ? `risk=${item.governance.riskClass}` : '',
     freshness || 'freshness=none',
     `sourceRefs=${sourceRefs || 'synthetic:none'}`,
     `content=${item.content}`,
-  ].join(' | ');
+  ].filter(Boolean).join(' | ');
 }
 
 export function renderSessionMemoryHints(document: SessionMemoryDocument): string[] {

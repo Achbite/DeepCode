@@ -443,7 +443,8 @@ export function getAgentSession(sessionId: string): Promise<ApiResponse<AgentSes
 }
 
 export async function getAgentSessionMemorySnapshot(
-  sessionId: string
+  sessionId: string,
+  options: { projectMemoryMode?: 'confirm' | 'auto' } = {}
 ): Promise<ApiResponse<SessionMemorySnapshot>> {
   const result = await getAgentSession(sessionId);
   if (!result.ok || !result.data) {
@@ -464,6 +465,7 @@ export async function getAgentSessionMemorySnapshot(
     sessionId,
     workspaceScopeKey,
     displaySessionName: typeof session?.title === 'string' ? session.title : sessionId,
+    projectMemoryMode: options.projectMemoryMode,
   });
   void api.persistAgentSessionMemoryArchive(sessionId, { snapshot }).catch((error) => {
     console.warn('persist agent session memory archive failed', error);
