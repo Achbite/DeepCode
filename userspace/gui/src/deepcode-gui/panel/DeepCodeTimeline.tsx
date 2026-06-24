@@ -13,6 +13,13 @@ import { t, type UiLanguage } from '../../i18n';
 import { submitAgentFeedback } from '../../services/runtimeAdapter';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
 import ToolEvidenceDetails from '../../components/agent-panel/ToolEvidenceDetails';
+import {
+  buildLiveDisplayItems,
+  flattenLiveDisplayDeltas,
+  liveDisplayStatus,
+  useLiveTimelinePlayback,
+  type LiveDisplayItem,
+} from '../../components/agent-panel/liveTimelinePlayback';
 import { useSettingsStore } from '../../state/settingsStore';
 import { formatToolEvidence } from '../../utils/toolEvidence';
 
@@ -59,9 +66,22 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     [fallbackTimeline, timeline]
   );
   const coalescedActiveDeltas = useCoalescedProjectionDeltas(activeDeltas, 50);
+  const committedActivityIds = useMemo(() => collectCommittedActivityIds(view), [view]);
+  const liveDisplayItems = useMemo(
+    () => buildLiveDisplayItems({
+      sessionId: view.sessionId,
+      deltas: coalescedActiveDeltas,
+      committedActivityIds,
+    }),
+    [coalescedActiveDeltas, committedActivityIds, view.sessionId]
+  );
+  const livePlayback = useLiveTimelinePlayback(liveDisplayItems, {
+    enabled: loading,
+    holdMs: 1000,
+  });
   const viewWithActive = useMemo(
-    () => appendActiveDeltaTurn(view, coalescedActiveDeltas, language),
-    [coalescedActiveDeltas, language, view]
+    () => appendLiveDisplayTurn(view, livePlayback.visibleItems, language),
+    [language, livePlayback.visibleItems, view]
   );
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineContentRef = useRef<HTMLDivElement | null>(null);
@@ -111,6 +131,7 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     }
     return false;
   }, [completedTypewriterBlockLengths, typewriterBlockLengths]);
+  const hasPendingPlayback = hasPendingTypewriter || livePlayback.isHolding;
 
   useEffect(() => {
     setCompletedTypewriterBlockLengths((current) => {
@@ -128,8 +149,8 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   }, [typewriterBlockLengthSignature, typewriterBlockLengths]);
 
   useEffect(() => {
-    onTypewriterActiveChange?.(hasPendingTypewriter);
-  }, [hasPendingTypewriter, onTypewriterActiveChange]);
+    onTypewriterActiveChange?.(hasPendingPlayback);
+  }, [hasPendingPlayback, onTypewriterActiveChange]);
 
   useEffect(() => () => {
     onTypewriterActiveChange?.(false);
@@ -381,137 +402,22 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   );
 };
 
-function appendActiveDeltaTurn(
+function appendLiveDisplayTurn(
   view: AgentTimelineResult,
-  deltas: ProjectionDelta[],
+  items: LiveDisplayItem[],
   language: UiLanguage
 ): AgentTimelineResult {
-  const active = deltas
-    .filter((delta) => delta.sessionId === view.sessionId && delta.type !== 'committed')
-    .sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
-  if (active.length === 0) return view;
+  if (items.length === 0) return view;
 
-  const runId = active.find((delta) => delta.runId)?.runId ?? 'active-run';
-  const turnId = active.find((delta) => delta.turnId)?.turnId ?? `active-${runId}`;
-  const status = activeTimelineStatus(active);
-  const parentDeltas = active.filter((delta) => !isBranchDelta(delta));
-  const committedActivityIds = collectCommittedActivityIds(view);
-
-  const blocks: AgentTimelineBlock[] = [];
-  let textSegmentKind: 'thinking' | 'assistant' | 'draft' | null = null;
-  let textSegmentStartKey = '';
-  let textSegmentBody = '';
-
-  const flushTextSegment = (completed = false) => {
-    if (!textSegmentKind || !textSegmentBody.trim()) {
-      textSegmentKind = null;
-      textSegmentStartKey = '';
-      textSegmentBody = '';
-      return;
-    }
-    const segmentStatus = completed ? 'completed' : status;
-    if (textSegmentKind === 'thinking') {
-      blocks.push({
-        id: `active-thinking-${safeActiveBlockId(runId)}-${textSegmentStartKey}`,
-        kind: 'thinking',
-        narrativeKind: 'thinking',
-        title: t(language, 'deepcodeGui.timeline.thinking'),
-        summary: t(language, 'deepcodeGui.timeline.reasoningStreaming'),
-        status: segmentStatus,
-        defaultCollapsed: completed,
-        bodyMarkdown: textSegmentBody,
-        displayHints: {
-          renderMode: 'typewriter',
-          typewriterSpeed: 'slow',
-          initialOpen: !completed,
-          replaceOnComplete: true,
-        },
-        events: [],
-      });
-    } else if (textSegmentKind === 'assistant') {
-      blocks.push({
-        id: `active-assistant-${safeActiveBlockId(runId)}-${textSegmentStartKey}`,
-        kind: 'assistant',
-        narrativeKind: 'assistantText',
-        title: 'DeepCode',
-        summary: t(language, 'deepcodeGui.timeline.responding'),
-        status: segmentStatus,
-        defaultCollapsed: false,
-        bodyMarkdown: textSegmentBody,
-        displayHints: {
-          renderMode: 'typewriter',
-          typewriterSpeed: 'normal',
-          replaceOnComplete: true,
-        },
-        events: [],
-      });
-    } else {
-      blocks.push({
-        id: `active-draft-${safeActiveBlockId(runId)}-${textSegmentStartKey}`,
-        kind: 'stage',
-        narrativeKind: 'operationEvidence',
-        title: t(language, 'deepcodeGui.timeline.editDraft'),
-        summary: t(language, 'deepcodeGui.timeline.editDraftStreaming'),
-        status: segmentStatus,
-        defaultCollapsed: false,
-        bodyMarkdown: textSegmentBody,
-        displayHints: {
-          renderMode: 'typewriter',
-          typewriterSpeed: 'normal',
-          replaceOnComplete: true,
-        },
-        events: [],
-      });
-    }
-    textSegmentKind = null;
-    textSegmentStartKey = '';
-    textSegmentBody = '';
-  };
-
-  const appendTextSegment = (
-    kind: 'thinking' | 'assistant' | 'draft',
-    delta: ProjectionDelta,
-    index: number
-  ) => {
-    if (textSegmentKind && textSegmentKind !== kind) {
-      flushTextSegment(true);
-    }
-    if (!textSegmentKind) {
-      textSegmentKind = kind;
-      textSegmentStartKey = activeDeltaSegmentKey(delta, index);
-    }
-    textSegmentBody += delta.delta ?? '';
-  };
-
-  for (let index = 0; index < parentDeltas.length; index += 1) {
-    const delta = parentDeltas[index];
-    if (delta.type === 'part_delta' && delta.channel === 'reasoning' && typeof delta.delta === 'string') {
-      appendTextSegment('thinking', delta, index);
-      continue;
-    }
-    if (
-      (delta.type === 'draft_delta' || delta.type === 'part_delta') &&
-      (delta.channel === 'draft' || !delta.channel) &&
-      typeof delta.delta === 'string'
-    ) {
-      appendTextSegment('draft', delta, index);
-      continue;
-    }
-    const activity = delta.activity;
-    if (activity && !committedActivityIds.has(activity.activityId) && isMainTimelineActivity(activity)) {
-      flushTextSegment(true);
-      blocks.push(activityBlockFromActivity(activity, language, true));
-      continue;
-    }
-    if (delta.type === 'reasoning_delta' && typeof delta.delta === 'string') {
-      appendTextSegment('thinking', delta, index);
-      continue;
-    }
-    if (delta.type === 'assistant_delta' && typeof delta.delta === 'string') {
-      appendTextSegment('assistant', delta, index);
-    }
-  }
-  flushTextSegment();
+  const deltas = flattenLiveDisplayDeltas(items);
+  const runId = items.find((item) => item.runId)?.runId ?? 'active-run';
+  const turnId = items.find((item) => item.turnId)?.turnId ?? `active-${runId}`;
+  const status = liveDisplayStatus(items);
+  const blocks = items
+    .map((item) => item.type === 'activity'
+      ? activityBlockFromActivity(item.activity, language, true)
+      : textBlockFromLiveDisplayItem(item, runId, status, language))
+    .filter((block): block is AgentTimelineBlock => Boolean(block));
   if (blocks.length === 0) return view;
 
   return {
@@ -522,12 +428,96 @@ function appendActiveDeltaTurn(
         id: `active-${turnId}`,
         sessionId: view.sessionId,
         status,
-        startedAt: active[0]?.payload && isRecord(active[0].payload)
-          ? stringField(active[0].payload, 'startedAt')
+        startedAt: deltas[0]?.payload && isRecord(deltas[0].payload)
+          ? stringField(deltas[0].payload, 'startedAt')
           : undefined,
         blocks,
       },
     ],
+  };
+}
+
+function textBlockFromLiveDisplayItem(
+  item: Extract<LiveDisplayItem, { type: 'text' }>,
+  runId: string,
+  activeStatus: AgentTimelineTurn['status'],
+  language: UiLanguage
+): AgentTimelineBlock | null {
+  if (!item.bodyMarkdown.trim()) return null;
+  const segmentStatus = item.sealed ? 'completed' : activeStatus;
+  const shouldType = !item.sealed;
+  const sealedThinkingHeld = item.textKind === 'thinking' && item.sealed && item.held;
+
+  if (item.textKind === 'thinking') {
+    return {
+      id: `active-thinking-${safeActiveBlockId(runId)}-${safeActiveBlockId(item.key)}`,
+      kind: 'thinking',
+      narrativeKind: 'thinking',
+      title: t(language, 'deepcodeGui.timeline.thinking'),
+      summary: t(language, 'deepcodeGui.timeline.reasoningStreaming'),
+      status: segmentStatus,
+      defaultCollapsed: sealedThinkingHeld,
+      bodyMarkdown: item.bodyMarkdown,
+      displayHints: shouldType
+        ? {
+            renderMode: 'typewriter',
+            typewriterSpeed: 'slow',
+            initialOpen: true,
+            replaceOnComplete: true,
+          }
+        : {
+            renderMode: 'instant',
+            initialOpen: !sealedThinkingHeld,
+            replaceOnComplete: true,
+          },
+      events: [],
+    };
+  }
+
+  if (item.textKind === 'assistant') {
+    return {
+      id: `active-assistant-${safeActiveBlockId(runId)}-${safeActiveBlockId(item.key)}`,
+      kind: 'assistant',
+      narrativeKind: 'assistantText',
+      title: 'DeepCode',
+      summary: t(language, 'deepcodeGui.timeline.responding'),
+      status: segmentStatus,
+      defaultCollapsed: false,
+      bodyMarkdown: item.bodyMarkdown,
+      displayHints: shouldType
+        ? {
+            renderMode: 'typewriter',
+            typewriterSpeed: 'normal',
+            replaceOnComplete: true,
+          }
+        : {
+            renderMode: 'instant',
+            replaceOnComplete: true,
+          },
+      events: [],
+    };
+  }
+
+  return {
+    id: `active-draft-${safeActiveBlockId(runId)}-${safeActiveBlockId(item.key)}`,
+    kind: 'stage',
+    narrativeKind: 'operationEvidence',
+    title: t(language, 'deepcodeGui.timeline.editDraft'),
+    summary: t(language, 'deepcodeGui.timeline.editDraftStreaming'),
+    status: segmentStatus,
+    defaultCollapsed: false,
+    bodyMarkdown: item.bodyMarkdown,
+    displayHints: shouldType
+      ? {
+          renderMode: 'typewriter',
+          typewriterSpeed: 'normal',
+          replaceOnComplete: true,
+        }
+      : {
+          renderMode: 'instant',
+          replaceOnComplete: true,
+        },
+    events: [],
   };
 }
 
@@ -540,12 +530,6 @@ function collectCommittedActivityIds(view: AgentTimelineResult): Set<string> {
     }
   }
   return ids;
-}
-
-function isMainTimelineActivity(activity: AgentConversationActivity): boolean {
-  return activity.kind !== 'providerThinking'
-    && activity.kind !== 'subagentBranch'
-    && activity.kind !== 'subagentMerge';
 }
 
 function activityBlockFromActivity(
@@ -640,25 +624,9 @@ function activityTargetsLabel(activity: AgentConversationActivity, language: UiL
   return t(language, 'deepcodeGui.activity.targets');
 }
 
-function isBranchDelta(delta: ProjectionDelta): boolean {
-  return Boolean(delta.branchId || delta.subAgentId);
-}
-
-function activeDeltaSegmentKey(delta: ProjectionDelta, index: number): string {
-  const seqKey = typeof delta.seq === 'number' ? String(delta.seq) : `idx-${index}`;
-  return safeActiveBlockId(seqKey);
-}
-
 function safeActiveBlockId(value: string): string {
   const safe = value.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
   return safe || 'branch';
-}
-
-function activeTimelineStatus(deltas: ProjectionDelta[]): AgentTimelineTurn['status'] {
-  if (deltas.some((delta) => delta.status === 'failed' || delta.type === 'error')) return 'failed';
-  const latest = deltas[deltas.length - 1];
-  if (latest?.status === 'waiting') return 'waiting';
-  return 'running';
 }
 
 function findTimelineScrollContainer(timelineElement: HTMLElement | null): HTMLElement | null {
@@ -832,7 +800,8 @@ const TurnCard: React.FC<{
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
 }> = ({ turn, language, typewriterBlockIds, collapseCompletedThinking, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const startedAtLabel = formatTurnTime(turn.startedAt);
-  const blocks = turn.blocks;
+  const blocks = turn.blocks.filter(isVisibleTimelineBlock);
+  if (blocks.length === 0) return null;
 
   return (
     <section className={`deepcode-gui-turn deepcode-gui-turn--${turn.status}`}>
@@ -1015,6 +984,7 @@ const TimelineBlock: React.FC<{
   onTypewriterComplete: (blockId: string, textLength: number) => void;
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
 }> = ({ block, language, animateAssistant = false, collapseCompletedThinking = true, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
+  if (!isVisibleTimelineBlock(block)) return null;
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   if (block.kind === 'user') {
@@ -1210,7 +1180,9 @@ const OperationEvidenceBlock: React.FC<{
   block: AgentTimelineBlock;
   language: UiLanguage;
 }> = ({ block, language }) => {
-  const evidence = formatToolEvidence(block.events, language, {
+  const events = visibleOperationEvidenceEvents(block.events);
+  if (block.events.length > 0 && events.length === 0 && !block.activity) return null;
+  const evidence = formatToolEvidence(events, language, {
     fallbackTitle: block.title,
   });
   const title = localizedTimelineText(language, evidence.title);
@@ -1548,11 +1520,33 @@ function localizedTimelineText(language: UiLanguage, text: string): string {
 
 function visibleFallbackDetailEvents(block: AgentTimelineBlock): AgentEvent[] {
   if ((block.bodyMarkdown ?? '').trim()) return [];
-  return block.events.filter((event) => !isRedundantFallbackEvent(event));
+  return block.events.filter((event) => !isRedundantFallbackEvent(event) && !isInternalKernelCheckpointEvent(event));
 }
 
 function isRedundantFallbackEvent(event: AgentEvent): boolean {
   return event.kind === 'requirement_confirmation' || event.kind === 'requirement_decision';
+}
+
+function visibleOperationEvidenceEvents(events: AgentEvent[]): AgentEvent[] {
+  return events.filter((event) => !isInternalKernelCheckpointEvent(event));
+}
+
+function isVisibleTimelineBlock(block: AgentTimelineBlock): boolean {
+  if (block.narrativeKind !== 'operationEvidence' && block.kind !== 'stage') return true;
+  if (block.events.length === 0) return true;
+  return !block.events.every(isInternalKernelCheckpointEvent);
+}
+
+function isInternalKernelCheckpointEvent(event: AgentEvent): boolean {
+  if (event.kind !== 'workflow_stage') return false;
+  if (!isRecord(event.payload)) return false;
+  const stage = stringField(event.payload, 'stage');
+  const kernelEvent = isRecord(event.payload.kernelEvent) ? event.payload.kernelEvent : null;
+  const kernelKind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
+  return stage === 'state.entered' ||
+    stage === 'driver.request_produced' ||
+    kernelKind === 'state.entered' ||
+    kernelKind === 'driver.request_produced';
 }
 
 function planBlockMarkdown(block: AgentTimelineBlock): string {
@@ -1581,12 +1575,12 @@ function trimReviewFooter(markdown: string): string {
 
 function thinkingMarkdown(block: AgentTimelineBlock): string {
   const body = (block.bodyMarkdown ?? '').trim();
-  if (body) return body;
+  if (body) return stripProviderLifecyclePrefix(body);
   const eventText = block.events
     .map(thinkingEventText)
     .filter(Boolean)
     .join('');
-  return eventText.trim();
+  return stripProviderLifecyclePrefix(eventText).trim();
 }
 
 function thinkingEventText(event: AgentEvent): string {
@@ -1597,12 +1591,22 @@ function thinkingEventText(event: AgentEvent): string {
   if (channel && channel !== 'reasoning' && channel !== 'thinking' && channel !== 'thought') {
     return '';
   }
-  return (
+  return stripProviderLifecyclePrefix(
     stringField(event.payload, 'content') ??
     stringField(event.payload, 'message') ??
     stringField(event.payload, 'details') ??
     ''
   ).trim();
+}
+
+function stripProviderLifecyclePrefix(markdown: string): string {
+  return markdown
+    .split(/\r?\n/)
+    .map((line) => line
+      .replace(/^\s*Provider\s+Call\s*[:：]\s*(?:请求模型生成结构化回复[。.]?\s*)?/i, '')
+      .replace(/^\s*Provider\s+Tool\s+Resume(?:\s+\d+)?\s*[:：]\s*(?:请求模型生成结构化回复[。.]?\s*)?/i, ''))
+    .join('\n')
+    .trim();
 }
 
 function eventText(event: AgentEvent): string {
