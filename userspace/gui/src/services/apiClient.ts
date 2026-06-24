@@ -637,6 +637,17 @@ export function readConversationArchiveFile(
   );
 }
 
+export function persistAgentSessionMemoryArchive(
+  sessionId: string,
+  request: { snapshot: unknown }
+): Promise<ApiResponse<unknown>> {
+  return sendJson<unknown>(
+    `${API_BASE}/session-store/${encodeURIComponent(sessionId)}/memory/archive`,
+    'POST',
+    request
+  );
+}
+
 export function appendAgentEvents(
   sessionId: string,
   request: AppendAgentEventsRequest
@@ -685,10 +696,15 @@ export function streamAgentRun(
   sessionId: string,
   runId: string,
   onEvent: (event: AgentRunStreamEvent) => void,
+  cursor?: { sinceEventCount?: number; sinceDeltaSeq?: number },
   signal?: AbortSignal
 ): Promise<void> {
+  const qs = buildQuery({
+    sinceEventCount: cursor?.sinceEventCount === undefined ? undefined : String(cursor.sinceEventCount),
+    sinceDeltaSeq: cursor?.sinceDeltaSeq === undefined ? undefined : String(cursor.sinceDeltaSeq),
+  });
   return streamSse(
-    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/stream`,
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/stream${qs}`,
     onEvent,
     signal
   );

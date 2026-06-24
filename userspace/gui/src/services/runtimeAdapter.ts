@@ -453,9 +453,24 @@ export async function getAgentSessionMemorySnapshot(
       message: result.message ?? 'Agent session events are unavailable.',
     };
   }
+  const session = result.data.session;
+  const workspaceScopeKey =
+    typeof session?.workspaceScopeKey === 'string'
+      ? session.workspaceScopeKey
+      : typeof session?.workspaceId === 'string' && typeof session?.workspaceHash === 'string'
+        ? `workspace-${session.workspaceId}-${session.workspaceHash}`
+        : undefined;
+  const snapshot = buildSessionMemorySnapshot(result.data.events, {
+    sessionId,
+    workspaceScopeKey,
+    displaySessionName: typeof session?.title === 'string' ? session.title : sessionId,
+  });
+  void api.persistAgentSessionMemoryArchive(sessionId, { snapshot }).catch((error) => {
+    console.warn('persist agent session memory archive failed', error);
+  });
   return {
     ok: true,
-    data: buildSessionMemorySnapshot(result.data.events, { sessionId }),
+    data: snapshot,
   };
 }
 
@@ -477,9 +492,10 @@ export function streamAgentRun(
   sessionId: string,
   runId: string,
   onEvent: (event: api.AgentRunStreamEvent) => void,
+  cursor?: { sinceEventCount?: number; sinceDeltaSeq?: number },
   signal?: AbortSignal
 ): Promise<void> {
-  return api.streamAgentRun(sessionId, runId, onEvent, signal);
+  return api.streamAgentRun(sessionId, runId, onEvent, cursor, signal);
 }
 
 export function cancelAgentRunById(

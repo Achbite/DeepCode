@@ -421,11 +421,17 @@ async function startAndWaitAgentRun(
   let result = started.data;
   activeAgentRunIds.set(sessionId, result.run.runId);
   const controller = new AbortController();
+  let lastDeltaSeq = 0;
   const streamDone = streamAgentRun(sessionId, result.run.runId, (event) => {
     const data = event.data;
     if (event.event === 'delta' && isRecord(data)) {
       const delta = data.delta;
-      if (isRecord(delta)) handlers.onDelta?.(delta as unknown as ProjectionDelta);
+      if (isRecord(delta)) {
+        const deltaSeq = typeof delta.deltaSeq === 'number' ? delta.deltaSeq : 0;
+        if (deltaSeq > 0 && deltaSeq <= lastDeltaSeq) return;
+        if (deltaSeq > 0) lastDeltaSeq = deltaSeq;
+        handlers.onDelta?.(delta as unknown as ProjectionDelta);
+      }
     }
     if (event.event === 'events' && isRecord(data) && Array.isArray(data.events)) {
       handlers.onEvents?.(data.events.filter(isRecord) as unknown as AgentEvent[]);
@@ -433,7 +439,7 @@ async function startAndWaitAgentRun(
     if (event.event === 'terminal' && isRecord(data) && Array.isArray(data.events)) {
       handlers.onEvents?.(data.events.filter(isRecord) as unknown as AgentEvent[]);
     }
-  }, controller.signal).catch(() => undefined);
+  }, { sinceEventCount: result.events.length }, controller.signal).catch(() => undefined);
   try {
     while (!isTerminalRunStatus(result.run.status)) {
       await sleep(300);

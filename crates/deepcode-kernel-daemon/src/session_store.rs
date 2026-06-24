@@ -189,6 +189,73 @@ pub(crate) async fn session_store_archive_file_get(
     }))
 }
 
+pub(crate) async fn session_store_memory_archive_get(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<ApiResponse> {
+    let (memory_root, session) = {
+        let gui = state.gui.lock().expect("gui state lock");
+        (
+            gui.paths.memory_archives_dir.clone(),
+            session_metadata(&gui.sessions, &session_id),
+        )
+    };
+    let archive_dir = memory_archive_dir(&memory_root, session.as_ref());
+    let session_archive_dir = archive_dir.join("sessions");
+    let safe_session = safe_path_segment(&session_id);
+    let project_markdown_path = archive_dir.join("project.md");
+    let project_sidecar_path = archive_dir.join("project.memory.json");
+    let session_markdown_path = session_archive_dir.join(format!("{safe_session}.md"));
+    let session_sidecar_path = session_archive_dir.join(format!("{safe_session}.memory.json"));
+    let manifest_path = archive_dir.join("manifest.json");
+    ApiResponse::ok(json!({
+        "sessionId": session_id,
+        "workspaceScopeKey": workspace_scope_key(session.as_ref()),
+        "memoryArchiveRoot": memory_root.to_string_lossy(),
+        "archivePath": archive_dir.to_string_lossy(),
+        "exists": project_markdown_path.exists() || session_markdown_path.exists(),
+        "projectMarkdown": read_optional_text_file(&project_markdown_path),
+        "sessionMarkdown": read_optional_text_file(&session_markdown_path),
+        "projectSidecar": read_json_file(&project_sidecar_path),
+        "sessionSidecar": read_json_file(&session_sidecar_path),
+        "manifest": read_json_file(&manifest_path),
+        "files": {
+            "projectMarkdown": project_markdown_path.to_string_lossy(),
+            "projectSidecar": project_sidecar_path.to_string_lossy(),
+            "sessionMarkdown": session_markdown_path.to_string_lossy(),
+            "sessionSidecar": session_sidecar_path.to_string_lossy(),
+            "manifest": manifest_path.to_string_lossy()
+        }
+    }))
+}
+
+pub(crate) async fn session_store_memory_archive_post(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Json<ApiResponse> {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            return json_body_rejection_response(
+                "/api/session-store/:session_id/memory/archive",
+                rejection,
+            )
+        }
+    };
+    let (memory_root, session) = {
+        let gui = state.gui.lock().expect("gui state lock");
+        (
+            gui.paths.memory_archives_dir.clone(),
+            session_metadata(&gui.sessions, &session_id),
+        )
+    };
+    match write_session_memory_archive(&memory_root, &session_id, session.as_ref(), &body) {
+        Ok(result) => ApiResponse::ok(result),
+        Err(error) => ApiResponse::error("write_memory_archive_failed", error.to_string()),
+    }
+}
+
 pub(crate) async fn session_store_projection_get(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -1067,6 +1134,10 @@ fn conversation_archive_dir(
         .join(safe_path_segment(run_id))
 }
 
+fn memory_archive_dir(memory_root: &FsPath, session: Option<&Value>) -> PathBuf {
+    memory_root.join(workspace_scope_key(session))
+}
+
 fn workspace_scope_key(session: Option<&Value>) -> String {
     let Some(session) = session else {
         return "unbound-workspace".to_string();
@@ -1085,6 +1156,106 @@ fn workspace_scope_key(session: Option<&Value>) -> String {
         (Some(id), None) => format!("workspace-{}", safe_path_segment(id)),
         _ => "unbound-workspace".to_string(),
     }
+}
+
+fn write_session_memory_archive(
+    memory_root: &FsPath,
+    session_id: &str,
+    session: Option<&Value>,
+    body: &Value,
+) -> std::io::Result<Value> {
+    let snapshot = body.get("snapshot").unwrap_or(body);
+    let metadata = snapshot.get("metadata").unwrap_or(snapshot);
+    let project_markdown = metadata
+        .get("projectMarkdownPreview")
+        .or_else(|| body.get("projectMarkdown"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "projectMarkdownPreview is required",
+            )
+        })?;
+    let session_markdown = metadata
+        .get("sessionMarkdownPreview")
+        .or_else(|| body.get("sessionMarkdown"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sessionMarkdownPreview is required",
+            )
+        })?;
+    let descriptor = metadata
+        .get("archiveDescriptor")
+        .cloned()
+        .or_else(|| {
+            metadata
+                .get("archiveSidecar")
+                .and_then(|sidecar| sidecar.get("descriptor"))
+                .cloned()
+        })
+        .unwrap_or_else(|| json!({}));
+    let sidecar = metadata
+        .get("archiveSidecar")
+        .cloned()
+        .or_else(|| body.get("archiveSidecar").cloned())
+        .unwrap_or_else(|| json!({}));
+
+    let archive_dir = memory_archive_dir(memory_root, session);
+    let session_archive_dir = archive_dir.join("sessions");
+    let safe_session = safe_path_segment(session_id);
+    let project_markdown_path = archive_dir.join("project.md");
+    let project_sidecar_path = archive_dir.join("project.memory.json");
+    let session_markdown_path = session_archive_dir.join(format!("{safe_session}.md"));
+    let session_sidecar_path = session_archive_dir.join(format!("{safe_session}.memory.json"));
+    let manifest_path = archive_dir.join("manifest.json");
+
+    let project_sidecar = scoped_memory_sidecar(&sidecar, "project");
+    let session_sidecar = scoped_memory_sidecar(&sidecar, "session");
+    atomic_write_text_file(&project_markdown_path, project_markdown)?;
+    atomic_write_json_file(&project_sidecar_path, &project_sidecar)?;
+    atomic_write_text_file(&session_markdown_path, session_markdown)?;
+    atomic_write_json_file(&session_sidecar_path, &session_sidecar)?;
+
+    let manifest = json!({
+        "schemaVersion": "deepcode.session.memory-archive-manifest.v1",
+        "sessionId": session_id,
+        "workspaceScopeKey": workspace_scope_key(session),
+        "archivePath": archive_dir.to_string_lossy(),
+        "generatedAt": now_text(),
+        "descriptor": descriptor,
+        "files": {
+            "projectMarkdown": project_markdown_path.to_string_lossy(),
+            "projectSidecar": project_sidecar_path.to_string_lossy(),
+            "sessionMarkdown": session_markdown_path.to_string_lossy(),
+            "sessionSidecar": session_sidecar_path.to_string_lossy()
+        }
+    });
+    atomic_write_json_file(&manifest_path, &manifest)?;
+
+    Ok(json!({
+        "sessionId": session_id,
+        "workspaceScopeKey": workspace_scope_key(session),
+        "memoryArchiveRoot": memory_root.to_string_lossy(),
+        "archivePath": archive_dir.to_string_lossy(),
+        "manifest": manifest,
+        "files": {
+            "projectMarkdown": project_markdown_path.to_string_lossy(),
+            "projectSidecar": project_sidecar_path.to_string_lossy(),
+            "sessionMarkdown": session_markdown_path.to_string_lossy(),
+            "sessionSidecar": session_sidecar_path.to_string_lossy(),
+            "manifest": manifest_path.to_string_lossy()
+        }
+    }))
+}
+
+fn scoped_memory_sidecar(sidecar: &Value, scope: &str) -> Value {
+    let mut value = sidecar.clone();
+    if let Value::Object(object) = &mut value {
+        object.insert("memoryScope".to_string(), json!(scope));
+    }
+    value
 }
 
 fn extract_run_id(value: &Value) -> Option<String> {
@@ -1132,6 +1303,10 @@ fn atomic_write_text_file(path: &FsPath, content: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, content)?;
     fs::rename(&tmp, path)
+}
+
+fn read_optional_text_file(path: &FsPath) -> Option<String> {
+    fs::read_to_string(path).ok()
 }
 
 fn read_jsonl_file(path: &FsPath) -> Vec<Value> {
@@ -1831,6 +2006,76 @@ mod tests {
     }
 
     #[test]
+    fn memory_archive_writes_markdown_sidecars_and_manifest() {
+        let root = archive_test_root("memory-archive");
+        let session_id = "session/archive";
+        let session = json!({
+            "id": session_id,
+            "workspaceId": "workspace/alpha",
+            "workspaceHash": "hash/beta"
+        });
+        let body = json!({
+            "snapshot": {
+                "metadata": {
+                    "projectMarkdownPreview": "# Project Memory\n\n- Boundary retained",
+                    "sessionMarkdownPreview": "# Session Memory\n\n- Next checkpoint retained",
+                    "archiveDescriptor": {
+                        "schemaVersion": "deepcode.session.memory-archive.v1",
+                        "workspaceScopeKey": "workspace-workspace_alpha-hash_beta"
+                    },
+                    "archiveSidecar": {
+                        "schemaVersion": "deepcode.session.memory-sidecar.v1",
+                        "items": [{
+                            "scope": "session",
+                            "kind": "checkpoint",
+                            "content": "checkpoint retained",
+                            "sourceRefs": [{
+                                "sessionId": session_id,
+                                "eventId": "event-generic"
+                            }]
+                        }]
+                    }
+                }
+            }
+        });
+
+        let result = write_session_memory_archive(&root, session_id, Some(&session), &body)
+            .expect("memory archive write");
+        let archive_dir = root.join("workspace-workspace_alpha-hash_beta");
+        let safe_session = safe_path_segment(session_id);
+        assert_eq!(
+            result.get("workspaceScopeKey").and_then(Value::as_str),
+            Some("workspace-workspace_alpha-hash_beta")
+        );
+        assert!(archive_dir.join("project.md").exists());
+        assert!(archive_dir.join("project.memory.json").exists());
+        assert!(archive_dir
+            .join("sessions")
+            .join(format!("{safe_session}.md"))
+            .exists());
+        assert!(archive_dir
+            .join("sessions")
+            .join(format!("{safe_session}.memory.json"))
+            .exists());
+        let project_markdown =
+            fs::read_to_string(archive_dir.join("project.md")).expect("project memory markdown");
+        assert!(project_markdown.contains("Boundary retained"));
+        let project_sidecar =
+            read_json_file(&archive_dir.join("project.memory.json")).expect("project sidecar");
+        assert_eq!(
+            project_sidecar.get("memoryScope").and_then(Value::as_str),
+            Some("project")
+        );
+        let manifest = read_json_file(&archive_dir.join("manifest.json")).expect("manifest");
+        assert_eq!(
+            manifest.get("schemaVersion").and_then(Value::as_str),
+            Some("deepcode.session.memory-archive-manifest.v1")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn restore_session_index_uses_archive_manifest_and_projection_fallback() {
         let root = archive_test_root("session-restore");
         let sessions_dir = root.join("sessions");
@@ -1842,6 +2087,7 @@ mod tests {
             workflow_config_path: root.join("workflow.json"),
             sessions_dir: sessions_dir.clone(),
             conversation_archives_dir: archive_root.clone(),
+            memory_archives_dir: root.join("memory").join("projects"),
         };
 
         let archived_session_id = "session-12345";
@@ -1956,6 +2202,7 @@ mod tests {
             workflow_config_path: root.join("workflow.json"),
             sessions_dir: sessions_dir.clone(),
             conversation_archives_dir: archive_root,
+            memory_archives_dir: root.join("memory").join("projects"),
         };
         let historical_event = json!({
             "id": "evt-history",

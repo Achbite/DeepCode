@@ -29,6 +29,12 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/api/session-store/:session_id/archive/file",
             get(session_store_archive_file_get),
         )
+        .route(
+            "/api/session-store/:session_id/memory/archive",
+            get(session_store_memory_archive_get)
+                .post(session_store_memory_archive_post)
+                .layer(DefaultBodyLimit::max(LARGE_JSON_BODY_LIMIT_BYTES)),
+        )
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/default-path", get(workspace_default_path))
         .route("/api/workspaces/open", post(workspace_open))

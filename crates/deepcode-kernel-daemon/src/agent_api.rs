@@ -33,6 +33,13 @@ pub(crate) struct AgentSessionRunRequest {
     pub(crate) target_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentRunStreamQuery {
+    pub(crate) since_event_count: Option<usize>,
+    pub(crate) since_delta_seq: Option<u64>,
+}
+
 pub(crate) async fn agent_sessions_list(
     State(state): State<AppState>,
     Query(query): Query<AgentSessionScopeQuery>,
@@ -291,7 +298,7 @@ pub(crate) async fn agent_session_run_start(
     };
     let start_event_count = events.len();
     let run_id = format!("session-run-{}", now_millis());
-    let run = AgentRunState::running(run_id.clone(), session_id.clone());
+    let run = AgentRunState::running(run_id.clone(), session_id.clone(), start_event_count);
     {
         let mut runs = state.session_runs.lock().expect("session run state lock");
         runs.insert(run_id.clone(), run.clone());
@@ -388,13 +395,18 @@ pub(crate) async fn agent_session_run_delta(
     if !run_belongs_to_session(&state, &session_id, &run_id) {
         return ApiResponse::error("agent_run_not_found", "agent run not found");
     }
-    let delta = normalize_run_delta(&session_id, &run_id, body);
     {
         let mut deltas = state
             .session_run_deltas
             .lock()
             .expect("session run delta state lock");
         let queue = deltas.entry(run_id.clone()).or_default();
+        let delta_seq = queue
+            .last()
+            .and_then(|delta| delta.get("deltaSeq").and_then(Value::as_u64))
+            .unwrap_or(0)
+            + 1;
+        let delta = normalize_run_delta(&session_id, &run_id, delta_seq, body);
         queue.push(delta);
         const MAX_RUN_DELTAS: usize = 2_000;
         if queue.len() > MAX_RUN_DELTAS {
@@ -481,11 +493,15 @@ pub(crate) async fn agent_session_run_guidance(
 pub(crate) async fn agent_session_run_stream(
     State(state): State<AppState>,
     Path((session_id, run_id)): Path<(String, String)>,
+    Query(query): Query<AgentRunStreamQuery>,
 ) -> Response {
     let stream_state = state.clone();
     let stream = async_stream::stream! {
-        let mut sent_delta_count = 0usize;
-        let mut sent_event_count = 0usize;
+        let mut sent_delta_seq = query.since_delta_seq.unwrap_or(0);
+        let mut sent_event_count = query.since_event_count.unwrap_or_else(|| {
+            let runs = stream_state.session_runs.lock().expect("session run state lock");
+            runs.get(&run_id).map(|run| run.start_event_count).unwrap_or(0)
+        });
         let mut last_run_status = String::new();
         let mut heartbeat_at = Instant::now();
         loop {
@@ -520,14 +536,20 @@ pub(crate) async fn agent_session_run_stream(
                     .expect("session run delta state lock");
                 deltas.get(&run_id).cloned().unwrap_or_default()
             };
-            for delta in deltas.iter().skip(sent_delta_count) {
+            for delta in deltas.iter() {
+                let Some(seq) = delta.get("deltaSeq").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if seq <= sent_delta_seq {
+                    continue;
+                }
                 yield sse_bytes("delta", json!({
                     "sessionId": session_id.clone(),
                     "runId": run_id.clone(),
                     "delta": delta
                 }));
+                sent_delta_seq = seq;
             }
-            sent_delta_count = deltas.len();
 
             let events = session_projection(&stream_state, &session_id);
             if events.len() != sent_event_count {
@@ -1384,7 +1406,12 @@ fn run_belongs_to_session(state: &AppState, session_id: &str, run_id: &str) -> b
         .unwrap_or(false)
 }
 
-fn normalize_run_delta(session_id: &str, host_run_id: &str, mut delta: Value) -> Value {
+fn normalize_run_delta(
+    session_id: &str,
+    host_run_id: &str,
+    delta_seq: u64,
+    mut delta: Value,
+) -> Value {
     if let Value::Object(object) = &mut delta {
         object
             .entry("sessionId".to_string())
@@ -1392,6 +1419,9 @@ fn normalize_run_delta(session_id: &str, host_run_id: &str, mut delta: Value) ->
         object
             .entry("hostRunId".to_string())
             .or_insert_with(|| json!(host_run_id));
+        object
+            .entry("deltaSeq".to_string())
+            .or_insert_with(|| json!(delta_seq));
         object
             .entry("receivedAt".to_string())
             .or_insert_with(|| json!(now_text()));
@@ -2198,6 +2228,31 @@ mod tests {
             2
         );
         assert_eq!(normalize_sub_agent_max_parallel(Some(json!(16)), None), 2);
+    }
+
+    #[test]
+    fn run_delta_normalization_attaches_monotonic_stream_cursor_fields() {
+        let delta = normalize_run_delta(
+            "session-generic",
+            "run-generic",
+            7,
+            json!({
+                "kind": "stage_delta",
+                "payload": {
+                    "status": "streaming"
+                }
+            }),
+        );
+        assert_eq!(
+            delta.get("sessionId").and_then(Value::as_str),
+            Some("session-generic")
+        );
+        assert_eq!(
+            delta.get("hostRunId").and_then(Value::as_str),
+            Some("run-generic")
+        );
+        assert_eq!(delta.get("deltaSeq").and_then(Value::as_u64), Some(7));
+        assert!(delta.get("receivedAt").and_then(Value::as_str).is_some());
     }
 
     #[test]

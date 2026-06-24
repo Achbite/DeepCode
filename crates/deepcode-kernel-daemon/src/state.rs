@@ -21,6 +21,7 @@ pub(crate) struct HostPaths {
     pub(crate) workflow_config_path: PathBuf,
     pub(crate) sessions_dir: PathBuf,
     pub(crate) conversation_archives_dir: PathBuf,
+    pub(crate) memory_archives_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -43,6 +44,7 @@ pub(crate) struct AgentRunState {
     pub(crate) run_id: String,
     pub(crate) session_id: String,
     pub(crate) status: String,
+    pub(crate) start_event_count: usize,
     pub(crate) started_at: String,
     pub(crate) updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,12 +56,13 @@ pub(crate) struct AgentRunState {
 }
 
 impl AgentRunState {
-    pub(crate) fn running(run_id: String, session_id: String) -> Self {
+    pub(crate) fn running(run_id: String, session_id: String, start_event_count: usize) -> Self {
         let now = now_text();
         Self {
             run_id,
             session_id,
             status: "running".to_string(),
+            start_event_count,
             started_at: now.clone(),
             updated_at: now,
             completed_at: None,
@@ -131,6 +134,7 @@ impl HostPaths {
             workflow_config_path: settings_dir.join("agent-workflow-config.json"),
             sessions_dir: root.join("sessions"),
             conversation_archives_dir: root.join("conversation-archives"),
+            memory_archives_dir: root.join("memory").join("projects"),
         }
     }
 }

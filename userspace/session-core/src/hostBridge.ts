@@ -1,5 +1,6 @@
 import type {
   AgentContextAttachment,
+  AgentEvent,
   AgentSessionResult,
   AgentTimelineResult,
   AgentWorkspaceBinding,
@@ -12,6 +13,7 @@ import type {
   ProjectionDelta,
   ToolCall,
 } from '@deepcode/protocol';
+import { buildSessionMemorySnapshot } from './context/memory.js';
 import { SessionDriverLoop, type SessionDecisionResolverInput } from './driver/sessionDriverLoop.js';
 import { SessionStorageClient } from './storageClient.js';
 import type { ProjectWorkingDirectory } from './context/types.js';
@@ -106,6 +108,7 @@ async function runAsk(request: HostBridgeRequest): Promise<HostBridgeResult> {
     subAgentMode: request.subAgentMode,
     subAgentMaxParallel: request.subAgentMaxParallel,
   });
+  await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session);
   const timeline = await readTimeline(apiBase, result.session.id);
   const finalText = extractFinalText(timeline);
   const lifecycle = inferHostRunLifecycle(result.events, finalText);
@@ -147,6 +150,7 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
     subAgentMode: request.subAgentMode,
     subAgentMaxParallel: request.subAgentMaxParallel,
   });
+  await persistMemoryArchive(apiBase, result.session.id, result.events ?? [], binding, result.session);
   const timeline = await readTimeline(apiBase, result.session.id);
   const finalText = extractFinalText(timeline);
   const lifecycle = inferHostRunLifecycle(result.events, finalText);
@@ -159,6 +163,33 @@ async function resolveDecision(request: HostBridgeRequest): Promise<HostBridgeRe
     finalText,
     ...lifecycle,
   };
+}
+
+async function persistMemoryArchive(
+  apiBase: string,
+  sessionId: string,
+  events: AgentEvent[],
+  binding: AgentWorkspaceBinding | undefined,
+  session: unknown
+): Promise<void> {
+  try {
+    const client = new SessionStorageClient(apiBase);
+    const snapshot = buildSessionMemorySnapshot(events, {
+      sessionId,
+      workspaceScopeKey: binding?.workspaceHash ?? binding?.workspaceId,
+      displayProjectName: binding?.openPath,
+      displaySessionName: sessionTitle(session) ?? sessionId,
+    });
+    await client.persistMemoryArchive(sessionId, snapshot);
+  } catch (error) {
+    process.stderr.write(`memory archive persist skipped: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}
+
+function sessionTitle(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const title = (value as Record<string, unknown>).title;
+  return typeof title === 'string' && title.trim() ? title : undefined;
 }
 
 function createDriver(apiBase: string, hostRunId?: string): SessionDriverLoop {
