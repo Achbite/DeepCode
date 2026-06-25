@@ -5,8 +5,9 @@ import type {
   AgentEvent,
   AgentEventPresentation,
   AgentTimelineBlock,
+  ProjectionDelta,
 } from '@deepcode/protocol';
-import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
+import { buildTimelineProjectionWithLiveOverlay } from '@deepcode/session-core';
 import { t, resolveDiagnosticText, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
@@ -23,6 +24,7 @@ import {
 
 interface MessageListProps {
   events: AgentEvent[];
+  activeDeltas?: ProjectionDelta[];
   loading?: boolean;
   language: UiLanguage;
   resolvingPlan?: {
@@ -627,11 +629,17 @@ function traceGroupRunning(groupEvents: AgentEvent[], turnEvents: AgentEvent[], 
   });
 }
 
-function createRenderItems(events: AgentEvent[], loading: boolean, language: UiLanguage): RenderItem[] {
+function createRenderItems(
+  events: AgentEvent[],
+  loading: boolean,
+  language: UiLanguage,
+  activeDeltas: ProjectionDelta[] = []
+): RenderItem[] {
   if (events.length === 0) return [];
-  const projection = buildNarrativeTimelineProjection({
+  const projection = buildTimelineProjectionWithLiveOverlay({
     sessionId: events[0]?.sessionId ?? 'session',
-    events,
+    committedEvents: events,
+    activeDeltas,
   });
   if (projection.turns.length === 0) return createLegacyRenderItems(events, loading, language);
 
@@ -977,13 +985,13 @@ function archiveProjectionTitle(kind: string, language: UiLanguage): string {
     case 'assistant_msg':
       return 'Agent';
     case 'user_guidance':
-      return 'User guidance';
+      return t(language, 'deepcodeGui.tasks.guidance');
     case 'plan_card':
-      return 'Plan';
+      return t(language, 'deepcodeGui.tasks.plan');
     case 'plan_review':
-      return 'Plan Review';
+      return t(language, 'agent.plan.reviewTitle');
     case 'review_summary':
-      return 'Review';
+      return t(language, 'agent.review.title');
     case 'tool_call':
       return t(language, 'agent.archive.kind.toolCall');
     case 'tool_result':
@@ -993,13 +1001,13 @@ function archiveProjectionTitle(kind: string, language: UiLanguage): string {
     case 'permission_result':
       return t(language, 'agent.archive.kind.permissionResult');
     case 'workflow_stage':
-      return 'Workflow Stage';
+      return t(language, 'deepcodeGui.timeline.workflowStage');
     case 'workflow_decision':
-      return 'Workflow Decision';
+      return t(language, 'deepcodeGui.timeline.workflowDecision');
     case 'error':
       return t(language, 'agent.archive.kind.error');
     default:
-      return kind || 'Projection';
+      return t(language, 'deepcodeGui.timeline.event');
   }
 }
 
@@ -1168,7 +1176,7 @@ function PlanCard({
   language: UiLanguage;
 }) {
   const [expanded, setExpanded] = React.useState(false);
-  const title = stringField(event.payload, 'title') ?? 'Plan';
+  const title = stringField(event.payload, 'title') ?? t(language, 'deepcodeGui.tasks.plan');
   const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
   const content = stringField(event.payload, 'content');
   const expectedValidation = stringField(event.payload, 'expectedValidation');
@@ -2121,6 +2129,7 @@ function renderMessage(
 
 const MessageList: React.FC<MessageListProps> = ({
   events,
+  activeDeltas = [],
   loading = false,
   language,
   resolvingPlan,
@@ -2133,8 +2142,8 @@ const MessageList: React.FC<MessageListProps> = ({
     [events, resolvingPlan]
   );
   const renderItems = React.useMemo(
-    () => createRenderItems(events, loading, language),
-    [events, language, loading]
+    () => createRenderItems(events, loading, language, activeDeltas),
+    [activeDeltas, events, language, loading]
   );
 
   return (

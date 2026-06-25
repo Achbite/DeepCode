@@ -14,6 +14,7 @@ import './agentPanel.css';
 
 const AgentPanel: React.FC = () => {
   const events = useAgentSessionStore((s) => s.events);
+  const activeDeltas = useAgentSessionStore((s) => s.activeDeltas);
   const session = useAgentSessionStore((s) => s.session);
   const sessions = useAgentSessionStore((s) => s.sessions);
   const traceEvents = useAgentSessionStore((s) => s.traceEvents);
@@ -102,6 +103,7 @@ const AgentPanel: React.FC = () => {
 
       <MessageList
         events={events}
+        activeDeltas={activeDeltas}
         loading={agentBusy}
         language={language}
         resolvingPlan={resolvingPlan}

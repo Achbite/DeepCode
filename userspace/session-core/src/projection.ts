@@ -1,6 +1,7 @@
 import type {
   AgentEvent,
   AgentConversationActivity,
+  AgentEventChannel,
   AgentTimelineBlock,
   AgentTimelineBlockKind,
   AgentTimelineNarrativeKind,
@@ -11,6 +12,7 @@ import type {
   AgentTimelineTokenUsageTotals,
   KernelPlanReviewReport,
   PermissionRequest,
+  ProjectionDelta,
 } from '@deepcode/protocol';
 import type { AgentPlanParts } from './agent-plan/types.js';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
@@ -44,6 +46,13 @@ type NarrativeRenderMode = NonNullable<NonNullable<AgentTimelineBlock['displayHi
 export interface NarrativeTimelineProjectionInput {
   sessionId: string;
   events: AgentEvent[];
+  generatedAt?: string;
+}
+
+export interface TimelineProjectionWithLiveOverlayInput {
+  sessionId: string;
+  committedEvents: AgentEvent[];
+  activeDeltas?: ProjectionDelta[];
   generatedAt?: string;
 }
 
@@ -236,6 +245,247 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     tokenUsageProjection: buildTokenUsageProjection(input.events),
     rawEventRefs,
   };
+}
+
+export function buildTimelineProjectionWithLiveOverlay(
+  input: TimelineProjectionWithLiveOverlayInput
+): AgentTimelineResult {
+  const activeEvents = projectionDeltasToTransientEvents({
+    sessionId: input.sessionId,
+    committedEvents: input.committedEvents,
+    activeDeltas: input.activeDeltas ?? [],
+    generatedAt: input.generatedAt,
+  });
+  const projection = buildNarrativeTimelineProjection({
+    sessionId: input.sessionId,
+    events: [...input.committedEvents, ...activeEvents],
+    generatedAt: input.generatedAt,
+  });
+  return annotateLiveOverlayBlocks(projection, activeEvents);
+}
+
+function projectionDeltasToTransientEvents(input: {
+  sessionId: string;
+  committedEvents: AgentEvent[];
+  activeDeltas: ProjectionDelta[];
+  generatedAt?: string;
+}): AgentEvent[] {
+  const committedActivityIds = new Set(
+    input.committedEvents
+      .map(eventActivityId)
+      .filter((id): id is string => Boolean(id))
+  );
+  return input.activeDeltas
+    .filter((delta) => delta.sessionId === input.sessionId)
+    .filter((delta) => delta.type !== 'committed')
+    .filter((delta) => !isBranchProjectionDelta(delta))
+    .filter((delta) => !activeDeltaAlreadyCommitted(delta, committedActivityIds))
+    .sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0))
+    .flatMap((delta) => projectionDeltaToTransientEvent(delta, input.generatedAt));
+}
+
+function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: string): AgentEvent[] {
+  const id = liveOverlayEventId(delta);
+  const ts = generatedAt ?? new Date().toISOString();
+  const basePayload = {
+    runId: delta.runId,
+    turnId: delta.turnId,
+    stage: delta.stage,
+    status: projectionStatus(delta.status),
+    summary: delta.summary,
+    source: delta.source,
+    activeOverlay: true,
+  };
+
+  const textKind = projectionDeltaTextChannel(delta);
+  if (textKind && typeof delta.delta === 'string' && delta.delta.length > 0) {
+    return [{
+      id,
+      sessionId: delta.sessionId,
+      ts,
+      kind: 'assistant_msg',
+      payload: {
+        ...basePayload,
+        channel: textKind,
+        content: delta.delta,
+        presentation: 'body',
+        visibility: 'conversation',
+      },
+      display: {
+        presentation: 'body',
+        defaultOpen: true,
+      },
+    }];
+  }
+
+  if (delta.type === 'error') {
+    return [{
+      id,
+      sessionId: delta.sessionId,
+      ts,
+      kind: 'error',
+      payload: {
+        ...basePayload,
+        content: delta.delta ?? delta.summary ?? 'Live projection error',
+        message: delta.delta ?? delta.summary ?? 'Live projection error',
+      },
+    }];
+  }
+
+  const activity = delta.activity;
+  if (activity) {
+    const stage = delta.stage ?? activity.kind;
+    const eventKind = liveActivityEventKind(delta);
+    return [{
+      id,
+      sessionId: delta.sessionId,
+      ts,
+      kind: eventKind,
+      payload: {
+        ...basePayload,
+        channel: liveActivityChannel(delta),
+        stage,
+        status: projectionStatus(delta.status) ?? activity.status,
+        summary: delta.summary ?? activity.summary,
+        toolName: activity.toolName,
+        activity,
+        payload: delta.payload,
+        presentation: 'collapsible',
+        visibility: 'conversation',
+      },
+      display: {
+        presentation: 'collapsible',
+        defaultOpen: activity.status === 'running' || activity.status === 'waiting' || activity.status === 'failed',
+      },
+    }];
+  }
+
+  return [];
+}
+
+function liveOverlayEventId(delta: ProjectionDelta): string {
+  return [
+    'live',
+    delta.sessionId,
+    delta.runId ?? 'run',
+    delta.turnId ?? 'turn',
+    typeof delta.seq === 'number' ? String(delta.seq) : 'seq',
+    delta.type,
+    delta.itemId ?? delta.draftId ?? delta.activity?.activityId ?? '',
+  ].filter(Boolean).join(':');
+}
+
+function projectionDeltaTextChannel(delta: ProjectionDelta): 'reasoning' | 'progress' | 'final' | null {
+  if (delta.type === 'reasoning_delta') return 'reasoning';
+  if (delta.type === 'part_delta' && delta.channel === 'reasoning') return 'reasoning';
+  if (delta.type === 'assistant_delta') return delta.channel === 'progress' ? 'progress' : 'final';
+  if (delta.type === 'draft_delta') return 'progress';
+  if (delta.type === 'part_delta' && (delta.channel === 'draft' || !delta.channel)) return 'progress';
+  return null;
+}
+
+function liveActivityEventKind(delta: ProjectionDelta): AgentEvent['kind'] {
+  if (delta.type === 'resource_delta') return 'tool_result';
+  if (delta.type === 'tool_call_delta') return 'tool_call';
+  return 'workflow_stage';
+}
+
+function liveActivityChannel(delta: ProjectionDelta): AgentEventChannel {
+  if (delta.channel === 'tool' || delta.type === 'tool_call_delta') return 'tool';
+  if (delta.channel === 'resource' || delta.type === 'resource_delta') return 'tool';
+  if (delta.channel === 'workunit' || delta.type === 'workunit_delta') return 'progress';
+  if (delta.channel === 'reasoning') return 'reasoning';
+  if (delta.channel === 'final') return 'final';
+  return 'progress';
+}
+
+function projectionStatus(status: ProjectionDelta['status']): string | undefined {
+  if (!status) return undefined;
+  if (status === 'streaming') return 'running';
+  if (status === 'draftReady') return 'completed';
+  if (status === 'discarded' || status === 'skipped') return 'blocked';
+  return status;
+}
+
+function isBranchProjectionDelta(delta: ProjectionDelta): boolean {
+  return Boolean(delta.branchId || delta.subAgentId || delta.mergeGroupId);
+}
+
+function activeDeltaAlreadyCommitted(
+  delta: ProjectionDelta,
+  committedActivityIds: Set<string>
+): boolean {
+  const activityId = delta.activity?.activityId;
+  if (activityId && committedActivityIds.has(activityId)) return true;
+  return false;
+}
+
+function eventActivityId(event: AgentEvent): string | undefined {
+  const payload = isRecordPayload(event.payload) ? event.payload : {};
+  const activity = isRecordPayload(payload.activity) ? payload.activity : undefined;
+  return activity ? stringField(activity, 'activityId') : undefined;
+}
+
+function annotateLiveOverlayBlocks(
+  projection: AgentTimelineResult,
+  activeEvents: AgentEvent[]
+): AgentTimelineResult {
+  if (activeEvents.length === 0) return projection;
+  const liveEventIds = new Set(activeEvents.map((event) => event.id));
+  const liveEventIndex = new Map(activeEvents.map((event, index) => [event.id, index]));
+  const lastLiveTextIndex = [...activeEvents].reverse().findIndex(isLiveTextEvent);
+  const lastTextEvent = lastLiveTextIndex >= 0 ? activeEvents[activeEvents.length - 1 - lastLiveTextIndex] : null;
+  const hasLiveAfterLastText = Boolean(lastTextEvent) &&
+    activeEvents.some((event) => (liveEventIndex.get(event.id) ?? -1) > (liveEventIndex.get(lastTextEvent!.id) ?? -1));
+
+  return {
+    ...projection,
+    turns: projection.turns.map((turn) => ({
+      ...turn,
+      status: turnContainsLiveEvent(turn, liveEventIds) && turn.status === 'completed' ? 'running' : turn.status,
+      blocks: turn.blocks.map((block) => {
+        const liveIds = block.events.map((event) => event.id).filter((id) => liveEventIds.has(id));
+        if (liveIds.length === 0) return block;
+        const containsLastText = Boolean(lastTextEvent && liveIds.includes(lastTextEvent.id));
+        const textBlock = isTimelineTextBlock(block);
+        const shouldStream = textBlock && containsLastText && !hasLiveAfterLastText;
+        const shouldSeal = textBlock && !shouldStream && block.events.some(isLiveTextEvent);
+        const renderMode: NarrativeRenderMode | undefined = shouldStream
+          ? 'typewriter'
+          : shouldSeal
+            ? 'instant'
+            : block.displayHints?.renderMode;
+        return {
+          ...block,
+          status: shouldStream ? 'running' : block.status,
+          defaultCollapsed: block.narrativeKind === 'thinking' && shouldSeal,
+          displayHints: {
+            ...(block.displayHints ?? {}),
+            renderMode,
+            initialOpen: shouldStream || block.displayHints?.initialOpen,
+            replaceOnComplete: block.narrativeKind === 'thinking' ? true : block.displayHints?.replaceOnComplete,
+          },
+        };
+      }),
+    })),
+  };
+}
+
+function isLiveTextEvent(event: AgentEvent): boolean {
+  if (!event.id.startsWith('live:')) return false;
+  if (event.kind !== 'assistant_msg') return false;
+  const channel = stringValueFromPayload(event.payload, 'channel');
+  return channel === 'reasoning' || channel === 'progress' || channel === 'final';
+}
+
+function isTimelineTextBlock(block: AgentTimelineBlock): boolean {
+  return block.narrativeKind === 'thinking' ||
+    block.narrativeKind === 'assistantNarration' ||
+    block.narrativeKind === 'assistantText';
+}
+
+function turnContainsLiveEvent(turn: AgentTimelineResult['turns'][number], liveEventIds: Set<string>): boolean {
+  return turn.blocks.some((block) => block.events.some((event) => liveEventIds.has(event.id)));
 }
 
 function implementationPlanTaskProjectionItems(

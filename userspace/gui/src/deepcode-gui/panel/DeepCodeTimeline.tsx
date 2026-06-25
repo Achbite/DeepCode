@@ -8,18 +8,15 @@ import type {
   AgentTimelineTurn,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import { buildNarrativeTimelineProjection, isInternalOrchestrationStage } from '@deepcode/session-core';
+import {
+  buildNarrativeTimelineProjection,
+  buildTimelineProjectionWithLiveOverlay,
+  isInternalOrchestrationStage,
+} from '@deepcode/session-core';
 import { t, resolveDiagnosticText, type UiLanguage } from '../../i18n';
 import { submitAgentFeedback } from '../../services/runtimeAdapter';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
 import ToolEvidenceDetails from '../../components/agent-panel/ToolEvidenceDetails';
-import {
-  buildLiveDisplayItems,
-  flattenLiveDisplayDeltas,
-  liveDisplayStatus,
-  useLiveTimelinePlayback,
-  type LiveDisplayItem,
-} from '../../components/agent-panel/liveTimelinePlayback';
 import { useSettingsStore } from '../../state/settingsStore';
 import { formatToolEvidence } from '../../utils/toolEvidence';
 
@@ -66,22 +63,23 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     [fallbackTimeline, timeline]
   );
   const coalescedActiveDeltas = useCoalescedProjectionDeltas(activeDeltas, 50);
-  const committedActivityIds = useMemo(() => collectCommittedActivityIds(view), [view]);
-  const liveDisplayItems = useMemo(
-    () => buildLiveDisplayItems({
-      sessionId: view.sessionId,
-      deltas: coalescedActiveDeltas,
-      committedActivityIds,
-    }),
-    [coalescedActiveDeltas, committedActivityIds, view.sessionId]
+  const committedEvents = useMemo(
+    () => fallbackEvents.length > 0 ? fallbackEvents : eventsFromTimeline(view),
+    [fallbackEvents, view]
   );
-  const livePlayback = useLiveTimelinePlayback(liveDisplayItems, {
-    enabled: loading,
-    holdMs: 1000,
-  });
+  const liveProjection = useMemo(
+    () => buildTimelineProjectionWithLiveOverlay({
+      sessionId: view.sessionId,
+      committedEvents,
+      activeDeltas: coalescedActiveDeltas,
+      generatedAt: view.generatedAt,
+    }),
+    [coalescedActiveDeltas, committedEvents, view.generatedAt, view.sessionId]
+  );
+  const livePlayback = useProjectedTimelinePlayback(liveProjection, loading, 1000);
   const viewWithActive = useMemo(
-    () => appendLiveDisplayTurn(view, livePlayback.visibleItems, language),
-    [language, livePlayback.visibleItems, view]
+    () => normalizeNarrativeTimeline(livePlayback.view),
+    [livePlayback.view]
   );
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineContentRef = useRef<HTMLDivElement | null>(null);
@@ -402,166 +400,129 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   );
 };
 
-function appendLiveDisplayTurn(
+interface ProjectedTimelinePlaybackResult {
+  view: AgentTimelineResult;
+  isHolding: boolean;
+}
+
+function useProjectedTimelinePlayback(
   view: AgentTimelineResult,
-  items: LiveDisplayItem[],
-  language: UiLanguage
-): AgentTimelineResult {
-  if (items.length === 0) return view;
+  enabled: boolean,
+  holdMs: number
+): ProjectedTimelinePlaybackResult {
+  const liveBlockSignature = useMemo(() => livePlaybackBlockIds(view).join('|'), [view]);
+  const [releasedBlockIds, setReleasedBlockIds] = useState<Set<string>>(() => new Set());
 
-  const deltas = flattenLiveDisplayDeltas(items);
-  const runId = items.find((item) => item.runId)?.runId ?? 'active-run';
-  const turnId = items.find((item) => item.turnId)?.turnId ?? `active-${runId}`;
-  const status = liveDisplayStatus(items);
-  const blocks = items
-    .map((item) => item.type === 'activity'
-      ? activityBlockFromActivity(item.activity, language, true)
-      : textBlockFromLiveDisplayItem(item, runId, status, language))
-    .filter((block): block is AgentTimelineBlock => Boolean(block));
-  if (blocks.length === 0) return view;
-
-  return {
-    ...view,
-    turns: [
-      ...view.turns,
-      {
-        id: `active-${turnId}`,
-        sessionId: view.sessionId,
-        status,
-        startedAt: deltas[0]?.payload && isRecord(deltas[0].payload)
-          ? stringField(deltas[0].payload, 'startedAt')
-          : undefined,
-        blocks,
-      },
-    ],
-  };
-}
-
-function textBlockFromLiveDisplayItem(
-  item: Extract<LiveDisplayItem, { type: 'text' }>,
-  runId: string,
-  activeStatus: AgentTimelineTurn['status'],
-  language: UiLanguage
-): AgentTimelineBlock | null {
-  if (!item.bodyMarkdown.trim()) return null;
-  const segmentStatus = item.sealed ? 'completed' : activeStatus;
-  const shouldType = !item.sealed;
-  const sealedThinkingHeld = item.textKind === 'thinking' && item.sealed && item.held;
-
-  if (item.textKind === 'thinking') {
-    return {
-      id: `active-thinking-${safeActiveBlockId(runId)}-${safeActiveBlockId(item.key)}`,
-      kind: 'thinking',
-      narrativeKind: 'thinking',
-      title: t(language, 'deepcodeGui.timeline.thinking'),
-      summary: t(language, 'deepcodeGui.timeline.reasoningStreaming'),
-      status: segmentStatus,
-      defaultCollapsed: sealedThinkingHeld,
-      bodyMarkdown: item.bodyMarkdown,
-      displayHints: shouldType
-        ? {
-            renderMode: 'typewriter',
-            typewriterSpeed: 'slow',
-            initialOpen: true,
-            replaceOnComplete: true,
-          }
-        : {
-            renderMode: 'instant',
-            initialOpen: !sealedThinkingHeld,
-            replaceOnComplete: true,
-          },
-      events: [],
-    };
-  }
-
-  if (item.textKind === 'assistant') {
-    return {
-      id: `active-assistant-${safeActiveBlockId(runId)}-${safeActiveBlockId(item.key)}`,
-      kind: 'assistant',
-      narrativeKind: 'assistantText',
-      title: 'DeepCode',
-      summary: t(language, 'deepcodeGui.timeline.responding'),
-      status: segmentStatus,
-      defaultCollapsed: false,
-      bodyMarkdown: item.bodyMarkdown,
-      displayHints: shouldType
-        ? {
-            renderMode: 'typewriter',
-            typewriterSpeed: 'normal',
-            replaceOnComplete: true,
-          }
-        : {
-            renderMode: 'instant',
-            replaceOnComplete: true,
-          },
-      events: [],
-    };
-  }
-
-  return {
-    id: `active-draft-${safeActiveBlockId(runId)}-${safeActiveBlockId(item.key)}`,
-    kind: 'stage',
-    narrativeKind: 'operationEvidence',
-    title: t(language, 'deepcodeGui.timeline.editDraft'),
-    summary: t(language, 'deepcodeGui.timeline.editDraftStreaming'),
-    status: segmentStatus,
-    defaultCollapsed: false,
-    bodyMarkdown: item.bodyMarkdown,
-    displayHints: shouldType
-      ? {
-          renderMode: 'typewriter',
-          typewriterSpeed: 'normal',
-          replaceOnComplete: true,
+  useEffect(() => {
+    const liveIds = new Set(livePlaybackBlockIds(view));
+    setReleasedBlockIds((current) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of current) {
+        if (liveIds.has(id)) {
+          next.add(id);
+        } else {
+          changed = true;
         }
-      : {
-          renderMode: 'instant',
-          replaceOnComplete: true,
-        },
-    events: [],
+      }
+      return changed || next.size !== current.size ? next : current;
+    });
+  }, [liveBlockSignature, view]);
+
+  const blockingBlockId = useMemo(() => {
+    if (!enabled) return null;
+    const blocks = flattenTimelineBlocks(view);
+    for (let index = 0; index < blocks.length - 1; index += 1) {
+      const block = blocks[index];
+      if (!isLiveTextBlock(block)) continue;
+      if (block.status === 'running') continue;
+      if (releasedBlockIds.has(block.id)) continue;
+      const hasLaterLiveBlock = blocks.slice(index + 1).some(isLiveOverlayBlock);
+      if (hasLaterLiveBlock) return block.id;
+    }
+    return null;
+  }, [enabled, releasedBlockIds, view]);
+
+  useEffect(() => {
+    if (!enabled || !blockingBlockId) return undefined;
+    const timer = window.setTimeout(() => {
+      setReleasedBlockIds((current) => {
+        if (current.has(blockingBlockId)) return current;
+        const next = new Set(current);
+        next.add(blockingBlockId);
+        return next;
+      });
+    }, holdMs);
+    return () => window.clearTimeout(timer);
+  }, [blockingBlockId, enabled, holdMs]);
+
+  const visibleView = useMemo(
+    () => blockingBlockId ? truncateTimelineAfterBlock(view, blockingBlockId) : view,
+    [blockingBlockId, view]
+  );
+
+  return {
+    view: visibleView,
+    isHolding: Boolean(blockingBlockId),
   };
 }
 
-function collectCommittedActivityIds(view: AgentTimelineResult): Set<string> {
-  const ids = new Set<string>();
+function eventsFromTimeline(view: AgentTimelineResult): AgentEvent[] {
+  const byId = new Map<string, AgentEvent>();
   for (const turn of view.turns) {
     for (const block of turn.blocks) {
-      const activityId = block.activity?.activityId;
-      if (activityId) ids.add(activityId);
+      for (const event of block.events) {
+        if (!byId.has(event.id)) byId.set(event.id, event);
+      }
     }
   }
-  return ids;
+  return [...byId.values()];
 }
 
-function activityBlockFromActivity(
-  activity: AgentConversationActivity,
-  language: UiLanguage,
-  live: boolean
-): AgentTimelineBlock {
-  return {
-    id: `${live ? 'active-' : ''}activity-${safeActiveBlockId(activity.activityId)}`,
-    kind: activityBlockKind(activity),
-    narrativeKind: activity.kind === 'diagnostic' ? 'diagnostic' : 'operationEvidence',
-    activity,
-    title: activity.title || activityKindLabel(language, activity.kind),
-    summary: activity.summary,
-    status: activity.status,
-    defaultCollapsed: activity.status !== 'running' && activity.status !== 'waiting' && activity.status !== 'failed',
-    bodyMarkdown: activityBodyMarkdown(activity, language),
-    displayHints: {
-      renderMode: 'instant',
-      density: 'compact',
-      evidenceMode: activity.status === 'failed' ? 'inline' : 'collapsed',
-      replaceOnComplete: live,
-    },
-    events: [],
-  };
+function flattenTimelineBlocks(view: AgentTimelineResult): AgentTimelineBlock[] {
+  return view.turns.flatMap((turn) => turn.blocks);
 }
 
-function activityBlockKind(activity: AgentConversationActivity): AgentTimelineBlock['kind'] {
-  if (activity.kind === 'diagnostic' || activity.status === 'failed') return 'error';
-  if (activity.kind === 'reviewCheckpoint') return 'review';
-  if (activity.kind === 'toolExecution') return 'toolBatch';
-  return 'stage';
+function livePlaybackBlockIds(view: AgentTimelineResult): string[] {
+  return flattenTimelineBlocks(view).filter(isLiveOverlayBlock).map((block) => block.id);
+}
+
+function isLiveOverlayBlock(block: AgentTimelineBlock): boolean {
+  return block.events.some((event) => event.id.startsWith('live:')) ||
+    (block.rawEventRefs ?? []).some((ref) => ref.startsWith('event:live:'));
+}
+
+function isLiveTextBlock(block: AgentTimelineBlock): boolean {
+  if (!isLiveOverlayBlock(block)) return false;
+  return block.narrativeKind === 'thinking' ||
+    block.narrativeKind === 'assistantNarration' ||
+    block.narrativeKind === 'assistantText';
+}
+
+function truncateTimelineAfterBlock(view: AgentTimelineResult, blockId: string): AgentTimelineResult {
+  let found = false;
+  const turns: AgentTimelineResult['turns'] = [];
+  for (const turn of view.turns) {
+    if (found) break;
+    const blocks: AgentTimelineBlock[] = [];
+    for (const block of turn.blocks) {
+      blocks.push(block.id === blockId ? {
+        ...block,
+        defaultCollapsed: false,
+        displayHints: {
+          ...(block.displayHints ?? {}),
+          initialOpen: true,
+          renderMode: 'instant',
+        },
+      } : block);
+      if (block.id === blockId) {
+        found = true;
+        break;
+      }
+    }
+    turns.push({ ...turn, blocks });
+  }
+  return { ...view, turns };
 }
 
 function activityKindLabel(language: UiLanguage, kind: AgentConversationActivity['kind']): string {
@@ -622,11 +583,6 @@ function activityTargetsLabel(activity: AgentConversationActivity, language: UiL
     return t(language, 'deepcodeGui.activity.filesChanged');
   }
   return t(language, 'deepcodeGui.activity.targets');
-}
-
-function safeActiveBlockId(value: string): string {
-  const safe = value.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
-  return safe || 'branch';
 }
 
 function findTimelineScrollContainer(timelineElement: HTMLElement | null): HTMLElement | null {
@@ -770,8 +726,10 @@ function collectTypewriterBlockLengths(
 }
 
 function shouldAnimateTimelineBlock(block: AgentTimelineBlock): boolean {
-  return block.displayHints?.renderMode === 'typewriter' ||
-    block.displayHints?.renderMode === 'accelerated' ||
+  const renderMode = block.displayHints?.renderMode;
+  if (renderMode === 'instant' || renderMode === 'static') return false;
+  return renderMode === 'typewriter' ||
+    renderMode === 'accelerated' ||
     block.narrativeKind === 'assistantText' ||
     block.narrativeKind === 'requirement' ||
     block.kind === 'plan' ||
@@ -1430,7 +1388,7 @@ const EventList: React.FC<{ events: AgentEvent[]; compact?: boolean; language: U
   </div>
 );
 
-function localFallbackTimeline(events: AgentEvent[]): AgentTimelineResult {
+function localFallbackTimeline(events: AgentEvent[], language: UiLanguage = 'zh-CN'): AgentTimelineResult {
   return {
     sessionId: events[0]?.sessionId ?? 'session',
     generatedAt: new Date().toISOString(),
@@ -1445,7 +1403,7 @@ function localFallbackTimeline(events: AgentEvent[]): AgentTimelineResult {
             blocks: events.map((event) => ({
             id: event.id,
             kind: fallbackBlockKind(event),
-              title: fallbackBlockTitle(event),
+              title: fallbackBlockTitle(language, event),
               summary: eventSummary(event),
               status: fallbackBlockStatus(event),
               defaultCollapsed: event.kind !== 'user_msg' && event.kind !== 'assistant_msg',
@@ -1472,9 +1430,9 @@ function fallbackBlockKind(event: AgentEvent): AgentTimelineBlock['kind'] {
   return 'stage';
 }
 
-function fallbackBlockTitle(event: AgentEvent): string {
-  if (event.kind === 'user_guidance') return 'User guidance';
-  return event.kind;
+function fallbackBlockTitle(language: UiLanguage, event: AgentEvent): string {
+  if (event.kind === 'user_guidance') return t(language, 'deepcodeGui.tasks.guidance');
+  return localizedEventKind(language, event.kind);
 }
 
 function fallbackBlockStatus(event: AgentEvent): AgentTimelineBlock['status'] {
@@ -1490,7 +1448,6 @@ function eventSummary(event: AgentEvent): string {
 }
 
 function localizedEventKind(language: UiLanguage, kind: string): string {
-  if (language !== 'zh-CN') return kind;
   if (kind === 'workflow_stage') return t(language, 'deepcodeGui.timeline.workflowStage');
   if (kind === 'workflow_decision') return t(language, 'deepcodeGui.timeline.workflowDecision');
   if (kind === 'plan_card') return t(language, 'deepcodeGui.tasks.plan');
@@ -1499,7 +1456,7 @@ function localizedEventKind(language: UiLanguage, kind: string): string {
   if (kind === 'tool_result') return t(language, 'deepcodeGui.tasks.tool');
   if (kind === 'permission_request' || kind === 'permission_result') return t(language, 'deepcodeGui.tasks.permission');
   if (kind === 'requirement_confirmation' || kind === 'requirement_decision') return t(language, 'deepcodeGui.tasks.requirement');
-  return kind;
+  return t(language, 'deepcodeGui.timeline.event');
 }
 
 function localizedEventSummary(language: UiLanguage, event: AgentEvent): string {
@@ -1508,8 +1465,14 @@ function localizedEventSummary(language: UiLanguage, event: AgentEvent): string 
 
 function localizedTimelineText(language: UiLanguage, text: string): string {
   if (!text) return '';
-  if (language !== 'zh-CN') return text;
   const replacements: Array<[string, string]> = [
+    ['User guidance', t(language, 'deepcodeGui.tasks.guidance')],
+    ['User', t(language, 'deepcodeGui.timeline.user')],
+    ['Plan', t(language, 'deepcodeGui.tasks.plan')],
+    ['Review', t(language, 'deepcodeGui.tasks.review')],
+    ['Permission', t(language, 'deepcodeGui.tasks.permission')],
+    ['Verification', t(language, 'deepcodeGui.timeline.verification')],
+    ['Diagnostic', t(language, 'deepcodeGui.activity.kind.diagnostic')],
     ['Requirement decision', t(language, 'deepcodeGui.timeline.requirementDecision')],
     ['Requirement confirmation', t(language, 'deepcodeGui.timeline.requirementConfirmation')],
     ['Kernel state contract entered.', t(language, 'deepcodeGui.timeline.kernelStateEntered')],
@@ -1519,7 +1482,6 @@ function localizedTimelineText(language: UiLanguage, text: string): string {
     ['Provider Tool Resume', t(language, 'deepcodeGui.timeline.providerToolResume')],
     ['Operation evidence', t(language, 'deepcodeGui.timeline.operationEvidence')],
     ['Thinking', t(language, 'deepcodeGui.timeline.thinking')],
-    ['User guidance', t(language, 'deepcodeGui.tasks.guidance')],
   ];
   let result = text;
   for (const [source, target] of replacements) {

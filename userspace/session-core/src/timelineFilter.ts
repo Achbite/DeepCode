@@ -1,12 +1,8 @@
 /**
- * P5-lite 共享渲染过滤规则：消除 live/final 两套独立过滤实现的漂移隐患。
+ * P5 共享渲染过滤规则：消除 live/final 两套独立过滤实现的漂移隐患。
  *
- * 两壳的过滤规则原本各写各的：
- *   live（liveTimelinePlayback.ts）  按 AgentConversationActivity 抑制内部步骤/冗余工具前置
- *   final（DeepCodeTimeline.tsx）    按 AgentEvent.workflow_stage 抑制纯编排生命周期
- *
- * 本模块把两个判定规则统一放在 session-core，两壳从这里导入，
- * 确保 live 与 final 对同批事实的"是否显示"判定保持一致。
+ * live overlay 会先被转换为临时 AgentEvent，再走 narrative projection。
+ * 本模块只保留结构化事实级过滤规则，确保 live 与 final 对同批事实的"是否显示"判定一致。
  */
 
 // 不应单独成块的纯编排/调度生命周期事件 stage / kernelEvent.kind 集合。

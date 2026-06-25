@@ -7,6 +7,7 @@ import type {
   KernelReply,
   LlmChatRequest,
   LlmChatResult,
+  ProjectionDelta,
 } from '@deepcode/protocol';
 import {
   agentConfigurableSettingsIndex,
@@ -18,6 +19,7 @@ import {
   applyProviderCacheStrategy,
   assembleContext,
   buildNarrativeTimelineProjection,
+  buildTimelineProjectionWithLiveOverlay,
   buildPromptEnvelope,
   buildResourcePromptContext,
   buildSessionMemoryDocument,
@@ -50,6 +52,7 @@ async function main(): Promise<void> {
   await assertAcceptedPlanStreamingDraftsAndJsonProgress();
   assertSettingsCatalogBoundaries();
   assertNarrativeTimelineProjection();
+  assertTimelineProjectionWithLiveOverlay();
   assertImplementationPlanTaskProjectionProgress();
   assertSessionDriverSkeleton();
   await assertSessionDriverLoop();
@@ -2051,6 +2054,161 @@ function assertNarrativeTimelineProjection(): void {
     projection.rawEventRefs?.includes('event:event-tool'),
     true,
     'raw event refs are preserved for debug views'
+  );
+}
+
+function assertTimelineProjectionWithLiveOverlay(): void {
+  const userEvent: AgentEvent = {
+    id: 'event-live-user',
+    sessionId: 'session-live-overlay',
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'user_msg',
+    payload: { content: 'Inspect a generic project.' },
+  };
+  const readActivity = {
+    activityId: 'activity-live-read',
+    kind: 'resourceRead' as const,
+    status: 'completed' as const,
+    title: 'Read generic resources',
+    summary: 'Read generic project resources.',
+    source: 'session' as const,
+    runId: 'run-live-overlay',
+    targets: ['src/generic-a.ts', 'docs/generic.md'],
+  };
+  const activeDeltas: ProjectionDelta[] = [
+    {
+      type: 'reasoning_delta',
+      seq: 1,
+      sessionId: 'session-live-overlay',
+      runId: 'run-live-overlay',
+      turnId: 'turn-live-overlay',
+      channel: 'reasoning',
+      source: 'provider',
+      delta: 'Need generic context before proposing changes.',
+    },
+    {
+      type: 'resource_delta',
+      seq: 2,
+      sessionId: 'session-live-overlay',
+      runId: 'run-live-overlay',
+      turnId: 'turn-live-overlay',
+      channel: 'resource',
+      source: 'session',
+      status: 'completed',
+      summary: 'Read generic project resources.',
+      activity: readActivity,
+    },
+    {
+      type: 'reasoning_delta',
+      seq: 3,
+      sessionId: 'session-live-overlay',
+      runId: 'run-live-overlay',
+      turnId: 'turn-live-overlay',
+      branchId: 'branch-ignored',
+      channel: 'reasoning',
+      source: 'provider',
+      delta: 'Branch reasoning must not enter the parent timeline.',
+    },
+  ];
+  const liveProjection = buildTimelineProjectionWithLiveOverlay({
+    sessionId: 'session-live-overlay',
+    committedEvents: [userEvent],
+    activeDeltas,
+    generatedAt: '2026-01-01T00:00:01.000Z',
+  });
+  const liveBlocks = liveProjection.turns[0].blocks;
+  const liveKinds = liveBlocks.map((block) => block.narrativeKind);
+  assertEqual(
+    liveKinds.join('>'),
+    'user>thinking>operationEvidence',
+    'live overlay reuses narrative projection ordering for parent deltas'
+  );
+  const liveThinking = liveBlocks.find((block) => block.narrativeKind === 'thinking');
+  assertEqual(
+    liveThinking?.bodyMarkdown,
+    'Need generic context before proposing changes.',
+    'live reasoning remains complete when sealed by a following activity'
+  );
+  assertEqual(liveThinking?.defaultCollapsed, true, 'sealed live thinking is eligible for collapse');
+  assertEqual(
+    liveBlocks.some((block) => (block.bodyMarkdown ?? '').includes('Branch reasoning')),
+    false,
+    'branch reasoning delta does not enter parent live projection'
+  );
+  const liveActivity = liveBlocks.find((block) => block.activity?.activityId === 'activity-live-read');
+  assertEqual(liveActivity?.activity?.kind, 'resourceRead', 'live activity survives projection as structured activity');
+  assertEqual(
+    liveActivity?.rawEventRefs?.some((ref) => ref.startsWith('event:live:session-live-overlay:run-live-overlay:turn-live-overlay:2:resource_delta')),
+    true,
+    'live activity uses a structured transient event ref'
+  );
+
+  const committedProjection = buildNarrativeTimelineProjection({
+    sessionId: 'session-live-overlay',
+    events: [
+      userEvent,
+      {
+        id: 'event-committed-reasoning',
+        sessionId: 'session-live-overlay',
+        ts: '2026-01-01T00:00:01.000Z',
+        kind: 'assistant_msg',
+        payload: {
+          channel: 'reasoning',
+          content: 'Need generic context before proposing changes.',
+        },
+      },
+      {
+        id: 'event-committed-resource',
+        sessionId: 'session-live-overlay',
+        ts: '2026-01-01T00:00:02.000Z',
+        kind: 'tool_result',
+        payload: {
+          channel: 'tool',
+          status: 'completed',
+          summary: 'Read generic project resources.',
+          activity: readActivity,
+        },
+      },
+    ],
+  });
+  assertEqual(
+    committedProjection.turns[0].blocks.map((block) => block.narrativeKind).join('>'),
+    liveKinds.join('>'),
+    'live and committed projection produce the same narrative block order'
+  );
+
+  const streamingProjection = buildTimelineProjectionWithLiveOverlay({
+    sessionId: 'session-live-overlay',
+    committedEvents: [userEvent],
+    activeDeltas: [activeDeltas[0]],
+  });
+  const streamingThinking = streamingProjection.turns[0].blocks.find((block) => block.narrativeKind === 'thinking');
+  assertEqual(streamingThinking?.status, 'running', 'latest live text block remains running');
+  assertEqual(streamingThinking?.displayHints?.renderMode, 'typewriter', 'latest live text block keeps typewriter mode');
+
+  const dedupedProjection = buildTimelineProjectionWithLiveOverlay({
+    sessionId: 'session-live-overlay',
+    committedEvents: [
+      userEvent,
+      {
+        id: 'event-already-committed-resource',
+        sessionId: 'session-live-overlay',
+        ts: '2026-01-01T00:00:02.000Z',
+        kind: 'tool_result',
+        payload: {
+          channel: 'tool',
+          status: 'completed',
+          summary: 'Read generic project resources.',
+          activity: readActivity,
+        },
+      },
+    ],
+    activeDeltas: [activeDeltas[1]],
+  });
+  assertEqual(
+    dedupedProjection.turns[0].blocks.filter((block) => block.activity?.activityId === 'activity-live-read').length,
+    1,
+    'active activity is suppressed when the same activityId is already committed'
   );
 }
 
