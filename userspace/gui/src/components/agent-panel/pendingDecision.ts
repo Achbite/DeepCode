@@ -6,7 +6,18 @@ export interface AgentComposerDecisionOption {
   label: string;
   description?: string;
   recommended?: boolean;
+  // R4：用户介入卡 option 的状态机副作用。GUI 据此向用户展示
+  // "选择后会触发什么"，避免模型/用户对结果不一致的伪造（卡片所读即事实）。
+  effect?: AgentRequirementOptionEffectView;
 }
+
+// 与 session-core protocolV3.normalizeOptionEffect 对齐（运行时视图，结构最小）。
+export type AgentRequirementOptionEffectView =
+  | { kind: 'continueWithAction' }
+  | { kind: 'markTasksCompleted'; taskIds: string[] }
+  | { kind: 'skipCurrentTask' }
+  | { kind: 'replan'; reason?: string }
+  | { kind: 'finishRun' };
 
 export interface AgentComposerDecisionRequest {
   id?: string;
@@ -114,6 +125,7 @@ function findRequirementDecisionRequest(
             stringField(option, 'impact') ??
             stringField(option, 'tradeoff'),
           recommended: option.recommended === true,
+          effect: extractOptionEffect(option.effect),
         }];
       })
       : [];
@@ -138,4 +150,30 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 function stringField(value: Record<string, unknown>, key: string): string | undefined {
   const field = value[key];
   return typeof field === 'string' && field.trim() ? field.trim() : undefined;
+}
+
+function extractOptionEffect(value: unknown): AgentRequirementOptionEffectView | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  const kind = stringField(record, 'kind');
+  if (!kind) return undefined;
+  switch (kind) {
+    case 'continueWithAction':
+    case 'skipCurrentTask':
+    case 'finishRun':
+      return { kind } as AgentRequirementOptionEffectView;
+    case 'markTasksCompleted': {
+      const ids = Array.isArray(record.taskIds)
+        ? record.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
+        : [];
+      if (ids.length === 0) return undefined;
+      return { kind: 'markTasksCompleted', taskIds: ids };
+    }
+    case 'replan': {
+      const reason = stringField(record, 'reason');
+      return reason ? { kind: 'replan', reason } : { kind: 'replan' };
+    }
+    default:
+      return undefined;
+  }
 }

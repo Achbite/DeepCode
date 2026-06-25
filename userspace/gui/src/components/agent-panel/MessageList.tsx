@@ -7,7 +7,7 @@ import type {
   AgentTimelineBlock,
 } from '@deepcode/protocol';
 import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
-import { t, type UiLanguage } from '../../i18n';
+import { t, resolveDiagnosticText, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
 import ToolEvidenceDetails from './ToolEvidenceDetails';
@@ -1264,17 +1264,107 @@ function RequirementConfirmationCard({
   const confirmable = isRecord(event.payload) &&
     event.payload.confirmable === true &&
     status === 'waitingUserConfirmation';
+  const options = extractRequirementOptions(event.payload);
   return (
     <section key={event.id} className="agent-flow-card agent-flow-card--requirement">
       <div className="agent-flow-card__title">{title}</div>
       <div className="agent-flow-card__summary">{summary}</div>
       {content && <MarkdownContent content={content} />}
+      {options.length > 0 && <RequirementOptionsList options={options} language={language} />}
       {confirmable && (
         <div className="agent-plan-review-actions agent-plan-review-actions--composer">
           {t(language, 'agent.requirement.useComposer')}
         </div>
       )}
     </section>
+  );
+}
+
+// R4：从 requirement_confirmation 事件中提取 options 与 effect，供卡片渲染"选择后副作用"。
+// payload 路径与 session-core 写入对齐：payload.decisionRequest.options[].effect
+interface RequirementOptionView {
+  id: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+  effect?: { kind: string; taskIds?: string[]; reason?: string };
+}
+
+function extractRequirementOptions(payload: unknown): RequirementOptionView[] {
+  if (!isRecord(payload)) return [];
+  const decisionRequest = isRecord(payload.decisionRequest) ? payload.decisionRequest : undefined;
+  if (!decisionRequest || !Array.isArray(decisionRequest.options)) return [];
+  return decisionRequest.options.flatMap((item): RequirementOptionView[] => {
+    if (!isRecord(item)) return [];
+    const id = stringField(item, 'id');
+    const label = stringField(item, 'label');
+    if (!id || !label) return [];
+    const effectRecord = isRecord(item.effect) ? item.effect : undefined;
+    const effectKind = effectRecord ? stringField(effectRecord, 'kind') : undefined;
+    let effect: RequirementOptionView['effect'];
+    if (effectKind) {
+      effect = { kind: effectKind };
+      if (effectKind === 'markTasksCompleted' && Array.isArray(effectRecord?.taskIds)) {
+        effect.taskIds = effectRecord.taskIds.filter((v): v is string => typeof v === 'string' && v.length > 0);
+      } else if (effectKind === 'replan') {
+        const reason = effectRecord ? stringField(effectRecord, 'reason') : undefined;
+        if (reason) effect.reason = reason;
+      }
+    }
+    return [{
+      id,
+      label,
+      description: stringField(item, 'description'),
+      recommended: item.recommended === true,
+      effect,
+    }];
+  });
+}
+
+function formatOptionEffect(effect: RequirementOptionView['effect'], language: UiLanguage): string | undefined {
+  if (!effect) return undefined;
+  const key = `requirement.optionEffect.${effect.kind}`;
+  if (effect.kind === 'markTasksCompleted' && Array.isArray(effect.taskIds) && effect.taskIds.length > 0) {
+    return t(language, key, { taskIds: effect.taskIds.join(', ') });
+  }
+  const translated = t(language, key);
+  return translated === key ? undefined : translated;
+}
+
+function RequirementOptionsList({
+  options,
+  language,
+}: {
+  options: RequirementOptionView[];
+  language: UiLanguage;
+}) {
+  return (
+    <ul className="agent-flow-card__options" aria-label={t(language, 'requirement.optionsTitle')}>
+      {options.map((option) => {
+        const effectText = formatOptionEffect(option.effect, language);
+        return (
+          <li key={option.id} className="agent-flow-card__option">
+            <div className="agent-flow-card__option-head">
+              <span className="agent-flow-card__option-label">{option.label}</span>
+              {option.recommended && (
+                <span className="agent-flow-card__option-badge">{t(language, 'requirement.optionRecommended')}</span>
+              )}
+            </div>
+            {option.description && (
+              <div className="agent-flow-card__option-desc">{option.description}</div>
+            )}
+            {effectText && (
+              <div className="agent-flow-card__option-effect">
+                <span className="agent-flow-card__option-effect-label">
+                  {t(language, 'requirement.optionEffectLabel')}：
+                </span>
+                {effectText}
+              </div>
+            )}
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
@@ -1973,7 +2063,9 @@ function renderMessage(
   const label = stringField(event.payload, 'label');
   const speaker = event.kind === 'user_msg' ? t(language, 'agent.message.user') : (label ?? 'Agent');
   const pending = isRecord(event.payload) && event.payload.pending === true;
-  const text = payloadText(event.payload);
+  const isDiagnostic = isRecord(event.payload) && event.payload.diagnostic === true;
+  const text = (isDiagnostic ? resolveDiagnosticText(event.payload as Record<string, unknown>, language) : undefined)
+    ?? payloadText(event.payload);
   const renderMarkdown = event.kind === 'assistant_msg' || event.kind === 'user_msg';
   const shouldCollapse = shouldCollapseAssistantMessage(event, text);
   const attachments = event.kind === 'user_msg' ? payloadAttachments(event.payload) : [];

@@ -4033,3 +4033,26 @@ button {
     margin-bottom: 12px;
   }
 }
+
+/* P4(B) phase 视觉分区：plan 探索性事件弱化、execute 阶段正常展示 */
+.deepcode-gui-block--phase-explore {
+  opacity: 0.72;
+}
+
+.deepcode-gui-block--phase-explore::before {
+  content: 'plan';
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 5px;
+  font-size: 9px;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  color: var(--text-muted, #a1a1aa);
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 2px;
+  vertical-align: middle;
+}
+
+.deepcode-gui-block--phase-execute {
+  opacity: 1;
+}

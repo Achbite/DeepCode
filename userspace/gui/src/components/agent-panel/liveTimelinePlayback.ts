@@ -4,6 +4,7 @@ import type {
   AgentTimelineTurn,
   ProjectionDelta,
 } from '@deepcode/protocol';
+import { isMainTimelineActivityShape } from '@deepcode/session-core';
 
 export type LiveDisplayTextKind = 'thinking' | 'assistant' | 'draft';
 
@@ -120,6 +121,20 @@ export function buildLiveDisplayItems(input: BuildLiveDisplayItemsInput): LiveDi
     const activity = delta.activity;
     if (activity && !committedActivityIds.has(activity.activityId) && isMainTimelineActivity(activity)) {
       flushTextSegment();
+      const last = items[items.length - 1];
+      if (last && last.type === 'activity' && activityOperationKey(last.activity) === activityOperationKey(activity)) {
+        // 合并连续的同操作生命周期事件，保留最新状态/标题，避免一次读取被拆成多块
+        items[items.length - 1] = {
+          ...last,
+          key: `activity:${activity.activityId}`,
+          runId: delta.runId ?? activity.runId,
+          turnId: delta.turnId,
+          seq: delta.seq ?? index,
+          activity,
+          delta,
+        };
+        continue;
+      }
       items.push({
         type: 'activity',
         key: `activity:${activity.activityId}`,
@@ -229,10 +244,16 @@ export function isBranchProjectionDelta(delta: ProjectionDelta): boolean {
   return Boolean(delta.branchId || delta.subAgentId || delta.mergeGroupId);
 }
 
+// P5-lite：判定规则统一抽至 @deepcode/session-core/timelineFilter，live 与 final 共用同一套规则，
+// 消除两套独立过滤实现的漂移隐患。此处仅做 AgentConversationActivity 形状适配，规则本身在 session-core。
 export function isMainTimelineActivity(activity: AgentConversationActivity): boolean {
-  return activity.kind !== 'providerThinking'
-    && activity.kind !== 'subagentBranch'
-    && activity.kind !== 'subagentMerge';
+  return isMainTimelineActivityShape({ kind: activity.kind, toolName: activity.toolName ?? undefined });
+}
+
+// 同一逻辑操作（同工具 + 同目标）的连续生命周期事件归并键，用于 live 去重合并。
+function activityOperationKey(activity: AgentConversationActivity): string {
+  const targets = (activity.targets ?? []).slice().sort().join('|');
+  return `${activity.toolName ?? activity.kind}::${targets}`;
 }
 
 function liveTextKind(delta: ProjectionDelta): LiveDisplayTextKind | null {

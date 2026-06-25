@@ -8,8 +8,8 @@ import type {
   AgentTimelineTurn,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import { buildNarrativeTimelineProjection } from '@deepcode/session-core';
-import { t, type UiLanguage } from '../../i18n';
+import { buildNarrativeTimelineProjection, isInternalOrchestrationStage } from '@deepcode/session-core';
+import { t, resolveDiagnosticText, type UiLanguage } from '../../i18n';
 import { submitAgentFeedback } from '../../services/runtimeAdapter';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
 import ToolEvidenceDetails from '../../components/agent-panel/ToolEvidenceDetails';
@@ -990,7 +990,7 @@ const TimelineBlock: React.FC<{
   if (block.kind === 'user') {
     const attachments = blockAttachments(block);
     return (
-      <article className={`deepcode-gui-block deepcode-gui-block--user${narrativeClass}${densityClass}`}>
+      <article className={`deepcode-gui-block deepcode-gui-block--user${narrativeClass}${densityClass}${phaseClassName(block)}`}>
         <div className="deepcode-gui-block__label">{t(language, 'agent.message.user')}</div>
         <DeepCodeAttachmentChips attachments={attachments} language={language} />
         <MarkdownContent content={block.bodyMarkdown ?? block.summary} />
@@ -1000,28 +1000,32 @@ const TimelineBlock: React.FC<{
 
   if (block.narrativeKind === 'assistantNarration') {
     return (
-      <article className={`deepcode-gui-assistant-narration${narrativeClass}${densityClass}`}>
+      <article className={`deepcode-gui-assistant-narration${narrativeClass}${densityClass}${phaseClassName(block)}`}>
         <TypewriterMarkdown
-          content={block.bodyMarkdown ?? block.summary}
+          content={visibleTypewriterMarkdown(block, language)}
           animate={animateAssistant}
           speed={block.displayHints?.typewriterSpeed}
           onVisibleContentChange={onLiveContentChange}
-          onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
+          onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block, language).length)}
         />
       </article>
     );
   }
 
   if (block.kind === 'assistant') {
+    const requirementOptions = block.narrativeKind === 'requirement'
+      ? extractRequirementOptionsFromBlock(block)
+      : [];
     return (
-      <article className={`deepcode-gui-assistant-text${narrativeClass}${densityClass}`}>
+      <article className={`deepcode-gui-assistant-text${narrativeClass}${densityClass}${phaseClassName(block)}`}>
         <TypewriterMarkdown
-          content={block.bodyMarkdown ?? block.summary}
+          content={visibleTypewriterMarkdown(block, language)}
           animate={animateAssistant}
           speed={block.displayHints?.typewriterSpeed}
           onVisibleContentChange={onLiveContentChange}
-          onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
+          onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block, language).length)}
         />
+        {requirementOptions.length > 0 && <DeepCodeRequirementOptionsList options={requirementOptions} language={language} />}
       </article>
     );
   }
@@ -1075,7 +1079,7 @@ const TimelineBlock: React.FC<{
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
   const detailEvents = visibleFallbackDetailEvents(block);
   return (
-    <details className={`deepcode-gui-block deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}`} open={open}>
+    <details className={`deepcode-gui-block deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}${phaseClassName(block)}`} open={open}>
       <summary>
         <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
         <span className="deepcode-gui-block__title">{localizedTimelineText(language, block.title)}</span>
@@ -1117,7 +1121,7 @@ const ActivityBlock: React.FC<{
 
   return (
     <details
-      className={`deepcode-gui-block deepcode-gui-block--activity deepcode-gui-block--activity-${activity.kind} deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}`}
+      className={`deepcode-gui-block deepcode-gui-block--activity deepcode-gui-block--activity-${activity.kind} deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}${phaseClassName(block)}`}
       open={open}
     >
       <summary>
@@ -1153,7 +1157,7 @@ const ReviewBlock: React.FC<{
   const markdown = reviewBlockMarkdown(block);
 
   return (
-    <details className={`deepcode-gui-block deepcode-gui-block--review${narrativeClass}${densityClass}`} open={open}>
+    <details className={`deepcode-gui-block deepcode-gui-block--review${narrativeClass}${densityClass}${phaseClassName(block)}`} open={open}>
       <summary>
         <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
         <span className="deepcode-gui-block__title">
@@ -1194,7 +1198,7 @@ const OperationEvidenceBlock: React.FC<{
 
   return (
     <details
-      className={`deepcode-gui-block deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}`}
+      className={`deepcode-gui-block deepcode-gui-block--${block.kind}${narrativeClass}${densityClass}${phaseClassName(block)}`}
       open={open}
     >
       <summary>
@@ -1256,12 +1260,18 @@ const ThinkingBlock: React.FC<{
 }> = ({ block, language, animate = false, collapseCompletedThinking = true, onLiveContentChange = () => undefined, onTypewriterComplete }) => {
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
-  const completedThinkingOpen = block.status === 'completed' && !collapseCompletedThinking;
-  const open = completedThinkingOpen || (block.displayHints?.initialOpen ?? (!block.defaultCollapsed || block.status === 'running' || block.status === 'waiting'));
   const markdown = thinkingMarkdown(block);
+  const running = block.status === 'running' || block.status === 'waiting';
+  // 空"推理过程"块不渲染（避免空壳卡片）。
+  if (!markdown && !running) return null;
+  // 超长 reasoning（执行阶段完整 CoT 可达上万字符）默认折叠，避免一次性大段平铺。
+  const longContent = markdown.length > 1600;
+  const completedThinkingOpen = block.status === 'completed' && !collapseCompletedThinking;
+  const open = completedThinkingOpen ||
+    (block.displayHints?.initialOpen ?? (longContent ? false : (!block.defaultCollapsed || running)));
 
   return (
-    <details className={`deepcode-gui-block deepcode-gui-block--thinking${narrativeClass}${densityClass}`} open={open}>
+    <details className={`deepcode-gui-block deepcode-gui-block--thinking${narrativeClass}${densityClass}${phaseClassName(block)}`} open={open}>
       <summary>
         <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
         <span className="deepcode-gui-block__title">{t(language, 'deepcodeGui.timeline.thinking')}</span>
@@ -1311,7 +1321,7 @@ const PlanBlock: React.FC<{
 
   return (
     <details
-      className={`deepcode-gui-block deepcode-gui-block--plan deepcode-gui-block--${status}${narrativeClass}${densityClass}`}
+      className={`deepcode-gui-block deepcode-gui-block--plan deepcode-gui-block--${status}${narrativeClass}${densityClass}${phaseClassName(block)}`}
       open={open}
     >
       <summary>
@@ -1537,16 +1547,15 @@ function isVisibleTimelineBlock(block: AgentTimelineBlock): boolean {
   return !block.events.every(isInternalKernelCheckpointEvent);
 }
 
+// P5-lite：规则统一抽至 @deepcode/session-core/timelineFilter，与 live 路径共用。
+// 此处仅做 AgentEvent → {stage, kernelEventKind} 形状适配。
 function isInternalKernelCheckpointEvent(event: AgentEvent): boolean {
   if (event.kind !== 'workflow_stage') return false;
   if (!isRecord(event.payload)) return false;
   const stage = stringField(event.payload, 'stage');
   const kernelEvent = isRecord(event.payload.kernelEvent) ? event.payload.kernelEvent : null;
-  const kernelKind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
-  return stage === 'state.entered' ||
-    stage === 'driver.request_produced' ||
-    kernelKind === 'state.entered' ||
-    kernelKind === 'driver.request_produced';
+  const kernelEventKind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
+  return isInternalOrchestrationStage({ stage, kernelEventKind });
 }
 
 function planBlockMarkdown(block: AgentTimelineBlock): string {
@@ -1701,10 +1710,18 @@ function blockCopyBody(block: AgentTimelineBlock, activityBody: string): string 
   return (block.bodyMarkdown ?? block.summary ?? activityBody).trim();
 }
 
-function visibleTypewriterMarkdown(block: AgentTimelineBlock): string {
+function visibleTypewriterMarkdown(block: AgentTimelineBlock, language?: UiLanguage): string {
   if (block.kind === 'review' || block.narrativeKind === 'review') return reviewBlockMarkdown(block);
   if (block.kind === 'thinking' || block.narrativeKind === 'thinking') return thinkingMarkdown(block);
   if (block.activity) return block.bodyMarkdown ?? '';
+  // diagnostic 事件本地化：源事件携带 diagnosticCode 时按 i18n 翻译
+  if (language && block.events.length > 0) {
+    const payload = isRecord(block.events[0].payload) ? block.events[0].payload : undefined;
+    if (payload && payload.diagnostic === true) {
+      const translated = resolveDiagnosticText(payload as Record<string, unknown>, language);
+      if (translated) return translated;
+    }
+  }
   return (block.bodyMarkdown ?? block.summary ?? '').trim();
 }
 
@@ -1736,6 +1753,102 @@ async function copyText(text: string): Promise<void> {
   textarea.select();
   document.execCommand('copy');
   document.body.removeChild(textarea);
+}
+
+// R4 DeepCodeTimeline 壳：从 requirement_confirmation block 提取 options 与 effect，
+// 在卡片中显式渲染"选择后副作用"，与 agent-panel 壳保持一致。
+interface DeepCodeRequirementOption {
+  id: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+  effect?: { kind: string; taskIds?: string[]; reason?: string };
+}
+
+function extractRequirementOptionsFromBlock(block: AgentTimelineBlock): DeepCodeRequirementOption[] {
+  for (const event of block.events) {
+    if (event.kind !== 'requirement_confirmation') continue;
+    const payload = isRecord(event.payload) ? event.payload : undefined;
+    if (!payload) continue;
+    const decisionRequest = isRecord(payload.decisionRequest) ? payload.decisionRequest : undefined;
+    if (!decisionRequest || !Array.isArray(decisionRequest.options)) continue;
+    return decisionRequest.options.flatMap((item): DeepCodeRequirementOption[] => {
+      if (!isRecord(item)) return [];
+      const id = stringField(item, 'id');
+      const label = stringField(item, 'label');
+      if (!id || !label) return [];
+      const effectRecord = isRecord(item.effect) ? item.effect : undefined;
+      const effectKind = effectRecord ? stringField(effectRecord, 'kind') : undefined;
+      let effect: DeepCodeRequirementOption['effect'];
+      if (effectKind) {
+        effect = { kind: effectKind };
+        if (effectKind === 'markTasksCompleted' && Array.isArray(effectRecord?.taskIds)) {
+          effect.taskIds = effectRecord.taskIds.filter((v): v is string => typeof v === 'string' && v.length > 0);
+        } else if (effectKind === 'replan') {
+          const reason = effectRecord ? stringField(effectRecord, 'reason') : undefined;
+          if (reason) effect.reason = reason;
+        }
+      }
+      return [{
+        id,
+        label,
+        description: stringField(item, 'description'),
+        recommended: item.recommended === true,
+        effect,
+      }];
+    });
+  }
+  return [];
+}
+
+function formatDeepCodeOptionEffect(effect: DeepCodeRequirementOption['effect'], language: UiLanguage): string | undefined {
+  if (!effect) return undefined;
+  const key = `requirement.optionEffect.${effect.kind}`;
+  if (effect.kind === 'markTasksCompleted' && Array.isArray(effect.taskIds) && effect.taskIds.length > 0) {
+    return t(language, key, { taskIds: effect.taskIds.join(', ') });
+  }
+  const translated = t(language, key);
+  return translated === key ? undefined : translated;
+}
+
+const DeepCodeRequirementOptionsList: React.FC<{
+  options: DeepCodeRequirementOption[];
+  language: UiLanguage;
+}> = ({ options, language }) => {
+  return (
+    <ul className="deepcode-gui-requirement-options" aria-label={t(language, 'requirement.optionsTitle')}>
+      {options.map((option) => {
+        const effectText = formatDeepCodeOptionEffect(option.effect, language);
+        return (
+          <li key={option.id} className="deepcode-gui-requirement-option">
+            <div className="deepcode-gui-requirement-option__head">
+              <span className="deepcode-gui-requirement-option__label">{option.label}</span>
+              {option.recommended && (
+                <span className="deepcode-gui-requirement-option__badge">{t(language, 'requirement.optionRecommended')}</span>
+              )}
+            </div>
+            {option.description && (
+              <div className="deepcode-gui-requirement-option__desc">{option.description}</div>
+            )}
+            {effectText && (
+              <div className="deepcode-gui-requirement-option__effect">
+                <span className="deepcode-gui-requirement-option__effect-label">
+                  {t(language, 'requirement.optionEffectLabel')}：
+                </span>
+                {effectText}
+              </div>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+};
+
+// P4(B)：返回 block 的 phase 视觉 className 片段（用于 plan 探索 vs complete 执行的视觉分区）。
+function phaseClassName(block: AgentTimelineBlock): string {
+  const phase = block.displayHints?.phase;
+  return phase ? ` deepcode-gui-block--phase-${phase}` : '';
 }
 
 function stringField(payload: Record<string, unknown>, key: string): string | undefined {
