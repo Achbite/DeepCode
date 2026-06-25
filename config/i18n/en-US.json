@@ -865,7 +865,37 @@
     "agent.toolEvidence.details.preview": "Preview",
     "agent.toolEvidence.details.output": "Output",
     "deepcodeGui.boot.startingTitle": "DeepCode-GUI is starting",
-    "deepcodeGui.boot.loadingWorkbench": "Loading local workbench..."
+    "deepcodeGui.boot.loadingWorkbench": "Loading local workbench...",
+
+    "diagnostic.generic": "{message}",
+    "diagnostic.decisionResolverMissing": "Decision kind \"{kind}\" is not yet connected to Session DecisionResolver.",
+    "diagnostic.requirementConfirmationFailed": "Requirement confirmation generation failed: {message}",
+    "diagnostic.protocolRepairFailed": "{message}\n\nThe model output could not form a valid structured proposal (protocol format issue); automatic repair was attempted but unsuccessful. Previously completed steps are not affected. You may retry this turn or rephrase your request.",
+    "diagnostic.providerCallFailed": "Model call failed: {raw}\n\nThe connection to the model was interrupted (possibly due to network fluctuation, provider timeout, or response stream closure). Previously completed steps are not affected; please retry this turn.",
+    "diagnostic.modelDiagnostic": "{summary}",
+    "diagnostic.resourceResolveRepairFailed": "The requested resources could not be located in attachments or project directory, and repair failed: {message}",
+    "diagnostic.resourceResolveFailed": "The requested resources could not be located in the current attachments or project directory; Session rejected the request.\nUnresolved: {unresolved}\nMultiple candidate roots: {ambiguous}\nAvailable project/attachment roots:\n{roots}\nPlease specify an explicit attachment, rootId, or relative path.",
+    "diagnostic.acceptedPlanScopeRecoveryFailed": "Accepted-plan scope decision could not recover the original implementationPlan; Session will not start a detached requirement flow.",
+    "diagnostic.acceptedPlanInteractionRecoveryFailed": "Accepted-plan interaction decision could not recover the parent implementationPlan; Session will not start a detached requirement flow.",
+    "diagnostic.actionBundleAdmissionDiagnostic": "{summary}",
+    "diagnostic.planProposalReviewedMissing": "Kernel did not return a proposal.reviewed event for the actionBundle; Session will not display a confirmable plan.",
+    "diagnostic.planRevisionRepairFailed": "The plan needs revision, but model repair failed: {message}",
+    "diagnostic.planRejected": "Kernel rejected the plan: {reasons}",
+    "diagnostic.autoBatchResourceResolveFailed": "Automatic execution batch requires additional resource evidence, but the repaired resourceRequest could not be located: {detail}",
+    "diagnostic.autoBatchScopeRepairFailed": "Automatic execution batch went out of scope and model repair failed: {message}",
+    "diagnostic.autoPlanProposalReviewedMissing": "Kernel did not return a proposal.reviewed event for the accepted-plan actionBundle; Session will not auto-execute this batch.",
+    "diagnostic.autoBatchRevisionRepairFailed": "The automatic execution batch needs revision, but model repair failed: {message}",
+    "diagnostic.autoBatchRejected": "Kernel rejected the automatic execution batch: {reasons}",
+    "diagnostic.subAgentModeViolation": "Sub-agent mode is off, but Session attempted to emit a sub-agent branch/merge delta. Automatic execution has been stopped as a Session orchestration violation.",
+
+    "requirement.optionsTitle": "Options",
+    "requirement.optionRecommended": "Recommended",
+    "requirement.optionEffectLabel": "If selected",
+    "requirement.optionEffect.continueWithAction": "Generate the next batch of execution actions",
+    "requirement.optionEffect.skipCurrentTask": "Mark the current task as completed and advance the cursor",
+    "requirement.optionEffect.markTasksCompleted": "Mark tasks {taskIds} as completed",
+    "requirement.optionEffect.replan": "Return to plan stage and re-plan",
+    "requirement.optionEffect.finishRun": "Finish this run"
   },
   "settings": {
     "workbench.language": {

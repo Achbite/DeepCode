@@ -865,7 +865,37 @@
     "agent.toolEvidence.details.preview": "片段",
     "agent.toolEvidence.details.output": "输出",
     "deepcodeGui.boot.startingTitle": "DeepCode-GUI 正在启动",
-    "deepcodeGui.boot.loadingWorkbench": "正在加载本地工作台..."
+    "deepcodeGui.boot.loadingWorkbench": "正在加载本地工作台...",
+
+    "diagnostic.generic": "{message}",
+    "diagnostic.decisionResolverMissing": "当前决策类型 {kind} 尚未接入 Session DecisionResolver。",
+    "diagnostic.requirementConfirmationFailed": "需求理解确认生成失败：{message}",
+    "diagnostic.protocolRepairFailed": "{message}\n\n说明：本轮模型输出未能形成合法的结构化方案（协议格式问题），已自动尝试修复但未成功；这不影响此前已完成的步骤。可直接重试本轮，或换一种表述后重新发起。",
+    "diagnostic.providerCallFailed": "模型调用失败：{raw}\n\n说明：与模型的连接被中断（可能是网络波动、provider 超时或响应流被关闭）。这不影响此前已完成的步骤；请重试本轮。",
+    "diagnostic.modelDiagnostic": "{summary}",
+    "diagnostic.resourceResolveRepairFailed": "模型请求的资源无法在附件或项目目录中定位，且 repair 失败：{message}",
+    "diagnostic.resourceResolveFailed": "模型请求的资源无法在当前附件或项目目录中定位，Session 已拒绝该请求。\n无法定位：{unresolved}\n存在多个候选根目录：{ambiguous}\n可用项目/附件根目录：\n{roots}\n请重新指定明确附件、rootId 或相对路径。",
+    "diagnostic.acceptedPlanScopeRecoveryFailed": "已确认计划的 scope 决策无法恢复原始 implementationPlan；Session 不会启动独立需求流程。",
+    "diagnostic.acceptedPlanInteractionRecoveryFailed": "已确认计划的交互决策无法恢复父 implementationPlan；Session 不会启动独立需求流程。",
+    "diagnostic.actionBundleAdmissionDiagnostic": "{summary}",
+    "diagnostic.planProposalReviewedMissing": "Kernel 未返回 actionBundle 的 proposal.reviewed 事件，Session 不会展示可确认计划。",
+    "diagnostic.planRevisionRepairFailed": "计划需要修订，但模型 repair 失败：{message}",
+    "diagnostic.planRejected": "Kernel 拒绝该计划：{reasons}",
+    "diagnostic.autoBatchResourceResolveFailed": "自动执行批次需要补充资源证据，但 repair 后的 resourceRequest 无法定位：{detail}",
+    "diagnostic.autoBatchScopeRepairFailed": "自动执行批次越界，且模型 repair 失败：{message}",
+    "diagnostic.autoPlanProposalReviewedMissing": "Kernel 未返回 accepted-plan actionBundle 的 proposal.reviewed 事件，Session 不会自动执行该批次。",
+    "diagnostic.autoBatchRevisionRepairFailed": "自动执行批次需要修订，但模型 repair 失败：{message}",
+    "diagnostic.autoBatchRejected": "Kernel 拒绝该自动执行批次：{reasons}",
+    "diagnostic.subAgentModeViolation": "子代理模式已关闭，但 Session 尝试发出子代理分支/合并增量。自动执行已因 Session 编排违规而停止。",
+
+    "requirement.optionsTitle": "可选方案",
+    "requirement.optionRecommended": "推荐",
+    "requirement.optionEffectLabel": "选择后",
+    "requirement.optionEffect.continueWithAction": "继续生成下一批执行操作",
+    "requirement.optionEffect.skipCurrentTask": "将当前任务标记为完成，自动推进到下一任务",
+    "requirement.optionEffect.markTasksCompleted": "将任务 {taskIds} 标记为完成",
+    "requirement.optionEffect.replan": "回到计划阶段重新规划",
+    "requirement.optionEffect.finishRun": "结束本轮执行"
   },
   "settings": {
     "workbench.language": {
