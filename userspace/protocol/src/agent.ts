@@ -546,6 +546,11 @@ export interface AgentTimelineDisplayHints {
   showInTaskList?: boolean;
   taskListLabel?: string;
   taskListSummary?: string;
+  // P4(B)：阶段标记。投影层按 plan_review.accepted 边界算一次：
+  //   'explore' = plan 阶段探索性事件（plan_card accepted 之前的工具调用 / 思考等）
+  //   'execute' = complete 阶段正式执行事件
+  // 旧数据无此字段时回退为 undefined，两壳应按 undefined 等同正常显示。
+  phase?: 'explore' | 'execute';
 }
 
 export interface AgentTimelineTaskProjectionItem {
