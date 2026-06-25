@@ -189,7 +189,19 @@ export interface DecisionRequestOptionDraft {
   label: string;
   description: string;
   recommended?: boolean;
+  // 用户介入卡的"接受副作用合约"：声明该 option 被选中后状态机如何转移。
+  // 缺失时按 continueWithAction 处理（与当前行为一致，向下兼容）。
+  effect?: AgentRequirementOptionEffect;
 }
+
+// 用户介入卡 option 的状态机副作用。Session 据此推进 taskCursor / 跳过 / 重规划 / 结束。
+// GUI 据此在卡片上显式标注"接受后会发生什么"，避免模型与用户对结果不一致的伪造。
+export type AgentRequirementOptionEffect =
+  | { kind: 'continueWithAction' }
+  | { kind: 'markTasksCompleted'; taskIds: string[] }
+  | { kind: 'skipCurrentTask' }
+  | { kind: 'replan'; reason?: string }
+  | { kind: 'finishRun' };
 
 export interface DecisionRequestDraft {
   version: '1';

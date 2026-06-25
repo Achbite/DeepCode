@@ -585,7 +585,7 @@ export class SessionDriverLoop {
     return this.append(input.sessionId, [
       finalDiagnosticEvent(
         input.sessionId,
-        `当前决策类型 ${input.kind} 尚未接入 Session DecisionResolver。`,
+        diag('decisionResolverMissing', `Decision kind "${input.kind}" is not yet connected to Session DecisionResolver.`, { kind: input.kind }),
         this.ts(),
         this.id('decision-unsupported')
       ),
@@ -742,7 +742,7 @@ export class SessionDriverLoop {
         return this.append(sessionId, [
           finalDiagnosticEvent(
             sessionId,
-            `需求理解确认生成失败：${message}`,
+            diag('requirementConfirmationFailed', `Requirement confirmation generation failed: ${message}`, { message }),
             this.ts(),
             this.id('requirement-confirmation-failed')
           ),
@@ -806,13 +806,23 @@ export class SessionDriverLoop {
           return this.append(sessionId, [
             finalDiagnosticEvent(
               sessionId,
-              error.message,
+              readableDriverFailureMessage(error.code, error.message),
               this.ts(),
               this.id(error.code)
             ),
           ]);
         }
-        throw error;
+        // S5：provider 流式连接中断（undici "terminated"）、网络抖动、provider 超时等
+        // 原始错误不属于协议错误，过去会直接抛出成裸错误终止整轮；此处统一降级为可读、
+        // 可恢复的诊断，不影响此前已完成步骤。
+        return this.append(sessionId, [
+          finalDiagnosticEvent(
+            sessionId,
+            readableProviderFailureMessage(error),
+            this.ts(),
+            this.id('provider_call_failed')
+          ),
+        ]);
       }
       const narration = proposalNarrationEvent(sessionId, proposal, this.ts(), this.id('progress-model-narration'));
       if (narration) {
@@ -871,7 +881,7 @@ export class SessionDriverLoop {
         const diagnostic = objectRecord(proposal.payload) ?? {};
         const summary = stringValue(diagnostic.summary)
           ?? stringValue(diagnostic.details)
-          ?? '模型返回诊断信息，未生成计划或执行队列。';
+          ?? 'The model returned diagnostic information without generating a plan or execution queue.';
         return this.append(sessionId, [
           finalDiagnosticEvent(sessionId, summary, this.ts(), this.id('diagnostic')),
         ]);
@@ -929,7 +939,7 @@ export class SessionDriverLoop {
               return this.append(sessionId, [
                 finalDiagnosticEvent(
                   sessionId,
-                  `模型请求的资源无法在附件或项目目录中定位，且 repair 失败：${message}`,
+                  diag('resourceResolveRepairFailed', `The requested resources could not be located in attachments or project directory, and repair failed: ${message}`, { message }),
                   this.ts(),
                   this.id('resource-repair-failed')
                 ),
@@ -1051,6 +1061,24 @@ export class SessionDriverLoop {
       return this.resolveAcceptedPlanExecutionRequirementDecision(input, confirmation, decisionEvent, interactionOverlay, result);
     }
 
+    // R2 状态机派发：如果用户接受的 option 携带 effect 合约，按其声明推进状态机，
+    // 不再让模型重新猜测。这是"卡片所读即事实"的兜底：选项已显式声明副作用，
+    // 系统据此产事实事件，避免模型再次伪造任务完成。
+    if (input.decision === 'accept') {
+      const optionEffect = selectedRequirementDecisionOptionEffect(decisionEvent);
+      if (optionEffect) {
+        const dispatched = await this.applyRequirementOptionEffect(
+          input,
+          confirmation,
+          decisionEvent,
+          interactionOverlay,
+          optionEffect,
+          result
+        );
+        if (dispatched) return dispatched;
+      }
+    }
+
     const originalRequest = requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
     const next = await this.runUserTurn({
       sessionId: input.sessionId,
@@ -1151,6 +1179,160 @@ export class SessionDriverLoop {
       acceptedImplementationPlan: acceptedPlan,
       interactionOverlay,
     });
+  }
+
+  // R2 effect 派发：按用户选定 option 的 effect 合约推进状态机，
+  // 通过产 workflow_stage(stage=accepted_plan.batch_checkpoint, source=requirementDecision) 事件
+  // 复用现有"completedTaskIds 推进"机制——状态由事实事件驱动，GUI 所读即事实。
+  // 返回 undefined 表示降级到默认的 runUserTurn 路径（continueWithAction 或缺少 acceptedPlan 上下文）。
+  private async applyRequirementOptionEffect(
+    input: SessionDecisionResolverInput,
+    confirmation: AgentEvent,
+    decisionEvent: AgentEvent,
+    interactionOverlay: InteractionOverlayContext | undefined,
+    effect: RequirementOptionEffect,
+    current: AgentSessionResult
+  ): Promise<AgentSessionResult | undefined> {
+    if (effect.kind === 'continueWithAction') return undefined;
+
+    const decisionPayload = objectRecord(decisionEvent.payload) ?? {};
+    const runId = stringValue(decisionPayload.runId) ?? input.runId ?? 'run-unknown';
+    const requirementId = stringValue(decisionPayload.requirementId) ?? input.targetId;
+    const baseOwner = {
+      kind: 'requirement' as const,
+      runId,
+      targetId: requirementId,
+      requirementId,
+    };
+
+    if (effect.kind === 'finishRun') {
+      return this.append(input.sessionId, [
+        sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId,
+          phase: 'completed',
+          status: 'completed',
+          reason: 'requirement',
+          decisionOwner: baseOwner,
+          interactionOverlay,
+          ts: this.ts(),
+          id: this.id('session-run-completed-requirement'),
+        }),
+      ]) ?? current;
+    }
+
+    if (effect.kind === 'replan') {
+      return this.append(input.sessionId, [
+        sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId,
+          phase: 'waiting_plan_review',
+          status: 'waiting',
+          reason: 'plan_review',
+          decisionOwner: baseOwner,
+          interactionOverlay,
+          ts: this.ts(),
+          id: this.id('session-run-replan-requirement'),
+        }),
+      ]) ?? current;
+    }
+
+    // skipCurrentTask / markTasksCompleted：必须有 acceptedImplementationPlan 上下文。
+    const confirmationPayload = objectRecord(confirmation.payload) ?? {};
+    const decisionRequest = objectRecord(confirmationPayload.decisionRequest) ?? {};
+    const planId = stringValue(decisionRequest.acceptedPlanId)
+      ?? stringValue(confirmationPayload.acceptedPlanId)
+      ?? stringValue(decisionPayload.acceptedPlanId);
+    const accepted = this.recoverAcceptedPlanForRequirement(current.events, runId, planId);
+    if (!accepted) return undefined;
+
+    const currentCompleted = new Set(accepted.completedTaskIds);
+    const currentTaskId = accepted.tasks.find((task) => !currentCompleted.has(task.taskId))?.taskId;
+    const newlyCompleted: string[] = [];
+    if (effect.kind === 'skipCurrentTask') {
+      if (!currentTaskId) return undefined;
+      newlyCompleted.push(currentTaskId);
+    } else {
+      for (const id of effect.taskIds) {
+        if (!currentCompleted.has(id) && accepted.tasks.some((task) => task.taskId === id)) {
+          newlyCompleted.push(id);
+        }
+      }
+      if (newlyCompleted.length === 0) return undefined;
+    }
+    const mergedCompletedTaskIds = [...accepted.completedTaskIds, ...newlyCompleted];
+    const nextAccepted = acceptedPlanAfterBatch(accepted, mergedCompletedTaskIds);
+    const remainingTaskIds = accepted.tasks
+      .map((task) => task.taskId)
+      .filter((id) => !mergedCompletedTaskIds.includes(id));
+    const allDone = remainingTaskIds.length === 0;
+
+    const checkpointId = this.id('requirement-driven-task-checkpoint');
+    const events: AgentEvent[] = [
+      requirementDrivenTaskCheckpointEvent(
+        input.sessionId,
+        runId,
+        nextAccepted,
+        newlyCompleted,
+        mergedCompletedTaskIds,
+        remainingTaskIds,
+        effect.kind,
+        stringValue(objectRecord(decisionPayload.selectedOption)?.id),
+        this.ts(),
+        checkpointId
+      ),
+    ];
+    if (allDone) {
+      events.push(sessionRunStateEvent({
+        sessionId: input.sessionId,
+        runId,
+        phase: 'completed',
+        status: 'completed',
+        reason: 'requirement',
+        decisionOwner: baseOwner,
+        interactionOverlay,
+        ts: this.ts(),
+        id: this.id('session-run-completed-requirement-tasks'),
+      }));
+      return this.append(input.sessionId, events) ?? current;
+    }
+
+    // 尚有剩余任务：以更新后的 acceptedImplementationPlan 继续 runUserTurn
+    const result = await this.append(input.sessionId, events) ?? current;
+    const originalRequest = requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
+    return this.runUserTurn({
+      sessionId: input.sessionId,
+      content: originalRequest,
+      attachments: requirementAttachments(confirmation),
+      existingEvents: result.events,
+      workspaceBinding: input.workspaceBinding,
+      projectMemoryMode: input.projectMemoryMode,
+      projectWorkingDirectory: input.projectWorkingDirectory,
+      profileId: input.profileId,
+      workflow: input.workflow,
+      appendUserMessage: false,
+      confirmedRequirement: requirementRecordFromEvent(confirmation, 'confirmed'),
+      requirementConfirmationMode: 'off',
+      interventionLevel: input.interventionLevel,
+      subAgentMode: input.subAgentMode,
+      subAgentMaxParallel: input.subAgentMaxParallel,
+      acceptedImplementationPlan: nextAccepted,
+      interactionOverlay,
+    });
+  }
+
+  // 从既有 events 中恢复 acceptedImplementationPlan：先找 plan_card+implementationPlan，再叠加最新 checkpoint。
+  private recoverAcceptedPlanForRequirement(
+    events: AgentEvent[],
+    runId: string,
+    planId: string | undefined
+  ): AcceptedImplementationPlanContext | undefined {
+    const plan = (runId ? findPlanCard(events, runId, planId) : null)
+      ?? findPlanCard(events, undefined, planId)
+      ?? (runId ? latestExecutablePlan(events, runId) : null);
+    if (!plan || !plan.implementationPlan) return undefined;
+    const base = acceptedImplementationPlanContext(plan, undefined, undefined);
+    return acceptedPlanWithLatestCheckpoint(base, events);
   }
 
   private async resolveAcceptedPlanExecutionRequirementDecision(
@@ -2732,7 +2914,7 @@ export class SessionDriverLoop {
     if (resolution.unresolved.length || resolution.ambiguous.length) {
       throw new SessionDriverLoopError(
         'subagent_evidence_preflight_failed',
-        `子代理文件节点 ${slice.nodeId} 证据预取无法定位：${resourceResolutionDiagnostic(resolution)}`
+        `Sub-agent file node ${slice.nodeId} evidence preflight failed: ${resourceResolutionDiagnostic(resolution).fallback}`
       );
     }
     const packet = await this.resolveResources(state, resolution.manifest);
@@ -3886,7 +4068,7 @@ export class SessionDriverLoop {
             state.sessionId,
             state.runId,
             proposal,
-            [`actionBundle admission repair returned resourceRequest that cannot be resolved: ${resourceResolutionDiagnostic(subset)}`],
+            [`actionBundle admission repair returned resourceRequest that cannot be resolved: ${resourceResolutionDiagnostic(subset).fallback}`],
             this.ts(),
             this.id('action-bundle-admission-resource-invalid')
           )) ?? result;
@@ -4043,7 +4225,7 @@ export class SessionDriverLoop {
       return this.append(state.sessionId, [
         finalDiagnosticEvent(
           state.sessionId,
-          'Kernel 未返回 actionBundle 的 proposal.reviewed 事件，Session 不会展示可确认计划。',
+          diag('planProposalReviewedMissing', 'Kernel did not return a proposal.reviewed event for the actionBundle; Session will not display a confirmable plan.'),
           this.ts(),
           this.id('plan-review-missing')
         ),
@@ -4067,7 +4249,7 @@ export class SessionDriverLoop {
         return this.append(state.sessionId, [
           finalDiagnosticEvent(
             state.sessionId,
-            `计划需要修订，但模型 repair 失败：${message}`,
+            diag('planRevisionRepairFailed', `The plan needs revision, but model repair failed: ${message}`, { message }),
             this.ts(),
             this.id('plan-review-repair-failed')
           ),
@@ -4086,7 +4268,7 @@ export class SessionDriverLoop {
       return this.append(state.sessionId, [
         finalDiagnosticEvent(
           state.sessionId,
-          `Kernel 拒绝该计划：${planReviewDiagnosticSummary(reviewReport)}`,
+          diag('planRejected', `Kernel rejected the plan: ${planReviewDiagnosticSummary(reviewReport)}`, { reasons: planReviewDiagnosticSummary(reviewReport) }),
           this.ts(),
           this.id('plan-review-denied')
         ),
@@ -4162,7 +4344,11 @@ export class SessionDriverLoop {
                 return this.append(state.sessionId, [
                   finalDiagnosticEvent(
                     state.sessionId,
-                    `自动执行批次需要补充资源证据，但 repair 后的 resourceRequest 无法定位：${resourceResolutionDiagnostic(subset)}`,
+                    diag(
+              'autoBatchResourceResolveFailed',
+              `Automatic execution batch requires additional resource evidence, but the repaired resourceRequest could not be located: ${resourceResolutionDiagnostic(subset).fallback}`,
+              { detail: resourceResolutionDiagnostic(subset).fallback }
+            ),
                     this.ts(),
                     this.id('accepted-plan-scope-repair-resource-invalid')
                   ),
@@ -4267,7 +4453,7 @@ export class SessionDriverLoop {
           return this.append(state.sessionId, [
             finalDiagnosticEvent(
               state.sessionId,
-              `自动执行批次越界，且模型 repair 失败：${message}`,
+              diag('autoBatchScopeRepairFailed', `Automatic execution batch went out of scope and model repair failed: ${message}`, { message }),
               this.ts(),
               this.id('accepted-plan-scope-repair-failed')
             ),
@@ -4331,7 +4517,7 @@ export class SessionDriverLoop {
       return this.append(state.sessionId, [
         finalDiagnosticEvent(
           state.sessionId,
-          'Kernel 未返回 accepted-plan actionBundle 的 proposal.reviewed 事件，Session 不会自动执行该批次。',
+          diag('autoPlanProposalReviewedMissing', 'Kernel did not return a proposal.reviewed event for the accepted-plan actionBundle; Session will not auto-execute this batch.'),
           this.ts(),
           this.id('accepted-plan-review-missing')
         ),
@@ -4355,7 +4541,7 @@ export class SessionDriverLoop {
         return this.append(state.sessionId, [
           finalDiagnosticEvent(
             state.sessionId,
-            `自动执行批次需要修订，但模型 repair 失败：${message}`,
+            diag('autoBatchRevisionRepairFailed', `The automatic execution batch needs revision, but model repair failed: ${message}`, { message }),
             this.ts(),
             this.id('accepted-plan-review-repair-failed')
           ),
@@ -4375,7 +4561,7 @@ export class SessionDriverLoop {
       return this.append(state.sessionId, [
         finalDiagnosticEvent(
           state.sessionId,
-          `Kernel 拒绝该自动执行批次：${planReviewDiagnosticSummary(reviewReport)}`,
+          diag('autoBatchRejected', `Kernel rejected the automatic execution batch: ${planReviewDiagnosticSummary(reviewReport)}`, { reasons: planReviewDiagnosticSummary(reviewReport) }),
           this.ts(),
           this.id('accepted-plan-review-denied')
         ),
@@ -6897,21 +7083,34 @@ function rootPriority(root: ConversationResourceRoot): number {
   return 4;
 }
 
-function resourceResolutionDiagnostic(resolution: ResourceRequestResolution): string {
-  const details = [
-    resolution.unresolved.length ? `无法定位：${resolution.unresolved.join('; ')}` : '',
-    resolution.ambiguous.length ? `存在多个候选根目录：${resolution.ambiguous.join('; ')}` : '',
-  ].filter(Boolean).join('\n');
+// i18n 诊断结构：session-core 产出语言无关的 code + params + 英文 fallback，
+// GUI 渲染时按 diagnosticCode 走 i18n 翻译，fallback 供无 i18n 消费者（CLI/日志）。
+interface DiagnosticInfo {
+  code: string;
+  fallback: string;
+  params?: Record<string, string | number>;
+}
+
+function diag(code: string, fallback: string, params?: Record<string, string | number>): DiagnosticInfo {
+  return { code, fallback, params };
+}
+
+function resourceResolutionDiagnostic(resolution: ResourceRequestResolution): DiagnosticInfo {
+  const unresolved = resolution.unresolved.join('; ');
+  const ambiguous = resolution.ambiguous.join('; ');
   const roots = resolution.availableRoots.length
     ? resolution.availableRoots.map((root) => `${root.rootId} -> ${root.displayPath}`).join('\n')
-    : '无可用附件或项目目录。';
-  return [
-    '模型请求的资源无法在当前附件或项目目录中定位，Session 已拒绝该请求。',
-    details,
-    '可用项目/附件根目录：',
-    roots,
-    '请重新指定明确附件、rootId 或相对路径。',
+    : '';
+  // fallback 为中性英文成文；语言无关数据（unresolved/ambiguous/roots）作为 params 供 UI 壳本地化组装。
+  const fallback = [
+    'The requested resources could not be located in the current attachments or project directory; Session rejected the request.',
+    unresolved ? `Unresolved: ${unresolved}` : '',
+    ambiguous ? `Multiple candidate roots: ${ambiguous}` : '',
+    'Available project/attachment roots:',
+    roots || 'No available attachment or project directory.',
+    'Please specify an explicit attachment, rootId, or relative path.',
   ].filter(Boolean).join('\n');
+  return diag('resourceResolveFailed', fallback, { unresolved, ambiguous, roots });
 }
 
 function addDiscoveredManifestEntries(manifest: ResourceManifest, packet: ResourcePacket): void {
@@ -7769,18 +7968,23 @@ function guidanceRevisionOverlay(
   ].join('\n\n');
 }
 
-function finalDiagnosticEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent {
+function finalDiagnosticEvent(sessionId: string, content: string | DiagnosticInfo, ts: string, id: string): AgentEvent {
+  const info: DiagnosticInfo = typeof content === 'string'
+    ? { code: 'generic', fallback: content }
+    : content;
   return {
     id,
     sessionId,
     ts,
     kind: 'assistant_msg',
     payload: {
-      content,
+      content: info.fallback,
       channel: 'final',
       visibility: 'conversation',
       label: 'DeepCode',
       diagnostic: true,
+      diagnosticCode: info.code,
+      ...(info.params ? { diagnosticParams: info.params } : {}),
     },
   };
 }
@@ -8385,7 +8589,7 @@ function planReviewStatusAwaitingUser(status: string | undefined): boolean {
 
 function planReviewDiagnosticSummary(report: Record<string, unknown>): string {
   const diagnostics = planReviewDiagnostics(report);
-  return diagnostics.filter(Boolean).join('；') || '计划审查未通过。';
+  return diagnostics.filter(Boolean).join('; ') || 'Plan review did not pass.';
 }
 
 function planReviewDiagnostics(report: Record<string, unknown>): string[] {
@@ -11380,7 +11584,10 @@ function scopeCoveredByAcceptedPlanForCapability(
   if (!normalized) return false;
   if (exactOperationGrantCoversAcceptedPlanTarget(normalized, capability, accepted)) return true;
   if (capability === 'fs.delete' || capability === 'fs.rename') return false;
-  const acceptedScopes = accepted.targetScopes.map(normalizePlanScope).filter(Boolean);
+  const acceptedScopes = accepted.targetScopes
+    .flatMap(expandPlanTargetTokens)
+    .map(normalizePlanScope)
+    .filter(Boolean);
   if (scopeCoveredByAcceptedPlan(normalized, acceptedScopes)) return true;
   return accepted.accessScopes.some((accessScope) => {
     if (accessScope.outsideWorkspace) return false;
@@ -11459,6 +11666,18 @@ function normalizePlanScope(value: string): string {
     .replace(/^\.\//, '')
     .replace(/\/+/g, '/')
     .trim();
+}
+
+// 任务编排修复：accepted taskPlan 的 task.targets 可能是自由文本（含路径与说明混排），
+// 直接做 scope 匹配会因多路径合并串永不命中，造成合法写入被判越界、任务死结。
+// 这里只做"语言无关的结构化路径提取"——按路径字符集取出 token，保留含 "/" 或带扩展名者；
+// 不依赖任何自然语言分隔词/描述词、不针对特定样例或语言，黑盒通用。目录 token 仍由
+// planScopeCovers 以前缀方式覆盖其下文件。
+function expandPlanTargetTokens(target: string): string[] {
+  if (!target || !target.trim()) return [];
+  const candidates = target.match(/[A-Za-z0-9_.\-/]+/g) ?? [];
+  const pathLike = candidates.filter((token) => token.includes('/') || /\.[A-Za-z0-9]+$/.test(token));
+  return pathLike.length ? pathLike : [target.trim()];
 }
 
 function dirnameLike(value: string): string | undefined {
@@ -11689,6 +11908,60 @@ function sessionRunStateSummary(
   return 'Session run is waiting for plan review.';
 }
 
+// R2 requirement decision 驱动的任务推进事件：
+// 复用 stage='accepted_plan.batch_checkpoint' 以便 acceptedPlanWithLatestCheckpoint 自动识别，
+// 同时通过 source='requirementDecision' 字段保留审计来源（与正常批次完成区分）。
+function requirementDrivenTaskCheckpointEvent(
+  sessionId: string,
+  runId: string,
+  accepted: AcceptedImplementationPlanContext,
+  newlyCompletedTaskIds: string[],
+  completedTaskIds: string[],
+  remainingTaskIds: string[],
+  effectKind: RequirementOptionEffect['kind'],
+  selectedOptionId: string | undefined,
+  ts: string,
+  id: string
+): AgentEvent {
+  const complete = remainingTaskIds.length === 0;
+  const summary = complete
+    ? 'Accepted plan tasks resolved via user requirement decision; ready for final review.'
+    : 'User requirement decision advanced the accepted plan task cursor.';
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'workflow_stage',
+    payload: {
+      stage: 'accepted_plan.batch_checkpoint',
+      status: 'completed',
+      summary,
+      runId,
+      planId: accepted.planId,
+      source: 'requirementDecision',
+      effectKind,
+      selectedOptionId,
+      batchIndex: accepted.batchIndex,
+      newlyCompletedTaskIds,
+      completedTaskIds,
+      remainingTaskIds,
+      channel: 'progress',
+      visibility: 'conversation',
+      presentation: 'collapsible',
+      activity: conversationActivity({
+        activityId: id,
+        kind: complete ? 'reviewCheckpoint' : 'editBatchQueued',
+        status: 'completed',
+        title: complete ? 'Accepted plan complete' : 'Task advanced by user decision',
+        summary,
+        source: 'session',
+        runId,
+        planId: accepted.planId,
+      }),
+    },
+  };
+}
+
 function acceptedPlanBatchCheckpointEvent(
   sessionId: string,
   runId: string,
@@ -11793,7 +12066,7 @@ function actionBundleAdmissionRepairingEvent(
 ): AgentEvent {
   const batch = proposalActionBundleAdmissionBatch(proposal);
   const audit = acceptedPlanBatchPreflightAudit(batch);
-  const summary = `ActionBundle 进入 Plan 卡前需要修订：${reasons.join('；')}`;
+  const summary = `ActionBundle requires revision before entering the Plan card: ${reasons.join('; ')}`;
   return {
     id,
     sessionId,
@@ -11834,7 +12107,7 @@ function actionBundleAdmissionFailureEvents(
   ts: string,
   id: string
 ): AgentEvent[] {
-  const summary = `ActionBundle 未进入 Plan 确认卡，Session 已停止当前计划生成：${reasons.join('；')}`;
+  const summary = `ActionBundle did not enter the Plan confirmation card; Session has stopped plan generation: ${reasons.join('; ')}`;
   return [
     {
       id,
@@ -11887,7 +12160,7 @@ function planActionBundlePreflightFailureEvents(
   ts: string,
   id: string
 ): AgentEvent[] {
-  const summary = `已确认计划 actionBatch 提交前审计失败，Session 未提交 Kernel：${reasons.join('；')}`;
+  const summary = `Accepted plan actionBatch pre-submission audit failed; Session did not submit to Kernel: ${reasons.join('; ')}`;
   return [
     {
       id,
@@ -12000,8 +12273,8 @@ function planActionBundleExecutionFailureEvents(
 ): AgentEvent[] {
   const failures = actionBatchFailureDetails(kernelEvents, batch);
   const summary = failures.length
-    ? `已确认计划执行批次失败，Session 已停止自动推进：${failures.map(failureDetailSummary).join('；')}`
-    : '已确认计划执行批次失败或阻塞，Session 已停止自动推进。';
+    ? `Accepted plan execution batch failed; Session has stopped auto-advancing: ${failures.map(failureDetailSummary).join('; ')}`
+    : 'Accepted plan execution batch failed or blocked; Session has stopped auto-advancing.';
   return [
     {
       id,
@@ -12062,7 +12335,7 @@ function acceptedPlanNormalizationFailureEvents(
   ts: string,
   id: string
 ): AgentEvent[] {
-  const summary = `Accepted plan actionBatch 提交前规范化失败，Session 未提交 Kernel：${reasons.join('；')}`;
+  const summary = `Accepted plan actionBatch pre-submission canonicalization failed; Session did not submit to Kernel: ${reasons.join('; ')}`;
   return [
     {
       id,
@@ -12120,8 +12393,8 @@ function acceptedPlanExecutionFailureEvents(
 ): AgentEvent[] {
   const failures = actionBatchFailureDetails(kernelEvents, batch);
   const summary = failures.length
-    ? `Accepted plan 执行批次失败，Session 已停止自动推进：${failures.map(failureDetailSummary).join('；')}`
-    : 'Accepted plan 执行批次失败或阻塞，Session 已停止自动推进。';
+    ? `Accepted plan execution batch failed; Session has stopped auto-advancing: ${failures.map(failureDetailSummary).join('; ')}`
+    : 'Accepted plan execution batch failed or blocked; Session has stopped auto-advancing.';
   return [
     {
       id,
@@ -14161,6 +14434,28 @@ function minimalActionBundleRepairSkeleton(): string {
   }, null, 2);
 }
 
+// S4：协议解析/repair 失败 → 结构化 DiagnosticInfo，英文 fallback + code，不含硬编码中文。
+function readableDriverFailureMessage(code: string, message: string): DiagnosticInfo {
+  const protocolFailureCodes = new Set([
+    'agent_protocol_repair_failed',
+    'accepted_plan_resource_resume_repair_failed',
+    'invalid_json_envelope',
+    'invalid_action_bundle',
+    'invalid_action_bundle_expectation',
+    'invalid_action_bundle_continuation',
+  ]);
+  if (!protocolFailureCodes.has(code)) return diag('generic', message, { message });
+  const fallback = `${message}\n\nThe model output could not form a valid structured proposal (protocol format issue); automatic repair was attempted but unsuccessful. Previously completed steps are not affected. You may retry this turn or rephrase your request.`;
+  return diag('protocolRepairFailed', fallback, { message });
+}
+
+// S5：provider 调用/网络层失败 → 结构化 DiagnosticInfo，英文 fallback + code。
+function readableProviderFailureMessage(error: unknown): DiagnosticInfo {
+  const raw = (error instanceof Error ? error.message : String(error)).trim() || 'unknown error';
+  const fallback = `Model call failed: ${raw}\n\nThe connection to the model was interrupted (possibly due to network fluctuation, provider timeout, or response stream closure). Previously completed steps are not affected; please retry this turn.`;
+  return diag('providerCallFailed', fallback, { raw });
+}
+
 function repairMessages(
   prompt: PromptEnvelope,
   state: SessionDriverLoopRunState,
@@ -14180,6 +14475,9 @@ function repairMessages(
         'Use codeBlocks[].contentLines for source code. Do not output large codeBlocks.content strings and do not manually escape multiline source code into JSON strings.',
         'For fs.write, args.sourceBlockId must reference a top-level codeBlocks[].blockId for the same args.path. Directory targets are planning scopes; do not repair by creating empty .gitkeep or other placeholder files.',
         'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or payload wrapper fields.',
+        'Output ONLY the single JSON object — no prose, no explanation, and no markdown ``` code fences before or after it.',
+        'actionBundle.version must be exactly the string "1".',
+        'For a side-effect actionBundle, actionBundle.validationExpectations must be a non-empty array of { id, description }.',
         'Repair once from the compact context only; do not rely on omitted prompt text.',
       ].join('\n'),
     },
@@ -14394,7 +14692,8 @@ function resourceRequestRepairMessages(
         'Use kind="answer" if the available ResourcePacket facts are enough.',
         'Use kind="resourceRequest" only when requesting manifestEntryId, root-relative path, or kind="search" with a non-empty query under the listed conversation roots.',
         resourceRequestProtocolShapeLine(),
-        'Use kind="decisionRequest" only when user input is required; minimal shape is {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","decisionRequest":{"id":"decision-1","question":"...","options":[{"id":"option-1","label":"...","description":"..."},{"id":"option-2","label":"...","description":"..."}],"allowsFreeform":true}}.',
+        'Use kind="decisionRequest" only when user input is required; minimal shape is {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","decisionRequest":{"id":"decision-1","question":"...","options":[{"id":"option-1","label":"...","description":"...","effect":{"kind":"continueWithAction"}},{"id":"option-2","label":"...","description":"...","effect":{"kind":"continueWithAction"}}],"allowsFreeform":true}}.',
+        'Each decisionRequest option SHOULD declare its state-machine effect via option.effect. Allowed kinds: "continueWithAction" (default, generate next actionBundle), "skipCurrentTask" (mark current accepted-plan task complete and advance), "markTasksCompleted" with taskIds[], "replan" with reason, "finishRun". When the user-visible question implies "the task is already satisfied / nothing to do", at least one option MUST use skipCurrentTask or markTasksCompleted so the session can advance without forcing an empty actionBundle.',
         'Do not invent arbitrary absolute local paths. Absolute file paths are only for user-provided outside-workspace targets that require Kernel PlanReview/permission.',
       ].join('\n'),
     },
@@ -14405,7 +14704,7 @@ function resourceRequestRepairMessages(
         'Invalid or unresolved resourceRequest proposal:',
         fenced(clip(JSON.stringify(proposal.payload, null, 2), 4_000)),
         'Resolution diagnostic:',
-        fenced(resourceResolutionDiagnostic(resolution)),
+        fenced(resourceResolutionDiagnostic(resolution).fallback),
       ].join('\n\n'),
     },
   ];
@@ -14691,6 +14990,44 @@ function selectedRequirementDecisionOptionId(event: AgentEvent): string | undefi
   const selectedOption = objectRecord(payload?.selectedOption);
   return stringValue(selectedOption?.id);
 }
+
+// R2：读取用户接受的 option 上声明的状态机副作用（effect）。
+// 缺失/非法时返回 undefined，调用方按 continueWithAction 处理（向下兼容）。
+function selectedRequirementDecisionOptionEffect(event: AgentEvent): RequirementOptionEffect | undefined {
+  const payload = objectRecord(event.payload);
+  const selectedOption = objectRecord(payload?.selectedOption);
+  const effect = objectRecord(selectedOption?.effect);
+  if (!effect) return undefined;
+  const kind = stringValue(effect.kind);
+  if (!kind) return undefined;
+  switch (kind) {
+    case 'continueWithAction':
+    case 'skipCurrentTask':
+    case 'finishRun':
+      return { kind } as RequirementOptionEffect;
+    case 'markTasksCompleted': {
+      const ids = Array.isArray(effect.taskIds)
+        ? effect.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
+        : [];
+      if (ids.length === 0) return undefined;
+      return { kind: 'markTasksCompleted', taskIds: ids };
+    }
+    case 'replan': {
+      const reason = stringValue(effect.reason);
+      return reason ? { kind: 'replan', reason } : { kind: 'replan' };
+    }
+    default:
+      return undefined;
+  }
+}
+
+// R2：用户介入卡 option 的状态机副作用合约（运行时类型，与 protocolV3 normalizeOptionEffect 对齐）。
+type RequirementOptionEffect =
+  | { kind: 'continueWithAction' }
+  | { kind: 'markTasksCompleted'; taskIds: string[] }
+  | { kind: 'skipCurrentTask' }
+  | { kind: 'replan'; reason?: string }
+  | { kind: 'finishRun' };
 
 function acceptedPlanScopeRevisionRequest(
   confirmation: AgentEvent,

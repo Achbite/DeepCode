@@ -208,7 +208,9 @@ function normalizeActionBundle(value: Record<string, unknown>, proposalId: strin
   }
   return {
     ...value,
-    version: optionalString(value, 'version') ?? '1',
+    // S2：actionBundle.version 在 v3 协议中固定为 "1"，模型给出缺失/数字/其它值时强制归一，
+    // 避免下游 version 强校验因模型笔误整轮失败（仍保留对结构性错误的拒绝）。
+    version: '1',
     id: optionalString(value, 'id') ?? `${proposalId}-action-bundle`,
     goal: deriveActionBundleGoal(value, proposalId, userPlan),
     actions: normalizeToolActions(value.actions, 'actions'),
@@ -534,14 +536,45 @@ function normalizeDecisionRequest(value: Record<string, unknown>): Record<string
     allowsFreeform: typeof value.allowsFreeform === 'boolean' ? value.allowsFreeform : true,
     options: options.map((item, index) => {
       const record = requireObject(item, `Agent Protocol v3.decisionRequest.options[${index}]`);
-      return {
+      const normalized: Record<string, unknown> = {
         id: optionalString(record, 'id') ?? `option-${index + 1}`,
         label: optionalString(record, 'label') ?? `Option ${index + 1}`,
         description: optionalString(record, 'description') ?? '',
         recommended: typeof record.recommended === 'boolean' ? record.recommended : index === 0,
       };
+      const effect = normalizeOptionEffect(record.effect);
+      if (effect) normalized.effect = effect;
+      return normalized;
     }),
   };
+}
+
+// 归一化用户介入卡 option.effect：未声明或非法时返回 undefined（按 continueWithAction 处理）。
+// 不在此处把 undefined 写回字段，保持事件 payload 干净（无 effect 即向下兼容）。
+function normalizeOptionEffect(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const kind = typeof record.kind === 'string' ? record.kind : undefined;
+  if (!kind) return undefined;
+  switch (kind) {
+    case 'continueWithAction':
+    case 'skipCurrentTask':
+    case 'finishRun':
+      return { kind };
+    case 'markTasksCompleted': {
+      const ids = Array.isArray(record.taskIds)
+        ? record.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
+        : [];
+      if (ids.length === 0) return undefined;
+      return { kind, taskIds: ids };
+    }
+    case 'replan': {
+      const reason = typeof record.reason === 'string' ? record.reason : undefined;
+      return reason ? { kind, reason } : { kind };
+    }
+    default:
+      return undefined;
+  }
 }
 
 function normalizeDiagnostic(value: Record<string, unknown>): Record<string, unknown> {
@@ -555,13 +588,53 @@ function normalizeDiagnostic(value: Record<string, unknown>): Record<string, unk
 }
 
 function parseJsonObject(raw: string, label: string): Record<string, unknown> {
+  const candidate = extractJsonCandidate(raw);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(candidate);
   } catch (error) {
     throw new AgentPlanParseError('invalid_json_envelope', `${label} must be valid JSON: ${String(error)}`);
   }
   return requireObject(parsed, label);
+}
+
+// S1 宽松提取：模型常在合法 JSON 前后附带说明文字或 ```json 代码围栏，
+// 严格 JSON.parse 会因尾随内容整体失败。此处先去围栏，若仍不可解析则按平衡花括号
+// 截取首个完整的顶层 JSON 对象，丢弃其前后噪声。仅做"提取"，不改变 JSON 语义。
+function extractJsonCandidate(raw: string): string {
+  let text = raw.trim();
+  const fence = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fence) text = fence[1].trim();
+  try {
+    JSON.parse(text);
+    return text;
+  } catch {
+    // 继续尝试截取首个平衡对象
+  }
+  const start = text.indexOf('{');
+  if (start < 0) return text;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start);
 }
 
 function requireObject(value: unknown, label: string): Record<string, unknown> {

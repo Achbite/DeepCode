@@ -168,11 +168,19 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
   let currentTurn: AgentTimelineResult['turns'][number] | null = null;
   let syntheticTurnIndex = 0;
 
+  // P4(B)：预扫描 plan_review.accepted 的事件索引，作为 plan(explore) → execute 阶段分界。
+  // 不依赖具体 planId，简单按"是否已出现任何 accepted 的 plan_review"判定。
+  const planAcceptedIndex = findFirstPlanAcceptedIndex(input.events);
+
   input.events.forEach((event, index) => {
     if (event.kind === 'cache_telemetry') {
       return;
     }
     if (isDebugTimelineEvent(event)) {
+      return;
+    }
+    // 跳过空/纯代码围栏的 reasoning 事件，避免产生空"推理过程"块。
+    if (event.kind === 'assistant_msg' && isBlankReasoningEvent(event)) {
       return;
     }
 
@@ -203,6 +211,13 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
   });
 
   if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
+
+  // P4(B)：按 plan_review.accepted 边界给 displayHints 注入 phase。
+  // 使用 block.rawEventRefs 推断最早事件索引（rawEventRefs 与事件顺序一致）。
+  if (planAcceptedIndex >= 0) {
+    annotateBlocksWithPhase(turns, input.events, planAcceptedIndex);
+  }
+
   const rawEventRefs = input.events.map(eventRefForAgentEvent);
   const implementationTaskItems = input.events.flatMap((event, index) =>
     implementationPlanTaskProjectionItems(input.events, event, index)
@@ -1047,6 +1062,57 @@ function isDebugTimelineEvent(event: AgentEvent): boolean {
   if (event.kind.startsWith('trace/')) return true;
   return stringValueFromPayload(event.payload, 'visibility') === 'debug';
 }
+
+// reasoning channel 的 assistant_msg 若正文为空或仅含空代码围栏，则视为空块，不进入时间线。
+function isBlankReasoningEvent(event: AgentEvent): boolean {
+  if (stringValueFromPayload(event.payload, 'channel') !== 'reasoning') return false;
+  const body = reasoningEventBody(event);
+  return body.replace(/```+/g, '').trim().length === 0;
+}
+
+// P4(B)：定位"plan accepted"边界——第一次 plan_review(status=accepted) 出现的事件索引。
+// 在此索引之前的 operationEvidence / thinking 视为 explore 阶段，之后为 execute 阶段。
+function findFirstPlanAcceptedIndex(events: AgentEvent[]): number {
+  for (let i = 0; i < events.length; i += 1) {
+    const event = events[i];
+    if (event.kind !== 'plan_review') continue;
+    if (stringValueFromPayload(event.payload, 'status') === 'accepted') return i;
+  }
+  return -1;
+}
+
+// P4(B)：按事件索引把 phase 写入 block.displayHints。
+// 只对 thinking / operationEvidence / assistantNarration 等"过程性"块标注，
+// 用户消息、plan/review/permission/requirement 等不标注（语义不需要分阶段）。
+function annotateBlocksWithPhase(
+  turns: AgentTimelineResult['turns'],
+  events: AgentEvent[],
+  acceptedIndex: number
+): void {
+  // 反查事件 id → 索引
+  const idToIndex = new Map<string, number>();
+  events.forEach((event, index) => {
+    if (event.id) idToIndex.set(event.id, index);
+  });
+  const phaseTargets = new Set<AgentTimelineNarrativeKind>([
+    'thinking',
+    'operationEvidence',
+    'assistantNarration',
+    'assistantText',
+  ]);
+  for (const turn of turns) {
+    for (const block of turn.blocks) {
+      if (!block.narrativeKind || !phaseTargets.has(block.narrativeKind)) continue;
+      const firstEventId = block.events[0]?.id;
+      if (!firstEventId) continue;
+      const idx = idToIndex.get(firstEventId);
+      if (idx === undefined) continue;
+      const phase: 'explore' | 'execute' = idx < acceptedIndex ? 'explore' : 'execute';
+      block.displayHints = { ...(block.displayHints ?? {}), phase };
+    }
+  }
+}
+
 
 function planCardEventAwaitingDecision(event: AgentEvent): boolean {
   const payload = isRecordPayload(event.payload) ? event.payload : {};

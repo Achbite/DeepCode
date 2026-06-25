@@ -14,6 +14,7 @@ export * from './review/index.js';
 export * from './sidechain.js';
 export * from './storageClient.js';
 export * from './task-queue/index.js';
+export * from './timelineFilter.js';
 export * from './transcript.js';
 export * from './workflow/index.js';
 export * from './workspaceScope.js';
