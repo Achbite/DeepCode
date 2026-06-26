@@ -10,7 +10,7 @@ import type {
   InitialLocation,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import { buildNarrativeTimelineProjection, type SessionMemorySnapshot } from '@deepcode/session-core';
+import type { SessionMemorySnapshot } from '@deepcode/session-core';
 import WindowControls from '../../components/window-controls/WindowControls';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import {
@@ -23,6 +23,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { deriveTokenUsageStats, formatPercent, formatTokenCount } from '../../utils/tokenUsageStats';
+import { buildUiTimelineProjection, latestPlanTaskItemsFromProjection } from '../../utils/uiTimelineProjection';
 import AgentMemoryViewer from '../../components/agent-memory/AgentMemoryViewer';
 import DeepCodeAgentPanel from '../panel/DeepCodeAgentPanel';
 import '../../components/workspace-open-dialog/workspaceOpenDialog.css';
@@ -131,6 +132,7 @@ interface PendingProjectSession {
 
 const DEEPCODE_GUI_PROJECTS_STORAGE_KEY = 'deepcode-gui.projects.v1';
 const EMPTY_AGENT_EVENTS: AgentEvent[] = [];
+const EMPTY_PROJECTION_DELTAS: ProjectionDelta[] = [];
 
 const DeepCodeSidebarIcon: React.FC<{ name: DeepCodeSidebarIconName; className?: string }> = ({
   name,
@@ -703,23 +705,12 @@ function dedupeTaskItems(items: DeepCodeTaskItem[]): DeepCodeTaskItem[] {
 }
 
 function deriveTaskItems(
-  events: AgentEvent[],
+  projection: AgentTimelineResult,
   language: UiLanguage,
   loading: boolean,
-  sessionId?: string
+  fallbackItems: DeepCodeTaskItem[] = []
 ): DeepCodeTaskItem[] {
-  const projection = buildNarrativeTimelineProjection({
-    sessionId: sessionId ?? events[0]?.sessionId ?? 'session',
-    events,
-  });
-  const latestTurn = projection.turns[projection.turns.length - 1];
-  const latestPlanBlockIds = new Set(
-    latestTurn?.blocks
-      .filter((block) => block.narrativeKind === 'plan')
-      .map((block) => block.id) ?? []
-  );
-  const projectedItems = (projection.taskProjection?.items ?? [])
-    .filter((item) => item.narrativeKind === 'plan' && latestPlanBlockIds.has(item.blockId));
+  const projectedItems = latestPlanTaskItemsFromProjection(projection);
 
   if (projectedItems.length > 0) {
     return dedupeTaskItems(
@@ -730,6 +721,10 @@ function deriveTaskItems(
         status: item.status,
       }))
     ).slice(-6);
+  }
+
+  if (fallbackItems.length > 0) {
+    return fallbackItems;
   }
 
   if (loading) {
@@ -749,7 +744,7 @@ function deriveTaskItems(
 function deriveCacheHitSummary(
   events: AgentEvent[],
   language: UiLanguage,
-  tokenUsageProjection?: ReturnType<typeof buildNarrativeTimelineProjection>['tokenUsageProjection'] | null
+  tokenUsageProjection?: AgentTimelineResult['tokenUsageProjection'] | null
 ): DeepCodeCacheHitSummary | null {
   const stats = deriveTokenUsageStats(events, tokenUsageProjection);
   const percent = formatPercent(stats.cacheHitRate);
@@ -899,6 +894,10 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const [sidebarPendingAction, setSidebarPendingAction] = useState<string | null>(null);
   const pendingProjectSendRef = useRef<PendingProjectSession | null>(null);
   const sidebarPendingActionRef = useRef<string | null>(null);
+  const lastPlanTaskItemsRef = useRef<{ sessionId: string | null; items: DeepCodeTaskItem[] }>({
+    sessionId: null,
+    items: [],
+  });
   const workspace = useWorkspaceStore((s) => s.current);
   const activeFolderId = useWorkspaceStore((s) => s.activeFolderId);
   const sessions = useAgentSessionStore((s) => s.sessions);
@@ -979,31 +978,42 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     : t(language, 'deepcodeGui.status.pending');
   const projectDraftActive = Boolean(draftTargetProjectId);
   const projectionEvents = projectDraftActive ? EMPTY_AGENT_EVENTS : events;
-  const taskItems = useMemo(
-    () => deriveTaskItems(
-      projectionEvents,
-      language,
-      !projectDraftActive && Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id)),
-      projectDraftActive ? undefined : activeSession?.id
-    ),
-    [activeSession?.id, projectionEvents, language, projectDraftActive, runningSessionIds]
-  );
-  const timelineProjection = useMemo(
-    () => buildNarrativeTimelineProjection({
+  const liveTimelineProjection = useMemo(
+    () => buildUiTimelineProjection({
       sessionId: projectDraftActive ? 'project-draft' : activeSession?.id ?? projectionEvents[0]?.sessionId ?? 'session',
       events: projectionEvents,
+      activeDeltas: projectDraftActive ? [] : activeDeltas,
     }),
-    [activeSession?.id, projectDraftActive, projectionEvents]
+    [activeDeltas, activeSession?.id, projectDraftActive, projectionEvents]
   );
+  const taskItems = useMemo(() => {
+    const taskSessionId = projectDraftActive ? null : activeSession?.id ?? null;
+    const fallbackItems = lastPlanTaskItemsRef.current.sessionId === taskSessionId
+      ? lastPlanTaskItemsRef.current.items
+      : [];
+    const items = deriveTaskItems(
+      liveTimelineProjection,
+      language,
+      !projectDraftActive && Boolean(activeSession?.id && runningSessionIds.includes(activeSession.id)),
+      fallbackItems
+    );
+    if (items.length > 0 && items.some((item) => item.id !== 'runtime-preparing')) {
+      lastPlanTaskItemsRef.current = { sessionId: taskSessionId, items };
+    }
+    if (items.length === 0 && lastPlanTaskItemsRef.current.sessionId !== taskSessionId) {
+      lastPlanTaskItemsRef.current = { sessionId: taskSessionId, items: [] };
+    }
+    return items;
+  }, [activeSession?.id, liveTimelineProjection, language, projectDraftActive, runningSessionIds]);
   const subAgentWorkItems = useMemo(
     () => projectDraftActive
       ? []
-      : deriveSubAgentWorkItems(timelineProjection, activeDeltas, language, activeSession?.id),
-    [activeDeltas, activeSession?.id, language, projectDraftActive, timelineProjection]
+      : deriveSubAgentWorkItems(liveTimelineProjection, EMPTY_PROJECTION_DELTAS, language, activeSession?.id),
+    [activeSession?.id, language, liveTimelineProjection, projectDraftActive]
   );
   const cacheHitSummary = useMemo(
-    () => deriveCacheHitSummary(projectionEvents, language, timelineProjection.tokenUsageProjection),
-    [projectionEvents, language, timelineProjection.tokenUsageProjection]
+    () => deriveCacheHitSummary(projectionEvents, language, liveTimelineProjection.tokenUsageProjection),
+    [projectionEvents, language, liveTimelineProjection.tokenUsageProjection]
   );
   const activeProject = useMemo(
     () => projectRecords.find((project) => project.id === activeProjectId) ?? null,
@@ -1914,7 +1924,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                   wsStatus={wsStatus}
                   serverVersion={serverVersion}
                   events={events}
-                  tokenUsageProjection={timelineProjection.tokenUsageProjection}
+                  tokenUsageProjection={liveTimelineProjection.tokenUsageProjection}
                   surface="gui"
                 />
               </div>

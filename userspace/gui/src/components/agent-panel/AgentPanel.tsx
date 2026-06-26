@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -9,7 +9,8 @@ import AgentSessionSelector from './AgentSessionSelector';
 import AgentTaskList from './AgentTaskList';
 import MessageList from './MessageList';
 import PermissionRequestBubble from './PermissionRequestBubble';
-import { findPendingComposerDecision } from './pendingDecision';
+import { findPendingComposerDecisionFromProjection } from './pendingDecision';
+import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
 import './agentPanel.css';
 
 const AgentPanel: React.FC = () => {
@@ -17,7 +18,6 @@ const AgentPanel: React.FC = () => {
   const activeDeltas = useAgentSessionStore((s) => s.activeDeltas);
   const session = useAgentSessionStore((s) => s.session);
   const sessions = useAgentSessionStore((s) => s.sessions);
-  const traceEvents = useAgentSessionStore((s) => s.traceEvents);
   const profileId = useAgentSessionStore((s) => s.profileId);
   const loading = useAgentSessionStore((s) => s.loading);
   const runningSessionIds = useAgentSessionStore((s) => s.runningSessionIds);
@@ -50,15 +50,25 @@ const AgentPanel: React.FC = () => {
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
   const activeSessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
-  const agentBusy = loading || activeSessionRunning;
-  const pendingDecision = findPendingComposerDecision({
-    events,
+  const timelineProjection = useMemo(
+    () => buildUiTimelineProjection({
+      sessionId: session?.id,
+      events,
+      activeDeltas,
+    }),
+    [activeDeltas, events, session?.id]
+  );
+  const pendingDecision = findPendingComposerDecisionFromProjection({
+    timeline: timelineProjection,
     pendingPermission: pendingPermission?.request ?? null,
     resolvingRequirement,
     resolvingPlan,
     resolvingReview,
     resolvingPermission,
   });
+  const pendingDecisionResolving = Boolean(pendingDecision?.resolving);
+  const composerPendingDecision = pendingDecisionResolving ? null : pendingDecision;
+  const agentBusy = loading || activeSessionRunning || pendingDecisionResolving;
 
   useEffect(() => {
     void loadOrCreate();
@@ -95,15 +105,13 @@ const AgentPanel: React.FC = () => {
       />
 
       <AgentTaskList
-        events={events}
-        traceEvents={traceEvents}
+        projection={timelineProjection}
         loading={agentBusy}
         language={language}
       />
 
       <MessageList
-        events={events}
-        activeDeltas={activeDeltas}
+        timeline={timelineProjection}
         loading={agentBusy}
         language={language}
         resolvingPlan={resolvingPlan}
@@ -142,46 +150,46 @@ const AgentPanel: React.FC = () => {
         onStop={() => void cancelCurrentRun()}
         onAddAttachment={addAttachment}
         onRemoveAttachment={removeAttachment}
-        pendingDecision={pendingDecision}
+        pendingDecision={composerPendingDecision}
         onDecisionSubmit={(guidance, action) => {
-          if (!pendingDecision) return;
+          if (!composerPendingDecision) return;
           const decision = action ?? (guidance ? 'revise' : 'accept');
-          if (pendingDecision.kind === 'requirement') {
+          if (composerPendingDecision.kind === 'requirement') {
             void resolveRequirement(
-              pendingDecision.runId,
-              pendingDecision.requirementId,
+              composerPendingDecision.runId,
+              composerPendingDecision.requirementId,
               decision,
               guidance
             );
             return;
           }
-          if (pendingDecision.kind === 'plan') {
+          if (composerPendingDecision.kind === 'plan') {
             void resolvePlan(
-              pendingDecision.runId,
-              pendingDecision.planId,
+              composerPendingDecision.runId,
+              composerPendingDecision.planId,
               decision,
               guidance
             );
             return;
           }
-          if (pendingDecision.kind === 'review') {
-            void resolveReview(pendingDecision.runId, decision, guidance);
+          if (composerPendingDecision.kind === 'review') {
+            void resolveReview(composerPendingDecision.runId, decision, guidance);
             return;
           }
           void acceptPermission();
         }}
         onDecisionReject={() => {
-          if (!pendingDecision) return;
-          if (pendingDecision.kind === 'requirement') {
-            void resolveRequirement(pendingDecision.runId, pendingDecision.requirementId, 'reject');
+          if (!composerPendingDecision) return;
+          if (composerPendingDecision.kind === 'requirement') {
+            void resolveRequirement(composerPendingDecision.runId, composerPendingDecision.requirementId, 'reject');
             return;
           }
-          if (pendingDecision.kind === 'plan') {
-            void resolvePlan(pendingDecision.runId, pendingDecision.planId, 'reject');
+          if (composerPendingDecision.kind === 'plan') {
+            void resolvePlan(composerPendingDecision.runId, composerPendingDecision.planId, 'reject');
             return;
           }
-          if (pendingDecision.kind === 'review') {
-            void resolveReview(pendingDecision.runId, 'reject');
+          if (composerPendingDecision.kind === 'review') {
+            void resolveReview(composerPendingDecision.runId, 'reject');
             return;
           }
           void rejectPermission();

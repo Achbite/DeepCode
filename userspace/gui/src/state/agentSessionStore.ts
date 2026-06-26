@@ -669,14 +669,30 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   archiveSession: async (sessionId) => {
     const result = await archiveAgentSession(sessionId, { archived: true });
     if (result.ok && result.data) {
+      const data = result.data;
       const wasActive = get().session?.id === sessionId;
-      set({
-        sessions: result.data.sessions,
-        currentSessionId: result.data.currentSessionId,
-        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null, resolvingRequirement: null, resolvingPlan: null, resolvingReview: null } : {}),
-      });
+      set((state) => ({
+        sessions: data.sessions,
+        currentSessionId: data.currentSessionId,
+        runningSessionIds: state.runningSessionIds.filter((id) => id !== sessionId),
+        ...(wasActive ? {
+          session: null,
+          events: [],
+          traceEvents: [],
+          activeDeltas: [],
+          pendingPermission: null,
+          resolvingPermission: null,
+          resolvingRequirement: null,
+          resolvingPlan: null,
+          resolvingReview: null,
+          messageAttachments: [],
+          sessionAttachments: [],
+          errorMessage: null,
+          loading: false,
+        } : {}),
+      }));
       if (wasActive) {
-        const nextSessionId = result.data.currentSessionId;
+        const nextSessionId = data.currentSessionId;
         if (nextSessionId && nextSessionId !== sessionId) {
           await get().activateSession(nextSessionId);
           return;
@@ -691,14 +707,30 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
   deleteSession: async (sessionId) => {
     const result = await deleteAgentSession(sessionId);
     if (result.ok && result.data) {
+      const data = result.data;
       const wasActive = get().session?.id === sessionId;
-      set({
-        sessions: result.data.sessions,
-        currentSessionId: result.data.currentSessionId,
-        ...(wasActive ? { session: null, events: [], traceEvents: [], pendingPermission: null, resolvingPermission: null, resolvingRequirement: null, resolvingPlan: null, resolvingReview: null } : {}),
-      });
+      set((state) => ({
+        sessions: data.sessions,
+        currentSessionId: data.currentSessionId,
+        runningSessionIds: state.runningSessionIds.filter((id) => id !== sessionId),
+        ...(wasActive ? {
+          session: null,
+          events: [],
+          traceEvents: [],
+          activeDeltas: [],
+          pendingPermission: null,
+          resolvingPermission: null,
+          resolvingRequirement: null,
+          resolvingPlan: null,
+          resolvingReview: null,
+          messageAttachments: [],
+          sessionAttachments: [],
+          errorMessage: null,
+          loading: false,
+        } : {}),
+      }));
       if (wasActive) {
-        const nextSessionId = result.data.currentSessionId;
+        const nextSessionId = data.currentSessionId;
         if (nextSessionId && nextSessionId !== sessionId) {
           await get().activateSession(nextSessionId);
         }

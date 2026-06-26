@@ -8,17 +8,14 @@ import type {
   AgentTimelineTurn,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import {
-  buildNarrativeTimelineProjection,
-  buildTimelineProjectionWithLiveOverlay,
-  isInternalOrchestrationStage,
-} from '@deepcode/session-core';
+import { isInternalOrchestrationStage } from '@deepcode/session-core';
 import { t, resolveDiagnosticText, type UiLanguage } from '../../i18n';
 import { submitAgentFeedback } from '../../services/runtimeAdapter';
 import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
 import ToolEvidenceDetails from '../../components/agent-panel/ToolEvidenceDetails';
 import { useSettingsStore } from '../../state/settingsStore';
 import { formatToolEvidence } from '../../utils/toolEvidence';
+import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
 
 interface DeepCodeTimelineProps {
   timeline: AgentTimelineResult | null;
@@ -51,34 +48,19 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   onTypewriterActiveChange,
   onPlanResolve,
 }) => {
-  const fallbackTimeline = useMemo(
-    () => buildNarrativeTimelineProjection({
-      sessionId: fallbackEvents[0]?.sessionId ?? 'session',
-      events: fallbackEvents,
-    }),
-    [fallbackEvents]
-  );
-  const view = useMemo(
-    () => normalizeNarrativeTimeline(timeline ?? fallbackTimeline),
-    [fallbackTimeline, timeline]
-  );
   const coalescedActiveDeltas = useCoalescedProjectionDeltas(activeDeltas, 50);
-  const committedEvents = useMemo(
-    () => fallbackEvents.length > 0 ? fallbackEvents : eventsFromTimeline(view),
-    [fallbackEvents, view]
-  );
-  const liveProjection = useMemo(
-    () => buildTimelineProjectionWithLiveOverlay({
-      sessionId: view.sessionId,
-      committedEvents,
+  const view = useMemo(
+    () => buildUiTimelineProjection({
+      sessionId: timeline?.sessionId ?? fallbackEvents[0]?.sessionId ?? 'session',
+      events: fallbackEvents,
       activeDeltas: coalescedActiveDeltas,
-      generatedAt: view.generatedAt,
+      timeline,
     }),
-    [coalescedActiveDeltas, committedEvents, view.generatedAt, view.sessionId]
+    [coalescedActiveDeltas, fallbackEvents, timeline]
   );
-  const livePlayback = useProjectedTimelinePlayback(liveProjection, loading, 1000);
+  const livePlayback = useProjectedTimelinePlayback(view, loading, 1000);
   const viewWithActive = useMemo(
-    () => normalizeNarrativeTimeline(livePlayback.view),
+    () => livePlayback.view,
     [livePlayback.view]
   );
   const timelineRef = useRef<HTMLDivElement | null>(null);
@@ -434,11 +416,10 @@ function useProjectedTimelinePlayback(
     const blocks = flattenTimelineBlocks(view);
     for (let index = 0; index < blocks.length - 1; index += 1) {
       const block = blocks[index];
-      if (!isLiveTextBlock(block)) continue;
-      if (block.status === 'running') continue;
+      if (!isBlockingLiveTextBlock(block)) continue;
       if (releasedBlockIds.has(block.id)) continue;
-      const hasLaterLiveBlock = blocks.slice(index + 1).some(isLiveOverlayBlock);
-      if (hasLaterLiveBlock) return block.id;
+      const hasLaterVisibleBlock = blocks.slice(index + 1).some(isVisibleTimelineBlock);
+      if (hasLaterVisibleBlock) return block.id;
     }
     return null;
   }, [enabled, releasedBlockIds, view]);
@@ -467,18 +448,6 @@ function useProjectedTimelinePlayback(
   };
 }
 
-function eventsFromTimeline(view: AgentTimelineResult): AgentEvent[] {
-  const byId = new Map<string, AgentEvent>();
-  for (const turn of view.turns) {
-    for (const block of turn.blocks) {
-      for (const event of block.events) {
-        if (!byId.has(event.id)) byId.set(event.id, event);
-      }
-    }
-  }
-  return [...byId.values()];
-}
-
 function flattenTimelineBlocks(view: AgentTimelineResult): AgentTimelineBlock[] {
   return view.turns.flatMap((turn) => turn.blocks);
 }
@@ -492,11 +461,16 @@ function isLiveOverlayBlock(block: AgentTimelineBlock): boolean {
     (block.rawEventRefs ?? []).some((ref) => ref.startsWith('event:live:'));
 }
 
-function isLiveTextBlock(block: AgentTimelineBlock): boolean {
+function isBlockingLiveTextBlock(block: AgentTimelineBlock): boolean {
   if (!isLiveOverlayBlock(block)) return false;
-  return block.narrativeKind === 'thinking' ||
-    block.narrativeKind === 'assistantNarration' ||
-    block.narrativeKind === 'assistantText';
+  if (visibleTypewriterMarkdown(block).length === 0) return false;
+  return block.narrativeKind === 'assistantNarration' ||
+    block.narrativeKind === 'assistantText' ||
+    block.narrativeKind === 'requirement' ||
+    block.narrativeKind === 'review' ||
+    block.kind === 'assistant' ||
+    block.kind === 'plan' ||
+    block.kind === 'review';
 }
 
 function truncateTimelineAfterBlock(view: AgentTimelineResult, blockId: string): AgentTimelineResult {
@@ -651,6 +625,7 @@ function useTypewriterBlockIds(
   return useMemo(() => {
     const sessionId = view.sessionId;
     const candidateIds = collectTypewriterBlockIds(view);
+    const candidateIdSet = new Set(candidateIds);
 
     if (activeSessionIdRef.current !== sessionId) {
       activeSessionIdRef.current = sessionId;
@@ -663,6 +638,9 @@ function useTypewriterBlockIds(
     if (loading) {
       liveSessionIdRef.current = sessionId;
     }
+    typewriterBlockIdsRef.current = new Set(
+      [...typewriterBlockIdsRef.current].filter((blockId) => candidateIdSet.has(blockId))
+    );
     const shouldAnimateNewAssistant = liveSessionIdRef.current === sessionId;
     for (const blockId of candidateIds) {
       if (seenBlockIdsRef.current.has(blockId)) continue;
@@ -728,6 +706,9 @@ function collectTypewriterBlockLengths(
 function shouldAnimateTimelineBlock(block: AgentTimelineBlock): boolean {
   const renderMode = block.displayHints?.renderMode;
   if (renderMode === 'instant' || renderMode === 'static') return false;
+  if (block.kind === 'thinking' || block.narrativeKind === 'thinking') {
+    return block.status === 'running' || block.status === 'waiting';
+  }
   return renderMode === 'typewriter' ||
     renderMode === 'accelerated' ||
     block.narrativeKind === 'assistantText' ||
@@ -735,17 +716,6 @@ function shouldAnimateTimelineBlock(block: AgentTimelineBlock): boolean {
     block.kind === 'plan' ||
     block.kind === 'review' ||
     (!block.narrativeKind && block.kind === 'assistant');
-}
-
-function normalizeNarrativeTimeline(view: AgentTimelineResult): AgentTimelineResult {
-  if (view.schemaVersion === 'deepcode.session.timeline.v1') return view;
-  const events = view.turns.flatMap((turn) => turn.blocks.flatMap((block) => block.events));
-  if (events.length === 0) return view;
-  return buildNarrativeTimelineProjection({
-    sessionId: view.sessionId,
-    events,
-    generatedAt: view.generatedAt,
-  });
 }
 
 const TurnCard: React.FC<{
@@ -1225,17 +1195,26 @@ const ThinkingBlock: React.FC<{
   // 超长 reasoning（执行阶段完整 CoT 可达上万字符）默认折叠，避免一次性大段平铺。
   const longContent = markdown.length > 1600;
   const completedThinkingOpen = block.status === 'completed' && !collapseCompletedThinking;
-  const open = completedThinkingOpen ||
+  const initialOpen = completedThinkingOpen ||
     (block.displayHints?.initialOpen ?? (longContent ? false : (!block.defaultCollapsed || running)));
+  const [open, setOpen] = useState(initialOpen);
+
+  useEffect(() => {
+    setOpen(initialOpen);
+  }, [block.id, initialOpen]);
 
   return (
-    <details className={`deepcode-gui-block deepcode-gui-block--thinking${narrativeClass}${densityClass}${phaseClassName(block)}`} open={open}>
+    <details
+      className={`deepcode-gui-block deepcode-gui-block--thinking${narrativeClass}${densityClass}${phaseClassName(block)}`}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
       <summary>
         <span className={`deepcode-gui-block__status deepcode-gui-block__status--${block.status}`} />
         <span className="deepcode-gui-block__title">{t(language, 'deepcodeGui.timeline.thinking')}</span>
       </summary>
       <div className="deepcode-gui-block__details deepcode-gui-block__details--thinking">
-        {markdown && (
+        {open && markdown && (
           <TypewriterMarkdown
             content={markdown}
             animate={animate}
@@ -1258,12 +1237,11 @@ const PlanBlock: React.FC<{
   onPlanResolve?: DeepCodeTimelineProps['onPlanResolve'];
 }> = ({ block, language, animate, onLiveContentChange, onTypewriterComplete, onPlanResolve }) => {
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
-  const reviewEvent = block.events.find((event) => event.kind === 'plan_review');
-  const payload = isRecord(reviewEvent?.payload) ? reviewEvent.payload : {};
-  const runId = stringField(payload, 'runId');
-  const planId = stringField(payload, 'planId');
+  const decisionEvent = [...block.events]
+    .reverse()
+    .find((event) => event.kind === 'plan_review' || event.kind === 'plan_card');
+  const payload = isRecord(decisionEvent?.payload) ? decisionEvent.payload : {};
   const status = stringField(payload, 'status') ?? block.status;
-  const confirmable = payload.confirmable === true && Boolean(runId && planId);
   const narrativeClass = block.narrativeKind ? ` deepcode-gui-block--narrative-${block.narrativeKind}` : '';
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   const open = !block.defaultCollapsed || block.status === 'running' || block.status === 'waiting';
@@ -1312,11 +1290,6 @@ const PlanBlock: React.FC<{
             onVisibleContentChange={onLiveContentChange}
             onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
           />
-        )}
-        {confirmable && (
-          <div className="deepcode-gui-plan-actions deepcode-gui-plan-actions--composer">
-            {t(language, 'deepcodeGui.plan.useComposer')}
-          </div>
         )}
       </div>
     </details>
@@ -1387,61 +1360,6 @@ const EventList: React.FC<{ events: AgentEvent[]; compact?: boolean; language: U
     ))}
   </div>
 );
-
-function localFallbackTimeline(events: AgentEvent[], language: UiLanguage = 'zh-CN'): AgentTimelineResult {
-  return {
-    sessionId: events[0]?.sessionId ?? 'session',
-    generatedAt: new Date().toISOString(),
-    eventCount: events.length,
-    turns: events.length === 0
-      ? []
-      : [
-          {
-            id: 'local-fallback-turn',
-            sessionId: events[0]?.sessionId ?? 'session',
-            status: 'running',
-            blocks: events.map((event) => ({
-            id: event.id,
-            kind: fallbackBlockKind(event),
-              title: fallbackBlockTitle(language, event),
-              summary: eventSummary(event),
-              status: fallbackBlockStatus(event),
-              defaultCollapsed: event.kind !== 'user_msg' && event.kind !== 'assistant_msg',
-              bodyMarkdown: eventText(event),
-              events: [event],
-            })),
-          },
-        ],
-  };
-}
-
-function fallbackBlockKind(event: AgentEvent): AgentTimelineBlock['kind'] {
-  if (event.kind === 'user_msg') return 'user';
-  if (event.kind === 'user_guidance') return 'stage';
-  if (event.kind === 'plan_card' || event.kind === 'plan_review') return 'plan';
-  if (event.kind === 'review_summary') return 'review';
-  if (event.kind === 'error') return 'error';
-  if (event.kind === 'assistant_msg') {
-    const payload = isRecord(event.payload) ? event.payload : {};
-    if (payload.channel === 'reasoning') return 'thinking';
-    if (payload.channel === 'final') return 'assistant';
-    return 'stage';
-  }
-  return 'stage';
-}
-
-function fallbackBlockTitle(language: UiLanguage, event: AgentEvent): string {
-  if (event.kind === 'user_guidance') return t(language, 'deepcodeGui.tasks.guidance');
-  return localizedEventKind(language, event.kind);
-}
-
-function fallbackBlockStatus(event: AgentEvent): AgentTimelineBlock['status'] {
-  if (event.kind === 'user_guidance') {
-    const payload = isRecord(event.payload) ? event.payload : {};
-    return stringField(payload, 'status') === 'consumed' ? 'completed' : 'queued';
-  }
-  return 'completed';
-}
 
 function eventSummary(event: AgentEvent): string {
   return eventText(event) || event.kind;

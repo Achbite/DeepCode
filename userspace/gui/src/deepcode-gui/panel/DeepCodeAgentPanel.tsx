@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import type { AgentTimelineResult } from '@deepcode/protocol';
 import { getLlmProfiles, getAgentTimeline } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
@@ -6,7 +6,8 @@ import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
 import AgentComposer from '../../components/agent-panel/AgentComposer';
 import PermissionRequestBubble from '../../components/agent-panel/PermissionRequestBubble';
-import { findPendingComposerDecision } from '../../components/agent-panel/pendingDecision';
+import { findPendingComposerDecisionFromProjection } from '../../components/agent-panel/pendingDecision';
+import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
 import DeepCodeTimeline from './DeepCodeTimeline';
 
 interface DeepCodeAgentPanelProps {
@@ -91,6 +92,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     const loadTimeline = async () => {
       if (!session?.id) {
         setTimeline(null);
+        setTimelineError(null);
         return;
       }
       const result = await getAgentTimeline(session.id);
@@ -111,11 +113,20 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   }, [events.length, session?.id, sessionRunning]);
 
   const activeSessionTitle = displaySessionTitle(language, session?.title);
-  const hasTimelineTurns = (timeline?.turns.length ?? 0) > 0;
+  const uiTimelineProjection = useMemo(
+    () => buildUiTimelineProjection({
+      sessionId: session?.id,
+      events,
+      activeDeltas,
+      timeline,
+    }),
+    [activeDeltas, events, session?.id, timeline]
+  );
+  const hasTimelineTurns = uiTimelineProjection.turns.length > 0;
   const pendingDecision = suppressPendingDecision
     ? null
-    : findPendingComposerDecision({
-      events,
+    : findPendingComposerDecisionFromProjection({
+      timeline: uiTimelineProjection,
       pendingPermission: pendingPermission?.request ?? null,
       resolvingRequirement,
       resolvingPlan,
@@ -137,12 +148,15 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
     revealedPendingDecisionKey === pendingDecisionKey &&
     !timelineTypewriterActive
   );
-  const composerPendingDecision = decisionReadyForComposer ? pendingDecision : null;
+  const pendingDecisionResolving = Boolean(pendingDecision?.resolving);
+  const composerPendingDecision = decisionReadyForComposer && !pendingDecisionResolving
+    ? pendingDecision
+    : null;
   const showHome = forceHome || (
     !sessionRunning && !composerPendingDecision && !errorMessage && !timelineError
     && events.length === 0 && !hasTimelineTurns
   );
-  const composerRunning = forceHome ? false : sessionRunning;
+  const composerRunning = forceHome ? false : (sessionRunning || pendingDecisionResolving);
   const homePrompt = homeProjectTitle
     ? t(language, 'deepcodeGui.home.projectPrompt', { project: homeProjectTitle })
     : t(language, 'deepcodeGui.home.prompt');
@@ -282,7 +296,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
 };
 
 function pendingDecisionIdentity(
-  decision: ReturnType<typeof findPendingComposerDecision>
+  decision: ReturnType<typeof findPendingComposerDecisionFromProjection>
 ): string | null {
   if (!decision) return null;
   if (decision.kind === 'requirement') {

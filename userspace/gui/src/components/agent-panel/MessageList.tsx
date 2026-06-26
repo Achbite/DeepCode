@@ -5,9 +5,8 @@ import type {
   AgentEvent,
   AgentEventPresentation,
   AgentTimelineBlock,
-  ProjectionDelta,
+  AgentTimelineResult,
 } from '@deepcode/protocol';
-import { buildTimelineProjectionWithLiveOverlay } from '@deepcode/session-core';
 import { t, resolveDiagnosticText, type UiLanguage } from '../../i18n';
 import MarkdownContent from './LazyMarkdownContent';
 import ToolCallBubble from './ToolCallBubble';
@@ -21,10 +20,10 @@ import {
   readConversationArchiveFile,
   submitAgentFeedback,
 } from '../../services/runtimeAdapter';
+import { timelineEventsFromProjection } from '../../utils/uiTimelineProjection';
 
 interface MessageListProps {
-  events: AgentEvent[];
-  activeDeltas?: ProjectionDelta[];
+  timeline: AgentTimelineResult;
   loading?: boolean;
   language: UiLanguage;
   resolvingPlan?: {
@@ -630,18 +629,11 @@ function traceGroupRunning(groupEvents: AgentEvent[], turnEvents: AgentEvent[], 
 }
 
 function createRenderItems(
-  events: AgentEvent[],
+  projection: AgentTimelineResult,
   loading: boolean,
-  language: UiLanguage,
-  activeDeltas: ProjectionDelta[] = []
+  language: UiLanguage
 ): RenderItem[] {
-  if (events.length === 0) return [];
-  const projection = buildTimelineProjectionWithLiveOverlay({
-    sessionId: events[0]?.sessionId ?? 'session',
-    committedEvents: events,
-    activeDeltas,
-  });
-  if (projection.turns.length === 0) return createLegacyRenderItems(events, loading, language);
+  if (projection.turns.length === 0) return [];
 
   const items: RenderItem[] = [];
 
@@ -706,142 +698,6 @@ function createRenderItems(
         targetEvent: turnActionTarget,
       });
     }
-  }
-
-  return items.length > 0 ? items : createLegacyRenderItems(events, loading, language);
-}
-
-function createLegacyRenderItems(events: AgentEvent[], loading: boolean, language: UiLanguage): RenderItem[] {
-  const items: RenderItem[] = [];
-  let index = 0;
-
-  while (index < events.length) {
-    const event = events[index];
-
-    if (event.kind === 'user_msg') {
-      const turnItems: RenderContentItem[] = [];
-      const pushTurnItem = (item: RenderContentItem) => {
-        turnItems.push(item);
-        items.push(item);
-      };
-
-      pushTurnItem({ type: 'event', event });
-      index += 1;
-
-      const turnEvents: AgentEvent[] = [];
-      while (index < events.length && events[index].kind !== 'user_msg') {
-        turnEvents.push(events[index]);
-        index += 1;
-      }
-
-      const finalAssistant = pickVisibleAssistantEvent(turnEvents);
-      const explicitFinalAssistant = finalAssistant ? eventChannel(finalAssistant) === 'final' : false;
-      const renderedEventIds = new Set<string>();
-      const deferredReviewEvents: AgentEvent[] = [];
-
-      for (let turnIndex = 0; turnIndex < turnEvents.length; turnIndex += 1) {
-        const turnEvent = turnEvents[turnIndex];
-        if (isAgentThoughtEvent(turnEvent)) {
-          const groupEvents: AgentEvent[] = [];
-          while (turnIndex < turnEvents.length && isAgentThoughtEvent(turnEvents[turnIndex])) {
-            groupEvents.push(turnEvents[turnIndex]);
-            renderedEventIds.add(turnEvents[turnIndex].id);
-            turnIndex += 1;
-          }
-          turnIndex -= 1;
-          pushTurnItem({
-            type: 'trace',
-            group: {
-              id: `trace-${event.id}-${groupEvents[0]?.id}`,
-              events: groupEvents,
-              running: traceGroupRunning(groupEvents, turnEvents, loading),
-            },
-          });
-          continue;
-        }
-
-        if (isHiddenConversationEvent(turnEvent)) continue;
-        if (
-          finalAssistant &&
-          turnEvent.kind === 'assistant_msg' &&
-          eventChannel(turnEvent) === 'final' &&
-          turnEvent.id !== finalAssistant.id
-        ) {
-          renderedEventIds.add(turnEvent.id);
-          continue;
-        }
-        if (explicitFinalAssistant && finalAssistant && turnEvent.id === finalAssistant.id) {
-          continue;
-        }
-
-        if (isTerminalReviewEvent(turnEvent)) {
-          renderedEventIds.add(turnEvent.id);
-          deferredReviewEvents.push(turnEvent);
-          continue;
-        }
-
-        if (isToolTimelineEvent(turnEvent)) {
-          const batchEvents: AgentEvent[] = [];
-          const batchId = eventBatchId(turnEvent);
-          while (
-            turnIndex < turnEvents.length &&
-            isToolTimelineEvent(turnEvents[turnIndex]) &&
-            (batchId ? eventBatchId(turnEvents[turnIndex]) === batchId : !eventBatchId(turnEvents[turnIndex]))
-          ) {
-            batchEvents.push(turnEvents[turnIndex]);
-            renderedEventIds.add(turnEvents[turnIndex].id);
-            turnIndex += 1;
-          }
-          turnIndex -= 1;
-          pushTurnItem({
-            type: 'toolBatch',
-            group: {
-              id: `tool-batch-${event.id}-${batchId ?? batchEvents[0]?.id}`,
-              label: eventBatchLabel(turnEvent, language),
-              events: batchEvents,
-              autoOpen: batchEvents.some((batchEvent, batchEventIndex) =>
-                batchEvent.kind === 'tool_call' && !hasLaterResult(batchEvents, batchEventIndex)
-              ),
-            },
-          });
-          continue;
-        }
-
-        renderedEventIds.add(turnEvent.id);
-        pushTurnItem({
-          type: 'event',
-          event: turnEvent,
-          autoOpen: eventDefaultOpen(turnEvent) ?? (turnEvent.kind === 'tool_call' && !hasLaterResult(turnEvents, turnEvents.indexOf(turnEvent))),
-        });
-      }
-
-      for (const reviewEvent of deferredReviewEvents) {
-        pushTurnItem({ type: 'event', event: reviewEvent });
-      }
-
-      if (finalAssistant && !renderedEventIds.has(finalAssistant.id)) {
-        pushTurnItem({ type: 'event', event: finalAssistant });
-      }
-
-      const turnActionTarget = pickTurnActionTarget(turnEvents, finalAssistant);
-      if (turnActionTarget && !loading) {
-        items.push({
-          type: 'turnActions',
-          id: `turn-actions-${event.id}`,
-          items: turnItems,
-          targetEvent: turnActionTarget,
-        });
-      }
-      continue;
-    }
-
-    if (isHiddenConversationEvent(event)) {
-      index += 1;
-      continue;
-    }
-
-    items.push({ type: 'event', event });
-    index += 1;
   }
 
   return items;
@@ -1268,10 +1124,6 @@ function RequirementConfirmationCard({
   const title = stringField(event.payload, 'title') ?? t(language, 'agent.requirement.title');
   const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
   const content = stringField(event.payload, 'content');
-  const status = stringField(event.payload, 'status') ?? 'waitingUserConfirmation';
-  const confirmable = isRecord(event.payload) &&
-    event.payload.confirmable === true &&
-    status === 'waitingUserConfirmation';
   const options = extractRequirementOptions(event.payload);
   return (
     <section key={event.id} className="agent-flow-card agent-flow-card--requirement">
@@ -1279,11 +1131,6 @@ function RequirementConfirmationCard({
       <div className="agent-flow-card__summary">{summary}</div>
       {content && <MarkdownContent content={content} />}
       {options.length > 0 && <RequirementOptionsList options={options} language={language} />}
-      {confirmable && (
-        <div className="agent-plan-review-actions agent-plan-review-actions--composer">
-          {t(language, 'agent.requirement.useComposer')}
-        </div>
-      )}
     </section>
   );
 }
@@ -1434,26 +1281,12 @@ function PlanReviewCard({
   const title = stringField(event.payload, 'title') ?? t(language, 'agent.plan.reviewTitle');
   const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
   const status = stringField(event.payload, 'status') ?? 'pending';
-  const runId = stringField(event.payload, 'runId');
-  const planId = stringField(event.payload, 'planId');
   const facts = payloadArray(event.payload, 'facts');
-  const confirmable =
-    isRecord(event.payload) &&
-    event.payload.confirmable === true &&
-    status !== 'accepted' &&
-    status !== 'rejected' &&
-    Boolean(runId) &&
-    Boolean(planId);
   return (
     <section key={event.id} className={`agent-flow-card agent-flow-card--check agent-flow-card--${status}`}>
       <div className="agent-flow-card__title">{title}</div>
       <div className="agent-flow-card__summary">{summary}</div>
       {facts.length > 0 && <ul className="agent-flow-card__facts">{facts.map((fact) => <li key={fact}>{fact}</li>)}</ul>}
-      {confirmable && (
-        <div className="agent-plan-review-actions agent-plan-review-actions--composer">
-          {t(language, 'agent.plan.useComposer')}
-        </div>
-      )}
     </section>
   );
 }
@@ -1470,12 +1303,6 @@ function ReviewSummaryCard({
   const content = stringField(event.payload, 'content');
   const llmGuidance = stringField(event.payload, 'llmGuidance');
   const status = stringField(event.payload, 'status') ?? 'waitingUserReview';
-  const runId = stringField(event.payload, 'runId');
-  const confirmable =
-    isRecord(event.payload) &&
-    event.payload.confirmable === true &&
-    status === 'waitingUserReview' &&
-    Boolean(runId);
   const facts = payloadArray(event.payload, 'facts');
   const gitReview = isRecord(event.payload) ? event.payload.gitReview : undefined;
   const readableReview = isRecord(event.payload) && isRecord(event.payload.readableReview)
@@ -1547,11 +1374,6 @@ function ReviewSummaryCard({
           <summary>{t(language, 'agent.review.llmGuidance')}</summary>
           <MarkdownContent content={llmGuidance} />
         </details>
-      )}
-      {confirmable && (
-        <div className="agent-plan-review-actions agent-plan-review-actions--composer">
-          {t(language, 'agent.review.useComposer')}
-        </div>
       )}
     </section>
   );
@@ -2128,8 +1950,7 @@ function renderMessage(
 }
 
 const MessageList: React.FC<MessageListProps> = ({
-  events,
-  activeDeltas = [],
+  timeline,
   loading = false,
   language,
   resolvingPlan,
@@ -2137,13 +1958,17 @@ const MessageList: React.FC<MessageListProps> = ({
   onPlanResolve,
   onReviewResolve,
 }) => {
+  const events = React.useMemo(
+    () => timelineEventsFromProjection(timeline),
+    [timeline]
+  );
   const planState = React.useMemo(
     () => buildPlanConfirmationState(events, resolvingPlan),
     [events, resolvingPlan]
   );
   const renderItems = React.useMemo(
-    () => createRenderItems(events, loading, language, activeDeltas),
-    [activeDeltas, events, language, loading]
+    () => createRenderItems(timeline, loading, language),
+    [language, loading, timeline]
   );
 
   return (
