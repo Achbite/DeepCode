@@ -575,11 +575,15 @@ pub(crate) async fn agent_session_run_stream(
             }
 
             if run_status_terminal(&run.status) {
+                let (terminal_events, terminal_event_count) =
+                    terminal_stream_event_tail(&events, sent_event_count);
+                sent_event_count = terminal_event_count;
                 yield sse_bytes("terminal", json!({
                     "sessionId": session_id.clone(),
                     "runId": run_id.clone(),
                     "run": run.clone(),
-                    "events": events
+                    "events": terminal_events,
+                    "eventCount": sent_event_count
                 }));
                 break;
             }
@@ -1453,6 +1457,11 @@ fn normalize_run_delta(
             .or_insert_with(|| json!(now_text()));
     }
     delta
+}
+
+fn terminal_stream_event_tail(events: &[Value], sent_event_count: usize) -> (Vec<Value>, usize) {
+    let start = sent_event_count.min(events.len());
+    (events.iter().skip(start).cloned().collect(), events.len())
 }
 
 fn pending_permission_message(events: &[Value]) -> Option<String> {
@@ -2380,6 +2389,28 @@ mod tests {
         );
         assert_eq!(delta.get("deltaSeq").and_then(Value::as_u64), Some(7));
         assert!(delta.get("receivedAt").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn terminal_stream_event_tail_does_not_replay_sent_history() {
+        let unique = now_millis();
+        let events = vec![
+            json!({ "id": format!("event-{unique}-a") }),
+            json!({ "id": format!("event-{unique}-b") }),
+            json!({ "id": format!("event-{unique}-c") }),
+        ];
+        let (tail, count) = terminal_stream_event_tail(&events, 2);
+        let expected_tail_id = format!("event-{unique}-c");
+        assert_eq!(count, 3);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(
+            tail[0].get("id").and_then(Value::as_str),
+            Some(expected_tail_id.as_str())
+        );
+
+        let (empty_tail, empty_count) = terminal_stream_event_tail(&events, count);
+        assert_eq!(empty_count, 3);
+        assert!(empty_tail.is_empty());
     }
 
     #[test]

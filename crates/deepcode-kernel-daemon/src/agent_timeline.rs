@@ -125,6 +125,9 @@ fn finalize_turn(mut turn: AgentTimelineTurn) -> AgentTimelineTurn {
 }
 
 fn append_event_block(turn: &mut AgentTimelineTurn, event: Value, index: usize) {
+    if is_hidden_timeline_event(&event) {
+        return;
+    }
     let kind = timeline_kind(&event);
     if kind == "toolBatch" || kind == "thinking" || kind == "stage" {
         if let Some(last) = turn.blocks.last_mut() {
@@ -136,6 +139,14 @@ fn append_event_block(turn: &mut AgentTimelineTurn, event: Value, index: usize) 
         }
     }
     turn.blocks.push(block_from_event(&event, &kind, index));
+}
+
+fn is_hidden_timeline_event(event: &Value) -> bool {
+    let payload = payload(event);
+    matches!(
+        string_field(payload, "visibility").as_deref(),
+        Some("debug" | "trace")
+    ) || string_field(payload, "presentation").as_deref() == Some("traceOnly")
 }
 
 fn refresh_group_block(block: &mut AgentTimelineBlock) {
