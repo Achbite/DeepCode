@@ -1515,7 +1515,7 @@ function NarrativeThinkingCard({ block, language }: { block: AgentTimelineBlock;
     }
   }, [running, longContent]);
 
-  const summary = compactDisplayText(markdown, 140);
+  const summary = longContent ? '' : compactDisplayText(markdown, 140);
   const title = [block.title || t(language, 'agent.copy.thinking'), summary]
     .filter((part, index, parts) => Boolean(part && (index === 0 || part !== parts[0])))
     .join(' · ');
@@ -1571,7 +1571,7 @@ function TypewriterMarkdown({
   renderMode?: TimelineRenderMode;
   speed?: TimelineTypewriterSpeed;
 }) {
-  const animate = renderMode === 'typewriter' || renderMode === 'accelerated';
+  const animate = content.length <= 1600 && (renderMode === 'typewriter' || renderMode === 'accelerated');
   const [visible, setVisible] = React.useState(() => (animate ? '' : content));
   const visibleRef = React.useRef(visible);
 

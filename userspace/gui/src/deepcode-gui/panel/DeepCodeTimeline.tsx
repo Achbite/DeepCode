@@ -36,6 +36,9 @@ interface DeepCodeTimelineProps {
 
 type TypewriterSpeed = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']>;
 type TimelineFollowMode = 'following' | 'detached';
+const MAX_TYPEWRITER_CHARS = 1600;
+const LIVE_REASONING_FAST_BACKLOG_CHARS = 4000;
+const LIVE_REASONING_SNAP_BACKLOG_CHARS = 12000;
 
 const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   timeline,
@@ -466,9 +469,11 @@ function isBlockingLiveTextBlock(block: AgentTimelineBlock): boolean {
   if (visibleTypewriterMarkdown(block).length === 0) return false;
   return block.narrativeKind === 'assistantNarration' ||
     block.narrativeKind === 'assistantText' ||
+    block.narrativeKind === 'thinking' ||
     block.narrativeKind === 'requirement' ||
     block.narrativeKind === 'review' ||
     block.kind === 'assistant' ||
+    block.kind === 'thinking' ||
     block.kind === 'plan' ||
     block.kind === 'review';
 }
@@ -682,8 +687,10 @@ function useCoalescedProjectionDeltas(deltas: ProjectionDelta[], delayMs: number
 function collectTypewriterBlockIds(view: AgentTimelineResult): string[] {
   return view.turns.flatMap((turn) =>
     turn.blocks
-      .filter(shouldAnimateTimelineBlock)
-      .filter((block) => visibleTypewriterMarkdown(block).length > 0)
+      .filter((block) => {
+        const markdown = visibleTypewriterMarkdown(block);
+        return markdown.length > 0 && markdown.length <= MAX_TYPEWRITER_CHARS && shouldAnimateTimelineBlock(block);
+      })
       .map((block) => block.id)
   );
 }
@@ -1190,13 +1197,10 @@ const ThinkingBlock: React.FC<{
   const densityClass = block.displayHints?.density ? ` deepcode-gui-block--density-${block.displayHints.density}` : '';
   const markdown = thinkingMarkdown(block);
   const running = block.status === 'running' || block.status === 'waiting';
+  const liveReasoning = isLiveOverlayBlock(block) && running;
   // 空"推理过程"块不渲染（避免空壳卡片）。
   if (!markdown && !running) return null;
-  // 超长 reasoning（执行阶段完整 CoT 可达上万字符）默认折叠，避免一次性大段平铺。
-  const longContent = markdown.length > 1600;
-  const completedThinkingOpen = block.status === 'completed' && !collapseCompletedThinking;
-  const initialOpen = completedThinkingOpen ||
-    (block.displayHints?.initialOpen ?? (longContent ? false : (!block.defaultCollapsed || running)));
+  const initialOpen = block.displayHints?.initialOpen ?? true;
   const [open, setOpen] = useState(initialOpen);
 
   useEffect(() => {
@@ -1215,18 +1219,161 @@ const ThinkingBlock: React.FC<{
       </summary>
       <div className="deepcode-gui-block__details deepcode-gui-block__details--thinking">
         {open && markdown && (
-          <TypewriterMarkdown
+          <ReasoningMarkdownStream
             content={markdown}
-            animate={animate}
-            speed={block.displayHints?.typewriterSpeed}
+            animate={liveReasoning || animate}
             onVisibleContentChange={onLiveContentChange}
-            onAnimationComplete={() => onTypewriterComplete(block.id, visibleTypewriterMarkdown(block).length)}
+            onAnimationComplete={() => onTypewriterComplete(block.id, markdown.length)}
           />
         )}
       </div>
     </details>
   );
 };
+
+const ReasoningMarkdownStream: React.FC<{
+  content: string;
+  animate: boolean;
+  onVisibleContentChange: () => void;
+  onAnimationComplete?: () => void;
+}> = ({ content, animate, onVisibleContentChange, onAnimationComplete }) => {
+  const [visible, setVisible] = useState(() => (animate ? '' : content));
+  const visibleRef = useRef(visible);
+  const latestRef = useRef(content);
+  const timerRef = useRef<number | null>(null);
+  const onAnimationCompleteRef = useRef(onAnimationComplete);
+  const onVisibleContentChangeRef = useRef(onVisibleContentChange);
+
+  useEffect(() => {
+    visibleRef.current = visible;
+  }, [visible]);
+
+  useEffect(() => {
+    onAnimationCompleteRef.current = onAnimationComplete;
+  }, [onAnimationComplete]);
+
+  useEffect(() => {
+    onVisibleContentChangeRef.current = onVisibleContentChange;
+  }, [onVisibleContentChange]);
+
+  useEffect(() => {
+    latestRef.current = content;
+    if (!animate) {
+      visibleRef.current = content;
+      setVisible(content);
+      onAnimationCompleteRef.current?.();
+      window.requestAnimationFrame(onVisibleContentChangeRef.current);
+      return undefined;
+    }
+
+    const clearTimer = () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+
+    const commitVisible = (next: string) => {
+      visibleRef.current = next;
+      setVisible(next);
+      window.requestAnimationFrame(onVisibleContentChangeRef.current);
+    };
+
+    const tick = () => {
+      timerRef.current = null;
+      const latest = latestRef.current;
+      const current = visibleRef.current;
+      if (!latest.startsWith(current)) {
+        commitVisible(latest);
+        onAnimationCompleteRef.current?.();
+        return;
+      }
+      const backlog = latest.length - current.length;
+      if (backlog <= 0) {
+        onAnimationCompleteRef.current?.();
+        return;
+      }
+      if (backlog >= LIVE_REASONING_SNAP_BACKLOG_CHARS) {
+        commitVisible(latest);
+        onAnimationCompleteRef.current?.();
+        return;
+      }
+      const step = backlog >= LIVE_REASONING_FAST_BACKLOG_CHARS ? 360 : backlog >= 1000 ? 120 : 36;
+      const delayMs = backlog >= LIVE_REASONING_FAST_BACKLOG_CHARS ? 8 : 16;
+      commitVisible(latest.slice(0, Math.min(latest.length, current.length + step)));
+      timerRef.current = window.setTimeout(tick, delayMs);
+    };
+
+    if (timerRef.current === null) {
+      timerRef.current = window.setTimeout(tick, 24);
+    }
+    return clearTimer;
+  }, [animate, content]);
+
+  const blocks = useMemo(() => segmentReasoningMarkdown(visible, animate), [animate, visible]);
+
+  return (
+    <div className="deepcode-gui-reasoning-stream">
+      {blocks.map((block, index) => (
+        <MemoizedReasoningMarkdownBlock
+          key={`reasoning-block-${index}`}
+          content={block.content}
+          sealed={block.sealed}
+        />
+      ))}
+    </div>
+  );
+};
+
+const MemoizedReasoningMarkdownBlock = React.memo(
+  ({ content, sealed }: { content: string; sealed: boolean }) => (
+    <div className={`deepcode-gui-reasoning-stream__block${sealed ? ' deepcode-gui-reasoning-stream__block--sealed' : ' deepcode-gui-reasoning-stream__block--tail'}`}>
+      <MarkdownContent content={content} />
+    </div>
+  ),
+  (prev, next) => prev.content === next.content && prev.sealed === next.sealed
+);
+
+function segmentReasoningMarkdown(content: string, streaming: boolean): Array<{ content: string; sealed: boolean }> {
+  if (!content) return [];
+  const lines = content.match(/[^\n]*\n|[^\n]+$/g) ?? [content];
+  const blocks: Array<{ content: string; sealed: boolean }> = [];
+  let current = '';
+  let inFence: string | null = null;
+
+  const pushCurrent = (sealed: boolean) => {
+    if (!current) return;
+    blocks.push({ content: current, sealed });
+    current = '';
+  };
+
+  for (const line of lines) {
+    current += line;
+    const trimmed = line.trim();
+    const fence = markdownFenceMarker(trimmed);
+    if (fence) {
+      if (!inFence) {
+        inFence = fence;
+      } else if (trimmed.startsWith(inFence)) {
+        inFence = null;
+      }
+    }
+    if (!inFence && trimmed === '') {
+      pushCurrent(true);
+    }
+  }
+
+  if (current) {
+    pushCurrent(!streaming);
+  }
+  return blocks;
+}
+
+function markdownFenceMarker(trimmedLine: string): string | null {
+  if (trimmedLine.startsWith('```')) return '```';
+  if (trimmedLine.startsWith('~~~')) return '~~~';
+  return null;
+}
 
 const PlanBlock: React.FC<{
   block: AgentTimelineBlock;
@@ -1303,10 +1450,11 @@ const TypewriterMarkdown: React.FC<{
   onVisibleContentChange: () => void;
   onAnimationComplete?: () => void;
 }> = ({ content, animate, speed = 'normal', onVisibleContentChange, onAnimationComplete }) => {
-  const [visible, setVisible] = useState(() => (animate ? '' : content));
+  const shouldAnimate = animate && content.length <= MAX_TYPEWRITER_CHARS;
+  const [visible, setVisible] = useState(() => (shouldAnimate ? '' : content));
   const visibleRef = useRef(visible);
   const onAnimationCompleteRef = useRef(onAnimationComplete);
-  const renderedContent = animate ? visible : content;
+  const renderedContent = shouldAnimate ? visible : content;
 
   useLayoutEffect(() => {
     onVisibleContentChange();
@@ -1321,7 +1469,7 @@ const TypewriterMarkdown: React.FC<{
   }, [onAnimationComplete]);
 
   useEffect(() => {
-    if (!animate) {
+    if (!shouldAnimate) {
       setVisible(content);
       onAnimationCompleteRef.current?.();
       return undefined;
@@ -1345,7 +1493,7 @@ const TypewriterMarkdown: React.FC<{
       }
     }, delayMs);
     return () => window.clearInterval(id);
-  }, [animate, content]);
+  }, [shouldAnimate, content]);
 
   return <MarkdownContent content={renderedContent} />;
 };

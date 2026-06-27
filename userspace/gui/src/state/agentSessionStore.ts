@@ -255,6 +255,8 @@ function mergeEventsById(existing: AgentEvent[], incoming: AgentEvent[]): AgentE
 }
 
 const MAX_ACTIVE_PROGRESS_DELTAS = 240;
+const MAX_ACTIVE_TEXT_DELTAS = 32;
+const MAX_ACTIVE_REASONING_CHARS = 120000;
 
 function isActiveTextDelta(delta: ProjectionDelta): boolean {
   return (
@@ -267,7 +269,7 @@ function isActiveTextDelta(delta: ProjectionDelta): boolean {
 
 function activeDeltaMergeKey(delta: ProjectionDelta): string {
   const activityId = delta.activity?.activityId;
-  if (activityId) return `activity:${delta.sessionId}:${activityId}`;
+  if (activityId) return `activity:${delta.sessionId}:${delta.runId ?? ''}:${activityId}`;
   const branchKey = delta.branchId ?? delta.subAgentId ?? delta.mergeGroupId ?? 'parent';
   return [
     delta.sessionId,
@@ -292,10 +294,14 @@ function committedDeltaMatchesActive(committed: ProjectionDelta, active: Project
 
 function mergeActiveDelta(existing: ProjectionDelta, incoming: ProjectionDelta): ProjectionDelta {
   if (isActiveTextDelta(existing) && isActiveTextDelta(incoming)) {
+    const merged = `${existing.delta ?? ''}${incoming.delta ?? ''}`;
+    const capped = incoming.type === 'reasoning_delta' || incoming.channel === 'reasoning'
+      ? capActiveText(merged, MAX_ACTIVE_REASONING_CHARS)
+      : merged;
     return {
       ...existing,
       ...incoming,
-      delta: `${existing.delta ?? ''}${incoming.delta ?? ''}`,
+      delta: capped,
     };
   }
   return {
@@ -306,8 +312,15 @@ function mergeActiveDelta(existing: ProjectionDelta, incoming: ProjectionDelta):
   };
 }
 
+function capActiveText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `...[${value.length - maxChars} chars omitted]\n${value.slice(-maxChars)}`;
+}
+
 function trimActiveDeltas(deltas: ProjectionDelta[]): ProjectionDelta[] {
-  const stable = deltas.filter((delta) => delta.activity || isActiveTextDelta(delta));
+  const text = deltas.filter(isActiveTextDelta).slice(-MAX_ACTIVE_TEXT_DELTAS);
+  const activity = deltas.filter((delta) => delta.activity && !isActiveTextDelta(delta));
+  const stable = [...activity, ...text];
   const progress = deltas.filter((delta) => !delta.activity && !isActiveTextDelta(delta)).slice(-MAX_ACTIVE_PROGRESS_DELTAS);
   return [...stable, ...progress].sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
 }
@@ -315,9 +328,6 @@ function trimActiveDeltas(deltas: ProjectionDelta[]): ProjectionDelta[] {
 function mergeActiveProjectionDelta(existing: ProjectionDelta[], incoming: ProjectionDelta): ProjectionDelta[] {
   if (incoming.type === 'committed') {
     return existing.filter((delta) => !committedDeltaMatchesActive(incoming, delta));
-  }
-  if (isActiveTextDelta(incoming)) {
-    return trimActiveDeltas([...existing, incoming]);
   }
   const byKey = new Map<string, ProjectionDelta>();
   for (const delta of existing) byKey.set(activeDeltaMergeKey(delta), delta);
@@ -356,8 +366,12 @@ function pruneActiveDeltasForCommittedEvents(existing: ProjectionDelta[], events
       event.kind === 'plan_card' ||
       event.kind === 'review_summary' ||
       event.kind === 'error' ||
+      event.kind === 'session_run_state' ||
       (event.kind === 'workflow_stage' && (eventStringField(event, 'stage') ?? '').startsWith('accepted_plan.'))
     ) {
+      committedTextTypes.add('active_turn');
+      committedTextTypes.add('reasoning_delta');
+      committedTextTypes.add('stage_delta');
       committedTextTypes.add('draft_delta');
       committedTextTypes.add('part_delta');
     }

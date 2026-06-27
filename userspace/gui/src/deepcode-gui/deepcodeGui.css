@@ -708,6 +708,20 @@ button {
   margin: 0;
 }
 
+.deepcode-gui-reasoning-stream {
+  display: grid;
+  gap: 8px;
+}
+
+.deepcode-gui-reasoning-stream__block .agent-markdown {
+  display: grid;
+  gap: 8px;
+}
+
+.deepcode-gui-reasoning-stream__block--tail {
+  overflow-wrap: anywhere;
+}
+
 .deepcode-gui-event-list {
   display: grid;
   gap: 6px;

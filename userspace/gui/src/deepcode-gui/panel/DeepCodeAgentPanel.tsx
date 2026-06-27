@@ -6,7 +6,7 @@ import { useWorkspaceStore } from '../../state/workspaceStore';
 import { t, type UiLanguage } from '../../i18n';
 import AgentComposer from '../../components/agent-panel/AgentComposer';
 import PermissionRequestBubble from '../../components/agent-panel/PermissionRequestBubble';
-import { findPendingComposerDecisionFromProjection } from '../../components/agent-panel/pendingDecision';
+import { findPendingComposerDecision } from '../../components/agent-panel/pendingDecision';
 import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
 import DeepCodeTimeline from './DeepCodeTimeline';
 
@@ -125,8 +125,8 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
   const hasTimelineTurns = uiTimelineProjection.turns.length > 0;
   const pendingDecision = suppressPendingDecision
     ? null
-    : findPendingComposerDecisionFromProjection({
-      timeline: uiTimelineProjection,
+    : findPendingComposerDecision({
+      events,
       pendingPermission: pendingPermission?.request ?? null,
       resolvingRequirement,
       resolvingPlan,
@@ -296,7 +296,7 @@ const DeepCodeAgentPanel: React.FC<DeepCodeAgentPanelProps> = ({
 };
 
 function pendingDecisionIdentity(
-  decision: ReturnType<typeof findPendingComposerDecisionFromProjection>
+  decision: ReturnType<typeof findPendingComposerDecision>
 ): string | null {
   if (!decision) return null;
   if (decision.kind === 'requirement') {

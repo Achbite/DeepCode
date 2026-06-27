@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { getLlmProfiles } from '../../services/runtimeAdapter';
 import { useAgentSessionStore } from '../../state/agentSessionStore';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -9,7 +9,7 @@ import AgentSessionSelector from './AgentSessionSelector';
 import AgentTaskList from './AgentTaskList';
 import MessageList from './MessageList';
 import PermissionRequestBubble from './PermissionRequestBubble';
-import { findPendingComposerDecisionFromProjection } from './pendingDecision';
+import { findPendingComposerDecision } from './pendingDecision';
 import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
 import './agentPanel.css';
 
@@ -50,16 +50,17 @@ const AgentPanel: React.FC = () => {
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
   const activeSessionRunning = Boolean(session?.id && runningSessionIds.includes(session.id));
+  const coalescedActiveDeltas = useCoalescedProjectionDeltas(activeDeltas, 50);
   const timelineProjection = useMemo(
     () => buildUiTimelineProjection({
       sessionId: session?.id,
       events,
-      activeDeltas,
+      activeDeltas: coalescedActiveDeltas,
     }),
-    [activeDeltas, events, session?.id]
+    [coalescedActiveDeltas, events, session?.id]
   );
-  const pendingDecision = findPendingComposerDecisionFromProjection({
-    timeline: timelineProjection,
+  const pendingDecision = findPendingComposerDecision({
+    events,
     pendingPermission: pendingPermission?.request ?? null,
     resolvingRequirement,
     resolvingPlan,
@@ -198,5 +199,30 @@ const AgentPanel: React.FC = () => {
     </div>
   );
 };
+
+function useCoalescedProjectionDeltas<T>(deltas: T[], delayMs: number): T[] {
+  const [coalesced, setCoalesced] = useState(deltas);
+  const latestRef = useRef(deltas);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    latestRef.current = deltas;
+    if (timerRef.current !== null) return undefined;
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      setCoalesced(latestRef.current);
+    }, delayMs);
+    return undefined;
+  }, [deltas, delayMs]);
+
+  useEffect(() => () => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  return coalesced;
+}
 
 export default AgentPanel;
