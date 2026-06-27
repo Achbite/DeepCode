@@ -201,7 +201,10 @@ export type AgentRequirementOptionEffect =
   | { kind: 'markTasksCompleted'; taskIds: string[] }
   | { kind: 'skipCurrentTask' }
   | { kind: 'replan'; reason?: string }
-  | { kind: 'finishRun' };
+  | { kind: 'finishRun' }
+  | { kind: 'markAcceptedIncomplete'; taskIds?: string[]; reason?: string }
+  | { kind: 'finishWithAnswer'; reason?: string }
+  | { kind: 'cancel'; reason?: string };
 
 export interface DecisionRequestDraft {
   version: '1';
@@ -230,6 +233,7 @@ export interface ImplementationPlanTaskDraft {
   softOrderAfter?: string[];
   conflictKeys?: string[];
   canDraftInParallel?: boolean;
+  batchKind?: 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review' | string;
   role?: 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review';
   capability: string;
   fileOperations?: FileOperationDraft[];

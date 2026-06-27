@@ -17,6 +17,7 @@ import type {
 import type { AgentPlanParts } from './agent-plan/types.js';
 import type { ResourcePacket, ResourceRequest } from './context/types.js';
 import type { ReviewPacket } from './review/types.js';
+import { isInternalOrchestrationStage, isMainTimelineActivityShape } from './timelineFilter.js';
 import type { TranscriptMessageEntry } from './transcript.js';
 import type { DynamicWorkflowPlan } from './workflow/types.js';
 
@@ -179,7 +180,7 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
 
   // P4(B)：预扫描 plan_review.accepted 的事件索引，作为 plan(explore) → execute 阶段分界。
   // 不依赖具体 planId，简单按"是否已出现任何 accepted 的 plan_review"判定。
-  const planAcceptedIndex = findFirstPlanAcceptedIndex(input.events);
+  const acceptedReviewIndex = findFirstAcceptedReviewIndex(input.events);
 
   input.events.forEach((event, index) => {
     if (event.kind === 'cache_telemetry') {
@@ -188,9 +189,27 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
     if (isDebugTimelineEvent(event)) {
       return;
     }
+    if (isProjectionTimelineHiddenEvent(event)) {
+      return;
+    }
     // 跳过空/纯代码围栏的 reasoning 事件，避免产生空"推理过程"块。
     if (event.kind === 'assistant_msg' && isBlankReasoningEvent(event)) {
       return;
+    }
+
+    const userInputEvent = userInputBubbleEvent(event, index);
+    if (userInputEvent) {
+      if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
+      currentTurn = {
+        id: `turn-${userInputEvent.id || index}`,
+        sessionId: input.sessionId,
+        status: 'running',
+        startedAt: userInputEvent.ts,
+        blocks: [narrativeBlockFromEvents([userInputEvent], index)],
+      };
+      if (isUserInputAuditOnlyEvent(event)) {
+        return;
+      }
     }
 
     if (event.kind === 'user_msg') {
@@ -223,8 +242,8 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
 
   // P4(B)：按 plan_review.accepted 边界给 displayHints 注入 phase。
   // 使用 block.rawEventRefs 推断最早事件索引（rawEventRefs 与事件顺序一致）。
-  if (planAcceptedIndex >= 0) {
-    annotateBlocksWithPhase(turns, input.events, planAcceptedIndex);
+  if (acceptedReviewIndex >= 0) {
+    annotateBlocksWithPhase(turns, input.events, acceptedReviewIndex);
   }
 
   const rawEventRefs = input.events.map(eventRefForAgentEvent);
@@ -299,6 +318,30 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
 
   const textKind = projectionDeltaTextChannel(delta);
   if (textKind && typeof delta.delta === 'string' && delta.delta.length > 0) {
+    if (textKind === 'reasoning') {
+      return [{
+        id,
+        sessionId: delta.sessionId,
+        ts,
+        kind: 'assistant_msg',
+        payload: {
+          ...basePayload,
+          channel: 'reasoning',
+          content: delta.delta,
+          status: projectionStatus(delta.status) ?? 'running',
+          source: 'provider',
+          presentation: 'collapsible',
+          visibility: 'conversation',
+          reasoningTrace: true,
+          activeOverlay: true,
+          activity: delta.activity,
+        },
+        display: {
+          presentation: 'collapsible',
+          defaultOpen: true,
+        },
+      }];
+    }
     return [{
       id,
       sessionId: delta.sessionId,
@@ -308,6 +351,7 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
         ...basePayload,
         channel: textKind,
         content: delta.delta,
+        status: projectionStatus(delta.status) ?? 'running',
         presentation: 'body',
         visibility: 'conversation',
       },
@@ -364,6 +408,19 @@ function projectionDeltaToTransientEvent(delta: ProjectionDelta, generatedAt?: s
 }
 
 function liveOverlayEventId(delta: ProjectionDelta): string {
+  const textKind = projectionDeltaTextChannel(delta);
+  if (textKind) {
+    return [
+      'live',
+      delta.sessionId,
+      delta.runId ?? 'run',
+      delta.turnId ?? 'turn',
+      'text',
+      delta.type,
+      delta.activity?.activityId ?? delta.itemId ?? delta.draftId ?? delta.stage ?? '',
+      delta.channel ?? '',
+    ].filter(Boolean).join(':');
+  }
   return [
     'live',
     delta.sessionId,
@@ -424,6 +481,89 @@ function eventActivityId(event: AgentEvent): string | undefined {
   const payload = isRecordPayload(event.payload) ? event.payload : {};
   const activity = isRecordPayload(payload.activity) ? payload.activity : undefined;
   return activity ? stringField(activity, 'activityId') : undefined;
+}
+
+function isProjectionTimelineHiddenEvent(event: AgentEvent): boolean {
+  const activity = conversationActivityFromEvent(event);
+  const activeOverlay = Boolean(isRecordPayload(event.payload) && event.payload.activeOverlay === true);
+  if (activeOverlay && activity?.kind === 'providerThinking') {
+    return false;
+  }
+  if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') {
+    const payload = isRecordPayload(event.payload) ? event.payload : {};
+    const stage = stringField(payload, 'stage');
+    const kernelEvent = isRecordPayload(payload.kernelEvent) ? payload.kernelEvent : undefined;
+    const kernelEventKind = kernelEvent ? stringField(kernelEvent, 'kind') : undefined;
+    if (isInternalOrchestrationStage({ stage, kernelEventKind })) return true;
+  }
+  if (activity && !isMainTimelineActivityShape({ kind: activity.kind, toolName: activity.toolName })) {
+    return true;
+  }
+  return false;
+}
+
+function conversationActivityFromEvent(event: AgentEvent): AgentConversationActivity | undefined {
+  const payload = isRecordPayload(event.payload) ? event.payload : undefined;
+  return payload ? activityFromValue(payload.activity) : undefined;
+}
+
+function userInputBubbleEvent(event: AgentEvent, index: number): AgentEvent | null {
+  const content = userInputBubbleContent(event);
+  if (!content) return null;
+  return {
+    id: `user-input-${event.id || index}`,
+    sessionId: event.sessionId,
+    ts: event.ts,
+    kind: 'user_msg',
+    payload: {
+      content,
+      source: 'user',
+      sourceEventId: event.id,
+      sourceEventKind: event.kind,
+      presentation: 'body',
+      visibility: 'conversation',
+    },
+    display: {
+      presentation: 'body',
+      defaultOpen: true,
+    },
+  };
+}
+
+function userInputBubbleContent(event: AgentEvent): string | undefined {
+  if (!isRecordPayload(event.payload)) return undefined;
+  if (event.kind === 'user_guidance') {
+    return firstPayloadText(event.payload, ['content', 'guidance', 'text', 'message']);
+  }
+  if (event.kind === 'requirement_decision') {
+    return firstPayloadText(event.payload, ['guidance', 'summary', 'message']) ??
+      selectedOptionLabel(event.payload);
+  }
+  if (event.kind === 'plan_review') {
+    const status = stringField(event.payload, 'status');
+    if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
+    return firstPayloadText(event.payload, ['guidance', 'summary', 'message']);
+  }
+  return undefined;
+}
+
+function selectedOptionLabel(payload: Record<string, unknown>): string | undefined {
+  const selectedOption = isRecordPayload(payload.selectedOption) ? payload.selectedOption : undefined;
+  return selectedOption ? stringField(selectedOption, 'label') : undefined;
+}
+
+function firstPayloadText(payload: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = stringField(payload, key);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function isUserInputAuditOnlyEvent(event: AgentEvent): boolean {
+  return event.kind === 'user_guidance' ||
+    event.kind === 'requirement_decision' ||
+    (event.kind === 'plan_review' && Boolean(userInputBubbleContent(event)));
 }
 
 function annotateLiveOverlayBlocks(
@@ -1218,7 +1358,13 @@ function narrativeRenderMode(
   if (kind === 'assistantNarration') return 'typewriter';
   if (kind === 'assistantText') return 'typewriter';
   if (kind === 'thinking') return status === 'running' || status === 'waiting' ? 'typewriter' : 'static';
-  if ((kind === 'plan' || kind === 'review') && (status === 'running' || status === 'waiting')) return 'typewriter';
+  if (
+    kind === 'plan' ||
+    kind === 'review' ||
+    kind === 'requirement' ||
+    kind === 'permission' ||
+    kind === 'diagnostic'
+  ) return 'typewriter';
   return 'static';
 }
 
@@ -1322,7 +1468,7 @@ function isBlankReasoningEvent(event: AgentEvent): boolean {
 
 // P4(B)：定位"plan accepted"边界——第一次 plan_review(status=accepted) 出现的事件索引。
 // 在此索引之前的 operationEvidence / thinking 视为 explore 阶段，之后为 execute 阶段。
-function findFirstPlanAcceptedIndex(events: AgentEvent[]): number {
+function findFirstAcceptedReviewIndex(events: AgentEvent[]): number {
   for (let i = 0; i < events.length; i += 1) {
     const event = events[i];
     if (event.kind !== 'plan_review') continue;

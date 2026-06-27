@@ -128,6 +128,7 @@ function normalizeTaskPlanTask(value: unknown, index: number): Record<string, un
     softOrderAfter: normalizeStringList(record.softOrderAfter).concat(normalizeStringList(record.softDependencies)),
     conflictKeys: normalizeStringList(record.conflictKeys),
     canDraftInParallel: record.canDraftInParallel !== false,
+    batchKind: optionalString(record, 'batchKind') ?? optionalString(record, 'role'),
     acceptanceCriteria: normalizeStringList(record.acceptanceCriteria),
     failureCriteria: normalizeStringList(record.failureCriteria),
   };
@@ -560,7 +561,19 @@ function normalizeOptionEffect(value: unknown): Record<string, unknown> | undefi
     case 'continueWithAction':
     case 'skipCurrentTask':
     case 'finishRun':
+    case 'finishWithAnswer':
       return { kind };
+    case 'cancel': {
+      const reason = typeof record.reason === 'string' ? record.reason : undefined;
+      return reason ? { kind, reason } : { kind };
+    }
+    case 'markAcceptedIncomplete': {
+      const ids = Array.isArray(record.taskIds)
+        ? record.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
+        : undefined;
+      const reason = typeof record.reason === 'string' ? record.reason : undefined;
+      return { kind, ...(ids?.length ? { taskIds: ids } : {}), ...(reason ? { reason } : {}) };
+    }
     case 'markTasksCompleted': {
       const ids = Array.isArray(record.taskIds)
         ? record.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)

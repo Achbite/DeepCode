@@ -50,6 +50,16 @@ import type { PromptEnvelope } from '../prompt/types.js';
 import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import { buildSessionTaskGraph, type SessionTaskGraph } from '../workflow/index.js';
+import {
+  buildAcceptedPlanPromptFrame,
+  buildAnswerFactsContext,
+  buildReviewFactsContext,
+  buildTaskLedgerSnapshot,
+  evaluateRunState,
+  normalizeDecisionEffect,
+  type AcceptedPlanPromptFrame,
+  type TaskLedgerSnapshot,
+} from '../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 
 export interface SessionDriverLoopPorts {
@@ -137,6 +147,8 @@ interface SessionDriverLoopRunState {
   contextAssembly?: ContextAssemblyRecord;
   taskExecutionCursor?: TaskExecutionCursor;
   currentTaskContext?: CurrentTaskContext;
+  taskLedger?: TaskLedgerSnapshot;
+  acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
   implementationBatch: ImplementationBatchContext;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   resourceRequestRepairAttempted: boolean;
@@ -218,6 +230,8 @@ interface TaskExecutionCursor {
   cursorId: string;
   planId?: string;
   currentTaskId?: string;
+  taskOrder: string[];
+  pendingTaskIds: string[];
   currentNodeId?: string;
   completedTaskIds: string[];
   pendingNodeIds: string[];
@@ -233,6 +247,8 @@ interface CurrentTaskContext {
   taskTitle?: string;
   targets: string[];
   capabilities: string[];
+  taskOrder: string[];
+  pendingTaskIds: string[];
   dependsOn: string[];
   unlocks: string[];
   evidenceNeeds: string[];
@@ -251,6 +267,7 @@ interface AcceptedImplementationPlanTaskContext {
   softOrderAfter: string[];
   conflictKeys: string[];
   canDraftInParallel: boolean;
+  batchKind?: ExecutionSliceRole;
   role?: ExecutionSliceRole;
 }
 
@@ -460,6 +477,14 @@ interface AcceptedPlanBatchProgress {
   remainingTaskIds: string[];
 }
 
+interface AcceptedPlanReadOnlyResourceCompletion {
+  taskId: string;
+  newlyCompletedTaskIds: string[];
+  completedTaskIds: string[];
+  remainingTaskIds: string[];
+  coveredTargets: string[];
+}
+
 type SessionRunStateStatus = 'waiting' | 'running' | 'completed' | 'cancelled' | 'failed';
 
 type SessionRunStateReason =
@@ -542,6 +567,12 @@ interface ProviderToolCallBufferItem {
   argumentsText: string;
 }
 
+interface ProviderReasoningDeltaBuffer {
+  pending: string;
+  lastFlushAt: number;
+  itemId?: string;
+}
+
 interface LlmTurnResult {
   result: LlmChatResult;
   content: string;
@@ -560,6 +591,8 @@ const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
 const DEFAULT_SUB_AGENT_NO_DELTA_TIMEOUT_MS = 45_000;
 const DEFAULT_SUB_AGENT_TOTAL_TIMEOUT_MS = 240_000;
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
+const PROVIDER_REASONING_FLUSH_CHARS = 768;
+const PROVIDER_REASONING_FLUSH_MS = 120;
 const SIDE_EFFECT_CAPABILITIES = new Set([
   'fs.write',
   'fs.patch',
@@ -647,6 +680,8 @@ export class SessionDriverLoop {
       lastAcceptedPlanTaskSavepointId(input.existingEvents ?? [])
     );
     const initialTaskContext = buildCurrentTaskContext(acceptedImplementationPlan, initialTaskCursor);
+    const initialTaskLedger = buildAcceptedPlanTaskLedger(acceptedImplementationPlan);
+    const initialAcceptedPlanPromptFrame = buildAcceptedPlanPromptFrameForContext(acceptedImplementationPlan, initialTaskLedger);
     const state: SessionDriverLoopRunState = {
       sessionId,
       runId,
@@ -675,6 +710,8 @@ export class SessionDriverLoop {
       }),
       taskExecutionCursor: initialTaskCursor,
       currentTaskContext: initialTaskContext,
+      taskLedger: initialTaskLedger,
+      acceptedPlanPromptFrame: initialAcceptedPlanPromptFrame,
       implementationBatch,
       acceptedImplementationPlan,
       resourceRequestRepairAttempted: false,
@@ -974,6 +1011,13 @@ export class SessionDriverLoop {
             this.id('accepted-plan-resource-resume')
           );
           lastResult = await this.append(sessionId, [resumeEvent]) ?? lastResult;
+          const readOnlyCompletion = await this.tryCompleteAcceptedPlanReadOnlyResourceTask(
+            input,
+            state,
+            packet,
+            lastResult
+          );
+          if (readOnlyCompletion) return readOnlyCompletion;
           const resumed = await this.callAcceptedPlanResourceResume(input, state, prompt, proposal, packet);
           if (resumed.kind === 'actionBundle') {
             return this.submitActionProposal(input, state, prompt, resumed, lastResult);
@@ -1193,7 +1237,9 @@ export class SessionDriverLoop {
     effect: RequirementOptionEffect,
     current: AgentSessionResult
   ): Promise<AgentSessionResult | undefined> {
-    if (effect.kind === 'continueWithAction') return undefined;
+    const normalizedEffect = normalizeDecisionEffect(effect);
+    const stateDecision = evaluateRunState({ decisionEffect: normalizedEffect });
+    if (stateDecision.kind === 'continueAcceptedPlan') return undefined;
 
     const decisionPayload = objectRecord(decisionEvent.payload) ?? {};
     const runId = stringValue(decisionPayload.runId) ?? input.runId ?? 'run-unknown';
@@ -1205,7 +1251,39 @@ export class SessionDriverLoop {
       requirementId,
     };
 
-    if (effect.kind === 'finishRun') {
+    if (stateDecision.kind === 'finishWithAnswer') {
+      return this.append(input.sessionId, [
+        answerEvent(input.sessionId, answerProposalFromDecisionEffect(
+          input.sessionId,
+          runId,
+          effect,
+          current.events,
+          input.guidance,
+          this.id('finish-with-answer-proposal')
+        ), this.ts(), this.id('answer'), {
+          answerFactsContext: buildAnswerFactsContext({
+            reviewFactsContext: buildReviewFactsContext({
+              runId,
+              taskLedger: buildAcceptedPlanTaskLedger(this.recoverAcceptedPlanForRequirement(current.events, runId, undefined)),
+            }),
+            userGuidance: input.guidance,
+          }),
+        }),
+        sessionRunStateEvent({
+          sessionId: input.sessionId,
+          runId,
+          phase: 'completed',
+          status: 'completed',
+          reason: 'requirement',
+          decisionOwner: baseOwner,
+          interactionOverlay,
+          ts: this.ts(),
+          id: this.id('session-run-completed-answer'),
+        }),
+      ]) ?? current;
+    }
+
+    if (stateDecision.kind === 'cancel') {
       return this.append(input.sessionId, [
         sessionRunStateEvent({
           sessionId: input.sessionId,
@@ -1221,7 +1299,7 @@ export class SessionDriverLoop {
       ]) ?? current;
     }
 
-    if (effect.kind === 'replan') {
+    if (stateDecision.kind === 'waitForPlanReview') {
       return this.append(input.sessionId, [
         sessionRunStateEvent({
           sessionId: input.sessionId,
@@ -1237,7 +1315,7 @@ export class SessionDriverLoop {
       ]) ?? current;
     }
 
-    // skipCurrentTask / markTasksCompleted：必须有 acceptedImplementationPlan 上下文。
+    // skipTask / markTasksCompleted / markAcceptedIncomplete：必须有 acceptedImplementationPlan 上下文。
     const confirmationPayload = objectRecord(confirmation.payload) ?? {};
     const decisionRequest = objectRecord(confirmationPayload.decisionRequest) ?? {};
     const planId = stringValue(decisionRequest.acceptedPlanId)
@@ -1249,16 +1327,24 @@ export class SessionDriverLoop {
     const currentCompleted = new Set(accepted.completedTaskIds);
     const currentTaskId = accepted.tasks.find((task) => !currentCompleted.has(task.taskId))?.taskId;
     const newlyCompleted: string[] = [];
-    if (effect.kind === 'skipCurrentTask') {
+    let acceptedIncompleteTaskIds: string[] = [];
+    if (normalizedEffect.kind === 'skipTask') {
       if (!currentTaskId) return undefined;
       newlyCompleted.push(currentTaskId);
-    } else {
-      for (const id of effect.taskIds) {
+    } else if (normalizedEffect.kind === 'markAcceptedIncomplete') {
+      const ids = normalizedEffect.taskIds?.length ? normalizedEffect.taskIds : (currentTaskId ? [currentTaskId] : []);
+      acceptedIncompleteTaskIds = ids.filter((id) => !currentCompleted.has(id) && accepted.tasks.some((task) => task.taskId === id));
+      newlyCompleted.push(...acceptedIncompleteTaskIds);
+      if (newlyCompleted.length === 0) return undefined;
+    } else if (normalizedEffect.kind === 'markTasksCompleted') {
+      for (const id of normalizedEffect.taskIds) {
         if (!currentCompleted.has(id) && accepted.tasks.some((task) => task.taskId === id)) {
           newlyCompleted.push(id);
         }
       }
       if (newlyCompleted.length === 0) return undefined;
+    } else {
+      return undefined;
     }
     const mergedCompletedTaskIds = [...accepted.completedTaskIds, ...newlyCompleted];
     const nextAccepted = acceptedPlanAfterBatch(accepted, mergedCompletedTaskIds);
@@ -2291,6 +2377,123 @@ export class SessionDriverLoop {
         );
       }
     }
+  }
+
+  private async tryCompleteAcceptedPlanReadOnlyResourceTask(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    packet: ResourcePacket,
+    fallback: AgentSessionResult
+  ): Promise<AgentSessionResult | null> {
+    const accepted = state.acceptedImplementationPlan;
+    if (!accepted) return null;
+    refreshTaskExecutionState(state);
+    const completion = acceptedPlanReadOnlyResourceCompletion(
+      accepted,
+      state.taskExecutionCursor,
+      state.currentTaskContext,
+      packet
+    );
+    if (!completion.ok) return null;
+
+    const nextAccepted = acceptedPlanAfterBatch(accepted, completion.completedTaskIds);
+    const checkpoint = acceptedPlanResourceValidationCheckpointEvent(
+      state.sessionId,
+      state.runId,
+      accepted,
+      packet,
+      completion,
+      this.ts(),
+      this.id('accepted-plan-resource-validation-checkpoint')
+    );
+    let result = await this.append(state.sessionId, [checkpoint]) ?? fallback;
+
+    if (!acceptedPlanComplete(nextAccepted)) {
+      return this.runUserTurn({
+        sessionId: input.sessionId,
+        content: implementationPlanExecutionRequest(
+          {
+            sessionId: state.sessionId,
+            runId: state.runId,
+            planId: accepted.planId,
+            userPlan: accepted.summary ?? accepted.title ?? 'Accepted implementation plan',
+            actionBundle: {
+              version: '1',
+              id: `${accepted.planId}:read-only-validation`,
+              goal: 'Read-only validation evidence satisfied the current accepted task.',
+              actions: [],
+              validationExpectations: [],
+              reviewExpectations: [],
+            },
+            codeBlocks: [],
+            commandBlocks: [],
+            expectedValidation: '',
+            reviewGuide: '',
+            implementationPlan: accepted.rawPlan,
+          },
+          nextAccepted
+        ),
+        attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
+        existingEvents: result.events,
+        workspaceBinding: input.workspaceBinding,
+        projectWorkingDirectory: input.projectWorkingDirectory,
+        profileId: input.profileId,
+        workflow: input.workflow,
+        appendUserMessage: false,
+        requirementConfirmationMode: 'off',
+        reviewContinuationMode: input.reviewContinuationMode,
+        interventionLevel: input.interventionLevel,
+        projectMemoryMode: input.projectMemoryMode,
+        subAgentMode: input.subAgentMode,
+        subAgentMaxParallel: input.subAgentMaxParallel,
+        resumeResourcePackets: true,
+        acceptedImplementationPlan: nextAccepted,
+      });
+    }
+
+    const factsReply = await this.kernel({
+      command: {
+        kind: 'reviewFactsGet',
+        requestId: this.id('accepted-plan-review-facts-get'),
+        runId: state.runId,
+        sessionId: state.sessionId,
+      },
+    });
+    result = await this.appendProjectedKernelEvents(state.sessionId, factsReply) ?? result;
+    const plan = acceptedPlanReadOnlyReviewContext(state, nextAccepted, packet, completion);
+    const resourceFact = {
+      kind: 'tool.completed',
+      toolName: 'kernel.resourceResolve',
+      status: 'ok',
+      summary: `Kernel resolved ${packet.items.length} resource item(s) for accepted-plan read-only validation.`,
+      output: packet,
+    };
+    const review = reviewSummaryEvent(
+      state.sessionId,
+      plan,
+      [resourceFact, ...(factsReply.events ?? [])],
+      this.ts(),
+      this.id('review-summary')
+    );
+    const reviewPayload = objectRecord(review.payload) ?? {};
+    return this.append(state.sessionId, [
+      review,
+      sessionRunStateEvent({
+        sessionId: state.sessionId,
+        runId: state.runId,
+        phase: 'waiting_review',
+        reason: 'review',
+        decisionOwner: {
+          kind: 'review',
+          runId: state.runId,
+          targetId: stringValue(reviewPayload.reviewId) ?? state.runId,
+          reviewId: stringValue(reviewPayload.reviewId) ?? state.runId,
+          planId: accepted.planId,
+        },
+        ts: this.ts(),
+        id: this.id('session-run-waiting-review'),
+      }),
+    ]) ?? result;
   }
 
   private async callAcceptedPlanResourceResume(
@@ -3451,6 +3654,11 @@ export class SessionDriverLoop {
       },
     };
     const toolCallBuffer = new ProviderToolCallBuffer();
+    const reasoningBuffer: ProviderReasoningDeltaBuffer = {
+      pending: '',
+      lastFlushAt: Date.now(),
+      itemId: undefined,
+    };
     let firstDeltaObserved = false;
     const markFirstDelta = async (): Promise<void> => {
       if (firstDeltaObserved) return;
@@ -3460,18 +3668,19 @@ export class SessionDriverLoop {
     const providerCall = this.ports.llmChatStream
       ? this.ports.llmChatStream(request, async (event) => {
         if (subAgentStreamEventHasDelta(event)) await markFirstDelta();
-        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, deltaContext);
+        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, reasoningBuffer, deltaContext);
       })
       : this.ports.llmChat(request);
-    const result = await raceSubAgentProviderCall(
+	    const result = await raceSubAgentProviderCall(
       providerCall,
       {
         noDeltaTimeoutMs: normalizeSubAgentTimeout(options?.noDeltaTimeoutMs, DEFAULT_SUB_AGENT_NO_DELTA_TIMEOUT_MS),
         totalTimeoutMs: normalizeSubAgentTimeout(options?.totalTimeoutMs, DEFAULT_SUB_AGENT_TOTAL_TIMEOUT_MS),
         enforceNoDelta: Boolean(this.ports.llmChatStream),
       },
-      () => firstDeltaObserved
-    );
+	      () => firstDeltaObserved
+	    );
+    await this.flushProviderReasoningBuffer(state, stage, reasoningBuffer, deltaContext);
     if (!result.ok || !result.data) {
       await this.emitProjectionDelta(state, {
         type: 'error',
@@ -4945,14 +5154,6 @@ export class SessionDriverLoop {
     options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {},
     deltaContext?: ProjectionDeltaBranchContext
   ): Promise<LlmTurnResult> {
-    await this.append(state.sessionId, [
-      thinkingEvent(
-        state.sessionId,
-        providerStageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
-        this.ts(),
-        this.id(`thinking-${stage}`)
-      ),
-    ]);
     await this.appendProviderTrace(state, `${stage}.request`, {
       profileId,
       messages: ensureJsonObjectModeMessages(messages, options.responseFormat),
@@ -4969,6 +5170,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'session',
       summary: providerStageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
+      activity: providerActivity(state, stage, 'running'),
     }, deltaContext);
     const request: LlmChatRequest = {
       profileId,
@@ -4984,11 +5186,17 @@ export class SessionDriverLoop {
       },
     };
     const toolCallBuffer = new ProviderToolCallBuffer();
+    const reasoningBuffer: ProviderReasoningDeltaBuffer = {
+      pending: '',
+      lastFlushAt: Date.now(),
+      itemId: undefined,
+    };
     const result = this.ports.llmChatStream
       ? await this.ports.llmChatStream(request, async (event) => {
-        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, deltaContext);
+        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, reasoningBuffer, deltaContext);
       })
       : await this.ports.llmChat(request);
+    await this.flushProviderReasoningBuffer(state, stage, reasoningBuffer, deltaContext);
     if (!result.ok || !result.data) {
       await this.emitProjectionDelta(state, {
         type: 'error',
@@ -5021,15 +5229,6 @@ export class SessionDriverLoop {
       await this.append(state.sessionId, [
         reasoningEvent(state.sessionId, reasoning, this.ts(), this.id(`reasoning-${stage}`)),
       ]);
-    } else {
-      await this.append(state.sessionId, [
-        thinkingEvent(
-            state.sessionId,
-            providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
-            this.ts(),
-            this.id(`thinking-${stage}-response`)
-        ),
-      ]);
     }
     await this.emitProjectionDelta(state, {
       type: 'active_turn',
@@ -5038,6 +5237,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'provider',
       summary: providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
+      activity: providerActivity(state, stage, 'completed'),
     }, deltaContext);
     const content = stripProviderPartFrames(result.data.assistantMessage?.content
       ?? result.data.chunks
@@ -5061,6 +5261,7 @@ export class SessionDriverLoop {
     stage: string,
     event: LlmChatStreamEvent,
     toolCallBuffer: ProviderToolCallBuffer,
+    reasoningBuffer: ProviderReasoningDeltaBuffer,
     deltaContext?: ProjectionDeltaBranchContext
   ): Promise<void> {
     const chunk = event.chunk;
@@ -5086,17 +5287,7 @@ export class SessionDriverLoop {
       return;
     }
     if (event.type === 'provider_reasoning_delta' && chunk?.content) {
-      await this.emitProjectionDelta(state, {
-        type: 'reasoning_delta',
-        stage,
-        status: 'streaming',
-        channel: 'reasoning',
-        source: 'provider',
-        itemId: chunk.callId,
-        delta: chunk.content,
-        activity: providerActivity(state, stage, 'running'),
-        payload: chunk.rawProvider,
-      }, deltaContext);
+      await this.bufferProviderReasoningDelta(state, stage, reasoningBuffer, chunk, deltaContext);
       return;
     }
     if (event.type === 'provider_tool_call_delta' && chunk) {
@@ -5167,6 +5358,53 @@ export class SessionDriverLoop {
         payload: event.rawProvider ?? chunk?.rawProvider,
       }, deltaContext);
     }
+  }
+
+  private async bufferProviderReasoningDelta(
+    state: SessionDriverLoopRunState,
+    stage: string,
+    buffer: ProviderReasoningDeltaBuffer,
+    chunk: LlmChatResult['chunks'][number],
+    deltaContext?: ProjectionDeltaBranchContext
+  ): Promise<void> {
+    if (typeof chunk.content !== 'string' || chunk.content.length === 0) return;
+    buffer.pending += chunk.content;
+    buffer.itemId = chunk.callId ?? buffer.itemId;
+    const now = Date.now();
+    if (
+      buffer.pending.length < PROVIDER_REASONING_FLUSH_CHARS &&
+      now - buffer.lastFlushAt < PROVIDER_REASONING_FLUSH_MS
+    ) {
+      return;
+    }
+    await this.flushProviderReasoningBuffer(state, stage, buffer, deltaContext);
+  }
+
+  private async flushProviderReasoningBuffer(
+    state: SessionDriverLoopRunState,
+    stage: string,
+    buffer: ProviderReasoningDeltaBuffer,
+    deltaContext?: ProjectionDeltaBranchContext
+  ): Promise<void> {
+    if (!buffer.pending) return;
+    const delta = buffer.pending;
+    buffer.pending = '';
+    buffer.lastFlushAt = Date.now();
+    await this.emitProjectionDelta(state, {
+      type: 'reasoning_delta',
+      stage,
+      status: 'streaming',
+      channel: 'reasoning',
+      source: 'provider',
+      itemId: buffer.itemId,
+      delta,
+      activity: providerActivity(state, stage, 'running'),
+      payload: {
+        presentation: 'reasoningTrace',
+        streamMode: 'markdownBlocks',
+        buffered: true,
+      },
+    }, deltaContext);
   }
 
   private async emitProjectionDelta(
@@ -5258,6 +5496,7 @@ export class SessionDriverLoop {
       source: 'session',
       itemId: `${stage}-provider-json-progress`,
       summary,
+      activity: providerActivity(state, stage, 'running'),
       payload: {
         stage,
         receivedChars: progress.receivedChars,
@@ -6566,6 +6805,53 @@ function refreshTaskExecutionState(state: SessionDriverLoopRunState): void {
     state.taskExecutionCursor?.lastSavepointId
   );
   state.currentTaskContext = buildCurrentTaskContext(state.acceptedImplementationPlan, state.taskExecutionCursor);
+  state.taskLedger = buildAcceptedPlanTaskLedger(state.acceptedImplementationPlan);
+  state.acceptedPlanPromptFrame = buildAcceptedPlanPromptFrameForContext(state.acceptedImplementationPlan, state.taskLedger);
+}
+
+function buildAcceptedPlanTaskLedger(
+  acceptedPlan: AcceptedImplementationPlanContext | undefined,
+  failedTaskId?: string,
+  skippedTaskIds: string[] = [],
+  acceptedIncompleteTaskIds: string[] = []
+): TaskLedgerSnapshot | undefined {
+  if (!acceptedPlan) return undefined;
+  const completed = new Set(acceptedPlan.completedTaskIds);
+  const currentTask = acceptedPlan.tasks.find((task) =>
+    !completed.has(task.taskId) &&
+    task.taskId !== failedTaskId &&
+    !skippedTaskIds.includes(task.taskId) &&
+    !acceptedIncompleteTaskIds.includes(task.taskId)
+  );
+  return buildTaskLedgerSnapshot({
+    planId: acceptedPlan.planId,
+    runId: acceptedPlan.runId,
+    tasks: acceptedPlan.tasks.map((task) => ({
+      taskId: task.taskId,
+      title: task.title,
+      targets: task.targets,
+      capability: task.capability,
+    })),
+    completedTaskIds: acceptedPlan.completedTaskIds,
+    failedTaskId,
+    skippedTaskIds,
+    acceptedIncompleteTaskIds,
+    currentTaskId: currentTask?.taskId,
+  });
+}
+
+function buildAcceptedPlanPromptFrameForContext(
+  acceptedPlan: AcceptedImplementationPlanContext | undefined,
+  taskLedger: TaskLedgerSnapshot | undefined
+): AcceptedPlanPromptFrame | undefined {
+  if (!acceptedPlan || !taskLedger) return undefined;
+  return buildAcceptedPlanPromptFrame({
+    planId: acceptedPlan.planId,
+    runId: acceptedPlan.runId,
+    title: acceptedPlan.title,
+    summary: acceptedPlan.summary,
+    taskLedger,
+  });
 }
 
 function buildTaskExecutionCursor(
@@ -6574,6 +6860,7 @@ function buildTaskExecutionCursor(
   lastSavepointId?: string
 ): TaskExecutionCursor | undefined {
   if (!acceptedPlan) return undefined;
+  const ledger = buildAcceptedPlanTaskLedger(acceptedPlan);
   const completedTasks = new Set(acceptedPlan.completedTaskIds);
   const currentTask = acceptedPlan.tasks.find((task) => !completedTasks.has(task.taskId))
     ?? acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
@@ -6592,6 +6879,8 @@ function buildTaskExecutionCursor(
     cursorId: `task-cursor-${stableHash(cursorKey).slice(0, 16)}`,
     planId: acceptedPlan.planId,
     currentTaskId: currentTask?.taskId,
+    taskOrder: ledger?.taskOrder ?? acceptedPlan.tasks.map((task) => task.taskId),
+    pendingTaskIds: ledger?.pendingTaskIds ?? [],
     currentNodeId: undefined,
     completedTaskIds: [...acceptedPlan.completedTaskIds],
     pendingNodeIds: [],
@@ -6626,6 +6915,8 @@ function buildCurrentTaskContext(
     taskTitle: task?.title,
     targets,
     capabilities,
+    taskOrder: cursor.taskOrder,
+    pendingTaskIds: cursor.pendingTaskIds,
     dependsOn: [],
     unlocks: [],
     evidenceNeeds: [],
@@ -6645,7 +6936,7 @@ function currentTaskMemoryHints(context: CurrentTaskContext | undefined): string
   return [
     'CurrentTaskGoal:',
     context.goal,
-    `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; capabilities=${context.capabilities.join(', ') || 'none'}; completedTasks=${context.completedTaskIds.length}.`,
+    `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; capabilities=${context.capabilities.join(', ') || 'none'}; taskOrder=${context.taskOrder.join(', ') || 'none'}; pendingTasks=${context.pendingTaskIds.join(', ') || 'none'}; completedTasks=${context.completedTaskIds.length}.`,
   ];
 }
 
@@ -6717,6 +7008,8 @@ function acceptedPlanTaskSavepointEvent(
   id: string
 ): AgentEvent {
   const complete = progress.remainingTaskIds.length === 0 && !actionBatchHasFailureOrBlocker(kernelEvents);
+  const ledger = buildAcceptedPlanTaskLedger(nextAccepted);
+  const promptFrame = buildAcceptedPlanPromptFrameForContext(nextAccepted, ledger);
   return {
     id,
     sessionId,
@@ -6726,8 +7019,8 @@ function acceptedPlanTaskSavepointEvent(
       stage: 'accepted_plan.task_savepoint',
       status: complete ? 'completed' : 'running',
       summary: complete
-        ? '当前 accepted taskPlan 已完成全部任务节点。'
-        : '当前 accepted taskPlan 已保存任务节点进度，下一批将从更新后的任务目标继续。',
+        ? '当前 accepted taskPlan 已完成全部任务清单。'
+        : '当前 accepted taskPlan 已保存任务批次进度，下一批将按任务清单顺序继续。',
       runId,
       planId: accepted.planId,
       taskCursorId: cursor?.cursorId,
@@ -6737,6 +7030,10 @@ function acceptedPlanTaskSavepointEvent(
       newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
       remainingTaskIds: progress.remainingTaskIds,
       nextReadyNodeIds: readyNodeIdsForAcceptedPlan(nextAccepted),
+      taskLedger: ledger,
+      taskOrder: ledger?.taskOrder ?? [],
+      nextPendingTaskIds: ledger?.pendingTaskIds ?? [],
+      acceptedPlanPromptFrame: promptFrame,
       targetPaths: progress.targetPaths,
       workUnitIds: progress.workUnitIds,
       kernelEventCount: kernelEvents.length,
@@ -6749,7 +7046,7 @@ function acceptedPlanTaskSavepointEvent(
         kind: complete ? 'reviewCheckpoint' : 'editBatchQueued',
         status: complete ? 'completed' : 'running',
         title: complete ? 'Task plan savepoint complete' : 'Task plan savepoint',
-        summary: complete ? 'All accepted task nodes are complete.' : 'Accepted task progress saved for the next provider checkpoint.',
+        summary: complete ? 'All accepted tasks are complete.' : 'Accepted task progress saved for the next provider checkpoint.',
         source: 'session',
         runId,
         targets: progress.targetPaths,
@@ -7452,7 +7749,7 @@ function providerActivity(
   status: 'running' | 'completed'
 ): AgentConversationActivity {
   return conversationActivity({
-    activityId: `provider-${stage}-${status}`,
+    activityId: `provider-${stage}`,
     kind: 'providerThinking',
     status,
     title: status === 'running' ? 'Provider call running' : 'Provider call completed',
@@ -7883,6 +8180,62 @@ function answerEvent(
   };
 }
 
+function answerProposalFromDecisionEffect(
+  sessionId: string,
+  runId: string,
+  effect: RequirementOptionEffect,
+  events: AgentEvent[],
+  guidance: string | undefined,
+  proposalId: string
+): ProposalEnvelope {
+  const accepted = recoverAcceptedPlanFromEvents(events, runId);
+  const ledger = buildAcceptedPlanTaskLedger(accepted);
+  const completed = ledger?.completedTaskIds.length ?? 0;
+  const total = ledger?.taskOrder.length ?? 0;
+  const pending = ledger?.pendingTaskIds.length ?? 0;
+  const reason = effect.kind === 'finishWithAnswer'
+    ? effect.reason
+    : effect.kind === 'markAcceptedIncomplete'
+      ? effect.reason
+      : undefined;
+  const lines = [
+    '## 当前会话已按用户介入收口',
+    '',
+    '用户已要求停止继续执行并输出总结。以下内容只基于 Session ledger 与 Kernel facts 派生，不声明未发生的工具执行。',
+    '',
+    total ? `- 已确认任务总数：${total}` : '- 当前没有可恢复的 accepted plan 任务清单。',
+    total ? `- 已完成任务：${completed}` : '',
+    total ? `- 未继续执行任务：${pending}` : '',
+    reason ? `- 用户介入原因：${reason}` : '',
+    guidance?.trim() ? `- 用户补充说明：${guidance.trim()}` : '',
+    '',
+    '后续如需继续，需要重新生成或确认新的 Plan；未提交 Kernel 的任务不会被视为完成事实。',
+  ].filter(Boolean);
+  return {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId,
+    runId,
+    sessionId,
+    source: 'system',
+    kind: 'answer',
+    payload: {
+      answer: {
+        version: '1',
+        format: 'markdown',
+        content: lines.join('\n'),
+      },
+    },
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  };
+}
+
+function recoverAcceptedPlanFromEvents(events: AgentEvent[], runId: string): AcceptedImplementationPlanContext | undefined {
+  const plan = latestExecutablePlan(events, runId);
+  if (!plan?.implementationPlan) return undefined;
+  return acceptedPlanWithLatestCheckpoint(acceptedImplementationPlanContext(plan), events);
+}
+
 function answerContent(proposal: ProposalEnvelope): string {
   const payload = objectRecord(proposal.payload) ?? {};
   const answer = objectRecord(payload.answer) ?? payload;
@@ -7994,13 +8347,17 @@ function thinkingEvent(sessionId: string, content: string, ts: string, id: strin
     id,
     sessionId,
     ts,
-    kind: 'assistant_msg',
+    kind: 'workflow_stage',
     payload: {
+      stage: 'session.provider_status',
+      status: 'completed',
+      summary: content,
       content,
-      channel: 'reasoning',
+      channel: 'progress',
+      source: 'session',
       visibility: 'conversation',
-      presentation: 'collapsible',
-      label: 'Thinking',
+      presentation: 'stageSummary',
+      label: 'Session status',
     },
   };
 }
@@ -8014,9 +8371,11 @@ function reasoningEvent(sessionId: string, content: string, ts: string, id: stri
     payload: {
       content,
       channel: 'reasoning',
+      source: 'provider',
       visibility: 'conversation',
       presentation: 'collapsible',
-      label: 'Thinking',
+      reasoningTrace: true,
+      label: 'Model reasoning',
     },
   };
 }
@@ -9265,7 +9624,8 @@ function acceptedImplementationPlanContext(
       softOrderAfter: [...new Set([...explicitSoftOrder, ...legacyDependencies.filter((dependency) => !hardDependencies.includes(dependency))])],
       conflictKeys,
       canDraftInParallel: record.canDraftInParallel !== false,
-      role: executionSliceRoleValue(record.role),
+      batchKind: executionSliceRoleValue(record.batchKind) ?? executionSliceRoleValue(record.role),
+      role: executionSliceRoleValue(record.batchKind) ?? executionSliceRoleValue(record.role),
     }];
   });
   const capabilities = [...new Set(taskContexts.map((task) => task.capability).filter((item): item is string => Boolean(item)))];
@@ -9506,6 +9866,43 @@ function acceptedPlanExecutionContext(
     reviewGuide: stringValue(payload.reviewGuide) ?? '',
     planReviewReport,
     implementationPlan: accepted?.rawPlan,
+  };
+}
+
+function acceptedPlanReadOnlyReviewContext(
+  state: SessionDriverLoopRunState,
+  accepted: AcceptedImplementationPlanContext,
+  packet: ResourcePacket,
+  completion: AcceptedPlanReadOnlyResourceCompletion
+): SessionPlanContext {
+  const targets = completion.coveredTargets.join(', ');
+  return {
+    sessionId: state.sessionId,
+    runId: state.runId,
+    planId: accepted.planId,
+    proposalId: `${accepted.planId}:read-only-validation`,
+    userPlan: targets
+      ? `Read-only validation evidence resolved for accepted targets: ${targets}.`
+      : 'Read-only validation evidence resolved for the accepted plan.',
+    actionBundle: {
+      version: '1',
+      id: `${accepted.planId}:read-only-validation`,
+      goal: 'Read-only validation evidence satisfied the accepted task.',
+      actions: [],
+      validationExpectations: [{
+        id: 'read-only-resource-validation',
+        description: `ResourcePacket ${packet.id} resolved the read-only evidence required by the accepted task.`,
+      }],
+      reviewExpectations: [{
+        id: 'review-read-only-validation',
+        description: 'Review the resolved resource evidence and accepted-plan checkpoint.',
+      }],
+    },
+    codeBlocks: [],
+    commandBlocks: [],
+    expectedValidation: `ResourcePacket ${packet.id} resolved the read-only evidence for the accepted task.`,
+    reviewGuide: 'Review the resolved ResourcePacket evidence and accepted-plan checkpoint.',
+    implementationPlan: accepted.rawPlan,
   };
 }
 
@@ -9968,6 +10365,76 @@ function resourceEvidenceMentionsAnyTarget(packets: ResourcePacket[], targets: s
     .some((item) => resourcePacketItemMatchesAnyTarget(item, normalizedTargets));
 }
 
+function acceptedPlanReadOnlyResourceCompletion(
+  accepted: AcceptedImplementationPlanContext,
+  cursor: TaskExecutionCursor | undefined,
+  current: CurrentTaskContext | undefined,
+  packet: ResourcePacket
+): { ok: true } & AcceptedPlanReadOnlyResourceCompletion | { ok: false } {
+  if (!cursor?.currentTaskId || !current?.taskId || cursor.currentTaskId !== current.taskId) return { ok: false };
+  const task = accepted.tasks.find((candidate) => candidate.taskId === current.taskId);
+  if (!task || accepted.completedTaskIds.includes(task.taskId)) return { ok: false };
+  const capabilities = current.capabilities.length
+    ? current.capabilities
+    : task.capability
+      ? [task.capability]
+      : [];
+  if (!capabilities.length || !capabilities.every(acceptedPlanCapabilityIsReadOnlyValidation)) return { ok: false };
+  const targets = current.targets.length ? current.targets : task.targets;
+  const coveredTargets = acceptedPlanResourceCoveredTargets(packet, targets);
+  if (!targets.length || coveredTargets.length < uniqueStrings(targets.map(normalizePlanScope).filter(Boolean)).length) {
+    return { ok: false };
+  }
+  const completedTaskIds = [...new Set([...accepted.completedTaskIds, task.taskId])];
+  const completed = new Set(completedTaskIds);
+  return {
+    ok: true,
+    taskId: task.taskId,
+    newlyCompletedTaskIds: [task.taskId],
+    completedTaskIds,
+    remainingTaskIds: accepted.tasks.map((item) => item.taskId).filter((taskId) => !completed.has(taskId)),
+    coveredTargets,
+  };
+}
+
+function acceptedPlanCapabilityIsReadOnlyValidation(capability: string): boolean {
+  return [
+    'fs.read',
+    'fs.list',
+    'code.search',
+    'git.read',
+  ].includes(capability);
+}
+
+function acceptedPlanResourceCoveredTargets(packet: ResourcePacket, targets: string[]): string[] {
+  const normalizedTargets = uniqueStrings(targets.map(normalizePlanScope).filter(Boolean));
+  if (!normalizedTargets.length) return [];
+  const resolvedItems = (packet.items ?? [])
+    .filter((item) => item.status === 'resolved' || item.status === 'provided');
+  return normalizedTargets.filter((target) =>
+    resolvedItems.some((item) => resourcePacketItemMatchesTargetScope(item, target))
+  );
+}
+
+function resourcePacketItemMatchesTargetScope(item: ResourcePacketItem, target: string): boolean {
+  const normalizedTarget = normalizePlanScope(target);
+  if (!normalizedTarget) return false;
+  const candidates = [
+    item.path,
+    item.absolutePath,
+    item.manifestEntryId,
+  ]
+    .map((value) => typeof value === 'string' ? normalizePlanScope(value) : '')
+    .filter(Boolean);
+  return candidates.some((candidate) =>
+    candidate === normalizedTarget ||
+    candidate.endsWith(`/${normalizedTarget}`) ||
+    normalizedTarget.endsWith(`/${candidate}`) ||
+    planScopeCovers(normalizedTarget, candidate) ||
+    planScopeCovers(candidate, normalizedTarget)
+  );
+}
+
 function resourceEvidenceContainsExactBlock(
   packets: ResourcePacket[],
   targets: string[],
@@ -10098,12 +10565,17 @@ function acceptedPlanBatchProgress(
     .filter((target) => target && target !== '.' && target !== '..'))];
   const workUnitIds = workUnitIdsFromKernelEvents(kernelEvents);
   const priorCompleted = new Set(accepted.completedTaskIds);
+  const coveredTaskIds = new Set<string>();
+  for (const task of accepted.tasks) {
+    if (!priorCompleted.has(task.taskId) && acceptedPlanTaskCoveredByBatch(task, targetPaths, actionCapabilities)) {
+      coveredTaskIds.add(task.taskId);
+    }
+  }
   const newlyCompleted = new Set<string>();
   for (const task of accepted.tasks) {
     if (priorCompleted.has(task.taskId)) continue;
-    if (acceptedPlanTaskCoveredByBatch(task, targetPaths, actionCapabilities)) {
-      newlyCompleted.add(task.taskId);
-    }
+    if (!coveredTaskIds.has(task.taskId)) break;
+    newlyCompleted.add(task.taskId);
   }
   if (!newlyCompleted.size && !actionBatchHasFailureOrBlocker(kernelEvents)) {
     const currentTask = accepted.tasks[Math.max(0, accepted.batchIndex - 1)];
@@ -10589,12 +11061,12 @@ function subAgentSkippedSummary(
   if (reason === 'mode_off') return `子代理已在设置中关闭，Session 将按串行执行。${suffix}`;
   if (reason === 'max_parallel_lt_2') return `子代理最大并发小于 2，Session 将按串行执行。${suffix}`;
   if (reason === 'already_attempted') return `本轮 accepted plan 已尝试过子代理并行，Session 不会重复启动分支。${suffix}`;
-  if (reason === 'flow_graph_blocked') return `当前 ExecutionFlowGraph 没有两个可同时运行的 ready 节点，Session 将按 parent 线性执行。${suffix}`;
+  if (reason === 'flow_graph_blocked') return `当前任务清单没有足够可安全并行的批次，Session 将按 parent 线性执行。${suffix}`;
   if (reason === 'hard_dependency_blocked') return `当前剩余任务存在真实 hard dependency 阻塞，Session 暂不并行。${suffix}`;
   if (reason === 'target_conflict') return `当前剩余任务存在目标或 conflictKey 重叠，Session 暂不并行。${suffix}`;
   if (reason === 'capability_not_parallel_safe') return `当前剩余任务包含不适合子代理草稿并行的能力，Session 暂不并行。${suffix}`;
   if (reason === 'queued_guidance') return `检测到新的用户引导，Session 将回到 parent checkpoint。${suffix}`;
-  return `当前 accepted plan 没有足够可并行的 DAG ready 节点，Session 将按串行执行。${suffix}`;
+  return `当前 accepted plan 没有足够可安全并行的任务批次，Session 将按串行执行。${suffix}`;
 }
 
 function subAgentParentFallbackMessages(
@@ -11924,6 +12396,19 @@ function requirementDrivenTaskCheckpointEvent(
   id: string
 ): AgentEvent {
   const complete = remainingTaskIds.length === 0;
+  const ledger = buildTaskLedgerSnapshot({
+    planId: accepted.planId,
+    runId,
+    tasks: accepted.tasks.map((task) => ({
+      taskId: task.taskId,
+      title: task.title,
+      targets: task.targets,
+      capability: task.capability,
+    })),
+    completedTaskIds,
+    skippedTaskIds: effectKind === 'skipCurrentTask' ? newlyCompletedTaskIds : [],
+    acceptedIncompleteTaskIds: effectKind === 'markAcceptedIncomplete' ? newlyCompletedTaskIds : [],
+  });
   const summary = complete
     ? 'Accepted plan tasks resolved via user requirement decision; ready for final review.'
     : 'User requirement decision advanced the accepted plan task cursor.';
@@ -11945,6 +12430,9 @@ function requirementDrivenTaskCheckpointEvent(
       newlyCompletedTaskIds,
       completedTaskIds,
       remainingTaskIds,
+      taskLedger: ledger,
+      taskOrder: ledger.taskOrder,
+      nextPendingTaskIds: ledger.pendingTaskIds,
       channel: 'progress',
       visibility: 'conversation',
       presentation: 'collapsible',
@@ -11974,6 +12462,20 @@ function acceptedPlanBatchCheckpointEvent(
 ): AgentEvent {
   const failedOrBlocked = actionBatchHasFailureOrBlocker(kernelEvents);
   const complete = !failedOrBlocked && progress.remainingTaskIds.length === 0;
+  const ledger = buildTaskLedgerSnapshot({
+    planId: accepted.planId,
+    runId,
+    tasks: accepted.tasks.map((task) => ({
+      taskId: task.taskId,
+      title: task.title,
+      targets: task.targets,
+      capability: task.capability,
+    })),
+    completedTaskIds: progress.completedTaskIds,
+    failedTaskId: failedOrBlocked
+      ? accepted.tasks.find((task) => !progress.completedTaskIds.includes(task.taskId))?.taskId
+      : undefined,
+  });
   const summary = failedOrBlocked
     ? '已确认计划的当前执行批次存在失败或阻塞，已暂停自动推进。'
     : complete
@@ -11998,6 +12500,9 @@ function acceptedPlanBatchCheckpointEvent(
       newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
       completedTaskIds: progress.completedTaskIds,
       remainingTaskIds: progress.remainingTaskIds,
+      taskLedger: ledger,
+      taskOrder: ledger.taskOrder,
+      nextPendingTaskIds: ledger.pendingTaskIds,
       channel: 'progress',
       visibility: 'conversation',
       presentation: 'collapsible',
@@ -12013,6 +12518,71 @@ function acceptedPlanBatchCheckpointEvent(
         targets: progress.targetPaths,
         actionIds: progress.actionIds,
         workUnitIds: progress.workUnitIds,
+      }),
+    },
+  };
+}
+
+function acceptedPlanResourceValidationCheckpointEvent(
+  sessionId: string,
+  runId: string,
+  accepted: AcceptedImplementationPlanContext,
+  packet: ResourcePacket,
+  completion: AcceptedPlanReadOnlyResourceCompletion,
+  ts: string,
+  id: string
+): AgentEvent {
+  const complete = completion.remainingTaskIds.length === 0;
+  const ledger = buildTaskLedgerSnapshot({
+    planId: accepted.planId,
+    runId,
+    tasks: accepted.tasks.map((task) => ({
+      taskId: task.taskId,
+      title: task.title,
+      targets: task.targets,
+      capability: task.capability,
+    })),
+    completedTaskIds: completion.completedTaskIds,
+  });
+  const summary = complete
+    ? 'Read-only evidence satisfied the remaining accepted task; ready for final review.'
+    : 'Read-only evidence satisfied the current accepted task; Session will continue with the next task.';
+  return {
+    id,
+    sessionId,
+    ts,
+    kind: 'workflow_stage',
+    payload: {
+      stage: 'accepted_plan.batch_checkpoint',
+      status: 'completed',
+      summary,
+      runId,
+      planId: accepted.planId,
+      source: 'resourceValidation',
+      batchIndex: accepted.batchIndex,
+      resourcePacketId: packet.id,
+      validatedTaskId: completion.taskId,
+      coveredTargets: completion.coveredTargets,
+      targetPaths: completion.coveredTargets,
+      newlyCompletedTaskIds: completion.newlyCompletedTaskIds,
+      completedTaskIds: completion.completedTaskIds,
+      remainingTaskIds: completion.remainingTaskIds,
+      taskLedger: ledger,
+      taskOrder: ledger.taskOrder,
+      nextPendingTaskIds: ledger.pendingTaskIds,
+      channel: 'progress',
+      visibility: 'conversation',
+      presentation: 'collapsible',
+      activity: conversationActivity({
+        activityId: id,
+        kind: complete ? 'reviewCheckpoint' : 'editBatchQueued',
+        status: 'completed',
+        title: complete ? 'Accepted plan validation complete' : 'Accepted plan read-only validation completed',
+        summary,
+        source: 'session',
+        runId,
+        planId: accepted.planId,
+        targets: completion.coveredTargets,
       }),
     },
   };
@@ -13038,6 +13608,22 @@ function reviewSummaryEvent(
   const language = visibleLanguageForRequest(plan.userPlan);
   const summary = reviewWaitingSummary(failed, blocked, language);
   const readableReview = buildReadableReviewSummary(kernelEvents, reviewFacts);
+  const acceptedPlanForReview = plan.implementationPlan
+    ? acceptedImplementationPlanContext(plan)
+    : undefined;
+  const reviewTaskLedger = acceptedPlanForReview
+    ? buildAcceptedPlanTaskLedger(acceptedPlanAfterBatch(
+      acceptedPlanForReview,
+      acceptedPlanBatchProgress(acceptedPlanForReview, proposalEnvelopeFromPlanContext(plan), kernelEvents).completedTaskIds
+    ))
+    : undefined;
+  const reviewFactsContext = buildReviewFactsContext({
+    planId: plan.planId,
+    runId: plan.runId,
+    taskLedger: reviewTaskLedger,
+    changedFileCount: readableReview.changedFiles.length,
+    auditRefCount: readableReview.auditRefs.length,
+  });
   return {
     id,
     sessionId,
@@ -13066,11 +13652,13 @@ function reviewSummaryEvent(
       reviewFacts,
       gitReview,
       readableReview,
+      reviewFactsContext,
       changedFiles: readableReview.changedFiles,
       developerDetails: {
         facts,
         reviewFacts,
         gitReview,
+        reviewFactsContext,
       },
       facts,
       factCounts: {
@@ -13800,18 +14388,23 @@ function implementationPlanExecutionRequest(
 ): string {
   const planJson = JSON.stringify(plan.implementationPlan ?? {}, null, 2);
   const currentTask = acceptedPlan.tasks.find((task) => !acceptedPlan.completedTaskIds.includes(task.taskId));
+  const taskLedger = buildAcceptedPlanTaskLedger(acceptedPlan);
+  const promptFrame = buildAcceptedPlanPromptFrameForContext(acceptedPlan, taskLedger);
   return [
     '用户已接受 Kernel execution contract。现在进入 Edit 阶段，生成下一批可执行候选 actionBundle。',
     '已接受的计划/contract 是 intent/checklist，不是执行事实；不得声称文件已创建、测试已通过或权限已授予。',
     'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. Final workspace writes still come only from the complete actionBundle JSON.',
     'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
     '选择当前任务清单中的相关工作，允许在同一个 actionBundle 中输出多个相关文件或动作；文件数、任务数、codeBlock 数不是权限边界。',
-    '任务顺序约定：accepted plan 已按用户确认的 tasks[] 顺序执行。不要重新生成依赖图、ready nodes 或并行分支；如果后续任务依赖当前任务，请把它留到当前任务完成后的下一批。',
+    '任务顺序约定：accepted plan 已按用户确认的 tasks[] 顺序执行。不要重新生成依赖图或并行调度结构；如果后续任务依赖当前任务，请把它留到当前任务完成后的下一批。',
     '嵌套 actionBundle 对象必须包含 version/id/goal/actions；goal 只是本批次目标摘要，不是权限授权、执行事实或完成声明。',
     'actionBundle.actions 必须使用 actionId、toolId、args、description、dependsOn；Kernel 会从 toolId 和 args 派生 capability、permission、readSet/writeSet/conflictKeys。',
     currentTask
       ? `当前任务：taskId=${currentTask.taskId}; title=${currentTask.title ?? '未命名'}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}。`
       : '当前任务清单已完成或无法定位；请返回 diagnostic 或 review-ready summary，不要扩展新范围。',
+    promptFrame
+      ? `AcceptedPlanPromptFrame: stableFrameHash=${promptFrame.stableFrameHash.slice(0, 16)}; taskOrder=${promptFrame.taskLedger.taskOrder.join(', ') || 'none'}; currentTask=${promptFrame.taskLedger.currentTaskId ?? 'none'}; pending=${promptFrame.taskLedger.pendingTaskIds.join(', ') || 'none'}; projectMemoryRefresh=${promptFrame.cachePolicy.projectMemoryRefresh}.`
+      : '',
     acceptedPlan.completedTaskIds.length
       ? `已完成 taskId：${acceptedPlan.completedTaskIds.join(', ')}。不要重复生成已完成任务，除非 Kernel facts 显示失败或用户要求修订。`
       : '当前 accepted contract 尚无已完成任务。',
@@ -13856,11 +14449,11 @@ function acceptedPlanResourceResumePrompt(
     'You are resuming the same accepted taskPlan after Session resolved read-only evidence. Do not restart planning, do not ask for already-confirmed scope, and do not claim execution facts.',
     'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. These frames are draft ledger previews only; final workspace writes still come only from the complete actionBundle JSON.',
     'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
-    'Return exactly one Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, or diagnostic.',
+    'Return exactly one Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, answer, or diagnostic.',
     resourceRequestProtocolShapeLine(),
-    'Prefer actionBundle if the just-resolved evidence is sufficient for the current task. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
+    'Prefer actionBundle if the just-resolved evidence is sufficient for an edit task. If the current task is read-only validation and the ResourcePacket is enough, return answer summarizing only the resolved evidence. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
     accepted ? `Accepted plan: planId=${accepted.planId}; title=${accepted.title ?? accepted.summary ?? accepted.planId}; completedTasks=${accepted.completedTaskIds.join(', ') || 'none'}.` : '',
-    cursor ? `TaskExecutionCursor: cursorId=${cursor.cursorId}; currentTaskId=${cursor.currentTaskId ?? 'none'}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}. Deprecated graph node fields may appear in compatibility telemetry; do not plan around them.` : '',
+    cursor ? `TaskExecutionCursor: cursorId=${cursor.cursorId}; currentTaskId=${cursor.currentTaskId ?? 'none'}; taskOrder=${cursor.taskOrder.join(', ') || 'none'}; pendingTasks=${cursor.pendingTaskIds.join(', ') || 'none'}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}. Deprecated graph node fields may appear in compatibility telemetry only; do not plan around them.` : '',
     current ? `CurrentTaskGoal: ${current.goal}` : '',
     current ? `CurrentTaskContext: targets=${current.targets.join(', ') || 'none'}; capabilities=${current.capabilities.join(', ') || 'none'}; dependsOn=${current.dependsOn.join(', ') || 'none'}; unlocks=${current.unlocks.join(', ') || 'none'}; evidenceNeeds=${current.evidenceNeeds.join(', ') || 'none'}.` : '',
     `Original resourceRequest proposalId=${requestProposal.proposalId}; kind=${requestProposal.kind}.`,
@@ -14221,6 +14814,7 @@ interface RequirementDecisionOption {
   label: string;
   description?: string;
   recommended?: boolean;
+  effect?: unknown;
 }
 
 function isDecisionRequestPayload(value: Record<string, unknown> | undefined): boolean {
@@ -14251,6 +14845,7 @@ function decisionRequestOptions(value: Record<string, unknown> | undefined): Req
       label,
       description,
       recommended: record.recommended === true,
+      effect: record.effect,
     }];
   });
 }
@@ -14693,7 +15288,7 @@ function resourceRequestRepairMessages(
         'Use kind="resourceRequest" only when requesting manifestEntryId, root-relative path, or kind="search" with a non-empty query under the listed conversation roots.',
         resourceRequestProtocolShapeLine(),
         'Use kind="decisionRequest" only when user input is required; minimal shape is {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","decisionRequest":{"id":"decision-1","question":"...","options":[{"id":"option-1","label":"...","description":"...","effect":{"kind":"continueWithAction"}},{"id":"option-2","label":"...","description":"...","effect":{"kind":"continueWithAction"}}],"allowsFreeform":true}}.',
-        'Each decisionRequest option SHOULD declare its state-machine effect via option.effect. Allowed kinds: "continueWithAction" (default, generate next actionBundle), "skipCurrentTask" (mark current accepted-plan task complete and advance), "markTasksCompleted" with taskIds[], "replan" with reason, "finishRun". When the user-visible question implies "the task is already satisfied / nothing to do", at least one option MUST use skipCurrentTask or markTasksCompleted so the session can advance without forcing an empty actionBundle.',
+        'Each decisionRequest option SHOULD declare its state-machine effect via option.effect. Allowed kinds: "continueWithAction" (default, generate next actionBundle), "skipCurrentTask" (mark current accepted-plan task complete and advance), "markTasksCompleted" with taskIds[], "markAcceptedIncomplete" with optional taskIds[] and reason, "replan" with reason, "finishWithAnswer", and "cancel". When the user-visible question implies "the task is already satisfied / nothing to do / stop and summarize", at least one option MUST use skipCurrentTask, markTasksCompleted, markAcceptedIncomplete, or finishWithAnswer so the session can advance without forcing an empty actionBundle.',
         'Do not invent arbitrary absolute local paths. Absolute file paths are only for user-provided outside-workspace targets that require Kernel PlanReview/permission.',
       ].join('\n'),
     },
@@ -15004,7 +15599,23 @@ function selectedRequirementDecisionOptionEffect(event: AgentEvent): Requirement
     case 'continueWithAction':
     case 'skipCurrentTask':
     case 'finishRun':
+    case 'finishWithAnswer':
       return { kind } as RequirementOptionEffect;
+    case 'cancel': {
+      const reason = stringValue(effect.reason);
+      return reason ? { kind: 'cancel', reason } : { kind: 'cancel' };
+    }
+    case 'markAcceptedIncomplete': {
+      const taskIds = Array.isArray(effect.taskIds)
+        ? effect.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
+        : undefined;
+      const reason = stringValue(effect.reason);
+      return {
+        kind: 'markAcceptedIncomplete',
+        ...(taskIds?.length ? { taskIds } : {}),
+        ...(reason ? { reason } : {}),
+      };
+    }
     case 'markTasksCompleted': {
       const ids = Array.isArray(effect.taskIds)
         ? effect.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
@@ -15027,7 +15638,10 @@ type RequirementOptionEffect =
   | { kind: 'markTasksCompleted'; taskIds: string[] }
   | { kind: 'skipCurrentTask' }
   | { kind: 'replan'; reason?: string }
-  | { kind: 'finishRun' };
+  | { kind: 'finishRun' }
+  | { kind: 'markAcceptedIncomplete'; taskIds?: string[]; reason?: string }
+  | { kind: 'finishWithAnswer'; reason?: string }
+  | { kind: 'cancel'; reason?: string };
 
 function acceptedPlanScopeRevisionRequest(
   confirmation: AgentEvent,

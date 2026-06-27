@@ -11,6 +11,7 @@ export * from './promptHistory.js';
 export * from './requirement/index.js';
 export * from './resume.js';
 export * from './review/index.js';
+export * from './run-state/index.js';
 export * from './sidechain.js';
 export * from './storageClient.js';
 export * from './task-queue/index.js';

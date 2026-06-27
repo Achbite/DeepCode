@@ -32,15 +32,12 @@ const REDUNDANT_PRE_TOOL_EXECUTION = new Set<string>([
   'fs.delete',
 ]);
 
-// 元噪声活动 kind：providerThinking / subagentBranch / subagentMerge / diagnostic / editFileStarted / editBatchQueued
-// 这些不携带最终用户事实，不应单独成块。
+// 元噪声活动 kind：providerThinking 只表示模型等待状态；subagentBranch/subagentMerge
+// 归右侧子代理面板展示生命周期，不在主时间线重复成块。
 const SUPPRESSED_ACTIVITY_KINDS = new Set<string>([
   'providerThinking',
   'subagentBranch',
   'subagentMerge',
-  'diagnostic',
-  'editFileStarted',
-  'editBatchQueued',
 ]);
 
 /**
@@ -48,9 +45,16 @@ const SUPPRESSED_ACTIVITY_KINDS = new Set<string>([
  * 输入参数采用解构而非完整 AgentEvent，避免 session-core 引用 GUI 的运行时投影类型。
  */
 export function isInternalOrchestrationStage(input: { stage?: string; kernelEventKind?: string }): boolean {
+  if (input.stage && isProviderLifecycleStage(input.stage)) return true;
   if (input.stage && INTERNAL_ORCHESTRATION_STAGES.has(input.stage)) return true;
   if (input.kernelEventKind && INTERNAL_ORCHESTRATION_STAGES.has(input.kernelEventKind)) return true;
   return false;
+}
+
+function isProviderLifecycleStage(stage: string): boolean {
+  return stage === 'provider_call' ||
+    stage === 'accepted_plan_provider_call' ||
+    stage.startsWith('provider_tool_resume_');
 }
 
 /**

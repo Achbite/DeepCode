@@ -25,9 +25,13 @@ import {
   buildSessionMemoryDocument,
   buildSessionMemorySnapshot,
   buildSessionTaskGraph,
+  buildAcceptedPlanPromptFrame,
+  buildTaskLedgerSnapshot,
   collectUserGuidanceEvents,
   createResourcePacket,
+  evaluateRunState,
   findLatestPendingPermission,
+  normalizeDecisionEffect,
   parseProposalEnvelope,
   SessionDriver,
   SessionDriverLoop,
@@ -42,6 +46,7 @@ async function main(): Promise<void> {
   assertActionBundleProtocolFields();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
+  assertRunStateMachineTaskLedger();
   assertResourcePromptBlocksStabilize();
   assertSessionMemoryDocument();
   assertSessionTaskGraphProjection();
@@ -50,6 +55,7 @@ async function main(): Promise<void> {
   await assertProviderTraceArchiveCompactsStreamingChunks();
   await assertProviderPartFramesEnterKernelDraftLedger();
   await assertAcceptedPlanStreamingDraftsAndJsonProgress();
+  await assertProviderLifecycleStatusDoesNotEnterReasoningBody();
   assertSettingsCatalogBoundaries();
   assertNarrativeTimelineProjection();
   assertTimelineProjectionWithLiveOverlay();
@@ -66,6 +72,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopOldResourceBudgetDecisionStillResumes();
   await assertSessionDriverLoopProjectsDecisionRequest();
   await assertSessionDriverLoopRequirementChoiceEntersResumePrompt();
+  await assertSessionDriverLoopRequirementFinishWithAnswerClosesWithoutProviderLoop();
   await assertSessionDriverLoopProjectsTaskPlanBeforeComplete();
   await assertSessionDriverLoopRepairsSideEffectBundleEvidence();
   await assertSessionDriverLoopRepairsInvalidSourceBlock();
@@ -116,6 +123,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedImplementationPlanResumesAfterDecisionRequest();
   await assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedArtifactEvidence();
   await assertSessionDriverLoopAcceptedImplementationPlanResumesFromResourceCursor();
+  await assertSessionDriverLoopAcceptedReadOnlyResourceValidationCompletesWithoutProviderLoop();
   await assertSessionDriverLoopAcceptedImplementationPlanDoesNotInheritSubAgentAutoSetting();
   await assertSessionDriverLoopAcceptedImplementationPlanInheritsSubAgentOffSetting();
   await assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedProcessExecPermissionGate();
@@ -279,6 +287,93 @@ async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Pro
   assert(promptText.includes('用户已完成用户介入选择'), 'resume prompt states that the user already selected an option');
   assert(promptText.includes('Alpha branch'), 'resume prompt includes the selected option label');
   assert(promptText.includes('不要重复输出同一个 decisionRequest'), 'resume prompt guards against repeating the same decision request');
+}
+
+async function assertSessionDriverLoopRequirementFinishWithAnswerClosesWithoutProviderLoop(): Promise<void> {
+  const suffix = randomSmokeToken('finish');
+  const events: AgentEvent[] = [{
+    id: `requirement-${suffix}`,
+    sessionId: `session-${suffix}`,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'requirement_confirmation',
+    payload: {
+      title: 'Requirement confirmation',
+      summary: 'Choose a generic continuation.',
+      content: 'Choose a generic continuation.',
+      originalUserRequest: 'Handle a generic accepted-plan checkpoint.',
+      runId: `run-${suffix}`,
+      requirementId: `requirement-${suffix}`,
+      status: 'waitingUserConfirmation',
+      confirmable: true,
+      decisionRequest: {
+        id: `decision-${suffix}`,
+        question: 'Choose a generic continuation.',
+        options: [
+          {
+            id: 'finish',
+            label: 'Finish with answer',
+            description: 'Stop further implementation and summarize current facts.',
+            recommended: true,
+            effect: { kind: 'finishWithAnswer', reason: 'generic user stop request' },
+          },
+          {
+            id: 'continue',
+            label: 'Continue',
+            description: 'Continue with the next implementation batch.',
+            effect: { kind: 'continueWithAction' },
+          },
+        ],
+        allowsFreeform: true,
+      },
+    },
+  }];
+  const session: AgentSession = {
+    id: `session-${suffix}`,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'answer',
+        outputLanguage: 'en-US',
+        answer: { format: 'markdown', content: 'This should not be needed for finishWithAnswer.' },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'requirement',
+    decision: 'accept',
+    guidance: [
+      'Selected option:',
+      '- id: finish',
+      '- label: Finish with answer',
+    ].join('\n'),
+    runId: `run-${suffix}`,
+    targetId: `requirement-${suffix}`,
+    existingEvents: events,
+  });
+
+  assertEqual(llmCalls, 0, 'finishWithAnswer is handled by Session facts without provider loop');
+  assert(result.events.some((event) => event.kind === 'assistant_msg'), 'finishWithAnswer emits an answer message');
+  assert(result.events.some((event) =>
+    event.kind === 'session_run_state' &&
+    (event.payload as any)?.status === 'completed' &&
+    (event.payload as any)?.reason === 'requirement'
+  ), 'finishWithAnswer closes the requirement run');
 }
 
 async function assertSessionDriverLoopProjectsTaskPlanBeforeComplete(): Promise<void> {
@@ -851,6 +946,38 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('not governed by a fixed Session round budget'), 'prompt explains read-only requests are user-controlled');
   assert(prompt.dynamicSuffix.includes('offsetBytes/limitBytes'), 'prompt hints range reread for truncated resources');
   assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
+}
+
+function assertRunStateMachineTaskLedger(): void {
+  const suffix = randomSmokeToken('ledger');
+  const taskIds = Array.from({ length: 5 }, (_item, index) => `task-${suffix}-${index + 1}`);
+  const ledger = buildTaskLedgerSnapshot({
+    planId: `plan-${suffix}`,
+    runId: `run-${suffix}`,
+    tasks: taskIds.map((taskId, index) => ({
+      taskId,
+      title: `Generic batch ${index + 1}`,
+      targets: [`generated-${suffix}-${index + 1}.txt`],
+      capability: 'fs.write',
+    })),
+    completedTaskIds: [taskIds[0], taskIds[1]],
+  });
+  assertEqual(ledger.taskOrder.join('|'), taskIds.join('|'), 'task ledger preserves ordered checklist order');
+  assertEqual(ledger.currentTaskId, taskIds[2], 'task ledger selects the first incomplete task as current');
+  assertEqual(ledger.pendingTaskIds.includes(taskIds[4]), true, 'task ledger keeps later tasks pending instead of ready-node scheduling');
+  assertEqual(evaluateRunState({ ledger }).kind, 'continueAcceptedPlan', 'state machine continues accepted plan when tasks remain');
+  const finish = evaluateRunState({ ledger, decisionEffect: normalizeDecisionEffect({ kind: 'finishWithAnswer', reason: 'generic stop' }) });
+  assertEqual(finish.kind, 'finishWithAnswer', 'finishWithAnswer effect routes to an answer terminal');
+  const frame = buildAcceptedPlanPromptFrame({
+    planId: `plan-${suffix}`,
+    runId: `run-${suffix}`,
+    title: 'Generic ordered plan',
+    summary: 'Generic ordered plan summary',
+    taskLedger: ledger,
+  });
+  assertEqual(frame.cachePolicy.stablePrefixFrozen, true, 'accepted plan prompt frame freezes stable prefix policy');
+  assertEqual(frame.cachePolicy.projectMemoryRefresh, 'afterReviewOrRunCompletion', 'project memory does not refresh during active execution');
+  assert(frame.stableFrameHash.length > 0, 'accepted plan prompt frame records a stable hash');
 }
 
 function assertSettingsCatalogBoundaries(): void {
@@ -1729,6 +1856,13 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
     },
     llmChatStream: async (_request, onEvent): Promise<ApiResponse<LlmChatResult>> => {
       await onEvent({
+        type: 'provider_reasoning_delta',
+        chunk: {
+          type: 'reasoning_delta',
+          content: `${randomSmokeToken('hidden-reasoning')} `.repeat(240),
+        },
+      });
+      await onEvent({
         type: 'provider_delta',
         chunk: {
           type: 'delta',
@@ -1790,6 +1924,81 @@ async function assertAcceptedPlanStreamingDraftsAndJsonProgress(): Promise<void>
     deltas.some((delta: any) => delta.type === 'assistant_delta'),
     false,
     'accepted-plan raw JSON delta is not exposed as a formal assistant answer'
+  );
+  assertEqual(
+    deltas.some((delta: any) => delta.type === 'reasoning_delta'),
+    true,
+    'accepted-plan provider reasoning is exposed as a live reasoning trace delta'
+  );
+}
+
+async function assertProviderLifecycleStatusDoesNotEnterReasoningBody(): Promise<void> {
+  const token = randomSmokeToken('provider-lifecycle');
+  const events: AgentEvent[] = [];
+  const deltas: ProjectionDelta[] = [];
+  const session: AgentSession = {
+    id: `session-${token}`,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const reasoningText = `reasoning-${token}`;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => fakeKernel(request),
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => ({
+      ok: true,
+      data: {
+        chunks: [{ type: 'reasoning_delta', content: reasoningText }, { type: 'done' }],
+        assistantMessage: {
+          role: 'assistant',
+          reasoningContent: reasoningText,
+          content: JSON.stringify({
+            schemaVersion: 'deepcode.agent.protocol.v3',
+            kind: 'answer',
+            outputLanguage: 'en-US',
+            answer: { format: 'markdown', content: `answer-${token}` },
+          }),
+        },
+      },
+    }),
+    onProjectionDelta: async (delta) => {
+      deltas.push(delta);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + deltas.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: session.id,
+    content: `generic request ${token}`,
+    requirementConfirmationMode: 'off',
+  });
+  const reasoningEvents = result.events.filter((event) =>
+    event.kind === 'assistant_msg' && (event.payload as any)?.channel === 'reasoning'
+  );
+  assertEqual(reasoningEvents.length, 1, 'only real provider reasoning is committed as reasoning');
+  assertEqual((reasoningEvents[0].payload as any).content, reasoningText, 'provider reasoning content is preserved');
+  assertEqual((reasoningEvents[0].payload as any).visibility, 'conversation', 'provider reasoning remains visible to the user');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'assistant_msg' &&
+      (event.payload as any)?.channel === 'reasoning' &&
+      String((event.payload as any)?.content ?? '').includes('Provider Call')
+    ),
+    false,
+    'provider lifecycle placeholder is not committed as reasoning body'
+  );
+  assertEqual(
+    deltas.some((delta) =>
+      delta.type === 'active_turn' &&
+      delta.activity?.activityId === 'provider-provider_call'
+    ),
+    true,
+    'provider lifecycle is projected as replaceable activity status'
   );
 }
 
@@ -1905,13 +2114,19 @@ function assertNarrativeTimelineProjection(): void {
     generatedAt: '2026-01-01T00:00:05.000Z',
   });
   assertEqual(projection.schemaVersion, 'deepcode.session.timeline.v1', 'narrative timeline is versioned');
-  assertEqual(projection.turns.length, 1, 'events are grouped into one turn');
-  const kinds = projection.turns[0].blocks.map((block) => block.narrativeKind);
+  assertEqual(projection.turns.length, 2, 'user guidance starts a new user-bubble turn');
+  const allBlocks = projection.turns.flatMap((turn) => turn.blocks);
+  const kinds = allBlocks.map((block) => block.narrativeKind);
   assertEqual(kinds.includes('user'), true, 'user block is projected');
   assertEqual(kinds.includes('thinking'), true, 'thinking block is projected');
   assertEqual(kinds.includes('assistantNarration'), true, 'llm progress assistant messages become narration');
   assertEqual(kinds.includes('operationEvidence'), true, 'tool facts become operation evidence');
-  assertEqual(kinds.includes('requirement'), true, 'user guidance is projected as a user-intervention timeline block');
+  assertEqual(
+    allBlocks.filter((block) => block.narrativeKind === 'user').length,
+    2,
+    'user guidance is projected as a user bubble'
+  );
+  assertEqual(kinds.includes('requirement'), false, 'user guidance audit does not become a requirement card');
   assertEqual(kinds.includes('plan'), true, 'plan facts become a plan block');
   assertEqual(kinds.includes('assistantText'), true, 'final answer becomes assistant text');
   assertEqual(
@@ -1999,10 +2214,10 @@ function assertNarrativeTimelineProjection(): void {
   assertEqual(activityBlock?.activity?.kind, 'editFileCompleted', 'timeline block carries public conversation activity');
   assertEqual(activityBlock?.title, 'Generic edit completed', 'activity title drives operation block title');
   assertEqual(activityBlock?.status, 'completed', 'activity status drives operation block status');
-  const narrationBlock = projection.turns[0].blocks.find((block) => block.narrativeKind === 'assistantNarration');
+  const narrationBlock = allBlocks.find((block) => block.narrativeKind === 'assistantNarration');
   assertEqual(narrationBlock?.displayHints?.renderMode, 'typewriter', 'assistant narration uses typewriter projection hints');
   assertEqual(narrationBlock?.displayHints?.checkpointKind, 'llmProposal', 'assistant narration is tied to an LLM proposal checkpoint');
-  const thinkingBlock = projection.turns[0].blocks.find((block) => block.narrativeKind === 'thinking');
+  const thinkingBlock = allBlocks.find((block) => block.narrativeKind === 'thinking');
   assertEqual(
     thinkingBlock?.bodyMarkdown,
     'Need generic context. Continue with generic constraints.',
@@ -2010,12 +2225,13 @@ function assertNarrativeTimelineProjection(): void {
   );
   assertEqual(Boolean(thinkingBlock?.displayHints?.replaceOnComplete), true, 'thinking exposes replacement/collapse projection hints');
   assertEqual(thinkingBlock?.displayHints?.typewriterSpeed, 'slow', 'running thinking uses a slower typewriter speed');
-  const guidanceBlock = projection.turns[0].blocks.find((block) => block.events.some((event) => event.kind === 'user_guidance'));
-  assertEqual(guidanceBlock?.title, 'User guidance', 'user guidance has its own visible timeline title');
-  assertEqual(guidanceBlock?.status, 'queued', 'user guidance remains queued before provider consumption');
-  assertEqual(guidanceBlock?.displayHints?.checkpointKind, 'userGuidance', 'user guidance marks the next provider checkpoint');
+  const guidanceBlock = allBlocks.find((block) =>
+    block.events.some((event) => (event.payload as any)?.sourceEventKind === 'user_guidance')
+  );
+  assertEqual(guidanceBlock?.narrativeKind, 'user', 'user guidance carries a user narrative kind');
+  assertEqual(guidanceBlock?.bodyMarkdown, 'Apply this generic guidance at the next provider checkpoint.', 'user guidance bubble preserves the user text');
   assertEqual(
-    projection.turns[0].blocks.some((block) => block.events.some((event) => event.kind === 'cache_telemetry')),
+    allBlocks.some((block) => block.events.some((event) => event.kind === 'cache_telemetry')),
     false,
     'cache telemetry is hidden from narrative blocks'
   );
@@ -2046,7 +2262,7 @@ function assertNarrativeTimelineProjection(): void {
     'token projection totals are summed across provider calls'
   );
   assertEqual(
-    projection.turns[0].blocks.some((block) => block.evidenceRefs?.includes('evidence-generic')),
+    allBlocks.some((block) => block.evidenceRefs?.includes('evidence-generic')),
     true,
     'evidence refs are preserved for frontend drilldown'
   );
@@ -2076,6 +2292,27 @@ function assertTimelineProjectionWithLiveOverlay(): void {
     targets: ['src/generic-a.ts', 'docs/generic.md'],
   };
   const activeDeltas: ProjectionDelta[] = [
+    {
+      type: 'active_turn',
+      seq: 0,
+      sessionId: 'session-live-overlay',
+      runId: 'run-live-overlay',
+      turnId: 'turn-live-overlay',
+      stage: 'provider_call',
+      channel: 'progress',
+      source: 'provider',
+      status: 'running',
+      summary: 'Provider lifecycle status only.',
+      activity: {
+        activityId: 'activity-provider-lifecycle',
+        kind: 'providerThinking',
+        status: 'running',
+        title: 'Provider lifecycle',
+        summary: 'Provider lifecycle status only.',
+        source: 'provider',
+        runId: 'run-live-overlay',
+      },
+    },
     {
       type: 'reasoning_delta',
       seq: 1,
@@ -2120,16 +2357,22 @@ function assertTimelineProjectionWithLiveOverlay(): void {
   const liveKinds = liveBlocks.map((block) => block.narrativeKind);
   assertEqual(
     liveKinds.join('>'),
-    'user>thinking>operationEvidence',
-    'live overlay reuses narrative projection ordering for parent deltas'
+    'user>operationEvidence>thinking>operationEvidence',
+    'live overlay shows provider status, structured activity, and live provider reasoning as a thinking trace'
   );
-  const liveThinking = liveBlocks.find((block) => block.narrativeKind === 'thinking');
   assertEqual(
-    liveThinking?.bodyMarkdown,
-    'Need generic context before proposing changes.',
-    'live reasoning remains complete when sealed by a following activity'
+    liveBlocks.some((block) => block.events.some((event) => (event.payload as any)?.activity?.activityId === 'activity-provider-lifecycle')),
+    true,
+    'live provider lifecycle remains visible as a temporary status'
   );
-  assertEqual(liveThinking?.defaultCollapsed, true, 'sealed live thinking is eligible for collapse');
+  assertEqual(
+    liveBlocks.some((block) =>
+      block.narrativeKind === 'thinking' &&
+      (block.bodyMarkdown ?? '').includes('Need generic context before proposing changes.')
+    ),
+    true,
+    'provider reasoning delta enters the live timeline as a reasoning trace block'
+  );
   assertEqual(
     liveBlocks.some((block) => (block.bodyMarkdown ?? '').includes('Branch reasoning')),
     false,
@@ -2147,6 +2390,26 @@ function assertTimelineProjectionWithLiveOverlay(): void {
     sessionId: 'session-live-overlay',
     events: [
       userEvent,
+      {
+        id: 'event-committed-provider-lifecycle',
+        sessionId: 'session-live-overlay',
+        ts: '2026-01-01T00:00:00.500Z',
+        kind: 'workflow_stage',
+        payload: {
+          stage: 'provider_call',
+          status: 'running',
+          summary: 'Provider lifecycle status only.',
+          activity: {
+            activityId: 'activity-provider-lifecycle',
+            kind: 'providerThinking',
+            status: 'running',
+            title: 'Provider lifecycle',
+            summary: 'Provider lifecycle status only.',
+            source: 'provider',
+            runId: 'run-live-overlay',
+          },
+        },
+      },
       {
         id: 'event-committed-reasoning',
         sessionId: 'session-live-overlay',
@@ -2173,18 +2436,20 @@ function assertTimelineProjectionWithLiveOverlay(): void {
   });
   assertEqual(
     committedProjection.turns[0].blocks.map((block) => block.narrativeKind).join('>'),
-    liveKinds.join('>'),
-    'live and committed projection produce the same narrative block order'
+    'user>thinking>operationEvidence',
+    'committed reasoning remains a separate collapsible audit block when explicitly recorded'
   );
 
   const streamingProjection = buildTimelineProjectionWithLiveOverlay({
     sessionId: 'session-live-overlay',
     committedEvents: [userEvent],
-    activeDeltas: [activeDeltas[0]],
+    activeDeltas: [activeDeltas[1]],
   });
-  const streamingThinking = streamingProjection.turns[0].blocks.find((block) => block.narrativeKind === 'thinking');
-  assertEqual(streamingThinking?.status, 'running', 'latest live text block remains running');
-  assertEqual(streamingThinking?.displayHints?.renderMode, 'typewriter', 'latest live text block keeps typewriter mode');
+  assertEqual(
+    streamingProjection.turns[0].blocks.some((block) => block.narrativeKind === 'thinking'),
+    true,
+    'standalone provider reasoning delta is visible as a live thinking trace'
+  );
 
   const dedupedProjection = buildTimelineProjectionWithLiveOverlay({
     sessionId: 'session-live-overlay',
@@ -3318,7 +3583,14 @@ async function assertSessionDriverLoopRepairsSideEffectBundleEvidence(): Promise
     true,
     'waiting plan review is exposed as an explicit session run state'
   );
-  assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any).channel === 'reasoning'), true, 'provider reasoning is visible');
+  const providerReasoningEvent = result.events.find((event) =>
+    event.kind === 'assistant_msg' &&
+    (event.payload as any).channel === 'reasoning' &&
+    String((event.payload as any).content ?? '').includes('generic reasoning')
+  );
+  assert(Boolean(providerReasoningEvent), 'provider reasoning is archived as an assistant reasoning event');
+  assertEqual((providerReasoningEvent?.payload as any)?.visibility, 'conversation', 'provider reasoning remains visible to the user');
+  assertEqual((providerReasoningEvent?.payload as any)?.presentation, 'collapsible', 'provider reasoning is visible as a collapsible trace, not body text');
   assertEqual(transcript.some((entry) => entry.type === 'metadata' && entry.kind === 'provider_trace'), true, 'provider trace is archived');
 }
 
@@ -3680,7 +3952,15 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
   assertEqual(llmCalls, 2, 'empty actionBundle response triggers one compact repair');
   assertEqual(submittedPlans.length, 1, 'repaired empty response reaches Kernel plan review once');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired empty response renders a plan card');
-  assertEqual(result.events.some((event) => event.kind === 'assistant_msg' && String((event.payload as any).content ?? '').includes('没有返回有效 JSON')), true, 'empty response repair is visible as Thinking');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'session.provider_status' &&
+      String((event.payload as any).summary ?? '').includes('没有返回有效 JSON')
+    ),
+    true,
+    'empty response repair is visible as provider status, not model reasoning'
+  );
 }
 
 async function assertSessionDriverLoopAcceptsLocalizedStructuredPlan(): Promise<void> {
@@ -8262,6 +8542,151 @@ async function assertSessionDriverLoopAcceptedImplementationPlanResumesFromResou
   assert(providerPrompts[0] && !providerPrompts[0].includes('Accepted-plan resource resume checkpoint'), 'first call remains the normal accepted-plan provider call');
 }
 
+async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationCompletesWithoutProviderLoop(): Promise<void> {
+  const token = randomSmokeToken('readonly');
+  const targets = Array.from({ length: 5 }, () => `${randomSmokeToken('scope')}/${randomSmokeToken('target')}.txt`);
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const events = [readOnlyAcceptedImplementationPlanCardEvent(sessionId, runId, token, targets)];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  let actionBatchSubmits = 0;
+  let permissionGrants = 0;
+  let reviewFactsRequests = 0;
+  let resourceResolveCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'resourceResolve') {
+        resourceResolveCalls += 1;
+        const entries = Array.isArray(command.request?.manifest?.entries)
+          ? command.request.manifest.entries
+          : [];
+        return {
+          ok: true,
+          events: [{
+            kind: 'resource.packet_produced',
+            runId,
+            sessionId,
+            packet: {
+              id: `packet-${token}-${resourceResolveCalls}`,
+              workspaceScopeKey: command.request?.manifest?.workspaceScopeKey ?? `workspace-${token}`,
+              requestId: command.requestId,
+              items: entries.map((entry: any, index: number) => {
+                const target = targets[index] ?? String(entry.resourceRef ?? entry.id ?? `fallback-${index}`);
+                return {
+                  requestItemId: `item-${token}-${index}`,
+                  manifestEntryId: String(entry.id ?? target),
+                  readPolicy: 'explicit-manifest-readonly',
+                  status: 'resolved',
+                  path: target,
+                  absolutePath: `/tmp/${token}/${target}`,
+                  contentKind: 'fileText',
+                  promptContent: `resolved ${randomSmokeToken('content')} for ${target}`,
+                  evidenceRefs: [`evidence-${token}-${index}`],
+                };
+              }),
+            },
+          }],
+        };
+      }
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return fakeKernel(request);
+      }
+      if (command.kind === 'permissionGrantTemporary') {
+        permissionGrants += 1;
+        return { ok: true, events: [] };
+      }
+      if (command.kind === 'reviewFactsGet') {
+        reviewFactsRequests += 1;
+        return { ok: true, events: [] };
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      assertEqual(llmCalls, 1, 'read-only validation should not make a second provider call after ResourcePacket coverage');
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'resourceRequest',
+        outputLanguage: 'en-US',
+        resourceRequest: {
+          version: '1',
+          id: `request-${token}`,
+          reason: 'Read current evidence for the accepted validation task.',
+          items: targets.map((target, index) => ({
+            id: `item-${token}-${index}`,
+            kind: 'file',
+            path: target,
+            reason: 'Resolve read-only validation evidence.',
+          })),
+        },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + resourceResolveCalls + reviewFactsRequests + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId,
+    kind: 'plan',
+    decision: 'accept',
+    runId,
+    targetId: `impl-${token}`,
+    existingEvents: events,
+    projectWorkingDirectory: {
+      rootId: `root-${token}`,
+      label: 'Random workspace',
+      displayPath: `/tmp/${token}`,
+      absolutePath: `/tmp/${token}`,
+      source: 'projectWorkingDirectory',
+    },
+    subAgentMode: 'off',
+  });
+
+  assertEqual(llmCalls, 1, 'read-only validation completes without provider resume loop');
+  assertEqual(resourceResolveCalls, 1, 'read-only validation resolves one focused ResourcePacket');
+  assertEqual(actionBatchSubmits, 0, 'read-only validation does not submit actionBatch');
+  assertEqual(permissionGrants, 0, 'read-only validation does not request temporary grants');
+  assertEqual(reviewFactsRequests, 1, 'read-only validation enters final review facts collection');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'accepted_plan.batch_checkpoint' &&
+      (event.payload as any)?.source === 'resourceValidation' &&
+      (event.payload as any)?.validatedTaskId === `task-${token}-read`
+    ),
+    true,
+    'read-only validation writes an accepted-plan checkpoint'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'review_summary' &&
+      (event.payload as any)?.status === 'waitingUserReview'
+    ),
+    true,
+    'read-only validation reaches review instead of waiting for permission or provider output'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.phase === 'waiting_review'
+    ),
+    true,
+    'read-only validation leaves the run waiting for review'
+  );
+}
+
 async function assertSessionDriverLoopAcceptedImplementationPlanInheritsSubAgentOffSetting(): Promise<void> {
   const events = [
     independentMultiTargetAcceptedImplementationPlanCardEvent('session-accepted-plan-inherit-off', 'run-accepted-plan-inherit-off'),
@@ -10810,6 +11235,41 @@ function acceptedImplementationPlanCardEvent(sessionId: string, runId: string): 
       commandBlocks: [],
     },
   };
+}
+
+function readOnlyAcceptedImplementationPlanCardEvent(
+  sessionId: string,
+  runId: string,
+  token: string,
+  targets: string[]
+): AgentEvent {
+  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+  const payload = event.payload as any;
+  payload.planId = `impl-${token}`;
+  payload.implementationPlan.id = `impl-${token}`;
+  payload.implementationPlan.title = 'Random read-only validation plan';
+  payload.implementationPlan.summary = 'Resolve current evidence for accepted read-only targets.';
+  payload.implementationPlan.tasks = [
+    {
+      taskId: `task-${token}-read`,
+      title: 'Validate random accepted targets',
+      target: targets,
+      scope: 'Resolve current read-only evidence for the accepted targets.',
+      dependencies: [],
+      capability: 'fs.read',
+      acceptanceCriteria: ['ResourcePacket covers every accepted target.'],
+      failureCriteria: ['Stop if current evidence cannot cover each target.'],
+    },
+  ];
+  payload.actionBundle = {
+    version: '1',
+    id: `impl-${token}`,
+    goal: 'Read-only validation placeholder; evidence is resolved after acceptance.',
+    actions: [],
+    validationExpectations: [{ id: `validation-${token}`, description: 'Resource evidence covers all accepted targets.' }],
+    reviewExpectations: [{ id: `review-${token}`, description: 'User reviews the read-only validation checkpoint.' }],
+  };
+  return event;
 }
 
 function generatedArtifactAcceptedImplementationPlanCardEvent(sessionId: string, runId: string): AgentEvent {
