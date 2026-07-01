@@ -883,6 +883,7 @@
     "diagnostic.autoPlanProposalReviewedMissing": "Kernel 未返回 accepted-plan actionBundle 的 proposal.reviewed 事件，Session 不会自动执行该批次。",
     "diagnostic.autoBatchRevisionRepairFailed": "自动执行批次需要修订，但模型 repair 失败：{message}",
     "diagnostic.autoBatchRejected": "Kernel 拒绝该自动执行批次：{reasons}",
+    "session.driver.acceptedPlanScopeRepair": "当前自动执行批次未落在 current task 的已确认范围内，Session 正在要求模型继续当前 task 或请求补充授权。",
     "requirement.optionsTitle": "可选方案",
     "requirement.optionRecommended": "推荐",
     "requirement.optionEffectLabel": "选择后",

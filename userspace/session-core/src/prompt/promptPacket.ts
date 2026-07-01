@@ -40,9 +40,11 @@ export function buildPromptPacketFrames(input: PromptEnvelopeBuilderInput): Prom
       use: 'choose exactly one allowed proposal kind and follow its top-level Agent Protocol v3 shape',
       content: [
         `Allowed proposal kinds for this call: ${input.allowedProposals.join(', ') || 'none'}.`,
+        'Frames later in this packet are context, not protocol examples. Use source/trust/use to decide whether a frame is user intent, observed resource evidence, compressed memory, or an immediate instruction.',
         'If current facts are enough, produce the next proposal. If facts are missing, request focused resources. If user choice or scope expansion is required, use decisionRequest.',
       ],
     },
+    memoryFrame(input),
     {
       kind: 'UserRequest',
       source: 'user.message',
@@ -57,9 +59,10 @@ export function buildPromptPacketFrames(input: PromptEnvelopeBuilderInput): Prom
   if (decisionFrame) frames.push(decisionFrame);
   const taskFrame = taskFrameFromInput(input);
   if (taskFrame) frames.push(taskFrame);
+  const resourceEvidence = resourceEvidenceFrame(input);
+  if (resourceEvidence) frames.push(resourceEvidence);
   const accessFrame = accessSummaryFrame(input);
   if (accessFrame) frames.push(accessFrame);
-  frames.push(memoryFrame(input));
   const errorFrame = errorContextFrame(input);
   if (errorFrame) frames.push(errorFrame);
   frames.push(nextActionInstructionFrame(input));
@@ -111,6 +114,28 @@ function taskFrameFromInput(input: PromptEnvelopeBuilderInput): PromptPacketFram
   };
 }
 
+function resourceEvidenceFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame | undefined {
+  const blocks = input.resourcePromptContext?.resourceBlocks ?? [];
+  if (!blocks.length) return undefined;
+  return {
+    kind: 'ResourceEvidence',
+    source: 'kernel.resourceResolve',
+    trust: 'kernelObservedFact',
+    scope: 'currentRun',
+    use: 'read/list/search evidence for files, directories, ranges, and hashes; use exact full content or focused ranges as patch evidence, summaries only as navigation handles',
+    content: blocks.slice(-16).map((block) => [
+      `ref=${block.displayRef}`,
+      `kind=${block.contentKind ?? 'unknown'}`,
+      `status=${block.status}`,
+      `retention=${block.retention}`,
+      `range=${resourceRangeLabel(block)}`,
+      `hash=${block.contentHash.slice(0, 12)}`,
+      `chars=${block.charLength}`,
+      `summary=${oneLine(block.summary, 300)}`,
+    ].join('; ')),
+  };
+}
+
 function accessSummaryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame | undefined {
   const blocks = input.resourcePromptContext?.resourceBlocks ?? [];
   if (!blocks.length) return undefined;
@@ -123,12 +148,21 @@ function accessSummaryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFram
     content: blocks.slice(-12).map((block) => [
       `ref=${block.displayRef}`,
       `kind=${block.contentKind ?? 'unknown'}`,
-      `status=${block.status}`,
       `retention=${block.retention}`,
       `hash=${block.contentHash.slice(0, 12)}`,
       `summary=${oneLine(block.summary, 300)}`,
     ].join('; ')),
   };
+}
+
+function resourceRangeLabel(block: NonNullable<PromptEnvelopeBuilderInput['resourcePromptContext']>['resourceBlocks'][number]): string {
+  const range = [
+    typeof block.offsetBytes === 'number' ? `offsetBytes=${block.offsetBytes}` : '',
+    typeof block.limitBytes === 'number' ? `limitBytes=${block.limitBytes}` : '',
+    typeof block.returnedBytes === 'number' ? `returnedBytes=${block.returnedBytes}` : '',
+    typeof block.rangeComplete === 'boolean' ? `rangeComplete=${block.rangeComplete}` : '',
+  ].filter(Boolean).join(',');
+  return range || 'full-or-directory';
 }
 
 function memoryFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame {

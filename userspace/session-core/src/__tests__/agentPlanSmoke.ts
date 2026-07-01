@@ -896,13 +896,20 @@ function assertPromptEnvelope(): void {
   assert(prompt.stablePrefix.includes('reviewSummary is Session-generated'), 'prompt excludes reviewSummary from provider proposal kinds');
   assert(prompt.stablePrefix.includes('Implementation payload budget'), 'prompt documents payload-based implementation budget');
   assert(!prompt.stablePrefix.includes('implementationPlan top-level field'), 'prompt no longer documents implementationPlan as a provider kind');
-  assert(prompt.stablePrefix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description,dependsOn?}'), 'prompt documents canonical action shape');
-  assert(prompt.stablePrefix.includes('actionBundle.continuationExpectations[] are non-executable continuation notes shaped {id,description,target?,reason?,dependsOn?}'), 'prompt documents continuation as non-executable intent');
+  assert(prompt.stablePrefix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'prompt documents canonical action shape');
+  assert(prompt.stablePrefix.includes('actionBundle.continuationExpectations[] are non-executable continuation notes shaped {id,description,target?,reason?}'), 'prompt documents continuation as non-executable intent');
+  assert(!prompt.stablePrefix.includes('dependsOn'), 'prompt no longer teaches provider action dependency fields');
+  assert(!prompt.stablePrefix.includes('hard dependencies'), 'prompt no longer teaches hard dependency planning');
+  assert(!prompt.stablePrefix.includes('prerequisite'), 'prompt no longer teaches prerequisite planning');
+  assert(!prompt.stablePrefix.includes('dependencyDepth'), 'prompt no longer exposes dependency depth');
   assert(prompt.stablePrefix.includes('contentLines is the only provider-facing source-code content carrier'), 'prompt requires contentLines for source code');
   assert(prompt.stablePrefix.includes('Do not output capability, permissionLabels, accessScopes, or resourceScope'), 'prompt forbids provider-declared permissions');
   assert(prompt.stablePrefix.includes('Do not add a generic payload wrapper'), 'prompt tells provider not to wrap proposals in payload');
   assert(prompt.stablePrefix.includes('actionBundle proposal top-level fields'), 'prompt documents actionBundle top-level fields');
-  assert(prompt.stablePrefix.includes('tasks[] is an ordered implementation checklist'), 'prompt treats taskPlan as ordered checklist');
+  assert(prompt.stablePrefix.includes('validationExpectations[] and reviewExpectations[] are the only provider-facing validation/review note carriers'), 'prompt teaches nested validation/review carriers');
+  assert(!prompt.stablePrefix.includes('expectedValidation'), 'prompt no longer teaches expectedValidation to providers');
+  assert(!prompt.stablePrefix.includes('reviewGuide'), 'prompt no longer teaches reviewGuide to providers');
+  assert(prompt.stablePrefix.includes('tasks[] is a Session-advanced ordered implementation queue'), 'prompt treats taskPlan as an ordered queue');
   assert(!prompt.stablePrefix.includes('Session can schedule parallel graph nodes'), 'prompt no longer requires provider-facing graph scheduling');
   assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
   assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
@@ -925,11 +932,22 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('<PromptPacket schemaVersion="deepcode.session.prompt-packet.v1">'), 'prompt packet frame renders into dynamic suffix');
   assert(prompt.dynamicSuffix.includes('kind: UserRequest'), 'prompt packet labels user request frame');
   assert(prompt.dynamicSuffix.includes('trust: userIntent'), 'prompt packet marks user request as user intent');
+  assert(prompt.dynamicSuffix.includes('kind: ResourceEvidence'), 'prompt packet includes kernel-observed resource evidence frame');
+  assert(prompt.dynamicSuffix.includes('trust: kernelObservedFact'), 'prompt packet marks resource evidence as observed facts');
   assert(prompt.dynamicSuffix.includes('kind: AccessSummary'), 'prompt packet includes access summary from resource evidence');
   assert(prompt.dynamicSuffix.includes('trust: derivedObservedFact'), 'prompt packet marks access summary as derived from observed resources');
   assert(prompt.dynamicSuffix.includes('kind: Memory'), 'prompt packet labels compacted memory frame');
   assert(prompt.dynamicSuffix.includes('trust: compressedReference'), 'prompt packet marks memory as reference rather than fact');
   assert(prompt.dynamicSuffix.includes('kind: NextActionInstruction'), 'prompt packet includes final next-action instruction');
+  const memoryFrameIndex = prompt.dynamicSuffix.indexOf('kind: Memory');
+  const userFrameIndex = prompt.dynamicSuffix.indexOf('kind: UserRequest');
+  const resourceEvidenceIndex = prompt.dynamicSuffix.indexOf('kind: ResourceEvidence');
+  const accessSummaryIndex = prompt.dynamicSuffix.indexOf('kind: AccessSummary');
+  const nextActionIndex = prompt.dynamicSuffix.indexOf('kind: NextActionInstruction');
+  assert(memoryFrameIndex > -1 && userFrameIndex > memoryFrameIndex, 'prompt packet renders Memory before the current UserRequest');
+  assert(resourceEvidenceIndex > userFrameIndex, 'prompt packet renders ResourceEvidence after task/user context');
+  assert(accessSummaryIndex > resourceEvidenceIndex, 'prompt packet renders AccessSummary after ResourceEvidence');
+  assert(nextActionIndex > accessSummaryIndex, 'prompt packet renders NextActionInstruction at the end');
   assert(prompt.dynamicSuffix.includes('fs.read'), 'dynamic suffix carries capability projection');
   assert(prompt.stableLayerNames.includes('projectMemory'), 'project memory index digest is an explicit stable context partition');
   assert(prompt.dynamicLayerNames.includes('projectMemoryRecall'), 'project memory recall is an explicit dynamic context partition');
@@ -1262,14 +1280,75 @@ function assertResourcePromptBlocksStabilize(): void {
   assertEqual(firstAlpha.blockKey, secondAlpha.blockKey, 'old resource block keeps stable key across later packets');
   assertEqual(firstAlpha.contentHash, secondAlpha.contentHash, 'old resource block keeps stable content hash across later packets');
   assertEqual(firstAlpha.retention, 'full', 'latest small resource can be full text');
-  assertEqual(secondAlpha.retention, 'summary', 'old resource is downgraded to summary after a newer packet');
+  assertEqual(secondAlpha.retention, 'full', 'old resource remains full text while dynamic read budget is available');
   assertEqual(secondBeta.retention, 'full', 'new current small resource remains full text');
   assertEqual(secondAlpha.volatileFieldStripped, true, 'resource block records volatile field stripping');
   assert(second.prompt.dynamicSuffix.includes(betaContent), 'current resource full text remains available');
-  assert(!second.prompt.dynamicSuffix.includes(alphaMiddleMarker), 'old resource middle content is not repeatedly carried after summary downgrade');
+  assert(second.prompt.dynamicSuffix.includes(alphaMiddleMarker), 'old resource middle content is retained until the dynamic read budget is exceeded');
   assert(!second.prompt.dynamicSuffix.includes('volatile-evidence-alpha'), 'volatile evidence refs are not provider-visible');
   assert(!second.prompt.dynamicSuffix.includes('packet-alpha-volatile'), 'volatile packet ids are not provider-visible');
-  assert(second.contextAssembly.resourceFullTextCharCount < first.contextAssembly.resourceFullTextCharCount + betaContent.length, 'full resource text budget does not grow by repeating old full text');
+  assert(second.contextAssembly.resourceFullTextCharCount >= first.contextAssembly.resourceFullTextCharCount + betaContent.length, 'dynamic read full text budget accumulates current-run reads before compression');
+
+  const largeEntries = Array.from({ length: 6 }, (_, index) => ({
+    id: `large-file-${index}`,
+    kind: 'file' as const,
+    label: `File generated/resource-${index}.txt`,
+    resourceRef: `generated/resource-${index}.txt`,
+    readPolicy: 'autoRead' as const,
+    reason: 'Generic budget resource.',
+  }));
+  const largeManifest: ResourceManifest = {
+    id: 'manifest-resource-budget',
+    workspaceScopeKey: 'workspace-resource-budget',
+    entries: largeEntries,
+    budget: { maxEntries: 12, maxBytes: 128000 },
+    defaultDenyPatterns: [],
+  };
+  const largeInitialContext = {
+    id: 'initial-resource-budget',
+    workspaceScopeKey: largeManifest.workspaceScopeKey,
+    manifest: largeManifest,
+  };
+  const largeMarkers = largeEntries.map((entry, index) => `RESOURCE_BUDGET_MARKER_${index}`);
+  const largePackets = largeEntries.map((entry, index) => createResourcePacket({
+    packetId: `packet-large-${index}`,
+    manifest: largeManifest,
+    request: {
+      id: `request-large-${index}`,
+      items: [{ id: `item-large-${index}`, manifestEntryId: entry.id, reason: 'Read budget resource.' }],
+    },
+    kernelEvidence: {
+      [entry.id]: {
+        contentKind: 'fileText',
+        promptContent: `${'head '.repeat(520)}${largeMarkers[index]!}${' tail'.repeat(520)}`,
+        evidenceRefs: [`volatile-large-${index}`],
+      },
+    },
+  }));
+  const overBudget = assembleContext({
+    workflowState: 'needProposal',
+    allowedProposals: ['answer', 'resourceRequest'],
+    capabilityCatalogSummary: 'fs.read',
+    userRequest: 'Analyze budgeted resource context.',
+    initialContext: largeInitialContext,
+    resourcePackets: largePackets,
+    profile: { provider: 'deepseek', model: 'deepseek-chat' },
+    templateVersion: 'resource-budget-test',
+  });
+  const oldestLargeEntry = largeEntries[0]!;
+  const oldestLarge = overBudget.contextAssembly.resourceBlocks.find((block) => block.displayRef === oldestLargeEntry.resourceRef);
+  const newestLargeEntry = largeEntries[largeEntries.length - 1]!;
+  const newestLargeMarker = largeMarkers[largeMarkers.length - 1]!;
+  const newestLarge = overBudget.contextAssembly.resourceBlocks.find((block) => block.displayRef === newestLargeEntry.resourceRef);
+  assert(oldestLarge, 'over-budget old resource block still exists');
+  assert(newestLarge, 'over-budget newest resource block still exists');
+  if (!oldestLarge || !newestLarge) throw new Error('resource budget test setup failed');
+  assertEqual(oldestLarge.retention, 'summary', 'over-budget oldest resource is downgraded to summary instead of being discarded');
+  assertEqual(newestLarge.retention, 'full', 'over-budget newest resource keeps full text');
+  assert(overBudget.prompt.dynamicSuffix.includes('handle=generated/resource-0.txt'), 'over-budget summary keeps a stable resource handle');
+  assert(overBudget.prompt.dynamicSuffix.includes('summary:'), 'over-budget summary keeps a compact text summary');
+  assert(!overBudget.prompt.dynamicSuffix.includes(largeMarkers[0]), 'over-budget old middle marker is removed from provider-visible full text');
+  assert(overBudget.prompt.dynamicSuffix.includes(newestLargeMarker), 'over-budget newest full text remains provider-visible');
 }
 
 function assertSessionMemoryDocument(): void {
@@ -5187,7 +5266,7 @@ async function assertSessionDriverLoopAcceptedScopeRejectsDirectoryDeleteFromRes
 }
 
 async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDelete(): Promise<void> {
-  const deleteProposal = deleteActionBundleProposal('generic-dir') as any;
+  const deleteProposal = deleteActionBundleProposal('generic-dir/') as any;
   const actionBundle = deleteProposal.actionBundle as Record<string, any>;
   actionBundle.actions[0].targetKind = 'directory';
   actionBundle.actions[0].targetResourceKind = 'directory';
@@ -5276,7 +5355,11 @@ async function assertSessionDriverLoopAcceptedScopeExecutesReviewedDirectoryDele
   assertEqual(actionBatchSubmits, 1, 'reviewed directory delete submits an action batch');
   assertEqual(temporaryGrants.length, 1, 'reviewed directory delete receives one scoped temporary grant');
   assertEqual(temporaryGrants[0]?.resourceKind, 'workspaceDirectory', 'reviewed directory delete uses a directory scoped grant');
-  assertEqual(temporaryGrants[0]?.resourcePath, 'generic-dir', 'reviewed directory delete grant is scoped to the confirmed directory');
+  assertEqual(
+    String(temporaryGrants[0]?.resourcePath ?? '').replace(/\/+$/, ''),
+    'generic-dir',
+    'reviewed directory delete grant is scoped to the confirmed directory despite trailing slash spelling'
+  );
   assertEqual(
     result.events.some((event) => event.kind === 'error' && (event.payload as any).code === 'accepted_plan_action_batch_preflight_failed'),
     false,
@@ -5295,6 +5378,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
   let proposalSubmits = 0;
   let actionBatchSubmits = 0;
   let temporaryGrants = 0;
+  const llmRequests: LlmChatRequest[] = [];
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -5355,7 +5439,10 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
       }
       return fakeKernel(request);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => jsonLlmResponse(genericWriteProposal(false)),
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
+      return jsonLlmResponse(genericWriteProposal(false));
+    },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + temporaryGrants + 1}`,
   });
@@ -5373,6 +5460,15 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesBatc
   assertEqual(proposalSubmits, 1, 'accepted implementationPlan still submits actionBundle to Kernel PlanReview for audit');
   assertEqual(actionBatchSubmits, 1, 'accepted implementationPlan auto-submits in-scope actionBundle to Kernel execution');
   assertEqual(temporaryGrants, 1, 'accepted implementationPlan grants scoped workspace write permission for in-scope batch');
+  assertEqual(llmRequests.length, 1, 'accepted implementationPlan execution calls provider once');
+  const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
+  assert(promptText.includes('Accepted execution sanitized context'), 'accepted execution sends sanitized context');
+  assert(!promptText.includes('Accepted execution contract context'), 'accepted execution does not send raw contract JSON');
+  assert(!promptText.includes('taskOrder='), 'accepted execution does not expose taskOrder in provider text');
+  assert(!promptText.includes('pendingTasks='), 'accepted execution does not expose pending task ids in provider text');
+  assert(!promptText.includes('dependsOn'), 'accepted execution does not expose provider dependency fields');
+  assert(!promptText.includes('dependencies'), 'accepted execution does not expose raw dependency fields');
+  assert(!promptText.includes('dependencyDepth'), 'accepted execution does not expose dependency depth');
   assertEqual(result.events.filter((event) => event.kind === 'plan_card').length, 1, 'accepted implementationPlan execution does not create a second confirmable plan card');
   assertEqual(
     result.events.some((event) =>

@@ -883,6 +883,7 @@
     "diagnostic.autoPlanProposalReviewedMissing": "Kernel did not return a proposal.reviewed event for the accepted-plan actionBundle; Session will not auto-execute this batch.",
     "diagnostic.autoBatchRevisionRepairFailed": "The automatic execution batch needs revision, but model repair failed: {message}",
     "diagnostic.autoBatchRejected": "Kernel rejected the automatic execution batch: {reasons}",
+    "session.driver.acceptedPlanScopeRepair": "The current execution batch is outside the confirmed current-task scope; Session is asking the model to continue the current task or request additional authorization.",
     "requirement.optionsTitle": "Options",
     "requirement.optionRecommended": "Recommended",
     "requirement.optionEffectLabel": "If selected",

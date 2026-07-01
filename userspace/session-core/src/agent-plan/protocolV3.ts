@@ -333,7 +333,7 @@ function normalizeContinuationExpectations(value: unknown): Array<Record<string,
   if (!Array.isArray(value)) {
     throw new AgentPlanParseError(
       'invalid_action_bundle_continuation',
-      'Agent Protocol v3.actionBundle.continuationExpectations must be an array of { id, description, target?, reason?, dependsOn? } objects; string and string[] are accepted only as compatibility input.'
+      'Agent Protocol v3.actionBundle.continuationExpectations must be an array of { id, description, target?, reason? } objects; string and string[] are accepted only as compatibility input.'
     );
   }
   return value.map((item, index) => {

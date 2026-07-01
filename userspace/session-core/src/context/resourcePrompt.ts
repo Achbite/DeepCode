@@ -11,6 +11,7 @@ import type {
 } from './types.js';
 
 const FULL_TEXT_CHAR_LIMIT = 6000;
+const DYNAMIC_READ_FULL_TEXT_BUDGET_CHARS = 24000;
 const SUMMARY_HEAD_CHARS = 720;
 const SUMMARY_TAIL_CHARS = 220;
 const MANIFEST_ENTRY_LIMIT = 80;
@@ -22,13 +23,22 @@ export interface BuildResourcePromptContextInput {
   resourcePackets?: ResourcePacket[];
 }
 
+interface ResourcePromptBlockDraft {
+  blockKey: string;
+  packet: ResourcePacket;
+  item: ResourcePacketItem;
+  content: string;
+  contentHash: string;
+  displayRef: string;
+}
+
 export function buildResourcePromptContext(input: BuildResourcePromptContextInput): ResourcePromptContext {
   const manifestEntries = new Map<string, ResourceManifestEntry>();
   for (const entry of input.initialContext?.manifest.entries ?? []) {
     manifestEntries.set(entry.id, entry);
   }
   const resourcePackets = input.resourcePackets ?? [];
-  const latestPacketIndex = resourcePackets.length - 1;
+  const drafts: ResourcePromptBlockDraft[] = [];
   const orderedKeys: string[] = [];
   const blocksByKey = new Map<string, ResourcePromptBlock>();
 
@@ -47,36 +57,49 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
         String(item.limitBytes ?? 'full'),
         contentHash,
       ].join('\n'));
-      const retention = chooseRetention(item, content, packetIndex === latestPacketIndex);
-      const summary = resourceSummary(item, content, retention);
-      const block: ResourcePromptBlock = {
+      drafts.push({
         blockKey,
-        workspaceScopeKey: packet.workspaceScopeKey,
-        manifestEntryId: item.manifestEntryId,
-        displayRef,
+        packet,
+        item,
+        content,
         contentHash,
-        retention,
-        status: item.status,
-        readPolicy: item.readPolicy,
-        contentKind: item.contentKind,
-        originalBytes: item.originalBytes,
-        offsetBytes: item.offsetBytes,
-        limitBytes: item.limitBytes,
-        returnedBytes: item.returnedBytes,
-        rangeComplete: item.rangeComplete,
-        truncated: item.truncated,
-        charLength: content.length,
-        summaryCharLength: summary.length,
-        fullTextCharLength: retention === 'full' ? content.length : 0,
-        summary,
-        handle: resourceHandle(item, displayRef),
-        content: retention === 'full' ? content : undefined,
-        volatileFieldStripped: hasVolatileResourceFields(packet, item),
-        sourceKind: item.sourceKind,
-      };
-      if (!blocksByKey.has(blockKey)) orderedKeys.push(blockKey);
-      blocksByKey.set(blockKey, block);
+        displayRef,
+      });
     }
+  }
+
+  const fullTextBlockKeys = selectFullTextResourceBlockKeys(drafts);
+  for (const draft of drafts) {
+    const { blockKey, packet, item, content, contentHash, displayRef } = draft;
+    const retention = chooseRetention(item, content, fullTextBlockKeys.has(blockKey));
+    const summary = resourceSummary(item, content, retention);
+    const block: ResourcePromptBlock = {
+      blockKey,
+      workspaceScopeKey: packet.workspaceScopeKey,
+      manifestEntryId: item.manifestEntryId,
+      displayRef,
+      contentHash,
+      retention,
+      status: item.status,
+      readPolicy: item.readPolicy,
+      contentKind: item.contentKind,
+      originalBytes: item.originalBytes,
+      offsetBytes: item.offsetBytes,
+      limitBytes: item.limitBytes,
+      returnedBytes: item.returnedBytes,
+      rangeComplete: item.rangeComplete,
+      truncated: item.truncated,
+      charLength: content.length,
+      summaryCharLength: summary.length,
+      fullTextCharLength: retention === 'full' ? content.length : 0,
+      summary,
+      handle: resourceHandle(item, displayRef),
+      content: retention === 'full' ? content : undefined,
+      volatileFieldStripped: hasVolatileResourceFields(packet, item),
+      sourceKind: item.sourceKind,
+    };
+    if (!blocksByKey.has(blockKey)) orderedKeys.push(blockKey);
+    blocksByKey.set(blockKey, block);
   }
 
   const resourceBlocks = orderedKeys
@@ -100,13 +123,35 @@ export function buildResourcePromptContext(input: BuildResourcePromptContextInpu
   };
 }
 
-function chooseRetention(item: ResourcePacketItem, content: string, latestPacket: boolean): ResourceBlockRetention {
+function selectFullTextResourceBlockKeys(drafts: ResourcePromptBlockDraft[]): Set<string> {
+  const selected = new Set<string>();
+  let used = 0;
+  for (let index = drafts.length - 1; index >= 0; index -= 1) {
+    const draft = drafts[index]!;
+    if (selected.has(draft.blockKey) || !resourceBlockFullTextEligible(draft.item, draft.content)) continue;
+    const nextUsed = used + draft.content.length;
+    if (nextUsed > DYNAMIC_READ_FULL_TEXT_BUDGET_CHARS) continue;
+    selected.add(draft.blockKey);
+    used = nextUsed;
+  }
+  return selected;
+}
+
+function resourceBlockFullTextEligible(item: ResourcePacketItem, content: string): boolean {
+  if (item.status === 'denied' || item.status === 'needsUserApproval') return false;
+  if (item.status === 'error' || item.status === 'skipped') return false;
+  if (!content.trim()) return false;
+  if (item.contentKind === 'directoryTree' || item.contentKind === 'searchResults') return false;
+  return !item.truncated && content.length <= FULL_TEXT_CHAR_LIMIT;
+}
+
+function chooseRetention(item: ResourcePacketItem, content: string, keepFullText: boolean): ResourceBlockRetention {
   if (item.status === 'denied' || item.status === 'needsUserApproval') return 'denied';
   if (item.status === 'error') return 'error';
   if (item.status === 'skipped') return 'handleOnly';
   if (!content.trim()) return 'handleOnly';
   if (item.contentKind === 'directoryTree' || item.contentKind === 'searchResults') return 'summary';
-  if (latestPacket && !item.truncated && content.length <= FULL_TEXT_CHAR_LIMIT) return 'full';
+  if (keepFullText && !item.truncated && content.length <= FULL_TEXT_CHAR_LIMIT) return 'full';
   return 'summary';
 }
 

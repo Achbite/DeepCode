@@ -3180,9 +3180,13 @@ export class SessionDriverLoop {
         await this.append(state.sessionId, [
           thinkingEvent(
             state.sessionId,
-            '当前自动执行批次超出已确认计划范围，Session 正在要求模型按 accepted taskPlan 重新拆分一次。',
+            'The current execution batch is outside the confirmed current-task scope; Session is asking the model to continue the current task or request additional authorization.',
             this.ts(),
-            this.id('accepted-plan-scope-repair')
+            this.id('accepted-plan-scope-repair'),
+            {
+              messageKey: 'session.driver.acceptedPlanScopeRepair',
+              messageArgs: {},
+            }
           ),
         ]);
         try {
@@ -5300,24 +5304,20 @@ function implementationBatchHints(
   ];
   if (acceptedPlan) {
     const currentTask = acceptedPlan.tasks.find((task) => !acceptedPlan.completedTaskIds.includes(task.taskId));
+    const currentTaskOperations = objectRecord(sanitizedAcceptedPlanExecutionContext(acceptedPlan))?.currentTaskOperations;
     hints.push(
-      `Accepted taskPlan active: planId=${acceptedPlan.planId}; taskCursor=${currentTask?.taskId ?? 'complete'}; completedTasks=${acceptedPlan.completedTaskIds.length}/${acceptedPlan.tasks.length}. Automatic execution is allowed for related batches whose targets and capabilities stay inside the accepted plan.`,
+      `Accepted taskPlan active: planId=${acceptedPlan.planId}; currentTask=${currentTask?.taskId ?? 'complete'}; completedTasks=${acceptedPlan.completedTaskIds.length}/${acceptedPlan.tasks.length}. Automatic execution is allowed only for the current task when targets and capabilities stay inside the accepted plan.`,
       currentTask
         ? `Current accepted taskPlan task: taskId=${currentTask.taskId}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}.`
         : 'Current accepted taskPlan task is complete or unavailable; return diagnostic or review-ready summary rather than expanding scope.',
-      `Accepted taskPlan capabilities: ${acceptedPlan.capabilities.length ? acceptedPlan.capabilities.join(', ') : 'none'}.`,
-      `Accepted taskPlan target scopes: ${acceptedPlan.targetScopes.length ? acceptedPlan.targetScopes.join(', ') : 'none'}.`,
-      acceptedPlan.exactOperationGrants.length
-        ? `Accepted taskPlan exact operation grants: ${acceptedPlan.exactOperationGrants.map((grant) => `${grant.operation}:${grant.capability}:${grant.targetPath}`).join(', ')}.`
-        : 'Accepted taskPlan exact operation grants: none.',
-      acceptedPlan.accessScopes.length
-        ? `Accepted taskPlan access scopes: ${acceptedPlan.accessScopes.map((scope) => `${scope.scopeKind}:${scope.path}:${scope.capabilities.join('|')}:depth${scope.dependencyDepth ?? 0}`).join(', ')}.`
-        : 'Accepted taskPlan access scopes: none.',
-      'Exact file operations such as fs.delete/fs.rename are authorized by exact operation grants, not by actionBundle.accessScopes. accessScopes are only for workspace module or one-hop dependency fs.write/fs.patch batches.',
+      Array.isArray(currentTaskOperations) && currentTaskOperations.length
+        ? `Accepted current task operations: ${JSON.stringify(currentTaskOperations)}.`
+        : 'Accepted current task operations: none.',
+      'Exact file operations such as fs.delete/fs.rename are authorized by exact operation grants, not by provider-declared scope fields.',
       acceptedPlan.executionRoot
         ? `Accepted taskPlan primary root: ${acceptedPlan.executionRoot.ref}. Workspace actionBundle targetPath/codeBlock paths must be relative to this root and must not include the root directory name. Absolute paths are allowed only for outside-workspace targets already reviewed in the accepted plan.`
         : 'Accepted taskPlan primary root is not explicit; use relative target paths from the authorized workspace root unless the accepted plan explicitly contains outside-workspace absolute file targets.',
-      'Do not ask the user to reconfirm routine implementation batches already covered by the accepted taskPlan. If new targets, capabilities, or material technical choices are needed, return decisionRequest or taskPlan revision instead of an out-of-scope actionBundle.'
+      'Do not ask the user to reconfirm routine implementation batches already covered by the accepted taskPlan. If new targets, capabilities, or material technical choices are needed during accepted execution, return decisionRequest instead of an out-of-scope actionBundle.'
     );
   }
   if (context.recentPlanSummaries.length) {
@@ -5456,8 +5456,46 @@ function currentTaskMemoryHints(context: CurrentTaskContext | undefined): string
   return [
     'CurrentTaskGoal:',
     context.goal,
-    `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; capabilities=${context.capabilities.join(', ') || 'none'}; taskOrder=${context.taskOrder.join(', ') || 'none'}; pendingTasks=${context.pendingTaskIds.join(', ') || 'none'}; completedTasks=${context.completedTaskIds.length}.`,
+    `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; capabilities=${context.capabilities.join(', ') || 'none'}; completedTasks=${context.completedTaskIds.length}.`,
   ];
+}
+
+function sanitizedAcceptedPlanExecutionContext(acceptedPlan: AcceptedImplementationPlanContext | undefined): Record<string, unknown> {
+  if (!acceptedPlan) return {};
+  const completed = new Set(acceptedPlan.completedTaskIds);
+  const currentTask = acceptedPlan.tasks.find((task) => !completed.has(task.taskId));
+  const currentTargets = [...new Set((currentTask?.targets ?? []).flatMap((target) => expandPlanTargetTokens(target))
+    .map((target) => normalizePlanScopeIdentity(target))
+    .filter((target) => target && acceptedPlanTargetListSegmentSafe(target)))];
+  const currentTaskOperations = acceptedPlan.exactOperationGrants.reduce<Record<string, unknown>[]>((items, grant) => {
+    if (currentTask?.taskId && grant.sourceTaskId && grant.sourceTaskId !== currentTask.taskId) return items;
+    const targetPath = normalizePlanScopeIdentity(grant.targetRefPath ?? grant.targetPath);
+    if (!acceptedPlanTargetListSegmentSafe(targetPath)) return items;
+    items.push({
+      operation: grant.operation,
+      capability: grant.capability,
+      targetPath,
+      targetResourceKind: grant.targetResourceKind,
+      recursive: grant.recursive === true,
+    });
+    return items;
+  }, []);
+  return {
+    planId: acceptedPlan.planId,
+    title: acceptedPlan.title ?? acceptedPlan.summary ?? acceptedPlan.planId,
+    currentTask: currentTask
+      ? {
+          taskId: currentTask.taskId,
+          title: currentTask.title,
+          targets: currentTargets,
+          capability: currentTask.capability,
+        }
+      : undefined,
+    completedTaskCount: acceptedPlan.completedTaskIds.length,
+    remainingTaskCount: acceptedPlan.tasks.filter((task) => !completed.has(task.taskId)).length,
+    currentTaskOperations,
+    primaryRoot: acceptedPlan.executionRoot?.ref,
+  };
 }
 
 function lastAcceptedPlanTaskSavepointId(events: AgentEvent[]): string | undefined {
@@ -6817,7 +6855,13 @@ function finalDiagnosticEvent(sessionId: string, content: string | DiagnosticInf
   };
 }
 
-function thinkingEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent {
+function thinkingEvent(
+  sessionId: string,
+  content: string,
+  ts: string,
+  id: string,
+  message?: { messageKey: string; messageArgs?: Record<string, string> }
+): AgentEvent {
   return {
     id,
     sessionId,
@@ -6833,6 +6877,7 @@ function thinkingEvent(sessionId: string, content: string, ts: string, id: strin
       visibility: 'conversation',
       presentation: 'stageSummary',
       label: 'Session status',
+      ...(message ? { messageKey: message.messageKey, messageArgs: message.messageArgs ?? {} } : {}),
     },
   };
 }
@@ -8436,7 +8481,7 @@ function acceptedPlanDeletePreflightReasons(
 }
 
 function resourcePacketsContainDirectoryPath(resourcePackets: ResourcePacket[], targetPath: string): boolean {
-  const target = normalizePlanScope(targetPath);
+  const target = normalizePlanScopeIdentity(targetPath);
   if (!target) return false;
   for (const packet of resourcePackets) {
     const items = Array.isArray(packet.items) ? packet.items : [];
@@ -8454,7 +8499,7 @@ function resourceNodeListContainsDirectoryPath(value: unknown, targetPath: strin
   for (const item of value) {
     const node = objectRecord(item);
     if (!node) continue;
-    if (stringValue(node.type) === 'directory' && normalizePlanScope(stringValue(node.path) ?? '') === targetPath) {
+    if (stringValue(node.type) === 'directory' && normalizePlanScopeIdentity(stringValue(node.path) ?? '') === targetPath) {
       return true;
     }
     if (resourceNodeListContainsDirectoryPath(node.children, targetPath)) return true;
@@ -9030,15 +9075,15 @@ function acceptedPlanScopeDecisionResumeGuidance(effect: RequirementOptionEffect
     const target = effect.targetPath ? ` target=${effect.targetPath}` : '';
     const kind = effect.targetResourceKind ? ` targetKind=${effect.targetResourceKind}` : '';
     const recursive = effect.recursive === true ? ' recursive=true' : '';
-    return `用户已确认当前 accepted task 的执行范围扩展。继续同一任务，基于扩展后的 overlay 输出下一批 actionBundle 或必要的 resourceRequest，不要生成新的 implementationPlan。${target}${kind}${recursive}`;
+    return `The user confirmed an execution-scope expansion for the current accepted task. Continue the same task and output the next actionBundle or a necessary resourceRequest from the expanded overlay. Do not generate a new implementationPlan.${target}${kind}${recursive}`;
   }
   if (effect?.kind === 'confirmOperationGrant') {
-    return '用户已确认当前 accepted task 的操作授权。继续同一任务，若证据充分请输出 actionBundle；不要生成新的 implementationPlan。';
+    return 'The user confirmed an operation grant for the current accepted task. Continue the same task and output an actionBundle when evidence is sufficient. Do not generate a new implementationPlan.';
   }
   if (effect?.kind === 'continueCurrentTask') {
-    return '用户选择继续当前 accepted task。请保持原 accepted taskPlan，在当前任务范围内输出下一批 actionBundle 或必要的 resourceRequest；不要生成新的 implementationPlan。';
+    return 'The user chose to continue the current accepted task. Keep the original accepted taskPlan and output the next actionBundle or necessary resourceRequest within the current task scope. Do not generate a new implementationPlan.';
   }
-  return '用户选择重新生成合规批次；请保持原 accepted taskPlan，不新增 target/capability，只移除或收窄执行批次中的冗余 accessScopes。';
+  return 'The user chose to regenerate a compliant batch. Keep the same current task, do not add targets or capabilities, and only remove or narrow content that is outside the current task scope.';
 }
 
 function looksLikeResourcePath(value: string): boolean {
@@ -9345,11 +9390,11 @@ function exactOperationGrantCoversAcceptedPlanTarget(
   capability: string | undefined,
   accepted: AcceptedImplementationPlanContext
 ): boolean {
-  const normalized = normalizePlanScope(scope);
+  const normalized = normalizePlanScopeIdentity(scope);
   if (!normalized || !capability) return false;
   return accepted.exactOperationGrants.some((grant) => {
     if (!exactOperationGrantCapabilityMatches(grant, capability)) return false;
-    return normalizePlanScope(grant.targetPath) === normalized;
+    return normalizePlanScopeIdentity(grant.targetPath) === normalized;
   });
 }
 
@@ -9396,8 +9441,8 @@ function accessScopeCapabilityMatches(scope: AcceptedPlanAccessScope, capability
 
 function planScopeCovers(accepted: string, candidate: string): boolean {
   if (!accepted || !candidate) return false;
-  const acceptedNormalized = normalizePlanScope(accepted);
-  const candidateNormalized = normalizePlanScope(candidate);
+  const acceptedNormalized = normalizePlanScopeIdentity(accepted);
+  const candidateNormalized = normalizePlanScopeIdentity(candidate);
   if (acceptedNormalized === candidateNormalized) return true;
   if (isAbsolutePath(acceptedNormalized) || isAbsolutePath(candidateNormalized)) return false;
   const acceptedDir = acceptedNormalized.endsWith('/') ? acceptedNormalized : `${acceptedNormalized}/`;
@@ -9410,6 +9455,10 @@ function normalizePlanScope(value: string): string {
     .replace(/^\.\//, '')
     .replace(/\/+/g, '/')
     .trim();
+}
+
+function normalizePlanScopeIdentity(value: string): string {
+  return normalizePlanScope(value).replace(/\/+$/, '');
 }
 
 // 任务编排修复：accepted taskPlan 的 task.targets 可能是自由文本（含路径与说明混排），
@@ -11626,44 +11675,47 @@ function implementationPlanExecutionRequest(
   acceptedPlan: AcceptedImplementationPlanContext,
   guidance?: string
 ): string {
-  const planJson = JSON.stringify(plan.implementationPlan ?? {}, null, 2);
   const currentTask = acceptedPlan.tasks.find((task) => !acceptedPlan.completedTaskIds.includes(task.taskId));
   const taskLedger = buildAcceptedPlanTaskLedger(acceptedPlan);
   const promptFrame = buildAcceptedPlanPromptFrameForContext(acceptedPlan, taskLedger);
+  const providerContext = {
+    sessionPlanId: plan.planId,
+    ...sanitizedAcceptedPlanExecutionContext(acceptedPlan),
+  };
   return [
-    '用户已接受 Kernel execution contract。现在进入 Edit 阶段，生成下一批可执行候选 actionBundle。',
-    '已接受的计划/contract 是 intent/checklist，不是执行事实；不得声称文件已创建、测试已通过或权限已授予。',
+    'The user accepted the Kernel execution contract. You are now in Edit stage and must generate the next executable candidate actionBundle.',
+    'The accepted plan/contract is intent/checklist context, not execution fact. Do not claim files were created, tests passed, or permissions were granted.',
     'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. Final workspace writes still come only from the complete actionBundle JSON.',
     'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
-    '选择当前任务清单中的相关工作，允许在同一个 actionBundle 中输出多个相关文件或动作；文件数、任务数、codeBlock 数不是权限边界。',
-    '任务顺序约定：accepted plan 已按用户确认的 tasks[] 顺序执行。不要重新生成依赖图或并行调度结构；如果后续任务依赖当前任务，请把它留到当前任务完成后的下一批。',
-    '嵌套 actionBundle 对象必须包含 version/id/goal/actions；goal 只是本批次目标摘要，不是权限授权、执行事实或完成声明。',
-    'actionBundle.actions 必须使用 actionId、toolId、args、description、dependsOn；Kernel 会从 toolId 和 args 派生 capability、permission、readSet/writeSet/conflictKeys。',
+    'Handle only the task referenced by the current task cursor. One actionBundle may contain multiple related files or actions required by that current task; file count, task count, and codeBlock count are not permission boundaries.',
+    'The task list is a Session-advanced queue in the order confirmed by the user. Do not generate or reason about cross-task scheduling structures. Do not write continuationExpectations for later tasks; Session advances later tasks with its cursor.',
+    'The nested actionBundle object must include version/id/goal/actions; goal is only this batch objective summary, not a permission grant, execution fact, or completion claim.',
+    'actionBundle.actions must use actionId, toolId, args, and description; Kernel derives capability, permission, readSet/writeSet, and conflictKeys from toolId and args.',
     currentTask
-      ? `当前任务：taskId=${currentTask.taskId}; title=${currentTask.title ?? '未命名'}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}。`
-      : '当前任务清单已完成或无法定位；请返回 diagnostic 或 review-ready summary，不要扩展新范围。',
+      ? `Current task: taskId=${currentTask.taskId}; title=${currentTask.title ?? 'untitled'}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}.`
+      : 'The current task list is complete or unavailable; return diagnostic or a review-ready summary instead of expanding scope.',
     promptFrame
-      ? `AcceptedPlanPromptFrame: stableFrameHash=${promptFrame.stableFrameHash.slice(0, 16)}; taskOrder=${promptFrame.taskLedger.taskOrder.join(', ') || 'none'}; currentTask=${promptFrame.taskLedger.currentTaskId ?? 'none'}; pending=${promptFrame.taskLedger.pendingTaskIds.join(', ') || 'none'}; projectMemoryRefresh=${promptFrame.cachePolicy.projectMemoryRefresh}.`
+      ? `AcceptedPlanPromptFrame: stableFrameHash=${promptFrame.stableFrameHash.slice(0, 16)}; currentTask=${promptFrame.taskLedger.currentTaskId ?? 'none'}; completedTaskCount=${promptFrame.taskLedger.completedTaskIds.length}; remainingTaskCount=${promptFrame.taskLedger.pendingTaskIds.length + (promptFrame.taskLedger.currentTaskId ? 1 : 0)}; projectMemoryRefresh=${promptFrame.cachePolicy.projectMemoryRefresh}.`
       : '',
     acceptedPlan.completedTaskIds.length
-      ? `已完成 taskId：${acceptedPlan.completedTaskIds.join(', ')}。不要重复生成已完成任务，除非 Kernel facts 显示失败或用户要求修订。`
-      : '当前 accepted contract 尚无已完成任务。',
+      ? `Completed taskIds: ${acceptedPlan.completedTaskIds.join(', ')}. Do not regenerate completed tasks unless Kernel facts show failure or the user requests revision.`
+      : 'The current accepted contract has no completed tasks yet.',
     acceptedPlan.executionRoot
-      ? `primary root：${acceptedPlan.executionRoot.ref}。workspace 内 args.path、codeBlocks.targetPath 必须相对该 root；禁止包含 root 目录名和 ../。只有已确认计划中的外部文件目标可以使用绝对文件路径。`
-      : 'workspace 内 args.path、codeBlocks.targetPath 必须是相对 workspace root 的路径；只有已确认计划中的外部文件目标可以使用绝对文件路径，禁止 ../。',
-    '该 actionBundle 如果落在 accepted contract 的 target/tool 范围内，会由 Session 提交 Kernel 执行；新增 target/tool 必须返回 decisionRequest，而不是隐式扩展。',
-    '执行批次不要携带 workspace root、"."、module root、通配符、accessScopes、resourceScope 或 capability；已确认 Kernel contract 才是授权来源。',
-    'accepted task target 如果是目录（例如 src/），它只是文件分组范围；不要输出目录创建 action、空 .gitkeep 占位写入或空 contentLines。请输出该目录下的具体文件 fs.write/fs.patch action；新文件写入时父目录由 Kernel 创建。',
-    '不要重新询问已确认的技术路线、目录结构、Docker/script workflow、模块拆分或验证策略。',
-    '如果发现必须新增 target/tool，或缺少关键技术选择，请返回 kind="decisionRequest"，而不是输出超范围 actionBundle。',
-    '本轮 actionBundle 必须包含具体 codeBlocks（如需要）和 Kernel 可审查的 validationExpectations/reviewExpectations；validationExpectations 使用 [{id,description,command?}]，reviewExpectations 使用 [{id,description}]。',
-    '修改已有文件时，先使用 resourceRequest kind="search" 或 file/range 读取当前锚点；patch action 必须包含 patchSpec.match.kind="exactBlock" 和从当前 ResourcePacket fileText/searchResults 复制的非空 patchSpec.match.text。',
-    '删除文件或已确认目录时必须输出 fs.delete action：toolId="fs.delete"，args.path 为已确认任务范围内的具体路径；workspace 目标用相对路径，已确认的外部目标可用绝对路径；删除 action 不需要也不得引用 codeBlocks/sourceBlockId。',
-    '目录删除只能在 accepted contract 已展示 exact directory operation/grant 时使用；必须设置 args.targetKind="directory"、args.recursive=true。未确认目录、通配符、根目录和空路径不能作为 fs.delete action。',
-    `总 codeBlock 内容必须控制在 ${MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES} bytes payload 预算内。新建文件优先一次性完整写入；已有文件大范围改写必须按模块、函数、类、文件 section、脚本段或配置段切片。continuationExpectations 只表示 payload/证据/依赖延后，不表示缩小 accepted plan 授权范围。`,
-    '所有源码内容必须放在 codeBlocks[].contentLines，不得使用大段或多行 codeBlocks.content。',
-    guidance?.trim() ? `用户确认计划时补充的 guidance：\n${guidance.trim()}` : '',
-    `Accepted execution contract context:\n${planJson}`,
+      ? `Primary root: ${acceptedPlan.executionRoot.ref}. Workspace args.path and codeBlocks.targetPath must be relative to this root; do not include the root directory name or ../. Absolute file paths are allowed only for outside-workspace targets already confirmed in the accepted plan.`
+      : 'Workspace args.path and codeBlocks.targetPath must be relative to the workspace root. Absolute file paths are allowed only for outside-workspace targets already confirmed in the accepted plan. Do not use ../.',
+    'If this actionBundle stays inside the accepted contract target/tool scope, Session will submit it to Kernel execution. New target/tool needs must return decisionRequest instead of implicit expansion.',
+    'Execution batches must not carry workspace root, ".", module root, wildcards, accessScopes, resourceScope, or capability; the confirmed Kernel contract is the authorization source.',
+    'If an accepted task target is a directory such as src/, it is only a file grouping scope. Do not output directory-create actions, empty .gitkeep placeholder writes, or empty contentLines. Output concrete fs.write/fs.patch actions for files under that directory; Kernel creates parent directories for new file writes.',
+    'Do not re-ask already confirmed technical route, directory layout, Docker/script workflow, module split, or validation strategy.',
+    'If a new target/tool is required, or a key technical choice is missing, return kind="decisionRequest" instead of an out-of-scope actionBundle.',
+    'This actionBundle must include concrete codeBlocks when needed and Kernel-reviewable validationExpectations/reviewExpectations. validationExpectations use [{id,description,command?}], and reviewExpectations use [{id,description}].',
+    'When modifying an existing file, first use resourceRequest kind="search" or a file/range read for the current anchor. patch action must include patchSpec.match.kind="exactBlock" and non-empty patchSpec.match.text copied from current ResourcePacket fileText/searchResults.',
+    'When deleting a file or confirmed directory, output an fs.delete action: toolId="fs.delete", args.path is a concrete path inside the confirmed task scope. Workspace targets use relative paths; confirmed external targets may use absolute paths. Delete actions do not need and must not reference codeBlocks/sourceBlockId.',
+    'Directory deletion is allowed only when the accepted contract exposed an exact directory operation/grant; set args.targetKind="directory" and args.recursive=true. Unconfirmed directories, wildcards, root directories, and empty paths cannot be fs.delete actions.',
+    `Keep total codeBlock content within the ${MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES} byte payload budget. Prefer complete writes for new files when they fit. For large existing-file rewrites, slice by module, function, class, file section, script segment, or config segment. continuationExpectations may only record current-task payload or evidence deferral; they do not narrow accepted plan authorization and must not schedule later tasks.`,
+    'All source content must be in codeBlocks[].contentLines. Do not use large or multiline codeBlocks.content.',
+    guidance?.trim() ? `Additional guidance supplied when the user confirmed the plan:\n${guidance.trim()}` : '',
+    `Accepted execution sanitized context:\n${fenced(JSON.stringify(providerContext, null, 2))}`,
   ].filter(Boolean).join('\n\n');
 }
 
@@ -11686,16 +11738,16 @@ function acceptedPlanResourceResumePrompt(
   });
   return [
     'Accepted-plan resource resume checkpoint.',
-    'You are resuming the same accepted taskPlan after Session resolved read-only evidence. Do not restart planning, do not ask for already-confirmed scope, and do not claim execution facts.',
+    'You are resuming the same accepted task after Session resolved read-only evidence. Do not restart planning, do not ask for already-confirmed scope, and do not claim execution facts.',
     'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. These frames are draft ledger previews only; final workspace writes still come only from the complete actionBundle JSON.',
     'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
     'Return exactly one Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, answer, or diagnostic.',
     resourceRequestProtocolShapeLine(),
     'Prefer actionBundle if the just-resolved evidence is sufficient for an edit task. If the current task is read-only validation and the ResourcePacket is enough, return answer summarizing only the resolved evidence. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
-    accepted ? `Accepted plan: planId=${accepted.planId}; title=${accepted.title ?? accepted.summary ?? accepted.planId}; completedTasks=${accepted.completedTaskIds.join(', ') || 'none'}.` : '',
-    cursor ? `TaskExecutionCursor: cursorId=${cursor.cursorId}; currentTaskId=${cursor.currentTaskId ?? 'none'}; taskOrder=${cursor.taskOrder.join(', ') || 'none'}; pendingTasks=${cursor.pendingTaskIds.join(', ') || 'none'}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
+    accepted ? `Accepted plan: planId=${accepted.planId}; title=${accepted.title ?? accepted.summary ?? accepted.planId}; completedTaskCount=${accepted.completedTaskIds.length}; remainingTaskCount=${accepted.tasks.filter((task) => !accepted.completedTaskIds.includes(task.taskId)).length}.` : '',
+    cursor ? `TaskExecutionCursor: cursorId=${cursor.cursorId}; currentTaskId=${cursor.currentTaskId ?? 'none'}; completedTaskCount=${cursor.completedTaskIds.length}; remainingTaskCount=${cursor.pendingTaskIds.length + (cursor.currentTaskId ? 1 : 0)}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
     current ? `CurrentTaskGoal: ${current.goal}` : '',
-    current ? `CurrentTaskContext: targets=${current.targets.join(', ') || 'none'}; capabilities=${current.capabilities.join(', ') || 'none'}; dependsOn=${current.dependsOn.join(', ') || 'none'}; evidenceNeeds=${current.evidenceNeeds.join(', ') || 'none'}.` : '',
+    current ? `CurrentTaskContext: targets=${current.targets.join(', ') || 'none'}; capabilities=${current.capabilities.join(', ') || 'none'}; evidenceNeeds=${current.evidenceNeeds.join(', ') || 'none'}.` : '',
     `Original resourceRequest proposalId=${requestProposal.proposalId}; kind=${requestProposal.kind}.`,
     `Resolved ResourcePacket id=${packet.id}; itemCount=${packet.items.length}:`,
     fenced(clip(JSON.stringify(resourceItems, null, 2), 6_000)),
@@ -12231,7 +12283,7 @@ function compactRepairContextLines(
     lines.push('Implementation batch context summary:', fenced(clip(JSON.stringify(state.implementationBatch, null, 2), 2_000)));
   }
   if (options?.includeAcceptedPlan) {
-    lines.push('Accepted plan context summary:', fenced(clip(JSON.stringify(state.acceptedImplementationPlan ?? {}, null, 2), 3_000)));
+    lines.push('Accepted plan context summary:', fenced(clip(JSON.stringify(sanitizedAcceptedPlanExecutionContext(state.acceptedImplementationPlan), null, 2), 3_000)));
   }
   return lines;
 }
@@ -12336,8 +12388,8 @@ function protocolRepairShapeReference(errorCode: string): string {
     'Provider output must be one Agent Protocol v3 JSON object.',
     'Allowed proposal kinds: answer, resourceRequest, decisionRequest, taskPlan, actionBundle, diagnostic.',
     'reviewSummary is Session-generated and must not be returned by the provider.',
-    'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be an ordered engineering checklist; put prerequisite tasks earlier. Deprecated graph fields may be parsed for telemetry but are not required and must not be used for provider-facing scheduling. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.',
-    'For kind="actionBundle", put userPlanMarkdown, codeBlocks, actionBundle, expectedValidation, and reviewGuide directly on the top-level JSON object. Do not wrap them in a payload object.',
+    'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered engineering queue, not a graph. Deprecated graph fields may be parsed for telemetry but are not required and must not be used for provider-facing scheduling. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.',
+    'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. Put validation notes in actionBundle.validationExpectations[] and review obligations in actionBundle.reviewExpectations[].',
     'For kind="decisionRequest", put decisionRequest:{id,question,reason?,summary?,options:[{id,label,description,recommended?}],allowsFreeform?} on the top-level JSON object. Do not return bare reason/options without decisionRequest.',
     'codeBlocks[] uses {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}; contentLines is the only source-code carrier.',
     'fs.write actions use args={path,sourceBlockId}; sourceBlockId must match the blockId of the codeBlock carrying that exact file content.',
@@ -12367,12 +12419,12 @@ function actionBundleCompactionRepairMessages(
         'You are the DeepCode Agent Protocol v3 implementation batch repair step.',
         'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
         'If proposing executable work, return kind="actionBundle" for a coherent batch that fits the payload budget.',
-        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, actionBundle, expectedValidation, and reviewGuide directly on the top-level JSON object. Do not wrap them in a payload object.',
+        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. Put validation notes in actionBundle.validationExpectations[] and review obligations in actionBundle.reviewExpectations[].',
         ...actionBundleProtocolShapeLines(),
         'Use codeBlocks[].contentLines for source code.',
         'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large/multiline codeBlocks.content strings.',
         `Payload budget: at most ${MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES} bytes total joined contentLines. File count, task count, and codeBlock count are not permission boundaries.`,
-        'For new files, prefer one complete file write when it fits the payload budget. For large rewrites, split by module, file section, class, function, or script/config section. continuationExpectations may describe payload/dependency/evidence-delayed work, but must not reduce the accepted plan scope.',
+        'For new files, prefer one complete file write when it fits the payload budget. For large rewrites, split by module, file section, class, function, or script/config section. continuationExpectations may describe current-task payload or evidence-delayed work, but must not reduce the accepted plan scope or schedule later tasks.',
         'Directory targets are planning scopes only. Do not create empty .gitkeep or placeholder writes for directories; output concrete file writes and reference each file content with args.sourceBlockId.',
         'If current facts are insufficient, return kind="resourceRequest" using manifestEntryId, rootId+path, or kind="search" with a non-empty query under the listed conversation roots.',
         'Do not claim execution, permissions, tests passed, or task completion.',
@@ -12447,7 +12499,7 @@ function sideEffectNativeToolRepairMessages(
         'Never claim that files were written, commands ran, permissions were granted, or validation passed.',
         'If returning decisionRequest, ask one concise question with 2-3 mutually exclusive options, exactly one recommended option, impact descriptions, allowsFreeform=true, and user-visible text in the current user language.',
         'If returning taskPlan, put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints directly on the top-level JSON object. tasks[] must be ordered by practical development sequence; deprecated graph fields may be parsed for telemetry but are not required. taskPlan must not include source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
-        'If returning actionBundle after acceptedTaskPlan, put userPlanMarkdown, codeBlocks, actionBundle, expectedValidation, and reviewGuide directly on the top-level JSON object. Do not wrap them in a payload object.',
+        'If returning actionBundle after acceptedTaskPlan, put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. Put validation notes in actionBundle.validationExpectations[] and review obligations in actionBundle.reviewExpectations[].',
         ...actionBundleProtocolShapeLines(),
         'Command plans use actionBundle.actions[] with toolId="process.exec" and typed args; do not output commandBlocks.',
         'Use codeBlocks[].contentLines for source code in Complete-stage actionBundle only. Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or large/multiline codeBlocks.content strings.',
@@ -12487,7 +12539,7 @@ function nativeToolDuplicateRepairMessages(
           ? 'A plan has already been accepted. If executable work is ready, return kind="actionBundle" within the accepted plan scope.'
           : 'If enough facts are available, return kind="answer"; otherwise return kind="resourceRequest" only for a different target/range or search query that adds new evidence.',
         'Never request fs.read or fs.list for any duplicate target/range listed below. Use the existing ResourcePacket facts.',
-        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, actionBundle, expectedValidation, and reviewGuide directly on the top-level JSON object. Do not wrap them in a payload object.',
+        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. Put validation notes in actionBundle.validationExpectations[] and review obligations in actionBundle.reviewExpectations[].',
         ...actionBundleProtocolShapeLines(),
         'Use codeBlocks[].contentLines for source code.',
       ].join('\n'),
@@ -12648,7 +12700,7 @@ function acceptedPlanScopeRepairMessages(
         'If executable work is still valid, return kind="actionBundle" with one related implementation batch. Multiple related files are allowed when all targets are inside the accepted plan.',
         'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. Final workspace writes still come only from the complete actionBundle JSON.',
         'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
-        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, actionBundle, expectedValidation, and reviewGuide directly on the top-level JSON object. Do not wrap them in a payload object.',
+        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. Put validation notes in actionBundle.validationExpectations[] and review obligations in actionBundle.reviewExpectations[].',
         ...actionBundleProtocolShapeLines(),
         resourceRequestProtocolShapeLine(),
         'Use codeBlocks[].contentLines for source code.',
@@ -12665,8 +12717,8 @@ function acceptedPlanScopeRepairMessages(
       role: 'user',
       content: [
         ...compactRepairContextLines(prompt, state, { includeImplementationBatch: true, includeAcceptedPlan: true }),
-        'Accepted taskPlan:',
-        fenced(clip(JSON.stringify(state.acceptedImplementationPlan?.rawPlan ?? {}, null, 2), 4_000)),
+        'Accepted task context:',
+        fenced(clip(JSON.stringify(sanitizedAcceptedPlanExecutionContext(state.acceptedImplementationPlan), null, 2), 4_000)),
         'Invalid ProposalEnvelope:',
         fenced(clip(JSON.stringify(proposal, null, 2), 5_000)),
         'Session validation reasons:',
@@ -12922,13 +12974,21 @@ function acceptedPlanScopeRevisionRequest(
   guidance?: string
 ): string {
   const decisionRequest = objectRecord(objectRecord(confirmation.payload)?.decisionRequest) ?? {};
+  const implementationPlan = objectRecord(plan?.implementationPlan);
+  const planSummary = plan
+    ? {
+        planId: plan.planId,
+        title: stringValue(implementationPlan?.title),
+        summary: stringValue(implementationPlan?.summary),
+      }
+    : undefined;
   return [
     'User requested an accepted-plan scope revision.',
     'Return a decisionRequest if a new user choice is required, or return a new actionBundle if the requested revision is already precise enough.',
     'Do not output legacy implementationPlan, fileOperations, accessScopes, capability, resourceScope, commandBlocks, or large/multiline codeBlocks.content.',
     'Only expand targets or toolIds when the user guidance or Kernel review reason requires it. Kernel will review the resulting execution contract and the user must confirm it before execution continues.',
     guidance?.trim() ? `User guidance:\n${guidance.trim()}` : '',
-    plan?.implementationPlan ? `Current accepted execution contract context:\n${JSON.stringify(plan.implementationPlan, null, 2)}` : '',
+    planSummary ? `Current accepted execution summary:\n${JSON.stringify(planSummary, null, 2)}` : '',
     Object.keys(decisionRequest).length ? `Accepted-plan scope decision:\n${JSON.stringify(decisionRequest, null, 2)}` : '',
   ].filter(Boolean).join('\n\n');
 }
