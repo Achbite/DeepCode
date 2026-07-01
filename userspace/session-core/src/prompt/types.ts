@@ -23,6 +23,7 @@ export interface PromptSystemLayer {
     | 'currentWorkflowState'
     | 'currentRequirement'
     | 'currentResourceResults'
+    | 'promptPacketFrame'
     | 'auditOnlyContext';
   priority: number;
   stable: boolean;
@@ -77,6 +78,12 @@ export interface PromptEnvelopeBuilderInput {
   conversationRoots?: ConversationResourceRoot[];
   resourcePackets?: ResourcePacket[];
   resourcePromptContext?: ResourcePromptContext;
+  currentTaskGoal?: string;
+  currentTaskContext?: unknown;
+  taskCursor?: {
+    cursorId?: string;
+    lastSavepointId?: string;
+  };
   userRequest: string;
   auditOnly?: {
     runId?: string;

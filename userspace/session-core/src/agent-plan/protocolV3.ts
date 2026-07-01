@@ -560,6 +560,33 @@ function normalizeOptionEffect(value: unknown): Record<string, unknown> | undefi
     case 'finishRun':
     case 'finishWithAnswer':
       return { kind };
+    case 'continueCurrentTask': {
+      const taskId = typeof record.taskId === 'string' ? record.taskId : undefined;
+      return taskId ? { kind, taskId } : { kind };
+    }
+    case 'expandCurrentTaskScope': {
+      const taskId = typeof record.taskId === 'string' ? record.taskId : undefined;
+      const targetPath = typeof record.targetPath === 'string' ? record.targetPath : undefined;
+      const targetResourceKindRaw = typeof record.targetResourceKind === 'string' ? record.targetResourceKind : undefined;
+      const targetResourceKind = targetResourceKindRaw === 'directory' || targetResourceKindRaw === 'file'
+        ? targetResourceKindRaw
+        : undefined;
+      const reason = typeof record.reason === 'string' ? record.reason : undefined;
+      return {
+        kind,
+        ...(taskId ? { taskId } : {}),
+        ...(targetPath ? { targetPath } : {}),
+        ...(targetResourceKind ? { targetResourceKind } : {}),
+        ...(record.recursive === true ? { recursive: true } : {}),
+        ...(reason ? { reason } : {}),
+      };
+    }
+    case 'confirmOperationGrant':
+    case 'answerReviewQuestion': {
+      const taskId = typeof record.taskId === 'string' ? record.taskId : undefined;
+      const reason = typeof record.reason === 'string' ? record.reason : undefined;
+      return { kind, ...(taskId ? { taskId } : {}), ...(reason ? { reason } : {}) };
+    }
     case 'cancel': {
       const reason = typeof record.reason === 'string' ? record.reason : undefined;
       return reason ? { kind, reason } : { kind };

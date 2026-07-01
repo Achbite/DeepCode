@@ -256,6 +256,9 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     resourcePromptContext,
     conversationRoots: input.conversationRoots,
     requirement: input.requirement,
+    currentTaskGoal: input.currentTaskGoal,
+    currentTaskContext: input.currentTaskContext,
+    taskCursor: input.taskCursor,
     auditOnly: input.auditOnly,
   };
   const prompt = buildPromptEnvelope(promptInput);

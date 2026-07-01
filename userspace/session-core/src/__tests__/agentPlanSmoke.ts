@@ -21,6 +21,7 @@ import {
   buildNarrativeTimelineProjection,
   buildTimelineProjectionWithLiveOverlay,
   buildPromptEnvelope,
+  buildPromptPacketFrames,
   buildResourcePromptContext,
   buildSessionMemoryDocument,
   buildSessionMemorySnapshot,
@@ -920,6 +921,15 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('zh-CN'), 'stable prefix excludes localized JSON example payloads');
   assert(prompt.dynamicSuffix.includes('Current workflow state: needProposal'), 'dynamic suffix carries current workflow state');
   assert(prompt.dynamicSuffix.includes('Allowed proposals: answer, resourceRequest, actionBundle'), 'dynamic suffix carries allowed proposals');
+  assert(prompt.dynamicLayerNames.includes('promptPacketFrame'), 'prompt packet is an explicit provider-visible frame partition');
+  assert(prompt.dynamicSuffix.includes('<PromptPacket schemaVersion="deepcode.session.prompt-packet.v1">'), 'prompt packet frame renders into dynamic suffix');
+  assert(prompt.dynamicSuffix.includes('kind: UserRequest'), 'prompt packet labels user request frame');
+  assert(prompt.dynamicSuffix.includes('trust: userIntent'), 'prompt packet marks user request as user intent');
+  assert(prompt.dynamicSuffix.includes('kind: AccessSummary'), 'prompt packet includes access summary from resource evidence');
+  assert(prompt.dynamicSuffix.includes('trust: derivedObservedFact'), 'prompt packet marks access summary as derived from observed resources');
+  assert(prompt.dynamicSuffix.includes('kind: Memory'), 'prompt packet labels compacted memory frame');
+  assert(prompt.dynamicSuffix.includes('trust: compressedReference'), 'prompt packet marks memory as reference rather than fact');
+  assert(prompt.dynamicSuffix.includes('kind: NextActionInstruction'), 'prompt packet includes final next-action instruction');
   assert(prompt.dynamicSuffix.includes('fs.read'), 'dynamic suffix carries capability projection');
   assert(prompt.stableLayerNames.includes('projectMemory'), 'project memory index digest is an explicit stable context partition');
   assert(prompt.dynamicLayerNames.includes('projectMemoryRecall'), 'project memory recall is an explicit dynamic context partition');
@@ -932,6 +942,30 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('not governed by a fixed Session round budget'), 'prompt explains read-only requests are user-controlled');
   assert(prompt.dynamicSuffix.includes('offsetBytes/limitBytes'), 'prompt hints range reread for truncated resources');
   assert(!prompt.dynamicSuffix.includes('auditOnlyContext'), 'audit-only context is not in dynamic suffix');
+
+  const acceptedFrames = buildPromptPacketFrames({
+    workflowState: 'executing_accepted_plan',
+    allowedProposals: ['taskPlan', 'actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+    capabilityCatalogSummary: 'fs.delete',
+    memoryHints: ['Prior plan accepted by user.'],
+    userRequest: 'Continue the accepted cleanup task.',
+    currentTaskGoal: 'Remove a confirmed generated directory.',
+    currentTaskContext: {
+      taskId: 'task-generic-delete',
+      taskTitle: 'Remove generated directory',
+      targets: ['generated-dir'],
+      capabilities: ['fs.delete'],
+      pendingTaskIds: ['task-generic-delete'],
+      completedTaskIds: [],
+    },
+  });
+  const acceptedTaskFrame = acceptedFrames.find((frame) => frame.kind === 'TaskFrame');
+  assert(acceptedTaskFrame?.trust === 'confirmedTaskInstruction', 'accepted execution prompt packet marks task frame as confirmed instruction');
+  const nextAction = acceptedFrames.find((frame) => frame.kind === 'NextActionInstruction');
+  assert(nextAction, 'accepted execution prompt packet includes next action frame');
+  const allowedLine = nextAction?.content.find((line) => line.startsWith('allowedOutputs=')) ?? '';
+  assert(!allowedLine.includes('taskPlan') && allowedLine.includes('actionBundle'), 'accepted execution narrows allowed outputs away from taskPlan');
+  assert(nextAction?.content.some((line) => line.includes('forbiddenOutputs=taskPlan')), 'accepted execution explicitly forbids plan output');
 }
 
 function assertRunStateMachineTaskLedger(): void {

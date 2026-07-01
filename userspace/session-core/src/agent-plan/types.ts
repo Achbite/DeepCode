@@ -199,6 +199,17 @@ export interface DecisionRequestOptionDraft {
 export type AgentRequirementOptionEffect =
   | { kind: 'continueWithAction' }
   | { kind: 'skipCurrentTask' }
+  | { kind: 'continueCurrentTask'; taskId?: string }
+  | {
+    kind: 'expandCurrentTaskScope';
+    taskId?: string;
+    targetPath?: string;
+    targetResourceKind?: 'file' | 'directory';
+    recursive?: boolean;
+    reason?: string;
+  }
+  | { kind: 'confirmOperationGrant'; taskId?: string; reason?: string }
+  | { kind: 'answerReviewQuestion'; reason?: string }
   | { kind: 'replan'; reason?: string }
   | { kind: 'finishRun' }
   | { kind: 'markAcceptedIncomplete'; taskIds?: string[]; reason?: string }

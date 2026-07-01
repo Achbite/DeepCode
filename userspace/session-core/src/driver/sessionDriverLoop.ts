@@ -994,13 +994,15 @@ export class SessionDriverLoop {
       acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot),
       current.events
     );
+    const selectedEffect = selectedRequirementDecisionOptionEffect(decisionEvent);
+    const nextAcceptedPlan = acceptedPlanWithScopeDecisionEffect(acceptedPlan, selectedEffect);
     const guidance = input.guidance?.trim()
       ? `用户对 accepted-plan scope 介入的补充意见：${input.guidance.trim()}`
-      : '用户选择重新生成合规批次；请保持原 accepted taskPlan，不新增 target/capability，只移除或收窄执行批次中的冗余 accessScopes。';
+      : acceptedPlanScopeDecisionResumeGuidance(selectedEffect);
     return this.runUserTurn({
       sessionId: input.sessionId,
-      content: implementationPlanExecutionRequest(plan, acceptedPlan, guidance),
-      attachments: acceptedPlan.executionRoot ? [acceptedPlan.executionRoot.attachment] : requirementAttachments(confirmation),
+      content: implementationPlanExecutionRequest(plan, nextAcceptedPlan, guidance),
+      attachments: nextAcceptedPlan.executionRoot ? [nextAcceptedPlan.executionRoot.attachment] : requirementAttachments(confirmation),
       existingEvents: current.events,
       workspaceBinding: input.workspaceBinding,
       projectWorkingDirectory: input.projectWorkingDirectory,
@@ -1012,7 +1014,7 @@ export class SessionDriverLoop {
       interventionLevel: input.interventionLevel,
       projectMemoryMode: input.projectMemoryMode,
       resumeResourcePackets: true,
-      acceptedImplementationPlan: acceptedPlan,
+      acceptedImplementationPlan: nextAcceptedPlan,
       interactionOverlay,
     });
   }
@@ -3002,24 +3004,17 @@ export class SessionDriverLoop {
       ]) ?? result;
     }
     if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
-      const planId = stringValue(objectRecord(repaired.payload)?.id) ?? repaired.proposalId;
-      state.phase = 'waiting_plan_review';
       return this.append(state.sessionId, [
-        implementationPlanCardEvent(state, repaired, this.ts(), this.id('action-bundle-admission-plan')),
-        sessionRunStateEvent({
-          sessionId: state.sessionId,
-          runId: state.runId,
-          phase: 'waiting_plan_review',
-          reason: 'plan_review',
-          decisionOwner: {
-            kind: 'plan',
-            runId: state.runId,
-            targetId: planId,
-            planId,
-          },
-          ts: this.ts(),
-          id: this.id('session-run-waiting-action-bundle-admission-plan'),
-        }),
+        finalDiagnosticEvent(
+          state.sessionId,
+          diag(
+            'actionBundleAdmissionRepairReturnedPlan',
+            'Action-bundle admission repair returned a plan proposal during execution. Session will not switch execution repair back into plan review; request a scoped actionBundle, resourceRequest, decisionRequest, or diagnostic instead.',
+            { returnedKind: repaired.kind, proposalId: repaired.proposalId }
+          ),
+          this.ts(),
+          this.id('action-bundle-admission-repair-plan-forbidden')
+        ),
       ]) ?? result;
     }
     if (repaired.kind === 'answer') {
@@ -3295,24 +3290,17 @@ export class SessionDriverLoop {
             ]);
           }
           if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
-            const planId = stringValue(objectRecord(repaired.payload)?.id) ?? repaired.proposalId;
-            state.phase = 'waiting_plan_review';
             return this.append(state.sessionId, [
-              implementationPlanCardEvent(state, repaired, this.ts(), this.id('accepted-plan-scope-repair-plan')),
-              sessionRunStateEvent({
-                sessionId: state.sessionId,
-                runId: state.runId,
-                phase: 'waiting_plan_review',
-                reason: 'plan_review',
-                decisionOwner: {
-                  kind: 'plan',
-                  runId: state.runId,
-                  targetId: planId,
-                  planId,
-                },
-                ts: this.ts(),
-                id: this.id('session-run-waiting-accepted-plan-repair-plan'),
-              }),
+              finalDiagnosticEvent(
+                state.sessionId,
+                diag(
+                  'acceptedPlanScopeRepairReturnedPlan',
+                  'Accepted-plan execution repair returned a plan proposal. Session will not re-enter plan review from an accepted task; request a scoped actionBundle, resourceRequest, decisionRequest, or diagnostic instead.',
+                  { returnedKind: repaired.kind, proposalId: repaired.proposalId }
+                ),
+                this.ts(),
+                this.id('accepted-plan-scope-repair-plan-forbidden')
+              ),
             ]);
           }
           return this.submitNonExecutableProposal(state, repaired, fallback);
@@ -7732,7 +7720,11 @@ function findPendingPermissionContext(events: AgentEvent[], permissionId?: strin
 
 function sessionProviderAllowedProposals(allowed: string[], state: SessionDriverLoopRunState): string[] {
   const merged = new Set(allowed);
-  if (!state.acceptedImplementationPlan) {
+  if (state.acceptedImplementationPlan) {
+    merged.delete('taskPlan');
+    merged.delete('implementationPlan');
+    for (const kind of ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']) merged.add(kind);
+  } else {
     merged.add('taskPlan');
   }
   return [...merged];
@@ -8975,6 +8967,80 @@ function acceptedPlanWithLatestCheckpoint(
   return accepted;
 }
 
+function acceptedPlanWithScopeDecisionEffect(
+  accepted: AcceptedImplementationPlanContext,
+  effect: RequirementOptionEffect | undefined
+): AcceptedImplementationPlanContext {
+  if (!effect || effect.kind !== 'expandCurrentTaskScope') return accepted;
+  const currentTask = accepted.tasks.find((task) => task.taskId === effect.taskId)
+    ?? accepted.tasks[Math.max(0, accepted.batchIndex - 1)];
+  const capability = currentTask?.capability
+    ?? accepted.capabilities.find(planAcceptedAutoGrantCapability);
+  if (!capability) return accepted;
+  const rawTarget = stringValue(effect.targetPath);
+  if (!rawTarget) return accepted;
+  const targetResourceKind = effect.targetResourceKind ?? (rawTarget.endsWith('/') ? 'directory' : 'file');
+  const normalized = normalizePlanTargetForExecutionRoot(rawTarget, accepted.executionRoot);
+  const targetPath = targetResourceKind === 'directory'
+    ? concreteDirectoryOperationTarget(normalized)
+    : concreteFileOperationTarget(normalized);
+  if (!targetPath) return accepted;
+  const operation = operationForCapability(capability);
+  const sourceTaskId = effect.taskId ?? currentTask?.taskId;
+  const grant: AcceptedPlanExactOperationGrant = {
+    operation,
+    targetPath,
+    targetResourceKind,
+    recursive: effect.recursive === true || targetResourceKind === 'directory',
+    capability,
+    sourceTaskId,
+    source: 'implementationPlan',
+  };
+  const tasks = accepted.tasks.map((task) => {
+    if (sourceTaskId && task.taskId !== sourceTaskId) return task;
+    if (!sourceTaskId && task !== currentTask) return task;
+    return {
+      ...task,
+      capability: task.capability ?? capability,
+      targets: uniqueStrings([...task.targets, targetPath]),
+    };
+  });
+  return {
+    ...accepted,
+    tasks,
+    capabilities: uniqueStrings([...accepted.capabilities, capability]),
+    targetScopes: uniqueStrings([...accepted.targetScopes, targetPath]),
+    exactOperationGrants: normalizeAcceptedPlanExactOperationGrants([
+      ...accepted.exactOperationGrants,
+      grant,
+    ], accepted.executionRoot),
+  };
+}
+
+function operationForCapability(capability: string): string {
+  if (capability === 'fs.delete') return 'delete';
+  if (capability === 'fs.rename') return 'rename';
+  if (capability === 'fs.patch') return 'patch';
+  if (capability === 'fs.write') return 'write';
+  return capability;
+}
+
+function acceptedPlanScopeDecisionResumeGuidance(effect: RequirementOptionEffect | undefined): string {
+  if (effect?.kind === 'expandCurrentTaskScope') {
+    const target = effect.targetPath ? ` target=${effect.targetPath}` : '';
+    const kind = effect.targetResourceKind ? ` targetKind=${effect.targetResourceKind}` : '';
+    const recursive = effect.recursive === true ? ' recursive=true' : '';
+    return `用户已确认当前 accepted task 的执行范围扩展。继续同一任务，基于扩展后的 overlay 输出下一批 actionBundle 或必要的 resourceRequest，不要生成新的 implementationPlan。${target}${kind}${recursive}`;
+  }
+  if (effect?.kind === 'confirmOperationGrant') {
+    return '用户已确认当前 accepted task 的操作授权。继续同一任务，若证据充分请输出 actionBundle；不要生成新的 implementationPlan。';
+  }
+  if (effect?.kind === 'continueCurrentTask') {
+    return '用户选择继续当前 accepted task。请保持原 accepted taskPlan，在当前任务范围内输出下一批 actionBundle 或必要的 resourceRequest；不要生成新的 implementationPlan。';
+  }
+  return '用户选择重新生成合规批次；请保持原 accepted taskPlan，不新增 target/capability，只移除或收窄执行批次中的冗余 accessScopes。';
+}
+
 function looksLikeResourcePath(value: string): boolean {
   if (!value || value.includes(' ') || value.includes('\n')) return false;
   return value.includes('/') || /\.[A-Za-z0-9]+$/.test(value);
@@ -9427,11 +9493,13 @@ function acceptedPlanOutOfScopeDecisionProposal(
             label: 'Regenerate in scope',
             description: 'Keep the accepted plan and ask the agent to output the next batch within its targets and capabilities.',
             recommended: true,
+            effect: { kind: 'continueCurrentTask' },
           },
           {
             id: 'revise-plan',
             label: 'Revise plan scope',
             description: 'Treat the new targets or capabilities as a plan revision before continuing.',
+            effect: { kind: 'replan', reason: 'revise accepted plan scope' },
           },
         ]
         : [
@@ -9440,11 +9508,13 @@ function acceptedPlanOutOfScopeDecisionProposal(
             label: '重新生成合规批次',
             description: '保持已确认计划不变，让 Agent 重新输出落在目标和能力范围内的下一批。',
             recommended: true,
+            effect: { kind: 'continueCurrentTask' },
           },
           {
             id: 'revise-plan',
             label: '修订计划范围',
             description: '把新增目标或能力作为计划修订先确认，再继续执行。',
+            effect: { kind: 'replan', reason: 'revise accepted plan scope' },
           },
         ],
       allowsFreeform: true,
@@ -12586,7 +12656,8 @@ function acceptedPlanScopeRepairMessages(
         'Accepted-plan execution batches should not request workspace root, ".", module root, wildcard, or traversal scope. The accepted Kernel contract is already the authorization source; list concrete args.path/codeBlock.targetPath instead.',
         'If a patch needs current file evidence, return kind="resourceRequest" with kind="search" or a focused file/range read under the conversation roots; Session will resolve it and resume the accepted plan.',
         'Patch actions must use patchSpec.match.kind="exactBlock" and patchSpec.match.text copied from current ResourcePacket fileText/searchResults evidence.',
-        'If the accepted contract is missing a required exact file target, tool, or material technical choice, return kind="decisionRequest" instead of expanding the batch.',
+        'If the accepted contract is missing a required exact file/folder target, tool, or material technical choice, return kind="decisionRequest" instead of expanding the batch.',
+        'For decisionRequest options that continue the same accepted task, include option.effect. Use effect.kind="expandCurrentTaskScope" with taskId, targetPath, targetResourceKind="file"|"directory", recursive=true when asking the user to approve a concrete folder/file expansion. Use effect.kind="continueCurrentTask" only when no scope expansion is needed. Use effect.kind="replan" only when the user must revise the accepted plan.',
         'Do not claim execution, permissions, tests passed, or task completion.',
       ].join('\n'),
     },
@@ -12601,7 +12672,7 @@ function acceptedPlanScopeRepairMessages(
         'Session validation reasons:',
         fenced(validation.reasons.map((reason) => `- ${reason}`).join('\n')),
         'Repair requirement:',
-        fenced('Return a corrected actionBundle within the accepted contract scope. Minimal patch shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"actionBundle","outputLanguage":"zh-CN","userPlanMarkdown":"# Plan\\n\\n## Summary\\n...","codeBlocks":[{"blockId":"block-1","targetPath":"relative/file.ext","contentLines":["replacement line"]}],"actionBundle":{"version":"1","id":"batch-id","goal":"...","actions":[{"actionId":"patch-file","toolId":"fs.patch","args":{"path":"relative/file.ext","replacementBlockId":"block-1","patchSpec":{"match":{"kind":"exactBlock","text":"..."}}},"description":"..."}],"validationExpectations":[{"id":"validation-1","description":"..."}],"reviewExpectations":[{"id":"review-1","description":"..."}]}}. Do not add accessScopes/resourceScope/capability/commandBlocks/payload wrapper. If current patch evidence is missing, return resourceRequest search/read first. Return decisionRequest only if scope expansion is truly required.'),
+        fenced('Return a corrected actionBundle within the accepted contract scope. Minimal patch shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"actionBundle","outputLanguage":"zh-CN","userPlanMarkdown":"# Plan\\n\\n## Summary\\n...","codeBlocks":[{"blockId":"block-1","targetPath":"relative/file.ext","contentLines":["replacement line"]}],"actionBundle":{"version":"1","id":"batch-id","goal":"...","actions":[{"actionId":"patch-file","toolId":"fs.patch","args":{"path":"relative/file.ext","replacementBlockId":"block-1","patchSpec":{"match":{"kind":"exactBlock","text":"..."}}},"description":"..."}],"validationExpectations":[{"id":"validation-1","description":"..."}],"reviewExpectations":[{"id":"review-1","description":"..."}]}}. Do not add accessScopes/resourceScope/capability/commandBlocks/payload wrapper. If current patch evidence is missing, return resourceRequest search/read first. Return decisionRequest only if scope expansion is truly required, and include option.effect so Session can resume the same task without re-planning.'),
       ].join('\n\n'),
     },
   ];
@@ -12771,6 +12842,35 @@ function selectedRequirementDecisionOptionEffect(event: AgentEvent): Requirement
     case 'finishRun':
     case 'finishWithAnswer':
       return { kind } as RequirementOptionEffect;
+    case 'continueCurrentTask': {
+      const taskId = stringValue(effect.taskId);
+      return taskId ? { kind: 'continueCurrentTask', taskId } : { kind: 'continueCurrentTask' };
+    }
+    case 'expandCurrentTaskScope': {
+      const taskId = stringValue(effect.taskId);
+      const targetPath = stringValue(effect.targetPath);
+      const targetKind = stringValue(effect.targetResourceKind);
+      const targetResourceKind = targetKind === 'directory' || targetKind === 'file' ? targetKind : undefined;
+      const reason = stringValue(effect.reason);
+      return {
+        kind: 'expandCurrentTaskScope',
+        ...(taskId ? { taskId } : {}),
+        ...(targetPath ? { targetPath } : {}),
+        ...(targetResourceKind ? { targetResourceKind } : {}),
+        ...(effect.recursive === true ? { recursive: true } : {}),
+        ...(reason ? { reason } : {}),
+      };
+    }
+    case 'confirmOperationGrant':
+    case 'answerReviewQuestion': {
+      const taskId = stringValue(effect.taskId);
+      const reason = stringValue(effect.reason);
+      return {
+        kind,
+        ...(taskId ? { taskId } : {}),
+        ...(reason ? { reason } : {}),
+      } as RequirementOptionEffect;
+    }
     case 'cancel': {
       const reason = stringValue(effect.reason);
       return reason ? { kind: 'cancel', reason } : { kind: 'cancel' };
@@ -12799,6 +12899,17 @@ function selectedRequirementDecisionOptionEffect(event: AgentEvent): Requirement
 type RequirementOptionEffect =
   | { kind: 'continueWithAction' }
   | { kind: 'skipCurrentTask' }
+  | { kind: 'continueCurrentTask'; taskId?: string }
+  | {
+    kind: 'expandCurrentTaskScope';
+    taskId?: string;
+    targetPath?: string;
+    targetResourceKind?: 'file' | 'directory';
+    recursive?: boolean;
+    reason?: string;
+  }
+  | { kind: 'confirmOperationGrant'; taskId?: string; reason?: string }
+  | { kind: 'answerReviewQuestion'; reason?: string }
   | { kind: 'replan'; reason?: string }
   | { kind: 'finishRun' }
   | { kind: 'markAcceptedIncomplete'; taskIds?: string[]; reason?: string }

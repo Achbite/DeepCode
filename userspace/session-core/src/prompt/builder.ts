@@ -1,5 +1,6 @@
 import type { PromptEnvelope, PromptEnvelopeBuilderInput, PromptSegment, PromptSystemLayer } from './types.js';
 import { actionBundleProtocolShapeLines, kernelCatalogToolIdList } from '../agent-plan/protocolContract.js';
+import { renderPromptPacketFrameLayer } from './promptPacket.js';
 
 export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEnvelope {
   const layers = ([
@@ -243,6 +244,13 @@ export function buildPromptEnvelope(input: PromptEnvelopeBuilderInput): PromptEn
       stable: false,
       cacheClass: 'turnDynamic',
       content: currentResourceResultsSummary(input),
+    },
+    {
+      name: 'promptPacketFrame',
+      priority: 98,
+      stable: false,
+      cacheClass: 'turnDynamic',
+      content: renderPromptPacketFrameLayer(input),
     },
     {
       name: 'auditOnlyContext',
