@@ -49,6 +49,8 @@ import {
   type UserGuidanceEvent,
 } from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
+import { renderProviderTurnContract, type ProviderTurnContract, type ProviderTurnMode } from '../prompt/providerTurnContract.js';
+import type { PromptPacketFrame } from '../prompt/promptPacket.js';
 import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import {
@@ -166,6 +168,7 @@ interface GeneratedArtifactEvidence {
 type SessionTurnPhase =
   | 'context_reading'
   | 'provider_proposing'
+  | 'waiting_requirement_confirmation'
   | 'waiting_plan_review'
   | 'waiting_permission'
   | 'executing_accepted_plan'
@@ -534,6 +537,17 @@ class ExecutionPromptCoordinator {
     if (!Array.isArray(payload.codeBlocks)) {
       payload.codeBlocks = [];
     }
+    const existingUserPlan = stringValue(payload.userPlan) ?? stringValue(payload.userPlanMarkdown);
+    if (!isDetailedUserPlanMarkdown(existingUserPlan)) {
+      const generatedUserPlan = defaultActionBundleUserPlanMarkdown({
+        goal: stringValue(bundle.goal),
+        actions,
+        existingUserPlan,
+        outputLanguage: stringValue(payload.outputLanguage),
+      });
+      payload.userPlan = generatedUserPlan;
+      payload.userPlanMarkdown = generatedUserPlan;
+    }
     if (!expectationsHaveDescription(bundle.validationExpectations)) {
       bundle.validationExpectations = [defaultValidationExpectation(actions)];
     }
@@ -815,14 +829,14 @@ export class SessionDriverLoop {
     if (shouldRequestRequirementConfirmation(input, state)) {
       try {
         const event = await this.buildRequirementConfirmation(input, state);
-        state.phase = 'waiting_plan_review';
+        state.phase = 'waiting_requirement_confirmation';
         const payload = objectRecord(event.payload) ?? {};
         return this.append(sessionId, [
           event,
           sessionRunStateEvent({
             sessionId,
             runId: state.runId,
-            phase: 'waiting_plan_review',
+            phase: 'waiting_requirement_confirmation',
             reason: 'requirement',
             decisionOwner: {
               kind: 'requirement',
@@ -946,13 +960,13 @@ export class SessionDriverLoop {
             ts: this.ts(),
             id: this.id('decision-request'),
           });
-        state.phase = 'waiting_plan_review';
+        state.phase = 'waiting_requirement_confirmation';
         return this.append(sessionId, [
           confirmation,
           sessionRunStateEvent({
             sessionId,
             runId: state.runId,
-            phase: 'waiting_plan_review',
+            phase: 'waiting_requirement_confirmation',
             reason: 'requirement',
             decisionOwner: {
               kind: 'requirement',
@@ -3533,13 +3547,13 @@ export class SessionDriverLoop {
               ts: this.ts(),
               id: this.id('accepted-plan-scope-repair-decision'),
             });
-            state.phase = 'waiting_plan_review';
+            state.phase = 'waiting_permission';
             return this.append(state.sessionId, [
               confirmation,
               sessionRunStateEvent({
                 sessionId: state.sessionId,
                 runId: state.runId,
-                phase: 'waiting_plan_review',
+                phase: 'waiting_permission',
                 reason: 'requirement',
                 decisionOwner: {
                   kind: 'requirement',
@@ -3569,15 +3583,7 @@ export class SessionDriverLoop {
           }
           return this.submitNonExecutableProposal(state, repaired, fallback);
         } catch (error) {
-          const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-          return this.append(state.sessionId, [
-            finalDiagnosticEvent(
-              state.sessionId,
-              diag('autoBatchScopeRepairFailed', `Automatic execution batch went out of scope and model repair failed: ${message}`, { message }),
-              this.ts(),
-              this.id('accepted-plan-scope-repair-failed')
-            ),
-          ]);
+          return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, validation);
         }
       }
       return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, validation);
@@ -7212,6 +7218,78 @@ function defaultReviewExpectation(actions: Record<string, unknown>[]): ReviewExp
   return expectation;
 }
 
+function isDetailedUserPlanMarkdown(userPlan: string | undefined): boolean {
+  if (!userPlan || userPlan.trim().length < 240) return false;
+  const lines = userPlan.split(/\r?\n/);
+  const headings = lines.filter((line) => /^#{1,3}\s+\S/.test(line.trim()));
+  const listItems = lines.filter((line) => /^\s*[-*+]\s+\S/.test(line));
+  return headings.length >= 4 && listItems.length >= 3;
+}
+
+function defaultActionBundleUserPlanMarkdown(input: {
+  goal?: string;
+  actions: Record<string, unknown>[];
+  existingUserPlan?: string;
+  outputLanguage?: string;
+}): string {
+  const targets = input.actions.map(actionFileTargetPath).filter((target): target is string => Boolean(target));
+  const actionLines = input.actions.map((action, index) => {
+    const capability = actionEffectiveCapability(action) || 'side-effect';
+    const target = actionFileTargetPath(action) ?? `action-${index + 1}`;
+    const description = stringValue(action.description) ?? stringValue(action.title) ?? capability;
+    return { capability, target, description };
+  });
+  const targetList = targets.length
+    ? targets.slice(0, 12).map((target) => `- ${target}`)
+    : ['- Kernel facts will identify the affected workspace targets.'];
+  const changeList = actionLines.length
+    ? actionLines.slice(0, 12).map((action) => `- ${action.capability}: ${action.target} - ${action.description}`)
+    : ['- Submit the current accepted-task side-effect batch to Kernel review.'];
+  const summary = input.goal ?? input.existingUserPlan ?? 'Execute the current accepted-task action bundle.';
+  if ((input.outputLanguage ?? '').toLowerCase().startsWith('zh')) {
+    return [
+      '# 执行批次',
+      '',
+      '## 摘要',
+      summary,
+      '',
+      '## 关键变更',
+      ...changeList,
+      '',
+      '## 影响范围',
+      ...targetList,
+      '',
+      '## 验证计划',
+      '- Kernel facts 必须记录本批次的工具执行结果。',
+      '- Review 阶段必须展示实际变更路径和执行状态。',
+      '',
+      '## 假设与约束',
+      '- 本批次只覆盖当前已确认任务范围内的操作。',
+      '- Session 只补充可审查说明，不把该说明当作完成事实。',
+    ].join('\n');
+  }
+  return [
+    '# Execution Batch',
+    '',
+    '## Summary',
+    summary,
+    '',
+    '## Key Changes',
+    ...changeList,
+    '',
+    '## Affected Targets',
+    ...targetList,
+    '',
+    '## Validation Plan',
+    '- Kernel facts must record the tool execution results for this batch.',
+    '- Review must show the actual changed paths and execution status.',
+    '',
+    '## Assumptions And Constraints',
+    '- This batch only covers operations inside the current accepted task scope.',
+    '- Session adds reviewable explanation only; this explanation is not a completion fact.',
+  ].join('\n');
+}
+
 function canonicalizeWriteActionSourceBlockRefs(proposal: ProposalEnvelope): void {
   if (proposal.kind !== 'actionBundle') return;
   const payload = objectRecord(proposal.payload);
@@ -8244,6 +8322,7 @@ function sessionTurnPhaseValue(value: unknown): SessionTurnPhase | undefined {
   if (
     phase === 'context_reading' ||
     phase === 'provider_proposing' ||
+    phase === 'waiting_requirement_confirmation' ||
     phase === 'waiting_plan_review' ||
     phase === 'waiting_permission' ||
     phase === 'executing_accepted_plan' ||
@@ -8832,7 +8911,8 @@ function validateAcceptedImplementationPlanActionBundle(
   const actionBundle = readActionBundle(proposal);
   if (!actionBundle) return { ok: false, reasons: ['当前 provider 输出不包含 actionBundle，无法按已确认计划自动执行。'] };
   const reasons: string[] = [];
-  const allowedCapabilities = new Set(accepted.capabilities);
+  const allowedCapabilities = canonicalAcceptedPlanCapabilities(accepted);
+  const hasCanonicalCapabilityContract = allowedCapabilities.size > 0;
   const batchTargets = acceptedPlanProposalTargetScopes(proposal, accepted);
   for (const target of batchTargets) {
     const targetError = acceptedPlanRelativeTargetError(target, accepted);
@@ -8844,7 +8924,7 @@ function validateAcceptedImplementationPlanActionBundle(
       reasons.push(`能力 ${capability || '[empty]'} 需要单独用户介入，不能在 accepted taskPlan 后自动执行。`);
       continue;
     }
-    if (!acceptedPlanCapabilitySetAllows(allowedCapabilities, capability)) {
+    if (hasCanonicalCapabilityContract && !acceptedPlanCapabilitySetAllows(allowedCapabilities, capability)) {
       reasons.push(`能力 ${capability} 未出现在已确认 implementationPlan 的任务能力列表中。`);
     }
     const scopes = actionPlanTargetScopes(action, proposal)
@@ -9637,6 +9717,9 @@ function scopeCoveredByAcceptedPlanForCapability(
   const normalized = normalizePlanScope(scope);
   if (!normalized) return false;
   if (exactOperationGrantCoversAcceptedPlanTarget(normalized, capability, accepted)) return true;
+  if ((capability === 'fs.delete' || capability === 'fs.rename') && acceptedPlanTaskTargetsCoverScope(normalized, accepted)) {
+    return true;
+  }
   if (capability === 'fs.delete' || capability === 'fs.rename') return false;
   const acceptedScopes = accepted.targetScopes
     .flatMap(expandPlanTargetTokens)
@@ -9648,6 +9731,21 @@ function scopeCoveredByAcceptedPlanForCapability(
     if (!accessScopeCapabilityMatches(accessScope, capability)) return false;
     return planScopeCovers(accessScope.path, normalized);
   });
+}
+
+function acceptedPlanTaskTargetsCoverScope(scope: string, accepted: AcceptedImplementationPlanContext): boolean {
+  const normalized = normalizePlanScopeIdentity(scope);
+  if (!normalized) return false;
+  return accepted.tasks.some((task) =>
+    task.targets
+      .flatMap(expandPlanTargetTokens)
+      .map(normalizePlanScopeIdentity)
+      .filter(Boolean)
+      .some((target) =>
+        planScopeCovers(target, normalized) ||
+        planScopeCovers(normalized, target)
+      )
+  );
 }
 
 function exactOperationGrantCoversAcceptedPlanTarget(
@@ -9688,6 +9786,40 @@ function acceptedPlanCapabilitySetAllows(
       ? acceptedPlanCapabilityCovers(item, capability)
       : acceptedPlanCapabilityCovers(capability, item)
   );
+}
+
+function canonicalAcceptedPlanCapabilities(accepted: AcceptedImplementationPlanContext): Set<string> {
+  const capabilities = [
+    ...accepted.capabilities,
+    ...accepted.tasks.map((task) => task.capability),
+    ...accepted.exactOperationGrants.flatMap((grant) => [
+      grant.capability,
+      capabilityForAcceptedPlanOperation(grant.operation),
+    ]),
+    ...accepted.accessScopes.flatMap((scope) => [
+      ...scope.capabilities,
+      ...scope.operations.map(capabilityForAcceptedPlanOperation),
+    ]),
+  ];
+  return new Set(capabilities
+    .map((capability) => canonicalAcceptedPlanCapability(capability))
+    .filter((capability): capability is string => Boolean(capability)));
+}
+
+function canonicalAcceptedPlanCapability(capability: string | undefined): string | undefined {
+  if (!capability) return undefined;
+  if (acceptedPlanAutoExecutableCapability(capability)) return capability;
+  return undefined;
+}
+
+function capabilityForAcceptedPlanOperation(operation: string | undefined): string | undefined {
+  if (!operation) return undefined;
+  if (operation === 'read' || operation === 'list' || operation === 'search') return 'fs.read';
+  if (operation === 'create' || operation === 'write' || operation === 'overwrite') return 'fs.write';
+  if (operation === 'patch' || operation === 'replace') return 'fs.patch';
+  if (operation === 'delete' || operation === 'remove') return 'fs.delete';
+  if (operation === 'rename' || operation === 'move') return 'fs.rename';
+  return undefined;
 }
 
 function acceptedPlanCapabilityCovers(acceptedCapability: string, actionCapability: string): boolean {
@@ -12013,6 +12145,12 @@ function acceptedPlanResourceResumePrompt(
     };
   });
   return [
+    renderRepairProviderTurnContract(state, {
+      turnMode: 'resourceResume',
+      allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'answer', 'diagnostic'],
+      repairPolicy: 'diagnosticOnly',
+      errorLines: [`ResourcePacket ${packet.id} resolved ${packet.items.length} item(s) for the current accepted task.`],
+    }),
     'Accepted-plan resource resume checkpoint.',
     'You are resuming the same accepted task after Session resolved read-only evidence. Do not restart planning, do not ask for already-confirmed scope, and do not claim execution facts.',
     'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. These frames are draft ledger previews only; final workspace writes still come only from the complete actionBundle JSON.',
@@ -12020,8 +12158,8 @@ function acceptedPlanResourceResumePrompt(
     'Return exactly one Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, answer, or diagnostic.',
     resourceRequestProtocolShapeLine(),
     'Prefer actionBundle if the just-resolved evidence is sufficient for an edit task. If the current task is read-only validation and the ResourcePacket is enough, return answer summarizing only the resolved evidence. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
-    accepted ? `Accepted plan: planId=${accepted.planId}; title=${accepted.title ?? accepted.summary ?? accepted.planId}; completedTaskCount=${accepted.completedTaskIds.length}; remainingTaskCount=${accepted.tasks.filter((task) => !accepted.completedTaskIds.includes(task.taskId)).length}.` : '',
-    cursor ? `TaskExecutionCursor: cursorId=${cursor.cursorId}; currentTaskId=${cursor.currentTaskId ?? 'none'}; completedTaskCount=${cursor.completedTaskIds.length}; remainingTaskCount=${cursor.pendingTaskIds.length + (cursor.currentTaskId ? 1 : 0)}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
+    accepted ? `Accepted plan progress: planId=${accepted.planId}; completedTaskCount=${accepted.completedTaskIds.length}; remainingTaskCount=${accepted.tasks.filter((task) => !accepted.completedTaskIds.includes(task.taskId)).length}.` : '',
+    cursor ? `TaskExecutionCursor: currentTaskId=${cursor.currentTaskId ?? 'none'}; completedTaskCount=${cursor.completedTaskIds.length}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
     current ? `CurrentTaskGoal: ${current.goal}` : '',
     current ? `CurrentTaskContext: targets=${current.targets.join(', ') || 'none'}; capabilities=${current.capabilities.join(', ') || 'none'}; evidenceNeeds=${current.evidenceNeeds.join(', ') || 'none'}.` : '',
     `Original resourceRequest proposalId=${requestProposal.proposalId}; kind=${requestProposal.kind}.`,
@@ -12435,7 +12573,38 @@ function selectedDecisionOptionFromGuidance(
 function requirementRecordFromEvent(event: AgentEvent, status: RequirementRecord['status']): RequirementRecord | undefined {
   const payload = objectRecord(event.payload);
   const raw = objectRecord(payload?.requirement);
-  if (!raw) return undefined;
+  const decisionRequest = objectRecord(payload?.decisionRequest);
+  if (!raw) {
+    const requirementId = stringValue(payload?.requirementId) ?? stringValue(decisionRequest?.id) ?? event.id;
+    const initialUserRequest = stringValue(payload?.initialUserRequest)
+      ?? stringValue(payload?.originalUserRequest)
+      ?? stringValue(payload?.content)
+      ?? '';
+    const goal = stringValue(decisionRequest?.summary)
+      ?? stringValue(decisionRequest?.question)
+      ?? stringValue(decisionRequest?.reason)
+      ?? stringValue(payload?.summary)
+      ?? initialUserRequest;
+    return {
+      requirementId,
+      sessionId: event.sessionId,
+      initialUserRequest,
+      checklist: {
+        goal,
+        explicitTasks: [],
+        inferredTasks: [],
+        outOfScope: [],
+        affectedAreaCandidates: [],
+        resourceRequests: [],
+        acceptanceCriteriaCandidates: [],
+        clarificationQuestions: [],
+        riskNotes: [],
+      },
+      status,
+      createdAt: event.ts,
+      updatedAt: new Date().toISOString(),
+    };
+  }
   const checklist = objectRecord(raw.checklist);
   return {
     requirementId: stringValue(raw.requirementId) ?? stringValue(payload?.requirementId) ?? event.id,
@@ -12564,6 +12733,131 @@ function compactRepairContextLines(
   return lines;
 }
 
+function renderRepairProviderTurnContract(
+  state: SessionDriverLoopRunState,
+  input: {
+    turnMode: ProviderTurnMode;
+    allowedKinds: string[];
+    requiredKind?: string;
+    repairPolicy?: ProviderTurnContract['repairPolicy'];
+    errorLines?: string[];
+  }
+): string {
+  const acceptedContext = sanitizedAcceptedPlanExecutionContext(state.acceptedImplementationPlan);
+  const currentTask = objectRecord(acceptedContext.currentTask);
+  const operations = Array.isArray(acceptedContext.currentTaskOperations)
+    ? acceptedContext.currentTaskOperations.length
+    : 0;
+  const templates = Array.isArray(acceptedContext.currentTaskActionTemplates)
+    ? acceptedContext.currentTaskActionTemplates.length
+    : 0;
+  const frames: PromptPacketFrame[] = [
+    {
+      kind: 'SystemContract',
+      source: 'session.staticPrompt',
+      trust: 'systemInstruction',
+      scope: 'allRuns',
+      use: 'repair the proposal only; do not create facts, permissions, or task completion',
+      content: [
+        'Session parses proposals. Kernel executes tools and records facts.',
+        'Repair output must be a proposal only, not an explanation of the error.',
+      ],
+    },
+    {
+      kind: 'ProtocolContract',
+      source: 'session.protocol',
+      trust: 'schemaInstruction',
+      scope: 'currentProviderCall',
+      use: 'choose exactly one allowed proposal kind for this repair call',
+      content: [
+        `Allowed proposal kinds for this call: ${input.allowedKinds.join(', ') || 'none'}.`,
+        input.requiredKind ? `Required proposal kind: ${input.requiredKind}.` : 'No required proposal kind; choose the narrowest valid allowed kind.',
+        'Do not return taskPlan or implementationPlan during accepted task execution repair.',
+      ].filter(Boolean),
+    },
+  ];
+  if (state.currentTaskContext || currentTask) {
+    frames.push({
+      kind: 'TaskFrame',
+      source: 'session.acceptedPlanCursor',
+      trust: 'confirmedTaskInstruction',
+      scope: 'currentAcceptedTask',
+      use: 'repair only this current task unless decisionRequest asks the user to expand scope',
+      content: [
+        `taskId=${state.currentTaskContext?.taskId ?? stringValue(currentTask?.taskId) ?? 'none'}`,
+        `title=${oneLineText(state.currentTaskContext?.taskTitle ?? stringValue(currentTask?.title) ?? '', 240) || 'none'}`,
+        `objective=${oneLineText(state.currentTaskContext?.goal ?? stringValue(currentTask?.objective) ?? '', 500) || 'none'}`,
+        `targets=${state.currentTaskContext?.targets?.join(', ') || stringArrayValue(currentTask?.targets).join(', ') || 'none'}`,
+        `capabilities=${state.currentTaskContext?.capabilities?.join(', ') || stringValue(currentTask?.capability) || 'none'}`,
+        `completedTaskCount=${state.acceptedImplementationPlan?.completedTaskIds.length ?? 0}`,
+        `currentTaskOperations=${operations}`,
+        `currentTaskActionTemplates=${templates}`,
+      ],
+    });
+  }
+  if (input.errorLines?.length) {
+    frames.push({
+      kind: 'ErrorContext',
+      source: 'session.validation',
+      trust: 'currentFailureFact',
+      scope: 'currentProviderCall',
+      use: 'repair only the reported issue without changing the current task goal',
+      content: input.errorLines.map((line) => oneLineText(line, 500)),
+    });
+  }
+  frames.push({
+    kind: 'NextActionInstruction',
+    source: 'session.state',
+    trust: 'immediateInstruction',
+    scope: 'currentProviderCall',
+    use: 'highest priority for this repair call after system safety rules',
+    content: [
+      `state=${input.turnMode}`,
+      `allowedOutputs=${input.allowedKinds.join(' | ') || 'none'}`,
+      input.requiredKind ? `requiredOutput=${input.requiredKind}` : '',
+      'forbiddenOutputs=taskPlan | implementationPlan | reviewSummary',
+      'Return exactly one valid Agent Protocol v3 JSON object. No prose, markdown fences, or protocol explanation.',
+      'If executable work remains in current scope, output actionBundle. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.',
+    ].filter(Boolean),
+  });
+  return renderProviderTurnContract({
+    schemaVersion: 'deepcode.session.provider-turn-contract.v1',
+    turnMode: input.turnMode,
+    allowedKinds: input.allowedKinds,
+    requiredKind: input.requiredKind,
+    repairPolicy: input.repairPolicy ?? 'sameKindOnly',
+    projectionVisibility: input.turnMode === 'protocolRepair' ? 'debugOnly' : 'normal',
+    toolIntentTemplates: repairToolIntentTemplates(state, acceptedContext),
+    frames,
+  });
+}
+
+function repairToolIntentTemplates(
+  state: SessionDriverLoopRunState,
+  acceptedContext: Record<string, unknown>
+): string[] {
+  const templates = Array.isArray(acceptedContext.currentTaskActionTemplates)
+    ? acceptedContext.currentTaskActionTemplates
+    : [];
+  if (templates.length) {
+    return [
+      'Use currentTaskActionTemplates only for the current accepted task.',
+      clip(JSON.stringify(templates, null, 2), 2_000),
+    ];
+  }
+  const targets = state.currentTaskContext?.targets ?? [];
+  const capabilities = state.currentTaskContext?.capabilities ?? [];
+  return [
+    `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
+    `currentTaskCapabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
+    'Do not infer additional targets from the original user request, memory, or invalid proposal.',
+  ];
+}
+
+function oneLineText(value: string, maxChars: number): string {
+  return clip(value.replace(/\s+/g, ' ').trim(), maxChars);
+}
+
 function minimalActionBundleRepairSkeleton(): string {
   return JSON.stringify({
     schemaVersion: 'deepcode.agent.protocol.v3',
@@ -12625,6 +12919,10 @@ function repairMessages(
   invalidOutput: string,
   parseError: { code: string; message: string }
 ): LlmChatRequest['messages'] {
+  const acceptedExecution = Boolean(state.acceptedImplementationPlan || state.currentTaskContext);
+  const allowedKinds = acceptedExecution
+    ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+    : ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'];
   return [
     {
       role: 'system',
@@ -12632,8 +12930,10 @@ function repairMessages(
         'You are the DeepCode Agent Protocol v3 repair step.',
         'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
         'Do not add execution facts, permissions, or tool results.',
-        'Allowed proposal kinds: answer, resourceRequest, decisionRequest, taskPlan, actionBundle, diagnostic.',
-        'For initial side-effect work, output taskPlan unless acceptedTaskPlan context is already present. For Complete stage work after acceptedTaskPlan, output a smaller actionBundle batch.',
+        `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
+        acceptedExecution
+          ? 'An accepted task is already active. Do not output taskPlan or implementationPlan; repair toward the current task actionBundle/resourceRequest/decisionRequest/diagnostic only.'
+          : 'For initial side-effect work, output taskPlan unless acceptedTaskPlan context is already present.',
         ...actionBundleProtocolShapeLines(),
         'Use codeBlocks[].contentLines for source code. Do not output large codeBlocks.content strings and do not manually escape multiline source code into JSON strings.',
         'For fs.write, args.sourceBlockId must reference a top-level codeBlocks[].blockId for the same args.path. Directory targets are planning scopes; do not repair by creating empty .gitkeep or other placeholder files.',
@@ -12647,6 +12947,12 @@ function repairMessages(
     {
       role: 'user',
       content: [
+        renderRepairProviderTurnContract(state, {
+          turnMode: 'protocolRepair',
+          allowedKinds,
+          repairPolicy: 'sameKindOnly',
+          errorLines: [`${parseError.code}: ${parseError.message}`],
+        }),
         ...compactRepairContextLines(prompt, state),
         'Protocol field quick reference:',
         fenced(protocolRepairShapeReference(parseError.code)),
@@ -12709,6 +13015,13 @@ function actionBundleCompactionRepairMessages(
     {
       role: 'user',
       content: [
+        renderRepairProviderTurnContract(state, {
+          turnMode: 'acceptedTaskExecution',
+          allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+          requiredKind: 'actionBundle',
+          repairPolicy: 'sameKindOnly',
+          errorLines: [reason],
+        }),
         ...compactRepairContextLines(prompt, state, { includeImplementationBatch: true }),
         `Repair reason: ${reason}`,
         'Invalid or empty model output, clipped:',
@@ -12739,13 +13052,19 @@ function completeStageToolViolationRepairMessages(
     {
       role: 'user',
       content: [
+        renderRepairProviderTurnContract(state, {
+          turnMode: 'acceptedTaskExecution',
+          allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+          repairPolicy: 'sameKindOnly',
+          errorLines: [`Provider-native tool call was blocked in Complete stage: ${toolCall.name}`],
+        }),
         `Blocked native tool during Complete stage: ${toolCall.name}`,
         `Tool call id: ${toolCall.callId}`,
         'Tool arguments:',
         fenced(JSON.stringify(toolCall.arguments, null, 2)),
         'Provider narration before blocked tool:',
         fenced(clip(turn.content || '[empty]', 2_000)),
-        ...compactRepairContextLines(prompt, state, { includeImplementationBatch: true, includeAcceptedPlan: true }),
+        ...compactRepairContextLines(prompt, state, { includeAcceptedPlan: true }),
         'Minimum actionBundle skeleton:',
         fenced(minimalActionBundleRepairSkeleton()),
       ].join('\n\n'),
@@ -12784,6 +13103,14 @@ function sideEffectNativeToolRepairMessages(
     {
       role: 'user',
       content: [
+        renderRepairProviderTurnContract(state, {
+          turnMode: afterAcceptedPlan ? 'acceptedTaskExecution' : 'protocolRepair',
+          allowedKinds: afterAcceptedPlan
+            ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+            : ['decisionRequest', 'taskPlan', 'resourceRequest', 'diagnostic'],
+          repairPolicy: 'sameKindOnly',
+          errorLines: [`Provider-native side-effect tool call was blocked: ${toolCall.name}`],
+        }),
         `Requested repair kind: ${requestedKind}`,
         `Blocked native tool: ${toolCall.name}`,
         `Tool call id: ${toolCall.callId}`,
@@ -12823,6 +13150,14 @@ function nativeToolDuplicateRepairMessages(
     {
       role: 'user',
       content: [
+        renderRepairProviderTurnContract(state, {
+          turnMode: afterAcceptedPlan ? 'resourceResume' : 'protocolRepair',
+          allowedKinds: afterAcceptedPlan
+            ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'answer', 'diagnostic']
+            : ['answer', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+          repairPolicy: 'sameKindOnly',
+          errorLines: ['Duplicate provider-native read request after Kernel ResourcePacket facts were already returned.'],
+        }),
         'Duplicate native read targets:',
         fenced(JSON.stringify(duplicates.map((item) => ({
           callId: item.toolCall.callId,
@@ -12863,6 +13198,14 @@ function resourceRequestRepairMessages(
     {
       role: 'user',
       content: [
+        renderRepairProviderTurnContract(state, {
+          turnMode: state.acceptedImplementationPlan ? 'resourceResume' : 'protocolRepair',
+          allowedKinds: state.acceptedImplementationPlan
+            ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'answer', 'diagnostic']
+            : ['answer', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+          repairPolicy: 'sameKindOnly',
+          errorLines: [resourceResolutionDiagnostic(resolution).fallback],
+        }),
         ...compactRepairContextLines(prompt, state),
         'Invalid or unresolved resourceRequest proposal:',
         fenced(clip(JSON.stringify(proposal.payload, null, 2), 4_000)),
@@ -12896,9 +13239,22 @@ function planReviewRepairMessages(
     {
       role: 'user',
       content: [
+        renderRepairProviderTurnContract(state, {
+          turnMode: state.acceptedImplementationPlan ? 'acceptedTaskExecution' : 'protocolRepair',
+          allowedKinds: state.acceptedImplementationPlan
+            ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+            : ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
+          requiredKind: 'actionBundle',
+          repairPolicy: 'sameKindOnly',
+          errorLines: ['Kernel PlanReview rejected the actionBundle proposal.'],
+        }),
         ...compactRepairContextLines(prompt, state, { includeImplementationBatch: true, includeAcceptedPlan: true }),
-        'Original ProposalEnvelope:',
-        fenced(clip(JSON.stringify(proposal, null, 2), 5_000)),
+        'Original proposal summary:',
+        fenced(clip(JSON.stringify({
+          proposalId: proposal.proposalId,
+          kind: proposal.kind,
+          payloadKeys: Object.keys(objectRecord(proposal.payload) ?? {}),
+        }, null, 2), 1_000)),
         'Kernel PlanReview report:',
         fenced(clip(JSON.stringify(report, null, 2), 5_000)),
         'Repair requirement:',
@@ -12933,9 +13289,21 @@ function actionBundleAdmissionRepairMessages(
     {
       role: 'user',
       content: [
+        renderRepairProviderTurnContract(state, {
+          turnMode: state.acceptedImplementationPlan ? 'acceptedTaskExecution' : 'protocolRepair',
+          allowedKinds: state.acceptedImplementationPlan
+            ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+            : ['actionBundle', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'],
+          repairPolicy: 'sameKindOnly',
+          errorLines: reasons,
+        }),
         ...compactRepairContextLines(prompt, state),
-        'Invalid ProposalEnvelope:',
-        fenced(clip(JSON.stringify(proposal, null, 2), 5_000)),
+        'Invalid proposal summary:',
+        fenced(clip(JSON.stringify({
+          proposalId: proposal.proposalId,
+          kind: proposal.kind,
+          payloadKeys: Object.keys(objectRecord(proposal.payload) ?? {}),
+        }, null, 2), 1_000)),
         'Session admission reasons:',
         fenced(reasons.map((reason) => `- ${reason}`).join('\n')),
         'Repair requirement:',
@@ -12985,6 +13353,7 @@ function acceptedPlanScopeRepairMessages(
         'If a patch needs current file evidence, return kind="resourceRequest" with kind="search" or a focused file/range read under the conversation roots; Session will resolve it and resume the accepted plan.',
         'Patch actions must use patchSpec.match.kind="exactBlock" and patchSpec.match.text copied from current ResourcePacket fileText/searchResults evidence.',
         'If the accepted contract is missing a required exact file/folder target, tool, or material technical choice, return kind="decisionRequest" instead of expanding the batch.',
+        'For kind="decisionRequest", include decisionRequest.question as a non-empty string, plus decisionRequest.options with 2-3 options and allowsFreeform=true.',
         'For decisionRequest options that continue the same accepted task, include option.effect. Use effect.kind="expandCurrentTaskScope" with taskId, targetPath, targetResourceKind="file"|"directory", recursive=true when asking the user to approve a concrete folder/file expansion. Use effect.kind="continueCurrentTask" only when no scope expansion is needed. Use effect.kind="replan" only when the user must revise the accepted plan.',
         'Do not claim execution, permissions, tests passed, or task completion.',
       ].join('\n'),
@@ -12992,15 +13361,26 @@ function acceptedPlanScopeRepairMessages(
     {
       role: 'user',
       content: [
+        renderRepairProviderTurnContract(state, {
+          turnMode: 'scopeIntervention',
+          allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+          repairPolicy: 'deterministicIntervention',
+          errorLines: validation.reasons,
+        }),
         ...compactRepairContextLines(prompt, state, { includeImplementationBatch: true, includeAcceptedPlan: true }),
         'Accepted task context:',
         fenced(clip(JSON.stringify(sanitizedAcceptedPlanExecutionContext(state.acceptedImplementationPlan), null, 2), 4_000)),
-        'Invalid ProposalEnvelope:',
-        fenced(clip(JSON.stringify(proposal, null, 2), 5_000)),
+        'Invalid proposal summary:',
+        fenced(clip(JSON.stringify({
+          proposalId: proposal.proposalId,
+          kind: proposal.kind,
+          outputLanguage: stringValue((proposal as unknown as Record<string, unknown>).outputLanguage),
+          payloadKeys: Object.keys(objectRecord(proposal.payload) ?? {}),
+        }, null, 2), 1_000)),
         'Session validation reasons:',
         fenced(validation.reasons.map((reason) => `- ${reason}`).join('\n')),
         'Repair requirement:',
-        fenced('Return a corrected actionBundle within the accepted current-task scope. Set outputLanguage from the current user language. Prefer currentTaskActionTemplates from the accepted task context when present. Minimal patch shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"actionBundle","outputLanguage":"<current-user-language>","userPlanMarkdown":"# Plan\\n\\n## Summary\\n...","codeBlocks":[{"blockId":"block-1","targetPath":"relative/file.ext","contentLines":["replacement line"]}],"actionBundle":{"version":"1","id":"batch-id","goal":"...","actions":[{"actionId":"patch-file","toolId":"fs.patch","args":{"path":"relative/file.ext","replacementBlockId":"block-1","patchSpec":{"match":{"kind":"exactBlock","text":"..."}}},"description":"..."}]}}. Do not add accessScopes/resourceScope/capability/commandBlocks/payload wrapper. If current patch evidence is missing, return resourceRequest search/read first. Return decisionRequest only if scope expansion is truly required, and include option.effect so Session can resume the same task without re-planning.'),
+        fenced('Return a corrected actionBundle within the accepted current-task scope. Set outputLanguage from the current user language. Prefer currentTaskActionTemplates from the accepted task context when present. Minimal patch shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"actionBundle","outputLanguage":"<current-user-language>","userPlanMarkdown":"# Plan\\n\\n## Summary\\n...","codeBlocks":[{"blockId":"block-1","targetPath":"relative/file.ext","contentLines":["replacement line"]}],"actionBundle":{"version":"1","id":"batch-id","goal":"...","actions":[{"actionId":"patch-file","toolId":"fs.patch","args":{"path":"relative/file.ext","replacementBlockId":"block-1","patchSpec":{"match":{"kind":"exactBlock","text":"..."}}},"description":"..."}]}}. DecisionRequest minimal shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","outputLanguage":"<current-user-language>","decisionRequest":{"version":"1","id":"scope-choice","question":"...","options":[{"id":"continue-current-task","label":"...","description":"...","recommended":true,"effect":{"kind":"continueCurrentTask"}},{"id":"revise-plan","label":"...","description":"...","effect":{"kind":"replan","reason":"revise accepted plan scope"}}],"allowsFreeform":true}}. Do not add accessScopes/resourceScope/capability/commandBlocks/payload wrapper. If current patch evidence is missing, return resourceRequest search/read first. Return decisionRequest only if scope expansion is truly required, and include option.effect so Session can resume the same task without re-planning.'),
       ].join('\n\n'),
     },
   ];

@@ -87,6 +87,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopPlanCardAcceptDoesNotNoopWithoutPlanReview();
   await assertSessionDriverLoopPlanCardAcceptExecutesReviewedDeletePlan();
   await assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutTaskTargets();
+  await assertSessionDriverLoopAcceptedPlanDeleteUsesCurrentTaskTargetsWhenCapabilityIsDisplayOnly();
   await assertSessionDriverLoopAcceptedExecutionExceptionClosesRun();
   await assertSessionDriverLoopAcceptedExecutionKernelErrorClosesRun();
   await assertSessionDriverLoopAcceptedDecisionRecoversUnconsumedExecution();
@@ -119,6 +120,8 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedImplementationRejectsAttachmentRootTarget();
   await assertSessionDriverLoopAcceptedImplementationPlanProjectsWorkUnitFailureReason();
   await assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBatch();
+  await assertSessionDriverLoopAcceptedScopeRepairDecisionWaitsForPermission();
+  await assertSessionDriverLoopAcceptedScopeRepairInvalidDecisionFallsBackToIntervention();
   await assertSessionDriverLoopAcceptedPlanPatchRequestsSearchEvidence();
   await assertSessionDriverLoopAcceptedDecisionGroupsWorkspaceWriteGrants();
   await assertSessionDriverLoopAcceptedDecisionGrantsOutsideWorkspaceFileTargets();
@@ -201,6 +204,25 @@ async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
     false,
     'decisionRequest options are not copied into requirement checklist tasks'
   );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.status === 'waiting' &&
+      (event.payload as any)?.phase === 'waiting_requirement_confirmation' &&
+      (event.payload as any)?.reason === 'requirement'
+    ),
+    true,
+    'decisionRequest waits in requirement confirmation phase'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.phase === 'waiting_plan_review' &&
+      (event.payload as any)?.reason === 'requirement'
+    ),
+    false,
+    'decisionRequest does not masquerade as plan review waiting state'
+  );
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), false, 'decisionRequest does not generate a plan before user decision');
 }
 
@@ -275,6 +297,9 @@ async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Pro
   assert(promptText.includes('用户已完成用户介入选择'), 'resume prompt states that the user already selected an option');
   assert(promptText.includes('Alpha branch'), 'resume prompt includes the selected option label');
   assert(promptText.includes('不要重复输出同一个 decisionRequest'), 'resume prompt guards against repeating the same decision request');
+  assert(promptText.includes('kind: ConfirmedDecision'), 'resume prompt contains a formal confirmed decision frame');
+  assert(promptText.includes('state=ConfirmedRequirementContinuation'), 'resume prompt narrows the next action after a confirmed requirement choice');
+  assert(promptText.includes('Do not infer extra preserved/deleted/modified targets'), 'resume prompt prevents target guessing after a confirmed choice');
 }
 
 async function assertSessionDriverLoopRequirementFinishWithAnswerClosesWithoutProviderLoop(): Promise<void> {
@@ -902,25 +927,26 @@ function assertPromptEnvelope(): void {
   assert(prompt.dynamicSuffix.includes('primary=true'), 'prompt marks the primary conversation root');
   assert(prompt.dynamicSuffix.includes('Primary conversation workspace root'), 'prompt exposes the primary workspace root');
   assert(prompt.dynamicSuffix.includes('targetPath/codeBlocks targetPath must be a concrete file path relative to the primary root'), 'prompt tells the model to avoid root-prefixed write paths');
-  assert(prompt.stablePrefix.includes('rootId+path'), 'prompt documents path-based resourceRequest without long JSON examples');
+  assert(prompt.dynamicSuffix.includes('rootId+path'), 'provider turn schema documents path-based resourceRequest without long JSON examples');
   assert(prompt.stablePrefix.includes('optional top-level narration'), 'prompt documents model-generated narration');
-  assert(prompt.stablePrefix.includes('reviewSummary is Session-generated'), 'prompt excludes reviewSummary from provider proposal kinds');
-  assert(prompt.stablePrefix.includes('Implementation payload budget'), 'prompt documents payload-based implementation budget');
+  assert(prompt.dynamicSuffix.includes('reviewSummary is Session-generated'), 'provider turn schema excludes reviewSummary from provider proposal kinds');
+  assert(!prompt.stablePrefix.includes('Implementation payload budget'), 'stable prefix does not expose execution payload budgeting');
   assert(!prompt.stablePrefix.includes('implementationPlan top-level field'), 'prompt no longer documents implementationPlan as a provider kind');
-  assert(prompt.stablePrefix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'prompt documents canonical action shape');
-  assert(prompt.stablePrefix.includes('actionBundle.continuationExpectations[] are non-executable continuation notes shaped {id,description,target?,reason?}'), 'prompt documents continuation as non-executable intent');
+  assert(!prompt.stablePrefix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'stable prefix no longer exposes execution action shape');
+  assert(!prompt.dynamicSuffix.includes('actionBundle.actions[] are executable Kernel tool actions shaped {actionId,toolId,args,description}'), 'planning provider turn does not expose execution action shape');
+  assert(prompt.dynamicSuffix.includes('Execution tool argument schema is withheld in this turn'), 'planning provider turn withholds execution tool schema');
   assert(!prompt.stablePrefix.includes('dependsOn'), 'prompt no longer teaches provider action dependency fields');
   assert(!prompt.stablePrefix.includes('hard dependencies'), 'prompt no longer teaches hard dependency planning');
   assert(!prompt.stablePrefix.includes('prerequisite'), 'prompt no longer teaches prerequisite planning');
   assert(!prompt.stablePrefix.includes('dependencyDepth'), 'prompt no longer exposes dependency depth');
-  assert(prompt.stablePrefix.includes('contentLines is the only provider-facing source-code content carrier'), 'prompt requires contentLines for source code');
-  assert(prompt.stablePrefix.includes('Do not output capability, permissionLabels, accessScopes, or resourceScope'), 'prompt forbids provider-declared permissions');
-  assert(prompt.stablePrefix.includes('Do not add a generic payload wrapper'), 'prompt tells provider not to wrap proposals in payload');
-  assert(prompt.stablePrefix.includes('actionBundle proposal top-level fields'), 'prompt documents actionBundle top-level fields');
-  assert(prompt.stablePrefix.includes('Session derives routine defaults when they are omitted'), 'prompt teaches Session-derived validation/review defaults');
+  assert(!prompt.stablePrefix.includes('contentLines is the only provider-facing source-code content carrier'), 'stable prefix no longer exposes source-code carrier shape');
+  assert(!prompt.stablePrefix.includes('Do not output capability, permissionLabels, accessScopes, or resourceScope'), 'stable prefix no longer exposes execution permission-field ban details');
+  assert(!prompt.stablePrefix.includes('Do not add a generic payload wrapper'), 'stable prefix no longer carries full schema digest');
+  assert(!prompt.stablePrefix.includes('actionBundle proposal top-level fields'), 'stable prefix no longer documents actionBundle top-level fields');
+  assert(!prompt.stablePrefix.includes('Session derives routine defaults when they are omitted'), 'stable prefix no longer teaches execution defaults');
   assert(!prompt.stablePrefix.includes('expectedValidation'), 'prompt no longer teaches expectedValidation to providers');
   assert(!prompt.stablePrefix.includes('reviewGuide'), 'prompt no longer teaches reviewGuide to providers');
-  assert(prompt.stablePrefix.includes('tasks[] is a Session-advanced ordered implementation queue'), 'prompt treats taskPlan as an ordered queue');
+  assert(prompt.dynamicSuffix.includes('tasks[] is a Session-advanced ordered implementation queue'), 'provider turn schema treats taskPlan as an ordered queue');
   assert(!prompt.stablePrefix.includes('Session can schedule parallel graph nodes'), 'prompt no longer requires provider-facing graph scheduling');
   assert(!prompt.stablePrefix.includes('payload object matching that kind'), 'prompt avoids payload wrapper wording');
   assert(!prompt.stablePrefix.includes('actionBundle payload:'), 'prompt avoids ambiguous actionBundle payload wording');
@@ -939,6 +965,8 @@ function assertPromptEnvelope(): void {
   assert(!prompt.stablePrefix.includes('zh-CN'), 'stable prefix excludes localized JSON example payloads');
   assert(prompt.dynamicSuffix.includes('Current workflow state: needProposal'), 'dynamic suffix carries current workflow state');
   assert(prompt.dynamicSuffix.includes('Allowed proposals: answer, resourceRequest, actionBundle'), 'dynamic suffix carries allowed proposals');
+  assert(prompt.dynamicSuffix.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'dynamic suffix carries provider turn contract');
+  assert(prompt.dynamicSuffix.includes('turnMode: planning'), 'provider turn contract marks planning mode');
   assert(prompt.dynamicLayerNames.includes('promptPacketFrame'), 'prompt packet is an explicit provider-visible frame partition');
   assert(prompt.dynamicSuffix.includes('<PromptPacket schemaVersion="deepcode.session.prompt-packet.v1">'), 'prompt packet frame renders into dynamic suffix');
   assert(prompt.dynamicSuffix.includes('kind: UserRequest'), 'prompt packet labels user request frame');
@@ -959,7 +987,7 @@ function assertPromptEnvelope(): void {
   assert(resourceEvidenceIndex > userFrameIndex, 'prompt packet renders ResourceEvidence after task/user context');
   assert(accessSummaryIndex > resourceEvidenceIndex, 'prompt packet renders AccessSummary after ResourceEvidence');
   assert(nextActionIndex > accessSummaryIndex, 'prompt packet renders NextActionInstruction at the end');
-  assert(prompt.dynamicSuffix.includes('fs.read'), 'dynamic suffix carries capability projection');
+  assert(!prompt.dynamicSuffix.includes('Kernel tool catalog visible to provider as schema only'), 'planning turn does not expose execution tool catalog');
   assert(prompt.stableLayerNames.includes('projectMemory'), 'project memory index digest is an explicit stable context partition');
   assert(prompt.dynamicLayerNames.includes('projectMemoryRecall'), 'project memory recall is an explicit dynamic context partition');
   assert(prompt.dynamicLayerNames.includes('sessionMemory'), 'session memory is an explicit dynamic context partition');
@@ -4762,6 +4790,118 @@ async function assertSessionDriverLoopAcceptedPlanExecutesReviewedDeleteWithoutT
   );
 }
 
+async function assertSessionDriverLoopAcceptedPlanDeleteUsesCurrentTaskTargetsWhenCapabilityIsDisplayOnly(): Promise<void> {
+  const token = randomSmokeToken('display-delete');
+  const targetPath = `${token}.tmp`;
+  const events = [acceptedImplementationPlanCardEvent(`session-${token}`, `run-${token}`)];
+  const planPayload = events[0].payload as any;
+  planPayload.planId = `impl-${token}`;
+  planPayload.implementationPlan.id = `impl-${token}`;
+  planPayload.implementationPlan.title = 'Generic display capability delete plan';
+  planPayload.implementationPlan.summary = 'Delete one current task target with a display-only operation label.';
+  planPayload.implementationPlan.tasks = [{
+    taskId: `task-${token}`,
+    title: 'Remove current target',
+    target: [targetPath],
+    scope: 'The target is concrete and already belongs to the current accepted task.',
+    dependencies: [],
+    capability: `display-${token}`,
+    acceptanceCriteria: ['Kernel records the delete work unit fact for the current task target.'],
+    failureCriteria: ['Stop if the delete target leaves the accepted current task scope.'],
+  }];
+  delete planPayload.planReviewReport;
+  delete planPayload.requiredFileOperations;
+
+  const session: AgentSession = {
+    id: `session-${token}`,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        const actionBundle = command.proposal?.payload?.actionBundle ?? {};
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId: command.runId, sessionId: session.id, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId: command.runId,
+              sessionId: session.id,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(actionBundle),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'userDecisionSubmit') return { ok: true, events: [] };
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId: command.runId, sessionId: session.id, batch: command.batch },
+            {
+              kind: 'work_unit.completed',
+              runId: command.runId,
+              sessionId: session.id,
+              workUnitId: `work-unit-${token}`,
+              output: { path: targetPath },
+            },
+            { kind: 'stage.changed', runId: command.runId, sessionId: session.id, phase: 'review' },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return jsonLlmResponse(deleteActionBundleProposal(targetPath));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + actionBatchSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId: session.id,
+    kind: 'plan',
+    decision: 'accept',
+    runId: `run-${token}`,
+    targetId: `impl-${token}`,
+    existingEvents: events,
+  });
+
+  assertEqual(llmCalls, 1, 'display-only accepted task capability does not trigger accepted-plan scope repair');
+  assertEqual(proposalSubmits, 1, 'display-only capability delete still goes through Kernel PlanReview');
+  assertEqual(actionBatchSubmits, 1, 'display-only capability delete submits actionBatch for the current task target');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'accepted-plan-scope-repair'
+    ),
+    false,
+    'display-only capability delete does not emit accepted-plan scope repair'
+  );
+  assertEqual(
+    result.events.some((event) => event.kind === 'requirement_confirmation'),
+    false,
+    'display-only capability delete does not ask the user to reconfirm current task scope'
+  );
+}
+
 async function assertSessionDriverLoopAcceptedExecutionExceptionClosesRun(): Promise<void> {
   const proposal = deleteActionBundleProposal('generic-stale.txt') as any;
   const actionBundle = proposal.actionBundle as Record<string, any>;
@@ -6372,6 +6512,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
   let actionBatchSubmits = 0;
   const transcripts: TranscriptEntry[] = [];
   let submittedBatch: Record<string, any> | undefined;
+  let submittedProposal: Record<string, any> | undefined;
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
       events.push(...nextEvents);
@@ -6381,6 +6522,7 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
       const command = request.command as Record<string, any>;
       if (command.kind === 'proposalSubmit') {
         proposalSubmits += 1;
+        submittedProposal = command.proposal;
         return {
           ok: true,
           events: [
@@ -6427,7 +6569,10 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       const proposal = deleteActionBundleProposal('generic-obsolete.txt');
+      proposal.userPlan = 'Delete the accepted obsolete target.';
       delete (proposal.actionBundle as any).goal;
+      (proposal.actionBundle as any).validationExpectations = [];
+      (proposal.actionBundle as any).reviewExpectations = [];
       return jsonLlmResponse(proposal);
     },
     now: () => '2026-01-01T00:00:00.000Z',
@@ -6447,6 +6592,28 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
   assertEqual(actionBatchSubmits, 1, 'delete-only accepted implementationPlan batch is auto-executed without codeBlocks');
   assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'in-scope delete action does not become a user intervention');
   assertEqual(result.events.filter((event) => event.kind === 'plan_card').length, 1, 'delete action does not create a second confirmable plan card');
+  assert(
+    String((submittedProposal?.payload as any)?.userPlan ?? '').includes('## Key Changes'),
+    'Session expands brief delete actionBundle userPlan before Kernel proposalSubmit'
+  );
+  assertEqual(
+    (((submittedProposal?.payload as any)?.actionBundle?.validationExpectations ?? []) as unknown[]).length > 0,
+    true,
+    'Session adds default validation expectations before Kernel proposalSubmit'
+  );
+  assertEqual(
+    (((submittedProposal?.payload as any)?.actionBundle?.reviewExpectations ?? []) as unknown[]).length > 0,
+    true,
+    'Session adds default review expectations before Kernel proposalSubmit'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      String((event.payload as any)?.content ?? (event.payload as any)?.summary ?? '').includes('Agent Protocol v3 修复')
+    ),
+    false,
+    'clear delete actionBundle does not enter LLM protocol repair only to expand display markdown'
+  );
   const deleteAction = submittedBatch?.actionBundle?.actions?.[0];
   assertEqual(deleteAction?.capability, 'fs.delete', 'submitted delete batch keeps fs.delete capability');
   assertEqual(deleteAction?.kind, 'delete', 'submitted delete batch keeps delete kind');
@@ -8015,6 +8182,174 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
     ),
     true,
     'accepted-plan scope decision remains attached to the parent execution overlay'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedScopeRepairDecisionWaitsForPermission(): Promise<void> {
+  const token = randomSmokeToken('scope-decision');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const events = [acceptedImplementationPlanCardEvent(sessionId, runId)];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const llmPromptTexts: string[] = [];
+  const outOfScopeProposal = genericWriteProposal(false);
+  (outOfScopeProposal.codeBlocks as any[])[0].targetPath = `${token}-outside.txt`;
+  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: `${token}-outside.txt`, sourceBlockId: 'generic-block' };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') proposalSubmits += 1;
+      if (command.kind === 'actionBatchSubmit') actionBatchSubmits += 1;
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      llmPromptTexts.push(request.messages.map((message) => message.content).join('\n'));
+      return jsonLlmResponse(llmCalls === 1 ? outOfScopeProposal : genericDecisionRequestProposal(`decision-${token}`));
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + actionBatchSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId,
+    kind: 'plan',
+    decision: 'accept',
+    runId,
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+    interventionLevel: 'medium',
+  });
+
+  assertEqual(llmCalls, 2, 'scope repair asks provider once after the out-of-scope batch');
+  const repairPrompt = llmPromptTexts[1] ?? '';
+  assert(repairPrompt.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'scope repair prompt includes provider turn contract');
+  assert(repairPrompt.includes('turnMode: scopeIntervention'), 'scope repair prompt identifies scope intervention mode');
+  assert(repairPrompt.includes('kind: NextActionInstruction'), 'scope repair prompt includes a final next action instruction frame');
+  assert(!repairPrompt.includes('Invalid ProposalEnvelope:'), 'scope repair prompt does not inject a full invalid proposal envelope');
+  assert(repairPrompt.includes('Invalid proposal summary:'), 'scope repair prompt uses a compact invalid proposal summary');
+  assertEqual(proposalSubmits, 0, 'scope repair decision does not submit out-of-scope work to Kernel PlanReview');
+  assertEqual(actionBatchSubmits, 0, 'scope repair decision does not execute out-of-scope work');
+  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), true, 'valid scope repair decision projects to user intervention');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.status === 'waiting' &&
+      (event.payload as any)?.phase === 'waiting_permission' &&
+      (event.payload as any)?.reason === 'requirement'
+    ),
+    true,
+    'scope repair decision waits in execution permission phase'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.phase === 'waiting_plan_review' &&
+      (event.payload as any)?.reason === 'requirement'
+    ),
+    false,
+    'scope repair decision does not return accepted execution to plan review'
+  );
+}
+
+async function assertSessionDriverLoopAcceptedScopeRepairInvalidDecisionFallsBackToIntervention(): Promise<void> {
+  const token = randomSmokeToken('scope-fallback');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const events = [acceptedImplementationPlanCardEvent(sessionId, runId)];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  const outOfScopeProposal = genericWriteProposal(false);
+  (outOfScopeProposal.codeBlocks as any[])[0].targetPath = `${token}-outside.txt`;
+  (outOfScopeProposal.actionBundle as any).actions[0].args = { path: `${token}-outside.txt`, sourceBlockId: 'generic-block' };
+  const invalidDecisionRequest = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind: 'decisionRequest',
+    outputLanguage: 'en-US',
+    decisionRequest: {
+      version: '1',
+      id: `decision-${token}`,
+      options: [
+        { id: 'continue', label: 'Continue', description: 'Continue the current task.', recommended: true },
+        { id: 'revise', label: 'Revise', description: 'Revise the current task scope.' },
+      ],
+      allowsFreeform: true,
+    },
+  };
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') proposalSubmits += 1;
+      if (command.kind === 'actionBatchSubmit') actionBatchSubmits += 1;
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return jsonLlmResponse(llmCalls === 1 ? outOfScopeProposal : invalidDecisionRequest);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + proposalSubmits + actionBatchSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId,
+    kind: 'plan',
+    decision: 'accept',
+    runId,
+    targetId: 'impl-generic-auto',
+    existingEvents: events,
+    interventionLevel: 'medium',
+  });
+
+  const confirmation = result.events.find((event) => event.kind === 'requirement_confirmation');
+  const confirmationPayload = confirmation?.payload as Record<string, any> | undefined;
+  assertEqual(llmCalls, 2, 'invalid scope repair decision is attempted once before deterministic fallback');
+  assertEqual(proposalSubmits, 0, 'invalid scope repair fallback does not submit out-of-scope work to Kernel PlanReview');
+  assertEqual(actionBatchSubmits, 0, 'invalid scope repair fallback does not execute out-of-scope work');
+  assertEqual(Boolean(confirmation), true, 'invalid scope repair decision falls back to a legal user intervention');
+  assertEqual(typeof confirmationPayload?.decisionRequest?.question, 'string', 'fallback decisionRequest includes required question');
+  assertEqual(Array.isArray(confirmationPayload?.decisionRequest?.options), true, 'fallback decisionRequest includes options');
+  assertEqual(confirmationPayload?.decisionRequest?.allowsFreeform, true, 'fallback decisionRequest allows freeform guidance');
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'error' &&
+      String((event.payload as any)?.diagnosticCode ?? '').includes('autoBatchScopeRepairFailed')
+    ),
+    false,
+    'invalid scope repair decision no longer terminates as autoBatchScopeRepairFailed'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.status === 'waiting' &&
+      (event.payload as any)?.phase === 'waiting_permission' &&
+      (event.payload as any)?.reason === 'requirement'
+    ),
+    true,
+    'fallback intervention waits in execution permission phase'
   );
 }
 

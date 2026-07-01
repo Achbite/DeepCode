@@ -11,6 +11,10 @@ export interface PromptPacketFrame {
 
 export function renderPromptPacketFrameLayer(input: PromptEnvelopeBuilderInput): string {
   const frames = buildPromptPacketFrames(input);
+  return renderPromptPacketFrames(frames);
+}
+
+export function renderPromptPacketFrames(frames: PromptPacketFrame[]): string {
   return [
     '<PromptPacket schemaVersion="deepcode.session.prompt-packet.v1">',
     'Read this packet as ordered frames. Frame headers define source, trust, scope, and allowed use. Do not infer authority from memory, audit, examples, or protocol explanations.',
@@ -73,17 +77,31 @@ function confirmedDecisionFrame(input: PromptEnvelopeBuilderInput): PromptPacket
   const decisions = (input.userGuidance ?? [])
     .filter((item) => item.source === 'decision' || item.source === 'review' || item.checkpointKind === 'permission')
     .slice(-6);
-  if (!decisions.length) return undefined;
+  const content = decisions.map((item) =>
+    `id=${item.id}; source=${item.source}; checkpoint=${item.checkpointKind}${item.ts ? `; ts=${item.ts}` : ''}; content=${oneLine(item.content, 500)}`
+  );
+  if (input.requirement?.status === 'confirmed') {
+    content.push(...confirmedRequirementDecisionLines(input.requirement));
+  }
+  if (!content.length) return undefined;
   return {
     kind: 'ConfirmedDecision',
     source: 'user.decision',
     trust: 'confirmedUserDecision',
     scope: 'currentRun',
     use: 'apply exactly as user-confirmed intent; do not reinterpret as execution fact',
-    content: decisions.map((item) =>
-      `id=${item.id}; source=${item.source}; checkpoint=${item.checkpointKind}${item.ts ? `; ts=${item.ts}` : ''}; content=${oneLine(item.content, 500)}`
-    ),
+    content,
   };
+}
+
+function confirmedRequirementDecisionLines(requirement: NonNullable<PromptEnvelopeBuilderInput['requirement']>): string[] {
+  const checklist = requirement.checklist;
+  return [
+    `requirementId=${requirement.requirementId}; status=confirmed`,
+    `initialUserRequest=${oneLine(requirement.initialUserRequest, 500)}`,
+    checklist?.goal ? `confirmedGoal=${oneLine(checklist.goal, 300)}` : '',
+    'This requirement confirmation is a resolved user decision. Do not ask the same question again, and do not reinterpret the original request in a way that conflicts with the confirmed decision text in UserRequest.',
+  ].filter(Boolean);
 }
 
 function taskFrameFromInput(input: PromptEnvelopeBuilderInput): PromptPacketFrame | undefined {
@@ -93,7 +111,6 @@ function taskFrameFromInput(input: PromptEnvelopeBuilderInput): PromptPacketFram
   const title = stringValue(record.taskTitle);
   const targets = stringArray(record.targets);
   const capabilities = stringArray(record.capabilities);
-  const pending = stringArray(record.pendingTaskIds);
   const completed = stringArray(record.completedTaskIds);
   const goal = input.currentTaskGoal ?? stringValue(record.goal);
   return {
@@ -108,7 +125,6 @@ function taskFrameFromInput(input: PromptEnvelopeBuilderInput): PromptPacketFram
       goal ? `objective=${oneLine(goal, 500)}` : '',
       `targets=${targets.length ? targets.join(', ') : 'none'}`,
       `capabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
-      `pendingTaskIds=${pending.length ? pending.join(', ') : 'none'}`,
       `completedTaskCount=${completed.length}`,
     ].filter(Boolean),
   };
@@ -201,9 +217,24 @@ function errorContextFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame
 
 function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPacketFrame {
   const acceptedExecution = Boolean(input.currentTaskContext);
+  const confirmedRequirement = input.requirement?.status === 'confirmed';
   const allowed = acceptedExecution
     ? input.allowedProposals.filter((kind) => kind !== 'taskPlan' && kind !== 'implementationPlan')
     : input.allowedProposals;
+  const genericContent = confirmedRequirement
+    ? [
+      'state=ConfirmedRequirementContinuation',
+      `confirmedRequirementId=${input.requirement?.requirementId ?? 'unknown'}`,
+      `allowedOutputs=${allowed.join(' | ') || 'none'}`,
+      'The user has already resolved the previous decisionRequest. Do not repeat that intervention.',
+      'Use UserRequest and ConfirmedDecision as the resolved current scope. Do not infer extra preserved/deleted/modified targets from memory or from ambiguous wording in the original request.',
+      'Choose the narrowest valid next proposal from allowedOutputs. If a side-effect is now fully specified and actionBundle is allowed, you may output actionBundle; otherwise output taskPlan or a focused decisionRequest only for a new independent ambiguity.',
+    ]
+    : [
+      `state=${input.workflowState || 'needProposal'}`,
+      `allowedOutputs=${allowed.join(' | ') || 'none'}`,
+      'Choose the next proposal kind from the allowed outputs. For side-effect work, plan first unless Session already provided an accepted task.',
+    ];
   return {
     kind: 'NextActionInstruction',
     source: 'session.state',
@@ -218,11 +249,7 @@ function nextActionInstructionFrame(input: PromptEnvelopeBuilderInput): PromptPa
         'Continue the current accepted task. Do not re-plan unless a user decision explicitly requests replan/revisePlan.',
         'If the current task is in scope and evidence is sufficient, output actionBundle. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.',
       ]
-      : [
-        `state=${input.workflowState || 'needProposal'}`,
-        `allowedOutputs=${allowed.join(' | ') || 'none'}`,
-        'Choose the next proposal kind from the allowed outputs. For side-effect work, plan first unless Session already provided an accepted task.',
-      ],
+      : genericContent,
   };
 }
 
