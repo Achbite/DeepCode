@@ -542,7 +542,7 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
   if (event.kind === 'review_summary') {
     const status = stringField(event.payload, 'status');
     if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
-    if (status === 'accepted') return firstPayloadText(event.payload, ['summary', 'message']);
+    if (status === 'accepted') return undefined;
     return firstPayloadText(event.payload, ['guidance', 'content', 'summary', 'message']);
   }
   return undefined;

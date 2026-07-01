@@ -6,7 +6,6 @@ import type {
   AgentTimelineBlock,
   AgentTimelineResult,
   AgentTimelineTurn,
-  ProjectionDelta,
 } from '@deepcode/protocol';
 import { isInternalOrchestrationStage } from '@deepcode/session-core';
 import { t, resolveDiagnosticText, type UiLanguage } from '../../i18n';
@@ -15,14 +14,11 @@ import MarkdownContent from '../../components/agent-panel/LazyMarkdownContent';
 import ToolEvidenceDetails from '../../components/agent-panel/ToolEvidenceDetails';
 import { useSettingsStore } from '../../state/settingsStore';
 import { formatToolEvidence } from '../../utils/toolEvidence';
-import { buildUiTimelineProjection } from '../../utils/uiTimelineProjection';
 
 interface DeepCodeTimelineProps {
-  timeline: AgentTimelineResult | null;
-  fallbackEvents: AgentEvent[];
+  timeline: AgentTimelineResult;
   loading: boolean;
   language: UiLanguage;
-  activeDeltas?: ProjectionDelta[];
   followLatestSignal?: number;
   scrollWatchElement?: HTMLElement | null;
   onTypewriterActiveChange?: (active: boolean) => void;
@@ -43,25 +39,14 @@ const LIVE_REASONING_SNAP_BACKLOG_CHARS = 12000;
 
 const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
   timeline,
-  fallbackEvents,
   loading,
   language,
-  activeDeltas = [],
   followLatestSignal = 0,
   scrollWatchElement = null,
   onTypewriterActiveChange,
   onPlanResolve,
 }) => {
-  const coalescedActiveDeltas = useCoalescedProjectionDeltas(activeDeltas, 50);
-  const view = useMemo(
-    () => buildUiTimelineProjection({
-      sessionId: timeline?.sessionId ?? fallbackEvents[0]?.sessionId ?? 'session',
-      events: fallbackEvents,
-      activeDeltas: coalescedActiveDeltas,
-      timeline,
-    }),
-    [coalescedActiveDeltas, fallbackEvents, timeline]
-  );
+  const view = timeline;
   const [completedTypewriterBlockLengths, setCompletedTypewriterBlockLengths] = useState<Map<string, number>>(
     () => new Map()
   );
@@ -683,31 +668,6 @@ function useTypewriterBlockIds(
   }, [loading, view]);
 }
 
-function useCoalescedProjectionDeltas(deltas: ProjectionDelta[], delayMs: number): ProjectionDelta[] {
-  const [coalesced, setCoalesced] = useState(deltas);
-  const latestRef = useRef(deltas);
-  const timerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    latestRef.current = deltas;
-    if (timerRef.current !== null) return undefined;
-    timerRef.current = window.setTimeout(() => {
-      timerRef.current = null;
-      setCoalesced(latestRef.current);
-    }, delayMs);
-    return undefined;
-  }, [deltas, delayMs]);
-
-  useEffect(() => () => {
-    if (timerRef.current !== null) {
-      window.clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
-  }, []);
-
-  return coalesced;
-}
-
 function collectTypewriterBlocks(view: AgentTimelineResult): AgentTimelineBlock[] {
   return view.turns.flatMap((turn) =>
     turn.blocks
@@ -1149,7 +1109,7 @@ const ReviewAcceptedBlock: React.FC<{
 }> = ({ block, language, animate, onLiveContentChange, onTypewriterComplete }) => {
   const markdown = reviewAcceptedMarkdown(block, language);
   return (
-    <article className={`deepcode-gui-review-accepted${phaseClassName(block)}`}>
+    <article className={`deepcode-gui-block deepcode-gui-block--review deepcode-gui-review-accepted${phaseClassName(block)}`}>
       <span className="deepcode-gui-review-accepted__status" aria-hidden="true" />
       <div className="deepcode-gui-review-accepted__content">
         <TypewriterMarkdown

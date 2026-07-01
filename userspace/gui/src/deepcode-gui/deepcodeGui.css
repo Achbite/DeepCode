@@ -3294,6 +3294,31 @@ button {
   gap: 9px;
 }
 
+.deepcode-gui-review-accepted {
+  width: auto;
+  max-width: none;
+  margin: 0;
+  padding: 12px 14px;
+  border-color: rgba(37, 99, 235, 0.22);
+  border-radius: 14px;
+  background: #f7f9ff;
+  box-shadow: none;
+  color: #24272d;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.deepcode-gui-review-accepted__status {
+  width: 7px;
+  height: 7px;
+  margin-top: 8px;
+  background: #217452;
+}
+
+.deepcode-gui-review-accepted__content {
+  min-width: 0;
+}
+
 .deepcode-gui-activity__head {
   display: flex;
   min-width: 0;
