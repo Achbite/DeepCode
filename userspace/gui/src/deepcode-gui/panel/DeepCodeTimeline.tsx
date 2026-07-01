@@ -61,7 +61,20 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     }),
     [coalescedActiveDeltas, fallbackEvents, timeline]
   );
-  const livePlayback = useProjectedTimelinePlayback(view, loading, 1000);
+  const [completedTypewriterBlockLengths, setCompletedTypewriterBlockLengths] = useState<Map<string, number>>(
+    () => new Map()
+  );
+  const typewriterEnabled = useSettingsStore((s) =>
+    Boolean(s.effectiveSettings['gui.typewriterAnimation'] ?? true)
+  );
+  const typewriterBlockIds = useTypewriterBlockIds(view, loading && typewriterEnabled);
+  const livePlayback = useProjectedTimelinePlayback(
+    view,
+    loading,
+    1000,
+    completedTypewriterBlockLengths,
+    typewriterBlockIds
+  );
   const viewWithActive = useMemo(
     () => livePlayback.view,
     [livePlayback.view]
@@ -83,16 +96,12 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
     () => timelineScrollSignature(viewWithActive, loading),
     [viewWithActive, loading]
   );
-  const typewriterEnabled = useSettingsStore((s) =>
-    Boolean(s.effectiveSettings['gui.typewriterAnimation'] ?? true)
-  );
   const timelineDensity = useSettingsStore((s) =>
     String(s.effectiveSettings['gui.timelineDensity'] ?? 'normal')
   );
   const collapseCompletedThinking = useSettingsStore((s) =>
     Boolean(s.effectiveSettings['gui.collapseCompletedThinking'] ?? true)
   );
-  const typewriterBlockIds = useTypewriterBlockIds(viewWithActive, loading && typewriterEnabled);
   const typewriterBlockLengths = useMemo(
     () => collectTypewriterBlockLengths(viewWithActive, typewriterBlockIds),
     [typewriterBlockIds, viewWithActive]
@@ -103,9 +112,6 @@ const DeepCodeTimeline: React.FC<DeepCodeTimelineProps> = ({
       .sort()
       .join('|'),
     [typewriterBlockLengths]
-  );
-  const [completedTypewriterBlockLengths, setCompletedTypewriterBlockLengths] = useState<Map<string, number>>(
-    () => new Map()
   );
   const timelineDensityClass = timelineDensity === 'compact' ? ' deepcode-gui-timeline--compact' : '';
   const hasPendingTypewriter = useMemo(() => {
@@ -393,18 +399,22 @@ interface ProjectedTimelinePlaybackResult {
 function useProjectedTimelinePlayback(
   view: AgentTimelineResult,
   enabled: boolean,
-  holdMs: number
+  holdMs: number,
+  completedTextLengths: Map<string, number>,
+  playbackBlockIds: Set<string>
 ): ProjectedTimelinePlaybackResult {
-  const liveBlockSignature = useMemo(() => livePlaybackBlockIds(view).join('|'), [view]);
+  const playbackBlockSignature = useMemo(
+    () => [...playbackBlockIds].sort().join('|'),
+    [playbackBlockIds]
+  );
   const [releasedBlockIds, setReleasedBlockIds] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
-    const liveIds = new Set(livePlaybackBlockIds(view));
     setReleasedBlockIds((current) => {
       let changed = false;
       const next = new Set<string>();
       for (const id of current) {
-        if (liveIds.has(id)) {
+        if (playbackBlockIds.has(id)) {
           next.add(id);
         } else {
           changed = true;
@@ -412,23 +422,29 @@ function useProjectedTimelinePlayback(
       }
       return changed || next.size !== current.size ? next : current;
     });
-  }, [liveBlockSignature, view]);
+  }, [playbackBlockIds, playbackBlockSignature]);
 
   const blockingBlockId = useMemo(() => {
     if (!enabled) return null;
     const blocks = flattenTimelineBlocks(view);
     for (let index = 0; index < blocks.length - 1; index += 1) {
       const block = blocks[index];
-      if (!isBlockingLiveTextBlock(block)) continue;
+      if (!isPlaybackBlockingTextBlock(block, playbackBlockIds)) continue;
       if (releasedBlockIds.has(block.id)) continue;
       const hasLaterVisibleBlock = blocks.slice(index + 1).some(isVisibleTimelineBlock);
       if (hasLaterVisibleBlock) return block.id;
     }
     return null;
-  }, [enabled, releasedBlockIds, view]);
+  }, [enabled, playbackBlockIds, releasedBlockIds, view]);
 
   useEffect(() => {
     if (!enabled || !blockingBlockId) return undefined;
+    const block = findTimelineBlock(view, blockingBlockId);
+    if (!block) return undefined;
+    const textLength = visibleTypewriterMarkdown(block).length;
+    if (textLength > 0 && (completedTextLengths.get(blockingBlockId) ?? 0) < textLength) {
+      return undefined;
+    }
     const timer = window.setTimeout(() => {
       setReleasedBlockIds((current) => {
         if (current.has(blockingBlockId)) return current;
@@ -438,7 +454,7 @@ function useProjectedTimelinePlayback(
       });
     }, holdMs);
     return () => window.clearTimeout(timer);
-  }, [blockingBlockId, enabled, holdMs]);
+  }, [blockingBlockId, completedTextLengths, enabled, holdMs, view]);
 
   const visibleView = useMemo(
     () => blockingBlockId ? truncateTimelineAfterBlock(view, blockingBlockId) : view,
@@ -455,8 +471,8 @@ function flattenTimelineBlocks(view: AgentTimelineResult): AgentTimelineBlock[] 
   return view.turns.flatMap((turn) => turn.blocks);
 }
 
-function livePlaybackBlockIds(view: AgentTimelineResult): string[] {
-  return flattenTimelineBlocks(view).filter(isLiveOverlayBlock).map((block) => block.id);
+function findTimelineBlock(view: AgentTimelineResult, blockId: string): AgentTimelineBlock | undefined {
+  return flattenTimelineBlocks(view).find((block) => block.id === blockId);
 }
 
 function isLiveOverlayBlock(block: AgentTimelineBlock): boolean {
@@ -464,8 +480,11 @@ function isLiveOverlayBlock(block: AgentTimelineBlock): boolean {
     (block.rawEventRefs ?? []).some((ref) => ref.startsWith('event:live:'));
 }
 
-function isBlockingLiveTextBlock(block: AgentTimelineBlock): boolean {
-  if (!isLiveOverlayBlock(block)) return false;
+function isPlaybackBlockingTextBlock(
+  block: AgentTimelineBlock,
+  playbackBlockIds: Set<string>
+): boolean {
+  if (!playbackBlockIds.has(block.id)) return false;
   if (visibleTypewriterMarkdown(block).length === 0) return false;
   return block.narrativeKind === 'assistantNarration' ||
     block.narrativeKind === 'assistantText' ||

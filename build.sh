@@ -591,6 +591,25 @@ configure_sccache() {
       SCCACHE_SERVER_RESET_DONE=1
       echo "==[build][cache]== sccache server reset for Docker cache path"
     fi
+    if [ "$RUSTC_WRAPPER" = "sccache" ]; then
+      local rustc_probe sccache_probe_status
+      rustc_probe="$(rustup which rustc 2>/dev/null || command -v rustc || true)"
+      sccache_probe_status=0
+      sccache --start-server >/dev/null 2>&1 || sccache_probe_status=$?
+      if [ "$sccache_probe_status" = "0" ] && [ -n "$rustc_probe" ]; then
+        if command -v timeout >/dev/null 2>&1; then
+          timeout 20s "$RUSTC_WRAPPER" "$rustc_probe" -vV >/dev/null 2>&1 || sccache_probe_status=$?
+        else
+          "$RUSTC_WRAPPER" "$rustc_probe" -vV >/dev/null 2>&1 || sccache_probe_status=$?
+        fi
+      fi
+      if [ "$sccache_probe_status" != "0" ]; then
+        sccache --stop-server >/dev/null 2>&1 || true
+        unset RUSTC_WRAPPER
+        echo "==[build][cache]== sccache failed to start; continuing without RUSTC_WRAPPER"
+        return
+      fi
+    fi
     echo "==[build][cache]== sccache enabled: RUSTC_WRAPPER=$RUSTC_WRAPPER SCCACHE_DIR=$SCCACHE_DIR"
   else
     echo "==[build][cache]== sccache not found; cargo builds continue without RUSTC_WRAPPER"

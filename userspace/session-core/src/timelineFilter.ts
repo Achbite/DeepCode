@@ -14,6 +14,7 @@ const INTERNAL_ORCHESTRATION_STAGES = new Set<string>([
   'proposal.reviewed',
   'proposal.accepted',
   'action_batch.accepted',
+  'accepted_plan.static_syntax_review',
   'needProposal',
   'autonomy.transitioned',
   'message.appended',

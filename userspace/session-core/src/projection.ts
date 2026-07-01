@@ -539,6 +539,12 @@ function userInputBubbleContent(event: AgentEvent): string | undefined {
     if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
     return firstPayloadText(event.payload, ['guidance', 'summary', 'message']);
   }
+  if (event.kind === 'review_summary') {
+    const status = stringField(event.payload, 'status');
+    if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return undefined;
+    if (status === 'accepted') return firstPayloadText(event.payload, ['summary', 'message']);
+    return firstPayloadText(event.payload, ['guidance', 'content', 'summary', 'message']);
+  }
   return undefined;
 }
 
@@ -558,7 +564,7 @@ function firstPayloadText(payload: Record<string, unknown>, keys: string[]): str
 function isUserInputAuditOnlyEvent(event: AgentEvent): boolean {
   return event.kind === 'user_guidance' ||
     event.kind === 'requirement_decision' ||
-    (event.kind === 'plan_review' && Boolean(userInputBubbleContent(event)));
+    ((event.kind === 'plan_review' || event.kind === 'review_summary') && Boolean(userInputBubbleContent(event)));
 }
 
 function annotateLiveOverlayBlocks(
@@ -593,11 +599,17 @@ function annotateLiveOverlayBlocks(
         return {
           ...block,
           status: shouldStream ? 'running' : block.status,
-          defaultCollapsed: block.narrativeKind === 'thinking' && shouldSeal,
+          defaultCollapsed: block.narrativeKind === 'thinking' && shouldSeal
+            ? true
+            : block.defaultCollapsed,
           displayHints: {
             ...(block.displayHints ?? {}),
             renderMode,
-            initialOpen: shouldStream || block.displayHints?.initialOpen,
+            initialOpen: shouldStream
+              ? true
+              : shouldSeal && block.narrativeKind === 'thinking'
+                ? false
+                : block.displayHints?.initialOpen,
             replaceOnComplete: block.narrativeKind === 'thinking' ? true : block.displayHints?.replaceOnComplete,
           },
         };
