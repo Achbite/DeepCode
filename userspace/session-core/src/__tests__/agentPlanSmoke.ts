@@ -2550,6 +2550,96 @@ function assertImplementationPlanTaskProjectionProgress(): void {
   const beta = acceptedItems.find((item) => item.title === 'Update generic validation');
   assertEqual(alpha?.status, 'completed', 'implementation task status follows matching Kernel completion facts');
   assertEqual(beta?.status, 'running', 'implementation task status follows matching Kernel running facts');
+
+  const directoryProjection = buildNarrativeTimelineProjection({
+    sessionId: 'session-task-projection',
+    events: [
+      {
+        id: 'event-plan-directory-progress',
+        sessionId: 'session-task-projection',
+        ts: '2026-01-01T00:00:00.000Z',
+        kind: 'plan_card',
+        payload: {
+          runId: 'run-directory-projection',
+          planId: 'plan-directory-projection',
+          title: 'Directory cleanup plan',
+          summary: 'Review generic directory cleanup tasks.',
+          implementationPlan: {
+            id: 'plan-directory-projection',
+            tasks: [
+              {
+                taskId: 'task-build-dir',
+                title: 'Remove generated directory',
+                target: ['alpha-build/'],
+                acceptanceCriteria: ['Kernel facts show the directory removal.'],
+              },
+              {
+                taskId: 'task-source-dir',
+                title: 'Remove source directory',
+                target: ['beta-src/'],
+                acceptanceCriteria: ['Kernel facts show the directory removal.'],
+              },
+            ],
+          },
+        },
+      },
+      {
+        id: 'event-plan-directory-accepted',
+        sessionId: 'session-task-projection',
+        ts: '2026-01-01T00:00:01.000Z',
+        kind: 'plan_review',
+        payload: {
+          runId: 'run-directory-projection',
+          planId: 'plan-directory-projection',
+          status: 'accepted',
+          summary: 'User accepted the directory cleanup plan.',
+        },
+      },
+      {
+        id: 'event-plan-directory-checkpoint',
+        sessionId: 'session-task-projection',
+        ts: '2026-01-01T00:00:02.000Z',
+        kind: 'workflow_stage',
+        payload: {
+          stage: 'accepted_plan.batch_checkpoint',
+          runId: 'run-directory-projection',
+          planId: 'plan-directory-projection',
+          completedTaskIds: ['task-build-dir', 'task-source-dir'],
+          remainingTaskIds: [],
+          taskLedger: {
+            schemaVersion: 'deepcode.session.task-ledger.v1',
+            planId: 'plan-directory-projection',
+            runId: 'run-directory-projection',
+            taskOrder: ['task-build-dir', 'task-source-dir'],
+            completedTaskIds: ['task-build-dir', 'task-source-dir'],
+            skippedTaskIds: [],
+            acceptedIncompleteTaskIds: [],
+            pendingTaskIds: [],
+            entries: [
+              {
+                taskId: 'task-build-dir',
+                title: 'Remove generated directory',
+                targets: ['alpha-build/'],
+                status: 'completedByKernelFacts',
+              },
+              {
+                taskId: 'task-source-dir',
+                title: 'Remove source directory',
+                targets: ['beta-src/'],
+                status: 'completedByKernelFacts',
+              },
+            ],
+          },
+        },
+      },
+    ],
+  });
+  const directoryItems = directoryProjection.taskProjection?.items ?? [];
+  assertEqual(
+    directoryItems.filter((item) => item.id.includes('implementation-plan')).every((item) => item.status === 'completed'),
+    true,
+    'accepted-plan taskLedger checkpoint overrides plan-card task statuses for directory targets'
+  );
 }
 
 function assertSessionDriverSkeleton(): void {
@@ -3514,12 +3604,12 @@ async function assertSessionDriverLoopRepairsSideEffectBundleEvidence(): Promise
     content: 'Create a generic scaffold.',
     requirementConfirmationMode: 'off',
   });
-  assertEqual(llmCalls, 2, 'side-effect actionBundle missing evidence triggers one protocol repair');
-  assertEqual(submittedPlans.length, 1, 'repaired actionBundle reaches Kernel ProposalSubmit once');
-  assertEqual(submittedPlans[0].kind, 'actionBundle', 'repaired proposal remains an actionBundle');
+  assertEqual(llmCalls, 1, 'side-effect actionBundle missing routine review notes is canonicalized without protocol repair');
+  assertEqual(submittedPlans.length, 1, 'canonicalized actionBundle reaches Kernel ProposalSubmit once');
+  assertEqual(submittedPlans[0].kind, 'actionBundle', 'canonicalized proposal remains an actionBundle');
   const repairedBundle = submittedPlans[0].payload?.actionBundle ?? {};
-  assertEqual((repairedBundle.validationExpectations ?? []).length, 1, 'repaired actionBundle contains validation expectations');
-  assertEqual((repairedBundle.reviewExpectations ?? []).length, 1, 'repaired actionBundle contains review expectations');
+  assertEqual((repairedBundle.validationExpectations ?? []).length, 1, 'canonicalized actionBundle contains validation expectations');
+  assertEqual((repairedBundle.reviewExpectations ?? []).length, 1, 'canonicalized actionBundle contains review expectations');
   const planCards = result.events.filter((event) => event.kind === 'plan_card');
   const planReviews = result.events.filter((event) => event.kind === 'plan_review');
   assertEqual(planCards.length, 1, 'repaired plan renders one interactive plan card');
@@ -6892,6 +6982,12 @@ async function assertSessionDriverLoopAcceptedImplementationPlanContinuesUntilTa
   assertEqual(llmCalls, 2, 'accepted implementationPlan automatically requests the second provider batch');
   assertEqual(actionBatchSubmits, 2, 'accepted implementationPlan executes both in-scope batches');
   assertEqual(result.events.filter((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview').length, 1, 'accepted implementationPlan produces only one terminal review');
+  const terminalReview = result.events.find((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'waitingUserReview');
+  const terminalReviewContent = String((terminalReview?.payload as any)?.content ?? '');
+  assert(
+    terminalReviewContent.includes('generic-one.txt') && terminalReviewContent.includes('generic-two.txt'),
+    'terminal accepted-plan review aggregates changed files from every executed task batch'
+  );
   assertEqual(
     result.events.some((event) =>
       event.kind === 'workflow_stage' &&

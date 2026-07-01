@@ -632,7 +632,10 @@ function implementationPlanTaskProjectionItems(
   const implementationPlan = event.payload.implementationPlan;
   if (!isRecordPayload(implementationPlan)) return [];
   const tasks = Array.isArray(implementationPlan.tasks) ? implementationPlan.tasks : [];
+  const planRunId = stringField(event.payload, 'runId');
+  const planId = stringField(event.payload, 'planId');
   const lifecycle = implementationPlanLifecycle(events, event, eventIndex);
+  const taskLedger = latestAcceptedPlanTaskLedger(events.slice(eventIndex + 1), planRunId, planId);
   return tasks.flatMap((item, index) => {
     if (!isRecordPayload(item)) return [];
     const taskId = stringField(item, 'taskId') ?? stringField(item, 'id') ?? `task-${index + 1}`;
@@ -650,11 +653,47 @@ function implementationPlanTaskProjectionItems(
       id: `implementation-plan-${event.id || eventIndex}-${taskId}`,
       title,
       summary: summary || stringField(implementationPlan, 'summary') || '',
-      status: implementationTaskStatus(lifecycle, targets, taskId),
+      status: implementationTaskStatusFromLedger(taskLedger, taskId) ?? implementationTaskStatus(lifecycle, targets, taskId),
       blockId: `plan-${event.id || eventIndex}`,
       narrativeKind: 'plan' as const,
     }];
   });
+}
+
+function latestAcceptedPlanTaskLedger(
+  events: AgentEvent[],
+  planRunId?: string,
+  planId?: string
+): Record<string, unknown> | undefined {
+  for (const event of [...events].reverse()) {
+    if (event.kind !== 'workflow_stage') continue;
+    const payload = isRecordPayload(event.payload) ? event.payload : {};
+    if (stringField(payload, 'stage') !== 'accepted_plan.batch_checkpoint') continue;
+    if (!samePlanDecision(payload, planRunId, planId)) continue;
+    const ledger = isRecordPayload(payload.taskLedger) ? payload.taskLedger : undefined;
+    if (ledger) return ledger;
+  }
+  return undefined;
+}
+
+function implementationTaskStatusFromLedger(
+  ledger: Record<string, unknown> | undefined,
+  taskId: string
+): AgentTimelineStatus | undefined {
+  if (!ledger) return undefined;
+  const entries = Array.isArray(ledger.entries) ? ledger.entries : [];
+  const normalizedTaskId = normalizeTaskId(taskId);
+  for (const entry of entries) {
+    if (!isRecordPayload(entry)) continue;
+    const entryTaskId = normalizeTaskId(stringField(entry, 'taskId') ?? '');
+    if (!entryTaskId || entryTaskId !== normalizedTaskId) continue;
+    const status = stringField(entry, 'status');
+    if (status === 'completedByKernelFacts' || status === 'skippedByUser' || status === 'acceptedIncompleteByUser') return 'completed';
+    if (status === 'failed') return 'failed';
+    if (status === 'inProgress') return 'running';
+    return 'queued';
+  }
+  return undefined;
 }
 
 interface ImplementationPlanLifecycle {
@@ -840,12 +879,17 @@ function stringArrayOrSingleField(record: Record<string, unknown>, key: string):
 }
 
 function normalizeTaskPath(path: string): string {
-  return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim();
+  const normalized = path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim();
+  return normalized === '/' ? normalized : normalized.replace(/\/+$/, '');
 }
 
 function pathMatchesTaskTarget(path: string, target: string): boolean {
-  if (!path || !target) return false;
-  return path === target || path.endsWith(`/${target}`) || target.endsWith(`/${path}`);
+  const normalizedPath = normalizeTaskPath(path);
+  const normalizedTarget = normalizeTaskPath(target);
+  if (!normalizedPath || !normalizedTarget) return false;
+  return normalizedPath === normalizedTarget ||
+    normalizedPath.endsWith(`/${normalizedTarget}`) ||
+    normalizedTarget.endsWith(`/${normalizedPath}`);
 }
 
 function normalizeTaskId(id: string): string {

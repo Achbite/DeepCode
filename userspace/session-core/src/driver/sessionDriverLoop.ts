@@ -341,6 +341,258 @@ interface AcceptedPlanReadOnlyResourceCompletion {
   coveredTargets: string[];
 }
 
+class AcceptedTaskRegistry {
+  constructor(private readonly acceptedPlan: AcceptedImplementationPlanContext | undefined) {}
+
+  ledger(
+    failedTaskId?: string,
+    skippedTaskIds: string[] = [],
+    acceptedIncompleteTaskIds: string[] = []
+  ): TaskLedgerSnapshot | undefined {
+    const acceptedPlan = this.acceptedPlan;
+    if (!acceptedPlan) return undefined;
+    const completed = new Set(acceptedPlan.completedTaskIds);
+    const currentTask = acceptedPlan.tasks.find((task) =>
+      !completed.has(task.taskId) &&
+      task.taskId !== failedTaskId &&
+      !skippedTaskIds.includes(task.taskId) &&
+      !acceptedIncompleteTaskIds.includes(task.taskId)
+    );
+    return buildTaskLedgerSnapshot({
+      planId: acceptedPlan.planId,
+      runId: acceptedPlan.runId,
+      tasks: acceptedPlan.tasks.map((task) => ({
+        taskId: task.taskId,
+        title: task.title,
+        targets: task.targets,
+        capability: task.capability,
+      })),
+      completedTaskIds: acceptedPlan.completedTaskIds,
+      failedTaskId,
+      skippedTaskIds,
+      acceptedIncompleteTaskIds,
+      currentTaskId: currentTask?.taskId,
+    });
+  }
+
+  promptFrame(taskLedger?: TaskLedgerSnapshot): AcceptedPlanPromptFrame | undefined {
+    const acceptedPlan = this.acceptedPlan;
+    const ledger = taskLedger ?? this.ledger();
+    if (!acceptedPlan || !ledger) return undefined;
+    return buildAcceptedPlanPromptFrame({
+      planId: acceptedPlan.planId,
+      runId: acceptedPlan.runId,
+      title: acceptedPlan.title,
+      summary: acceptedPlan.summary,
+      taskLedger: ledger,
+    });
+  }
+
+  cursor(resourcePackets: ResourcePacket[], lastSavepointId?: string): TaskExecutionCursor | undefined {
+    const acceptedPlan = this.acceptedPlan;
+    if (!acceptedPlan) return undefined;
+    const ledger = this.ledger();
+    const completedTasks = new Set(acceptedPlan.completedTaskIds);
+    const currentTask = acceptedPlan.tasks.find((task) => !completedTasks.has(task.taskId))
+      ?? acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
+    const lastResourcePacketIds = resourcePackets
+      .map((packet) => packet.id)
+      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+      .slice(-6);
+    const cursorKey = [
+      acceptedPlan.planId,
+      currentTask?.taskId ?? 'none',
+      acceptedPlan.completedTaskIds.join(','),
+      lastResourcePacketIds.join(','),
+      lastSavepointId ?? '',
+    ].join('|');
+    return {
+      cursorId: `task-cursor-${stableHash(cursorKey).slice(0, 16)}`,
+      planId: acceptedPlan.planId,
+      currentTaskId: currentTask?.taskId,
+      taskOrder: ledger?.taskOrder ?? acceptedPlan.tasks.map((task) => task.taskId),
+      pendingTaskIds: ledger?.pendingTaskIds ?? [],
+      completedTaskIds: [...acceptedPlan.completedTaskIds],
+      lastResourcePacketIds,
+      lastSavepointId,
+    };
+  }
+
+  currentTaskContext(cursor: TaskExecutionCursor | undefined): CurrentTaskContext | undefined {
+    const acceptedPlan = this.acceptedPlan;
+    if (!acceptedPlan || !cursor) return undefined;
+    const task = acceptedPlan.tasks.find((item) => item.taskId === cursor.currentTaskId)
+      ?? acceptedPlan.tasks.find((item) => !cursor.completedTaskIds.includes(item.taskId));
+    const targets = [...new Set([
+      ...(task?.targets ?? []),
+    ].map((item) => item.trim()).filter(Boolean))];
+    const capabilities = [...new Set([
+      task?.capability,
+    ].filter((item): item is string => Boolean(item && item.trim())))];
+    const goalParts = [
+      acceptedPlan.title ?? acceptedPlan.summary ?? acceptedPlan.planId,
+      task ? `task=${task.taskId}${task.title ? ` ${task.title}` : ''}` : '',
+      targets.length ? `targets=${targets.join(', ')}` : '',
+    ].filter(Boolean);
+    return {
+      goal: goalParts.join(' | '),
+      taskId: task?.taskId,
+      nodeId: undefined,
+      taskTitle: task?.title,
+      targets,
+      capabilities,
+      taskOrder: cursor.taskOrder,
+      pendingTaskIds: cursor.pendingTaskIds,
+      dependsOn: [],
+      evidenceNeeds: [],
+      completedTaskIds: cursor.completedTaskIds,
+    };
+  }
+
+  withCompleted(completedTaskIds: string[]): AcceptedImplementationPlanContext | undefined {
+    const acceptedPlan = this.acceptedPlan;
+    if (!acceptedPlan) return undefined;
+    const completed = new Set(completedTaskIds);
+    const nextIndex = acceptedPlan.tasks.findIndex((task) => !completed.has(task.taskId));
+    return {
+      ...acceptedPlan,
+      completedTaskIds,
+      batchIndex: nextIndex >= 0 ? nextIndex + 1 : acceptedPlan.tasks.length + 1,
+    };
+  }
+}
+
+class AcceptedPlanProgressAggregator {
+  progress(
+    accepted: AcceptedImplementationPlanContext,
+    proposal: ProposalEnvelope,
+    kernelEvents: unknown[]
+  ): AcceptedPlanBatchProgress {
+    const actionBundle = readActionBundle(proposal);
+    const actions = actionBundle?.actions ?? [];
+    const actionIds = actions
+      .map((action) => {
+        const record = objectRecord(action) ?? {};
+        return stringValue(record.actionId) ?? stringValue(record.id) ?? stringValue(record.title);
+      })
+      .filter((item): item is string => Boolean(item));
+    const actionCapabilities = new Set(actions
+      .map((action) => actionEffectiveCapability(action as unknown as Record<string, unknown>))
+      .filter((item): item is string => Boolean(item)));
+    const targetPaths = [...new Set(acceptedPlanProposalTargetScopes(proposal, accepted)
+      .map((target) => target.normalized)
+      .filter((target) => target && target !== '.' && target !== '..'))];
+    const workUnitIds = workUnitIdsFromKernelEvents(kernelEvents);
+    const priorCompleted = new Set(accepted.completedTaskIds);
+    const coveredTaskIds = new Set<string>();
+    for (const task of accepted.tasks) {
+      if (!priorCompleted.has(task.taskId) && acceptedPlanTaskCoveredByBatch(task, targetPaths, actionCapabilities)) {
+        coveredTaskIds.add(task.taskId);
+      }
+    }
+    const newlyCompleted = new Set<string>();
+    for (const task of accepted.tasks) {
+      if (priorCompleted.has(task.taskId)) continue;
+      if (!coveredTaskIds.has(task.taskId)) break;
+      newlyCompleted.add(task.taskId);
+    }
+    if (!newlyCompleted.size && !actionBatchHasFailureOrBlocker(kernelEvents)) {
+      const currentTask = accepted.tasks[Math.max(0, accepted.batchIndex - 1)];
+      if (currentTask && !priorCompleted.has(currentTask.taskId)) {
+        newlyCompleted.add(currentTask.taskId);
+      }
+    }
+    const completedTaskIds = [...new Set([...accepted.completedTaskIds, ...newlyCompleted])];
+    const completed = new Set(completedTaskIds);
+    const remainingTaskIds = accepted.tasks
+      .map((task) => task.taskId)
+      .filter((taskId) => !completed.has(taskId));
+    return {
+      actionIds: [...new Set(actionIds)],
+      targetPaths,
+      workUnitIds,
+      newlyCompletedTaskIds: [...newlyCompleted],
+      completedTaskIds,
+      remainingTaskIds,
+    };
+  }
+}
+
+class ExecutionPromptCoordinator {
+  static ensureReviewableExpectations(proposal: ProposalEnvelope): void {
+    if (proposal.kind !== 'actionBundle') return;
+    const payload = objectRecord(proposal.payload);
+    const bundle = objectRecord(payload?.actionBundle);
+    if (!payload || !bundle) return;
+    const actions = Array.isArray(bundle.actions)
+      ? bundle.actions.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+      : [];
+    const sideEffectful = actions.some((action) => SIDE_EFFECT_CAPABILITIES.has(actionEffectiveCapability(action)));
+    if (!sideEffectful) return;
+    if (!Array.isArray(payload.codeBlocks)) {
+      payload.codeBlocks = [];
+    }
+    if (!expectationsHaveDescription(bundle.validationExpectations)) {
+      bundle.validationExpectations = [defaultValidationExpectation(actions)];
+    }
+    if (!expectationsHaveDescription(bundle.reviewExpectations)) {
+      bundle.reviewExpectations = [defaultReviewExpectation(actions)];
+    }
+  }
+
+  static executionRequest(
+    plan: SessionPlanContext,
+    acceptedPlan: AcceptedImplementationPlanContext,
+    guidance?: string
+  ): string {
+    return implementationPlanExecutionRequestText(plan, acceptedPlan, guidance);
+  }
+}
+
+class ReviewFactsAggregator {
+  static acceptedPlanKernelEvents(
+    events: AgentEvent[],
+    runId: string,
+    planId: string | undefined,
+    currentKernelEvents: unknown[]
+  ): unknown[] {
+    const output: unknown[] = [];
+    const seen = new Set<string>();
+    let startIndex = 0;
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+      if (event.kind !== 'plan_review') continue;
+      const payload = objectRecord(event.payload) ?? {};
+      if (stringValue(payload.status) !== 'accepted') continue;
+      const payloadRunId = stringValue(payload.runId);
+      const payloadPlanId = stringValue(payload.planId);
+      if (payloadRunId && payloadRunId !== runId) continue;
+      if (planId && payloadPlanId && payloadPlanId !== planId) continue;
+      startIndex = index;
+      break;
+    }
+    const push = (event: unknown): void => {
+      const record = objectRecord(event);
+      if (!record) return;
+      const eventPlanId = stringValue(record.planId)
+        ?? stringValue(objectRecord(record.batch)?.planId)
+        ?? stringValue(objectRecord(record.facts)?.planId);
+      if (planId && eventPlanId && eventPlanId !== planId) return;
+      const key = stableHash(JSON.stringify(record));
+      if (seen.has(key)) return;
+      seen.add(key);
+      output.push(record);
+    };
+    for (const event of events.slice(startIndex)) {
+      const payload = objectRecord(event.payload);
+      const kernelEvent = objectRecord(payload?.kernelEvent);
+      if (kernelEvent) push(kernelEvent);
+    }
+    for (const event of currentKernelEvents) push(event);
+    return output;
+  }
+}
+
 type SessionRunStateStatus = 'waiting' | 'running' | 'completed' | 'cancelled' | 'failed';
 
 type SessionRunStateReason =
@@ -1564,10 +1816,16 @@ export class SessionDriverLoop {
       });
       assertKernelReplyOk(factsReply, 'accepted_plan_review_facts_failed', 'Kernel reviewFactsGet failed');
       result = await this.appendProjectedKernelEvents(input.sessionId, factsReply) ?? result;
+      const reviewKernelEvents = ReviewFactsAggregator.acceptedPlanKernelEvents(
+        result.events,
+        plan.runId,
+        plan.planId,
+        [...batchEvents, ...staticReviewEvents.map((event) => event.payload), ...(factsReply.events ?? [])]
+      );
       const review = reviewSummaryEvent(
         input.sessionId,
         plan,
-        [...batchEvents, ...staticReviewEvents.map((event) => event.payload), ...(factsReply.events ?? [])],
+        reviewKernelEvents,
         this.ts(),
         this.id('review-summary')
       );
@@ -3639,10 +3897,16 @@ export class SessionDriverLoop {
       },
     });
     result = await this.appendProjectedKernelEvents(state.sessionId, factsReply) ?? result;
+    const reviewKernelEvents = ReviewFactsAggregator.acceptedPlanKernelEvents(
+      result.events,
+      state.runId,
+      accepted.planId,
+      [...(batchReply.events ?? []), ...staticReviewEvents.map((event) => event.payload), ...(factsReply.events ?? [])]
+    );
     const review = reviewSummaryEvent(
       state.sessionId,
       plan,
-      [...(batchReply.events ?? []), ...staticReviewEvents.map((event) => event.payload), ...(factsReply.events ?? [])],
+      reviewKernelEvents,
       this.ts(),
       this.id('review-summary')
     );
@@ -5346,43 +5610,14 @@ function buildAcceptedPlanTaskLedger(
   skippedTaskIds: string[] = [],
   acceptedIncompleteTaskIds: string[] = []
 ): TaskLedgerSnapshot | undefined {
-  if (!acceptedPlan) return undefined;
-  const completed = new Set(acceptedPlan.completedTaskIds);
-  const currentTask = acceptedPlan.tasks.find((task) =>
-    !completed.has(task.taskId) &&
-    task.taskId !== failedTaskId &&
-    !skippedTaskIds.includes(task.taskId) &&
-    !acceptedIncompleteTaskIds.includes(task.taskId)
-  );
-  return buildTaskLedgerSnapshot({
-    planId: acceptedPlan.planId,
-    runId: acceptedPlan.runId,
-    tasks: acceptedPlan.tasks.map((task) => ({
-      taskId: task.taskId,
-      title: task.title,
-      targets: task.targets,
-      capability: task.capability,
-    })),
-    completedTaskIds: acceptedPlan.completedTaskIds,
-    failedTaskId,
-    skippedTaskIds,
-    acceptedIncompleteTaskIds,
-    currentTaskId: currentTask?.taskId,
-  });
+  return new AcceptedTaskRegistry(acceptedPlan).ledger(failedTaskId, skippedTaskIds, acceptedIncompleteTaskIds);
 }
 
 function buildAcceptedPlanPromptFrameForContext(
   acceptedPlan: AcceptedImplementationPlanContext | undefined,
   taskLedger: TaskLedgerSnapshot | undefined
 ): AcceptedPlanPromptFrame | undefined {
-  if (!acceptedPlan || !taskLedger) return undefined;
-  return buildAcceptedPlanPromptFrame({
-    planId: acceptedPlan.planId,
-    runId: acceptedPlan.runId,
-    title: acceptedPlan.title,
-    summary: acceptedPlan.summary,
-    taskLedger,
-  });
+  return new AcceptedTaskRegistry(acceptedPlan).promptFrame(taskLedger);
 }
 
 function buildTaskExecutionCursor(
@@ -5390,65 +5625,14 @@ function buildTaskExecutionCursor(
   resourcePackets: ResourcePacket[],
   lastSavepointId?: string
 ): TaskExecutionCursor | undefined {
-  if (!acceptedPlan) return undefined;
-  const ledger = buildAcceptedPlanTaskLedger(acceptedPlan);
-  const completedTasks = new Set(acceptedPlan.completedTaskIds);
-  const currentTask = acceptedPlan.tasks.find((task) => !completedTasks.has(task.taskId))
-    ?? acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
-  const lastResourcePacketIds = resourcePackets
-    .map((packet) => packet.id)
-    .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
-    .slice(-6);
-  const cursorKey = [
-    acceptedPlan.planId,
-    currentTask?.taskId ?? 'none',
-    acceptedPlan.completedTaskIds.join(','),
-    lastResourcePacketIds.join(','),
-    lastSavepointId ?? '',
-  ].join('|');
-  return {
-    cursorId: `task-cursor-${stableHash(cursorKey).slice(0, 16)}`,
-    planId: acceptedPlan.planId,
-    currentTaskId: currentTask?.taskId,
-    taskOrder: ledger?.taskOrder ?? acceptedPlan.tasks.map((task) => task.taskId),
-    pendingTaskIds: ledger?.pendingTaskIds ?? [],
-    completedTaskIds: [...acceptedPlan.completedTaskIds],
-    lastResourcePacketIds,
-    lastSavepointId,
-  };
+  return new AcceptedTaskRegistry(acceptedPlan).cursor(resourcePackets, lastSavepointId);
 }
 
 function buildCurrentTaskContext(
   acceptedPlan: AcceptedImplementationPlanContext | undefined,
   cursor: TaskExecutionCursor | undefined
 ): CurrentTaskContext | undefined {
-  if (!acceptedPlan || !cursor) return undefined;
-  const task = acceptedPlan.tasks.find((item) => item.taskId === cursor.currentTaskId)
-    ?? acceptedPlan.tasks.find((item) => !cursor.completedTaskIds.includes(item.taskId));
-  const targets = [...new Set([
-    ...(task?.targets ?? []),
-  ].map((item) => item.trim()).filter(Boolean))];
-  const capabilities = [...new Set([
-    task?.capability,
-  ].filter((item): item is string => Boolean(item && item.trim())))];
-  const goalParts = [
-    acceptedPlan.title ?? acceptedPlan.summary ?? acceptedPlan.planId,
-    task ? `task=${task.taskId}${task.title ? ` ${task.title}` : ''}` : '',
-    targets.length ? `targets=${targets.join(', ')}` : '',
-  ].filter(Boolean);
-  return {
-    goal: goalParts.join(' | '),
-    taskId: task?.taskId,
-    nodeId: undefined,
-    taskTitle: task?.title,
-    targets,
-    capabilities,
-    taskOrder: cursor.taskOrder,
-    pendingTaskIds: cursor.pendingTaskIds,
-    dependsOn: [],
-    evidenceNeeds: [],
-    completedTaskIds: cursor.completedTaskIds,
-  };
+  return new AcceptedTaskRegistry(acceptedPlan).currentTaskContext(cursor);
 }
 
 function currentTaskMemoryHints(context: CurrentTaskContext | undefined): string[] {
@@ -6926,10 +7110,46 @@ function parseAndValidateProposal(input: {
 }): ProposalEnvelope {
   const proposal = parseProposalEnvelope(input);
   canonicalizeWriteActionSourceBlockRefs(proposal);
+  ExecutionPromptCoordinator.ensureReviewableExpectations(proposal);
   validateProposalSemantics(proposal, {
     allowBriefActionBundleUserPlan: input.allowBriefActionBundleUserPlan === true,
   });
   return proposal;
+}
+
+function expectationsHaveDescription(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+  return value.some((item) => typeof objectRecord(item)?.description === 'string' && Boolean(String(objectRecord(item)?.description).trim()));
+}
+
+function defaultValidationExpectation(actions: Record<string, unknown>[]): Record<string, unknown> {
+  const targets = actions.map(actionFileTargetPath).filter((target): target is string => Boolean(target));
+  const targetSummary = targets.slice(0, 8).join(', ');
+  return {
+    id: 'session-default-validation',
+    messageKey: targets.length
+      ? 'session.driver.defaultValidation.targets'
+      : 'session.driver.defaultValidation.generic',
+    messageArgs: targets.length ? { targets: targetSummary } : {},
+    description: targets.length
+      ? `Kernel facts must show the requested operation completed for: ${targetSummary}.`
+      : 'Kernel facts must show the requested side-effect operation completed.',
+  };
+}
+
+function defaultReviewExpectation(actions: Record<string, unknown>[]): Record<string, unknown> {
+  const targets = actions.map(actionFileTargetPath).filter((target): target is string => Boolean(target));
+  const targetSummary = targets.slice(0, 8).join(', ');
+  return {
+    id: 'session-default-review',
+    messageKey: targets.length
+      ? 'session.driver.defaultReview.targets'
+      : 'session.driver.defaultReview.generic',
+    messageArgs: targets.length ? { targets: targetSummary } : {},
+    description: targets.length
+      ? `Review the Kernel facts and resulting workspace state for: ${targetSummary}.`
+      : 'Review the Kernel facts and resulting workspace state for this action bundle.',
+  };
 }
 
 function canonicalizeWriteActionSourceBlockRefs(proposal: ProposalEnvelope): void {
@@ -8916,53 +9136,7 @@ function acceptedPlanBatchProgress(
   proposal: ProposalEnvelope,
   kernelEvents: unknown[]
 ): AcceptedPlanBatchProgress {
-  const actionBundle = readActionBundle(proposal);
-  const actions = actionBundle?.actions ?? [];
-  const actionIds = actions
-    .map((action) => {
-      const record = objectRecord(action) ?? {};
-      return stringValue(record.actionId) ?? stringValue(record.id) ?? stringValue(record.title);
-    })
-    .filter((item): item is string => Boolean(item));
-  const actionCapabilities = new Set(actions
-    .map((action) => actionEffectiveCapability(action as unknown as Record<string, unknown>))
-    .filter((item): item is string => Boolean(item)));
-  const targetPaths = [...new Set(acceptedPlanProposalTargetScopes(proposal, accepted)
-    .map((target) => target.normalized)
-    .filter((target) => target && target !== '.' && target !== '..'))];
-  const workUnitIds = workUnitIdsFromKernelEvents(kernelEvents);
-  const priorCompleted = new Set(accepted.completedTaskIds);
-  const coveredTaskIds = new Set<string>();
-  for (const task of accepted.tasks) {
-    if (!priorCompleted.has(task.taskId) && acceptedPlanTaskCoveredByBatch(task, targetPaths, actionCapabilities)) {
-      coveredTaskIds.add(task.taskId);
-    }
-  }
-  const newlyCompleted = new Set<string>();
-  for (const task of accepted.tasks) {
-    if (priorCompleted.has(task.taskId)) continue;
-    if (!coveredTaskIds.has(task.taskId)) break;
-    newlyCompleted.add(task.taskId);
-  }
-  if (!newlyCompleted.size && !actionBatchHasFailureOrBlocker(kernelEvents)) {
-    const currentTask = accepted.tasks[Math.max(0, accepted.batchIndex - 1)];
-    if (currentTask && !priorCompleted.has(currentTask.taskId)) {
-      newlyCompleted.add(currentTask.taskId);
-    }
-  }
-  const completedTaskIds = [...new Set([...accepted.completedTaskIds, ...newlyCompleted])];
-  const completed = new Set(completedTaskIds);
-  const remainingTaskIds = accepted.tasks
-    .map((task) => task.taskId)
-    .filter((taskId) => !completed.has(taskId));
-  return {
-    actionIds: [...new Set(actionIds)],
-    targetPaths,
-    workUnitIds,
-    newlyCompletedTaskIds: [...newlyCompleted],
-    completedTaskIds,
-    remainingTaskIds,
-  };
+  return new AcceptedPlanProgressAggregator().progress(accepted, proposal, kernelEvents);
 }
 
 function acceptedPlanTaskCoveredByBatch(
@@ -8986,13 +9160,7 @@ function acceptedPlanAfterBatch(
   accepted: AcceptedImplementationPlanContext,
   completedTaskIds: string[]
 ): AcceptedImplementationPlanContext {
-  const completed = new Set(completedTaskIds);
-  const nextIndex = accepted.tasks.findIndex((task) => !completed.has(task.taskId));
-  return {
-    ...accepted,
-    completedTaskIds,
-    batchIndex: nextIndex >= 0 ? nextIndex + 1 : accepted.tasks.length + 1,
-  };
+  return new AcceptedTaskRegistry(accepted).withCompleted(completedTaskIds) ?? accepted;
 }
 
 function acceptedPlanWithLatestCheckpoint(
@@ -10881,18 +11049,22 @@ function reviewSummaryEvent(
   ];
   const reviewFacts = findReviewFacts(kernelEvents);
   const gitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
-  const completed = reviewFacts
-    ? arrayLength(reviewFacts.completedWorkUnits)
-    : kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.completed').length;
-  const failed = reviewFacts
-    ? arrayLength(reviewFacts.failedWorkUnits)
-    : kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.failed').length;
-  const blocked = reviewFacts
-    ? arrayLength(reviewFacts.blockedWorkUnits)
-    : kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.blocked').length;
-  const toolResults = reviewFacts
-    ? arrayLength(reviewFacts.toolResults)
-    : kernelEvents.filter((event) => objectRecord(event)?.kind === 'tool.completed').length;
+  const completed = Math.max(
+    reviewFacts ? arrayLength(reviewFacts.completedWorkUnits) : 0,
+    kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.completed').length
+  );
+  const failed = Math.max(
+    reviewFacts ? arrayLength(reviewFacts.failedWorkUnits) : 0,
+    kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.failed').length
+  );
+  const blocked = Math.max(
+    reviewFacts ? arrayLength(reviewFacts.blockedWorkUnits) : 0,
+    kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.blocked').length
+  );
+  const toolResults = Math.max(
+    reviewFacts ? arrayLength(reviewFacts.toolResults) : 0,
+    kernelEvents.filter((event) => objectRecord(event)?.kind === 'tool.completed').length
+  );
   const continuations = concreteContinuationExpectations(plan.actionBundle.continuationExpectations);
   const language = visibleLanguageForRequest(plan.userPlan);
   const summary = reviewWaitingSummary(failed, blocked, language);
@@ -11196,16 +11368,14 @@ function buildReadableReviewSummary(
   const toolResults = Array.isArray(reviewFacts?.toolResults) ? reviewFacts.toolResults : [];
   for (const item of toolResults) addReviewToolFile(changedFiles, auditRefs, item);
 
-  if (!changedFiles.size) {
-    for (const event of kernelEvents) {
-      const record = objectRecord(event);
-      if (!record) continue;
-      const kind = stringValue(record.kind);
-      if (kind === 'work_unit.completed') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'completed');
-      if (kind === 'work_unit.failed') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'failed');
-      if (kind === 'work_unit.blocked') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'blocked');
-      if (kind === 'tool.completed') addReviewToolFile(changedFiles, auditRefs, record);
-    }
+  for (const event of kernelEvents) {
+    const record = objectRecord(event);
+    if (!record) continue;
+    const kind = stringValue(record.kind);
+    if (kind === 'work_unit.completed') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'completed');
+    if (kind === 'work_unit.failed') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'failed');
+    if (kind === 'work_unit.blocked') addReviewWorkUnitFile(changedFiles, auditRefs, record, 'blocked');
+    if (kind === 'tool.completed') addReviewToolFile(changedFiles, auditRefs, record);
   }
 
   const files = [...changedFiles.values()];
@@ -11671,6 +11841,14 @@ function reviewContinuationRequest(review: SessionReviewContext): string {
 }
 
 function implementationPlanExecutionRequest(
+  plan: SessionPlanContext,
+  acceptedPlan: AcceptedImplementationPlanContext,
+  guidance?: string
+): string {
+  return ExecutionPromptCoordinator.executionRequest(plan, acceptedPlan, guidance);
+}
+
+function implementationPlanExecutionRequestText(
   plan: SessionPlanContext,
   acceptedPlan: AcceptedImplementationPlanContext,
   guidance?: string

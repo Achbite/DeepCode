@@ -1,6 +1,6 @@
 {
   "name": "deepcode",
-  "version": "0.5.23",
+  "version": "0.5.24",
   "license": "MIT",
   "private": true,
   "description": "DeepCode - 轻量级 AI Agent 代码工作台",
