@@ -515,8 +515,6 @@
     "deepcodeGui.activity.kind.editFileCompleted": "Edit completed",
     "deepcodeGui.activity.kind.editFileFailed": "Edit failed",
     "deepcodeGui.activity.kind.toolExecution": "Tool execution",
-    "deepcodeGui.activity.kind.subagentBranch": "Sub-agent branch",
-    "deepcodeGui.activity.kind.subagentMerge": "Sub-agent merge",
     "deepcodeGui.activity.kind.reviewCheckpoint": "Review checkpoint",
     "deepcodeGui.activity.kind.diagnostic": "Diagnostic",
     "deepcodeGui.activity.targets": "Targets",
@@ -526,10 +524,6 @@
     "deepcodeGui.activity.actions": "Actions",
     "deepcodeGui.activity.workUnits": "Work units",
     "deepcodeGui.activity.error": "Error",
-    "deepcodeGui.subagents.title": "Sub-agents",
-    "deepcodeGui.subagents.branchFallback": "Sub-agent branch",
-    "deepcodeGui.subagents.streaming": "Sub-agent is streaming.",
-    "deepcodeGui.subagents.reasoning": "Reasoning",
     "deepcodeGui.progress.title": "Progress",
     "deepcodeGui.progress.heartbeat": "Heartbeat",
     "deepcodeGui.context.title": "Context",
@@ -889,14 +883,11 @@
     "diagnostic.autoPlanProposalReviewedMissing": "Kernel did not return a proposal.reviewed event for the accepted-plan actionBundle; Session will not auto-execute this batch.",
     "diagnostic.autoBatchRevisionRepairFailed": "The automatic execution batch needs revision, but model repair failed: {message}",
     "diagnostic.autoBatchRejected": "Kernel rejected the automatic execution batch: {reasons}",
-    "diagnostic.subAgentModeViolation": "Sub-agent mode is off, but Session attempted to emit a sub-agent branch/merge delta. Automatic execution has been stopped as a Session orchestration violation.",
-
     "requirement.optionsTitle": "Options",
     "requirement.optionRecommended": "Recommended",
     "requirement.optionEffectLabel": "If selected",
     "requirement.optionEffect.continueWithAction": "Generate the next batch of execution actions",
     "requirement.optionEffect.skipCurrentTask": "Mark the current task as completed and advance the cursor",
-    "requirement.optionEffect.markTasksCompleted": "Mark tasks {taskIds} as completed",
     "requirement.optionEffect.replan": "Return to plan stage and re-plan",
     "requirement.optionEffect.finishRun": "Finish this run"
   },
@@ -1061,18 +1052,6 @@
         "confirm": "Confirm Before Writing",
         "auto": "Auto Low-risk Candidates"
       }
-    },
-    "agent.subagents.mode": {
-      "label": "Sub-agents",
-      "description": "Conservative parallel draft generation for independent accepted-plan tasks. Parent Session still validates and submits all work.",
-      "options": {
-        "auto": "Auto",
-        "off": "Off"
-      }
-    },
-    "agent.subagents.maxParallel": {
-      "label": "Sub-agent Max Parallel",
-      "description": "Maximum parallel sub-agent draft branches. Version 1 clamps this value to 2."
     },
     "agent.permissions.allowFileRead": {
       "label": "Allow File Read",

@@ -14,7 +14,6 @@ export interface AgentComposerDecisionOption {
 // 与 session-core protocolV3.normalizeOptionEffect 对齐（运行时视图，结构最小）。
 export type AgentRequirementOptionEffectView =
   | { kind: 'continueWithAction' }
-  | { kind: 'markTasksCompleted'; taskIds: string[] }
   | { kind: 'skipCurrentTask' }
   | { kind: 'replan'; reason?: string }
   | { kind: 'finishRun' };
@@ -362,13 +361,6 @@ function extractOptionEffect(value: unknown): AgentRequirementOptionEffectView |
     case 'skipCurrentTask':
     case 'finishRun':
       return { kind } as AgentRequirementOptionEffectView;
-    case 'markTasksCompleted': {
-      const ids = Array.isArray(record.taskIds)
-        ? record.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
-        : [];
-      if (ids.length === 0) return undefined;
-      return { kind: 'markTasksCompleted', taskIds: ids };
-    }
     case 'replan': {
       const reason = stringField(record, 'reason');
       return reason ? { kind: 'replan', reason } : { kind: 'replan' };

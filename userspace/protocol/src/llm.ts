@@ -136,9 +136,6 @@ export interface AgentStreamPartFrame {
   draftId?: string;
   frameId?: string;
   runId?: string;
-  branchId?: string;
-  subAgentId?: string;
-  mergeGroupId?: string;
   targetPath?: string;
   language?: string;
   capability?: string;
@@ -198,9 +195,6 @@ export interface ProjectionDelta {
   sessionId: string;
   runId?: string;
   turnId?: string;
-  branchId?: string;
-  subAgentId?: string;
-  mergeGroupId?: string;
   draftId?: string;
   targetPath?: string;
   itemId?: string;

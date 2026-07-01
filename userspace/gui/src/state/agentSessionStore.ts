@@ -171,14 +171,6 @@ function settingProjectMemoryMode(value: unknown): 'confirm' | 'auto' {
   return value === 'auto' ? 'auto' : 'confirm';
 }
 
-function settingSubAgentMode(value: unknown): 'auto' | 'off' {
-  return value === 'off' ? 'off' : 'auto';
-}
-
-function settingSubAgentMaxParallel(value: unknown): number {
-  const numeric = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(numeric) && numeric >= 2 ? 2 : 2;
-}
 
 function createLocalEvent(
   sessionId: string,
@@ -270,7 +262,7 @@ function isActiveTextDelta(delta: ProjectionDelta): boolean {
 function activeDeltaMergeKey(delta: ProjectionDelta): string {
   const activityId = delta.activity?.activityId;
   if (activityId) return `activity:${delta.sessionId}:${delta.runId ?? ''}:${activityId}`;
-  const branchKey = delta.branchId ?? delta.subAgentId ?? delta.mergeGroupId ?? 'parent';
+  const branchKey = 'parent';
   return [
     delta.sessionId,
     delta.runId ?? '',
@@ -939,12 +931,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         projectMemoryMode: settingProjectMemoryMode(
           useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
         ),
-        subAgentMode: settingSubAgentMode(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
-        ),
-        subAgentMaxParallel: settingSubAgentMaxParallel(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
-        ),
       }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
@@ -1100,12 +1086,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         projectMemoryMode: settingProjectMemoryMode(
           useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
         ),
-        subAgentMode: settingSubAgentMode(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
-        ),
-        subAgentMaxParallel: settingSubAgentMaxParallel(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
-        ),
       }, streamHandlersForSession(session.id));
       const data = {
         session: result.session,
@@ -1181,12 +1161,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         ),
         projectMemoryMode: settingProjectMemoryMode(
           useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
-        ),
-        subAgentMode: settingSubAgentMode(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
-        ),
-        subAgentMaxParallel: settingSubAgentMaxParallel(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
         ),
       }, streamHandlersForSession(session.id));
       const data = {
@@ -1266,12 +1240,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         ),
         projectMemoryMode: settingProjectMemoryMode(
           useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
-        ),
-        subAgentMode: settingSubAgentMode(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
-        ),
-        subAgentMaxParallel: settingSubAgentMaxParallel(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
         ),
       }, streamHandlersForSession(session.id));
       const data = {
@@ -1353,12 +1321,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         ),
         projectMemoryMode: settingProjectMemoryMode(
           useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
-        ),
-        subAgentMode: settingSubAgentMode(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
-        ),
-        subAgentMaxParallel: settingSubAgentMaxParallel(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
         ),
       }, streamHandlersForSession(session.id));
       const data = {
@@ -1442,12 +1404,6 @@ export const useAgentSessionStore = create<Store>((set, get) => ({
         ),
         projectMemoryMode: settingProjectMemoryMode(
           useSettingsStore.getState().effectiveSettings['agent.memory.projectMode']
-        ),
-        subAgentMode: settingSubAgentMode(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.mode']
-        ),
-        subAgentMaxParallel: settingSubAgentMaxParallel(
-          useSettingsStore.getState().effectiveSettings['agent.subagents.maxParallel']
         ),
       }, streamHandlersForSession(session.id));
       const data = {

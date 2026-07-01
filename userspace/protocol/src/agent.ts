@@ -507,8 +507,6 @@ export type AgentConversationActivityKind =
   | 'editFileCompleted'
   | 'editFileFailed'
   | 'toolExecution'
-  | 'subagentBranch'
-  | 'subagentMerge'
   | 'reviewCheckpoint'
   | 'diagnostic';
 
@@ -521,9 +519,6 @@ export interface AgentConversationActivity {
   source: 'session' | 'kernel' | 'provider' | 'llm';
   runId?: string;
   planId?: string;
-  branchId?: string;
-  subAgentId?: string;
-  mergeGroupId?: string;
   draftId?: string;
   targets?: string[];
   actionIds?: string[];

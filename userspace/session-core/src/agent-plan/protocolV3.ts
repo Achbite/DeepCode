@@ -124,10 +124,7 @@ function normalizeTaskPlanTask(value: unknown, index: number): Record<string, un
     target: [...new Set(target)],
     capability: optionalString(record, 'capability') ?? optionalString(record, 'toolId'),
     dependencies: normalizeStringList(record.dependencies).concat(normalizeStringList(record.dependsOn)),
-    hardDependencies: normalizeStringList(record.hardDependencies).concat(normalizeStringList(record.hardDependsOn)),
-    softOrderAfter: normalizeStringList(record.softOrderAfter).concat(normalizeStringList(record.softDependencies)),
     conflictKeys: normalizeStringList(record.conflictKeys),
-    canDraftInParallel: record.canDraftInParallel !== false,
     batchKind: optionalString(record, 'batchKind') ?? optionalString(record, 'role'),
     acceptanceCriteria: normalizeStringList(record.acceptanceCriteria),
     failureCriteria: normalizeStringList(record.failureCriteria),
@@ -573,13 +570,6 @@ function normalizeOptionEffect(value: unknown): Record<string, unknown> | undefi
         : undefined;
       const reason = typeof record.reason === 'string' ? record.reason : undefined;
       return { kind, ...(ids?.length ? { taskIds: ids } : {}), ...(reason ? { reason } : {}) };
-    }
-    case 'markTasksCompleted': {
-      const ids = Array.isArray(record.taskIds)
-        ? record.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
-        : [];
-      if (ids.length === 0) return undefined;
-      return { kind, taskIds: ids };
     }
     case 'replan': {
       const reason = typeof record.reason === 'string' ? record.reason : undefined;

@@ -297,7 +297,6 @@ function projectionDeltasToTransientEvents(input: {
   return input.activeDeltas
     .filter((delta) => delta.sessionId === input.sessionId)
     .filter((delta) => delta.type !== 'committed')
-    .filter((delta) => !isBranchProjectionDelta(delta))
     .filter((delta) => !activeDeltaAlreadyCommitted(delta, committedActivityIds))
     .sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0))
     .flatMap((delta) => projectionDeltaToTransientEvent(delta, input.generatedAt));
@@ -462,10 +461,6 @@ function projectionStatus(status: ProjectionDelta['status']): string | undefined
   if (status === 'draftReady') return 'completed';
   if (status === 'discarded' || status === 'skipped') return 'blocked';
   return status;
-}
-
-function isBranchProjectionDelta(delta: ProjectionDelta): boolean {
-  return Boolean(delta.branchId || delta.subAgentId || delta.mergeGroupId);
 }
 
 function activeDeltaAlreadyCommitted(
@@ -1416,9 +1411,6 @@ function activityFromValue(value: unknown): AgentConversationActivity | undefine
     source,
     runId: stringField(value, 'runId'),
     planId: stringField(value, 'planId'),
-    branchId: stringField(value, 'branchId'),
-    subAgentId: stringField(value, 'subAgentId'),
-    mergeGroupId: stringField(value, 'mergeGroupId'),
     draftId: stringField(value, 'draftId'),
     targets: stringArrayField(value, 'targets'),
     actionIds: stringArrayField(value, 'actionIds'),

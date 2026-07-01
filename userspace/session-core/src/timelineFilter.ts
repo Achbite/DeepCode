@@ -32,12 +32,9 @@ const REDUNDANT_PRE_TOOL_EXECUTION = new Set<string>([
   'fs.delete',
 ]);
 
-// 元噪声活动 kind：providerThinking 只表示模型等待状态；subagentBranch/subagentMerge
-// 归右侧子代理面板展示生命周期，不在主时间线重复成块。
+// 元噪声活动 kind：providerThinking 只表示模型等待状态，不在主时间线重复成块。
 const SUPPRESSED_ACTIVITY_KINDS = new Set<string>([
   'providerThinking',
-  'subagentBranch',
-  'subagentMerge',
 ]);
 
 /**

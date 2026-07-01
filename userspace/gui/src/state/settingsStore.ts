@@ -358,24 +358,6 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
     ],
   },
   {
-    key: 'agent.subagents.mode',
-    label: 'Sub-agents',
-    description: 'Experimental parallel draft generation for independent accepted-plan tasks. It is disabled by default until the orchestration path is fully stable.',
-    group: 'agent',
-    control: 'select',
-    options: [
-      { label: 'Auto', value: 'auto' },
-      { label: 'Off', value: 'off' },
-    ],
-  },
-  {
-    key: 'agent.subagents.maxParallel',
-    label: 'Sub-agent Max Parallel',
-    description: 'Maximum parallel sub-agent draft branches. Version 1 clamps this value to 2.',
-    group: 'agent',
-    control: 'number',
-  },
-  {
     key: 'agent.permissions.allowFileRead',
     label: 'Allow File Read',
     description: 'Allow Agent tools to read workspace files.',

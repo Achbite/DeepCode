@@ -193,12 +193,6 @@ export interface ContextAssemblyRecord {
   currentTaskContextHash?: string;
   taskCursorId?: string;
   lastTaskSavepointId?: string;
-  subAgentMode?: 'auto' | 'off';
-  effectiveSubAgentMode?: 'auto' | 'off';
-  subAgentModeSource?: 'request' | 'runtimeSnapshot' | 'default';
-  sliceCount?: number;
-  mergeGroupId?: string;
-  branchContextCharCounts?: Record<string, number>;
   redactionNote: string;
 }
 
@@ -229,13 +223,6 @@ export interface ContextAssemblyInput {
   taskCursor?: {
     cursorId?: string;
     lastSavepointId?: string;
-  };
-  subAgentTelemetry?: {
-    mode: 'auto' | 'off';
-    modeSource?: 'request' | 'runtimeSnapshot' | 'default';
-    sliceCount?: number;
-    mergeGroupId?: string;
-    branchContextCharCounts?: Record<string, number>;
   };
   auditOnly?: PromptEnvelopeBuilderInput['auditOnly'];
 }
@@ -367,12 +354,6 @@ export function assembleContext(input: ContextAssemblyInput): ContextAssemblyRes
     currentTaskContextHash: input.currentTaskContext ? stableHash(JSON.stringify(input.currentTaskContext)) : undefined,
     taskCursorId: input.taskCursor?.cursorId,
     lastTaskSavepointId: input.taskCursor?.lastSavepointId,
-    subAgentMode: input.subAgentTelemetry?.mode,
-    effectiveSubAgentMode: input.subAgentTelemetry?.mode,
-    subAgentModeSource: input.subAgentTelemetry?.modeSource,
-    sliceCount: input.subAgentTelemetry?.sliceCount,
-    mergeGroupId: input.subAgentTelemetry?.mergeGroupId,
-    branchContextCharCounts: input.subAgentTelemetry?.branchContextCharCounts,
     redactionNote: 'Segment previews and provider traces are compacted for inspection; raw provider token deltas and full prompt messages are not stored in transcript.',
   };
   return {

@@ -49,7 +49,6 @@ import {
 import type { PromptEnvelope } from '../prompt/types.js';
 import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
-import { buildSessionTaskGraph, type SessionTaskGraph } from '../workflow/index.js';
 import {
   buildAcceptedPlanPromptFrame,
   buildAnswerFactsContext,
@@ -91,10 +90,6 @@ export interface SessionDriverLoopInput {
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
   projectMemoryMode?: ProjectMemoryMode;
-  subAgentMode?: SubAgentMode;
-  subAgentMaxParallel?: number;
-  subAgentNoDeltaTimeoutMs?: number;
-  subAgentTotalTimeoutMs?: number;
   resumeResourcePackets?: boolean;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   interactionOverlay?: InteractionOverlayContext;
@@ -103,7 +98,6 @@ export interface SessionDriverLoopInput {
 export type RequirementConfirmationMode = 'auto' | 'always' | 'off';
 export type ReviewContinuationMode = 'auto' | 'ask' | 'off';
 export type InterventionLevel = 'low' | 'medium' | 'high';
-export type SubAgentMode = 'auto' | 'off';
 
 export interface SessionDecisionResolverInput {
   sessionId: string;
@@ -120,10 +114,6 @@ export interface SessionDecisionResolverInput {
   reviewContinuationMode?: ReviewContinuationMode;
   interventionLevel?: InterventionLevel;
   projectMemoryMode?: ProjectMemoryMode;
-  subAgentMode?: SubAgentMode;
-  subAgentMaxParallel?: number;
-  subAgentNoDeltaTimeoutMs?: number;
-  subAgentTotalTimeoutMs?: number;
   interactionOverlay?: InteractionOverlayContext;
 }
 
@@ -142,7 +132,6 @@ interface SessionDriverLoopRunState {
   generatedArtifactEvidence: Map<string, GeneratedArtifactEvidence>;
   memoryDocument: SessionMemoryDocument;
   memoryHints: string[];
-  taskGraph: SessionTaskGraph;
   cachePlan?: PromptCachePlan;
   contextAssembly?: ContextAssemblyRecord;
   taskExecutionCursor?: TaskExecutionCursor;
@@ -155,19 +144,6 @@ interface SessionDriverLoopRunState {
   actionBundleAdmissionRepairAttempted: boolean;
   planReviewRepairAttempted: boolean;
   acceptedPlanScopeRepairAttempted: boolean;
-  subAgentMergeAttempted: boolean;
-  subAgentParentFallbackRepairAttempted: boolean;
-  subAgentMode: SubAgentMode;
-  subAgentMaxParallel: number;
-  subAgentModeSource: SubAgentModeSource;
-  subAgentModeViolationReported: boolean;
-  subAgentTelemetry?: {
-    mode: SubAgentMode;
-    modeSource?: SubAgentModeSource;
-    sliceCount?: number;
-    mergeGroupId?: string;
-    branchContextCharCounts?: Record<string, number>;
-  };
   terminalGuidanceRevisionAttempted: boolean;
   nativeToolReadLedger: Map<string, NativeToolReadLedgerEntry>;
   nativeToolDuplicateRepairAttempted: boolean;
@@ -232,10 +208,7 @@ interface TaskExecutionCursor {
   currentTaskId?: string;
   taskOrder: string[];
   pendingTaskIds: string[];
-  currentNodeId?: string;
   completedTaskIds: string[];
-  pendingNodeIds: string[];
-  readyNodeIds: string[];
   lastResourcePacketIds: string[];
   lastSavepointId?: string;
 }
@@ -250,11 +223,8 @@ interface CurrentTaskContext {
   taskOrder: string[];
   pendingTaskIds: string[];
   dependsOn: string[];
-  unlocks: string[];
   evidenceNeeds: string[];
   completedTaskIds: string[];
-  pendingNodeIds: string[];
-  readyNodeIds: string[];
 }
 
 interface AcceptedImplementationPlanTaskContext {
@@ -263,32 +233,9 @@ interface AcceptedImplementationPlanTaskContext {
   capability?: string;
   targets: string[];
   dependencies: string[];
-  hardDependencies: string[];
-  softOrderAfter: string[];
   conflictKeys: string[];
-  canDraftInParallel: boolean;
   batchKind?: ExecutionSliceRole;
   role?: ExecutionSliceRole;
-}
-
-interface ExecutionFlowNodeContext {
-  nodeId: string;
-  moduleId: string;
-  modulePath?: string;
-  taskIds: string[];
-  targets: string[];
-  capabilities: string[];
-  prerequisites: string[];
-  outputs: string[];
-  dependsOn: string[];
-  unlocks: string[];
-  conflictKeys: string[];
-  evidenceNeeds: string[];
-}
-
-interface ExecutionFlowGraphContext {
-  graphId: string;
-  nodes: ExecutionFlowNodeContext[];
 }
 
 interface AcceptedImplementationPlanExecutionRoot {
@@ -307,7 +254,6 @@ interface AcceptedImplementationPlanContext {
   targetScopes: string[];
   exactOperationGrants: AcceptedPlanExactOperationGrant[];
   accessScopes: AcceptedPlanAccessScope[];
-  executionFlowGraph: ExecutionFlowGraphContext;
   executionRoot?: AcceptedImplementationPlanExecutionRoot;
   interventionLevel?: InterventionLevel;
   batchIndex: number;
@@ -316,73 +262,6 @@ interface AcceptedImplementationPlanContext {
 }
 
 type ExecutionSliceRole = 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review';
-
-interface SubAgentTaskSlice {
-  sliceId: string;
-  nodeId: string;
-  branchId: string;
-  subAgentId: string;
-  moduleId: string;
-  modulePath?: string;
-  tasks: AcceptedImplementationPlanTaskContext[];
-  task: AcceptedImplementationPlanTaskContext;
-  role?: ExecutionSliceRole;
-  prerequisites: string[];
-  outputs: string[];
-  dependsOn: string[];
-  unlocks: string[];
-  evidenceNeeds: string[];
-  hardDependencies: string[];
-  softOrderAfter: string[];
-  conflictKeys: string[];
-}
-
-interface SubAgentBranchState {
-  slice: SubAgentTaskSlice;
-  status: 'queued' | 'request_sent' | 'first_delta' | 'streaming' | 'draft_ready' | 'waiting_merge' | 'completed' | 'failed' | 'stalled';
-  error?: string;
-  draft?: SubAgentModuleDraft;
-  contextCharCount: number;
-}
-
-interface SubAgentFragment {
-  branchId: string;
-  subAgentId: string;
-  draft: SubAgentModuleDraft;
-}
-
-interface SubAgentModuleDraftFile {
-  targetPath: string;
-  operation?: string;
-  language?: string;
-  contentLines?: string[];
-  content?: string;
-  patchSpec?: unknown;
-  summary?: string;
-}
-
-interface SubAgentModuleDraft {
-  schemaVersion: 'deepcode.subagent.module-draft.v1';
-  kind: 'subAgentModuleDraft';
-  moduleId: string;
-  modulePath?: string;
-  taskIds: string[];
-  targets: string[];
-  draftFiles: SubAgentModuleDraftFile[];
-  evidenceSummary: string[];
-  assumptions: string[];
-  diagnostics: string[];
-  summary?: string;
-}
-
-interface SubAgentBranchDiagnostic {
-  branchId: string;
-  subAgentId: string;
-  taskId: string;
-  title?: string;
-  targets: string[];
-  reason: string;
-}
 
 interface StaticSyntaxReviewPacket {
   planId: string;
@@ -393,29 +272,6 @@ interface StaticSyntaxReviewPacket {
     contentHash?: string;
   }>;
 }
-
-interface SubAgentMergeGroup {
-  mergeGroupId: string;
-  slices: SubAgentTaskSlice[];
-  branches: SubAgentBranchState[];
-}
-
-interface SubAgentMergeGroupEvaluation {
-  mergeGroup: SubAgentMergeGroup | null;
-  reason: SubAgentSkippedReason;
-  summary?: string;
-}
-
-type SubAgentSkippedReason =
-  | 'mode_off'
-  | 'max_parallel_lt_2'
-  | 'insufficient_slices'
-  | 'flow_graph_blocked'
-  | 'hard_dependency_blocked'
-  | 'target_conflict'
-  | 'capability_not_parallel_safe'
-  | 'queued_guidance'
-  | 'already_attempted';
 
 interface AcceptedPlanBatchValidationResult {
   ok: boolean;
@@ -493,17 +349,7 @@ type SessionRunStateReason =
   | 'permission'
   | 'review'
   | 'accepted_plan_execution'
-  | 'work_unit_failed'
-  | 'subagent_mode_violation';
-
-type SubAgentModeSource = 'request' | 'runtimeSnapshot' | 'default';
-
-interface EffectiveSubAgentSettings {
-  mode: SubAgentMode;
-  maxParallel: number;
-  source: SubAgentModeSource;
-  inheritedFromRunId?: string;
-}
+  | 'work_unit_failed';
 
 interface ResourceManifestBuildResult {
   manifest: ResourceManifest;
@@ -527,14 +373,6 @@ interface ActiveTurnState {
     receivedChars: number;
     lastEmittedChars: number;
   }>;
-}
-
-interface ProjectionDeltaBranchContext {
-  branchId?: string;
-  subAgentId?: string;
-  mergeGroupId?: string;
-  draftId?: string;
-  targetPath?: string;
 }
 
 interface NativeToolCallProposal {
@@ -665,9 +503,6 @@ export class SessionDriverLoop {
     if (acceptedImplementationPlan) {
       implementationBatch.batchIndex = acceptedImplementationPlan.batchIndex;
     }
-    const subAgentSettings = resolveEffectiveSubAgentSettings(input);
-    const subAgentMode = subAgentSettings.mode;
-    const subAgentMaxParallel = subAgentSettings.maxParallel;
     const memoryDocument = buildSessionMemoryDocument(input.existingEvents ?? [], {
       projectMemoryMode: input.projectMemoryMode,
     });
@@ -701,13 +536,6 @@ export class SessionDriverLoop {
       generatedArtifactEvidence: generatedArtifactEvidenceFromPackets(restoredResourcePackets),
       memoryDocument,
       memoryHints: implementationBatchHints(implementationBatch, acceptedImplementationPlan),
-      taskGraph: buildSessionTaskGraph({
-        sessionId,
-        runId,
-        events: input.existingEvents ?? [],
-        stateContract,
-        driverRequest,
-      }),
       taskExecutionCursor: initialTaskCursor,
       currentTaskContext: initialTaskContext,
       taskLedger: initialTaskLedger,
@@ -718,33 +546,11 @@ export class SessionDriverLoop {
       actionBundleAdmissionRepairAttempted: false,
       planReviewRepairAttempted: false,
       acceptedPlanScopeRepairAttempted: false,
-      subAgentMergeAttempted: false,
-      subAgentParentFallbackRepairAttempted: false,
-      subAgentMode,
-      subAgentMaxParallel,
-      subAgentModeSource: subAgentSettings.source,
-      subAgentModeViolationReported: false,
       terminalGuidanceRevisionAttempted: false,
       nativeToolReadLedger: new Map(),
       nativeToolDuplicateRepairAttempted: false,
       interactionOverlay: input.interactionOverlay,
     };
-    lastResult = await this.append(sessionId, [
-      agentRuntimeSettingsEvent(
-        sessionId,
-        state.runId,
-        {
-          subAgentMode,
-          subAgentMaxParallel,
-          source: subAgentSettings.source,
-          inheritedFromRunId: subAgentSettings.inheritedFromRunId,
-          parentRunId: input.interactionOverlay?.parentRunId ?? input.acceptedImplementationPlan?.runId,
-        },
-        this.ts(),
-        this.id('agent-runtime-settings')
-      ),
-    ]) ?? lastResult;
-
     if (state.manifest.entries.length > 0 && !input.resumeResourcePackets) {
       const packet = await this.resolveResources(state, state.manifest);
       state.resourcePackets.push(packet);
@@ -789,13 +595,6 @@ export class SessionDriverLoop {
 
     while (true) {
       refreshTaskExecutionState(state);
-      state.taskGraph = buildSessionTaskGraph({
-        sessionId,
-        runId: state.runId,
-        events: lastResult.events,
-        stateContract: state.stateContract,
-        driverRequest: state.driverRequest,
-      });
       const assembledContext = assembleContext({
         contextAssemblyId: this.id('context-assembly'),
         workflowState: state.stateContract?.stateId ?? state.driverRequest?.kind ?? 'needProposal',
@@ -824,7 +623,6 @@ export class SessionDriverLoop {
         resourcePackets: state.resourcePackets,
         conversationRoots: state.conversationRoots,
         requirement: input.confirmedRequirement,
-        subAgentTelemetry: state.subAgentTelemetry ?? { mode: state.subAgentMode, modeSource: state.subAgentModeSource },
         auditOnly: {
           runId: state.runId,
           sessionId,
@@ -1138,8 +936,6 @@ export class SessionDriverLoop {
       confirmedRequirement: input.decision === 'accept' ? requirementRecordFromEvent(confirmation, 'confirmed') : undefined,
       requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
       interventionLevel: input.interventionLevel,
-      subAgentMode: input.subAgentMode,
-      subAgentMaxParallel: input.subAgentMaxParallel,
       interactionOverlay,
     });
 
@@ -1177,8 +973,6 @@ export class SessionDriverLoop {
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
         projectMemoryMode: input.projectMemoryMode,
-        subAgentMode: input.subAgentMode,
-        subAgentMaxParallel: input.subAgentMaxParallel,
         resumeResourcePackets: true,
         interactionOverlay,
       });
@@ -1217,8 +1011,6 @@ export class SessionDriverLoop {
       reviewContinuationMode: input.reviewContinuationMode,
       interventionLevel: input.interventionLevel,
       projectMemoryMode: input.projectMemoryMode,
-      subAgentMode: input.subAgentMode,
-      subAgentMaxParallel: input.subAgentMaxParallel,
       resumeResourcePackets: true,
       acceptedImplementationPlan: acceptedPlan,
       interactionOverlay,
@@ -1315,7 +1107,7 @@ export class SessionDriverLoop {
       ]) ?? current;
     }
 
-    // skipTask / markTasksCompleted / markAcceptedIncomplete：必须有 acceptedImplementationPlan 上下文。
+    // skipTask / markAcceptedIncomplete：必须有 acceptedImplementationPlan 上下文。
     const confirmationPayload = objectRecord(confirmation.payload) ?? {};
     const decisionRequest = objectRecord(confirmationPayload.decisionRequest) ?? {};
     const planId = stringValue(decisionRequest.acceptedPlanId)
@@ -1335,13 +1127,6 @@ export class SessionDriverLoop {
       const ids = normalizedEffect.taskIds?.length ? normalizedEffect.taskIds : (currentTaskId ? [currentTaskId] : []);
       acceptedIncompleteTaskIds = ids.filter((id) => !currentCompleted.has(id) && accepted.tasks.some((task) => task.taskId === id));
       newlyCompleted.push(...acceptedIncompleteTaskIds);
-      if (newlyCompleted.length === 0) return undefined;
-    } else if (normalizedEffect.kind === 'markTasksCompleted') {
-      for (const id of normalizedEffect.taskIds) {
-        if (!currentCompleted.has(id) && accepted.tasks.some((task) => task.taskId === id)) {
-          newlyCompleted.push(id);
-        }
-      }
       if (newlyCompleted.length === 0) return undefined;
     } else {
       return undefined;
@@ -1400,8 +1185,6 @@ export class SessionDriverLoop {
       confirmedRequirement: requirementRecordFromEvent(confirmation, 'confirmed'),
       requirementConfirmationMode: 'off',
       interventionLevel: input.interventionLevel,
-      subAgentMode: input.subAgentMode,
-      subAgentMaxParallel: input.subAgentMaxParallel,
       acceptedImplementationPlan: nextAccepted,
       interactionOverlay,
     });
@@ -1461,8 +1244,6 @@ export class SessionDriverLoop {
       reviewContinuationMode: input.reviewContinuationMode,
       interventionLevel: input.interventionLevel,
       projectMemoryMode: input.projectMemoryMode,
-      subAgentMode: input.subAgentMode,
-      subAgentMaxParallel: input.subAgentMaxParallel,
       resumeResourcePackets: true,
       acceptedImplementationPlan: acceptedContext.acceptedPlan,
       interactionOverlay,
@@ -1517,8 +1298,6 @@ export class SessionDriverLoop {
           reviewContinuationMode: input.reviewContinuationMode,
           interventionLevel: input.interventionLevel,
           projectMemoryMode: input.projectMemoryMode,
-          subAgentMode: input.subAgentMode,
-          subAgentMaxParallel: input.subAgentMaxParallel,
           interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
         });
       }
@@ -1565,8 +1344,6 @@ export class SessionDriverLoop {
         requirementConfirmationMode: 'off',
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
-        subAgentMode: input.subAgentMode,
-        subAgentMaxParallel: input.subAgentMaxParallel,
         resumeResourcePackets: true,
         acceptedImplementationPlan: acceptedPlan,
         interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
@@ -1762,8 +1539,6 @@ export class SessionDriverLoop {
             reviewContinuationMode: input.reviewContinuationMode,
             interventionLevel: input.interventionLevel,
             projectMemoryMode: input.projectMemoryMode,
-            subAgentMode: input.subAgentMode,
-            subAgentMaxParallel: input.subAgentMaxParallel,
             resumeResourcePackets: true,
             acceptedImplementationPlan: nextAccepted,
             interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
@@ -2195,13 +1970,6 @@ export class SessionDriverLoop {
         this.id('guidance-revision-transition')
       ),
     ]);
-    state.taskGraph = buildSessionTaskGraph({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      events: result.events,
-      stateContract: state.stateContract,
-      driverRequest: state.driverRequest,
-    });
     const assembledContext = assembleContext({
       contextAssemblyId: this.id('context-assembly-guidance-revision'),
       workflowState: 'guidanceRevision',
@@ -2288,9 +2056,6 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     prompt: PromptEnvelope
   ): Promise<ProposalEnvelope> {
-    const subAgentProposal = await this.trySubAgentAcceptedPlanProposal(input, state, prompt);
-    if (subAgentProposal) return subAgentProposal;
-
     let raw: string;
     try {
       const messages: LlmChatRequest['messages'] = [
@@ -2444,8 +2209,6 @@ export class SessionDriverLoop {
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
         projectMemoryMode: input.projectMemoryMode,
-        subAgentMode: input.subAgentMode,
-        subAgentMaxParallel: input.subAgentMaxParallel,
         resumeResourcePackets: true,
         acceptedImplementationPlan: nextAccepted,
       });
@@ -2559,610 +2322,6 @@ export class SessionDriverLoop {
     }
   }
 
-  private async trySubAgentAcceptedPlanProposal(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope
-  ): Promise<ProposalEnvelope | null> {
-    if (!state.acceptedImplementationPlan) return null;
-    if (state.subAgentMode !== 'auto') {
-      await this.emitSubAgentSkipped(state, 'mode_off');
-      return null;
-    }
-    if (state.subAgentMaxParallel < 2) {
-      await this.emitSubAgentSkipped(state, 'max_parallel_lt_2');
-      return null;
-    }
-    if (state.subAgentMergeAttempted) {
-      await this.emitSubAgentSkipped(state, 'already_attempted');
-      return null;
-    }
-    const evaluation = buildSubAgentMergeGroup(state, this.id('subagent-merge'));
-    if (!evaluation.mergeGroup) {
-      await this.emitSubAgentSkipped(state, evaluation.reason, evaluation.summary);
-      return null;
-    }
-    const mergeGroup = evaluation.mergeGroup;
-    state.subAgentMergeAttempted = true;
-    state.subAgentTelemetry = {
-      mode: state.subAgentMode,
-      modeSource: state.subAgentModeSource,
-      sliceCount: mergeGroup.slices.length,
-      mergeGroupId: mergeGroup.mergeGroupId,
-      branchContextCharCounts: {},
-    };
-    const initialGuidanceMessages = await this.consumeQueuedGuidanceForProviderResume(state, 'subagent_preflight_guidance');
-    if (initialGuidanceMessages.length) {
-      await this.emitSubAgentSkipped(state, 'queued_guidance', 'Session 在启动子代理前发现新的用户引导，已回到 parent checkpoint。');
-      return this.parentProviderCheckpointAfterSubAgentGuidance(
-        input,
-        state,
-        prompt,
-        'subagent_preflight_guidance',
-        initialGuidanceMessages,
-        'Session 在启动子代理前发现了新的用户引导；不会启动并行分支，将由 parent provider 重新决策。'
-      );
-    }
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'subagent_dispatch.announced',
-      status: 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: `Session 将开启 ${mergeGroup.slices.length} 个子代理分支并行生成已确认文件流水图节点草稿。`,
-      payload: {
-        runId: state.runId,
-        planId: state.acceptedImplementationPlan.planId,
-        graphId: state.acceptedImplementationPlan.executionFlowGraph.graphId,
-        mergeGroupId: mergeGroup.mergeGroupId,
-        mode: state.subAgentMode,
-        maxParallel: state.subAgentMaxParallel,
-        nodeCount: state.acceptedImplementationPlan.executionFlowGraph.nodes.length,
-        sliceCount: mergeGroup.slices.length,
-        branches: mergeGroup.slices.map((slice) => ({
-          nodeId: slice.nodeId,
-          branchId: slice.branchId,
-          subAgentId: slice.subAgentId,
-          sliceId: slice.sliceId,
-          moduleId: slice.moduleId,
-          modulePath: slice.modulePath,
-          taskIds: slice.tasks.map((task) => task.taskId),
-          title: slice.moduleId,
-          role: slice.role,
-          targets: [...new Set(slice.tasks.flatMap((task) => task.targets))],
-          capabilities: [...new Set(slice.tasks.map((task) => task.capability).filter(Boolean))],
-          dependsOn: slice.dependsOn,
-          unlocks: slice.unlocks,
-          prerequisites: slice.prerequisites,
-          outputs: slice.outputs,
-          hardDependencies: slice.hardDependencies,
-          softOrderAfter: slice.softOrderAfter,
-          conflictKeys: slice.conflictKeys,
-        })),
-      },
-    });
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'subagent_plan.created',
-      status: 'queued',
-      channel: 'progress',
-      source: 'session',
-      summary: `Session 已创建 ${mergeGroup.slices.length} 个子代理文件节点草稿任务。`,
-      payload: {
-        mergeGroupId: mergeGroup.mergeGroupId,
-        planId: state.acceptedImplementationPlan.planId,
-        graphId: state.acceptedImplementationPlan.executionFlowGraph.graphId,
-        mode: state.subAgentMode,
-        nodeCount: state.acceptedImplementationPlan.executionFlowGraph.nodes.length,
-        sliceCount: mergeGroup.slices.length,
-        slices: mergeGroup.slices.map((slice) => ({
-          nodeId: slice.nodeId,
-          sliceId: slice.sliceId,
-          branchId: slice.branchId,
-          subAgentId: slice.subAgentId,
-          moduleId: slice.moduleId,
-          modulePath: slice.modulePath,
-          taskId: slice.task.taskId,
-          taskIds: slice.tasks.map((task) => task.taskId),
-          title: slice.moduleId,
-          role: slice.role,
-          targets: [...new Set(slice.tasks.flatMap((task) => task.targets))],
-          capabilities: [...new Set(slice.tasks.map((task) => task.capability).filter(Boolean))],
-          dependsOn: slice.dependsOn,
-          unlocks: slice.unlocks,
-          prerequisites: slice.prerequisites,
-          outputs: slice.outputs,
-          hardDependencies: slice.hardDependencies,
-          softOrderAfter: slice.softOrderAfter,
-          conflictKeys: slice.conflictKeys,
-        })),
-      },
-    });
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'subagent_merge.started',
-      status: 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: `Session 正在并行处理 ${mergeGroup.slices.length} 个已确认的 ready 文件节点。`,
-      payload: {
-        mergeGroupId: mergeGroup.mergeGroupId,
-        planId: state.acceptedImplementationPlan.planId,
-        graphId: state.acceptedImplementationPlan.executionFlowGraph.graphId,
-        sliceCount: mergeGroup.slices.length,
-        scheduler: 'dag',
-      },
-    });
-    const branches = await this.runSubAgentDagScheduler(input, state, prompt, mergeGroup);
-
-    mergeGroup.branches = branches;
-    state.subAgentTelemetry = {
-      ...state.subAgentTelemetry,
-      branchContextCharCounts: Object.fromEntries(
-        branches.map((branch) => [branch.slice.branchId, branch.contextCharCount])
-      ),
-    };
-    const guidanceMessages = await this.consumeQueuedGuidanceForProviderResume(state, 'subagent_merge_guidance');
-    if (guidanceMessages.length) {
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_merge.discarded',
-        status: 'discarded',
-        channel: 'progress',
-        source: 'session',
-        summary: '并行草稿已因为新的用户引导而作废，Session 将回到 parent provider checkpoint。',
-        payload: {
-          mergeGroupId: mergeGroup.mergeGroupId,
-          planId: state.acceptedImplementationPlan.planId,
-          discardedBranchIds: branches.map((branch) => branch.slice.branchId),
-          reason: 'queued_guidance',
-        },
-      });
-      return this.parentProviderCheckpointAfterSubAgentGuidance(
-        input,
-        state,
-        prompt,
-        'subagent_merge_guidance',
-        guidanceMessages,
-        'Session 在子代理并行期间收到新的用户引导；所有子代理草稿仅作为临时草稿丢弃，不进入 Kernel actionBatch。请基于用户引导重新输出同一 accepted taskPlan 范围内的下一步。'
-      );
-    }
-    const failedBranches = branches.filter((branch) => branch.status === 'failed' || !branch.draft);
-    const successfulBranches = branches.filter((branch) => branch.draft);
-    if (failedBranches.length) {
-      const diagnostics = failedBranches.map(subAgentBranchDiagnostic);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_merge.discarded',
-        status: 'discarded',
-        channel: 'progress',
-        source: 'session',
-        summary: '子代理文件节点草稿存在失败，Session 已丢弃未提交草稿并回收失败节点给 Parent 串行处理。',
-        payload: {
-          mergeGroupId: mergeGroup.mergeGroupId,
-          planId: state.acceptedImplementationPlan.planId,
-          discardedBranchIds: branches.map((branch) => branch.slice.branchId),
-          failedBranchIds: failedBranches.map((branch) => branch.slice.branchId),
-          successfulBranchIds: successfulBranches.map((branch) => branch.slice.branchId),
-          diagnostics,
-          reason: 'branch_failed',
-        },
-      });
-      await this.appendProviderTrace(state, 'subagent_merge.discarded', {
-        reason: 'branch_failed',
-        mergeGroupId: mergeGroup.mergeGroupId,
-        planId: state.acceptedImplementationPlan.planId,
-        diagnostics,
-      });
-      return this.serialSliceFallbackAfterSubAgentDiscard(
-        input,
-        state,
-        prompt,
-        mergeGroup,
-        diagnostics,
-        failedBranches[0].slice
-      );
-    }
-    const fragments = successfulBranches.map((branch): SubAgentFragment => ({
-      branchId: branch.slice.branchId,
-      subAgentId: branch.slice.subAgentId,
-      draft: branch.draft!,
-    }));
-    const merged = mergeSubAgentModuleDrafts(state, mergeGroup, fragments);
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'subagent_merge.completed',
-      status: 'completed',
-      channel: 'progress',
-      source: 'session',
-      summary: `Session 已合并 ${fragments.length} 个子代理草稿，准备交给 Kernel 统一审核。`,
-      payload: {
-        mergeGroupId: mergeGroup.mergeGroupId,
-        planId: state.acceptedImplementationPlan.planId,
-        branchIds: fragments.map((fragment) => fragment.branchId),
-      },
-    });
-    return parseAndValidateProposal({
-      raw: merged,
-      runId: state.runId,
-      sessionId: state.sessionId,
-      source: 'llm',
-    });
-  }
-
-  private async runSubAgentDagScheduler(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    mergeGroup: SubAgentMergeGroup
-  ): Promise<SubAgentBranchState[]> {
-    const pending = new Map(mergeGroup.slices.map((slice) => [slice.nodeId, slice]));
-    const completed = new Set<string>();
-    const failed = new Set<string>();
-    const branches: SubAgentBranchState[] = [];
-
-    while (pending.size) {
-      const ready = [...pending.values()].filter((slice) =>
-        slice.dependsOn.every((dependency) =>
-          completed.has(dependency) || (!pending.has(dependency) && !failed.has(dependency))
-        )
-      );
-      if (!ready.length) break;
-      const batch: SubAgentTaskSlice[] = [];
-      for (const slice of ready) {
-        if (batch.length >= state.subAgentMaxParallel) break;
-        if (batch.some((selected) => taskSlicesConflict(selected, {
-          tasks: slice.tasks,
-          conflictKeys: slice.conflictKeys,
-          targets: slice.tasks.flatMap((task) => task.targets),
-        }))) {
-          continue;
-        }
-        batch.push(slice);
-      }
-      if (!batch.length) break;
-      for (const slice of batch) {
-        pending.delete(slice.nodeId);
-        await this.emitProjectionDelta(state, {
-          type: 'stage_delta',
-          stage: 'subagent_node.ready',
-          status: 'queued',
-          channel: 'progress',
-          source: 'session',
-          summary: `子代理文件节点 ${slice.nodeId} 已满足前置条件，进入并发窗口。`,
-          payload: {
-            ...subAgentSlicePayload(state, mergeGroup, slice, 'queued'),
-            readyNodeIds: batch.map((item) => item.nodeId),
-          },
-        }, subAgentDeltaContext(mergeGroup, slice));
-        await this.emitProjectionDelta(state, {
-          type: 'stage_delta',
-          stage: 'subagent_node.queued',
-          status: 'queued',
-          channel: 'progress',
-          source: 'session',
-          summary: `子代理文件节点 ${slice.nodeId} 已进入 ready 队列。`,
-          payload: subAgentSlicePayload(state, mergeGroup, slice, 'queued'),
-        }, subAgentDeltaContext(mergeGroup, slice));
-        await this.emitProjectionDelta(state, {
-          type: 'stage_delta',
-          stage: 'subagent_branch.queued',
-          status: 'queued',
-          channel: 'progress',
-          source: 'session',
-          summary: `子代理 ${slice.subAgentId} 已排队处理模块 ${slice.moduleId}。`,
-          payload: subAgentSlicePayload(state, mergeGroup, slice, 'queued'),
-        }, subAgentDeltaContext(mergeGroup, slice));
-      }
-      const batchBranches = await Promise.all(batch.map((slice) =>
-        this.runSubAgentDagNode(input, state, prompt, mergeGroup, slice)
-      ));
-      branches.push(...batchBranches);
-      for (const branch of batchBranches) {
-        if (branch.draft) {
-          completed.add(branch.slice.nodeId);
-          await this.emitProjectionDelta(state, {
-            type: 'stage_delta',
-            stage: 'subagent_node.completed',
-            status: 'completed',
-            channel: 'progress',
-            source: 'session',
-            summary: `子代理 DAG 节点 ${branch.slice.nodeId} 草稿已完成，可参与 Parent 合并。`,
-            payload: subAgentSlicePayload(state, mergeGroup, branch.slice, 'completed'),
-          }, subAgentDeltaContext(mergeGroup, branch.slice));
-        } else {
-          failed.add(branch.slice.nodeId);
-          await this.emitProjectionDelta(state, {
-            type: 'stage_delta',
-            stage: 'subagent_node.reclaimed',
-            status: 'failed',
-            channel: 'progress',
-            source: 'session',
-            summary: `子代理 DAG 节点 ${branch.slice.nodeId} 已回收给 Parent 串行处理。`,
-            payload: {
-              ...subAgentSlicePayload(state, mergeGroup, branch.slice, 'failed'),
-              reason: branch.error ?? 'branch did not return a mergeable draft',
-            },
-          }, subAgentDeltaContext(mergeGroup, branch.slice));
-        }
-      }
-      const blocked = [...pending.values()].filter((slice) =>
-        slice.dependsOn.some((dependency) => failed.has(dependency))
-      );
-      for (const slice of blocked) {
-        pending.delete(slice.nodeId);
-        await this.emitProjectionDelta(state, {
-          type: 'stage_delta',
-          stage: 'subagent_node.blocked',
-          status: 'skipped',
-          channel: 'progress',
-          source: 'session',
-          summary: `子代理 DAG 节点 ${slice.nodeId} 等待的前置节点已回收，当前节点交给 Parent 后续处理。`,
-          payload: {
-            ...subAgentSlicePayload(state, mergeGroup, slice, 'skipped'),
-            blockedBy: slice.dependsOn.filter((dependency) => failed.has(dependency)),
-          },
-        }, subAgentDeltaContext(mergeGroup, slice));
-      }
-    }
-    return branches;
-  }
-
-  private async runSubAgentDagNode(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    mergeGroup: SubAgentMergeGroup,
-    slice: SubAgentTaskSlice
-  ): Promise<SubAgentBranchState> {
-    const deltaContext = subAgentDeltaContext(mergeGroup, slice);
-    try {
-      await this.ensureSubAgentNodeEvidence(state, mergeGroup, slice, deltaContext);
-      const branchContext = subAgentTaskSlicePrompt(state, prompt, slice, mergeGroup.mergeGroupId);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_node.started',
-        status: 'running',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理 DAG 节点 ${slice.nodeId} 已开始。`,
-        payload: subAgentSlicePayload(state, mergeGroup, slice, 'running'),
-      }, deltaContext);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_branch.started',
-        status: 'running',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理 ${slice.subAgentId} 正在生成模块 ${slice.moduleId} 的草稿。`,
-        payload: subAgentSlicePayload(state, mergeGroup, slice, 'running'),
-      }, deltaContext);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_branch.context_ready',
-        status: 'running',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理 ${slice.subAgentId} 已获得 DAG 节点上下文。`,
-        payload: {
-          ...subAgentSlicePayload(state, mergeGroup, slice, 'running'),
-          contextCharCount: branchContext.length,
-        },
-      }, deltaContext);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_branch.request_sent',
-        status: 'running',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理 ${slice.subAgentId} 请求已发送。`,
-        payload: subAgentSlicePayload(state, mergeGroup, slice, 'running'),
-      }, deltaContext);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_branch.provider_streaming',
-        status: 'streaming',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理 ${slice.subAgentId} 正在流式生成草稿。`,
-        payload: subAgentSlicePayload(state, mergeGroup, slice, 'streaming'),
-      }, deltaContext);
-      const raw = await this.llmSubAgent(
-        input.profileId,
-        state,
-        `subagent_${slice.nodeId}`,
-        [
-          { role: 'system', content: prompt.stablePrefix },
-          { role: 'user', content: branchContext },
-        ],
-        deltaContext,
-        {
-          noDeltaTimeoutMs: input.subAgentNoDeltaTimeoutMs,
-          totalTimeoutMs: input.subAgentTotalTimeoutMs,
-          onFirstDelta: async () => {
-            await this.emitProjectionDelta(state, {
-              type: 'stage_delta',
-              stage: 'subagent_branch.first_delta',
-              status: 'streaming',
-              channel: 'progress',
-              source: 'provider',
-              summary: `子代理 ${slice.subAgentId} 已收到首个流式片段。`,
-              payload: subAgentSlicePayload(state, mergeGroup, slice, 'streaming'),
-            }, deltaContext);
-          },
-        }
-      );
-      const draft = parseSubAgentModuleDraft(raw, slice);
-      const draftProblem = validateSubAgentModuleDraft(state, slice, draft);
-      if (draftProblem) {
-        throw new SessionDriverLoopError(
-          'subagent_invalid_module_draft',
-          `子代理 ${slice.subAgentId} 返回的 module draft 无法合并：${draftProblem}`
-        );
-      }
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_branch.draft_ready',
-        status: 'draftReady',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理 ${slice.subAgentId} 已生成 ${slice.moduleId} 的模块草稿。`,
-        payload: {
-          ...subAgentSlicePayload(state, mergeGroup, slice, 'draftReady'),
-          draftFileCount: draft.draftFiles.length,
-          evidenceSummary: draft.evidenceSummary,
-        },
-      }, deltaContext);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_node.draft_ready',
-        status: 'draftReady',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理 DAG 节点 ${slice.nodeId} 草稿已生成。`,
-        payload: {
-          ...subAgentSlicePayload(state, mergeGroup, slice, 'draftReady'),
-          draftFileCount: draft.draftFiles.length,
-        },
-      }, deltaContext);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_branch.waiting_merge',
-        status: 'waiting',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理 ${slice.subAgentId} 正在等待 Parent 合并。`,
-        payload: subAgentSlicePayload(state, mergeGroup, slice, 'waiting'),
-      }, deltaContext);
-      return {
-        slice,
-        status: 'completed',
-        draft,
-        contextCharCount: branchContext.length,
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (isSubAgentStalledError(error)) {
-        await this.emitProjectionDelta(state, {
-          type: 'stage_delta',
-          stage: 'subagent_branch.stalled',
-          status: 'failed',
-          channel: 'progress',
-          source: 'session',
-          summary: message,
-          payload: {
-            ...subAgentSlicePayload(state, mergeGroup, slice, 'failed'),
-            reason: message,
-          },
-        }, deltaContext);
-      }
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_branch.failed',
-        status: 'failed',
-        channel: 'progress',
-        source: 'session',
-        summary: message,
-        payload: {
-          ...subAgentSlicePayload(state, mergeGroup, slice, 'failed'),
-          reason: message,
-        },
-      }, deltaContext);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_node.failed',
-        status: 'failed',
-        channel: 'progress',
-        source: 'session',
-        summary: message,
-        payload: {
-          ...subAgentSlicePayload(state, mergeGroup, slice, 'failed'),
-          reason: message,
-        },
-      }, deltaContext);
-      return {
-        slice,
-        status: 'failed',
-        error: message,
-        contextCharCount: 0,
-      };
-    }
-  }
-
-  private async ensureSubAgentNodeEvidence(
-    state: SessionDriverLoopRunState,
-    mergeGroup: SubAgentMergeGroup,
-    slice: SubAgentTaskSlice,
-    deltaContext: ProjectionDeltaBranchContext
-  ): Promise<void> {
-    const request = subAgentEvidenceRequestForSlice(state, slice);
-    if (!request.items.length) {
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_node.evidence_preflight',
-        status: 'completed',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理文件节点 ${slice.nodeId} 不需要额外只读证据预取。`,
-        payload: {
-          ...subAgentSlicePayload(state, mergeGroup, slice, 'queued'),
-          itemCount: 0,
-          source: 'already_available_or_create',
-        },
-      }, deltaContext);
-      return;
-    }
-
-    const resolution = manifestForResourceRequest(state.manifest, request, state.conversationRoots);
-    if (resolution.unresolved.length || resolution.ambiguous.length) {
-      throw new SessionDriverLoopError(
-        'subagent_evidence_preflight_failed',
-        `Sub-agent file node ${slice.nodeId} evidence preflight failed: ${resourceResolutionDiagnostic(resolution).fallback}`
-      );
-    }
-    const packet = await this.resolveResources(state, resolution.manifest);
-    state.resourcePackets.push(packet);
-    addDiscoveredManifestEntries(state.manifest, packet);
-    await this.append(state.sessionId, [
-      resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('subagent-node-evidence')),
-    ]);
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'subagent_node.evidence_preflight',
-      status: 'completed',
-      channel: 'progress',
-      source: 'session',
-      summary: `子代理文件节点 ${slice.nodeId} 已完成只读证据预取。`,
-      payload: {
-        ...subAgentSlicePayload(state, mergeGroup, slice, 'queued'),
-        resourcePacketId: packet.id,
-        itemCount: packet.items.length,
-      },
-    }, deltaContext);
-  }
-
-  private async emitSubAgentSkipped(
-    state: SessionDriverLoopRunState,
-    reason: SubAgentSkippedReason,
-    summary?: string
-  ): Promise<void> {
-    if (!state.acceptedImplementationPlan) return;
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'subagent_skipped',
-      status: 'skipped',
-      channel: 'progress',
-      source: 'session',
-      summary: summary ?? subAgentSkippedSummary(reason),
-      payload: {
-        runId: state.runId,
-        planId: state.acceptedImplementationPlan.planId,
-        status: 'skipped',
-        reason,
-      },
-    });
-  }
-
   private async maybeRunStaticSyntaxReview(
     input: SessionDriverLoopInput,
     state: SessionDriverLoopRunState,
@@ -3232,502 +2391,6 @@ export class SessionDriverLoop {
         issues,
       }),
     ];
-  }
-
-  private async serialSliceFallbackAfterSubAgentDiscard(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    mergeGroup: SubAgentMergeGroup,
-    diagnostics: SubAgentBranchDiagnostic[],
-    failedSlice: SubAgentTaskSlice
-  ): Promise<ProposalEnvelope> {
-    const guidanceMessages = await this.consumeQueuedGuidanceForProviderResume(state, 'subagent_serial_fallback_guidance');
-    if (guidanceMessages.length) {
-      return this.parentProviderCheckpointAfterSubAgentGuidance(
-        input,
-        state,
-        prompt,
-        'subagent_serial_fallback_guidance',
-        guidanceMessages,
-        'Session 在串行切片 fallback 前发现新的用户引导；不会继续使用已丢弃的子代理草稿，将回到 proposal-only parent checkpoint。'
-      );
-    }
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'subagent_serial_fallback.started',
-      status: 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: 'Session 已丢弃并行草稿，正在用同一切片合同串行重试失败分支。',
-      payload: {
-        mergeGroupId: mergeGroup.mergeGroupId,
-        planId: state.acceptedImplementationPlan?.planId,
-        failedBranchId: failedSlice.branchId,
-        failedTaskId: failedSlice.task.taskId,
-        diagnostics,
-      },
-    });
-    let raw: string;
-    try {
-      raw = await this.llm(
-        input.profileId,
-        state,
-        'subagent_serial_fallback',
-        serialSliceFallbackMessages(state, prompt, mergeGroup, diagnostics, failedSlice)
-      );
-    } catch (error) {
-      const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_serial_fallback.failed',
-        status: 'failed',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理串行切片 fallback provider 调用失败：${message}`,
-        payload: {
-          mergeGroupId: mergeGroup.mergeGroupId,
-          planId: state.acceptedImplementationPlan?.planId,
-          failedBranchId: failedSlice.branchId,
-          failedTaskId: failedSlice.task.taskId,
-          diagnostics,
-          errorCode: error instanceof SessionDriverLoopError ? error.code : 'subagent_serial_fallback_provider_failed',
-        },
-      });
-      return subAgentSerialFallbackDiagnosticProposal(state, failedSlice, message);
-    }
-    let proposal: ProposalEnvelope;
-    try {
-      proposal = parseAndValidateProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-      });
-    } catch (error) {
-      const message = `子代理串行切片 fallback 输出无法解析：${normalizeParseError(error).message}`;
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_serial_fallback.failed',
-        status: 'failed',
-        channel: 'progress',
-        source: 'session',
-        summary: message,
-        payload: {
-          mergeGroupId: mergeGroup.mergeGroupId,
-          planId: state.acceptedImplementationPlan?.planId,
-          failedBranchId: failedSlice.branchId,
-          failedTaskId: failedSlice.task.taskId,
-          diagnostics,
-          errorCode: 'subagent_serial_fallback_parse_failed',
-        },
-      });
-      return subAgentSerialFallbackDiagnosticProposal(state, failedSlice, message);
-    }
-    const problem = subAgentParentFallbackProposalProblem(state, proposal);
-    if (problem) {
-      const message = `子代理串行切片 fallback 输出仍不能继续 accepted taskPlan：${problem}`;
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_serial_fallback.failed',
-        status: 'failed',
-        channel: 'progress',
-        source: 'session',
-        summary: message,
-        payload: {
-          mergeGroupId: mergeGroup.mergeGroupId,
-          planId: state.acceptedImplementationPlan?.planId,
-          failedBranchId: failedSlice.branchId,
-          failedTaskId: failedSlice.task.taskId,
-          diagnostics,
-          errorCode: 'subagent_serial_fallback_invalid_proposal',
-        },
-      });
-      return subAgentSerialFallbackDiagnosticProposal(state, failedSlice, message);
-    }
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'subagent_serial_fallback.completed',
-      status: 'completed',
-      channel: 'progress',
-      source: 'session',
-      summary: '串行切片 fallback 已返回可交给 Session admission 的 proposal。',
-      payload: {
-        mergeGroupId: mergeGroup.mergeGroupId,
-        planId: state.acceptedImplementationPlan?.planId,
-        proposalKind: proposal.kind,
-        failedBranchId: failedSlice.branchId,
-      },
-    });
-    return proposal;
-  }
-
-  private async parentProviderCheckpointAfterSubAgentGuidance(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    stage: string,
-    guidanceMessages: LlmChatRequest['messages'],
-    reason: string
-  ): Promise<ProposalEnvelope> {
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage,
-      status: 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: reason,
-    });
-    const messages: LlmChatRequest['messages'] = [
-      { role: 'system', content: prompt.stablePrefix },
-      { role: 'user', content: `${prompt.dynamicSuffix}\n\n${reason}` },
-      ...guidanceMessages,
-    ];
-    const providerResult = state.acceptedImplementationPlan
-      ? await this.callProviderProposalOnly(input, state, prompt, stage, messages)
-      : await this.callProviderWithNativeTools(input, state, prompt, messages);
-    if (typeof providerResult !== 'string') return providerResult;
-    try {
-      return parseAndValidateProposal({
-        raw: providerResult,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-      });
-    } catch (error) {
-      throw new SessionDriverLoopError(
-        'subagent_guidance_parent_repair_failed',
-        `用户引导 checkpoint 后模型输出无法解析：${normalizeParseError(error).message}`
-      );
-    }
-  }
-
-  private async parentProviderCheckpointAfterSubAgentDiscard(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    mergeGroup: SubAgentMergeGroup,
-    diagnostics: SubAgentBranchDiagnostic[]
-  ): Promise<ProposalEnvelope> {
-    const reason = 'Session 子代理并行草稿已全部丢弃，因为至少一个 branch 没有返回可合并的 module draft。';
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'subagent_parent_fallback',
-      status: 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: 'Session 正在由 parent provider 接管已丢弃的子代理并行草稿。',
-      payload: {
-        mergeGroupId: mergeGroup.mergeGroupId,
-        planId: state.acceptedImplementationPlan?.planId,
-        reason: 'branch_failed',
-        diagnostics,
-      },
-    });
-    let providerResult: string | ProposalEnvelope;
-    try {
-      providerResult = await this.callProviderProposalOnly(
-        input,
-        state,
-        prompt,
-        'subagent_parent_fallback',
-        subAgentParentFallbackMessages(state, mergeGroup, diagnostics, reason)
-      );
-    } catch (error) {
-      const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: 'subagent_parent_fallback.failed',
-        status: 'failed',
-        channel: 'progress',
-        source: 'session',
-        summary: `子代理 parent fallback provider 调用失败：${message}`,
-        payload: {
-          mergeGroupId: mergeGroup.mergeGroupId,
-          planId: state.acceptedImplementationPlan?.planId,
-          reason: 'provider_failed',
-          diagnostics,
-          errorCode: error instanceof SessionDriverLoopError ? error.code : 'subagent_parent_fallback_provider_failed',
-        },
-      });
-      return subAgentParentFallbackDiagnosticProposal(state, mergeGroup, diagnostics, message);
-    }
-    if (typeof providerResult !== 'string') {
-      return this.acceptOrRepairSubAgentParentFallbackProposal(
-        input,
-        state,
-        prompt,
-        mergeGroup,
-        diagnostics,
-        providerResult,
-        'parent provider returned a native proposal envelope',
-        true
-      );
-    }
-    try {
-      const proposal = parseAndValidateProposal({
-        raw: providerResult,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-      });
-      return this.acceptOrRepairSubAgentParentFallbackProposal(
-        input,
-        state,
-        prompt,
-        mergeGroup,
-        diagnostics,
-        proposal,
-        'parent provider returned a parsed proposal envelope',
-        true
-      );
-    } catch (error) {
-      return this.repairSubAgentParentFallbackProposal(
-        input,
-        state,
-        prompt,
-        mergeGroup,
-        diagnostics,
-        `parent provider 输出无法解析：${normalizeParseError(error).message}`
-      );
-    }
-  }
-
-  private async acceptOrRepairSubAgentParentFallbackProposal(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    mergeGroup: SubAgentMergeGroup,
-    diagnostics: SubAgentBranchDiagnostic[],
-    proposal: ProposalEnvelope,
-    sourceSummary: string,
-    allowRepair: boolean
-  ): Promise<ProposalEnvelope> {
-    const problem = subAgentParentFallbackProposalProblem(state, proposal);
-    if (!problem) return proposal;
-    if (!allowRepair) {
-      throw new SessionDriverLoopError(
-        'subagent_discard_parent_repair_failed',
-        `子代理草稿丢弃后 parent provider repair 后仍无效：${problem}`
-      );
-    }
-    return this.repairSubAgentParentFallbackProposal(
-      input,
-      state,
-      prompt,
-      mergeGroup,
-      diagnostics,
-      `${sourceSummary}，但不能继续 accepted taskPlan：${problem}`
-    );
-  }
-
-  private async repairSubAgentParentFallbackProposal(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    mergeGroup: SubAgentMergeGroup,
-    diagnostics: SubAgentBranchDiagnostic[],
-    problemSummary: string
-  ): Promise<ProposalEnvelope> {
-    if (state.subAgentParentFallbackRepairAttempted) {
-      throw new SessionDriverLoopError(
-        'subagent_discard_parent_repair_failed',
-        `子代理草稿丢弃后 parent provider 输出仍不可用，且 repair 已尝试过一次：${problemSummary}`
-      );
-    }
-    state.subAgentParentFallbackRepairAttempted = true;
-    const guidanceMessages = await this.consumeQueuedGuidanceForProviderResume(state, 'subagent_parent_fallback_repair_guidance');
-    if (guidanceMessages.length) {
-      return this.parentProviderCheckpointAfterSubAgentGuidance(
-        input,
-        state,
-        prompt,
-        'subagent_parent_fallback_repair_guidance',
-        guidanceMessages,
-        'Session 在 parent fallback repair 前发现新的用户引导；不会继续使用已丢弃的子代理草稿，将由 parent provider 重新决策。'
-      );
-    }
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'subagent_parent_fallback.repairing',
-      status: 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: 'Session 正在修复 parent fallback 输出，避免把子代理草稿失败升级为计划失败。',
-      payload: {
-        mergeGroupId: mergeGroup.mergeGroupId,
-        planId: state.acceptedImplementationPlan?.planId,
-        reason: 'parent_fallback_invalid',
-        problemSummary,
-        diagnostics,
-      },
-    });
-    const providerResult = await this.callProviderProposalOnly(
-      input,
-      state,
-      prompt,
-      'subagent_parent_fallback_repair',
-      subAgentParentFallbackMessages(
-        state,
-        mergeGroup,
-        diagnostics,
-        'Session 子代理并行草稿已经丢弃；parent fallback 的上一份输出仍不能继续执行。',
-        problemSummary
-      )
-    );
-    if (typeof providerResult !== 'string') {
-      return this.acceptOrRepairSubAgentParentFallbackProposal(
-        input,
-        state,
-        prompt,
-        mergeGroup,
-        diagnostics,
-        providerResult,
-        'parent fallback repair returned a native proposal envelope',
-        false
-      );
-    }
-    try {
-      const proposal = parseAndValidateProposal({
-        raw: providerResult,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-      });
-      return this.acceptOrRepairSubAgentParentFallbackProposal(
-        input,
-        state,
-        prompt,
-        mergeGroup,
-        diagnostics,
-        proposal,
-        'parent fallback repair returned a parsed proposal envelope',
-        false
-      );
-    } catch (error) {
-      throw new SessionDriverLoopError(
-        'subagent_discard_parent_repair_failed',
-        `子代理草稿丢弃后 parent provider repair 输出无法解析：${normalizeParseError(error).message}`
-      );
-    }
-  }
-
-  private async llmSubAgent(
-    profileId: string | undefined,
-    state: SessionDriverLoopRunState,
-    stage: string,
-    messages: LlmChatRequest['messages'],
-    deltaContext: ProjectionDeltaBranchContext,
-    options?: {
-      noDeltaTimeoutMs?: number;
-      totalTimeoutMs?: number;
-      onFirstDelta?: () => Promise<void>;
-    }
-  ): Promise<string> {
-    await this.appendProviderTrace(state, `${stage}.request`, {
-      profileId,
-      messages,
-      cachePlan: state.cachePlan,
-      contextAssembly: state.contextAssembly,
-      subAgent: deltaContext,
-    });
-    await this.emitProjectionDelta(state, {
-      type: 'active_turn',
-      stage,
-      status: this.ports.llmChatStream ? 'streaming' : 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: providerStageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
-      activity: providerActivity(state, stage, 'running'),
-    }, deltaContext);
-    const request: LlmChatRequest = {
-      profileId,
-      messages,
-      responseFormat: { type: 'json_object' },
-      stream: Boolean(this.ports.llmChatStream),
-      providerOptions: {
-        deepcode: {
-          cachePlan: state.cachePlan,
-          taskGraph: state.taskGraph,
-          subAgent: deltaContext,
-        },
-      },
-    };
-    const toolCallBuffer = new ProviderToolCallBuffer();
-    const reasoningBuffer: ProviderReasoningDeltaBuffer = {
-      pending: '',
-      lastFlushAt: Date.now(),
-      itemId: undefined,
-    };
-    let firstDeltaObserved = false;
-    const markFirstDelta = async (): Promise<void> => {
-      if (firstDeltaObserved) return;
-      firstDeltaObserved = true;
-      await options?.onFirstDelta?.();
-    };
-    const providerCall = this.ports.llmChatStream
-      ? this.ports.llmChatStream(request, async (event) => {
-        if (subAgentStreamEventHasDelta(event)) await markFirstDelta();
-        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, reasoningBuffer, deltaContext);
-      })
-      : this.ports.llmChat(request);
-	    const result = await raceSubAgentProviderCall(
-      providerCall,
-      {
-        noDeltaTimeoutMs: normalizeSubAgentTimeout(options?.noDeltaTimeoutMs, DEFAULT_SUB_AGENT_NO_DELTA_TIMEOUT_MS),
-        totalTimeoutMs: normalizeSubAgentTimeout(options?.totalTimeoutMs, DEFAULT_SUB_AGENT_TOTAL_TIMEOUT_MS),
-        enforceNoDelta: Boolean(this.ports.llmChatStream),
-      },
-	      () => firstDeltaObserved
-	    );
-    await this.flushProviderReasoningBuffer(state, stage, reasoningBuffer, deltaContext);
-    if (!result.ok || !result.data) {
-      await this.emitProjectionDelta(state, {
-        type: 'error',
-        stage,
-        status: 'failed',
-        channel: 'progress',
-        source: 'provider',
-        summary: result.message ?? result.error ?? 'LLM provider request failed.',
-        activity: conversationActivity({
-          activityId: `provider-${stage}-failed`,
-          kind: 'diagnostic',
-          status: 'failed',
-          title: 'Provider call failed',
-          summary: result.message ?? result.error ?? 'LLM provider request failed.',
-          source: 'provider',
-          runId: state.runId,
-        }),
-      }, deltaContext);
-      throw new SessionDriverLoopError(
-        'subagent_llm_chat_failed',
-        result.message ?? result.error ?? 'LLM provider request failed.'
-      );
-    }
-    await this.appendProviderTrace(state, `${stage}.response`, {
-      usage: result.data.usage,
-      assistantContentLength: result.data.assistantMessage?.content?.length ?? 0,
-      chunkSummary: providerTraceChunkSummary(result.data.chunks),
-      subAgent: deltaContext,
-    });
-    await this.emitProjectionDelta(state, {
-      type: 'active_turn',
-      stage,
-      status: 'completed',
-      channel: 'progress',
-      source: 'provider',
-      summary: providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
-      activity: providerActivity(state, stage, 'completed'),
-    }, deltaContext);
-    const content = stripProviderPartFrames(result.data.assistantMessage?.content
-      ?? result.data.chunks
-        .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
-        .map((chunk) => chunk.content)
-        .join(''));
-    if (!content.trim()) {
-      throw new SessionDriverLoopError('subagent_empty_response', 'Sub-agent provider returned an empty response.');
-    }
-    return content;
   }
 
   private async callProviderWithNativeTools(
@@ -4304,8 +2967,6 @@ export class SessionDriverLoop {
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
         projectMemoryMode: input.projectMemoryMode,
-        subAgentMode: input.subAgentMode,
-        subAgentMaxParallel: input.subAgentMaxParallel,
         resumeResourcePackets: true,
       });
     }
@@ -4589,8 +3250,6 @@ export class SessionDriverLoop {
               reviewContinuationMode: input.reviewContinuationMode,
               interventionLevel: input.interventionLevel,
               projectMemoryMode: input.projectMemoryMode,
-              subAgentMode: input.subAgentMode,
-              subAgentMaxParallel: input.subAgentMaxParallel,
               resumeResourcePackets: true,
               acceptedImplementationPlan: accepted,
             });
@@ -4962,8 +3621,6 @@ export class SessionDriverLoop {
         reviewContinuationMode: input.reviewContinuationMode,
         interventionLevel: input.interventionLevel,
         projectMemoryMode: input.projectMemoryMode,
-        subAgentMode: input.subAgentMode,
-        subAgentMaxParallel: input.subAgentMaxParallel,
         resumeResourcePackets: true,
         acceptedImplementationPlan: nextAccepted,
       });
@@ -5134,12 +3791,11 @@ export class SessionDriverLoop {
     profileId: string | undefined,
     state: SessionDriverLoopRunState,
     stage: string,
-    messages: LlmChatRequest['messages'],
-    deltaContext?: ProjectionDeltaBranchContext
+    messages: LlmChatRequest['messages']
   ): Promise<string> {
     const turn = await this.llmTurn(profileId, state, stage, messages, {
       responseFormat: { type: 'json_object' },
-    }, deltaContext);
+    });
     if (!turn.content.trim()) {
       throw new SessionDriverLoopError('llm_empty_response', 'LLM provider returned an empty response.');
     }
@@ -5151,15 +3807,13 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     stage: string,
     messages: LlmChatRequest['messages'],
-    options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {},
-    deltaContext?: ProjectionDeltaBranchContext
+    options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {}
   ): Promise<LlmTurnResult> {
     await this.appendProviderTrace(state, `${stage}.request`, {
       profileId,
       messages: ensureJsonObjectModeMessages(messages, options.responseFormat),
       cachePlan: state.cachePlan,
       contextAssembly: state.contextAssembly,
-      taskGraph: state.taskGraph,
       responseFormat: options.responseFormat,
       responseFormatAudit: jsonObjectResponseFormatAudit(messages, options.responseFormat),
     });
@@ -5171,7 +3825,7 @@ export class SessionDriverLoop {
       source: 'session',
       summary: providerStageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
       activity: providerActivity(state, stage, 'running'),
-    }, deltaContext);
+    });
     const request: LlmChatRequest = {
       profileId,
       messages: ensureJsonObjectModeMessages(messages, options.responseFormat),
@@ -5181,7 +3835,6 @@ export class SessionDriverLoop {
       providerOptions: {
         deepcode: {
           cachePlan: state.cachePlan,
-          taskGraph: state.taskGraph,
         },
       },
     };
@@ -5193,10 +3846,10 @@ export class SessionDriverLoop {
     };
     const result = this.ports.llmChatStream
       ? await this.ports.llmChatStream(request, async (event) => {
-        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, reasoningBuffer, deltaContext);
+        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, reasoningBuffer);
       })
       : await this.ports.llmChat(request);
-    await this.flushProviderReasoningBuffer(state, stage, reasoningBuffer, deltaContext);
+    await this.flushProviderReasoningBuffer(state, stage, reasoningBuffer);
     if (!result.ok || !result.data) {
       await this.emitProjectionDelta(state, {
         type: 'error',
@@ -5205,7 +3858,7 @@ export class SessionDriverLoop {
         channel: 'progress',
         source: 'provider',
         summary: result.message ?? result.error ?? 'LLM provider request failed.',
-      }, deltaContext);
+      });
       throw new SessionDriverLoopError(
         'llm_chat_failed',
         result.message ?? result.error ?? 'LLM provider request failed.'
@@ -5238,7 +3891,7 @@ export class SessionDriverLoop {
       source: 'provider',
       summary: providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
       activity: providerActivity(state, stage, 'completed'),
-    }, deltaContext);
+    });
     const content = stripProviderPartFrames(result.data.assistantMessage?.content
       ?? result.data.chunks
         .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
@@ -5261,14 +3914,13 @@ export class SessionDriverLoop {
     stage: string,
     event: LlmChatStreamEvent,
     toolCallBuffer: ProviderToolCallBuffer,
-    reasoningBuffer: ProviderReasoningDeltaBuffer,
-    deltaContext?: ProjectionDeltaBranchContext
+    reasoningBuffer: ProviderReasoningDeltaBuffer
   ): Promise<void> {
     const chunk = event.chunk;
     if (event.type === 'provider_delta' && chunk?.content) {
       const frames = this.consumeProviderPartFrames(state, stage, chunk.content);
       for (const frame of frames) {
-        await this.submitProviderPartFrame(state, stage, frame, deltaContext);
+        await this.submitProviderPartFrame(state, stage, frame);
       }
       if (providerStageExposesAssistantDelta(stage)) {
         await this.emitProjectionDelta(state, {
@@ -5280,14 +3932,14 @@ export class SessionDriverLoop {
           itemId: chunk.callId,
           delta: chunk.content,
           payload: chunk.rawProvider,
-        }, deltaContext);
+        });
       } else if (providerStageEmitsJsonProgress(stage)) {
-        await this.emitProviderJsonStreamProgress(state, stage, chunk.content, deltaContext);
+        await this.emitProviderJsonStreamProgress(state, stage, chunk.content);
       }
       return;
     }
     if (event.type === 'provider_reasoning_delta' && chunk?.content) {
-      await this.bufferProviderReasoningDelta(state, stage, reasoningBuffer, chunk, deltaContext);
+      await this.bufferProviderReasoningDelta(state, stage, reasoningBuffer, chunk);
       return;
     }
     if (event.type === 'provider_tool_call_delta' && chunk) {
@@ -5323,7 +3975,7 @@ export class SessionDriverLoop {
           toolCallDelta: chunk.toolCallDelta,
           rawProvider: chunk.rawProvider,
         },
-      }, deltaContext);
+      });
       return;
     }
     if (event.type === 'provider_usage') {
@@ -5335,7 +3987,7 @@ export class SessionDriverLoop {
         source: 'provider',
         summary: providerUsageSummary(visibleLanguageForRequest(state.userRequest)),
         payload: event.usage ?? chunk?.usage,
-      }, deltaContext);
+      });
       return;
     }
     if (event.type === 'provider_error') {
@@ -5356,7 +4008,7 @@ export class SessionDriverLoop {
           runId: state.runId,
         }),
         payload: event.rawProvider ?? chunk?.rawProvider,
-      }, deltaContext);
+      });
     }
   }
 
@@ -5364,8 +4016,7 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     stage: string,
     buffer: ProviderReasoningDeltaBuffer,
-    chunk: LlmChatResult['chunks'][number],
-    deltaContext?: ProjectionDeltaBranchContext
+    chunk: LlmChatResult['chunks'][number]
   ): Promise<void> {
     if (typeof chunk.content !== 'string' || chunk.content.length === 0) return;
     buffer.pending += chunk.content;
@@ -5377,14 +4028,13 @@ export class SessionDriverLoop {
     ) {
       return;
     }
-    await this.flushProviderReasoningBuffer(state, stage, buffer, deltaContext);
+    await this.flushProviderReasoningBuffer(state, stage, buffer);
   }
 
   private async flushProviderReasoningBuffer(
     state: SessionDriverLoopRunState,
     stage: string,
-    buffer: ProviderReasoningDeltaBuffer,
-    deltaContext?: ProjectionDeltaBranchContext
+    buffer: ProviderReasoningDeltaBuffer
   ): Promise<void> {
     if (!buffer.pending) return;
     const delta = buffer.pending;
@@ -5404,43 +4054,13 @@ export class SessionDriverLoop {
         streamMode: 'markdownBlocks',
         buffered: true,
       },
-    }, deltaContext);
+    });
   }
 
   private async emitProjectionDelta(
     state: SessionDriverLoopRunState,
-    delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>,
-    deltaContext?: ProjectionDeltaBranchContext
+    delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>
   ): Promise<void> {
-    if (state.subAgentMode === 'off' && subAgentExecutionDeltaWouldViolateOffMode(delta, deltaContext)) {
-      if (!state.subAgentModeViolationReported) {
-        state.subAgentModeViolationReported = true;
-        await this.append(state.sessionId, [
-          sessionRunStateEvent({
-            sessionId: state.sessionId,
-            runId: state.runId,
-            phase: 'failed',
-            status: 'failed',
-            reason: 'subagent_mode_violation',
-            decisionOwner: {
-              kind: 'plan',
-              runId: state.runId,
-              targetId: state.acceptedImplementationPlan?.planId,
-              planId: state.acceptedImplementationPlan?.planId,
-            },
-            ts: this.ts(),
-            id: this.id('subagent-mode-violation'),
-          }),
-          finalDiagnosticEvent(
-            state.sessionId,
-            'Sub-agent mode is off, but Session attempted to emit a sub-agent branch/merge delta. Automatic execution has been stopped as a Session orchestration violation.',
-            this.ts(),
-            this.id('subagent-mode-violation-diagnostic')
-          ),
-        ]);
-      }
-      return;
-    }
     if (!this.ports.onProjectionDelta) return;
     const activeTurn = state.activeTurn ?? {
       turnId: this.id('active-turn'),
@@ -5450,10 +4070,9 @@ export class SessionDriverLoop {
     activeTurn.seq += 1;
     activeTurn.stage = delta.stage ?? activeTurn.stage;
     state.activeTurn = activeTurn;
-    const activity = delta.activity ?? projectionDeltaActivity(state, delta, deltaContext);
+    const activity = delta.activity ?? projectionDeltaActivity(state, delta);
     await this.ports.onProjectionDelta({
       ...delta,
-      ...deltaContext,
       activity,
       sessionId: state.sessionId,
       runId: state.runId,
@@ -5465,8 +4084,7 @@ export class SessionDriverLoop {
   private async emitProviderJsonStreamProgress(
     state: SessionDriverLoopRunState,
     stage: string,
-    content: string,
-    deltaContext?: ProjectionDeltaBranchContext
+    content: string
   ): Promise<void> {
     const activeTurn = state.activeTurn ?? {
       turnId: this.id('active-turn'),
@@ -5503,14 +4121,13 @@ export class SessionDriverLoop {
         rawJsonHidden: true,
         reason: 'proposal_json_stream_hidden_from_assistant',
       },
-    }, deltaContext);
+    });
   }
 
   private async emitKernelActivityDeltas(
     state: SessionDriverLoopRunState,
     kernelEvents: unknown[],
-    stage: string,
-    deltaContext?: ProjectionDeltaBranchContext
+    stage: string
   ): Promise<void> {
     const workUnitFacts = indexKernelWorkUnitFacts(kernelEvents);
     for (let index = 0; index < kernelEvents.length; index += 1) {
@@ -5533,7 +4150,7 @@ export class SessionDriverLoop {
           kernelEvent: enriched,
           activity,
         },
-      }, deltaContext);
+      });
     }
   }
 
@@ -5555,16 +4172,12 @@ export class SessionDriverLoop {
   private async submitProviderPartFrame(
     state: SessionDriverLoopRunState,
     stage: string,
-    frame: AgentStreamPartFrame,
-    deltaContext?: ProjectionDeltaBranchContext
+    frame: AgentStreamPartFrame
   ): Promise<void> {
     const enrichedFrame = {
       ...frame,
-      branchId: frame.branchId ?? deltaContext?.branchId,
-      subAgentId: frame.subAgentId ?? deltaContext?.subAgentId,
-      mergeGroupId: frame.mergeGroupId ?? deltaContext?.mergeGroupId,
-      draftId: frame.draftId ?? deltaContext?.draftId,
-      targetPath: frame.targetPath ?? deltaContext?.targetPath,
+      draftId: frame.draftId,
+      targetPath: frame.targetPath,
     };
     await this.emitProjectionDelta(state, {
       type: 'part_delta',
@@ -5573,15 +4186,12 @@ export class SessionDriverLoop {
       channel: enrichedFrame.partKind === 'thinkingDelta' ? 'reasoning' : 'draft',
       source: 'session',
       itemId: enrichedFrame.frameId ?? enrichedFrame.draftId,
-      branchId: enrichedFrame.branchId,
-      subAgentId: enrichedFrame.subAgentId,
-      mergeGroupId: enrichedFrame.mergeGroupId,
       draftId: enrichedFrame.draftId,
       targetPath: enrichedFrame.targetPath,
       delta: enrichedFrame.chunk,
       summary: enrichedFrame.summary ?? `Provider stream part: ${enrichedFrame.partKind}`,
       payload: enrichedFrame,
-    }, deltaContext);
+    });
 
     const reply = await this.ports.kernelCommand({
       requestId: this.id('draft-ledger-submit'),
@@ -5604,14 +4214,11 @@ export class SessionDriverLoop {
         channel: 'draft',
         source: 'kernel',
         itemId: enrichedFrame.frameId ?? enrichedFrame.draftId,
-        branchId: enrichedFrame.branchId,
-        subAgentId: enrichedFrame.subAgentId,
-        mergeGroupId: enrichedFrame.mergeGroupId,
         draftId: enrichedFrame.draftId,
         targetPath: enrichedFrame.targetPath,
         summary: reply.error?.message ?? 'Kernel draft ledger rejected provider stream part.',
         payload: reply.error,
-      }, deltaContext);
+      });
       return;
     }
     for (const event of reply.events) {
@@ -5623,14 +4230,11 @@ export class SessionDriverLoop {
         channel: 'draft',
         source: 'kernel',
         itemId: stringValue(record?.draftId) ?? enrichedFrame.draftId,
-        branchId: enrichedFrame.branchId,
-        subAgentId: enrichedFrame.subAgentId,
-        mergeGroupId: enrichedFrame.mergeGroupId,
         draftId: stringValue(record?.draftId) ?? enrichedFrame.draftId,
         targetPath: enrichedFrame.targetPath,
         summary: stringValue(record?.summary) ?? stringValue(objectRecord(record?.draft)?.summary),
         payload: event,
-      }, deltaContext);
+      });
     }
   }
 
@@ -5785,67 +4389,6 @@ export class SessionDriverLoop {
 
 const JSON_OBJECT_MODE_INSTRUCTION =
   'Return exactly one valid JSON object. Do not return markdown, prose outside JSON, or multiple JSON objects.';
-
-function subAgentSerialFallbackDiagnosticProposal(
-  state: SessionDriverLoopRunState,
-  failedSlice: SubAgentTaskSlice,
-  message: string
-): ProposalEnvelope {
-  return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    proposalId: `proposal-${state.runId}-subagent-serial-fallback-diagnostic`,
-    runId: state.runId,
-    sessionId: state.sessionId,
-    source: 'system',
-    kind: 'diagnostic',
-    payload: {
-      version: '1',
-      id: 'subagent-serial-fallback-provider-failed',
-      severity: 'error',
-      summary: `Sub-agent serial fallback provider call failed: ${message}`,
-      details: {
-        failedBranchId: failedSlice.branchId,
-        failedTaskId: failedSlice.task.taskId,
-      },
-    },
-    referencedResourcePacketRefs: [],
-    referencedEvidenceRefs: [],
-  };
-}
-
-function subAgentParentFallbackDiagnosticProposal(
-  state: SessionDriverLoopRunState,
-  mergeGroup: SubAgentMergeGroup,
-  diagnostics: SubAgentBranchDiagnostic[],
-  message: string
-): ProposalEnvelope {
-  return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    proposalId: `proposal-${state.runId}-subagent-parent-fallback-diagnostic`,
-    runId: state.runId,
-    sessionId: state.sessionId,
-    source: 'system',
-    kind: 'diagnostic',
-    payload: {
-      version: '1',
-      id: 'subagent-parent-fallback-provider-failed',
-      severity: 'error',
-      summary: `Sub-agent parent fallback provider call failed: ${message}`,
-      details: {
-        mergeGroupId: mergeGroup.mergeGroupId,
-        diagnostics: diagnostics.map((item) => ({
-          branchId: item.branchId,
-          subAgentId: item.subAgentId,
-          taskId: item.taskId,
-          targets: item.targets,
-          reason: item.reason,
-        })),
-      },
-    },
-    referencedResourcePacketRefs: [],
-    referencedEvidenceRefs: [],
-  };
-}
 
 function ensureJsonObjectModeMessages(
   messages: LlmChatRequest['messages'],
@@ -6881,10 +5424,7 @@ function buildTaskExecutionCursor(
     currentTaskId: currentTask?.taskId,
     taskOrder: ledger?.taskOrder ?? acceptedPlan.tasks.map((task) => task.taskId),
     pendingTaskIds: ledger?.pendingTaskIds ?? [],
-    currentNodeId: undefined,
     completedTaskIds: [...acceptedPlan.completedTaskIds],
-    pendingNodeIds: [],
-    readyNodeIds: [],
     lastResourcePacketIds,
     lastSavepointId,
   };
@@ -6918,17 +5458,9 @@ function buildCurrentTaskContext(
     taskOrder: cursor.taskOrder,
     pendingTaskIds: cursor.pendingTaskIds,
     dependsOn: [],
-    unlocks: [],
     evidenceNeeds: [],
     completedTaskIds: cursor.completedTaskIds,
-    pendingNodeIds: cursor.pendingNodeIds,
-    readyNodeIds: cursor.readyNodeIds,
   };
-}
-
-function readyNodeIdsForAcceptedPlan(acceptedPlan: AcceptedImplementationPlanContext): string[] {
-  void acceptedPlan;
-  return [];
 }
 
 function currentTaskMemoryHints(context: CurrentTaskContext | undefined): string[] {
@@ -6973,7 +5505,6 @@ function acceptedPlanResourceResumeEvent(
       planId: accepted.planId,
       taskCursorId: cursor?.cursorId,
       currentTaskId: context?.taskId,
-      currentNodeId: context?.nodeId,
       targetPaths: context?.targets ?? [],
       resourcePacketId: packet.id,
       resourceItemCount: packet.items.length,
@@ -7025,11 +5556,9 @@ function acceptedPlanTaskSavepointEvent(
       planId: accepted.planId,
       taskCursorId: cursor?.cursorId,
       taskId: context?.taskId,
-      nodeId: context?.nodeId,
       completedTaskIds: progress.completedTaskIds,
       newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
       remainingTaskIds: progress.remainingTaskIds,
-      nextReadyNodeIds: readyNodeIdsForAcceptedPlan(nextAccepted),
       taskLedger: ledger,
       taskOrder: ledger?.taskOrder ?? [],
       nextPendingTaskIds: ledger?.pendingTaskIds ?? [],
@@ -8049,39 +6578,21 @@ function projectionStatusForActivity(activity: AgentConversationActivity): Proje
 
 function projectionDeltaActivity(
   state: SessionDriverLoopRunState,
-  delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>,
-  deltaContext?: ProjectionDeltaBranchContext
+  delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>
 ): AgentConversationActivity | undefined {
   const status = activityStatusFromDelta(delta.status);
   if (!status) return undefined;
   const stage = delta.stage ?? delta.type;
   const base = {
-    activityId: `${stage}-${delta.itemId ?? deltaContext?.branchId ?? deltaContext?.mergeGroupId ?? status}`,
+    activityId: `${stage}-${delta.itemId ?? status}`,
     status,
     title: delta.summary ?? stage,
     summary: delta.summary ?? stage,
     source: activitySourceFromDelta(delta.source),
     runId: state.runId,
-    branchId: delta.branchId ?? deltaContext?.branchId,
-    subAgentId: delta.subAgentId ?? deltaContext?.subAgentId,
-    mergeGroupId: delta.mergeGroupId ?? deltaContext?.mergeGroupId,
-    draftId: delta.draftId ?? deltaContext?.draftId,
-    targets: uniqueStrings([delta.targetPath, deltaContext?.targetPath]),
+    draftId: delta.draftId,
+    targets: uniqueStrings([delta.targetPath]),
   };
-  if (stage.startsWith('subagent_branch.')) {
-    return conversationActivity({
-      ...base,
-      kind: 'subagentBranch',
-      title: subAgentActivityTitle(stage),
-    });
-  }
-  if (stage.startsWith('subagent_merge.') || stage === 'subagent_skipped' || stage === 'subagent_plan.created' || stage === 'subagent_dispatch.announced') {
-    return conversationActivity({
-      ...base,
-      kind: 'subagentMerge',
-      title: subAgentActivityTitle(stage),
-    });
-  }
   if (delta.type === 'resource_delta') {
     return conversationActivity({
       ...base,
@@ -8106,21 +6617,6 @@ function projectionDeltaActivity(
   return undefined;
 }
 
-function subAgentExecutionDeltaWouldViolateOffMode(
-  delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>,
-  deltaContext?: ProjectionDeltaBranchContext
-): boolean {
-  const stage = delta.stage ?? delta.type;
-  if (stage === 'subagent_skipped') return false;
-  if (deltaContext?.branchId || deltaContext?.subAgentId || deltaContext?.mergeGroupId) return true;
-  if (delta.branchId || delta.subAgentId || delta.mergeGroupId) return true;
-  return stage === 'subagent_dispatch.announced'
-    || stage === 'subagent_plan.created'
-    || stage.startsWith('subagent_branch.')
-    || stage.startsWith('subagent_merge.')
-    || stage.startsWith('subagent_serial_fallback.');
-}
-
 function activitySourceFromDelta(source: ProjectionDelta['source'] | undefined): AgentConversationActivity['source'] {
   if (source === 'kernel' || source === 'provider' || source === 'llm') return source;
   return 'session';
@@ -8132,15 +6628,6 @@ function activityStatusFromDelta(status: ProjectionDelta['status'] | undefined):
   if (status === 'draftReady') return 'completed';
   if (status === 'discarded' || status === 'skipped') return 'blocked';
   return undefined;
-}
-
-function subAgentActivityTitle(stage: string): string {
-  if (stage === 'subagent_dispatch.announced') return 'Sub-agent dispatch announced';
-  if (stage === 'subagent_plan.created') return 'Sub-agent plan created';
-  if (stage === 'subagent_skipped') return 'Sub-agent skipped';
-  if (stage.startsWith('subagent_merge.')) return 'Sub-agent merge';
-  if (stage.startsWith('subagent_branch.')) return 'Sub-agent branch';
-  return 'Sub-agent activity';
 }
 
 function uniqueStrings(values: Array<string | undefined>): string[] {
@@ -9603,14 +8090,6 @@ function acceptedImplementationPlanContext(
       .concat(stringArrayValue(record.dependsOn))
       .map(normalizePlanScope)
       .filter(Boolean);
-    const hardDependencies = stringArrayValue(record.hardDependencies)
-      .concat(stringArrayValue(record.hardDependsOn))
-      .map(normalizePlanScope)
-      .filter(Boolean);
-    const explicitSoftOrder = stringArrayValue(record.softOrderAfter)
-      .concat(stringArrayValue(record.softDependencies))
-      .map(normalizePlanScope)
-      .filter(Boolean);
     const conflictKeys = stringArrayValue(record.conflictKeys)
       .map(normalizePlanScope)
       .filter(Boolean);
@@ -9620,10 +8099,7 @@ function acceptedImplementationPlanContext(
       capability: stringValue(record.capability),
       targets: acceptedPlanTaskTargets(record),
       dependencies: legacyDependencies,
-      hardDependencies,
-      softOrderAfter: [...new Set([...explicitSoftOrder, ...legacyDependencies.filter((dependency) => !hardDependencies.includes(dependency))])],
       conflictKeys,
-      canDraftInParallel: record.canDraftInParallel !== false,
       batchKind: executionSliceRoleValue(record.batchKind) ?? executionSliceRoleValue(record.role),
       role: executionSliceRoleValue(record.batchKind) ?? executionSliceRoleValue(record.role),
     }];
@@ -9643,7 +8119,6 @@ function acceptedImplementationPlanContext(
     ...exactOperationGrants.map((grant) => grant.capability),
     ...accessScopes.flatMap((scope) => scope.capabilities),
   ].filter(Boolean))];
-  const executionFlowGraph = executionFlowGraphFromImplementationPlan(rawPlan, taskContexts);
   return {
     planId: plan.planId,
     runId: plan.runId,
@@ -9654,138 +8129,12 @@ function acceptedImplementationPlanContext(
     targetScopes,
     exactOperationGrants,
     accessScopes,
-    executionFlowGraph,
     executionRoot,
     interventionLevel,
     batchIndex: 1,
     completedTaskIds: [],
     rawPlan,
   };
-}
-
-function executionFlowGraphFromImplementationPlan(
-  rawPlan: Record<string, unknown>,
-  tasks: AcceptedImplementationPlanTaskContext[]
-): ExecutionFlowGraphContext {
-  const taskToModuleNode = new Map<string, string>();
-  const fallbackGroups = groupAcceptedTasksBySubAgentModule(tasks);
-  for (const group of fallbackGroups) {
-    const nodeId = `node-${safeSegment(group.moduleId)}`;
-    for (const task of group.tasks) taskToModuleNode.set(task.taskId, nodeId);
-  }
-
-  const graphRecord = objectRecord(rawPlan.executionFlowGraph)
-    ?? objectRecord(rawPlan.flowGraph)
-    ?? objectRecord(rawPlan.taskGraph);
-  const graphId = stringValue(graphRecord?.graphId)
-    ?? stringValue(graphRecord?.id)
-    ?? `${stringValue(rawPlan.id) ?? 'accepted-plan'}-flow`;
-  const rawNodes = Array.isArray(graphRecord?.nodes)
-    ? graphRecord.nodes
-    : Array.isArray(rawPlan.executionNodes)
-      ? rawPlan.executionNodes
-      : [];
-  const explicitNodes = rawNodes.flatMap((item, index): ExecutionFlowNodeContext[] => {
-    const record = objectRecord(item);
-    if (!record) return [];
-    const rawTaskIds = [
-      ...stringArrayValue(record.taskIds),
-      ...stringArrayValue(record.tasks),
-      ...stringArrayValue(record.taskId),
-    ];
-    const taskIds = [...new Set(rawTaskIds.length ? rawTaskIds : [`task-${index + 1}`])];
-    const nodeTasks = tasks.filter((task) => taskIds.includes(task.taskId));
-    const targets = [...new Set([
-      ...stringArrayValue(record.targets),
-      ...stringArrayValue(record.target),
-      ...nodeTasks.flatMap((task) => task.targets),
-    ].map(normalizePlanScope).filter(Boolean))];
-    const capabilities = [...new Set([
-      ...stringArrayValue(record.capabilities),
-      ...stringArrayValue(record.capability),
-      ...nodeTasks.map((task) => task.capability).filter((item): item is string => Boolean(item)),
-    ])];
-    const modulePath = stringValue(record.modulePath) ?? modulePathFromTargets(targets);
-    const moduleId = stringValue(record.moduleId)
-      ?? (modulePath ? `module-${safeSegment(modulePath)}` : `node-${safeSegment(stringValue(record.nodeId) ?? stringValue(record.id) ?? taskIds[0] ?? index + 1)}`);
-    const nodeId = stringValue(record.nodeId) ?? stringValue(record.id) ?? `node-${safeSegment(moduleId)}`;
-    return [{
-      nodeId,
-      moduleId,
-      modulePath,
-      taskIds,
-      targets,
-      capabilities,
-      prerequisites: stringArrayValue(record.prerequisites).concat(stringArrayValue(record.preconditions)),
-      outputs: stringArrayValue(record.outputs).concat(stringArrayValue(record.produces)),
-      dependsOn: normalizeNodeDependencies(record, taskToModuleNode),
-      unlocks: stringArrayValue(record.unlocks).concat(stringArrayValue(record.unblocks)),
-      conflictKeys: [...new Set([
-        ...stringArrayValue(record.conflictKeys),
-        ...nodeTasks.flatMap((task) => task.conflictKeys),
-        ...targets,
-      ].map(normalizePlanScope).filter(Boolean))],
-      evidenceNeeds: stringArrayValue(record.evidenceNeeds).concat(stringArrayValue(record.requiredEvidence)),
-    }];
-  });
-  const nodes = explicitNodes.length ? explicitNodes : fallbackGroups.map((group): ExecutionFlowNodeContext => {
-    const nodeId = `node-${safeSegment(group.moduleId)}`;
-    const targets = [...new Set(group.tasks.flatMap((task) => task.targets).map(normalizePlanScope).filter(Boolean))];
-    const capabilities = [...new Set(group.tasks.map((task) => task.capability).filter((item): item is string => Boolean(item)))];
-    const dependsOn = [...new Set(group.tasks.flatMap((task) => task.hardDependencies)
-      .map((dependency) => taskToModuleNode.get(dependency) ?? dependency)
-      .filter((dependency) => dependency && dependency !== nodeId))];
-    return {
-      nodeId,
-      moduleId: group.moduleId,
-      modulePath: group.modulePath,
-      taskIds: group.tasks.map((task) => task.taskId),
-      targets,
-      capabilities,
-      prerequisites: group.tasks.flatMap((task) => task.hardDependencies),
-      outputs: targets,
-      dependsOn,
-      unlocks: [],
-      conflictKeys: subAgentModuleConflictKeys(group.tasks),
-      evidenceNeeds: [],
-    };
-  });
-  return {
-    graphId,
-    nodes: withExecutionFlowUnlocks(nodes),
-  };
-}
-
-function normalizeNodeDependencies(record: Record<string, unknown>, taskToNode: Map<string, string>): string[] {
-  return [...new Set([
-    ...stringArrayValue(record.dependsOn),
-    ...stringArrayValue(record.dependencies),
-  ].map((dependency) => taskToNode.get(dependency) ?? dependency).filter(Boolean))];
-}
-
-function withExecutionFlowUnlocks(nodes: ExecutionFlowNodeContext[]): ExecutionFlowNodeContext[] {
-  const nodeIds = new Set(nodes.map((node) => node.nodeId));
-  const unlocksByNode = new Map<string, Set<string>>();
-  for (const node of nodes) {
-    for (const dependency of node.dependsOn) {
-      if (!nodeIds.has(dependency)) continue;
-      const unlocks = unlocksByNode.get(dependency) ?? new Set<string>();
-      unlocks.add(node.nodeId);
-      unlocksByNode.set(dependency, unlocks);
-    }
-  }
-  return nodes.map((node) => ({
-    ...node,
-    dependsOn: node.dependsOn.filter((dependency) => nodeIds.has(dependency)),
-    unlocks: [...new Set([...node.unlocks, ...[...(unlocksByNode.get(node.nodeId) ?? [])]])],
-  }));
-}
-
-function modulePathFromTargets(targets: string[]): string | undefined {
-  const target = targets.find(Boolean);
-  if (!target) return undefined;
-  const parts = target.split('/').filter(Boolean);
-  return parts.length > 1 ? parts.slice(0, -1).join('/') : undefined;
 }
 
 function acceptedPlanExecutionRootFromDecision(
@@ -10261,25 +8610,6 @@ function invalidAcceptedPlanExecutionAccessScopeReason(scope: unknown): string |
   return undefined;
 }
 
-function subAgentParentFallbackProposalProblem(
-  state: SessionDriverLoopRunState,
-  proposal: ProposalEnvelope
-): string | undefined {
-  if (proposal.kind === 'actionBundle') {
-    const accepted = state.acceptedImplementationPlan;
-    if (!accepted) return 'parent fallback returned actionBundle without an accepted taskPlan context.';
-    const validation = validateAcceptedImplementationPlanActionBundle(accepted, proposal, state.resourcePackets);
-    return validation.ok ? undefined : validation.reasons.join('; ');
-  }
-  if (proposal.kind === 'resourceRequest'
-    || proposal.kind === 'decisionRequest'
-    || proposal.kind === 'taskPlan'
-    || proposal.kind === 'implementationPlan') {
-    return undefined;
-  }
-  return `parent fallback returned ${proposal.kind}; expected actionBundle, resourceRequest, decisionRequest, or taskPlan.`;
-}
-
 function fileOperationFreshnessValidationReasons(
   accepted: AcceptedImplementationPlanContext,
   proposal: ProposalEnvelope,
@@ -10645,801 +8975,6 @@ function acceptedPlanWithLatestCheckpoint(
   return accepted;
 }
 
-function normalizeSubAgentMode(value: unknown): SubAgentMode | undefined {
-  return value === 'auto' || value === 'off' ? value : undefined;
-}
-
-function subAgentRuntimeSettingsFromEvents(
-  events: AgentEvent[],
-  parentRunId?: string
-): { mode?: SubAgentMode; maxParallel?: number; runId?: string } | undefined {
-  for (const event of [...events].reverse()) {
-    if (event.kind !== 'workflow_stage') continue;
-    const payload = objectRecord(event.payload);
-    if (stringValue(payload?.stage) !== 'agent_runtime_settings') continue;
-    const runId = stringValue(payload?.runId);
-    const payloadParentRunId = stringValue(payload?.parentRunId);
-    if (parentRunId && runId !== parentRunId && payloadParentRunId !== parentRunId) continue;
-    const mode = normalizeSubAgentMode(payload?.subAgentMode);
-    const maxParallel = normalizedPositiveInteger(payload?.subAgentMaxParallel);
-    if (mode) {
-      return {
-        mode,
-        maxParallel,
-        runId,
-      };
-    }
-  }
-  return undefined;
-}
-
-function resolveEffectiveSubAgentSettings(
-  input: Pick<SessionDriverLoopInput, 'subAgentMode' | 'subAgentMaxParallel' | 'acceptedImplementationPlan' | 'interactionOverlay' | 'existingEvents'>
-): EffectiveSubAgentSettings {
-  const explicitMode = normalizeSubAgentMode(input.subAgentMode);
-  if (explicitMode) {
-    return {
-      mode: explicitMode,
-      maxParallel: clampSubAgentMaxParallel(input.subAgentMaxParallel),
-      source: 'request',
-    };
-  }
-  const parentRunId = input.interactionOverlay?.parentRunId ?? input.acceptedImplementationPlan?.runId;
-  const inherited = subAgentRuntimeSettingsFromEvents(input.existingEvents ?? [], parentRunId)
-    ?? subAgentRuntimeSettingsFromEvents(input.existingEvents ?? []);
-  if (inherited?.mode === 'off') {
-    return {
-      mode: inherited.mode,
-      maxParallel: clampSubAgentMaxParallel(input.subAgentMaxParallel ?? inherited.maxParallel),
-      source: 'runtimeSnapshot',
-      inheritedFromRunId: inherited.runId,
-    };
-  }
-  return {
-    mode: 'off',
-    maxParallel: clampSubAgentMaxParallel(input.subAgentMaxParallel),
-    source: 'default',
-  };
-}
-
-function clampSubAgentMaxParallel(value: unknown): number {
-  const numeric = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(numeric) || numeric < 2) return 2;
-  return Math.min(2, Math.floor(numeric));
-}
-
-function normalizeSubAgentTimeout(value: unknown, fallback: number): number {
-  const numeric = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) return fallback;
-  return Math.max(1, Math.floor(numeric));
-}
-
-function subAgentStreamEventHasDelta(event: LlmChatStreamEvent): boolean {
-  if (event.type === 'provider_delta' || event.type === 'provider_reasoning_delta') {
-    return typeof event.chunk?.content === 'string' && event.chunk.content.length > 0;
-  }
-  if (event.type === 'provider_tool_call_delta') return Boolean(event.chunk);
-  return false;
-}
-
-function isSubAgentStalledError(error: unknown): boolean {
-  return error instanceof SessionDriverLoopError &&
-    (error.code === 'subagent_no_delta_timeout' || error.code === 'subagent_total_timeout');
-}
-
-async function raceSubAgentProviderCall(
-  providerCall: Promise<ApiResponse<LlmChatResult>>,
-  options: {
-    noDeltaTimeoutMs: number;
-    totalTimeoutMs: number;
-    enforceNoDelta: boolean;
-  },
-  hasFirstDelta: () => boolean
-): Promise<ApiResponse<LlmChatResult>> {
-  const timers: Array<ReturnType<typeof setTimeout>> = [];
-  const competitors: Array<Promise<ApiResponse<LlmChatResult>>> = [providerCall];
-  if (options.enforceNoDelta) {
-    competitors.push(new Promise<ApiResponse<LlmChatResult>>((_resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (!hasFirstDelta()) {
-          reject(new SessionDriverLoopError(
-            'subagent_no_delta_timeout',
-            `Sub-agent provider did not emit any stream delta within ${options.noDeltaTimeoutMs}ms.`
-          ));
-        }
-      }, options.noDeltaTimeoutMs);
-      timers.push(timer);
-    }));
-  }
-  competitors.push(new Promise<ApiResponse<LlmChatResult>>((_resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new SessionDriverLoopError(
-        'subagent_total_timeout',
-        `Sub-agent provider did not finish within ${options.totalTimeoutMs}ms.`
-      ));
-    }, options.totalTimeoutMs);
-    timers.push(timer);
-  }));
-  try {
-    return await Promise.race(competitors);
-  } finally {
-    for (const timer of timers) clearTimeout(timer);
-  }
-}
-
-function buildSubAgentMergeGroup(
-  state: SessionDriverLoopRunState,
-  mergeGroupId: string
-): SubAgentMergeGroupEvaluation {
-  const accepted = state.acceptedImplementationPlan;
-  if (!accepted) return { mergeGroup: null, reason: 'insufficient_slices' };
-  const completed = new Set(accepted.completedTaskIds);
-  const candidateDrafts: Array<SubAgentTaskSlice & { sourceNodeId: string; sourceDependsOn: string[]; sourceUnlocks: string[] }> = [];
-  const skipped = {
-    hardDependencyBlocked: 0,
-    targetConflict: 0,
-    capabilityUnsafe: 0,
-  };
-  const tasksById = new Map(accepted.tasks.map((task) => [task.taskId, task]));
-  const remainingNodes = accepted.executionFlowGraph.nodes
-    .map((node) => ({
-      node,
-      tasks: node.taskIds.map((taskId) => tasksById.get(taskId)).filter((task): task is AcceptedImplementationPlanTaskContext => Boolean(task)),
-    }))
-    .filter(({ tasks }) => tasks.some((task) => !completed.has(task.taskId)));
-  for (const { node, tasks: rawTasks } of remainingNodes) {
-    const tasks = sortSubAgentModuleTasks(rawTasks.filter((task) => !completed.has(task.taskId)));
-    if (!tasks.length) continue;
-    const nodeTargets = [...new Set([
-      ...node.targets,
-      ...tasks.flatMap((task) => task.targets),
-    ].map(normalizePlanScope).filter(Boolean))];
-    const targets = nodeTargets
-      .map((target) => concreteFileOperationTarget(target))
-      .filter((target): target is string => Boolean(target));
-    if (!targets.length) continue;
-    const capabilities = [...new Set([
-      ...node.capabilities,
-      ...tasks.map((task) => task.capability).filter((item): item is string => Boolean(item)),
-    ])];
-    if (!capabilities.length) continue;
-    if (!capabilities.every(subAgentParallelSafeCapability) || tasks.some((task) => !task.canDraftInParallel)) {
-      skipped.capabilityUnsafe += 1;
-      continue;
-    }
-    for (const target of targets) {
-      const sliceTasks = tasks
-        .filter((task) => {
-          const taskTargets = task.targets.map(normalizePlanScope).filter(Boolean);
-          return !taskTargets.length || taskTargets.some((taskTarget) =>
-            planScopeCovers(taskTarget, target) || planScopeCovers(target, taskTarget)
-          );
-        })
-        .map((task) => ({
-          ...task,
-          targets: [target],
-          conflictKeys: task.conflictKeys.length ? task.conflictKeys : [target],
-        }));
-      const assignedTasks = sliceTasks.length ? sliceTasks : tasks.map((task) => ({
-        ...task,
-        targets: [target],
-        conflictKeys: task.conflictKeys.length ? task.conflictKeys : [target],
-      }));
-      const primaryTask = assignedTasks[0];
-      const nodeId = targets.length === 1 ? node.nodeId : `${node.nodeId}-${safeSegment(target)}`;
-      const branchId = `branch-${safeSegment(nodeId)}`;
-      const modulePath = dirnameLike(target);
-      candidateDrafts.push({
-        sliceId: `slice-${safeSegment(nodeId)}`,
-        nodeId,
-        branchId,
-        subAgentId: `subagent-${safeSegment(nodeId)}`,
-        moduleId: `file-${safeSegment(target)}`,
-        modulePath,
-        tasks: assignedTasks,
-        task: primaryTask,
-        role: primaryTask.role,
-        prerequisites: node.prerequisites,
-        outputs: node.outputs,
-        dependsOn: [],
-        unlocks: [],
-        evidenceNeeds: node.evidenceNeeds,
-        hardDependencies: [...new Set(assignedTasks.flatMap((task) => task.hardDependencies))],
-        softOrderAfter: [...new Set(assignedTasks.flatMap((task) => task.softOrderAfter))],
-        conflictKeys: node.conflictKeys.length ? node.conflictKeys : [target],
-        sourceNodeId: node.nodeId,
-        sourceDependsOn: node.dependsOn,
-        sourceUnlocks: node.unlocks,
-      });
-    }
-  }
-  const nodeIdsBySource = new Map<string, string[]>();
-  for (const candidate of candidateDrafts) {
-    const existing = nodeIdsBySource.get(candidate.sourceNodeId) ?? [];
-    existing.push(candidate.nodeId);
-    nodeIdsBySource.set(candidate.sourceNodeId, existing);
-  }
-  const candidates: SubAgentTaskSlice[] = candidateDrafts.map((candidate) => {
-    const dependsOn = [...new Set(candidate.sourceDependsOn.flatMap((nodeId) => nodeIdsBySource.get(nodeId) ?? [nodeId]))];
-    const unlocks = [...new Set(candidate.sourceUnlocks.flatMap((nodeId) => nodeIdsBySource.get(nodeId) ?? [nodeId]))];
-    return {
-      sliceId: candidate.sliceId,
-      nodeId: candidate.nodeId,
-      branchId: candidate.branchId,
-      subAgentId: candidate.subAgentId,
-      moduleId: candidate.moduleId,
-      modulePath: candidate.modulePath,
-      tasks: candidate.tasks,
-      task: candidate.task,
-      role: candidate.role,
-      prerequisites: candidate.prerequisites,
-      outputs: candidate.outputs,
-      evidenceNeeds: candidate.evidenceNeeds,
-      hardDependencies: candidate.hardDependencies,
-      softOrderAfter: candidate.softOrderAfter,
-      conflictKeys: candidate.conflictKeys,
-      dependsOn,
-      unlocks,
-    };
-  });
-  const readyWidth = maxSubAgentReadyWidth(candidates);
-  if (candidates.length < 2) {
-    const reason = subAgentSkippedReasonFromCounts(skipped);
-    return {
-      mergeGroup: null,
-      reason,
-      summary: subAgentSkippedSummary(reason, {
-        candidateCount: candidates.length,
-        remainingCount: remainingNodes.length,
-        hardDependencyBlocked: skipped.hardDependencyBlocked,
-        targetConflict: skipped.targetConflict,
-        capabilityUnsafe: skipped.capabilityUnsafe,
-      }),
-    };
-  }
-  if (readyWidth < 2) {
-    return {
-      mergeGroup: null,
-      reason: 'flow_graph_blocked',
-      summary: subAgentSkippedSummary('flow_graph_blocked', {
-        candidateCount: candidates.length,
-        remainingCount: remainingNodes.length,
-        hardDependencyBlocked: skipped.hardDependencyBlocked,
-        targetConflict: skipped.targetConflict,
-        capabilityUnsafe: skipped.capabilityUnsafe,
-      }),
-    };
-  }
-  return {
-    mergeGroup: {
-      mergeGroupId,
-      slices: candidates,
-      branches: candidates.map((slice) => ({
-        slice,
-        status: 'queued',
-        contextCharCount: 0,
-      })),
-    },
-    reason: 'insufficient_slices',
-  };
-}
-
-function groupAcceptedTasksBySubAgentModule(
-  tasks: AcceptedImplementationPlanTaskContext[]
-): Array<{ moduleId: string; modulePath?: string; tasks: AcceptedImplementationPlanTaskContext[] }> {
-  const groups = new Map<string, { moduleId: string; modulePath?: string; tasks: AcceptedImplementationPlanTaskContext[] }>();
-  for (const task of tasks) {
-    const moduleInfo = subAgentModuleInfoForTask(task);
-    const existing = groups.get(moduleInfo.moduleId);
-    if (existing) {
-      existing.tasks.push(task);
-      continue;
-    }
-    groups.set(moduleInfo.moduleId, {
-      moduleId: moduleInfo.moduleId,
-      modulePath: moduleInfo.modulePath,
-      tasks: [task],
-    });
-  }
-  return [...groups.values()];
-}
-
-function maxSubAgentReadyWidth(slices: SubAgentTaskSlice[]): number {
-  const pending = new Map(slices.map((slice) => [slice.nodeId, slice]));
-  const completed = new Set<string>();
-  let maxWidth = 0;
-  while (pending.size) {
-    const ready = [...pending.values()].filter((slice) =>
-      slice.dependsOn.every((dependency) => completed.has(dependency) || !pending.has(dependency))
-    );
-    if (!ready.length) break;
-    const batch: SubAgentTaskSlice[] = [];
-    for (const slice of ready) {
-      if (batch.some((selected) => taskSlicesConflict(selected, {
-        tasks: slice.tasks,
-        conflictKeys: slice.conflictKeys,
-        targets: slice.tasks.flatMap((task) => task.targets),
-      }))) {
-        continue;
-      }
-      batch.push(slice);
-    }
-    maxWidth = Math.max(maxWidth, batch.length);
-    for (const slice of ready) {
-      pending.delete(slice.nodeId);
-      completed.add(slice.nodeId);
-    }
-  }
-  return maxWidth;
-}
-
-function subAgentModuleInfoForTask(task: AcceptedImplementationPlanTaskContext): { moduleId: string; modulePath?: string } {
-  const targets = task.targets.map(normalizePlanScope).filter(Boolean);
-  const firstTarget = targets[0];
-  if (!firstTarget) return { moduleId: `task-${safeSegment(task.taskId)}` };
-  const parts = firstTarget.split('/').filter(Boolean);
-  if (parts.length > 1) {
-    const modulePath = parts.slice(0, -1).join('/');
-    return { moduleId: `module-${safeSegment(modulePath)}`, modulePath };
-  }
-  if (task.role) return { moduleId: `root-${task.role}`, modulePath: '' };
-  return { moduleId: `root-file-${safeSegment(firstTarget)}`, modulePath: '' };
-}
-
-function sortSubAgentModuleTasks(
-  tasks: AcceptedImplementationPlanTaskContext[]
-): AcceptedImplementationPlanTaskContext[] {
-  const remaining = [...tasks];
-  const sorted: AcceptedImplementationPlanTaskContext[] = [];
-  const internalIds = new Set(tasks.map((task) => task.taskId));
-  while (remaining.length) {
-    const index = remaining.findIndex((task) =>
-      task.hardDependencies
-        .filter((dependency) => internalIds.has(dependency))
-        .every((dependency) => sorted.some((sortedTask) => sortedTask.taskId === dependency))
-    );
-    if (index < 0) {
-      sorted.push(...remaining);
-      break;
-    }
-    sorted.push(remaining.splice(index, 1)[0]);
-  }
-  return sorted;
-}
-
-function taskSlicesConflict(
-  left: Pick<SubAgentTaskSlice, 'tasks' | 'conflictKeys'>,
-  right: { tasks: AcceptedImplementationPlanTaskContext[]; conflictKeys: string[]; targets: string[] }
-): boolean {
-  const leftKeys = left.conflictKeys.length ? left.conflictKeys : subAgentModuleConflictKeys(left.tasks);
-  const rightKeys = right.conflictKeys.length ? right.conflictKeys : right.targets;
-  return leftKeys.some((leftTarget) =>
-    rightKeys.some((rightTarget) =>
-      planScopeCovers(leftTarget, rightTarget) || planScopeCovers(rightTarget, leftTarget)
-    )
-  );
-}
-
-function subAgentModuleConflictKeys(tasks: AcceptedImplementationPlanTaskContext[]): string[] {
-  const keys = tasks.flatMap((task) => task.conflictKeys.length ? task.conflictKeys : task.targets);
-  return [...new Set(keys.map(normalizePlanScope).filter(Boolean))];
-}
-
-function subAgentTaskConflictKeys(task: AcceptedImplementationPlanTaskContext): string[] {
-  const keys = task.conflictKeys.length ? task.conflictKeys : task.targets;
-  return [...new Set(keys.map(normalizePlanScope).filter(Boolean))];
-}
-
-function subAgentParallelSafeCapability(capability: string): boolean {
-  return ['fs.write', 'fs.patch'].includes(capability);
-}
-
-function subAgentSkippedReasonFromCounts(input: {
-  hardDependencyBlocked: number;
-  targetConflict: number;
-  capabilityUnsafe: number;
-}): SubAgentSkippedReason {
-  if (input.capabilityUnsafe > 0) return 'capability_not_parallel_safe';
-  if (input.hardDependencyBlocked > 0) return 'hard_dependency_blocked';
-  if (input.targetConflict > 0) return 'target_conflict';
-  return 'insufficient_slices';
-}
-
-function subAgentSkippedSummary(
-  reason: SubAgentSkippedReason,
-  counts?: {
-    candidateCount?: number;
-    remainingCount?: number;
-    hardDependencyBlocked?: number;
-    targetConflict?: number;
-    capabilityUnsafe?: number;
-  }
-): string {
-  const suffix = counts
-    ? `（remaining=${counts.remainingCount ?? 0}, candidates=${counts.candidateCount ?? 0}, hardBlocked=${counts.hardDependencyBlocked ?? 0}, targetConflict=${counts.targetConflict ?? 0}, unsafe=${counts.capabilityUnsafe ?? 0}）`
-    : '';
-  if (reason === 'mode_off') return `子代理已在设置中关闭，Session 将按串行执行。${suffix}`;
-  if (reason === 'max_parallel_lt_2') return `子代理最大并发小于 2，Session 将按串行执行。${suffix}`;
-  if (reason === 'already_attempted') return `本轮 accepted plan 已尝试过子代理并行，Session 不会重复启动分支。${suffix}`;
-  if (reason === 'flow_graph_blocked') return `当前任务清单没有足够可安全并行的批次，Session 将按 parent 线性执行。${suffix}`;
-  if (reason === 'hard_dependency_blocked') return `当前剩余任务存在真实 hard dependency 阻塞，Session 暂不并行。${suffix}`;
-  if (reason === 'target_conflict') return `当前剩余任务存在目标或 conflictKey 重叠，Session 暂不并行。${suffix}`;
-  if (reason === 'capability_not_parallel_safe') return `当前剩余任务包含不适合子代理草稿并行的能力，Session 暂不并行。${suffix}`;
-  if (reason === 'queued_guidance') return `检测到新的用户引导，Session 将回到 parent checkpoint。${suffix}`;
-  return `当前 accepted plan 没有足够可安全并行的任务批次，Session 将按串行执行。${suffix}`;
-}
-
-function subAgentParentFallbackMessages(
-  state: SessionDriverLoopRunState,
-  mergeGroup: SubAgentMergeGroup,
-  diagnostics: SubAgentBranchDiagnostic[],
-  reason: string,
-  problemSummary?: string
-): LlmChatRequest['messages'] {
-  const accepted = state.acceptedImplementationPlan;
-  const compactAcceptedPlan = {
-    planId: accepted?.planId,
-    title: accepted?.title,
-    summary: accepted?.summary,
-    capabilities: accepted?.capabilities,
-    targetScopes: accepted?.targetScopes,
-    accessScopes: accepted?.accessScopes?.map((scope) => ({
-      scopeKind: scope.scopeKind,
-      path: scope.path,
-      capabilities: scope.capabilities,
-      operations: scope.operations,
-      dependencyDepth: scope.dependencyDepth,
-    })),
-    remainingTasks: accepted?.tasks
-      .filter((task) => !accepted.completedTaskIds.includes(task.taskId))
-      .map((task) => ({
-        taskId: task.taskId,
-        title: task.title,
-        capability: task.capability,
-        targets: task.targets,
-        hardDependencies: task.hardDependencies,
-        conflictKeys: task.conflictKeys,
-      })),
-    completedTaskIds: accepted?.completedTaskIds,
-  };
-  const compactEvidence = state.resourcePackets.slice(-3).map((packet) => ({
-    packetId: packet.id,
-    itemCount: packet.items.length,
-    items: packet.items.slice(-8).map((item) => ({
-      kind: item.contentKind,
-      status: item.status,
-      path: item.path ?? item.absolutePath ?? item.manifestEntryId,
-      summary: item.contentSummary,
-    })),
-  }));
-  const compactDiagnostics = diagnostics.map((item) => ({
-    branchId: item.branchId,
-    subAgentId: item.subAgentId,
-    taskId: item.taskId,
-    title: item.title,
-    targets: item.targets,
-    reason: item.reason,
-  }));
-  return [
-    {
-      role: 'system',
-      content: [
-        'You are the compact parent fallback step for DeepCode accepted-plan execution.',
-        'You are not a tool executor, permission judge, ReviewGate, or Kernel fact source.',
-        'Continue only within the already accepted taskPlan scope. Do not start sub-agents again.',
-        'Return exactly one valid Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, taskPlan, or diagnostic.',
-        resourceRequestProtocolShapeLine(),
-        'If returning actionBundle, keep it small and executable. If new targets or capabilities are needed, return decisionRequest or taskPlan revision.',
-        'Use the accepted fs.* tool catalog only; fs.delete must name an accepted path and must not use wildcards or an empty root.',
-        'Do not include raw provider traces, full prompts, full sibling branch drafts, or large copied context.',
-      ].join('\n'),
-    },
-    {
-      role: 'user',
-      content: [
-        reason,
-        problemSummary ? `通用错误原因：${problemSummary}` : undefined,
-        problemSummary ? `Fallback problem: ${problemSummary}` : undefined,
-        '不得把未提交草稿当成已执行事实。',
-        'These sub-agent outputs are not Kernel facts and were not submitted. Do not treat uncommitted drafts as executed work.',
-        'Accepted taskPlan compact checkpoint:',
-        fenced(clip(JSON.stringify(compactAcceptedPlan, null, 2), 6_000)),
-        'Discarded branch diagnostics:',
-        fenced(clip(JSON.stringify(compactDiagnostics, null, 2), 4_000)),
-        'Recent evidence summary:',
-        fenced(clip(JSON.stringify(compactEvidence, null, 2), 4_000)),
-        'Minimum actionBundle skeleton if you can continue within the accepted scope:',
-        fenced(minimalActionBundleRepairSkeleton()),
-      ].filter(Boolean).join('\n\n'),
-    },
-  ];
-}
-
-function serialSliceFallbackMessages(
-  state: SessionDriverLoopRunState,
-  prompt: PromptEnvelope,
-  mergeGroup: SubAgentMergeGroup,
-  diagnostics: SubAgentBranchDiagnostic[],
-  slice: SubAgentTaskSlice
-): LlmChatRequest['messages'] {
-  const compactDiagnostics = diagnostics.map((item) => ({
-    branchId: item.branchId,
-    subAgentId: item.subAgentId,
-    taskId: item.taskId,
-    targets: item.targets,
-    reason: item.reason,
-  }));
-  return [
-    {
-      role: 'system',
-      content: [
-        'You are the DeepCode serial slice fallback for an already accepted taskPlan.',
-        'You are not a planner, tool executor, permission judge, ReviewGate, or Kernel fact source.',
-        'Retry only the provided task slice. Do not include sibling task work, do not request broader scope, and do not call native tools.',
-        'Return exactly one valid JSON object containing exactly one Agent Protocol v3 proposal. Prefer kind="actionBundle" within the accepted scope. If evidence is missing, return resourceRequest. If the accepted scope is insufficient, return decisionRequest or diagnostic.',
-        resourceRequestProtocolShapeLine(),
-        'Do not include raw provider traces, full prompts, or full discarded branch drafts.',
-      ].join('\n'),
-    },
-    {
-      role: 'user',
-      content: [
-        'Parallel sub-agent drafts were discarded before Kernel submission. Unsubmitted drafts are not facts.',
-        `mergeGroupId=${mergeGroup.mergeGroupId}; retryBranchId=${slice.branchId}; retryTaskId=${slice.task.taskId}`,
-        'Failed branch diagnostics:',
-        fenced(clip(JSON.stringify(compactDiagnostics, null, 2), 3_000)),
-        'Task slice contract:',
-        fenced(clip(parentSerialSliceContract(state, slice), 6_000)),
-        'Minimum actionBundle skeleton if you can continue within accepted scope:',
-        fenced(minimalActionBundleRepairSkeleton()),
-      ].join('\n\n'),
-    },
-  ];
-}
-
-function executionFlowGraphPromptSummary(
-  graph: ExecutionFlowGraphContext,
-  assigned: SubAgentTaskSlice
-): string {
-  const assignedNeighbourIds = new Set([assigned.nodeId, ...assigned.dependsOn, ...assigned.unlocks]);
-  const nodes = graph.nodes.map((node) => ({
-    nodeId: node.nodeId,
-    moduleId: node.moduleId,
-    taskIds: node.taskIds,
-    targets: node.targets,
-    capabilities: node.capabilities,
-    dependsOn: node.dependsOn,
-    unlocks: node.unlocks,
-    outputs: node.outputs,
-    relation: node.nodeId === assigned.nodeId
-      ? 'assigned'
-      : assignedNeighbourIds.has(node.nodeId)
-        ? 'adjacent'
-        : 'global',
-  }));
-  return clip(JSON.stringify({
-    graphId: graph.graphId,
-    assignedNodeId: assigned.nodeId,
-    nodes,
-  }, null, 2), 6_000);
-}
-
-function subAgentTaskSlicePrompt(
-  state: SessionDriverLoopRunState,
-  prompt: PromptEnvelope,
-  slice: SubAgentTaskSlice,
-  mergeGroupId: string
-): string {
-  const accepted = state.acceptedImplementationPlan;
-  const task = slice.task;
-  const evidenceTargets = [
-    ...slice.tasks.flatMap((item) => item.targets),
-    ...slice.dependsOn.flatMap((nodeId) => accepted?.executionFlowGraph.nodes.find((node) => node.nodeId === nodeId)?.targets ?? []),
-    ...slice.unlocks.flatMap((nodeId) => accepted?.executionFlowGraph.nodes.find((node) => node.nodeId === nodeId)?.targets ?? []),
-  ];
-  const evidence = relevantResourceEvidenceForTargets(state.resourcePackets, evidenceTargets);
-  return [
-    'Sub-agent file-node packet for an already accepted taskPlan.',
-    'Boundary: return only one DeepCode internal module draft object for the assigned file node or tightly-bound file-node group. Do not return Agent Protocol v3 actionBundle, do not ask the user for confirmation, do not create a new taskPlan, do not include sibling node work, and do not expand target/capability scope.',
-    'The parent Session owns the DAG scheduler, validates this draft, optionally refreshes evidence, and creates the only Agent Protocol actionBundle that can reach Kernel. You must not claim that any file was written or tested.',
-    'During streaming, emit only structured part frames wrapped as <deepcode-part>{...}</deepcode-part>. Do not stream raw JSON as readable assistant text.',
-    'Recommended partKind values: thinkingDelta for brief branch progress, actionDraftChunk for operation draft summaries, fileDone when one target draft is complete, batchDone when the slice draft is complete, diagnostic when the branch cannot continue.',
-    'After any part frames, the final assistant content must be exactly one JSON object: {"schemaVersion":"deepcode.subagent.module-draft.v1","kind":"subAgentModuleDraft","moduleId":"...","modulePath":"...","taskIds":["..."],"targets":["..."],"draftFiles":[{"targetPath":"relative/file","operation":"create|write|patch|delete","language":"...","contentLines":["..."],"patchSpec":{...},"summary":"..."}],"evidenceSummary":["..."],"assumptions":["..."],"diagnostics":[]}.',
-    `mergeGroupId=${mergeGroupId}; branchId=${slice.branchId}; subAgentId=${slice.subAgentId}`,
-    accepted ? `ExecutionFlowGraph file pipeline:\n${executionFlowGraphPromptSummary(accepted.executionFlowGraph, slice)}` : '',
-    `Assigned file node: nodeId=${slice.nodeId}; moduleId=${slice.moduleId}; modulePath=${slice.modulePath ?? ''}; taskIds=${slice.tasks.map((item) => item.taskId).join(', ')}`,
-    `Primary task: taskId=${task.taskId}; title=${task.title ?? task.taskId}; capability=${task.capability ?? 'none'}; targets=${task.targets.join(', ')}`,
-    `Module tasks: ${slice.tasks.map((item) => `${item.taskId}:${item.title ?? item.taskId}:capability=${item.capability ?? 'none'}:targets=${item.targets.join('|')}`).join('; ')}`,
-    accepted ? `Accepted plan summary: ${accepted.summary ?? accepted.title ?? accepted.planId}` : '',
-    accepted ? `Accepted plan id: ${accepted.planId}` : '',
-    `Node prerequisites: ${slice.prerequisites.join('; ') || 'none'}.`,
-    `Node outputs: ${slice.outputs.join('; ') || 'none'}.`,
-    `Dependency/class/name hints: ${subAgentDependencyNameSummary(accepted, slice)}`,
-    `Direct predecessors: ${slice.dependsOn.join(', ') || 'none'}; direct successors: ${slice.unlocks.join(', ') || 'none'}.`,
-    `Slice role: ${slice.role ?? 'sourceCode'}; hardDependencies=${slice.hardDependencies.join(', ') || 'none'}; softOrderAfter=${slice.softOrderAfter.join(', ') || 'none'}; conflictKeys=${slice.conflictKeys.join(', ') || 'none'}.`,
-    'Allowed output: kind="subAgentModuleDraft" only. Only draft files listed in the assigned node targets or a directly declared tightly-bound target. Use workspace-relative targetPath under the accepted primary root; use absolute targetPath only for outside-workspace files already present in the accepted plan. Parent Session will assign final action/codeBlock ids.',
-    'If modifying an existing file, use exactBlock patch only when current ResourcePacket evidence below contains the exact match text. If evidence is insufficient, include diagnostics in the module draft and let parent repair.',
-    'Before finalizing any draft, use only the selected evidence below and the dependency/class/name hints above. If required code evidence is missing, return a diagnostic/resourceNeed in the module draft instead of guessing.',
-    evidence.length ? `Relevant EvidenceTail:\n${evidence.join('\n\n')}` : 'Relevant EvidenceTail: none selected for this slice.',
-    'Protocol reminder from parent stable prefix is already applied. Dynamic sibling context is intentionally omitted.',
-    `Parent dynamic context hash hint: ${stableHash(prompt.dynamicSuffix).slice(0, 16)}`,
-  ].filter(Boolean).join('\n\n');
-}
-
-function subAgentSlicePayload(
-  state: SessionDriverLoopRunState,
-  mergeGroup: SubAgentMergeGroup,
-  slice: SubAgentTaskSlice,
-  status: ProjectionDelta['status']
-): Record<string, unknown> {
-  return {
-    runId: state.runId,
-    planId: state.acceptedImplementationPlan?.planId,
-    mergeGroupId: mergeGroup.mergeGroupId,
-    graphId: state.acceptedImplementationPlan?.executionFlowGraph.graphId,
-    nodeId: slice.nodeId,
-    branchId: slice.branchId,
-    subAgentId: slice.subAgentId,
-    sliceId: slice.sliceId,
-    moduleId: slice.moduleId,
-    modulePath: slice.modulePath,
-    taskIds: slice.tasks.map((task) => task.taskId),
-    taskId: slice.task.taskId,
-    title: slice.moduleId,
-    role: slice.role,
-    targets: [...new Set(slice.tasks.flatMap((task) => task.targets))],
-    capability: slice.task.capability,
-    capabilities: [...new Set(slice.tasks.map((task) => task.capability).filter(Boolean))],
-    status,
-    prerequisites: slice.prerequisites,
-    outputs: slice.outputs,
-    dependsOn: slice.dependsOn,
-    unlocks: slice.unlocks,
-    evidenceNeeds: slice.evidenceNeeds,
-    hardDependencies: slice.hardDependencies,
-    softOrderAfter: slice.softOrderAfter,
-    conflictKeys: slice.conflictKeys,
-    summary: slice.moduleId,
-  };
-}
-
-function subAgentDeltaContext(
-  mergeGroup: SubAgentMergeGroup,
-  slice: SubAgentTaskSlice
-): ProjectionDeltaBranchContext {
-  return {
-    branchId: slice.branchId,
-    subAgentId: slice.subAgentId,
-    mergeGroupId: mergeGroup.mergeGroupId,
-    targetPath: slice.tasks.flatMap((task) => task.targets)[0],
-  };
-}
-
-function subAgentBranchDiagnostic(branch: SubAgentBranchState): SubAgentBranchDiagnostic {
-  return {
-    branchId: branch.slice.branchId,
-    subAgentId: branch.slice.subAgentId,
-    taskId: branch.slice.task.taskId,
-    title: branch.slice.moduleId,
-    targets: [...new Set(branch.slice.tasks.flatMap((task) => task.targets))],
-    reason: branch.error ?? 'branch did not return a valid module draft',
-  };
-}
-
-function parentSerialSliceContract(
-  state: SessionDriverLoopRunState,
-  slice: SubAgentTaskSlice
-): string {
-  const accepted = state.acceptedImplementationPlan;
-  const evidence = relevantResourceEvidenceForTargets(state.resourcePackets, slice.tasks.flatMap((task) => task.targets));
-  return JSON.stringify({
-    acceptedPlan: accepted
-      ? {
-          planId: accepted.planId,
-          title: accepted.title,
-          summary: accepted.summary,
-          targetScopes: accepted.targetScopes,
-        }
-      : null,
-    module: {
-      moduleId: slice.moduleId,
-      modulePath: slice.modulePath,
-      role: slice.role,
-      taskIds: slice.tasks.map((task) => task.taskId),
-      tasks: slice.tasks.map((task) => ({
-        taskId: task.taskId,
-        title: task.title,
-        capability: task.capability,
-        targets: task.targets,
-        hardDependencies: task.hardDependencies,
-      })),
-      conflictKeys: slice.conflictKeys,
-    },
-    evidenceSummary: evidence,
-    expectedOutput: 'Parent fallback must return Agent Protocol v3 actionBundle/resourceRequest/decisionRequest/diagnostic, not subAgentModuleDraft.',
-  }, null, 2);
-}
-
-function subAgentEvidenceRequestForSlice(
-  state: SessionDriverLoopRunState,
-  slice: SubAgentTaskSlice
-): ResourceRequestDraft {
-  const items: ResourceRequestDraft['items'] = [];
-  const seen = new Set<string>();
-  const pushFile = (path: string, reason: string) => {
-    const normalized = normalizePlanScope(path);
-    if (!normalized || seen.has(`file:${normalized}`)) return;
-    if (resourceEvidenceExistsForTarget(state.resourcePackets, normalized)) return;
-    seen.add(`file:${normalized}`);
-    items.push({
-      id: `file-${safeSegment(normalized)}`,
-      kind: 'file',
-      path: normalized,
-      reason,
-    });
-  };
-  const pushSearch = (query: string, reason: string) => {
-    const normalized = query.trim();
-    if (!normalized || seen.has(`search:${normalized}`)) return;
-    seen.add(`search:${normalized}`);
-    items.push({
-      id: `search-${safeSegment(normalized)}`,
-      kind: 'search',
-      query: normalized,
-      maxResults: 20,
-      contextLines: 2,
-      reason,
-    });
-  };
-
-  const patchTargets = slice.tasks
-    .filter((task) => task.capability === 'fs.patch')
-    .flatMap((task) => task.targets)
-    .map(normalizePlanScope)
-    .filter(Boolean);
-  for (const target of patchTargets) {
-    pushFile(target, `Read current target before sub-agent drafts patch content for node ${slice.nodeId}.`);
-  }
-
-  for (const need of slice.evidenceNeeds) {
-    const normalized = normalizePlanScope(need);
-    if (looksLikeResourcePath(normalized)) {
-      pushFile(normalized, `Read declared evidence dependency for sub-agent node ${slice.nodeId}.`);
-    } else if (looksLikeSearchEvidenceQuery(need)) {
-      pushSearch(need, `Search declared symbol or dependency name before sub-agent node ${slice.nodeId}.`);
-    }
-  }
-
-  return {
-    version: '1',
-    id: `subagent-evidence-${safeSegment(slice.nodeId)}`,
-    reason: `Refresh selected evidence for sub-agent file node ${slice.nodeId}.`,
-    items,
-  };
-}
-
-function subAgentDependencyNameSummary(
-  accepted: AcceptedImplementationPlanContext | undefined,
-  slice: SubAgentTaskSlice
-): string {
-  const nodeById = new Map((accepted?.executionFlowGraph.nodes ?? []).map((node) => [node.nodeId, node]));
-  const adjacent = [...new Set([...slice.dependsOn, ...slice.unlocks])]
-    .map((nodeId) => nodeById.get(nodeId))
-    .filter((node): node is ExecutionFlowNodeContext => Boolean(node));
-  const hints = [
-    ...slice.prerequisites,
-    ...slice.outputs,
-    ...slice.evidenceNeeds,
-    ...adjacent.flatMap((node) => [
-      node.moduleId,
-      ...node.outputs,
-      ...node.targets,
-      ...node.evidenceNeeds,
-    ]),
-  ].map((item) => item.trim()).filter(Boolean);
-  return [...new Set(hints)].slice(0, 24).join('; ') || 'none';
-}
-
 function looksLikeResourcePath(value: string): boolean {
   if (!value || value.includes(' ') || value.includes('\n')) return false;
   return value.includes('/') || /\.[A-Za-z0-9]+$/.test(value);
@@ -11618,335 +9153,6 @@ function relevantResourceEvidenceForTargets(
       body ? clip(body, 2400) : item.contentSummary ?? 'no text evidence',
     ].join('\n');
   });
-}
-
-function parseSubAgentModuleDraft(raw: string, slice: SubAgentTaskSlice): SubAgentModuleDraft {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    throw new SessionDriverLoopError(
-      'subagent_module_draft_parse_failed',
-      `子代理 ${slice.subAgentId} module draft 不是合法 JSON：${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-  const record = objectRecord(parsed);
-  if (!record) {
-    throw new SessionDriverLoopError('subagent_module_draft_invalid', `子代理 ${slice.subAgentId} module draft must be an object.`);
-  }
-  if (stringValue(record.kind) === 'actionBundle' || record.actionBundle) {
-    throw new SessionDriverLoopError(
-      'subagent_action_bundle_not_allowed',
-      `子代理 ${slice.subAgentId} returned Agent Protocol actionBundle; sub-agents must return deepcode.subagent.module-draft.v1 only.`
-    );
-  }
-  const kind = stringValue(record.kind);
-  if (kind !== 'subAgentModuleDraft') {
-    throw new SessionDriverLoopError(
-      'subagent_module_draft_invalid',
-      `子代理 ${slice.subAgentId} module draft kind must be "subAgentModuleDraft".`
-    );
-  }
-  const draftFiles = recordArray(record.draftFiles).map((file, index): SubAgentModuleDraftFile => {
-    const targetPath = stringValue(file.targetPath) ?? stringValue(file.path);
-    if (!targetPath) {
-      throw new SessionDriverLoopError(
-        'subagent_module_draft_invalid',
-        `子代理 ${slice.subAgentId} draftFiles[${index}] missing targetPath.`
-      );
-    }
-    const contentLines = stringArrayValue(file.contentLines);
-    const content = stringValue(file.content);
-    const operation = (stringValue(file.operation) ?? 'write').toLowerCase();
-    if (operation !== 'delete' && !contentLines.length && content === undefined && !file.patchSpec) {
-      throw new SessionDriverLoopError(
-        'subagent_module_draft_invalid',
-        `子代理 ${slice.subAgentId} draftFiles[${index}] must include contentLines, content, or patchSpec.`
-      );
-    }
-    if (operation === 'patch' && !contentLines.length && content === undefined) {
-      throw new SessionDriverLoopError(
-        'subagent_module_draft_invalid',
-        `子代理 ${slice.subAgentId} draftFiles[${index}] patch operation must include replacement contentLines or content.`
-      );
-    }
-    return {
-      targetPath,
-      operation,
-      language: stringValue(file.language),
-      contentLines,
-      content,
-      patchSpec: file.patchSpec,
-      summary: stringValue(file.summary),
-    };
-  });
-  if (!draftFiles.length) {
-    throw new SessionDriverLoopError('subagent_module_draft_invalid', `子代理 ${slice.subAgentId} module draft has no draftFiles.`);
-  }
-  const taskIds = stringArrayValue(record.taskIds);
-  return {
-    schemaVersion: 'deepcode.subagent.module-draft.v1',
-    kind: 'subAgentModuleDraft',
-    moduleId: stringValue(record.moduleId) ?? slice.moduleId,
-    modulePath: stringValue(record.modulePath) ?? slice.modulePath,
-    taskIds: taskIds.length ? taskIds : slice.tasks.map((task) => task.taskId),
-    targets: stringArrayValue(record.targets).length ? stringArrayValue(record.targets) : draftFiles.map((file) => file.targetPath),
-    draftFiles,
-    evidenceSummary: stringArrayValue(record.evidenceSummary),
-    assumptions: stringArrayValue(record.assumptions),
-    diagnostics: stringArrayValue(record.diagnostics),
-    summary: stringValue(record.summary),
-  };
-}
-
-function validateSubAgentModuleDraft(
-  state: SessionDriverLoopRunState,
-  slice: SubAgentTaskSlice,
-  draft: SubAgentModuleDraft
-): string | undefined {
-  const accepted = state.acceptedImplementationPlan;
-  if (!accepted) return 'missing accepted plan context';
-  const allowedTaskIds = new Set(slice.tasks.map((task) => task.taskId));
-  for (const taskId of draft.taskIds) {
-    if (!allowedTaskIds.has(taskId)) return `draft taskId ${taskId} is outside slice ${slice.sliceId}`;
-  }
-  const acceptedTargets = new Set(slice.tasks.flatMap((task) => task.targets).map(normalizePlanScope).filter(Boolean));
-  for (const file of draft.draftFiles) {
-    const target = normalizePlanScope(file.targetPath);
-    if (!target) return `draft file has invalid targetPath ${file.targetPath}`;
-    const operation = (file.operation ?? 'write').toLowerCase();
-    const capability = operation === 'patch' ? 'fs.patch'
-      : operation === 'delete' ? 'fs.delete'
-        : operation === 'rename' ? 'fs.rename'
-          : 'fs.write';
-    const declaredInSlice = acceptedTargets.has(target) || [...acceptedTargets].some((scope) =>
-      planScopeCovers(scope, target) || planScopeCovers(target, scope)
-    );
-    if (!declaredInSlice && !scopeCoveredByAcceptedPlanForCapability(target, capability, accepted)) {
-      return `draft target ${target} is outside accepted slice/module scope`;
-    }
-  }
-  return undefined;
-}
-
-function mergeSubAgentModuleDrafts(
-  state: SessionDriverLoopRunState,
-  mergeGroup: SubAgentMergeGroup,
-  fragments: SubAgentFragment[]
-): Record<string, unknown> {
-  const codeBlocks: Record<string, unknown>[] = [];
-  const actions: Record<string, unknown>[] = [];
-  const validationExpectations: unknown[] = [];
-  const reviewExpectations: unknown[] = [];
-  const expectedValidation: string[] = [];
-  const reviewGuide: string[] = [];
-  const userPlans: string[] = [];
-
-  for (const fragment of fragments) {
-    const merged = moduleDraftFragmentToActionParts(fragment);
-    codeBlocks.push(...merged.codeBlocks);
-    actions.push(...merged.actions);
-    validationExpectations.push(...merged.validationExpectations);
-    reviewExpectations.push(...merged.reviewExpectations);
-    expectedValidation.push(`[${fragment.branchId}] Kernel records WorkUnit/tool facts for ${fragment.draft.moduleId}.`);
-    reviewGuide.push(`[${fragment.branchId}] Review ${fragment.draft.draftFiles.map((file) => file.targetPath).join(', ')}.`);
-    userPlans.push([
-      `### Module ${fragment.draft.moduleId}`,
-      fragment.draft.summary ?? `Module draft for ${fragment.draft.moduleId}.`,
-      `Targets: ${fragment.draft.draftFiles.map((file) => file.targetPath).join(', ')}`,
-      fragment.draft.evidenceSummary.length ? `Evidence summary: ${fragment.draft.evidenceSummary.join('; ')}` : 'Evidence summary: Parent Session will rely on accepted plan scope and current EvidenceTail during admission.',
-      fragment.draft.assumptions.length ? `Assumptions: ${fragment.draft.assumptions.join('; ')}` : 'Assumptions: Kernel remains the execution and review fact source.',
-    ].filter(Boolean).join('\n\n'));
-  }
-
-  const accepted = state.acceptedImplementationPlan;
-  const userPlanMarkdown = [
-    '# Accepted Plan Parallel Draft Merge',
-    '',
-    '## Summary',
-    `Parent Session merged ${fragments.length} independent module drafts from accepted-plan sub-agents into one Kernel-reviewable actionBundle.`,
-    '',
-    '## Key Changes',
-    userPlans.length ? userPlans.join('\n\n') : '- No module drafts were available.',
-    '',
-    '## Validation',
-    expectedValidation.length
-      ? expectedValidation.map((item) => `- ${item}`).join('\n')
-      : '- Kernel records WorkUnit/tool facts for every merged module draft.',
-    '',
-    '## Review',
-    reviewGuide.length
-      ? reviewGuide.map((item) => `- ${item}`).join('\n')
-      : '- Review the unified Kernel facts and changed paths after execution.',
-    '',
-    '## Assumptions',
-    '- Sub-agent drafts are not execution facts; Parent Session is the only merger and Kernel submitter.',
-    '- Kernel PlanReview, PermissionGate, WorkUnit facts, and ReviewGate remain authoritative.',
-  ].join('\n');
-  return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    kind: 'actionBundle',
-    proposalId: `${mergeGroup.mergeGroupId}-proposal`,
-    runId: state.runId,
-    sessionId: state.sessionId,
-    userPlanMarkdown,
-    codeBlocks,
-    actionBundle: {
-      version: '1',
-      id: `${mergeGroup.mergeGroupId}-action-bundle`,
-      goal: accepted?.summary ?? accepted?.title ?? 'Merged accepted implementation plan batch',
-      actions,
-      continuationExpectations: [],
-      validationExpectations,
-      reviewExpectations,
-      metadata: {
-        mergeGroupId: mergeGroup.mergeGroupId,
-        branchIds: fragments.map((fragment) => fragment.branchId),
-        moduleIds: fragments.map((fragment) => fragment.draft.moduleId),
-        subAgentMode: state.subAgentMode,
-      },
-    },
-    expectedValidation: expectedValidation.join('\n') || 'Kernel records WorkUnit/tool facts for every merged sub-agent fragment.',
-    reviewGuide: reviewGuide.join('\n') || 'Review the unified Kernel facts and changed paths after the merged batch completes.',
-  };
-}
-
-function moduleDraftFragmentToActionParts(
-  fragment: SubAgentFragment,
-): {
-  codeBlocks: Record<string, unknown>[];
-  actions: Record<string, unknown>[];
-  validationExpectations: unknown[];
-  reviewExpectations: unknown[];
-} {
-  const prefix = fragment.branchId;
-  const codeBlocks: Record<string, unknown>[] = [];
-  const actions: Record<string, unknown>[] = [];
-  for (const [index, file] of fragment.draft.draftFiles.entries()) {
-    const operation = (file.operation ?? 'write').toLowerCase();
-    const blockId = `${prefix}-draft-${index + 1}`;
-    const targetPath = normalizePlanScope(file.targetPath);
-    if (!targetPath) continue;
-    const contentLines = file.contentLines?.length
-      ? file.contentLines
-      : typeof file.content === 'string'
-        ? file.content.split(/\r?\n/)
-        : [];
-    if (contentLines.length || operation !== 'delete') {
-      codeBlocks.push({
-        id: blockId,
-        blockId,
-        targetPath,
-        language: file.language,
-        operation: operation === 'patch' ? 'patch' : operation === 'create' ? 'create' : 'write',
-        contentLines,
-      });
-    }
-    const actionId = `${prefix}-${safeSegment(operation)}-${safeSegment(targetPath) || index + 1}`;
-    if (operation === 'patch') {
-      actions.push({
-        actionId,
-        toolId: 'fs.patch',
-        args: {
-          path: targetPath,
-          replacementBlockId: blockId,
-          ...(file.patchSpec ? { patchSpec: file.patchSpec } : {}),
-        },
-        description: file.summary ?? `Patch ${targetPath}`,
-      });
-      continue;
-    }
-    if (operation === 'delete') {
-      actions.push({
-        actionId,
-        toolId: 'fs.delete',
-        args: { path: targetPath },
-        description: file.summary ?? `Delete ${targetPath}`,
-      });
-      continue;
-    }
-    actions.push({
-      actionId,
-      toolId: 'fs.write',
-      args: { path: targetPath, sourceBlockId: blockId },
-      description: file.summary ?? `${operation === 'create' ? 'Create' : 'Write'} ${targetPath}`,
-    });
-  }
-  return {
-    codeBlocks,
-    actions,
-    validationExpectations: [{
-      id: `${prefix}-validation`,
-      description: `Kernel records WorkUnit/tool facts for module draft ${fragment.draft.moduleId}.`,
-    }],
-    reviewExpectations: [{
-      id: `${prefix}-review`,
-      description: `Review module draft ${fragment.draft.moduleId} and changed targets ${fragment.draft.draftFiles.map((file) => file.targetPath).join(', ')}.`,
-    }],
-  };
-}
-
-function rewriteSubAgentFragmentIds(
-  fragment: SubAgentFragment,
-  payload: Record<string, unknown>,
-  actionBundle?: ActionBundleDraft
-): {
-  codeBlocks: Record<string, unknown>[];
-  commandBlocks: Record<string, unknown>[];
-  actions: Record<string, unknown>[];
-  validationExpectations: unknown[];
-  reviewExpectations: unknown[];
-} {
-  const prefix = fragment.branchId;
-  const blockIdMap = new Map<string, string>();
-  const codeBlocks = recordArray(payload.codeBlocks).map((block, index) => {
-    const currentId = stringValue(block.blockId) ?? stringValue(block.id) ?? `code-block-${index + 1}`;
-    const nextId = `${prefix}-${safeSegment(currentId)}`;
-    blockIdMap.set(currentId, nextId);
-    return {
-      ...block,
-      id: nextId,
-      blockId: nextId,
-    };
-  });
-  const commandBlocks = recordArray(payload.commandBlocks).map((block, index) => {
-    const currentId = stringValue(block.commandId) ?? stringValue(block.id) ?? `command-${index + 1}`;
-    const nextId = `${prefix}-${safeSegment(currentId)}`;
-    return {
-      ...block,
-      id: nextId,
-      commandId: nextId,
-    };
-  });
-  const actions = (actionBundle?.actions ?? []).map((action, index) => {
-    const record = { ...(action as unknown as Record<string, unknown>) };
-    const currentId = stringValue(record.actionId) ?? stringValue(record.id) ?? `action-${index + 1}`;
-    const nextId = `${prefix}-${safeSegment(currentId)}`;
-    const inputArgs = objectRecord(record.args) ?? objectRecord(record.toolArgs) ?? {};
-    const sourceBlockId = stringValue(inputArgs.sourceBlockId) ?? stringValue(record.sourceBlockId);
-    const replacementBlockId = stringValue(inputArgs.replacementBlockId) ?? stringValue(record.replacementBlockId);
-    const args: Record<string, unknown> = { ...inputArgs };
-    const targetPath = stringValue(args.path) ?? stringValue(args.targetPath) ?? stringValue(record.targetPath);
-    if (targetPath && !stringValue(args.path) && !stringValue(args.targetPath)) args.path = targetPath;
-    if (sourceBlockId && blockIdMap.has(sourceBlockId)) args.sourceBlockId = blockIdMap.get(sourceBlockId);
-    if (replacementBlockId && blockIdMap.has(replacementBlockId)) args.replacementBlockId = blockIdMap.get(replacementBlockId);
-    if (!args.patchSpec && record.patchSpec) args.patchSpec = record.patchSpec;
-    const dependsOn = stringArrayValue(record.dependsOn);
-    return {
-      actionId: nextId,
-      toolId: stringValue(record.toolId) ?? actionEffectiveCapability(record),
-      args,
-      description: stringValue(record.description) ?? stringValue(record.purpose) ?? stringValue(record.title) ?? nextId,
-      ...(dependsOn.length ? { dependsOn } : {}),
-    };
-  });
-  return {
-    codeBlocks,
-    commandBlocks,
-    actions,
-    validationExpectations: Array.isArray(actionBundle?.validationExpectations) ? actionBundle.validationExpectations : [],
-    reviewExpectations: Array.isArray(actionBundle?.reviewExpectations) ? actionBundle.reviewExpectations : [],
-  };
 }
 
 function recordArray(value: unknown): Record<string, unknown>[] {
@@ -12292,41 +9498,6 @@ function planReviewDecisionEvent(
   };
 }
 
-function agentRuntimeSettingsEvent(
-  sessionId: string,
-  runId: string,
-  settings: {
-    subAgentMode: SubAgentMode;
-    subAgentMaxParallel: number;
-    source: SubAgentModeSource;
-    inheritedFromRunId?: string;
-    parentRunId?: string;
-  },
-  ts: string,
-  id: string
-): AgentEvent {
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'workflow_stage',
-    payload: {
-      stage: 'agent_runtime_settings',
-      status: 'completed',
-      runId,
-      parentRunId: settings.parentRunId,
-      subAgentMode: settings.subAgentMode,
-      subAgentMaxParallel: settings.subAgentMaxParallel,
-      source: settings.source,
-      inheritedFromRunId: settings.inheritedFromRunId,
-      summary: `Agent runtime settings resolved: subAgentMode=${settings.subAgentMode}.`,
-      channel: 'progress',
-      visibility: 'debug',
-      presentation: 'traceOnly',
-    },
-  };
-}
-
 function sessionRunStateEvent(input: {
   sessionId: string;
   runId: string;
@@ -12368,7 +9539,6 @@ function sessionRunStateSummary(
 ): string {
   if (status === 'cancelled') return '用户已忽略当前介入点，本轮会话已中止。';
   if (status === 'failed' && reason === 'work_unit_failed') return 'Kernel work unit 执行失败，本轮 accepted plan 自动推进已停止。';
-  if (status === 'failed' && reason === 'subagent_mode_violation') return 'Sub-agent mode is off, but Session attempted to emit sub-agent execution activity.';
   if (status === 'failed') return 'Session run failed.';
   if (status === 'completed' && reason === 'review') return 'Review 已通过，本次计划执行完成。';
   if (status === 'completed') return 'Session run is completed.';
@@ -14453,9 +11623,9 @@ function acceptedPlanResourceResumePrompt(
     resourceRequestProtocolShapeLine(),
     'Prefer actionBundle if the just-resolved evidence is sufficient for an edit task. If the current task is read-only validation and the ResourcePacket is enough, return answer summarizing only the resolved evidence. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
     accepted ? `Accepted plan: planId=${accepted.planId}; title=${accepted.title ?? accepted.summary ?? accepted.planId}; completedTasks=${accepted.completedTaskIds.join(', ') || 'none'}.` : '',
-    cursor ? `TaskExecutionCursor: cursorId=${cursor.cursorId}; currentTaskId=${cursor.currentTaskId ?? 'none'}; taskOrder=${cursor.taskOrder.join(', ') || 'none'}; pendingTasks=${cursor.pendingTaskIds.join(', ') || 'none'}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}. Deprecated graph node fields may appear in compatibility telemetry only; do not plan around them.` : '',
+    cursor ? `TaskExecutionCursor: cursorId=${cursor.cursorId}; currentTaskId=${cursor.currentTaskId ?? 'none'}; taskOrder=${cursor.taskOrder.join(', ') || 'none'}; pendingTasks=${cursor.pendingTaskIds.join(', ') || 'none'}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
     current ? `CurrentTaskGoal: ${current.goal}` : '',
-    current ? `CurrentTaskContext: targets=${current.targets.join(', ') || 'none'}; capabilities=${current.capabilities.join(', ') || 'none'}; dependsOn=${current.dependsOn.join(', ') || 'none'}; unlocks=${current.unlocks.join(', ') || 'none'}; evidenceNeeds=${current.evidenceNeeds.join(', ') || 'none'}.` : '',
+    current ? `CurrentTaskContext: targets=${current.targets.join(', ') || 'none'}; capabilities=${current.capabilities.join(', ') || 'none'}; dependsOn=${current.dependsOn.join(', ') || 'none'}; evidenceNeeds=${current.evidenceNeeds.join(', ') || 'none'}.` : '',
     `Original resourceRequest proposalId=${requestProposal.proposalId}; kind=${requestProposal.kind}.`,
     `Resolved ResourcePacket id=${packet.id}; itemCount=${packet.items.length}:`,
     fenced(clip(JSON.stringify(resourceItems, null, 2), 6_000)),
@@ -15288,7 +12458,7 @@ function resourceRequestRepairMessages(
         'Use kind="resourceRequest" only when requesting manifestEntryId, root-relative path, or kind="search" with a non-empty query under the listed conversation roots.',
         resourceRequestProtocolShapeLine(),
         'Use kind="decisionRequest" only when user input is required; minimal shape is {"schemaVersion":"deepcode.agent.protocol.v3","kind":"decisionRequest","decisionRequest":{"id":"decision-1","question":"...","options":[{"id":"option-1","label":"...","description":"...","effect":{"kind":"continueWithAction"}},{"id":"option-2","label":"...","description":"...","effect":{"kind":"continueWithAction"}}],"allowsFreeform":true}}.',
-        'Each decisionRequest option SHOULD declare its state-machine effect via option.effect. Allowed kinds: "continueWithAction" (default, generate next actionBundle), "skipCurrentTask" (mark current accepted-plan task complete and advance), "markTasksCompleted" with taskIds[], "markAcceptedIncomplete" with optional taskIds[] and reason, "replan" with reason, "finishWithAnswer", and "cancel". When the user-visible question implies "the task is already satisfied / nothing to do / stop and summarize", at least one option MUST use skipCurrentTask, markTasksCompleted, markAcceptedIncomplete, or finishWithAnswer so the session can advance without forcing an empty actionBundle.',
+        'Each decisionRequest option SHOULD declare its state-machine effect via option.effect. Allowed kinds: "continueWithAction" (default, generate next actionBundle), "skipCurrentTask" (skip the current accepted-plan task), "markAcceptedIncomplete" with optional taskIds[] and reason, "replan" with reason, "finishWithAnswer", and "cancel". When the user-visible question implies "the task is already satisfied / nothing to do / stop and summarize", at least one option MUST use skipCurrentTask, markAcceptedIncomplete, or finishWithAnswer so the session can advance without forcing an empty actionBundle.',
         'Do not invent arbitrary absolute local paths. Absolute file paths are only for user-provided outside-workspace targets that require Kernel PlanReview/permission.',
       ].join('\n'),
     },
@@ -15616,13 +12786,6 @@ function selectedRequirementDecisionOptionEffect(event: AgentEvent): Requirement
         ...(reason ? { reason } : {}),
       };
     }
-    case 'markTasksCompleted': {
-      const ids = Array.isArray(effect.taskIds)
-        ? effect.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
-        : [];
-      if (ids.length === 0) return undefined;
-      return { kind: 'markTasksCompleted', taskIds: ids };
-    }
     case 'replan': {
       const reason = stringValue(effect.reason);
       return reason ? { kind: 'replan', reason } : { kind: 'replan' };
@@ -15635,7 +12798,6 @@ function selectedRequirementDecisionOptionEffect(event: AgentEvent): Requirement
 // R2：用户介入卡 option 的状态机副作用合约（运行时类型，与 protocolV3 normalizeOptionEffect 对齐）。
 type RequirementOptionEffect =
   | { kind: 'continueWithAction' }
-  | { kind: 'markTasksCompleted'; taskIds: string[] }
   | { kind: 'skipCurrentTask' }
   | { kind: 'replan'; reason?: string }
   | { kind: 'finishRun' }
@@ -15993,7 +13155,6 @@ interface ProviderTraceArchiveRecord {
   payload?: unknown;
   cachePlan?: unknown;
   contextAssembly?: unknown;
-  taskGraph?: unknown;
 }
 
 interface ProviderTraceToolDefinitionDigest {
@@ -16040,7 +13201,7 @@ interface ProviderTraceChunkSummary {
 
 function archiveProviderTracePayload(stage: string, payload: unknown): ProviderTraceArchiveRecord {
   const record = objectRecord(payload);
-  if (record && (Array.isArray(record.messages) || record.contextAssembly || record.cachePlan || record.taskGraph)) {
+  if (record && (Array.isArray(record.messages) || record.contextAssembly || record.cachePlan)) {
     const messages = Array.isArray(record.messages) ? record.messages : [];
     const messageDigests = messages.map((message, index) => providerTraceMessageDigest(message, index));
     return {
@@ -16059,7 +13220,6 @@ function archiveProviderTracePayload(stage: string, payload: unknown): ProviderT
       },
       cachePlan: compactArchiveValue(record.cachePlan),
       contextAssembly: compactArchiveValue(record.contextAssembly),
-      taskGraph: compactArchiveValue(record.taskGraph),
     };
   }
 
@@ -16251,9 +13411,6 @@ function parseProviderPartFrame(raw: string): AgentStreamPartFrame | null {
     draftId: stringValue(record.draftId),
     frameId: stringValue(record.frameId),
     runId: stringValue(record.runId),
-    branchId: stringValue(record.branchId),
-    subAgentId: stringValue(record.subAgentId),
-    mergeGroupId: stringValue(record.mergeGroupId),
     targetPath: stringValue(record.targetPath),
     language: stringValue(record.language),
     capability: stringValue(record.capability),

@@ -70,8 +70,6 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'agent.reviewContinuationMode': 'auto',
   'agent.interventionLevel': 'medium',
   'agent.memory.projectMode': 'confirm',
-  'agent.subagents.mode': 'off',
-  'agent.subagents.maxParallel': 2,
   'agent.permissions.allowFileRead': true,
   'agent.permissions.allowFileWrite': true,
   'agent.permissions.allowCodeSearch': true,

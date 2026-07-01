@@ -1810,9 +1810,7 @@ function extractRequirementOptionsFromBlock(block: AgentTimelineBlock): DeepCode
       let effect: DeepCodeRequirementOption['effect'];
       if (effectKind) {
         effect = { kind: effectKind };
-        if (effectKind === 'markTasksCompleted' && Array.isArray(effectRecord?.taskIds)) {
-          effect.taskIds = effectRecord.taskIds.filter((v): v is string => typeof v === 'string' && v.length > 0);
-        } else if (effectKind === 'replan') {
+        if (effectKind === 'replan') {
           const reason = effectRecord ? stringField(effectRecord, 'reason') : undefined;
           if (reason) effect.reason = reason;
         }
@@ -1832,9 +1830,6 @@ function extractRequirementOptionsFromBlock(block: AgentTimelineBlock): DeepCode
 function formatDeepCodeOptionEffect(effect: DeepCodeRequirementOption['effect'], language: UiLanguage): string | undefined {
   if (!effect) return undefined;
   const key = `requirement.optionEffect.${effect.kind}`;
-  if (effect.kind === 'markTasksCompleted' && Array.isArray(effect.taskIds) && effect.taskIds.length > 0) {
-    return t(language, key, { taskIds: effect.taskIds.join(', ') });
-  }
   const translated = t(language, key);
   return translated === key ? undefined : translated;
 }

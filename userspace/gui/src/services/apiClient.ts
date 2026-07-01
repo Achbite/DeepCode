@@ -82,8 +82,6 @@ export interface StartAgentRunRequest {
   reviewContinuationMode?: 'auto' | 'ask' | 'off';
   interventionLevel?: 'low' | 'medium' | 'high';
   projectMemoryMode?: 'confirm' | 'auto';
-  subAgentMode?: 'auto' | 'off';
-  subAgentMaxParallel?: number;
   title?: string;
   decisionKind?: 'requirement' | 'plan' | 'review' | 'permission' | 'boundary';
   decision?: 'accept' | 'reject' | 'revise';

@@ -515,8 +515,6 @@
     "deepcodeGui.activity.kind.editFileCompleted": "编辑完成",
     "deepcodeGui.activity.kind.editFileFailed": "编辑失败",
     "deepcodeGui.activity.kind.toolExecution": "工具执行",
-    "deepcodeGui.activity.kind.subagentBranch": "子代理分支",
-    "deepcodeGui.activity.kind.subagentMerge": "子代理合并",
     "deepcodeGui.activity.kind.reviewCheckpoint": "审查节点",
     "deepcodeGui.activity.kind.diagnostic": "诊断",
     "deepcodeGui.activity.targets": "目标",
@@ -526,10 +524,6 @@
     "deepcodeGui.activity.actions": "操作",
     "deepcodeGui.activity.workUnits": "工作单元",
     "deepcodeGui.activity.error": "错误",
-    "deepcodeGui.subagents.title": "子代理",
-    "deepcodeGui.subagents.branchFallback": "子代理分支",
-    "deepcodeGui.subagents.streaming": "子代理正在输出。",
-    "deepcodeGui.subagents.reasoning": "推理过程",
     "deepcodeGui.progress.title": "进度",
     "deepcodeGui.progress.heartbeat": "心跳",
     "deepcodeGui.context.title": "上下文",
@@ -889,14 +883,11 @@
     "diagnostic.autoPlanProposalReviewedMissing": "Kernel 未返回 accepted-plan actionBundle 的 proposal.reviewed 事件，Session 不会自动执行该批次。",
     "diagnostic.autoBatchRevisionRepairFailed": "自动执行批次需要修订，但模型 repair 失败：{message}",
     "diagnostic.autoBatchRejected": "Kernel 拒绝该自动执行批次：{reasons}",
-    "diagnostic.subAgentModeViolation": "子代理模式已关闭，但 Session 尝试发出子代理分支/合并增量。自动执行已因 Session 编排违规而停止。",
-
     "requirement.optionsTitle": "可选方案",
     "requirement.optionRecommended": "推荐",
     "requirement.optionEffectLabel": "选择后",
     "requirement.optionEffect.continueWithAction": "继续生成下一批执行操作",
     "requirement.optionEffect.skipCurrentTask": "将当前任务标记为完成，自动推进到下一任务",
-    "requirement.optionEffect.markTasksCompleted": "将任务 {taskIds} 标记为完成",
     "requirement.optionEffect.replan": "回到计划阶段重新规划",
     "requirement.optionEffect.finishRun": "结束本轮执行"
   },
@@ -1061,18 +1052,6 @@
         "confirm": "确认后写入",
         "auto": "自动低风险候选"
       }
-    },
-    "agent.subagents.mode": {
-      "label": "子代理",
-      "description": "对已确认计划中的独立任务进行保守并行草稿生成。最终校验与提交仍由父 Session 完成。",
-      "options": {
-        "auto": "自动",
-        "off": "关闭"
-      }
-    },
-    "agent.subagents.maxParallel": {
-      "label": "子代理最大并发",
-      "description": "子代理并行草稿分支上限。v1 会保守限制为 2。"
     },
     "agent.permissions.allowFileRead": {
       "label": "允许读取文件",

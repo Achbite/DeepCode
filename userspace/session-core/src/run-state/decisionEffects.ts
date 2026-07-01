@@ -3,14 +3,12 @@ export type DecisionEffect =
   | { kind: 'revisePlan'; reason?: string }
   | { kind: 'replan'; reason?: string }
   | { kind: 'skipTask'; taskId?: string }
-  | { kind: 'markTasksCompleted'; taskIds: string[] }
   | { kind: 'markAcceptedIncomplete'; taskIds?: string[]; reason?: string }
   | { kind: 'finishWithAnswer'; reason?: string }
   | { kind: 'cancel'; reason?: string };
 
 export type LegacyRequirementEffect =
   | { kind: 'continueWithAction' }
-  | { kind: 'markTasksCompleted'; taskIds: string[] }
   | { kind: 'skipCurrentTask' }
   | { kind: 'replan'; reason?: string }
   | { kind: 'finishRun' }
@@ -29,4 +27,3 @@ export function normalizeDecisionEffect(effect: LegacyRequirementEffect | undefi
 export function decisionEffectTerminatesWithAnswer(effect: DecisionEffect): boolean {
   return effect.kind === 'finishWithAnswer';
 }
-

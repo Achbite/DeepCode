@@ -198,7 +198,6 @@ export interface DecisionRequestOptionDraft {
 // GUI 据此在卡片上显式标注"接受后会发生什么"，避免模型与用户对结果不一致的伪造。
 export type AgentRequirementOptionEffect =
   | { kind: 'continueWithAction' }
-  | { kind: 'markTasksCompleted'; taskIds: string[] }
   | { kind: 'skipCurrentTask' }
   | { kind: 'replan'; reason?: string }
   | { kind: 'finishRun' }
@@ -229,10 +228,7 @@ export interface ImplementationPlanTaskDraft {
   target: string[];
   scope: string;
   dependencies: string[];
-  hardDependencies?: string[];
-  softOrderAfter?: string[];
   conflictKeys?: string[];
-  canDraftInParallel?: boolean;
   batchKind?: 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review' | string;
   role?: 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review';
   capability: string;

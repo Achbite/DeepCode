@@ -3404,8 +3404,7 @@ button {
 }
 
 .deepcode-gui-task-list-card,
-.deepcode-gui-progress-card,
-.deepcode-gui-subagent-work-card {
+.deepcode-gui-progress-card {
   display: grid;
   gap: 12px;
   padding: 16px;
@@ -3420,8 +3419,7 @@ button {
 }
 
 .deepcode-gui-task-list-card__title,
-.deepcode-gui-progress-card__title,
-.deepcode-gui-subagent-work-card__title {
+.deepcode-gui-progress-card__title {
   color: #7b7f87;
   font-size: 12px;
   font-weight: 560;
@@ -3498,147 +3496,6 @@ button {
   color: #8a8f98;
   font-size: 10px;
   font-weight: 560;
-}
-
-.deepcode-gui-subagent-work-list {
-  display: grid;
-  gap: 8px;
-}
-
-.deepcode-gui-subagent-work-item {
-  display: grid;
-  grid-template-columns: 8px minmax(0, 1fr);
-  align-items: start;
-  gap: 10px;
-  padding: 10px;
-  border: 1px solid #e5e9ef;
-  border-radius: 12px;
-  background: #fbfcff;
-}
-
-.deepcode-gui-subagent-work-item__dot {
-  width: 7px;
-  height: 7px;
-  margin-top: 6px;
-  border-radius: 999px;
-  background: #a2a8b0;
-}
-
-.deepcode-gui-subagent-work-item--running .deepcode-gui-subagent-work-item__dot {
-  background: #2f80ed;
-}
-
-.deepcode-gui-subagent-work-item--waiting,
-.deepcode-gui-subagent-work-item--queued,
-.deepcode-gui-subagent-work-item--blocked {
-  background: #fffaf1;
-  border-color: #eee4cf;
-}
-
-.deepcode-gui-subagent-work-item--waiting .deepcode-gui-subagent-work-item__dot,
-.deepcode-gui-subagent-work-item--queued .deepcode-gui-subagent-work-item__dot,
-.deepcode-gui-subagent-work-item--blocked .deepcode-gui-subagent-work-item__dot {
-  background: #c87d16;
-}
-
-.deepcode-gui-subagent-work-item--completed .deepcode-gui-subagent-work-item__dot {
-  background: #2f9e6d;
-}
-
-.deepcode-gui-subagent-work-item--failed {
-  border-color: #f0d1ce;
-  background: #fff7f6;
-}
-
-.deepcode-gui-subagent-work-item--failed .deepcode-gui-subagent-work-item__dot {
-  background: #c2413a;
-}
-
-.deepcode-gui-subagent-work-item__body {
-  min-width: 0;
-  display: grid;
-  gap: 4px;
-}
-
-.deepcode-gui-subagent-work-item__topline {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-}
-
-.deepcode-gui-subagent-work-item__title {
-  min-width: 0;
-  overflow: hidden;
-  color: #2f3337;
-  font-size: 12px;
-  font-weight: 620;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.deepcode-gui-subagent-work-item__topline strong {
-  color: #8a8f98;
-  font-size: 10px;
-  font-weight: 560;
-}
-
-.deepcode-gui-subagent-work-item__summary,
-.deepcode-gui-subagent-work-item__error,
-.deepcode-gui-subagent-work-item__thinking {
-  min-width: 0;
-  overflow: hidden;
-  color: #828891;
-  font-size: 11px;
-  line-height: 1.35;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.deepcode-gui-subagent-work-item__error {
-  color: #b3342e;
-}
-
-.deepcode-gui-subagent-work-item__thinking {
-  display: grid;
-  gap: 2px;
-  padding: 6px 7px;
-  border-radius: 8px;
-  background: #f3f5f8;
-  white-space: normal;
-}
-
-.deepcode-gui-subagent-work-item__thinking strong {
-  color: #59616c;
-  font-size: 10px;
-  font-weight: 640;
-}
-
-.deepcode-gui-subagent-work-item__thinking span {
-  display: -webkit-box;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-}
-
-.deepcode-gui-subagent-work-item__meta {
-  display: flex;
-  min-width: 0;
-  flex-wrap: wrap;
-  gap: 5px;
-}
-
-.deepcode-gui-subagent-work-item__meta span {
-  min-width: 0;
-  max-width: 100%;
-  padding: 2px 6px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: #eef1f5;
-  color: #6d7480;
-  font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .deepcode-gui-progress-row {
