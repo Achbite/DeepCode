@@ -37,6 +37,7 @@ interface DeepCodeTimelineProps {
 type TypewriterSpeed = NonNullable<NonNullable<AgentTimelineBlock['displayHints']>['typewriterSpeed']>;
 type TimelineFollowMode = 'following' | 'detached';
 const MAX_TYPEWRITER_CHARS = 1600;
+const TYPEWRITER_BUFFER_DELAY_MS = 36;
 const LIVE_REASONING_FAST_BACKLOG_CHARS = 4000;
 const LIVE_REASONING_SNAP_BACKLOG_CHARS = 12000;
 
@@ -1607,7 +1608,10 @@ const TypewriterMarkdown: React.FC<{
   const shouldAnimate = animate && content.length <= MAX_TYPEWRITER_CHARS;
   const [visible, setVisible] = useState(() => (shouldAnimate ? '' : content));
   const visibleRef = useRef(visible);
+  const latestRef = useRef(content);
+  const timerRef = useRef<number | null>(null);
   const onAnimationCompleteRef = useRef(onAnimationComplete);
+  const onVisibleContentChangeRef = useRef(onVisibleContentChange);
   const renderedContent = shouldAnimate ? visible : content;
 
   useLayoutEffect(() => {
@@ -1623,34 +1627,77 @@ const TypewriterMarkdown: React.FC<{
   }, [onAnimationComplete]);
 
   useEffect(() => {
-    if (!shouldAnimate) {
-      setVisible(content);
-      onAnimationCompleteRef.current?.();
-      return undefined;
-    }
-    const startIndex = content.startsWith(visibleRef.current) ? visibleRef.current.length : 0;
-    setVisible(content.slice(0, startIndex));
-    if (!content || startIndex >= content.length) {
-      onAnimationCompleteRef.current?.();
-      return undefined;
-    }
-    let index = startIndex;
-    const step = speed === 'fast' ? 12 : speed === 'slow' ? 2 : 4;
-    const delayMs = speed === 'fast' ? 8 : speed === 'slow' ? 20 : 12;
-    const id = window.setInterval(() => {
-      index = Math.min(content.length, index + step);
-      setVisible(content.slice(0, index));
-      window.requestAnimationFrame(onVisibleContentChange);
-      if (index >= content.length) {
-        window.clearInterval(id);
-        onAnimationCompleteRef.current?.();
+    onVisibleContentChangeRef.current = onVisibleContentChange;
+  }, [onVisibleContentChange]);
+
+  useEffect(() => {
+    latestRef.current = content;
+    const clearTimer = () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
       }
-    }, delayMs);
-    return () => window.clearInterval(id);
-  }, [shouldAnimate, content]);
+    };
+
+    const commitVisible = (next: string) => {
+      visibleRef.current = next;
+      setVisible(next);
+      window.requestAnimationFrame(onVisibleContentChangeRef.current);
+    };
+
+    if (!shouldAnimate) {
+      clearTimer();
+      commitVisible(content);
+      onAnimationCompleteRef.current?.();
+      return undefined;
+    }
+
+    if (!content.startsWith(visibleRef.current)) {
+      commitVisible(content);
+      onAnimationCompleteRef.current?.();
+      return undefined;
+    }
+
+    const tick = () => {
+      timerRef.current = null;
+      const latest = latestRef.current;
+      const current = visibleRef.current;
+      if (!latest.startsWith(current)) {
+        commitVisible(latest);
+        onAnimationCompleteRef.current?.();
+        return;
+      }
+      const backlog = latest.length - current.length;
+      if (backlog <= 0) {
+        onAnimationCompleteRef.current?.();
+        return;
+      }
+      const step = typewriterBufferedStep(backlog, speed);
+      commitVisible(latest.slice(0, Math.min(latest.length, current.length + step)));
+      timerRef.current = window.setTimeout(tick, typewriterBufferedDelay(speed));
+    };
+
+    if (timerRef.current === null) {
+      timerRef.current = window.setTimeout(tick, TYPEWRITER_BUFFER_DELAY_MS);
+    }
+    return clearTimer;
+  }, [shouldAnimate, content, speed]);
 
   return <MarkdownContent content={renderedContent} />;
 };
+
+function typewriterBufferedStep(backlog: number, speed: TypewriterSpeed): number {
+  const base = speed === 'fast' ? 32 : speed === 'slow' ? 6 : 16;
+  if (backlog >= 1000) return base * 5;
+  if (backlog >= 400) return base * 3;
+  return base;
+}
+
+function typewriterBufferedDelay(speed: TypewriterSpeed): number {
+  if (speed === 'fast') return 24;
+  if (speed === 'slow') return 52;
+  return TYPEWRITER_BUFFER_DELAY_MS;
+}
 
 const EventList: React.FC<{ events: AgentEvent[]; compact?: boolean; language: UiLanguage }> = ({ events, compact, language }) => (
   <div className={`deepcode-gui-event-list ${compact ? 'deepcode-gui-event-list--compact' : ''}`}>
