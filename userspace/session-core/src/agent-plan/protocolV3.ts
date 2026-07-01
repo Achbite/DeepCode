@@ -389,12 +389,7 @@ function normalizeExpectations(value: unknown, label: string): Array<Record<stri
   if (value === undefined || value === null) return [];
   if (typeof value === 'string') {
     const description = value.trim();
-    if (!description) {
-      throw new AgentPlanParseError(
-        'invalid_action_bundle_expectation',
-        `Agent Protocol v3.actionBundle.${label} string value must be non-empty; use [{ "id": "${label}-1", "description": "..." }].`
-      );
-    }
+    if (!description) return [];
     return [{ id: `${label}-1`, description }];
   }
   if (!Array.isArray(value)) {
@@ -403,30 +398,19 @@ function normalizeExpectations(value: unknown, label: string): Array<Record<stri
       `Agent Protocol v3.actionBundle.${label} must be an array of { id, description } objects; string and string[] are accepted only as compatibility input.`
     );
   }
-  return value.map((item, index) => {
+  return value.flatMap((item, index) => {
     if (typeof item === 'string') {
       const description = item.trim();
-      if (!description) {
-        throw new AgentPlanParseError(
-          'invalid_action_bundle_expectation',
-          `Agent Protocol v3.actionBundle.${label}[${index}] string value must be non-empty; use { "id": "${label}-${index + 1}", "description": "..." }.`
-        );
-      }
-      return { id: `${label}-${index + 1}`, description };
+      return description ? [{ id: `${label}-${index + 1}`, description }] : [];
     }
     const record = requireObject(item, `Agent Protocol v3.actionBundle.${label}[${index}]`);
     const description = optionalString(record, 'description');
-    if (!description) {
-      throw new AgentPlanParseError(
-        'invalid_action_bundle_expectation',
-        `Agent Protocol v3.actionBundle.${label}[${index}].description must be a non-empty string; minimal shape is { "id": "${label}-${index + 1}", "description": "..." }.`
-      );
-    }
-    return {
+    if (!description) return [];
+    return [{
       ...record,
       id: optionalString(record, 'id') ?? `${label}-${index + 1}`,
       description,
-    };
+    }];
   });
 }
 

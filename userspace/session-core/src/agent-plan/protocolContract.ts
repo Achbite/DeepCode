@@ -38,8 +38,8 @@ export function actionBundleProtocolShapeLines(): string[] {
     'fs.write actions must use args={path,sourceBlockId}; sourceBlockId references the top-level codeBlocks[].blockId that carries the exact file content.',
     'Directory targets are planning scopes, not executable write actions. Do not create empty .gitkeep or placeholder files unless the user explicitly requested that concrete file.',
     'actionBundle.continuationExpectations[] are non-executable continuation notes shaped {id,description,target?,reason?}. They do not require toolId and never enter Kernel execution.',
-    'actionBundle.validationExpectations[] are reviewable validation notes shaped {id,description,command?}.',
-    'actionBundle.reviewExpectations[] are user review obligations shaped {id,description}.',
+    'actionBundle.validationExpectations[] are optional reviewable validation notes shaped {id,description,command?}; Session derives routine defaults when omitted.',
+    'actionBundle.reviewExpectations[] are optional user review obligations shaped {id,description}; Session derives routine defaults when omitted.',
   ];
 }
 

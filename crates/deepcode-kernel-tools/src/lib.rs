@@ -173,10 +173,16 @@ pub struct KernelToolCatalogTool {
     pub family: ToolFamily,
     pub operation_kind: Option<&'static str>,
     pub provider_schema: Value,
+    pub provider_visible: bool,
+    #[serde(default)]
+    pub forbidden_fields: Vec<String>,
     pub risk: ToolRiskLevel,
     pub permission_mode: ToolPermissionMode,
+    pub permission_summary: String,
     pub path_scope_policy: &'static str,
     pub execution_mode: OperationExecutionMode,
+    #[serde(default)]
+    pub hard_deny_rules: Vec<String>,
     pub needs_workspace: bool,
     pub read_only: bool,
 }
@@ -225,11 +231,15 @@ impl KernelToolRegistry {
                 capability: template.permission.capability,
                 family: template.family,
                 operation_kind: template.operation_kind,
-                provider_schema: template.input.schema,
+                provider_schema: template.input.schema.clone(),
+                provider_visible: provider_visible_for_tool(template.tool_id),
+                forbidden_fields: template.input.forbidden_fields.clone(),
                 risk: template.permission.risk,
                 permission_mode: template.permission.mode,
+                permission_summary: permission_summary_for_template(&template),
                 path_scope_policy: template.resource.path_scope_policy,
                 execution_mode: template.execution.execution_mode,
+                hard_deny_rules: hard_deny_rules_for_tool(template.tool_id),
                 needs_workspace: template.resource.needs_workspace,
                 read_only: template.resource.read_only,
             })
@@ -472,6 +482,52 @@ fn cleanup_policy_for_tool(tool_id: &str) -> &'static str {
         "provider.call" => "close-provider-stream",
         _ => "none",
     }
+}
+
+fn provider_visible_for_tool(_tool_id: &str) -> bool {
+    true
+}
+
+fn permission_summary_for_template(template: &KernelToolTemplate) -> String {
+    match template.permission.mode {
+        ToolPermissionMode::Allow => {
+            "Kernel policy allows this tool without user confirmation in the current mode."
+                .to_string()
+        }
+        ToolPermissionMode::Ask => format!(
+            "Kernel gate asks the user before executing {} operations.",
+            template.permission.capability
+        ),
+        ToolPermissionMode::Deny => {
+            "Kernel policy denies this tool unless policy is changed.".to_string()
+        }
+    }
+}
+
+fn hard_deny_rules_for_tool(tool_id: &str) -> Vec<String> {
+    let rules: &[&str] = match tool_id {
+        "fs.delete" => &[
+            "pathTraversal",
+            "workspaceRootMutation",
+            "outsideRegisteredRootWithoutGrant",
+            "wildcardDelete",
+            "directoryDeleteWithoutRecursive",
+        ],
+        "fs.write" | "fs.patch" => &[
+            "pathTraversal",
+            "workspaceRootMutation",
+            "outsideRegisteredRootWithoutGrant",
+        ],
+        "process.exec" => &[
+            "commandStringFallback",
+            "unmanagedRedirection",
+            "backgroundEscape",
+        ],
+        "git.push" => &["missingRemote", "missingBranch", "unapprovedRemoteWrite"],
+        "web.search" | "web.fetch" | "provider.call" => &["secretExfiltration", "unapprovedEgress"],
+        _ => &[],
+    };
+    rules.iter().map(|rule| (*rule).to_string()).collect()
 }
 
 fn operation_kind_for_tool(tool_id: &str) -> Option<&'static str> {
@@ -2186,6 +2242,18 @@ mod tests {
         assert_eq!(delete.operation_kind, Some("delete"));
         assert_eq!(delete.path_scope_policy, "workspace-path-scoped-grant");
         assert_eq!(delete.provider_schema["required"][0], "path");
+        assert!(delete.provider_visible);
+        assert_eq!(delete.execution_mode, OperationExecutionMode::Execute);
+        assert_eq!(delete.permission_mode, ToolPermissionMode::Ask);
+        assert!(delete
+            .forbidden_fields
+            .iter()
+            .any(|field| field == "sourceBlockId"));
+        assert!(delete
+            .hard_deny_rules
+            .iter()
+            .any(|rule| rule == "directoryDeleteWithoutRecursive"));
+        assert!(delete.permission_summary.contains("Kernel gate"));
     }
 
     #[test]

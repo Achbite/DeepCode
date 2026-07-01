@@ -3,6 +3,7 @@ use crate::{
     PlannedAction,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Component;
 
@@ -33,6 +34,8 @@ pub type ProposalReviewFinding = PlanReviewFinding;
 pub struct RequiredFileOperation {
     pub operation: String,
     pub target_path: String,
+    #[serde(default)]
+    pub tool_id: String,
     pub capability: String,
     pub action_id: String,
     #[serde(default)]
@@ -67,6 +70,8 @@ pub struct RequiredAccessScope {
 #[serde(rename_all = "camelCase")]
 pub struct PermissionBundle {
     pub id: String,
+    #[serde(default)]
+    pub tool_id: String,
     pub capability: String,
     pub resource_kind: String,
     #[serde(default)]
@@ -88,10 +93,14 @@ pub struct GateInterventionRequired {
     pub intervention_kind: String,
     pub status: String,
     #[serde(default)]
+    pub tool_id: Option<String>,
+    #[serde(default)]
     pub capability: Option<String>,
     #[serde(default)]
     pub permission_bundle_id: Option<String>,
     pub summary: String,
+    #[serde(default)]
+    pub affected_operation_ids: Vec<String>,
     #[serde(default)]
     pub options: Vec<String>,
 }
@@ -102,7 +111,11 @@ pub struct KernelExecutionOperation {
     pub id: String,
     pub title: String,
     pub operation: String,
+    #[serde(default)]
+    pub tool_id: String,
     pub capability: String,
+    #[serde(default)]
+    pub args_template: Value,
     pub target_path: String,
     #[serde(default)]
     pub target_ref: Option<FileTargetRef>,
@@ -409,7 +422,9 @@ fn execution_contract_for_review(
                 id: operation.action_id.clone(),
                 title: format!("{} {}", operation.operation, operation.target_path),
                 operation: operation.operation.clone(),
+                tool_id: operation_tool_id(operation),
                 capability: operation.capability.clone(),
+                args_template: operation_args_template(operation),
                 target_path: operation.target_path.clone(),
                 target_ref: operation.target_ref.clone(),
                 target_kind: operation.target_kind.clone(),
@@ -552,6 +567,7 @@ fn permission_bundle(
     };
     PermissionBundle {
         id,
+        tool_id: tool_id_for_permission_bundle(capability, &operation_ids),
         capability: capability.to_string(),
         resource_kind: resource_kind.to_string(),
         resource_path,
@@ -575,9 +591,15 @@ fn gate_interventions_for_review(
             id: format!("gate-{}", bundle.id),
             intervention_kind: "permission".to_string(),
             status: "requiresUserDecision".to_string(),
+            tool_id: if bundle.tool_id.is_empty() {
+                None
+            } else {
+                Some(bundle.tool_id.clone())
+            },
             capability: Some(bundle.capability.clone()),
             permission_bundle_id: Some(bundle.id.clone()),
             summary: bundle.summary.clone(),
+            affected_operation_ids: bundle.operation_ids.clone(),
             options: vec![
                 "approve".to_string(),
                 "reject".to_string(),
@@ -590,9 +612,11 @@ fn gate_interventions_for_review(
             id: format!("gate-hard-floor-{}", safe_contract_segment(capability)),
             intervention_kind: "hardFloor".to_string(),
             status: "blocked".to_string(),
+            tool_id: None,
             capability: Some(capability.clone()),
             permission_bundle_id: None,
             summary: format!("Kernel hard floor blocks capability {capability}."),
+            affected_operation_ids: Vec::new(),
             options: vec!["revise".to_string(), "abort".to_string()],
         });
     }
@@ -601,9 +625,11 @@ fn gate_interventions_for_review(
             id: format!("gate-denied-{}", index + 1),
             intervention_kind: "diagnostic".to_string(),
             status: "blocked".to_string(),
+            tool_id: None,
             capability: None,
             permission_bundle_id: None,
             summary: reason.clone(),
+            affected_operation_ids: Vec::new(),
             options: vec!["revise".to_string(), "abort".to_string()],
         });
     }
@@ -741,6 +767,7 @@ fn required_file_operations_for_input(
                     operations.push(RequiredFileOperation {
                         operation: operation.to_string(),
                         target_path: target.target_path,
+                        tool_id: tool_id_for_file_operation(action, operation),
                         capability: action.capability.clone(),
                         action_id: action.id.clone(),
                         target_ref: Some(target.target_ref),
@@ -917,6 +944,71 @@ fn operations_for_access_scope_capability(capability: &str) -> Vec<String> {
         "fs.write" => vec!["create".to_string(), "write".to_string()],
         "fs.patch" => vec!["patch".to_string()],
         _ => Vec::new(),
+    }
+}
+
+fn tool_id_for_file_operation(action: &PlannedAction, operation: &str) -> String {
+    match action.capability.as_str() {
+        "fs.write" | "fs.patch" | "fs.delete" => action.capability.clone(),
+        _ => match operation {
+            "delete" => "fs.delete".to_string(),
+            "patch" => "fs.patch".to_string(),
+            "create" | "write" | "rename" => "fs.write".to_string(),
+            _ => action.capability.clone(),
+        },
+    }
+}
+
+fn operation_tool_id(operation: &RequiredFileOperation) -> String {
+    if !operation.tool_id.trim().is_empty() {
+        return operation.tool_id.clone();
+    }
+    match operation.capability.as_str() {
+        "fs.write" | "fs.patch" | "fs.delete" => operation.capability.clone(),
+        _ => match operation.operation.as_str() {
+            "delete" => "fs.delete".to_string(),
+            "patch" => "fs.patch".to_string(),
+            "create" | "write" | "rename" => "fs.write".to_string(),
+            _ => operation.capability.clone(),
+        },
+    }
+}
+
+fn operation_args_template(operation: &RequiredFileOperation) -> Value {
+    match operation_tool_id(operation).as_str() {
+        "fs.delete" => serde_json::json!({
+            "path": operation.target_path,
+            "targetKind": if operation.target_resource_kind == "directory" { "directory" } else { "file" },
+            "targetResourceKind": if operation.target_resource_kind == "directory" { "directory" } else { "file" },
+            "recursive": operation.target_resource_kind == "directory" && operation.recursive
+        }),
+        "fs.patch" => serde_json::json!({
+            "path": operation.target_path,
+            "replacementBlockId": "<matching-codeBlocks.blockId>",
+            "patchSpec": "<required-patchSpec>"
+        }),
+        "fs.write" => serde_json::json!({
+            "path": operation.target_path,
+            "sourceBlockId": "<matching-codeBlocks.blockId>"
+        }),
+        tool_id => serde_json::json!({
+            "toolId": tool_id,
+            "path": operation.target_path
+        }),
+    }
+}
+
+fn tool_id_for_permission_bundle(capability: &str, _operation_ids: &[String]) -> String {
+    match capability {
+        "fs.write" | "fs.patch" | "fs.delete" => capability.to_string(),
+        "git.read" => "git.status".to_string(),
+        "git.write" => "git.stage".to_string(),
+        "git.push" => "git.push".to_string(),
+        "process.exec" => "process.exec".to_string(),
+        "network.egress" => "web.fetch".to_string(),
+        "browser.control" => "browser.open".to_string(),
+        "provider.egress" => "provider.call".to_string(),
+        _ => String::new(),
     }
 }
 
@@ -1364,12 +1456,29 @@ mod tests {
             .as_ref()
             .expect("kernel execution contract");
         assert_eq!(contract.operations.len(), 2);
+        assert!(contract.operations.iter().any(|operation| {
+            operation.id == "delete-generic"
+                && operation.tool_id == "fs.delete"
+                && operation.args_template.get("path").and_then(Value::as_str)
+                    == Some("generic-obsolete.tmp")
+                && operation
+                    .args_template
+                    .get("targetKind")
+                    .and_then(Value::as_str)
+                    == Some("file")
+                && operation
+                    .args_template
+                    .get("recursive")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+        }));
         assert_eq!(report.permission_bundles.len(), 2);
         assert_eq!(report.interventions.len(), 2);
         assert!(report
             .permission_bundles
             .iter()
             .any(|bundle| bundle.capability == "fs.delete"
+                && bundle.tool_id == "fs.delete"
                 && bundle.resource_kind == "workspaceFile"
                 && bundle.targets == vec!["generic-obsolete.tmp"]));
     }
@@ -1411,6 +1520,34 @@ mod tests {
 
         assert_eq!(report.status, PlanReviewStatus::AwaitingTemporaryGrant);
         assert_eq!(report.required_file_operations.len(), 1);
+        let contract = report
+            .execution_contract
+            .as_ref()
+            .expect("kernel execution contract");
+        let operation = contract
+            .operations
+            .iter()
+            .find(|operation| operation.id == "delete-generic-directory")
+            .expect("directory delete operation");
+        assert_eq!(operation.tool_id, "fs.delete");
+        assert_eq!(
+            operation.args_template.get("path").and_then(Value::as_str),
+            Some("generic-directory")
+        );
+        assert_eq!(
+            operation
+                .args_template
+                .get("targetKind")
+                .and_then(Value::as_str),
+            Some("directory")
+        );
+        assert_eq!(
+            operation
+                .args_template
+                .get("recursive")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         let operation = &report.required_file_operations[0];
         assert_eq!(operation.operation, "delete");
         assert_eq!(operation.capability, "fs.delete");
@@ -1423,10 +1560,6 @@ mod tests {
                 && bundle.resource_kind == "workspaceDirectory"
                 && bundle.targets == vec!["generic-directory"]
         }));
-        let contract = report
-            .execution_contract
-            .as_ref()
-            .expect("kernel execution contract");
         assert_eq!(contract.operations[0].target_resource_kind, "directory");
         assert!(contract.operations[0].recursive);
     }

@@ -26,6 +26,8 @@ import {
   type ActionBundleDraft,
   type ProposalEnvelope,
   type ResourceRequestDraft,
+  type ReviewExpectationDraft,
+  type ValidationExpectationDraft,
 } from '../agent-plan/types.js';
 import type {
   InitialContextPacket,
@@ -3957,13 +3959,13 @@ export class SessionDriverLoop {
       ts: this.ts(),
       id: this.id('accepted-plan-scope-confirmation'),
     });
-    state.phase = 'waiting_plan_review';
+    state.phase = 'waiting_permission';
     return this.append(state.sessionId, [
       confirmation,
       sessionRunStateEvent({
         sessionId: state.sessionId,
         runId: state.runId,
-        phase: 'waiting_plan_review',
+        phase: 'waiting_permission',
         reason: 'requirement',
         decisionOwner: {
           kind: 'requirement',
@@ -5648,7 +5650,8 @@ function sanitizedAcceptedPlanExecutionContext(acceptedPlan: AcceptedImplementat
   if (!acceptedPlan) return {};
   const completed = new Set(acceptedPlan.completedTaskIds);
   const currentTask = acceptedPlan.tasks.find((task) => !completed.has(task.taskId));
-  const currentTargets = [...new Set((currentTask?.targets ?? []).flatMap((target) => expandPlanTargetTokens(target))
+  const currentTargets = [...new Set((currentTask?.targets ?? [])
+    .flatMap((target) => expandAcceptedPlanTargetValue(target))
     .map((target) => normalizePlanScopeIdentity(target))
     .filter((target) => target && acceptedPlanTargetListSegmentSafe(target)))];
   const currentTaskOperations = acceptedPlan.exactOperationGrants.reduce<Record<string, unknown>[]>((items, grant) => {
@@ -5664,6 +5667,9 @@ function sanitizedAcceptedPlanExecutionContext(acceptedPlan: AcceptedImplementat
     });
     return items;
   }, []);
+  const currentTaskActionTemplates = currentTaskOperations
+    .map((operation) => acceptedPlanOperationActionTemplate(operation))
+    .filter((item): item is Record<string, unknown> => Boolean(item));
   return {
     planId: acceptedPlan.planId,
     title: acceptedPlan.title ?? acceptedPlan.summary ?? acceptedPlan.planId,
@@ -5678,8 +5684,60 @@ function sanitizedAcceptedPlanExecutionContext(acceptedPlan: AcceptedImplementat
     completedTaskCount: acceptedPlan.completedTaskIds.length,
     remainingTaskCount: acceptedPlan.tasks.filter((task) => !completed.has(task.taskId)).length,
     currentTaskOperations,
+    currentTaskActionTemplates,
     primaryRoot: acceptedPlan.executionRoot?.ref,
   };
+}
+
+function acceptedPlanOperationActionTemplate(operation: Record<string, unknown>): Record<string, unknown> | undefined {
+  const capability = stringValue(operation.capability);
+  const targetPath = stringValue(operation.targetPath);
+  if (!capability || !targetPath) return undefined;
+  if (capability === 'fs.delete') {
+    const targetResourceKind = stringValue(operation.targetResourceKind) === 'directory' ? 'directory' : 'file';
+    return {
+      toolId: 'fs.delete',
+      args: {
+        path: targetPath,
+        targetKind: targetResourceKind,
+        recursive: targetResourceKind === 'directory' || Boolean(operation.recursive),
+      },
+    };
+  }
+  if (capability === 'fs.write') {
+    return {
+      toolId: 'fs.write',
+      args: {
+        path: targetPath,
+        sourceBlockId: '<matching-codeBlocks.blockId>',
+      },
+    };
+  }
+  if (capability === 'fs.patch') {
+    return {
+      toolId: 'fs.patch',
+      args: {
+        path: targetPath,
+        replacementBlockId: '<matching-codeBlocks.blockId>',
+        patchSpec: {
+          match: {
+            kind: 'exactBlock',
+            text: '<copy-current-block-from-ResourceEvidence>',
+          },
+        },
+      },
+    };
+  }
+  if (capability === 'fs.rename') {
+    return {
+      toolId: 'fs.rename',
+      args: {
+        path: targetPath,
+        renameTo: '<new-relative-path-inside-current-task-scope>',
+      },
+    };
+  }
+  return undefined;
 }
 
 function lastAcceptedPlanTaskSavepointId(events: AgentEvent[]): string | undefined {
@@ -7122,10 +7180,10 @@ function expectationsHaveDescription(value: unknown): boolean {
   return value.some((item) => typeof objectRecord(item)?.description === 'string' && Boolean(String(objectRecord(item)?.description).trim()));
 }
 
-function defaultValidationExpectation(actions: Record<string, unknown>[]): Record<string, unknown> {
+function defaultValidationExpectation(actions: Record<string, unknown>[]): ValidationExpectationDraft {
   const targets = actions.map(actionFileTargetPath).filter((target): target is string => Boolean(target));
   const targetSummary = targets.slice(0, 8).join(', ');
-  return {
+  const expectation: ValidationExpectationDraft & Record<string, unknown> = {
     id: 'session-default-validation',
     messageKey: targets.length
       ? 'session.driver.defaultValidation.targets'
@@ -7135,12 +7193,13 @@ function defaultValidationExpectation(actions: Record<string, unknown>[]): Recor
       ? `Kernel facts must show the requested operation completed for: ${targetSummary}.`
       : 'Kernel facts must show the requested side-effect operation completed.',
   };
+  return expectation;
 }
 
-function defaultReviewExpectation(actions: Record<string, unknown>[]): Record<string, unknown> {
+function defaultReviewExpectation(actions: Record<string, unknown>[]): ReviewExpectationDraft {
   const targets = actions.map(actionFileTargetPath).filter((target): target is string => Boolean(target));
   const targetSummary = targets.slice(0, 8).join(', ');
-  return {
+  const expectation: ReviewExpectationDraft & Record<string, unknown> = {
     id: 'session-default-review',
     messageKey: targets.length
       ? 'session.driver.defaultReview.targets'
@@ -7150,6 +7209,7 @@ function defaultReviewExpectation(actions: Record<string, unknown>[]): Record<st
       ? `Review the Kernel facts and resulting workspace state for: ${targetSummary}.`
       : 'Review the Kernel facts and resulting workspace state for this action bundle.',
   };
+  return expectation;
 }
 
 function canonicalizeWriteActionSourceBlockRefs(proposal: ProposalEnvelope): void {
@@ -7334,16 +7394,10 @@ function validateProposalSemantics(proposal: ProposalEnvelope, options?: {
   const validationExpectations = Array.isArray(bundle.validationExpectations) ? bundle.validationExpectations : [];
   const reviewExpectations = Array.isArray(bundle.reviewExpectations) ? bundle.reviewExpectations : [];
   if (!validationExpectations.some((item) => item?.description?.trim())) {
-    throw new AgentPlanParseError(
-      'action_bundle_evidence_required',
-      'Side-effect actionBundle must include non-empty validationExpectations describing reviewable evidence.'
-    );
+    bundle.validationExpectations = [defaultValidationExpectation(bundle.actions as unknown as Record<string, unknown>[])];
   }
   if (!reviewExpectations.some((item) => item?.description?.trim())) {
-    throw new AgentPlanParseError(
-      'action_bundle_review_required',
-      'Side-effect actionBundle must include non-empty reviewExpectations describing user review obligations.'
-    );
+    bundle.reviewExpectations = [defaultReviewExpectation(bundle.actions as unknown as Record<string, unknown>[])];
   }
 }
 
@@ -8313,14 +8367,17 @@ function acceptedPlanTaskFileOperationTargets(record: Record<string, unknown>): 
 function expandAcceptedPlanTargetValue(value: string): string[] {
   const normalized = normalizePlanScope(value);
   if (!normalized) return [];
-  if (!normalized.includes(',')) return [normalized];
-  const parts = normalized
-    .split(',')
-    .map((part) => normalizePlanScope(part))
-    .filter(Boolean);
-  if (parts.length <= 1) return [normalized];
-  if (!parts.every(acceptedPlanTargetListSegmentSafe)) return [normalized];
-  return parts;
+  if (normalized.includes(',')) {
+    const parts = normalized
+      .split(',')
+      .map((part) => normalizePlanScope(part))
+      .filter(Boolean);
+    if (parts.length > 1 && parts.every(acceptedPlanTargetListSegmentSafe)) return parts;
+    const extracted = extractAcceptedPlanTargetTokens(normalized);
+    return extracted.length ? extracted : [normalized];
+  }
+  const extracted = extractAcceptedPlanTargetTokens(normalized);
+  return extracted.length ? extracted : [normalized];
 }
 
 function acceptedPlanTargetListSegmentSafe(value: string): boolean {
@@ -8328,8 +8385,48 @@ function acceptedPlanTargetListSegmentSafe(value: string): boolean {
   if (!normalized || normalized === '.' || normalized === '..' || normalized === '/') return false;
   if (normalized.includes(',') || normalized.includes('*')) return false;
   if (normalized.startsWith('../') || normalized.includes('/../')) return false;
+  if (/[\s()[\]{}<>（）【】]/.test(normalized)) return false;
   if (isAbsolutePath(normalized)) return normalized.replace(/\/+$/, '').length > 1;
   return true;
+}
+
+interface AcceptedPlanTargetToken {
+  value: string;
+  index: number;
+}
+
+function extractAcceptedPlanTargetTokens(target: string): string[] {
+  const tokens = acceptedPlanPathTokens(target);
+  if (!tokens.length) return [];
+  const hasFreeformBoundary = /[,;:()[\]{}<>（）【】]/.test(target) ||
+    Boolean(tokens[0]?.value.endsWith('/') && target.trim() !== tokens[0].value) ||
+    (tokens.length > 1 && tokens[0]?.value.endsWith('/'));
+  if (!hasFreeformBoundary) return [];
+  const first = tokens[0];
+  if (!first || first.index !== 0) return [];
+  const normalizedFirst = normalizePlanScope(first.value);
+  if (
+    normalizedFirst.endsWith('/') &&
+    tokens.slice(1).every((token) => !token.value.includes('/'))
+  ) {
+    return [normalizedFirst];
+  }
+  return uniqueStrings(tokens
+    .map((token) => normalizePlanScope(token.value))
+    .filter((token) => token && acceptedPlanTargetListSegmentSafe(token)));
+}
+
+function acceptedPlanPathTokens(value: string): AcceptedPlanTargetToken[] {
+  const tokens: AcceptedPlanTargetToken[] = [];
+  for (const match of value.matchAll(/[A-Za-z0-9_.\-/]+/g)) {
+    const token = match[0];
+    const index = match.index ?? -1;
+    if (!token || index < 0) continue;
+    if (token === '.' || token === '..') continue;
+    if (!token.includes('/') && !/\.[A-Za-z0-9]+$/.test(token)) continue;
+    tokens.push({ value: token, index });
+  }
+  return tokens;
 }
 
 function acceptedImplementationPlanContext(
@@ -11867,7 +11964,7 @@ function implementationPlanExecutionRequestText(
     'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
     'Handle only the task referenced by the current task cursor. One actionBundle may contain multiple related files or actions required by that current task; file count, task count, and codeBlock count are not permission boundaries.',
     'The task list is a Session-advanced queue in the order confirmed by the user. Do not generate or reason about cross-task scheduling structures. Do not write continuationExpectations for later tasks; Session advances later tasks with its cursor.',
-    'The nested actionBundle object must include version/id/goal/actions; goal is only this batch objective summary, not a permission grant, execution fact, or completion claim.',
+    'The nested actionBundle object must include version/id/goal/actions; goal is only this batch objective summary, not a permission grant, execution fact, or completion claim. Session can derive routine validationExpectations/reviewExpectations when they are omitted.',
     'actionBundle.actions must use actionId, toolId, args, and description; Kernel derives capability, permission, readSet/writeSet, and conflictKeys from toolId and args.',
     currentTask
       ? `Current task: taskId=${currentTask.taskId}; title=${currentTask.title ?? 'untitled'}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}.`
@@ -11881,12 +11978,13 @@ function implementationPlanExecutionRequestText(
     acceptedPlan.executionRoot
       ? `Primary root: ${acceptedPlan.executionRoot.ref}. Workspace args.path and codeBlocks.targetPath must be relative to this root; do not include the root directory name or ../. Absolute file paths are allowed only for outside-workspace targets already confirmed in the accepted plan.`
       : 'Workspace args.path and codeBlocks.targetPath must be relative to the workspace root. Absolute file paths are allowed only for outside-workspace targets already confirmed in the accepted plan. Do not use ../.',
+    'Use currentTaskActionTemplates from the sanitized context whenever present. They are Session-derived action shapes for the current accepted task; fill only ids, descriptions, sourceBlockId/replacementBlockId references, and codeBlocks as needed.',
     'If this actionBundle stays inside the accepted contract target/tool scope, Session will submit it to Kernel execution. New target/tool needs must return decisionRequest instead of implicit expansion.',
     'Execution batches must not carry workspace root, ".", module root, wildcards, accessScopes, resourceScope, or capability; the confirmed Kernel contract is the authorization source.',
-    'If an accepted task target is a directory such as src/, it is only a file grouping scope. Do not output directory-create actions, empty .gitkeep placeholder writes, or empty contentLines. Output concrete fs.write/fs.patch actions for files under that directory; Kernel creates parent directories for new file writes.',
+    'Directory targets are valid only for exact fs.delete directory operation templates. For writes and patches, output concrete file paths under the current task target; Kernel creates parent directories for new file writes.',
     'Do not re-ask already confirmed technical route, directory layout, Docker/script workflow, module split, or validation strategy.',
     'If a new target/tool is required, or a key technical choice is missing, return kind="decisionRequest" instead of an out-of-scope actionBundle.',
-    'This actionBundle must include concrete codeBlocks when needed and Kernel-reviewable validationExpectations/reviewExpectations. validationExpectations use [{id,description,command?}], and reviewExpectations use [{id,description}].',
+    'This actionBundle must include concrete codeBlocks when needed. You may include actionBundle.validationExpectations/reviewExpectations, but Session will add default reviewable notes for routine side effects when omitted.',
     'When modifying an existing file, first use resourceRequest kind="search" or a file/range read for the current anchor. patch action must include patchSpec.match.kind="exactBlock" and non-empty patchSpec.match.text copied from current ResourcePacket fileText/searchResults.',
     'When deleting a file or confirmed directory, output an fs.delete action: toolId="fs.delete", args.path is a concrete path inside the confirmed task scope. Workspace targets use relative paths; confirmed external targets may use absolute paths. Delete actions do not need and must not reference codeBlocks/sourceBlockId.',
     'Directory deletion is allowed only when the accepted contract exposed an exact directory operation/grant; set args.targetKind="directory" and args.recursive=true. Unconfirmed directories, wildcards, root directories, and empty paths cannot be fs.delete actions.',
@@ -12542,7 +12640,7 @@ function repairMessages(
         'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or payload wrapper fields.',
         'Output ONLY the single JSON object — no prose, no explanation, and no markdown ``` code fences before or after it.',
         'actionBundle.version must be exactly the string "1".',
-        'For a side-effect actionBundle, actionBundle.validationExpectations must be a non-empty array of { id, description }.',
+        'For a side-effect actionBundle, actionBundle.validationExpectations and actionBundle.reviewExpectations are optional; Session derives routine defaults when they are omitted or empty.',
         'Repair once from the compact context only; do not rely on omitted prompt text.',
       ].join('\n'),
     },
@@ -12567,7 +12665,7 @@ function protocolRepairShapeReference(errorCode: string): string {
     'Allowed proposal kinds: answer, resourceRequest, decisionRequest, taskPlan, actionBundle, diagnostic.',
     'reviewSummary is Session-generated and must not be returned by the provider.',
     'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered engineering queue, not a graph. Deprecated graph fields may be parsed for telemetry but are not required and must not be used for provider-facing scheduling. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.',
-    'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. Put validation notes in actionBundle.validationExpectations[] and review obligations in actionBundle.reviewExpectations[].',
+    'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
     'For kind="decisionRequest", put decisionRequest:{id,question,reason?,summary?,options:[{id,label,description,recommended?}],allowsFreeform?} on the top-level JSON object. Do not return bare reason/options without decisionRequest.',
     'codeBlocks[] uses {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}; contentLines is the only source-code carrier.',
     'fs.write actions use args={path,sourceBlockId}; sourceBlockId must match the blockId of the codeBlock carrying that exact file content.',
@@ -12597,7 +12695,7 @@ function actionBundleCompactionRepairMessages(
         'You are the DeepCode Agent Protocol v3 implementation batch repair step.',
         'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
         'If proposing executable work, return kind="actionBundle" for a coherent batch that fits the payload budget.',
-        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. Put validation notes in actionBundle.validationExpectations[] and review obligations in actionBundle.reviewExpectations[].',
+        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
         ...actionBundleProtocolShapeLines(),
         'Use codeBlocks[].contentLines for source code.',
         'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large/multiline codeBlocks.content strings.',
@@ -12677,7 +12775,7 @@ function sideEffectNativeToolRepairMessages(
         'Never claim that files were written, commands ran, permissions were granted, or validation passed.',
         'If returning decisionRequest, ask one concise question with 2-3 mutually exclusive options, exactly one recommended option, impact descriptions, allowsFreeform=true, and user-visible text in the current user language.',
         'If returning taskPlan, put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints directly on the top-level JSON object. tasks[] must be ordered by practical development sequence; deprecated graph fields may be parsed for telemetry but are not required. taskPlan must not include source code, codeBlocks, actionBundle, commandBlocks, patches, or executable tool calls.',
-        'If returning actionBundle after acceptedTaskPlan, put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. Put validation notes in actionBundle.validationExpectations[] and review obligations in actionBundle.reviewExpectations[].',
+        'If returning actionBundle after acceptedTaskPlan, put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
         ...actionBundleProtocolShapeLines(),
         'Command plans use actionBundle.actions[] with toolId="process.exec" and typed args; do not output commandBlocks.',
         'Use codeBlocks[].contentLines for source code in Complete-stage actionBundle only. Do not output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, legacy implementationPlan, or large/multiline codeBlocks.content strings.',
@@ -12717,7 +12815,7 @@ function nativeToolDuplicateRepairMessages(
           ? 'A plan has already been accepted. If executable work is ready, return kind="actionBundle" within the accepted plan scope.'
           : 'If enough facts are available, return kind="answer"; otherwise return kind="resourceRequest" only for a different target/range or search query that adds new evidence.',
         'Never request fs.read or fs.list for any duplicate target/range listed below. Use the existing ResourcePacket facts.',
-        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. Put validation notes in actionBundle.validationExpectations[] and review obligations in actionBundle.reviewExpectations[].',
+        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
         ...actionBundleProtocolShapeLines(),
         'Use codeBlocks[].contentLines for source code.',
       ].join('\n'),
@@ -12804,7 +12902,7 @@ function planReviewRepairMessages(
         'Kernel PlanReview report:',
         fenced(clip(JSON.stringify(report, null, 2), 5_000)),
         'Repair requirement:',
-        fenced('For side-effect actions, include detailed structured Markdown userPlan. It must cover summary, changes, interfaces or affected surfaces, validation or test plan, and assumptions or constraints; headings may be localized to the user language. Include non-empty actionBundle.validationExpectations as [{id,description,command?}] and actionBundle.reviewExpectations as [{id,description}]. Each validation expectation must describe evidence Kernel or the user can inspect after execution. Use toolId+typed args only.'),
+        fenced('For side-effect actions, include detailed structured Markdown userPlan. It must cover summary, changes, interfaces or affected surfaces, validation or test plan, and assumptions or constraints; headings may be localized to the user language. actionBundle.validationExpectations/reviewExpectations are optional provider notes because Session derives routine defaults when omitted. Use toolId+typed args only.'),
       ].join('\n\n'),
     },
   ];
@@ -12878,7 +12976,7 @@ function acceptedPlanScopeRepairMessages(
         'If executable work is still valid, return kind="actionBundle" with one related implementation batch. Multiple related files are allowed when all targets are inside the accepted plan.',
         'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. Final workspace writes still come only from the complete actionBundle JSON.',
         'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
-        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. Put validation notes in actionBundle.validationExpectations[] and review obligations in actionBundle.reviewExpectations[].',
+        'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
         ...actionBundleProtocolShapeLines(),
         resourceRequestProtocolShapeLine(),
         'Use codeBlocks[].contentLines for source code.',
@@ -12902,7 +13000,7 @@ function acceptedPlanScopeRepairMessages(
         'Session validation reasons:',
         fenced(validation.reasons.map((reason) => `- ${reason}`).join('\n')),
         'Repair requirement:',
-        fenced('Return a corrected actionBundle within the accepted contract scope. Minimal patch shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"actionBundle","outputLanguage":"zh-CN","userPlanMarkdown":"# Plan\\n\\n## Summary\\n...","codeBlocks":[{"blockId":"block-1","targetPath":"relative/file.ext","contentLines":["replacement line"]}],"actionBundle":{"version":"1","id":"batch-id","goal":"...","actions":[{"actionId":"patch-file","toolId":"fs.patch","args":{"path":"relative/file.ext","replacementBlockId":"block-1","patchSpec":{"match":{"kind":"exactBlock","text":"..."}}},"description":"..."}],"validationExpectations":[{"id":"validation-1","description":"..."}],"reviewExpectations":[{"id":"review-1","description":"..."}]}}. Do not add accessScopes/resourceScope/capability/commandBlocks/payload wrapper. If current patch evidence is missing, return resourceRequest search/read first. Return decisionRequest only if scope expansion is truly required, and include option.effect so Session can resume the same task without re-planning.'),
+        fenced('Return a corrected actionBundle within the accepted current-task scope. Set outputLanguage from the current user language. Prefer currentTaskActionTemplates from the accepted task context when present. Minimal patch shape: {"schemaVersion":"deepcode.agent.protocol.v3","kind":"actionBundle","outputLanguage":"<current-user-language>","userPlanMarkdown":"# Plan\\n\\n## Summary\\n...","codeBlocks":[{"blockId":"block-1","targetPath":"relative/file.ext","contentLines":["replacement line"]}],"actionBundle":{"version":"1","id":"batch-id","goal":"...","actions":[{"actionId":"patch-file","toolId":"fs.patch","args":{"path":"relative/file.ext","replacementBlockId":"block-1","patchSpec":{"match":{"kind":"exactBlock","text":"..."}}},"description":"..."}]}}. Do not add accessScopes/resourceScope/capability/commandBlocks/payload wrapper. If current patch evidence is missing, return resourceRequest search/read first. Return decisionRequest only if scope expansion is truly required, and include option.effect so Session can resume the same task without re-planning.'),
       ].join('\n\n'),
     },
   ];

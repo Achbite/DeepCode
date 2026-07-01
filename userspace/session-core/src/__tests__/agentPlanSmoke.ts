@@ -105,6 +105,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedImplementationPlanAllowsBriefExecutionBatchPlan();
   await assertSessionDriverLoopAcceptedImplementationPlanKeepsContinuationNonExecutable();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDeleteAction();
+  await assertSessionDriverLoopAcceptedImplementationPlanUsesDirectoryDeleteTemplate();
   await assertSessionDriverLoopAcceptedImplementationRejectsDeleteRootTarget();
   await assertSessionDriverLoopAcceptedImplementationPlanClassifiesDeleteCompileMismatch();
   await assertSessionDriverLoopAcceptedImplementationPlanClassifiesPatchEvidenceMismatch();
@@ -785,20 +786,30 @@ function assertActionBundleProtocolFields(): void {
     ...emptyExpectationRaw.actionBundle,
     validationExpectations: [''],
   };
-  assertThrows(() => parseProposalEnvelope({
+  const emptyExpectationProposal = parseProposalEnvelope({
     runId: 'run-empty-expectation',
     raw: emptyExpectationRaw,
-  }), 'string value must be non-empty');
+  });
+  assertEqual(
+    ((emptyExpectationProposal.payload as any).actionBundle.validationExpectations ?? []).length,
+    0,
+    'empty validationExpectation notes are ignored so Session can derive defaults'
+  );
 
   const missingDescriptionRaw = providerFacingWriteProposalWithoutMachineIds() as any;
   missingDescriptionRaw.actionBundle = {
     ...missingDescriptionRaw.actionBundle,
     reviewExpectations: [{ id: 'review-without-description' }],
   };
-  assertThrows(() => parseProposalEnvelope({
+  const missingDescriptionProposal = parseProposalEnvelope({
     runId: 'run-missing-expectation-description',
     raw: missingDescriptionRaw,
-  }), 'description must be a non-empty string');
+  });
+  assertEqual(
+    ((missingDescriptionProposal.payload as any).actionBundle.reviewExpectations ?? []).length,
+    0,
+    'expectation objects without descriptions are ignored so Session can derive defaults'
+  );
 
   const emptyContinuationRaw = providerFacingWriteProposalWithoutMachineIds() as any;
   emptyContinuationRaw.actionBundle = {
@@ -906,7 +917,7 @@ function assertPromptEnvelope(): void {
   assert(prompt.stablePrefix.includes('Do not output capability, permissionLabels, accessScopes, or resourceScope'), 'prompt forbids provider-declared permissions');
   assert(prompt.stablePrefix.includes('Do not add a generic payload wrapper'), 'prompt tells provider not to wrap proposals in payload');
   assert(prompt.stablePrefix.includes('actionBundle proposal top-level fields'), 'prompt documents actionBundle top-level fields');
-  assert(prompt.stablePrefix.includes('validationExpectations[] and reviewExpectations[] are the only provider-facing validation/review note carriers'), 'prompt teaches nested validation/review carriers');
+  assert(prompt.stablePrefix.includes('Session derives routine defaults when they are omitted'), 'prompt teaches Session-derived validation/review defaults');
   assert(!prompt.stablePrefix.includes('expectedValidation'), 'prompt no longer teaches expectedValidation to providers');
   assert(!prompt.stablePrefix.includes('reviewGuide'), 'prompt no longer teaches reviewGuide to providers');
   assert(prompt.stablePrefix.includes('tasks[] is a Session-advanced ordered implementation queue'), 'prompt treats taskPlan as an ordered queue');
@@ -6449,6 +6460,101 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
   assert(Boolean(preflight), 'delete preflight trace is archived before Kernel actionBatchSubmit');
 }
 
+async function assertSessionDriverLoopAcceptedImplementationPlanUsesDirectoryDeleteTemplate(): Promise<void> {
+  const token = randomSmokeToken('dir-template');
+  const dirPath = `${token}/`;
+  const childNames = [`${randomSmokeToken('child')}.txt`, `${randomSmokeToken('child')}.hpp`];
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const events = [directoryDeleteAcceptedImplementationPlanCardEvent(sessionId, runId, dirPath, childNames)];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  let providerPrompt = '';
+  let submittedDeleteAction: Record<string, any> | undefined;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId, sessionId, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId,
+              sessionId,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        submittedDeleteAction = command.batch?.actionBundle?.actions?.[0];
+        return {
+          ok: true,
+          events: [
+            { kind: 'action_batch.accepted', runId, sessionId, batch: { planId: command.batch?.planId } },
+            {
+              kind: 'work_unit.completed',
+              runId,
+              sessionId,
+              workUnitId: 'work-unit-directory-delete',
+              actionId: submittedDeleteAction?.actionId,
+              output: { path: dirPath.replace(/\/+$/, '') },
+            },
+          ],
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      providerPrompt = request.messages.map((message) => message.content).join('\n');
+      const proposal = deleteActionBundleProposal(dirPath.replace(/\/+$/, '')) as any;
+      proposal.actionBundle.actions[0].args.targetKind = 'directory';
+      proposal.actionBundle.actions[0].args.recursive = true;
+      return jsonLlmResponse(proposal);
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId,
+    kind: 'plan',
+    decision: 'accept',
+    runId,
+    targetId: `impl-${dirPath.replace(/[^A-Za-z0-9_.-]+/g, '-')}`,
+    existingEvents: events,
+  });
+
+  assertEqual(proposalSubmits, 1, 'directory delete template batch reaches Kernel PlanReview');
+  assertEqual(actionBatchSubmits, 1, 'directory delete template batch executes without returning to Plan');
+  assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), false, 'directory delete template stays inside accepted scope');
+  assert(providerPrompt.includes('currentTaskActionTemplates'), 'accepted execution prompt exposes current task action templates');
+  assert(providerPrompt.includes('"targetKind": "directory"'), 'directory delete action template exposes directory target kind');
+  assert(providerPrompt.includes('"recursive": true'), 'directory delete action template exposes recursive delete intent');
+  for (const childName of childNames) {
+    assert(!providerPrompt.includes(`"${childName}"`), 'child filenames from human target annotation are not exposed as accepted targets');
+  }
+  assertEqual(submittedDeleteAction?.args?.targetKind, 'directory', 'submitted delete action keeps directory targetKind');
+  assertEqual(submittedDeleteAction?.args?.recursive, true, 'submitted delete action keeps recursive=true');
+}
+
 async function assertSessionDriverLoopAcceptedImplementationRejectsDeleteRootTarget(): Promise<void> {
   const events = [deleteAcceptedImplementationPlanCardEvent('session-accepted-plan-delete-root', 'run-accepted-plan-delete-root')];
   const session: AgentSession = {
@@ -7871,11 +7977,21 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
     result.events.some((event) =>
       event.kind === 'session_run_state' &&
       (event.payload as any)?.status === 'waiting' &&
+      (event.payload as any)?.phase === 'waiting_permission' &&
       (event.payload as any)?.reason === 'requirement' &&
       (event.payload as any)?.interactionOverlay === true
     ),
     true,
-    'out-of-scope batch records waiting requirement overlay session state'
+    'out-of-scope batch records waiting execution-scope overlay session state without returning to plan review'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.phase === 'waiting_plan_review' &&
+      (event.payload as any)?.reason === 'requirement'
+    ),
+    false,
+    'out-of-scope accepted execution does not enter plan-review waiting phase'
   );
 
   const resumed = await loop.resolveDecision({
@@ -10059,6 +10175,34 @@ function deleteAcceptedImplementationPlanCardEvent(sessionId: string, runId: str
       capability: 'fs.delete',
       acceptanceCriteria: ['Kernel records the delete work unit fact for the generic obsolete file.'],
       failureCriteria: ['Stop if the delete target is empty, root, absolute, or outside the accepted target scope.'],
+    },
+  ];
+  return event;
+}
+
+function directoryDeleteAcceptedImplementationPlanCardEvent(
+  sessionId: string,
+  runId: string,
+  dirPath: string,
+  childNames: string[]
+): AgentEvent {
+  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+  const payload = event.payload as any;
+  const planId = `impl-${dirPath.replace(/[^A-Za-z0-9_.-]+/g, '-')}`;
+  payload.planId = planId;
+  payload.implementationPlan.id = planId;
+  payload.implementationPlan.title = 'Generic directory delete implementation plan';
+  payload.implementationPlan.summary = 'Remove one accepted directory as a single current-task delete.';
+  payload.implementationPlan.tasks = [
+    {
+      taskId: `task-${dirPath.replace(/[^A-Za-z0-9_.-]+/g, '-')}`,
+      title: 'Delete accepted directory target',
+      target: [`${dirPath} (${childNames.join(', ')})`],
+      scope: 'The task target field intentionally combines one directory path with human-readable child examples.',
+      dependencies: [],
+      capability: 'fs.delete',
+      acceptanceCriteria: ['Kernel records a directory delete work unit fact for the accepted target.'],
+      failureCriteria: ['Stop if the delete target leaves the accepted directory target scope.'],
     },
   ];
   return event;

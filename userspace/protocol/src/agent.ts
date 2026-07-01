@@ -443,6 +443,11 @@ export interface AgentWorkspaceBinding {
 
 export interface PermissionRequest {
   id: string;
+  permissionBundleId?: string;
+  contractId?: string;
+  affectedOperationIds?: string[];
+  workUnitIds?: string[];
+  toolId?: string;
   toolName: string;
   riskLevel: 'low' | 'medium' | 'high' | 'critical';
   summary: string;

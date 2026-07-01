@@ -39,6 +39,39 @@ impl DeepCodeKernelRuntime {
                 let permission_id = event.payload.get("permissionId")?.as_str()?;
                 Some(deepcode_kernel_abi::PermissionRequestEnvelope {
                     id: permission_id.to_string(),
+                    permission_bundle_id: event
+                        .payload
+                        .get("permissionBundleId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    contract_id: event
+                        .payload
+                        .get("contractId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    affected_operation_ids: event
+                        .payload
+                        .get("affectedOperationIds")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    work_unit_ids: event
+                        .payload
+                        .get("workUnitIds")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    tool_id: event
+                        .payload
+                        .get("toolName")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     capability: event
                         .payload
                         .get("capability")
@@ -152,6 +185,34 @@ impl DeepCodeKernelRuntime {
                         session_id,
                         tool_name,
                         arguments,
+                        permission_bundle_id: event
+                            .payload
+                            .get("permissionBundleId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        contract_id: event
+                            .payload
+                            .get("contractId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        affected_operation_ids: event
+                            .payload
+                            .get("affectedOperationIds")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect(),
+                        work_unit_ids: event
+                            .payload
+                            .get("workUnitIds")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect(),
                         request_id: event
                             .payload
                             .get("requestId")
@@ -195,6 +256,7 @@ impl DeepCodeKernelRuntime {
                             .filter_map(Value::as_str)
                             .map(str::to_string)
                             .collect(),
+                        group_items: Vec::new(),
                     },
                 ))
             });
@@ -247,9 +309,30 @@ impl DeepCodeKernelRuntime {
                 .apply_event(&resolved_event, &resolved_phase);
         }
 
+        let group_item_context = pending
+            .group_items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "actionId": item.action_id.as_deref(),
+                    "planId": item.plan_id.as_deref(),
+                    "workUnitId": item.work_unit_id.as_deref(),
+                    "toolName": &item.tool_name,
+                    "operationKind": item.operation_kind.as_deref(),
+                    "readSet": &item.read_set,
+                    "writeSet": &item.write_set
+                })
+            })
+            .collect::<Vec<_>>();
         let work_unit_context = serde_json::json!({
             "actionId": pending.action_id.as_deref(),
             "planId": pending.plan_id.as_deref(),
+            "permissionBundleId": pending.permission_bundle_id.as_deref(),
+            "contractId": pending.contract_id.as_deref(),
+            "affectedOperationIds": &pending.affected_operation_ids,
+            "workUnitIds": &pending.work_unit_ids,
+            "groupItemCount": pending.group_items.len(),
+            "groupItems": group_item_context,
             "operationKind": pending.operation_kind.as_deref(),
             "readSet": &pending.read_set,
             "writeSet": &pending.write_set
@@ -268,69 +351,84 @@ impl DeepCodeKernelRuntime {
         )?;
 
         let mut events = vec![resolved_event];
-        let work_unit_request_id = pending
-            .request_id
-            .as_ref()
-            .map(|value| RequestId(value.clone()))
-            .unwrap_or_else(|| request_id.clone());
-
-        if let Some(work_unit_id) = pending.work_unit_id.clone() {
+        let group_items = pending_group_items(&permission_id, &pending);
+        if group_items.iter().any(|item| item.work_unit_id.is_some()) {
             match decision {
                 deepcode_kernel_abi::PermissionDecisionKind::Reject => {
-                    events.push(self.work_unit_blocked_event(
-                        &work_unit_request_id,
-                        &run_id,
-                        &session_id,
-                        &work_unit_id,
-                        "permission rejected by user",
-                    )?);
+                    for item in &group_items {
+                        let Some(work_unit_id) = item.work_unit_id.as_deref() else {
+                            continue;
+                        };
+                        let item_request_id = item
+                            .request_id
+                            .as_ref()
+                            .map(|value| RequestId(value.clone()))
+                            .unwrap_or_else(|| request_id.clone());
+                        events.push(self.work_unit_blocked_event(
+                            &item_request_id,
+                            &run_id,
+                            &session_id,
+                            work_unit_id,
+                            "permission rejected by user",
+                        )?);
+                    }
                 }
                 deepcode_kernel_abi::PermissionDecisionKind::Accept => {
-                    let tool_event = self.execute_bound_tool(
-                        &run_id,
-                        &session_id,
-                        permission_id.clone(),
-                        pending.tool_name.clone(),
-                        pending.arguments.clone(),
-                    )?;
-                    let tool_ok =
-                        matches!(&tool_event, KernelEvent::ToolCompleted { ok: true, .. });
-                    let tool_error = match &tool_event {
-                        KernelEvent::ToolCompleted {
-                            error: Some(error), ..
-                        } => Some(error.clone()),
-                        _ => None,
-                    };
-                    let tool_output = match &tool_event {
-                        KernelEvent::ToolCompleted { output, .. } => output.clone(),
-                        _ => None,
-                    };
-                    events.push(tool_event);
-                    if tool_ok {
-                        events.push(self.work_unit_completed_event(
-                            &work_unit_request_id,
+                    for item in &group_items {
+                        let Some(work_unit_id) = item.work_unit_id.as_deref() else {
+                            continue;
+                        };
+                        let item_request_id = item
+                            .request_id
+                            .as_ref()
+                            .map(|value| RequestId(value.clone()))
+                            .unwrap_or_else(|| request_id.clone());
+                        let tool_event = self.execute_bound_tool(
                             &run_id,
                             &session_id,
-                            &work_unit_id,
-                            tool_output,
-                        )?);
-                    } else {
-                        let error = tool_error.unwrap_or_else(|| KernelErrorEnvelope {
-                            code: "tool_execution_failed".to_string(),
-                            message: format!(
-                                "{} did not produce a successful tool result",
-                                pending.tool_name
-                            ),
-                            message_key: None,
-                            args: None,
-                        });
-                        events.push(self.work_unit_failed_envelope_event(
-                            &work_unit_request_id,
-                            &run_id,
-                            &session_id,
-                            &work_unit_id,
-                            error,
-                        )?);
+                            item.tool_call_id.clone(),
+                            item.tool_name.clone(),
+                            item.arguments.clone(),
+                        )?;
+                        let tool_ok =
+                            matches!(&tool_event, KernelEvent::ToolCompleted { ok: true, .. });
+                        let tool_error = match &tool_event {
+                            KernelEvent::ToolCompleted {
+                                error: Some(error), ..
+                            } => Some(error.clone()),
+                            _ => None,
+                        };
+                        let tool_output = match &tool_event {
+                            KernelEvent::ToolCompleted { output, .. } => output.clone(),
+                            _ => None,
+                        };
+                        events.push(tool_event);
+                        if tool_ok {
+                            events.push(self.work_unit_completed_event(
+                                &item_request_id,
+                                &run_id,
+                                &session_id,
+                                work_unit_id,
+                                tool_output,
+                            )?);
+                        } else {
+                            let error = tool_error.unwrap_or_else(|| KernelErrorEnvelope {
+                                code: "tool_execution_failed".to_string(),
+                                message: format!(
+                                    "{} did not produce a successful tool result",
+                                    item.tool_name
+                                ),
+                                message_key: None,
+                                args: None,
+                            });
+                            events.push(self.work_unit_failed_envelope_event(
+                                &item_request_id,
+                                &run_id,
+                                &session_id,
+                                work_unit_id,
+                                error,
+                            )?);
+                        }
                     }
                 }
             }
@@ -629,13 +727,52 @@ pub(crate) fn permission_envelope_from_pending(
     permission_id: &str,
     pending: &PendingKernelTool,
 ) -> deepcode_kernel_abi::PermissionRequestEnvelope {
+    let grouped_work_unit_ids = pending
+        .group_items
+        .iter()
+        .filter_map(|item| item.work_unit_id.clone())
+        .collect::<Vec<_>>();
     deepcode_kernel_abi::PermissionRequestEnvelope {
         id: permission_id.to_string(),
+        permission_bundle_id: pending.permission_bundle_id.clone(),
+        contract_id: pending.contract_id.clone(),
+        affected_operation_ids: pending.affected_operation_ids.clone(),
+        work_unit_ids: if pending.work_unit_ids.is_empty() {
+            if grouped_work_unit_ids.is_empty() {
+                pending.work_unit_id.iter().cloned().collect::<Vec<_>>()
+            } else {
+                grouped_work_unit_ids
+            }
+        } else {
+            pending.work_unit_ids.clone()
+        },
+        tool_id: Some(pending.tool_name.clone()),
         capability: capability_for_tool(&pending.tool_name).to_string(),
         risk_level: risk_for_tool(&pending.tool_name).to_string(),
         summary: format!("Allow {} to access workspace resources?", pending.tool_name),
         args_preview: redact_tool_arguments(&pending.tool_name, &pending.arguments),
     }
+}
+
+fn pending_group_items(
+    permission_id: &str,
+    pending: &PendingKernelTool,
+) -> Vec<PendingKernelToolItem> {
+    if !pending.group_items.is_empty() {
+        return pending.group_items.clone();
+    }
+    vec![PendingKernelToolItem {
+        tool_call_id: permission_id.to_string(),
+        tool_name: pending.tool_name.clone(),
+        arguments: pending.arguments.clone(),
+        request_id: pending.request_id.clone(),
+        work_unit_id: pending.work_unit_id.clone(),
+        action_id: pending.action_id.clone(),
+        plan_id: pending.plan_id.clone(),
+        operation_kind: pending.operation_kind.clone(),
+        read_set: pending.read_set.clone(),
+        write_set: pending.write_set.clone(),
+    }]
 }
 
 fn argument_resource_matches(tool_name: &str, arguments: &Value, path: &str) -> bool {
