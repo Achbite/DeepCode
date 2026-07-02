@@ -45,13 +45,15 @@ export class ExecutionPromptCoordinator<TPlan> {
     if (!Array.isArray(payload.codeBlocks)) {
       payload.codeBlocks = [];
     }
+    const envelope = proposal as unknown as Record<string, unknown>;
     const existingUserPlan = this.ports.stringValue(payload.userPlan) ?? this.ports.stringValue(payload.userPlanMarkdown);
+    const outputLanguage = this.ports.stringValue(payload.outputLanguage) ?? this.ports.stringValue(envelope.outputLanguage);
     if (!this.ports.isDetailedUserPlanMarkdown(existingUserPlan)) {
       const generatedUserPlan = this.ports.defaultActionBundleUserPlanMarkdown({
         goal: this.ports.stringValue(bundle.goal),
         actions,
         existingUserPlan,
-        outputLanguage: this.ports.stringValue(payload.outputLanguage),
+        outputLanguage,
       });
       payload.userPlan = generatedUserPlan;
       payload.userPlanMarkdown = generatedUserPlan;

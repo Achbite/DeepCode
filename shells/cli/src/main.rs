@@ -6,11 +6,12 @@ use deepcode_kernel_client::{
 use serde_json::Value;
 use std::env;
 use std::io::{self, IsTerminal, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const EXIT_DAEMON_UNAVAILABLE: i32 = 3;
 const EXIT_BAD_ARGS: i32 = 4;
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CLI_RUN_TIMEOUT_ENV: &str = "DEEPCODE_CLI_RUN_TIMEOUT_MS";
 
 #[tokio::main]
 async fn main() {
@@ -440,6 +441,12 @@ struct SessionHostOptions {
     session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSessionDecision {
+    run_id: String,
+    target_id: Option<String>,
+}
+
 async fn run_interactive(
     client: HttpKernelClient,
     mut host: SessionHostOptions,
@@ -522,7 +529,7 @@ async fn ask(
     let mut request = StartAgentRunRequest::ask(prompt);
     request.workspace_path = workspace_path_for_host(&host);
     request.no_workspace = Some(host.no_workspace);
-    let result = start_and_wait_for_run(client, &session_id, request).await?;
+    let result = start_and_wait_for_run(client, &session_id, request, !plain).await?;
     if plain {
         let mut text = result.run.final_text.clone().unwrap_or_default();
         if text.trim().is_empty() {
@@ -593,13 +600,44 @@ async fn resolve_session_decision(
             "no current session; pass --session <id> or create a session first".to_string()
         })?
     };
+    let mut resolved_run_id = run_id;
+    let mut resolved_target_id = target_id;
+    if resolved_run_id.is_none()
+        || (resolved_target_id.is_none() && matches!(kind.as_str(), "requirement" | "plan"))
+    {
+        let timeline = client
+            .agent_timeline(&session_id)
+            .await
+            .map_err(|error| format!("failed to read timeline for pending decision: {error}"))?;
+        let pending = find_pending_session_decision(&timeline, &kind, resolved_run_id.as_deref())
+            .ok_or_else(|| {
+                let run_hint = resolved_run_id
+                    .as_deref()
+                    .map(|value| format!(" for run {value}"))
+                    .unwrap_or_default();
+                format!(
+                    "no pending {kind} decision{run_hint} found in current session timeline; pass run-id and target-id explicitly"
+                )
+            })?;
+        if resolved_run_id.is_none() {
+            resolved_run_id = Some(pending.run_id);
+        }
+        if resolved_target_id.is_none() {
+            resolved_target_id = pending.target_id;
+        }
+        println!(
+            "decision target: {kind} run={} target={}",
+            resolved_run_id.as_deref().unwrap_or("-"),
+            resolved_target_id.as_deref().unwrap_or("-")
+        );
+    }
     let mut request = StartAgentRunRequest::resolve_decision(kind, decision);
-    request.run_id = run_id;
-    request.target_id = target_id;
+    request.run_id = resolved_run_id;
+    request.target_id = resolved_target_id;
     request.guidance = guidance;
     request.workspace_path = workspace_path_for_host(&host);
     request.no_workspace = Some(host.no_workspace);
-    let result = start_and_wait_for_run(client, &session_id, request).await?;
+    let result = start_and_wait_for_run(client, &session_id, request, true).await?;
     println!("session: {}", result.run.session_id);
     let timeline = client
         .agent_timeline(&result.run.session_id)
@@ -640,12 +678,31 @@ async fn start_and_wait_for_run(
     client: &HttpKernelClient,
     session_id: &str,
     request: StartAgentRunRequest,
+    show_progress: bool,
 ) -> Result<AgentRunResult, String> {
     let mut result = client
         .start_agent_run(session_id, request)
         .await
         .map_err(|error| format!("failed to start shared session run: {error}"))?;
+    let run_timeout = cli_run_timeout()?;
+    let run_started = Instant::now();
+    let mut last_progress_key = run_progress_key(&result.run);
+    let mut last_progress_emit = Instant::now();
+    if show_progress {
+        print_run_progress(&result.run);
+    }
     while !result.run.is_terminal() {
+        if let Some(limit) = run_timeout {
+            if run_started.elapsed() >= limit {
+                return Err(format!(
+                    "shared session run {} is still {} after {} ms; inspect it with `DeepCode-CLI timeline {}` or set {CLI_RUN_TIMEOUT_ENV}=0 to wait without a CLI-side timeout",
+                    result.run.run_id,
+                    result.run.status,
+                    limit.as_millis(),
+                    result.run.session_id
+                ));
+            }
+        }
         tokio::time::sleep(RUN_POLL_INTERVAL).await;
         let session_id = result.run.session_id.clone();
         let run_id = result.run.run_id.clone();
@@ -653,8 +710,55 @@ async fn start_and_wait_for_run(
             .get_agent_run(&session_id, &run_id)
             .await
             .map_err(|error| format!("failed to read shared session run: {error}"))?;
+        if show_progress {
+            let progress_key = run_progress_key(&result.run);
+            if progress_key != last_progress_key
+                || last_progress_emit.elapsed() >= Duration::from_secs(5)
+            {
+                print_run_progress(&result.run);
+                last_progress_key = progress_key;
+                last_progress_emit = Instant::now();
+            }
+        }
+    }
+    if show_progress && run_progress_key(&result.run) != last_progress_key {
+        print_run_progress(&result.run);
     }
     Ok(result)
+}
+
+fn cli_run_timeout() -> Result<Option<Duration>, String> {
+    let Ok(value) = env::var(CLI_RUN_TIMEOUT_ENV) else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Ok(None);
+    }
+    let millis = trimmed
+        .parse::<u64>()
+        .map_err(|_| format!("{CLI_RUN_TIMEOUT_ENV} must be a positive integer number of milliseconds, or 0 to disable"))?;
+    Ok(Some(Duration::from_millis(millis)))
+}
+
+fn run_progress_key(run: &deepcode_kernel_client::AgentRunStatus) -> String {
+    format!(
+        "{}|{}",
+        run.status,
+        run.message.as_deref().unwrap_or_default()
+    )
+}
+
+fn print_run_progress(run: &deepcode_kernel_client::AgentRunStatus) {
+    if let Some(message) = run
+        .message
+        .as_deref()
+        .filter(|message| !message.trim().is_empty())
+    {
+        println!("run: {} {} - {}", run.run_id, run.status, message);
+    } else {
+        println!("run: {} {}", run.run_id, run.status);
+    }
 }
 
 async fn current_session_id(
@@ -959,6 +1063,185 @@ fn render_timeline(timeline: &Value) {
     }
 }
 
+fn find_pending_session_decision(
+    timeline: &Value,
+    requested_kind: &str,
+    run_filter: Option<&str>,
+) -> Option<PendingSessionDecision> {
+    let events = timeline_events(timeline);
+    for event in events.iter().rev() {
+        let Some(kind) = event_kind(event) else {
+            continue;
+        };
+        let pending = match kind {
+            "plan_card" | "plan_review" if requested_kind == "plan" => {
+                pending_plan_from_event(event, &events)
+            }
+            "review_summary" if requested_kind == "review" => {
+                pending_review_from_event(event, &events)
+            }
+            "requirement_confirmation" if requested_kind == "requirement" => {
+                pending_requirement_from_event(event, &events)
+            }
+            _ => None,
+        };
+        if let Some(pending) = pending {
+            if run_filter.is_none_or(|run_id| pending.run_id == run_id) {
+                return Some(pending);
+            }
+        }
+    }
+    None
+}
+
+fn pending_plan_from_event(event: &Value, events: &[&Value]) -> Option<PendingSessionDecision> {
+    if payload_bool(event, "confirmable") != Some(true) {
+        return None;
+    }
+    let run_id = payload_string(event, "runId")?.to_string();
+    let plan_id = payload_string(event, "planId")?.to_string();
+    if has_terminal_plan_decision(events, &run_id, &plan_id) {
+        return None;
+    }
+    Some(PendingSessionDecision {
+        run_id,
+        target_id: Some(plan_id),
+    })
+}
+
+fn pending_review_from_event(event: &Value, events: &[&Value]) -> Option<PendingSessionDecision> {
+    if payload_bool(event, "confirmable") == Some(false) {
+        return None;
+    }
+    if payload_string(event, "status") != Some("waitingUserReview") {
+        return None;
+    }
+    let run_id = payload_string(event, "runId")?.to_string();
+    let review_id = payload_string(event, "reviewId");
+    let source_plan_id = payload_string(event, "sourcePlanId");
+    if has_terminal_review_decision(events, &run_id, review_id, source_plan_id) {
+        return None;
+    }
+    Some(PendingSessionDecision {
+        run_id,
+        target_id: review_id.or(source_plan_id).map(ToOwned::to_owned),
+    })
+}
+
+fn pending_requirement_from_event(
+    event: &Value,
+    events: &[&Value],
+) -> Option<PendingSessionDecision> {
+    if payload_bool(event, "confirmable") != Some(true) {
+        return None;
+    }
+    if payload_string(event, "status") != Some("waitingUserConfirmation") {
+        return None;
+    }
+    let run_id = payload_string(event, "runId")?.to_string();
+    let requirement_id = payload_string(event, "requirementId")?.to_string();
+    if has_terminal_requirement_decision(events, &run_id, &requirement_id) {
+        return None;
+    }
+    Some(PendingSessionDecision {
+        run_id,
+        target_id: Some(requirement_id),
+    })
+}
+
+fn timeline_events(timeline: &Value) -> Vec<&Value> {
+    let mut events = Vec::new();
+    if let Some(top_level_events) = timeline.get("events").and_then(Value::as_array) {
+        events.extend(top_level_events);
+    }
+    let Some(turns) = timeline.get("turns").and_then(Value::as_array) else {
+        return events;
+    };
+    for turn in turns {
+        if let Some(turn_events) = turn.get("events").and_then(Value::as_array) {
+            events.extend(turn_events);
+        }
+        let Some(blocks) = turn.get("blocks").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks {
+            if let Some(block_events) = block.get("events").and_then(Value::as_array) {
+                events.extend(block_events);
+            }
+        }
+    }
+    events
+}
+
+fn has_terminal_plan_decision(events: &[&Value], run_id: &str, plan_id: &str) -> bool {
+    events.iter().any(|event| {
+        event_kind(event) == Some("plan_review")
+            && is_terminal_status(payload_string(event, "status"))
+            && payload_string(event, "runId") == Some(run_id)
+            && payload_string(event, "planId") == Some(plan_id)
+    })
+}
+
+fn has_terminal_review_decision(
+    events: &[&Value],
+    run_id: &str,
+    review_id: Option<&str>,
+    source_plan_id: Option<&str>,
+) -> bool {
+    events.iter().any(|event| {
+        if event_kind(event) != Some("review_summary")
+            || !is_terminal_status(payload_string(event, "status"))
+            || payload_string(event, "runId") != Some(run_id)
+        {
+            return false;
+        }
+        match (review_id, source_plan_id) {
+            (Some(id), _) => payload_string(event, "reviewId") == Some(id),
+            (None, Some(id)) => payload_string(event, "sourcePlanId") == Some(id),
+            (None, None) => true,
+        }
+    })
+}
+
+fn has_terminal_requirement_decision(
+    events: &[&Value],
+    run_id: &str,
+    requirement_id: &str,
+) -> bool {
+    events.iter().any(|event| {
+        event_kind(event) == Some("requirement_decision")
+            && is_terminal_status(payload_string(event, "status"))
+            && payload_string(event, "runId") == Some(run_id)
+            && payload_string(event, "requirementId") == Some(requirement_id)
+    })
+}
+
+fn is_terminal_status(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("accepted" | "rejected" | "needsRevision" | "cancelled" | "failed")
+    )
+}
+
+fn event_kind(event: &Value) -> Option<&str> {
+    event.get("kind").and_then(Value::as_str)
+}
+
+fn event_payload(event: &Value) -> Option<&serde_json::Map<String, Value>> {
+    event.get("payload").and_then(Value::as_object)
+}
+
+fn payload_string<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
+    event_payload(event)?
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn payload_bool(event: &Value, key: &str) -> Option<bool> {
+    event_payload(event)?.get(key).and_then(Value::as_bool)
+}
+
 fn extract_final_text(timeline: &Value) -> Option<String> {
     let turns = timeline.get("turns").and_then(Value::as_array)?;
     for turn in turns.iter().rev() {
@@ -1034,10 +1317,12 @@ Environment:
   DEEPCODE_SESSION_BRIDGE=/path/to/hostBridge.js overrides daemon session-core lookup.
   DEEPCODE_NODE=/path/to/node overrides daemon internal Node runtime lookup.
   DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS controls daemon session run timeout. Defaults to 600000; 0 disables it.
+  DEEPCODE_CLI_RUN_TIMEOUT_MS stops CLI polling after the given milliseconds. Defaults to no CLI-side timeout; 0 disables it.
 
 Session Runtime:
   Ordinary input is submitted to daemon /api/agent/sessions/:id/runs.
   CLI only polls run status and renders shared timeline projection.
+  Decision run-id/target-id are optional when the current shared timeline has one pending matching decision.
   If the daemon session runtime is missing, run `pnpm --filter @deepcode/session-core build`
   or use a packaged distribution that includes session-core/dist, node_modules/@deepcode/protocol,
   and node/bin/node.
@@ -1066,7 +1351,7 @@ Sessions:
 
 Permissions and decisions:
   /decision ...         Resolve requirement/plan/review through the shared Session Runtime
-  decision plan accept  Confirm a pending plan
+  decision plan accept  Confirm the latest pending plan in the shared timeline projection
   decision plan revise  Submit review guidance for a pending plan
   decision plan reject  End a pending plan
   any text              Send a message through the shared Session Runtime
@@ -1085,7 +1370,132 @@ This shell uses the same daemon Session Runtime and Kernel permission settings a
     println!(
         "session run timeout: DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS, default 600000 ms, 0 disables"
     );
+    println!("cli wait timeout: DEEPCODE_CLI_RUN_TIMEOUT_MS, default unset, 0 disables");
     if !io::stdin().is_terminal() {
         println!("stdin is not a terminal; EOF exits immediately.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn timeline(events: Vec<Value>) -> Value {
+        json!({
+            "turns": [
+                {
+                    "blocks": [
+                        { "events": events }
+                    ]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn selects_latest_pending_plan_from_projection_events() {
+        let timeline = timeline(vec![
+            json!({
+                "kind": "plan_card",
+                "payload": { "confirmable": true, "runId": "run-a", "planId": "plan-a" }
+            }),
+            json!({
+                "kind": "plan_card",
+                "payload": { "confirmable": true, "runId": "run-b", "planId": "plan-b" }
+            }),
+        ]);
+
+        let pending = find_pending_session_decision(&timeline, "plan", None).unwrap();
+        assert_eq!(
+            pending,
+            PendingSessionDecision {
+                run_id: "run-b".to_string(),
+                target_id: Some("plan-b".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn selects_pending_plan_matching_explicit_run_filter() {
+        let timeline = timeline(vec![
+            json!({
+                "kind": "plan_card",
+                "payload": { "confirmable": true, "runId": "run-a", "planId": "plan-a" }
+            }),
+            json!({
+                "kind": "plan_card",
+                "payload": { "confirmable": true, "runId": "run-b", "planId": "plan-b" }
+            }),
+        ]);
+
+        let pending = find_pending_session_decision(&timeline, "plan", Some("run-a")).unwrap();
+        assert_eq!(
+            pending,
+            PendingSessionDecision {
+                run_id: "run-a".to_string(),
+                target_id: Some("plan-a".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_plan_consumed_by_terminal_plan_review() {
+        let timeline = timeline(vec![
+            json!({
+                "kind": "plan_card",
+                "payload": { "confirmable": true, "runId": "run-a", "planId": "plan-a" }
+            }),
+            json!({
+                "kind": "plan_review",
+                "payload": { "status": "accepted", "runId": "run-a", "planId": "plan-a" }
+            }),
+        ]);
+
+        assert!(find_pending_session_decision(&timeline, "plan", None).is_none());
+    }
+
+    #[test]
+    fn selects_pending_requirement_confirmation() {
+        let timeline = timeline(vec![json!({
+            "kind": "requirement_confirmation",
+            "payload": {
+                "confirmable": true,
+                "status": "waitingUserConfirmation",
+                "runId": "run-a",
+                "requirementId": "requirement-a"
+            }
+        })]);
+
+        let pending = find_pending_session_decision(&timeline, "requirement", None).unwrap();
+        assert_eq!(
+            pending,
+            PendingSessionDecision {
+                run_id: "run-a".to_string(),
+                target_id: Some("requirement-a".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn selects_pending_review_summary() {
+        let timeline = timeline(vec![json!({
+            "kind": "review_summary",
+            "payload": {
+                "status": "waitingUserReview",
+                "runId": "run-a",
+                "reviewId": "review-a",
+                "sourcePlanId": "plan-a"
+            }
+        })]);
+
+        let pending = find_pending_session_decision(&timeline, "review", None).unwrap();
+        assert_eq!(
+            pending,
+            PendingSessionDecision {
+                run_id: "run-a".to_string(),
+                target_id: Some("review-a".to_string()),
+            }
+        );
     }
 }

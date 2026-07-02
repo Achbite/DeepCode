@@ -39,6 +39,7 @@ import {
   type ResourceManifest,
   type TranscriptEntry,
 } from '../index.js';
+import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 
 async function main(): Promise<void> {
   assertV3Parser();
@@ -47,6 +48,7 @@ async function main(): Promise<void> {
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
   assertRunStateMachineTaskLedger();
+  assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
   assertSessionMemoryDocument();
   assertDeepSeekCacheStrategyDoesNotInjectRequestParameter();
@@ -106,6 +108,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedImplementationPlanAllowsBriefExecutionBatchPlan();
   await assertSessionDriverLoopAcceptedImplementationPlanKeepsContinuationNonExecutable();
   await assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDeleteAction();
+  await assertSessionDriverLoopAcceptedImplementationPlanCanonicalizesMultiDeleteBriefPlan();
   await assertSessionDriverLoopAcceptedImplementationPlanUsesDirectoryDeleteTemplate();
   await assertSessionDriverLoopAcceptedImplementationRejectsDeleteRootTarget();
   await assertSessionDriverLoopAcceptedImplementationPlanClassifiesDeleteCompileMismatch();
@@ -1055,6 +1058,43 @@ function assertRunStateMachineTaskLedger(): void {
   assertEqual(frame.cachePolicy.stablePrefixFrozen, true, 'accepted plan prompt frame freezes stable prefix policy');
   assertEqual(frame.cachePolicy.projectMemoryRefresh, 'afterReviewOrRunCompletion', 'project memory does not refresh during active execution');
   assert(frame.stableFrameHash.length > 0, 'accepted plan prompt frame records a stable hash');
+}
+
+function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {
+  const suffix = randomSmokeToken('grant-frame');
+  const taskId = `task-${suffix}`;
+  const targetPath = `${suffix}/generated-${randomSmokeToken('file')}.txt`;
+  const acceptedPlan: AcceptedImplementationPlanContext = {
+    planId: `plan-${suffix}`,
+    runId: `run-${suffix}`,
+    title: 'Grant-backed task',
+    summary: 'Task targets are intentionally empty; exact grants carry executable scope.',
+    tasks: [{
+      taskId,
+      title: 'Write grant-backed file',
+      targets: [],
+      dependencies: [],
+      conflictKeys: [],
+    }],
+    capabilities: [],
+    targetScopes: [],
+    exactOperationGrants: [{
+      operation: 'write',
+      targetPath,
+      targetResourceKind: 'file',
+      capability: 'fs.write',
+      sourceTaskId: taskId,
+      source: 'kernelPlanReview',
+    }],
+    accessScopes: [],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: {},
+  };
+  const registry = new AcceptedTaskRegistry(acceptedPlan);
+  const context = registry.currentTaskContext(registry.cursor([]));
+  assertEqual(context?.targets.includes(targetPath), true, 'current task context includes exact operation grant target when task targets are empty');
+  assertEqual(context?.capabilities.includes('fs.write'), true, 'current task context includes exact operation grant capability');
 }
 
 function assertSettingsCatalogBoundaries(): void {
@@ -6627,6 +6667,140 @@ async function assertSessionDriverLoopAcceptedImplementationPlanAutoExecutesDele
   assert(Boolean(preflight), 'delete preflight trace is archived before Kernel actionBatchSubmit');
 }
 
+async function assertSessionDriverLoopAcceptedImplementationPlanCanonicalizesMultiDeleteBriefPlan(): Promise<void> {
+  const token = randomSmokeToken('multi-delete');
+  const targets = [
+    `${token}-one.tmp`,
+    `${token}-two.tmp`,
+    `${token}-three.bin`,
+  ];
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const events = [multiDeleteAcceptedImplementationPlanCardEvent(sessionId, runId, token, targets)];
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let proposalSubmits = 0;
+  let actionBatchSubmits = 0;
+  let llmCalls = 0;
+  let submittedProposal: Record<string, any> | undefined;
+  let submittedBatch: Record<string, any> | undefined;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'proposalSubmit') {
+        proposalSubmits += 1;
+        submittedProposal = command.proposal;
+        return {
+          ok: true,
+          events: [
+            { kind: 'proposal.accepted', runId, sessionId, proposal: command.proposal },
+            {
+              kind: 'proposal.reviewed',
+              runId,
+              sessionId,
+              proposalId: command.proposal?.proposalId,
+              report: proposalReviewReport(command.proposal?.payload?.actionBundle ?? {}),
+            },
+          ],
+        };
+      }
+      if (command.kind === 'permissionGrantTemporary') return { ok: true, events: [] };
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        submittedBatch = command.batch;
+        return {
+          ok: true,
+          events: targets.flatMap((target, index) => [
+            {
+              kind: 'work_unit.queued',
+              runId,
+              sessionId,
+              workUnit: { id: `work-unit-${index}`, actionId: `delete-${index}`, status: 'queued', writeSet: [target] },
+            },
+            {
+              kind: 'work_unit.completed',
+              runId,
+              sessionId,
+              workUnitId: `work-unit-${index}`,
+              output: { path: target },
+            },
+          ]),
+        };
+      }
+      if (command.kind === 'reviewFactsGet') return { ok: true, events: [] };
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'actionBundle',
+        outputLanguage: 'en-US',
+        userPlan: 'Delete the accepted cleanup targets.',
+        codeBlocks: [],
+        actionBundle: {
+          version: '1',
+          id: `bundle-${token}`,
+          actions: targets.map((target, index) => ({
+            actionId: `delete-${index}`,
+            toolId: 'fs.delete',
+            args: { path: target },
+            description: `Delete accepted target ${index + 1}.`,
+          })),
+          validationExpectations: [],
+          reviewExpectations: [],
+        },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId,
+    kind: 'plan',
+    decision: 'accept',
+    runId,
+    targetId: `impl-${token}`,
+    existingEvents: events,
+  });
+
+  assertEqual(llmCalls, 1, 'brief multi-delete batch does not trigger provider protocol repair');
+  assertEqual(proposalSubmits, 1, 'canonicalized multi-delete proposal reaches Kernel PlanReview once');
+  assertEqual(actionBatchSubmits, 1, 'canonicalized multi-delete batch reaches Kernel action execution once');
+  assertEqual((submittedBatch?.actionBundle?.actions ?? []).length, targets.length, 'submitted batch preserves every delete action');
+  assert(
+    String((submittedProposal?.payload as any)?.userPlan ?? '').includes('## Key Changes'),
+    'Session expands brief multi-delete actionBundle userPlan before Kernel proposalSubmit'
+  );
+  assertEqual(
+    (((submittedProposal?.payload as any)?.actionBundle?.validationExpectations ?? []) as unknown[]).length > 0,
+    true,
+    'Session adds default validation expectations for brief multi-delete actionBundle'
+  );
+  assertEqual(
+    (((submittedProposal?.payload as any)?.actionBundle?.reviewExpectations ?? []) as unknown[]).length > 0,
+    true,
+    'Session adds default review expectations for brief multi-delete actionBundle'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      String((event.payload as any)?.content ?? (event.payload as any)?.summary ?? '').includes('Agent Protocol v3 修复')
+    ),
+    false,
+    'clear multi-delete actionBundle does not enter LLM protocol repair only to expand display markdown'
+  );
+}
+
 async function assertSessionDriverLoopAcceptedImplementationPlanUsesDirectoryDeleteTemplate(): Promise<void> {
   const token = randomSmokeToken('dir-template');
   const dirPath = `${token}/`;
@@ -8115,7 +8289,7 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
     },
     llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
-      return jsonLlmResponse(llmCalls <= 2 ? outOfScopeProposal : genericWriteProposal(false));
+      return jsonLlmResponse(llmCalls === 1 ? outOfScopeProposal : genericWriteProposal(false));
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + proposalSubmits + actionBatchSubmits + 1}`,
@@ -8172,6 +8346,7 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsOutOfScopeBat
     interventionLevel: 'medium',
   });
 
+  assertEqual(llmCalls, 2, 'out-of-scope accepted batch skips provider scope repair and resumes once after user decision');
   assertEqual(proposalSubmits, 1, 'accepted-plan scope decision resumes provider checkpoint and submits repaired batch');
   assertEqual(actionBatchSubmits, 1, 'accepted-plan scope decision continues to actionBatchSubmit after in-scope regeneration');
   assertEqual(
@@ -8233,16 +8408,16 @@ async function assertSessionDriverLoopAcceptedScopeRepairDecisionWaitsForPermiss
     interventionLevel: 'medium',
   });
 
-  assertEqual(llmCalls, 2, 'scope repair asks provider once after the out-of-scope batch');
-  const repairPrompt = llmPromptTexts[1] ?? '';
-  assert(repairPrompt.includes('<ProviderTurnContract schemaVersion="deepcode.session.provider-turn-contract.v1">'), 'scope repair prompt includes provider turn contract');
-  assert(repairPrompt.includes('turnMode: scopeIntervention'), 'scope repair prompt identifies scope intervention mode');
-  assert(repairPrompt.includes('kind: NextActionInstruction'), 'scope repair prompt includes a final next action instruction frame');
-  assert(!repairPrompt.includes('Invalid ProposalEnvelope:'), 'scope repair prompt does not inject a full invalid proposal envelope');
-  assert(repairPrompt.includes('Invalid proposal summary:'), 'scope repair prompt uses a compact invalid proposal summary');
+  assertEqual(llmCalls, 1, 'target out-of-scope accepted batch does not ask provider for scope repair');
   assertEqual(proposalSubmits, 0, 'scope repair decision does not submit out-of-scope work to Kernel PlanReview');
   assertEqual(actionBatchSubmits, 0, 'scope repair decision does not execute out-of-scope work');
   assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), true, 'valid scope repair decision projects to user intervention');
+  const confirmation = result.events.find((event) => event.kind === 'requirement_confirmation');
+  const decisionOptions = (((confirmation?.payload as any)?.decisionRequest?.options ?? []) as any[]);
+  assert(
+    decisionOptions.some((option) => option?.effect?.kind === 'expandCurrentTaskScope'),
+    'target out-of-scope decision offers an explicit current-task scope expansion'
+  );
   assertEqual(
     result.events.some((event) =>
       event.kind === 'session_run_state' &&
@@ -8326,7 +8501,7 @@ async function assertSessionDriverLoopAcceptedScopeRepairInvalidDecisionFallsBac
 
   const confirmation = result.events.find((event) => event.kind === 'requirement_confirmation');
   const confirmationPayload = confirmation?.payload as Record<string, any> | undefined;
-  assertEqual(llmCalls, 2, 'invalid scope repair decision is attempted once before deterministic fallback');
+  assertEqual(llmCalls, 1, 'target out-of-scope deterministic intervention bypasses invalid provider scope repair');
   assertEqual(proposalSubmits, 0, 'invalid scope repair fallback does not submit out-of-scope work to Kernel PlanReview');
   assertEqual(actionBatchSubmits, 0, 'invalid scope repair fallback does not execute out-of-scope work');
   assertEqual(Boolean(confirmation), true, 'invalid scope repair decision falls back to a legal user intervention');
@@ -10510,6 +10685,33 @@ function deleteAcceptedImplementationPlanCardEvent(sessionId: string, runId: str
       capability: 'fs.delete',
       acceptanceCriteria: ['Kernel records the delete work unit fact for the generic obsolete file.'],
       failureCriteria: ['Stop if the delete target is empty, root, absolute, or outside the accepted target scope.'],
+    },
+  ];
+  return event;
+}
+
+function multiDeleteAcceptedImplementationPlanCardEvent(
+  sessionId: string,
+  runId: string,
+  token: string,
+  targets: string[]
+): AgentEvent {
+  const event = acceptedImplementationPlanCardEvent(sessionId, runId);
+  const payload = event.payload as any;
+  payload.planId = `impl-${token}`;
+  payload.implementationPlan.id = `impl-${token}`;
+  payload.implementationPlan.title = 'Generic multi-delete implementation plan';
+  payload.implementationPlan.summary = 'Remove several accepted cleanup targets in one current task batch.';
+  payload.implementationPlan.tasks = [
+    {
+      taskId: `task-${token}`,
+      title: 'Delete accepted cleanup targets',
+      target: targets,
+      scope: 'Delete only the accepted cleanup targets listed by this task.',
+      dependencies: [],
+      capability: 'fs.delete',
+      acceptanceCriteria: ['Kernel records delete work unit facts for every accepted cleanup target.'],
+      failureCriteria: ['Stop if any delete action leaves the accepted target scope.'],
     },
   ];
   return event;

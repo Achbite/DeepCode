@@ -22,7 +22,10 @@ import { parseProposalEnvelope } from '../agent-plan/protocolV3.js';
 import { actionBundleProtocolShapeLines, actionBundleProtocolShapeReference, resourceRequestProtocolShapeLine } from '../agent-plan/protocolContract.js';
 import { stableHash } from '../cache/canonicalizer.js';
 import {
+  AcceptedPlanAdmission,
   AcceptedPlanProgressAggregator,
+  AcceptedPlanScopeIntervention,
+  AcceptedPlanScopeMatcher,
   AcceptedTaskRegistry,
   ExecutionPromptCoordinator,
   ReviewFactsAggregator,
@@ -30,6 +33,7 @@ import {
   type AcceptedImplementationPlanExecutionRoot,
   type AcceptedImplementationPlanTaskContext,
   type AcceptedPlanAccessScope,
+  type AcceptedPlanBatchValidationResult,
   type AcceptedPlanBatchProgress,
   type AcceptedPlanExactOperationGrant,
   type AcceptedPlanTargetScope,
@@ -238,11 +242,6 @@ interface StaticSyntaxReviewPacket {
     content: string;
     contentHash?: string;
   }>;
-}
-
-interface AcceptedPlanBatchValidationResult {
-  ok: boolean;
-  reasons: string[];
 }
 
 interface AcceptedPlanAccessScopeCanonicalizationResult {
@@ -3089,8 +3088,12 @@ export class SessionDriverLoop {
     const actionBundle = readActionBundle(proposal);
     if (!accepted || !actionBundle) return fallback;
 
-    const validation = validateAcceptedImplementationPlanActionBundle(accepted, proposal, state.resourcePackets);
+    const admission = acceptedPlanAdmission();
+    const validation = admission.validate(accepted, proposal, state.resourcePackets);
     if (!validation.ok) {
+      if (admission.needsDeterministicScopeIntervention(validation)) {
+        return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, validation);
+      }
       if (!state.acceptedPlanScopeRepairAttempted) {
         state.acceptedPlanScopeRepairAttempted = true;
         await this.append(state.sessionId, [
@@ -3587,7 +3590,13 @@ export class SessionDriverLoop {
     proposal: ProposalEnvelope,
     validation: AcceptedPlanBatchValidationResult
   ): Promise<AgentSessionResult> {
-    const decisionProposal = acceptedPlanOutOfScopeDecisionProposal(state, proposal, validation, this.id('accepted-plan-scope-decision'));
+    const decisionProposal = acceptedPlanScopeIntervention((prefix) => this.id(prefix)).createDecisionProposal({
+      runId: state.runId,
+      sessionId: state.sessionId,
+      userRequest: state.userRequest,
+      acceptedPlan: state.acceptedImplementationPlan,
+      currentTaskId: state.currentTaskContext?.taskId,
+    }, proposal, validation);
     const requirement = requirementRecordFromProposal(decisionProposal, input, state, this.ts());
     const interactionOverlay: InteractionOverlayContext = {
       parentRunId: state.runId,
@@ -4859,6 +4868,20 @@ function resourceManifestBuilder(): ResourceManifestBuilder {
   });
 }
 
+function acceptedPlanAdmission(): AcceptedPlanAdmission {
+  return new AcceptedPlanAdmission({
+    scopeMatcher: new AcceptedPlanScopeMatcher(),
+    fileOperationFreshnessReasons: fileOperationFreshnessValidationReasons,
+  });
+}
+
+function acceptedPlanScopeIntervention(createId: (prefix: string) => string): AcceptedPlanScopeIntervention {
+  return new AcceptedPlanScopeIntervention({
+    createId,
+    visibleLanguageForRequest,
+  });
+}
+
 function buildImplementationBatchContext(events: AgentEvent[]): ImplementationBatchContext {
   const recentPlanSummaries: string[] = [];
   const continuationSummaries: string[] = [];
@@ -4999,10 +5022,10 @@ function sanitizedAcceptedPlanExecutionContext(acceptedPlan: AcceptedImplementat
   if (!acceptedPlan) return {};
   const completed = new Set(acceptedPlan.completedTaskIds);
   const currentTask = acceptedPlan.tasks.find((task) => !completed.has(task.taskId));
-  const currentTargets = [...new Set((currentTask?.targets ?? [])
+  const taskTargets = (currentTask?.targets ?? [])
     .flatMap((target) => expandAcceptedPlanTargetValue(target))
     .map((target) => normalizePlanScopeIdentity(target))
-    .filter((target) => target && acceptedPlanTargetListSegmentSafe(target)))];
+    .filter((target) => target && acceptedPlanTargetListSegmentSafe(target));
   const currentTaskOperations = acceptedPlan.exactOperationGrants.reduce<Record<string, unknown>[]>((items, grant) => {
     if (currentTask?.taskId && grant.sourceTaskId && grant.sourceTaskId !== currentTask.taskId) return items;
     const targetPath = normalizePlanScopeIdentity(grant.targetRefPath ?? grant.targetPath);
@@ -5016,6 +5039,10 @@ function sanitizedAcceptedPlanExecutionContext(acceptedPlan: AcceptedImplementat
     });
     return items;
   }, []);
+  const operationTargets = currentTaskOperations
+    .map((operation) => stringValue(operation.targetPath))
+    .filter((target): target is string => Boolean(target && acceptedPlanTargetListSegmentSafe(target)));
+  const currentTargets = uniqueStrings([...taskTargets, ...operationTargets]);
   const currentTaskActionTemplates = currentTaskOperations
     .map((operation) => acceptedPlanOperationActionTemplate(operation))
     .filter((item): item is Record<string, unknown> => Boolean(item));
@@ -6823,8 +6850,20 @@ function validateProposalSemantics(proposal: ProposalEnvelope, options?: {
       throw new AgentPlanParseError('invalid_action_bundle', `codeBlocks[${index}].content must be a string.`);
     }
   }
-  const userPlan = typeof payload.userPlan === 'string' ? payload.userPlan.trim() : '';
+  let userPlan = typeof payload.userPlan === 'string' ? payload.userPlan.trim() : '';
   if (!options?.allowBriefActionBundleUserPlan) {
+    if (!isDetailedUserPlanMarkdown(userPlan)) {
+      const generatedUserPlan = defaultActionBundleUserPlanMarkdown({
+        goal: bundle.goal,
+        actions: bundle.actions as unknown as Record<string, unknown>[],
+        existingUserPlan: userPlan,
+        outputLanguage: stringValue(payload.outputLanguage)
+          ?? stringValue((proposal as unknown as Record<string, unknown>).outputLanguage),
+      });
+      payload.userPlan = generatedUserPlan;
+      payload.userPlanMarkdown = generatedUserPlan;
+      userPlan = generatedUserPlan.trim();
+    }
     validateDetailedUserPlan(userPlan);
   }
   const validationExpectations = Array.isArray(bundle.validationExpectations) ? bundle.validationExpectations : [];
@@ -8262,47 +8301,6 @@ function resourceNodeListContainsDirectoryPath(value: unknown, targetPath: strin
   return false;
 }
 
-function validateAcceptedImplementationPlanActionBundle(
-  accepted: AcceptedImplementationPlanContext,
-  proposal: ProposalEnvelope,
-  resourcePackets: ResourcePacket[] = []
-): AcceptedPlanBatchValidationResult {
-  const actionBundle = readActionBundle(proposal);
-  if (!actionBundle) return { ok: false, reasons: ['当前 provider 输出不包含 actionBundle，无法按已确认计划自动执行。'] };
-  const reasons: string[] = [];
-  const allowedCapabilities = canonicalAcceptedPlanCapabilities(accepted);
-  const hasCanonicalCapabilityContract = allowedCapabilities.size > 0;
-  const batchTargets = acceptedPlanProposalTargetScopes(proposal, accepted);
-  for (const target of batchTargets) {
-    const targetError = acceptedPlanRelativeTargetError(target, accepted);
-    if (targetError) reasons.push(targetError);
-  }
-  for (const action of actionBundle.actions ?? []) {
-    const capability = actionEffectiveCapability(action as unknown as Record<string, unknown>);
-    if (!acceptedPlanAutoExecutableCapability(capability)) {
-      reasons.push(`能力 ${capability || '[empty]'} 需要单独用户介入，不能在 accepted taskPlan 后自动执行。`);
-      continue;
-    }
-    if (hasCanonicalCapabilityContract && !acceptedPlanCapabilitySetAllows(allowedCapabilities, capability)) {
-      reasons.push(`能力 ${capability} 未出现在已确认 implementationPlan 的任务能力列表中。`);
-    }
-    const scopes = actionPlanTargetScopes(action, proposal)
-      .map((scope) => normalizeAcceptedPlanTargetScope(scope, accepted))
-      .filter(Boolean);
-    if (scopes.length === 0) {
-      reasons.push(`动作 ${action.id || action.title || '[unnamed]'} 缺少 target/resourceScope，不能证明其落在已确认计划范围内。`);
-      continue;
-    }
-    for (const scope of scopes) {
-      if (!scopeCoveredByAcceptedPlanForCapability(scope, capability, accepted)) {
-        reasons.push(`目标 ${scope} 超出已确认 implementationPlan 的 target 范围。`);
-      }
-    }
-  }
-  reasons.push(...fileOperationFreshnessValidationReasons(accepted, proposal, resourcePackets));
-  return { ok: reasons.length === 0, reasons: [...new Set(reasons)] };
-}
-
 function canonicalizeAcceptedPlanExecutionAccessScopes(
   accepted: AcceptedImplementationPlanContext,
   proposal: ProposalEnvelope
@@ -9267,84 +9265,6 @@ function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted
     : [];
   const acceptedCapabilities = new Set(accepted.capabilities);
   return gaps.filter((capability) => !planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
-}
-
-function acceptedPlanOutOfScopeDecisionProposal(
-  state: SessionDriverLoopRunState,
-  proposal: ProposalEnvelope,
-  validation: AcceptedPlanBatchValidationResult,
-  proposalId: string
-): ProposalEnvelope {
-  const language = visibleLanguageForRequest(state.userRequest);
-  const accepted = state.acceptedImplementationPlan;
-  const summary = language === 'en-US'
-    ? 'The next batch is outside the accepted implementation plan.'
-    : '下一批 actionBundle 超出已确认 implementationPlan 范围。';
-  const reasons = validation.reasons.length ? validation.reasons : [summary];
-  return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    proposalId,
-    runId: state.runId,
-    sessionId: state.sessionId,
-    source: 'system',
-    kind: 'decisionRequest',
-    payload: {
-      id: `accepted-plan-scope-${safeSegment(accepted?.planId ?? proposal.proposalId)}`,
-      decisionScope: 'acceptedPlanBatchOutOfScope',
-      acceptedPlanId: accepted?.planId,
-      sourceProposalId: proposal.proposalId,
-      parentRunId: state.runId,
-      parentPhase: 'executing_accepted_plan',
-      goal: summary,
-      summary: `${summary}\n${reasons.map((reason) => `- ${reason}`).join('\n')}`,
-      question: language === 'en-US'
-        ? 'How should DeepCode continue?'
-        : '接下来如何继续？',
-      options: language === 'en-US'
-        ? [
-          {
-            id: 'regenerate-in-scope',
-            label: 'Regenerate in scope',
-            description: 'Keep the accepted plan and ask the agent to output the next batch within its targets and capabilities.',
-            recommended: true,
-            effect: { kind: 'continueCurrentTask' },
-          },
-          {
-            id: 'revise-plan',
-            label: 'Revise plan scope',
-            description: 'Treat the new targets or capabilities as a plan revision before continuing.',
-            effect: { kind: 'replan', reason: 'revise accepted plan scope' },
-          },
-        ]
-        : [
-          {
-            id: 'regenerate-in-scope',
-            label: '重新生成合规批次',
-            description: '保持已确认计划不变，让 Agent 重新输出落在目标和能力范围内的下一批。',
-            recommended: true,
-            effect: { kind: 'continueCurrentTask' },
-          },
-          {
-            id: 'revise-plan',
-            label: '修订计划范围',
-            description: '把新增目标或能力作为计划修订先确认，再继续执行。',
-            effect: { kind: 'replan', reason: 'revise accepted plan scope' },
-          },
-        ],
-      allowsFreeform: true,
-      risks: reasons,
-      affectedAreas: uniqueStrings([
-        ...(accepted?.targetScopes ?? []),
-        ...((accepted?.exactOperationGrants ?? []).map((grant) => grant.targetPath)),
-      ]),
-      constraints: [
-        'Accepted taskPlan controls automatic batch execution scope.',
-        'Kernel permissions remain authoritative.',
-      ],
-    },
-    referencedResourcePacketRefs: [],
-    referencedEvidenceRefs: [],
-  };
 }
 
 function planReviewDecisionEvent(

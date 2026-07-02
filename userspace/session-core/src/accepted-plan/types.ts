@@ -100,3 +100,26 @@ export interface AcceptedPlanBatchProgress {
   completedTaskIds: string[];
   remainingTaskIds: string[];
 }
+
+export interface AcceptedPlanBatchValidationResult {
+  ok: boolean;
+  reasons: string[];
+  issues?: AcceptedPlanBatchValidationIssue[];
+}
+
+export interface AcceptedPlanBatchValidationIssue {
+  code:
+    | 'missingActionBundle'
+    | 'invalidTargetPath'
+    | 'capabilityRequiresDecision'
+    | 'capabilityOutOfScope'
+    | 'missingTarget'
+    | 'targetOutOfScope'
+    | 'freshEvidenceMissing';
+  message: string;
+  targetPath?: string;
+  capability?: string;
+  actionId?: string;
+  targetResourceKind?: 'file' | 'directory';
+  recursive?: boolean;
+}

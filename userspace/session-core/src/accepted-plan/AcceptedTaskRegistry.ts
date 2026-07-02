@@ -94,11 +94,16 @@ export class AcceptedTaskRegistry {
     if (!acceptedPlan || !cursor) return undefined;
     const task = acceptedPlan.tasks.find((item) => item.taskId === cursor.currentTaskId)
       ?? acceptedPlan.tasks.find((item) => !cursor.completedTaskIds.includes(item.taskId));
+    const currentTaskGrants = acceptedPlan.exactOperationGrants.filter((grant) =>
+      !grant.sourceTaskId || !task?.taskId || grant.sourceTaskId === task.taskId
+    );
     const targets = [...new Set([
       ...(task?.targets ?? []),
-    ].map((item) => item.trim()).filter(Boolean))];
+      ...currentTaskGrants.map((grant) => grant.targetPath),
+    ].map(normalizeTaskContextPath).filter(Boolean))];
     const capabilities = [...new Set([
       task?.capability,
+      ...currentTaskGrants.map((grant) => grant.capability),
     ].filter((item): item is string => Boolean(item && item.trim())))];
     const goalParts = [
       acceptedPlan.title ?? acceptedPlan.summary ?? acceptedPlan.planId,
@@ -131,4 +136,8 @@ export class AcceptedTaskRegistry {
       batchIndex: nextIndex >= 0 ? nextIndex + 1 : acceptedPlan.tasks.length + 1,
     };
   }
+}
+
+function normalizeTaskContextPath(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '');
 }
