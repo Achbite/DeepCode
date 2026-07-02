@@ -4033,7 +4033,7 @@ async function assertSessionDriverLoopRepairsOversizedActionBundle(): Promise<vo
 async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promise<void> {
   const events: AgentEvent[] = [];
   const submittedPlans: Array<Record<string, any>> = [];
-  const repairRequests: LlmChatRequest[] = [];
+  const retryRequests: LlmChatRequest[] = [];
   let llmCalls = 0;
   const session: AgentSession = {
     id: 'session-empty-repair',
@@ -4062,7 +4062,7 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
           },
         };
       }
-      repairRequests.push(request);
+      retryRequests.push(request);
       return jsonLlmResponse(genericTaskPlanProposal());
     },
     now: () => '2026-01-01T00:00:00.000Z',
@@ -4074,32 +4074,32 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
     content: 'Create a generic workspace change in reviewable batches.',
     requirementConfirmationMode: 'off',
   });
-  assertEqual(llmCalls, 2, 'empty planning response triggers one protocol repair');
+  assertEqual(llmCalls, 2, 'empty planning response triggers one provider retry');
   assertEqual(submittedPlans.length, 0, 'repaired empty planning response does not submit executable Kernel plan review');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired empty response renders a taskPlan card');
-  const repairPrompt = repairRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
+  assertEqual(retryRequests.length, 1, 'empty planning response retry asks provider once');
+  const retryPrompt = retryRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
   assert(
-    repairPrompt.includes('For initial side-effect work, output taskPlan'),
-    'empty planning response uses protocol repair rather than execution-batch compaction'
+    retryPrompt.includes('The previous provider turn returned no JSON proposal.'),
+    'empty planning response uses provider retry before protocol repair'
   );
   assert(
-    !repairPrompt.includes('requiredKind: actionBundle'),
-    'empty planning response repair must not force an actionBundle'
+    !retryPrompt.includes('requiredKind: actionBundle'),
+    'empty planning response retry must not force an actionBundle'
   );
   assert(
-    !repairPrompt.includes('actionBundle.actions[] are executable Kernel tool actions') &&
-      !repairPrompt.includes('Kernel catalog ids') &&
-      !repairPrompt.includes('fs.delete intent'),
-    'planning empty response repair must not expose execution tool schema'
+    !retryPrompt.includes('actionBundle.actions[] are executable Kernel tool actions') &&
+      !retryPrompt.includes('Kernel catalog ids') &&
+      !retryPrompt.includes('fs.delete intent'),
+    'planning empty response retry must not expose execution tool schema'
   );
   assertEqual(
     result.events.some((event) =>
       event.kind === 'workflow_stage' &&
-      (event.payload as any)?.stage === 'session.provider_status' &&
-      String((event.payload as any).summary ?? '').includes('Agent Protocol v3 修复')
+      String((event.payload as any)?.summary ?? '').includes('Agent Protocol v3 修复')
     ),
-    true,
-    'empty response protocol repair is visible as provider status, not model reasoning'
+    false,
+    'empty response retry should not enter protocol repair when retry succeeds'
   );
   assertEqual(
     result.events.some((event) =>

@@ -3,6 +3,8 @@ import type {
   LlmChatResult,
 } from '@deepcode/protocol';
 
+export { ProviderEmptyProposalRetry } from './ProviderEmptyProposalRetry.js';
+
 export interface NativeToolCallProposal {
   callId: string;
   index: number;

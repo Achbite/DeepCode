@@ -71,6 +71,7 @@ import type { PromptEnvelope } from '../prompt/types.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder, type ProviderRepairMessageState } from '../prompt/ProviderRepairMessageBuilder.js';
 import {
+  ProviderEmptyProposalRetry,
   ProviderPartFrameParser,
   ProviderToolCallBuffer,
   stripProviderPartFrames,
@@ -332,6 +333,7 @@ const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
 const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
 const providerRepairMessageBuilder = new ProviderRepairMessageBuilder(MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES);
 const acceptedPlanResourceResumePromptBuilder = new AcceptedPlanResourceResumePromptBuilder(providerRepairMessageBuilder);
+const providerEmptyProposalRetry = new ProviderEmptyProposalRetry();
 const DEFAULT_SUB_AGENT_NO_DELTA_TIMEOUT_MS = 45_000;
 const DEFAULT_SUB_AGENT_TOTAL_TIMEOUT_MS = 240_000;
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
@@ -2357,19 +2359,19 @@ export class SessionDriverLoop {
     let currentMessages = [...messages];
     for (let round = 0; ; round += 1) {
       const stage = round === 0 ? 'provider_call' : `provider_tool_resume_${round}`;
-      const turn = await this.llmTurn(input.profileId, state, stage, currentMessages, {
-        responseFormat: { type: 'json_object' },
-        tools: nativeProviderToolsForState(state),
-      });
-      const effectiveTurn = turn.toolCalls.length === 0 && !turn.content.trim()
-        ? await this.llmTurn(input.profileId, state, `${stage}_empty_retry`, [
-          ...currentMessages,
-          emptyProviderProposalRetryMessage(),
-        ], {
+      const effectiveTurn = await providerEmptyProposalRetry.runWithRetry({
+        profileId: input.profileId,
+        state,
+        stage,
+        messages: currentMessages,
+        options: {
           responseFormat: { type: 'json_object' },
           tools: nativeProviderToolsForState(state),
-        })
-        : turn;
+        },
+        runTurn: (profileId, runState, retryStage, retryMessages, options) =>
+          this.llmTurn(profileId, runState, retryStage, retryMessages, options),
+        isEmptyResponseError,
+      });
       if (effectiveTurn.toolCalls.length === 0) return effectiveTurn.content;
 
       const handled = await this.handleNativeToolCalls(input, state, prompt, effectiveTurn, round);
@@ -2397,17 +2399,18 @@ export class SessionDriverLoop {
     stage: string,
     messages: LlmChatRequest['messages']
   ): Promise<string | ProposalEnvelope> {
-    const turn = await this.llmTurn(input.profileId, state, stage, messages, {
-      responseFormat: { type: 'json_object' },
-    });
-    const effectiveTurn = turn.toolCalls.length === 0 && !turn.content.trim()
-      ? await this.llmTurn(input.profileId, state, `${stage}_empty_retry`, [
-        ...messages,
-        emptyProviderProposalRetryMessage(),
-      ], {
+    const effectiveTurn = await providerEmptyProposalRetry.runWithRetry({
+      profileId: input.profileId,
+      state,
+      stage,
+      messages,
+      options: {
         responseFormat: { type: 'json_object' },
-      })
-      : turn;
+      },
+      runTurn: (profileId, runState, retryStage, retryMessages, options) =>
+        this.llmTurn(profileId, runState, retryStage, retryMessages, options),
+      isEmptyResponseError,
+    });
     if (effectiveTurn.toolCalls.length === 0) return effectiveTurn.content;
 
     const firstToolCall = effectiveTurn.toolCalls[0];
@@ -4400,16 +4403,8 @@ export class SessionDriverLoop {
 const JSON_OBJECT_MODE_INSTRUCTION =
   'Return exactly one valid JSON object. Do not return markdown, prose outside JSON, or multiple JSON objects.';
 
-function emptyProviderProposalRetryMessage(): LlmChatRequest['messages'][number] {
-  return {
-    role: 'user',
-    content: [
-      'The previous provider turn returned no JSON proposal.',
-      'Use the already supplied user request, confirmed decisions, ResourcePacket/tool facts, and current task context.',
-      'Return exactly one valid Agent Protocol v3 JSON proposal now.',
-      'Do not explain the empty response. Do not restate protocol rules. Do not claim execution facts, permissions, validation, or task completion.',
-    ].join('\n'),
-  };
+function isEmptyResponseError(error: unknown): boolean {
+  return error instanceof SessionDriverLoopError && error.code === 'llm_empty_response';
 }
 
 function ensureJsonObjectModeMessages(
