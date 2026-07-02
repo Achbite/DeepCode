@@ -24,6 +24,7 @@ import { stableHash } from '../cache/canonicalizer.js';
 import {
   AcceptedPlanProgressAggregator,
   AcceptedTaskRegistry,
+  ExecutionPromptCoordinator,
   ReviewFactsAggregator,
   type AcceptedImplementationPlanContext,
   type AcceptedImplementationPlanExecutionRoot,
@@ -265,48 +266,6 @@ interface AcceptedPlanReadOnlyResourceCompletion {
   completedTaskIds: string[];
   remainingTaskIds: string[];
   coveredTargets: string[];
-}
-
-class ExecutionPromptCoordinator {
-  static ensureReviewableExpectations(proposal: ProposalEnvelope): void {
-    if (proposal.kind !== 'actionBundle') return;
-    const payload = objectRecord(proposal.payload);
-    const bundle = objectRecord(payload?.actionBundle);
-    if (!payload || !bundle) return;
-    const actions = Array.isArray(bundle.actions)
-      ? bundle.actions.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-      : [];
-    const sideEffectful = actions.some((action) => SIDE_EFFECT_CAPABILITIES.has(actionEffectiveCapability(action)));
-    if (!sideEffectful) return;
-    if (!Array.isArray(payload.codeBlocks)) {
-      payload.codeBlocks = [];
-    }
-    const existingUserPlan = stringValue(payload.userPlan) ?? stringValue(payload.userPlanMarkdown);
-    if (!isDetailedUserPlanMarkdown(existingUserPlan)) {
-      const generatedUserPlan = defaultActionBundleUserPlanMarkdown({
-        goal: stringValue(bundle.goal),
-        actions,
-        existingUserPlan,
-        outputLanguage: stringValue(payload.outputLanguage),
-      });
-      payload.userPlan = generatedUserPlan;
-      payload.userPlanMarkdown = generatedUserPlan;
-    }
-    if (!expectationsHaveDescription(bundle.validationExpectations)) {
-      bundle.validationExpectations = [defaultValidationExpectation(actions)];
-    }
-    if (!expectationsHaveDescription(bundle.reviewExpectations)) {
-      bundle.reviewExpectations = [defaultReviewExpectation(actions)];
-    }
-  }
-
-  static executionRequest(
-    plan: SessionPlanContext,
-    acceptedPlan: AcceptedImplementationPlanContext,
-    guidance?: string
-  ): string {
-    return implementationPlanExecutionRequestText(plan, acceptedPlan, guidance);
-  }
 }
 
 type SessionRunStateStatus = 'waiting' | 'running' | 'completed' | 'cancelled' | 'failed';
@@ -6766,11 +6725,26 @@ function parseAndValidateProposal(input: {
 }): ProposalEnvelope {
   const proposal = parseProposalEnvelope(input);
   canonicalizeWriteActionSourceBlockRefs(proposal);
-  ExecutionPromptCoordinator.ensureReviewableExpectations(proposal);
+  executionPromptCoordinator().ensureReviewableExpectations(proposal);
   validateProposalSemantics(proposal, {
     allowBriefActionBundleUserPlan: input.allowBriefActionBundleUserPlan === true,
   });
   return proposal;
+}
+
+function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanContext> {
+  return new ExecutionPromptCoordinator<SessionPlanContext>({
+    sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
+    objectRecord,
+    stringValue,
+    actionEffectiveCapability,
+    isDetailedUserPlanMarkdown,
+    defaultActionBundleUserPlanMarkdown,
+    expectationsHaveDescription,
+    defaultValidationExpectation,
+    defaultReviewExpectation,
+    implementationPlanExecutionRequestText,
+  });
 }
 
 function expectationsHaveDescription(value: unknown): boolean {
@@ -11675,7 +11649,7 @@ function implementationPlanExecutionRequest(
   acceptedPlan: AcceptedImplementationPlanContext,
   guidance?: string
 ): string {
-  return ExecutionPromptCoordinator.executionRequest(plan, acceptedPlan, guidance);
+  return executionPromptCoordinator().executionRequest(plan, acceptedPlan, guidance);
 }
 
 function implementationPlanExecutionRequestText(
