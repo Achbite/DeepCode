@@ -804,7 +804,7 @@ button {
   align-items: center;
   gap: 8px;
   border: 1px solid #ebe3d7;
-  border-radius: 9px;
+  border-radius: 8px;
   background: #fffdf9;
   padding: 7px 9px;
   color: #202124;
@@ -1398,7 +1398,7 @@ button {
   display: block;
   box-sizing: border-box;
   border-color: transparent;
-  border-radius: 10px;
+  border-radius: 8px;
   background: transparent;
   color: var(--text);
   padding: 6px 0;
