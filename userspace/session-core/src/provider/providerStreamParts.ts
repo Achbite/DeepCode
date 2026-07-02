@@ -4,6 +4,11 @@ import type {
 } from '@deepcode/protocol';
 
 export { ProviderEmptyProposalRetry } from './ProviderEmptyProposalRetry.js';
+export {
+  NativeToolCoordinator,
+  type NativeToolReadLedgerEntry,
+  type NativeToolReadSignature,
+} from './NativeToolCoordinator.js';
 
 export interface NativeToolCallProposal {
   callId: string;

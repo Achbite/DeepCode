@@ -13,11 +13,7 @@ import type {
   LlmChatResult,
   ProjectionDelta,
   ToolCall,
-  ToolDefinition,
-  KernelToolCatalogSnapshot,
-  KernelToolCatalogTool,
 } from '@deepcode/protocol';
-import { listDefaultAgentTools } from '@deepcode/protocol';
 import { parseProposalEnvelope } from '../agent-plan/protocolV3.js';
 import { stableHash } from '../cache/canonicalizer.js';
 import {
@@ -53,7 +49,6 @@ import type {
   ConversationResourceRoot,
   ProjectWorkingDirectory,
   ResourceManifest,
-  ResourceManifestEntry,
   ResourcePacket,
   ResourcePacketItem,
 } from '../context/types.js';
@@ -71,10 +66,13 @@ import type { PromptEnvelope } from '../prompt/types.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder, type ProviderRepairMessageState } from '../prompt/ProviderRepairMessageBuilder.js';
 import {
+  NativeToolCoordinator,
   ProviderEmptyProposalRetry,
   ProviderPartFrameParser,
   ProviderToolCallBuffer,
   stripProviderPartFrames,
+  type NativeToolReadLedgerEntry,
+  type NativeToolReadSignature,
   type NativeToolCallProposal,
 } from '../provider/providerStreamParts.js';
 import {
@@ -294,22 +292,6 @@ interface ActiveTurnState {
   }>;
 }
 
-interface NativeToolReadSignature {
-  key: string;
-  toolName: string;
-  path: string;
-  rootId?: string;
-  offsetBytes?: number;
-  limitBytes?: number;
-}
-
-interface NativeToolReadLedgerEntry {
-  signature: NativeToolReadSignature;
-  packet: ResourcePacket;
-  contentHash: string;
-  repeatCount: number;
-}
-
 interface ProviderReasoningDeltaBuffer {
   pending: string;
   lastFlushAt: number;
@@ -334,6 +316,7 @@ const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
 const providerRepairMessageBuilder = new ProviderRepairMessageBuilder(MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES);
 const acceptedPlanResourceResumePromptBuilder = new AcceptedPlanResourceResumePromptBuilder(providerRepairMessageBuilder);
 const providerEmptyProposalRetry = new ProviderEmptyProposalRetry();
+const nativeToolCoordinator = new NativeToolCoordinator();
 const DEFAULT_SUB_AGENT_NO_DELTA_TIMEOUT_MS = 45_000;
 const DEFAULT_SUB_AGENT_TOTAL_TIMEOUT_MS = 240_000;
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
@@ -515,7 +498,7 @@ export class SessionDriverLoop {
           'actionBundle',
           'diagnostic',
         ], state),
-        capabilityCatalogSummary: capabilityCatalogSummaryForState(state),
+        capabilityCatalogSummary: nativeToolCoordinator.capabilityCatalogSummary(state),
         memoryDocument: state.memoryDocument,
         projectMemoryMode: input.projectMemoryMode,
         extraMemoryHints: [
@@ -1821,7 +1804,7 @@ export class SessionDriverLoop {
       contextAssemblyId: this.id('context-assembly'),
       workflowState: 'needDecisionRequest',
       allowedProposals: ['decisionRequest'],
-      capabilityCatalogSummary: capabilityCatalogSummaryForState(state),
+      capabilityCatalogSummary: nativeToolCoordinator.capabilityCatalogSummary(state),
       memoryDocument: state.memoryDocument,
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: state.memoryHints,
@@ -1891,7 +1874,7 @@ export class SessionDriverLoop {
       contextAssemblyId: this.id('context-assembly-guidance-revision'),
       workflowState: 'guidanceRevision',
       allowedProposals: ['answer'],
-      capabilityCatalogSummary: capabilityCatalogSummaryForState(state),
+      capabilityCatalogSummary: nativeToolCoordinator.capabilityCatalogSummary(state),
       memoryDocument: state.memoryDocument,
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: implementationBatchHints(state.implementationBatch),
@@ -2366,7 +2349,7 @@ export class SessionDriverLoop {
         messages: currentMessages,
         options: {
           responseFormat: { type: 'json_object' },
-          tools: nativeProviderToolsForState(state),
+          tools: nativeToolCoordinator.providerTools(state),
         },
         runTurn: (profileId, runState, retryStage, retryMessages, options) =>
           this.llmTurn(profileId, runState, retryStage, retryMessages, options),
@@ -2383,7 +2366,7 @@ export class SessionDriverLoop {
           role: 'assistant',
           content: effectiveTurn.content,
           reasoningContent: effectiveTurn.reasoning || undefined,
-          toolCalls: effectiveTurn.toolCalls.map(nativeToolCallToProtocol),
+          toolCalls: effectiveTurn.toolCalls.map((toolCall) => nativeToolCoordinator.callToProtocol(toolCall)),
         },
         ...handled.toolMessages,
       ];
@@ -2507,7 +2490,7 @@ export class SessionDriverLoop {
         },
       });
     }
-    const unsupportedOrSideEffect = turn.toolCalls.find((toolCall) => !canResolveNativeToolReadOnly(toolCall));
+    const unsupportedOrSideEffect = turn.toolCalls.find((toolCall) => !nativeToolCoordinator.canResolveReadOnly(toolCall));
     if (unsupportedOrSideEffect) {
       const repaired = await this.repairSideEffectNativeTool(input, state, prompt, unsupportedOrSideEffect, turn);
       return {
@@ -2518,7 +2501,7 @@ export class SessionDriverLoop {
 
     const repeatedReadCalls = turn.toolCalls
       .map((toolCall) => {
-        const signature = nativeToolReadSignature(toolCall);
+        const signature = nativeToolCoordinator.readSignature(toolCall);
         return { toolCall, signature, entry: state.nativeToolReadLedger.get(signature.key) };
       })
       .filter((item): item is { toolCall: NativeToolCallProposal; signature: NativeToolReadSignature; entry: NativeToolReadLedgerEntry } => Boolean(item.entry));
@@ -2538,7 +2521,7 @@ export class SessionDriverLoop {
 
     const toolMessages: LlmChatRequest['messages'] = [];
     for (const toolCall of turn.toolCalls) {
-      const signature = nativeToolReadSignature(toolCall);
+      const signature = nativeToolCoordinator.readSignature(toolCall);
       const existing = state.nativeToolReadLedger.get(signature.key);
       if (existing) {
         existing.repeatCount += 1;
@@ -2573,7 +2556,7 @@ export class SessionDriverLoop {
         toolMessages.push({
           role: 'tool',
           toolCallId: toolCall.callId,
-          content: clipJson(nativeToolDuplicateResult(toolCall, existing), NATIVE_TOOL_RESULT_MAX_CHARS),
+          content: clipJson(nativeToolCoordinator.duplicateResult(toolCall, existing), NATIVE_TOOL_RESULT_MAX_CHARS),
         });
         continue;
       }
@@ -2606,7 +2589,7 @@ export class SessionDriverLoop {
       state.nativeToolReadLedger.set(signature.key, {
         signature,
         packet,
-        contentHash: nativeToolPacketContentHash(packet),
+        contentHash: nativeToolCoordinator.packetContentHash(packet),
         repeatCount: 0,
       });
       state.resourcePackets.push(packet);
@@ -2634,7 +2617,7 @@ export class SessionDriverLoop {
       toolMessages.push({
         role: 'tool',
         toolCallId: toolCall.callId,
-        content: clipJson(nativeToolResultFromPacket(toolCall, packet), NATIVE_TOOL_RESULT_MAX_CHARS),
+        content: clipJson(nativeToolCoordinator.resultFromPacket(toolCall, packet), NATIVE_TOOL_RESULT_MAX_CHARS),
       });
     }
     return { kind: 'resume', toolMessages };
@@ -2644,7 +2627,7 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     toolCall: NativeToolCallProposal
   ): Promise<ResourcePacket> {
-    const manifest = nativeReadToolManifest(state, toolCall);
+    const manifest = nativeToolCoordinator.readManifest(state, toolCall);
     return this.resolveResources(state, manifest);
   }
 
@@ -4489,194 +4472,6 @@ function collectNativeToolCalls(
   return [...output.values()].sort((left, right) => left.index - right.index);
 }
 
-function nativeToolCallToProtocol(toolCall: NativeToolCallProposal): ToolCall {
-  return {
-    id: toolCall.callId,
-    name: toolCall.name,
-    arguments: toolCall.arguments,
-  };
-}
-
-function toolCatalogSnapshotForState(state: SessionDriverLoopRunState): KernelToolCatalogSnapshot | undefined {
-  return state.stateContract?.toolCatalogSnapshot ?? state.driverRequest?.stateContract?.toolCatalogSnapshot;
-}
-
-function capabilityCatalogSummaryForState(state: SessionDriverLoopRunState): string {
-  const snapshot = toolCatalogSnapshotForState(state);
-  if (snapshot?.tools?.length) {
-    const lines = snapshot.tools
-      .slice()
-      .sort((left, right) => left.toolId.localeCompare(right.toolId))
-      .map((tool) => {
-        const kind = tool.operationKind ? ` kind=${tool.operationKind}` : '';
-        return `- ${tool.toolId}: capability=${tool.capability}${kind} risk=${tool.risk} permission=${tool.permissionMode} pathScope=${tool.pathScopePolicy}`;
-      });
-    return [
-      `KernelToolCatalog ${snapshot.catalogVersion} hash=${snapshot.catalogHash}`,
-      ...lines,
-      'Use Kernel capabilities in actionBundle. Executor tool names are runtime facts, not permission grants.',
-    ].join('\n');
-  }
-  const capabilities = state.stateContract?.capabilityProjection ?? state.driverRequest?.stateContract?.capabilityProjection ?? [];
-  return capabilities.join('\n');
-}
-
-function providerToolDefinitionFromCatalogTool(
-  tool: KernelToolCatalogTool,
-  snapshot: KernelToolCatalogSnapshot
-): ToolDefinition {
-  return {
-    name: tool.toolId,
-    description: `Kernel tool ${tool.toolId} (${tool.capability}).`,
-    inputSchema: tool.providerSchema,
-    riskLevel: tool.risk === 'critical' ? 'critical' : tool.risk === 'high' ? 'high' : tool.risk === 'medium' ? 'medium' : 'low',
-    needsApproval: tool.permissionMode !== 'allow',
-    allowedModes: ['readOnly', 'plan', 'askBeforeWrite'],
-    capability: tool.capability,
-    family: tool.family,
-    operationKind: tool.operationKind,
-    permissionMode: tool.permissionMode,
-    pathScopePolicy: tool.pathScopePolicy,
-    executionMode: tool.executionMode,
-    readOnly: tool.readOnly,
-    catalogVersion: snapshot.catalogVersion,
-    catalogHash: snapshot.catalogHash,
-  };
-}
-
-function catalogProviderToolsForState(state: SessionDriverLoopRunState, names: Set<string>): ToolDefinition[] {
-  const snapshot = toolCatalogSnapshotForState(state);
-  if (!snapshot?.tools?.length) {
-    return listDefaultAgentTools('askBeforeWrite').filter((tool) => names.has(tool.name));
-  }
-  return snapshot.tools
-    .filter((tool) => names.has(tool.toolId))
-    .filter((tool) => tool.executionMode === 'execute')
-    .map((tool) => providerToolDefinitionFromCatalogTool(tool, snapshot));
-}
-
-function nativeProviderToolsForState(state: SessionDriverLoopRunState): ToolDefinition[] {
-  const allowed = state.stateContract?.allowedProposals ?? state.driverRequest?.stateContract?.allowedProposals ?? [];
-  const allowResources = allowed.length === 0 || allowed.includes('resourceRequest') || allowed.includes('answer');
-  const names = new Set<string>();
-  if (allowResources) {
-    names.add('fs.read');
-    names.add('fs.list');
-  }
-  if (names.size === 0) return [];
-  return catalogProviderToolsForState(state, names);
-}
-
-function canResolveNativeToolReadOnly(toolCall: NativeToolCallProposal): boolean {
-  return toolCall.name === 'fs.read' || toolCall.name === 'fs.list';
-}
-
-function nativeToolReadSignature(toolCall: NativeToolCallProposal): NativeToolReadSignature {
-  const path = stringValue(toolCall.arguments.path)
-    ?? stringValue(toolCall.arguments.resourceRef)
-    ?? '.';
-  const rootId = stringValue(toolCall.arguments.rootId);
-  const offsetBytes = normalizedNonNegativeInteger(toolCall.arguments.offsetBytes);
-  const limitBytes = normalizedPositiveInteger(toolCall.arguments.limitBytes);
-  const key = stableHash(JSON.stringify({
-    toolName: toolCall.name,
-    rootId: rootId ?? '',
-    path,
-    offsetBytes: typeof offsetBytes === 'number' ? offsetBytes : null,
-    limitBytes: typeof limitBytes === 'number' ? limitBytes : null,
-  }));
-  return {
-    key,
-    toolName: toolCall.name,
-    path,
-    ...(rootId ? { rootId } : {}),
-    ...(typeof offsetBytes === 'number' ? { offsetBytes } : {}),
-    ...(typeof limitBytes === 'number' ? { limitBytes } : {}),
-  };
-}
-
-function nativeReadToolManifest(
-  state: SessionDriverLoopRunState,
-  toolCall: NativeToolCallProposal
-): ResourceManifest {
-  const requestedPath = stringValue(toolCall.arguments.path)
-    ?? stringValue(toolCall.arguments.resourceRef)
-    ?? '.';
-  const itemId = `native-${sanitizeId(toolCall.callId)}`;
-  const kind: ResourceManifestEntry['kind'] = toolCall.name === 'fs.list' ? 'directory' : 'file';
-  const synthesized = resourceRequestResolver().synthesizeEntryForPath(
-    state.manifest,
-    state.conversationRoots,
-    itemId,
-    requestedPath,
-    stringValue(toolCall.arguments.rootId),
-    `Provider-native ${toolCall.name} request normalized by Session.`
-  );
-  const baseEntry: ResourceManifestEntry = synthesized.kind === 'entry'
-    ? { ...synthesized.entry, kind }
-    : {
-        id: itemId,
-        kind,
-        label: `${toolCall.name} ${requestedPath}`,
-        resourceRef: requestedPath,
-        readPolicy: 'autoRead',
-        reason: `Provider-native ${toolCall.name} request normalized by Session.`,
-      };
-  const offsetBytes = normalizedNonNegativeInteger(toolCall.arguments.offsetBytes);
-  const limitBytes = normalizedPositiveInteger(toolCall.arguments.limitBytes);
-  const entry: ResourceManifestEntry = {
-    ...baseEntry,
-    id: itemId,
-    ...(typeof offsetBytes === 'number' ? { offsetBytes } : {}),
-    ...(typeof limitBytes === 'number' ? { limitBytes } : {}),
-  };
-  return {
-    ...state.manifest,
-    id: `${state.manifest.id}-${itemId}`,
-    entries: [entry],
-  };
-}
-
-function nativeToolPacketContentHash(packet: ResourcePacket): string {
-  return stableHash(JSON.stringify(packet.items.map((item) => ({
-    status: item.status,
-    path: item.path,
-    absolutePath: item.absolutePath,
-    contentKind: item.contentKind,
-    promptContent: item.promptContent,
-    contentSummary: item.contentSummary,
-    truncated: item.truncated,
-    originalBytes: item.originalBytes,
-    returnedBytes: item.returnedBytes,
-    matches: item.matches,
-  }))));
-}
-
-function nativeToolResultFromPacket(
-  toolCall: NativeToolCallProposal,
-  packet: ResourcePacket
-): Record<string, unknown> {
-  return {
-    callId: toolCall.callId,
-    toolName: toolCall.name,
-    ok: packet.items.every((item) => item.status !== 'error' && item.status !== 'denied'),
-    packetId: packet.id,
-    items: packet.items.map((item) => ({
-      manifestEntryId: item.manifestEntryId,
-      status: item.status,
-      path: item.path,
-      absolutePath: item.absolutePath,
-      contentKind: item.contentKind,
-      contentSummary: item.contentSummary,
-      content: item.promptContent ? clip(item.promptContent, 9000) : undefined,
-      truncated: item.truncated,
-      originalBytes: item.originalBytes,
-      returnedBytes: item.returnedBytes,
-      denialReason: item.denialReason,
-    })),
-  };
-}
-
 function generatedArtifactEvidenceFromPackets(packets: ResourcePacket[]): Map<string, GeneratedArtifactEvidence> {
   const evidence = new Map<string, GeneratedArtifactEvidence>();
   for (const packet of packets) {
@@ -4888,20 +4683,6 @@ function generatedArtifactAbsolutePath(state: SessionDriverLoopRunState, targetP
   const root = state.conversationRoots.find((item) => item.primary) ?? state.conversationRoots[0];
   const base = root?.absolutePath ?? root?.displayPath;
   return base ? joinFsPath(base, targetPath) : undefined;
-}
-
-function nativeToolDuplicateResult(
-  toolCall: NativeToolCallProposal,
-  entry: NativeToolReadLedgerEntry
-): Record<string, unknown> {
-  return {
-    ...nativeToolResultFromPacket(toolCall, entry.packet),
-    duplicate: true,
-    duplicateOfPacketId: entry.packet.id,
-    duplicateContentHash: entry.contentHash,
-    duplicateCount: entry.repeatCount,
-    message: 'This exact read-only native tool target/range was already resolved in this provider checkpoint. Use the returned ResourcePacket facts and output a valid proposal instead of calling the same read tool again.',
-  };
 }
 
 function providerStageExposesAssistantDelta(stage: string): boolean {
