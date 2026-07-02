@@ -22,6 +22,21 @@ import { parseProposalEnvelope } from '../agent-plan/protocolV3.js';
 import { actionBundleProtocolShapeLines, actionBundleProtocolShapeReference, resourceRequestProtocolShapeLine } from '../agent-plan/protocolContract.js';
 import { stableHash } from '../cache/canonicalizer.js';
 import {
+  AcceptedPlanProgressAggregator,
+  AcceptedTaskRegistry,
+  ReviewFactsAggregator,
+  type AcceptedImplementationPlanContext,
+  type AcceptedImplementationPlanExecutionRoot,
+  type AcceptedImplementationPlanTaskContext,
+  type AcceptedPlanAccessScope,
+  type AcceptedPlanBatchProgress,
+  type AcceptedPlanExactOperationGrant,
+  type AcceptedPlanTargetScope,
+  type CurrentTaskContext,
+  type ExecutionSliceRole,
+  type TaskExecutionCursor,
+} from '../accepted-plan/index.js';
+import {
   AgentPlanParseError,
   type ActionBundleDraft,
   type ProposalEnvelope,
@@ -51,6 +66,12 @@ import {
 import type { PromptEnvelope } from '../prompt/types.js';
 import { renderProviderTurnContract, type ProviderTurnContract, type ProviderTurnMode } from '../prompt/providerTurnContract.js';
 import type { PromptPacketFrame } from '../prompt/promptPacket.js';
+import {
+  ProviderPartFrameParser,
+  ProviderToolCallBuffer,
+  stripProviderPartFrames,
+  type NativeToolCallProposal,
+} from '../provider/providerStreamParts.js';
 import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import {
@@ -207,67 +228,6 @@ interface ImplementationBatchContext {
   continuationSummaries: string[];
 }
 
-interface TaskExecutionCursor {
-  cursorId: string;
-  planId?: string;
-  currentTaskId?: string;
-  taskOrder: string[];
-  pendingTaskIds: string[];
-  completedTaskIds: string[];
-  lastResourcePacketIds: string[];
-  lastSavepointId?: string;
-}
-
-interface CurrentTaskContext {
-  goal: string;
-  taskId?: string;
-  nodeId?: string;
-  taskTitle?: string;
-  targets: string[];
-  capabilities: string[];
-  taskOrder: string[];
-  pendingTaskIds: string[];
-  dependsOn: string[];
-  evidenceNeeds: string[];
-  completedTaskIds: string[];
-}
-
-interface AcceptedImplementationPlanTaskContext {
-  taskId: string;
-  title?: string;
-  capability?: string;
-  targets: string[];
-  dependencies: string[];
-  conflictKeys: string[];
-  batchKind?: ExecutionSliceRole;
-  role?: ExecutionSliceRole;
-}
-
-interface AcceptedImplementationPlanExecutionRoot {
-  attachment: AgentContextAttachment;
-  ref: string;
-  source: 'projectWorkingDirectory' | 'workspaceBinding' | 'recentAttachment';
-}
-
-interface AcceptedImplementationPlanContext {
-  planId: string;
-  runId: string;
-  title?: string;
-  summary?: string;
-  tasks: AcceptedImplementationPlanTaskContext[];
-  capabilities: string[];
-  targetScopes: string[];
-  exactOperationGrants: AcceptedPlanExactOperationGrant[];
-  accessScopes: AcceptedPlanAccessScope[];
-  executionRoot?: AcceptedImplementationPlanExecutionRoot;
-  interventionLevel?: InterventionLevel;
-  batchIndex: number;
-  completedTaskIds: string[];
-  rawPlan: Record<string, unknown>;
-}
-
-type ExecutionSliceRole = 'sourceCode' | 'infra' | 'script' | 'test' | 'docs' | 'config' | 'review';
-
 interface StaticSyntaxReviewPacket {
   planId: string;
   files: Array<{
@@ -299,228 +259,12 @@ interface RemovedAcceptedPlanAccessScope {
   scope: unknown;
 }
 
-interface AcceptedPlanTargetScope {
-  raw: string;
-  normalized: string;
-}
-
-interface AcceptedPlanAccessScope {
-  scopeKind: string;
-  path: string;
-  capabilities: string[];
-  operations: string[];
-  reason?: string;
-  dependencyDepth?: number;
-  sourceTaskId?: string;
-  outsideWorkspace?: boolean;
-  source: 'kernelPlanReview' | 'implementationPlan';
-}
-
-interface AcceptedPlanExactOperationGrant {
-  operation: string;
-  targetPath: string;
-  targetRefPath?: string;
-  targetResourceKind?: 'file' | 'directory';
-  recursive?: boolean;
-  capability: string;
-  actionId?: string;
-  sourceTaskId?: string;
-  outsideWorkspace?: boolean;
-  source: 'kernelPlanReview' | 'implementationPlan';
-}
-
-interface AcceptedPlanBatchProgress {
-  actionIds: string[];
-  targetPaths: string[];
-  workUnitIds: string[];
-  newlyCompletedTaskIds: string[];
-  completedTaskIds: string[];
-  remainingTaskIds: string[];
-}
-
 interface AcceptedPlanReadOnlyResourceCompletion {
   taskId: string;
   newlyCompletedTaskIds: string[];
   completedTaskIds: string[];
   remainingTaskIds: string[];
   coveredTargets: string[];
-}
-
-class AcceptedTaskRegistry {
-  constructor(private readonly acceptedPlan: AcceptedImplementationPlanContext | undefined) {}
-
-  ledger(
-    failedTaskId?: string,
-    skippedTaskIds: string[] = [],
-    acceptedIncompleteTaskIds: string[] = []
-  ): TaskLedgerSnapshot | undefined {
-    const acceptedPlan = this.acceptedPlan;
-    if (!acceptedPlan) return undefined;
-    const completed = new Set(acceptedPlan.completedTaskIds);
-    const currentTask = acceptedPlan.tasks.find((task) =>
-      !completed.has(task.taskId) &&
-      task.taskId !== failedTaskId &&
-      !skippedTaskIds.includes(task.taskId) &&
-      !acceptedIncompleteTaskIds.includes(task.taskId)
-    );
-    return buildTaskLedgerSnapshot({
-      planId: acceptedPlan.planId,
-      runId: acceptedPlan.runId,
-      tasks: acceptedPlan.tasks.map((task) => ({
-        taskId: task.taskId,
-        title: task.title,
-        targets: task.targets,
-        capability: task.capability,
-      })),
-      completedTaskIds: acceptedPlan.completedTaskIds,
-      failedTaskId,
-      skippedTaskIds,
-      acceptedIncompleteTaskIds,
-      currentTaskId: currentTask?.taskId,
-    });
-  }
-
-  promptFrame(taskLedger?: TaskLedgerSnapshot): AcceptedPlanPromptFrame | undefined {
-    const acceptedPlan = this.acceptedPlan;
-    const ledger = taskLedger ?? this.ledger();
-    if (!acceptedPlan || !ledger) return undefined;
-    return buildAcceptedPlanPromptFrame({
-      planId: acceptedPlan.planId,
-      runId: acceptedPlan.runId,
-      title: acceptedPlan.title,
-      summary: acceptedPlan.summary,
-      taskLedger: ledger,
-    });
-  }
-
-  cursor(resourcePackets: ResourcePacket[], lastSavepointId?: string): TaskExecutionCursor | undefined {
-    const acceptedPlan = this.acceptedPlan;
-    if (!acceptedPlan) return undefined;
-    const ledger = this.ledger();
-    const completedTasks = new Set(acceptedPlan.completedTaskIds);
-    const currentTask = acceptedPlan.tasks.find((task) => !completedTasks.has(task.taskId))
-      ?? acceptedPlan.tasks[Math.max(0, acceptedPlan.batchIndex - 1)];
-    const lastResourcePacketIds = resourcePackets
-      .map((packet) => packet.id)
-      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
-      .slice(-6);
-    const cursorKey = [
-      acceptedPlan.planId,
-      currentTask?.taskId ?? 'none',
-      acceptedPlan.completedTaskIds.join(','),
-      lastResourcePacketIds.join(','),
-      lastSavepointId ?? '',
-    ].join('|');
-    return {
-      cursorId: `task-cursor-${stableHash(cursorKey).slice(0, 16)}`,
-      planId: acceptedPlan.planId,
-      currentTaskId: currentTask?.taskId,
-      taskOrder: ledger?.taskOrder ?? acceptedPlan.tasks.map((task) => task.taskId),
-      pendingTaskIds: ledger?.pendingTaskIds ?? [],
-      completedTaskIds: [...acceptedPlan.completedTaskIds],
-      lastResourcePacketIds,
-      lastSavepointId,
-    };
-  }
-
-  currentTaskContext(cursor: TaskExecutionCursor | undefined): CurrentTaskContext | undefined {
-    const acceptedPlan = this.acceptedPlan;
-    if (!acceptedPlan || !cursor) return undefined;
-    const task = acceptedPlan.tasks.find((item) => item.taskId === cursor.currentTaskId)
-      ?? acceptedPlan.tasks.find((item) => !cursor.completedTaskIds.includes(item.taskId));
-    const targets = [...new Set([
-      ...(task?.targets ?? []),
-    ].map((item) => item.trim()).filter(Boolean))];
-    const capabilities = [...new Set([
-      task?.capability,
-    ].filter((item): item is string => Boolean(item && item.trim())))];
-    const goalParts = [
-      acceptedPlan.title ?? acceptedPlan.summary ?? acceptedPlan.planId,
-      task ? `task=${task.taskId}${task.title ? ` ${task.title}` : ''}` : '',
-      targets.length ? `targets=${targets.join(', ')}` : '',
-    ].filter(Boolean);
-    return {
-      goal: goalParts.join(' | '),
-      taskId: task?.taskId,
-      nodeId: undefined,
-      taskTitle: task?.title,
-      targets,
-      capabilities,
-      taskOrder: cursor.taskOrder,
-      pendingTaskIds: cursor.pendingTaskIds,
-      dependsOn: [],
-      evidenceNeeds: [],
-      completedTaskIds: cursor.completedTaskIds,
-    };
-  }
-
-  withCompleted(completedTaskIds: string[]): AcceptedImplementationPlanContext | undefined {
-    const acceptedPlan = this.acceptedPlan;
-    if (!acceptedPlan) return undefined;
-    const completed = new Set(completedTaskIds);
-    const nextIndex = acceptedPlan.tasks.findIndex((task) => !completed.has(task.taskId));
-    return {
-      ...acceptedPlan,
-      completedTaskIds,
-      batchIndex: nextIndex >= 0 ? nextIndex + 1 : acceptedPlan.tasks.length + 1,
-    };
-  }
-}
-
-class AcceptedPlanProgressAggregator {
-  progress(
-    accepted: AcceptedImplementationPlanContext,
-    proposal: ProposalEnvelope,
-    kernelEvents: unknown[]
-  ): AcceptedPlanBatchProgress {
-    const actionBundle = readActionBundle(proposal);
-    const actions = actionBundle?.actions ?? [];
-    const actionIds = actions
-      .map((action) => {
-        const record = objectRecord(action) ?? {};
-        return stringValue(record.actionId) ?? stringValue(record.id) ?? stringValue(record.title);
-      })
-      .filter((item): item is string => Boolean(item));
-    const actionCapabilities = new Set(actions
-      .map((action) => actionEffectiveCapability(action as unknown as Record<string, unknown>))
-      .filter((item): item is string => Boolean(item)));
-    const targetPaths = [...new Set(acceptedPlanProposalTargetScopes(proposal, accepted)
-      .map((target) => target.normalized)
-      .filter((target) => target && target !== '.' && target !== '..'))];
-    const workUnitIds = workUnitIdsFromKernelEvents(kernelEvents);
-    const priorCompleted = new Set(accepted.completedTaskIds);
-    const coveredTaskIds = new Set<string>();
-    for (const task of accepted.tasks) {
-      if (!priorCompleted.has(task.taskId) && acceptedPlanTaskCoveredByBatch(task, targetPaths, actionCapabilities)) {
-        coveredTaskIds.add(task.taskId);
-      }
-    }
-    const newlyCompleted = new Set<string>();
-    for (const task of accepted.tasks) {
-      if (priorCompleted.has(task.taskId)) continue;
-      if (!coveredTaskIds.has(task.taskId)) break;
-      newlyCompleted.add(task.taskId);
-    }
-    if (!newlyCompleted.size && !actionBatchHasFailureOrBlocker(kernelEvents)) {
-      const currentTask = accepted.tasks[Math.max(0, accepted.batchIndex - 1)];
-      if (currentTask && !priorCompleted.has(currentTask.taskId)) {
-        newlyCompleted.add(currentTask.taskId);
-      }
-    }
-    const completedTaskIds = [...new Set([...accepted.completedTaskIds, ...newlyCompleted])];
-    const completed = new Set(completedTaskIds);
-    const remainingTaskIds = accepted.tasks
-      .map((task) => task.taskId)
-      .filter((taskId) => !completed.has(taskId));
-    return {
-      actionIds: [...new Set(actionIds)],
-      targetPaths,
-      workUnitIds,
-      newlyCompletedTaskIds: [...newlyCompleted],
-      completedTaskIds,
-      remainingTaskIds,
-    };
-  }
 }
 
 class ExecutionPromptCoordinator {
@@ -565,50 +309,6 @@ class ExecutionPromptCoordinator {
   }
 }
 
-class ReviewFactsAggregator {
-  static acceptedPlanKernelEvents(
-    events: AgentEvent[],
-    runId: string,
-    planId: string | undefined,
-    currentKernelEvents: unknown[]
-  ): unknown[] {
-    const output: unknown[] = [];
-    const seen = new Set<string>();
-    let startIndex = 0;
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      const event = events[index];
-      if (event.kind !== 'plan_review') continue;
-      const payload = objectRecord(event.payload) ?? {};
-      if (stringValue(payload.status) !== 'accepted') continue;
-      const payloadRunId = stringValue(payload.runId);
-      const payloadPlanId = stringValue(payload.planId);
-      if (payloadRunId && payloadRunId !== runId) continue;
-      if (planId && payloadPlanId && payloadPlanId !== planId) continue;
-      startIndex = index;
-      break;
-    }
-    const push = (event: unknown): void => {
-      const record = objectRecord(event);
-      if (!record) return;
-      const eventPlanId = stringValue(record.planId)
-        ?? stringValue(objectRecord(record.batch)?.planId)
-        ?? stringValue(objectRecord(record.facts)?.planId);
-      if (planId && eventPlanId && eventPlanId !== planId) return;
-      const key = stableHash(JSON.stringify(record));
-      if (seen.has(key)) return;
-      seen.add(key);
-      output.push(record);
-    };
-    for (const event of events.slice(startIndex)) {
-      const payload = objectRecord(event.payload);
-      const kernelEvent = objectRecord(payload?.kernelEvent);
-      if (kernelEvent) push(kernelEvent);
-    }
-    for (const event of currentKernelEvents) push(event);
-    return output;
-  }
-}
-
 type SessionRunStateStatus = 'waiting' | 'running' | 'completed' | 'cancelled' | 'failed';
 
 type SessionRunStateReason =
@@ -643,14 +343,6 @@ interface ActiveTurnState {
   }>;
 }
 
-interface NativeToolCallProposal {
-  callId: string;
-  index: number;
-  name: string;
-  arguments: Record<string, unknown>;
-  rawArguments?: string;
-}
-
 interface NativeToolReadSignature {
   key: string;
   toolName: string;
@@ -665,12 +357,6 @@ interface NativeToolReadLedgerEntry {
   packet: ResourcePacket;
   contentHash: string;
   repeatCount: number;
-}
-
-interface ProviderToolCallBufferItem {
-  callId?: string;
-  name?: string;
-  argumentsText: string;
 }
 
 interface ProviderReasoningDeltaBuffer {
@@ -4102,7 +3788,10 @@ export class SessionDriverLoop {
         },
       },
     };
-    const toolCallBuffer = new ProviderToolCallBuffer();
+    const toolCallBuffer = new ProviderToolCallBuffer({
+      parseArguments: parseNativeToolArguments,
+      normalizeToolName: normalizeProviderToolName,
+    });
     const reasoningBuffer: ProviderReasoningDeltaBuffer = {
       pending: '',
       lastFlushAt: Date.now(),
@@ -4708,103 +4397,6 @@ export class SessionDriverLoopError extends Error {
   ) {
     super(message);
     this.name = 'SessionDriverLoopError';
-  }
-}
-
-class ProviderPartFrameParser {
-  private buffer = '';
-
-  push(content: string): AgentStreamPartFrame[] {
-    this.buffer = `${this.buffer}${content}`;
-    if (this.buffer.length > 512 * 1024) {
-      this.buffer = this.buffer.slice(-256 * 1024);
-    }
-    return [
-      ...this.consumeNdjsonFrames(),
-      ...this.consumeTaggedFrames(),
-    ];
-  }
-
-  private consumeTaggedFrames(): AgentStreamPartFrame[] {
-    const frames: AgentStreamPartFrame[] = [];
-    const startTag = '<deepcode-part>';
-    const endTag = '</deepcode-part>';
-    while (true) {
-      const start = this.buffer.indexOf(startTag);
-      if (start < 0) {
-        if (this.buffer.length > startTag.length) {
-          this.buffer = this.buffer.slice(-(startTag.length - 1));
-        }
-        break;
-      }
-      const payloadStart = start + startTag.length;
-      const end = this.buffer.indexOf(endTag, payloadStart);
-      if (end < 0) {
-        if (start > 0) this.buffer = this.buffer.slice(start);
-        break;
-      }
-      const raw = this.buffer.slice(payloadStart, end);
-      this.buffer = this.buffer.slice(end + endTag.length);
-      const frame = parseProviderPartFrame(raw);
-      if (frame) frames.push(frame);
-    }
-    return frames;
-  }
-
-  private consumeNdjsonFrames(): AgentStreamPartFrame[] {
-    const frames: AgentStreamPartFrame[] = [];
-    while (true) {
-      const newline = this.buffer.indexOf('\n');
-      if (newline < 0) break;
-      const line = this.buffer.slice(0, newline).trim();
-      if (!line.includes('"deepcode.agent.stream.part.v1"')) break;
-      this.buffer = this.buffer.slice(newline + 1);
-      const frame = parseProviderPartFrame(line);
-      if (frame) frames.push(frame);
-    }
-    return frames;
-  }
-}
-
-class ProviderToolCallBuffer {
-  private readonly items = new Map<number, ProviderToolCallBufferItem>();
-
-  addChunk(chunk: LlmChatResult['chunks'][number]): void {
-    if (chunk.toolCall) {
-      const index = typeof chunk.index === 'number' ? chunk.index : this.items.size;
-      this.items.set(index, {
-        callId: chunk.toolCall.id,
-        name: normalizeProviderToolName(chunk.toolCall.name),
-        argumentsText: typeof chunk.toolCall.arguments === 'string'
-          ? chunk.toolCall.arguments
-          : JSON.stringify(chunk.toolCall.arguments ?? {}),
-      });
-      return;
-    }
-    const delta = chunk.toolCallDelta;
-    if (!delta && !chunk.callId) return;
-    const index = typeof delta?.index === 'number'
-      ? delta.index
-      : typeof chunk.index === 'number'
-        ? chunk.index
-        : 0;
-    const item = this.items.get(index) ?? { argumentsText: '' };
-    item.callId = delta?.id ?? chunk.callId ?? item.callId;
-    item.name = delta?.name ? normalizeProviderToolName(delta.name) : item.name;
-    item.argumentsText += delta?.argumentsDelta ?? '';
-    this.items.set(index, item);
-  }
-
-  toToolCalls(): NativeToolCallProposal[] {
-    return [...this.items.entries()]
-      .sort(([left], [right]) => left - right)
-      .map(([index, item]) => ({
-        callId: item.callId ?? `tool-call-${index}`,
-        index,
-        name: normalizeProviderToolName(item.name ?? 'unknown'),
-        arguments: parseNativeToolArguments(item.argumentsText, item.name ?? 'unknown'),
-        rawArguments: item.argumentsText,
-      }));
   }
 }
 
@@ -9313,7 +8905,16 @@ function acceptedPlanBatchProgress(
   proposal: ProposalEnvelope,
   kernelEvents: unknown[]
 ): AcceptedPlanBatchProgress {
-  return new AcceptedPlanProgressAggregator().progress(accepted, proposal, kernelEvents);
+  return new AcceptedPlanProgressAggregator({
+    readActionBundle,
+    objectRecord,
+    stringValue,
+    actionEffectiveCapability,
+    proposalTargetScopes: acceptedPlanProposalTargetScopes,
+    workUnitIdsFromKernelEvents,
+    taskCoveredByBatch: acceptedPlanTaskCoveredByBatch,
+    actionBatchHasFailureOrBlocker,
+  }).progress(accepted, proposal, kernelEvents);
 }
 
 function acceptedPlanTaskCoveredByBatch(
@@ -14219,51 +13820,6 @@ function isSensitiveKey(key: string): boolean {
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
-
-function parseProviderPartFrame(raw: string): AgentStreamPartFrame | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  const record = objectRecord(parsed);
-  if (!record || record.schemaVersion !== 'deepcode.agent.stream.part.v1') return null;
-  const partKind = stringValue(record.partKind);
-  if (!partKind || !isAgentStreamPartKind(partKind)) return null;
-  return {
-    schemaVersion: 'deepcode.agent.stream.part.v1',
-    partKind,
-    draftId: stringValue(record.draftId),
-    frameId: stringValue(record.frameId),
-    runId: stringValue(record.runId),
-    targetPath: stringValue(record.targetPath),
-    language: stringValue(record.language),
-    capability: stringValue(record.capability),
-    blockId: stringValue(record.blockId),
-    actionId: stringValue(record.actionId),
-    sequence: typeof record.sequence === 'number' ? record.sequence : undefined,
-    chunk: typeof record.chunk === 'string' ? record.chunk : undefined,
-    contentHash: stringValue(record.contentHash),
-    summary: stringValue(record.summary),
-    diagnostic: objectRecord(record.diagnostic) as AgentStreamPartFrame['diagnostic'],
-    resumeHandle: stringValue(record.resumeHandle),
-    metadata: objectRecord(record.metadata),
-  };
-}
-
-function stripProviderPartFrames(content: string): string {
-  return content.replace(/<deepcode-part>[\s\S]*?<\/deepcode-part>/g, '').trim();
-}
-
-function isAgentStreamPartKind(value: string): value is AgentStreamPartFrame['partKind'] {
-  return value === 'thinkingDelta'
-    || value === 'codeBlockChunk'
-    || value === 'actionDraftChunk'
-    || value === 'fileDone'
-    || value === 'batchDone'
-    || value === 'diagnostic';
 }
 
 function utf8Bytes(value: string): number {
