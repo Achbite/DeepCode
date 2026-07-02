@@ -712,14 +712,11 @@ button {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  width: fit-content;
-  max-width: min(100%, 680px);
-  margin: 10px 0 18px;
-  padding: 12px 14px;
-  border: 1px solid rgba(36, 161, 72, 0.2);
-  border-radius: 12px;
-  background: rgba(36, 161, 72, 0.06);
-  color: var(--text);
+  width: auto;
+  max-width: none;
+  margin: 0;
+  padding: 12px 13px;
+  border-radius: 8px;
   font-size: 13px;
   line-height: 1.65;
 }
@@ -3298,12 +3295,8 @@ button {
   width: auto;
   max-width: none;
   margin: 0;
-  padding: 12px 14px;
-  border-color: rgba(37, 99, 235, 0.22);
-  border-radius: 14px;
-  background: #f7f9ff;
-  box-shadow: none;
-  color: #24272d;
+  padding: 12px 13px;
+  border-radius: 8px;
   font-size: 13px;
   line-height: 1.6;
 }
