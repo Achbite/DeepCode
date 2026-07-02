@@ -159,6 +159,18 @@ export class AcceptedPlanScopeMatcher {
     return normalizePlanTargetForExecutionRoot(scope, accepted.executionRoot);
   }
 
+  normalizeScopeIdentity(scope: string): string {
+    return normalizePlanScopeIdentity(scope);
+  }
+
+  expandTargetTokens(target: string): string[] {
+    return expandPlanTargetTokens(target);
+  }
+
+  scopesOverlap(left: string, right: string): boolean {
+    return planScopeCovers(left, right) || planScopeCovers(right, left);
+  }
+
   scopeCovered(scope: string, capability: string | undefined, accepted: AcceptedImplementationPlanContext): boolean {
     const normalized = normalizePlanScope(scope);
     if (!normalized) return false;

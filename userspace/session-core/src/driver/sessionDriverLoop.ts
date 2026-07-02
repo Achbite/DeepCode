@@ -1986,8 +1986,41 @@ export class SessionDriverLoop {
       raw = providerResult;
     } catch (error) {
       if (error instanceof SessionDriverLoopError
-        && error.code === 'llm_empty_response'
-        && shouldAttemptActionBundleCompactionRepair(state)) {
+        && error.code === 'llm_empty_response') {
+        if (!shouldAttemptActionBundleCompactionRepair(state)) {
+          const parseError = {
+            code: 'llm_empty_response',
+            message: 'LLM provider returned an empty response before emitting a JSON proposal.',
+          };
+          await this.append(state.sessionId, [
+            thinkingEvent(
+              state.sessionId,
+              `模型输出需要按 Agent Protocol v3 修复：${parseError.message}`,
+              this.ts(),
+              this.id('protocol-repair')
+            ),
+          ]);
+          const repairedRaw = await this.llm(
+            input.profileId,
+            state,
+            'protocol_repair',
+            repairMessages(prompt, state, '', parseError)
+          );
+          try {
+            return parseAndValidateProposal({
+              raw: repairedRaw,
+              runId: state.runId,
+              sessionId: state.sessionId,
+              source: 'llm',
+              allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
+            });
+          } catch (repairError) {
+            throw new SessionDriverLoopError(
+              'agent_protocol_repair_failed',
+              `模型空响应 repair 后仍无法解析：${normalizeParseError(repairError).message}`
+            );
+          }
+        }
         await this.append(state.sessionId, [
           thinkingEvent(
             state.sessionId,
@@ -7243,6 +7276,7 @@ function planReviewDiagnostics(report: Record<string, unknown>): string[] {
 }
 
 function shouldAttemptActionBundleCompactionRepair(state: SessionDriverLoopRunState): boolean {
+  if (!state.acceptedImplementationPlan && !state.currentTaskContext) return false;
   const allowed = state.stateContract?.allowedProposals ?? state.driverRequest?.stateContract?.allowedProposals ?? [];
   if (allowed.length && !allowed.includes('actionBundle')) return false;
   const capabilities = state.stateContract?.capabilityProjection ?? state.driverRequest?.stateContract?.capabilityProjection ?? [];
@@ -8671,32 +8705,10 @@ function acceptedPlanBatchProgress(
   kernelEvents: unknown[]
 ): AcceptedPlanBatchProgress {
   return new AcceptedPlanProgressAggregator({
-    readActionBundle,
-    objectRecord,
-    stringValue,
-    actionEffectiveCapability,
-    proposalTargetScopes: acceptedPlanProposalTargetScopes,
+    scopeMatcher: new AcceptedPlanScopeMatcher(),
     workUnitIdsFromKernelEvents,
-    taskCoveredByBatch: acceptedPlanTaskCoveredByBatch,
     actionBatchHasFailureOrBlocker,
   }).progress(accepted, proposal, kernelEvents);
-}
-
-function acceptedPlanTaskCoveredByBatch(
-  task: AcceptedImplementationPlanTaskContext,
-  targetPaths: string[],
-  actionCapabilities: Set<string>
-): boolean {
-  if (task.capability && actionCapabilities.size && !acceptedPlanCapabilitySetAllows(actionCapabilities, task.capability, 'actionCoversAccepted')) return false;
-  if (!task.targets.length) return !task.capability || acceptedPlanCapabilitySetAllows(actionCapabilities, task.capability, 'actionCoversAccepted');
-  if (!targetPaths.length) return false;
-  return task.targets.every((taskTarget) => {
-    const normalizedTaskTarget = normalizePlanScope(taskTarget);
-    return targetPaths.some((targetPath) =>
-      planScopeCovers(normalizedTaskTarget, targetPath) ||
-      planScopeCovers(targetPath, normalizedTaskTarget)
-    );
-  });
 }
 
 function acceptedPlanAfterBatch(

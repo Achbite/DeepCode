@@ -3,28 +3,16 @@ import type {
   AcceptedImplementationPlanContext,
   AcceptedImplementationPlanTaskContext,
   AcceptedPlanBatchProgress,
-  AcceptedPlanTargetScope,
 } from './types.js';
+import type { AcceptedPlanScopeMatcher } from './AcceptedPlanScopeMatcher.js';
 
 interface AcceptedPlanProgressActionBundle {
   actions?: unknown[];
 }
 
 export interface AcceptedPlanProgressAggregatorPorts {
-  readActionBundle(proposal: ProposalEnvelope): AcceptedPlanProgressActionBundle | undefined;
-  objectRecord(value: unknown): Record<string, unknown> | undefined;
-  stringValue(value: unknown): string | undefined;
-  actionEffectiveCapability(action: { capability?: unknown; toolId?: unknown }): string;
-  proposalTargetScopes(
-    proposal: ProposalEnvelope,
-    accepted: AcceptedImplementationPlanContext
-  ): AcceptedPlanTargetScope[];
+  scopeMatcher: AcceptedPlanScopeMatcher;
   workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[];
-  taskCoveredByBatch(
-    task: AcceptedImplementationPlanTaskContext,
-    targetPaths: string[],
-    actionCapabilities: Set<string>
-  ): boolean;
   actionBatchHasFailureOrBlocker(kernelEvents: unknown[]): boolean;
 }
 
@@ -36,27 +24,28 @@ export class AcceptedPlanProgressAggregator {
     proposal: ProposalEnvelope,
     kernelEvents: unknown[]
   ): AcceptedPlanBatchProgress {
-    const actionBundle = this.ports.readActionBundle(proposal);
+    const matcher = this.ports.scopeMatcher;
+    const actionBundle = matcher.readActionBundle(proposal) as AcceptedPlanProgressActionBundle | undefined;
     const actions = actionBundle?.actions ?? [];
     const actionIds = actions
       .map((action) => {
-        const record = this.ports.objectRecord(action) ?? {};
-        return this.ports.stringValue(record.actionId)
-          ?? this.ports.stringValue(record.id)
-          ?? this.ports.stringValue(record.title);
+        const record = matcher.objectRecord(action) ?? {};
+        return matcher.stringValue(record.actionId)
+          ?? matcher.stringValue(record.id)
+          ?? matcher.stringValue(record.title);
       })
       .filter((item): item is string => Boolean(item));
     const actionCapabilities = new Set(actions
-      .map((action) => this.ports.actionEffectiveCapability(action as { capability?: unknown; toolId?: unknown }))
+      .map((action) => matcher.actionEffectiveCapability(action as { capability?: unknown; toolId?: unknown }))
       .filter((item): item is string => Boolean(item)));
-    const targetPaths = [...new Set(this.ports.proposalTargetScopes(proposal, accepted)
+    const targetPaths = [...new Set(matcher.proposalTargetScopes(proposal, accepted)
       .map((target) => target.normalized)
       .filter((target) => target && target !== '.' && target !== '..'))];
     const workUnitIds = this.ports.workUnitIdsFromKernelEvents(kernelEvents);
     const priorCompleted = new Set(accepted.completedTaskIds);
     const coveredTaskIds = new Set<string>();
     for (const task of accepted.tasks) {
-      if (!priorCompleted.has(task.taskId) && this.ports.taskCoveredByBatch(task, targetPaths, actionCapabilities)) {
+      if (!priorCompleted.has(task.taskId) && this.taskCoveredByBatch(task, targetPaths, actionCapabilities)) {
         coveredTaskIds.add(task.taskId);
       }
     }
@@ -85,5 +74,32 @@ export class AcceptedPlanProgressAggregator {
       completedTaskIds,
       remainingTaskIds,
     };
+  }
+
+  private taskCoveredByBatch(
+    task: AcceptedImplementationPlanTaskContext,
+    targetPaths: string[],
+    actionCapabilities: Set<string>
+  ): boolean {
+    const matcher = this.ports.scopeMatcher;
+    if (
+      task.capability &&
+      actionCapabilities.size &&
+      !matcher.capabilitySetAllows(actionCapabilities, task.capability, 'actionCoversAccepted')
+    ) {
+      return false;
+    }
+    if (!task.targets.length) {
+      return !task.capability || matcher.capabilitySetAllows(actionCapabilities, task.capability, 'actionCoversAccepted');
+    }
+    if (!targetPaths.length) return false;
+    return task.targets.every((taskTarget) =>
+      matcher.expandTargetTokens(taskTarget)
+        .map((target) => matcher.normalizeScopeIdentity(target))
+        .filter(Boolean)
+        .some((normalizedTaskTarget) =>
+          targetPaths.some((targetPath) => matcher.scopesOverlap(normalizedTaskTarget, targetPath))
+        )
+    );
   }
 }

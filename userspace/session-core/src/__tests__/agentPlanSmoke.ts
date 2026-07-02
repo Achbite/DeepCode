@@ -4033,6 +4033,7 @@ async function assertSessionDriverLoopRepairsOversizedActionBundle(): Promise<vo
 async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promise<void> {
   const events: AgentEvent[] = [];
   const submittedPlans: Array<Record<string, any>> = [];
+  const repairRequests: LlmChatRequest[] = [];
   let llmCalls = 0;
   const session: AgentSession = {
     id: 'session-empty-repair',
@@ -4046,7 +4047,7 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
       return { session: { ...session, eventCount: events.length }, events: [...events] };
     },
     kernelCommand: async (request): Promise<KernelReply> => planKernel(request, 'session-empty-repair', submittedPlans),
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
       llmCalls += 1;
       if (llmCalls === 1) {
         return {
@@ -4061,6 +4062,7 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
           },
         };
       }
+      repairRequests.push(request);
       return jsonLlmResponse(genericWriteProposal(false));
     },
     now: () => '2026-01-01T00:00:00.000Z',
@@ -4072,17 +4074,34 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
     content: 'Create a generic workspace change in reviewable batches.',
     requirementConfirmationMode: 'off',
   });
-  assertEqual(llmCalls, 2, 'empty actionBundle response triggers one compact repair');
+  assertEqual(llmCalls, 2, 'empty planning response triggers one protocol repair');
   assertEqual(submittedPlans.length, 1, 'repaired empty response reaches Kernel plan review once');
   assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired empty response renders a plan card');
+  const repairPrompt = repairRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
+  assert(
+    repairPrompt.includes('For initial side-effect work, output taskPlan'),
+    'empty planning response uses protocol repair rather than execution-batch compaction'
+  );
+  assert(
+    !repairPrompt.includes('requiredKind: actionBundle'),
+    'empty planning response repair must not force an actionBundle'
+  );
   assertEqual(
     result.events.some((event) =>
       event.kind === 'workflow_stage' &&
       (event.payload as any)?.stage === 'session.provider_status' &&
-      String((event.payload as any).summary ?? '').includes('没有返回有效 JSON')
+      String((event.payload as any).summary ?? '').includes('Agent Protocol v3 修复')
     ),
     true,
-    'empty response repair is visible as provider status, not model reasoning'
+    'empty response protocol repair is visible as provider status, not model reasoning'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      String((event.payload as any)?.summary ?? '').includes('缩小为下一批可审查 actionBundle')
+    ),
+    false,
+    'planning empty response must not be projected as actionBundle compaction repair'
   );
 }
 
