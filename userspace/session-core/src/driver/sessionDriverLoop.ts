@@ -19,7 +19,6 @@ import type {
 } from '@deepcode/protocol';
 import { listDefaultAgentTools } from '@deepcode/protocol';
 import { parseProposalEnvelope } from '../agent-plan/protocolV3.js';
-import { resourceRequestProtocolShapeLine } from '../agent-plan/protocolContract.js';
 import { stableHash } from '../cache/canonicalizer.js';
 import {
   AcceptedPlanAdmission,
@@ -69,6 +68,7 @@ import {
   type UserGuidanceEvent,
 } from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
+import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder, type ProviderRepairMessageState } from '../prompt/ProviderRepairMessageBuilder.js';
 import {
   ProviderPartFrameParser,
@@ -331,6 +331,7 @@ const MAX_DERIVED_MANIFEST_ENTRIES = 240;
 const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
 const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
 const providerRepairMessageBuilder = new ProviderRepairMessageBuilder(MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES);
+const acceptedPlanResourceResumePromptBuilder = new AcceptedPlanResourceResumePromptBuilder(providerRepairMessageBuilder);
 const DEFAULT_SUB_AGENT_NO_DELTA_TIMEOUT_MS = 45_000;
 const DEFAULT_SUB_AGENT_TOTAL_TIMEOUT_MS = 240_000;
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
@@ -2217,7 +2218,14 @@ export class SessionDriverLoop {
       { role: 'system', content: prompt.stablePrefix },
       {
         role: 'user',
-        content: acceptedPlanResourceResumePrompt(state, requestProposal, packet),
+        content: acceptedPlanResourceResumePromptBuilder.render({
+          repairState: providerRepairMessageState(state),
+          acceptedPlan: state.acceptedImplementationPlan,
+          cursor: state.taskExecutionCursor,
+          currentTask: state.currentTaskContext,
+          requestProposal,
+          packet,
+        }),
       },
     ];
     const providerResult = await this.callProviderProposalOnly(
@@ -2353,18 +2361,27 @@ export class SessionDriverLoop {
         responseFormat: { type: 'json_object' },
         tools: nativeProviderToolsForState(state),
       });
-      if (turn.toolCalls.length === 0) return turn.content;
+      const effectiveTurn = turn.toolCalls.length === 0 && !turn.content.trim()
+        ? await this.llmTurn(input.profileId, state, `${stage}_empty_retry`, [
+          ...currentMessages,
+          emptyProviderProposalRetryMessage(),
+        ], {
+          responseFormat: { type: 'json_object' },
+          tools: nativeProviderToolsForState(state),
+        })
+        : turn;
+      if (effectiveTurn.toolCalls.length === 0) return effectiveTurn.content;
 
-      const handled = await this.handleNativeToolCalls(input, state, prompt, turn, round);
+      const handled = await this.handleNativeToolCalls(input, state, prompt, effectiveTurn, round);
       if (handled.kind === 'proposal') return handled.proposal;
 
       currentMessages = [
         ...currentMessages,
         {
           role: 'assistant',
-          content: turn.content,
-          reasoningContent: turn.reasoning || undefined,
-          toolCalls: turn.toolCalls.map(nativeToolCallToProtocol),
+          content: effectiveTurn.content,
+          reasoningContent: effectiveTurn.reasoning || undefined,
+          toolCalls: effectiveTurn.toolCalls.map(nativeToolCallToProtocol),
         },
         ...handled.toolMessages,
       ];
@@ -2383,9 +2400,17 @@ export class SessionDriverLoop {
     const turn = await this.llmTurn(input.profileId, state, stage, messages, {
       responseFormat: { type: 'json_object' },
     });
-    if (turn.toolCalls.length === 0) return turn.content;
+    const effectiveTurn = turn.toolCalls.length === 0 && !turn.content.trim()
+      ? await this.llmTurn(input.profileId, state, `${stage}_empty_retry`, [
+        ...messages,
+        emptyProviderProposalRetryMessage(),
+      ], {
+        responseFormat: { type: 'json_object' },
+      })
+      : turn;
+    if (effectiveTurn.toolCalls.length === 0) return effectiveTurn.content;
 
-    const firstToolCall = turn.toolCalls[0];
+    const firstToolCall = effectiveTurn.toolCalls[0];
     await this.emitProjectionDelta(state, {
       type: 'stage_delta',
       stage: 'accepted_plan.provider_tool_violation',
@@ -2416,7 +2441,7 @@ export class SessionDriverLoop {
       input.profileId,
       state,
       `${stage}_tool_violation_repair`,
-      providerRepairMessageBuilder.completeStageToolViolationRepairMessages(prompt, providerRepairMessageState(state), firstToolCall, turn)
+      providerRepairMessageBuilder.completeStageToolViolationRepairMessages(prompt, providerRepairMessageState(state), firstToolCall, effectiveTurn)
     );
     try {
       return parseAndValidateProposal({
@@ -4374,6 +4399,18 @@ export class SessionDriverLoop {
 
 const JSON_OBJECT_MODE_INSTRUCTION =
   'Return exactly one valid JSON object. Do not return markdown, prose outside JSON, or multiple JSON objects.';
+
+function emptyProviderProposalRetryMessage(): LlmChatRequest['messages'][number] {
+  return {
+    role: 'user',
+    content: [
+      'The previous provider turn returned no JSON proposal.',
+      'Use the already supplied user request, confirmed decisions, ResourcePacket/tool facts, and current task context.',
+      'Return exactly one valid Agent Protocol v3 JSON proposal now.',
+      'Do not explain the empty response. Do not restate protocol rules. Do not claim execution facts, permissions, validation, or task completion.',
+    ].join('\n'),
+  };
+}
 
 function ensureJsonObjectModeMessages(
   messages: LlmChatRequest['messages'],
@@ -11197,49 +11234,6 @@ function implementationPlanExecutionRequestText(
     'All source content must be in codeBlocks[].contentLines. Do not use large or multiline codeBlocks.content.',
     guidance?.trim() ? `Additional guidance supplied when the user confirmed the plan:\n${guidance.trim()}` : '',
     `Accepted execution sanitized context:\n${fenced(JSON.stringify(providerContext, null, 2))}`,
-  ].filter(Boolean).join('\n\n');
-}
-
-function acceptedPlanResourceResumePrompt(
-  state: SessionDriverLoopRunState,
-  requestProposal: ProposalEnvelope,
-  packet: ResourcePacket
-): string {
-  const accepted = state.acceptedImplementationPlan;
-  const cursor = state.taskExecutionCursor;
-  const current = state.currentTaskContext;
-  const resourceItems = packet.items.map((item) => {
-    const record = objectRecord(item) ?? {};
-    return {
-      manifestEntryId: stringValue(record.manifestEntryId) ?? stringValue(record.id),
-      path: stringValue(record.path) ?? stringValue(record.absolutePath) ?? stringValue(record.ref),
-      kind: stringValue(record.contentKind) ?? stringValue(record.resolvedKind) ?? stringValue(record.kind),
-      textPreview: clip(stringValue(record.text) ?? stringValue(record.content) ?? stringValue(record.fileText) ?? '', 1200),
-    };
-  });
-  return [
-    providerRepairMessageBuilder.renderRepairProviderTurnContract(providerRepairMessageState(state), {
-      turnMode: 'resourceResume',
-      allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'answer', 'diagnostic'],
-      repairPolicy: 'diagnosticOnly',
-      errorLines: [`ResourcePacket ${packet.id} resolved ${packet.items.length} item(s) for the current accepted task.`],
-    }),
-    'Accepted-plan resource resume checkpoint.',
-    'You are resuming the same accepted task after Session resolved read-only evidence. Do not restart planning, do not ask for already-confirmed scope, and do not claim execution facts.',
-    'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. These frames are draft ledger previews only; final workspace writes still come only from the complete actionBundle JSON.',
-    'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
-    'Return exactly one Agent Protocol v3 proposal: actionBundle, resourceRequest, decisionRequest, answer, or diagnostic.',
-    resourceRequestProtocolShapeLine(),
-    'Prefer actionBundle if the just-resolved evidence is sufficient for an edit task. If the current task is read-only validation and the ResourcePacket is enough, return answer summarizing only the resolved evidence. If more evidence is needed, request only a different focused resource. If scope is insufficient, return decisionRequest.',
-    accepted ? `Accepted plan progress: planId=${accepted.planId}; completedTaskCount=${accepted.completedTaskIds.length}; remainingTaskCount=${accepted.tasks.filter((task) => !accepted.completedTaskIds.includes(task.taskId)).length}.` : '',
-    cursor ? `TaskExecutionCursor: currentTaskId=${cursor.currentTaskId ?? 'none'}; completedTaskCount=${cursor.completedTaskIds.length}; lastResourcePackets=${cursor.lastResourcePacketIds.join(', ') || 'none'}.` : '',
-    current ? `CurrentTaskGoal: ${current.goal}` : '',
-    current ? `CurrentTaskContext: targets=${current.targets.join(', ') || 'none'}; capabilities=${current.capabilities.join(', ') || 'none'}; evidenceNeeds=${current.evidenceNeeds.join(', ') || 'none'}.` : '',
-    `Original resourceRequest proposalId=${requestProposal.proposalId}; kind=${requestProposal.kind}.`,
-    `Resolved ResourcePacket id=${packet.id}; itemCount=${packet.items.length}:`,
-    fenced(clip(JSON.stringify(resourceItems, null, 2), 6_000)),
-    'ActionBundle constraints: use concrete tool actions only; codeBlocks use contentLines; patch match text must come from the resolved ResourcePacket or another fresh ResourcePacket; new files may be complete writes if in accepted scope.',
-    'Directory targets are planning scopes only. Do not output empty .gitkeep or placeholder writes to create directories; write concrete files and let Kernel create parent directories.',
   ].filter(Boolean).join('\n\n');
 }
 
