@@ -1,7 +1,9 @@
-import type { ActionBundleDraft, ResourceRequestDraft } from '../../agent-plan/types.js';
+import type { ActionBundleDraft, ProposalEnvelope, ResourceRequestDraft } from '../../agent-plan/types.js';
+import type { AcceptedPlanAdmission } from '../../accepted-plan/AcceptedPlanAdmission.js';
 import type { ResourcePacket, ResourcePacketItem } from '../../context/types.js';
 import type {
   AcceptedImplementationPlanContext,
+  AcceptedPlanBatchValidationResult,
   CurrentTaskContext,
   TaskExecutionCursor,
 } from '../../accepted-plan/types.js';
@@ -14,7 +16,76 @@ export interface AcceptedPlanReadOnlyResourceCompletion {
   coveredTargets: string[];
 }
 
+export interface AcceptedPlanRemovedAccessScope {
+  index: number;
+  reason: string;
+  source: string;
+  path?: string;
+  scopeKind?: string;
+  scope: unknown;
+}
+
+export interface AcceptedPlanAccessScopeCanonicalizationResult {
+  proposal: ProposalEnvelope;
+  changed: boolean;
+  removedAccessScopes: AcceptedPlanRemovedAccessScope[];
+  actionTargets: string[];
+}
+
+export type AcceptedPlanActionProposalAssessment =
+  | { kind: 'missingActionBundle' }
+  | { kind: 'deterministicScopeIntervention'; actionBundle: ActionBundleDraft; validation: AcceptedPlanBatchValidationResult }
+  | { kind: 'scopeRepair'; actionBundle: ActionBundleDraft; validation: AcceptedPlanBatchValidationResult }
+  | {
+      kind: 'executable';
+      actionBundle: ActionBundleDraft;
+      scopeCanonicalization: AcceptedPlanAccessScopeCanonicalizationResult;
+    };
+
+export interface AcceptedPlanActionProposalAssessmentInput {
+  accepted: AcceptedImplementationPlanContext;
+  proposal: ProposalEnvelope;
+  actionBundle: ActionBundleDraft | undefined;
+  resourcePackets: ResourcePacket[];
+  scopeRepairAttempted: boolean;
+  admission: AcceptedPlanAdmission;
+  canonicalizeAccessScopes(
+    accepted: AcceptedImplementationPlanContext,
+    proposal: ProposalEnvelope
+  ): AcceptedPlanAccessScopeCanonicalizationResult;
+}
+
 export class AcceptedPlanExecutor {
+  assessActionProposal(
+    input: AcceptedPlanActionProposalAssessmentInput
+  ): AcceptedPlanActionProposalAssessment {
+    const {
+      accepted,
+      proposal,
+      actionBundle,
+      resourcePackets,
+      scopeRepairAttempted,
+      admission,
+      canonicalizeAccessScopes,
+    } = input;
+    if (!actionBundle) return { kind: 'missingActionBundle' };
+    const validation = admission.validate(accepted, proposal, resourcePackets);
+    if (!validation.ok) {
+      if (admission.needsDeterministicScopeIntervention(validation)) {
+        return { kind: 'deterministicScopeIntervention', actionBundle, validation };
+      }
+      if (!scopeRepairAttempted) {
+        return { kind: 'scopeRepair', actionBundle, validation };
+      }
+      return { kind: 'deterministicScopeIntervention', actionBundle, validation };
+    }
+    return {
+      kind: 'executable',
+      actionBundle,
+      scopeCanonicalization: canonicalizeAccessScopes(accepted, proposal),
+    };
+  }
+
   currentTaskIsReadOnlyResourceValidation(
     accepted: AcceptedImplementationPlanContext,
     cursor: TaskExecutionCursor | undefined,

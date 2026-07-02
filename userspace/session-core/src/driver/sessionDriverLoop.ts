@@ -3214,153 +3214,158 @@ export class SessionDriverLoop {
     );
     if (readOnlyActionResult) return readOnlyActionResult;
 
-    const admission = acceptedPlanAdmission();
-    const validation = admission.validate(accepted, proposal, state.resourcePackets);
-    if (!validation.ok) {
-      if (admission.needsDeterministicScopeIntervention(validation)) {
-        return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, validation);
-      }
-      if (!state.acceptedPlanScopeRepairAttempted) {
-        state.acceptedPlanScopeRepairAttempted = true;
-        await this.append(state.sessionId, [
-          thinkingEvent(
-            state.sessionId,
-            'The current execution batch is outside the confirmed current-task scope; Session is asking the model to continue the current task or request additional authorization.',
-            this.ts(),
-            this.id('accepted-plan-scope-repair'),
-            {
-              messageKey: 'session.driver.acceptedPlanScopeRepair',
-              messageArgs: {},
-            }
-          ),
-        ]);
-        try {
-          const repaired = await this.repairAcceptedPlanScope(input, state, prompt, proposal, validation);
-          if (repaired.kind === 'actionBundle') {
-            return this.submitAcceptedPlanActionProposal(input, state, prompt, repaired, fallback);
+    const assessment = acceptedPlanExecutor.assessActionProposal({
+      accepted,
+      proposal,
+      actionBundle,
+      resourcePackets: state.resourcePackets,
+      scopeRepairAttempted: state.acceptedPlanScopeRepairAttempted,
+      admission: acceptedPlanAdmission(),
+      canonicalizeAccessScopes: canonicalizeAcceptedPlanExecutionAccessScopes,
+    });
+    if (assessment.kind === 'missingActionBundle') return fallback;
+    if (assessment.kind === 'deterministicScopeIntervention') {
+      return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, assessment.validation);
+    }
+    if (assessment.kind === 'scopeRepair') {
+      state.acceptedPlanScopeRepairAttempted = true;
+      await this.append(state.sessionId, [
+        thinkingEvent(
+          state.sessionId,
+          'The current execution batch is outside the confirmed current-task scope; Session is asking the model to continue the current task or request additional authorization.',
+          this.ts(),
+          this.id('accepted-plan-scope-repair'),
+          {
+            messageKey: 'session.driver.acceptedPlanScopeRepair',
+            messageArgs: {},
           }
-          if (repaired.kind === 'resourceRequest') {
-            let result = fallback;
-            const generated = generatedArtifactResourcePacketForRequest(
-              state,
-              repaired.payload as ResourceRequestDraft,
-              this.id('accepted-plan-repair-generated-resource')
-            );
-            if (generated.packet) {
-              state.resourcePackets.push(generated.packet);
-              result = await this.append(state.sessionId, [
-                resourcePacketEvent(state.sessionId, generated.packet, this.ts(), this.id('accepted-plan-repair-generated-resource-context')),
-              ]) ?? result;
-            }
-            const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
-            if (!subset.manifest.entries.length) {
-              if (!generated.packet) {
-                return this.append(state.sessionId, [
-                  finalDiagnosticEvent(
-                    state.sessionId,
-                    diag(
-              'autoBatchResourceResolveFailed',
-              `Automatic execution batch requires additional resource evidence, but the repaired resourceRequest could not be located: ${resourceResolutionDiagnostic(subset).fallback}`,
-              { detail: resourceResolutionDiagnostic(subset).fallback }
-            ),
-                    this.ts(),
-                    this.id('accepted-plan-scope-repair-resource-invalid')
+        ),
+      ]);
+      try {
+        const repaired = await this.repairAcceptedPlanScope(input, state, prompt, proposal, assessment.validation);
+        if (repaired.kind === 'actionBundle') {
+          return this.submitAcceptedPlanActionProposal(input, state, prompt, repaired, fallback);
+        }
+        if (repaired.kind === 'resourceRequest') {
+          let result = fallback;
+          const generated = generatedArtifactResourcePacketForRequest(
+            state,
+            repaired.payload as ResourceRequestDraft,
+            this.id('accepted-plan-repair-generated-resource')
+          );
+          if (generated.packet) {
+            state.resourcePackets.push(generated.packet);
+            result = await this.append(state.sessionId, [
+              resourcePacketEvent(state.sessionId, generated.packet, this.ts(), this.id('accepted-plan-repair-generated-resource-context')),
+            ]) ?? result;
+          }
+          const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
+          if (!subset.manifest.entries.length) {
+            if (!generated.packet) {
+              return this.append(state.sessionId, [
+                finalDiagnosticEvent(
+                  state.sessionId,
+                  diag(
+                    'autoBatchResourceResolveFailed',
+                    `Automatic execution batch requires additional resource evidence, but the repaired resourceRequest could not be located: ${resourceResolutionDiagnostic(subset).fallback}`,
+                    { detail: resourceResolutionDiagnostic(subset).fallback }
                   ),
-                ]);
-              }
-            } else {
-              const packet = await this.resolveResources(state, subset.manifest);
-              state.resourcePackets.push(packet);
-              addDiscoveredManifestEntries(state.manifest, packet);
-              result = await this.append(state.sessionId, [
-                resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-repair-resource-context')),
-              ]) ?? result;
+                  this.ts(),
+                  this.id('accepted-plan-scope-repair-resource-invalid')
+                ),
+              ]);
             }
-            return this.runUserTurn({
-              sessionId: input.sessionId,
-              content: implementationPlanExecutionRequest(
-                acceptedPlanExecutionContext(state, proposal, {}),
-                accepted,
-                'Session 已补充当前修改所需的只读 search/read 证据；请基于 ResourcePacket 输出同一 accepted taskPlan 范围内的下一批 actionBundle。'
-              ),
-              attachments: accepted.executionRoot ? [accepted.executionRoot.attachment] : [],
-              existingEvents: result.events,
-              workspaceBinding: input.workspaceBinding,
-              projectWorkingDirectory: input.projectWorkingDirectory,
-              profileId: input.profileId,
-              workflow: input.workflow,
-              appendUserMessage: false,
-              requirementConfirmationMode: 'off',
-              reviewContinuationMode: input.reviewContinuationMode,
-              interventionLevel: input.interventionLevel,
-              projectMemoryMode: input.projectMemoryMode,
-              resumeResourcePackets: true,
-              acceptedImplementationPlan: accepted,
-            });
+          } else {
+            const packet = await this.resolveResources(state, subset.manifest);
+            state.resourcePackets.push(packet);
+            addDiscoveredManifestEntries(state.manifest, packet);
+            result = await this.append(state.sessionId, [
+              resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-repair-resource-context')),
+            ]) ?? result;
           }
-          if (repaired.kind === 'decisionRequest') {
-            const requirement = requirementRecordFromProposal(repaired, input, state, this.ts());
-            const interactionOverlay: InteractionOverlayContext = {
-              parentRunId: state.runId,
-              parentPhase: 'executing_accepted_plan',
-              interactionRunId: state.runId,
-              interactionId: requirement.requirementId,
-              sourceInteractionId: repaired.proposalId,
-            };
-            const confirmation = requirementConfirmationEvent({
+          return this.runUserTurn({
+            sessionId: input.sessionId,
+            content: implementationPlanExecutionRequest(
+              acceptedPlanExecutionContext(state, proposal, {}),
+              accepted,
+              'Session 已补充当前修改所需的只读 search/read 证据；请基于 ResourcePacket 输出同一 accepted taskPlan 范围内的下一批 actionBundle。'
+            ),
+            attachments: accepted.executionRoot ? [accepted.executionRoot.attachment] : [],
+            existingEvents: result.events,
+            workspaceBinding: input.workspaceBinding,
+            projectWorkingDirectory: input.projectWorkingDirectory,
+            profileId: input.profileId,
+            workflow: input.workflow,
+            appendUserMessage: false,
+            requirementConfirmationMode: 'off',
+            reviewContinuationMode: input.reviewContinuationMode,
+            interventionLevel: input.interventionLevel,
+            projectMemoryMode: input.projectMemoryMode,
+            resumeResourcePackets: true,
+            acceptedImplementationPlan: accepted,
+          });
+        }
+        if (repaired.kind === 'decisionRequest') {
+          const requirement = requirementRecordFromProposal(repaired, input, state, this.ts());
+          const interactionOverlay: InteractionOverlayContext = {
+            parentRunId: state.runId,
+            parentPhase: 'executing_accepted_plan',
+            interactionRunId: state.runId,
+            interactionId: requirement.requirementId,
+            sourceInteractionId: repaired.proposalId,
+          };
+          const confirmation = requirementConfirmationEvent({
+            sessionId: state.sessionId,
+            runId: state.runId,
+            requirement,
+            proposal: repaired,
+            originalUserRequest: input.content,
+            attachments: input.attachments ?? [],
+            interactionOverlay,
+            ts: this.ts(),
+            id: this.id('accepted-plan-scope-repair-decision'),
+          });
+          state.phase = 'waiting_permission';
+          return this.append(state.sessionId, [
+            confirmation,
+            sessionRunStateEvent({
               sessionId: state.sessionId,
               runId: state.runId,
-              requirement,
-              proposal: repaired,
-              originalUserRequest: input.content,
-              attachments: input.attachments ?? [],
+              phase: 'waiting_permission',
+              reason: 'requirement',
+              decisionOwner: {
+                kind: 'requirement',
+                runId: state.runId,
+                targetId: requirement.requirementId,
+                requirementId: requirement.requirementId,
+              },
               interactionOverlay,
               ts: this.ts(),
-              id: this.id('accepted-plan-scope-repair-decision'),
-            });
-            state.phase = 'waiting_permission';
-            return this.append(state.sessionId, [
-              confirmation,
-              sessionRunStateEvent({
-                sessionId: state.sessionId,
-                runId: state.runId,
-                phase: 'waiting_permission',
-                reason: 'requirement',
-                decisionOwner: {
-                  kind: 'requirement',
-                  runId: state.runId,
-                  targetId: requirement.requirementId,
-                  requirementId: requirement.requirementId,
-                },
-                interactionOverlay,
-                ts: this.ts(),
-                id: this.id('session-run-waiting-accepted-plan-repair-decision'),
-              }),
-            ]);
-          }
-          if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
-            return this.append(state.sessionId, [
-              finalDiagnosticEvent(
-                state.sessionId,
-                diag(
-                  'acceptedPlanScopeRepairReturnedPlan',
-                  'Accepted-plan execution repair returned a plan proposal. Session will not re-enter plan review from an accepted task; request a scoped actionBundle, resourceRequest, decisionRequest, or diagnostic instead.',
-                  { returnedKind: repaired.kind, proposalId: repaired.proposalId }
-                ),
-                this.ts(),
-                this.id('accepted-plan-scope-repair-plan-forbidden')
-              ),
-            ]);
-          }
-          return this.submitNonExecutableProposal(state, repaired, fallback);
-        } catch (error) {
-          return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, validation);
+              id: this.id('session-run-waiting-accepted-plan-repair-decision'),
+            }),
+          ]);
         }
+        if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
+          return this.append(state.sessionId, [
+            finalDiagnosticEvent(
+              state.sessionId,
+              diag(
+                'acceptedPlanScopeRepairReturnedPlan',
+                'Accepted-plan execution repair returned a plan proposal. Session will not re-enter plan review from an accepted task; request a scoped actionBundle, resourceRequest, decisionRequest, or diagnostic instead.',
+                { returnedKind: repaired.kind, proposalId: repaired.proposalId }
+              ),
+              this.ts(),
+              this.id('accepted-plan-scope-repair-plan-forbidden')
+            ),
+          ]);
+        }
+        return this.submitNonExecutableProposal(state, repaired, fallback);
+      } catch (error) {
+        return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, assessment.validation);
       }
-      return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, validation);
     }
 
-    const scopeCanonicalization = canonicalizeAcceptedPlanExecutionAccessScopes(accepted, proposal);
+    const scopeCanonicalization = assessment.scopeCanonicalization;
     const executionProposal = scopeCanonicalization.proposal;
     state.phase = 'executing_accepted_plan';
     let result = fallback;
