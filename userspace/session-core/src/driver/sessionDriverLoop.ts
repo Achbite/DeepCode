@@ -73,6 +73,7 @@ import {
   stripProviderPartFrames,
   type NativeToolCallProposal,
 } from '../provider/providerStreamParts.js';
+import { ResourceManifestBuilder } from '../resources/index.js';
 import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import {
@@ -278,11 +279,6 @@ type SessionRunStateReason =
   | 'accepted_plan_execution'
   | 'work_unit_failed';
 
-interface ResourceManifestBuildResult {
-  manifest: ResourceManifest;
-  conversationRoots: ConversationResourceRoot[];
-}
-
 interface ResourceRequestResolution {
   manifest: ResourceManifest;
   unresolved: string[];
@@ -389,7 +385,8 @@ export class SessionDriverLoop {
         }),
       ]);
 
-    const kernelAttachments = kernelRunAttachments(input);
+    const manifestBuilder = resourceManifestBuilder();
+    const kernelAttachments = manifestBuilder.kernelRunAttachments(input);
     const runReply = await this.kernel({
       command: {
         kind: 'runCreate',
@@ -410,7 +407,7 @@ export class SessionDriverLoop {
     const stateContract = findStateContract(runReply.events);
     const driverRequest = findDriverRequest(runReply.events);
 
-    const manifestBuild = createManifest(input, this.id('resource-manifest'));
+    const manifestBuild = manifestBuilder.build(input, this.id('resource-manifest'));
     const acceptedImplementationPlan = input.acceptedImplementationPlan;
     const implementationBatch = buildImplementationBatchContext(input.existingEvents ?? []);
     if (acceptedImplementationPlan) {
@@ -4851,220 +4848,15 @@ function normalizeProviderToolName(name: string): string {
   return name.replace(/__/g, '.');
 }
 
-function createManifest(input: SessionDriverLoopInput, id: string): ResourceManifestBuildResult {
-  const entries: ResourceManifestEntry[] = [];
-  const conversationRoots: ConversationResourceRoot[] = [];
-  const seenEntryRefs = new Set<string>();
-  const seenRootRefs = new Set<string>();
-  const primaryRootRef = primaryConversationRootRef(input);
-
-  const addAttachment = (
-    attachment: AgentContextAttachment,
-    index: number,
-    source: ConversationResourceRoot['source'],
-    reason: string,
-    addToManifest = true
-  ) => {
-    if (attachment.kind !== 'file' && attachment.kind !== 'directory') return;
-    const resourceRef = attachment.absolutePath ?? attachment.path;
-    if (!resourceRef) return;
-    const refKey = comparablePath(resourceRef);
-    if (!addToManifest && seenRootRefs.has(refKey)) return;
-    if (addToManifest && seenEntryRefs.has(refKey) && seenRootRefs.has(refKey)) return;
-    const entry: ResourceManifestEntry = {
-      id: manifestEntryId(attachment, index, source),
-      kind: attachment.kind,
-      label: `${attachment.kind === 'directory' ? 'Directory' : 'File'} ${attachment.path || resourceRef}`,
-      resourceRef,
-      readPolicy: 'autoRead',
-      reason,
-    };
-    if (addToManifest && !seenEntryRefs.has(refKey)) {
-      seenEntryRefs.add(refKey);
-      entries.push(entry);
-    }
-    if (attachment.kind === 'directory' && !seenRootRefs.has(refKey)) {
-      seenRootRefs.add(refKey);
-      conversationRoots.push({
-        rootId: entry.id,
-        kind: 'directory',
-        label: entry.label,
-        displayPath: attachment.path || resourceRef,
-        absolutePath: attachment.absolutePath ?? (isAbsolutePath(resourceRef) ? resourceRef : undefined),
-        source,
-        primary: comparablePath(resourceRef) === primaryRootRef,
-      });
-    }
-  };
-
-  (input.attachments ?? []).forEach((attachment, index) => {
-    addAttachment(
-      attachment,
-      index,
-      attachment.scope === 'session' ? 'sessionAttachment' : 'currentAttachment',
-      'Explicit user attachment for the current user turn.'
-    );
+function resourceManifestBuilder(): ResourceManifestBuilder {
+  return new ResourceManifestBuilder({
+    maxDerivedManifestEntries: MAX_DERIVED_MANIFEST_ENTRIES,
+    resourceManifestMaxBytes: RESOURCE_MANIFEST_MAX_BYTES,
+    comparablePath,
+    isAbsolutePath,
+    sanitizeId,
+    objectRecord,
   });
-
-  recentAttachmentFacts(input.existingEvents ?? []).forEach((attachment, index) => {
-    addAttachment(
-      attachment,
-      index,
-      'recentAttachment',
-      'Recent explicit user attachment selected from session projection.',
-      false
-    );
-  });
-
-  if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
-    const workingDirectory = input.projectWorkingDirectory;
-    const resourceRef = workingDirectory.absolutePath ?? workingDirectory.displayPath;
-    const refKey = comparablePath(resourceRef);
-    if (!seenRootRefs.has(refKey)) {
-      seenRootRefs.add(refKey);
-      conversationRoots.push({
-        ...workingDirectory,
-        rootId: workingDirectory.rootId || `project-root-${sanitizeId(workingDirectory.displayPath)}`,
-        kind: 'directory',
-        absolutePath: workingDirectory.absolutePath ?? (isAbsolutePath(resourceRef) ? resourceRef : undefined),
-        primary: comparablePath(resourceRef) === primaryRootRef,
-      });
-    }
-  }
-
-  if (input.workspaceBinding?.openPath) {
-    const resourceRef = input.workspaceBinding.openPath;
-    const refKey = comparablePath(resourceRef);
-    if (!seenRootRefs.has(refKey)) {
-      seenRootRefs.add(refKey);
-      conversationRoots.push({
-        rootId: `editor-workspace-${sanitizeId(resourceRef)}`,
-        kind: 'directory',
-        label: `Editor workspace ${resourceRef}`,
-        displayPath: resourceRef,
-        absolutePath: resourceRef,
-        source: 'workspaceBinding',
-        primary: comparablePath(resourceRef) === primaryRootRef,
-      });
-    }
-  }
-
-  const workspaceScopeKey = [
-    input.workspaceBinding?.workspaceId,
-    input.workspaceBinding?.workspaceHash,
-    input.workspaceBinding?.openPath,
-    input.workspaceBinding?.activeFolderId,
-  ].filter(Boolean).join(':') || `session:${input.sessionId}:${conversationRoots[0]?.rootId ?? 'no-root'}`;
-  return {
-    manifest: {
-      id,
-      workspaceScopeKey,
-      workspaceId: input.workspaceBinding?.workspaceId,
-      entries,
-      budget: {
-        maxEntries: Math.max(MAX_DERIVED_MANIFEST_ENTRIES, entries.length),
-        maxBytes: RESOURCE_MANIFEST_MAX_BYTES,
-      },
-      defaultDenyPatterns: [],
-    },
-    conversationRoots,
-  };
-}
-
-function kernelRunAttachments(input: SessionDriverLoopInput): AgentContextAttachment[] {
-  if (input.acceptedImplementationPlan?.executionRoot) {
-    return uniqueAttachments([input.acceptedImplementationPlan.executionRoot.attachment]);
-  }
-  const attachments = uniqueAttachments(input.attachments ?? []);
-  if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
-    const workingDirectory = input.projectWorkingDirectory;
-    attachments.push({
-      kind: 'directory',
-      path: workingDirectory.displayPath,
-      absolutePath: workingDirectory.absolutePath,
-      source: 'userSelected',
-      scope: 'session',
-      rootId: workingDirectory.rootId,
-    } as AgentContextAttachment);
-  }
-  const directoryAttachments = attachments.filter((attachment) => attachment.kind === 'directory');
-  if (directoryAttachments.length === 0) {
-    const recentDirectories = uniqueAttachments(recentAttachmentFacts(input.existingEvents ?? []))
-      .filter((attachment) => attachment.kind === 'directory');
-    if (recentDirectories.length === 1) {
-      attachments.push({
-        ...recentDirectories[0],
-        scope: recentDirectories[0].scope ?? 'session',
-      });
-    }
-  }
-  return uniqueAttachments(attachments);
-}
-
-function primaryConversationRootRef(input: SessionDriverLoopInput): string | undefined {
-  if (input.acceptedImplementationPlan?.executionRoot?.ref) {
-    return comparablePath(input.acceptedImplementationPlan.executionRoot.ref);
-  }
-  const currentDirectories = (input.attachments ?? [])
-    .filter((attachment) => attachment.kind === 'directory')
-    .map((attachment) => attachment.absolutePath ?? attachment.path)
-    .filter((value): value is string => Boolean(value && value.trim()));
-  if (currentDirectories.length === 1) return comparablePath(currentDirectories[0]);
-  if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
-    return comparablePath(input.projectWorkingDirectory.absolutePath ?? input.projectWorkingDirectory.displayPath);
-  }
-  const recentDirectories = recentAttachmentFacts(input.existingEvents ?? [])
-    .filter((attachment) => attachment.kind === 'directory')
-    .map((attachment) => attachment.absolutePath ?? attachment.path)
-    .filter((value): value is string => Boolean(value && value.trim()));
-  const unique = [...new Set(recentDirectories.map(comparablePath))];
-  return unique.length === 1 ? unique[0] : undefined;
-}
-
-function uniqueAttachments(attachments: AgentContextAttachment[]): AgentContextAttachment[] {
-  const output: AgentContextAttachment[] = [];
-  const seen = new Set<string>();
-  for (const attachment of attachments) {
-    const ref = attachment.absolutePath ?? attachment.path;
-    if (!ref) continue;
-    const key = `${attachment.kind}:${comparablePath(ref)}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    output.push(attachment);
-  }
-  return output;
-}
-
-function manifestEntryId(
-  attachment: AgentContextAttachment,
-  index: number,
-  source: ConversationResourceRoot['source']
-): string {
-  const base = (attachment.path || attachment.absolutePath || `attachment-${index}`)
-    .replace(/[^a-zA-Z0-9._/-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 96);
-  const prefix = source === 'recentAttachment' ? 'recent-attachment' : 'attachment';
-  return `${prefix}-${index}-${base || 'resource'}`;
-}
-
-function recentAttachmentFacts(events: AgentEvent[]): AgentContextAttachment[] {
-  const output: AgentContextAttachment[] = [];
-  for (const event of [...events].reverse()) {
-    if (output.length >= 16) break;
-    if (event.kind !== 'user_msg') continue;
-    const payload = objectRecord(event.payload);
-    const attachments = Array.isArray(payload?.attachments) ? payload.attachments : [];
-    for (const item of attachments) {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-      const attachment = item as AgentContextAttachment;
-      if (attachment.kind !== 'file' && attachment.kind !== 'directory') continue;
-      if (!attachment.path && !attachment.absolutePath) continue;
-      output.push(attachment);
-      if (output.length >= 16) break;
-    }
-  }
-  return output;
 }
 
 function buildImplementationBatchContext(events: AgentEvent[]): ImplementationBatchContext {
@@ -8168,7 +7960,8 @@ function acceptedPlanExecutionRootFromDecision(
       source: 'workspaceBinding',
     };
   }
-  const recentDirectories = uniqueAttachments(recentAttachmentFacts(events))
+  const manifestBuilder = resourceManifestBuilder();
+  const recentDirectories = manifestBuilder.uniqueAttachments(manifestBuilder.recentAttachmentFacts(events))
     .filter((attachment) => attachment.kind === 'directory');
   const uniqueRefs = [...new Set(recentDirectories.map((attachment) => comparablePath(attachment.absolutePath ?? attachment.path)))];
   if (uniqueRefs.length !== 1) return undefined;
