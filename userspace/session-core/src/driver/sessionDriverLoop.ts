@@ -17,10 +17,13 @@ import { parseProposalEnvelope } from '../agent-plan/protocolV3.js';
 import { stableHash } from '../cache/canonicalizer.js';
 import {
   AcceptedPlanAdmission,
+  AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
   AcceptedPlanProgressAggregator,
+  type AcceptedPlanReadOnlyResourceCompletion,
   AcceptedPlanScopeIntervention,
   AcceptedPlanScopeMatcher,
+  AcceptedPlanTaskLedgerCoordinator,
   ExecutionPromptCoordinator,
   ReviewFactsAggregator,
   type AcceptedImplementationPlanContext,
@@ -34,7 +37,7 @@ import {
   type CurrentTaskContext,
   type ExecutionSliceRole,
   type TaskExecutionCursor,
-} from '../accepted-plan/index.js';
+} from './execution/index.js';
 import {
   AgentPlanParseError,
   type ActionBundleDraft,
@@ -64,12 +67,12 @@ import {
 import type { PromptEnvelope } from '../prompt/types.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder, type ProviderRepairMessageState } from '../prompt/ProviderRepairMessageBuilder.js';
-import { ProviderTraceArchive } from '../provider/ProviderTraceArchive.js';
 import {
   NativeToolCoordinator,
   NativeToolCoordinatorError,
   NativeToolTurnHandler,
   ProviderEmptyProposalRetry,
+  ProviderTraceArchive,
   ProviderPartFrameParser,
   ProviderToolCallBuffer,
   stripProviderPartFrames,
@@ -77,12 +80,12 @@ import {
   type NativeToolReadLedgerEntry,
   type NativeToolReadSignature,
   type NativeToolCallProposal,
-} from '../provider/providerStreamParts.js';
+} from './pipelines/providerPipeline.js';
 import {
   ResourceManifestBuilder,
   ResourceRequestResolver,
   type ResourceRequestResolution,
-} from '../resources/index.js';
+} from './context/index.js';
 import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import {
@@ -96,12 +99,7 @@ import {
   type TaskLedgerSnapshot,
 } from '../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
-import {
-  AcceptedPlanExecutor,
-  type AcceptedPlanReadOnlyResourceCompletion,
-  AcceptedPlanTaskLedgerCoordinator,
-} from './execution/index.js';
-import { ReviewAssembler } from './review/reviewAssembler.js';
+import { ReviewAssembler } from './review/index.js';
 
 export interface SessionDriverLoopPorts {
   appendEvents(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
