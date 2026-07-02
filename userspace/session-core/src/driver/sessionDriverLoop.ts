@@ -12,12 +12,12 @@ import type {
   LlmChatStreamEvent,
   LlmChatResult,
   ProjectionDelta,
-  ToolCall,
 } from '@deepcode/protocol';
 import { parseProposalEnvelope } from '../agent-plan/protocolV3.js';
 import { stableHash } from '../cache/canonicalizer.js';
 import {
   AcceptedPlanAdmission,
+  AcceptedPlanExecutionRootResolver,
   AcceptedPlanProgressAggregator,
   AcceptedPlanScopeIntervention,
   AcceptedPlanScopeMatcher,
@@ -67,6 +67,7 @@ import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanR
 import { ProviderRepairMessageBuilder, type ProviderRepairMessageState } from '../prompt/ProviderRepairMessageBuilder.js';
 import {
   NativeToolCoordinator,
+  NativeToolCoordinatorError,
   ProviderEmptyProposalRetry,
   ProviderPartFrameParser,
   ProviderToolCallBuffer,
@@ -881,12 +882,13 @@ export class SessionDriverLoop {
       ]) ?? current;
     }
 
-    const executionRoot = acceptedPlanExecutionRootFromDecision(input, current.events);
+    const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, current.events);
     const acceptedPlan = acceptedPlanWithLatestCheckpoint(
       acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot),
       current.events
     );
-    const selectedEffect = selectedRequirementDecisionOptionEffect(decisionEvent);
+    const selectedEffect = selectedRequirementDecisionOptionEffect(decisionEvent)
+      ?? (input.decision === 'accept' ? defaultRequirementDecisionOptionEffect(confirmation) : undefined);
     const nextAcceptedPlan = acceptedPlanWithScopeDecisionEffect(acceptedPlan, selectedEffect);
     const guidance = input.guidance?.trim()
       ? `用户对 accepted-plan scope 介入的补充意见：${input.guidance.trim()}`
@@ -1094,7 +1096,7 @@ export class SessionDriverLoop {
       ?? findPlanCard(events, undefined, planId)
       ?? (runId ? latestExecutablePlan(events, runId) : null);
     if (!plan || !plan.implementationPlan) return undefined;
-    const base = acceptedImplementationPlanContext(plan, undefined, undefined);
+    const base = acceptedImplementationPlanContext(plan, undefined, plan.executionRoot);
     return acceptedPlanWithLatestCheckpoint(base, events);
   }
 
@@ -1222,7 +1224,7 @@ export class SessionDriverLoop {
       planReviewDecisionEvent(input.sessionId, plan, 'accepted', '用户已确认计划，准备进入执行。', this.ts(), this.id('plan-accepted')),
     ]);
     if (plan.implementationPlan) {
-      const executionRoot = acceptedPlanExecutionRootFromDecision(input, result.events);
+      const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, result.events);
       const acceptedPlan = acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot);
       return this.runUserTurn({
         sessionId: input.sessionId,
@@ -1843,6 +1845,7 @@ export class SessionDriverLoop {
       proposal,
       originalUserRequest: input.content,
       attachments: input.attachments ?? [],
+      executionRoot: AcceptedPlanExecutionRootResolver.fromState(state),
       ts: this.ts(),
       id: this.id('requirement-confirmation'),
     });
@@ -1990,11 +1993,12 @@ export class SessionDriverLoop {
             providerRepairMessageBuilder.repairMessages(prompt, providerRepairMessageState(state), '', parseError)
           );
           try {
-            return parseAndValidateProposal({
+            return parseAndValidateRepairedProposal({
               raw: repairedRaw,
               runId: state.runId,
               sessionId: state.sessionId,
               source: 'llm',
+              allowedKinds: repairAllowedKinds(state, 'llm_empty_response'),
               allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
             });
           } catch (repairError) {
@@ -2019,11 +2023,12 @@ export class SessionDriverLoop {
           providerRepairMessageBuilder.actionBundleCompactionRepairMessages(prompt, providerRepairMessageState(state), 'LLM provider returned an empty response before emitting a JSON proposal.', '')
         );
         try {
-          return parseAndValidateProposal({
+          return parseAndValidateRepairedProposal({
             raw: repairedRaw,
             runId: state.runId,
             sessionId: state.sessionId,
             source: 'llm',
+            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
             allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
           });
         } catch (repairError) {
@@ -2061,11 +2066,12 @@ export class SessionDriverLoop {
         : providerRepairMessageBuilder.repairMessages(prompt, providerRepairMessageState(state), raw, parseError);
       const repairedRaw = await this.llm(input.profileId, state, repairStage, repairPrompt);
       try {
-        return parseAndValidateProposal({
+        return parseAndValidateRepairedProposal({
           raw: repairedRaw,
           runId: state.runId,
           sessionId: state.sessionId,
           source: 'llm',
+          allowedKinds: repairAllowedKinds(state, parseError.code),
           allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
         });
       } catch (repairError) {
@@ -2246,11 +2252,12 @@ export class SessionDriverLoop {
         providerRepairMessageBuilder.repairMessages(prompt, providerRepairMessageState(state), providerResult, parseError)
       );
       try {
-        return parseAndValidateProposal({
+        return parseAndValidateRepairedProposal({
           raw: repairedRaw,
           runId: state.runId,
           sessionId: state.sessionId,
           source: 'llm',
+          allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
           allowBriefActionBundleUserPlan: true,
         });
       } catch (repairError) {
@@ -2430,11 +2437,12 @@ export class SessionDriverLoop {
       providerRepairMessageBuilder.completeStageToolViolationRepairMessages(prompt, providerRepairMessageState(state), firstToolCall, effectiveTurn)
     );
     try {
-      return parseAndValidateProposal({
+      return parseAndValidateRepairedProposal({
         raw: repairedRaw,
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
+        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
       });
     } catch (error) {
       throw new SessionDriverLoopError(
@@ -2674,11 +2682,14 @@ export class SessionDriverLoop {
       )
     );
     try {
-      return parseAndValidateProposal({
+      return parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
+        allowedKinds: state.acceptedImplementationPlan || state.implementationBatch.batchIndex > 1
+          ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+          : ['decisionRequest', 'taskPlan', 'resourceRequest', 'diagnostic'],
       });
     } catch (error) {
       throw new SessionDriverLoopError(
@@ -2764,11 +2775,12 @@ export class SessionDriverLoop {
       )
     );
     try {
-      return parseAndValidateProposal({
+      return parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
+        allowedKinds: ['resourceRequest', 'decisionRequest', 'diagnostic'],
       });
     } catch (error) {
       throw new SessionDriverLoopError(
@@ -2833,11 +2845,12 @@ export class SessionDriverLoop {
       )
     );
     try {
-      return parseAndValidateProposal({
+      return parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
+        allowedKinds: ['resourceRequest', 'decisionRequest', 'diagnostic'],
       });
     } catch (error) {
       throw new SessionDriverLoopError(
@@ -2885,11 +2898,12 @@ export class SessionDriverLoop {
         'action_bundle_admission_repair',
         providerRepairMessageBuilder.actionBundleAdmissionRepairMessages(prompt, providerRepairMessageState(state), proposal, reasons)
       );
-      repaired = parseAndValidateProposal({
+      repaired = parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
+        allowedKinds: ['taskPlan', 'resourceRequest', 'decisionRequest', 'diagnostic'],
       });
     } catch (error) {
       const message = error instanceof SessionDriverLoopError ? error.message : normalizeParseError(error).message;
@@ -3719,11 +3733,12 @@ export class SessionDriverLoop {
       providerRepairMessageBuilder.planReviewRepairMessages(prompt, providerRepairMessageState(state), proposal, report)
     );
     try {
-      return parseAndValidateProposal({
+      return parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
+        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
       });
     } catch (error) {
       throw new SessionDriverLoopError(
@@ -3747,11 +3762,12 @@ export class SessionDriverLoop {
       providerRepairMessageBuilder.acceptedPlanScopeRepairMessages(prompt, providerRepairMessageState(state), proposal, validation.reasons)
     );
     try {
-      return parseAndValidateProposal({
+      return parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
         source: 'llm',
+        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
         allowBriefActionBundleUserPlan: true,
       });
     } catch (error) {
@@ -3832,8 +3848,8 @@ export class SessionDriverLoop {
       },
     };
     const toolCallBuffer = new ProviderToolCallBuffer({
-      parseArguments: parseNativeToolArguments,
-      normalizeToolName: normalizeProviderToolName,
+      parseArguments: (raw, toolName) => nativeToolCoordinator.parseArguments(raw, toolName),
+      normalizeToolName: (name) => nativeToolCoordinator.normalizeToolName(name),
     });
     const reasoningBuffer: ProviderReasoningDeltaBuffer = {
       pending: '',
@@ -3893,7 +3909,15 @@ export class SessionDriverLoop {
         .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
         .map((chunk) => chunk.content)
         .join(''));
-    const toolCalls = collectNativeToolCalls(result.data, toolCallBuffer);
+    let toolCalls: NativeToolCallProposal[];
+    try {
+      toolCalls = nativeToolCoordinator.collectCalls(result.data, toolCallBuffer);
+    } catch (error) {
+      if (error instanceof NativeToolCoordinatorError) {
+        throw new SessionDriverLoopError(error.code, error.message);
+      }
+      throw error;
+    }
     if (!content.trim() && toolCalls.length === 0) {
       throw new SessionDriverLoopError('llm_empty_response', 'LLM provider returned an empty response.');
     }
@@ -4447,31 +4471,6 @@ export class SessionDriverLoopError extends Error {
   }
 }
 
-function collectNativeToolCalls(
-  result: LlmChatResult,
-  buffer: ProviderToolCallBuffer
-): NativeToolCallProposal[] {
-  const output = new Map<string, NativeToolCallProposal>();
-  const add = (toolCall: ToolCall, index: number) => {
-    const callId = toolCall.id || `tool-call-${index}`;
-    output.set(callId, {
-      callId,
-      index,
-      name: normalizeProviderToolName(toolCall.name),
-      arguments: normalizeNativeToolArguments(toolCall.arguments, toolCall.name),
-      rawArguments: typeof toolCall.arguments === 'string' ? toolCall.arguments : undefined,
-    });
-  };
-  result.assistantMessage?.toolCalls?.forEach(add);
-  result.chunks.forEach((chunk, index) => {
-    if (chunk.toolCall) add(chunk.toolCall, typeof chunk.index === 'number' ? chunk.index : index);
-  });
-  for (const toolCall of buffer.toToolCalls()) {
-    output.set(toolCall.callId, toolCall);
-  }
-  return [...output.values()].sort((left, right) => left.index - right.index);
-}
-
 function generatedArtifactEvidenceFromPackets(packets: ResourcePacket[]): Map<string, GeneratedArtifactEvidence> {
   const evidence = new Map<string, GeneratedArtifactEvidence>();
   for (const packet of packets) {
@@ -4702,36 +4701,6 @@ function providerJsonStreamProgressSummary(language: VisibleLanguage, receivedCh
   return language === 'en-US'
     ? `Generating the executable actionBundle draft (${receivedChars} chars received).`
     : `正在生成可执行 actionBundle 草稿（已接收 ${receivedChars} 字符）。`;
-}
-
-function parseNativeToolArguments(raw: string, toolName: string): Record<string, unknown> {
-  const text = raw.trim();
-  if (!text) return {};
-  try {
-    const parsed = JSON.parse(text) as unknown;
-    return normalizeNativeToolArguments(parsed, toolName);
-  } catch (error) {
-    throw new SessionDriverLoopError(
-      'native_tool_arguments_invalid',
-      `Provider-native tool call ${toolName} returned invalid JSON arguments: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-}
-
-function normalizeNativeToolArguments(value: unknown, toolName: string): Record<string, unknown> {
-  if (typeof value === 'string') return parseNativeToolArguments(value, toolName);
-  const record = objectRecord(value);
-  if (!record) {
-    throw new SessionDriverLoopError(
-      'native_tool_arguments_invalid',
-      `Provider-native tool call ${toolName} arguments must be a JSON object.`
-    );
-  }
-  return record;
-}
-
-function normalizeProviderToolName(name: string): string {
-  return name.replace(/__/g, '.');
 }
 
 function resourceManifestBuilder(): ResourceManifestBuilder {
@@ -5983,7 +5952,7 @@ function answerProposalFromDecisionEffect(
 function recoverAcceptedPlanFromEvents(events: AgentEvent[], runId: string): AcceptedImplementationPlanContext | undefined {
   const plan = latestExecutablePlan(events, runId);
   if (!plan?.implementationPlan) return undefined;
-  return acceptedPlanWithLatestCheckpoint(acceptedImplementationPlanContext(plan), events);
+  return acceptedPlanWithLatestCheckpoint(acceptedImplementationPlanContext(plan, undefined, plan.executionRoot), events);
 }
 
 function answerContent(proposal: ProposalEnvelope): string {
@@ -6168,6 +6137,176 @@ function parseAndValidateProposal(input: {
     allowBriefActionBundleUserPlan: input.allowBriefActionBundleUserPlan === true,
   });
   return proposal;
+}
+
+function parseAndValidateRepairedProposal(input: {
+  raw: string | Record<string, unknown>;
+  runId: string;
+  sessionId?: string;
+  source?: 'llm' | 'user' | 'system' | 'cache';
+  allowedKinds: string[];
+  allowBriefActionBundleUserPlan?: boolean;
+}): ProposalEnvelope {
+  try {
+    return parseAndValidateProposal(input);
+  } catch (error) {
+    const parseError = normalizeParseError(error);
+    if (parseError.code !== 'missing_string' || !parseError.message.includes('schemaVersion')) {
+      throw error;
+    }
+    const canonical = canonicalizeBareRepairedProposal(input);
+    if (!canonical) throw error;
+    return parseAndValidateProposal({
+      ...input,
+      raw: canonical,
+    });
+  }
+}
+
+function canonicalizeBareRepairedProposal(input: {
+  raw: string | Record<string, unknown>;
+  runId: string;
+  sessionId?: string;
+  source?: 'llm' | 'user' | 'system' | 'cache';
+  allowedKinds: string[];
+}): Record<string, unknown> | null {
+  const record = typeof input.raw === 'string'
+    ? repairJsonObject(input.raw)
+    : objectRecord(input.raw);
+  if (!record || typeof repairString(record.schemaVersion) === 'string') return null;
+  const allowedKinds = input.allowedKinds.filter((kind) => [
+    'answer',
+    'resourceRequest',
+    'decisionRequest',
+    'taskPlan',
+    'actionBundle',
+    'diagnostic',
+  ].includes(kind));
+  if (!allowedKinds.length) return null;
+  const explicitKind = repairString(record.kind);
+  const kind = explicitKind
+    ? (allowedKinds.includes(explicitKind) ? explicitKind : undefined)
+    : inferBareRepairKind(record, allowedKinds);
+  if (!kind) return null;
+  const payload = kindPayloadField(kind);
+  if (!payload) return null;
+  const hasKindPayload = record[payload] !== undefined;
+  const canonical: Record<string, unknown> = {
+    ...record,
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind,
+    runId: repairString(record.runId) ?? input.runId,
+    sessionId: repairString(record.sessionId) ?? input.sessionId,
+    source: repairString(record.source) ?? input.source ?? 'llm',
+  };
+  if (!hasKindPayload) {
+    canonical[payload] = stripBareRepairEnvelopeFields(record);
+  }
+  return canonical;
+}
+
+function inferBareRepairKind(record: Record<string, unknown>, allowedKinds: string[]): string | undefined {
+  const fields = allowedKinds.filter((kind) => {
+    const field = kindPayloadField(kind);
+    return Boolean(field && record[field] !== undefined);
+  });
+  if (fields.length === 1) return fields[0];
+  const shapeKinds = allowedKinds.filter((kind) => bareRepairShapeMatches(kind, record));
+  return shapeKinds.length === 1 ? shapeKinds[0] : undefined;
+}
+
+function bareRepairShapeMatches(kind: string, record: Record<string, unknown>): boolean {
+  if (kind === 'taskPlan') return Array.isArray(record.tasks);
+  if (kind === 'resourceRequest') return Array.isArray(record.items) || Array.isArray(record.resources) || Array.isArray(record.requests);
+  if (kind === 'decisionRequest') return typeof repairString(record.question) === 'string' && Array.isArray(record.options);
+  if (kind === 'answer') return typeof repairString(record.content) === 'string' || typeof repairString(record.markdown) === 'string';
+  if (kind === 'diagnostic') return typeof repairString(record.summary) === 'string' && typeof repairString(record.severity) === 'string';
+  if (kind === 'actionBundle') return Array.isArray(record.actions) || record.actionBundle !== undefined;
+  return false;
+}
+
+function kindPayloadField(kind: string): string | undefined {
+  if (kind === 'answer') return 'answer';
+  if (kind === 'resourceRequest') return 'resourceRequest';
+  if (kind === 'decisionRequest') return 'decisionRequest';
+  if (kind === 'taskPlan') return 'taskPlan';
+  if (kind === 'diagnostic') return 'diagnostic';
+  if (kind === 'actionBundle') return 'actionBundle';
+  return undefined;
+}
+
+function stripBareRepairEnvelopeFields(record: Record<string, unknown>): Record<string, unknown> {
+  const stripped: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if ([
+      'schemaVersion',
+      'proposalId',
+      'runId',
+      'sessionId',
+      'source',
+      'kind',
+      'narration',
+      'referencedResourcePacketRefs',
+      'referencedEvidenceRefs',
+      'parserDiagnostics',
+      'outputLanguage',
+    ].includes(key)) continue;
+    stripped[key] = value;
+  }
+  return stripped;
+}
+
+function repairJsonObject(raw: string): Record<string, unknown> | null {
+  const candidate = repairJsonCandidate(raw);
+  if (!candidate) return null;
+  try {
+    return objectRecord(JSON.parse(candidate)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function repairJsonCandidate(raw: string): string | null {
+  let text = raw.trim();
+  const fence = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fence) text = fence[1].trim();
+  const start = text.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start);
+}
+
+function repairAllowedKinds(state: SessionDriverLoopRunState, errorCode: string): string[] {
+  if (errorCode === 'action_bundle_budget_exceeded') {
+    return ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'];
+  }
+  return state.acceptedImplementationPlan
+    ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
+    : ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'];
+}
+
+function repairString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
 function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanContext> {
@@ -6601,6 +6740,7 @@ function actionBundlePlanCardEvent(
   const confirmable = planReviewStatusAwaitingUser(status);
   const kernelPlan = renderKernelExecutionContractPlan(userPlan, report);
   const overlayPayload = interactionOverlayProjection(state.interactionOverlay);
+  const executionRoot = AcceptedPlanExecutionRootResolver.fromState(state);
   return {
     id,
     sessionId: state.sessionId,
@@ -6624,6 +6764,7 @@ function actionBundlePlanCardEvent(
       },
       implementationBatch: state.implementationBatch,
       ...overlayPayload,
+      executionRoot: AcceptedPlanExecutionRootResolver.toPayload(executionRoot),
       actionBundle,
       codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
       commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
@@ -6655,6 +6796,7 @@ function implementationPlanCardEvent(
   const summary = stringValue(implementationPlan.summary) ?? title;
   const content = renderImplementationPlanMarkdown(implementationPlan, summary, language);
   const overlayPayload = interactionOverlayProjection(state.interactionOverlay);
+  const executionRoot = AcceptedPlanExecutionRootResolver.fromState(state);
   return {
     id,
     sessionId: state.sessionId,
@@ -6678,6 +6820,7 @@ function implementationPlanCardEvent(
       },
       implementationBatch: state.implementationBatch,
       ...overlayPayload,
+      executionRoot: AcceptedPlanExecutionRootResolver.toPayload(executionRoot),
       taskPlan: implementationPlan,
       implementationPlan,
       requiredAccessScopes: accessScopesFromImplementationPlan(implementationPlan),
@@ -7060,6 +7203,7 @@ interface SessionPlanContext {
   planReviewReport?: Record<string, unknown>;
   implementationPlan?: Record<string, unknown>;
   interactionOverlay?: InteractionOverlayContext;
+  executionRoot?: AcceptedImplementationPlanExecutionRoot;
 }
 
 interface RecoveredAcceptedPlanContext {
@@ -7204,7 +7348,7 @@ function recoverAcceptedPlanFromOverlay(
   const plan = (overlay.acceptedPlanRunId ? findPlanCard(events, overlay.acceptedPlanRunId, planId) : null)
     ?? findPlanCard(events, undefined, planId);
   if (!plan?.implementationPlan) return undefined;
-  const executionRoot = acceptedPlanExecutionRootFromDecision(input, events);
+  const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, events);
   let acceptedPlan = acceptedPlanWithLatestCheckpoint(
     acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot),
     events
@@ -7259,6 +7403,7 @@ function planContextFromEvent(event: AgentEvent, payload: Record<string, unknown
     planReviewReport: objectRecord(payload.planReviewReport) ?? undefined,
     implementationPlan,
     interactionOverlay: interactionOverlayFromPayload(payload),
+    executionRoot: AcceptedPlanExecutionRootResolver.fromPayload(payload),
   };
 }
 
@@ -7584,57 +7729,6 @@ function acceptedImplementationPlanContext(
     batchIndex: 1,
     completedTaskIds: [],
     rawPlan,
-  };
-}
-
-function acceptedPlanExecutionRootFromDecision(
-  input: SessionDecisionResolverInput,
-  events: AgentEvent[]
-): AcceptedImplementationPlanExecutionRoot | undefined {
-  if (input.projectWorkingDirectory?.absolutePath || input.projectWorkingDirectory?.displayPath) {
-    const workingDirectory = input.projectWorkingDirectory;
-    const ref = workingDirectory.absolutePath ?? workingDirectory.displayPath;
-    return {
-      attachment: {
-        kind: 'directory',
-        path: workingDirectory.displayPath,
-        absolutePath: workingDirectory.absolutePath,
-        source: 'userSelected',
-        scope: 'session',
-      },
-      ref,
-      source: 'projectWorkingDirectory',
-    };
-  }
-  if (input.workspaceBinding?.openPath) {
-    return {
-      attachment: {
-        kind: 'directory',
-        path: input.workspaceBinding.openPath,
-        absolutePath: input.workspaceBinding.openPath,
-        source: 'userSelected',
-        scope: 'session',
-      },
-      ref: input.workspaceBinding.openPath,
-      source: 'workspaceBinding',
-    };
-  }
-  const manifestBuilder = resourceManifestBuilder();
-  const recentDirectories = manifestBuilder.uniqueAttachments(manifestBuilder.recentAttachmentFacts(events))
-    .filter((attachment) => attachment.kind === 'directory');
-  const uniqueRefs = [...new Set(recentDirectories.map((attachment) => comparablePath(attachment.absolutePath ?? attachment.path)))];
-  if (uniqueRefs.length !== 1) return undefined;
-  const attachment = recentDirectories.find((item) => comparablePath(item.absolutePath ?? item.path) === uniqueRefs[0]);
-  if (!attachment) return undefined;
-  const ref = attachment.absolutePath ?? attachment.path;
-  return {
-    attachment: {
-      ...attachment,
-      path: attachment.path || ref,
-      scope: 'session',
-    },
-    ref,
-    source: 'recentAttachment',
   };
 }
 
@@ -10185,7 +10279,7 @@ function reviewSummaryEvent(
   const summary = reviewWaitingSummary(failed, blocked, language);
   const readableReview = buildReadableReviewSummary(kernelEvents, reviewFacts);
   const acceptedPlanForReview = plan.implementationPlan
-    ? acceptedImplementationPlanContext(plan)
+    ? acceptedImplementationPlanContext(plan, undefined, plan.executionRoot)
     : undefined;
   const reviewTaskLedger = acceptedPlanForReview
     ? buildAcceptedPlanTaskLedger(acceptedPlanAfterBatch(
@@ -11528,10 +11622,7 @@ function acceptedPlanExecutionRequirementResumeRequest(
 }
 
 function requirementAttachments(event: AgentEvent): AgentContextAttachment[] {
-  const payload = objectRecord(event.payload);
-  return Array.isArray(payload?.attachments)
-    ? payload.attachments.filter((item): item is AgentContextAttachment => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-    : [];
+  return AcceptedPlanExecutionRootResolver.attachmentsFromEvent(event);
 }
 
 function stringArray(value: unknown): string[] {
@@ -11642,6 +11733,7 @@ function requirementConfirmationEvent(input: {
   proposal: ProposalEnvelope;
   originalUserRequest: string;
   attachments: AgentContextAttachment[];
+  executionRoot?: AcceptedImplementationPlanExecutionRoot;
   interactionOverlay?: InteractionOverlayContext;
   ts: string;
   id: string;
@@ -11671,6 +11763,7 @@ function requirementConfirmationEvent(input: {
       proposalId: input.proposal.proposalId,
       originalUserRequest: input.originalUserRequest,
       attachments: input.attachments,
+      executionRoot: AcceptedPlanExecutionRootResolver.toPayload(input.executionRoot),
       ...overlayPayload,
       channel: 'action',
       visibility: 'conversation',
@@ -11738,6 +11831,24 @@ function selectedRequirementDecisionOptionId(event: AgentEvent): string | undefi
 function selectedRequirementDecisionOptionEffect(event: AgentEvent): RequirementOptionEffect | undefined {
   const payload = objectRecord(event.payload);
   const selectedOption = objectRecord(payload?.selectedOption);
+  return requirementDecisionOptionEffect(selectedOption);
+}
+
+function defaultRequirementDecisionOptionEffect(event: AgentEvent): RequirementOptionEffect | undefined {
+  const payload = objectRecord(event.payload);
+  const decisionRequest = objectRecord(payload?.decisionRequest);
+  const options = Array.isArray(decisionRequest?.options)
+    ? decisionRequest.options
+      .map((option) => objectRecord(option))
+      .filter((option): option is Record<string, unknown> => Boolean(option))
+    : [];
+  const selected = options.find((option) => option.recommended === true) ?? options[0];
+  return requirementDecisionOptionEffect(selected);
+}
+
+function requirementDecisionOptionEffect(
+  selectedOption: Record<string, unknown> | undefined
+): RequirementOptionEffect | undefined {
   const effect = objectRecord(selectedOption?.effect);
   if (!effect) return undefined;
   const kind = stringValue(effect.kind);

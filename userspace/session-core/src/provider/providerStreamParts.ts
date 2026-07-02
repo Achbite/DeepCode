@@ -6,6 +6,7 @@ import type {
 export { ProviderEmptyProposalRetry } from './ProviderEmptyProposalRetry.js';
 export {
   NativeToolCoordinator,
+  NativeToolCoordinatorError,
   type NativeToolReadLedgerEntry,
   type NativeToolReadSignature,
 } from './NativeToolCoordinator.js';

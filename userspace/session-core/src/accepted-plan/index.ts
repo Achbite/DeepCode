@@ -1,4 +1,5 @@
 export * from './AcceptedPlanAdmission.js';
+export * from './AcceptedPlanExecutionRootResolver.js';
 export * from './AcceptedPlanProgressAggregator.js';
 export * from './AcceptedPlanScopeIntervention.js';
 export * from './AcceptedPlanScopeMatcher.js';

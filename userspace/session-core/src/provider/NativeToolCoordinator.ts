@@ -1,6 +1,7 @@
 import type {
   KernelToolCatalogSnapshot,
   KernelToolCatalogTool,
+  LlmChatResult,
   ToolCall,
   ToolDefinition,
 } from '@deepcode/protocol';
@@ -48,7 +49,76 @@ export interface NativeToolCoordinatorState {
   conversationRoots: ConversationResourceRoot[];
 }
 
+interface NativeToolCallBuffer {
+  toToolCalls(): NativeToolCallProposal[];
+}
+
+export class NativeToolCoordinatorError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string
+  ) {
+    super(message);
+    this.name = 'NativeToolCoordinatorError';
+  }
+}
+
 export class NativeToolCoordinator {
+  collectCalls(
+    result: LlmChatResult,
+    buffer: NativeToolCallBuffer
+  ): NativeToolCallProposal[] {
+    const output = new Map<string, NativeToolCallProposal>();
+    const add = (toolCall: ToolCall, index: number) => {
+      const callId = toolCall.id || `tool-call-${index}`;
+      output.set(callId, {
+        callId,
+        index,
+        name: this.normalizeToolName(toolCall.name),
+        arguments: this.normalizeArguments(toolCall.arguments, toolCall.name),
+        rawArguments: typeof toolCall.arguments === 'string' ? toolCall.arguments : undefined,
+      });
+    };
+    result.assistantMessage?.toolCalls?.forEach(add);
+    result.chunks.forEach((chunk, index) => {
+      if (chunk.toolCall) add(chunk.toolCall, typeof chunk.index === 'number' ? chunk.index : index);
+    });
+    for (const toolCall of buffer.toToolCalls()) {
+      output.set(toolCall.callId, toolCall);
+    }
+    return [...output.values()].sort((left, right) => left.index - right.index);
+  }
+
+  parseArguments(raw: string, toolName: string): Record<string, unknown> {
+    const text = raw.trim();
+    if (!text) return {};
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      return this.normalizeArguments(parsed, toolName);
+    } catch (error) {
+      throw new NativeToolCoordinatorError(
+        'native_tool_arguments_invalid',
+        `Provider-native tool call ${toolName} returned invalid JSON arguments: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  normalizeArguments(value: unknown, toolName: string): Record<string, unknown> {
+    if (typeof value === 'string') return this.parseArguments(value, toolName);
+    const record = objectRecord(value);
+    if (!record) {
+      throw new NativeToolCoordinatorError(
+        'native_tool_arguments_invalid',
+        `Provider-native tool call ${toolName} arguments must be a JSON object.`
+      );
+    }
+    return record;
+  }
+
+  normalizeToolName(name: string): string {
+    return name.replace(/__/g, '.');
+  }
+
   callToProtocol(toolCall: NativeToolCallProposal): ToolCall {
     return {
       id: toolCall.callId,
@@ -255,6 +325,12 @@ export class NativeToolCoordinator {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function normalizedNonNegativeInteger(value: unknown): number | undefined {
