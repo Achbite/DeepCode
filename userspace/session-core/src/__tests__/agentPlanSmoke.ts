@@ -4063,7 +4063,7 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
         };
       }
       repairRequests.push(request);
-      return jsonLlmResponse(genericWriteProposal(false));
+      return jsonLlmResponse(genericTaskPlanProposal());
     },
     now: () => '2026-01-01T00:00:00.000Z',
     createId: (prefix) => `${prefix}-${events.length + submittedPlans.length + 1}`,
@@ -4075,8 +4075,8 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
     requirementConfirmationMode: 'off',
   });
   assertEqual(llmCalls, 2, 'empty planning response triggers one protocol repair');
-  assertEqual(submittedPlans.length, 1, 'repaired empty response reaches Kernel plan review once');
-  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired empty response renders a plan card');
+  assertEqual(submittedPlans.length, 0, 'repaired empty planning response does not submit executable Kernel plan review');
+  assertEqual(result.events.some((event) => event.kind === 'plan_card'), true, 'repaired empty response renders a taskPlan card');
   const repairPrompt = repairRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
   assert(
     repairPrompt.includes('For initial side-effect work, output taskPlan'),
@@ -4085,6 +4085,12 @@ async function assertSessionDriverLoopRepairsEmptyActionBundleResponse(): Promis
   assert(
     !repairPrompt.includes('requiredKind: actionBundle'),
     'empty planning response repair must not force an actionBundle'
+  );
+  assert(
+    !repairPrompt.includes('actionBundle.actions[] are executable Kernel tool actions') &&
+      !repairPrompt.includes('Kernel catalog ids') &&
+      !repairPrompt.includes('fs.delete intent'),
+    'planning empty response repair must not expose execution tool schema'
   );
   assertEqual(
     result.events.some((event) =>

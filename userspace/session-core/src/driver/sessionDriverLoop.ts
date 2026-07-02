@@ -77,7 +77,11 @@ import {
   stripProviderPartFrames,
   type NativeToolCallProposal,
 } from '../provider/providerStreamParts.js';
-import { ResourceManifestBuilder } from '../resources/index.js';
+import {
+  ResourceManifestBuilder,
+  ResourceRequestResolver,
+  type ResourceRequestResolution,
+} from '../resources/index.js';
 import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import {
@@ -277,13 +281,6 @@ type SessionRunStateReason =
   | 'review'
   | 'accepted_plan_execution'
   | 'work_unit_failed';
-
-interface ResourceRequestResolution {
-  manifest: ResourceManifest;
-  unresolved: string[];
-  ambiguous: string[];
-  availableRoots: ConversationResourceRoot[];
-}
 
 interface ActiveTurnState {
   turnId: string;
@@ -662,7 +659,7 @@ export class SessionDriverLoop {
           lastResult = await this.append(sessionId, [resourcePacketEvent(sessionId, generated.packet, this.ts(), this.id('generated-artifact-resource-context'))]);
           if (!generated.remaining.items.length) continue;
         }
-        let subset = manifestForResourceRequest(state.manifest, generated.remaining, state.conversationRoots);
+        let subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
         if (!subset.manifest.entries.length) {
           if (!state.resourceRequestRepairAttempted) {
             state.resourceRequestRepairAttempted = true;
@@ -672,7 +669,7 @@ export class SessionDriverLoop {
                 return this.append(sessionId, [answerEvent(sessionId, repaired, this.ts(), this.id('answer'))]);
               }
               if (repaired.kind === 'resourceRequest') {
-                subset = manifestForResourceRequest(state.manifest, repaired.payload as ResourceRequestDraft, state.conversationRoots);
+                subset = resourceRequestResolver().resolve(state.manifest, repaired.payload as ResourceRequestDraft, state.conversationRoots);
               } else if (repaired.kind === 'actionBundle') {
                 return this.submitActionProposal(input, state, prompt, repaired, lastResult);
               } else {
@@ -2883,7 +2880,7 @@ export class SessionDriverLoop {
           resourcePacketEvent(state.sessionId, generated.packet, this.ts(), this.id('action-bundle-admission-generated-resource-context')),
         ]) ?? result;
       }
-      const subset = manifestForResourceRequest(state.manifest, generated.remaining, state.conversationRoots);
+      const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
       if (!subset.manifest.entries.length) {
         if (!generated.packet) {
           return this.append(state.sessionId, actionBundleAdmissionFailureEvents(
@@ -3159,7 +3156,7 @@ export class SessionDriverLoop {
                 resourcePacketEvent(state.sessionId, generated.packet, this.ts(), this.id('accepted-plan-repair-generated-resource-context')),
               ]) ?? result;
             }
-            const subset = manifestForResourceRequest(state.manifest, generated.remaining, state.conversationRoots);
+            const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
             if (!subset.manifest.entries.length) {
               if (!generated.packet) {
                 return this.append(state.sessionId, [
@@ -4538,7 +4535,7 @@ function nativeReadToolManifest(
     ?? '.';
   const itemId = `native-${sanitizeId(toolCall.callId)}`;
   const kind: ResourceManifestEntry['kind'] = toolCall.name === 'fs.list' ? 'directory' : 'file';
-  const synthesized = synthesizeManifestEntryForPath(
+  const synthesized = resourceRequestResolver().synthesizeEntryForPath(
     state.manifest,
     state.conversationRoots,
     itemId,
@@ -4768,14 +4765,11 @@ function generatedArtifactEvidenceForRequestItem(
     stringValue(item.path),
     stringValue(item.manifestEntryId),
   ]);
+  const resolver = resourceRequestResolver();
   for (const candidate of candidates) {
-    const resolved = resolveRequestPath(candidate, item.rootId, state.conversationRoots);
-    const fallback = resolved.kind === 'resolved'
-      ? resolved
-      : resolveRequestPath(candidate, undefined, state.conversationRoots);
-    const targetPath = fallback.kind === 'resolved'
-      ? fallback.relativePath
-      : normalizeRelativePath(candidate);
+    const targetPath = resolver.resolveRelativePath(candidate, item.rootId, state.conversationRoots)
+      ?? resolver.resolveRelativePath(candidate, undefined, state.conversationRoots)
+      ?? normalizeRelativePath(candidate);
     if (!targetPath || targetPath === '.') continue;
     const evidence = state.generatedArtifactEvidence.get(comparablePath(targetPath));
     if (evidence) return evidence;
@@ -4899,6 +4893,10 @@ function resourceManifestBuilder(): ResourceManifestBuilder {
     sanitizeId,
     objectRecord,
   });
+}
+
+function resourceRequestResolver(): ResourceRequestResolver {
+  return new ResourceRequestResolver();
 }
 
 function acceptedPlanAdmission(): AcceptedPlanAdmission {
@@ -5262,106 +5260,6 @@ function acceptedPlanTaskSavepointEvent(
   };
 }
 
-function manifestForResourceRequest(
-  manifest: ResourceManifest,
-  request: ResourceRequestDraft,
-  roots: ConversationResourceRoot[]
-): ResourceRequestResolution {
-  const entries: ResourceManifestEntry[] = [];
-  const seen = new Set<string>();
-  const unresolved: string[] = [];
-  const ambiguous: string[] = [];
-
-  const pushEntry = (entry: ResourceManifestEntry, item?: ResourceRequestDraft['items'][number]) => {
-    const ranged = item ? resourceEntryWithRange(entry, item) : entry;
-    if (seen.has(ranged.id)) return;
-    seen.add(ranged.id);
-    entries.push(ranged);
-  };
-
-  for (const item of request.items ?? []) {
-    const searchQuery = item.query?.trim();
-    if (item.kind === 'search' || searchQuery) {
-      const synthesized = synthesizeManifestEntryForSearch(roots, item);
-      if (synthesized.kind === 'entry') {
-        manifest.entries.push(synthesized.entry);
-        pushEntry(synthesized.entry, item);
-        continue;
-      }
-      if (synthesized.kind === 'ambiguous') {
-        ambiguous.push(`${item.id} (${synthesized.reason})`);
-        continue;
-      }
-      unresolved.push(`${item.id} (${synthesized.reason})`);
-      continue;
-    }
-
-    const exactId = item.manifestEntryId?.trim();
-    if (exactId) {
-      const exact = manifest.entries.find((entry) => entry.id === exactId);
-      if (exact) {
-        pushEntry(exact, item);
-        continue;
-      }
-    }
-
-    const pathCandidate = item.path?.trim() || item.manifestEntryId?.trim();
-    if (!pathCandidate) {
-      unresolved.push(item.id);
-      continue;
-    }
-
-    const existing = findExistingEntryByPath(manifest, pathCandidate, roots);
-    if (existing) {
-      pushEntry(existing, item);
-      continue;
-    }
-
-    const synthesized = synthesizeManifestEntryForPath(manifest, roots, item.id, pathCandidate, item.rootId, item.reason);
-    if (synthesized.kind === 'entry') {
-      const entry = resourceEntryWithRange(synthesized.entry, item);
-      manifest.entries.push(synthesized.entry);
-      pushEntry(entry);
-      continue;
-    }
-    if (synthesized.kind === 'ambiguous') {
-      ambiguous.push(`${pathCandidate} (${synthesized.reason})`);
-      continue;
-    }
-    unresolved.push(`${pathCandidate} (${synthesized.reason})`);
-  }
-
-  return {
-    manifest: {
-      ...manifest,
-      id: `${manifest.id}-request-${sanitizeId(request.id ?? 'resource-request')}`,
-      entries,
-    },
-    unresolved,
-    ambiguous,
-    availableRoots: roots,
-  };
-}
-
-function resourceEntryWithRange(entry: ResourceManifestEntry, item: ResourceRequestDraft['items'][number]): ResourceManifestEntry {
-  const offsetBytes = normalizedNonNegativeInteger(item.offsetBytes);
-  const limitBytes = normalizedPositiveInteger(item.limitBytes);
-  if (typeof offsetBytes !== 'number' && typeof limitBytes !== 'number') return entry;
-  const rangeId = [
-    entry.id,
-    'range',
-    typeof offsetBytes === 'number' ? offsetBytes : 0,
-    typeof limitBytes === 'number' ? limitBytes : 'default',
-  ].join(':');
-  return {
-    ...entry,
-    id: rangeId,
-    ...(typeof offsetBytes === 'number' ? { offsetBytes } : {}),
-    ...(typeof limitBytes === 'number' ? { limitBytes } : {}),
-    reason: `${entry.reason} Range request: offsetBytes=${offsetBytes ?? 0}, limitBytes=${limitBytes ?? 'default'}.`,
-  };
-}
-
 function normalizedNonNegativeInteger(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   const integer = Math.floor(value);
@@ -5371,180 +5269,6 @@ function normalizedNonNegativeInteger(value: unknown): number | undefined {
 function normalizedPositiveInteger(value: unknown): number | undefined {
   const integer = normalizedNonNegativeInteger(value);
   return typeof integer === 'number' && integer > 0 ? integer : undefined;
-}
-
-type SynthesizedManifestEntryResult =
-  | { kind: 'entry'; entry: ResourceManifestEntry }
-  | { kind: 'ambiguous'; reason: string }
-  | { kind: 'unresolved'; reason: string };
-
-function findExistingEntryByPath(
-  manifest: ResourceManifest,
-  requestedPath: string,
-  roots: ConversationResourceRoot[]
-): ResourceManifestEntry | undefined {
-  const exact = manifest.entries.find((entry) => comparablePath(entry.resourceRef) === comparablePath(requestedPath));
-  if (exact) return exact;
-  const resolved = resolveRequestPath(requestedPath, undefined, roots);
-  if (resolved.kind !== 'resolved') return undefined;
-  const ref = joinFsPath(resolved.root.absolutePath ?? resolved.root.displayPath, resolved.relativePath);
-  return manifest.entries.find((entry) => comparablePath(entry.resourceRef) === comparablePath(ref));
-}
-
-function synthesizeManifestEntryForPath(
-  manifest: ResourceManifest,
-  roots: ConversationResourceRoot[],
-  itemId: string,
-  requestedPath: string,
-  rootId: string | undefined,
-  reason: string
-): SynthesizedManifestEntryResult {
-  const resolved = resolveRequestPath(requestedPath, rootId, roots);
-  if (resolved.kind !== 'resolved') return resolved;
-  const resourceRef = joinFsPath(resolved.root.absolutePath ?? resolved.root.displayPath, resolved.relativePath);
-  const existing = manifest.entries.find((entry) => comparablePath(entry.resourceRef) === comparablePath(resourceRef));
-  if (existing) return { kind: 'entry', entry: existing };
-  const entry: ResourceManifestEntry = {
-    id: `path-${sanitizeId(resolved.root.rootId)}-${sanitizeId(resolved.relativePath || itemId)}`,
-    kind: 'resource',
-    label: `Resource ${resolved.root.displayPath}/${resolved.relativePath}`,
-    resourceRef,
-    readPolicy: 'autoRead',
-    reason: reason || `Requested path under conversation root ${resolved.root.rootId}.`,
-  };
-  return { kind: 'entry', entry };
-}
-
-function synthesizeManifestEntryForSearch(
-  roots: ConversationResourceRoot[],
-  item: ResourceRequestDraft['items'][number]
-): SynthesizedManifestEntryResult {
-  const query = item.query?.trim();
-  if (!query) return { kind: 'unresolved', reason: 'search request requires query' };
-  const root = searchRootForRequest(item.rootId, roots);
-  if (root.kind !== 'resolved') return root;
-  const include = stringArrayValue(item.include);
-  const contextLines = normalizedNonNegativeInteger(item.contextLines);
-  const maxResults = normalizedPositiveInteger(item.maxResults);
-  const resourceRef = root.root.absolutePath ?? root.root.displayPath;
-  return {
-    kind: 'entry',
-    entry: {
-      id: `search-${sanitizeId(root.root.rootId)}-${sanitizeId(item.id)}`,
-      kind: 'search',
-      label: `Search ${query}`,
-      resourceRef,
-      readPolicy: 'autoRead',
-      reason: item.reason || `Search under conversation root ${root.root.rootId}.`,
-      query,
-      ...(include.length ? { include } : {}),
-      ...(typeof contextLines === 'number' ? { contextLines } : {}),
-      ...(typeof maxResults === 'number' ? { maxResults } : {}),
-    },
-  };
-}
-
-function searchRootForRequest(
-  rootId: string | undefined,
-  roots: ConversationResourceRoot[]
-): { kind: 'resolved'; root: ConversationResourceRoot } | { kind: 'ambiguous'; reason: string } | { kind: 'unresolved'; reason: string } {
-  if (!roots.length) return { kind: 'unresolved', reason: 'no available conversation root' };
-  if (rootId) {
-    const root = roots.find((item) => item.rootId === rootId);
-    if (!root) return { kind: 'unresolved', reason: `unknown rootId ${rootId}` };
-    return { kind: 'resolved', root };
-  }
-  const primary = roots.find((item) => item.primary);
-  if (primary) return { kind: 'resolved', root: primary };
-  if (roots.length === 1) return { kind: 'resolved', root: roots[0]! };
-  return { kind: 'ambiguous', reason: 'search request must include rootId when multiple roots are available' };
-}
-
-type ResolvedRequestPath =
-  | { kind: 'resolved'; root: ConversationResourceRoot; relativePath: string }
-  | { kind: 'ambiguous'; reason: string }
-  | { kind: 'unresolved'; reason: string };
-
-function resolveRequestPath(
-  requestedPath: string,
-  rootId: string | undefined,
-  roots: ConversationResourceRoot[]
-): ResolvedRequestPath {
-  const trimmed = requestedPath.trim();
-  if (!trimmed) return { kind: 'unresolved', reason: 'empty path' };
-  if (!roots.length) return { kind: 'unresolved', reason: 'no available conversation root' };
-
-  if (rootId) {
-    const root = roots.find((item) => item.rootId === rootId);
-    if (!root) return { kind: 'unresolved', reason: `unknown rootId ${rootId}` };
-    const relativePath = relativePathForRoot(trimmed, root, true);
-    if (!relativePath) return { kind: 'unresolved', reason: `path is outside root ${rootId}` };
-    return { kind: 'resolved', root, relativePath };
-  }
-
-  if (isAbsolutePath(trimmed)) {
-    const matches = roots
-      .map((root) => ({ root, relativePath: relativePathForRoot(trimmed, root, true) }))
-      .filter((item): item is { root: ConversationResourceRoot; relativePath: string } => Boolean(item.relativePath))
-      .sort((left, right) => comparablePath(right.root.absolutePath ?? right.root.displayPath).length - comparablePath(left.root.absolutePath ?? left.root.displayPath).length);
-    if (matches.length === 0) return { kind: 'unresolved', reason: 'absolute path is outside explicit attachments and project roots' };
-    return { kind: 'resolved', root: matches[0].root, relativePath: matches[0].relativePath };
-  }
-
-  const explicitMatches = roots
-    .map((root) => ({ root, relativePath: relativePathForRoot(trimmed, root, false) }))
-    .filter((item): item is { root: ConversationResourceRoot; relativePath: string } => Boolean(item.relativePath));
-  if (explicitMatches.length > 0) {
-    explicitMatches.sort((left, right) => right.root.displayPath.length - left.root.displayPath.length);
-    return { kind: 'resolved', root: explicitMatches[0].root, relativePath: explicitMatches[0].relativePath };
-  }
-
-  const relativePath = normalizeRelativePath(trimmed);
-  if (!relativePath) return { kind: 'unresolved', reason: 'path traversal or empty relative path is not allowed' };
-  const sorted = [...roots].sort((left, right) => rootPriority(left) - rootPriority(right));
-  const bestPriority = rootPriority(sorted[0]);
-  const candidates = sorted.filter((root) => rootPriority(root) === bestPriority);
-  if (candidates.length === 1) {
-    return { kind: 'resolved', root: candidates[0], relativePath };
-  }
-  return {
-    kind: 'ambiguous',
-    reason: `multiple roots at the same priority: ${candidates.map((root) => root.rootId).join(', ')}`,
-  };
-}
-
-function relativePathForRoot(
-  requestedPath: string,
-  root: ConversationResourceRoot,
-  allowPlainRelative: boolean
-): string | undefined {
-  const normalized = normalizeSlashes(requestedPath);
-  const rootKeys = [
-    root.rootId,
-    root.displayPath,
-    root.absolutePath,
-    basename(root.displayPath),
-    root.absolutePath ? basename(root.absolutePath) : undefined,
-  ].filter((item): item is string => Boolean(item && item.trim()));
-
-  for (const key of rootKeys) {
-    const normalizedKey = normalizeSlashes(key).replace(/\/+$/g, '');
-    if (!normalizedKey) continue;
-    if (normalized === normalizedKey) return '.';
-    if (normalized.startsWith(`${normalizedKey}/`)) {
-      return normalizeRelativePath(normalized.slice(normalizedKey.length + 1));
-    }
-  }
-
-  if (isAbsolutePath(normalized)) {
-    const rootPath = root.absolutePath ? normalizeSlashes(root.absolutePath).replace(/\/+$/g, '') : undefined;
-    if (!rootPath) return undefined;
-    if (normalized === rootPath) return '.';
-    if (!normalized.startsWith(`${rootPath}/`)) return undefined;
-    return normalizeRelativePath(normalized.slice(rootPath.length + 1));
-  }
-
-  return allowPlainRelative ? normalizeRelativePath(normalized) : undefined;
 }
 
 function normalizeRelativePath(value: string | undefined): string | undefined {
@@ -5575,15 +5299,6 @@ function basename(value: string): string {
   const normalized = normalizeSlashes(value).replace(/\/+$/g, '');
   const parts = normalized.split('/');
   return parts[parts.length - 1] || normalized;
-}
-
-function rootPriority(root: ConversationResourceRoot): number {
-  if (root.primary) return -1;
-  if (root.source === 'currentAttachment') return 0;
-  if (root.source === 'sessionAttachment') return 1;
-  if (root.source === 'projectWorkingDirectory') return 2;
-  if (root.source === 'recentAttachment') return 3;
-  return 4;
 }
 
 // i18n 诊断结构：session-core 产出语言无关的 code + params + 英文 fallback，
@@ -12111,14 +11826,7 @@ function renderRepairProviderTurnContract(
     trust: 'immediateInstruction',
     scope: 'currentProviderCall',
     use: 'highest priority for this repair call after system safety rules',
-    content: [
-      `state=${input.turnMode}`,
-      `allowedOutputs=${input.allowedKinds.join(' | ') || 'none'}`,
-      input.requiredKind ? `requiredOutput=${input.requiredKind}` : '',
-      'forbiddenOutputs=taskPlan | implementationPlan | reviewSummary',
-      'Return exactly one valid Agent Protocol v3 JSON object. No prose, markdown fences, or protocol explanation.',
-      'If executable work remains in current scope, output actionBundle. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.',
-    ].filter(Boolean),
+    content: repairNextActionInstructionLines(input),
   });
   return renderProviderTurnContract({
     schemaVersion: 'deepcode.session.provider-turn-contract.v1',
@@ -12127,15 +11835,44 @@ function renderRepairProviderTurnContract(
     requiredKind: input.requiredKind,
     repairPolicy: input.repairPolicy ?? 'sameKindOnly',
     projectionVisibility: input.turnMode === 'protocolRepair' ? 'debugOnly' : 'normal',
-    toolIntentTemplates: repairToolIntentTemplates(state, acceptedContext),
+    toolIntentTemplates: repairToolIntentTemplates(state, acceptedContext, input.allowedKinds),
     frames,
   });
 }
 
+function repairNextActionInstructionLines(input: {
+  turnMode: ProviderTurnMode;
+  allowedKinds: string[];
+  requiredKind?: string;
+}): string[] {
+  const allowsActionBundle = input.allowedKinds.includes('actionBundle');
+  const forbidden = allowsActionBundle
+    ? 'taskPlan | implementationPlan | reviewSummary'
+    : 'actionBundle | implementationPlan | reviewSummary';
+  const nextAction = allowsActionBundle
+    ? 'If executable work remains in current scope, output actionBundle. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.'
+    : 'Do not output executable tool args. If side-effect work remains unaccepted, output taskPlan. If evidence is missing, output focused resourceRequest. If a user choice is needed, output decisionRequest.';
+  return [
+    `state=${input.turnMode}`,
+    `allowedOutputs=${input.allowedKinds.join(' | ') || 'none'}`,
+    input.requiredKind ? `requiredOutput=${input.requiredKind}` : '',
+    `forbiddenOutputs=${forbidden}`,
+    'Return exactly one valid Agent Protocol v3 JSON object. No prose, markdown fences, or protocol explanation.',
+    nextAction,
+  ].filter(Boolean);
+}
+
 function repairToolIntentTemplates(
   state: SessionDriverLoopRunState,
-  acceptedContext: Record<string, unknown>
+  acceptedContext: Record<string, unknown>,
+  allowedKinds: string[]
 ): string[] {
+  if (!allowedKinds.includes('actionBundle')) {
+    return [
+      'No executable tool intent templates are visible in this repair call.',
+      'Use taskPlan operation intent, focused resourceRequest, decisionRequest, answer, or diagnostic according to allowedOutputs.',
+    ];
+  }
   const templates = Array.isArray(acceptedContext.currentTaskActionTemplates)
     ? acceptedContext.currentTaskActionTemplates
     : [];
@@ -12220,29 +11957,41 @@ function repairMessages(
   parseError: { code: string; message: string }
 ): LlmChatRequest['messages'] {
   const acceptedExecution = Boolean(state.acceptedImplementationPlan || state.currentTaskContext);
-  const allowedKinds = acceptedExecution
+  const actionBundleRepair = acceptedExecution || isActionBundleRepairError(parseError.code);
+  const allowedKinds = actionBundleRepair
     ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
     : ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'];
+  const repairSystemLines = [
+    'You are the DeepCode Agent Protocol v3 repair step.',
+    'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
+    'Do not add execution facts, permissions, or tool results.',
+    `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
+    acceptedExecution
+      ? 'An accepted task is already active. Do not output taskPlan or implementationPlan; repair toward the current task actionBundle/resourceRequest/decisionRequest/diagnostic only.'
+      : actionBundleRepair
+        ? 'Repair the existing actionBundle proposal only if it remains a valid reviewable side-effect proposal; otherwise output taskPlan, resourceRequest, decisionRequest, or diagnostic as allowed.'
+        : 'For initial side-effect work, output taskPlan unless acceptedTaskPlan context is already present. Do not output actionBundle in this repair call.',
+    ...(actionBundleRepair ? actionBundleProtocolShapeLines() : []),
+    actionBundleRepair
+      ? 'Use codeBlocks[].contentLines for source code. Do not output large codeBlocks.content strings and do not manually escape multiline source code into JSON strings.'
+      : 'Execution actionBundle schema and Kernel tool args are intentionally withheld in this repair call.',
+    actionBundleRepair
+      ? 'For fs.write, args.sourceBlockId must reference a top-level codeBlocks[].blockId for the same args.path. Directory targets are planning scopes; do not repair by creating empty .gitkeep or other placeholder files.'
+      : 'Represent future file operations as taskPlan targets/capabilities only; do not invent toolIds or executable args.',
+    'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or payload wrapper fields.',
+    'Output ONLY the single JSON object — no prose, no explanation, and no markdown ``` code fences before or after it.',
+    actionBundleRepair
+      ? 'actionBundle.version must be exactly the string "1".'
+      : '',
+    actionBundleRepair
+      ? 'For a side-effect actionBundle, actionBundle.validationExpectations and actionBundle.reviewExpectations are optional; Session derives routine defaults when they are omitted or empty.'
+      : '',
+    'Repair once from the compact context only; do not rely on omitted prompt text.',
+  ].filter(Boolean);
   return [
     {
       role: 'system',
-      content: [
-        'You are the DeepCode Agent Protocol v3 repair step.',
-        'Return exactly one valid JSON object using schemaVersion "deepcode.agent.protocol.v3".',
-        'Do not add execution facts, permissions, or tool results.',
-        `Allowed proposal kinds: ${allowedKinds.join(', ')}.`,
-        acceptedExecution
-          ? 'An accepted task is already active. Do not output taskPlan or implementationPlan; repair toward the current task actionBundle/resourceRequest/decisionRequest/diagnostic only.'
-          : 'For initial side-effect work, output taskPlan unless acceptedTaskPlan context is already present.',
-        ...actionBundleProtocolShapeLines(),
-        'Use codeBlocks[].contentLines for source code. Do not output large codeBlocks.content strings and do not manually escape multiline source code into JSON strings.',
-        'For fs.write, args.sourceBlockId must reference a top-level codeBlocks[].blockId for the same args.path. Directory targets are planning scopes; do not repair by creating empty .gitkeep or other placeholder files.',
-        'Do not output legacy implementationPlan, commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or payload wrapper fields.',
-        'Output ONLY the single JSON object — no prose, no explanation, and no markdown ``` code fences before or after it.',
-        'actionBundle.version must be exactly the string "1".',
-        'For a side-effect actionBundle, actionBundle.validationExpectations and actionBundle.reviewExpectations are optional; Session derives routine defaults when they are omitted or empty.',
-        'Repair once from the compact context only; do not rely on omitted prompt text.',
-      ].join('\n'),
+      content: repairSystemLines.join('\n'),
     },
     {
       role: 'user',
@@ -12255,7 +12004,7 @@ function repairMessages(
         }),
         ...compactRepairContextLines(prompt, state),
         'Protocol field quick reference:',
-        fenced(protocolRepairShapeReference(parseError.code)),
+        fenced(protocolRepairShapeReference(parseError.code, allowedKinds)),
         `Parser error code: ${parseError.code}`,
         `Parser error message: ${parseError.message}`,
         'Invalid model output, clipped:',
@@ -12265,27 +12014,55 @@ function repairMessages(
   ];
 }
 
-function protocolRepairShapeReference(errorCode: string): string {
+function protocolRepairShapeReference(errorCode: string, allowedKinds: string[]): string {
+  const allows = (kind: string): boolean => allowedKinds.includes(kind);
   const common = [
     'Provider output must be one Agent Protocol v3 JSON object.',
-    'Allowed proposal kinds: answer, resourceRequest, decisionRequest, taskPlan, actionBundle, diagnostic.',
+    `Allowed proposal kinds for this repair call: ${allowedKinds.join(', ') || 'none'}.`,
     'reviewSummary is Session-generated and must not be returned by the provider.',
-    'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered engineering queue, not a graph. Deprecated graph fields may be parsed for telemetry but are not required and must not be used for provider-facing scheduling. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.',
-    'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.',
-    'For kind="decisionRequest", put decisionRequest:{id,question,reason?,summary?,options:[{id,label,description,recommended?}],allowsFreeform?} on the top-level JSON object. Do not return bare reason/options without decisionRequest.',
-    'codeBlocks[] uses {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}; contentLines is the only source-code carrier.',
-    'fs.write actions use args={path,sourceBlockId}; sourceBlockId must match the blockId of the codeBlock carrying that exact file content.',
-    'Directory targets such as src/ are planning scopes only. Do not create empty .gitkeep or placeholder files unless the user explicitly requested that concrete file. For new files, write the concrete file and let Kernel create parent directories.',
-    'Empty content is valid only for operation="createEmpty" on an explicit empty file, or for patch/replace/insert operations when the protocol explicitly permits it.',
-    actionBundleProtocolShapeReference(),
+    allows('answer')
+      ? 'For kind="answer", put answer:{format:"markdown",content:"..."} on the top-level JSON object.'
+      : '',
+    allows('resourceRequest')
+      ? resourceRequestProtocolShapeLine()
+      : '',
+    allows('decisionRequest')
+      ? 'For kind="decisionRequest", put decisionRequest:{id,question,reason?,summary?,options:[{id,label,description,recommended?}],allowsFreeform?} on the top-level JSON object. Do not return bare reason/options without decisionRequest.'
+      : '',
+    allows('taskPlan')
+      ? 'For kind="taskPlan", put taskPlan.version/id/title/summary/tasks/risks/reviewCheckpoints at the top level. tasks[] must be a Session-advanced ordered engineering queue, not a graph. It must not include codeBlocks, actionBundle, commandBlocks, patches, source code, or executable tool calls.'
+      : '',
+    allows('actionBundle')
+      ? 'For kind="actionBundle", put userPlanMarkdown, codeBlocks, and actionBundle directly on the top-level JSON object. Do not wrap them in a payload object. validationExpectations[] and reviewExpectations[] are optional provider notes; Session derives routine defaults when they are omitted.'
+      : '',
+    allows('actionBundle')
+      ? 'codeBlocks[] uses {blockId,targetPath,language?,operation?,contentLines,allowEmptyContent?}; contentLines is the only source-code carrier.'
+      : '',
+    allows('actionBundle')
+      ? 'fs.write actions use args={path,sourceBlockId}; sourceBlockId must match the blockId of the codeBlock carrying that exact file content.'
+      : '',
+    allows('actionBundle')
+      ? 'Directory targets such as src/ are planning scopes only. Do not create empty .gitkeep or placeholder files unless the user explicitly requested that concrete file. For new files, write the concrete file and let Kernel create parent directories.'
+      : '',
+    allows('actionBundle')
+      ? 'Empty content is valid only for operation="createEmpty" on an explicit empty file, or for patch/replace/insert operations when the protocol explicitly permits it.'
+      : '',
+    allows('actionBundle') ? actionBundleProtocolShapeReference() : '',
     'Never output capability, permissionLabels, accessScopes, resourceScope, commandBlocks, or legacy implementationPlan.',
-  ];
-  if (errorCode === 'invalid_action_bundle' || errorCode === 'invalid_object') {
+  ].filter(Boolean);
+  if (allows('actionBundle') && (errorCode === 'invalid_action_bundle' || errorCode === 'invalid_object')) {
     common.push(
       `Minimal actionBundle skeleton:\n${minimalActionBundleRepairSkeleton()}`
     );
   }
   return common.join('\n');
+}
+
+function isActionBundleRepairError(errorCode: string): boolean {
+  return errorCode === 'invalid_action_bundle'
+    || errorCode === 'invalid_action_bundle_expectation'
+    || errorCode === 'invalid_action_bundle_continuation'
+    || errorCode === 'action_bundle_budget_exceeded';
 }
 
 function actionBundleCompactionRepairMessages(
