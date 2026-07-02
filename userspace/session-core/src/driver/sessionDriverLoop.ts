@@ -4793,7 +4793,7 @@ function implementationBatchHints(
   ];
   if (acceptedPlan) {
     const currentTask = acceptedPlan.tasks.find((task) => !acceptedPlan.completedTaskIds.includes(task.taskId));
-    const currentTaskOperations = objectRecord(sanitizedAcceptedPlanExecutionContext(acceptedPlan))?.currentTaskOperations;
+    const currentTaskOperations = objectRecord(executionPromptCoordinator().sanitizedContext(acceptedPlan))?.currentTaskOperations;
     hints.push(
       `Accepted taskPlan active: planId=${acceptedPlan.planId}; currentTask=${currentTask?.taskId ?? 'complete'}; completedTasks=${acceptedPlan.completedTaskIds.length}/${acceptedPlan.tasks.length}. Automatic execution is allowed only for the current task when targets and capabilities stay inside the accepted plan.`,
       currentTask
@@ -4869,53 +4869,6 @@ function currentTaskMemoryHints(context: CurrentTaskContext | undefined): string
   ];
 }
 
-function sanitizedAcceptedPlanExecutionContext(acceptedPlan: AcceptedImplementationPlanContext | undefined): Record<string, unknown> {
-  if (!acceptedPlan) return {};
-  const completed = new Set(acceptedPlan.completedTaskIds);
-  const currentTask = acceptedPlan.tasks.find((task) => !completed.has(task.taskId));
-  const taskTargets = (currentTask?.targets ?? [])
-    .flatMap((target) => expandAcceptedPlanTargetValue(target))
-    .map((target) => normalizePlanScopeIdentity(target))
-    .filter((target) => target && acceptedPlanTargetListSegmentSafe(target));
-  const currentTaskOperations = acceptedPlan.exactOperationGrants.reduce<Record<string, unknown>[]>((items, grant) => {
-    if (currentTask?.taskId && grant.sourceTaskId && grant.sourceTaskId !== currentTask.taskId) return items;
-    const targetPath = normalizePlanScopeIdentity(grant.targetRefPath ?? grant.targetPath);
-    if (!acceptedPlanTargetListSegmentSafe(targetPath)) return items;
-    items.push({
-      operation: grant.operation,
-      capability: grant.capability,
-      targetPath,
-      targetResourceKind: grant.targetResourceKind,
-      recursive: grant.recursive === true,
-    });
-    return items;
-  }, []);
-  const operationTargets = currentTaskOperations
-    .map((operation) => stringValue(operation.targetPath))
-    .filter((target): target is string => Boolean(target && acceptedPlanTargetListSegmentSafe(target)));
-  const currentTargets = uniqueStrings([...taskTargets, ...operationTargets]);
-  const currentTaskActionTemplates = currentTaskOperations
-    .map((operation) => acceptedPlanOperationActionTemplate(operation))
-    .filter((item): item is Record<string, unknown> => Boolean(item));
-  return {
-    planId: acceptedPlan.planId,
-    title: acceptedPlan.title ?? acceptedPlan.summary ?? acceptedPlan.planId,
-    currentTask: currentTask
-      ? {
-          taskId: currentTask.taskId,
-          title: currentTask.title,
-          targets: currentTargets,
-          capability: currentTask.capability,
-        }
-      : undefined,
-    completedTaskCount: acceptedPlan.completedTaskIds.length,
-    remainingTaskCount: acceptedPlan.tasks.filter((task) => !completed.has(task.taskId)).length,
-    currentTaskOperations,
-    currentTaskActionTemplates,
-    primaryRoot: acceptedPlan.executionRoot?.ref,
-  };
-}
-
 function providerRepairMessageState(state: SessionDriverLoopRunState): ProviderRepairMessageState {
   return {
     runId: state.runId,
@@ -4923,7 +4876,7 @@ function providerRepairMessageState(state: SessionDriverLoopRunState): ProviderR
     conversationRoots: state.conversationRoots,
     resourcePackets: state.resourcePackets,
     implementationBatch: state.implementationBatch,
-    acceptedContext: sanitizedAcceptedPlanExecutionContext(state.acceptedImplementationPlan),
+    acceptedContext: executionPromptCoordinator().sanitizedContext(state.acceptedImplementationPlan),
     currentTaskContext: state.currentTaskContext
       ? {
         taskId: state.currentTaskContext.taskId,
@@ -4935,57 +4888,6 @@ function providerRepairMessageState(state: SessionDriverLoopRunState): ProviderR
       : undefined,
     completedTaskCount: state.acceptedImplementationPlan?.completedTaskIds.length ?? 0,
   };
-}
-
-function acceptedPlanOperationActionTemplate(operation: Record<string, unknown>): Record<string, unknown> | undefined {
-  const capability = stringValue(operation.capability);
-  const targetPath = stringValue(operation.targetPath);
-  if (!capability || !targetPath) return undefined;
-  if (capability === 'fs.delete') {
-    const targetResourceKind = stringValue(operation.targetResourceKind) === 'directory' ? 'directory' : 'file';
-    return {
-      toolId: 'fs.delete',
-      args: {
-        path: targetPath,
-        targetKind: targetResourceKind,
-        recursive: targetResourceKind === 'directory' || Boolean(operation.recursive),
-      },
-    };
-  }
-  if (capability === 'fs.write') {
-    return {
-      toolId: 'fs.write',
-      args: {
-        path: targetPath,
-        sourceBlockId: '<matching-codeBlocks.blockId>',
-      },
-    };
-  }
-  if (capability === 'fs.patch') {
-    return {
-      toolId: 'fs.patch',
-      args: {
-        path: targetPath,
-        replacementBlockId: '<matching-codeBlocks.blockId>',
-        patchSpec: {
-          match: {
-            kind: 'exactBlock',
-            text: '<copy-current-block-from-ResourceEvidence>',
-          },
-        },
-      },
-    };
-  }
-  if (capability === 'fs.rename') {
-    return {
-      toolId: 'fs.rename',
-      args: {
-        path: targetPath,
-        renameTo: '<new-relative-path-inside-current-task-scope>',
-      },
-    };
-  }
-  return undefined;
 }
 
 function lastAcceptedPlanTaskSavepointId(events: AgentEvent[]): string | undefined {
@@ -6312,16 +6214,17 @@ function repairString(value: unknown): string | undefined {
 
 function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanContext> {
   return new ExecutionPromptCoordinator<SessionPlanContext>({
+    maxActionBundleTotalCodeBytes: MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES,
     sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
     objectRecord,
     stringValue,
+    planId: (plan) => plan.planId,
     actionEffectiveCapability,
     isDetailedUserPlanMarkdown,
     defaultActionBundleUserPlanMarkdown,
     expectationsHaveDescription,
     defaultValidationExpectation,
     defaultReviewExpectation,
-    implementationPlanExecutionRequestText,
   });
 }
 
@@ -11056,56 +10959,6 @@ function implementationPlanExecutionRequest(
   guidance?: string
 ): string {
   return executionPromptCoordinator().executionRequest(plan, acceptedPlan, guidance);
-}
-
-function implementationPlanExecutionRequestText(
-  plan: SessionPlanContext,
-  acceptedPlan: AcceptedImplementationPlanContext,
-  guidance?: string
-): string {
-  const currentTask = acceptedPlan.tasks.find((task) => !acceptedPlan.completedTaskIds.includes(task.taskId));
-  const taskLedger = buildAcceptedPlanTaskLedger(acceptedPlan);
-  const promptFrame = buildAcceptedPlanPromptFrameForContext(acceptedPlan, taskLedger);
-  const providerContext = {
-    sessionPlanId: plan.planId,
-    ...sanitizedAcceptedPlanExecutionContext(acceptedPlan),
-  };
-  return [
-    'The user accepted the Kernel execution contract. You are now in Edit stage and must generate the next executable candidate actionBundle.',
-    'The accepted plan/contract is intent/checklist context, not execution fact. Do not claim files were created, tests passed, or permissions were granted.',
-    'Before the final JSON proposal, stream visible edit drafts with <deepcode-part>{...}</deepcode-part> frames when generating long codeBlocks/actionBundles. Final workspace writes still come only from the complete actionBundle JSON.',
-    'All user-visible natural language in narration, userPlanMarkdown, validation descriptions, and review guidance must follow the current user input language.',
-    'Handle only the task referenced by the current task cursor. One actionBundle may contain multiple related files or actions required by that current task; file count, task count, and codeBlock count are not permission boundaries.',
-    'The task list is a Session-advanced queue in the order confirmed by the user. Do not generate or reason about cross-task scheduling structures. Do not write continuationExpectations for later tasks; Session advances later tasks with its cursor.',
-    'The nested actionBundle object must include version/id/goal/actions; goal is only this batch objective summary, not a permission grant, execution fact, or completion claim. Session can derive routine validationExpectations/reviewExpectations when they are omitted.',
-    'actionBundle.actions must use actionId, toolId, args, and description; Kernel derives capability, permission, readSet/writeSet, and conflictKeys from toolId and args.',
-    currentTask
-      ? `Current task: taskId=${currentTask.taskId}; title=${currentTask.title ?? 'untitled'}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}.`
-      : 'The current task list is complete or unavailable; return diagnostic or a review-ready summary instead of expanding scope.',
-    promptFrame
-      ? `AcceptedPlanPromptFrame: stableFrameHash=${promptFrame.stableFrameHash.slice(0, 16)}; currentTask=${promptFrame.taskLedger.currentTaskId ?? 'none'}; completedTaskCount=${promptFrame.taskLedger.completedTaskIds.length}; remainingTaskCount=${promptFrame.taskLedger.pendingTaskIds.length + (promptFrame.taskLedger.currentTaskId ? 1 : 0)}; projectMemoryRefresh=${promptFrame.cachePolicy.projectMemoryRefresh}.`
-      : '',
-    acceptedPlan.completedTaskIds.length
-      ? `Completed taskIds: ${acceptedPlan.completedTaskIds.join(', ')}. Do not regenerate completed tasks unless Kernel facts show failure or the user requests revision.`
-      : 'The current accepted contract has no completed tasks yet.',
-    acceptedPlan.executionRoot
-      ? `Primary root: ${acceptedPlan.executionRoot.ref}. Workspace args.path and codeBlocks.targetPath must be relative to this root; do not include the root directory name or ../. Absolute file paths are allowed only for outside-workspace targets already confirmed in the accepted plan.`
-      : 'Workspace args.path and codeBlocks.targetPath must be relative to the workspace root. Absolute file paths are allowed only for outside-workspace targets already confirmed in the accepted plan. Do not use ../.',
-    'Use currentTaskActionTemplates from the sanitized context whenever present. They are Session-derived action shapes for the current accepted task; fill only ids, descriptions, sourceBlockId/replacementBlockId references, and codeBlocks as needed.',
-    'If this actionBundle stays inside the accepted contract target/tool scope, Session will submit it to Kernel execution. New target/tool needs must return decisionRequest instead of implicit expansion.',
-    'Execution batches must not carry workspace root, ".", module root, wildcards, accessScopes, resourceScope, or capability; the confirmed Kernel contract is the authorization source.',
-    'Directory targets are valid only for exact fs.delete directory operation templates. For writes and patches, output concrete file paths under the current task target; Kernel creates parent directories for new file writes.',
-    'Do not re-ask already confirmed technical route, directory layout, Docker/script workflow, module split, or validation strategy.',
-    'If a new target/tool is required, or a key technical choice is missing, return kind="decisionRequest" instead of an out-of-scope actionBundle.',
-    'This actionBundle must include concrete codeBlocks when needed. You may include actionBundle.validationExpectations/reviewExpectations, but Session will add default reviewable notes for routine side effects when omitted.',
-    'When modifying an existing file, first use resourceRequest kind="search" or a file/range read for the current anchor. patch action must include patchSpec.match.kind="exactBlock" and non-empty patchSpec.match.text copied from current ResourcePacket fileText/searchResults.',
-    'When deleting a file or confirmed directory, output an fs.delete action: toolId="fs.delete", args.path is a concrete path inside the confirmed task scope. Workspace targets use relative paths; confirmed external targets may use absolute paths. Delete actions do not need and must not reference codeBlocks/sourceBlockId.',
-    'Directory deletion is allowed only when the accepted contract exposed an exact directory operation/grant; set args.targetKind="directory" and args.recursive=true. Unconfirmed directories, wildcards, root directories, and empty paths cannot be fs.delete actions.',
-    `Keep total codeBlock content within the ${MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES} byte payload budget. Prefer complete writes for new files when they fit. For large existing-file rewrites, slice by module, function, class, file section, script segment, or config segment. continuationExpectations may only record current-task payload or evidence deferral; they do not narrow accepted plan authorization and must not schedule later tasks.`,
-    'All source content must be in codeBlocks[].contentLines. Do not use large or multiline codeBlocks.content.',
-    guidance?.trim() ? `Additional guidance supplied when the user confirmed the plan:\n${guidance.trim()}` : '',
-    `Accepted execution sanitized context:\n${fenced(JSON.stringify(providerContext, null, 2))}`,
-  ].filter(Boolean).join('\n\n');
 }
 
 function planRevisionRequest(plan: SessionPlanContext, guidance?: string): string {
