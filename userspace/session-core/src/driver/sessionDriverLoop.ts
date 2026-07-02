@@ -101,6 +101,7 @@ import {
   type AcceptedPlanReadOnlyResourceCompletion,
   AcceptedPlanTaskLedgerCoordinator,
 } from './execution/index.js';
+import { ReviewAssembler } from './review/reviewAssembler.js';
 
 export interface SessionDriverLoopPorts {
   appendEvents(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
@@ -242,16 +243,6 @@ interface ImplementationBatchContext {
   batchIndex: number;
   recentPlanSummaries: string[];
   continuationSummaries: string[];
-}
-
-interface StaticSyntaxReviewPacket {
-  planId: string;
-  files: Array<{
-    targetPath: string;
-    language?: string;
-    content: string;
-    contentHash?: string;
-  }>;
 }
 
 interface AcceptedPlanAccessScopeCanonicalizationResult {
@@ -2337,7 +2328,13 @@ export class SessionDriverLoop {
     batch: Record<string, unknown>,
     batchEvents: unknown[]
   ): Promise<AgentEvent[]> {
-    const packet = staticSyntaxReviewPacket(state, accepted, batch, batchEvents);
+    const packet = reviewAssembler().staticSyntaxReviewPacket({
+      accepted,
+      batch,
+      batchEvents,
+      generatedArtifactEvidence: state.generatedArtifactEvidence,
+      resourcePackets: state.resourcePackets,
+    });
     if (!packet.files.length) return [];
     await this.emitProjectionDelta(state, {
       type: 'stage_delta',
@@ -2358,7 +2355,12 @@ export class SessionDriverLoop {
         input.profileId,
         state,
         'accepted_plan_static_syntax_review',
-        staticSyntaxReviewMessages(prompt, state, accepted, packet)
+        reviewAssembler().staticSyntaxReviewMessages({
+          prompt,
+          runId: state.runId,
+          accepted,
+          packet,
+        })
       );
       parsed = JSON.parse(raw) as Record<string, unknown>;
     } catch (error) {
@@ -2379,7 +2381,7 @@ export class SessionDriverLoop {
         }),
       ];
     }
-    const issues = normalizeStaticSyntaxIssues(parsed.issues);
+    const issues = reviewAssembler().normalizeStaticSyntaxIssues(parsed.issues);
     const status = issues.length ? 'blocked' : 'completed';
     const summary = stringValue(parsed.summary)
       ?? (issues.length ? `Review 前静态审查发现 ${issues.length} 个潜在问题。` : 'Review 前静态审查未发现明显语法/API 问题。');
@@ -4790,6 +4792,18 @@ function acceptedPlanScopeIntervention(createId: (prefix: string) => string): Ac
   return new AcceptedPlanScopeIntervention({
     createId,
     visibleLanguageForRequest,
+  });
+}
+
+function reviewAssembler(): ReviewAssembler {
+  return new ReviewAssembler({
+    completedWorkUnitFacts,
+    batchActionRecords,
+    actionEffectiveCapability,
+    actionFileTargetPath,
+    normalizeAcceptedPlanTargetScope,
+    comparablePath,
+    resourceTextForTarget,
   });
 }
 
@@ -8395,116 +8409,6 @@ function resourceEvidenceExistsForTarget(packets: ResourcePacket[], target: stri
   );
 }
 
-function staticSyntaxReviewPacket(
-  state: SessionDriverLoopRunState,
-  accepted: AcceptedImplementationPlanContext,
-  batch: Record<string, unknown>,
-  events: unknown[]
-): StaticSyntaxReviewPacket {
-  const completed = completedWorkUnitFacts(events);
-  const targetPaths = new Set<string>();
-  for (const action of batchActionRecords(batch)) {
-    const capability = actionEffectiveCapability(action);
-    if (capability !== 'fs.write' && capability !== 'fs.patch') continue;
-    const actionId = stringValue(action.actionId) ?? stringValue(action.id);
-    if (actionId && completed.actionIds.size && !completed.actionIds.has(actionId)) continue;
-    const target = actionFileTargetPath(action);
-    if (target) targetPaths.add(normalizeAcceptedPlanTargetScope(target, accepted));
-  }
-  for (const block of recordArray(batch.codeBlocks)) {
-    const target = stringValue(block.targetPath) ?? stringValue(block.path);
-    if (target) targetPaths.add(normalizeAcceptedPlanTargetScope(target, accepted));
-  }
-  const files: StaticSyntaxReviewPacket['files'] = [];
-  for (const target of targetPaths) {
-    if (!isStaticSyntaxReviewTarget(target)) continue;
-    const evidence = state.generatedArtifactEvidence.get(comparablePath(target));
-    const content = evidence?.content ?? resourceTextForTarget(state.resourcePackets, target);
-    if (!content) continue;
-    files.push({
-      targetPath: target,
-      language: languageForPath(target),
-      content,
-      contentHash: evidence?.contentHash ?? stableHash(content),
-    });
-  }
-  return {
-    planId: accepted.planId,
-    files,
-  };
-}
-
-function staticSyntaxReviewMessages(
-  prompt: PromptEnvelope,
-  state: SessionDriverLoopRunState,
-  accepted: AcceptedImplementationPlanContext,
-  packet: StaticSyntaxReviewPacket
-): LlmChatRequest['messages'] {
-  const files = packet.files.map((file) => ({
-    targetPath: file.targetPath,
-    language: file.language,
-    contentHash: file.contentHash,
-    content: clip(file.content, 24_000),
-  }));
-  return [
-    {
-      role: 'system',
-      content: [
-        'You are the DeepCode static syntax/API review step before user Review.',
-        'You are not a tool executor, permission judge, or Kernel fact source.',
-        'Inspect only the provided generated or freshly resolved code files. Report likely syntax errors, missing declarations, inconsistent function signatures, or obvious API mismatches.',
-        'Return exactly one JSON object shaped {"kind":"staticSyntaxReview","summary":"...","issues":[{"targetPath":"relative/file","severity":"error|warning","message":"...","lineHint?":number,"evidence?":"..."}]}.',
-        'If no issue is visible, return issues:[]. Do not output Agent Protocol actionBundle, resourceRequest, markdown, or prose outside JSON.',
-        `Parent stable prefix hash: ${stableHash(prompt.stablePrefix).slice(0, 16)}; runId=${state.runId}; planId=${accepted.planId}.`,
-      ].join('\n'),
-    },
-    {
-      role: 'user',
-      content: [
-        'StaticSyntaxReviewPacket:',
-        fenced(clip(JSON.stringify({
-          planId: packet.planId,
-          files,
-        }, null, 2), 64_000)),
-      ].join('\n\n'),
-    },
-  ];
-}
-
-function normalizeStaticSyntaxIssues(value: unknown): Array<Record<string, unknown>> {
-  if (!Array.isArray(value)) return [];
-  return value.map((item, index) => {
-    const record = objectRecord(item) ?? {};
-    return {
-      targetPath: stringValue(record.targetPath) ?? stringValue(record.path) ?? 'unknown',
-      severity: stringValue(record.severity) ?? 'warning',
-      message: stringValue(record.message) ?? stringValue(record.summary) ?? `Static review issue ${index + 1}`,
-      ...(typeof record.lineHint === 'number' ? { lineHint: record.lineHint } : {}),
-      ...(stringValue(record.evidence) ? { evidence: stringValue(record.evidence) } : {}),
-    };
-  }).filter((item) => stringValue(item.message));
-}
-
-function staticSyntaxReviewFactLines(kernelEvents: unknown[]): string[] {
-  return kernelEvents.flatMap((event) => {
-    const record = objectRecord(event);
-    if (record?.kind !== 'accepted_plan.static_syntax_review') return [];
-    const status = stringValue(record.status) ?? 'completed';
-    const summary = stringValue(record.summary) ?? 'Static syntax review completed.';
-    const issues = Array.isArray(record.issues) ? record.issues : [];
-    const lines = [`- Static syntax review ${status}：${summary}`];
-    for (const issue of issues.slice(0, 8)) {
-      const item = objectRecord(issue) ?? {};
-      const target = stringValue(item.targetPath) ?? 'unknown';
-      const severity = stringValue(item.severity) ?? 'warning';
-      const message = stringValue(item.message) ?? 'issue';
-      lines.push(`  - \`${target}\` ${severity}: ${message}`);
-    }
-    if (issues.length > 8) lines.push(`  - 另有 ${issues.length - 8} 个静态审查问题未展开。`);
-    return lines;
-  });
-}
-
 function resourceTextForTarget(packets: ResourcePacket[], target: string): string | undefined {
   const normalized = normalizePlanScope(target);
   for (const packet of [...packets].reverse()) {
@@ -8515,22 +8419,6 @@ function resourceTextForTarget(packets: ResourcePacket[], target: string): strin
       if (text) return text;
     }
   }
-  return undefined;
-}
-
-function isStaticSyntaxReviewTarget(path: string): boolean {
-  return /\.(c|cc|cpp|cxx|h|hh|hpp|hxx|rs|ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|swift|cs)$/i.test(path);
-}
-
-function languageForPath(path: string): string | undefined {
-  const lower = path.toLowerCase();
-  if (/\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$/.test(lower)) return 'cpp';
-  if (lower.endsWith('.rs')) return 'rust';
-  if (lower.endsWith('.ts') || lower.endsWith('.tsx')) return 'typescript';
-  if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) return 'javascript';
-  if (lower.endsWith('.py')) return 'python';
-  if (lower.endsWith('.go')) return 'go';
-  if (lower.endsWith('.java')) return 'java';
   return undefined;
 }
 
@@ -10138,7 +10026,7 @@ function reviewSummaryEvent(
 ): AgentEvent {
   const facts = [
     ...reviewFactLines(kernelEvents),
-    ...staticSyntaxReviewFactLines(kernelEvents),
+    ...reviewAssembler().staticSyntaxReviewFactLines(kernelEvents),
   ];
   const reviewFacts = findReviewFacts(kernelEvents);
   const gitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
