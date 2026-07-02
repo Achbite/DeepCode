@@ -69,10 +69,12 @@ import { ProviderTraceArchive } from '../provider/ProviderTraceArchive.js';
 import {
   NativeToolCoordinator,
   NativeToolCoordinatorError,
+  NativeToolTurnHandler,
   ProviderEmptyProposalRetry,
   ProviderPartFrameParser,
   ProviderToolCallBuffer,
   stripProviderPartFrames,
+  type NativeToolHandlingResult,
   type NativeToolReadLedgerEntry,
   type NativeToolReadSignature,
   type NativeToolCallProposal,
@@ -95,6 +97,10 @@ import {
   type TaskLedgerSnapshot,
 } from '../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
+import {
+  AcceptedPlanExecutor,
+  type AcceptedPlanReadOnlyResourceCompletion,
+} from './execution/index.js';
 
 export interface SessionDriverLoopPorts {
   appendEvents(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
@@ -264,14 +270,6 @@ interface RemovedAcceptedPlanAccessScope {
   scope: unknown;
 }
 
-interface AcceptedPlanReadOnlyResourceCompletion {
-  taskId: string;
-  newlyCompletedTaskIds: string[];
-  completedTaskIds: string[];
-  remainingTaskIds: string[];
-  coveredTargets: string[];
-}
-
 type SessionRunStateStatus = 'waiting' | 'running' | 'completed' | 'cancelled' | 'failed';
 
 type SessionRunStateReason =
@@ -307,10 +305,6 @@ interface LlmTurnResult {
   toolCalls: NativeToolCallProposal[];
 }
 
-type NativeToolHandlingResult =
-  | { kind: 'resume'; toolMessages: LlmChatRequest['messages'] }
-  | { kind: 'proposal'; proposal: ProposalEnvelope };
-
 const RESOURCE_BUDGET_REQUIREMENT_PREFIX = 'resource-budget';
 const MAX_DERIVED_MANIFEST_ENTRIES = 240;
 const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
@@ -319,6 +313,8 @@ const providerRepairMessageBuilder = new ProviderRepairMessageBuilder(MAX_ACTION
 const acceptedPlanResourceResumePromptBuilder = new AcceptedPlanResourceResumePromptBuilder(providerRepairMessageBuilder);
 const providerEmptyProposalRetry = new ProviderEmptyProposalRetry();
 const nativeToolCoordinator = new NativeToolCoordinator();
+const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
+const acceptedPlanExecutor = new AcceptedPlanExecutor();
 const DEFAULT_SUB_AGENT_NO_DELTA_TIMEOUT_MS = 45_000;
 const DEFAULT_SUB_AGENT_TOTAL_TIMEOUT_MS = 240_000;
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
@@ -2093,7 +2089,7 @@ export class SessionDriverLoop {
     const accepted = state.acceptedImplementationPlan;
     if (!accepted) return null;
     refreshTaskExecutionState(state);
-    const completion = acceptedPlanReadOnlyResourceCompletion(
+    const completion = acceptedPlanExecutor.readOnlyResourceCompletion(
       accepted,
       state.taskExecutionCursor,
       state.currentTaskContext,
@@ -2197,6 +2193,69 @@ export class SessionDriverLoop {
         id: this.id('session-run-waiting-review'),
       }),
     ]) ?? result;
+  }
+
+  private async tryCompleteAcceptedPlanReadOnlyActionBundle(
+    input: SessionDriverLoopInput,
+    state: SessionDriverLoopRunState,
+    prompt: PromptEnvelope,
+    proposal: ProposalEnvelope,
+    fallback: AgentSessionResult
+  ): Promise<AgentSessionResult | null> {
+    const accepted = state.acceptedImplementationPlan;
+    const actionBundle = readActionBundle(proposal);
+    if (!accepted || !actionBundle) return null;
+    refreshTaskExecutionState(state);
+    if (!acceptedPlanExecutor.currentTaskIsReadOnlyResourceValidation(
+      accepted,
+      state.taskExecutionCursor,
+      state.currentTaskContext
+    )) {
+      return null;
+    }
+
+    const request = acceptedPlanExecutor.resourceRequestFromReadOnlyActionBundle(
+      actionBundle,
+      state.currentTaskContext,
+      this.id('accepted-plan-readonly-action-resource-request')
+    );
+    if (!request) return null;
+    const subset = resourceRequestResolver().resolve(state.manifest, request, state.conversationRoots);
+    if (!subset.manifest.entries.length) return null;
+
+    const packet = await this.resolveResources(state, subset.manifest);
+    state.resourcePackets.push(packet);
+    addDiscoveredManifestEntries(state.manifest, packet);
+    let result = await this.append(state.sessionId, [
+      resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-readonly-action-resource-context')),
+      acceptedPlanResourceResumeEvent(
+        state.sessionId,
+        state.runId,
+        accepted,
+        state.taskExecutionCursor,
+        state.currentTaskContext,
+        packet,
+        this.ts(),
+        this.id('accepted-plan-readonly-action-resource-resume')
+      ),
+    ]) ?? fallback;
+
+    const readOnlyCompletion = await this.tryCompleteAcceptedPlanReadOnlyResourceTask(
+      input,
+      state,
+      packet,
+      result
+    );
+    if (readOnlyCompletion) return readOnlyCompletion;
+
+    const resumed = await this.callAcceptedPlanResourceResume(input, state, prompt, proposal, packet);
+    if (resumed.kind === 'actionBundle') {
+      return this.submitActionProposal(input, state, prompt, resumed, result);
+    }
+    if (resumed.kind !== 'resourceRequest') {
+      return this.submitNonExecutableProposal(state, resumed, result);
+    }
+    return result;
   }
 
   private async callAcceptedPlanResourceResume(
@@ -2365,7 +2424,161 @@ export class SessionDriverLoop {
       });
       if (effectiveTurn.toolCalls.length === 0) return effectiveTurn.content;
 
-      const handled = await this.handleNativeToolCalls(input, state, prompt, effectiveTurn, round);
+      const handled = await nativeToolTurnHandler.handle({
+        state,
+        prompt,
+        turn: effectiveTurn,
+        round,
+        ports: {
+          appendAssistantProgress: async (runState, narration) => {
+            await this.append(runState.sessionId, [
+              this.event(runState.sessionId, 'assistant_msg', {
+                content: narration,
+                channel: 'progress',
+                source: 'llm',
+                visibility: 'conversation',
+                presentation: 'body',
+                runId: runState.runId,
+              }),
+            ]);
+          },
+          emitCheckpoint: async (runState, nativeToolRound, toolCallCount) => {
+            await this.emitProjectionDelta(runState, {
+              type: 'stage_delta',
+              stage: `native_tool_round_${nativeToolRound + 1}`,
+              status: 'running',
+              channel: 'progress',
+              source: 'session',
+              summary: 'native_tool_checkpoint',
+              activity: conversationActivity({
+                activityId: `native-tool-round-${nativeToolRound + 1}`,
+                kind: 'toolExecution',
+                status: 'running',
+                title: 'Native tool checkpoint',
+                summary: 'Provider requested read-only native tools. Session is routing them through Kernel resource boundaries.',
+                source: 'session',
+                runId: runState.runId,
+                itemCount: toolCallCount,
+              }),
+              payload: {
+                visibility: 'task',
+                nativeToolRound,
+                toolCallCount,
+                resourcePacketCount: runState.resourcePackets.length,
+              },
+            });
+          },
+          repairSideEffect: (runState, repairPrompt, toolCall, turn) =>
+            this.repairSideEffectNativeTool(input, runState, repairPrompt, toolCall, turn),
+          tryParseTurnProposal: (runState, turn) =>
+            this.tryParseNativeToolTurnProposal(runState, turn),
+          repairDuplicate: (runState, repairPrompt, turn, duplicates) =>
+            this.repairDuplicateNativeReadTool(input, runState, repairPrompt, turn, duplicates),
+          emitDuplicateRead: async (runState, toolCall, existing) => {
+            await this.emitProjectionDelta(runState, {
+              type: 'stage_delta',
+              stage: 'native_tool_duplicate_read',
+              status: 'completed',
+              channel: 'tool',
+              source: 'session',
+              itemId: toolCall.callId,
+              summary: `Provider repeated ${toolCall.name} for an already resolved target; Session is reusing the existing ResourcePacket without another Kernel read.`,
+              activity: conversationActivity({
+                activityId: `native-tool-duplicate-${toolCall.callId}`,
+                kind: 'resourceRead',
+                status: 'completed',
+                title: 'Duplicate native read reused',
+                summary: `Session reused ${existing.packet.id} for a repeated ${toolCall.name} request.`,
+                source: 'session',
+                runId: runState.runId,
+                toolName: toolCall.name,
+                targets: [existing.signature.path],
+              }),
+              payload: {
+                callId: toolCall.callId,
+                name: toolCall.name,
+                duplicateOfPacketId: existing.packet.id,
+                duplicateCount: existing.repeatCount,
+                signature: existing.signature,
+                contentHash: existing.contentHash,
+              },
+            });
+          },
+          duplicateToolMessage: (toolCall, existing) => ({
+            role: 'tool',
+            toolCallId: toolCall.callId,
+            content: clipJson(nativeToolCoordinator.duplicateResult(toolCall, existing), NATIVE_TOOL_RESULT_MAX_CHARS),
+          }),
+          emitToolCallRunning: async (runState, toolCall, nativeToolRound) => {
+            const language = visibleLanguageForRequest(runState.userRequest);
+            await this.emitProjectionDelta(runState, {
+              type: 'tool_call_delta',
+              stage: 'native_tool_call',
+              status: 'running',
+              channel: 'tool',
+              source: 'session',
+              itemId: toolCall.callId,
+              summary: nativeToolResolveRunningSummary(toolCall.name, language),
+              activity: conversationActivity({
+                activityId: `native-tool-${toolCall.callId}`,
+                kind: 'toolExecution',
+                status: 'running',
+                title: 'Resolving native read tool',
+                summary: nativeToolResolveRunningSummary(toolCall.name, language),
+                source: 'session',
+                runId: runState.runId,
+                toolName: toolCall.name,
+              }),
+              payload: {
+                callId: toolCall.callId,
+                name: toolCall.name,
+                arguments: toolCall.arguments,
+                nativeToolRound,
+              },
+            });
+          },
+          resolveReadToolCall: (runState, toolCall) =>
+            this.resolveNativeReadToolCall(runState, toolCall),
+          recordResolvedPacket: async (runState, signature, packet) => {
+            runState.nativeToolReadLedger.set(signature.key, {
+              signature,
+              packet,
+              contentHash: nativeToolCoordinator.packetContentHash(packet),
+              repeatCount: 0,
+            });
+            runState.resourcePackets.push(packet);
+            addDiscoveredManifestEntries(runState.manifest, packet);
+            await this.append(runState.sessionId, [
+              resourcePacketEvent(runState.sessionId, packet, this.ts(), this.id('native-resource-context')),
+            ]);
+          },
+          emitResourceResolved: async (runState, toolCall, packet, nativeToolRound) => {
+            const language = visibleLanguageForRequest(runState.userRequest);
+            await this.emitProjectionDelta(runState, {
+              type: 'resource_delta',
+              stage: 'native_tool_resource_resolve',
+              status: 'completed',
+              channel: 'resource',
+              source: 'kernel',
+              itemId: toolCall.callId,
+              summary: nativeToolResolveCompletedSummary(toolCall.name, language),
+              activity: resourcePacketActivity(packet, `native-tool-resource-${toolCall.callId}`, runState.runId),
+              payload: {
+                callId: toolCall.callId,
+                packetId: packet.id,
+                itemCount: packet.items.length,
+                nativeToolRound,
+                resourcePacketCount: runState.resourcePackets.length,
+              },
+            });
+          },
+          packetToolMessage: (toolCall, packet) => ({
+            role: 'tool',
+            toolCallId: toolCall.callId,
+            content: clipJson(nativeToolCoordinator.resultFromPacket(toolCall, packet), NATIVE_TOOL_RESULT_MAX_CHARS),
+          }),
+        },
+      });
       if (handled.kind === 'proposal') return handled.proposal;
 
       currentMessages = [
@@ -2451,185 +2664,6 @@ export class SessionDriverLoop {
         `Complete-stage provider requested native tool ${firstToolCall.name}; proposal-only repair failed: ${normalizeParseError(error).message}`
       );
     }
-  }
-
-  private async handleNativeToolCalls(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    turn: LlmTurnResult,
-    round: number
-  ): Promise<NativeToolHandlingResult> {
-    const language = visibleLanguageForRequest(state.userRequest);
-    const narration = turn.content.trim();
-    if (narration) {
-      await this.append(state.sessionId, [
-        this.event(state.sessionId, 'assistant_msg', {
-          content: narration,
-          channel: 'progress',
-          source: 'llm',
-          visibility: 'conversation',
-          presentation: 'body',
-          runId: state.runId,
-        }),
-      ]);
-    } else {
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage: `native_tool_round_${round + 1}`,
-        status: 'running',
-        channel: 'progress',
-        source: 'session',
-        summary: 'native_tool_checkpoint',
-        activity: conversationActivity({
-          activityId: `native-tool-round-${round + 1}`,
-          kind: 'toolExecution',
-          status: 'running',
-          title: 'Native tool checkpoint',
-          summary: 'Provider requested read-only native tools. Session is routing them through Kernel resource boundaries.',
-          source: 'session',
-          runId: state.runId,
-          itemCount: turn.toolCalls.length,
-        }),
-        payload: {
-          visibility: 'task',
-          nativeToolRound: round,
-          toolCallCount: turn.toolCalls.length,
-          resourcePacketCount: state.resourcePackets.length,
-        },
-      });
-    }
-    const unsupportedOrSideEffect = turn.toolCalls.find((toolCall) => !nativeToolCoordinator.canResolveReadOnly(toolCall));
-    if (unsupportedOrSideEffect) {
-      const repaired = await this.repairSideEffectNativeTool(input, state, prompt, unsupportedOrSideEffect, turn);
-      return {
-        kind: 'proposal',
-        proposal: repaired,
-      };
-    }
-
-    const repeatedReadCalls = turn.toolCalls
-      .map((toolCall) => {
-        const signature = nativeToolCoordinator.readSignature(toolCall);
-        return { toolCall, signature, entry: state.nativeToolReadLedger.get(signature.key) };
-      })
-      .filter((item): item is { toolCall: NativeToolCallProposal; signature: NativeToolReadSignature; entry: NativeToolReadLedgerEntry } => Boolean(item.entry));
-    if (repeatedReadCalls.length > 0) {
-      const proposal = this.tryParseNativeToolTurnProposal(state, turn);
-      if (proposal) {
-        return { kind: 'proposal', proposal };
-      }
-    }
-    if (repeatedReadCalls.some((item) => item.entry.repeatCount > 0)) {
-      const repaired = await this.repairDuplicateNativeReadTool(input, state, prompt, turn, repeatedReadCalls);
-      return {
-        kind: 'proposal',
-        proposal: repaired,
-      };
-    }
-
-    const toolMessages: LlmChatRequest['messages'] = [];
-    for (const toolCall of turn.toolCalls) {
-      const signature = nativeToolCoordinator.readSignature(toolCall);
-      const existing = state.nativeToolReadLedger.get(signature.key);
-      if (existing) {
-        existing.repeatCount += 1;
-        await this.emitProjectionDelta(state, {
-          type: 'stage_delta',
-          stage: 'native_tool_duplicate_read',
-          status: 'completed',
-          channel: 'tool',
-          source: 'session',
-          itemId: toolCall.callId,
-          summary: `Provider repeated ${toolCall.name} for an already resolved target; Session is reusing the existing ResourcePacket without another Kernel read.`,
-          activity: conversationActivity({
-            activityId: `native-tool-duplicate-${toolCall.callId}`,
-            kind: 'resourceRead',
-            status: 'completed',
-            title: 'Duplicate native read reused',
-            summary: `Session reused ${existing.packet.id} for a repeated ${toolCall.name} request.`,
-            source: 'session',
-            runId: state.runId,
-            toolName: toolCall.name,
-            targets: [existing.signature.path],
-          }),
-          payload: {
-            callId: toolCall.callId,
-            name: toolCall.name,
-            duplicateOfPacketId: existing.packet.id,
-            duplicateCount: existing.repeatCount,
-            signature: existing.signature,
-            contentHash: existing.contentHash,
-          },
-        });
-        toolMessages.push({
-          role: 'tool',
-          toolCallId: toolCall.callId,
-          content: clipJson(nativeToolCoordinator.duplicateResult(toolCall, existing), NATIVE_TOOL_RESULT_MAX_CHARS),
-        });
-        continue;
-      }
-      await this.emitProjectionDelta(state, {
-        type: 'tool_call_delta',
-        stage: 'native_tool_call',
-        status: 'running',
-        channel: 'tool',
-        source: 'session',
-        itemId: toolCall.callId,
-        summary: nativeToolResolveRunningSummary(toolCall.name, language),
-        activity: conversationActivity({
-          activityId: `native-tool-${toolCall.callId}`,
-          kind: 'toolExecution',
-          status: 'running',
-          title: 'Resolving native read tool',
-          summary: nativeToolResolveRunningSummary(toolCall.name, language),
-          source: 'session',
-          runId: state.runId,
-          toolName: toolCall.name,
-        }),
-        payload: {
-          callId: toolCall.callId,
-          name: toolCall.name,
-          arguments: toolCall.arguments,
-          nativeToolRound: round,
-        },
-      });
-      const packet = await this.resolveNativeReadToolCall(state, toolCall);
-      state.nativeToolReadLedger.set(signature.key, {
-        signature,
-        packet,
-        contentHash: nativeToolCoordinator.packetContentHash(packet),
-        repeatCount: 0,
-      });
-      state.resourcePackets.push(packet);
-      addDiscoveredManifestEntries(state.manifest, packet);
-      await this.append(state.sessionId, [
-        resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('native-resource-context')),
-      ]);
-      await this.emitProjectionDelta(state, {
-        type: 'resource_delta',
-        stage: 'native_tool_resource_resolve',
-        status: 'completed',
-        channel: 'resource',
-        source: 'kernel',
-        itemId: toolCall.callId,
-        summary: nativeToolResolveCompletedSummary(toolCall.name, language),
-        activity: resourcePacketActivity(packet, `native-tool-resource-${toolCall.callId}`, state.runId),
-        payload: {
-          callId: toolCall.callId,
-          packetId: packet.id,
-          itemCount: packet.items.length,
-          nativeToolRound: round,
-          resourcePacketCount: state.resourcePackets.length,
-        },
-      });
-      toolMessages.push({
-        role: 'tool',
-        toolCallId: toolCall.callId,
-        content: clipJson(nativeToolCoordinator.resultFromPacket(toolCall, packet), NATIVE_TOOL_RESULT_MAX_CHARS),
-      });
-    }
-    return { kind: 'resume', toolMessages };
   }
 
   private async resolveNativeReadToolCall(
@@ -3170,6 +3204,15 @@ export class SessionDriverLoop {
     const accepted = state.acceptedImplementationPlan;
     const actionBundle = readActionBundle(proposal);
     if (!accepted || !actionBundle) return fallback;
+
+    const readOnlyActionResult = await this.tryCompleteAcceptedPlanReadOnlyActionBundle(
+      input,
+      state,
+      prompt,
+      proposal,
+      fallback
+    );
+    if (readOnlyActionResult) return readOnlyActionResult;
 
     const admission = acceptedPlanAdmission();
     const validation = admission.validate(accepted, proposal, state.resourcePackets);
@@ -3857,12 +3900,20 @@ export class SessionDriverLoop {
       lastFlushAt: Date.now(),
       itemId: undefined,
     };
-    const result = this.ports.llmChatStream
+    let result = this.ports.llmChatStream
       ? await this.ports.llmChatStream(request, async (event) => {
         await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, reasoningBuffer);
       })
       : await this.ports.llmChat(request);
     await this.flushProviderReasoningBuffer(state, stage, reasoningBuffer);
+    if (this.ports.llmChatStream && (!result.ok || !result.data)) {
+      const fallbackRequest: LlmChatRequest = { ...request, stream: false };
+      await this.appendProviderTrace(state, `${stage}.stream_fallback.request`, {
+        reason: result.message ?? result.error ?? 'streaming provider request failed',
+        request: fallbackRequest,
+      });
+      result = await this.ports.llmChat(fallbackRequest);
+    }
     if (!result.ok || !result.data) {
       await this.emitProjectionDelta(state, {
         type: 'error',
@@ -8102,76 +8153,6 @@ function resourceEvidenceMentionsAnyTarget(packets: ResourcePacket[], targets: s
   return packets.flatMap((packet) => packet.items ?? [])
     .filter((item) => item.status === 'resolved' || item.status === 'provided')
     .some((item) => resourcePacketItemMatchesAnyTarget(item, normalizedTargets));
-}
-
-function acceptedPlanReadOnlyResourceCompletion(
-  accepted: AcceptedImplementationPlanContext,
-  cursor: TaskExecutionCursor | undefined,
-  current: CurrentTaskContext | undefined,
-  packet: ResourcePacket
-): { ok: true } & AcceptedPlanReadOnlyResourceCompletion | { ok: false } {
-  if (!cursor?.currentTaskId || !current?.taskId || cursor.currentTaskId !== current.taskId) return { ok: false };
-  const task = accepted.tasks.find((candidate) => candidate.taskId === current.taskId);
-  if (!task || accepted.completedTaskIds.includes(task.taskId)) return { ok: false };
-  const capabilities = current.capabilities.length
-    ? current.capabilities
-    : task.capability
-      ? [task.capability]
-      : [];
-  if (!capabilities.length || !capabilities.every(acceptedPlanCapabilityIsReadOnlyValidation)) return { ok: false };
-  const targets = current.targets.length ? current.targets : task.targets;
-  const coveredTargets = acceptedPlanResourceCoveredTargets(packet, targets);
-  if (!targets.length || coveredTargets.length < uniqueStrings(targets.map(normalizePlanScope).filter(Boolean)).length) {
-    return { ok: false };
-  }
-  const completedTaskIds = [...new Set([...accepted.completedTaskIds, task.taskId])];
-  const completed = new Set(completedTaskIds);
-  return {
-    ok: true,
-    taskId: task.taskId,
-    newlyCompletedTaskIds: [task.taskId],
-    completedTaskIds,
-    remainingTaskIds: accepted.tasks.map((item) => item.taskId).filter((taskId) => !completed.has(taskId)),
-    coveredTargets,
-  };
-}
-
-function acceptedPlanCapabilityIsReadOnlyValidation(capability: string): boolean {
-  return [
-    'fs.read',
-    'fs.list',
-    'code.search',
-    'git.read',
-  ].includes(capability);
-}
-
-function acceptedPlanResourceCoveredTargets(packet: ResourcePacket, targets: string[]): string[] {
-  const normalizedTargets = uniqueStrings(targets.map(normalizePlanScope).filter(Boolean));
-  if (!normalizedTargets.length) return [];
-  const resolvedItems = (packet.items ?? [])
-    .filter((item) => item.status === 'resolved' || item.status === 'provided');
-  return normalizedTargets.filter((target) =>
-    resolvedItems.some((item) => resourcePacketItemMatchesTargetScope(item, target))
-  );
-}
-
-function resourcePacketItemMatchesTargetScope(item: ResourcePacketItem, target: string): boolean {
-  const normalizedTarget = normalizePlanScope(target);
-  if (!normalizedTarget) return false;
-  const candidates = [
-    item.path,
-    item.absolutePath,
-    item.manifestEntryId,
-  ]
-    .map((value) => typeof value === 'string' ? normalizePlanScope(value) : '')
-    .filter(Boolean);
-  return candidates.some((candidate) =>
-    candidate === normalizedTarget ||
-    candidate.endsWith(`/${normalizedTarget}`) ||
-    normalizedTarget.endsWith(`/${candidate}`) ||
-    planScopeCovers(normalizedTarget, candidate) ||
-    planScopeCovers(candidate, normalizedTarget)
-  );
 }
 
 function resourceEvidenceContainsExactBlock(

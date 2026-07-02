@@ -10,6 +10,11 @@ export {
   type NativeToolReadLedgerEntry,
   type NativeToolReadSignature,
 } from './NativeToolCoordinator.js';
+export {
+  NativeToolTurnHandler,
+  type NativeToolHandlingResult,
+  type NativeToolTurnResult,
+} from './NativeToolTurnHandler.js';
 
 export interface NativeToolCallProposal {
   callId: string;

@@ -122,6 +122,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopAcceptedImplementationPlanReadsGeneratedArtifactEvidence();
   await assertSessionDriverLoopAcceptedImplementationPlanResumesFromResourceCursor();
   await assertSessionDriverLoopAcceptedReadOnlyResourceValidationCompletesWithoutProviderLoop();
+  await assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThroughResourceResolve();
   await assertSessionDriverLoopAcceptedImplementationPlanAllowsPlannedProcessExecPermissionGate();
   await assertSessionDriverLoopAcceptedImplementationPlanAllowsAbsoluteAttachmentChildTarget();
   await assertSessionDriverLoopAcceptedImplementationRejectsAttachmentRootTarget();
@@ -145,6 +146,7 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopPermissionRejectCancelsRun();
   await assertSessionDriverLoopStaleRequirementDecisionNoopsAfterReviewAccept();
   await assertSessionDriverLoopNativeReadToolStreamsThroughResourceResolve();
+  await assertSessionDriverLoopNativeReadToolStreamFailureFallsBackToNonStreaming();
   await assertSessionDriverLoopNativeReadToolLoopHasNoFourRoundLimit();
   await assertSessionDriverLoopNativeReadToolDuplicateLoopRepairsToProposal();
   await assertSessionDriverLoopNativeReadToolDuplicateProposalWinsOverToolCall();
@@ -8336,6 +8338,151 @@ async function assertSessionDriverLoopAcceptedReadOnlyResourceValidationComplete
   );
 }
 
+async function assertSessionDriverLoopAcceptedReadOnlyActionBundleCompletesThroughResourceResolve(): Promise<void> {
+  const token = randomSmokeToken('readonly-action');
+  const fileTargets = Array.from({ length: 3 }, () => `${randomSmokeToken('keep')}.${randomSmokeToken('ext')}`);
+  const directoryTarget = `${randomSmokeToken('dir')}/`;
+  const targets = [...fileTargets, directoryTarget];
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const events = [readOnlyAcceptedImplementationPlanCardEvent(sessionId, runId, token, targets)];
+  const planPayload = events[0].payload as any;
+  planPayload.implementationPlan.tasks[0].capability = 'fs.list';
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  let llmCalls = 0;
+  let actionBatchSubmits = 0;
+  let permissionGrants = 0;
+  let reviewFactsRequests = 0;
+  let resourceResolveCalls = 0;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'resourceResolve') {
+        resourceResolveCalls += 1;
+        return {
+          ok: true,
+          events: [{
+            kind: 'resource.packet_produced',
+            runId,
+            sessionId,
+            packet: {
+              id: `packet-${token}-${resourceResolveCalls}`,
+              workspaceScopeKey: command.request?.manifest?.workspaceScopeKey ?? `workspace-${token}`,
+              requestId: command.requestId,
+              items: [{
+                requestItemId: `item-${token}-root`,
+                manifestEntryId: String(command.request?.manifest?.entries?.[0]?.id ?? `root-${token}`),
+                readPolicy: 'explicit-manifest-readonly',
+                status: 'resolved',
+                path: '.',
+                absolutePath: `/tmp/${token}`,
+                contentKind: 'directoryTree',
+                contentSummary: 'Directory tree resolved for generic read-only validation.',
+                nodes: targets.map((target) => ({
+                  type: target.endsWith('/') ? 'directory' : 'file',
+                  path: target.replace(/\/+$/g, ''),
+                })),
+                evidenceRefs: [`evidence-${token}-root`],
+              }],
+            },
+          }],
+        };
+      }
+      if (command.kind === 'actionBatchSubmit') {
+        actionBatchSubmits += 1;
+        return fakeKernel(request);
+      }
+      if (command.kind === 'permissionGrantTemporary') {
+        permissionGrants += 1;
+        return { ok: true, events: [] };
+      }
+      if (command.kind === 'reviewFactsGet') {
+        reviewFactsRequests += 1;
+        return { ok: true, events: [] };
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+      llmCalls += 1;
+      assertEqual(llmCalls, 1, 'read-only actionBundle should not make a second provider call after ResourcePacket coverage');
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'actionBundle',
+        outputLanguage: 'en-US',
+        userPlanMarkdown: 'Resolve current directory evidence for the accepted read-only task.',
+        actionBundle: {
+          version: '1',
+          id: `batch-${token}`,
+          goal: 'Resolve current directory evidence.',
+          actions: [{
+            actionId: `list-${token}`,
+            toolId: 'fs.list',
+            args: { path: '' },
+          }],
+          validationExpectations: [{ id: `validation-${token}`, description: 'Directory listing covers accepted targets.' }],
+          reviewExpectations: [{ id: `review-${token}`, description: 'Review ResourcePacket evidence.' }],
+        },
+      });
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + llmCalls + resourceResolveCalls + reviewFactsRequests + 1}`,
+  });
+
+  const result = await loop.resolveDecision({
+    sessionId,
+    kind: 'plan',
+    decision: 'accept',
+    runId,
+    targetId: `impl-${token}`,
+    existingEvents: events,
+    projectWorkingDirectory: {
+      rootId: `root-${token}`,
+      label: 'Random workspace',
+      displayPath: `/tmp/${token}`,
+      absolutePath: `/tmp/${token}`,
+      source: 'projectWorkingDirectory',
+    },
+  });
+
+  assertEqual(llmCalls, 1, 'read-only actionBundle completes without provider retry');
+  assertEqual(resourceResolveCalls, 1, 'read-only actionBundle resolves one focused ResourcePacket');
+  assertEqual(actionBatchSubmits, 0, 'read-only actionBundle does not submit Kernel actionBatch');
+  assertEqual(permissionGrants, 0, 'read-only actionBundle does not request temporary grants');
+  assertEqual(reviewFactsRequests, 1, 'read-only actionBundle reaches final review facts collection');
+  assertEqual(
+    result.events.some((event) => event.kind === 'requirement_confirmation'),
+    false,
+    'read-only actionBundle does not ask for permission intervention'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'workflow_stage' &&
+      (event.payload as any)?.stage === 'accepted_plan.batch_checkpoint' &&
+      (event.payload as any)?.source === 'resourceValidation' &&
+      (event.payload as any)?.validatedTaskId === `task-${token}-read`
+    ),
+    true,
+    'read-only actionBundle writes an accepted-plan resource validation checkpoint'
+  );
+  assertEqual(
+    result.events.some((event) =>
+      event.kind === 'session_run_state' &&
+      (event.payload as any)?.phase === 'waiting_review'
+    ),
+    true,
+    'read-only actionBundle leaves the run waiting for review'
+  );
+}
+
 async function assertSessionDriverLoopAcceptedImplementationPlanAllowsAbsoluteAttachmentChildTarget(): Promise<void> {
   const root = '/workspace/generic-project';
   const events: AgentEvent[] = [
@@ -9770,6 +9917,101 @@ async function assertSessionDriverLoopNativeReadToolStreamsThroughResourceResolv
     deltas.some((delta) => (delta as any).activity?.kind === 'toolExecution'),
     true,
     'active projection deltas carry public conversation activity metadata'
+  );
+}
+
+async function assertSessionDriverLoopNativeReadToolStreamFailureFallsBackToNonStreaming(): Promise<void> {
+  const token = randomSmokeToken('native-stream-fallback');
+  const events: AgentEvent[] = [];
+  const resourceResolveManifests: Array<Record<string, any>> = [];
+  const streamRequests: LlmChatRequest[] = [];
+  const fallbackRequests: LlmChatRequest[] = [];
+  const session: AgentSession = {
+    id: `session-${token}`,
+    mode: 'plan',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const requestedPath = `${token}.txt`;
+  const loop = new SessionDriverLoop({
+    appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
+      events.push(...nextEvents);
+      return { session: { ...session, eventCount: events.length }, events: [...events] };
+    },
+    kernelCommand: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, any>;
+      if (command.kind === 'resourceResolve') {
+        resourceResolveManifests.push(command.request.manifest);
+      }
+      return fakeKernel(request);
+    },
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      fallbackRequests.push(request);
+      const toolMessage = request.messages.find((message) => message.role === 'tool');
+      assert(Boolean(toolMessage?.content.includes('resolved generic content')), 'non-stream fallback receives Kernel resource tool result');
+      assertEqual(request.stream, false, 'non-stream fallback disables streaming on the retry request');
+      return jsonLlmResponse({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'answer',
+        outputLanguage: 'en-US',
+        answer: {
+          format: 'markdown',
+          content: `The fallback incorporated ${token} after Kernel ResourceResolve.`,
+        },
+      });
+    },
+    llmChatStream: async (request, onEvent): Promise<ApiResponse<LlmChatResult>> => {
+      streamRequests.push(request);
+      if (streamRequests.length === 1) {
+        const chunks: LlmChatResult['chunks'] = [
+          {
+            type: 'tool_call',
+            index: 0,
+            callId: `call-${token}`,
+            toolCallDelta: { id: `call-${token}`, index: 0, name: 'fs.read', argumentsDelta: JSON.stringify({ path: requestedPath }) },
+          },
+          { type: 'done' },
+        ];
+        await onEvent({ type: 'provider_tool_call_delta', chunk: chunks[0] });
+        return {
+          ok: true,
+          data: {
+            chunks,
+            assistantMessage: {
+              role: 'assistant',
+              content: '',
+              toolCalls: [{
+                id: `call-${token}`,
+                name: 'fs.read',
+                arguments: { path: requestedPath },
+              }],
+            },
+          },
+        };
+      }
+      return {
+        ok: false,
+        error: 'provider_stream_error',
+        message: 'stream transport failed before final proposal',
+      };
+    },
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${events.length + streamRequests.length + fallbackRequests.length + resourceResolveManifests.length + 1}`,
+  });
+
+  const result = await loop.runUserTurn({
+    sessionId: session.id,
+    content: `Read a generic file if needed for ${token}.`,
+    attachments: [{ kind: 'directory', path: '.', absolutePath: '/tmp/generic-workspace', source: 'userSelected', scope: 'session' }],
+  });
+
+  assertEqual(streamRequests.length, 2, 'native read tool resume first attempts streaming provider call');
+  assertEqual(fallbackRequests.length, 1, 'streaming provider failure falls back to one non-stream request');
+  assertEqual(resourceResolveManifests.length >= 1, true, 'fallback path still routes native read through Kernel ResourceResolve');
+  assertEqual(
+    result.events.some((event) => event.kind === 'assistant_msg' && (event.payload as any).channel === 'final'),
+    true,
+    'non-stream fallback response commits final answer'
   );
 }
 

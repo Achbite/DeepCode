@@ -311,7 +311,8 @@ async function llmChatStream(
       if (event.usage) usage = event.usage;
       if (event.chunk?.usage) usage = event.chunk.usage;
       if (event.type === 'provider_error') {
-        errorMessage = event.error ?? event.chunk?.error ?? 'Provider stream error.';
+        const eventMessage = (event as LlmChatStreamEvent & { message?: string }).message;
+        errorMessage = event.error ?? eventMessage ?? event.chunk?.error ?? 'Provider stream error.';
       }
       await onEvent(event);
     };
