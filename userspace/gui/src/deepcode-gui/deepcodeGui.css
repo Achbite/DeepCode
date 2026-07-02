@@ -1125,7 +1125,7 @@ button {
 
 .agent-composer-decision {
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-radius: 8px;
   background: #ffffff;
   color: var(--text);
   padding: 16px;
@@ -1205,7 +1205,7 @@ button {
   align-items: center;
   gap: 12px;
   border: 1px solid transparent;
-  border-radius: 12px;
+  border-radius: 8px;
   background: transparent;
   color: var(--text);
   padding: 8px 12px;
@@ -1283,7 +1283,7 @@ button {
 .agent-composer-decision__resolving {
   margin-top: 12px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 8px;
   background: #f7f7f5;
   color: var(--text-muted);
   padding: 9px 10px;
@@ -3182,7 +3182,7 @@ button {
 
 .deepcode-gui-block {
   border-color: #e4e1d8;
-  border-radius: 14px;
+  border-radius: 8px;
   background: #ffffff;
   box-shadow: none;
 }
@@ -3470,7 +3470,7 @@ button {
   gap: 12px;
   padding: 16px;
   border: 1px solid #ece9e1;
-  border-radius: 14px;
+  border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 8px 22px rgba(32, 33, 36, 0.08);
 }
@@ -3496,7 +3496,7 @@ button {
   display: grid;
   place-items: center;
   border: 1px dashed #e5e1d7;
-  border-radius: 12px;
+  border-radius: 8px;
   color: #9aa0a6;
   font-size: 12px;
 }
@@ -3508,7 +3508,7 @@ button {
   gap: 10px;
   padding: 10px;
   border: 1px solid #ebe7de;
-  border-radius: 12px;
+  border-radius: 8px;
   background: #fbfaf6;
 }
 
@@ -3585,7 +3585,7 @@ button {
   gap: 4px;
   padding: 6px 10px;
   border: 1px solid #dfdcd2;
-  border-radius: 14px;
+  border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 10px 26px rgba(32, 33, 36, 0.1);
   transition: width 160ms ease, padding 160ms ease, box-shadow 160ms ease;
@@ -3641,7 +3641,7 @@ button {
 }
 
 .agent-composer--decision .agent-composer-decision {
-  border-radius: 16px;
+  border-radius: 8px;
   padding: 12px 14px;
   margin-bottom: 0;
 }
@@ -3664,7 +3664,7 @@ button {
 .agent-composer--decision .agent-composer-decision__option {
   min-height: 38px;
   gap: 10px;
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 6px 10px;
 }
 
