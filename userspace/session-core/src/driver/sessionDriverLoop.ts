@@ -69,8 +69,7 @@ import {
   type UserGuidanceEvent,
 } from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
-import { renderProviderTurnContract, type ProviderTurnContract, type ProviderTurnMode } from '../prompt/providerTurnContract.js';
-import type { PromptPacketFrame } from '../prompt/promptPacket.js';
+import { RepairProviderTurnContractBuilder } from '../prompt/RepairProviderTurnContractBuilder.js';
 import {
   ProviderPartFrameParser,
   ProviderToolCallBuffer,
@@ -11751,148 +11750,27 @@ function compactRepairContextLines(
 function renderRepairProviderTurnContract(
   state: SessionDriverLoopRunState,
   input: {
-    turnMode: ProviderTurnMode;
+    turnMode: Parameters<RepairProviderTurnContractBuilder['render']>[0]['turnMode'];
     allowedKinds: string[];
     requiredKind?: string;
-    repairPolicy?: ProviderTurnContract['repairPolicy'];
+    repairPolicy?: Parameters<RepairProviderTurnContractBuilder['render']>[0]['repairPolicy'];
     errorLines?: string[];
   }
 ): string {
-  const acceptedContext = sanitizedAcceptedPlanExecutionContext(state.acceptedImplementationPlan);
-  const currentTask = objectRecord(acceptedContext.currentTask);
-  const operations = Array.isArray(acceptedContext.currentTaskOperations)
-    ? acceptedContext.currentTaskOperations.length
-    : 0;
-  const templates = Array.isArray(acceptedContext.currentTaskActionTemplates)
-    ? acceptedContext.currentTaskActionTemplates.length
-    : 0;
-  const frames: PromptPacketFrame[] = [
-    {
-      kind: 'SystemContract',
-      source: 'session.staticPrompt',
-      trust: 'systemInstruction',
-      scope: 'allRuns',
-      use: 'repair the proposal only; do not create facts, permissions, or task completion',
-      content: [
-        'Session parses proposals. Kernel executes tools and records facts.',
-        'Repair output must be a proposal only, not an explanation of the error.',
-      ],
-    },
-    {
-      kind: 'ProtocolContract',
-      source: 'session.protocol',
-      trust: 'schemaInstruction',
-      scope: 'currentProviderCall',
-      use: 'choose exactly one allowed proposal kind for this repair call',
-      content: [
-        `Allowed proposal kinds for this call: ${input.allowedKinds.join(', ') || 'none'}.`,
-        input.requiredKind ? `Required proposal kind: ${input.requiredKind}.` : 'No required proposal kind; choose the narrowest valid allowed kind.',
-        'Do not return taskPlan or implementationPlan during accepted task execution repair.',
-      ].filter(Boolean),
-    },
-  ];
-  if (state.currentTaskContext || currentTask) {
-    frames.push({
-      kind: 'TaskFrame',
-      source: 'session.acceptedPlanCursor',
-      trust: 'confirmedTaskInstruction',
-      scope: 'currentAcceptedTask',
-      use: 'repair only this current task unless decisionRequest asks the user to expand scope',
-      content: [
-        `taskId=${state.currentTaskContext?.taskId ?? stringValue(currentTask?.taskId) ?? 'none'}`,
-        `title=${oneLineText(state.currentTaskContext?.taskTitle ?? stringValue(currentTask?.title) ?? '', 240) || 'none'}`,
-        `objective=${oneLineText(state.currentTaskContext?.goal ?? stringValue(currentTask?.objective) ?? '', 500) || 'none'}`,
-        `targets=${state.currentTaskContext?.targets?.join(', ') || stringArrayValue(currentTask?.targets).join(', ') || 'none'}`,
-        `capabilities=${state.currentTaskContext?.capabilities?.join(', ') || stringValue(currentTask?.capability) || 'none'}`,
-        `completedTaskCount=${state.acceptedImplementationPlan?.completedTaskIds.length ?? 0}`,
-        `currentTaskOperations=${operations}`,
-        `currentTaskActionTemplates=${templates}`,
-      ],
-    });
-  }
-  if (input.errorLines?.length) {
-    frames.push({
-      kind: 'ErrorContext',
-      source: 'session.validation',
-      trust: 'currentFailureFact',
-      scope: 'currentProviderCall',
-      use: 'repair only the reported issue without changing the current task goal',
-      content: input.errorLines.map((line) => oneLineText(line, 500)),
-    });
-  }
-  frames.push({
-    kind: 'NextActionInstruction',
-    source: 'session.state',
-    trust: 'immediateInstruction',
-    scope: 'currentProviderCall',
-    use: 'highest priority for this repair call after system safety rules',
-    content: repairNextActionInstructionLines(input),
+  return new RepairProviderTurnContractBuilder().render({
+    ...input,
+    acceptedContext: sanitizedAcceptedPlanExecutionContext(state.acceptedImplementationPlan),
+    currentTaskContext: state.currentTaskContext
+      ? {
+        taskId: state.currentTaskContext.taskId,
+        taskTitle: state.currentTaskContext.taskTitle,
+        goal: state.currentTaskContext.goal,
+        targets: state.currentTaskContext.targets,
+        capabilities: state.currentTaskContext.capabilities,
+      }
+      : undefined,
+    completedTaskCount: state.acceptedImplementationPlan?.completedTaskIds.length ?? 0,
   });
-  return renderProviderTurnContract({
-    schemaVersion: 'deepcode.session.provider-turn-contract.v1',
-    turnMode: input.turnMode,
-    allowedKinds: input.allowedKinds,
-    requiredKind: input.requiredKind,
-    repairPolicy: input.repairPolicy ?? 'sameKindOnly',
-    projectionVisibility: input.turnMode === 'protocolRepair' ? 'debugOnly' : 'normal',
-    toolIntentTemplates: repairToolIntentTemplates(state, acceptedContext, input.allowedKinds),
-    frames,
-  });
-}
-
-function repairNextActionInstructionLines(input: {
-  turnMode: ProviderTurnMode;
-  allowedKinds: string[];
-  requiredKind?: string;
-}): string[] {
-  const allowsActionBundle = input.allowedKinds.includes('actionBundle');
-  const forbidden = allowsActionBundle
-    ? 'taskPlan | implementationPlan | reviewSummary'
-    : 'actionBundle | implementationPlan | reviewSummary';
-  const nextAction = allowsActionBundle
-    ? 'If executable work remains in current scope, output actionBundle. If evidence is missing, output focused resourceRequest. If scope must expand, output decisionRequest.'
-    : 'Do not output executable tool args. If side-effect work remains unaccepted, output taskPlan. If evidence is missing, output focused resourceRequest. If a user choice is needed, output decisionRequest.';
-  return [
-    `state=${input.turnMode}`,
-    `allowedOutputs=${input.allowedKinds.join(' | ') || 'none'}`,
-    input.requiredKind ? `requiredOutput=${input.requiredKind}` : '',
-    `forbiddenOutputs=${forbidden}`,
-    'Return exactly one valid Agent Protocol v3 JSON object. No prose, markdown fences, or protocol explanation.',
-    nextAction,
-  ].filter(Boolean);
-}
-
-function repairToolIntentTemplates(
-  state: SessionDriverLoopRunState,
-  acceptedContext: Record<string, unknown>,
-  allowedKinds: string[]
-): string[] {
-  if (!allowedKinds.includes('actionBundle')) {
-    return [
-      'No executable tool intent templates are visible in this repair call.',
-      'Use taskPlan operation intent, focused resourceRequest, decisionRequest, answer, or diagnostic according to allowedOutputs.',
-    ];
-  }
-  const templates = Array.isArray(acceptedContext.currentTaskActionTemplates)
-    ? acceptedContext.currentTaskActionTemplates
-    : [];
-  if (templates.length) {
-    return [
-      'Use currentTaskActionTemplates only for the current accepted task.',
-      clip(JSON.stringify(templates, null, 2), 2_000),
-    ];
-  }
-  const targets = state.currentTaskContext?.targets ?? [];
-  const capabilities = state.currentTaskContext?.capabilities ?? [];
-  return [
-    `currentTaskTargets=${targets.length ? targets.join(', ') : 'none'}`,
-    `currentTaskCapabilities=${capabilities.length ? capabilities.join(', ') : 'none'}`,
-    'Do not infer additional targets from the original user request, memory, or invalid proposal.',
-  ];
-}
-
-function oneLineText(value: string, maxChars: number): string {
-  return clip(value.replace(/\s+/g, ' ').trim(), maxChars);
 }
 
 function minimalActionBundleRepairSkeleton(): string {
