@@ -21,7 +21,6 @@ import {
   AcceptedPlanProgressAggregator,
   AcceptedPlanScopeIntervention,
   AcceptedPlanScopeMatcher,
-  AcceptedTaskRegistry,
   ExecutionPromptCoordinator,
   ReviewFactsAggregator,
   type AcceptedImplementationPlanContext,
@@ -100,6 +99,7 @@ import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 import {
   AcceptedPlanExecutor,
   type AcceptedPlanReadOnlyResourceCompletion,
+  AcceptedPlanTaskLedgerCoordinator,
 } from './execution/index.js';
 
 export interface SessionDriverLoopPorts {
@@ -4782,6 +4782,10 @@ function acceptedPlanAdmission(): AcceptedPlanAdmission {
   });
 }
 
+function acceptedPlanTaskLedger(): AcceptedPlanTaskLedgerCoordinator {
+  return new AcceptedPlanTaskLedgerCoordinator();
+}
+
 function acceptedPlanScopeIntervention(createId: (prefix: string) => string): AcceptedPlanScopeIntervention {
   return new AcceptedPlanScopeIntervention({
     createId,
@@ -4875,14 +4879,15 @@ function implementationBatchHints(
 }
 
 function refreshTaskExecutionState(state: SessionDriverLoopRunState): void {
-  state.taskExecutionCursor = buildTaskExecutionCursor(
-    state.acceptedImplementationPlan,
-    state.resourcePackets,
-    state.taskExecutionCursor?.lastSavepointId
-  );
-  state.currentTaskContext = buildCurrentTaskContext(state.acceptedImplementationPlan, state.taskExecutionCursor);
-  state.taskLedger = buildAcceptedPlanTaskLedger(state.acceptedImplementationPlan);
-  state.acceptedPlanPromptFrame = buildAcceptedPlanPromptFrameForContext(state.acceptedImplementationPlan, state.taskLedger);
+  const snapshot = acceptedPlanTaskLedger().runtimeSnapshot({
+    acceptedPlan: state.acceptedImplementationPlan,
+    resourcePackets: state.resourcePackets,
+    lastSavepointId: state.taskExecutionCursor?.lastSavepointId,
+  });
+  state.taskExecutionCursor = snapshot.taskExecutionCursor;
+  state.currentTaskContext = snapshot.currentTaskContext;
+  state.taskLedger = snapshot.taskLedger;
+  state.acceptedPlanPromptFrame = snapshot.acceptedPlanPromptFrame;
 }
 
 function buildAcceptedPlanTaskLedger(
@@ -4891,14 +4896,14 @@ function buildAcceptedPlanTaskLedger(
   skippedTaskIds: string[] = [],
   acceptedIncompleteTaskIds: string[] = []
 ): TaskLedgerSnapshot | undefined {
-  return new AcceptedTaskRegistry(acceptedPlan).ledger(failedTaskId, skippedTaskIds, acceptedIncompleteTaskIds);
+  return acceptedPlanTaskLedger().ledger(acceptedPlan, failedTaskId, skippedTaskIds, acceptedIncompleteTaskIds);
 }
 
 function buildAcceptedPlanPromptFrameForContext(
   acceptedPlan: AcceptedImplementationPlanContext | undefined,
   taskLedger: TaskLedgerSnapshot | undefined
 ): AcceptedPlanPromptFrame | undefined {
-  return new AcceptedTaskRegistry(acceptedPlan).promptFrame(taskLedger);
+  return acceptedPlanTaskLedger().promptFrame(acceptedPlan, taskLedger);
 }
 
 function buildTaskExecutionCursor(
@@ -4906,23 +4911,18 @@ function buildTaskExecutionCursor(
   resourcePackets: ResourcePacket[],
   lastSavepointId?: string
 ): TaskExecutionCursor | undefined {
-  return new AcceptedTaskRegistry(acceptedPlan).cursor(resourcePackets, lastSavepointId);
+  return acceptedPlanTaskLedger().cursor(acceptedPlan, resourcePackets, lastSavepointId);
 }
 
 function buildCurrentTaskContext(
   acceptedPlan: AcceptedImplementationPlanContext | undefined,
   cursor: TaskExecutionCursor | undefined
 ): CurrentTaskContext | undefined {
-  return new AcceptedTaskRegistry(acceptedPlan).currentTaskContext(cursor);
+  return acceptedPlanTaskLedger().currentTaskContext(acceptedPlan, cursor);
 }
 
 function currentTaskMemoryHints(context: CurrentTaskContext | undefined): string[] {
-  if (!context) return [];
-  return [
-    'CurrentTaskGoal:',
-    context.goal,
-    `CurrentTaskContext: taskId=${context.taskId ?? 'none'}; targets=${context.targets.join(', ') || 'none'}; capabilities=${context.capabilities.join(', ') || 'none'}; completedTasks=${context.completedTaskIds.length}.`,
-  ];
+  return acceptedPlanTaskLedger().memoryHints(context);
 }
 
 function providerRepairMessageState(state: SessionDriverLoopRunState): ProviderRepairMessageState {
@@ -4947,13 +4947,7 @@ function providerRepairMessageState(state: SessionDriverLoopRunState): ProviderR
 }
 
 function lastAcceptedPlanTaskSavepointId(events: AgentEvent[]): string | undefined {
-  for (const event of [...events].reverse()) {
-    if (event.kind !== 'workflow_stage') continue;
-    const payload = objectRecord(event.payload);
-    if (stringValue(payload?.stage) !== 'accepted_plan.task_savepoint') continue;
-    return event.id;
-  }
-  return undefined;
+  return acceptedPlanTaskLedger().lastSavepointId(events);
 }
 
 function acceptedPlanResourceResumeEvent(
@@ -8285,7 +8279,7 @@ function acceptedPlanAfterBatch(
   accepted: AcceptedImplementationPlanContext,
   completedTaskIds: string[]
 ): AcceptedImplementationPlanContext {
-  return new AcceptedTaskRegistry(accepted).withCompleted(completedTaskIds) ?? accepted;
+  return acceptedPlanTaskLedger().withCompleted(accepted, completedTaskIds) ?? accepted;
 }
 
 function acceptedPlanWithLatestCheckpoint(
