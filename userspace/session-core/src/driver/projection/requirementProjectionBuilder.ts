@@ -1,4 +1,6 @@
-import type { AgentEvent } from '@deepcode/protocol';
+import type { AgentContextAttachment, AgentEvent } from '@deepcode/protocol';
+import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import type { RequirementRecord } from '../../requirement/types.js';
 
 export type RequirementDecisionKind = 'accept' | 'reject' | 'revise';
 export type RequirementDecisionLanguage = 'zh-CN' | 'en-US';
@@ -25,8 +27,55 @@ export interface RequirementDecisionEventInput {
   id: string;
 }
 
+export interface RequirementConfirmationEventInput {
+  sessionId: string;
+  runId: string;
+  requirement: RequirementRecord;
+  proposal: ProposalEnvelope;
+  originalUserRequest: string;
+  attachments: AgentContextAttachment[];
+  executionRootPayload?: Record<string, unknown>;
+  interactionOverlayPayload?: Record<string, unknown>;
+  ts: string;
+  id: string;
+}
+
 export class RequirementProjectionBuilder {
   constructor(private readonly ports: RequirementProjectionBuilderPorts) {}
+
+  confirmationEvent(input: RequirementConfirmationEventInput): AgentEvent {
+    const decisionRequest = objectRecord(input.proposal.payload);
+    const language = this.ports.visibleLanguageForRequest(input.originalUserRequest);
+    const content = decisionRequest && this.isDecisionRequestPayload(decisionRequest)
+      ? this.renderDecisionRequestMarkdown(decisionRequest, language)
+      : this.renderRequirementConfirmationMarkdown(input.requirement);
+    const summary = this.decisionRequestSummary(decisionRequest) ?? this.requirementSummary(input.requirement);
+    return {
+      id: input.id,
+      sessionId: input.sessionId,
+      ts: input.ts,
+      kind: 'requirement_confirmation',
+      payload: {
+        title: '用户介入请求',
+        summary,
+        content,
+        status: 'waitingUserConfirmation',
+        confirmable: true,
+        runId: input.runId,
+        requirementId: input.requirement.requirementId,
+        requirement: input.requirement,
+        decisionRequest: input.proposal.payload,
+        proposalId: input.proposal.proposalId,
+        originalUserRequest: input.originalUserRequest,
+        attachments: input.attachments,
+        executionRoot: input.executionRootPayload,
+        ...(input.interactionOverlayPayload ?? {}),
+        channel: 'action',
+        visibility: 'conversation',
+        presentation: 'body',
+      },
+    };
+  }
 
   decisionEvent(input: RequirementDecisionEventInput): AgentEvent {
     const payload = objectRecord(input.event.payload) ?? {};
@@ -121,6 +170,64 @@ export class RequirementProjectionBuilder {
     if (decision === 'accept') return '用户已确认需求理解。';
     if (decision === 'revise') return '用户要求修订需求理解。';
     return '用户拒绝当前需求理解。';
+  }
+
+  private renderRequirementConfirmationMarkdown(requirement: RequirementRecord): string {
+    const checklist = requirement.checklist;
+    const sections = [
+      ['目标', checklist?.goal ? [checklist.goal] : []],
+      ['范围', checklist?.explicitTasks ?? []],
+      ['非目标', checklist?.outOfScope ?? []],
+      ['约束', checklist?.inferredTasks ?? []],
+      ['风险点', checklist?.riskNotes ?? []],
+      ['验收标准', checklist?.acceptanceCriteriaCandidates ?? []],
+      ['仍不明确的问题', checklist?.clarificationQuestions ?? []],
+    ] as const;
+    return sections
+      .map(([heading, items]) => {
+        const body = items.length
+          ? items.map((item) => `- ${item}`).join('\n')
+          : '- 暂无。';
+        return `## ${heading}\n${body}`;
+      })
+      .join('\n\n');
+  }
+
+  private renderDecisionRequestMarkdown(
+    decisionRequest: Record<string, unknown>,
+    language: RequirementDecisionLanguage
+  ): string {
+    const options = this.decisionRequestOptions(decisionRequest);
+    const summary = this.decisionRequestSummary(decisionRequest);
+    const labels = language === 'en-US'
+      ? {
+        heading: 'Decision needed',
+        options: 'Options',
+        recommended: 'recommended',
+        supplement: 'Supplemental input',
+        supplementText: 'Use the input box to choose an option or add constraints before continuing.',
+      }
+      : {
+        heading: '需要确认的选择',
+        options: '可选方案',
+        recommended: '推荐',
+        supplement: '补充信息',
+        supplementText: '可在输入框选择方案编号，或补充约束后再继续。',
+      };
+    const lines = [`## ${labels.heading}`];
+    if (summary) lines.push('', summary);
+    lines.push('', `## ${labels.options}`, '');
+    options.forEach((option, index) => {
+      const recommended = option.recommended ? `（${labels.recommended}）` : '';
+      lines.push(`${index + 1}. ${option.label}${recommended}`);
+      if (option.description) lines.push(`   ${option.description}`);
+    });
+    lines.push('', `## ${labels.supplement}`, '', labels.supplementText);
+    return lines.join('\n');
+  }
+
+  private requirementSummary(requirement: RequirementRecord): string {
+    return requirement.checklist?.goal || requirement.initialUserRequest;
   }
 }
 

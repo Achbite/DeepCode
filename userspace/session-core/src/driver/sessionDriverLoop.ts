@@ -101,7 +101,7 @@ import {
   type GeneratedArtifactEvidence,
   type ResourceRequestResolution,
 } from './context/index.js';
-import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
+import type { RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import {
   buildAcceptedPlanPromptFrame,
@@ -656,7 +656,13 @@ export class SessionDriverLoop {
         return this.append(sessionId, [answerEvent(sessionId, proposal, this.ts(), this.id('answer'))]);
       }
       if (proposal.kind === 'decisionRequest') {
-        const requirement = requirementRecordFromProposal(proposal, input, state, this.ts());
+        const requirement = userInputPipeline.requirementRecordFromProposal({
+          proposal,
+          sessionId: state.sessionId,
+          runId: state.runId,
+          userRequest: input.content,
+          timestamp: this.ts(),
+        });
         const interactionOverlay: InteractionOverlayContext = {
           parentRunId: state.interactionOverlay?.parentRunId ?? state.runId,
           parentPhase: state.phase,
@@ -668,17 +674,17 @@ export class SessionDriverLoop {
           acceptedCurrentTaskId: state.currentTaskContext?.taskId,
           acceptedCompletedTaskIds: state.acceptedImplementationPlan?.completedTaskIds,
         };
-        const confirmation = requirementConfirmationEvent({
-            sessionId,
-            runId: state.runId,
-            requirement,
-            proposal,
-            originalUserRequest: input.content,
-            attachments: input.attachments ?? [],
-            interactionOverlay,
-            ts: this.ts(),
-            id: this.id('decision-request'),
-          });
+        const confirmation = requirementProjectionBuilder.confirmationEvent({
+          sessionId,
+          runId: state.runId,
+          requirement,
+          proposal,
+          originalUserRequest: input.content,
+          attachments: input.attachments ?? [],
+          interactionOverlayPayload: interactionOverlayProjection(interactionOverlay),
+          ts: this.ts(),
+          id: this.id('decision-request'),
+        });
         state.phase = 'waiting_requirement_confirmation';
         return this.append(sessionId, [
           confirmation,
@@ -1992,15 +1998,23 @@ export class SessionDriverLoop {
         `Expected decisionRequest before side-effect planning, got ${proposal.kind}.`
       );
     }
-    const requirement = requirementRecordFromProposal(proposal, input, state, this.ts());
-    return requirementConfirmationEvent({
+    const requirement = userInputPipeline.requirementRecordFromProposal({
+      proposal,
+      sessionId: state.sessionId,
+      runId: state.runId,
+      userRequest: input.content,
+      timestamp: this.ts(),
+    });
+    return requirementProjectionBuilder.confirmationEvent({
       sessionId: state.sessionId,
       runId: state.runId,
       requirement,
       proposal,
       originalUserRequest: input.content,
       attachments: input.attachments ?? [],
-      executionRoot: AcceptedPlanExecutionRootResolver.fromState(state),
+      executionRootPayload: AcceptedPlanExecutionRootResolver.toPayload(
+        AcceptedPlanExecutionRootResolver.fromState(state)
+      ),
       ts: this.ts(),
       id: this.id('requirement-confirmation'),
     });
@@ -3200,8 +3214,14 @@ export class SessionDriverLoop {
       });
     }
     if (repaired.kind === 'decisionRequest') {
-      const requirement = requirementRecordFromProposal(repaired, input, state, this.ts());
-      const confirmation = requirementConfirmationEvent({
+      const requirement = userInputPipeline.requirementRecordFromProposal({
+        proposal: repaired,
+        sessionId: state.sessionId,
+        runId: state.runId,
+        userRequest: input.content,
+        timestamp: this.ts(),
+      });
+      const confirmation = requirementProjectionBuilder.confirmationEvent({
         sessionId: state.sessionId,
         runId: state.runId,
         requirement,
@@ -3509,7 +3529,13 @@ export class SessionDriverLoop {
           });
         }
         if (repaired.kind === 'decisionRequest') {
-          const requirement = requirementRecordFromProposal(repaired, input, state, this.ts());
+          const requirement = userInputPipeline.requirementRecordFromProposal({
+            proposal: repaired,
+            sessionId: state.sessionId,
+            runId: state.runId,
+            userRequest: input.content,
+            timestamp: this.ts(),
+          });
           const interactionOverlay: InteractionOverlayContext = {
             parentRunId: state.runId,
             parentPhase: 'executing_accepted_plan',
@@ -3517,14 +3543,14 @@ export class SessionDriverLoop {
             interactionId: requirement.requirementId,
             sourceInteractionId: repaired.proposalId,
           };
-          const confirmation = requirementConfirmationEvent({
+          const confirmation = requirementProjectionBuilder.confirmationEvent({
             sessionId: state.sessionId,
             runId: state.runId,
             requirement,
             proposal: repaired,
             originalUserRequest: input.content,
             attachments: input.attachments ?? [],
-            interactionOverlay,
+            interactionOverlayPayload: interactionOverlayProjection(interactionOverlay),
             ts: this.ts(),
             id: this.id('accepted-plan-scope-repair-decision'),
           });
@@ -3931,7 +3957,13 @@ export class SessionDriverLoop {
       acceptedPlan: state.acceptedImplementationPlan,
       currentTaskId: state.currentTaskContext?.taskId,
     }, proposal, validation);
-    const requirement = requirementRecordFromProposal(decisionProposal, input, state, this.ts());
+    const requirement = userInputPipeline.requirementRecordFromProposal({
+      proposal: decisionProposal,
+      sessionId: state.sessionId,
+      runId: state.runId,
+      userRequest: input.content,
+      timestamp: this.ts(),
+    });
     const interactionOverlay: InteractionOverlayContext = {
       parentRunId: state.runId,
       parentPhase: 'executing_accepted_plan',
@@ -3939,14 +3971,14 @@ export class SessionDriverLoop {
       interactionId: requirement.requirementId,
       sourceInteractionId: proposal.proposalId,
     };
-    const confirmation = requirementConfirmationEvent({
+    const confirmation = requirementProjectionBuilder.confirmationEvent({
       sessionId: state.sessionId,
       runId: state.runId,
       requirement,
       proposal: decisionProposal,
       originalUserRequest: input.content,
       attachments: input.attachments ?? [],
-      interactionOverlay,
+      interactionOverlayPayload: interactionOverlayProjection(interactionOverlay),
       ts: this.ts(),
       id: this.id('accepted-plan-scope-confirmation'),
     });
@@ -7629,92 +7661,6 @@ function shouldRequestRequirementConfirmation(
   return false;
 }
 
-function requirementRecordFromProposal(
-  proposal: ProposalEnvelope,
-  input: SessionDriverLoopInput,
-  state: SessionDriverLoopRunState,
-  timestamp: string
-): RequirementRecord {
-  const draft = objectRecord(proposal.payload) ?? {};
-  const requirementId = stringValue(draft.requirementId)
-    ?? stringValue(draft.id)
-    ?? proposal.proposalId
-    ?? `requirement-${state.runId}`;
-  const checklist: RequirementChecklist = {
-    goal: stringValue(draft.goal) ?? stringValue(draft.summary) ?? stringValue(draft.reason) ?? input.content,
-    explicitTasks: stringArrayValue(draft.scope)
-      .concat(stringArrayValue(draft.explicitTasks))
-      .filter(Boolean),
-    inferredTasks: stringArrayValue(draft.inferredTasks)
-      .concat(stringArrayValue(draft.constraints))
-      .filter(Boolean),
-    outOfScope: stringArrayValue(draft.outOfScope).concat(stringArrayValue(draft.nonGoals)),
-    affectedAreaCandidates: stringArrayValue(draft.affectedAreas)
-      .concat(stringArrayValue(draft.affectedAreaCandidates)),
-    resourceRequests: stringArrayValue(draft.resourceRequests),
-    acceptanceCriteriaCandidates: stringArrayValue(draft.acceptanceCriteria)
-      .concat(stringArrayValue(draft.acceptanceCriteriaCandidates)),
-    clarificationQuestions: stringArrayValue(draft.openQuestions)
-      .concat(stringArrayValue(draft.clarificationQuestions)),
-    riskNotes: stringArrayValue(draft.risks).concat(stringArrayValue(draft.riskNotes)),
-  };
-  return {
-    requirementId,
-    sessionId: state.sessionId,
-    initialUserRequest: input.content,
-    checklist,
-    status: 'probing',
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
-}
-
-function requirementConfirmationEvent(input: {
-  sessionId: string;
-  runId: string;
-  requirement: RequirementRecord;
-  proposal: ProposalEnvelope;
-  originalUserRequest: string;
-  attachments: AgentContextAttachment[];
-  executionRoot?: AcceptedImplementationPlanExecutionRoot;
-  interactionOverlay?: InteractionOverlayContext;
-  ts: string;
-  id: string;
-}): AgentEvent {
-  const decisionRequest = objectRecord(input.proposal.payload);
-  const language = visibleLanguageForRequest(input.originalUserRequest);
-  const content = decisionRequest && requirementProjectionBuilder.isDecisionRequestPayload(decisionRequest)
-    ? renderDecisionRequestMarkdown(decisionRequest, language)
-    : renderRequirementConfirmationMarkdown(input.requirement);
-  const summary = requirementProjectionBuilder.decisionRequestSummary(decisionRequest) ?? requirementSummary(input.requirement);
-  const overlayPayload = interactionOverlayProjection(input.interactionOverlay);
-  return {
-    id: input.id,
-    sessionId: input.sessionId,
-    ts: input.ts,
-    kind: 'requirement_confirmation',
-    payload: {
-      title: '用户介入请求',
-      summary,
-      content,
-      status: 'waitingUserConfirmation',
-      confirmable: true,
-      runId: input.runId,
-      requirementId: input.requirement.requirementId,
-      requirement: input.requirement,
-      decisionRequest: input.proposal.payload,
-      proposalId: input.proposal.proposalId,
-      originalUserRequest: input.originalUserRequest,
-      attachments: input.attachments,
-      executionRoot: AcceptedPlanExecutionRootResolver.toPayload(input.executionRoot),
-      ...overlayPayload,
-      channel: 'action',
-      visibility: 'conversation',
-      presentation: 'body',
-    },
-  };
-}
-
 function acceptedPlanAccessScopesCanonicalizedEvent(
   sessionId: string,
   runId: string,
@@ -7896,64 +7842,6 @@ function acceptedPlanScopeRevisionRequest(
     planSummary ? `Current accepted execution summary:\n${JSON.stringify(planSummary, null, 2)}` : '',
     Object.keys(decisionRequest).length ? `Accepted-plan scope decision:\n${JSON.stringify(decisionRequest, null, 2)}` : '',
   ].filter(Boolean).join('\n\n');
-}
-
-function renderRequirementConfirmationMarkdown(requirement: RequirementRecord): string {
-  const checklist = requirement.checklist;
-  const sections = [
-    ['目标', checklist?.goal ? [checklist.goal] : []],
-    ['范围', checklist?.explicitTasks ?? []],
-    ['非目标', checklist?.outOfScope ?? []],
-    ['约束', checklist?.inferredTasks ?? []],
-    ['风险点', checklist?.riskNotes ?? []],
-    ['验收标准', checklist?.acceptanceCriteriaCandidates ?? []],
-    ['仍不明确的问题', checklist?.clarificationQuestions ?? []],
-  ] as const;
-  return sections
-    .map(([heading, items]) => {
-      const body = items.length
-        ? items.map((item) => `- ${item}`).join('\n')
-        : '- 暂无。';
-      return `## ${heading}\n${body}`;
-    })
-    .join('\n\n');
-}
-
-function renderDecisionRequestMarkdown(
-  decisionRequest: Record<string, unknown>,
-  language: VisibleLanguage
-): string {
-  const options = requirementProjectionBuilder.decisionRequestOptions(decisionRequest);
-  const summary = requirementProjectionBuilder.decisionRequestSummary(decisionRequest);
-  const labels = language === 'en-US'
-    ? {
-      heading: 'Decision needed',
-      options: 'Options',
-      recommended: 'recommended',
-      supplement: 'Supplemental input',
-      supplementText: 'Use the input box to choose an option or add constraints before continuing.',
-    }
-    : {
-      heading: '需要确认的选择',
-      options: '可选方案',
-      recommended: '推荐',
-      supplement: '补充信息',
-      supplementText: '可在输入框选择方案编号，或补充约束后再继续。',
-    };
-  const lines = [`## ${labels.heading}`];
-  if (summary) lines.push('', summary);
-  lines.push('', `## ${labels.options}`, '');
-  options.forEach((option, index) => {
-    const recommended = option.recommended ? `（${labels.recommended}）` : '';
-    lines.push(`${index + 1}. ${option.label}${recommended}`);
-    if (option.description) lines.push(`   ${option.description}`);
-  });
-  lines.push('', `## ${labels.supplement}`, '', labels.supplementText);
-  return lines.join('\n');
-}
-
-function requirementSummary(requirement: RequirementRecord): string {
-  return requirement.checklist?.goal || requirement.initialUserRequest;
 }
 
 function stringValue(value: unknown): string | undefined {

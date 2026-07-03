@@ -470,6 +470,30 @@ function assertUserInputPipelineFindsRequirementInteractions(): void {
   assertEqual(record?.requirementId, requirementId, 'user input pipeline recovers requirement id from confirmation payload');
   assertEqual(record?.initialUserRequest, requestText, 'user input pipeline recovers original request from confirmation payload');
   assertEqual(pipeline.requirementOriginalRequest(fallbackConfirmation), requestText, 'user input pipeline recovers original request directly');
+  const proposalRecord = pipeline.requirementRecordFromProposal({
+    proposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'decisionRequest',
+      runId,
+      sessionId: `session-${token}`,
+      proposalId: `proposal-${token}`,
+      source: 'llm',
+      payload: {
+        id: `proposal-requirement-${token}`,
+        summary: `Goal ${token}`,
+        scope: [`Scope ${token}`],
+        acceptanceCriteria: [`Acceptance ${token}`],
+      },
+    } as ProposalEnvelope,
+    sessionId: `session-${token}`,
+    runId,
+    userRequest: requestText,
+    timestamp: '2026-01-01T00:00:00.000Z',
+  });
+  assertEqual(proposalRecord.requirementId, `proposal-requirement-${token}`, 'user input pipeline builds requirement records from proposal ids');
+  assertEqual(proposalRecord.checklist?.goal, `Goal ${token}`, 'user input pipeline builds requirement goal from proposal summary');
+  assertEqual(proposalRecord.checklist?.explicitTasks[0], `Scope ${token}`, 'user input pipeline keeps proposal scope as explicit tasks');
+  assertEqual(proposalRecord.checklist?.acceptanceCriteriaCandidates[0], `Acceptance ${token}`, 'user input pipeline keeps proposal acceptance criteria');
   const decisionEvent = {
     kind: 'requirement_decision',
     payload: {
@@ -3178,6 +3202,50 @@ function assertRequirementProjectionBuilderCreatesDecisionEvents(): void {
   assertEqual(payload.status, 'accepted', 'requirement projection maps accepted decisions to accepted status');
   assertEqual(selectedOption.id, selectedOptionId, 'requirement projection selects the guided option');
   assertEqual(payload.overlayRunId, runId, 'requirement projection preserves overlay payload from ports');
+  const confirmation = builder.confirmationEvent({
+    sessionId: `session-${suffix}`,
+    runId,
+    requirement: {
+      requirementId,
+      sessionId: `session-${suffix}`,
+      initialUserRequest: `Request ${suffix}`,
+      checklist: {
+        goal: `Goal ${suffix}`,
+        explicitTasks: [`Task ${suffix}`],
+        inferredTasks: [],
+        outOfScope: [],
+        affectedAreaCandidates: [],
+        resourceRequests: [],
+        acceptanceCriteriaCandidates: [`Acceptance ${suffix}`],
+        clarificationQuestions: [],
+        riskNotes: [],
+      },
+      status: 'probing',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    },
+    proposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      kind: 'decisionRequest',
+      runId,
+      sessionId: `session-${suffix}`,
+      proposalId: `proposal-${suffix}`,
+      source: 'llm',
+      payload: decisionRequest,
+    } as ProposalEnvelope,
+    originalUserRequest: `Request ${suffix}`,
+    attachments: [],
+    executionRootPayload: { ref: `root-${suffix}` },
+    interactionOverlayPayload: { overlayRunId: runId },
+    ts: '2026-01-01T00:00:02.000Z',
+    id: `confirmation-${suffix}`,
+  });
+  const confirmationPayload = confirmation.payload as Record<string, any>;
+  assertEqual(confirmation.kind, 'requirement_confirmation', 'requirement projection creates confirmation events');
+  assertEqual(confirmationPayload.status, 'waitingUserConfirmation', 'requirement projection marks confirmations as waiting');
+  assertEqual(confirmationPayload.decisionRequest, decisionRequest, 'requirement projection preserves decision request payload');
+  assertEqual(confirmationPayload.executionRoot.ref, `root-${suffix}`, 'requirement projection preserves execution root payload');
+  assertEqual(confirmationPayload.overlayRunId, runId, 'requirement projection preserves confirmation overlay payload');
 }
 
 function assertSettingsCatalogBoundaries(): void {

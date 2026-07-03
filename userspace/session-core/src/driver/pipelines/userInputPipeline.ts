@@ -1,5 +1,6 @@
 import type { AgentContextAttachment, AgentEvent } from '@deepcode/protocol';
 import { AcceptedPlanExecutionRootResolver } from '../../accepted-plan/AcceptedPlanExecutionRootResolver.js';
+import type { ProposalEnvelope } from '../../agent-plan/types.js';
 import type { RequirementChecklist, RequirementRecord } from '../../requirement/types.js';
 
 export interface RequirementActiveInteractionRef {
@@ -12,6 +13,14 @@ export interface RequirementInteractionCandidateRef {
   kind: string;
   runId?: string;
   requirementId?: string;
+}
+
+export interface RequirementRecordFromProposalInput {
+  proposal: ProposalEnvelope;
+  sessionId: string;
+  runId: string;
+  userRequest: string;
+  timestamp: string;
 }
 
 export class UserInputPipeline {
@@ -134,6 +143,41 @@ export class UserInputPipeline {
     };
   }
 
+  requirementRecordFromProposal(input: RequirementRecordFromProposalInput): RequirementRecord {
+    const draft = objectRecord(input.proposal.payload) ?? {};
+    const requirementId = stringValue(draft.requirementId)
+      ?? stringValue(draft.id)
+      ?? input.proposal.proposalId
+      ?? `requirement-${input.runId}`;
+    const checklist: RequirementChecklist = {
+      goal: stringValue(draft.goal) ?? stringValue(draft.summary) ?? stringValue(draft.reason) ?? input.userRequest,
+      explicitTasks: stringArrayValue(draft.scope)
+        .concat(stringArrayValue(draft.explicitTasks))
+        .filter(Boolean),
+      inferredTasks: stringArrayValue(draft.inferredTasks)
+        .concat(stringArrayValue(draft.constraints))
+        .filter(Boolean),
+      outOfScope: stringArrayValue(draft.outOfScope).concat(stringArrayValue(draft.nonGoals)),
+      affectedAreaCandidates: stringArrayValue(draft.affectedAreas)
+        .concat(stringArrayValue(draft.affectedAreaCandidates)),
+      resourceRequests: stringArrayValue(draft.resourceRequests),
+      acceptanceCriteriaCandidates: stringArrayValue(draft.acceptanceCriteria)
+        .concat(stringArrayValue(draft.acceptanceCriteriaCandidates)),
+      clarificationQuestions: stringArrayValue(draft.openQuestions)
+        .concat(stringArrayValue(draft.clarificationQuestions)),
+      riskNotes: stringArrayValue(draft.risks).concat(stringArrayValue(draft.riskNotes)),
+    };
+    return {
+      requirementId,
+      sessionId: input.sessionId,
+      initialUserRequest: input.userRequest,
+      checklist,
+      status: 'probing',
+      createdAt: input.timestamp,
+      updatedAt: input.timestamp,
+    };
+  }
+
   requirementOriginalRequest(event: AgentEvent): string {
     const payload = objectRecord(event.payload);
     return stringValue(payload?.originalUserRequest)
@@ -236,6 +280,16 @@ export class UserInputPipeline {
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    const single = stringValue(value);
+    return single ? [single] : [];
+  }
+  return value
+    .map((item) => stringValue(item))
+    .filter((item): item is string => Boolean(item));
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
