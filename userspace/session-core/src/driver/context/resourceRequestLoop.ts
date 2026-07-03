@@ -3,11 +3,18 @@ import type {
   AgentEvent,
 } from '@deepcode/protocol';
 import type {
+  ResourceManifest,
   ResourcePacket,
   ResourcePacketItem,
 } from '../../context/types.js';
 
+export interface ResourceRequestLoopOptions {
+  maxDerivedManifestEntries?: number;
+}
+
 export class ResourceRequestLoop {
+  constructor(private readonly options: ResourceRequestLoopOptions = {}) {}
+
   findPacket(events: unknown[]): ResourcePacket | undefined {
     for (const event of events) {
       const record = objectRecord(event);
@@ -70,6 +77,35 @@ export class ResourceRequestLoop {
       ]).filter((item): item is string => Boolean(item)),
       itemCount: packet.items.length,
     });
+  }
+
+  addDiscoveredManifestEntries(manifest: ResourceManifest, packet: ResourcePacket): void {
+    const maxEntries = this.options.maxDerivedManifestEntries ?? 240;
+    const existing = new Set(manifest.entries.map((entry) => entry.id));
+    for (const item of packet.items) {
+      if (manifest.entries.length >= maxEntries) return;
+      if (item.contentKind !== 'directoryTree') continue;
+      const raw = item as ResourcePacketItem & { nodes?: unknown; absolutePath?: string; path?: string };
+      const root = typeof raw.absolutePath === 'string' ? raw.absolutePath : undefined;
+      if (!root || !Array.isArray(raw.nodes)) continue;
+      for (const node of flattenNodes(raw.nodes)) {
+        if (manifest.entries.length >= maxEntries) return;
+        const nodePath = typeof node.path === 'string' ? node.path : '';
+        const nodeType = node.type === 'directory' ? 'directory' : node.type === 'file' ? 'file' : undefined;
+        if (!nodePath || !nodeType) continue;
+        const id = `${item.manifestEntryId}:${sanitizeId(nodePath)}`;
+        if (existing.has(id)) continue;
+        existing.add(id);
+        manifest.entries.push({
+          id,
+          kind: nodeType,
+          label: `${nodeType === 'directory' ? 'Directory' : 'File'} ${nodePath}`,
+          resourceRef: joinFsPath(root, nodePath),
+          readPolicy: 'autoRead',
+          reason: `Discovered inside explicit directory attachment ${item.manifestEntryId}.`,
+        });
+      }
+    }
   }
 }
 
@@ -154,4 +190,27 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function flattenNodes(nodes: unknown[]): Array<Record<string, unknown>> {
+  const output: Array<Record<string, unknown>> = [];
+  const stack = nodes.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item));
+  while (stack.length) {
+    const node = stack.shift()!;
+    output.push(node);
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        if (child && typeof child === 'object' && !Array.isArray(child)) stack.push(child as Record<string, unknown>);
+      }
+    }
+  }
+  return output;
+}
+
+function sanitizeId(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'resource';
+}
+
+function joinFsPath(root: string, child: string): string {
+  return `${root.replace(/\/+$/g, '')}/${child.replace(/^\/+/g, '')}`;
 }

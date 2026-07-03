@@ -360,6 +360,41 @@ function assertResourceRequestLoopBuildsPacketEvents(): void {
   const recent = loop.recentPackets([event]);
   assertEqual(recent.length, 1, 'resource request loop reads recent packet from projection event');
   assertEqual(recent[0]?.items[0]?.promptContent, `content-${token}`, 'resource request loop preserves prompt content');
+
+  const manifest: ResourceManifest = {
+    id: `manifest-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    entries: [],
+    budget: { maxEntries: 16, maxBytes: 1024 },
+    defaultDenyPatterns: [],
+  };
+  loop.addDiscoveredManifestEntries(manifest, {
+    id: `tree-packet-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    requestId: `tree-request-${token}`,
+    items: [
+      {
+        requestItemId: `tree-item-${token}`,
+        manifestEntryId: `tree-entry-${token}`,
+        readPolicy: 'autoRead',
+        status: 'resolved',
+        contentKind: 'directoryTree',
+        absolutePath: `/tmp/root-${token}`,
+        nodes: [
+          {
+            path: `dir-${token}`,
+            type: 'directory',
+            children: [
+              { path: `dir-${token}/file.txt`, type: 'file' },
+            ],
+          },
+        ],
+      } as any,
+    ],
+  });
+  assertEqual(manifest.entries.length, 2, 'resource request loop derives manifest entries from directory tree');
+  assertEqual(manifest.entries[0]?.kind, 'directory', 'resource request loop preserves derived directory kind');
+  assertEqual(manifest.entries[1]?.resourceRef, `/tmp/root-${token}/dir-${token}/file.txt`, 'resource request loop joins derived resource paths');
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {

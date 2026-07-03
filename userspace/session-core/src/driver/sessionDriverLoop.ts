@@ -312,7 +312,9 @@ const nativeToolCoordinator = new NativeToolCoordinator();
 const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
 const acceptedPlanExecutor = new AcceptedPlanExecutor();
 const contextFrameBuilder = new ContextFrameBuilder();
-const resourceRequestLoop = new ResourceRequestLoop();
+const resourceRequestLoop = new ResourceRequestLoop({
+  maxDerivedManifestEntries: MAX_DERIVED_MANIFEST_ENTRIES,
+});
 const DEFAULT_SUB_AGENT_NO_DELTA_TIMEOUT_MS = 45_000;
 const DEFAULT_SUB_AGENT_TOTAL_TIMEOUT_MS = 240_000;
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
@@ -442,7 +444,7 @@ export class SessionDriverLoop {
     if (state.manifest.entries.length > 0 && !input.resumeResourcePackets) {
       const packet = await this.resolveResources(state, state.manifest);
       state.resourcePackets.push(packet);
-      addDiscoveredManifestEntries(state.manifest, packet);
+      resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
       lastResult = await this.append(sessionId, [resourceRequestLoop.packetEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
     }
 
@@ -696,7 +698,7 @@ export class SessionDriverLoop {
         }
         const packet = await this.resolveResources(state, subset.manifest);
         state.resourcePackets.push(packet);
-        addDiscoveredManifestEntries(state.manifest, packet);
+        resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
         lastResult = await this.append(sessionId, [resourceRequestLoop.packetEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
         if (state.acceptedImplementationPlan) {
           refreshTaskExecutionState(state);
@@ -2255,7 +2257,7 @@ export class SessionDriverLoop {
 
     const packet = await this.resolveResources(state, subset.manifest);
     state.resourcePackets.push(packet);
-    addDiscoveredManifestEntries(state.manifest, packet);
+    resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
     let result = await this.append(state.sessionId, [
       resourceRequestLoop.packetEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-readonly-action-resource-context')),
       acceptedPlanResourceResumeEvent(
@@ -2605,7 +2607,7 @@ export class SessionDriverLoop {
               repeatCount: 0,
             });
             runState.resourcePackets.push(packet);
-            addDiscoveredManifestEntries(runState.manifest, packet);
+            resourceRequestLoop.addDiscoveredManifestEntries(runState.manifest, packet);
             await this.append(runState.sessionId, [
               resourceRequestLoop.packetEvent(runState.sessionId, packet, this.ts(), this.id('native-resource-context')),
             ]);
@@ -3039,7 +3041,7 @@ export class SessionDriverLoop {
       } else {
         const packet = await this.resolveResources(state, subset.manifest);
         state.resourcePackets.push(packet);
-        addDiscoveredManifestEntries(state.manifest, packet);
+        resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
         result = await this.append(state.sessionId, [
           resourceRequestLoop.packetEvent(state.sessionId, packet, this.ts(), this.id('action-bundle-admission-resource-context')),
         ]) ?? result;
@@ -3335,7 +3337,7 @@ export class SessionDriverLoop {
           } else {
             const packet = await this.resolveResources(state, subset.manifest);
             state.resourcePackets.push(packet);
-            addDiscoveredManifestEntries(state.manifest, packet);
+            resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
             result = await this.append(state.sessionId, [
               resourceRequestLoop.packetEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-repair-resource-context')),
             ]) ?? result;
@@ -5136,49 +5138,6 @@ function resourceResolutionDiagnostic(resolution: ResourceRequestResolution): Di
     'Please specify an explicit attachment, rootId, or relative path.',
   ].filter(Boolean).join('\n');
   return diag('resourceResolveFailed', fallback, { unresolved, ambiguous, roots });
-}
-
-function addDiscoveredManifestEntries(manifest: ResourceManifest, packet: ResourcePacket): void {
-  const existing = new Set(manifest.entries.map((entry) => entry.id));
-  for (const item of packet.items) {
-    if (manifest.entries.length >= MAX_DERIVED_MANIFEST_ENTRIES) return;
-    if (item.contentKind !== 'directoryTree') continue;
-    const raw = item as ResourcePacketItem & { nodes?: unknown; absolutePath?: string; path?: string };
-    const root = typeof raw.absolutePath === 'string' ? raw.absolutePath : undefined;
-    if (!root || !Array.isArray(raw.nodes)) continue;
-    for (const node of flattenNodes(raw.nodes)) {
-      if (manifest.entries.length >= MAX_DERIVED_MANIFEST_ENTRIES) return;
-      const nodePath = typeof node.path === 'string' ? node.path : '';
-      const nodeType = node.type === 'directory' ? 'directory' : node.type === 'file' ? 'file' : undefined;
-      if (!nodePath || !nodeType) continue;
-      const id = `${item.manifestEntryId}:${sanitizeId(nodePath)}`;
-      if (existing.has(id)) continue;
-      existing.add(id);
-      manifest.entries.push({
-        id,
-        kind: nodeType,
-        label: `${nodeType === 'directory' ? 'Directory' : 'File'} ${nodePath}`,
-        resourceRef: joinFsPath(root, nodePath),
-        readPolicy: 'autoRead',
-        reason: `Discovered inside explicit directory attachment ${item.manifestEntryId}.`,
-      });
-    }
-  }
-}
-
-function flattenNodes(nodes: unknown[]): Array<Record<string, unknown>> {
-  const output: Array<Record<string, unknown>> = [];
-  const stack = nodes.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item));
-  while (stack.length) {
-    const node = stack.shift()!;
-    output.push(node);
-    if (Array.isArray(node.children)) {
-      for (const child of node.children) {
-        if (child && typeof child === 'object' && !Array.isArray(child)) stack.push(child as Record<string, unknown>);
-      }
-    }
-  }
-  return output;
 }
 
 function findStateContract(events: unknown[]): KernelStateContractRef | undefined {
