@@ -341,6 +341,26 @@ function assertProviderStreamCoordinatorClassifiesStages(): void {
     coordinator.jsonProgressSummary('zh-CN', 41).includes('41'),
     'provider stream Chinese progress summary includes received char count'
   );
+  assert(
+    coordinator.stageSummary(`stage_${token}`, 'request', 'en-US').includes('requesting'),
+    'provider stream coordinator renders request stage summary'
+  );
+  assert(
+    coordinator.nativeToolResolveRunningSummary(`tool-${token}`, 'en-US').includes(`tool-${token}`),
+    'provider stream coordinator renders native tool running summary'
+  );
+  assert(
+    coordinator.toolCallPreparingSummary(`tool-${token}`, 'en-US').includes(`tool-${token}`),
+    'provider stream coordinator renders tool call summary'
+  );
+  assert(
+    coordinator.usageSummary('en-US').length > 0,
+    'provider stream coordinator renders usage summary'
+  );
+  assert(
+    coordinator.guidanceRevisionTransitionMessage('en-US').length > 0,
+    'provider stream coordinator renders guidance revision summary'
+  );
 }
 
 async function assertProviderTraceRecorderArchivesPayload(): Promise<void> {

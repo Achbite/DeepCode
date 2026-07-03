@@ -2680,13 +2680,13 @@ export class SessionDriverLoop {
               channel: 'tool',
               source: 'session',
               itemId: toolCall.callId,
-              summary: nativeToolResolveRunningSummary(toolCall.name, language),
+              summary: providerStreamCoordinator.nativeToolResolveRunningSummary(toolCall.name, language),
               activity: conversationActivity({
                 activityId: `native-tool-${toolCall.callId}`,
                 kind: 'toolExecution',
                 status: 'running',
                 title: 'Resolving native read tool',
-                summary: nativeToolResolveRunningSummary(toolCall.name, language),
+                summary: providerStreamCoordinator.nativeToolResolveRunningSummary(toolCall.name, language),
                 source: 'session',
                 runId: runState.runId,
                 toolName: toolCall.name,
@@ -2723,7 +2723,7 @@ export class SessionDriverLoop {
               channel: 'resource',
               source: 'kernel',
               itemId: toolCall.callId,
-              summary: nativeToolResolveCompletedSummary(toolCall.name, language),
+              summary: providerStreamCoordinator.nativeToolResolveCompletedSummary(toolCall.name, language),
               activity: resourceRequestLoop.packetActivity(packet, `native-tool-resource-${toolCall.callId}`, runState.runId),
               payload: {
                 callId: toolCall.callId,
@@ -2997,7 +2997,7 @@ export class SessionDriverLoop {
     const events = guidance.map((item) => {
       const payload: Record<string, unknown> = {
         title: 'User guidance',
-        summary: userGuidanceConsumedSummary(language),
+        summary: providerStreamCoordinator.userGuidanceConsumedSummary(language),
         status: 'consumed',
         guidanceId: item.id,
         targetRunId: state.runId,
@@ -4052,7 +4052,7 @@ export class SessionDriverLoop {
       status: this.ports.llmChatStream ? 'streaming' : 'running',
       channel: 'progress',
       source: 'session',
-      summary: providerStageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
+      summary: providerStreamCoordinator.stageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
       activity: providerActivity(state, stage, 'running'),
     });
     const request: LlmChatRequest = {
@@ -4129,7 +4129,7 @@ export class SessionDriverLoop {
       status: 'completed',
       channel: 'progress',
       source: 'provider',
-      summary: providerStageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
+      summary: providerStreamCoordinator.stageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
       activity: providerActivity(state, stage, 'completed'),
     });
     const content = stripProviderPartFrames(result.data.assistantMessage?.content
@@ -4202,16 +4202,16 @@ export class SessionDriverLoop {
         itemId: chunk.callId ?? String(chunk.index ?? 0),
         delta: chunk.toolCallDelta?.argumentsDelta,
         summary: chunk.toolCallDelta?.name
-          ? providerToolCallPreparingSummary(chunk.toolCallDelta.name, language)
-          : providerToolCallStreamingSummary(language),
+          ? providerStreamCoordinator.toolCallPreparingSummary(chunk.toolCallDelta.name, language)
+          : providerStreamCoordinator.toolCallStreamingSummary(language),
         activity: conversationActivity({
           activityId: `provider-tool-${chunk.callId ?? chunk.index ?? 0}`,
           kind: 'toolExecution',
           status: 'running',
           title: 'Provider tool call',
           summary: chunk.toolCallDelta?.name
-            ? providerToolCallPreparingSummary(chunk.toolCallDelta.name, language)
-            : providerToolCallStreamingSummary(language),
+            ? providerStreamCoordinator.toolCallPreparingSummary(chunk.toolCallDelta.name, language)
+            : providerStreamCoordinator.toolCallStreamingSummary(language),
           source: 'provider',
           runId: state.runId,
           toolName: chunk.toolCallDelta?.name,
@@ -4233,7 +4233,7 @@ export class SessionDriverLoop {
         status: 'running',
         channel: 'progress',
         source: 'provider',
-        summary: providerUsageSummary(visibleLanguageForRequest(state.userRequest)),
+        summary: providerStreamCoordinator.usageSummary(visibleLanguageForRequest(state.userRequest)),
         payload: event.usage ?? chunk?.usage,
       });
       return;
@@ -5065,7 +5065,7 @@ function providerActivity(
     kind: 'providerThinking',
     status,
     title: status === 'running' ? 'Provider call running' : 'Provider call completed',
-    summary: providerStageSummary(stage, status === 'running' ? 'request' : 'response', visibleLanguageForRequest(state.userRequest)),
+    summary: providerStreamCoordinator.stageSummary(stage, status === 'running' ? 'request' : 'response', visibleLanguageForRequest(state.userRequest)),
     source: 'provider',
     runId: state.runId,
   });
@@ -5230,7 +5230,7 @@ function guidanceRevisionTransitionEvent(
     ts,
     kind: 'assistant_msg',
     payload: {
-      content: guidanceRevisionTransitionMessage(visibleLanguageForRequest(userRequest)),
+      content: providerStreamCoordinator.guidanceRevisionTransitionMessage(visibleLanguageForRequest(userRequest)),
       channel: 'progress',
       source: 'session',
       visibility: 'conversation',
@@ -8535,62 +8535,6 @@ type VisibleLanguage = 'zh-CN' | 'en-US';
 
 function visibleLanguageForRequest(userRequest: string): VisibleLanguage {
   return /[\u3400-\u9fff]/.test(userRequest) ? 'zh-CN' : 'en-US';
-}
-
-function providerStageSummary(stage: string, phase: 'request' | 'response', language: VisibleLanguage = 'zh-CN'): string {
-  const label = stage
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (value) => value.toUpperCase());
-  if (language === 'en-US') {
-    return phase === 'request'
-      ? `${label}: requesting a structured model response.`
-      : `${label}: model response received; parsing protocol output.`;
-  }
-  return phase === 'request'
-    ? `${label}: 请求模型生成结构化回复。`
-    : `${label}: 模型已返回，等待协议解析。`;
-}
-
-function nativeToolResolveRunningSummary(toolName: string, language: VisibleLanguage): string {
-  return language === 'en-US'
-    ? `${toolName} is being resolved by Kernel ResourceResolve.`
-    : `${toolName} 正在通过 Kernel ResourceResolve 解析。`;
-}
-
-function nativeToolResolveCompletedSummary(toolName: string, language: VisibleLanguage): string {
-  return language === 'en-US'
-    ? `Kernel resolved native tool resource for ${toolName}.`
-    : `Kernel 已完成 ${toolName} 的原生工具资源解析。`;
-}
-
-function providerToolCallPreparingSummary(toolName: string, language: VisibleLanguage): string {
-  return language === 'en-US'
-    ? `Provider is preparing native tool call ${toolName}.`
-    : `Provider 正在准备原生工具调用 ${toolName}。`;
-}
-
-function providerToolCallStreamingSummary(language: VisibleLanguage): string {
-  return language === 'en-US'
-    ? 'Provider is streaming native tool call arguments.'
-    : 'Provider 正在流式输出原生工具调用参数。';
-}
-
-function providerUsageSummary(language: VisibleLanguage): string {
-  return language === 'en-US'
-    ? 'Provider usage telemetry received.'
-    : '已收到 provider 用量遥测。';
-}
-
-function userGuidanceConsumedSummary(language: VisibleLanguage): string {
-  return language === 'en-US'
-    ? 'User guidance entered the provider resume prompt.'
-    : '用户引导已进入 provider resume prompt。';
-}
-
-function guidanceRevisionTransitionMessage(language: VisibleLanguage): string {
-  return language === 'en-US'
-    ? 'I received your update and will merge it into the current response before finalizing.'
-    : '收到你的补充，我会把这条引导合并到当前回复里重新整理。';
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
