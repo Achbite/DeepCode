@@ -510,6 +510,46 @@ function assertUserInputPipelineFindsRequirementInteractions(): void {
   assert(resume.includes(`Guidance ${token}`), 'user input pipeline resume request keeps user guidance');
   const acceptedResume = pipeline.acceptedPlanExecutionRequirementResumeRequest(fallbackConfirmation, decisionEvent, 'accept');
   assert(acceptedResume.includes('Accepted-plan continuation rule:'), 'user input pipeline accepted-plan resume request keeps execution continuation rule');
+  const effectTarget = `scope-${token}/target-${randomSmokeToken('file')}.txt`;
+  const effectEvent = {
+    kind: 'requirement_decision',
+    payload: {
+      selectedOption: {
+        id: `effect-${token}`,
+        effect: {
+          kind: 'expandCurrentTaskScope',
+          taskId: `task-${token}`,
+          targetPath: effectTarget,
+          targetResourceKind: 'file',
+          reason: `Reason ${token}`,
+        },
+      },
+    },
+  } as AgentEvent;
+  assertEqual(
+    pipeline.selectedRequirementDecisionOptionId(effectEvent),
+    `effect-${token}`,
+    'user input pipeline reads selected requirement option id'
+  );
+  const selectedEffect = pipeline.selectedRequirementDecisionOptionEffect(effectEvent);
+  assertEqual(selectedEffect?.kind, 'expandCurrentTaskScope', 'user input pipeline parses selected option effect kind');
+  assertEqual(
+    selectedEffect?.kind === 'expandCurrentTaskScope' ? selectedEffect.targetPath : undefined,
+    effectTarget,
+    'user input pipeline preserves selected option effect target'
+  );
+  const defaultEffect = pipeline.defaultRequirementDecisionOptionEffect({
+    kind: 'requirement_confirmation',
+    payload: {
+      decisionRequest: {
+        options: [
+          { id: `first-${token}`, effect: { kind: 'skipCurrentTask' } },
+          { id: `recommended-${token}`, recommended: true, effect: { kind: 'finishWithAnswer', reason: `Done ${token}` } },
+        ],
+      },
+    },
+  } as AgentEvent);
+  assertEqual(defaultEffect?.kind, 'finishWithAnswer', 'user input pipeline prefers recommended default effect');
 }
 
 async function assertProviderTraceRecorderArchivesPayload(): Promise<void> {

@@ -90,7 +90,7 @@ import {
   type NativeToolCallProposal,
 } from './pipelines/providerPipeline.js';
 import { PermissionPipeline } from './pipelines/permissionPipeline.js';
-import { UserInputPipeline } from './pipelines/userInputPipeline.js';
+import { UserInputPipeline, type RequirementOptionEffect } from './pipelines/userInputPipeline.js';
 import {
   ContextFrameBuilder,
   GeneratedArtifactEvidenceIndex,
@@ -923,7 +923,7 @@ export class SessionDriverLoop {
     }
 
     if (input.decision === 'accept') {
-      const optionEffect = selectedRequirementDecisionOptionEffect(decisionEvent);
+      const optionEffect = userInputPipeline.selectedRequirementDecisionOptionEffect(decisionEvent);
       if (optionEffect) {
         const dispatched = await this.applyRequirementOptionEffect(
           input,
@@ -969,7 +969,7 @@ export class SessionDriverLoop {
     const decisionRequest = objectRecord(confirmationPayload.decisionRequest) ?? {};
     const runId = stringValue(confirmationPayload.runId) ?? input.runId;
     const planId = stringValue(decisionRequest.acceptedPlanId);
-    const selectedOptionId = selectedRequirementDecisionOptionId(decisionEvent);
+    const selectedOptionId = userInputPipeline.selectedRequirementDecisionOptionId(decisionEvent);
     const plan = (runId ? findPlanCard(current.events, runId, planId) : null)
       ?? findPlanCard(current.events, undefined, planId)
       ?? (runId ? latestExecutablePlan(current.events, runId) : null);
@@ -1010,8 +1010,8 @@ export class SessionDriverLoop {
       acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot),
       current.events
     );
-    const selectedEffect = selectedRequirementDecisionOptionEffect(decisionEvent)
-      ?? (input.decision === 'accept' ? defaultRequirementDecisionOptionEffect(confirmation) : undefined);
+    const selectedEffect = userInputPipeline.selectedRequirementDecisionOptionEffect(decisionEvent)
+      ?? (input.decision === 'accept' ? userInputPipeline.defaultRequirementDecisionOptionEffect(confirmation) : undefined);
     const nextAcceptedPlan = acceptedPlanScopeDecisionOverlay.apply(acceptedPlan, selectedEffect);
     const guidance = input.guidance?.trim()
       ? `User guidance for the accepted-plan scope intervention (verbatim):\n${input.guidance.trim()}`
@@ -7708,116 +7708,6 @@ function isAcceptedPlanExecutionConfirmation(event: AgentEvent): boolean {
   const overlay = interactionOverlayFromPayload(payload);
   return Boolean(overlay?.acceptedPlanId);
 }
-
-function selectedRequirementDecisionOptionId(event: AgentEvent): string | undefined {
-  const payload = objectRecord(event.payload);
-  const selectedOption = objectRecord(payload?.selectedOption);
-  return stringValue(selectedOption?.id);
-}
-
-function selectedRequirementDecisionOptionEffect(event: AgentEvent): RequirementOptionEffect | undefined {
-  const payload = objectRecord(event.payload);
-  const selectedOption = objectRecord(payload?.selectedOption);
-  return requirementDecisionOptionEffect(selectedOption);
-}
-
-function defaultRequirementDecisionOptionEffect(event: AgentEvent): RequirementOptionEffect | undefined {
-  const payload = objectRecord(event.payload);
-  const decisionRequest = objectRecord(payload?.decisionRequest);
-  const options = Array.isArray(decisionRequest?.options)
-    ? decisionRequest.options
-      .map((option) => objectRecord(option))
-      .filter((option): option is Record<string, unknown> => Boolean(option))
-    : [];
-  const selected = options.find((option) => option.recommended === true) ?? options[0];
-  return requirementDecisionOptionEffect(selected);
-}
-
-function requirementDecisionOptionEffect(
-  selectedOption: Record<string, unknown> | undefined
-): RequirementOptionEffect | undefined {
-  const effect = objectRecord(selectedOption?.effect);
-  if (!effect) return undefined;
-  const kind = stringValue(effect.kind);
-  if (!kind) return undefined;
-  switch (kind) {
-    case 'continueWithAction':
-    case 'skipCurrentTask':
-    case 'finishRun':
-    case 'finishWithAnswer':
-      return { kind } as RequirementOptionEffect;
-    case 'continueCurrentTask': {
-      const taskId = stringValue(effect.taskId);
-      return taskId ? { kind: 'continueCurrentTask', taskId } : { kind: 'continueCurrentTask' };
-    }
-    case 'expandCurrentTaskScope': {
-      const taskId = stringValue(effect.taskId);
-      const targetPath = stringValue(effect.targetPath);
-      const targetKind = stringValue(effect.targetResourceKind);
-      const targetResourceKind = targetKind === 'directory' || targetKind === 'file' ? targetKind : undefined;
-      const reason = stringValue(effect.reason);
-      return {
-        kind: 'expandCurrentTaskScope',
-        ...(taskId ? { taskId } : {}),
-        ...(targetPath ? { targetPath } : {}),
-        ...(targetResourceKind ? { targetResourceKind } : {}),
-        ...(effect.recursive === true ? { recursive: true } : {}),
-        ...(reason ? { reason } : {}),
-      };
-    }
-    case 'confirmOperationGrant':
-    case 'answerReviewQuestion': {
-      const taskId = stringValue(effect.taskId);
-      const reason = stringValue(effect.reason);
-      return {
-        kind,
-        ...(taskId ? { taskId } : {}),
-        ...(reason ? { reason } : {}),
-      } as RequirementOptionEffect;
-    }
-    case 'cancel': {
-      const reason = stringValue(effect.reason);
-      return reason ? { kind: 'cancel', reason } : { kind: 'cancel' };
-    }
-    case 'markAcceptedIncomplete': {
-      const taskIds = Array.isArray(effect.taskIds)
-        ? effect.taskIds.filter((item): item is string => typeof item === 'string' && item.length > 0)
-        : undefined;
-      const reason = stringValue(effect.reason);
-      return {
-        kind: 'markAcceptedIncomplete',
-        ...(taskIds?.length ? { taskIds } : {}),
-        ...(reason ? { reason } : {}),
-      };
-    }
-    case 'replan': {
-      const reason = stringValue(effect.reason);
-      return reason ? { kind: 'replan', reason } : { kind: 'replan' };
-    }
-    default:
-      return undefined;
-  }
-}
-
-type RequirementOptionEffect =
-  | { kind: 'continueWithAction' }
-  | { kind: 'skipCurrentTask' }
-  | { kind: 'continueCurrentTask'; taskId?: string }
-  | {
-    kind: 'expandCurrentTaskScope';
-    taskId?: string;
-    targetPath?: string;
-    targetResourceKind?: 'file' | 'directory';
-    recursive?: boolean;
-    reason?: string;
-  }
-  | { kind: 'confirmOperationGrant'; taskId?: string; reason?: string }
-  | { kind: 'answerReviewQuestion'; reason?: string }
-  | { kind: 'replan'; reason?: string }
-  | { kind: 'finishRun' }
-  | { kind: 'markAcceptedIncomplete'; taskIds?: string[]; reason?: string }
-  | { kind: 'finishWithAnswer'; reason?: string }
-  | { kind: 'cancel'; reason?: string };
 
 function acceptedPlanScopeRevisionRequest(
   confirmation: AgentEvent,
