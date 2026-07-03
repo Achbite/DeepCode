@@ -1,4 +1,5 @@
 export * from './acceptedImplementationPlanContextBuilder.js';
+export * from './acceptedPlanBatchPreflight.js';
 export * from './acceptedPlanTargetParser.js';
 export * from './actionBatchFailureIndex.js';
 export * from '../../accepted-plan/index.js';

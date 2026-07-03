@@ -15,6 +15,7 @@ import type {
 } from '@deepcode/protocol';
 import {
   AcceptedPlanAdmission,
+  AcceptedPlanBatchPreflight,
   AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
   AcceptedPlanProgressAggregator,
@@ -328,6 +329,18 @@ const planProjectionBuilder = new PlanProjectionBuilder({
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
 const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();
+const acceptedPlanBatchPreflight = new AcceptedPlanBatchPreflight({
+  batchActionRecords,
+  objectRecord,
+  stringValue,
+  stringArrayValue,
+  actionEffectiveCapability,
+  actionFileTargetPath,
+  deleteActionTargetResourceKind,
+  deleteActionRecursive,
+  normalizePlanScope,
+  containsDirectoryPath: (resourcePackets, path) => resourceRequestLoop.containsDirectoryPath(resourcePackets, path),
+});
 const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
   objectRecord,
   stringValue,
@@ -1329,7 +1342,7 @@ export class SessionDriverLoop {
           this.id('accepted-action-plan-preflight')
         ),
       ]) ?? result;
-      const deletePreflightReasons = acceptedPlanDeletePreflightReasons(batch, resourceRequestLoop.recentPackets(result.events));
+      const deletePreflightReasons = acceptedPlanBatchPreflight.deleteReasons(batch, resourceRequestLoop.recentPackets(result.events));
       if (deletePreflightReasons.length) {
         return this.append(input.sessionId, planActionBundlePreflightFailureEvents(
           input.sessionId,
@@ -3208,7 +3221,7 @@ export class SessionDriverLoop {
     }
     if (actionBundle) {
       const admissionBatch = proposalActionBundleAdmissionBatch(proposal);
-      const admissionReasons = acceptedPlanDeletePreflightReasons(admissionBatch, state.resourcePackets);
+      const admissionReasons = acceptedPlanBatchPreflight.deleteReasons(admissionBatch, state.resourcePackets);
       if (admissionReasons.length) {
         return this.repairActionBundleAdmission(input, state, prompt, proposal, admissionReasons, fallback);
       }
@@ -3638,7 +3651,7 @@ export class SessionDriverLoop {
       )) ?? result;
     }
     const batch = normalizedBatch.batch;
-    const deletePreflightReasons = acceptedPlanDeletePreflightReasons(batch, state.resourcePackets);
+    const deletePreflightReasons = acceptedPlanBatchPreflight.deleteReasons(batch, state.resourcePackets);
     if (deletePreflightReasons.length) {
       return this.append(state.sessionId, acceptedPlanNormalizationFailureEvents(
         state.sessionId,
@@ -3652,7 +3665,7 @@ export class SessionDriverLoop {
     await providerTraceRecorder.append(state, 'accepted_plan.action_batch_preflight', {
       planId: accepted.planId,
       batchIndex: accepted.batchIndex,
-      audit: acceptedPlanBatchPreflightAudit(batch),
+      audit: acceptedPlanBatchPreflight.audit(batch),
     }, this.ports);
 
     await this.emitProjectionDelta(state, {
@@ -6342,53 +6355,6 @@ function normalizeAcceptedPlanKernelBatch(
   };
 }
 
-function acceptedPlanBatchPreflightAudit(batch: Record<string, unknown>): Record<string, unknown> {
-  return {
-    actionCount: batchActionRecords(batch).length,
-    actions: batchActionRecords(batch).map((action) => ({
-      actionId: stringValue(action.actionId) ?? stringValue(action.id),
-      toolId: stringValue(action.toolId),
-      capability: actionEffectiveCapability(action),
-      kind: stringValue(action.kind),
-      targetRef: objectRecord(action.targetRef) ?? stringValue(action.targetRef),
-      targetPath: stringValue(action.targetPath),
-      targetKind: stringValue(action.targetKind) ?? stringValue(action.targetResourceKind),
-      recursive: action.recursive === true,
-      resourceScope: stringArrayValue(action.resourceScope),
-      sourceBlockId: stringValue(action.sourceBlockId),
-      replacementBlockId: stringValue(action.replacementBlockId),
-    })),
-  };
-}
-
-function acceptedPlanDeletePreflightReasons(
-  batch: Record<string, unknown>,
-  resourcePackets: ResourcePacket[] = []
-): string[] {
-  const reasons: string[] = [];
-  for (const [index, action] of batchActionRecords(batch).entries()) {
-    if (actionEffectiveCapability(action) !== 'fs.delete') continue;
-    const target = actionFileTargetPath(action);
-    const normalized = target ? normalizePlanScope(target) : undefined;
-    if (!normalized || normalized === '.' || normalized === './') {
-      reasons.push(`actionBatch.actions[${index}] fs.delete is missing a concrete targetPath/resourceScope.`);
-    } else {
-      const targetResourceKind = deleteActionTargetResourceKind(action);
-      const normalizedDirectory = normalizePlanScope(normalized).replace(/\/+$/, '');
-      const resourcePacketSaysDirectory = resourceRequestLoop.containsDirectoryPath(resourcePackets, normalizedDirectory);
-      if ((normalized.endsWith('/') || resourcePacketSaysDirectory) && targetResourceKind !== 'directory') {
-        reasons.push(`actionBatch.actions[${index}] fs.delete target ${normalizedDirectory} is a directory; directory deletion must explicitly set targetKind="directory".`);
-      } else if (targetResourceKind === 'directory' && !deleteActionRecursive(action)) {
-        reasons.push(`actionBatch.actions[${index}] fs.delete directory target ${normalizedDirectory} must explicitly set recursive=true or use an empty-directory deletion semantic.`);
-      }
-    }
-    if (stringValue(action.sourceBlockId) || stringValue(action.replacementBlockId)) {
-      reasons.push(`actionBatch.actions[${index}] fs.delete must not reference a codeBlock.`);
-    }
-  }
-  return [...new Set(reasons)];
-}
-
 function canonicalizeAcceptedPlanExecutionAccessScopes(
   accepted: AcceptedImplementationPlanContext,
   proposal: ProposalEnvelope
@@ -7226,7 +7192,7 @@ function acceptedPlanActionBatchPreflightEvent(
   ts: string,
   id: string
 ): AgentEvent {
-  const audit = acceptedPlanBatchPreflightAudit(batch);
+  const audit = acceptedPlanBatchPreflight.audit(batch);
   const summary = `Session 已完成已确认计划 actionBatch 提交前审计：${Array.isArray(audit.actions) ? audit.actions.length : 0} 个 action。`;
   return {
     id,
@@ -7266,7 +7232,7 @@ function actionBundleAdmissionRepairingEvent(
   id: string
 ): AgentEvent {
   const batch = proposalActionBundleAdmissionBatch(proposal);
-  const audit = acceptedPlanBatchPreflightAudit(batch);
+  const audit = acceptedPlanBatchPreflight.audit(batch);
   const summary = `ActionBundle requires revision before entering the Plan card: ${reasons.join('; ')}`;
   return {
     id,
@@ -7293,7 +7259,7 @@ function actionBundleAdmissionRepairingEvent(
         source: 'session',
         runId,
         targets: audit.actions && Array.isArray(audit.actions)
-          ? audit.actions.flatMap((item) => stringArrayValue(objectRecord(item)?.resourceScope).concat(stringValue(objectRecord(item)?.targetPath) ?? []))
+          ? audit.actions.flatMap((item: unknown) => stringArrayValue(objectRecord(item)?.resourceScope).concat(stringValue(objectRecord(item)?.targetPath) ?? []))
           : [],
       }),
     },

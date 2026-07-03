@@ -46,6 +46,7 @@ import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import {
   AcceptedImplementationPlanContextBuilder,
+  AcceptedPlanBatchPreflight,
   AcceptedPlanTargetParser,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
@@ -74,6 +75,7 @@ async function main(): Promise<void> {
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
   assertCompletedWorkUnitFactIndexMatchesActionAndTarget();
   assertActionBatchFailureIndexSummarizesKernelFailures();
+  assertAcceptedPlanBatchPreflightAuditsDeleteActions();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
@@ -814,6 +816,71 @@ function assertActionBatchFailureIndexSummarizesKernelFailures(): void {
   assert(summary.includes(workUnitId), 'action batch failure summary includes work unit id');
   assert(summary.includes(actionId), 'action batch failure summary includes action id');
   assert(summary.includes(targetPath), 'action batch failure summary includes write target');
+}
+
+function assertAcceptedPlanBatchPreflightAuditsDeleteActions(): void {
+  const token = randomSmokeToken('batch-preflight');
+  const targetPath = `dir-${token}`;
+  const preflight = new AcceptedPlanBatchPreflight({
+    batchActionRecords: (batch) => {
+      const record = batch && typeof batch === 'object' && !Array.isArray(batch)
+        ? batch as Record<string, unknown>
+        : {};
+      return Array.isArray(record.actions)
+        ? record.actions.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+        : [];
+    },
+    objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined,
+    stringValue: (value) => typeof value === 'string' && value.trim() ? value.trim() : undefined,
+    stringArrayValue: (value) => Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : typeof value === 'string' && value.trim()
+        ? [value.trim()]
+        : [],
+    actionEffectiveCapability: (action) => typeof action.capability === 'string' && action.capability.trim()
+      ? action.capability.trim()
+      : typeof action.toolId === 'string'
+        ? action.toolId
+        : '',
+    actionFileTargetPath: (action) => {
+      const args = action.args && typeof action.args === 'object' && !Array.isArray(action.args)
+        ? action.args as Record<string, unknown>
+        : {};
+      return typeof action.targetPath === 'string'
+        ? action.targetPath
+        : typeof args.path === 'string'
+          ? args.path
+          : undefined;
+    },
+    deleteActionTargetResourceKind: (action) =>
+      action.targetKind === 'directory' || action.targetResourceKind === 'directory' ? 'directory' : undefined,
+    deleteActionRecursive: (action) => action.recursive === true,
+    normalizePlanScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim(),
+    containsDirectoryPath: (_packets, path) => path === targetPath,
+  });
+  const batch = {
+    actions: [
+      {
+        id: `delete-${token}`,
+        toolId: 'fs.delete',
+        capability: 'fs.delete',
+        targetPath: `./${targetPath}/`,
+        resourceScope: [`./${targetPath}/`],
+      },
+    ],
+  };
+  const audit = preflight.audit(batch);
+  assertEqual(audit.actionCount, 1, 'accepted plan batch preflight audits action count');
+  const actions = Array.isArray(audit.actions) ? audit.actions : [];
+  const action = actions[0] as Record<string, unknown> | undefined;
+  assertEqual(action?.targetPath, `./${targetPath}/`, 'accepted plan batch preflight preserves raw target path');
+  const reasons = preflight.deleteReasons(batch, []);
+  assert(
+    reasons.some((reason) => reason.includes(`fs.delete target ${targetPath} is a directory`)),
+    'accepted plan batch preflight detects directory delete without target kind'
+  );
 }
 
 function assertReviewAssemblerFormatsReviewFacts(): void {
