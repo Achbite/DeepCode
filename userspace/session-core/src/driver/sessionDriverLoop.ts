@@ -1319,7 +1319,7 @@ export class SessionDriverLoop {
       if (input.decision === 'revise') {
         return this.runUserTurn({
           sessionId: input.sessionId,
-          content: planRevisionRequest(plan, input.guidance),
+          content: repairLoop.planRevisionRequest({ plan, guidance: input.guidance }),
           attachments: [],
           existingEvents: result.events,
           workspaceBinding: input.workspaceBinding,
@@ -3239,7 +3239,7 @@ export class SessionDriverLoop {
       }
       return this.runUserTurn({
         sessionId: input.sessionId,
-        content: actionBundleAdmissionResourceFollowupRequest(state, reasons),
+        content: repairLoop.actionBundleAdmissionResourceFollowupRequest({ runId: state.runId, reasons }),
         attachments: input.attachments ?? [],
         existingEvents: result.events,
         workspaceBinding: input.workspaceBinding,
@@ -6465,25 +6465,6 @@ function implementationPlanExecutionRequest(
   return executionPromptCoordinator().executionRequest(plan, acceptedPlan, guidance);
 }
 
-function planRevisionRequest(plan: SessionPlanContext, guidance?: string): string {
-  const report = plan.planReviewReport ? clipJson(plan.planReviewReport, 4_000) : '';
-  return [
-    'The user revised the pending plan card. Generate a new reviewable taskPlan from the same user goal and the revision guidance.',
-    'This is plan revision, not plan acceptance. Do not execute work, do not output actionBundle, and do not claim any files were changed.',
-    guidance?.trim() ? `User plan revision guidance:\n${guidance.trim()}` : 'User plan revision guidance: revise the pending plan before execution.',
-    plan.userPlan ? `Previous plan card content:\n${clip(plan.userPlan, 6_000)}` : '',
-    report ? `Previous Kernel PlanReview report, clipped:\n${report}` : '',
-    [
-      'Next proposal requirements:',
-      '- Prefer kind="taskPlan" with a complete non-executable plan that waits for user confirmation.',
-      '- If more read-only evidence is required before planning, return resourceRequest.',
-      '- If a material user choice is still required, return decisionRequest.',
-      '- Do not return actionBundle until the revised plan is explicitly accepted.',
-      '- Keep targets and capabilities concrete enough for Kernel PlanReview, but do not include codeBlocks or executable tool actions in taskPlan.',
-    ].join('\n'),
-  ].filter(Boolean).join('\n\n');
-}
-
 function collectQueuedUserGuidanceEvents(events: AgentEvent[], runId?: string): UserGuidanceEvent[] {
   const consumedIds = new Set<string>();
   for (const event of events.slice(-120)) {
@@ -6557,23 +6538,6 @@ function readableProviderFailureMessage(error: unknown): DiagnosticInfo {
   const raw = (error instanceof Error ? error.message : String(error)).trim() || 'unknown error';
   const fallback = `Model call failed: ${raw}\n\nThe connection to the model was interrupted (possibly due to network fluctuation, provider timeout, or response stream closure). Previously completed steps are not affected; please retry this turn.`;
   return diag('providerCallFailed', fallback, { raw });
-}
-
-function actionBundleAdmissionResourceFollowupRequest(
-  state: SessionDriverLoopRunState,
-  reasons: string[]
-): string {
-  return [
-    'Session has resolved the read-only resource evidence required for actionBundle admission.',
-    'Continue the same user request by producing a confirmable plan, but satisfy the concrete target constraints for deletion.',
-    'fs.delete must use toolId="fs.delete" and args.path with concrete file targets or explicit directory targets. Workspace targets must be relative paths; user-confirmed outside targets may be absolute paths.',
-    'Directory deletion must use args.targetKind="directory" and args.recursive=true so Kernel PlanReview can display it and request user confirmation. Do not output wildcards, workspace root targets, empty targets, or ambiguous cleanup targets.',
-    'If ResourcePacket shows a target is a directory and the user intent really is to delete that directory, keep that directory path and set args.targetKind="directory" and args.recursive=true.',
-    'If the directory scope is uncertain, or if concrete file scope still cannot be confirmed, return decisionRequest instead of an unexecutable actionBundle.',
-    'Write user-visible proposal fields in the current user request language; keep protocol keys, toolIds, args keys, paths, and evidence refs unchanged.',
-    reasons.length ? `Previous admission rejection reasons:\n${reasons.map((reason) => `- ${reason}`).join('\n')}` : '',
-    `Current runId: ${state.runId}`,
-  ].filter(Boolean).join('\n\n');
 }
 
 function shouldRequestRequirementConfirmation(

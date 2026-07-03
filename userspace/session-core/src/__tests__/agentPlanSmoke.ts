@@ -1024,7 +1024,8 @@ function assertImplementationBatchContextBuilderExtractsConcreteContinuations():
 
 function assertRepairLoopBuildsAcceptedPlanScopeRevisionRequest(): void {
   const token = randomSmokeToken('repair-loop');
-  const request = new RepairLoop().acceptedPlanScopeRevisionRequest({
+  const repairLoop = new RepairLoop();
+  const request = repairLoop.acceptedPlanScopeRevisionRequest({
     confirmation: {
       id: `confirmation-${token}`,
       sessionId: `session-${token}`,
@@ -1049,6 +1050,26 @@ function assertRepairLoopBuildsAcceptedPlanScopeRevisionRequest(): void {
   assert(request.includes(`Guidance ${token}`), 'repair loop accepted-plan scope revision keeps guidance');
   assert(request.includes(`Title ${token}`), 'repair loop accepted-plan scope revision keeps plan title');
   assert(request.includes(`Reason ${token}`), 'repair loop accepted-plan scope revision keeps decision request context');
+
+  const revisionRequest = repairLoop.planRevisionRequest({
+    plan: {
+      userPlan: `Plan body ${token}`,
+      planReviewReport: { reportId: `report-${token}` },
+    },
+    guidance: `Plan revision ${token}`,
+  });
+  assert(revisionRequest.includes(`Plan revision ${token}`), 'repair loop plan revision request keeps guidance');
+  assert(revisionRequest.includes(`Plan body ${token}`), 'repair loop plan revision request keeps previous plan');
+  assert(revisionRequest.includes(`report-${token}`), 'repair loop plan revision request keeps review report context');
+  assert(revisionRequest.includes('Do not return actionBundle'), 'repair loop plan revision request keeps execution boundary');
+
+  const followupRequest = repairLoop.actionBundleAdmissionResourceFollowupRequest({
+    runId: `run-${token}`,
+    reasons: [`Reason ${token}`],
+  });
+  assert(followupRequest.includes(`run-${token}`), 'repair loop admission followup keeps run id');
+  assert(followupRequest.includes(`Reason ${token}`), 'repair loop admission followup keeps rejection reasons');
+  assert(followupRequest.includes('args.targetKind="directory"'), 'repair loop admission followup keeps directory target instruction');
 }
 
 function assertCompletedWorkUnitFactIndexMatchesActionAndTarget(): void {
