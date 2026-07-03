@@ -2,6 +2,9 @@ import type { AgentContextAttachment, AgentEvent } from '@deepcode/protocol';
 import { AcceptedPlanExecutionRootResolver } from '../../accepted-plan/AcceptedPlanExecutionRootResolver.js';
 import type { ProposalEnvelope } from '../../agent-plan/types.js';
 import type { RequirementChecklist, RequirementRecord } from '../../requirement/types.js';
+import { InteractionOverlayCodec } from './interactionOverlayCodec.js';
+
+const RESOURCE_BUDGET_REQUIREMENT_PREFIX = 'resource-budget';
 
 export interface RequirementActiveInteractionRef {
   kind: 'requirement';
@@ -44,6 +47,8 @@ export type RequirementOptionEffect =
   | { kind: 'cancel'; reason?: string };
 
 export class UserInputPipeline {
+  constructor(private readonly interactionOverlayCodec = new InteractionOverlayCodec()) {}
+
   findLatestActiveRequirementInteraction(events: AgentEvent[]): RequirementActiveInteractionRef | null {
     for (let index = events.length - 1; index >= 0; index -= 1) {
       const event = events[index];
@@ -267,6 +272,24 @@ export class UserInputPipeline {
 
   requirementAttachments(event: AgentEvent): AgentContextAttachment[] {
     return AcceptedPlanExecutionRootResolver.attachmentsFromEvent(event);
+  }
+
+  isResourceBudgetConfirmation(event: AgentEvent): boolean {
+    const payload = objectRecord(event.payload);
+    const requirementId = stringValue(payload?.requirementId);
+    return Boolean(requirementId?.startsWith(`${RESOURCE_BUDGET_REQUIREMENT_PREFIX}-`));
+  }
+
+  isAcceptedPlanScopeConfirmation(event: AgentEvent): boolean {
+    const payload = objectRecord(event.payload);
+    const decisionRequest = objectRecord(payload?.decisionRequest);
+    return stringValue(decisionRequest?.decisionScope) === 'acceptedPlanBatchOutOfScope';
+  }
+
+  isAcceptedPlanExecutionConfirmation(event: AgentEvent): boolean {
+    const payload = objectRecord(event.payload);
+    const overlay = this.interactionOverlayCodec.fromPayload(payload);
+    return Boolean(overlay?.acceptedPlanId);
   }
 
   selectedRequirementDecisionOptionId(event: AgentEvent): string | undefined {

@@ -282,7 +282,6 @@ interface LlmTurnResult {
   toolCalls: NativeToolCallProposal[];
 }
 
-const RESOURCE_BUDGET_REQUIREMENT_PREFIX = 'resource-budget';
 const MAX_DERIVED_MANIFEST_ENTRIES = 240;
 const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
 const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
@@ -861,7 +860,7 @@ export class SessionDriverLoop {
         }),
       ]) ?? result;
     }
-    if (isResourceBudgetConfirmation(confirmation)) {
+    if (userInputPipeline.isResourceBudgetConfirmation(confirmation)) {
       const originalRequest = userInputPipeline.requirementOriginalRequest(confirmation);
       return this.runUserTurn({
         sessionId: input.sessionId,
@@ -891,10 +890,10 @@ export class SessionDriverLoop {
         interactionOverlay,
       });
     }
-    if (isAcceptedPlanScopeConfirmation(confirmation)) {
+    if (userInputPipeline.isAcceptedPlanScopeConfirmation(confirmation)) {
       return this.resolveAcceptedPlanScopeRequirementDecision(input, confirmation, decisionEvent, interactionOverlay, result);
     }
-    if (isAcceptedPlanExecutionConfirmation(confirmation)) {
+    if (userInputPipeline.isAcceptedPlanExecutionConfirmation(confirmation)) {
       return this.resolveAcceptedPlanExecutionRequirementDecision(input, confirmation, decisionEvent, interactionOverlay, result);
     }
 
@@ -7595,24 +7594,6 @@ function acceptedPlanAccessScopesCanonicalizedEvent(
       presentation: 'collapsible',
     },
   };
-}
-
-function isResourceBudgetConfirmation(event: AgentEvent): boolean {
-  const payload = objectRecord(event.payload);
-  const requirementId = stringValue(payload?.requirementId);
-  return Boolean(requirementId?.startsWith(`${RESOURCE_BUDGET_REQUIREMENT_PREFIX}-`));
-}
-
-function isAcceptedPlanScopeConfirmation(event: AgentEvent): boolean {
-  const payload = objectRecord(event.payload);
-  const decisionRequest = objectRecord(payload?.decisionRequest);
-  return stringValue(decisionRequest?.decisionScope) === 'acceptedPlanBatchOutOfScope';
-}
-
-function isAcceptedPlanExecutionConfirmation(event: AgentEvent): boolean {
-  const payload = objectRecord(event.payload);
-  const overlay = interactionOverlayCodec.fromPayload(payload);
-  return Boolean(overlay?.acceptedPlanId);
 }
 
 function acceptedPlanScopeRevisionRequest(

@@ -585,6 +585,39 @@ function assertUserInputPipelineFindsRequirementInteractions(): void {
     },
   } as AgentEvent);
   assertEqual(defaultEffect?.kind, 'finishWithAnswer', 'user input pipeline prefers recommended default effect');
+  assertEqual(
+    pipeline.isResourceBudgetConfirmation({
+      kind: 'requirement_confirmation',
+      payload: { requirementId: `resource-budget-${token}` },
+    } as AgentEvent),
+    true,
+    'user input pipeline recognizes resource budget confirmations'
+  );
+  assertEqual(
+    pipeline.isAcceptedPlanScopeConfirmation({
+      kind: 'requirement_confirmation',
+      payload: {
+        decisionRequest: { decisionScope: 'acceptedPlanBatchOutOfScope' },
+      },
+    } as AgentEvent),
+    true,
+    'user input pipeline recognizes accepted-plan scope confirmations'
+  );
+  assertEqual(
+    pipeline.isAcceptedPlanExecutionConfirmation({
+      kind: 'requirement_confirmation',
+      payload: {
+        interactionOverlay: true,
+        parentRunId: `parent-${token}`,
+        parentPhase: 'executing_accepted_plan',
+        interactionRunId: `interaction-run-${token}`,
+        interactionId: `interaction-${token}`,
+        acceptedPlanId: `plan-${token}`,
+      },
+    } as AgentEvent),
+    true,
+    'user input pipeline recognizes accepted-plan execution confirmations'
+  );
 }
 
 async function assertProviderTraceRecorderArchivesPayload(): Promise<void> {
