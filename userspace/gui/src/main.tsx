@@ -48,13 +48,11 @@ function showBootstrapError(label: string, err: unknown): void {
 
 window.addEventListener('error', (event) => {
   if (!event.error) return;
-  // eslint-disable-next-line no-console
   console.error('[bootstrap] window.error:', event.error);
   showBootstrapError('window.error', event.error);
 });
 
 window.addEventListener('unhandledrejection', (event) => {
-  // eslint-disable-next-line no-console
   console.error('[bootstrap] unhandledrejection:', event.reason);
   showBootstrapError('unhandledrejection', event.reason);
 });
@@ -75,7 +73,6 @@ class ErrorBoundary extends React.Component<
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo): void {
-    // eslint-disable-next-line no-console
     console.error('[ErrorBoundary]', error, info.componentStack);
   }
 

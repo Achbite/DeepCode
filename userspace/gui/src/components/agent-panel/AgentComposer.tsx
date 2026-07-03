@@ -102,7 +102,6 @@ function writeLastAttachmentDirectory(workspaceRoot: string | undefined, absolut
   try {
     window.localStorage.setItem(lastAttachmentDirectoryKey(workspaceRoot), normalized);
   } catch {
-    // localStorage can be unavailable in restricted WebView modes.
   }
 }
 

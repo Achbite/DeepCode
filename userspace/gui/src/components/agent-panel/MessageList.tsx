@@ -280,24 +280,8 @@ function AttachmentChips({
   );
 }
 
-/**
- * 判断 AgentEvent 是否含可见正文/摘要/工具事实，用于折叠卡空容器过滤。
- * 阶段 7/8 review 反馈中 F4 残留横线根因之一是空 details 容器；通过此判定
- * 在渲染前剔除"只有边框没有内容"的折叠卡。
- *
- * 当前调用点：作为备用 helper 保留；上一轮在 TraceGroupCard 中的强过滤已按
- * 用户反馈回退（用户期望折叠卡始终可见，不消失），故此 helper 暂未挂入主链路。
- * 仍由 test.sh 行 478 grep 门禁保证未来回退/扩展时能快速定位。
- *
- * 判定规则：
- *   - 任意 string 字段（content / message / summary / details / output 等）非空 -> 有内容
- *   - tool_call / tool_result / permission_* 因含工具事实，默认视为有内容
- *   - workflow_stage / workflow_decision 必须有 stage 或 summary 字段才视为有内容
- *   - 其他默认按 payload 是否为非空对象判断
- */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+
 function hasMeaningfulContent(event: AgentEvent): boolean {
-  // 工具时间线事件即便 payload 仅含 toolName 也视为有内容（tool 卡可独立成立）。
   if (
     event.kind === 'tool_call' ||
     event.kind === 'tool_result' ||
@@ -313,7 +297,6 @@ function hasMeaningfulContent(event: AgentEvent): boolean {
   if (!isRecord(payload)) {
     return false;
   }
-  // workflow 类事件要求至少含 stage / summary / details / decision 之一可见字段。
   if (event.kind === 'workflow_stage' || event.kind === 'workflow_decision') {
     return Boolean(
       stringField(payload, 'stage') ??
@@ -323,7 +306,6 @@ function hasMeaningfulContent(event: AgentEvent): boolean {
         (isRecord(payload.decision) ? 'decision' : undefined),
     );
   }
-  // 通用判定：任一文本字段非空即视为有内容。
   const meaningfulKeys = [
     'content',
     'message',
@@ -1189,8 +1171,6 @@ function RequirementConfirmationCard({
   );
 }
 
-// R4：从 requirement_confirmation 事件中提取 options 与 effect，供卡片渲染"选择后副作用"。
-// payload 路径与 session-core 写入对齐：payload.decisionRequest.options[].effect
 interface RequirementOptionView {
   id: string;
   label: string;
@@ -1514,11 +1494,6 @@ function TraceGroupCard({ group, language }: { group: TraceGroup; language: UiLa
     }
   }, [group.running]);
 
-  // 注意：上一轮 review 曾在此处加 return null 过滤"空容器"，但用户反馈
-  // 期望折叠状态下也保留卡片（让"思考过程 - 1 条"按钮可见，点击可展开），
-  // 而非完全消失。当前规则：始终渲染折叠卡片；空内容由视觉收口（CSS）处理，
-  // 不再隐藏整个容器。`hasMeaningfulContent` helper 暂留作其他场景备用。
-
   return (
     <div className={`agent-thinking-trace ${group.running ? 'agent-thinking-trace--running' : ''}`}>
       <button
@@ -1546,8 +1521,7 @@ function TraceGroupCard({ group, language }: { group: TraceGroup; language: UiLa
 function NarrativeThinkingCard({ block, language }: { block: AgentTimelineBlock; language: UiLanguage }) {
   const running = block.status === 'running' || block.status === 'waiting';
   const markdown = thinkingMarkdown(block);
-  // 超长 reasoning（如执行阶段完整 CoT，可达上万字符）默认折叠且不随运行态自动展开，
-  // 避免主面板被一次性大段文本撑爆；标题摘要仍提供预览，用户可手动展开。
+
   const longContent = markdown.length > 1600;
   const [expanded, setExpanded] = React.useState(
     block.displayHints?.initialOpen ?? (longContent ? false : running || !block.defaultCollapsed)

@@ -5,12 +5,11 @@ export interface AgentComposerDecisionOption {
   label: string;
   description?: string;
   recommended?: boolean;
-  // R4：用户介入卡 option 的状态机副作用。GUI 据此向用户展示
-  // "选择后会触发什么"，避免模型/用户对结果不一致的伪造（卡片所读即事实）。
+
   effect?: AgentRequirementOptionEffectView;
 }
 
-// 与 session-core protocolV3.normalizeOptionEffect 对齐（运行时视图，结构最小）。
+
 export type AgentRequirementOptionEffectView =
   | { kind: 'continueWithAction' }
   | { kind: 'skipCurrentTask' }

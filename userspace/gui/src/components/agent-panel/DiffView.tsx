@@ -25,12 +25,10 @@ interface DiffLine {
 interface DiffViewProps {
   patch: string;
   filePath?: string;
-  /** 内容区最大高度，超出滚动；单位 px。 */
   maxHeight?: number;
   className?: string;
 }
 
-// ---- 单行分类 ----
 function classifyLine(line: string): DiffLineKind {
   if (line.startsWith('@@')) return 'hunk';
   if (
@@ -51,13 +49,11 @@ function classifyLine(line: string): DiffLineKind {
   return 'context';
 }
 
-// ---- 解析 unified diff 为行序列 ----
 function parsePatch(patch: string): DiffLine[] {
   const normalized = patch.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   return normalized.split('\n').map((text) => ({ kind: classifyLine(text), text }));
 }
 
-// ---- 统计新增/删除行数（不含文件头与 hunk 头） ----
 export function computeDiffStats(patch: string): DiffStats {
   let added = 0;
   let removed = 0;

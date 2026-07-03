@@ -105,7 +105,6 @@ function MermaidBlock({ source }: { source: string }) {
       {svg ? (
         <div
           className="agent-mermaid-card__svg"
-          // Mermaid returns sanitized SVG when securityLevel=strict.
           dangerouslySetInnerHTML={{ __html: svg }}
         />
       ) : (

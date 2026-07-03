@@ -1743,7 +1743,6 @@ const GUI_INTERNAL_STATUS_STAGES = new Set<string>([
   'session.provider_status',
 ]);
 
-// P5-lite：规则统一抽至 @deepcode/session-core/timelineFilter，与 live 路径共用。
 // 此处仅做 AgentEvent → {stage, kernelEventKind} 形状适配。
 function isInternalKernelCheckpointEvent(event: AgentEvent): boolean {
   if (event.kind !== 'workflow_stage') return false;
