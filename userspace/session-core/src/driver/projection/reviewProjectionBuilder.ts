@@ -1,3 +1,5 @@
+import type { AgentEvent } from '@deepcode/protocol';
+
 export type ReviewProjectionLanguage = 'zh-CN' | 'en-US';
 
 export interface ReviewProjectionPlan {
@@ -6,7 +8,17 @@ export interface ReviewProjectionPlan {
   reviewGuide: string;
   actionBundle: {
     reviewExpectations?: unknown;
+    continuationExpectations?: unknown;
+    [key: string]: unknown;
   };
+}
+
+export interface ReviewProjectionSummaryPlan extends ReviewProjectionPlan {
+  sessionId: string;
+  runId: string;
+  planId: string;
+  implementationPlan?: unknown;
+  executionRoot?: unknown;
 }
 
 export interface ReadableReviewChangedFile {
@@ -35,7 +47,151 @@ export interface ReadableReviewSummary {
   messageArgs: Record<string, string>;
 }
 
-export class ReviewProjectionBuilder {
+export interface ReviewFactsContextInput<TaskLedger = unknown> {
+  planId: string;
+  runId: string;
+  taskLedger?: TaskLedger;
+  changedFileCount: number;
+  auditRefCount: number;
+}
+
+export interface ReviewProjectionBuilderPorts<
+  Plan extends ReviewProjectionSummaryPlan = ReviewProjectionSummaryPlan,
+  AcceptedPlan = unknown,
+  TaskLedger = unknown,
+> {
+  reviewFactLines(kernelEvents: unknown[]): string[];
+  staticSyntaxReviewFactLines(kernelEvents: unknown[]): string[];
+  findReviewFacts(kernelEvents: unknown[]): Record<string, unknown> | undefined;
+  concreteContinuationExpectations(value: unknown): unknown[];
+  languageForRequest(userPlan: string): ReviewProjectionLanguage;
+  acceptedPlanContext(plan: Plan): AcceptedPlan | undefined;
+  acceptedPlanBatchCompletedTaskIds(acceptedPlan: AcceptedPlan, plan: Plan, kernelEvents: unknown[]): string[];
+  acceptedPlanAfterBatch(acceptedPlan: AcceptedPlan, completedTaskIds: string[]): AcceptedPlan;
+  acceptedPlanTaskLedger(acceptedPlan: AcceptedPlan): TaskLedger | undefined;
+  buildReviewFactsContext(input: ReviewFactsContextInput<TaskLedger>): unknown;
+}
+
+export class ReviewProjectionBuilder<
+  Plan extends ReviewProjectionSummaryPlan = ReviewProjectionSummaryPlan,
+  AcceptedPlan = unknown,
+  TaskLedger = unknown,
+> {
+  constructor(private readonly ports?: ReviewProjectionBuilderPorts<Plan, AcceptedPlan, TaskLedger>) {}
+
+  summaryEvent(input: {
+    sessionId: string;
+    plan: Plan;
+    kernelEvents: unknown[];
+    ts: string;
+    id: string;
+  }): AgentEvent {
+    const ports = this.requirePorts();
+    const facts = [
+      ...ports.reviewFactLines(input.kernelEvents),
+      ...ports.staticSyntaxReviewFactLines(input.kernelEvents),
+    ];
+    const reviewFacts = ports.findReviewFacts(input.kernelEvents);
+    const gitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
+    const completed = Math.max(
+      reviewFacts ? arrayLength(reviewFacts.completedWorkUnits) : 0,
+      input.kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.completed').length
+    );
+    const failed = Math.max(
+      reviewFacts ? arrayLength(reviewFacts.failedWorkUnits) : 0,
+      input.kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.failed').length
+    );
+    const blocked = Math.max(
+      reviewFacts ? arrayLength(reviewFacts.blockedWorkUnits) : 0,
+      input.kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.blocked').length
+    );
+    const toolResults = Math.max(
+      reviewFacts ? arrayLength(reviewFacts.toolResults) : 0,
+      input.kernelEvents.filter((event) => objectRecord(event)?.kind === 'tool.completed').length
+    );
+    const continuations = ports.concreteContinuationExpectations(input.plan.actionBundle.continuationExpectations);
+    const language = ports.languageForRequest(input.plan.userPlan);
+    const summary = this.waitingSummary(failed, blocked, language);
+    const readableReview = this.readableSummary(input.kernelEvents, reviewFacts);
+    const acceptedPlanForReview = input.plan.implementationPlan
+      ? ports.acceptedPlanContext(input.plan)
+      : undefined;
+    const reviewTaskLedger = acceptedPlanForReview
+      ? ports.acceptedPlanTaskLedger(ports.acceptedPlanAfterBatch(
+        acceptedPlanForReview,
+        ports.acceptedPlanBatchCompletedTaskIds(acceptedPlanForReview, input.plan, input.kernelEvents)
+      ))
+      : undefined;
+    const reviewFactsContextInput: ReviewFactsContextInput<TaskLedger> = {
+      planId: input.plan.planId,
+      runId: input.plan.runId,
+      changedFileCount: readableReview.changedFiles.length,
+      auditRefCount: readableReview.auditRefs.length,
+    };
+    if (reviewTaskLedger) reviewFactsContextInput.taskLedger = reviewTaskLedger;
+    const reviewFactsContext = ports.buildReviewFactsContext(reviewFactsContextInput);
+    return {
+      id: input.id,
+      sessionId: input.sessionId,
+      ts: input.ts,
+      kind: 'review_summary',
+      payload: {
+        title: 'Review',
+        summary,
+        messageKey: failed || blocked ? 'review.summary.needsAttention' : 'review.summary.waitingUserReview',
+        messageArgs: {
+          completed: String(completed),
+          failed: String(failed),
+          blocked: String(blocked),
+          toolResults: String(toolResults),
+        },
+        content: this.waitingContent({
+          plan: input.plan,
+          readableReview,
+          summary,
+          completed,
+          failed,
+          blocked,
+          toolResults,
+          continuations,
+          gitReview,
+          reviewFacts,
+          language,
+        }),
+        status: 'waitingUserReview',
+        runId: input.plan.runId,
+        reviewId: `${input.plan.runId}:${input.plan.planId}`,
+        sourcePlanId: input.plan.planId,
+        confirmable: true,
+        continuationRequested: false,
+        continuationCount: continuations.length,
+        continuations,
+        reviewExpectations: Array.isArray(input.plan.actionBundle.reviewExpectations) ? input.plan.actionBundle.reviewExpectations : [],
+        reviewFacts,
+        gitReview,
+        readableReview,
+        reviewFactsContext,
+        changedFiles: readableReview.changedFiles,
+        developerDetails: {
+          facts,
+          reviewFacts,
+          gitReview,
+          reviewFactsContext,
+        },
+        facts,
+        factCounts: {
+          workUnitsCompleted: completed,
+          workUnitsFailed: failed,
+          workUnitsBlocked: blocked,
+          toolResults,
+        },
+        channel: 'review',
+        visibility: 'conversation',
+        presentation: 'body',
+      },
+    };
+  }
+
   waitingSummary(failed: number, blocked: number, language: ReviewProjectionLanguage): string {
     if (language === 'en-US') {
       return failed || blocked
@@ -185,6 +341,17 @@ export class ReviewProjectionBuilder {
       },
     };
   }
+
+  private requirePorts(): ReviewProjectionBuilderPorts<Plan, AcceptedPlan, TaskLedger> {
+    if (!this.ports) {
+      throw new Error('ReviewProjectionBuilder.summaryEvent requires ports.');
+    }
+    return this.ports;
+  }
+}
+
+function arrayLength(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0;
 }
 
 function reviewContentLabels(language: ReviewProjectionLanguage): Record<string, string> {

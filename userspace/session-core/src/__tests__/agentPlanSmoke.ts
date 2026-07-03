@@ -1759,6 +1759,65 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   });
   assert(reviewContent.includes(targetPath), 'review projection renders changed file path in review content');
 
+  const reviewSummaryProjection = new ReviewProjectionBuilder<any, { id: string }, { completedTaskIds: string[] }>({
+    reviewFactLines: () => [`fact-${token}`],
+    staticSyntaxReviewFactLines: () => [`syntax-${token}`],
+    findReviewFacts: () => ({
+      completedWorkUnits: [{
+        workUnitId,
+        output: {
+          path: targetPath,
+          operation: 'write',
+          actionId,
+        },
+      }],
+      failedWorkUnits: [],
+      blockedWorkUnits: [],
+      toolResults: [],
+    }),
+    concreteContinuationExpectations: (value) => Array.isArray(value) ? value : [],
+    languageForRequest: () => 'en-US',
+    acceptedPlanContext: () => ({ id: `accepted-${token}` }),
+    acceptedPlanBatchCompletedTaskIds: () => [`task-${token}`],
+    acceptedPlanAfterBatch: (acceptedPlan) => acceptedPlan,
+    acceptedPlanTaskLedger: () => ({ completedTaskIds: [`task-${token}`] }),
+    buildReviewFactsContext: (input) => input,
+  });
+  const reviewEvent = reviewSummaryProjection.summaryEvent({
+    sessionId: `session-${token}`,
+    plan: {
+      sessionId: `session-${token}`,
+      runId,
+      planId: `plan-${token}`,
+      userPlan: `plan-${token}`,
+      expectedValidation: '',
+      reviewGuide: '',
+      implementationPlan: { id: `implementation-${token}` },
+      actionBundle: {
+        reviewExpectations: [],
+        continuationExpectations: [{ targetPath }],
+      },
+    },
+    kernelEvents: [{
+      kind: 'work_unit.completed',
+      runId,
+      workUnitId,
+      output: {
+        path: targetPath,
+        operation: 'write',
+        actionId,
+      },
+    }],
+    ts: new Date(0).toISOString(),
+    id: `review-${token}`,
+  });
+  assertEqual(reviewEvent.kind, 'review_summary', 'review projection builds review summary event');
+  const reviewPayload = reviewEvent.payload as any;
+  assertEqual(reviewPayload.factCounts.workUnitsCompleted, 1, 'review summary event counts completed work units');
+  assertEqual(reviewPayload.changedFiles[0]?.path, targetPath, 'review summary event carries changed files');
+  assertEqual(reviewPayload.reviewFactsContext.changedFileCount, 1, 'review summary event carries review facts context');
+  assert(reviewPayload.developerDetails.facts.includes(`fact-${token}`), 'review summary event carries review facts details');
+
   const planProjection = new PlanProjectionBuilder({
     readActionBundle: (proposal) => (proposal.payload as any).actionBundle,
     requiredFileOperationsFromReport: () => [{ operation: 'delete', targetPath, capability: 'fs.delete' }],

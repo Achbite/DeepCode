@@ -331,7 +331,21 @@ const sessionFailureProjectionBuilder = new SessionFailureProjectionBuilder({
   actionBatchFailureSummary: (failure) => actionBatchFailureIndex.summary(failure),
   sessionRunStateEvent: (input) => sessionProgressProjectionBuilder.sessionRunStateEvent(input),
 });
-const reviewProjectionBuilder = new ReviewProjectionBuilder();
+const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, AcceptedImplementationPlanContext, TaskLedgerSnapshot>({
+  reviewFactLines: (kernelEvents) => reviewAssembler().reviewFactLines(kernelEvents),
+  staticSyntaxReviewFactLines: (kernelEvents) => reviewAssembler().staticSyntaxReviewFactLines(kernelEvents),
+  findReviewFacts: (kernelEvents) => reviewAssembler().findReviewFacts(kernelEvents),
+  concreteContinuationExpectations: (value) => implementationBatchContextBuilder().concreteContinuationExpectations(value),
+  languageForRequest: (userPlan) => visibleLanguageForRequest(userPlan),
+  acceptedPlanContext: (plan) => plan.implementationPlan
+    ? acceptedImplementationPlanContext(plan, undefined, plan.executionRoot)
+    : undefined,
+  acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
+    acceptedPlanBatchProgress(acceptedPlan, proposalEnvelopeFromPlanContext(plan), kernelEvents).completedTaskIds,
+  acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanAfterBatch(acceptedPlan, completedTaskIds),
+  acceptedPlanTaskLedger: (acceptedPlan) => buildAcceptedPlanTaskLedger(acceptedPlan),
+  buildReviewFactsContext: (input) => buildReviewFactsContext(input),
+});
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
 const kernelEventStatusIndex = new KernelEventStatusIndex();
 const repairLoop = new RepairLoop();
@@ -1607,13 +1621,13 @@ export class SessionDriverLoop {
         plan.planId,
         [...batchEvents, ...staticReviewEvents.map((event) => event.payload), ...(factsReply.events ?? [])]
       );
-      const review = reviewSummaryEvent(
-        input.sessionId,
+      const review = reviewProjectionBuilder.summaryEvent({
+        sessionId: input.sessionId,
         plan,
-        reviewKernelEvents,
-        this.ts(),
-        this.id('review-summary')
-      );
+        kernelEvents: reviewKernelEvents,
+        ts: this.ts(),
+        id: this.id('review-summary'),
+      });
       const reviewPayload = objectRecord(review.payload) ?? {};
       return this.append(input.sessionId, [
         review,
@@ -1736,13 +1750,13 @@ export class SessionDriverLoop {
       },
     });
     result = await this.appendProjectedKernelEvents(input.sessionId, factsReply);
-    const review = reviewSummaryEvent(
-        input.sessionId,
-        plan,
-        [...(decisionReply.events ?? []), ...(factsReply.events ?? [])],
-        this.ts(),
-        this.id('review-summary')
-      );
+    const review = reviewProjectionBuilder.summaryEvent({
+      sessionId: input.sessionId,
+      plan,
+      kernelEvents: [...(decisionReply.events ?? []), ...(factsReply.events ?? [])],
+      ts: this.ts(),
+      id: this.id('review-summary'),
+    });
     const reviewPayload = objectRecord(review.payload) ?? {};
     return this.append(input.sessionId, [
       review,
@@ -2389,13 +2403,13 @@ export class SessionDriverLoop {
       summary: `Kernel resolved ${packet.items.length} resource item(s) for accepted-plan read-only validation.`,
       output: packet,
     };
-    const review = reviewSummaryEvent(
-      state.sessionId,
+    const review = reviewProjectionBuilder.summaryEvent({
+      sessionId: state.sessionId,
       plan,
-      [resourceFact, ...(factsReply.events ?? [])],
-      this.ts(),
-      this.id('review-summary')
-    );
+      kernelEvents: [resourceFact, ...(factsReply.events ?? [])],
+      ts: this.ts(),
+      id: this.id('review-summary'),
+    });
     const reviewPayload = objectRecord(review.payload) ?? {};
     return this.append(state.sessionId, [
       review,
@@ -3969,13 +3983,13 @@ export class SessionDriverLoop {
       accepted.planId,
       [...(batchReply.events ?? []), ...staticReviewEvents.map((event) => event.payload), ...(factsReply.events ?? [])]
     );
-    const review = reviewSummaryEvent(
-      state.sessionId,
+    const review = reviewProjectionBuilder.summaryEvent({
+      sessionId: state.sessionId,
       plan,
-      reviewKernelEvents,
-      this.ts(),
-      this.id('review-summary')
-    );
+      kernelEvents: reviewKernelEvents,
+      ts: this.ts(),
+      id: this.id('review-summary'),
+    });
     const reviewPayload = objectRecord(review.payload) ?? {};
     return this.append(state.sessionId, [
       review,
@@ -6339,122 +6353,6 @@ function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted
     : [];
   const acceptedCapabilities = new Set(accepted.capabilities);
   return gaps.filter((capability) => !planReviewGrantProjector.planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
-}
-
-function reviewSummaryEvent(
-  sessionId: string,
-  plan: SessionPlanContext,
-  kernelEvents: unknown[],
-  ts: string,
-  id: string
-): AgentEvent {
-  const review = reviewAssembler();
-  const facts = [
-    ...review.reviewFactLines(kernelEvents),
-    ...review.staticSyntaxReviewFactLines(kernelEvents),
-  ];
-  const reviewFacts = review.findReviewFacts(kernelEvents);
-  const gitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
-  const completed = Math.max(
-    reviewFacts ? arrayLength(reviewFacts.completedWorkUnits) : 0,
-    kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.completed').length
-  );
-  const failed = Math.max(
-    reviewFacts ? arrayLength(reviewFacts.failedWorkUnits) : 0,
-    kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.failed').length
-  );
-  const blocked = Math.max(
-    reviewFacts ? arrayLength(reviewFacts.blockedWorkUnits) : 0,
-    kernelEvents.filter((event) => objectRecord(event)?.kind === 'work_unit.blocked').length
-  );
-  const toolResults = Math.max(
-    reviewFacts ? arrayLength(reviewFacts.toolResults) : 0,
-    kernelEvents.filter((event) => objectRecord(event)?.kind === 'tool.completed').length
-  );
-  const continuations = implementationBatchContextBuilder().concreteContinuationExpectations(plan.actionBundle.continuationExpectations);
-  const language = visibleLanguageForRequest(plan.userPlan);
-  const summary = reviewProjectionBuilder.waitingSummary(failed, blocked, language);
-  const readableReview = reviewProjectionBuilder.readableSummary(kernelEvents, reviewFacts);
-  const acceptedPlanForReview = plan.implementationPlan
-    ? acceptedImplementationPlanContext(plan, undefined, plan.executionRoot)
-    : undefined;
-  const reviewTaskLedger = acceptedPlanForReview
-    ? buildAcceptedPlanTaskLedger(acceptedPlanAfterBatch(
-      acceptedPlanForReview,
-      acceptedPlanBatchProgress(acceptedPlanForReview, proposalEnvelopeFromPlanContext(plan), kernelEvents).completedTaskIds
-    ))
-    : undefined;
-  const reviewFactsContext = buildReviewFactsContext({
-    planId: plan.planId,
-    runId: plan.runId,
-    taskLedger: reviewTaskLedger,
-    changedFileCount: readableReview.changedFiles.length,
-    auditRefCount: readableReview.auditRefs.length,
-  });
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'review_summary',
-    payload: {
-      title: 'Review',
-      summary,
-      messageKey: failed || blocked ? 'review.summary.needsAttention' : 'review.summary.waitingUserReview',
-      messageArgs: {
-        completed: String(completed),
-        failed: String(failed),
-        blocked: String(blocked),
-        toolResults: String(toolResults),
-      },
-      content: reviewProjectionBuilder.waitingContent({
-        plan,
-        readableReview,
-        summary,
-        completed,
-        failed,
-        blocked,
-        toolResults,
-        continuations,
-        gitReview,
-        reviewFacts,
-        language,
-      }),
-      status: 'waitingUserReview',
-      runId: plan.runId,
-      reviewId: `${plan.runId}:${plan.planId}`,
-      sourcePlanId: plan.planId,
-      confirmable: true,
-      continuationRequested: false,
-      continuationCount: continuations.length,
-      continuations,
-      reviewExpectations: Array.isArray(plan.actionBundle.reviewExpectations) ? plan.actionBundle.reviewExpectations : [],
-      reviewFacts,
-      gitReview,
-      readableReview,
-      reviewFactsContext,
-      changedFiles: readableReview.changedFiles,
-      developerDetails: {
-        facts,
-        reviewFacts,
-        gitReview,
-        reviewFactsContext,
-      },
-      facts,
-      factCounts: {
-        workUnitsCompleted: completed,
-        workUnitsFailed: failed,
-        workUnitsBlocked: blocked,
-        toolResults,
-      },
-      channel: 'review',
-      visibility: 'conversation',
-      presentation: 'body',
-    },
-  };
-}
-
-function arrayLength(value: unknown): number {
-  return Array.isArray(value) ? value.length : 0;
 }
 
 function collectQueuedUserGuidanceEvents(events: AgentEvent[], runId?: string): UserGuidanceEvent[] {
