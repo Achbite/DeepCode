@@ -535,9 +535,6 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             )]
         }
         KernelEvent::WorkflowDecisionMade { decision, .. } => {
-            // 阶段 7/8 review 修复：把 stage / status / summary / details 提升到 payload 根字段，
-            // 让 GUI MessageList 在事件分类与折叠卡标题渲染时能直接读取根字段，
-            // 不再因 payload 只塞 decision 对象而出现"空标题"折叠卡（F4 残留横线根因之一）。
             let phase_text = decision
                 .phase
                 .clone()
@@ -656,9 +653,7 @@ pub(crate) fn kernel_event_to_agent_events(session_id: &str, event: &KernelEvent
             }),
             &now_text(),
         )],
-        // 阶段 7/8 新增的 4 个 KernelEvent 显式列出 fall through，避免阶段 6 G3
         // (workflow_decision 静默丢弃) 类问题复发。GUI 是否展示这些事件由阶段 15 收口决定，
-        // 当前阶段 7/8 只保证它们不会被悄无声息吞掉。
         KernelEvent::AutonomyTransitioned { .. }
         | KernelEvent::TempArtifactLeaseGranted { .. }
         | KernelEvent::TempArtifactLeaseReleased { .. }

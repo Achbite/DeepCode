@@ -328,9 +328,6 @@ fn content_type_for_path(path: &Path) -> &'static str {
     }
 }
 
-// 发布包中 `deepcode-kernel(.exe)` 是同目录 Kernel daemon；macOS .app
-// 同样优先查找 Contents/MacOS，并为后续资源式布局保留 Contents/Resources
-// 兜底。开发态或 `DEEPCODE_SHELL_CONNECT_ONLY=1` 时可只连接外部已启动 daemon。
 fn spawn_kernel_if_available(host: &str, port: &str) -> Option<Child> {
     if env_truthy("DEEPCODE_SHELL_CONNECT_ONLY") {
         return None;
