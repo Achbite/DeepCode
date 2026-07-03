@@ -5,9 +5,11 @@ import type {
   AcceptedImplementationPlanContext,
   AcceptedPlanBatchProgress,
   AcceptedPlanReadOnlyResourceCompletion,
+  CurrentTaskContext,
+  TaskExecutionCursor,
 } from '../execution/index.js';
 import type { InteractionOverlayContext, SessionTurnPhase } from '../pipelines/index.js';
-import { buildTaskLedgerSnapshot } from '../../run-state/index.js';
+import { buildTaskLedgerSnapshot, type AcceptedPlanPromptFrame, type TaskLedgerSnapshot } from '../../run-state/index.js';
 
 export interface DecisionOwnerRef {
   kind: 'requirement' | 'plan' | 'review' | 'permission';
@@ -34,6 +36,11 @@ export interface SessionProgressProjectionBuilderPorts {
   hasFailureOrBlocker(kernelEvents: unknown[]): boolean;
   auditAcceptedPlanBatch(batch: Record<string, unknown>): Record<string, unknown>;
   actionBundleAdmissionBatch(proposal: ProposalEnvelope): Record<string, unknown>;
+  acceptedPlanTaskLedger(accepted: AcceptedImplementationPlanContext): TaskLedgerSnapshot | undefined;
+  acceptedPlanPromptFrame(
+    accepted: AcceptedImplementationPlanContext,
+    taskLedger: TaskLedgerSnapshot | undefined
+  ): AcceptedPlanPromptFrame | undefined;
 }
 
 export class SessionProgressProjectionBuilder {
@@ -350,6 +357,121 @@ export class SessionProgressProjectionBuilder {
           source: 'session',
           runId,
           targets: actionTargetsFromAudit(audit),
+        }),
+      },
+    };
+  }
+
+  acceptedPlanResourceResumeEvent(
+    sessionId: string,
+    runId: string,
+    accepted: AcceptedImplementationPlanContext,
+    cursor: TaskExecutionCursor | undefined,
+    context: CurrentTaskContext | undefined,
+    packet: ResourcePacket,
+    ts: string,
+    id: string
+  ): AgentEvent {
+    const summary = 'Session resolved read-only resource evidence for the current accepted task and will resume from the same task cursor.';
+    return {
+      id,
+      sessionId,
+      ts,
+      kind: 'workflow_stage',
+      payload: {
+        stage: 'accepted_plan.resource_resume',
+        status: 'completed',
+        summary,
+        summaryKey: 'session.driver.acceptedPlanResourceResume',
+        messageKey: 'session.driver.acceptedPlanResourceResume',
+        messageArgs: { resourceItemCount: packet.items.length },
+        runId,
+        planId: accepted.planId,
+        taskCursorId: cursor?.cursorId,
+        currentTaskId: context?.taskId,
+        targetPaths: context?.targets ?? [],
+        resourcePacketId: packet.id,
+        resourceItemCount: packet.items.length,
+        lastResourcePacketIds: cursor?.lastResourcePacketIds ?? [],
+        channel: 'progress',
+        visibility: 'conversation',
+        presentation: 'collapsible',
+        activity: conversationActivity({
+          activityId: id,
+          kind: 'resourceRead',
+          status: 'completed',
+          title: 'Accepted plan resource resume',
+          summary,
+          source: 'session',
+          runId,
+          targets: context?.targets,
+        }),
+      },
+    };
+  }
+
+  acceptedPlanTaskSavepointEvent(
+    sessionId: string,
+    runId: string,
+    accepted: AcceptedImplementationPlanContext,
+    nextAccepted: AcceptedImplementationPlanContext,
+    progress: AcceptedPlanBatchProgress,
+    kernelEvents: unknown[],
+    cursor: TaskExecutionCursor | undefined,
+    context: CurrentTaskContext | undefined,
+    ts: string,
+    id: string
+  ): AgentEvent {
+    const complete = progress.remainingTaskIds.length === 0 && !this.ports.hasFailureOrBlocker(kernelEvents);
+    const ledger = this.ports.acceptedPlanTaskLedger(nextAccepted);
+    const promptFrame = this.ports.acceptedPlanPromptFrame(nextAccepted, ledger);
+    const summary = complete
+      ? 'All accepted taskPlan tasks are complete.'
+      : 'Accepted taskPlan progress was saved; the next batch will continue in task-list order.';
+    return {
+      id,
+      sessionId,
+      ts,
+      kind: 'workflow_stage',
+      payload: {
+        stage: 'accepted_plan.task_savepoint',
+        status: complete ? 'completed' : 'running',
+        summary,
+        summaryKey: complete
+          ? 'session.driver.acceptedPlanTaskSavepointComplete'
+          : 'session.driver.acceptedPlanTaskSavepointRunning',
+        messageKey: complete
+          ? 'session.driver.acceptedPlanTaskSavepointComplete'
+          : 'session.driver.acceptedPlanTaskSavepointRunning',
+        messageArgs: { newlyCompletedTaskCount: progress.newlyCompletedTaskIds.length },
+        runId,
+        planId: accepted.planId,
+        taskCursorId: cursor?.cursorId,
+        taskId: context?.taskId,
+        completedTaskIds: progress.completedTaskIds,
+        newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
+        remainingTaskIds: progress.remainingTaskIds,
+        taskLedger: ledger,
+        taskOrder: ledger?.taskOrder ?? [],
+        nextPendingTaskIds: ledger?.pendingTaskIds ?? [],
+        acceptedPlanPromptFrame: promptFrame,
+        targetPaths: progress.targetPaths,
+        workUnitIds: progress.workUnitIds,
+        kernelEventCount: kernelEvents.length,
+        memoryUpdateSummary: 'SessionMemory will retain the active task focus, completed task ids, and next checkpoint as derived intent/checkpoint memory.',
+        channel: 'progress',
+        visibility: 'conversation',
+        presentation: 'collapsible',
+        activity: conversationActivity({
+          activityId: id,
+          kind: complete ? 'reviewCheckpoint' : 'editBatchQueued',
+          status: complete ? 'completed' : 'running',
+          title: complete ? 'Task plan savepoint complete' : 'Task plan savepoint',
+          summary: complete ? 'All accepted tasks are complete.' : 'Accepted task progress saved for the next provider checkpoint.',
+          source: 'session',
+          runId,
+          targets: progress.targetPaths,
+          itemCount: progress.newlyCompletedTaskIds.length,
         }),
       },
     };

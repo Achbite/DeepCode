@@ -1954,6 +1954,26 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
     actionBundleAdmissionBatch: () => ({
       actions: [{ actionId: `admission-action-${token}`, resourceScope: [targetPath] }],
     }),
+    acceptedPlanTaskLedger: (accepted) => buildTaskLedgerSnapshot({
+      planId: accepted.planId,
+      runId: accepted.runId,
+      tasks: accepted.tasks.map((task) => ({
+        taskId: task.taskId,
+        title: task.title ?? task.taskId,
+        targets: task.targets,
+        capability: task.capability,
+      })),
+      completedTaskIds: accepted.completedTaskIds,
+    }),
+    acceptedPlanPromptFrame: (accepted, taskLedger) => taskLedger
+      ? buildAcceptedPlanPromptFrame({
+        planId: accepted.planId,
+        runId: accepted.runId,
+        title: `Plan ${token}`,
+        summary: `Plan summary ${token}`,
+        taskLedger,
+      })
+      : undefined,
   });
   const runState = builder.sessionRunStateEvent({
     sessionId: `session-${token}`,
@@ -2027,6 +2047,94 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
   assertEqual(payload.stage, 'accepted_plan.batch_checkpoint', 'session progress projection creates accepted-plan checkpoint');
   assertEqual(payload.taskLedger.completedTaskIds[0], taskId, 'session progress projection builds task ledger');
   assertEqual(payload.activity.kind, 'reviewCheckpoint', 'session progress projection marks complete accepted plan for review');
+
+  const resume = builder.acceptedPlanResourceResumeEvent(
+    `session-${token}`,
+    `run-${token}`,
+    accepted,
+    {
+      cursorId: `cursor-${token}`,
+      planId: `plan-${token}`,
+      currentTaskId: taskId,
+      taskOrder: [taskId],
+      pendingTaskIds: [taskId],
+      completedTaskIds: [],
+      lastResourcePacketIds: [`packet-previous-${token}`],
+    },
+    {
+      taskId,
+      taskTitle: `Task ${token}`,
+      goal: `Goal ${token}`,
+      targets: [targetPath],
+      capabilities: ['fs.write'],
+      taskOrder: [taskId],
+      pendingTaskIds: [taskId],
+      dependsOn: [],
+      evidenceNeeds: [],
+      completedTaskIds: [],
+    },
+    {
+      id: `packet-${token}`,
+      workspaceScopeKey: `workspace-${token}`,
+      requestId: `request-${token}`,
+      items: [{
+        requestItemId: `request-item-${token}`,
+        manifestEntryId: `manifest-${token}`,
+        readPolicy: 'autoRead',
+        status: 'provided',
+        contentKind: 'text',
+        promptContent: `content-${token}`,
+        evidenceRefs: [`evidence-${token}`],
+      }],
+    },
+    '2026-01-01T00:00:01.500Z',
+    `resource-resume-${token}`
+  );
+  assertEqual((resume.payload as any).stage, 'accepted_plan.resource_resume', 'session progress projection creates resource resume events');
+  assertEqual((resume.payload as any).messageKey, 'session.driver.acceptedPlanResourceResume', 'session progress projection marks resource resume with i18n key');
+  assertEqual((resume.payload as any).resourceItemCount, 1, 'session progress projection preserves resource resume packet count');
+
+  const savepoint = builder.acceptedPlanTaskSavepointEvent(
+    `session-${token}`,
+    `run-${token}`,
+    accepted,
+    { ...accepted, completedTaskIds: [taskId], batchIndex: 2 },
+    {
+      actionIds: [`action-${token}`],
+      targetPaths: [targetPath],
+      workUnitIds: [`work-unit-${token}`],
+      newlyCompletedTaskIds: [taskId],
+      completedTaskIds: [taskId],
+      remainingTaskIds: [],
+    },
+    [],
+    {
+      cursorId: `cursor-${token}`,
+      planId: `plan-${token}`,
+      currentTaskId: taskId,
+      taskOrder: [taskId],
+      pendingTaskIds: [taskId],
+      completedTaskIds: [],
+      lastResourcePacketIds: [],
+    },
+    {
+      taskId,
+      taskTitle: `Task ${token}`,
+      goal: `Goal ${token}`,
+      targets: [targetPath],
+      capabilities: ['fs.write'],
+      taskOrder: [taskId],
+      pendingTaskIds: [taskId],
+      dependsOn: [],
+      evidenceNeeds: [],
+      completedTaskIds: [],
+    },
+    '2026-01-01T00:00:01.750Z',
+    `task-savepoint-${token}`
+  );
+  assertEqual((savepoint.payload as any).stage, 'accepted_plan.task_savepoint', 'session progress projection creates task savepoint events');
+  assertEqual((savepoint.payload as any).messageKey, 'session.driver.acceptedPlanTaskSavepointComplete', 'session progress projection marks completed savepoint with i18n key');
+  assertEqual((savepoint.payload as any).acceptedPlanPromptFrame.taskLedger.completedTaskIds[0], taskId, 'session progress projection stores accepted-plan prompt frame');
 
   const preflight = builder.acceptedPlanActionBatchPreflightEvent(
     `session-${token}`,
@@ -7801,8 +7909,9 @@ async function assertSessionDriverLoopAcceptedExecutionKernelErrorClosesRun(): P
   assertEqual(
     result.events.some((event) =>
       event.kind === 'error' &&
-      String((event.payload as any)?.message ?? '').includes('已确认计划执行链路失败') &&
-      String((event.payload as any)?.message ?? '').includes('generic Kernel action batch submit failed')
+      (event.payload as any)?.messageKey === 'session.driver.acceptedPlanExecutionFailed' &&
+      (event.payload as any)?.code === 'generic_kernel_error' &&
+      String((event.payload as any)?.activity?.errorMessage ?? '').includes('generic Kernel action batch submit failed')
     ),
     true,
     'Kernel actionBatchSubmit error is projected as an accepted-plan failure while preserving the Kernel error'

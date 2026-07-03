@@ -323,6 +323,8 @@ const sessionProgressProjectionBuilder = new SessionProgressProjectionBuilder({
   hasFailureOrBlocker: (kernelEvents) => kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents),
   auditAcceptedPlanBatch: (batch) => acceptedPlanBatchPreflight.audit(batch),
   actionBundleAdmissionBatch: (proposal) => proposalActionBundleAdmissionBatch(proposal),
+  acceptedPlanTaskLedger: (accepted) => buildAcceptedPlanTaskLedger(accepted),
+  acceptedPlanPromptFrame: (accepted, taskLedger) => buildAcceptedPlanPromptFrameForContext(accepted, taskLedger),
 });
 const sessionFailureProjectionBuilder = new SessionFailureProjectionBuilder({
   actionBatchFailureDetails: (kernelEvents, batch) => actionBatchFailureIndex.details(kernelEvents, batch),
@@ -775,7 +777,7 @@ export class SessionDriverLoop {
         lastResult = await this.append(sessionId, [resourceRequestLoop.packetEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
         if (state.acceptedImplementationPlan) {
           refreshTaskExecutionState(state);
-          const resumeEvent = acceptedPlanResourceResumeEvent(
+          const resumeEvent = sessionProgressProjectionBuilder.acceptedPlanResourceResumeEvent(
             sessionId,
             state.runId,
             state.acceptedImplementationPlan,
@@ -1471,7 +1473,7 @@ export class SessionDriverLoop {
       const batchEvents = batchReply.events ?? [];
       if (!batchReply.ok && batchEvents.length === 0) {
         throw new SessionDriverLoopError(
-          'accepted_plan_action_batch_submit_failed',
+          stringValue(objectRecord(batchReply.error)?.code) ?? 'accepted_plan_action_batch_submit_failed',
           kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed without execution facts')
         );
       }
@@ -1527,7 +1529,7 @@ export class SessionDriverLoop {
             this.ts(),
             this.id('accepted-plan-overlay-batch-checkpoint')
           ),
-          acceptedPlanTaskSavepointEvent(
+          sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
             input.sessionId,
             plan.runId,
             acceptedOverlay.acceptedPlan,
@@ -2413,7 +2415,7 @@ export class SessionDriverLoop {
     resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
     let result = await this.append(state.sessionId, [
       resourceRequestLoop.packetEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-readonly-action-resource-context')),
-      acceptedPlanResourceResumeEvent(
+      sessionProgressProjectionBuilder.acceptedPlanResourceResumeEvent(
         state.sessionId,
         state.runId,
         accepted,
@@ -3792,6 +3794,18 @@ export class SessionDriverLoop {
     });
     await this.emitKernelActivityDeltas(state, batchReply.events ?? [], 'accepted_plan.action_batch_submit');
     result = await this.appendProjectedKernelEvents(state.sessionId, batchReply) ?? result;
+    if (!batchReply.ok) {
+      const message = kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed');
+      const code = stringValue(objectRecord(batchReply.error)?.code) ?? 'accepted_plan_execution_failed';
+      return this.append(state.sessionId, sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(
+        state.sessionId,
+        { runId: state.runId, planId: accepted.planId },
+        message,
+        code,
+        this.ts(),
+        this.id('accepted-plan-action-batch-submit-failed')
+      )) ?? result;
+    }
     const batchEvents = batchReply.events ?? [];
     if (kernelEventStatusIndex.hasFailureOrBlocker(batchEvents)) {
       return this.append(state.sessionId, sessionFailureProjectionBuilder.acceptedPlanExecutionFailureEvents(
@@ -3855,7 +3869,7 @@ export class SessionDriverLoop {
         this.ts(),
         this.id('accepted-plan-batch-checkpoint')
       ),
-      acceptedPlanTaskSavepointEvent(
+      sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
         state.sessionId,
         state.runId,
         accepted,
@@ -4932,109 +4946,6 @@ function providerRepairMessageState(state: SessionDriverLoopRunState): ProviderR
 
 function lastAcceptedPlanTaskSavepointId(events: AgentEvent[]): string | undefined {
   return acceptedPlanTaskLedger().lastSavepointId(events);
-}
-
-function acceptedPlanResourceResumeEvent(
-  sessionId: string,
-  runId: string,
-  accepted: AcceptedImplementationPlanContext,
-  cursor: TaskExecutionCursor | undefined,
-  context: CurrentTaskContext | undefined,
-  packet: ResourcePacket,
-  ts: string,
-  id: string
-): AgentEvent {
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'workflow_stage',
-    payload: {
-      stage: 'accepted_plan.resource_resume',
-      status: 'completed',
-      summary: `已为当前任务补充只读资源证据，Session 将从同一 task cursor 紧凑续接。`,
-      runId,
-      planId: accepted.planId,
-      taskCursorId: cursor?.cursorId,
-      currentTaskId: context?.taskId,
-      targetPaths: context?.targets ?? [],
-      resourcePacketId: packet.id,
-      resourceItemCount: packet.items.length,
-      lastResourcePacketIds: cursor?.lastResourcePacketIds ?? [],
-      channel: 'progress',
-      visibility: 'conversation',
-      presentation: 'collapsible',
-      activity: conversationActivity({
-        activityId: id,
-        kind: 'resourceRead',
-        status: 'completed',
-        title: 'Accepted plan resource resume',
-        summary: 'Session resolved evidence for the current accepted-plan task and will resume from a compact task checkpoint.',
-        source: 'session',
-        runId,
-        targets: context?.targets,
-      }),
-    },
-  };
-}
-
-function acceptedPlanTaskSavepointEvent(
-  sessionId: string,
-  runId: string,
-  accepted: AcceptedImplementationPlanContext,
-  nextAccepted: AcceptedImplementationPlanContext,
-  progress: AcceptedPlanBatchProgress,
-  kernelEvents: unknown[],
-  cursor: TaskExecutionCursor | undefined,
-  context: CurrentTaskContext | undefined,
-  ts: string,
-  id: string
-): AgentEvent {
-  const complete = progress.remainingTaskIds.length === 0 && !kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents);
-  const ledger = buildAcceptedPlanTaskLedger(nextAccepted);
-  const promptFrame = buildAcceptedPlanPromptFrameForContext(nextAccepted, ledger);
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'workflow_stage',
-    payload: {
-      stage: 'accepted_plan.task_savepoint',
-      status: complete ? 'completed' : 'running',
-      summary: complete
-        ? '当前 accepted taskPlan 已完成全部任务清单。'
-        : '当前 accepted taskPlan 已保存任务批次进度，下一批将按任务清单顺序继续。',
-      runId,
-      planId: accepted.planId,
-      taskCursorId: cursor?.cursorId,
-      taskId: context?.taskId,
-      completedTaskIds: progress.completedTaskIds,
-      newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
-      remainingTaskIds: progress.remainingTaskIds,
-      taskLedger: ledger,
-      taskOrder: ledger?.taskOrder ?? [],
-      nextPendingTaskIds: ledger?.pendingTaskIds ?? [],
-      acceptedPlanPromptFrame: promptFrame,
-      targetPaths: progress.targetPaths,
-      workUnitIds: progress.workUnitIds,
-      kernelEventCount: kernelEvents.length,
-      memoryUpdateSummary: 'SessionMemory will retain the active task focus, completed task ids, and next checkpoint as derived intent/checkpoint memory.',
-      channel: 'progress',
-      visibility: 'conversation',
-      presentation: 'collapsible',
-      activity: conversationActivity({
-        activityId: id,
-        kind: complete ? 'reviewCheckpoint' : 'editBatchQueued',
-        status: complete ? 'completed' : 'running',
-        title: complete ? 'Task plan savepoint complete' : 'Task plan savepoint',
-        summary: complete ? 'All accepted tasks are complete.' : 'Accepted task progress saved for the next provider checkpoint.',
-        source: 'session',
-        runId,
-        targets: progress.targetPaths,
-        itemCount: progress.newlyCompletedTaskIds.length,
-      }),
-    },
-  };
 }
 
 function normalizedNonNegativeInteger(value: unknown): number | undefined {
