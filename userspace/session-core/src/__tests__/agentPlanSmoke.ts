@@ -56,7 +56,7 @@ import {
   ImplementationBatchContextBuilder,
   KernelEventStatusIndex,
 } from '../driver/execution/index.js';
-import { PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
+import { PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
 import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
 import { KernelEventProjectionBuilder, PlanProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -73,6 +73,7 @@ async function main(): Promise<void> {
   assertProviderJsonModeCoordinator();
   assertProviderStreamCoordinatorClassifiesStages();
   assertPermissionPipelineFindsPendingPermission();
+  assertUserInputPipelineFindsRequirementInteractions();
   await assertProviderTraceRecorderArchivesPayload();
   await assertResourceRequestLoopBuildsPacketEvents();
   assertResourceEvidenceIndexQueriesPackets();
@@ -406,6 +407,46 @@ function assertPermissionPipelineFindsPendingPermission(): void {
     pipeline.findPendingPermissionContext(events, resolvedId),
     null,
     'permission pipeline ignores resolved permission request'
+  );
+}
+
+function assertUserInputPipelineFindsRequirementInteractions(): void {
+  const token = randomSmokeToken('user-input-pipeline');
+  const pipeline = new UserInputPipeline();
+  const runId = `run-${token}`;
+  const requirementId = `requirement-${token}`;
+  const confirmation = {
+    kind: 'requirement_confirmation',
+    payload: {
+      confirmable: true,
+      status: 'waitingUserConfirmation',
+      runId,
+      requirementId,
+    },
+  } as AgentEvent;
+  const events = [confirmation];
+  const active = pipeline.findLatestActiveRequirementInteraction(events);
+  assertEqual(active?.runId, runId, 'user input pipeline finds active requirement run');
+  assertEqual(active?.requirementId, requirementId, 'user input pipeline finds active requirement id');
+  assertEqual(
+    pipeline.findRequirementConfirmation(events, runId, requirementId, active),
+    confirmation,
+    'user input pipeline finds requirement confirmation'
+  );
+  assertEqual(
+    pipeline.findLatestActiveRequirementInteraction([
+      confirmation,
+      {
+        kind: 'requirement_decision',
+        payload: {
+          status: 'accepted',
+          runId,
+          requirementId,
+        },
+      } as AgentEvent,
+    ]),
+    null,
+    'user input pipeline ignores resolved requirements'
   );
 }
 

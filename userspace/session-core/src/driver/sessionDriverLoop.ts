@@ -90,6 +90,7 @@ import {
   type NativeToolCallProposal,
 } from './pipelines/providerPipeline.js';
 import { PermissionPipeline } from './pipelines/permissionPipeline.js';
+import { UserInputPipeline } from './pipelines/userInputPipeline.js';
 import {
   ContextFrameBuilder,
   GeneratedArtifactEvidenceIndex,
@@ -311,6 +312,7 @@ const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
 const providerStreamCoordinator = new ProviderStreamCoordinator();
 const providerTraceRecorder = new ProviderTraceRecorder();
 const permissionPipeline = new PermissionPipeline();
+const userInputPipeline = new UserInputPipeline();
 const acceptedPlanTargetParser = new AcceptedPlanTargetParser();
 const planReviewGrantProjector = new PlanReviewGrantProjector();
 const planReviewReportAnalyzer = new PlanReviewReportAnalyzer({
@@ -811,7 +813,12 @@ export class SessionDriverLoop {
   private async resolveRequirementDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
     const events = input.existingEvents ?? [];
     const requirementId = input.targetId;
-    const confirmation = findRequirementConfirmation(events, input.runId, requirementId);
+    const confirmation = userInputPipeline.findRequirementConfirmation(
+      events,
+      input.runId,
+      requirementId,
+      findActiveDriverInteraction(events)
+    );
     if (!confirmation) {
       return this.append(input.sessionId, [
         traceEvent(input.sessionId, 'trace/requirement_decision_noop', '该需求确认已处理或已过期。', this.ts(), this.id('requirement-noop'), {
@@ -7538,7 +7545,7 @@ function findActiveDriverInteraction(events: AgentEvent[]): DriverInteraction | 
   if (review) return review;
   const plan = findLatestActivePlanInteraction(events);
   if (plan) return plan;
-  return findLatestActiveRequirementInteraction(events);
+  return userInputPipeline.findLatestActiveRequirementInteraction(events);
 }
 
 function findLatestActivePlanInteraction(events: AgentEvent[]): DriverInteraction | null {
@@ -7560,89 +7567,6 @@ function findLatestActivePlanInteraction(events: AgentEvent[]): DriverInteractio
     return { kind: 'plan', runId, planId };
   }
   return null;
-}
-
-function findLatestActiveRequirementInteraction(events: AgentEvent[]): DriverInteraction | null {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event.kind !== 'requirement_confirmation') continue;
-    const payload = objectRecord(event.payload);
-    if (!payload || payload.confirmable !== true) continue;
-    if (hasLaterTerminalInteraction(events, index)) continue;
-    const runId = stringValue(payload.runId);
-    const requirementId = stringValue(payload.requirementId);
-    if (!runId || !requirementId || stringValue(payload.status) !== 'waitingUserConfirmation') continue;
-    if (requirementAlreadyResolved(events, runId, requirementId)) continue;
-    return { kind: 'requirement', runId, requirementId };
-  }
-  return null;
-}
-
-function hasLaterTerminalInteraction(events: AgentEvent[], index: number): boolean {
-  for (let nextIndex = index + 1; nextIndex < events.length; nextIndex += 1) {
-    const event = events[nextIndex];
-    if (
-      event.kind !== 'requirement_decision' &&
-      event.kind !== 'plan_review' &&
-      event.kind !== 'review_summary'
-    ) {
-      continue;
-    }
-    const payload = objectRecord(event.payload);
-    const status = stringValue(payload?.status);
-    if (status === 'accepted' || status === 'rejected' || status === 'needsRevision') return true;
-  }
-  return false;
-}
-
-function requirementAlreadyResolved(events: AgentEvent[], runId: string, requirementId: string): boolean {
-  return events.some((event) => {
-    if (event.kind !== 'requirement_decision') return false;
-    const payload = objectRecord(event.payload);
-    if (!payload) return false;
-    const status = stringValue(payload.status);
-    if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return false;
-    return stringValue(payload.runId) === runId && stringValue(payload.requirementId) === requirementId;
-  });
-}
-
-function findRequirementConfirmation(events: AgentEvent[], runId?: string, requirementId?: string): AgentEvent | null {
-  let direct: AgentEvent | undefined;
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event.kind !== 'requirement_confirmation') continue;
-    const payload = objectRecord(event.payload);
-    if (!payload || payload.confirmable !== true) continue;
-    const candidateRunId = stringValue(payload.runId);
-    const candidateRequirementId = stringValue(payload.requirementId);
-    if (runId && candidateRunId !== runId) continue;
-    if (requirementId && candidateRequirementId !== requirementId) continue;
-    if (!candidateRunId || !candidateRequirementId) continue;
-    if (stringValue(payload.status) !== 'waitingUserConfirmation') continue;
-    if (hasLaterTerminalInteraction(events, index)) continue;
-    if (requirementAlreadyResolved(events, candidateRunId, candidateRequirementId)) continue;
-    direct = event;
-    break;
-  }
-  if (direct) return direct;
-
-  const active = findActiveDriverInteraction(events);
-  if (
-    !active ||
-    active.kind !== 'requirement' ||
-    (runId && active.runId !== runId) ||
-    (requirementId && active.requirementId !== requirementId)
-  ) {
-    return null;
-  }
-  return [...events].reverse().find((event) => {
-    if (event.kind !== 'requirement_confirmation') return false;
-    const payload = objectRecord(event.payload);
-    if (!payload || payload.confirmable !== true) return false;
-    if (runId && stringValue(payload.runId) !== runId) return false;
-    if (requirementId && stringValue(payload.requirementId) !== requirementId) return false;
-    return stringValue(payload.status) === 'waitingUserConfirmation';
-  }) ?? null;
 }
 
 function requirementDecisionEvent(
