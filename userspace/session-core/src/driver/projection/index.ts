@@ -8,3 +8,7 @@ export {
   ReviewProjectionBuilder,
   type ReadableReviewSummary,
 } from './reviewProjectionBuilder.js';
+export {
+  RequirementProjectionBuilder,
+  type RequirementDecisionOption,
+} from './requirementProjectionBuilder.js';

@@ -124,6 +124,7 @@ import {
 import {
   KernelEventProjectionBuilder,
   PlanProjectionBuilder,
+  RequirementProjectionBuilder,
   ReviewProjectionBuilder,
 } from './projection/index.js';
 import type { ProviderTurnContract } from './runFrame.js';
@@ -345,6 +346,10 @@ const planProjectionBuilder = new PlanProjectionBuilder({
   gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
   interactionOverlayProjection,
   visibleLanguageForRequest,
+});
+const requirementProjectionBuilder = new RequirementProjectionBuilder({
+  visibleLanguageForRequest,
+  interactionOverlayPayload: (payload) => interactionOverlayProjection(interactionOverlayFromPayload(payload)),
 });
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
@@ -841,7 +846,14 @@ export class SessionDriverLoop {
       ]);
     }
 
-    const decisionEvent = requirementDecisionEvent(input.sessionId, confirmation, input.decision, input.guidance, this.ts(), this.id('requirement-decision'));
+    const decisionEvent = requirementProjectionBuilder.decisionEvent({
+      sessionId: input.sessionId,
+      event: confirmation,
+      decision: input.decision,
+      guidance: input.guidance,
+      ts: this.ts(),
+      id: this.id('requirement-decision'),
+    });
     const interactionOverlay = interactionOverlayFromRequirementDecision(confirmation, decisionEvent);
     let result = await this.append(input.sessionId, [decisionEvent]);
     if (input.decision === 'reject') {
@@ -7560,116 +7572,6 @@ function findActiveDriverInteraction(events: AgentEvent[]): DriverInteraction | 
   return userInputPipeline.findLatestActiveRequirementInteraction(events);
 }
 
-function requirementDecisionEvent(
-  sessionId: string,
-  event: AgentEvent,
-  decision: 'accept' | 'reject' | 'revise',
-  guidance: string | undefined,
-  ts: string,
-  id: string
-): AgentEvent {
-  const payload = objectRecord(event.payload) ?? {};
-  const decisionRequest = objectRecord(payload.decisionRequest);
-  const selectedOption = decision === 'accept'
-    ? selectedDecisionOptionFromGuidance(decisionRequest, guidance)
-    : undefined;
-  const language = visibleLanguageForRequest(stringValue(payload.originalUserRequest) ?? '');
-  const summary = requirementDecisionSummary(decision, selectedOption, language);
-  const overlayPayload = interactionOverlayProjection(interactionOverlayFromPayload(payload));
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'requirement_decision',
-    payload: {
-      title: 'Requirement decision',
-      summary,
-      status: decision === 'accept' ? 'accepted' : decision === 'revise' ? 'needsRevision' : 'rejected',
-      runId: stringValue(payload.runId),
-      requirementId: stringValue(payload.requirementId),
-      decision,
-      guidance,
-      selectedOption,
-      ...overlayPayload,
-      channel: 'progress',
-      visibility: 'conversation',
-      presentation: 'body',
-    },
-  };
-}
-
-function requirementDecisionSummary(
-  decision: 'accept' | 'reject' | 'revise',
-  selectedOption: RequirementDecisionOption | undefined,
-  language: VisibleLanguage
-): string {
-  if (language === 'en-US') {
-    if (decision === 'accept' && selectedOption?.label) return `Selected option: ${selectedOption.label}`;
-    if (decision === 'accept') return 'The user confirmed the requirement understanding.';
-    if (decision === 'revise') return 'The user requested requirement revisions.';
-    return 'The user rejected the current requirement understanding.';
-  }
-  if (decision === 'accept' && selectedOption?.label) return `已选择方案：${selectedOption.label}`;
-  if (decision === 'accept') return '用户已确认需求理解。';
-  if (decision === 'revise') return '用户要求修订需求理解。';
-  return '用户拒绝当前需求理解。';
-}
-
-interface RequirementDecisionOption {
-  id: string;
-  label: string;
-  description?: string;
-  recommended?: boolean;
-  effect?: unknown;
-}
-
-function isDecisionRequestPayload(value: Record<string, unknown> | undefined): boolean {
-  return decisionRequestOptions(value).length >= 2;
-}
-
-function decisionRequestSummary(value: Record<string, unknown> | undefined): string | undefined {
-  if (!value) return undefined;
-  return stringValue(value.summary)
-    ?? stringValue(value.question)
-    ?? stringValue(value.reason)
-    ?? stringValue(value.goal);
-}
-
-function decisionRequestOptions(value: Record<string, unknown> | undefined): RequirementDecisionOption[] {
-  if (!Array.isArray(value?.options)) return [];
-  return value.options.flatMap((item): RequirementDecisionOption[] => {
-    const record = objectRecord(item);
-    if (!record) return [];
-    const id = stringValue(record.id) ?? stringValue(record.label);
-    const label = stringValue(record.label) ?? id;
-    if (!id || !label) return [];
-    const description = stringValue(record.description)
-      ?? stringValue(record.impact)
-      ?? stringValue(record.tradeoff);
-    return [{
-      id,
-      label,
-      description,
-      recommended: record.recommended === true,
-      effect: record.effect,
-    }];
-  });
-}
-
-function selectedDecisionOptionFromGuidance(
-  decisionRequest: Record<string, unknown> | undefined,
-  guidance: string | undefined
-): RequirementDecisionOption | undefined {
-  const options = decisionRequestOptions(decisionRequest);
-  if (!options.length) return undefined;
-  const selectedId = guidance?.match(/^- id:\s*(.+)$/m)?.[1]?.trim();
-  const selectedLabel = guidance?.match(/^- label:\s*(.+)$/m)?.[1]?.trim();
-  return (selectedId ? options.find((option) => option.id === selectedId) : undefined)
-    ?? (selectedLabel ? options.find((option) => option.label === selectedLabel) : undefined)
-    ?? options.find((option) => option.recommended)
-    ?? options[0];
-}
-
 function requirementRecordFromEvent(event: AgentEvent, status: RequirementRecord['status']): RequirementRecord | undefined {
   const payload = objectRecord(event.payload);
   const raw = objectRecord(payload?.requirement);
@@ -7911,10 +7813,10 @@ function requirementConfirmationEvent(input: {
 }): AgentEvent {
   const decisionRequest = objectRecord(input.proposal.payload);
   const language = visibleLanguageForRequest(input.originalUserRequest);
-  const content = decisionRequest && isDecisionRequestPayload(decisionRequest)
+  const content = decisionRequest && requirementProjectionBuilder.isDecisionRequestPayload(decisionRequest)
     ? renderDecisionRequestMarkdown(decisionRequest, language)
     : renderRequirementConfirmationMarkdown(input.requirement);
-  const summary = decisionRequestSummary(decisionRequest) ?? requirementSummary(input.requirement);
+  const summary = requirementProjectionBuilder.decisionRequestSummary(decisionRequest) ?? requirementSummary(input.requirement);
   const overlayPayload = interactionOverlayProjection(input.interactionOverlay);
   return {
     id: input.id,
@@ -8151,8 +8053,8 @@ function renderDecisionRequestMarkdown(
   decisionRequest: Record<string, unknown>,
   language: VisibleLanguage
 ): string {
-  const options = decisionRequestOptions(decisionRequest);
-  const summary = decisionRequestSummary(decisionRequest);
+  const options = requirementProjectionBuilder.decisionRequestOptions(decisionRequest);
+  const summary = requirementProjectionBuilder.decisionRequestSummary(decisionRequest);
   const labels = language === 'en-US'
     ? {
       heading: 'Decision needed',

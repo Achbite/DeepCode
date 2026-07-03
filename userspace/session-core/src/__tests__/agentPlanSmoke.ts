@@ -58,7 +58,7 @@ import {
 } from '../driver/execution/index.js';
 import { PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
 import { PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
-import { KernelEventProjectionBuilder, PlanProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
+import { KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
 async function main(): Promise<void> {
@@ -90,6 +90,7 @@ async function main(): Promise<void> {
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
+  assertRequirementProjectionBuilderCreatesDecisionEvents();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
   assertPlanInteractionIndexFindsActivePlan();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
@@ -3079,6 +3080,68 @@ function assertPlanInteractionIndexFindsActivePlan(): void {
     null,
     'plan interaction index skips plans already resolved by session state'
   );
+}
+
+function assertRequirementProjectionBuilderCreatesDecisionEvents(): void {
+  const suffix = randomSmokeToken('requirement-projection');
+  const runId = `run-${suffix}`;
+  const requirementId = `requirement-${suffix}`;
+  const selectedOptionId = `option-${suffix}`;
+  const builder = new RequirementProjectionBuilder({
+    visibleLanguageForRequest: () => 'en-US',
+    interactionOverlayPayload: (payload) => ({
+      overlayRunId: payload.runId,
+      overlayRequirementId: payload.requirementId,
+    }),
+  });
+  const decisionRequest = {
+    question: `Choose ${suffix}`,
+    options: [
+      {
+        id: `fallback-${suffix}`,
+        label: `Fallback ${suffix}`,
+      },
+      {
+        id: selectedOptionId,
+        label: `Selected ${suffix}`,
+        recommended: true,
+        effect: { kind: 'continueCurrentTask', token: suffix },
+      },
+    ],
+  };
+  assertEqual(builder.isDecisionRequestPayload(decisionRequest), true, 'requirement projection recognizes multi-option decision payload');
+  assertEqual(builder.decisionRequestSummary(decisionRequest), `Choose ${suffix}`, 'requirement projection summarizes decision payload question');
+  assertEqual(
+    builder.decisionRequestOptions(decisionRequest).map((option) => option.id).join('|'),
+    `fallback-${suffix}|${selectedOptionId}`,
+    'requirement projection preserves structured decision options'
+  );
+  const event = {
+    id: `event-${suffix}`,
+    sessionId: `session-${suffix}`,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'requirement_confirmation',
+    payload: {
+      runId,
+      requirementId,
+      originalUserRequest: `Request ${suffix}`,
+      decisionRequest,
+    },
+  } as AgentEvent;
+  const decision = builder.decisionEvent({
+    sessionId: `session-${suffix}`,
+    event,
+    decision: 'accept',
+    guidance: `- id: ${selectedOptionId}`,
+    ts: '2026-01-01T00:00:01.000Z',
+    id: `decision-${suffix}`,
+  });
+  const payload = decision.payload as Record<string, unknown>;
+  const selectedOption = payload.selectedOption as Record<string, unknown>;
+  assertEqual(decision.kind, 'requirement_decision', 'requirement projection creates requirement decision events');
+  assertEqual(payload.status, 'accepted', 'requirement projection maps accepted decisions to accepted status');
+  assertEqual(selectedOption.id, selectedOptionId, 'requirement projection selects the guided option');
+  assertEqual(payload.overlayRunId, runId, 'requirement projection preserves overlay payload from ports');
 }
 
 function assertSettingsCatalogBoundaries(): void {
