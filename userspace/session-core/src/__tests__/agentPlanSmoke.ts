@@ -50,6 +50,7 @@ import {
   AcceptedPlanOperationTargetResolver,
   AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionOverlay,
+  AcceptedPlanExecutor,
   AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
   ActionBatchFailureIndex,
@@ -89,6 +90,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanScopeCoverageMatchesStructuredScopes();
   assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask();
   assertAcceptedPlanOperationTargetResolverFindsExactGrant();
+  assertAcceptedPlanExecutorBuildsExecutionBatch();
   assertKernelEventStatusIndexReadsStructuredEvents();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewAssemblerFindsWaitingReviewContext();
@@ -1399,6 +1401,110 @@ function assertAcceptedPlanOperationTargetResolverFindsExactGrant(): void {
     fileTarget,
     'operation target resolver normalizes file target'
   );
+}
+
+function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
+  const token = randomSmokeToken('executor');
+  const target = `generated-${token}.txt`;
+  const blockId = `block-${token}`;
+  const normalize = (value: string): string => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  const resolver = new AcceptedPlanOperationTargetResolver({
+    normalizeTargetScope: normalize,
+    normalizePlanScope: normalize,
+    concreteDirectoryOperationTarget: (value) => value && !value.includes('*') ? normalize(value) : undefined,
+    concreteFileOperationTarget: (value) => value && !value.endsWith('/') && !value.includes('*') ? normalize(value) : undefined,
+    exactGrantCapabilityMatches: (grant, capability) => grant.capability === capability,
+    actionEffectiveCapability: (action) => typeof action.capability === 'string'
+      ? action.capability
+      : typeof action.toolId === 'string'
+        ? action.toolId
+        : '',
+    actionFileTargetPath: (action) => typeof action.targetPath === 'string' ? action.targetPath : undefined,
+  });
+  const executor = new AcceptedPlanExecutor({
+    readActionBundle: (proposal) => (proposal.payload as Record<string, any>).actionBundle as ActionBundleDraft,
+    operationTargetResolver: resolver,
+    actionFileTargetPath: (action) => typeof action.targetPath === 'string' ? action.targetPath : undefined,
+    fileTargetRefFromPath: (path) => ({ path }),
+    deleteActionTargetResourceKind: (action) => typeof action.targetKind === 'string' ? action.targetKind : undefined,
+    deleteActionRecursive: (action) => action.recursive === true,
+    kernelExecutionContractId: (report) => typeof report?.contractId === 'string' ? report.contractId : undefined,
+  });
+  const acceptedPlan: AcceptedImplementationPlanContext = {
+    planId: `plan-${token}`,
+    runId: `run-${token}`,
+    tasks: [{
+      taskId: `task-${token}`,
+      title: 'Generic write task',
+      targets: [target],
+      capability: 'fs.write',
+      dependencies: [],
+      conflictKeys: [],
+    }],
+    capabilities: ['fs.write'],
+    targetScopes: [target],
+    exactOperationGrants: [{
+      operation: 'write',
+      targetPath: target,
+      targetResourceKind: 'file',
+      capability: 'fs.write',
+      source: 'implementationPlan',
+    }],
+    accessScopes: [],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: { id: `plan-${token}` },
+  };
+  const sessionId = `session-${token}`;
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId: acceptedPlan.runId,
+    sessionId,
+    source: 'llm',
+    kind: 'actionBundle',
+    payload: {
+      userPlan: 'Generic accepted execution batch.',
+      actionBundle: {
+        version: '1',
+        id: `bundle-${token}`,
+        goal: 'Generic accepted execution batch',
+        actions: [{
+          actionId: `action-${token}`,
+          capability: 'fs.write',
+          kind: 'write',
+          targetPath: `./${target}`,
+          sourceBlockId: blockId,
+        }],
+      },
+      codeBlocks: [{
+        id: blockId,
+        targetPath: `./${target}`,
+        content: 'generic content',
+      }],
+      commandBlocks: [],
+    },
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  } as ProposalEnvelope;
+  const plan = executor.executionContext({
+    sessionId,
+    runId: acceptedPlan.runId,
+    acceptedPlan,
+    proposal,
+    planReviewReport: { contractId: `contract-${token}` },
+  });
+  assertEqual(plan.planId, acceptedPlan.planId, 'accepted plan executor builds execution context with accepted plan id');
+  const normalized = executor.normalizeKernelBatch({ planId: acceptedPlan.planId, plan, acceptedPlan });
+  assertEqual(normalized.ok, true, 'accepted plan executor normalizes executable kernel batch');
+  if (!normalized.ok) throw new Error(normalized.reasons.join('; '));
+  const action = (normalized.batch.actionBundle.actions as Array<Record<string, any>>)[0];
+  const block = normalized.batch.codeBlocks[0] as Record<string, any>;
+  assertEqual(action.targetPath, target, 'accepted plan executor normalizes action target path');
+  assertEqual(action.resourceScope[0], target, 'accepted plan executor fills action resource scope');
+  assertEqual(action.targetRef.path, target, 'accepted plan executor fills targetRef path');
+  assertEqual(block.targetPath, target, 'accepted plan executor normalizes codeBlock target path');
+  assertEqual(normalized.batch.contractId, `contract-${token}`, 'accepted plan executor preserves kernel contract id');
 }
 
 function assertKernelEventStatusIndexReadsStructuredEvents(): void {

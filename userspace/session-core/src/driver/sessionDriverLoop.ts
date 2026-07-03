@@ -402,7 +402,15 @@ const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
 });
 const nativeToolCoordinator = new NativeToolCoordinator();
 const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
-const acceptedPlanExecutor = new AcceptedPlanExecutor();
+const acceptedPlanExecutor = new AcceptedPlanExecutor({
+  readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
+  operationTargetResolver: acceptedPlanOperationTargetResolver,
+  actionFileTargetPath,
+  fileTargetRefFromPath,
+  deleteActionTargetResourceKind,
+  deleteActionRecursive,
+  kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
+});
 const contextFrameBuilder = new ContextFrameBuilder();
 const resourceRequestLoop = new ResourceRequestLoop({
   maxDerivedManifestEntries: MAX_DERIVED_MANIFEST_ENTRIES,
@@ -2404,7 +2412,13 @@ export class SessionDriverLoop {
       },
     });
     result = await this.appendProjectedKernelEvents(state.sessionId, factsReply) ?? result;
-    const plan = acceptedPlanReadOnlyReviewContext(state, nextAccepted, packet, completion);
+    const plan = acceptedPlanExecutor.readOnlyReviewContext({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      acceptedPlan: nextAccepted,
+      packet,
+      completion,
+    });
     const resourceFact = {
       kind: 'tool.completed',
       toolName: 'kernel.resourceResolve',
@@ -3566,7 +3580,13 @@ export class SessionDriverLoop {
           return this.runUserTurn({
             sessionId: input.sessionId,
             content: executionPromptCoordinator().executionRequest(
-              acceptedPlanExecutionContext(state, proposal, {}),
+              acceptedPlanExecutor.executionContext({
+                sessionId: state.sessionId,
+                runId: state.runId,
+                acceptedPlan: accepted,
+                proposal,
+                planReviewReport: {},
+              }),
               accepted,
               [
                 'Session has resolved the read-only search/read evidence required for the current edit.',
@@ -3777,7 +3797,13 @@ export class SessionDriverLoop {
       });
     }
 
-    const plan = acceptedPlanExecutionContext(state, executionProposal, reviewReport);
+    const plan = acceptedPlanExecutor.executionContext({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      acceptedPlan: accepted,
+      proposal: executionProposal,
+      planReviewReport: reviewReport,
+    });
     const grantEvents: unknown[] = [];
     for (const grant of planReviewGrantProjector.temporaryGrantsForPlan(plan)) {
       const grantReply = await this.kernel({
@@ -3794,7 +3820,11 @@ export class SessionDriverLoop {
       result = await this.appendProjectedKernelEvents(state.sessionId, { ok: true, events: grantEvents }) ?? result;
     }
 
-    const normalizedBatch = normalizeAcceptedPlanKernelBatch(accepted.planId, plan, accepted);
+    const normalizedBatch = acceptedPlanExecutor.normalizeKernelBatch({
+      planId: accepted.planId,
+      plan,
+      acceptedPlan: accepted,
+    });
     if (!normalizedBatch.ok) {
       return this.append(state.sessionId, sessionFailureProjectionBuilder.acceptedPlanNormalizationFailureEvents(
         state.sessionId,
@@ -3946,7 +3976,16 @@ export class SessionDriverLoop {
       return this.runUserTurn({
         sessionId: input.sessionId,
         content: executionPromptCoordinator().executionRequest(
-          { ...acceptedPlanExecutionContext(state, executionProposal, reviewReport), implementationPlan: accepted.rawPlan },
+          {
+            ...acceptedPlanExecutor.executionContext({
+              sessionId: state.sessionId,
+              runId: state.runId,
+              acceptedPlan: accepted,
+              proposal: executionProposal,
+              planReviewReport: reviewReport,
+            }),
+            implementationPlan: accepted.rawPlan,
+          },
           nextAccepted
         ),
         attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
@@ -5585,215 +5624,6 @@ function recoverAcceptedPlanFromOverlay(
     ]);
   }
   return { plan, acceptedPlan };
-}
-
-function acceptedPlanExecutionContext(
-  state: SessionDriverLoopRunState,
-  proposal: ProposalEnvelope,
-  planReviewReport: Record<string, unknown>
-): SessionPlanContext {
-  const accepted = state.acceptedImplementationPlan;
-  const payload = objectRecord(proposal.payload) ?? {};
-  const actionBundle = driverActivityBuilder.readActionBundle(proposal) ?? {
-    id: accepted?.planId ?? proposal.proposalId,
-    version: '1',
-    goal: stringValue(accepted?.summary) ?? 'Accepted implementation plan batch',
-    actions: [],
-    validationExpectations: [],
-    reviewExpectations: [],
-  };
-  return {
-    sessionId: state.sessionId,
-    runId: state.runId,
-    planId: accepted?.planId ?? stringValue(actionBundle.id) ?? proposal.proposalId,
-    proposalId: proposal.proposalId,
-    userPlan: stringValue(payload.userPlan) ?? stringValue(accepted?.summary) ?? 'Accepted implementation plan batch',
-    actionBundle: actionBundle as unknown as Record<string, unknown>,
-    codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
-    commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
-    expectedValidation: stringValue(payload.expectedValidation) ?? '',
-    reviewGuide: stringValue(payload.reviewGuide) ?? '',
-    planReviewReport,
-    implementationPlan: accepted?.rawPlan,
-  };
-}
-
-function acceptedPlanReadOnlyReviewContext(
-  state: SessionDriverLoopRunState,
-  accepted: AcceptedImplementationPlanContext,
-  packet: ResourcePacket,
-  completion: AcceptedPlanReadOnlyResourceCompletion
-): SessionPlanContext {
-  const targets = completion.coveredTargets.join(', ');
-  return {
-    sessionId: state.sessionId,
-    runId: state.runId,
-    planId: accepted.planId,
-    proposalId: `${accepted.planId}:read-only-validation`,
-    userPlan: targets
-      ? `Read-only validation evidence resolved for accepted targets: ${targets}.`
-      : 'Read-only validation evidence resolved for the accepted plan.',
-    actionBundle: {
-      version: '1',
-      id: `${accepted.planId}:read-only-validation`,
-      goal: 'Read-only validation evidence satisfied the accepted task.',
-      actions: [],
-      validationExpectations: [{
-        id: 'read-only-resource-validation',
-        description: `ResourcePacket ${packet.id} resolved the read-only evidence required by the accepted task.`,
-      }],
-      reviewExpectations: [{
-        id: 'review-read-only-validation',
-        description: 'Review the resolved resource evidence and accepted-plan checkpoint.',
-      }],
-    },
-    codeBlocks: [],
-    commandBlocks: [],
-    expectedValidation: `ResourcePacket ${packet.id} resolved the read-only evidence for the accepted task.`,
-    reviewGuide: 'Review the resolved ResourcePacket evidence and accepted-plan checkpoint.',
-    implementationPlan: accepted.rawPlan,
-  };
-}
-
-type NormalizedAcceptedPlanKernelBatch =
-  | {
-    ok: true;
-    batch: {
-    planId: string;
-    contractId?: string;
-    actionBundle: Record<string, unknown>;
-    codeBlocks: unknown[];
-    commandBlocks: unknown[];
-    };
-    reasons: [];
-  }
-  | {
-    ok: false;
-    reasons: string[];
-  };
-
-function normalizeAcceptedPlanKernelBatch(
-  planId: string,
-  plan: SessionPlanContext,
-  accepted?: AcceptedImplementationPlanContext
-): NormalizedAcceptedPlanKernelBatch {
-  const actionBundle = objectRecord(plan.actionBundle);
-  const actions = Array.isArray(actionBundle?.actions) ? actionBundle.actions : [];
-  const codeBlocks = plan.codeBlocks.map((block) => objectRecord(block) ? { ...(objectRecord(block) ?? {}) } : block);
-  const commandBlocks = [...plan.commandBlocks];
-  const codeBlockById = new Map<string, Record<string, unknown>>();
-  const reasons: string[] = [];
-
-  for (const [index, block] of codeBlocks.entries()) {
-    const record = objectRecord(block);
-    if (!record) continue;
-    const id = stringValue(record.id) ?? stringValue(record.blockId);
-    if (!id) continue;
-    record.id = id;
-    record.blockId = stringValue(record.blockId) ?? id;
-    const path = acceptedPlanOperationTargetResolver.concreteFileTarget(
-      stringValue(record.targetPath) ?? stringValue(record.path) ?? '',
-      accepted
-    );
-    if (path) {
-      record.targetPath = path;
-      record.path = stringValue(record.path) ?? path;
-    }
-    codeBlocks[index] = record;
-    codeBlockById.set(id, record);
-  }
-
-  const normalizedActions = actions.map((action, index) => {
-    const record = objectRecord(action);
-    if (!record) {
-      reasons.push(`actionBundle.actions[${index}] is not an object and cannot be submitted to Kernel.`);
-      return action;
-    }
-    const next = { ...record };
-    const capability = stringValue(next.capability);
-    const kind = stringValue(next.kind);
-    if (capability === 'fs.delete') {
-      next.kind = kind ?? 'delete';
-      const deleteGrant = acceptedPlanOperationTargetResolver.exactGrantForAction(next, accepted);
-      const target = acceptedPlanOperationTargetResolver.concreteDeleteTarget(
-        actionFileTargetPath(next) ?? '',
-        accepted,
-        deleteGrant
-      );
-      if (!target) {
-        reasons.push(`actionBundle.actions[${index}] fs.delete is missing an executable concrete targetPath/resourceScope.`);
-      } else {
-        next.targetPath = target;
-        next.resourceScope = [target];
-        next.targetRef = objectRecord(next.targetRef) ?? fileTargetRefFromPath(target);
-        const targetResourceKind = deleteActionTargetResourceKind(next) ?? deleteGrant?.targetResourceKind;
-        if (targetResourceKind === 'directory') {
-          next.targetKind = 'directory';
-          next.targetResourceKind = 'directory';
-          next.recursive = deleteActionRecursive(next) || deleteGrant?.recursive === true;
-        }
-      }
-      return next;
-    }
-
-    if (capability !== 'fs.write' && capability !== 'fs.patch') {
-      return next;
-    }
-
-    next.kind = kind ?? (capability === 'fs.patch' ? 'patch' : 'write');
-    const patchLike = ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(String(next.kind));
-    const blockRef = stringValue(next.replacementBlockId) ?? stringValue(next.sourceBlockId);
-    if (!blockRef) {
-      reasons.push(`actionBundle.actions[${index}] ${capability} is missing sourceBlockId/replacementBlockId.`);
-      return next;
-    }
-    const block = codeBlockById.get(blockRef);
-    if (!block) {
-      reasons.push(`actionBundle.actions[${index}] references missing codeBlock "${blockRef}".`);
-      return next;
-    }
-    const target = acceptedPlanOperationTargetResolver.concreteFileTarget(
-      actionFileTargetPath(next) ??
-      stringValue(block.targetPath) ??
-      stringValue(block.path) ??
-      '',
-      accepted
-    );
-    if (!target) {
-      reasons.push(`actionBundle.actions[${index}] ${capability} is missing an executable file targetPath/resourceScope.`);
-      return next;
-    }
-    next.targetPath = target;
-    next.targetRef = objectRecord(next.targetRef) ?? fileTargetRefFromPath(target);
-    const existingScope = stringArrayValue(next.resourceScope)
-      .map((scope) => acceptedPlanOperationTargetResolver.concreteFileTarget(scope, accepted))
-      .filter((scope): scope is string => Boolean(scope));
-    next.resourceScope = existingScope.length ? existingScope : [target];
-    block.targetPath = stringValue(block.targetPath) ?? target;
-    block.path = stringValue(block.path) ?? target;
-    if (patchLike && !stringValue(next.replacementBlockId)) {
-      next.replacementBlockId = blockRef;
-    } else if (!stringValue(next.sourceBlockId)) {
-      next.sourceBlockId = blockRef;
-    }
-    return next;
-  });
-
-  if (reasons.length) return { ok: false, reasons: [...new Set(reasons)] };
-  return {
-    ok: true,
-    reasons: [],
-    batch: {
-      planId,
-      contractId: planReviewGrantProjector.kernelExecutionContractId(plan.planReviewReport),
-      actionBundle: {
-        ...(actionBundle ?? {}),
-        actions: normalizedActions,
-      },
-      codeBlocks,
-      commandBlocks,
-    },
-  };
 }
 
 function canonicalizeAcceptedPlanExecutionAccessScopes(

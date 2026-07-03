@@ -3,10 +3,12 @@ import type { AcceptedPlanAdmission } from '../../accepted-plan/AcceptedPlanAdmi
 import type { ResourcePacket, ResourcePacketItem } from '../../context/types.js';
 import type {
   AcceptedImplementationPlanContext,
+  AcceptedPlanExactOperationGrant,
   AcceptedPlanBatchValidationResult,
   CurrentTaskContext,
   TaskExecutionCursor,
 } from '../../accepted-plan/types.js';
+import type { PlanContext } from '../proposal/planContextIndex.js';
 
 export interface AcceptedPlanReadOnlyResourceCompletion {
   taskId: string;
@@ -30,6 +32,44 @@ export interface AcceptedPlanAccessScopeCanonicalizationResult {
   changed: boolean;
   removedAccessScopes: AcceptedPlanRemovedAccessScope[];
   actionTargets: string[];
+}
+
+export type NormalizedAcceptedPlanKernelBatch =
+  | {
+      ok: true;
+      batch: {
+        planId: string;
+        contractId?: string;
+        actionBundle: Record<string, unknown>;
+        codeBlocks: unknown[];
+        commandBlocks: unknown[];
+      };
+      reasons: [];
+    }
+  | {
+      ok: false;
+      reasons: string[];
+    };
+
+export interface AcceptedPlanExecutorPorts {
+  readActionBundle(proposal: ProposalEnvelope): ActionBundleDraft | undefined;
+  operationTargetResolver: {
+    concreteFileTarget(value: string, accepted?: AcceptedImplementationPlanContext): string | undefined;
+    concreteDeleteTarget(
+      value: string,
+      accepted?: AcceptedImplementationPlanContext,
+      grant?: AcceptedPlanExactOperationGrant
+    ): string | undefined;
+    exactGrantForAction(
+      action: Record<string, unknown>,
+      accepted?: AcceptedImplementationPlanContext
+    ): AcceptedPlanExactOperationGrant | undefined;
+  };
+  actionFileTargetPath(action: Record<string, unknown>): string | undefined;
+  fileTargetRefFromPath(path: string): Record<string, unknown>;
+  deleteActionTargetResourceKind(action: Record<string, unknown>): string | undefined;
+  deleteActionRecursive(action: Record<string, unknown>): boolean;
+  kernelExecutionContractId(report?: Record<string, unknown>): string | undefined;
 }
 
 export type AcceptedPlanActionProposalAssessment =
@@ -56,6 +96,8 @@ export interface AcceptedPlanActionProposalAssessmentInput {
 }
 
 export class AcceptedPlanExecutor {
+  constructor(private readonly ports?: AcceptedPlanExecutorPorts) {}
+
   assessActionProposal(
     input: AcceptedPlanActionProposalAssessmentInput
   ): AcceptedPlanActionProposalAssessment {
@@ -83,6 +125,202 @@ export class AcceptedPlanExecutor {
       kind: 'executable',
       actionBundle,
       scopeCanonicalization: canonicalizeAccessScopes(accepted, proposal),
+    };
+  }
+
+  executionContext(input: {
+    sessionId: string;
+    runId: string;
+    acceptedPlan?: AcceptedImplementationPlanContext;
+    proposal: ProposalEnvelope;
+    planReviewReport: Record<string, unknown>;
+  }): PlanContext {
+    const ports = this.requirePorts();
+    const payload = objectRecord(input.proposal.payload) ?? {};
+    const actionBundle = ports.readActionBundle(input.proposal) ?? {
+      id: input.acceptedPlan?.planId ?? input.proposal.proposalId,
+      version: '1',
+      goal: stringValue(input.acceptedPlan?.summary) ?? 'Accepted implementation plan batch',
+      actions: [],
+      validationExpectations: [],
+      reviewExpectations: [],
+    };
+    return {
+      sessionId: input.sessionId,
+      runId: input.runId,
+      planId: input.acceptedPlan?.planId ?? stringValue(actionBundle.id) ?? input.proposal.proposalId,
+      proposalId: input.proposal.proposalId,
+      userPlan: stringValue(payload.userPlan) ?? stringValue(input.acceptedPlan?.summary) ?? 'Accepted implementation plan batch',
+      actionBundle: actionBundle as unknown as Record<string, unknown>,
+      codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
+      commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
+      expectedValidation: stringValue(payload.expectedValidation) ?? '',
+      reviewGuide: stringValue(payload.reviewGuide) ?? '',
+      planReviewReport: input.planReviewReport,
+      implementationPlan: input.acceptedPlan?.rawPlan,
+    };
+  }
+
+  readOnlyReviewContext(input: {
+    sessionId: string;
+    runId: string;
+    acceptedPlan: AcceptedImplementationPlanContext;
+    packet: ResourcePacket;
+    completion: AcceptedPlanReadOnlyResourceCompletion;
+  }): PlanContext {
+    const targets = input.completion.coveredTargets.join(', ');
+    return {
+      sessionId: input.sessionId,
+      runId: input.runId,
+      planId: input.acceptedPlan.planId,
+      proposalId: `${input.acceptedPlan.planId}:read-only-validation`,
+      userPlan: targets
+        ? `Read-only validation evidence resolved for accepted targets: ${targets}.`
+        : 'Read-only validation evidence resolved for the accepted plan.',
+      actionBundle: {
+        version: '1',
+        id: `${input.acceptedPlan.planId}:read-only-validation`,
+        goal: 'Read-only validation evidence satisfied the accepted task.',
+        actions: [],
+        validationExpectations: [{
+          id: 'read-only-resource-validation',
+          description: `ResourcePacket ${input.packet.id} resolved the read-only evidence required by the accepted task.`,
+        }],
+        reviewExpectations: [{
+          id: 'review-read-only-validation',
+          description: 'Review the resolved resource evidence and accepted-plan checkpoint.',
+        }],
+      },
+      codeBlocks: [],
+      commandBlocks: [],
+      expectedValidation: `ResourcePacket ${input.packet.id} resolved the read-only evidence for the accepted task.`,
+      reviewGuide: 'Review the resolved ResourcePacket evidence and accepted-plan checkpoint.',
+      implementationPlan: input.acceptedPlan.rawPlan,
+    };
+  }
+
+  normalizeKernelBatch(input: {
+    planId: string;
+    plan: PlanContext;
+    acceptedPlan?: AcceptedImplementationPlanContext;
+  }): NormalizedAcceptedPlanKernelBatch {
+    const ports = this.requirePorts();
+    const actionBundle = objectRecord(input.plan.actionBundle);
+    const actions = Array.isArray(actionBundle?.actions) ? actionBundle.actions : [];
+    const codeBlocks = input.plan.codeBlocks.map((block) => objectRecord(block) ? { ...(objectRecord(block) ?? {}) } : block);
+    const commandBlocks = [...input.plan.commandBlocks];
+    const codeBlockById = new Map<string, Record<string, unknown>>();
+    const reasons: string[] = [];
+
+    for (const [index, block] of codeBlocks.entries()) {
+      const record = objectRecord(block);
+      if (!record) continue;
+      const id = stringValue(record.id) ?? stringValue(record.blockId);
+      if (!id) continue;
+      record.id = id;
+      record.blockId = stringValue(record.blockId) ?? id;
+      const path = ports.operationTargetResolver.concreteFileTarget(
+        stringValue(record.targetPath) ?? stringValue(record.path) ?? '',
+        input.acceptedPlan
+      );
+      if (path) {
+        record.targetPath = path;
+        record.path = stringValue(record.path) ?? path;
+      }
+      codeBlocks[index] = record;
+      codeBlockById.set(id, record);
+    }
+
+    const normalizedActions = actions.map((action, index) => {
+      const record = objectRecord(action);
+      if (!record) {
+        reasons.push(`actionBundle.actions[${index}] is not an object and cannot be submitted to Kernel.`);
+        return action;
+      }
+      const next = { ...record };
+      const capability = stringValue(next.capability);
+      const kind = stringValue(next.kind);
+      if (capability === 'fs.delete') {
+        next.kind = kind ?? 'delete';
+        const deleteGrant = ports.operationTargetResolver.exactGrantForAction(next, input.acceptedPlan);
+        const target = ports.operationTargetResolver.concreteDeleteTarget(
+          ports.actionFileTargetPath(next) ?? '',
+          input.acceptedPlan,
+          deleteGrant
+        );
+        if (!target) {
+          reasons.push(`actionBundle.actions[${index}] fs.delete is missing an executable concrete targetPath/resourceScope.`);
+        } else {
+          next.targetPath = target;
+          next.resourceScope = [target];
+          next.targetRef = objectRecord(next.targetRef) ?? ports.fileTargetRefFromPath(target);
+          const targetResourceKind = ports.deleteActionTargetResourceKind(next) ?? deleteGrant?.targetResourceKind;
+          if (targetResourceKind === 'directory') {
+            next.targetKind = 'directory';
+            next.targetResourceKind = 'directory';
+            next.recursive = ports.deleteActionRecursive(next) || deleteGrant?.recursive === true;
+          }
+        }
+        return next;
+      }
+
+      if (capability !== 'fs.write' && capability !== 'fs.patch') {
+        return next;
+      }
+
+      next.kind = kind ?? (capability === 'fs.patch' ? 'patch' : 'write');
+      const patchLike = ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(String(next.kind));
+      const blockRef = stringValue(next.replacementBlockId) ?? stringValue(next.sourceBlockId);
+      if (!blockRef) {
+        reasons.push(`actionBundle.actions[${index}] ${capability} is missing sourceBlockId/replacementBlockId.`);
+        return next;
+      }
+      const block = codeBlockById.get(blockRef);
+      if (!block) {
+        reasons.push(`actionBundle.actions[${index}] references missing codeBlock "${blockRef}".`);
+        return next;
+      }
+      const target = ports.operationTargetResolver.concreteFileTarget(
+        ports.actionFileTargetPath(next) ??
+        stringValue(block.targetPath) ??
+        stringValue(block.path) ??
+        '',
+        input.acceptedPlan
+      );
+      if (!target) {
+        reasons.push(`actionBundle.actions[${index}] ${capability} is missing an executable file targetPath/resourceScope.`);
+        return next;
+      }
+      next.targetPath = target;
+      next.targetRef = objectRecord(next.targetRef) ?? ports.fileTargetRefFromPath(target);
+      const existingScope = stringArrayValue(next.resourceScope)
+        .map((scope) => ports.operationTargetResolver.concreteFileTarget(scope, input.acceptedPlan))
+        .filter((scope): scope is string => Boolean(scope));
+      next.resourceScope = existingScope.length ? existingScope : [target];
+      block.targetPath = stringValue(block.targetPath) ?? target;
+      block.path = stringValue(block.path) ?? target;
+      if (patchLike && !stringValue(next.replacementBlockId)) {
+        next.replacementBlockId = blockRef;
+      } else if (!stringValue(next.sourceBlockId)) {
+        next.sourceBlockId = blockRef;
+      }
+      return next;
+    });
+
+    if (reasons.length) return { ok: false, reasons: [...new Set(reasons)] };
+    return {
+      ok: true,
+      reasons: [],
+      batch: {
+        planId: input.planId,
+        contractId: ports.kernelExecutionContractId(input.plan.planReviewReport),
+        actionBundle: {
+          ...(actionBundle ?? {}),
+          actions: normalizedActions,
+        },
+        codeBlocks,
+        commandBlocks,
+      },
     };
   }
 
@@ -183,6 +421,13 @@ export class AcceptedPlanExecutor {
       reason: 'Accepted-plan read-only actionBundle normalized to ResourceResolve by Session.',
       items,
     };
+  }
+
+  private requirePorts(): AcceptedPlanExecutorPorts {
+    if (!this.ports) {
+      throw new Error('AcceptedPlanExecutor requires ports for execution context and kernel batch normalization.');
+    }
+    return this.ports;
   }
 }
 
