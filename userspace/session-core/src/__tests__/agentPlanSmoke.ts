@@ -54,6 +54,7 @@ import {
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
   ImplementationBatchContextBuilder,
+  KernelEventStatusIndex,
 } from '../driver/execution/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
@@ -82,6 +83,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanScopeCoverageMatchesStructuredScopes();
   assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask();
   assertAcceptedPlanOperationTargetResolverFindsExactGrant();
+  assertKernelEventStatusIndexReadsStructuredEvents();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
@@ -1061,6 +1063,36 @@ function assertAcceptedPlanOperationTargetResolverFindsExactGrant(): void {
     fileTarget,
     'operation target resolver normalizes file target'
   );
+}
+
+function assertKernelEventStatusIndexReadsStructuredEvents(): void {
+  const token = randomSmokeToken('kernel-status');
+  const workUnitId = `work-unit-${token}`;
+  const permissionId = `permission-${token}`;
+  const runId = `run-${token}`;
+  const index = new KernelEventStatusIndex();
+  const events = [
+    {
+      kind: 'work_unit.queued',
+      runId,
+      workUnit: { id: workUnitId },
+    },
+    {
+      kind: 'permission.requested',
+      runId,
+      request: { id: permissionId },
+    },
+    {
+      kind: 'stage.changed',
+      runId,
+      phase: 'blocked',
+    },
+  ];
+  assert(index.workUnitIds(events).includes(workUnitId), 'kernel event status index reads work unit ids');
+  assert(index.hasPermissionRequest(events), 'kernel event status index detects permission request');
+  assertEqual(index.permissionId(events), permissionId, 'kernel event status index reads permission id');
+  assertEqual(index.runId(events), runId, 'kernel event status index reads run id');
+  assert(index.hasFailureOrBlocker(events), 'kernel event status index detects blocker status');
 }
 
 function assertReviewAssemblerFormatsReviewFacts(): void {

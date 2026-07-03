@@ -32,6 +32,7 @@ import {
   AcceptedImplementationPlanContextBuilder,
   ExecutionPromptCoordinator,
   ImplementationBatchContextBuilder,
+  KernelEventStatusIndex,
   ReviewFactsAggregator,
   type AcceptedImplementationPlanContext,
   type AcceptedImplementationPlanExecutionRoot,
@@ -331,6 +332,7 @@ const planProjectionBuilder = new PlanProjectionBuilder({
 });
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
+const kernelEventStatusIndex = new KernelEventStatusIndex();
 const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();
 const acceptedPlanScopeCoverage = new AcceptedPlanScopeCoverage({
   taskTargets: (task) => acceptedPlanTargetParser.taskTargets(task),
@@ -1430,7 +1432,7 @@ export class SessionDriverLoop {
           kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed without execution facts')
         );
       }
-      if (actionBatchHasFailureOrBlocker(batchEvents)) {
+      if (kernelEventStatusIndex.hasFailureOrBlocker(batchEvents)) {
         return this.append(input.sessionId, planActionBundleExecutionFailureEvents(
           input.sessionId,
           plan,
@@ -1441,8 +1443,8 @@ export class SessionDriverLoop {
         )) ?? result;
       }
       if (!actionBatchReadyForReview(batchEvents)) {
-        if (kernelEventsContainPermissionRequest(batchEvents)) {
-          const permissionId = permissionIdFromKernelEvents(batchEvents);
+        if (kernelEventStatusIndex.hasPermissionRequest(batchEvents)) {
+          const permissionId = kernelEventStatusIndex.permissionId(batchEvents);
           return this.append(input.sessionId, [
             sessionRunStateEvent({
               sessionId: input.sessionId,
@@ -1602,7 +1604,7 @@ export class SessionDriverLoop {
     });
     let result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
     if (input.decision === 'reject') {
-      const runId = pending.runId ?? input.runId ?? runIdFromKernelEvents(decisionReply.events ?? []) ?? 'run-unknown';
+      const runId = pending.runId ?? input.runId ?? kernelEventStatusIndex.runId(decisionReply.events ?? []) ?? 'run-unknown';
       return this.append(input.sessionId, [
         sessionRunStateEvent({
           sessionId: input.sessionId,
@@ -1623,9 +1625,9 @@ export class SessionDriverLoop {
       ]) ?? result;
     }
     if (!actionBatchReadyForReview(decisionReply.events ?? [])) {
-      if (kernelEventsContainPermissionRequest(decisionReply.events ?? [])) {
-        const runId = pending.runId ?? input.runId ?? runIdFromKernelEvents(decisionReply.events ?? []) ?? 'run-unknown';
-        const permissionId = permissionIdFromKernelEvents(decisionReply.events ?? []);
+      if (kernelEventStatusIndex.hasPermissionRequest(decisionReply.events ?? [])) {
+        const runId = pending.runId ?? input.runId ?? kernelEventStatusIndex.runId(decisionReply.events ?? []) ?? 'run-unknown';
+        const permissionId = kernelEventStatusIndex.permissionId(decisionReply.events ?? []);
         return this.append(input.sessionId, [
           sessionRunStateEvent({
             sessionId: input.sessionId,
@@ -1647,7 +1649,7 @@ export class SessionDriverLoop {
       return result;
     }
 
-    const runId = pending.runId ?? input.runId ?? runIdFromKernelEvents(decisionReply.events ?? []);
+    const runId = pending.runId ?? input.runId ?? kernelEventStatusIndex.runId(decisionReply.events ?? []);
     if (!runId) return result;
     const plan = findPlanCard(result.events, runId, pending.planId);
     if (!plan) return result;
@@ -3722,7 +3724,7 @@ export class SessionDriverLoop {
     await this.emitKernelActivityDeltas(state, batchReply.events ?? [], 'accepted_plan.action_batch_submit');
     result = await this.appendProjectedKernelEvents(state.sessionId, batchReply) ?? result;
     const batchEvents = batchReply.events ?? [];
-    if (actionBatchHasFailureOrBlocker(batchEvents)) {
+    if (kernelEventStatusIndex.hasFailureOrBlocker(batchEvents)) {
       return this.append(state.sessionId, acceptedPlanExecutionFailureEvents(
         state.sessionId,
         state.runId,
@@ -3747,8 +3749,8 @@ export class SessionDriverLoop {
       ]) ?? result;
     }
     if (!actionBatchReadyForReview(batchReply.events ?? [])) {
-      if (kernelEventsContainPermissionRequest(batchReply.events ?? [])) {
-        const permissionId = permissionIdFromKernelEvents(batchReply.events ?? []);
+      if (kernelEventStatusIndex.hasPermissionRequest(batchReply.events ?? [])) {
+        const permissionId = kernelEventStatusIndex.permissionId(batchReply.events ?? []);
         return this.append(state.sessionId, [
           sessionRunStateEvent({
             sessionId: state.sessionId,
@@ -3799,7 +3801,7 @@ export class SessionDriverLoop {
     ]) ?? result;
     if (state.taskExecutionCursor) state.taskExecutionCursor.lastSavepointId = savepointId;
 
-    if (!actionBatchHasFailureOrBlocker(batchReply.events ?? []) && !acceptedPlanComplete(nextAccepted)) {
+    if (!kernelEventStatusIndex.hasFailureOrBlocker(batchReply.events ?? []) && !acceptedPlanComplete(nextAccepted)) {
       return this.runUserTurn({
         sessionId: input.sessionId,
         content: implementationPlanExecutionRequest(
@@ -4913,7 +4915,7 @@ function acceptedPlanTaskSavepointEvent(
   ts: string,
   id: string
 ): AgentEvent {
-  const complete = progress.remainingTaskIds.length === 0 && !actionBatchHasFailureOrBlocker(kernelEvents);
+  const complete = progress.remainingTaskIds.length === 0 && !kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents);
   const ledger = buildAcceptedPlanTaskLedger(nextAccepted);
   const promptFrame = buildAcceptedPlanPromptFrameForContext(nextAccepted, ledger);
   return {
@@ -6564,8 +6566,8 @@ function acceptedPlanBatchProgress(
 ): AcceptedPlanBatchProgress {
   return new AcceptedPlanProgressAggregator({
     scopeMatcher: new AcceptedPlanScopeMatcher(),
-    workUnitIdsFromKernelEvents,
-    actionBatchHasFailureOrBlocker,
+    workUnitIdsFromKernelEvents: (events) => kernelEventStatusIndex.workUnitIds(events),
+    actionBatchHasFailureOrBlocker: (events) => kernelEventStatusIndex.hasFailureOrBlocker(events),
   }).progress(accepted, proposal, kernelEvents);
 }
 
@@ -6615,18 +6617,6 @@ function acceptedPlanComplete(accepted: AcceptedImplementationPlanContext): bool
   if (!accepted.tasks.length) return true;
   const completed = new Set(accepted.completedTaskIds);
   return accepted.tasks.every((task) => completed.has(task.taskId));
-}
-
-function workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[] {
-  const ids = new Set<string>();
-  for (const event of kernelEvents) {
-    const record = objectRecord(event);
-    if (!record) continue;
-    const workUnit = objectRecord(record.workUnit);
-    const id = stringValue(record.workUnitId) ?? stringValue(workUnit?.id);
-    if (id) ids.add(id);
-  }
-  return [...ids];
 }
 
 function normalizePlanScope(value: string): string {
@@ -6848,7 +6838,7 @@ function acceptedPlanBatchCheckpointEvent(
   ts: string,
   id: string
 ): AgentEvent {
-  const failedOrBlocked = actionBatchHasFailureOrBlocker(kernelEvents);
+  const failedOrBlocked = kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents);
   const complete = !failedOrBlocked && progress.remainingTaskIds.length === 0;
   const ledger = buildTaskLedgerSnapshot({
     planId: accepted.planId,
@@ -7518,7 +7508,7 @@ function reviewSummaryEvent(
 }
 
 function actionBatchReadyForReview(kernelEvents: unknown[]): boolean {
-  if (kernelEventsContainPermissionRequest(kernelEvents)) {
+  if (kernelEventStatusIndex.hasPermissionRequest(kernelEvents)) {
     return false;
   }
   if (kernelEvents.some((event) => {
@@ -7545,39 +7535,6 @@ function actionBatchReadyForReview(kernelEvents: unknown[]): boolean {
     }
   }
   return queued.size > 0 && [...queued].every((id) => terminal.has(id));
-}
-
-function actionBatchHasFailureOrBlocker(kernelEvents: unknown[]): boolean {
-  return kernelEvents.some((event) => {
-    const record = objectRecord(event);
-    return record?.kind === 'work_unit.failed' ||
-      record?.kind === 'work_unit.blocked' ||
-      (record?.kind === 'stage.changed' && ['blocked', 'failed'].includes(stringValue(record.phase) ?? ''));
-  });
-}
-
-function kernelEventsContainPermissionRequest(kernelEvents: unknown[]): boolean {
-  return kernelEvents.some((event) => objectRecord(event)?.kind === 'permission.requested');
-}
-
-function permissionIdFromKernelEvents(kernelEvents: unknown[]): string | undefined {
-  for (const event of kernelEvents) {
-    const record = objectRecord(event);
-    if (record?.kind !== 'permission.requested') continue;
-    const request = objectRecord(record.request);
-    const id = stringValue(request?.id) ?? stringValue(record.permissionId) ?? stringValue(record.toolCallId);
-    if (id) return id;
-  }
-  return undefined;
-}
-
-function runIdFromKernelEvents(kernelEvents: unknown[]): string | undefined {
-  for (const event of kernelEvents) {
-    const record = objectRecord(event);
-    const runId = stringValue(record?.runId);
-    if (runId) return runId;
-  }
-  return undefined;
 }
 
 function arrayLength(value: unknown): number {
