@@ -7634,40 +7634,11 @@ type DriverInteraction =
   | { kind: 'requirement'; runId: string; requirementId: string };
 
 function findActiveDriverInteraction(events: AgentEvent[]): DriverInteraction | null {
-  const review = findLatestActiveReviewInteraction(events);
+  const review = reviewAssembler().findLatestActiveReviewInteraction(events);
   if (review) return review;
   const plan = findLatestActivePlanInteraction(events);
   if (plan) return plan;
   return findLatestActiveRequirementInteraction(events);
-}
-
-function findLatestActiveReviewInteraction(events: AgentEvent[]): DriverInteraction | null {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event.kind !== 'review_summary') continue;
-    const payload = objectRecord(event.payload);
-    if (!payload || stringValue(payload.status) !== 'waitingUserReview') continue;
-    if (hasLaterTerminalInteraction(events, index)) continue;
-    const runId = stringValue(payload.runId);
-    if (!runId) continue;
-    const review: SessionReviewContext = {
-      sessionId: event.sessionId,
-      runId,
-      reviewId: stringValue(payload.reviewId) ?? runId,
-      sourcePlanId: stringValue(payload.sourcePlanId),
-      summary: stringValue(payload.summary) ?? '',
-      content: stringValue(payload.content) ?? '',
-      userPlan: stringValue(payload.userPlan) ?? '',
-      continuations: Array.isArray(payload.continuations) ? payload.continuations : [],
-      reviewExpectations: Array.isArray(payload.reviewExpectations) ? payload.reviewExpectations : [],
-      expectedValidation: stringValue(payload.expectedValidation) ?? '',
-      reviewGuide: stringValue(payload.reviewGuide) ?? '',
-      facts: Array.isArray(payload.facts) ? payload.facts.filter((item): item is string => typeof item === 'string') : [],
-    };
-    if (reviewAssembler().reviewAlreadyResolved(events, review)) continue;
-    return { kind: 'review', runId };
-  }
-  return null;
 }
 
 function findLatestActivePlanInteraction(events: AgentEvent[]): DriverInteraction | null {

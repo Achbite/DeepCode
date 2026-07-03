@@ -41,6 +41,11 @@ export interface ReviewContextRef {
 }
 
 export interface ReviewActiveInteractionRef {
+  kind: 'review';
+  runId: string;
+}
+
+export interface ReviewInteractionCandidateRef {
   kind: string;
   runId?: string;
 }
@@ -271,7 +276,7 @@ export class ReviewAssembler {
   findWaitingReview(
     events: Array<{ sessionId?: string; kind?: unknown; payload?: unknown }>,
     runId: string | undefined,
-    active: ReviewActiveInteractionRef | null | undefined
+    active: ReviewInteractionCandidateRef | null | undefined
   ): SessionReviewContext | null {
     if (!active || active.kind !== 'review' || (runId && active.runId !== runId)) {
       return null;
@@ -296,6 +301,37 @@ export class ReviewAssembler {
         reviewGuide: stringValue(payload.reviewGuide) ?? '',
         facts: Array.isArray(payload.facts) ? payload.facts.filter((item): item is string => typeof item === 'string') : [],
       };
+    }
+    return null;
+  }
+
+  findLatestActiveReviewInteraction(
+    events: Array<{ sessionId?: string; kind?: unknown; payload?: unknown }>
+  ): ReviewActiveInteractionRef | null {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+      if (event.kind !== 'review_summary') continue;
+      const payload = objectRecord(event.payload);
+      if (!payload || stringValue(payload.status) !== 'waitingUserReview') continue;
+      if (this.hasLaterTerminalInteraction(events, index)) continue;
+      const runId = stringValue(payload.runId);
+      if (!runId) continue;
+      const review: SessionReviewContext = {
+        sessionId: stringValue(event.sessionId) ?? '',
+        runId,
+        reviewId: stringValue(payload.reviewId) ?? runId,
+        sourcePlanId: stringValue(payload.sourcePlanId),
+        summary: stringValue(payload.summary) ?? '',
+        content: stringValue(payload.content) ?? '',
+        userPlan: stringValue(payload.userPlan) ?? '',
+        continuations: Array.isArray(payload.continuations) ? payload.continuations : [],
+        reviewExpectations: Array.isArray(payload.reviewExpectations) ? payload.reviewExpectations : [],
+        expectedValidation: stringValue(payload.expectedValidation) ?? '',
+        reviewGuide: stringValue(payload.reviewGuide) ?? '',
+        facts: Array.isArray(payload.facts) ? payload.facts.filter((item): item is string => typeof item === 'string') : [],
+      };
+      if (this.reviewAlreadyResolved(events, review)) continue;
+      return { kind: 'review', runId };
     }
     return null;
   }
@@ -354,6 +390,26 @@ export class ReviewAssembler {
   continuationSummary(value: unknown): string {
     const record = objectRecord(value);
     return stringValue(record?.title) ?? stringValue(record?.description) ?? stringValue(record?.id) ?? clipJson(value, 160);
+  }
+
+  private hasLaterTerminalInteraction(
+    events: Array<{ kind?: unknown; payload?: unknown }>,
+    index: number
+  ): boolean {
+    for (let nextIndex = index + 1; nextIndex < events.length; nextIndex += 1) {
+      const event = events[nextIndex];
+      if (
+        event.kind !== 'requirement_decision' &&
+        event.kind !== 'plan_review' &&
+        event.kind !== 'review_summary'
+      ) {
+        continue;
+      }
+      const payload = objectRecord(event.payload);
+      const status = stringValue(payload?.status);
+      if (status === 'accepted' || status === 'rejected' || status === 'needsRevision') return true;
+    }
+    return false;
   }
 }
 

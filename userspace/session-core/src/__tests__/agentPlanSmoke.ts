@@ -1224,6 +1224,27 @@ function assertReviewAssemblerFindsWaitingReviewContext(): void {
     'review assembler exposes continuation summaries'
   );
   assertEqual(
+    assembler.findLatestActiveReviewInteraction(events)?.runId,
+    runId,
+    'review assembler finds active review interaction'
+  );
+  assertEqual(
+    assembler.findLatestActiveReviewInteraction([
+      ...events,
+      {
+        sessionId,
+        kind: 'review_summary',
+        payload: {
+          status: 'accepted',
+          runId,
+          reviewId,
+        },
+      },
+    ]),
+    null,
+    'review assembler ignores resolved active review interaction'
+  );
+  assertEqual(
     assembler.findWaitingReview(events, `other-${token}`, { kind: 'review', runId: `other-${token}` }),
     null,
     'review assembler rejects run mismatch'
