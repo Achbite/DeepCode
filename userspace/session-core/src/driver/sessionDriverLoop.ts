@@ -17,7 +17,6 @@ import {
   AcceptedPlanBatchPreflight,
   AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
-  AcceptedPlanProgressAggregator,
   AcceptedPlanOperationTargetResolver,
   AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionOverlay,
@@ -38,7 +37,6 @@ import {
   type AcceptedImplementationPlanExecutionRoot,
   type AcceptedPlanAccessScope,
   type AcceptedPlanBatchValidationResult,
-  type AcceptedPlanBatchProgress,
   type AcceptedPlanExactOperationGrant,
   type CurrentTaskContext,
   type ExecutionSliceRole,
@@ -352,8 +350,8 @@ const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, 
     ? acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
     : undefined,
   acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
-    acceptedPlanBatchProgress(acceptedPlan, planContextIndex.proposalEnvelope(plan), kernelEvents).completedTaskIds,
-  acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanAfterBatch(acceptedPlan, completedTaskIds),
+    acceptedPlanTaskLedger().batchProgress({ acceptedPlan, proposal: planContextIndex.proposalEnvelope(plan), kernelEvents }).completedTaskIds,
+  acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(acceptedPlan, completedTaskIds),
   acceptedPlanTaskLedger: (acceptedPlan) => buildAcceptedPlanTaskLedger(acceptedPlan),
   buildReviewFactsContext: (input) => buildReviewFactsContext(input),
 });
@@ -1019,7 +1017,7 @@ export class SessionDriverLoop {
     }
 
     const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, current.events);
-    const acceptedPlan = acceptedPlanWithLatestCheckpoint(
+    const acceptedPlan = acceptedPlanTaskLedger().withLatestCheckpoint(
       acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: input.interventionLevel, executionRoot }),
       current.events
     );
@@ -1171,7 +1169,7 @@ export class SessionDriverLoop {
       return undefined;
     }
     const mergedCompletedTaskIds = [...accepted.completedTaskIds, ...newlyCompleted];
-    const nextAccepted = acceptedPlanAfterBatch(accepted, mergedCompletedTaskIds);
+    const nextAccepted = acceptedPlanTaskLedger().afterBatch(accepted, mergedCompletedTaskIds);
     const remainingTaskIds = accepted.tasks
       .map((task) => task.taskId)
       .filter((id) => !mergedCompletedTaskIds.includes(id));
@@ -1238,7 +1236,7 @@ export class SessionDriverLoop {
       ?? (runId ? planContextIndex.latestExecutablePlan(events, runId) : null);
     if (!plan || !plan.implementationPlan) return undefined;
     const base = acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot });
-    return acceptedPlanWithLatestCheckpoint(base, events);
+    return acceptedPlanTaskLedger().withLatestCheckpoint(base, events);
   }
 
   private async resolveAcceptedPlanExecutionRequirementDecision(
@@ -1559,8 +1557,8 @@ export class SessionDriverLoop {
       }
       if (acceptedOverlay) {
         const progressProposal = planContextIndex.proposalEnvelope(plan);
-        const progress = acceptedPlanBatchProgress(acceptedOverlay.acceptedPlan, progressProposal, batchEvents);
-        const nextAccepted = acceptedPlanAfterBatch(acceptedOverlay.acceptedPlan, progress.completedTaskIds);
+        const progress = acceptedPlanTaskLedger().batchProgress({ acceptedPlan: acceptedOverlay.acceptedPlan, proposal: progressProposal, kernelEvents: batchEvents });
+        const nextAccepted = acceptedPlanTaskLedger().afterBatch(acceptedOverlay.acceptedPlan, progress.completedTaskIds);
         const cursor = buildTaskExecutionCursor(acceptedOverlay.acceptedPlan, resourceRequestLoop.recentPackets(result.events));
         const context = buildCurrentTaskContext(acceptedOverlay.acceptedPlan, cursor);
         const savepointId = this.id('accepted-plan-overlay-task-savepoint');
@@ -1588,7 +1586,7 @@ export class SessionDriverLoop {
             savepointId
           ),
         ]) ?? result;
-        if (!acceptedPlanComplete(nextAccepted)) {
+        if (!acceptedPlanTaskLedger().complete(nextAccepted)) {
           return this.runUserTurn({
             sessionId: input.sessionId,
             content: executionPromptCoordinator().executionRequest(acceptedOverlay.plan, nextAccepted),
@@ -2344,7 +2342,7 @@ export class SessionDriverLoop {
     );
     if (!completion.ok) return null;
 
-    const nextAccepted = acceptedPlanAfterBatch(accepted, completion.completedTaskIds);
+    const nextAccepted = acceptedPlanTaskLedger().afterBatch(accepted, completion.completedTaskIds);
     const checkpoint = sessionProgressProjectionBuilder.acceptedPlanResourceValidationCheckpointEvent(
       state.sessionId,
       state.runId,
@@ -2356,7 +2354,7 @@ export class SessionDriverLoop {
     );
     let result = await this.append(state.sessionId, [checkpoint]) ?? fallback;
 
-    if (!acceptedPlanComplete(nextAccepted)) {
+    if (!acceptedPlanTaskLedger().complete(nextAccepted)) {
       return this.runUserTurn({
         sessionId: input.sessionId,
         content: executionPromptCoordinator().executionRequest(
@@ -3914,8 +3912,8 @@ export class SessionDriverLoop {
       }
       return result;
     }
-    const batchProgress = acceptedPlanBatchProgress(accepted, executionProposal, batchReply.events ?? []);
-    const nextAccepted = acceptedPlanAfterBatch(accepted, batchProgress.completedTaskIds);
+    const batchProgress = acceptedPlanTaskLedger().batchProgress({ acceptedPlan: accepted, proposal: executionProposal, kernelEvents: batchReply.events ?? [] });
+    const nextAccepted = acceptedPlanTaskLedger().afterBatch(accepted, batchProgress.completedTaskIds);
     refreshTaskExecutionState(state);
     const savepointId = this.id('accepted-plan-task-savepoint');
     result = await this.append(state.sessionId, [
@@ -3944,7 +3942,7 @@ export class SessionDriverLoop {
     ]) ?? result;
     if (state.taskExecutionCursor) state.taskExecutionCursor.lastSavepointId = savepointId;
 
-    if (!kernelEventStatusIndex.hasFailureOrBlocker(batchReply.events ?? []) && !acceptedPlanComplete(nextAccepted)) {
+    if (!kernelEventStatusIndex.hasFailureOrBlocker(batchReply.events ?? []) && !acceptedPlanTaskLedger().complete(nextAccepted)) {
       return this.runUserTurn({
         sessionId: input.sessionId,
         content: executionPromptCoordinator().executionRequest(
@@ -4901,7 +4899,10 @@ function acceptedPlanAdmission(): AcceptedPlanAdmission {
 }
 
 function acceptedPlanTaskLedger(): AcceptedPlanTaskLedgerCoordinator {
-  return new AcceptedPlanTaskLedgerCoordinator();
+  return new AcceptedPlanTaskLedgerCoordinator({
+    workUnitIdsFromKernelEvents: (events) => kernelEventStatusIndex.workUnitIds(events),
+    actionBatchHasFailureOrBlocker: (events) => kernelEventStatusIndex.hasFailureOrBlocker(events),
+  });
 }
 
 function acceptedPlanScopeIntervention(createId: (prefix: string) => string): AcceptedPlanScopeIntervention {
@@ -5573,13 +5574,13 @@ function recoverAcceptedPlanFromOverlay(
     ?? planContextIndex.findPlanCard(events, undefined, planId);
   if (!plan?.implementationPlan) return undefined;
   const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, events);
-  let acceptedPlan = acceptedPlanWithLatestCheckpoint(
+  let acceptedPlan = acceptedPlanTaskLedger().withLatestCheckpoint(
     acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: input.interventionLevel, executionRoot }),
     events
   );
   const overlayCompletedTaskIds = overlay.acceptedCompletedTaskIds ?? [];
   if (overlayCompletedTaskIds.length) {
-    acceptedPlan = acceptedPlanAfterBatch(acceptedPlan, [
+    acceptedPlan = acceptedPlanTaskLedger().afterBatch(acceptedPlan, [
       ...new Set([...acceptedPlan.completedTaskIds, ...overlayCompletedTaskIds]),
     ]);
   }
@@ -5973,42 +5974,6 @@ function actionDeclaresOverwritePlan(action: ActionBundleDraft['actions'][number
   return toolArgs?.overwrite === true || toolArgs?.overwritePlan === true || toolArgs?.confirmedOverwrite === true;
 }
 
-function acceptedPlanBatchProgress(
-  accepted: AcceptedImplementationPlanContext,
-  proposal: ProposalEnvelope,
-  kernelEvents: unknown[]
-): AcceptedPlanBatchProgress {
-  return new AcceptedPlanProgressAggregator({
-    scopeMatcher: new AcceptedPlanScopeMatcher(),
-    workUnitIdsFromKernelEvents: (events) => kernelEventStatusIndex.workUnitIds(events),
-    actionBatchHasFailureOrBlocker: (events) => kernelEventStatusIndex.hasFailureOrBlocker(events),
-  }).progress(accepted, proposal, kernelEvents);
-}
-
-function acceptedPlanAfterBatch(
-  accepted: AcceptedImplementationPlanContext,
-  completedTaskIds: string[]
-): AcceptedImplementationPlanContext {
-  return acceptedPlanTaskLedger().withCompleted(accepted, completedTaskIds) ?? accepted;
-}
-
-function acceptedPlanWithLatestCheckpoint(
-  accepted: AcceptedImplementationPlanContext,
-  events: AgentEvent[]
-): AcceptedImplementationPlanContext {
-  for (const event of [...events].reverse()) {
-    if (event.kind !== 'workflow_stage') continue;
-    const payload = objectRecord(event.payload);
-    if (!payload) continue;
-    if (stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
-    if (stringValue(payload.runId) !== accepted.runId || stringValue(payload.planId) !== accepted.planId) continue;
-    const completedTaskIds = stringArrayValue(payload.completedTaskIds);
-    if (!completedTaskIds.length) return accepted;
-    return acceptedPlanAfterBatch(accepted, completedTaskIds);
-  }
-  return accepted;
-}
-
 function looksLikeResourcePath(value: string): boolean {
   if (!value || value.includes(' ') || value.includes('\n')) return false;
   return value.includes('/') || /\.[A-Za-z0-9]+$/.test(value);
@@ -6025,12 +5990,6 @@ function recordArray(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value)
     ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
     : [];
-}
-
-function acceptedPlanComplete(accepted: AcceptedImplementationPlanContext): boolean {
-  if (!accepted.tasks.length) return true;
-  const completed = new Set(accepted.completedTaskIds);
-  return accepted.tasks.every((task) => completed.has(task.taskId));
 }
 
 function normalizePlanScope(value: string): string {

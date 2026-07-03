@@ -1,6 +1,10 @@
 import type { AgentEvent } from '@deepcode/protocol';
+import type { ProposalEnvelope } from '../../agent-plan/types.js';
+import { AcceptedPlanProgressAggregator } from '../../accepted-plan/AcceptedPlanProgressAggregator.js';
+import { AcceptedPlanScopeMatcher } from '../../accepted-plan/AcceptedPlanScopeMatcher.js';
 import { AcceptedTaskRegistry } from '../../accepted-plan/AcceptedTaskRegistry.js';
 import type {
+  AcceptedPlanBatchProgress,
   AcceptedImplementationPlanContext,
   CurrentTaskContext,
   TaskExecutionCursor,
@@ -18,7 +22,14 @@ export interface AcceptedPlanTaskRuntimeSnapshot {
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
 }
 
+export interface AcceptedPlanTaskLedgerCoordinatorPorts {
+  workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[];
+  actionBatchHasFailureOrBlocker(kernelEvents: unknown[]): boolean;
+}
+
 export class AcceptedPlanTaskLedgerCoordinator {
+  constructor(private readonly ports?: AcceptedPlanTaskLedgerCoordinatorPorts) {}
+
   runtimeSnapshot(input: {
     acceptedPlan?: AcceptedImplementationPlanContext;
     resourcePackets: ResourcePacket[];
@@ -90,6 +101,51 @@ export class AcceptedPlanTaskLedgerCoordinator {
     return new AcceptedTaskRegistry(acceptedPlan).withCompleted(completedTaskIds);
   }
 
+  batchProgress(input: {
+    acceptedPlan: AcceptedImplementationPlanContext;
+    proposal: ProposalEnvelope;
+    kernelEvents: unknown[];
+  }): AcceptedPlanBatchProgress {
+    if (!this.ports) {
+      throw new Error('AcceptedPlanTaskLedgerCoordinator batchProgress requires kernel event ports.');
+    }
+    return new AcceptedPlanProgressAggregator({
+      scopeMatcher: new AcceptedPlanScopeMatcher(),
+      workUnitIdsFromKernelEvents: this.ports.workUnitIdsFromKernelEvents,
+      actionBatchHasFailureOrBlocker: this.ports.actionBatchHasFailureOrBlocker,
+    }).progress(input.acceptedPlan, input.proposal, input.kernelEvents);
+  }
+
+  afterBatch(
+    acceptedPlan: AcceptedImplementationPlanContext,
+    completedTaskIds: string[]
+  ): AcceptedImplementationPlanContext {
+    return this.withCompleted(acceptedPlan, completedTaskIds) ?? acceptedPlan;
+  }
+
+  withLatestCheckpoint(
+    acceptedPlan: AcceptedImplementationPlanContext,
+    events: AgentEvent[]
+  ): AcceptedImplementationPlanContext {
+    for (const event of [...events].reverse()) {
+      if (event.kind !== 'workflow_stage') continue;
+      const payload = objectRecord(event.payload);
+      if (!payload) continue;
+      if (stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
+      if (stringValue(payload.runId) !== acceptedPlan.runId || stringValue(payload.planId) !== acceptedPlan.planId) continue;
+      const completedTaskIds = stringArrayValue(payload.completedTaskIds);
+      if (!completedTaskIds.length) return acceptedPlan;
+      return this.afterBatch(acceptedPlan, completedTaskIds);
+    }
+    return acceptedPlan;
+  }
+
+  complete(acceptedPlan: AcceptedImplementationPlanContext): boolean {
+    if (!acceptedPlan.tasks.length) return true;
+    const completed = new Set(acceptedPlan.completedTaskIds);
+    return acceptedPlan.tasks.every((task) => completed.has(task.taskId));
+  }
+
   lastSavepointId(events: AgentEvent[]): string | undefined {
     for (const event of [...events].reverse()) {
       if (event.kind !== 'workflow_stage') continue;
@@ -109,4 +165,14 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    const single = stringValue(value);
+    return single ? [single] : [];
+  }
+  return value
+    .map((item) => stringValue(item))
+    .filter((item): item is string => Boolean(item));
 }

@@ -51,6 +51,7 @@ import {
   AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionOverlay,
   AcceptedPlanTargetParser,
+  AcceptedPlanTaskLedgerCoordinator,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
   ImplementationBatchContextBuilder,
@@ -3808,13 +3809,16 @@ function assertPromptEnvelope(): void {
 function assertRunStateMachineTaskLedger(): void {
   const suffix = randomSmokeToken('ledger');
   const taskIds = Array.from({ length: 5 }, (_item, index) => `task-${suffix}-${index + 1}`);
+  const runId = `run-${suffix}`;
+  const planId = `plan-${suffix}`;
+  const targets = taskIds.map((_taskId, index) => `generated-${suffix}-${index + 1}.txt`);
   const ledger = buildTaskLedgerSnapshot({
-    planId: `plan-${suffix}`,
-    runId: `run-${suffix}`,
+    planId,
+    runId,
     tasks: taskIds.map((taskId, index) => ({
       taskId,
       title: `Generic batch ${index + 1}`,
-      targets: [`generated-${suffix}-${index + 1}.txt`],
+      targets: [targets[index]],
       capability: 'fs.write',
     })),
     completedTaskIds: [taskIds[0], taskIds[1]],
@@ -3826,8 +3830,8 @@ function assertRunStateMachineTaskLedger(): void {
   const finish = evaluateRunState({ ledger, decisionEffect: normalizeDecisionEffect({ kind: 'finishWithAnswer', reason: 'generic stop' }) });
   assertEqual(finish.kind, 'finishWithAnswer', 'finishWithAnswer effect routes to an answer terminal');
   const frame = buildAcceptedPlanPromptFrame({
-    planId: `plan-${suffix}`,
-    runId: `run-${suffix}`,
+    planId,
+    runId,
     title: 'Generic ordered plan',
     summary: 'Generic ordered plan summary',
     taskLedger: ledger,
@@ -3835,6 +3839,77 @@ function assertRunStateMachineTaskLedger(): void {
   assertEqual(frame.cachePolicy.stablePrefixFrozen, true, 'accepted plan prompt frame freezes stable prefix policy');
   assertEqual(frame.cachePolicy.projectMemoryRefresh, 'afterReviewOrRunCompletion', 'project memory does not refresh during active execution');
   assert(frame.stableFrameHash.length > 0, 'accepted plan prompt frame records a stable hash');
+
+  const acceptedPlan: AcceptedImplementationPlanContext = {
+    planId,
+    runId,
+    title: 'Generic ordered plan',
+    summary: 'Generic ordered plan summary',
+    tasks: taskIds.map((taskId, index) => ({
+      taskId,
+      title: `Generic batch ${index + 1}`,
+      targets: [targets[index]],
+      capability: 'fs.write',
+      dependencies: [],
+      conflictKeys: [],
+    })),
+    capabilities: [],
+    targetScopes: [],
+    exactOperationGrants: [],
+    accessScopes: [],
+    batchIndex: 3,
+    completedTaskIds: [taskIds[0], taskIds[1]],
+    rawPlan: {},
+  };
+  const workUnitId = `work-${suffix}`;
+  const coordinator = new AcceptedPlanTaskLedgerCoordinator({
+    workUnitIdsFromKernelEvents: () => [workUnitId],
+    actionBatchHasFailureOrBlocker: () => false,
+  });
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${suffix}`,
+    runId,
+    sessionId: `session-${suffix}`,
+    source: 'llm',
+    kind: 'actionBundle',
+    payload: {
+      actionBundle: {
+        id: `bundle-${suffix}`,
+        version: '1',
+        goal: 'Generic ordered batch',
+        actions: [{
+          actionId: `action-${suffix}`,
+          toolId: 'fs.write',
+          targetPath: targets[2],
+        }],
+        validationExpectations: [],
+        reviewExpectations: [],
+      },
+    },
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  } as ProposalEnvelope;
+  const progress = coordinator.batchProgress({ acceptedPlan, proposal, kernelEvents: [] });
+  assertEqual(progress.newlyCompletedTaskIds[0], taskIds[2], 'task ledger coordinator marks the current covered task complete');
+  assertEqual(progress.workUnitIds[0], workUnitId, 'task ledger coordinator preserves work unit ids from kernel events');
+  const afterBatch = coordinator.afterBatch(acceptedPlan, progress.completedTaskIds);
+  assertEqual(afterBatch.completedTaskIds.includes(taskIds[2]), true, 'task ledger coordinator advances accepted plan completed ids');
+  assertEqual(coordinator.complete(afterBatch), false, 'task ledger coordinator keeps incomplete accepted plan open');
+  const checkpoint = {
+    id: `checkpoint-${suffix}`,
+    sessionId: `session-${suffix}`,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'workflow_stage',
+    payload: {
+      stage: 'accepted_plan.batch_checkpoint',
+      runId,
+      planId,
+      completedTaskIds: taskIds,
+    },
+  } as AgentEvent;
+  const restored = coordinator.withLatestCheckpoint(acceptedPlan, [checkpoint]);
+  assertEqual(coordinator.complete(restored), true, 'task ledger coordinator restores completed checkpoint state');
 }
 
 function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {
