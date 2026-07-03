@@ -58,7 +58,7 @@ import {
   RepairLoop,
 } from '../driver/execution/index.js';
 import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
-import { PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
+import { PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
@@ -98,6 +98,7 @@ async function main(): Promise<void> {
   assertSessionFailureProjectionBuilderCreatesFailureEvents();
   assertRequirementProjectionBuilderCreatesDecisionEvents();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
+  assertPlanContextIndexBuildsPlanReadModels();
   assertPlanInteractionIndexFindsActivePlan();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
   assertAcceptedPlanTargetParserExtractsStructuredTargets();
@@ -3783,6 +3784,76 @@ function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {
   const context = registry.currentTaskContext(registry.cursor([]));
   assertEqual(context?.targets.includes(targetPath), true, 'current task context includes exact operation grant target when task targets are empty');
   assertEqual(context?.capabilities.includes('fs.write'), true, 'current task context includes exact operation grant capability');
+}
+
+function assertPlanContextIndexBuildsPlanReadModels(): void {
+  const suffix = randomSmokeToken('plan-context');
+  const sessionId = `session-${suffix}`;
+  const runId = `run-${suffix}`;
+  const planId = `plan-${suffix}`;
+  const proposalId = `proposal-${suffix}`;
+  const bundleId = `bundle-${suffix}`;
+  const reviewPlanId = `review-${suffix}`;
+  const targetPath = `${suffix}/target-${randomSmokeToken('file')}.txt`;
+  const overlay = {
+    parentRunId: `parent-${suffix}`,
+    parentPhase: 'waiting_permission' as const,
+    interactionRunId: runId,
+    interactionId: `interaction-${suffix}`,
+  };
+  const executionRoot = { attachment: { kind: 'directory', path: `root-${suffix}` } };
+  const index = new PlanContextIndex({
+    interactionOverlayFromPayload: (payload) => payload.overlay === overlay ? overlay as never : undefined,
+    executionRootFromPayload: (payload) => payload.executionRoot === executionRoot ? executionRoot as never : undefined,
+  });
+  const planCard = {
+    id: `event-${suffix}-card`,
+    sessionId,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'plan_card',
+    payload: {
+      runId,
+      planId,
+      proposalId,
+      content: `Plan ${suffix}`,
+      actionBundle: {
+        id: bundleId,
+        version: '1',
+        actions: [{ actionId: `action-${suffix}`, targetPath }],
+      },
+      codeBlocks: [],
+      commandBlocks: [],
+      expectedValidation: `Validate ${suffix}`,
+      reviewGuide: `Review ${suffix}`,
+      planReviewReport: { planId: reviewPlanId },
+      overlay,
+      executionRoot,
+    },
+  } as AgentEvent;
+  const found = index.findPlanCard([planCard], runId, bundleId);
+  assertEqual(found?.planId, planId, 'plan context index matches action bundle aliases');
+  assertEqual(found?.interactionOverlay, overlay, 'plan context index restores interaction overlay');
+  assertEqual(found?.executionRoot, executionRoot, 'plan context index restores execution root');
+  const proposal = index.proposalEnvelope(found!);
+  assertEqual(proposal.kind, 'actionBundle', 'plan context index converts plan to actionBundle proposal');
+  const proposalPayload = proposal.payload as { actionBundle: Record<string, unknown> };
+  assertEqual(proposalPayload.actionBundle.id, bundleId, 'plan context proposal preserves action bundle');
+  assertEqual(index.latestExecutablePlan([planCard])?.planId, planId, 'plan context index finds executable plan');
+  const accepted = {
+    id: `event-${suffix}-accepted`,
+    sessionId,
+    ts: '2026-01-01T00:00:01.000Z',
+    kind: 'plan_review',
+    payload: { runId, planId, status: 'accepted' },
+  } as AgentEvent;
+  const review = {
+    id: `event-${suffix}-summary`,
+    sessionId,
+    ts: '2026-01-01T00:00:02.000Z',
+    kind: 'review_summary',
+    payload: { runId, planId },
+  } as AgentEvent;
+  assertEqual(index.alreadyResolved([planCard, accepted, review], found!), true, 'plan context index treats accepted reviewed plans as resolved');
 }
 
 function assertPlanInteractionIndexFindsActivePlan(): void {

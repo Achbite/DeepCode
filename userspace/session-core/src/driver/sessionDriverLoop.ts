@@ -118,10 +118,12 @@ import {
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder, type SessionReviewContext } from './review/index.js';
 import {
+  PlanContextIndex,
   PlanInteractionIndex,
   PlanReviewGrantProjector,
   PlanReviewReportAnalyzer,
   ProtocolGate,
+  type PlanContext as SessionPlanContext,
 } from './proposal/index.js';
 import {
   AssistantProjectionBuilder,
@@ -286,12 +288,16 @@ const planReviewGrantProjector = new PlanReviewGrantProjector();
 const planReviewReportAnalyzer = new PlanReviewReportAnalyzer({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
 });
+const planContextIndex = new PlanContextIndex({
+  interactionOverlayFromPayload: (payload) => interactionOverlayCodec.fromPayload(payload),
+  executionRootFromPayload: (payload) => AcceptedPlanExecutionRootResolver.fromPayload(payload),
+});
 const planInteractionIndex = new PlanInteractionIndex<SessionPlanContext>({
   planCardAwaitingDecision: (payload) => planReviewReportAnalyzer.planCardAwaitingDecision(payload),
   planReviewEventAwaitingDecision: (payload) => planReviewReportAnalyzer.planReviewEventAwaitingDecision(payload),
-  planContextFromEvent,
-  findPlanCard,
-  planAlreadyResolved,
+  planContextFromEvent: (event, payload) => planContextIndex.contextFromEvent(event, payload),
+  findPlanCard: (events, runId, planId) => planContextIndex.findPlanCard(events, runId, planId),
+  planAlreadyResolved: (events, plan) => planContextIndex.alreadyResolved(events, plan),
 });
 const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
@@ -341,7 +347,7 @@ const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, 
     ? acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
     : undefined,
   acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
-    acceptedPlanBatchProgress(acceptedPlan, proposalEnvelopeFromPlanContext(plan), kernelEvents).completedTaskIds,
+    acceptedPlanBatchProgress(acceptedPlan, planContextIndex.proposalEnvelope(plan), kernelEvents).completedTaskIds,
   acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanAfterBatch(acceptedPlan, completedTaskIds),
   acceptedPlanTaskLedger: (acceptedPlan) => buildAcceptedPlanTaskLedger(acceptedPlan),
   buildReviewFactsContext: (input) => buildReviewFactsContext(input),
@@ -972,9 +978,9 @@ export class SessionDriverLoop {
     const runId = stringValue(confirmationPayload.runId) ?? input.runId;
     const planId = stringValue(decisionRequest.acceptedPlanId);
     const selectedOptionId = userInputPipeline.selectedRequirementDecisionOptionId(decisionEvent);
-    const plan = (runId ? findPlanCard(current.events, runId, planId) : null)
-      ?? findPlanCard(current.events, undefined, planId)
-      ?? (runId ? latestExecutablePlan(current.events, runId) : null);
+    const plan = (runId ? planContextIndex.findPlanCard(current.events, runId, planId) : null)
+      ?? planContextIndex.findPlanCard(current.events, undefined, planId)
+      ?? (runId ? planContextIndex.latestExecutablePlan(current.events, runId) : null);
 
     if (input.decision === 'revise' || selectedOptionId === 'revise-plan') {
       return this.runUserTurn({
@@ -1222,9 +1228,9 @@ export class SessionDriverLoop {
     runId: string,
     planId: string | undefined
   ): AcceptedImplementationPlanContext | undefined {
-    const plan = (runId ? findPlanCard(events, runId, planId) : null)
-      ?? findPlanCard(events, undefined, planId)
-      ?? (runId ? latestExecutablePlan(events, runId) : null);
+    const plan = (runId ? planContextIndex.findPlanCard(events, runId, planId) : null)
+      ?? planContextIndex.findPlanCard(events, undefined, planId)
+      ?? (runId ? planContextIndex.latestExecutablePlan(events, runId) : null);
     if (!plan || !plan.implementationPlan) return undefined;
     const base = acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot });
     return acceptedPlanWithLatestCheckpoint(base, events);
@@ -1281,7 +1287,7 @@ export class SessionDriverLoop {
     const active = findActiveDriverInteraction(events);
     const activePlanMatches = active?.kind === 'plan' &&
       active.runId === input.runId &&
-      (!input.targetId || active.planId === input.targetId || Boolean(findPlanCard(events, input.runId, input.targetId)));
+      (!input.targetId || active.planId === input.targetId || Boolean(planContextIndex.findPlanCard(events, input.runId, input.targetId)));
     if (!activePlanMatches) {
       return this.append(input.sessionId, [
         sessionProgressProjectionBuilder.traceEvent({
@@ -1299,8 +1305,8 @@ export class SessionDriverLoop {
         }),
       ]);
     }
-    const plan = findPlanCard(events, input.runId, input.targetId);
-    if (!plan || planAlreadyResolved(events, plan)) {
+    const plan = planContextIndex.findPlanCard(events, input.runId, input.targetId);
+    if (!plan || planContextIndex.alreadyResolved(events, plan)) {
       return this.append(input.sessionId, [
         sessionProgressProjectionBuilder.traceEvent({
           sessionId: input.sessionId,
@@ -1547,7 +1553,7 @@ export class SessionDriverLoop {
         return result;
       }
       if (acceptedOverlay) {
-        const progressProposal = proposalEnvelopeFromPlanContext(plan);
+        const progressProposal = planContextIndex.proposalEnvelope(plan);
         const progress = acceptedPlanBatchProgress(acceptedOverlay.acceptedPlan, progressProposal, batchEvents);
         const nextAccepted = acceptedPlanAfterBatch(acceptedOverlay.acceptedPlan, progress.completedTaskIds);
         const cursor = buildTaskExecutionCursor(acceptedOverlay.acceptedPlan, resourceRequestLoop.recentPackets(result.events));
@@ -1738,7 +1744,7 @@ export class SessionDriverLoop {
 
     const runId = pending.runId ?? input.runId ?? kernelEventStatusIndex.runId(decisionReply.events ?? []);
     if (!runId) return result;
-    const plan = findPlanCard(result.events, runId, pending.planId);
+    const plan = planContextIndex.findPlanCard(result.events, runId, pending.planId);
     if (!plan) return result;
 
     const factsReply = await this.kernel({
@@ -5635,23 +5641,6 @@ function shouldAttemptActionBundleCompactionRepair(state: SessionDriverLoopRunSt
   return capabilities.some((capability) => SIDE_EFFECT_CAPABILITIES.has(capability));
 }
 
-interface SessionPlanContext {
-  sessionId: string;
-  runId: string;
-  planId: string;
-  proposalId?: string;
-  userPlan: string;
-  actionBundle: Record<string, unknown>;
-  codeBlocks: unknown[];
-  commandBlocks: unknown[];
-  expectedValidation: string;
-  reviewGuide: string;
-  planReviewReport?: Record<string, unknown>;
-  implementationPlan?: Record<string, unknown>;
-  interactionOverlay?: InteractionOverlayContext;
-  executionRoot?: AcceptedImplementationPlanExecutionRoot;
-}
-
 interface RecoveredAcceptedPlanContext {
   plan: SessionPlanContext;
   acceptedPlan: AcceptedImplementationPlanContext;
@@ -5669,19 +5658,6 @@ function sessionProviderAllowedProposals(allowed: string[], state: SessionDriver
   return [...merged];
 }
 
-function findPlanCard(events: AgentEvent[], runId?: string, planId?: string): SessionPlanContext | null {
-  for (const event of [...events].reverse()) {
-    if (event.kind !== 'plan_card') continue;
-    const payload = objectRecord(event.payload);
-    const candidate = payload ? planContextFromEvent(event, payload) : null;
-    if (!candidate) continue;
-    if (runId && candidate.runId !== runId) continue;
-    if (planId && !planAliases(candidate).has(planId)) continue;
-    return candidate;
-  }
-  return null;
-}
-
 function recoverAcceptedPlanFromOverlay(
   input: SessionDecisionResolverInput,
   events: AgentEvent[],
@@ -5689,8 +5665,8 @@ function recoverAcceptedPlanFromOverlay(
 ): RecoveredAcceptedPlanContext | undefined {
   const planId = overlay?.acceptedPlanId;
   if (!planId) return undefined;
-  const plan = (overlay.acceptedPlanRunId ? findPlanCard(events, overlay.acceptedPlanRunId, planId) : null)
-    ?? findPlanCard(events, undefined, planId);
+  const plan = (overlay.acceptedPlanRunId ? planContextIndex.findPlanCard(events, overlay.acceptedPlanRunId, planId) : null)
+    ?? planContextIndex.findPlanCard(events, undefined, planId);
   if (!plan?.implementationPlan) return undefined;
   const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, events);
   let acceptedPlan = acceptedPlanWithLatestCheckpoint(
@@ -5704,146 +5680,6 @@ function recoverAcceptedPlanFromOverlay(
     ]);
   }
   return { plan, acceptedPlan };
-}
-
-function latestExecutablePlan(events: AgentEvent[], previousRunId?: string): SessionPlanContext | null {
-  for (const event of [...events].reverse()) {
-    if (event.kind !== 'plan_card') continue;
-    const payload = objectRecord(event.payload);
-    const candidate = payload ? planContextFromEvent(event, payload) : null;
-    if (!candidate) continue;
-    if (previousRunId && candidate.runId === previousRunId) continue;
-    if (planAlreadyResolved(events, candidate)) continue;
-    return candidate;
-  }
-  return null;
-}
-
-function planContextFromEvent(event: AgentEvent, payload: Record<string, unknown>): SessionPlanContext | null {
-  const implementationPlan = objectRecord(payload.taskPlan) ?? objectRecord(payload.implementationPlan) ?? undefined;
-  const actionBundle = objectRecord(payload.actionBundle) ?? (implementationPlan ? {
-    id: stringValue(payload.planId) ?? stringValue(implementationPlan.id) ?? stringValue(payload.proposalId),
-    version: '1',
-    actions: [],
-  } : undefined);
-  if (!actionBundle) return null;
-  const planId = stringValue(payload.planId)
-    ?? stringValue(actionBundle.id)
-    ?? stringValue(implementationPlan?.id)
-    ?? stringValue(payload.proposalId);
-  const runId = stringValue(payload.runId);
-  if (!planId || !runId) return null;
-  return {
-    sessionId: event.sessionId,
-    runId,
-    planId,
-    proposalId: stringValue(payload.proposalId),
-    userPlan: stringValue(payload.content) ?? stringValue(payload.summary) ?? 'Agent plan',
-    actionBundle: actionBundle as unknown as Record<string, unknown>,
-    codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
-    commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
-    expectedValidation: stringValue(payload.expectedValidation) ?? '',
-    reviewGuide: stringValue(payload.reviewGuide) ?? '',
-    planReviewReport: objectRecord(payload.planReviewReport) ?? undefined,
-    implementationPlan,
-    interactionOverlay: interactionOverlayCodec.fromPayload(payload),
-    executionRoot: AcceptedPlanExecutionRootResolver.fromPayload(payload),
-  };
-}
-
-function proposalEnvelopeFromPlanContext(plan: SessionPlanContext): ProposalEnvelope {
-  return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    proposalId: plan.proposalId ?? plan.planId,
-    runId: plan.runId,
-    sessionId: plan.sessionId,
-    source: 'system',
-    kind: 'actionBundle',
-    narration: plan.userPlan,
-    payload: {
-      userPlan: plan.userPlan,
-      actionBundle: plan.actionBundle,
-      codeBlocks: plan.codeBlocks,
-      commandBlocks: plan.commandBlocks,
-      expectedValidation: plan.expectedValidation,
-      reviewGuide: plan.reviewGuide,
-    },
-    referencedResourcePacketRefs: [],
-    referencedEvidenceRefs: [],
-  };
-}
-
-function planAliases(plan: SessionPlanContext): Set<string> {
-  const aliases = new Set<string>([plan.planId]);
-  if (plan.proposalId) aliases.add(plan.proposalId);
-  const bundleId = stringValue(plan.actionBundle.id);
-  if (bundleId) aliases.add(bundleId);
-  const reportPlanId = stringValue(plan.planReviewReport?.planId);
-  if (reportPlanId) aliases.add(reportPlanId);
-  return aliases;
-}
-
-function planAlreadyResolved(events: AgentEvent[], plan: SessionPlanContext): boolean {
-  const aliases = planAliases(plan);
-  return events.some((event, index) => {
-    if (event.kind !== 'plan_review') return false;
-    const payload = objectRecord(event.payload);
-    if (!payload) return false;
-    const status = stringValue(payload.status);
-    if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return false;
-    const runId = stringValue(payload.runId);
-    const planId = stringValue(payload.planId);
-    if (runId !== plan.runId || (planId && !aliases.has(planId))) return false;
-    if (status === 'rejected' || status === 'needsRevision') return true;
-    return acceptedPlanExecutionConsumed(events, plan, aliases, index);
-  });
-}
-
-function acceptedPlanExecutionConsumed(
-  events: AgentEvent[],
-  plan: SessionPlanContext,
-  aliases: Set<string>,
-  acceptedIndex: number
-): boolean {
-  for (let index = acceptedIndex + 1; index < events.length; index += 1) {
-    const event = events[index];
-    const payload = objectRecord(event.payload) ?? {};
-    const kernelEvent = objectRecord(payload.kernelEvent);
-    const runId = stringValue(payload.runId) ?? stringValue(kernelEvent?.runId);
-    if (runId && runId !== plan.runId) continue;
-    const owner = objectRecord(payload.decisionOwner);
-    const batch = objectRecord(kernelEvent?.batch);
-    const planId = stringValue(payload.planId)
-      ?? stringValue(owner?.planId)
-      ?? stringValue(kernelEvent?.planId)
-      ?? stringValue(batch?.planId);
-    if (planId && !aliases.has(planId)) continue;
-
-    if (event.kind === 'review_summary') return true;
-    if (event.kind === 'permission_request') return true;
-    if (event.kind === 'error') return true;
-
-    if (event.kind === 'session_run_state') {
-      const status = stringValue(payload.status);
-      const reason = stringValue(payload.reason);
-      if (status === 'failed' || status === 'cancelled' || status === 'completed') return true;
-      if (reason === 'permission' || reason === 'review' || reason === 'work_unit_failed') return true;
-      continue;
-    }
-
-    const stage = stringValue(payload.stage);
-    if (stage === 'accepted_plan.action_batch_submit' || stage === 'accepted_plan.batch_failed') return true;
-
-    const kernelKind = stringValue(kernelEvent?.kind) ?? stringValue(payload.kind);
-    if (
-      kernelKind === 'action_batch.accepted' ||
-      kernelKind === 'permission.requested' ||
-      kernelKind?.startsWith('work_unit.')
-    ) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function acceptedPlanExecutionContext(
