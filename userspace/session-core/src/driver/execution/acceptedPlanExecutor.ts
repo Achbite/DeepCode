@@ -70,6 +70,7 @@ export interface AcceptedPlanExecutorPorts {
   deleteActionTargetResourceKind(action: Record<string, unknown>): string | undefined;
   deleteActionRecursive(action: Record<string, unknown>): boolean;
   kernelExecutionContractId(report?: Record<string, unknown>): string | undefined;
+  proposalTargetScopes(proposal: ProposalEnvelope, accepted: AcceptedImplementationPlanContext): string[];
 }
 
 export type AcceptedPlanActionProposalAssessment =
@@ -89,10 +90,6 @@ export interface AcceptedPlanActionProposalAssessmentInput {
   resourcePackets: ResourcePacket[];
   scopeRepairAttempted: boolean;
   admission: AcceptedPlanAdmission;
-  canonicalizeAccessScopes(
-    accepted: AcceptedImplementationPlanContext,
-    proposal: ProposalEnvelope
-  ): AcceptedPlanAccessScopeCanonicalizationResult;
 }
 
 export class AcceptedPlanExecutor {
@@ -108,7 +105,6 @@ export class AcceptedPlanExecutor {
       resourcePackets,
       scopeRepairAttempted,
       admission,
-      canonicalizeAccessScopes,
     } = input;
     if (!actionBundle) return { kind: 'missingActionBundle' };
     const validation = admission.validate(accepted, proposal, resourcePackets);
@@ -124,7 +120,70 @@ export class AcceptedPlanExecutor {
     return {
       kind: 'executable',
       actionBundle,
-      scopeCanonicalization: canonicalizeAccessScopes(accepted, proposal),
+      scopeCanonicalization: this.canonicalizeAccessScopes(accepted, proposal),
+    };
+  }
+
+  canonicalizeAccessScopes(
+    accepted: AcceptedImplementationPlanContext,
+    proposal: ProposalEnvelope
+  ): AcceptedPlanAccessScopeCanonicalizationResult {
+    const ports = this.requirePorts();
+    const payload = objectRecord(proposal.payload);
+    const actionBundle = objectRecord(payload?.actionBundle);
+    const base = {
+      proposal,
+      changed: false,
+      removedAccessScopes: [] as AcceptedPlanRemovedAccessScope[],
+      actionTargets: ports.proposalTargetScopes(proposal, accepted),
+    };
+    if (!payload || !actionBundle) return base;
+
+    const topLevel = this.canonicalizeAccessScopeArray(actionBundle.accessScopes, 'actionBundle.accessScopes');
+    let nextActionBundle: Record<string, unknown> | undefined;
+    if (topLevel.changed) {
+      nextActionBundle = { ...actionBundle };
+      if (topLevel.kept.length) {
+        nextActionBundle.accessScopes = topLevel.kept;
+      } else {
+        delete nextActionBundle.accessScopes;
+      }
+    }
+
+    const actions = Array.isArray(actionBundle.actions) ? actionBundle.actions : [];
+    const nextActions = actions.map((action, actionIndex) => {
+      const record = objectRecord(action);
+      if (!record) return action;
+      const actionScopes = this.canonicalizeAccessScopeArray(
+        record.accessScopes,
+        `actionBundle.actions[${actionIndex}].accessScopes`
+      );
+      if (!actionScopes.changed) return action;
+      if (!nextActionBundle) nextActionBundle = { ...actionBundle };
+      const nextAction = { ...record };
+      if (actionScopes.kept.length) {
+        nextAction.accessScopes = actionScopes.kept;
+      } else {
+        delete nextAction.accessScopes;
+      }
+      topLevel.removed.push(...actionScopes.removed);
+      return nextAction;
+    });
+
+    if (!topLevel.changed && topLevel.removed.length === 0) return base;
+    if (!nextActionBundle) nextActionBundle = { ...actionBundle };
+    nextActionBundle.actions = nextActions;
+    return {
+      proposal: {
+        ...proposal,
+        payload: {
+          ...payload,
+          actionBundle: nextActionBundle,
+        },
+      },
+      changed: true,
+      removedAccessScopes: topLevel.removed,
+      actionTargets: base.actionTargets,
     };
   }
 
@@ -429,6 +488,44 @@ export class AcceptedPlanExecutor {
     }
     return this.ports;
   }
+
+  private canonicalizeAccessScopeArray(
+    value: unknown,
+    source: string
+  ): { kept: unknown[]; removed: AcceptedPlanRemovedAccessScope[]; changed: boolean } {
+    if (!Array.isArray(value)) return { kept: [], removed: [], changed: false };
+    const kept: unknown[] = [];
+    const removed: AcceptedPlanRemovedAccessScope[] = [];
+    for (const [index, scope] of value.entries()) {
+      const reason = invalidAcceptedPlanExecutionAccessScopeReason(scope);
+      if (reason) {
+        const record = objectRecord(scope);
+        removed.push({
+          index,
+          source,
+          reason,
+          path: stringValue(record?.path) ?? stringValue(record?.targetPath) ?? stringValue(record?.resourcePath),
+          scopeKind: stringValue(record?.scopeKind),
+          scope,
+        });
+        continue;
+      }
+      kept.push(scope);
+    }
+    return { kept, removed, changed: removed.length > 0 };
+  }
+}
+
+function invalidAcceptedPlanExecutionAccessScopeReason(scope: unknown): string | undefined {
+  const record = objectRecord(scope);
+  if (!record) return 'non_object_scope';
+  const rawPath = stringValue(record.path) ?? stringValue(record.targetPath) ?? stringValue(record.resourcePath);
+  const normalized = rawPath ? normalizePlanScope(rawPath).replace(/\/+$/, '') : '';
+  if (!normalized || normalized === '.' || normalized === '..' || normalized === '/') return 'invalid_root_scope';
+  if (normalized.startsWith('../') || normalized.includes('/../')) return 'path_traversal_scope';
+  if (normalized.includes('*')) return 'wildcard_scope';
+  if (isAbsolutePath(normalized)) return 'absolute_scope_not_allowed_in_execution_batch';
+  return undefined;
 }
 
 function acceptedPlanCapabilityIsReadOnlyValidation(capability: string): boolean {

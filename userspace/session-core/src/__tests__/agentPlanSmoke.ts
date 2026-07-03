@@ -1408,6 +1408,7 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
   const target = `generated-${token}.txt`;
   const blockId = `block-${token}`;
   const normalize = (value: string): string => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  const scopeMatcher = new AcceptedPlanScopeMatcher();
   const resolver = new AcceptedPlanOperationTargetResolver({
     normalizeTargetScope: normalize,
     normalizePlanScope: normalize,
@@ -1429,6 +1430,8 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
     deleteActionTargetResourceKind: (action) => typeof action.targetKind === 'string' ? action.targetKind : undefined,
     deleteActionRecursive: (action) => action.recursive === true,
     kernelExecutionContractId: (report) => typeof report?.contractId === 'string' ? report.contractId : undefined,
+    proposalTargetScopes: (proposal, accepted) =>
+      scopeMatcher.proposalTargetScopes(proposal, accepted).map((scope) => scope.normalized),
   });
   const acceptedPlan: AcceptedImplementationPlanContext = {
     planId: `plan-${token}`,
@@ -1469,12 +1472,14 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
         version: '1',
         id: `bundle-${token}`,
         goal: 'Generic accepted execution batch',
+        accessScopes: [{ path: target }, { path: `${target}/*` }],
         actions: [{
           actionId: `action-${token}`,
           capability: 'fs.write',
           kind: 'write',
           targetPath: `./${target}`,
           sourceBlockId: blockId,
+          accessScopes: [{ path: target }, { path: '../outside' }],
         }],
       },
       codeBlocks: [{
@@ -1505,6 +1510,13 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
   assertEqual(action.targetRef.path, target, 'accepted plan executor fills targetRef path');
   assertEqual(block.targetPath, target, 'accepted plan executor normalizes codeBlock target path');
   assertEqual(normalized.batch.contractId, `contract-${token}`, 'accepted plan executor preserves kernel contract id');
+  const canonicalized = executor.canonicalizeAccessScopes(acceptedPlan, proposal);
+  assertEqual(canonicalized.changed, true, 'accepted plan executor removes unsafe access scopes');
+  assertEqual(canonicalized.actionTargets.includes(target), true, 'accepted plan executor preserves proposal action targets');
+  assertEqual(canonicalized.removedAccessScopes.length, 2, 'accepted plan executor reports removed access scopes');
+  const canonicalPayload = canonicalized.proposal.payload as Record<string, any>;
+  assertEqual(canonicalPayload.actionBundle.accessScopes.length, 1, 'accepted plan executor keeps valid top-level access scope');
+  assertEqual(canonicalPayload.actionBundle.actions[0].accessScopes.length, 1, 'accepted plan executor keeps valid action access scope');
 }
 
 function assertKernelEventStatusIndexReadsStructuredEvents(): void {
