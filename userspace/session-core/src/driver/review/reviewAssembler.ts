@@ -149,6 +149,69 @@ export class ReviewAssembler {
       return lines;
     });
   }
+
+  reviewFactLines(kernelEvents: unknown[]): string[] {
+    const facts = this.findReviewFacts(kernelEvents);
+    if (facts) {
+      const lines: string[] = [];
+      const completed = Array.isArray(facts.completedWorkUnits) ? facts.completedWorkUnits : [];
+      const failed = Array.isArray(facts.failedWorkUnits) ? facts.failedWorkUnits : [];
+      const blocked = Array.isArray(facts.blockedWorkUnits) ? facts.blockedWorkUnits : [];
+      const tools = Array.isArray(facts.toolResults) ? facts.toolResults : [];
+      for (const item of completed) {
+        const record = objectRecord(item);
+        lines.push(`- \`${stringValue(record?.workUnitId) ?? 'work-unit'}\` completed${record?.output ? `：${clipJson(record.output, 180)}` : ''}`);
+      }
+      for (const item of failed) {
+        const record = objectRecord(item);
+        const error = objectRecord(record?.error);
+        lines.push(`- \`${stringValue(record?.workUnitId) ?? 'work-unit'}\` failed：${stringValue(error?.message) ?? 'unknown error'}`);
+      }
+      for (const item of blocked) {
+        const record = objectRecord(item);
+        lines.push(`- \`${stringValue(record?.workUnitId) ?? 'work-unit'}\` blocked：${stringValue(record?.reason) ?? 'blocked'}`);
+      }
+      for (const item of tools) {
+        const record = objectRecord(item);
+        const error = objectRecord(record?.error);
+        const status = record?.ok === true ? 'ok' : 'error';
+        const detail = stringValue(error?.message) ?? (record?.output ? clipJson(record.output, 180) : 'no output');
+        lines.push(`- \`${stringValue(record?.toolName) ?? 'tool'}\` ${status}：${detail}`);
+      }
+      return lines;
+    }
+    return kernelEvents.flatMap((event) => {
+      const record = objectRecord(event);
+      if (!record) return [];
+      const kind = stringValue(record.kind);
+      if (kind === 'work_unit.completed') {
+        return [`- \`${stringValue(record.workUnitId) ?? 'work-unit'}\` completed${record.output ? `：${clipJson(record.output, 180)}` : ''}`];
+      }
+      if (kind === 'work_unit.failed') {
+        const error = objectRecord(record.error);
+        return [`- \`${stringValue(record.workUnitId) ?? 'work-unit'}\` failed：${stringValue(error?.message) ?? 'unknown error'}`];
+      }
+      if (kind === 'work_unit.blocked') {
+        return [`- \`${stringValue(record.workUnitId) ?? 'work-unit'}\` blocked：${stringValue(record.reason) ?? 'blocked'}`];
+      }
+      if (kind === 'tool.completed') {
+        const error = objectRecord(record.error);
+        const status = record.ok === true ? 'ok' : 'error';
+        const detail = stringValue(error?.message) ?? (record.output ? clipJson(record.output, 180) : 'no output');
+        return [`- \`${stringValue(record.toolName) ?? 'tool'}\` ${status}：${detail}`];
+      }
+      return [];
+    });
+  }
+
+  findReviewFacts(kernelEvents: unknown[]): Record<string, unknown> | undefined {
+    for (const event of [...kernelEvents].reverse()) {
+      const record = objectRecord(event);
+      if (record?.kind !== 'review.facts_produced') continue;
+      return objectRecord(record.facts) ?? undefined;
+    }
+    return undefined;
+  }
 }
 
 function isStaticSyntaxReviewTarget(path: string): boolean {
@@ -185,6 +248,14 @@ function stringValue(value: unknown): string | undefined {
 
 function clip(value: string, max: number): string {
   return value.length > max ? `${value.slice(0, max)}\n...[truncated]` : value;
+}
+
+function clipJson(value: unknown, max: number): string {
+  try {
+    return clip(JSON.stringify(value), max);
+  } catch {
+    return String(value).slice(0, max);
+  }
 }
 
 function fenced(value: string): string {

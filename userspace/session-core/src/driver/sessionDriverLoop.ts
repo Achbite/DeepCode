@@ -9717,11 +9717,12 @@ function reviewSummaryEvent(
   ts: string,
   id: string
 ): AgentEvent {
+  const review = reviewAssembler();
   const facts = [
-    ...reviewFactLines(kernelEvents),
-    ...reviewAssembler().staticSyntaxReviewFactLines(kernelEvents),
+    ...review.reviewFactLines(kernelEvents),
+    ...review.staticSyntaxReviewFactLines(kernelEvents),
   ];
-  const reviewFacts = findReviewFacts(kernelEvents);
+  const reviewFacts = review.findReviewFacts(kernelEvents);
   const gitReview = reviewFacts ? objectRecord(reviewFacts.gitReview) : undefined;
   const completed = Math.max(
     reviewFacts ? arrayLength(reviewFacts.completedWorkUnits) : 0,
@@ -10277,69 +10278,6 @@ function reviewPathNormalizationLines(reviewFacts?: Record<string, unknown>, lan
       ? `- ${diagnostics.length - 24} additional path normalization diagnostic(s) are not expanded.`
       : `- 另有 ${diagnostics.length - 24} 条路径归一化诊断未展开。`]
     : []);
-}
-
-function reviewFactLines(kernelEvents: unknown[]): string[] {
-  const facts = findReviewFacts(kernelEvents);
-  if (facts) {
-    const lines: string[] = [];
-    const completed = Array.isArray(facts.completedWorkUnits) ? facts.completedWorkUnits : [];
-    const failed = Array.isArray(facts.failedWorkUnits) ? facts.failedWorkUnits : [];
-    const blocked = Array.isArray(facts.blockedWorkUnits) ? facts.blockedWorkUnits : [];
-    const tools = Array.isArray(facts.toolResults) ? facts.toolResults : [];
-    for (const item of completed) {
-      const record = objectRecord(item);
-      lines.push(`- \`${stringValue(record?.workUnitId) ?? 'work-unit'}\` completed${record?.output ? `：${clipJson(record.output, 180)}` : ''}`);
-    }
-    for (const item of failed) {
-      const record = objectRecord(item);
-      const error = objectRecord(record?.error);
-      lines.push(`- \`${stringValue(record?.workUnitId) ?? 'work-unit'}\` failed：${stringValue(error?.message) ?? 'unknown error'}`);
-    }
-    for (const item of blocked) {
-      const record = objectRecord(item);
-      lines.push(`- \`${stringValue(record?.workUnitId) ?? 'work-unit'}\` blocked：${stringValue(record?.reason) ?? 'blocked'}`);
-    }
-    for (const item of tools) {
-      const record = objectRecord(item);
-      const error = objectRecord(record?.error);
-      const status = record?.ok === true ? 'ok' : 'error';
-      const detail = stringValue(error?.message) ?? (record?.output ? clipJson(record.output, 180) : 'no output');
-      lines.push(`- \`${stringValue(record?.toolName) ?? 'tool'}\` ${status}：${detail}`);
-    }
-    return lines;
-  }
-  return kernelEvents.flatMap((event) => {
-    const record = objectRecord(event);
-    if (!record) return [];
-    const kind = stringValue(record.kind);
-    if (kind === 'work_unit.completed') {
-      return [`- \`${stringValue(record.workUnitId) ?? 'work-unit'}\` completed${record.output ? `：${clipJson(record.output, 180)}` : ''}`];
-    }
-    if (kind === 'work_unit.failed') {
-      const error = objectRecord(record.error);
-      return [`- \`${stringValue(record.workUnitId) ?? 'work-unit'}\` failed：${stringValue(error?.message) ?? 'unknown error'}`];
-    }
-    if (kind === 'work_unit.blocked') {
-      return [`- \`${stringValue(record.workUnitId) ?? 'work-unit'}\` blocked：${stringValue(record.reason) ?? 'blocked'}`];
-    }
-    if (kind === 'tool.completed') {
-      const error = objectRecord(record.error);
-      const status = record.ok === true ? 'ok' : 'error';
-      const detail = stringValue(error?.message) ?? (record.output ? clipJson(record.output, 180) : 'no output');
-      return [`- \`${stringValue(record.toolName) ?? 'tool'}\` ${status}：${detail}`];
-    }
-    return [];
-  });
-}
-
-function findReviewFacts(kernelEvents: unknown[]): Record<string, unknown> | undefined {
-  for (const event of [...kernelEvents].reverse()) {
-    const record = objectRecord(event);
-    if (record?.kind !== 'review.facts_produced') continue;
-    return objectRecord(record.facts) ?? undefined;
-  }
-  return undefined;
 }
 
 function arrayLength(value: unknown): number {

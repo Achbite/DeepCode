@@ -44,6 +44,7 @@ import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '..
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderTraceRecorder } from '../driver/pipelines/index.js';
+import { ReviewAssembler } from '../driver/review/index.js';
 
 async function main(): Promise<void> {
   assertV3Parser();
@@ -57,6 +58,7 @@ async function main(): Promise<void> {
   await assertProviderTraceRecorderArchivesPayload();
   await assertResourceRequestLoopBuildsPacketEvents();
   assertResourceEvidenceIndexQueriesPackets();
+  assertReviewAssemblerFormatsReviewFacts();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -526,6 +528,46 @@ function assertResourceEvidenceIndexQueriesPackets(): void {
     index.relevantForTargets([packet], [target]).some((line) => line.includes(`file-${token}.txt`)),
     'resource evidence index renders relevant evidence summaries'
   );
+}
+
+function assertReviewAssemblerFormatsReviewFacts(): void {
+  const token = randomSmokeToken('review-facts');
+  const assembler = new ReviewAssembler({
+    completedWorkUnitFacts: () => ({ actionIds: new Set(), targets: new Set() }),
+    batchActionRecords: () => [],
+    actionEffectiveCapability: () => '',
+    actionFileTargetPath: () => undefined,
+    normalizeAcceptedPlanTargetScope: (target) => target,
+    comparablePath: (value) => value,
+    resourceTextForTarget: () => undefined,
+  });
+  const events = [
+    {
+      kind: 'review.facts_produced',
+      facts: {
+        completedWorkUnits: [
+          {
+            workUnitId: `work-unit-${token}`,
+            output: { path: `path-${token}.txt` },
+          },
+        ],
+        toolResults: [
+          {
+            toolName: `tool-${token}`,
+            ok: true,
+            output: { targetPath: `path-${token}.txt` },
+          },
+        ],
+      },
+    },
+  ];
+  assert(
+    assembler.findReviewFacts(events)?.completedWorkUnits,
+    'review assembler finds latest ReviewFacts event'
+  );
+  const lines = assembler.reviewFactLines(events);
+  assert(lines.some((line) => line.includes(`work-unit-${token}`)), 'review assembler renders work unit facts');
+  assert(lines.some((line) => line.includes(`tool-${token}`)), 'review assembler renders tool facts');
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
