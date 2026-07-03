@@ -43,7 +43,13 @@ import {
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
-import { AcceptedImplementationPlanContextBuilder, AcceptedPlanTargetParser, CompletedWorkUnitFactIndex, ImplementationBatchContextBuilder } from '../driver/execution/index.js';
+import {
+  AcceptedImplementationPlanContextBuilder,
+  AcceptedPlanTargetParser,
+  ActionBatchFailureIndex,
+  CompletedWorkUnitFactIndex,
+  ImplementationBatchContextBuilder,
+} from '../driver/execution/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
 import { KernelEventProjectionBuilder, PlanProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
@@ -66,6 +72,7 @@ async function main(): Promise<void> {
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
   assertCompletedWorkUnitFactIndexMatchesActionAndTarget();
+  assertActionBatchFailureIndexSummarizesKernelFailures();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
@@ -758,6 +765,53 @@ function assertCompletedWorkUnitFactIndexMatchesActionAndTarget(): void {
     [`line-a-${token}`, `line-b-${token}`].join('\n'),
     'completed work unit index reads code block content lines'
   );
+}
+
+function assertActionBatchFailureIndexSummarizesKernelFailures(): void {
+  const token = randomSmokeToken('action-batch-failure');
+  const actionId = `action-${token}`;
+  const workUnitId = `work-unit-${token}`;
+  const targetPath = `scope-${token}/target-${randomSmokeToken('file')}.txt`;
+  const index = new ActionBatchFailureIndex();
+  const batch = {
+    actions: [
+      {
+        actionId,
+        toolId: 'fs.delete',
+        args: { path: targetPath },
+      },
+    ],
+  };
+  const failures = index.details([
+    {
+      kind: 'work_unit.queued',
+      workUnit: {
+        id: workUnitId,
+        actionId,
+        writeSet: [targetPath],
+      },
+    },
+    {
+      kind: 'work_unit.failed',
+      workUnitId,
+      error: {
+        code: `kernel-${token}`,
+        message: `fs.write target path is empty for ${targetPath}`,
+      },
+    },
+  ], batch);
+  assertEqual(failures.length, 1, 'action batch failure index finds failed work unit');
+  const detail = failures[0];
+  if (!detail) throw new Error('action batch failure index missing detail');
+  assertEqual(detail.workUnitId, workUnitId, 'action batch failure index preserves work unit id');
+  assertEqual(detail.actionId, actionId, 'action batch failure index preserves action id');
+  assertEqual(detail.code, 'kernel_delete_compile_mismatch', 'action batch failure index classifies delete compile mismatch');
+  assertEqual(detail.kernelCode, `kernel-${token}`, 'action batch failure index preserves kernel code');
+  assert(detail.writeSet.includes(targetPath), 'action batch failure index preserves write set');
+  const summary = index.summary(detail);
+  assert(summary.includes(workUnitId), 'action batch failure summary includes work unit id');
+  assert(summary.includes(actionId), 'action batch failure summary includes action id');
+  assert(summary.includes(targetPath), 'action batch failure summary includes write target');
 }
 
 function assertReviewAssemblerFormatsReviewFacts(): void {

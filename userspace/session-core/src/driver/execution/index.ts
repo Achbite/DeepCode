@@ -1,5 +1,6 @@
 export * from './acceptedImplementationPlanContextBuilder.js';
 export * from './acceptedPlanTargetParser.js';
+export * from './actionBatchFailureIndex.js';
 export * from '../../accepted-plan/index.js';
 export * from './acceptedPlanExecutor.js';
 export * from './completedWorkUnitFactIndex.js';

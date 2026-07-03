@@ -18,6 +18,7 @@ import {
   AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
   AcceptedPlanProgressAggregator,
+  ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
   type AcceptedPlanReadOnlyResourceCompletion,
   AcceptedPlanScopeIntervention,
@@ -326,6 +327,7 @@ const planProjectionBuilder = new PlanProjectionBuilder({
   visibleLanguageForRequest,
 });
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
+const actionBatchFailureIndex = new ActionBatchFailureIndex();
 const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
   objectRecord,
   stringValue,
@@ -7579,9 +7581,9 @@ function planActionBundleExecutionFailureEvents(
   ts: string,
   id: string
 ): AgentEvent[] {
-  const failures = actionBatchFailureDetails(kernelEvents, batch);
+  const failures = actionBatchFailureIndex.details(kernelEvents, batch);
   const summary = failures.length
-    ? `Accepted plan execution batch failed; Session has stopped auto-advancing: ${failures.map(failureDetailSummary).join('; ')}`
+    ? `Accepted plan execution batch failed; Session has stopped auto-advancing: ${failures.map((failure) => actionBatchFailureIndex.summary(failure)).join('; ')}`
     : 'Accepted plan execution batch failed or blocked; Session has stopped auto-advancing.';
   return [
     {
@@ -7699,9 +7701,9 @@ function acceptedPlanExecutionFailureEvents(
   ts: string,
   id: string
 ): AgentEvent[] {
-  const failures = actionBatchFailureDetails(kernelEvents, batch);
+  const failures = actionBatchFailureIndex.details(kernelEvents, batch);
   const summary = failures.length
-    ? `Accepted plan execution batch failed; Session has stopped auto-advancing: ${failures.map(failureDetailSummary).join('; ')}`
+    ? `Accepted plan execution batch failed; Session has stopped auto-advancing: ${failures.map((failure) => actionBatchFailureIndex.summary(failure)).join('; ')}`
     : 'Accepted plan execution batch failed or blocked; Session has stopped auto-advancing.';
   return [
     {
@@ -7753,115 +7755,6 @@ function acceptedPlanExecutionFailureEvents(
       id: `${id}-state`,
     }),
   ];
-}
-
-interface ActionBatchFailureDetail {
-  status: 'failed' | 'blocked';
-  workUnitId?: string;
-  actionId?: string;
-  message?: string;
-  code?: string;
-  kernelCode?: string;
-  classification?: string;
-  writeSet: string[];
-}
-
-function actionBatchFailureDetails(
-  kernelEvents: unknown[],
-  batch?: Record<string, unknown>
-): ActionBatchFailureDetail[] {
-  const workUnits = new Map<string, { actionId?: string; writeSet: string[] }>();
-  const actionIndex = actionBatchActionIndex(batch);
-  const details: ActionBatchFailureDetail[] = [];
-  for (const event of kernelEvents) {
-    const record = objectRecord(event);
-    if (!record) continue;
-    if (record.kind === 'work_unit.queued' || record.kind === 'work_unit.started') {
-      const workUnit = objectRecord(record.workUnit);
-      const id = stringValue(workUnit?.id) ?? stringValue(record.workUnitId);
-      if (!id) continue;
-      const prior = workUnits.get(id);
-      workUnits.set(id, {
-        actionId: stringValue(workUnit?.actionId) ?? stringValue(record.actionId) ?? prior?.actionId,
-        writeSet: stringArrayValue(workUnit?.writeSet).length ? stringArrayValue(workUnit?.writeSet) : prior?.writeSet ?? [],
-      });
-      continue;
-    }
-    if (record.kind !== 'work_unit.failed' && record.kind !== 'work_unit.blocked') continue;
-    const status = record.kind === 'work_unit.failed' ? 'failed' : 'blocked';
-    const workUnitId = stringValue(record.workUnitId) ?? stringValue(objectRecord(record.workUnit)?.id);
-    const indexed = workUnitId ? workUnits.get(workUnitId) : undefined;
-    const error = objectRecord(record.error);
-    const message = stringValue(record.message) ?? stringValue(error?.message) ?? stringValue(record.reason);
-    const actionId = stringValue(record.actionId) ?? indexed?.actionId;
-    const writeSet = stringArrayValue(record.writeSet).length ? stringArrayValue(record.writeSet) : indexed?.writeSet ?? [];
-    const action = (actionId ? actionIndex.get(actionId) : undefined)
-      ?? actionBatchDeleteActionForWriteSet(actionIndex, writeSet);
-    const kernelCode = stringValue(record.code) ?? stringValue(error?.code);
-    const classification = actionBatchFailureClassification(action, message);
-    details.push({
-      status,
-      workUnitId,
-      actionId,
-      message,
-      code: classification ?? kernelCode,
-      kernelCode,
-      classification,
-      writeSet,
-    });
-  }
-  return details;
-}
-
-function actionBatchActionIndex(batch?: Record<string, unknown>): Map<string, Record<string, unknown>> {
-  const index = new Map<string, Record<string, unknown>>();
-  for (const action of batchActionRecords(batch)) {
-    for (const id of [stringValue(action.actionId), stringValue(action.id)]) {
-      if (id) index.set(id, action);
-    }
-  }
-  return index;
-}
-
-function actionBatchDeleteActionForWriteSet(
-  actionIndex: Map<string, Record<string, unknown>>,
-  writeSet: string[]
-): Record<string, unknown> | undefined {
-  const targets = new Set(writeSet.map(normalizePlanScope).filter(Boolean));
-  if (!targets.size) return undefined;
-  for (const action of actionIndex.values()) {
-    if (actionEffectiveCapability(action) !== 'fs.delete') continue;
-    const actionTargets = actionTargetCandidates(action).map(normalizePlanScope).filter(Boolean);
-    if (actionTargets.some((target) => targets.has(target))) return action;
-  }
-  return undefined;
-}
-
-function actionBatchFailureClassification(
-  action: Record<string, unknown> | undefined,
-  message: string | undefined
-): string | undefined {
-  if (!action) return undefined;
-  const capability = actionEffectiveCapability(action);
-  const normalizedMessage = (message ?? '').toLowerCase();
-  if (capability === 'fs.patch' && normalizedMessage.includes('patch match did not occur')) {
-    return 'patch_stale_or_mismatched_evidence';
-  }
-  if (capability !== 'fs.delete') return undefined;
-  if (!message?.includes('fs.write target path is empty')) return undefined;
-  return 'kernel_delete_compile_mismatch';
-}
-
-function failureDetailSummary(detail: ActionBatchFailureDetail): string {
-  const parts = [
-    detail.workUnitId ? `workUnit=${detail.workUnitId}` : undefined,
-    detail.actionId ? `action=${detail.actionId}` : undefined,
-    detail.code ? `code=${detail.code}` : undefined,
-    detail.kernelCode && detail.kernelCode !== detail.code ? `kernelCode=${detail.kernelCode}` : undefined,
-    detail.message,
-    detail.writeSet.length ? `writeSet=${detail.writeSet.join(',')}` : undefined,
-  ].filter((item): item is string => Boolean(item));
-  return parts.length ? parts.join(' ') : detail.status;
 }
 
 function acceptedPlanConcreteFileOperationTarget(
