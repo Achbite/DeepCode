@@ -34,6 +34,12 @@ export interface StaticSyntaxReviewAssemblerPorts {
   resourceTextForTarget(packets: ResourcePacket[], target: string): string | undefined;
 }
 
+export interface ReviewContextRef {
+  runId: string;
+  reviewId: string;
+  sourcePlanId?: string;
+}
+
 export class ReviewAssembler {
   constructor(private readonly ports: StaticSyntaxReviewAssemblerPorts) {}
 
@@ -211,6 +217,35 @@ export class ReviewAssembler {
       return objectRecord(record.facts) ?? undefined;
     }
     return undefined;
+  }
+
+  reviewAlreadyResolved(events: unknown[], review: ReviewContextRef): boolean {
+    return events.some((event) => {
+      const record = objectRecord(event);
+      if (record?.kind !== 'review_summary') return false;
+      const payload = objectRecord(record.payload);
+      if (!payload) return false;
+      const status = stringValue(payload.status);
+      if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return false;
+      return stringValue(payload.runId) === review.runId &&
+        (stringValue(payload.reviewId) === review.reviewId || stringValue(payload.sourcePlanId) === review.sourcePlanId);
+    });
+  }
+
+  isTerminalAcceptedPlan(events: unknown[], review: ReviewContextRef): boolean {
+    for (const event of [...events].reverse()) {
+      const record = objectRecord(event);
+      if (record?.kind !== 'workflow_stage') continue;
+      const payload = objectRecord(record.payload);
+      if (!payload || stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
+      if (stringValue(payload.runId) !== review.runId) continue;
+      const planId = stringValue(payload.planId);
+      if (review.sourcePlanId && planId && planId !== review.sourcePlanId) continue;
+      const remaining = Array.isArray(payload.remainingTaskIds) ? payload.remainingTaskIds : [];
+      const status = stringValue(payload.status);
+      return status === 'completed' && remaining.length === 0;
+    }
+    return false;
   }
 }
 

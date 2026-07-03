@@ -1629,7 +1629,7 @@ export class SessionDriverLoop {
   private async resolveReviewDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
     const events = input.existingEvents ?? [];
     const review = findWaitingReview(events, input.runId);
-    if (!review || reviewAlreadyResolved(events, review)) {
+    if (!review || reviewAssembler().reviewAlreadyResolved(events, review)) {
       return this.append(input.sessionId, [
         traceEvent(input.sessionId, 'trace/review_accept_noop', '该 Review 已处理或已过期，没有重复推进任务。', this.ts(), this.id('review-noop'), {
           runId: input.runId,
@@ -1727,7 +1727,7 @@ export class SessionDriverLoop {
       });
     }
 
-    const terminalAcceptedPlan = reviewIsTerminalAcceptedPlan(events, review);
+    const terminalAcceptedPlan = reviewAssembler().isTerminalAcceptedPlan(events, review);
     const accepted = reviewDecisionEvent(input.sessionId, review, 'accepted', acceptedReviewContent(review, terminalAcceptedPlan), false, this.ts(), this.id('review-accepted'));
     let result = await this.append(input.sessionId, [accepted]);
     const decisionReply = await this.kernel({
@@ -10334,18 +10334,6 @@ function findWaitingReview(events: AgentEvent[], runId?: string): SessionReviewC
   return null;
 }
 
-function reviewAlreadyResolved(events: AgentEvent[], review: SessionReviewContext): boolean {
-  return events.some((event) => {
-    if (event.kind !== 'review_summary') return false;
-    const payload = objectRecord(event.payload);
-    if (!payload) return false;
-    const status = stringValue(payload.status);
-    if (status !== 'accepted' && status !== 'rejected' && status !== 'needsRevision') return false;
-    return stringValue(payload.runId) === review.runId &&
-      (stringValue(payload.reviewId) === review.reviewId || stringValue(payload.sourcePlanId) === review.sourcePlanId);
-  });
-}
-
 function reviewDecisionEvent(
   sessionId: string,
   review: SessionReviewContext,
@@ -10401,21 +10389,6 @@ function acceptedReviewContent(review: SessionReviewContext, terminalAcceptedPla
   }
   lines.push('', '### 决策边界', '- Review 通过只关闭当前批次。', '- 后续批次只能重新生成 Plan；新 Plan 经用户确认后，范围内 actionBundle 由 Session 自动提交 Kernel 执行。');
   return lines.join('\n');
-}
-
-function reviewIsTerminalAcceptedPlan(events: AgentEvent[], review: SessionReviewContext): boolean {
-  for (const event of [...events].reverse()) {
-    if (event.kind !== 'workflow_stage') continue;
-    const payload = objectRecord(event.payload);
-    if (!payload || stringValue(payload.stage) !== 'accepted_plan.batch_checkpoint') continue;
-    if (stringValue(payload.runId) !== review.runId) continue;
-    const planId = stringValue(payload.planId);
-    if (review.sourcePlanId && planId && planId !== review.sourcePlanId) continue;
-    const remaining = Array.isArray(payload.remainingTaskIds) ? payload.remainingTaskIds : [];
-    const status = stringValue(payload.status);
-    return status === 'completed' && remaining.length === 0;
-  }
-  return false;
 }
 
 function kernelReviewGateStatus(kernelEvents: unknown[] | undefined): string | undefined {
@@ -10627,7 +10600,7 @@ function findLatestActiveReviewInteraction(events: AgentEvent[]): DriverInteract
       reviewGuide: stringValue(payload.reviewGuide) ?? '',
       facts: Array.isArray(payload.facts) ? payload.facts.filter((item): item is string => typeof item === 'string') : [],
     };
-    if (reviewAlreadyResolved(events, review)) continue;
+    if (reviewAssembler().reviewAlreadyResolved(events, review)) continue;
     return { kind: 'review', runId };
   }
   return null;

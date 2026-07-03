@@ -568,6 +568,40 @@ function assertReviewAssemblerFormatsReviewFacts(): void {
   const lines = assembler.reviewFactLines(events);
   assert(lines.some((line) => line.includes(`work-unit-${token}`)), 'review assembler renders work unit facts');
   assert(lines.some((line) => line.includes(`tool-${token}`)), 'review assembler renders tool facts');
+
+  const review = {
+    runId: `run-${token}`,
+    reviewId: `review-${token}`,
+    sourcePlanId: `plan-${token}`,
+  };
+  assert(
+    assembler.reviewAlreadyResolved([
+      {
+        kind: 'review_summary',
+        payload: {
+          runId: review.runId,
+          reviewId: review.reviewId,
+          status: 'accepted',
+        },
+      },
+    ], review),
+    'review assembler detects resolved review summaries'
+  );
+  assert(
+    assembler.isTerminalAcceptedPlan([
+      {
+        kind: 'workflow_stage',
+        payload: {
+          runId: review.runId,
+          planId: review.sourcePlanId,
+          stage: 'accepted_plan.batch_checkpoint',
+          status: 'completed',
+          remainingTaskIds: [],
+        },
+      },
+    ], review),
+    'review assembler detects terminal accepted plan checkpoints'
+  );
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
