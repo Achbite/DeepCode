@@ -57,7 +57,7 @@ import {
   KernelEventStatusIndex,
 } from '../driver/execution/index.js';
 import { PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
-import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
+import { PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
 import { KernelEventProjectionBuilder, PlanProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
@@ -91,6 +91,7 @@ async function main(): Promise<void> {
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
+  assertPlanInteractionIndexFindsActivePlan();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
   assertAcceptedPlanTargetParserExtractsStructuredTargets();
   assertAcceptedPlanScopeMatcherNormalizesProposalTargets();
@@ -3002,6 +3003,82 @@ function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {
   const context = registry.currentTaskContext(registry.cursor([]));
   assertEqual(context?.targets.includes(targetPath), true, 'current task context includes exact operation grant target when task targets are empty');
   assertEqual(context?.capabilities.includes('fs.write'), true, 'current task context includes exact operation grant capability');
+}
+
+function assertPlanInteractionIndexFindsActivePlan(): void {
+  const suffix = randomSmokeToken('plan-interaction');
+  const runId = `run-${suffix}`;
+  const planId = `plan-${suffix}`;
+  interface TestPlan {
+    runId: string;
+    planId: string;
+    resolved: boolean;
+  }
+  const index = new PlanInteractionIndex<TestPlan>({
+    planCardAwaitingDecision: (payload) => payload.confirmable !== false && payload.status !== 'accepted',
+    planReviewEventAwaitingDecision: (payload) => payload.confirmable !== false && payload.status !== 'accepted',
+    planContextFromEvent: (_event, payload) => ({
+      runId: String(payload.runId),
+      planId: String(payload.planId),
+      resolved: payload.resolved === true,
+    }),
+    findPlanCard: (events, candidateRunId, candidatePlanId) => {
+      const event = events.find((item) => {
+        const payload = item.payload as Record<string, unknown> | undefined;
+        return item.kind === 'plan_card' &&
+          payload?.runId === candidateRunId &&
+          payload?.planId === candidatePlanId;
+      });
+      const payload = event?.payload as Record<string, unknown> | undefined;
+      return payload
+        ? {
+          runId: candidateRunId,
+          planId: candidatePlanId,
+          resolved: payload.resolved === true,
+        }
+        : null;
+    },
+    planAlreadyResolved: (_events, plan) => plan.resolved,
+  });
+  const planCard = {
+    id: `event-${suffix}-card`,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'plan_card',
+    payload: { runId, planId, status: 'pending', confirmable: true },
+  } as AgentEvent;
+  const planReview = {
+    id: `event-${suffix}-review`,
+    ts: '2026-01-01T00:00:01.000Z',
+    kind: 'plan_review',
+    payload: { runId, planId, status: 'awaitingUserApproval', confirmable: true },
+  } as AgentEvent;
+  assertEqual(
+    index.findLatestActivePlanInteraction([planCard])?.planId,
+    planId,
+    'plan interaction index finds a waiting plan card'
+  );
+  assertEqual(
+    index.findLatestActivePlanInteraction([planCard, planReview])?.runId,
+    runId,
+    'plan interaction index resolves review events through their plan card'
+  );
+  const resolvedPlan = {
+    id: `event-${suffix}-resolved`,
+    ts: '2026-01-01T00:00:02.000Z',
+    kind: 'plan_card',
+    payload: {
+      runId: `resolved-run-${suffix}`,
+      planId: `resolved-plan-${suffix}`,
+      status: 'pending',
+      confirmable: true,
+      resolved: true,
+    },
+  } as AgentEvent;
+  assertEqual(
+    index.findLatestActivePlanInteraction([resolvedPlan]),
+    null,
+    'plan interaction index skips plans already resolved by session state'
+  );
 }
 
 function assertSettingsCatalogBoundaries(): void {

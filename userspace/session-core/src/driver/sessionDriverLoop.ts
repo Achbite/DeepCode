@@ -115,7 +115,12 @@ import {
 } from '../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder, type SessionReviewContext } from './review/index.js';
-import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from './proposal/index.js';
+import {
+  PlanInteractionIndex,
+  PlanReviewGrantProjector,
+  PlanReviewReportAnalyzer,
+  ProtocolGate,
+} from './proposal/index.js';
 import {
   KernelEventProjectionBuilder,
   PlanProjectionBuilder,
@@ -317,6 +322,13 @@ const acceptedPlanTargetParser = new AcceptedPlanTargetParser();
 const planReviewGrantProjector = new PlanReviewGrantProjector();
 const planReviewReportAnalyzer = new PlanReviewReportAnalyzer({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
+});
+const planInteractionIndex = new PlanInteractionIndex<SessionPlanContext>({
+  planCardAwaitingDecision: (payload) => planReviewReportAnalyzer.planCardAwaitingDecision(payload),
+  planReviewEventAwaitingDecision: (payload) => planReviewReportAnalyzer.planReviewEventAwaitingDecision(payload),
+  planContextFromEvent,
+  findPlanCard,
+  planAlreadyResolved,
 });
 const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
@@ -7543,30 +7555,9 @@ type DriverInteraction =
 function findActiveDriverInteraction(events: AgentEvent[]): DriverInteraction | null {
   const review = reviewAssembler().findLatestActiveReviewInteraction(events);
   if (review) return review;
-  const plan = findLatestActivePlanInteraction(events);
+  const plan = planInteractionIndex.findLatestActivePlanInteraction(events);
   if (plan) return plan;
   return userInputPipeline.findLatestActiveRequirementInteraction(events);
-}
-
-function findLatestActivePlanInteraction(events: AgentEvent[]): DriverInteraction | null {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event.kind !== 'plan_review' && event.kind !== 'plan_card') continue;
-    const payload = objectRecord(event.payload);
-    if (!payload) continue;
-    const waiting = event.kind === 'plan_card'
-      ? planReviewReportAnalyzer.planCardAwaitingDecision(payload)
-      : planReviewReportAnalyzer.planReviewEventAwaitingDecision(payload);
-    const runId = stringValue(payload.runId);
-    const planId = stringValue(payload.planId);
-    if (!waiting || !runId || !planId) continue;
-    const plan = event.kind === 'plan_card'
-      ? planContextFromEvent(event, payload)
-      : findPlanCard(events.slice(0, index + 1), runId, planId);
-    if (!plan || planAlreadyResolved(events, plan)) continue;
-    return { kind: 'plan', runId, planId };
-  }
-  return null;
 }
 
 function requirementDecisionEvent(
