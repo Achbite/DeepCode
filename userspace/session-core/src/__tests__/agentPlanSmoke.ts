@@ -42,7 +42,7 @@ import {
 } from '../index.js';
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
+import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 import { ProtocolGate } from '../driver/proposal/index.js';
 import { ReviewAssembler } from '../driver/review/index.js';
@@ -60,6 +60,7 @@ async function main(): Promise<void> {
   await assertProviderTraceRecorderArchivesPayload();
   await assertResourceRequestLoopBuildsPacketEvents();
   assertResourceEvidenceIndexQueriesPackets();
+  assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertReviewAssemblerFormatsReviewFacts();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
@@ -530,6 +531,103 @@ function assertResourceEvidenceIndexQueriesPackets(): void {
     index.relevantForTargets([packet], [target]).some((line) => line.includes(`file-${token}.txt`)),
     'resource evidence index renders relevant evidence summaries'
   );
+}
+
+function assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets(): void {
+  const token = randomSmokeToken('generated-evidence');
+  const targetPath = `generated-${token}/artifact-${randomSmokeToken('file')}.txt`;
+  const sourceBlockId = `block-${token}`;
+  const actionId = `action-${token}`;
+  const content = `content-${randomSmokeToken('content')}`;
+  const index = new GeneratedArtifactEvidenceIndex({
+    normalizeRelativePath: (value) => value?.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/g, ''),
+    comparablePath: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/g, ''),
+    utf8Bytes: (value) => value.length,
+    sanitizeId: (value) => value.replace(/[^a-zA-Z0-9_-]+/g, '-'),
+    joinFsPath: (root, child) => `${root.replace(/\/+$/g, '')}/${child.replace(/^\/+/g, '')}`,
+    objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined,
+    stringValue: (value) => typeof value === 'string' ? value : undefined,
+    uniqueStrings: (values) => Array.from(new Set(values.filter((value): value is string => typeof value === 'string' && value.length > 0))),
+    batchActionRecords: (batch) => Array.isArray((batch as Record<string, unknown>).actions)
+      ? (batch as Record<string, unknown>).actions as Record<string, unknown>[]
+      : [],
+    actionEffectiveCapability: (action) => typeof action.capability === 'string' ? action.capability : '',
+    actionFileTargetPath: (action) => typeof action.targetPath === 'string' ? action.targetPath : undefined,
+    completedWorkUnitFacts: () => ({ actionIds: new Set([actionId]), targets: new Set([targetPath]) }),
+    completedActionMatches: (candidateActionId, candidateTargetPath, completed) =>
+      Boolean(candidateActionId && completed.actionIds.has(candidateActionId)) ||
+      completed.targets.has(candidateTargetPath),
+    codeBlockContent: (block) => Array.isArray(block.contentLines) ? block.contentLines.join('\n') : undefined,
+    resolveRelativePath: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/g, ''),
+  });
+  const state = {
+    workspaceScopeKey: `workspace-${token}`,
+    conversationRoots: [
+      {
+        rootId: `root-${token}`,
+        label: `Root ${token}`,
+        displayPath: `/tmp/root-${token}`,
+        absolutePath: `/tmp/root-${token}`,
+        source: 'currentAttachment' as const,
+        primary: true,
+        kind: 'directory' as const,
+      },
+    ],
+    generatedArtifactEvidence: new Map(),
+  };
+  const generatedPacket = index.packetFromSuccessfulBatch(
+    state,
+    {
+      codeBlocks: [
+        {
+          id: sourceBlockId,
+          targetPath,
+          contentLines: [content],
+        },
+      ],
+      actions: [
+        {
+          actionId,
+          capability: 'fs.write',
+          targetPath,
+          sourceBlockId,
+        },
+      ],
+    },
+    [{ kind: 'work_unit.completed', actionId, output: { path: targetPath } }],
+    `packet-${token}`
+  );
+  assertEqual(generatedPacket?.items[0]?.path, targetPath, 'generated artifact index emits packet target path');
+  assertEqual(
+    generatedPacket?.items[0]?.promptContent,
+    content,
+    'generated artifact index keeps generated file content as run-local evidence'
+  );
+  assert(
+    state.generatedArtifactEvidence.has(targetPath),
+    'generated artifact index stores generated evidence under comparable path'
+  );
+  const replay = index.packetForRequest(
+    state,
+    {
+      version: '1',
+      id: `request-${token}`,
+      reason: `read generated artifact ${token}`,
+      items: [
+        {
+          id: `item-${token}`,
+          kind: 'file',
+          path: targetPath,
+          reason: `read generated artifact ${token}`,
+        },
+      ],
+    },
+    `replay-${token}`
+  );
+  assertEqual(replay.remaining.items.length, 0, 'generated artifact index satisfies matching resource request');
+  assertEqual(replay.packet?.items[0]?.promptContent, content, 'generated artifact replay packet contains prompt content');
 }
 
 function assertReviewAssemblerFormatsReviewFacts(): void {

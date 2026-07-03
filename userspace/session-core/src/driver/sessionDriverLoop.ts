@@ -13,7 +13,6 @@ import type {
   LlmChatResult,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import { stableHash } from '../cache/canonicalizer.js';
 import {
   AcceptedPlanAdmission,
   AcceptedPlanExecutor,
@@ -51,7 +50,6 @@ import type {
   ProjectWorkingDirectory,
   ResourceManifest,
   ResourcePacket,
-  ResourcePacketItem,
 } from '../context/types.js';
 import {
   assembleContext,
@@ -83,10 +81,12 @@ import {
 } from './pipelines/providerPipeline.js';
 import {
   ContextFrameBuilder,
+  GeneratedArtifactEvidenceIndex,
   ResourceEvidenceIndex,
   ResourceManifestBuilder,
   ResourceRequestLoop,
   ResourceRequestResolver,
+  type GeneratedArtifactEvidence,
   type ResourceRequestResolution,
 } from './context/index.js';
 import type { RequirementChecklist, RequirementRecord } from '../requirement/types.js';
@@ -195,16 +195,6 @@ interface SessionDriverLoopRunState {
   nativeToolDuplicateRepairAttempted: boolean;
   activeTurn?: ActiveTurnState;
   interactionOverlay?: InteractionOverlayContext;
-}
-
-interface GeneratedArtifactEvidence {
-  targetPath: string;
-  content: string;
-  contentHash: string;
-  manifestEntryId: string;
-  sourceBlockId?: string;
-  actionId?: string;
-  workUnitId?: string;
 }
 
 type SessionTurnPhase =
@@ -424,7 +414,7 @@ export class SessionDriverLoop {
         manifest: manifestBuild.manifest,
       },
       resourcePackets: [...restoredResourcePackets],
-      generatedArtifactEvidence: generatedArtifactEvidenceFromPackets(restoredResourcePackets),
+      generatedArtifactEvidence: generatedArtifactEvidenceIndex().fromPackets(restoredResourcePackets),
       memoryDocument,
       memoryHints: implementationBatchHints(implementationBatch, acceptedImplementationPlan),
       taskExecutionCursor: initialTaskCursor,
@@ -648,7 +638,7 @@ export class SessionDriverLoop {
         ]);
       }
       if (proposal.kind === 'resourceRequest') {
-        const generated = generatedArtifactResourcePacketForRequest(
+        const generated = generatedArtifactEvidenceIndex().packetForRequest(
           state,
           proposal.payload as ResourceRequestDraft,
           this.id('generated-artifact-resource')
@@ -3022,7 +3012,7 @@ export class SessionDriverLoop {
       return this.submitActionProposal(input, state, prompt, repaired, result);
     }
     if (repaired.kind === 'resourceRequest') {
-      const generated = generatedArtifactResourcePacketForRequest(
+      const generated = generatedArtifactEvidenceIndex().packetForRequest(
         state,
         repaired.payload as ResourceRequestDraft,
         this.id('action-bundle-admission-generated-resource')
@@ -3309,7 +3299,7 @@ export class SessionDriverLoop {
         }
         if (repaired.kind === 'resourceRequest') {
           let result = fallback;
-          const generated = generatedArtifactResourcePacketForRequest(
+          const generated = generatedArtifactEvidenceIndex().packetForRequest(
             state,
             repaired.payload as ResourceRequestDraft,
             this.id('accepted-plan-repair-generated-resource')
@@ -3633,14 +3623,14 @@ export class SessionDriverLoop {
         this.id('accepted-plan-batch-failed')
       )) ?? result;
     }
-    const generatedPacket = generatedArtifactResourcePacketFromSuccessfulBatch(
+    const generatedPacket = generatedArtifactEvidenceIndex().packetFromSuccessfulBatch(
       state,
       batch,
       batchEvents,
       this.id('generated-artifact-evidence')
     );
     if (generatedPacket) {
-      indexGeneratedArtifactEvidence(state, generatedPacket);
+      generatedArtifactEvidenceIndex().indexPacket(state.generatedArtifactEvidence, generatedPacket);
       state.resourcePackets.push(generatedPacket);
       result = await this.append(state.sessionId, [
         resourceRequestLoop.packetEvent(state.sessionId, generatedPacket, this.ts(), this.id('accepted-plan-generated-artifact-evidence')),
@@ -4535,175 +4525,6 @@ export class SessionDriverLoopError extends Error {
   }
 }
 
-function generatedArtifactEvidenceFromPackets(packets: ResourcePacket[]): Map<string, GeneratedArtifactEvidence> {
-  const evidence = new Map<string, GeneratedArtifactEvidence>();
-  for (const packet of packets) {
-    for (const item of packet.items) {
-      if (!item.evidenceRefs?.includes('generatedArtifactEvidence')) continue;
-      const targetPath = normalizeRelativePath(item.path);
-      const content = typeof item.promptContent === 'string' ? item.promptContent : undefined;
-      if (!targetPath || !content) continue;
-      evidence.set(comparablePath(targetPath), {
-        targetPath,
-        content,
-        contentHash: stableHash(content),
-        manifestEntryId: item.manifestEntryId,
-      });
-    }
-  }
-  return evidence;
-}
-
-function indexGeneratedArtifactEvidence(state: SessionDriverLoopRunState, packet: ResourcePacket): void {
-  for (const item of packet.items) {
-    if (!item.evidenceRefs?.includes('generatedArtifactEvidence')) continue;
-    const targetPath = normalizeRelativePath(item.path);
-    const content = typeof item.promptContent === 'string' ? item.promptContent : undefined;
-    if (!targetPath || !content) continue;
-    state.generatedArtifactEvidence.set(comparablePath(targetPath), {
-      targetPath,
-      content,
-      contentHash: stableHash(content),
-      manifestEntryId: item.manifestEntryId,
-    });
-  }
-}
-
-function generatedArtifactResourcePacketFromSuccessfulBatch(
-  state: SessionDriverLoopRunState,
-  batch: Record<string, unknown>,
-  events: unknown[],
-  packetId: string
-): ResourcePacket | undefined {
-  const completed = completedWorkUnitFacts(events);
-  if (completed.actionIds.size === 0 && completed.targets.size === 0) return undefined;
-  const codeBlocks = Array.isArray(batch.codeBlocks) ? batch.codeBlocks : [];
-  const codeBlockById = new Map<string, Record<string, unknown>>();
-  for (const block of codeBlocks) {
-    const record = objectRecord(block);
-    const id = stringValue(record?.id) ?? stringValue(record?.blockId);
-    if (record && id) codeBlockById.set(id, record);
-  }
-  const items: ResourcePacketItem[] = [];
-  for (const action of batchActionRecords(batch)) {
-    const capability = actionEffectiveCapability(action);
-    if (capability !== 'fs.write' && capability !== 'fs.create') continue;
-    const actionId = stringValue(action.actionId) ?? stringValue(action.id);
-    const args = objectRecord(action.args) ?? objectRecord(action.toolArgs);
-    const sourceBlockId = stringValue(action.sourceBlockId) ?? stringValue(args?.sourceBlockId);
-    const block = sourceBlockId ? codeBlockById.get(sourceBlockId) : undefined;
-    const targetPath = normalizeRelativePath(
-      actionFileTargetPath(action) ??
-      stringValue(block?.targetPath) ??
-      stringValue(block?.path)
-    );
-    if (!targetPath || targetPath === '.') continue;
-    if (!completedActionMatches(actionId, targetPath, completed)) continue;
-    const content = block ? codeBlockContent(block) : undefined;
-    if (typeof content !== 'string') continue;
-    const manifestEntryId = `generated-${sanitizeId(targetPath)}`;
-    const absolutePath = generatedArtifactAbsolutePath(state, targetPath);
-    const contentHash = stableHash(content);
-    state.generatedArtifactEvidence.set(comparablePath(targetPath), {
-      targetPath,
-      content,
-      contentHash,
-      manifestEntryId,
-      sourceBlockId,
-      actionId,
-    });
-    items.push({
-      requestItemId: `generated-${sanitizeId(actionId ?? targetPath)}`,
-      manifestEntryId,
-      readPolicy: 'autoRead',
-      status: 'resolved',
-      path: targetPath,
-      ...(absolutePath ? { absolutePath } : {}),
-      contentKind: 'fileText',
-      contentSummary: `Generated artifact from completed Kernel work unit: ${targetPath}`,
-      promptContent: content,
-      originalBytes: utf8Bytes(content),
-      returnedBytes: utf8Bytes(content),
-      rangeComplete: true,
-      evidenceRefs: ['generatedArtifactEvidence'],
-    });
-  }
-  if (!items.length) return undefined;
-  return {
-    id: packetId,
-    workspaceScopeKey: state.workspaceScopeKey,
-    requestId: `${packetId}-request`,
-    items,
-  };
-}
-
-function generatedArtifactResourcePacketForRequest(
-  state: SessionDriverLoopRunState,
-  request: ResourceRequestDraft,
-  packetId: string
-): { packet?: ResourcePacket; remaining: ResourceRequestDraft } {
-  const remainingItems: ResourceRequestDraft['items'] = [];
-  const items: ResourcePacketItem[] = [];
-  for (const item of request.items ?? []) {
-    const evidence = generatedArtifactEvidenceForRequestItem(state, item);
-    if (!evidence) {
-      remainingItems.push(item);
-      continue;
-    }
-    const absolutePath = generatedArtifactAbsolutePath(state, evidence.targetPath);
-    items.push({
-      requestItemId: item.id,
-      manifestEntryId: evidence.manifestEntryId,
-      readPolicy: 'autoRead',
-      status: 'resolved',
-      path: evidence.targetPath,
-      ...(absolutePath ? { absolutePath } : {}),
-      contentKind: 'fileText',
-      contentSummary: `Run-local generated artifact evidence: ${evidence.targetPath}`,
-      promptContent: evidence.content,
-      originalBytes: utf8Bytes(evidence.content),
-      returnedBytes: utf8Bytes(evidence.content),
-      rangeComplete: true,
-      evidenceRefs: ['generatedArtifactEvidence'],
-    });
-  }
-  return {
-    packet: items.length
-      ? {
-        id: packetId,
-        workspaceScopeKey: state.workspaceScopeKey,
-        requestId: request.id ?? `${packetId}-request`,
-        items,
-      }
-      : undefined,
-    remaining: {
-      ...request,
-      items: remainingItems,
-    },
-  };
-}
-
-function generatedArtifactEvidenceForRequestItem(
-  state: SessionDriverLoopRunState,
-  item: ResourceRequestDraft['items'][number]
-): GeneratedArtifactEvidence | undefined {
-  if (item.kind === 'search' || item.query?.trim()) return undefined;
-  const candidates = uniqueStrings([
-    stringValue(item.path),
-    stringValue(item.manifestEntryId),
-  ]);
-  const resolver = resourceRequestResolver();
-  for (const candidate of candidates) {
-    const targetPath = resolver.resolveRelativePath(candidate, item.rootId, state.conversationRoots)
-      ?? resolver.resolveRelativePath(candidate, undefined, state.conversationRoots)
-      ?? normalizeRelativePath(candidate);
-    if (!targetPath || targetPath === '.') continue;
-    const evidence = state.generatedArtifactEvidence.get(comparablePath(targetPath));
-    if (evidence) return evidence;
-  }
-  return undefined;
-}
-
 function completedWorkUnitFacts(events: unknown[]): { actionIds: Set<string>; targets: Set<string> } {
   const actionIds = new Set<string>();
   const targets = new Set<string>();
@@ -4740,12 +4561,6 @@ function codeBlockContent(block: Record<string, unknown>): string | undefined {
   if (typeof block.content === 'string') return block.content;
   const lines = stringArrayValue(block.contentLines);
   return lines.length ? lines.join('\n') : undefined;
-}
-
-function generatedArtifactAbsolutePath(state: SessionDriverLoopRunState, targetPath: string): string | undefined {
-  const root = state.conversationRoots.find((item) => item.primary) ?? state.conversationRoots[0];
-  const base = root?.absolutePath ?? root?.displayPath;
-  return base ? joinFsPath(base, targetPath) : undefined;
 }
 
 function providerStageExposesAssistantDelta(stage: string): boolean {
@@ -4786,6 +4601,27 @@ function resourceEvidenceIndex(): ResourceEvidenceIndex {
   return new ResourceEvidenceIndex({
     normalizeTarget: normalizePlanScope,
     clip,
+  });
+}
+
+function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex {
+  return new GeneratedArtifactEvidenceIndex({
+    normalizeRelativePath,
+    comparablePath,
+    utf8Bytes,
+    sanitizeId,
+    joinFsPath,
+    objectRecord,
+    stringValue,
+    uniqueStrings,
+    batchActionRecords,
+    actionEffectiveCapability,
+    actionFileTargetPath,
+    completedWorkUnitFacts,
+    completedActionMatches,
+    codeBlockContent,
+    resolveRelativePath: (value, rootId, roots) =>
+      resourceRequestResolver().resolveRelativePath(value, rootId, roots),
   });
 }
 
