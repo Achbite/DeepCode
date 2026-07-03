@@ -41,7 +41,7 @@ import {
 } from '../index.js';
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { ProviderPipeline } from '../driver/pipelines/providerPipeline.js';
+import { ProviderJsonModeCoordinator, ProviderPipeline } from '../driver/pipelines/index.js';
 
 async function main(): Promise<void> {
   assertV3Parser();
@@ -51,6 +51,7 @@ async function main(): Promise<void> {
   assertContextAssemblerCachePlan();
   assertProviderTurnContractFrameOrder();
   await assertProviderPipelineUsesProviderTurnContract();
+  assertProviderJsonModeCoordinator();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -266,6 +267,22 @@ async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
     true,
     'provider pipeline renders contract frame after non-user resume messages'
   );
+}
+
+function assertProviderJsonModeCoordinator(): void {
+  const coordinator = new ProviderJsonModeCoordinator();
+  const messages: LlmChatRequest['messages'] = [{ role: 'user', content: 'Return the next proposal.' }];
+  const injected = coordinator.ensureMessages(messages, { type: 'json_object' });
+  assertEqual(injected.length, 2, 'provider json mode coordinator injects one system instruction');
+  assertEqual(String(injected[0]?.content ?? '').includes('valid JSON object'), true, 'json mode instruction is explicit');
+  const audit = coordinator.audit(messages, { type: 'json_object' });
+  assertEqual(audit?.injectedJsonInstruction, true, 'json mode audit records injected instruction');
+  const alreadyJson = coordinator.ensureMessages(
+    [{ role: 'user', content: 'Return JSON only.' }],
+    { type: 'json_object' }
+  );
+  assertEqual(alreadyJson.length, 1, 'provider json mode coordinator does not duplicate existing json instruction');
+  assertEqual(coordinator.ensureMessages(messages, undefined), messages, 'provider json mode coordinator ignores non-json mode');
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {

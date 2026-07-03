@@ -71,6 +71,7 @@ import {
   NativeToolCoordinator,
   NativeToolCoordinatorError,
   NativeToolTurnHandler,
+  ProviderJsonModeCoordinator,
   ProviderPipeline,
   ProviderTraceArchive,
   ProviderPartFrameParser,
@@ -304,6 +305,7 @@ const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
 const providerRepairMessageBuilder = new ProviderRepairMessageBuilder(MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES);
 const acceptedPlanResourceResumePromptBuilder = new AcceptedPlanResourceResumePromptBuilder(providerRepairMessageBuilder);
 const providerPipeline = new ProviderPipeline();
+const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
 const nativeToolCoordinator = new NativeToolCoordinator();
 const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
 const acceptedPlanExecutor = new AcceptedPlanExecutor();
@@ -3919,13 +3921,14 @@ export class SessionDriverLoop {
     messages: LlmChatRequest['messages'],
     options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {}
   ): Promise<LlmTurnResult> {
+    const jsonModeMessages = providerJsonModeCoordinator.ensureMessages(messages, options.responseFormat);
     await this.appendProviderTrace(state, `${stage}.request`, {
       profileId,
-      messages: ensureJsonObjectModeMessages(messages, options.responseFormat),
+      messages: jsonModeMessages,
       cachePlan: state.cachePlan,
       contextAssembly: state.contextAssembly,
       responseFormat: options.responseFormat,
-      responseFormatAudit: jsonObjectResponseFormatAudit(messages, options.responseFormat),
+      responseFormatAudit: providerJsonModeCoordinator.audit(messages, options.responseFormat),
     });
     await this.emitProjectionDelta(state, {
       type: 'active_turn',
@@ -3938,7 +3941,7 @@ export class SessionDriverLoop {
     });
     const request: LlmChatRequest = {
       profileId,
-      messages: ensureJsonObjectModeMessages(messages, options.responseFormat),
+      messages: jsonModeMessages,
       responseFormat: options.responseFormat,
       tools: options.tools,
       stream: Boolean(this.ports.llmChatStream),
@@ -4516,45 +4519,8 @@ export class SessionDriverLoop {
   }
 }
 
-const JSON_OBJECT_MODE_INSTRUCTION =
-  'Return exactly one valid JSON object. Do not return markdown, prose outside JSON, or multiple JSON objects.';
-
 function isEmptyResponseError(error: unknown): boolean {
   return error instanceof SessionDriverLoopError && error.code === 'llm_empty_response';
-}
-
-function ensureJsonObjectModeMessages(
-  messages: LlmChatRequest['messages'],
-  responseFormat: unknown
-): LlmChatRequest['messages'] {
-  if (!isJsonObjectResponseFormat(responseFormat) || messagesContainJsonInstruction(messages)) {
-    return messages;
-  }
-  return [
-    { role: 'system', content: JSON_OBJECT_MODE_INSTRUCTION },
-    ...messages,
-  ];
-}
-
-function jsonObjectResponseFormatAudit(
-  messages: LlmChatRequest['messages'],
-  responseFormat: unknown
-): Record<string, unknown> | undefined {
-  if (!isJsonObjectResponseFormat(responseFormat)) return undefined;
-  const jsonInstructionPresent = messagesContainJsonInstruction(messages);
-  return {
-    mode: 'json_object',
-    jsonInstructionPresent,
-    injectedJsonInstruction: !jsonInstructionPresent,
-  };
-}
-
-function isJsonObjectResponseFormat(responseFormat: unknown): boolean {
-  return objectRecord(responseFormat)?.type === 'json_object';
-}
-
-function messagesContainJsonInstruction(messages: LlmChatRequest['messages']): boolean {
-  return messages.some((message) => typeof message.content === 'string' && /\bjson\b/i.test(message.content));
 }
 
 function assertKernelReplyOk(reply: KernelReply, code: string, fallback: string): void {

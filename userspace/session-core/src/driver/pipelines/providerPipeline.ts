@@ -9,6 +9,8 @@ import {
   type ProviderEmptyProposalRetryOptions,
 } from '../../provider/ProviderEmptyProposalRetry.js';
 
+export { ProviderJsonModeCoordinator } from './providerJsonModeCoordinator.js';
+
 export {
   ProviderTraceArchive,
   type ProviderTraceArchiveRecord,
