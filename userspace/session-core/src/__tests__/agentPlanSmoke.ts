@@ -44,12 +44,14 @@ import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '..
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderTraceRecorder } from '../driver/pipelines/index.js';
+import { ProtocolGate } from '../driver/proposal/index.js';
 import { ReviewAssembler } from '../driver/review/index.js';
 
 async function main(): Promise<void> {
   assertV3Parser();
   assertLegacyProviderShapesAreRejected();
   assertActionBundleProtocolFields();
+  assertProtocolGateCanonicalizesBareRepair();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
   assertProviderTurnContractFrameOrder();
@@ -601,6 +603,58 @@ function assertReviewAssemblerFormatsReviewFacts(): void {
       },
     ], review),
     'review assembler detects terminal accepted plan checkpoints'
+  );
+}
+
+function assertProtocolGateCanonicalizesBareRepair(): void {
+  const token = randomSmokeToken('protocol-gate');
+  const gate = new ProtocolGate({
+    canonicalizeWriteActionSourceBlockRefs: () => undefined,
+    ensureReviewableExpectations: () => undefined,
+    validateProposalSemantics: () => undefined,
+  });
+  const plan = gate.parseAndValidateRepairedProposal({
+    raw: [
+      '```json',
+      JSON.stringify({
+        title: `Plan ${token}`,
+        summary: `Summary ${token}`,
+        tasks: [
+          {
+            taskId: `task-${token}`,
+            title: `Task ${token}`,
+            target: [`target-${token}.txt`],
+            acceptanceCriteria: [`accepted-${token}`],
+          },
+        ],
+      }),
+      '```',
+    ].join('\n'),
+    runId: `run-${token}`,
+    sessionId: `session-${token}`,
+    source: 'llm',
+    allowedKinds: ['taskPlan'],
+  });
+  assertEqual(plan.kind, 'taskPlan', 'protocol gate canonicalizes bare task plan repair');
+  assertEqual(plan.runId, `run-${token}`, 'protocol gate fills repaired run id');
+  const decision = gate.parseAndValidateRepairedProposal({
+    raw: {
+      question: `Question ${token}?`,
+      options: [
+        { id: `first-${token}`, label: `First ${token}` },
+        { id: `second-${token}`, label: `Second ${token}` },
+      ],
+      allowsFreeform: true,
+    },
+    runId: `run-decision-${token}`,
+    source: 'llm',
+    allowedKinds: ['decisionRequest'],
+  });
+  assertEqual(decision.kind, 'decisionRequest', 'protocol gate infers bare decision request shape');
+  assertEqual(
+    gate.repairAllowedKinds({ acceptedPlanActive: true, errorCode: `error-${token}` }).includes('taskPlan'),
+    false,
+    'protocol gate does not allow planning kinds during accepted-plan repair'
   );
 }
 

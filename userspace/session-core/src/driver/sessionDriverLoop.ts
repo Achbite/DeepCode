@@ -13,7 +13,6 @@ import type {
   LlmChatResult,
   ProjectionDelta,
 } from '@deepcode/protocol';
-import { parseProposalEnvelope } from '../agent-plan/protocolV3.js';
 import { stableHash } from '../cache/canonicalizer.js';
 import {
   AcceptedPlanAdmission,
@@ -104,6 +103,7 @@ import {
 } from '../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 import { ReviewAssembler } from './review/index.js';
+import { ProtocolGate } from './proposal/index.js';
 import type { ProviderTurnContract } from './runFrame.js';
 
 export interface SessionDriverLoopPorts {
@@ -1937,7 +1937,7 @@ export class SessionDriverLoop {
         { role: 'system', content: assembledContext.prompt.stablePrefix },
         { role: 'user', content: assembledContext.prompt.dynamicSuffix },
       ]);
-      revised = parseAndValidateProposal({
+      revised = protocolGate().parseAndValidateProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -2023,12 +2023,15 @@ export class SessionDriverLoop {
             providerRepairMessageBuilder.repairMessages(prompt, providerRepairMessageState(state), '', parseError)
           );
           try {
-            return parseAndValidateRepairedProposal({
+            return protocolGate().parseAndValidateRepairedProposal({
               raw: repairedRaw,
               runId: state.runId,
               sessionId: state.sessionId,
               source: 'llm',
-              allowedKinds: repairAllowedKinds(state, 'llm_empty_response'),
+              allowedKinds: protocolGate().repairAllowedKinds({
+                acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
+                errorCode: 'llm_empty_response',
+              }),
               allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
             });
           } catch (repairError) {
@@ -2053,7 +2056,7 @@ export class SessionDriverLoop {
           providerRepairMessageBuilder.actionBundleCompactionRepairMessages(prompt, providerRepairMessageState(state), 'LLM provider returned an empty response before emitting a JSON proposal.', '')
         );
         try {
-          return parseAndValidateRepairedProposal({
+          return protocolGate().parseAndValidateRepairedProposal({
             raw: repairedRaw,
             runId: state.runId,
             sessionId: state.sessionId,
@@ -2071,7 +2074,7 @@ export class SessionDriverLoop {
       throw error;
     }
     try {
-      return parseAndValidateProposal({
+      return protocolGate().parseAndValidateProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -2096,12 +2099,15 @@ export class SessionDriverLoop {
         : providerRepairMessageBuilder.repairMessages(prompt, providerRepairMessageState(state), raw, parseError);
       const repairedRaw = await this.llm(input.profileId, state, repairStage, repairPrompt);
       try {
-        return parseAndValidateRepairedProposal({
+        return protocolGate().parseAndValidateRepairedProposal({
           raw: repairedRaw,
           runId: state.runId,
           sessionId: state.sessionId,
           source: 'llm',
-          allowedKinds: repairAllowedKinds(state, parseError.code),
+          allowedKinds: protocolGate().repairAllowedKinds({
+            acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
+            errorCode: parseError.code,
+          }),
           allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
         });
       } catch (repairError) {
@@ -2338,7 +2344,7 @@ export class SessionDriverLoop {
     );
     if (typeof providerResult !== 'string') return providerResult;
     try {
-      return parseAndValidateProposal({
+      return protocolGate().parseAndValidateProposal({
         raw: providerResult,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -2362,7 +2368,7 @@ export class SessionDriverLoop {
         providerRepairMessageBuilder.repairMessages(prompt, providerRepairMessageState(state), providerResult, parseError)
       );
       try {
-        return parseAndValidateRepairedProposal({
+        return protocolGate().parseAndValidateRepairedProposal({
           raw: repairedRaw,
           runId: state.runId,
           sessionId: state.sessionId,
@@ -2711,7 +2717,7 @@ export class SessionDriverLoop {
       providerRepairMessageBuilder.completeStageToolViolationRepairMessages(prompt, providerRepairMessageState(state), firstToolCall, effectiveTurn)
     );
     try {
-      return parseAndValidateRepairedProposal({
+      return protocolGate().parseAndValidateRepairedProposal({
         raw: repairedRaw,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -2777,7 +2783,7 @@ export class SessionDriverLoop {
       )
     );
     try {
-      return parseAndValidateRepairedProposal({
+      return protocolGate().parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -2800,7 +2806,7 @@ export class SessionDriverLoop {
   ): ProposalEnvelope | null {
     if (!turn.content.trim().startsWith('{')) return null;
     try {
-      return parseAndValidateProposal({
+      return protocolGate().parseAndValidateProposal({
         raw: turn.content,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -2870,7 +2876,7 @@ export class SessionDriverLoop {
       )
     );
     try {
-      return parseAndValidateRepairedProposal({
+      return protocolGate().parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -2940,7 +2946,7 @@ export class SessionDriverLoop {
       )
     );
     try {
-      return parseAndValidateRepairedProposal({
+      return protocolGate().parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -2993,7 +2999,7 @@ export class SessionDriverLoop {
         'action_bundle_admission_repair',
         providerRepairMessageBuilder.actionBundleAdmissionRepairMessages(prompt, providerRepairMessageState(state), proposal, reasons)
       );
-      repaired = parseAndValidateRepairedProposal({
+      repaired = protocolGate().parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -3838,7 +3844,7 @@ export class SessionDriverLoop {
       providerRepairMessageBuilder.planReviewRepairMessages(prompt, providerRepairMessageState(state), proposal, report)
     );
     try {
-      return parseAndValidateRepairedProposal({
+      return protocolGate().parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -3867,7 +3873,7 @@ export class SessionDriverLoop {
       providerRepairMessageBuilder.acceptedPlanScopeRepairMessages(prompt, providerRepairMessageState(state), proposal, validation.reasons)
     );
     try {
-      return parseAndValidateRepairedProposal({
+      return protocolGate().parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -5910,190 +5916,12 @@ function proposalActionBundleAdmissionBatch(proposal: ProposalEnvelope): Record<
   };
 }
 
-function parseAndValidateProposal(input: {
-  raw: string | Record<string, unknown>;
-  runId: string;
-  sessionId?: string;
-  source?: 'llm' | 'user' | 'system' | 'cache';
-  allowBriefActionBundleUserPlan?: boolean;
-}): ProposalEnvelope {
-  const proposal = parseProposalEnvelope(input);
-  canonicalizeWriteActionSourceBlockRefs(proposal);
-  executionPromptCoordinator().ensureReviewableExpectations(proposal);
-  validateProposalSemantics(proposal, {
-    allowBriefActionBundleUserPlan: input.allowBriefActionBundleUserPlan === true,
+function protocolGate(): ProtocolGate {
+  return new ProtocolGate({
+    canonicalizeWriteActionSourceBlockRefs,
+    ensureReviewableExpectations: (proposal) => executionPromptCoordinator().ensureReviewableExpectations(proposal),
+    validateProposalSemantics,
   });
-  return proposal;
-}
-
-function parseAndValidateRepairedProposal(input: {
-  raw: string | Record<string, unknown>;
-  runId: string;
-  sessionId?: string;
-  source?: 'llm' | 'user' | 'system' | 'cache';
-  allowedKinds: string[];
-  allowBriefActionBundleUserPlan?: boolean;
-}): ProposalEnvelope {
-  try {
-    return parseAndValidateProposal(input);
-  } catch (error) {
-    const parseError = normalizeParseError(error);
-    if (parseError.code !== 'missing_string' || !parseError.message.includes('schemaVersion')) {
-      throw error;
-    }
-    const canonical = canonicalizeBareRepairedProposal(input);
-    if (!canonical) throw error;
-    return parseAndValidateProposal({
-      ...input,
-      raw: canonical,
-    });
-  }
-}
-
-function canonicalizeBareRepairedProposal(input: {
-  raw: string | Record<string, unknown>;
-  runId: string;
-  sessionId?: string;
-  source?: 'llm' | 'user' | 'system' | 'cache';
-  allowedKinds: string[];
-}): Record<string, unknown> | null {
-  const record = typeof input.raw === 'string'
-    ? repairJsonObject(input.raw)
-    : objectRecord(input.raw);
-  if (!record || typeof repairString(record.schemaVersion) === 'string') return null;
-  const allowedKinds = input.allowedKinds.filter((kind) => [
-    'answer',
-    'resourceRequest',
-    'decisionRequest',
-    'taskPlan',
-    'actionBundle',
-    'diagnostic',
-  ].includes(kind));
-  if (!allowedKinds.length) return null;
-  const explicitKind = repairString(record.kind);
-  const kind = explicitKind
-    ? (allowedKinds.includes(explicitKind) ? explicitKind : undefined)
-    : inferBareRepairKind(record, allowedKinds);
-  if (!kind) return null;
-  const payload = kindPayloadField(kind);
-  if (!payload) return null;
-  const hasKindPayload = record[payload] !== undefined;
-  const canonical: Record<string, unknown> = {
-    ...record,
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    kind,
-    runId: repairString(record.runId) ?? input.runId,
-    sessionId: repairString(record.sessionId) ?? input.sessionId,
-    source: repairString(record.source) ?? input.source ?? 'llm',
-  };
-  if (!hasKindPayload) {
-    canonical[payload] = stripBareRepairEnvelopeFields(record);
-  }
-  return canonical;
-}
-
-function inferBareRepairKind(record: Record<string, unknown>, allowedKinds: string[]): string | undefined {
-  const fields = allowedKinds.filter((kind) => {
-    const field = kindPayloadField(kind);
-    return Boolean(field && record[field] !== undefined);
-  });
-  if (fields.length === 1) return fields[0];
-  const shapeKinds = allowedKinds.filter((kind) => bareRepairShapeMatches(kind, record));
-  return shapeKinds.length === 1 ? shapeKinds[0] : undefined;
-}
-
-function bareRepairShapeMatches(kind: string, record: Record<string, unknown>): boolean {
-  if (kind === 'taskPlan') return Array.isArray(record.tasks);
-  if (kind === 'resourceRequest') return Array.isArray(record.items) || Array.isArray(record.resources) || Array.isArray(record.requests);
-  if (kind === 'decisionRequest') return typeof repairString(record.question) === 'string' && Array.isArray(record.options);
-  if (kind === 'answer') return typeof repairString(record.content) === 'string' || typeof repairString(record.markdown) === 'string';
-  if (kind === 'diagnostic') return typeof repairString(record.summary) === 'string' && typeof repairString(record.severity) === 'string';
-  if (kind === 'actionBundle') return Array.isArray(record.actions) || record.actionBundle !== undefined;
-  return false;
-}
-
-function kindPayloadField(kind: string): string | undefined {
-  if (kind === 'answer') return 'answer';
-  if (kind === 'resourceRequest') return 'resourceRequest';
-  if (kind === 'decisionRequest') return 'decisionRequest';
-  if (kind === 'taskPlan') return 'taskPlan';
-  if (kind === 'diagnostic') return 'diagnostic';
-  if (kind === 'actionBundle') return 'actionBundle';
-  return undefined;
-}
-
-function stripBareRepairEnvelopeFields(record: Record<string, unknown>): Record<string, unknown> {
-  const stripped: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(record)) {
-    if ([
-      'schemaVersion',
-      'proposalId',
-      'runId',
-      'sessionId',
-      'source',
-      'kind',
-      'narration',
-      'referencedResourcePacketRefs',
-      'referencedEvidenceRefs',
-      'parserDiagnostics',
-      'outputLanguage',
-    ].includes(key)) continue;
-    stripped[key] = value;
-  }
-  return stripped;
-}
-
-function repairJsonObject(raw: string): Record<string, unknown> | null {
-  const candidate = repairJsonCandidate(raw);
-  if (!candidate) return null;
-  try {
-    return objectRecord(JSON.parse(candidate)) ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function repairJsonCandidate(raw: string): string | null {
-  let text = raw.trim();
-  const fence = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  if (fence) text = fence[1].trim();
-  const start = text.indexOf('{');
-  if (start < 0) return null;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < text.length; i += 1) {
-    const ch = text[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-    if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return text.slice(start, i + 1);
-    }
-  }
-  return text.slice(start);
-}
-
-function repairAllowedKinds(state: SessionDriverLoopRunState, errorCode: string): string[] {
-  if (errorCode === 'action_bundle_budget_exceeded') {
-    return ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'];
-  }
-  return state.acceptedImplementationPlan
-    ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
-    : ['answer', 'resourceRequest', 'decisionRequest', 'taskPlan', 'diagnostic'];
-}
-
-function repairString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
 function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanContext> {
