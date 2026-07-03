@@ -107,7 +107,7 @@ import {
 } from '../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from './review/index.js';
-import { PlanReviewReportAnalyzer, ProtocolGate } from './proposal/index.js';
+import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from './proposal/index.js';
 import {
   KernelEventProjectionBuilder,
   PlanProjectionBuilder,
@@ -303,22 +303,23 @@ const providerPipeline = new ProviderPipeline();
 const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
 const providerStreamCoordinator = new ProviderStreamCoordinator();
 const providerTraceRecorder = new ProviderTraceRecorder();
+const planReviewGrantProjector = new PlanReviewGrantProjector();
 const planReviewReportAnalyzer = new PlanReviewReportAnalyzer({
-  requiredFileOperationsFromReport,
+  requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
 });
 const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
-  requiredFileOperationsFromReport,
-  requiredAccessScopesFromReport,
-  permissionBundlesFromReport,
-  gateInterventionsFromReport,
+  requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
+  requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
+  permissionBundlesFromReport: (report) => planReviewGrantProjector.permissionBundlesFromReport(report),
+  gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
   planReviewFacts: (report) => planReviewReportAnalyzer.facts(report),
 });
 const planProjectionBuilder = new PlanProjectionBuilder({
   readActionBundle,
-  requiredFileOperationsFromReport,
-  requiredAccessScopesFromReport,
-  permissionBundlesFromReport,
-  gateInterventionsFromReport,
+  requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
+  requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
+  permissionBundlesFromReport: (report) => planReviewGrantProjector.permissionBundlesFromReport(report),
+  gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
   interactionOverlayProjection,
   visibleLanguageForRequest,
 });
@@ -1310,7 +1311,7 @@ export class SessionDriverLoop {
       ]) ?? result;
       const batch: Record<string, unknown> = {
         planId: plan.planId,
-        contractId: kernelExecutionContractId(plan.planReviewReport),
+        contractId: planReviewGrantProjector.kernelExecutionContractId(plan.planReviewReport),
         actionBundle: plan.actionBundle,
         codeBlocks: plan.codeBlocks,
         commandBlocks: plan.commandBlocks,
@@ -1355,7 +1356,7 @@ export class SessionDriverLoop {
       result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply) ?? result;
 
       const grantEvents: unknown[] = [];
-      for (const grant of temporaryGrantsForPlan(plan)) {
+      for (const grant of planReviewGrantProjector.temporaryGrantsForPlan(plan)) {
         const grantReply = await this.kernel({
           command: {
             kind: 'permissionGrantTemporary',
@@ -3606,7 +3607,7 @@ export class SessionDriverLoop {
 
     const plan = acceptedPlanExecutionContext(state, executionProposal, reviewReport);
     const grantEvents: unknown[] = [];
-    for (const grant of temporaryGrantsForPlan(plan)) {
+    for (const grant of planReviewGrantProjector.temporaryGrantsForPlan(plan)) {
       const grantReply = await this.kernel({
         command: {
           kind: 'permissionGrantTemporary',
@@ -4649,7 +4650,7 @@ function implementationBatchContextBuilder(): ImplementationBatchContextBuilder 
   return new ImplementationBatchContextBuilder({
     objectRecord,
     stringArrayValue,
-    concreteFileOperationTarget,
+    concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
     clip,
   });
 }
@@ -5740,83 +5741,6 @@ function shouldAttemptActionBundleCompactionRepair(state: SessionDriverLoopRunSt
   return capabilities.some((capability) => SIDE_EFFECT_CAPABILITIES.has(capability));
 }
 
-interface PermissionBundleProjection {
-  id: string;
-  capability: string;
-  resourceKind: string;
-  resourcePath?: string;
-  targets: string[];
-  operationIds: string[];
-  riskLevel: string;
-  summary: string;
-  expiresAfter?: string;
-}
-
-function permissionBundlesFromReport(
-  report: Record<string, unknown> | undefined
-): PermissionBundleProjection[] {
-  const direct = Array.isArray(report?.permissionBundles) ? report.permissionBundles : [];
-  const contract = objectRecord(report?.executionContract);
-  const contractBundles = Array.isArray(contract?.permissionBundles) ? contract.permissionBundles : [];
-  const source = direct.length ? direct : contractBundles;
-  return source.flatMap((item): PermissionBundleProjection[] => {
-    const record = objectRecord(item);
-    if (!record) return [];
-    const id = stringValue(record.id);
-    const capability = stringValue(record.capability);
-    const resourceKind = stringValue(record.resourceKind);
-    if (!id || !capability || !resourceKind) return [];
-    return [{
-      id,
-      capability,
-      resourceKind,
-      resourcePath: stringValue(record.resourcePath),
-      targets: stringArrayValue(record.targets),
-      operationIds: stringArrayValue(record.operationIds),
-      riskLevel: stringValue(record.riskLevel) ?? 'unknown',
-      summary: stringValue(record.summary) ?? `Kernel requires ${capability}.`,
-      expiresAfter: stringValue(record.expiresAfter),
-    }];
-  });
-}
-
-interface GateInterventionProjection {
-  id: string;
-  interventionKind: string;
-  status: string;
-  summary: string;
-  capability?: string;
-  permissionBundleId?: string;
-  options: string[];
-}
-
-function gateInterventionsFromReport(
-  report: Record<string, unknown> | undefined
-): GateInterventionProjection[] {
-  const direct = Array.isArray(report?.interventions) ? report.interventions : [];
-  const contract = objectRecord(report?.executionContract);
-  const contractInterventions = Array.isArray(contract?.interventions) ? contract.interventions : [];
-  const source = direct.length ? direct : contractInterventions;
-  return source.flatMap((item): GateInterventionProjection[] => {
-    const record = objectRecord(item);
-    if (!record) return [];
-    const id = stringValue(record.id);
-    const interventionKind = stringValue(record.interventionKind);
-    const status = stringValue(record.status);
-    const summary = stringValue(record.summary);
-    if (!id || !interventionKind || !status || !summary) return [];
-    return [{
-      id,
-      interventionKind,
-      status,
-      summary,
-      capability: stringValue(record.capability),
-      permissionBundleId: stringValue(record.permissionBundleId),
-      options: stringArrayValue(record.options),
-    }];
-  });
-}
-
 interface SessionPlanContext {
   sessionId: string;
   runId: string;
@@ -6304,12 +6228,12 @@ function acceptedImplementationPlanContext(
   const capabilities = [...new Set(taskContexts.map((task) => task.capability).filter((item): item is string => Boolean(item)))];
   const targetScopes = [...new Set(taskContexts.flatMap((task) => task.targets).filter(Boolean))];
   const exactOperationGrants = [
-    ...exactOperationGrantsFromImplementationPlan(rawPlan, executionRoot),
-    ...exactOperationGrantsFromPlanReviewReport(plan.planReviewReport, executionRoot),
+    ...planReviewGrantProjector.exactOperationGrantsFromImplementationPlan(rawPlan, executionRoot),
+    ...planReviewGrantProjector.exactOperationGrantsFromPlanReviewReport(plan.planReviewReport, executionRoot),
   ];
   const accessScopes = [
-    ...accessScopesFromImplementationPlan(rawPlan),
-    ...requiredAccessScopesFromReport(plan.planReviewReport),
+    ...planReviewGrantProjector.accessScopesFromImplementationPlan(rawPlan),
+    ...planReviewGrantProjector.requiredAccessScopesFromReport(plan.planReviewReport),
   ];
   const acceptedCapabilities = [...new Set([
     ...capabilities,
@@ -6532,7 +6456,7 @@ function normalizeAcceptedPlanKernelBatch(
     reasons: [],
     batch: {
       planId,
-      contractId: kernelExecutionContractId(plan.planReviewReport),
+      contractId: planReviewGrantProjector.kernelExecutionContractId(plan.planReviewReport),
       actionBundle: {
         ...(actionBundle ?? {}),
         actions: normalizedActions,
@@ -6870,15 +6794,15 @@ function acceptedPlanWithScopeDecisionEffect(
   const currentTask = accepted.tasks.find((task) => task.taskId === effect.taskId)
     ?? accepted.tasks[Math.max(0, accepted.batchIndex - 1)];
   const capability = currentTask?.capability
-    ?? accepted.capabilities.find(planAcceptedAutoGrantCapability);
+    ?? accepted.capabilities.find((item) => planReviewGrantProjector.planAcceptedAutoGrantCapability(item));
   if (!capability) return accepted;
   const rawTarget = stringValue(effect.targetPath);
   if (!rawTarget) return accepted;
   const targetResourceKind = effect.targetResourceKind ?? (rawTarget.endsWith('/') ? 'directory' : 'file');
   const normalized = normalizePlanTargetForExecutionRoot(rawTarget, accepted.executionRoot);
   const targetPath = targetResourceKind === 'directory'
-    ? concreteDirectoryOperationTarget(normalized)
-    : concreteFileOperationTarget(normalized);
+    ? planReviewGrantProjector.concreteDirectoryOperationTarget(normalized)
+    : planReviewGrantProjector.concreteFileOperationTarget(normalized);
   if (!targetPath) return accepted;
   const operation = operationForCapability(capability);
   const sourceTaskId = effect.taskId ?? currentTask?.taskId;
@@ -6905,7 +6829,7 @@ function acceptedPlanWithScopeDecisionEffect(
     tasks,
     capabilities: uniqueStrings([...accepted.capabilities, capability]),
     targetScopes: uniqueStrings([...accepted.targetScopes, targetPath]),
-    exactOperationGrants: normalizeAcceptedPlanExactOperationGrants([
+    exactOperationGrants: planReviewGrantProjector.normalizeAcceptedPlanExactOperationGrants([
       ...accepted.exactOperationGrants,
       grant,
     ], accepted.executionRoot),
@@ -7230,7 +7154,7 @@ function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted
     ? report.permissionGaps.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     : [];
   const acceptedCapabilities = new Set(accepted.capabilities);
-  return gaps.filter((capability) => !planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
+  return gaps.filter((capability) => !planReviewGrantProjector.planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
 }
 
 function planReviewDecisionEvent(
@@ -7255,9 +7179,9 @@ function planReviewDecisionEvent(
       planId: plan.planId,
       confirmable: false,
       facts: planReviewReportAnalyzer.facts(plan.planReviewReport),
-      requiredFileOperations: requiredFileOperationsFromReport(plan.planReviewReport),
-      permissionBundles: permissionBundlesFromReport(plan.planReviewReport),
-      interventions: gateInterventionsFromReport(plan.planReviewReport),
+      requiredFileOperations: planReviewGrantProjector.requiredFileOperationsFromReport(plan.planReviewReport),
+      permissionBundles: planReviewGrantProjector.permissionBundlesFromReport(plan.planReviewReport),
+      interventions: planReviewGrantProjector.gateInterventionsFromReport(plan.planReviewReport),
       executionContract: objectRecord(plan.planReviewReport?.executionContract) ?? undefined,
       ...overlayPayload,
       channel: status === 'accepted' ? 'progress' : 'final',
@@ -8068,387 +7992,12 @@ function failureDetailSummary(detail: ActionBatchFailureDetail): string {
   return parts.length ? parts.join(' ') : detail.status;
 }
 
-function temporaryGrantsForPlan(plan: SessionPlanContext): Record<string, unknown>[] {
-  const report = plan.planReviewReport ?? {};
-  const bundles = permissionBundlesFromReport(report);
-  const gaps = Array.isArray(report.permissionGaps)
-    ? report.permissionGaps.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-    : [];
-  const gapSet = new Set(gaps);
-  const fileOperations = requiredFileOperationsFromReport(report);
-  const accessScopes = requiredAccessScopesFromReport(report);
-  const grants: Record<string, unknown>[] = [];
-  const seen = new Set<string>();
-  for (const operation of fileOperations) {
-    const capability = operation.capability;
-    if (!gapSet.has(capability)) continue;
-    if (!planAcceptedAutoGrantCapability(capability)) continue;
-    const targetPath = operation.targetResourceKind === 'directory'
-      ? concreteDirectoryOperationTarget(operation.targetPath ?? operation.targetRefPath ?? '')
-      : concreteFileOperationTarget(operation.targetPath ?? operation.targetRefPath ?? '');
-    if (!targetPath) continue;
-    const resourceKind = operation.targetResourceKind === 'directory'
-      ? (operation.outsideWorkspace || isAbsolutePath(targetPath) ? 'externalDirectory' : 'workspaceDirectory')
-      : (operation.outsideWorkspace || isAbsolutePath(targetPath) ? 'externalFile' : undefined);
-    const key = `${capability}\0${resourceKind ?? 'default'}\0${targetPath}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    grants.push(temporaryGrant(plan, capability, targetPath, resourceKind));
-  }
-  for (const scope of accessScopes) {
-    for (const capability of scope.capabilities) {
-      if (!gapSet.has(capability)) continue;
-      if (!planAcceptedAutoGrantCapability(capability)) continue;
-      if (!accessScopeCapabilityAllowed(capability)) continue;
-      const targetPath = normalizeAccessScopePath(scope.path);
-      if (!targetPath) continue;
-      const key = `${capability}\0workspaceModule\0${targetPath}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      grants.push(temporaryGrant(plan, capability, targetPath, scope.scopeKind === 'oneHopDependency' ? 'workspaceDependency' : 'workspaceModule'));
-    }
-  }
-  for (const bundle of bundles) {
-    if (!planAcceptedAutoGrantCapability(bundle.capability)) continue;
-    if (['fs.write', 'fs.patch', 'fs.delete', 'fs.rename'].includes(bundle.capability) && !bundle.resourcePath) {
-      continue;
-    }
-    const key = `${bundle.capability}\0${bundle.resourceKind}\0${bundle.resourcePath ?? 'bundle'}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    grants.push(temporaryGrantForPermissionBundle(plan, bundle));
-  }
-  return grants;
-}
-
-function temporaryGrantForPermissionBundle(
-  plan: SessionPlanContext,
-  bundle: PermissionBundleProjection
-): Record<string, unknown> {
-  return {
-    id: `grant-${safeSegment(plan.planId)}-${safeSegment(bundle.id)}`,
-    capability: bundle.capability,
-    resourceKind: bundle.resourceKind,
-    resourcePath: bundle.resourcePath,
-    reason: `Plan ${plan.planId} accepted by user; Kernel-derived permission bundle ${bundle.id} is scoped to this batch contract and expires after review or terminal work unit.`,
-    permissionBundle: {
-      source: 'kernelExecutionContract',
-      planId: plan.planId,
-      contractId: kernelExecutionContractId(plan.planReviewReport),
-      bundleId: bundle.id,
-      capability: bundle.capability,
-      targets: bundle.targets,
-      operationIds: bundle.operationIds,
-      expiresAfter: bundle.expiresAfter,
-    },
-  };
-}
-
-interface RequiredFileOperationProjection {
-  operation: string;
-  targetPath: string;
-  targetRefPath?: string;
-  capability: string;
-  actionId?: string;
-  targetKind?: string;
-  targetResourceKind?: 'file' | 'directory';
-  recursive?: boolean;
-  outsideWorkspace?: boolean;
-}
-
-function requiredFileOperationsFromReport(report: Record<string, unknown> | undefined): RequiredFileOperationProjection[] {
-  const operations = Array.isArray(report?.requiredFileOperations) ? report.requiredFileOperations : [];
-  const output: RequiredFileOperationProjection[] = [];
-  const seen = new Set<string>();
-  for (const item of operations) {
-    const record = objectRecord(item);
-    if (!record) continue;
-    const operation = stringValue(record.operation);
-    const targetRefPath = fileTargetRefPath(record.targetRef);
-    const rawTargetPath = stringValue(record.targetPath) ?? targetRefPath ?? '';
-    const capability = stringValue(record.capability);
-    const targetResourceKindValue = stringValue(record.targetResourceKind);
-    const targetResourceKind = targetResourceKindValue === 'directory' || targetResourceKindValue === 'dir'
-      ? 'directory'
-      : 'file';
-    const targetPath = targetResourceKind === 'directory'
-      ? concreteDirectoryOperationTarget(rawTargetPath)
-      : concreteFileOperationTarget(rawTargetPath);
-    if (!operation || !targetPath || !capability) continue;
-    const actionId = stringValue(record.actionId);
-    const targetKind = stringValue(record.targetKind);
-    const recursive = record.recursive === true;
-    const outsideWorkspace = Boolean(record.outsideWorkspace) || isAbsolutePath(targetPath);
-    const key = `${operation}\0${capability}\0${targetPath}\0${actionId ?? ''}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    output.push({ operation, targetPath, targetRefPath, capability, actionId, targetKind, targetResourceKind, recursive, outsideWorkspace });
-  }
-  return output;
-}
-
-function exactOperationGrantsFromPlanReviewReport(
-  report: Record<string, unknown> | undefined,
-  executionRoot?: AcceptedImplementationPlanExecutionRoot
-): AcceptedPlanExactOperationGrant[] {
-  return normalizeAcceptedPlanExactOperationGrants(
-    requiredFileOperationsFromReport(report).map((operation) => ({
-      ...operation,
-      source: 'kernelPlanReview' as const,
-    })),
-    executionRoot
-  );
-}
-
-function exactOperationGrantsFromImplementationPlan(
-  plan: Record<string, unknown> | undefined,
-  executionRoot?: AcceptedImplementationPlanExecutionRoot
-): AcceptedPlanExactOperationGrant[] {
-  const grants: AcceptedPlanExactOperationGrant[] = [];
-  const topLevelOperations = Array.isArray(plan?.fileOperations) ? plan.fileOperations : [];
-  for (const operation of topLevelOperations) {
-    const grant = exactOperationGrantFromRawOperation(operation, undefined, executionRoot);
-    if (grant) grants.push(grant);
-  }
-  const tasks = Array.isArray(plan?.tasks) ? plan.tasks : [];
-  for (const item of tasks) {
-    const task = objectRecord(item);
-    if (!task) continue;
-    const sourceTaskId = stringValue(task.taskId) ?? stringValue(task.id);
-    const taskCapability = stringValue(task.capability);
-    const fileOperations = Array.isArray(task.fileOperations) ? task.fileOperations : [];
-    for (const operation of fileOperations) {
-      const grant = exactOperationGrantFromRawOperation(operation, {
-        capability: taskCapability,
-        sourceTaskId,
-      }, executionRoot);
-      if (grant) grants.push(grant);
-    }
-    if (taskCapability === 'fs.delete' || taskCapability === 'fs.rename') {
-      for (const target of acceptedPlanTaskTargets(task)) {
-        const grant = exactOperationGrantFromRawOperation({
-          operation: taskCapability === 'fs.delete' ? 'delete' : 'rename',
-          capability: taskCapability,
-          targetPath: target,
-        }, { capability: taskCapability, sourceTaskId }, executionRoot);
-        if (grant) grants.push(grant);
-      }
-    }
-  }
-  return normalizeAcceptedPlanExactOperationGrants(grants, executionRoot);
-}
-
-function exactOperationGrantFromRawOperation(
-  value: unknown,
-  fallback: { capability?: string; sourceTaskId?: string } | undefined,
-  executionRoot?: AcceptedImplementationPlanExecutionRoot
-): AcceptedPlanExactOperationGrant | undefined {
-  const record = objectRecord(value);
-  if (!record) return undefined;
-  const operation = stringValue(record.operation);
-  const capability = stringValue(record.capability) ?? fallback?.capability;
-  const rawTarget = stringValue(record.targetPath) ?? fileTargetRefPath(record.targetRef);
-  const targetResourceKind = fileOperationTargetResourceKind(record, rawTarget);
-  const targetPath = rawTarget
-    ? targetResourceKind === 'directory'
-      ? concreteDirectoryOperationTarget(normalizePlanTargetForExecutionRoot(rawTarget, executionRoot))
-      : concreteFileOperationTarget(normalizePlanTargetForExecutionRoot(rawTarget, executionRoot))
-    : undefined;
-  if (!operation || !capability || !targetPath) return undefined;
-  if (!planAcceptedAutoGrantCapability(capability)) return undefined;
-  return {
-    operation,
-    targetPath,
-    targetRefPath: fileTargetRefPath(record.targetRef),
-    targetResourceKind,
-    recursive: fileOperationRecursive(record, targetResourceKind, rawTarget),
-    capability,
-    actionId: stringValue(record.actionId),
-    sourceTaskId: fallback?.sourceTaskId ?? stringValue(record.sourceTaskId) ?? stringValue(record.taskId),
-    outsideWorkspace: Boolean(record.outsideWorkspace) || isAbsolutePath(targetPath),
-    source: 'implementationPlan',
-  };
-}
-
-function normalizeAcceptedPlanExactOperationGrants(
-  grants: AcceptedPlanExactOperationGrant[],
-  executionRoot?: AcceptedImplementationPlanExecutionRoot
-): AcceptedPlanExactOperationGrant[] {
-  const output: AcceptedPlanExactOperationGrant[] = [];
-  const seen = new Set<string>();
-  for (const grant of grants) {
-    const targetPath = grant.targetResourceKind === 'directory'
-      ? concreteDirectoryOperationTarget(normalizePlanTargetForExecutionRoot(grant.targetPath, executionRoot))
-      : concreteFileOperationTarget(normalizePlanTargetForExecutionRoot(grant.targetPath, executionRoot));
-    if (!grant.operation || !grant.capability || !targetPath) continue;
-    if (!planAcceptedAutoGrantCapability(grant.capability)) continue;
-    const key = `${grant.operation}\0${grant.capability}\0${targetPath}\0${grant.actionId ?? ''}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    output.push({
-      ...grant,
-      targetPath,
-      targetResourceKind: grant.targetResourceKind ?? 'file',
-      outsideWorkspace: Boolean(grant.outsideWorkspace) || isAbsolutePath(targetPath),
-    });
-  }
-  return output;
-}
-
-function fileOperationTargetResourceKind(
-  record: Record<string, unknown>,
-  rawTarget: string | undefined
-): 'file' | 'directory' {
-  const value = stringValue(record.targetResourceKind) ?? stringValue(record.targetKind);
-  if (value === 'directory' || value === 'dir') return 'directory';
-  if (value === 'file') return 'file';
-  return rawTarget?.trim().endsWith('/') ? 'directory' : 'file';
-}
-
-function fileOperationRecursive(
-  record: Record<string, unknown>,
-  targetResourceKind: 'file' | 'directory',
-  rawTarget: string | undefined
-): boolean {
-  if (record.recursive === true) return true;
-  return targetResourceKind === 'directory' && Boolean(rawTarget?.trim().endsWith('/'));
-}
-
-function requiredAccessScopesFromReport(report: Record<string, unknown> | undefined): AcceptedPlanAccessScope[] {
-  const scopes = Array.isArray(report?.requiredAccessScopes) ? report.requiredAccessScopes : [];
-  return normalizeAcceptedPlanAccessScopes(scopes, 'kernelPlanReview');
-}
-
-function accessScopesFromImplementationPlan(plan: Record<string, unknown> | undefined): AcceptedPlanAccessScope[] {
-  const scopes: unknown[] = [];
-  if (Array.isArray(plan?.accessScopes)) scopes.push(...plan.accessScopes);
-  const tasks = Array.isArray(plan?.tasks) ? plan.tasks : [];
-  for (const item of tasks) {
-    const task = objectRecord(item);
-    if (!task) continue;
-    if (Array.isArray(task.accessScopes)) scopes.push(...task.accessScopes.map((scope) => ({
-      ...(objectRecord(scope) ?? {}),
-      sourceTaskId: stringValue((objectRecord(scope) ?? {})?.sourceTaskId) ?? stringValue(task.taskId) ?? stringValue(task.id),
-      capability: stringValue((objectRecord(scope) ?? {})?.capability) ?? stringValue(task.capability),
-    })));
-  }
-  return normalizeAcceptedPlanAccessScopes(scopes, 'implementationPlan');
-}
-
-function normalizeAcceptedPlanAccessScopes(
-  scopes: unknown[],
-  source: AcceptedPlanAccessScope['source']
-): AcceptedPlanAccessScope[] {
-  const output: AcceptedPlanAccessScope[] = [];
-  const seen = new Set<string>();
-  for (const item of scopes) {
-    const record = objectRecord(item);
-    if (!record) continue;
-    const scopeKind = stringValue(record.scopeKind) ?? stringValue(record.kind) ?? 'workspaceModule';
-    const rawPath = stringValue(record.path) ?? stringValue(record.targetPath);
-    const path = rawPath ? normalizeAccessScopePath(rawPath) : undefined;
-    if (!path) continue;
-    const dependencyDepth = typeof record.dependencyDepth === 'number' ? record.dependencyDepth : (
-      scopeKind === 'oneHopDependency' ? 1 : 0
-    );
-    if (dependencyDepth > 1) continue;
-    const outsideWorkspace = Boolean(record.outsideWorkspace) || isAbsolutePath(path);
-    if (outsideWorkspace) continue;
-    const capabilities = stringArrayValue(record.capabilities)
-      .concat(stringArrayValue(record.capability))
-      .filter((capability) => accessScopeCapabilityAllowed(capability));
-    const normalizedCapabilities = capabilities.length
-      ? [...new Set(capabilities)]
-      : ['fs.write', 'fs.patch'];
-    const operations = stringArrayValue(record.operations).length
-      ? stringArrayValue(record.operations)
-      : accessScopeOperationsForCapabilities(normalizedCapabilities);
-    const key = `${scopeKind}\0${path}\0${normalizedCapabilities.join(',')}\0${dependencyDepth}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    output.push({
-      scopeKind,
-      path,
-      capabilities: normalizedCapabilities,
-      operations: [...new Set(operations)],
-      reason: stringValue(record.reason),
-      dependencyDepth,
-      sourceTaskId: stringValue(record.sourceTaskId) ?? stringValue(record.taskId),
-      outsideWorkspace: false,
-      source,
-    });
-  }
-  return output;
-}
-
-function normalizeAccessScopePath(value: string): string | undefined {
-  const normalized = normalizePlanScope(value).replace(/\/+$/, '');
-  if (!normalized || normalized === '.' || normalized === './') return undefined;
-  if (isAbsolutePath(normalized)) return undefined;
-  if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) return undefined;
-  if (normalized.includes('*')) return undefined;
-  return normalized;
-}
-
-function accessScopeCapabilityAllowed(capability: string): boolean {
-  return ['fs.write', 'fs.patch'].includes(capability);
-}
-
-function accessScopeOperationsForCapabilities(capabilities: string[]): string[] {
-  const operations: string[] = [];
-  if (capabilities.includes('fs.write')) operations.push('create', 'write');
-  if (capabilities.includes('fs.patch')) operations.push('patch');
-  return operations.length ? operations : ['write', 'patch'];
-}
-
-function concreteFileOperationTarget(value: string): string | undefined {
-  const normalized = normalizePlanScope(value);
-  if (!normalized || normalized === '.' || normalized === './') return undefined;
-  if (isAbsolutePath(normalized)) return concreteAbsoluteFileOperationTarget(normalized);
-  if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) return undefined;
-  if (normalized.includes('*')) return undefined;
-  if (normalized.endsWith('/')) return undefined;
-  return normalized;
-}
-
-function concreteDirectoryOperationTarget(value: string): string | undefined {
-  const normalized = normalizePlanScope(value).replace(/\/+$/, '');
-  if (!normalized || normalized === '.' || normalized === './') return undefined;
-  if (isAbsolutePath(normalized)) return concreteAbsoluteDirectoryOperationTarget(normalized);
-  if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) return undefined;
-  if (normalized.includes('*')) return undefined;
-  return normalized;
-}
-
-function concreteAbsoluteFileOperationTarget(value: string): string | undefined {
-  const normalized = normalizeSlashes(value);
-  if (!isAbsolutePath(normalized)) return undefined;
-  if (!normalized || normalized === '/' || /^[a-zA-Z]:\/?$/.test(normalized)) return undefined;
-  if (normalized.includes('*')) return undefined;
-  if (normalized.includes('/../') || normalized.endsWith('/..')) return undefined;
-  if (normalized.endsWith('/')) return undefined;
-  const base = basename(normalized);
-  if (!base || base === '.' || base === '..') return undefined;
-  return normalized;
-}
-
-function concreteAbsoluteDirectoryOperationTarget(value: string): string | undefined {
-  const normalized = normalizeSlashes(value).replace(/\/+$/, '');
-  if (!isAbsolutePath(normalized)) return undefined;
-  if (!normalized || normalized === '/' || /^[a-zA-Z]:\/?$/.test(normalized)) return undefined;
-  if (normalized.includes('*')) return undefined;
-  if (normalized.includes('/../') || normalized.endsWith('/..')) return undefined;
-  const base = basename(normalized);
-  if (!base || base === '.' || base === '..') return undefined;
-  return normalized;
-}
-
 function acceptedPlanConcreteFileOperationTarget(
   value: string,
   accepted?: AcceptedImplementationPlanContext
 ): string | undefined {
   const normalized = accepted ? normalizeAcceptedPlanTargetScope(value, accepted) : normalizePlanScope(value);
-  return concreteFileOperationTarget(normalized);
+  return planReviewGrantProjector.concreteFileOperationTarget(normalized);
 }
 
 function acceptedPlanConcreteDeleteOperationTarget(
@@ -8458,9 +8007,10 @@ function acceptedPlanConcreteDeleteOperationTarget(
 ): string | undefined {
   const normalized = accepted ? normalizeAcceptedPlanTargetScope(value, accepted) : normalizePlanScope(value);
   if (grant?.targetResourceKind === 'directory') {
-    return concreteDirectoryOperationTarget(normalized);
+    return planReviewGrantProjector.concreteDirectoryOperationTarget(normalized);
   }
-  return concreteFileOperationTarget(normalized) ?? concreteDirectoryOperationTarget(normalized);
+  return planReviewGrantProjector.concreteFileOperationTarget(normalized)
+    ?? planReviewGrantProjector.concreteDirectoryOperationTarget(normalized);
 }
 
 function acceptedPlanExactOperationGrantForAction(
@@ -8476,49 +8026,6 @@ function acceptedPlanExactOperationGrantForAction(
     exactOperationGrantCapabilityMatches(grant, capability) &&
     normalizePlanScope(grant.targetPath).replace(/\/+$/, '') === normalized
   );
-}
-
-function planAcceptedAutoGrantCapability(capability: string): boolean {
-  return ['fs.write', 'fs.patch', 'fs.delete', 'fs.rename'].includes(capability);
-}
-
-function kernelExecutionContractId(report: Record<string, unknown> | undefined): string | undefined {
-  const contract = objectRecord(report?.executionContract);
-  return stringValue(contract?.id);
-}
-
-function temporaryGrant(
-  plan: SessionPlanContext,
-  capability: string,
-  resourcePath?: string,
-  resourceKind?: string
-): Record<string, unknown> {
-  return {
-    id: `grant-${safeSegment(plan.planId)}-${safeSegment(capability)}-${resourcePath ? safeSegment(resourcePath) : 'run'}`,
-    capability,
-    resourceKind: resourceKind ?? resourceKindForCapability(capability),
-    resourcePath,
-    reason: resourcePath
-      ? `Plan ${plan.planId} accepted by user through Session DecisionResolver; Kernel-reviewed file operation grant is scoped to ${resourcePath} and expires when ReviewGate closes.`
-      : `Plan ${plan.planId} accepted by user through Session DecisionResolver; capability grant is scoped to the current batch/run and expires when ReviewGate closes.`,
-    permissionBundle: {
-      source: 'kernelPlanReview',
-      planId: plan.planId,
-      capability,
-      groupedBy: resourcePath ? 'fileOperation' : 'capability',
-    },
-  };
-}
-
-function resourceKindForCapability(capability: string): string {
-  if (['fs.write', 'fs.patch', 'fs.delete', 'fs.rename'].includes(capability)) return 'workspaceFile';
-  if (capability === 'git.write' || capability === 'git.push') return 'git';
-  if (capability === 'config.modify') return 'config';
-  if (capability === 'process.exec') return 'process';
-  if (capability === 'network.egress') return 'network';
-  if (capability === 'browser.control') return 'browser';
-  if (capability === 'secret.read') return 'secret';
-  return 'capability';
 }
 
 function reviewSummaryEvent(

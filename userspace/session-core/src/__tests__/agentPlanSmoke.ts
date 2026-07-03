@@ -45,7 +45,7 @@ import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import { CompletedWorkUnitFactIndex, ImplementationBatchContextBuilder } from '../driver/execution/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
-import { PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
+import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
 import { KernelEventProjectionBuilder, PlanProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
@@ -70,6 +70,7 @@ async function main(): Promise<void> {
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
+  assertPlanReviewGrantProjectorBuildsExecutionReadModels();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -1082,6 +1083,76 @@ function assertPlanReviewReportAnalyzerKeepsReviewSemantics(): void {
     'plan review analyzer keeps accepted-plan access-scope repair semantics'
   );
   assertEqual(analyzer.denied({ status: 'interfaceOnly' }), true, 'plan review analyzer preserves denied status semantics');
+}
+
+function assertPlanReviewGrantProjectorBuildsExecutionReadModels(): void {
+  const token = randomSmokeToken('plan-review-grants');
+  const fileTarget = `dir-${token}/file-${token}.txt`;
+  const directoryTarget = `dir-${token}/`;
+  const projector = new PlanReviewGrantProjector();
+  const report = {
+    permissionGaps: ['fs.write', 'fs.delete'],
+    requiredFileOperations: [
+      {
+        operation: 'write',
+        capability: 'fs.write',
+        targetPath: fileTarget,
+        actionId: `write-${token}`,
+      },
+      {
+        operation: 'delete',
+        capability: 'fs.delete',
+        targetPath: directoryTarget,
+        targetResourceKind: 'directory',
+        recursive: true,
+        actionId: `delete-${token}`,
+      },
+    ],
+    requiredAccessScopes: [{
+      scopeKind: 'workspaceModule',
+      path: `module-${token}`,
+      capabilities: ['fs.write'],
+    }],
+    executionContract: {
+      id: `contract-${token}`,
+      permissionBundles: [{
+        id: `bundle-${token}`,
+        capability: 'fs.patch',
+        resourceKind: 'workspaceFile',
+        resourcePath: fileTarget,
+        targets: [fileTarget],
+      }],
+      interventions: [{
+        id: `intervention-${token}`,
+        interventionKind: 'permission',
+        status: 'pending',
+        summary: `summary-${token}`,
+        options: [`option-${token}`],
+      }],
+    },
+  };
+
+  const operations = projector.requiredFileOperationsFromReport(report);
+  assertEqual(operations.length, 2, 'grant projector keeps required file operations');
+  assertEqual(operations[1]?.targetResourceKind, 'directory', 'grant projector preserves directory targets');
+  assertEqual(operations[1]?.targetPath, directoryTarget.replace(/\/+$/, ''), 'grant projector normalizes directory target trailing slash');
+  const exactGrants = projector.exactOperationGrantsFromPlanReviewReport(report);
+  assert(exactGrants.some((grant) => grant.targetPath === fileTarget), 'grant projector builds exact file grants from plan review');
+  assert(exactGrants.some((grant) => grant.targetResourceKind === 'directory'), 'grant projector builds exact directory grants');
+  const accessScopes = projector.requiredAccessScopesFromReport(report);
+  assertEqual(accessScopes[0]?.path, `module-${token}`, 'grant projector keeps required access scope path');
+  const bundles = projector.permissionBundlesFromReport(report);
+  assertEqual(bundles[0]?.id, `bundle-${token}`, 'grant projector reads execution contract permission bundles');
+  const interventions = projector.gateInterventionsFromReport(report);
+  assertEqual(interventions[0]?.id, `intervention-${token}`, 'grant projector reads execution contract interventions');
+  const temporaryGrants = projector.temporaryGrantsForPlan({ planId: `plan-${token}`, planReviewReport: report });
+  assert(temporaryGrants.some((grant) => (grant as any).capability === 'fs.write'), 'grant projector creates file operation temporary grants');
+  assert(temporaryGrants.some((grant) => (grant as any).resourceKind === 'workspaceDirectory'), 'grant projector creates directory temporary grants');
+  assertEqual(
+    projector.concreteFileOperationTarget(`./${fileTarget}`),
+    fileTarget,
+    'grant projector normalizes concrete file operation targets'
+  );
 }
 
 function assertProtocolGateCanonicalizesBareRepair(): void {
