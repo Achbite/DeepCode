@@ -60,7 +60,7 @@ import {
   RepairLoop,
 } from '../driver/execution/index.js';
 import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
-import { PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
+import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
@@ -69,6 +69,7 @@ async function main(): Promise<void> {
   assertLegacyProviderShapesAreRejected();
   assertActionBundleProtocolFields();
   assertProtocolGateCanonicalizesBareRepair();
+  assertActionBundleActionInspectorReadsActionShape();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -253,6 +254,74 @@ function assertProviderTurnContractFrameOrder(): void {
   const memoryFrame = contract.frames.find((frame) => frame.kind === 'Memory');
   assertEqual(memoryFrame?.trust, 'compressedReference', 'memory is marked as compressed reference');
   assertEqual(contract.nextActionInstruction.kind, 'NextActionInstruction', 'contract exposes next action instruction directly');
+}
+
+function assertActionBundleActionInspectorReadsActionShape(): void {
+  const token = randomSmokeToken('action-inspector');
+  const workspacePath = `scope-${token}/target-${randomSmokeToken('file')}.txt`;
+  const argsPath = `args-${token}/target-${randomSmokeToken('args')}.txt`;
+  const inspector = new ActionBundleActionInspector();
+
+  assertEqual(
+    inspector.actionEffectiveCapability({ toolId: 'git.status' }),
+    'git.read',
+    'action inspector maps git read tool ids'
+  );
+  assertEqual(
+    inspector.actionEffectiveCapability({ toolId: 'git.commit' }),
+    'git.write',
+    'action inspector maps git write tool ids'
+  );
+  assertEqual(
+    inspector.actionEffectiveCapability({ toolId: 'web.search' }),
+    'network.egress',
+    'action inspector maps network tool ids'
+  );
+  assertEqual(
+    inspector.actionEffectiveCapability({ toolId: 'browser.open' }),
+    'browser.control',
+    'action inspector maps browser tool ids'
+  );
+  assertEqual(
+    inspector.actionEffectiveCapability({ capability: 'fs.write', toolId: 'fs.delete' }),
+    'fs.write',
+    'action inspector prefers explicit capability'
+  );
+  assertEqual(
+    inspector.actionFileTargetPath({ targetRef: { path: workspacePath }, targetPath: `ignored-${token}` }),
+    workspacePath,
+    'action inspector prefers targetRef path'
+  );
+  assertEqual(
+    inspector.actionFileTargetPath({ resourceScope: [workspacePath], args: { path: argsPath } }),
+    workspacePath,
+    'action inspector reads first resource scope before args path'
+  );
+  assertEqual(
+    inspector.actionFileTargetPath({ args: { path: argsPath } }),
+    argsPath,
+    'action inspector reads args path'
+  );
+  assertEqual(
+    inspector.deleteActionTargetResourceKind({ args: { targetKind: 'dir' } }),
+    'directory',
+    'action inspector normalizes directory target kind'
+  );
+  assertEqual(
+    inspector.deleteActionRecursive({ args: { recursive: true } }),
+    true,
+    'action inspector reads recursive flag from args'
+  );
+  assertEqual(
+    inspector.fileTargetRefFromPath(`/tmp/${token}`).kind,
+    'absolutePath',
+    'action inspector marks absolute target refs'
+  );
+  assertEqual(
+    inspector.fileTargetRefFromPath(workspacePath).kind,
+    'workspaceRelative',
+    'action inspector marks workspace relative target refs'
+  );
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {

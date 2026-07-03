@@ -112,6 +112,7 @@ import {
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder, type SessionReviewContext } from './review/index.js';
 import {
+  ActionBundleActionInspector,
   PlanContextIndex,
   PlanInteractionIndex,
   PlanReviewGrantProjector,
@@ -260,10 +261,11 @@ const providerPipeline = new ProviderPipeline();
 const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
 const providerStreamCoordinator = new ProviderStreamCoordinator();
 const providerTraceRecorder = new ProviderTraceRecorder();
+const actionBundleActionInspector = new ActionBundleActionInspector();
 const driverActivityBuilder = new DriverActivityBuilder({
   providerStageSummary: (stage, part, language) => providerStreamCoordinator.stageSummary(stage, part, language),
   visibleLanguageForRequest,
-  actionFileTargetPath,
+  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
 });
 const permissionPipeline = new PermissionPipeline();
 const userInputPipeline = new UserInputPipeline();
@@ -350,8 +352,8 @@ const acceptedPlanOperationTargetResolver = new AcceptedPlanOperationTargetResol
   concreteDirectoryOperationTarget: (value) => planReviewGrantProjector.concreteDirectoryOperationTarget(value),
   concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
   exactGrantCapabilityMatches: (grant, capability) => acceptedPlanScopeCoverage.exactGrantCapabilityMatches(grant, capability),
-  actionEffectiveCapability,
-  actionFileTargetPath,
+  actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
+  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
 });
 const acceptedPlanScopeDecisionOverlay = new AcceptedPlanScopeDecisionOverlay({
   planAcceptedAutoGrantCapability: (capability) => planReviewGrantProjector.planAcceptedAutoGrantCapability(capability),
@@ -367,10 +369,10 @@ const acceptedPlanBatchPreflight = new AcceptedPlanBatchPreflight({
   objectRecord,
   stringValue,
   stringArrayValue,
-  actionEffectiveCapability,
-  actionFileTargetPath,
-  deleteActionTargetResourceKind,
-  deleteActionRecursive,
+  actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
+  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
+  deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
+  deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
   normalizePlanScope,
   containsDirectoryPath: (resourcePackets, path) => resourceRequestLoop.containsDirectoryPath(resourcePackets, path),
 });
@@ -387,10 +389,10 @@ const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
 const acceptedPlanExecutor = new AcceptedPlanExecutor({
   readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
   operationTargetResolver: acceptedPlanOperationTargetResolver,
-  actionFileTargetPath,
-  fileTargetRefFromPath,
-  deleteActionTargetResourceKind,
-  deleteActionRecursive,
+  actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
+  fileTargetRefFromPath: (path) => actionBundleActionInspector.fileTargetRefFromPath(path),
+  deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
+  deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
   kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
   proposalTargetScopes: (proposal, accepted) =>
     acceptedPlanScopeMatcher.proposalTargetScopes(proposal, accepted).map((target) => target.normalized),
@@ -4882,8 +4884,8 @@ function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex {
     stringValue,
     uniqueStrings: (values) => driverActivityBuilder.uniqueStrings(values),
     batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
-    actionEffectiveCapability,
-    actionFileTargetPath,
+    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
+    actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
     completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
     completedActionMatches: (actionId, targetPath, completed) =>
       completedWorkUnitFactIndex.completedActionMatches(actionId, targetPath, completed),
@@ -4946,8 +4948,8 @@ function reviewAssembler(): ReviewAssembler {
   return new ReviewAssembler({
     completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
     batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
-    actionEffectiveCapability,
-    actionFileTargetPath,
+    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
+    actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
     normalizeAcceptedPlanTargetScope: (value, accepted) =>
       acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted),
     comparablePath,
@@ -5159,10 +5161,10 @@ function proposalSemanticValidator(): ProposalSemanticValidator {
     maxActionBundleTotalCodeBytes: MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES,
     sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
     readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
-    actionEffectiveCapability,
-    actionFileTargetPath,
-    deleteActionTargetResourceKind,
-    deleteActionRecursive,
+    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
+    actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
+    deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
+    deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
   });
 }
 
@@ -5174,34 +5176,13 @@ function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanCon
     objectRecord,
     stringValue,
     planId: (plan) => plan.planId,
-    actionEffectiveCapability,
+    actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
     isDetailedUserPlanMarkdown: (userPlan) => validator.isDetailedUserPlanMarkdown(userPlan),
     defaultActionBundleUserPlanMarkdown: (input) => validator.defaultActionBundleUserPlanMarkdown(input),
     expectationsHaveDescription: (value) => validator.expectationsHaveDescription(value),
     defaultValidationExpectation: (actions) => validator.defaultValidationExpectation(actions),
     defaultReviewExpectation: (actions) => validator.defaultReviewExpectation(actions),
   });
-}
-
-function deleteActionTargetResourceKind(action: {
-  targetResourceKind?: unknown;
-  targetKind?: unknown;
-  toolArgs?: unknown;
-  args?: unknown;
-}): 'file' | 'directory' | undefined {
-  const toolArgs = objectRecord(action.args) ?? objectRecord(action.toolArgs);
-  const value = stringValue(action.targetResourceKind)
-    ?? stringValue(action.targetKind)
-    ?? stringValue(toolArgs?.targetResourceKind)
-    ?? stringValue(toolArgs?.targetKind);
-  if (value === 'directory' || value === 'dir') return 'directory';
-  if (value === 'file') return 'file';
-  return undefined;
-}
-
-function deleteActionRecursive(action: { recursive?: unknown; toolArgs?: unknown; args?: unknown }): boolean {
-  const toolArgs = objectRecord(action.args) ?? objectRecord(action.toolArgs);
-  return action.recursive === true || toolArgs?.recursive === true;
 }
 
 function shouldAttemptActionBundleCompactionRepair(state: SessionDriverLoopRunState): boolean {
@@ -5401,43 +5382,6 @@ function stringArrayValue(value: unknown): string[] {
   return value
     .map((item) => stringValue(item))
     .filter((item): item is string => Boolean(item));
-}
-
-function actionEffectiveCapability(action: { capability?: unknown; toolId?: unknown }): string {
-  const capability = stringValue(action.capability);
-  if (capability) return capability;
-  const toolId = stringValue(action.toolId);
-  if (!toolId) return '';
-  if (toolId === 'git.status' || toolId === 'git.diff') return 'git.read';
-  if (toolId === 'git.push') return 'git.push';
-  if (toolId.startsWith('git.')) return 'git.write';
-  if (toolId === 'web.search' || toolId === 'web.fetch') return 'network.egress';
-  if (toolId.startsWith('browser.')) return 'browser.control';
-  if (toolId === 'provider.call') return 'provider.egress';
-  return toolId;
-}
-
-function actionFileTargetPath(action: { targetRef?: unknown; targetPath?: unknown; resourceScope?: unknown; args?: unknown }): string | undefined {
-  const args = objectRecord(action.args);
-  return fileTargetRefPath(action.targetRef)
-    ?? stringValue(action.targetPath)
-    ?? stringArrayValue(action.resourceScope)[0]
-    ?? stringValue(args?.path)
-    ?? stringValue(args?.targetPath);
-}
-
-function fileTargetRefPath(value: unknown): string | undefined {
-  const direct = stringValue(value);
-  if (direct) return direct;
-  const record = objectRecord(value);
-  return stringValue(record?.path) ?? stringValue(record?.targetPath);
-}
-
-function fileTargetRefFromPath(path: string): Record<string, unknown> {
-  return {
-    kind: isAbsolutePath(path) ? 'absolutePath' : 'workspaceRelative',
-    path,
-  };
 }
 
 function normalizeParseError(error: unknown): { code: string; message: string } {
