@@ -206,8 +206,6 @@ function normalizeActionBundle(value: Record<string, unknown>, proposalId: strin
   }
   return {
     ...value,
-    // S2：actionBundle.version 在 v3 协议中固定为 "1"，模型给出缺失/数字/其它值时强制归一，
-    // 避免下游 version 强校验因模型笔误整轮失败（仍保留对结构性错误的拒绝）。
     version: '1',
     id: optionalString(value, 'id') ?? `${proposalId}-action-bundle`,
     goal: deriveActionBundleGoal(value, proposalId, userPlan),
@@ -531,8 +529,6 @@ function normalizeDecisionRequest(value: Record<string, unknown>): Record<string
   };
 }
 
-// 归一化用户介入卡 option.effect：未声明或非法时返回 undefined（按 continueWithAction 处理）。
-// 不在此处把 undefined 写回字段，保持事件 payload 干净（无 effect 即向下兼容）。
 function normalizeOptionEffect(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
@@ -612,9 +608,6 @@ function parseJsonObject(raw: string, label: string): Record<string, unknown> {
   return requireObject(parsed, label);
 }
 
-// S1 宽松提取：模型常在合法 JSON 前后附带说明文字或 ```json 代码围栏，
-// 严格 JSON.parse 会因尾随内容整体失败。此处先去围栏，若仍不可解析则按平衡花括号
-// 截取首个完整的顶层 JSON 对象，丢弃其前后噪声。仅做"提取"，不改变 JSON 语义。
 function extractJsonCandidate(raw: string): string {
   let text = raw.trim();
   const fence = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
@@ -623,7 +616,6 @@ function extractJsonCandidate(raw: string): string {
     JSON.parse(text);
     return text;
   } catch {
-    // 继续尝试截取首个平衡对象
   }
   const start = text.indexOf('{');
   if (start < 0) return text;

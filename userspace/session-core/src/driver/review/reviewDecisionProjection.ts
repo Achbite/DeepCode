@@ -13,7 +13,6 @@ export interface ReviewDecisionProjectionInput {
   sessionId: string;
   review: ReviewDecisionProjectionContext;
   status: ReviewDecisionProjectionStatus;
-  /** User-authored review guidance. Session-generated decision copy must use i18n keys instead. */
   content?: string;
   continuationRequested: boolean;
   terminalAcceptedPlan?: boolean;

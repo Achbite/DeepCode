@@ -45,7 +45,8 @@ import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import { CompletedWorkUnitFactIndex, ImplementationBatchContextBuilder } from '../driver/execution/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
-import { ProtocolGate } from '../driver/proposal/index.js';
+import { PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
+import { KernelEventProjectionBuilder, PlanProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
 async function main(): Promise<void> {
@@ -67,6 +68,8 @@ async function main(): Promise<void> {
   assertCompletedWorkUnitFactIndexMatchesActionAndTarget();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewDecisionProjectionUsesI18nKeys();
+  assertProjectionBuildersKeepKernelAndReviewReadModels();
+  assertPlanReviewReportAnalyzerKeepsReviewSemantics();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -875,6 +878,210 @@ function assertReviewDecisionProjectionUsesI18nKeys(): void {
   assertEqual(revisionPayload.summaryKey, 'review.decision.needsRevision.summary', 'review decision projection includes revision summary key');
   assertEqual(revisionPayload.content, guidance, 'review decision projection preserves user guidance content');
   assertEqual(revisionPayload.contentKey, undefined, 'review decision projection does not assign content key to user guidance');
+}
+
+function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
+  const token = randomSmokeToken('projection-builder');
+  const runId = `run-${token}`;
+  const targetPath = `dir-${token}/file-${token}.txt`;
+  const workUnitId = `work-unit-${token}`;
+  const actionId = `action-${token}`;
+  const kernelProjection = new KernelEventProjectionBuilder({
+    requiredFileOperationsFromReport: () => [],
+    requiredAccessScopesFromReport: () => [],
+    permissionBundlesFromReport: () => [],
+    gateInterventionsFromReport: () => [],
+    planReviewFacts: () => [],
+  });
+  const queued = {
+    kind: 'work_unit.queued',
+    runId,
+    actionId,
+    workUnit: {
+      id: workUnitId,
+      actionId,
+      writeSet: [targetPath],
+    },
+  };
+  const completedWithoutTarget = {
+    kind: 'work_unit.completed',
+    runId,
+    workUnitId,
+  };
+  const facts = kernelProjection.indexKernelWorkUnitFacts([queued]);
+  const enriched = kernelProjection.enrichKernelWorkUnitRecord(completedWithoutTarget, facts);
+  assertEqual(
+    kernelProjection.kernelEventTargets(enriched)[0],
+    targetPath,
+    'kernel projection enriches completed work unit targets from queued facts'
+  );
+  const activity = kernelProjection.kernelEventActivity(enriched, `activity-${token}`, runId);
+  assertEqual(activity?.kind, 'editFileCompleted', 'kernel projection builds completed edit activity');
+  assertEqual(activity?.targets?.[0], targetPath, 'kernel projection carries activity target');
+  const projected = kernelProjection.projectKernelEvent({
+    sessionId: `session-${token}`,
+    event: enriched,
+    ts: new Date(0).toISOString(),
+    id: `event-${token}`,
+  });
+  assertEqual(projected.kind, 'workflow_stage', 'kernel projection preserves workflow stage event shape');
+
+  const reviewProjection = new ReviewProjectionBuilder();
+  const readableReview = reviewProjection.readableSummary([{
+    ...enriched,
+    output: {
+      path: targetPath,
+      actionId,
+      operation: 'write',
+    },
+  }]);
+  assertEqual(readableReview.changedFiles[0]?.path, targetPath, 'review projection keeps changed file target');
+  assertEqual(readableReview.changedFiles[0]?.operation, 'write', 'review projection keeps changed file operation');
+  const reviewContent = reviewProjection.waitingContent({
+    plan: {
+      userPlan: `plan-${token}`,
+      expectedValidation: '',
+      reviewGuide: '',
+      actionBundle: { reviewExpectations: [] },
+    },
+    readableReview,
+    summary: reviewProjection.waitingSummary(0, 0, 'en-US'),
+    completed: 1,
+    failed: 0,
+    blocked: 0,
+    toolResults: 0,
+    continuations: [],
+    language: 'en-US',
+  });
+  assert(reviewContent.includes(targetPath), 'review projection renders changed file path in review content');
+
+  const planProjection = new PlanProjectionBuilder({
+    readActionBundle: (proposal) => (proposal.payload as any).actionBundle,
+    requiredFileOperationsFromReport: () => [{ operation: 'delete', targetPath, capability: 'fs.delete' }],
+    requiredAccessScopesFromReport: () => [],
+    permissionBundlesFromReport: () => [{
+      id: `bundle-${token}`,
+      capability: 'fs.delete',
+      resourceKind: 'workspaceFile',
+      targets: [targetPath],
+      operationIds: [actionId],
+      riskLevel: 'medium',
+      summary: `delete ${targetPath}`,
+    }],
+    gateInterventionsFromReport: () => [],
+    interactionOverlayProjection: () => ({}),
+    visibleLanguageForRequest: () => 'en-US',
+  });
+  const planState = {
+    sessionId: `session-${token}`,
+    userRequest: `request-${token}`,
+    conversationRoots: [{
+      rootId: `root-${token}`,
+      displayPath: `/tmp/root-${token}`,
+      absolutePath: `/tmp/root-${token}`,
+      source: 'attachment',
+      primary: true,
+    }],
+    implementationBatch: {
+      batchIndex: 1,
+      recentPlanSummaries: [],
+      continuationSummaries: [],
+    },
+  } as any;
+  const actionBundlePlan = planProjection.actionBundlePlanCardEvent({
+    state: planState,
+    proposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-${token}`,
+      runId,
+      source: 'llm',
+      kind: 'actionBundle',
+      payload: {
+        userPlan: `## Plan ${token}\n\nDelete ${targetPath} after review.`,
+        actionBundle: {
+          version: '1',
+          id: `bundle-${token}`,
+          goal: `delete ${targetPath}`,
+          actions: [],
+          validationExpectations: [],
+          reviewExpectations: [],
+        },
+      },
+      referencedResourcePacketRefs: [],
+      referencedEvidenceRefs: [],
+    },
+    report: { status: 'awaitingTemporaryGrant', kernelGeneratedPermissionSummary: `Kernel summary ${token}` },
+    ts: new Date(0).toISOString(),
+    id: `plan-card-${token}`,
+  });
+  const actionPayload = actionBundlePlan.payload as any;
+  assertEqual(actionBundlePlan.kind, 'plan_card', 'plan projection builds actionBundle plan card event');
+  assertEqual(actionPayload.requiredFileOperations[0]?.targetPath, targetPath, 'plan projection preserves file operation target');
+  assert(String(actionPayload.content).includes(targetPath), 'plan projection renders operation target in plan content');
+
+  const implementationPlan = planProjection.implementationPlanCardEvent({
+    state: planState,
+    proposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `implementation-${token}`,
+      runId,
+      source: 'llm',
+      kind: 'implementationPlan',
+      payload: {
+        version: '1',
+        id: `implementation-${token}`,
+        title: `Implementation ${token}`,
+        summary: `Implement ${targetPath}`,
+        tasks: [{
+          taskId: `task-${token}`,
+          title: `Task ${token}`,
+          target: [targetPath],
+          scope: `Scope ${token}`,
+          capability: 'fs.write',
+          acceptanceCriteria: [`Accept ${token}`],
+          failureCriteria: [`Fail ${token}`],
+        }],
+      },
+      referencedResourcePacketRefs: [],
+      referencedEvidenceRefs: [],
+    },
+    ts: new Date(0).toISOString(),
+    id: `implementation-card-${token}`,
+  });
+  const implementationPayload = implementationPlan.payload as any;
+  assertEqual(implementationPayload.confirmable, true, 'plan projection keeps implementation plan confirmable');
+  assert(String(implementationPayload.content).includes(targetPath), 'plan projection renders implementation plan target');
+}
+
+function assertPlanReviewReportAnalyzerKeepsReviewSemantics(): void {
+  const token = randomSmokeToken('plan-review-analyzer');
+  const targetPath = `target-${token}.txt`;
+  const analyzer = new PlanReviewReportAnalyzer({
+    requiredFileOperationsFromReport: () => [{ operation: 'write', targetPath, capability: 'fs.write' }],
+  });
+  const reviewed = analyzer.findReport([{
+    kind: 'proposal.reviewed',
+    report: {
+      status: 'needsRevision',
+      findings: [{ code: 'completion_evidence_required', message: `evidence-${token}` }],
+      kernelGeneratedPermissionSummary: `summary-${token}`,
+    },
+  }]);
+  assert(Boolean(reviewed), 'plan review analyzer finds proposal.reviewed report');
+  assertEqual(analyzer.needsRepair(reviewed as Record<string, unknown>), true, 'plan review analyzer preserves repairable finding semantics');
+  assert(analyzer.diagnosticSummary(reviewed as Record<string, unknown>).includes(`evidence-${token}`), 'plan review analyzer keeps diagnostic messages');
+  const facts = analyzer.facts(reviewed);
+  assert(facts.some((fact) => fact.includes(targetPath)), 'plan review analyzer includes required file operation facts');
+  assertEqual(analyzer.statusAwaitingUser('awaitingTemporaryGrant'), true, 'plan review analyzer keeps awaiting-user status semantics');
+  assertEqual(
+    analyzer.acceptedPlanNeedsRepair({
+      status: 'needsRevision',
+      deniedReasons: [`access scope must not be the workspace root ${token}`],
+    }),
+    true,
+    'plan review analyzer keeps accepted-plan access-scope repair semantics'
+  );
+  assertEqual(analyzer.denied({ status: 'interfaceOnly' }), true, 'plan review analyzer preserves denied status semantics');
 }
 
 function assertProtocolGateCanonicalizesBareRepair(): void {

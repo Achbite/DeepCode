@@ -178,7 +178,6 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
   let currentTurn: AgentTimelineResult['turns'][number] | null = null;
   let syntheticTurnIndex = 0;
 
-  // P4(B)：预扫描 plan_review.accepted 的事件索引，作为 plan(explore) → execute 阶段分界。
   // 不依赖具体 planId，简单按"是否已出现任何 accepted 的 plan_review"判定。
   const acceptedReviewIndex = findFirstAcceptedReviewIndex(input.events);
 
@@ -240,7 +239,6 @@ export function buildNarrativeTimelineProjection(input: NarrativeTimelineProject
 
   if (currentTurn) turns.push(finalizeNarrativeTurn(currentTurn));
 
-  // P4(B)：按 plan_review.accepted 边界给 displayHints 注入 phase。
   // 使用 block.rawEventRefs 推断最早事件索引（rawEventRefs 与事件顺序一致）。
   if (acceptedReviewIndex >= 0) {
     annotateBlocksWithPhase(turns, input.events, acceptedReviewIndex);
@@ -1514,7 +1512,6 @@ function isBlankReasoningEvent(event: AgentEvent): boolean {
   return body.replace(/```+/g, '').trim().length === 0;
 }
 
-// P4(B)：定位"plan accepted"边界——第一次 plan_review(status=accepted) 出现的事件索引。
 // 在此索引之前的 operationEvidence / thinking 视为 explore 阶段，之后为 execute 阶段。
 function findFirstAcceptedReviewIndex(events: AgentEvent[]): number {
   for (let i = 0; i < events.length; i += 1) {
@@ -1525,9 +1522,6 @@ function findFirstAcceptedReviewIndex(events: AgentEvent[]): number {
   return -1;
 }
 
-// P4(B)：按事件索引把 phase 写入 block.displayHints。
-// 只对 thinking / operationEvidence / assistantNarration 等"过程性"块标注，
-// 用户消息、plan/review/permission/requirement 等不标注（语义不需要分阶段）。
 function annotateBlocksWithPhase(
   turns: AgentTimelineResult['turns'],
   events: AgentEvent[],
