@@ -1,5 +1,9 @@
 import type { LlmChatRequest } from '@deepcode/protocol';
-import type { ProviderTurnContract } from '../runFrame.js';
+import type {
+  ProviderContextFrame,
+  ProviderTurnContract,
+  ToolIntentTemplate,
+} from '../runFrame.js';
 import {
   ProviderEmptyProposalRetry,
   type ProviderEmptyProposalRetryOptions,
@@ -50,7 +54,7 @@ export class ProviderPipeline {
   messages(contract: ProviderTurnContract): LlmChatRequest['messages'] {
     return [
       { role: 'system', content: contract.prompt.stablePrefix },
-      { role: 'user', content: contract.prompt.dynamicSuffix },
+      { role: 'user', content: this.renderUserPrompt(contract.prompt.dynamicSuffix, contract) },
     ];
   }
 
@@ -80,10 +84,84 @@ export class ProviderPipeline {
       profileId: input.profileId,
       state: input.state,
       stage: input.stage,
-      messages: input.messages ?? this.messages(input.contract),
+      messages: input.messages
+        ? this.withContractFrame(input.messages, input.contract)
+        : this.messages(input.contract),
       options,
       runTurn: input.runTurn,
       isEmptyResponseError: input.isEmptyResponseError,
     });
   }
+
+  private withContractFrame(
+    messages: LlmChatRequest['messages'],
+    contract: ProviderTurnContract
+  ): LlmChatRequest['messages'] {
+    if (!messages.length) return this.messages(contract);
+    const lastIndex = messages.length - 1;
+    const lastMessage = messages[lastIndex];
+    if (lastMessage?.role !== 'user' || typeof lastMessage.content !== 'string') {
+      return [
+        ...messages,
+        { role: 'user', content: this.renderUserPrompt('', contract) },
+      ];
+    }
+    return messages.map((message, index) => {
+      if (index !== lastIndex) return message;
+      return {
+        ...message,
+        content: this.renderUserPrompt(message.content, contract),
+      };
+    });
+  }
+
+  private renderUserPrompt(dynamicContent: string, contract: ProviderTurnContract): string {
+    return [
+      dynamicContent,
+      'ProviderTurnContract:',
+      fencedJson({
+        schemaVersion: contract.schemaVersion,
+        contractId: contract.contractId,
+        turnMode: contract.turnMode,
+        allowedKinds: contract.allowedKinds,
+        ...(contract.requiredKind ? { requiredKind: contract.requiredKind } : {}),
+        repairPolicy: contract.repairPolicy,
+        projectionVisibility: contract.projectionVisibility,
+        frames: contract.frames.map(renderFrame),
+        toolIntentTemplates: contract.toolIntentTemplates.map(renderToolIntentTemplate),
+        nextActionInstruction: contract.nextActionInstruction.summary ?? '',
+      }),
+      [
+        'Provider turn instruction:',
+        contract.nextActionInstruction.summary ?? '',
+      ].join('\n'),
+    ].filter((part) => part.trim()).join('\n\n');
+  }
+}
+
+function renderFrame(frame: ProviderContextFrame): Record<string, unknown> {
+  return {
+    kind: frame.kind,
+    source: frame.source,
+    trust: frame.trust,
+    ...(frame.scope ? { scope: frame.scope } : {}),
+    use: frame.use,
+    ...(frame.summary ? { summary: frame.summary } : {}),
+    ...(frame.refs?.length ? { refs: frame.refs } : {}),
+    ...(frame.data ? { data: frame.data } : {}),
+  };
+}
+
+function renderToolIntentTemplate(template: ToolIntentTemplate): Record<string, unknown> {
+  return {
+    intentId: template.intentId,
+    label: template.label,
+    operation: template.operation,
+    targets: template.targets,
+    ...(template.evidencePolicy ? { evidencePolicy: template.evidencePolicy } : {}),
+  };
+}
+
+function fencedJson(value: unknown): string {
+  return `\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }

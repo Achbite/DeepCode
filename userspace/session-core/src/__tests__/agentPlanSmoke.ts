@@ -236,8 +236,36 @@ async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
   assertEqual(stages[0], `stage-${token}`, 'provider pipeline uses original stage for first call');
   assertEqual(stages[1], `stage-${token}_empty_retry`, 'provider pipeline reuses empty retry stage suffix');
   assertEqual(firstMessages[0]?.[0]?.content, prompt.stablePrefix, 'provider pipeline reads stable prefix from contract');
-  assertEqual(firstMessages[0]?.[1]?.content, prompt.dynamicSuffix, 'provider pipeline reads dynamic suffix from contract');
+  const firstUserPrompt = String(firstMessages[0]?.[1]?.content ?? '');
+  assertEqual(firstUserPrompt.startsWith(prompt.dynamicSuffix), true, 'provider pipeline keeps dynamic suffix first');
+  assertEqual(firstUserPrompt.includes('ProviderTurnContract:'), true, 'provider pipeline renders provider turn contract');
+  assertEqual(firstUserPrompt.includes(`answer-${token}`), true, 'provider pipeline renders next action instruction');
   assertEqual(firstMessages[1]?.length, 3, 'provider pipeline appends one retry instruction after empty response');
+  const retryUserPrompt = String(firstMessages[1]?.[1]?.content ?? '');
+  assertEqual(
+    retryUserPrompt.includes('ProviderTurnContract:'),
+    true,
+    'provider pipeline keeps provider turn contract in retry base prompt'
+  );
+  const resumedMessages: LlmChatRequest['messages'][] = [];
+  await pipeline.runProposalOnly({
+    profileId: `profile-resume-${token}`,
+    state: { token },
+    contract,
+    stage: `stage-resume-${token}`,
+    messages: [{ role: 'assistant', content: `tool-result-${token}` }],
+    isEmptyResponseError: () => false,
+    runTurn: async (_profileId, _state, _stage, messages) => {
+      resumedMessages.push(messages);
+      return { content: `{"kind":"answer","token":"${token}"}`, toolCalls: [] };
+    },
+  });
+  assertEqual(resumedMessages[0]?.length, 2, 'provider pipeline appends contract frame after non-user resume messages');
+  assertEqual(
+    String(resumedMessages[0]?.[1]?.content ?? '').includes('ProviderTurnContract:'),
+    true,
+    'provider pipeline renders contract frame after non-user resume messages'
+  );
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
