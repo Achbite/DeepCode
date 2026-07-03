@@ -40,6 +40,8 @@ import {
   type TranscriptEntry,
 } from '../index.js';
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
+import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
+import { ProviderPipeline } from '../driver/pipelines/providerPipeline.js';
 
 async function main(): Promise<void> {
   assertV3Parser();
@@ -47,6 +49,8 @@ async function main(): Promise<void> {
   assertActionBundleProtocolFields();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
+  assertProviderTurnContractFrameOrder();
+  await assertProviderPipelineUsesProviderTurnContract();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -152,6 +156,88 @@ async function main(): Promise<void> {
   await assertSessionDriverLoopNativeReadToolDuplicateProposalWinsOverToolCall();
   await assertSessionDriverLoopNativeWriteToolTriggersImplementationPlanRepair();
   await assertSessionDriverLoopAcceptedPlanNativeWriteToolUsesProposalOnlyRepair();
+}
+
+function assertProviderTurnContractFrameOrder(): void {
+  const contract = new ContextFrameBuilder().buildProviderTurnContract({
+    contractId: 'contract-smoke',
+    sessionId: 'session-smoke',
+    runId: 'run-smoke',
+    turnMode: 'acceptedTaskExecution',
+    allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+    prompt: buildPromptEnvelope({
+      workflowState: 'acceptedTaskExecution',
+      allowedProposals: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+      capabilityCatalogSummary: 'fs.read\nfs.write',
+      userRequest: 'Create generic files under the current task.',
+    }),
+    userRequest: 'Create generic files under the current task.',
+    currentTask: {
+      taskId: 'task-1',
+      title: 'Create generic files',
+      goal: 'Create generic files under target directory',
+      targets: ['src/example.txt'],
+    },
+    resourceEvidenceRefs: ['packet-1'],
+    accessSummary: 'resourcePackets=1; generatedArtifacts=0; currentTask=task-1',
+    nextActionInstruction: 'Use the current task cursor only.',
+  });
+  const kinds = contract.frames.map((frame) => frame.kind);
+  assertEqual(kinds[0], 'SystemContract', 'provider turn contract starts with system contract');
+  assertEqual(kinds[1], 'ProtocolContract', 'provider turn contract keeps protocol contract before dynamic context');
+  assertEqual(kinds[2], 'Memory', 'provider turn contract places memory before user request');
+  assertEqual(kinds[3], 'UserRequest', 'provider turn contract places user request after memory');
+  assertEqual(kinds.at(-1), 'NextActionInstruction', 'provider turn contract ends with next action instruction');
+  const resourceFrame = contract.frames.find((frame) => frame.kind === 'ResourceEvidence');
+  assertEqual(resourceFrame?.trust, 'kernelObservedFact', 'resource evidence is marked as Kernel-observed fact');
+  const accessFrame = contract.frames.find((frame) => frame.kind === 'AccessSummary');
+  assertEqual(accessFrame?.trust, 'derivedObservedFact', 'access summary is marked as derived observed fact');
+  const memoryFrame = contract.frames.find((frame) => frame.kind === 'Memory');
+  assertEqual(memoryFrame?.trust, 'compressedReference', 'memory is marked as compressed reference');
+  assertEqual(contract.nextActionInstruction.kind, 'NextActionInstruction', 'contract exposes next action instruction directly');
+}
+
+async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
+  const token = randomSmokeToken('provider-pipeline');
+  const prompt = buildPromptEnvelope({
+    workflowState: `workflow-${token}`,
+    allowedProposals: ['answer'],
+    capabilityCatalogSummary: `capability-${token}`,
+    userRequest: `request-${token}`,
+  });
+  const contract = new ContextFrameBuilder().buildProviderTurnContract({
+    contractId: `contract-${token}`,
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    turnMode: 'planning',
+    allowedKinds: ['answer'],
+    prompt,
+    userRequest: `request-${token}`,
+    nextActionInstruction: `answer-${token}`,
+  });
+  const pipeline = new ProviderPipeline();
+  const stages: string[] = [];
+  const firstMessages: LlmChatRequest['messages'][] = [];
+  const turn = await pipeline.runProposalOnly({
+    profileId: `profile-${token}`,
+    state: { token },
+    contract,
+    stage: `stage-${token}`,
+    isEmptyResponseError: () => false,
+    runTurn: async (_profileId, _state, stage, messages) => {
+      stages.push(stage);
+      firstMessages.push(messages);
+      return stages.length === 1
+        ? { content: '', toolCalls: [] }
+        : { content: `{"kind":"answer","token":"${token}"}`, toolCalls: [] };
+    },
+  });
+  assertEqual(turn.content.includes(token), true, 'provider pipeline returns retried turn content');
+  assertEqual(stages[0], `stage-${token}`, 'provider pipeline uses original stage for first call');
+  assertEqual(stages[1], `stage-${token}_empty_retry`, 'provider pipeline reuses empty retry stage suffix');
+  assertEqual(firstMessages[0]?.[0]?.content, prompt.stablePrefix, 'provider pipeline reads stable prefix from contract');
+  assertEqual(firstMessages[0]?.[1]?.content, prompt.dynamicSuffix, 'provider pipeline reads dynamic suffix from contract');
+  assertEqual(firstMessages[1]?.length, 3, 'provider pipeline appends one retry instruction after empty response');
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {

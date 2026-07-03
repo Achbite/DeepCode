@@ -71,7 +71,7 @@ import {
   NativeToolCoordinator,
   NativeToolCoordinatorError,
   NativeToolTurnHandler,
-  ProviderEmptyProposalRetry,
+  ProviderPipeline,
   ProviderTraceArchive,
   ProviderPartFrameParser,
   ProviderToolCallBuffer,
@@ -82,6 +82,7 @@ import {
   type NativeToolCallProposal,
 } from './pipelines/providerPipeline.js';
 import {
+  ContextFrameBuilder,
   ResourceManifestBuilder,
   ResourceRequestResolver,
   type ResourceRequestResolution,
@@ -100,6 +101,7 @@ import {
 } from '../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 import { ReviewAssembler } from './review/index.js';
+import type { ProviderTurnContract } from './runFrame.js';
 
 export interface SessionDriverLoopPorts {
   appendEvents(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
@@ -178,6 +180,7 @@ interface SessionDriverLoopRunState {
   currentTaskContext?: CurrentTaskContext;
   taskLedger?: TaskLedgerSnapshot;
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
+  providerTurnContract?: ProviderTurnContract;
   implementationBatch: ImplementationBatchContext;
   acceptedImplementationPlan?: AcceptedImplementationPlanContext;
   resourceRequestRepairAttempted: boolean;
@@ -300,10 +303,11 @@ const RESOURCE_MANIFEST_MAX_BYTES = 512 * 1024;
 const MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES = 384 * 1024;
 const providerRepairMessageBuilder = new ProviderRepairMessageBuilder(MAX_ACTION_BUNDLE_TOTAL_CODE_BYTES);
 const acceptedPlanResourceResumePromptBuilder = new AcceptedPlanResourceResumePromptBuilder(providerRepairMessageBuilder);
-const providerEmptyProposalRetry = new ProviderEmptyProposalRetry();
+const providerPipeline = new ProviderPipeline();
 const nativeToolCoordinator = new NativeToolCoordinator();
 const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
 const acceptedPlanExecutor = new AcceptedPlanExecutor();
+const contextFrameBuilder = new ContextFrameBuilder();
 const DEFAULT_SUB_AGENT_NO_DELTA_TIMEOUT_MS = 45_000;
 const DEFAULT_SUB_AGENT_TOTAL_TIMEOUT_MS = 240_000;
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
@@ -474,17 +478,18 @@ export class SessionDriverLoop {
 
     while (true) {
       refreshTaskExecutionState(state);
+      const allowedProposals = sessionProviderAllowedProposals(state.stateContract?.allowedProposals ?? [
+        'answer',
+        'resourceRequest',
+        'decisionRequest',
+        'taskPlan',
+        'actionBundle',
+        'diagnostic',
+      ], state);
       const assembledContext = assembleContext({
         contextAssemblyId: this.id('context-assembly'),
         workflowState: state.stateContract?.stateId ?? state.driverRequest?.kind ?? 'needProposal',
-        allowedProposals: sessionProviderAllowedProposals(state.stateContract?.allowedProposals ?? [
-          'answer',
-          'resourceRequest',
-          'decisionRequest',
-          'taskPlan',
-          'actionBundle',
-          'diagnostic',
-        ], state),
+        allowedProposals,
         capabilityCatalogSummary: nativeToolCoordinator.capabilityCatalogSummary(state),
         memoryDocument: state.memoryDocument,
         projectMemoryMode: input.projectMemoryMode,
@@ -511,6 +516,19 @@ export class SessionDriverLoop {
       state.contextAssembly = assembledContext.contextAssembly;
       lastResult = await this.appendConsumedUserGuidanceEvents(sessionId, lastResult, state.contextAssembly, state.runId);
       const prompt = assembledContext.prompt;
+      state.providerTurnContract = contextFrameBuilder.buildSessionProviderTurnContract({
+        contractId: this.id('provider-turn-contract'),
+        sessionId,
+        runId: state.runId,
+        allowedKinds: allowedProposals,
+        prompt,
+        contextAssembly: state.contextAssembly,
+        userRequest: input.content,
+        acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
+        currentTaskContext: state.currentTaskContext,
+        resourcePackets: state.resourcePackets,
+        generatedArtifactCount: state.generatedArtifactEvidence.size,
+      });
       state.phase = 'provider_proposing';
       let proposal: ProposalEnvelope;
       try {
@@ -1816,6 +1834,21 @@ export class SessionDriverLoop {
     state.cachePlan = assembledContext.cachePlan;
     state.contextAssembly = assembledContext.contextAssembly;
     const prompt = assembledContext.prompt;
+    state.providerTurnContract = contextFrameBuilder.buildSessionProviderTurnContract({
+      contractId: this.id('provider-turn-contract-requirement'),
+      sessionId: state.sessionId,
+      runId: state.runId,
+      turnMode: 'requirementDecision',
+      allowedKinds: ['decisionRequest'],
+      requiredKind: 'decisionRequest',
+      prompt,
+      contextAssembly: state.contextAssembly,
+      userRequest: input.content,
+      resourcePackets: state.resourcePackets,
+      generatedArtifactCount: state.generatedArtifactEvidence.size,
+      repairPolicy: 'deterministicIntervention',
+      nextActionInstruction: 'Return exactly one decisionRequest proposal for the concrete user decision needed before planning side-effect work.',
+    });
     const proposal = await this.callProviderAndParse(input, state, prompt);
     if (proposal.kind !== 'decisionRequest') {
       throw new SessionDriverLoopError(
@@ -1947,13 +1980,16 @@ export class SessionDriverLoop {
   ): Promise<ProposalEnvelope> {
     let raw: string;
     try {
-      const messages: LlmChatRequest['messages'] = [
-        { role: 'system', content: prompt.stablePrefix },
-        { role: 'user', content: prompt.dynamicSuffix },
-      ];
+      const contract = state.providerTurnContract;
+      if (!contract) {
+        throw new SessionDriverLoopError(
+          'provider_turn_contract_missing',
+          'Provider turn contract is required before calling the provider.'
+        );
+      }
       const providerResult = state.acceptedImplementationPlan
-        ? await this.callProviderProposalOnly(input, state, prompt, 'accepted_plan_provider_call', messages)
-        : await this.callProviderWithNativeTools(input, state, prompt, messages);
+        ? await this.callProviderProposalOnly(input, state, prompt, contract, 'accepted_plan_provider_call')
+        : await this.callProviderWithNativeTools(input, state, prompt, contract);
       if (typeof providerResult !== 'string') return providerResult;
       raw = providerResult;
     } catch (error) {
@@ -2268,10 +2304,27 @@ export class SessionDriverLoop {
         }),
       },
     ];
+    const contract = contextFrameBuilder.buildSessionProviderTurnContract({
+      contractId: this.id('provider-turn-contract-resource-resume'),
+      sessionId: state.sessionId,
+      runId: state.runId,
+      turnMode: 'resourceResume',
+      allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+      prompt,
+      contextAssembly: state.contextAssembly,
+      userRequest: input.content,
+      acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
+      currentTaskContext: state.currentTaskContext,
+      resourcePackets: state.resourcePackets,
+      generatedArtifactCount: state.generatedArtifactEvidence.size,
+      nextActionInstruction: 'Use the newly resolved ResourcePacket for the current accepted task. Return one actionBundle, resourceRequest, decisionRequest, or diagnostic proposal.',
+    });
+    state.providerTurnContract = contract;
     const providerResult = await this.callProviderProposalOnly(
       input,
       state,
       prompt,
+      contract,
       'accepted_plan_resource_resume',
       messages
     );
@@ -2404,18 +2457,18 @@ export class SessionDriverLoop {
     input: SessionDriverLoopInput,
     state: SessionDriverLoopRunState,
     prompt: PromptEnvelope,
-    messages: LlmChatRequest['messages']
+    contract: ProviderTurnContract
   ): Promise<string | ProposalEnvelope> {
-    let currentMessages = [...messages];
+    let currentMessages = providerPipeline.messages(contract);
     for (let round = 0; ; round += 1) {
       const stage = round === 0 ? 'provider_call' : `provider_tool_resume_${round}`;
-      const effectiveTurn = await providerEmptyProposalRetry.runWithRetry({
+      const effectiveTurn = await providerPipeline.runWithNativeTools({
         profileId: input.profileId,
         state,
+        contract,
         stage,
         messages: currentMessages,
         options: {
-          responseFormat: { type: 'json_object' },
           tools: nativeToolCoordinator.providerTools(state),
         },
         runTurn: (profileId, runState, retryStage, retryMessages, options) =>
@@ -2600,17 +2653,16 @@ export class SessionDriverLoop {
     input: SessionDriverLoopInput,
     state: SessionDriverLoopRunState,
     prompt: PromptEnvelope,
+    contract: ProviderTurnContract,
     stage: string,
-    messages: LlmChatRequest['messages']
+    messages?: LlmChatRequest['messages']
   ): Promise<string | ProposalEnvelope> {
-    const effectiveTurn = await providerEmptyProposalRetry.runWithRetry({
+    const effectiveTurn = await providerPipeline.runProposalOnly({
       profileId: input.profileId,
       state,
+      contract,
       stage,
       messages,
-      options: {
-        responseFormat: { type: 'json_object' },
-      },
       runTurn: (profileId, runState, retryStage, retryMessages, options) =>
         this.llmTurn(profileId, runState, retryStage, retryMessages, options),
       isEmptyResponseError,
