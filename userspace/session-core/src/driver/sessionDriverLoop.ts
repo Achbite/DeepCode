@@ -19,6 +19,7 @@ import {
   AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
   AcceptedPlanProgressAggregator,
+  AcceptedPlanScopeCoverage,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
   type AcceptedPlanReadOnlyResourceCompletion,
@@ -329,6 +330,9 @@ const planProjectionBuilder = new PlanProjectionBuilder({
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
 const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();
+const acceptedPlanScopeCoverage = new AcceptedPlanScopeCoverage({
+  taskTargets: (task) => acceptedPlanTargetParser.taskTargets(task),
+});
 const acceptedPlanBatchPreflight = new AcceptedPlanBatchPreflight({
   batchActionRecords,
   objectRecord,
@@ -6483,7 +6487,7 @@ function fileOperationFreshnessValidationReasons(
     }
     if (capability === 'fs.write') {
       if (writeActionIsExplicitCreate(action, proposal)) continue;
-      const targetIsAccepted = targets.some((target) => scopeCoveredByAcceptedPlanForCapability(target, capability, accepted));
+      const targetIsAccepted = targets.some((target) => acceptedPlanScopeCoverage.scopeCoveredForCapability(target, capability, accepted));
       if (!targetIsAccepted && !evidenceIndex.mentionsAnyTarget(resourcePackets, targets) && !actionDeclaresOverwritePlan(action)) {
         const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
         reasons.push(`write action ${action.actionId || action.id || action.title || index} is missing current read/search evidence or an explicit overwrite plan before overwriting an existing file (target=${targetLabel}). Return resourceRequest to read/search the target file or range first.`);
@@ -6491,7 +6495,7 @@ function fileOperationFreshnessValidationReasons(
       continue;
     }
     if (capability === 'fs.delete') {
-      if (!targets.some((target) => scopeCoveredByAcceptedPlanForCapability(target, capability, accepted)) && !evidenceIndex.mentionsAnyTarget(resourcePackets, targets)) {
+      if (!targets.some((target) => acceptedPlanScopeCoverage.scopeCoveredForCapability(target, capability, accepted)) && !evidenceIndex.mentionsAnyTarget(resourcePackets, targets)) {
         const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
         reasons.push(`delete action ${action.actionId || action.id || action.title || index} is missing current directory/read/search evidence or confirmed file-level scope (target=${targetLabel}). Return resourceRequest to read the directory tree or target-file evidence first.`);
       }
@@ -6677,165 +6681,6 @@ function workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[] {
     if (id) ids.add(id);
   }
   return [...ids];
-}
-
-function acceptedPlanAutoExecutableCapability(capability: string): boolean {
-  return [
-    'fs.read',
-    'fs.write',
-    'fs.patch',
-    'fs.delete',
-    'process.exec',
-    'network.egress',
-    'git.read',
-    'git.write',
-    'git.push',
-    'config.modify',
-    'browser.control',
-    'provider.egress',
-  ].includes(capability);
-}
-
-function scopeCoveredByAcceptedPlan(scope: string, acceptedScopes: string[]): boolean {
-  if (acceptedScopes.length === 0) return false;
-  return acceptedScopes.some((accepted) => planScopeCovers(accepted, scope));
-}
-
-function scopeCoveredByAcceptedPlanForCapability(
-  scope: string,
-  capability: string | undefined,
-  accepted: AcceptedImplementationPlanContext
-): boolean {
-  const normalized = normalizePlanScope(scope);
-  if (!normalized) return false;
-  if (exactOperationGrantCoversAcceptedPlanTarget(normalized, capability, accepted)) return true;
-  if ((capability === 'fs.delete' || capability === 'fs.rename') && acceptedPlanTaskTargetsCoverScope(normalized, accepted)) {
-    return true;
-  }
-  if (capability === 'fs.delete' || capability === 'fs.rename') return false;
-  const acceptedScopes = accepted.targetScopes
-    .flatMap(expandPlanTargetTokens)
-    .map(normalizePlanScope)
-    .filter(Boolean);
-  if (scopeCoveredByAcceptedPlan(normalized, acceptedScopes)) return true;
-  return accepted.accessScopes.some((accessScope) => {
-    if (accessScope.outsideWorkspace) return false;
-    if (!accessScopeCapabilityMatches(accessScope, capability)) return false;
-    return planScopeCovers(accessScope.path, normalized);
-  });
-}
-
-function acceptedPlanTaskTargetsCoverScope(scope: string, accepted: AcceptedImplementationPlanContext): boolean {
-  const normalized = normalizePlanScopeIdentity(scope);
-  if (!normalized) return false;
-  return accepted.tasks.some((task) =>
-    acceptedPlanTargetParser.taskTargets(task as unknown as Record<string, unknown>)
-      .flatMap(expandPlanTargetTokens)
-      .map(normalizePlanScopeIdentity)
-      .filter(Boolean)
-      .some((target) =>
-        planScopeCovers(target, normalized) ||
-        planScopeCovers(normalized, target)
-      )
-  );
-}
-
-function exactOperationGrantCoversAcceptedPlanTarget(
-  scope: string,
-  capability: string | undefined,
-  accepted: AcceptedImplementationPlanContext
-): boolean {
-  const normalized = normalizePlanScopeIdentity(scope);
-  if (!normalized || !capability) return false;
-  return accepted.exactOperationGrants.some((grant) => {
-    if (!exactOperationGrantCapabilityMatches(grant, capability)) return false;
-    return normalizePlanScopeIdentity(grant.targetPath) === normalized;
-  });
-}
-
-function exactOperationGrantCapabilityMatches(
-  grant: AcceptedPlanExactOperationGrant,
-  capability: string | undefined
-): boolean {
-  if (!capability) return false;
-  if (grant.capability === capability) return true;
-  if (grant.capability === 'fs.write' && capability === 'fs.patch') return true;
-  if (capability === 'fs.write' && ['create', 'write'].includes(grant.operation)) return true;
-  if (capability === 'fs.patch' && grant.operation === 'patch') return true;
-  if (capability === 'fs.delete' && grant.operation === 'delete') return true;
-  if (capability === 'fs.rename' && grant.operation === 'rename') return true;
-  return false;
-}
-
-function acceptedPlanCapabilitySetAllows(
-  allowed: Set<string>,
-  capability: string,
-  direction: 'acceptedCoversAction' | 'actionCoversAccepted' = 'acceptedCoversAction'
-): boolean {
-  if (allowed.has(capability)) return true;
-  return [...allowed].some((item) =>
-    direction === 'acceptedCoversAction'
-      ? acceptedPlanCapabilityCovers(item, capability)
-      : acceptedPlanCapabilityCovers(capability, item)
-  );
-}
-
-function canonicalAcceptedPlanCapabilities(accepted: AcceptedImplementationPlanContext): Set<string> {
-  const capabilities = [
-    ...accepted.capabilities,
-    ...accepted.tasks.map((task) => task.capability),
-    ...accepted.exactOperationGrants.flatMap((grant) => [
-      grant.capability,
-      capabilityForAcceptedPlanOperation(grant.operation),
-    ]),
-    ...accepted.accessScopes.flatMap((scope) => [
-      ...scope.capabilities,
-      ...scope.operations.map(capabilityForAcceptedPlanOperation),
-    ]),
-  ];
-  return new Set(capabilities
-    .map((capability) => canonicalAcceptedPlanCapability(capability))
-    .filter((capability): capability is string => Boolean(capability)));
-}
-
-function canonicalAcceptedPlanCapability(capability: string | undefined): string | undefined {
-  if (!capability) return undefined;
-  if (acceptedPlanAutoExecutableCapability(capability)) return capability;
-  return undefined;
-}
-
-function capabilityForAcceptedPlanOperation(operation: string | undefined): string | undefined {
-  if (!operation) return undefined;
-  if (operation === 'read' || operation === 'list' || operation === 'search') return 'fs.read';
-  if (operation === 'create' || operation === 'write' || operation === 'overwrite') return 'fs.write';
-  if (operation === 'patch' || operation === 'replace') return 'fs.patch';
-  if (operation === 'delete' || operation === 'remove') return 'fs.delete';
-  if (operation === 'rename' || operation === 'move') return 'fs.rename';
-  return undefined;
-}
-
-function acceptedPlanCapabilityCovers(acceptedCapability: string, actionCapability: string): boolean {
-  if (acceptedCapability === actionCapability) return true;
-  if (acceptedCapability === 'fs.write' && actionCapability === 'fs.patch') return true;
-  return false;
-}
-
-function accessScopeCapabilityMatches(scope: AcceptedPlanAccessScope, capability: string | undefined): boolean {
-  if (!capability) return false;
-  if (scope.capabilities.some((item) => acceptedPlanCapabilityCovers(item, capability))) return true;
-  if (capability === 'fs.write' && scope.operations.some((operation) => operation === 'create' || operation === 'write')) return true;
-  if (capability === 'fs.patch' && scope.operations.includes('patch')) return true;
-  return false;
-}
-
-function planScopeCovers(accepted: string, candidate: string): boolean {
-  if (!accepted || !candidate) return false;
-  const acceptedNormalized = normalizePlanScopeIdentity(accepted);
-  const candidateNormalized = normalizePlanScopeIdentity(candidate);
-  if (acceptedNormalized === candidateNormalized) return true;
-  if (isAbsolutePath(acceptedNormalized) || isAbsolutePath(candidateNormalized)) return false;
-  const acceptedDir = acceptedNormalized.endsWith('/') ? acceptedNormalized : `${acceptedNormalized}/`;
-  return candidateNormalized.startsWith(acceptedDir);
 }
 
 function normalizePlanScope(value: string): string {
@@ -7645,7 +7490,7 @@ function acceptedPlanExactOperationGrantForAction(
   if (!capability || !rawTarget) return undefined;
   const normalized = acceptedPlanScopeMatcher.normalizeTargetScope(rawTarget, accepted).replace(/\/+$/, '');
   return accepted.exactOperationGrants.find((grant) =>
-    exactOperationGrantCapabilityMatches(grant, capability) &&
+    acceptedPlanScopeCoverage.exactGrantCapabilityMatches(grant, capability) &&
     normalizePlanScope(grant.targetPath).replace(/\/+$/, '') === normalized
   );
 }

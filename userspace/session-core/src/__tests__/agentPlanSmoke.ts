@@ -47,6 +47,7 @@ import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestL
 import {
   AcceptedImplementationPlanContextBuilder,
   AcceptedPlanBatchPreflight,
+  AcceptedPlanScopeCoverage,
   AcceptedPlanTargetParser,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
@@ -76,6 +77,7 @@ async function main(): Promise<void> {
   assertCompletedWorkUnitFactIndexMatchesActionAndTarget();
   assertActionBatchFailureIndexSummarizesKernelFailures();
   assertAcceptedPlanBatchPreflightAuditsDeleteActions();
+  assertAcceptedPlanScopeCoverageMatchesStructuredScopes();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
@@ -880,6 +882,75 @@ function assertAcceptedPlanBatchPreflightAuditsDeleteActions(): void {
   assert(
     reasons.some((reason) => reason.includes(`fs.delete target ${targetPath} is a directory`)),
     'accepted plan batch preflight detects directory delete without target kind'
+  );
+}
+
+function assertAcceptedPlanScopeCoverageMatchesStructuredScopes(): void {
+  const token = randomSmokeToken('scope-coverage');
+  const taskDir = `task-${token}`;
+  const exactPath = `exact-${token}.txt`;
+  const accessDir = `access-${token}`;
+  const coverage = new AcceptedPlanScopeCoverage({
+    taskTargets: (task) => Array.isArray(task.targets)
+      ? task.targets.filter((item): item is string => typeof item === 'string')
+      : [],
+  });
+  const accepted: AcceptedImplementationPlanContext = {
+    planId: `plan-${token}`,
+    runId: `run-${token}`,
+    tasks: [
+      {
+        taskId: `task-${token}`,
+        title: `Task ${token}`,
+        capability: 'fs.delete',
+        targets: [`${taskDir}/item-${token}.txt`],
+        dependencies: [],
+        conflictKeys: [],
+      },
+    ],
+    capabilities: ['fs.delete', 'fs.write'],
+    targetScopes: [`${accessDir}/`],
+    exactOperationGrants: [
+      {
+        operation: 'delete',
+        targetPath: exactPath,
+        targetResourceKind: 'file',
+        capability: 'fs.delete',
+        source: 'implementationPlan',
+      },
+    ],
+    accessScopes: [
+      {
+        scopeKind: 'workspacePath',
+        path: `${accessDir}/`,
+        capabilities: ['fs.write'],
+        operations: ['write'],
+        source: 'implementationPlan',
+      },
+    ],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: {},
+  };
+  assert(
+    coverage.scopeCoveredForCapability(`${taskDir}/item-${token}.txt`, 'fs.delete', accepted),
+    'accepted plan scope coverage matches delete task target'
+  );
+  assert(
+    coverage.scopeCoveredForCapability(exactPath, 'fs.delete', accepted),
+    'accepted plan scope coverage matches exact delete grant'
+  );
+  assert(
+    coverage.scopeCoveredForCapability(`${accessDir}/nested-${token}.txt`, 'fs.write', accepted),
+    'accepted plan scope coverage matches write access scope'
+  );
+  assert(
+    !coverage.scopeCoveredForCapability(`outside-${token}.txt`, 'fs.delete', accepted),
+    'accepted plan scope coverage rejects unrelated delete target'
+  );
+  assert(
+    coverage.exactGrantCapabilityMatches(accepted.exactOperationGrants[0], 'fs.delete'),
+    'accepted plan scope coverage matches exact grant capability'
   );
 }
 
