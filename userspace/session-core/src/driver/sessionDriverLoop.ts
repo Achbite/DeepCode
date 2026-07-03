@@ -1006,7 +1006,7 @@ export class SessionDriverLoop {
       : acceptedPlanScopeDecisionOverlay.resumeGuidance(selectedEffect);
     return this.runUserTurn({
       sessionId: input.sessionId,
-      content: implementationPlanExecutionRequest(plan, nextAcceptedPlan, guidance),
+      content: executionPromptCoordinator().executionRequest(plan, nextAcceptedPlan, guidance),
       attachments: nextAcceptedPlan.executionRoot ? [nextAcceptedPlan.executionRoot.attachment] : userInputPipeline.requirementAttachments(confirmation),
       existingEvents: current.events,
       workspaceBinding: input.workspaceBinding,
@@ -1242,7 +1242,7 @@ export class SessionDriverLoop {
     );
     return this.runUserTurn({
       sessionId: input.sessionId,
-      content: implementationPlanExecutionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
+      content: executionPromptCoordinator().executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
       attachments: acceptedContext.acceptedPlan.executionRoot
         ? [acceptedContext.acceptedPlan.executionRoot.attachment]
         : userInputPipeline.requirementAttachments(confirmation),
@@ -1371,7 +1371,7 @@ export class SessionDriverLoop {
       const acceptedPlan = acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot);
       return this.runUserTurn({
         sessionId: input.sessionId,
-        content: implementationPlanExecutionRequest(plan, acceptedPlan, input.guidance),
+        content: executionPromptCoordinator().executionRequest(plan, acceptedPlan, input.guidance),
         attachments: acceptedPlan.executionRoot ? [acceptedPlan.executionRoot.attachment] : [],
         existingEvents: result.events,
         workspaceBinding: input.workspaceBinding,
@@ -1566,7 +1566,7 @@ export class SessionDriverLoop {
         if (!acceptedPlanComplete(nextAccepted)) {
           return this.runUserTurn({
             sessionId: input.sessionId,
-            content: implementationPlanExecutionRequest(acceptedOverlay.plan, nextAccepted),
+            content: executionPromptCoordinator().executionRequest(acceptedOverlay.plan, nextAccepted),
             attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
             existingEvents: result.events,
             workspaceBinding: input.workspaceBinding,
@@ -2334,7 +2334,7 @@ export class SessionDriverLoop {
     if (!acceptedPlanComplete(nextAccepted)) {
       return this.runUserTurn({
         sessionId: input.sessionId,
-        content: implementationPlanExecutionRequest(
+        content: executionPromptCoordinator().executionRequest(
           {
             sessionId: state.sessionId,
             runId: state.runId,
@@ -3542,7 +3542,7 @@ export class SessionDriverLoop {
           }
           return this.runUserTurn({
             sessionId: input.sessionId,
-            content: implementationPlanExecutionRequest(
+            content: executionPromptCoordinator().executionRequest(
               acceptedPlanExecutionContext(state, proposal, {}),
               accepted,
               [
@@ -3922,7 +3922,7 @@ export class SessionDriverLoop {
     if (!kernelEventStatusIndex.hasFailureOrBlocker(batchReply.events ?? []) && !acceptedPlanComplete(nextAccepted)) {
       return this.runUserTurn({
         sessionId: input.sessionId,
-        content: implementationPlanExecutionRequest(
+        content: executionPromptCoordinator().executionRequest(
           { ...acceptedPlanExecutionContext(state, executionProposal, reviewReport), implementationPlan: accepted.rawPlan },
           nextAccepted
         ),
@@ -6455,14 +6455,6 @@ function reviewSummaryEvent(
 
 function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
-}
-
-function implementationPlanExecutionRequest(
-  plan: SessionPlanContext,
-  acceptedPlan: AcceptedImplementationPlanContext,
-  guidance?: string
-): string {
-  return executionPromptCoordinator().executionRequest(plan, acceptedPlan, guidance);
 }
 
 function collectQueuedUserGuidanceEvents(events: AgentEvent[], runId?: string): UserGuidanceEvent[] {
