@@ -1,6 +1,8 @@
 import type {
   AgentConversationActivity,
   AgentEvent,
+  KernelCommandEnvelope,
+  KernelReply,
 } from '@deepcode/protocol';
 import type {
   ResourceManifest,
@@ -12,8 +14,35 @@ export interface ResourceRequestLoopOptions {
   maxDerivedManifestEntries?: number;
 }
 
+export interface ResourceRequestLoopState {
+  sessionId: string;
+  runId: string;
+}
+
+export interface ResourceRequestLoopResolvePorts {
+  kernelCommand(request: KernelCommandEnvelope): Promise<KernelReply>;
+  createId(prefix: string): string;
+}
+
 export class ResourceRequestLoop {
   constructor(private readonly options: ResourceRequestLoopOptions = {}) {}
+
+  async resolvePacket(
+    state: ResourceRequestLoopState,
+    manifest: ResourceManifest,
+    ports: ResourceRequestLoopResolvePorts
+  ): Promise<ResourcePacket | undefined> {
+    const reply = await ports.kernelCommand({
+      command: {
+        kind: 'resourceResolve',
+        requestId: ports.createId('resource-resolve'),
+        runId: state.runId,
+        sessionId: state.sessionId,
+        request: { manifest },
+      },
+    });
+    return this.findPacket(reply.events);
+  }
 
   findPacket(events: unknown[]): ResourcePacket | undefined {
     for (const event of events) {

@@ -54,7 +54,7 @@ async function main(): Promise<void> {
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
   await assertProviderTraceRecorderArchivesPayload();
-  assertResourceRequestLoopBuildsPacketEvents();
+  await assertResourceRequestLoopBuildsPacketEvents();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -325,7 +325,7 @@ async function assertProviderTraceRecorderArchivesPayload(): Promise<void> {
   assertEqual(archive?.kind, 'request', 'provider trace recorder archives request payloads');
 }
 
-function assertResourceRequestLoopBuildsPacketEvents(): void {
+async function assertResourceRequestLoopBuildsPacketEvents(): Promise<void> {
   const token = randomSmokeToken('resource-request-loop');
   const loop = new ResourceRequestLoop();
   const packet = loop.findPacket([
@@ -395,6 +395,43 @@ function assertResourceRequestLoopBuildsPacketEvents(): void {
   assertEqual(manifest.entries.length, 2, 'resource request loop derives manifest entries from directory tree');
   assertEqual(manifest.entries[0]?.kind, 'directory', 'resource request loop preserves derived directory kind');
   assertEqual(manifest.entries[1]?.resourceRef, `/tmp/root-${token}/dir-${token}/file.txt`, 'resource request loop joins derived resource paths');
+
+  const resolved = await loop.resolvePacket(
+    { sessionId: `session-${token}`, runId: `run-${token}` },
+    manifest,
+    {
+      createId: (prefix) => `${prefix}-${token}`,
+      kernelCommand: async (request): Promise<KernelReply> => {
+        const command = request.command as Record<string, unknown>;
+        assertEqual(command.kind, 'resourceResolve', 'resource request loop submits ResourceResolve command');
+        if (command.kind !== 'resourceResolve') throw new Error('expected resourceResolve command');
+        assertEqual(command.requestId, `resource-resolve-${token}`, 'resource request loop uses injected id source');
+        assertEqual(command.sessionId, `session-${token}`, 'resource request loop keeps session id');
+        return {
+          ok: true,
+          events: [
+            {
+              packet: {
+                id: `resolved-packet-${token}`,
+                workspaceScopeKey: `workspace-${token}`,
+                requestId: `resolved-request-${token}`,
+                items: [
+                  {
+                    requestItemId: `resolved-item-${token}`,
+                    manifestEntryId: `resolved-entry-${token}`,
+                    status: 'provided',
+                    contentKind: 'text',
+                    content: `resolved-content-${token}`,
+                  },
+                ],
+              },
+            },
+          ],
+        };
+      },
+    }
+  );
+  assertEqual(resolved?.id, `resolved-packet-${token}`, 'resource request loop resolves packet from kernel reply');
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {

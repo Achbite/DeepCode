@@ -3127,16 +3127,10 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     manifest: ResourceManifest
   ): Promise<ResourcePacket> {
-    const reply = await this.kernel({
-      command: {
-        kind: 'resourceResolve',
-        requestId: this.id('resource-resolve'),
-        runId: state.runId,
-        sessionId: state.sessionId,
-        request: { manifest },
-      },
+    const packet = await resourceRequestLoop.resolvePacket(state, manifest, {
+      kernelCommand: (request) => this.kernel(request),
+      createId: (prefix) => this.id(prefix),
     });
-    const packet = resourceRequestLoop.findPacket(reply.events);
     if (!packet) {
       throw new SessionDriverLoopError('resource_packet_missing', 'Kernel ResourceResolve did not produce a ResourcePacket.');
     }
