@@ -36,6 +36,7 @@ import {
   SessionDriver,
   SessionDriverLoop,
   type ActionBundleDraft,
+  type ProposalEnvelope,
   type ResourceManifest,
   type ResourcePacket,
   type TranscriptEntry,
@@ -45,6 +46,7 @@ import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import {
   AcceptedImplementationPlanContextBuilder,
+  AcceptedPlanProposalScopeIndex,
   AcceptedPlanTargetParser,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
@@ -79,6 +81,7 @@ async function main(): Promise<void> {
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
   assertAcceptedPlanTargetParserExtractsStructuredTargets();
+  assertAcceptedPlanProposalScopeIndexNormalizesTargets();
   assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
@@ -1230,6 +1233,74 @@ function assertAcceptedPlanTargetParserExtractsStructuredTargets(): void {
   assert(
     targets.includes(`generated-${token}/artifact-${token}.txt`),
     'target parser extracts file operation target refs'
+  );
+}
+
+function assertAcceptedPlanProposalScopeIndexNormalizesTargets(): void {
+  const token = randomSmokeToken('proposal-scope');
+  const rootRef = `/${randomSmokeToken('root')}`;
+  const actionTarget = `dir-${token}/action-${token}.txt`;
+  const blockTarget = `dir-${token}/block-${token}.txt`;
+  const index = new AcceptedPlanProposalScopeIndex();
+  const accepted: AcceptedImplementationPlanContext = {
+    planId: `plan-${token}`,
+    runId: `run-${token}`,
+    tasks: [],
+    capabilities: [],
+    targetScopes: [],
+    exactOperationGrants: [],
+    accessScopes: [],
+    executionRoot: {
+      attachment: {
+        kind: 'directory',
+        path: rootRef,
+        source: 'userSelected',
+        scope: 'session',
+      },
+      ref: rootRef,
+      source: 'workspaceBinding',
+    },
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: {},
+  };
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    kind: 'actionBundle',
+    outputLanguage: 'en-US',
+    payload: {
+      codeBlocks: [{
+        id: `block-${token}`,
+        path: blockTarget,
+      }],
+      actionBundle: {
+        actions: [
+          {
+            actionId: `action-${token}`,
+            toolId: 'fs.write',
+            targetPath: `${rootRef}/${actionTarget}`,
+          },
+          {
+            actionId: `block-action-${token}`,
+            toolId: 'fs.write',
+            sourceBlockId: `block-${token}`,
+          },
+        ],
+      },
+    },
+  } as unknown as ProposalEnvelope;
+  const targets = index.proposalTargetScopes(proposal, accepted);
+  assert(targets.some((target) => target.raw === `${rootRef}/${actionTarget}` && target.normalized === actionTarget), 'proposal scope index relativizes execution-root absolute targets');
+  assert(targets.some((target) => target.raw === blockTarget && target.normalized === blockTarget), 'proposal scope index extracts code block target paths');
+  assertEqual(
+    index.normalizeTargetForExecutionRoot(`${rootRef}/${actionTarget}`, accepted.executionRoot),
+    actionTarget,
+    'proposal scope index normalizes execution-root paths'
+  );
+  assertEqual(
+    index.actionTargetScopes({ sourceBlockId: `block-${token}` }, proposal).includes(blockTarget),
+    true,
+    'proposal scope index resolves action sourceBlockId targets'
   );
 }
 
