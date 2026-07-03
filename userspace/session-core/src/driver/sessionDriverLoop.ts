@@ -84,6 +84,7 @@ import {
 } from './pipelines/providerPipeline.js';
 import {
   ContextFrameBuilder,
+  ResourceEvidenceIndex,
   ResourceManifestBuilder,
   ResourceRequestLoop,
   ResourceRequestResolver,
@@ -4775,6 +4776,13 @@ function resourceRequestResolver(): ResourceRequestResolver {
   return new ResourceRequestResolver();
 }
 
+function resourceEvidenceIndex(): ResourceEvidenceIndex {
+  return new ResourceEvidenceIndex({
+    normalizeTarget: normalizePlanScope,
+    clip,
+  });
+}
+
 function acceptedPlanAdmission(): AcceptedPlanAdmission {
   return new AcceptedPlanAdmission({
     scopeMatcher: new AcceptedPlanScopeMatcher(),
@@ -4801,7 +4809,7 @@ function reviewAssembler(): ReviewAssembler {
     actionFileTargetPath,
     normalizeAcceptedPlanTargetScope,
     comparablePath,
-    resourceTextForTarget,
+    resourceTextForTarget: (packets, target) => resourceEvidenceIndex().textForTarget(packets, target),
   });
 }
 
@@ -7875,6 +7883,7 @@ function fileOperationFreshnessValidationReasons(
 ): string[] {
   const actionBundle = readActionBundle(proposal);
   const reasons: string[] = [];
+  const evidenceIndex = resourceEvidenceIndex();
   for (const [index, action] of (actionBundle?.actions ?? []).entries()) {
     const capability = actionEffectiveCapability(action as unknown as Record<string, unknown>);
     const actionKind = stringValue(action.kind) ?? (capability === 'fs.patch' ? 'patch' : undefined);
@@ -7887,7 +7896,7 @@ function fileOperationFreshnessValidationReasons(
       const match = objectRecord(patchSpec?.match);
       const matchText = stringValue(match?.text);
       if (!matchText) continue;
-      if (!resourceEvidenceContainsExactBlock(resourcePackets, targets, matchText)) {
+      if (!evidenceIndex.containsExactBlock(resourcePackets, targets, matchText)) {
         const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
         reasons.push(`patch action ${action.actionId || action.id || action.title || index} 缺少当前文件/search 证据：patchSpec.match.text 必须来自最近 ResourcePacket 的 fileText/searchResults（target=${targetLabel}）。请先返回 resourceRequest kind="search" 或读取目标文件/range。`);
       }
@@ -7896,21 +7905,21 @@ function fileOperationFreshnessValidationReasons(
     if (capability === 'fs.write') {
       if (writeActionIsExplicitCreate(action, proposal)) continue;
       const targetIsAccepted = targets.some((target) => scopeCoveredByAcceptedPlanForCapability(target, capability, accepted));
-      if (!targetIsAccepted && !resourceEvidenceMentionsAnyTarget(resourcePackets, targets) && !actionDeclaresOverwritePlan(action)) {
+      if (!targetIsAccepted && !evidenceIndex.mentionsAnyTarget(resourcePackets, targets) && !actionDeclaresOverwritePlan(action)) {
         const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
         reasons.push(`write action ${action.actionId || action.id || action.title || index} 覆盖已有文件前缺少当前 read/search 证据或明确 overwrite plan（target=${targetLabel}）。请先返回 resourceRequest 读取目标文件/range/search。`);
       }
       continue;
     }
     if (capability === 'fs.delete') {
-      if (!targets.some((target) => scopeCoveredByAcceptedPlanForCapability(target, capability, accepted)) && !resourceEvidenceMentionsAnyTarget(resourcePackets, targets)) {
+      if (!targets.some((target) => scopeCoveredByAcceptedPlanForCapability(target, capability, accepted)) && !evidenceIndex.mentionsAnyTarget(resourcePackets, targets)) {
         const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
         reasons.push(`delete action ${action.actionId || action.id || action.title || index} 缺少当前目录/read/search 证据或已确认文件级范围（target=${targetLabel}）。请先返回 resourceRequest 读取目录树或目标文件证据。`);
       }
       continue;
     }
     if (capability === 'fs.rename' || actionKind === 'rename') {
-      if (!resourceEvidenceMentionsAnyTarget(resourcePackets, targets)) {
+      if (!evidenceIndex.mentionsAnyTarget(resourcePackets, targets)) {
         const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
         reasons.push(`rename action ${action.actionId || action.id || action.title || index} 缺少 source 当前证据（target=${targetLabel}）。请先返回 resourceRequest 读取 source 文件或目录证据。`);
       }
@@ -7943,65 +7952,6 @@ function writeActionIsExplicitCreate(action: ActionBundleDraft['actions'][number
 function actionDeclaresOverwritePlan(action: ActionBundleDraft['actions'][number]): boolean {
   const toolArgs = objectRecord(action.toolArgs) ?? objectRecord(action.args);
   return toolArgs?.overwrite === true || toolArgs?.overwritePlan === true || toolArgs?.confirmedOverwrite === true;
-}
-
-function resourceEvidenceMentionsAnyTarget(packets: ResourcePacket[], targets: string[]): boolean {
-  if (!packets.length || !targets.length) return false;
-  const normalizedTargets = targets.map(normalizePlanScope).filter(Boolean);
-  return packets.flatMap((packet) => packet.items ?? [])
-    .filter((item) => item.status === 'resolved' || item.status === 'provided')
-    .some((item) => resourcePacketItemMatchesAnyTarget(item, normalizedTargets));
-}
-
-function resourceEvidenceContainsExactBlock(
-  packets: ResourcePacket[],
-  targets: string[],
-  matchText: string
-): boolean {
-  if (!packets.length) return false;
-  const normalizedMatch = normalizeLineEndings(matchText);
-  const normalizedTargets = targets.map(normalizePlanScope).filter(Boolean);
-  const candidateItems = packets.flatMap((packet) => packet.items ?? [])
-    .filter((item) => item.status === 'resolved' || item.status === 'provided');
-  const pathMatchedItems = normalizedTargets.length
-    ? candidateItems.filter((item) => resourcePacketItemMatchesAnyTarget(item, normalizedTargets))
-    : candidateItems;
-  const items = pathMatchedItems.length ? pathMatchedItems : candidateItems;
-  return items.some((item) => {
-    const evidence = resourcePacketItemEvidenceText(item);
-    if (!evidence) return false;
-    return normalizeLineEndings(evidence).includes(normalizedMatch);
-  });
-}
-
-function resourcePacketItemMatchesAnyTarget(item: ResourcePacketItem, targets: string[]): boolean {
-  const candidates = [
-    item.path,
-    item.absolutePath,
-  ]
-    .map((value) => typeof value === 'string' ? normalizePlanScope(value) : '')
-    .filter(Boolean);
-  if (!candidates.length) return false;
-  return targets.some((target) =>
-    candidates.some((candidate) =>
-      candidate === target ||
-      candidate.endsWith(`/${target}`) ||
-      target.endsWith(`/${candidate}`)
-    )
-  );
-}
-
-function resourcePacketItemEvidenceText(item: ResourcePacketItem): string {
-  const parts = [
-    item.promptContent,
-    item.contentSummary,
-    Array.isArray(item.matches) ? JSON.stringify(item.matches) : '',
-  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
-  return parts.join('\n');
-}
-
-function normalizeLineEndings(value: string): string {
-  return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
 function acceptedPlanProposalTargetScopes(
@@ -8182,48 +8132,6 @@ function looksLikeSearchEvidenceQuery(value: string): boolean {
   if (!normalized || normalized.length > 120 || normalized.includes('\n')) return false;
   if (/\s/.test(normalized)) return false;
   return /^[A-Za-z_$][A-Za-z0-9_$:.*#-]*$/.test(normalized);
-}
-
-function resourceEvidenceExistsForTarget(packets: ResourcePacket[], target: string): boolean {
-  const normalized = normalizePlanScope(target);
-  return packets.some((packet) =>
-    packet.items.some((item) => {
-      if (item.status !== 'resolved' && item.status !== 'provided') return false;
-      return resourcePacketItemMatchesAnyTarget(item, [normalized]) && Boolean(resourcePacketItemEvidenceText(item));
-    })
-  );
-}
-
-function resourceTextForTarget(packets: ResourcePacket[], target: string): string | undefined {
-  const normalized = normalizePlanScope(target);
-  for (const packet of [...packets].reverse()) {
-    for (const item of [...packet.items].reverse()) {
-      if (item.status !== 'resolved' && item.status !== 'provided') continue;
-      if (!resourcePacketItemMatchesAnyTarget(item, [normalized])) continue;
-      const text = resourcePacketItemEvidenceText(item);
-      if (text) return text;
-    }
-  }
-  return undefined;
-}
-
-function relevantResourceEvidenceForTargets(
-  packets: ResourcePacket[],
-  targets: string[]
-): string[] {
-  const normalizedTargets = targets.map(normalizePlanScope).filter(Boolean);
-  const items = packets.flatMap((packet) => packet.items ?? [])
-    .filter((item) => item.status === 'resolved' || item.status === 'provided')
-    .filter((item) => !normalizedTargets.length || resourcePacketItemMatchesAnyTarget(item, normalizedTargets));
-  return items.slice(-6).map((item) => {
-    const path = item.path ?? item.absolutePath ?? item.manifestEntryId;
-    const kind = item.contentKind ?? 'resource';
-    const body = resourcePacketItemEvidenceText(item);
-    return [
-      `ResourceEvidence kind=${kind}${path ? ` path=${path}` : ''}`,
-      body ? clip(body, 2400) : item.contentSummary ?? 'no text evidence',
-    ].join('\n');
-  });
 }
 
 function recordArray(value: unknown): Record<string, unknown>[] {

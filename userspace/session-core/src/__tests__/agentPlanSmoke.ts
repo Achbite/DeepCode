@@ -42,7 +42,7 @@ import {
 } from '../index.js';
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { ResourceRequestLoop } from '../driver/context/index.js';
+import { ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 
 async function main(): Promise<void> {
@@ -56,6 +56,7 @@ async function main(): Promise<void> {
   assertProviderJsonModeCoordinator();
   await assertProviderTraceRecorderArchivesPayload();
   await assertResourceRequestLoopBuildsPacketEvents();
+  assertResourceEvidenceIndexQueriesPackets();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -485,6 +486,45 @@ async function assertResourceRequestLoopBuildsPacketEvents(): Promise<void> {
   assert(
     loop.containsDirectoryPath([directoryPacket], `./root-${token}/nested-${token}/`),
     'resource request loop recognizes directory targets from ResourcePacket directory trees'
+  );
+}
+
+function assertResourceEvidenceIndexQueriesPackets(): void {
+  const token = randomSmokeToken('evidence');
+  const packet = {
+    id: `evidence-packet-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    requestId: `request-${token}`,
+    items: [
+      {
+        requestItemId: `item-${token}`,
+        manifestEntryId: `entry-${token}`,
+        readPolicy: 'autoRead',
+        status: 'resolved',
+        contentKind: 'fileText',
+        path: `root-${token}/src-${token}/file-${token}.txt`,
+        promptContent: `first line ${token}\r\nsecond line ${token}`,
+      },
+    ],
+  } as unknown as ResourcePacket;
+  const index = new ResourceEvidenceIndex({
+    normalizeTarget: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/g, ''),
+    clip: (value, maxChars) => value.slice(0, maxChars),
+  });
+  const target = `./src-${token}/file-${token}.txt`;
+  assert(index.mentionsAnyTarget([packet], [target]), 'resource evidence index matches target suffixes');
+  assert(
+    index.containsExactBlock([packet], [target], `first line ${token}\nsecond line ${token}`),
+    'resource evidence index matches exact text after line ending normalization'
+  );
+  assert(index.existsForTarget([packet], target), 'resource evidence index detects evidence for target');
+  assert(
+    index.textForTarget([packet], target)?.includes(`second line ${token}`),
+    'resource evidence index returns target text'
+  );
+  assert(
+    index.relevantForTargets([packet], [target]).some((line) => line.includes(`file-${token}.txt`)),
+    'resource evidence index renders relevant evidence summaries'
   );
 }
 
