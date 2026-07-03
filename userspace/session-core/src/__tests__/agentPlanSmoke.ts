@@ -44,7 +44,7 @@ import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '..
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import { ImplementationBatchContextBuilder } from '../driver/execution/index.js';
-import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderTraceRecorder } from '../driver/pipelines/index.js';
+import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 import { ProtocolGate } from '../driver/proposal/index.js';
 import { ReviewAssembler } from '../driver/review/index.js';
 
@@ -58,6 +58,7 @@ async function main(): Promise<void> {
   assertProviderTurnContractFrameOrder();
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
+  assertProviderStreamCoordinatorClassifiesStages();
   await assertProviderTraceRecorderArchivesPayload();
   await assertResourceRequestLoopBuildsPacketEvents();
   assertResourceEvidenceIndexQueriesPackets();
@@ -295,6 +296,23 @@ function assertProviderJsonModeCoordinator(): void {
   );
   assertEqual(alreadyJson.length, 1, 'provider json mode coordinator does not duplicate existing json instruction');
   assertEqual(coordinator.ensureMessages(messages, undefined), messages, 'provider json mode coordinator ignores non-json mode');
+}
+
+function assertProviderStreamCoordinatorClassifiesStages(): void {
+  const token = randomSmokeToken('provider-stream');
+  const coordinator = new ProviderStreamCoordinator();
+  assertEqual(coordinator.exposesAssistantDelta('answer_stream'), true, 'provider stream exposes answer deltas');
+  assertEqual(coordinator.exposesAssistantDelta(`answer-${token}`), false, 'provider stream rejects unknown assistant stages');
+  assertEqual(coordinator.emitsJsonProgress('accepted_plan_provider_call'), true, 'provider stream emits accepted-plan JSON progress');
+  assertEqual(coordinator.emitsJsonProgress(`accepted-${token}`), false, 'provider stream rejects unknown JSON progress stages');
+  assert(
+    coordinator.jsonProgressSummary('en-US', 37).includes('37'),
+    'provider stream English progress summary includes received char count'
+  );
+  assert(
+    coordinator.jsonProgressSummary('zh-CN', 41).includes('41'),
+    'provider stream Chinese progress summary includes received char count'
+  );
 }
 
 async function assertProviderTraceRecorderArchivesPayload(): Promise<void> {

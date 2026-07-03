@@ -10,6 +10,7 @@ import {
 } from '../../provider/ProviderEmptyProposalRetry.js';
 
 export { ProviderJsonModeCoordinator } from './providerJsonModeCoordinator.js';
+export { ProviderStreamCoordinator } from './providerStreamCoordinator.js';
 export { ProviderTraceRecorder } from './providerTraceRecorder.js';
 
 export {

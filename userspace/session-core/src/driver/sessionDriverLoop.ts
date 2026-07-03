@@ -72,6 +72,7 @@ import {
   NativeToolTurnHandler,
   ProviderJsonModeCoordinator,
   ProviderPipeline,
+  ProviderStreamCoordinator,
   ProviderTraceRecorder,
   ProviderPartFrameParser,
   ProviderToolCallBuffer,
@@ -294,6 +295,7 @@ const providerRepairMessageBuilder = new ProviderRepairMessageBuilder(MAX_ACTION
 const acceptedPlanResourceResumePromptBuilder = new AcceptedPlanResourceResumePromptBuilder(providerRepairMessageBuilder);
 const providerPipeline = new ProviderPipeline();
 const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
+const providerStreamCoordinator = new ProviderStreamCoordinator();
 const providerTraceRecorder = new ProviderTraceRecorder();
 const nativeToolCoordinator = new NativeToolCoordinator();
 const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
@@ -4048,7 +4050,7 @@ export class SessionDriverLoop {
       for (const frame of frames) {
         await this.submitProviderPartFrame(state, stage, frame);
       }
-      if (providerStageExposesAssistantDelta(stage)) {
+      if (providerStreamCoordinator.exposesAssistantDelta(stage)) {
         await this.emitProjectionDelta(state, {
           type: 'assistant_delta',
           stage,
@@ -4059,7 +4061,7 @@ export class SessionDriverLoop {
           delta: chunk.content,
           payload: chunk.rawProvider,
         });
-      } else if (providerStageEmitsJsonProgress(stage)) {
+      } else if (providerStreamCoordinator.emitsJsonProgress(stage)) {
         await this.emitProviderJsonStreamProgress(state, stage, chunk.content);
       }
       return;
@@ -4231,7 +4233,7 @@ export class SessionDriverLoop {
     if (!shouldEmit) return;
     progress.lastEmittedChars = progress.receivedChars;
     const language = visibleLanguageForRequest(state.userRequest);
-    const summary = providerJsonStreamProgressSummary(language, progress.receivedChars);
+    const summary = providerStreamCoordinator.jsonProgressSummary(language, progress.receivedChars);
     await this.emitProjectionDelta(state, {
       type: 'stage_delta',
       stage,
@@ -4557,25 +4559,6 @@ function codeBlockContent(block: Record<string, unknown>): string | undefined {
   if (typeof block.content === 'string') return block.content;
   const lines = stringArrayValue(block.contentLines);
   return lines.length ? lines.join('\n') : undefined;
-}
-
-function providerStageExposesAssistantDelta(stage: string): boolean {
-  return stage === 'answer_stream' || stage === 'review_final';
-}
-
-function providerStageEmitsJsonProgress(stage: string): boolean {
-  return stage === 'accepted_plan_provider_call' ||
-    stage === 'accepted_plan_resource_resume' ||
-    stage === 'accepted_plan_resource_resume_repair' ||
-    stage === 'accepted_plan_scope_repair' ||
-    stage === 'accepted_plan_parent_fallback' ||
-    stage === 'accepted_plan_parent_fallback_repair';
-}
-
-function providerJsonStreamProgressSummary(language: VisibleLanguage, receivedChars: number): string {
-  return language === 'en-US'
-    ? `Generating the executable actionBundle draft (${receivedChars} chars received).`
-    : `正在生成可执行 actionBundle 草稿（已接收 ${receivedChars} 字符）。`;
 }
 
 function resourceManifestBuilder(): ResourceManifestBuilder {
