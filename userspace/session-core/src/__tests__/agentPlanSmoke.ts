@@ -450,6 +450,42 @@ function assertUserInputPipelineFindsRequirementInteractions(): void {
     null,
     'user input pipeline ignores resolved requirements'
   );
+  const requestText = `Request ${token}`;
+  const fallbackConfirmation = {
+    id: `fallback-${token}`,
+    sessionId: `session-${token}`,
+    ts: '2026-01-01T00:00:00.000Z',
+    kind: 'requirement_confirmation',
+    payload: {
+      runId,
+      requirementId,
+      originalUserRequest: requestText,
+      decisionRequest: {
+        id: `decision-${token}`,
+        question: `Question ${token}`,
+      },
+    },
+  } as AgentEvent;
+  const record = pipeline.requirementRecordFromEvent(fallbackConfirmation, 'confirmed');
+  assertEqual(record?.requirementId, requirementId, 'user input pipeline recovers requirement id from confirmation payload');
+  assertEqual(record?.initialUserRequest, requestText, 'user input pipeline recovers original request from confirmation payload');
+  assertEqual(pipeline.requirementOriginalRequest(fallbackConfirmation), requestText, 'user input pipeline recovers original request directly');
+  const decisionEvent = {
+    kind: 'requirement_decision',
+    payload: {
+      selectedOption: {
+        id: `selected-${token}`,
+        label: `Selected ${token}`,
+        description: `Description ${token}`,
+      },
+    },
+  } as AgentEvent;
+  const resume = pipeline.requirementDecisionResumeRequest(fallbackConfirmation, decisionEvent, 'accept', `Guidance ${token}`);
+  assert(resume.includes(requestText), 'user input pipeline resume request keeps original request');
+  assert(resume.includes(`selected-${token}`), 'user input pipeline resume request keeps selected option id');
+  assert(resume.includes(`Guidance ${token}`), 'user input pipeline resume request keeps user guidance');
+  const acceptedResume = pipeline.acceptedPlanExecutionRequirementResumeRequest(fallbackConfirmation, decisionEvent, 'accept');
+  assert(acceptedResume.includes('Accepted-plan continuation rule:'), 'user input pipeline accepted-plan resume request keeps execution continuation rule');
 }
 
 async function assertProviderTraceRecorderArchivesPayload(): Promise<void> {

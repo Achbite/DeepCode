@@ -880,7 +880,7 @@ export class SessionDriverLoop {
       ]) ?? result;
     }
     if (isResourceBudgetConfirmation(confirmation)) {
-      const originalRequest = requirementOriginalRequest(confirmation);
+      const originalRequest = userInputPipeline.requirementOriginalRequest(confirmation);
       return this.runUserTurn({
         sessionId: input.sessionId,
         content: input.decision === 'revise' && input.guidance
@@ -895,7 +895,7 @@ export class SessionDriverLoop {
               'Write user-visible proposal fields in the current user request language; keep protocol keys and evidence refs unchanged.',
             ].join('\n')
           : originalRequest,
-        attachments: requirementAttachments(confirmation),
+        attachments: userInputPipeline.requirementAttachments(confirmation),
         existingEvents: result.events,
         workspaceBinding: input.workspaceBinding,
         projectWorkingDirectory: input.projectWorkingDirectory,
@@ -931,11 +931,11 @@ export class SessionDriverLoop {
       }
     }
 
-    const originalRequest = requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
+    const originalRequest = userInputPipeline.requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
     const next = await this.runUserTurn({
       sessionId: input.sessionId,
       content: originalRequest,
-      attachments: requirementAttachments(confirmation),
+      attachments: userInputPipeline.requirementAttachments(confirmation),
       existingEvents: result.events,
       workspaceBinding: input.workspaceBinding,
       projectMemoryMode: input.projectMemoryMode,
@@ -943,7 +943,7 @@ export class SessionDriverLoop {
       profileId: input.profileId,
       workflow: input.workflow,
       appendUserMessage: false,
-      confirmedRequirement: input.decision === 'accept' ? requirementRecordFromEvent(confirmation, 'confirmed') : undefined,
+      confirmedRequirement: input.decision === 'accept' ? userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed') : undefined,
       requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
       interventionLevel: input.interventionLevel,
       interactionOverlay,
@@ -972,7 +972,7 @@ export class SessionDriverLoop {
       return this.runUserTurn({
         sessionId: input.sessionId,
         content: acceptedPlanScopeRevisionRequest(confirmation, plan, input.guidance),
-        attachments: requirementAttachments(confirmation),
+        attachments: userInputPipeline.requirementAttachments(confirmation),
         existingEvents: current.events,
         workspaceBinding: input.workspaceBinding,
         projectWorkingDirectory: input.projectWorkingDirectory,
@@ -1013,7 +1013,7 @@ export class SessionDriverLoop {
     return this.runUserTurn({
       sessionId: input.sessionId,
       content: implementationPlanExecutionRequest(plan, nextAcceptedPlan, guidance),
-      attachments: nextAcceptedPlan.executionRoot ? [nextAcceptedPlan.executionRoot.attachment] : requirementAttachments(confirmation),
+      attachments: nextAcceptedPlan.executionRoot ? [nextAcceptedPlan.executionRoot.attachment] : userInputPipeline.requirementAttachments(confirmation),
       existingEvents: current.events,
       workspaceBinding: input.workspaceBinding,
       projectWorkingDirectory: input.projectWorkingDirectory,
@@ -1177,11 +1177,11 @@ export class SessionDriverLoop {
     }
 
     const result = await this.append(input.sessionId, events) ?? current;
-    const originalRequest = requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
+    const originalRequest = userInputPipeline.requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
     return this.runUserTurn({
       sessionId: input.sessionId,
       content: originalRequest,
-      attachments: requirementAttachments(confirmation),
+      attachments: userInputPipeline.requirementAttachments(confirmation),
       existingEvents: result.events,
       workspaceBinding: input.workspaceBinding,
       projectMemoryMode: input.projectMemoryMode,
@@ -1189,7 +1189,7 @@ export class SessionDriverLoop {
       profileId: input.profileId,
       workflow: input.workflow,
       appendUserMessage: false,
-      confirmedRequirement: requirementRecordFromEvent(confirmation, 'confirmed'),
+      confirmedRequirement: userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed'),
       requirementConfirmationMode: 'off',
       interventionLevel: input.interventionLevel,
       acceptedImplementationPlan: nextAccepted,
@@ -1228,7 +1228,7 @@ export class SessionDriverLoop {
         ),
       ]) ?? current;
     }
-    const guidance = acceptedPlanExecutionRequirementResumeRequest(
+    const guidance = userInputPipeline.acceptedPlanExecutionRequirementResumeRequest(
       confirmation,
       decisionEvent,
       input.decision,
@@ -1239,7 +1239,7 @@ export class SessionDriverLoop {
       content: implementationPlanExecutionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
       attachments: acceptedContext.acceptedPlan.executionRoot
         ? [acceptedContext.acceptedPlan.executionRoot.attachment]
-        : requirementAttachments(confirmation),
+        : userInputPipeline.requirementAttachments(confirmation),
       existingEvents: current.events,
       workspaceBinding: input.workspaceBinding,
       projectWorkingDirectory: input.projectWorkingDirectory,
@@ -7570,136 +7570,6 @@ function findActiveDriverInteraction(events: AgentEvent[]): DriverInteraction | 
   const plan = planInteractionIndex.findLatestActivePlanInteraction(events);
   if (plan) return plan;
   return userInputPipeline.findLatestActiveRequirementInteraction(events);
-}
-
-function requirementRecordFromEvent(event: AgentEvent, status: RequirementRecord['status']): RequirementRecord | undefined {
-  const payload = objectRecord(event.payload);
-  const raw = objectRecord(payload?.requirement);
-  const decisionRequest = objectRecord(payload?.decisionRequest);
-  if (!raw) {
-    const requirementId = stringValue(payload?.requirementId) ?? stringValue(decisionRequest?.id) ?? event.id;
-    const initialUserRequest = stringValue(payload?.initialUserRequest)
-      ?? stringValue(payload?.originalUserRequest)
-      ?? stringValue(payload?.content)
-      ?? '';
-    const goal = stringValue(decisionRequest?.summary)
-      ?? stringValue(decisionRequest?.question)
-      ?? stringValue(decisionRequest?.reason)
-      ?? stringValue(payload?.summary)
-      ?? initialUserRequest;
-    return {
-      requirementId,
-      sessionId: event.sessionId,
-      initialUserRequest,
-      checklist: {
-        goal,
-        explicitTasks: [],
-        inferredTasks: [],
-        outOfScope: [],
-        affectedAreaCandidates: [],
-        resourceRequests: [],
-        acceptanceCriteriaCandidates: [],
-        clarificationQuestions: [],
-        riskNotes: [],
-      },
-      status,
-      createdAt: event.ts,
-      updatedAt: new Date().toISOString(),
-    };
-  }
-  const checklist = objectRecord(raw.checklist);
-  return {
-    requirementId: stringValue(raw.requirementId) ?? stringValue(payload?.requirementId) ?? event.id,
-    sessionId: stringValue(raw.sessionId) ?? event.sessionId,
-    initialUserRequest: stringValue(raw.initialUserRequest) ?? stringValue(payload?.initialUserRequest) ?? stringValue(payload?.originalUserRequest) ?? '',
-    checklist: checklist ? {
-      goal: stringValue(checklist.goal) ?? '',
-      explicitTasks: stringArray(checklist.explicitTasks),
-      inferredTasks: stringArray(checklist.inferredTasks),
-      outOfScope: stringArray(checklist.outOfScope),
-      affectedAreaCandidates: stringArray(checklist.affectedAreaCandidates),
-      resourceRequests: stringArray(checklist.resourceRequests),
-      acceptanceCriteriaCandidates: stringArray(checklist.acceptanceCriteriaCandidates),
-      clarificationQuestions: stringArray(checklist.clarificationQuestions),
-      riskNotes: stringArray(checklist.riskNotes),
-    } satisfies RequirementChecklist : undefined,
-    status,
-    createdAt: stringValue(raw.createdAt) ?? event.ts,
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-function requirementOriginalRequest(event: AgentEvent): string {
-  const payload = objectRecord(event.payload);
-  return stringValue(payload?.originalUserRequest) ?? requirementRecordFromEvent(event, 'confirmed')?.initialUserRequest ?? '';
-}
-
-function requirementDecisionResumeRequest(
-  confirmation: AgentEvent,
-  decisionEvent: AgentEvent,
-  decision: 'accept' | 'reject' | 'revise',
-  guidance?: string
-): string {
-  const originalRequest = requirementOriginalRequest(confirmation);
-  if (decision === 'revise') {
-    return [
-      originalRequest,
-      '',
-      guidance?.trim()
-        ? `User revision guidance for the previous intervention request (verbatim):\n${guidance.trim()}`
-        : 'The user asked to revise the current intervention request.',
-      '',
-      'Write user-visible proposal fields in the current user request language; keep protocol keys, toolIds, paths, and evidence refs unchanged.',
-    ].join('\n');
-  }
-  if (decision !== 'accept') return originalRequest;
-  const payload = objectRecord(decisionEvent.payload);
-  const selectedOption = objectRecord(payload?.selectedOption);
-  const lines = [
-    originalRequest,
-    '',
-    'The user has resolved the previous decisionRequest. Continue the parent flow from that selected decision.',
-    'Do not repeat the same decisionRequest unless a new independent decision point appears later.',
-    'Write user-visible proposal fields in the current user request language; keep protocol keys, toolIds, paths, and evidence refs unchanged.',
-  ];
-  const id = stringValue(selectedOption?.id);
-  const label = stringValue(selectedOption?.label);
-  const description = stringValue(selectedOption?.description);
-  if (id || label || description) {
-    lines.push('', 'Selected option:');
-    if (id) lines.push(`- id: ${id}`);
-    if (label) lines.push(`- label: ${label}`);
-    if (description) lines.push(`- description: ${description}`);
-  }
-  if (guidance?.trim()) {
-    lines.push('', 'Additional user guidance (verbatim):', guidance.trim());
-  }
-  return lines.join('\n');
-}
-
-function acceptedPlanExecutionRequirementResumeRequest(
-  confirmation: AgentEvent,
-  decisionEvent: AgentEvent,
-  decision: 'accept' | 'reject' | 'revise',
-  guidance?: string
-): string {
-  return [
-    requirementDecisionResumeRequest(confirmation, decisionEvent, decision, guidance),
-    '',
-    'Accepted-plan continuation rule:',
-    '- This decision belongs to the current accepted implementationPlan execution checkpoint.',
-    '- Continue the same accepted taskPlan and current task cursor.',
-    '- Do not create a new standalone plan or final Review unless all accepted tasks are complete.',
-    '- If returning actionBundle, keep targets and capabilities inside the accepted plan scope.',
-  ].join('\n');
-}
-
-function requirementAttachments(event: AgentEvent): AgentContextAttachment[] {
-  return AcceptedPlanExecutionRootResolver.attachmentsFromEvent(event);
-}
-
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
 function safeSegment(value: string): string {
