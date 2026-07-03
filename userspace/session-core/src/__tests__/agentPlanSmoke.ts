@@ -41,12 +41,11 @@ import {
   type ResourcePacket,
   type TranscriptEntry,
 } from '../index.js';
-import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
+import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import {
   AcceptedImplementationPlanContextBuilder,
-  AcceptedPlanProposalScopeIndex,
   AcceptedPlanTargetParser,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
@@ -81,7 +80,7 @@ async function main(): Promise<void> {
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
   assertAcceptedPlanTargetParserExtractsStructuredTargets();
-  assertAcceptedPlanProposalScopeIndexNormalizesTargets();
+  assertAcceptedPlanScopeMatcherNormalizesProposalTargets();
   assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
@@ -1236,12 +1235,12 @@ function assertAcceptedPlanTargetParserExtractsStructuredTargets(): void {
   );
 }
 
-function assertAcceptedPlanProposalScopeIndexNormalizesTargets(): void {
+function assertAcceptedPlanScopeMatcherNormalizesProposalTargets(): void {
   const token = randomSmokeToken('proposal-scope');
   const rootRef = `/${randomSmokeToken('root')}`;
   const actionTarget = `dir-${token}/action-${token}.txt`;
   const blockTarget = `dir-${token}/block-${token}.txt`;
-  const index = new AcceptedPlanProposalScopeIndex();
+  const index = new AcceptedPlanScopeMatcher();
   const accepted: AcceptedImplementationPlanContext = {
     planId: `plan-${token}`,
     runId: `run-${token}`,
@@ -1290,17 +1289,26 @@ function assertAcceptedPlanProposalScopeIndexNormalizesTargets(): void {
     },
   } as unknown as ProposalEnvelope;
   const targets = index.proposalTargetScopes(proposal, accepted);
-  assert(targets.some((target) => target.raw === `${rootRef}/${actionTarget}` && target.normalized === actionTarget), 'proposal scope index relativizes execution-root absolute targets');
-  assert(targets.some((target) => target.raw === blockTarget && target.normalized === blockTarget), 'proposal scope index extracts code block target paths');
+  assert(targets.some((target) => target.raw === `${rootRef}/${actionTarget}` && target.normalized === actionTarget), 'scope matcher relativizes execution-root absolute targets');
+  assert(targets.some((target) => target.raw === blockTarget && target.normalized === blockTarget), 'scope matcher extracts code block target paths');
   assertEqual(
     index.normalizeTargetForExecutionRoot(`${rootRef}/${actionTarget}`, accepted.executionRoot),
     actionTarget,
-    'proposal scope index normalizes execution-root paths'
+    'scope matcher normalizes execution-root paths'
   );
   assertEqual(
-    index.actionTargetScopes({ sourceBlockId: `block-${token}` }, proposal).includes(blockTarget),
+    index.actionTargetScopes({
+      id: `block-action-${token}`,
+      title: `block action ${token}`,
+      toolId: 'fs.write',
+      capability: 'fs.write',
+      resourceScope: [],
+      canParallelize: false,
+      conflictKeys: [],
+      sourceBlockId: `block-${token}`,
+    }, proposal).includes(blockTarget),
     true,
-    'proposal scope index resolves action sourceBlockId targets'
+    'scope matcher resolves action sourceBlockId targets'
   );
 }
 
@@ -9885,7 +9893,7 @@ async function assertSessionDriverLoopAcceptedImplementationRejectsAttachmentRoo
   assertEqual(actionBatchSubmits, 0, 'attachment root target is rejected before Kernel actionBatchSubmit');
   assertEqual(result.events.some((event) => event.kind === 'requirement_confirmation'), true, 'attachment root target becomes one scope intervention');
   assert(
-    result.events.some((event) => String((event.payload as any)?.summary ?? '').includes('不是可写入文件')),
+    result.events.some((event) => String((event.payload as any)?.summary ?? '').includes('not a writable file target')),
     'attachment root target intervention explains that the target is a directory root'
   );
 }

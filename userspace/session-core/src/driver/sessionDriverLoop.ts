@@ -17,7 +17,6 @@ import {
   AcceptedPlanAdmission,
   AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
-  AcceptedPlanProposalScopeIndex,
   AcceptedPlanProgressAggregator,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
@@ -328,7 +327,7 @@ const planProjectionBuilder = new PlanProjectionBuilder({
 });
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
-const acceptedPlanProposalScopeIndex = new AcceptedPlanProposalScopeIndex();
+const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();
 const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
   objectRecord,
   stringValue,
@@ -4703,7 +4702,7 @@ function reviewAssembler(): ReviewAssembler {
     actionEffectiveCapability,
     actionFileTargetPath,
     normalizeAcceptedPlanTargetScope: (value, accepted) =>
-      acceptedPlanProposalScopeIndex.normalizeAcceptedTargetScope(value, accepted),
+      acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted),
     comparablePath,
     resourceTextForTarget: (packets, target) => resourceEvidenceIndex().textForTarget(packets, target),
   });
@@ -6400,7 +6399,7 @@ function canonicalizeAcceptedPlanExecutionAccessScopes(
     proposal,
     changed: false,
     removedAccessScopes: [] as RemovedAcceptedPlanAccessScope[],
-    actionTargets: acceptedPlanProposalScopeIndex.proposalTargetScopes(proposal, accepted).map((target) => target.normalized),
+    actionTargets: acceptedPlanScopeMatcher.proposalTargetScopes(proposal, accepted).map((target) => target.normalized),
   };
   if (!payload || !actionBundle) return base;
 
@@ -6502,8 +6501,8 @@ function fileOperationFreshnessValidationReasons(
     const capability = actionEffectiveCapability(action as unknown as Record<string, unknown>);
     const actionKind = stringValue(action.kind) ?? (capability === 'fs.patch' ? 'patch' : undefined);
     const actionArgs = objectRecord(action.args) ?? objectRecord(action.toolArgs);
-    const targets = acceptedPlanProposalScopeIndex.actionTargetScopes(action, proposal)
-      .map((target) => acceptedPlanProposalScopeIndex.normalizeAcceptedTargetScope(target, accepted))
+    const targets = acceptedPlanScopeMatcher.actionTargetScopes(action, proposal)
+      .map((target) => acceptedPlanScopeMatcher.normalizeTargetScope(target, accepted))
       .filter(Boolean);
     if (capability === 'fs.patch' || ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(actionKind ?? '')) {
       const patchSpec = objectRecord(action.patchSpec) ?? objectRecord(actionArgs?.patchSpec);
@@ -6617,7 +6616,7 @@ function acceptedPlanWithScopeDecisionEffect(
   const rawTarget = stringValue(effect.targetPath);
   if (!rawTarget) return accepted;
   const targetResourceKind = effect.targetResourceKind ?? (rawTarget.endsWith('/') ? 'directory' : 'file');
-  const normalized = acceptedPlanProposalScopeIndex.normalizeTargetForExecutionRoot(rawTarget, accepted.executionRoot);
+  const normalized = acceptedPlanScopeMatcher.normalizeTargetForExecutionRoot(rawTarget, accepted.executionRoot);
   const targetPath = targetResourceKind === 'directory'
     ? planReviewGrantProjector.concreteDirectoryOperationTarget(normalized)
     : planReviewGrantProjector.concreteFileOperationTarget(normalized);
@@ -7653,7 +7652,7 @@ function acceptedPlanConcreteFileOperationTarget(
   value: string,
   accepted?: AcceptedImplementationPlanContext
 ): string | undefined {
-  const normalized = accepted ? acceptedPlanProposalScopeIndex.normalizeAcceptedTargetScope(value, accepted) : normalizePlanScope(value);
+  const normalized = accepted ? acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted) : normalizePlanScope(value);
   return planReviewGrantProjector.concreteFileOperationTarget(normalized);
 }
 
@@ -7662,7 +7661,7 @@ function acceptedPlanConcreteDeleteOperationTarget(
   accepted: AcceptedImplementationPlanContext | undefined,
   grant?: AcceptedPlanExactOperationGrant
 ): string | undefined {
-  const normalized = accepted ? acceptedPlanProposalScopeIndex.normalizeAcceptedTargetScope(value, accepted) : normalizePlanScope(value);
+  const normalized = accepted ? acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted) : normalizePlanScope(value);
   if (grant?.targetResourceKind === 'directory') {
     return planReviewGrantProjector.concreteDirectoryOperationTarget(normalized);
   }
@@ -7678,7 +7677,7 @@ function acceptedPlanExactOperationGrantForAction(
   const capability = actionEffectiveCapability(action);
   const rawTarget = actionFileTargetPath(action);
   if (!capability || !rawTarget) return undefined;
-  const normalized = acceptedPlanProposalScopeIndex.normalizeAcceptedTargetScope(rawTarget, accepted).replace(/\/+$/, '');
+  const normalized = acceptedPlanScopeMatcher.normalizeTargetScope(rawTarget, accepted).replace(/\/+$/, '');
   return accepted.exactOperationGrants.find((grant) =>
     exactOperationGrantCapabilityMatches(grant, capability) &&
     normalizePlanScope(grant.targetPath).replace(/\/+$/, '') === normalized

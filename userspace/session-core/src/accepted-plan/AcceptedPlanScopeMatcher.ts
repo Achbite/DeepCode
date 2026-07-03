@@ -68,12 +68,12 @@ export class AcceptedPlanScopeMatcher {
   ): string | undefined {
     const raw = target.raw;
     const normalized = target.normalized;
-    if (!normalized) return 'actionBundle 目标路径为空，不能自动执行。';
+    if (!normalized) return 'actionBundle target path is empty and cannot be auto-executed.';
     if (normalized === '.' || normalized === '..') {
-      return `目标 ${raw} 指向 primary root 目录本身，不是可写入文件。`;
+      return `target ${raw} points to the primary root directory itself, not a writable file target.`;
     }
     if (normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) {
-      return `目标 ${raw} 不能包含跨出 primary root 的相对路径。`;
+      return `target ${raw} must not contain a relative path that escapes the primary root.`;
     }
     const rootRef = accepted.executionRoot?.ref;
     if (isAbsolutePath(raw)) return undefined;
@@ -82,7 +82,7 @@ export class AcceptedPlanScopeMatcher {
       const rootName = basename(rootRef);
       const rawNormalized = normalizePlanScope(raw);
       if (rootName && rawNormalized === rootName) {
-        return `目标 ${raw} 指向 primary root 目录本身，不是可写入文件。`;
+        return `target ${raw} points to the primary root directory itself, not a writable file target.`;
       }
     }
     return undefined;
@@ -157,6 +157,13 @@ export class AcceptedPlanScopeMatcher {
 
   normalizeTargetScope(scope: string, accepted: AcceptedImplementationPlanContext): string {
     return normalizePlanTargetForExecutionRoot(scope, accepted.executionRoot);
+  }
+
+  normalizeTargetForExecutionRoot(
+    scope: string,
+    executionRoot?: AcceptedImplementationPlanExecutionRoot
+  ): string {
+    return normalizePlanTargetForExecutionRoot(scope, executionRoot);
   }
 
   normalizeScopeIdentity(scope: string): string {
