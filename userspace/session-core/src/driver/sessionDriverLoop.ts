@@ -690,7 +690,7 @@ export class SessionDriverLoop {
           return this.append(sessionId, [
             finalDiagnosticEvent(
               sessionId,
-              resourceResolutionDiagnostic(subset),
+              resourceRequestLoop.resolutionDiagnostic(subset),
               this.ts(),
               this.id('resource-invalid')
             ),
@@ -2935,7 +2935,7 @@ export class SessionDriverLoop {
         prompt,
         providerRepairMessageState(state),
         proposal,
-        resourceResolutionDiagnostic(resolution).fallback
+        resourceRequestLoop.resolutionDiagnostic(resolution).fallback
       )
     );
     try {
@@ -3029,11 +3029,12 @@ export class SessionDriverLoop {
       const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
       if (!subset.manifest.entries.length) {
         if (!generated.packet) {
+          const diagnostic = resourceRequestLoop.resolutionDiagnostic(subset);
           return this.append(state.sessionId, actionBundleAdmissionFailureEvents(
             state.sessionId,
             state.runId,
             proposal,
-            [`actionBundle admission repair returned resourceRequest that cannot be resolved: ${resourceResolutionDiagnostic(subset).fallback}`],
+            [`actionBundle admission repair returned resourceRequest that cannot be resolved: ${diagnostic.fallback}`],
             this.ts(),
             this.id('action-bundle-admission-resource-invalid')
           )) ?? result;
@@ -3315,13 +3316,14 @@ export class SessionDriverLoop {
           const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
           if (!subset.manifest.entries.length) {
             if (!generated.packet) {
+              const diagnostic = resourceRequestLoop.resolutionDiagnostic(subset);
               return this.append(state.sessionId, [
                 finalDiagnosticEvent(
                   state.sessionId,
                   diag(
                     'autoBatchResourceResolveFailed',
-                    `Automatic execution batch requires additional resource evidence, but the repaired resourceRequest could not be located: ${resourceResolutionDiagnostic(subset).fallback}`,
-                    { detail: resourceResolutionDiagnostic(subset).fallback }
+                    `Automatic execution batch requires additional resource evidence, but the repaired resourceRequest could not be located: ${diagnostic.fallback}`,
+                    { detail: diagnostic.fallback }
                   ),
                   this.ts(),
                   this.id('accepted-plan-scope-repair-resource-invalid')
@@ -5114,24 +5116,6 @@ interface DiagnosticInfo {
 
 function diag(code: string, fallback: string, params?: Record<string, string | number>): DiagnosticInfo {
   return { code, fallback, params };
-}
-
-function resourceResolutionDiagnostic(resolution: ResourceRequestResolution): DiagnosticInfo {
-  const unresolved = resolution.unresolved.join('; ');
-  const ambiguous = resolution.ambiguous.join('; ');
-  const roots = resolution.availableRoots.length
-    ? resolution.availableRoots.map((root) => `${root.rootId} -> ${root.displayPath}`).join('\n')
-    : '';
-  // fallback 为中性英文成文；语言无关数据（unresolved/ambiguous/roots）作为 params 供 UI 壳本地化组装。
-  const fallback = [
-    'The requested resources could not be located in the current attachments or project directory; Session rejected the request.',
-    unresolved ? `Unresolved: ${unresolved}` : '',
-    ambiguous ? `Multiple candidate roots: ${ambiguous}` : '',
-    'Available project/attachment roots:',
-    roots || 'No available attachment or project directory.',
-    'Please specify an explicit attachment, rootId, or relative path.',
-  ].filter(Boolean).join('\n');
-  return diag('resourceResolveFailed', fallback, { unresolved, ambiguous, roots });
 }
 
 function findStateContract(events: unknown[]): KernelStateContractRef | undefined {

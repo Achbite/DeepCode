@@ -432,6 +432,28 @@ async function assertResourceRequestLoopBuildsPacketEvents(): Promise<void> {
     }
   );
   assertEqual(resolved?.id, `resolved-packet-${token}`, 'resource request loop resolves packet from kernel reply');
+
+  const diagnostic = loop.resolutionDiagnostic({
+    manifest,
+    unresolved: [`missing-${token}`],
+    ambiguous: [`ambiguous-${token}`],
+    availableRoots: [
+      {
+        rootId: `root-${token}`,
+        kind: 'directory',
+        label: `Root ${token}`,
+        displayPath: `/tmp/root-${token}`,
+        absolutePath: `/tmp/root-${token}`,
+        source: 'currentAttachment',
+      },
+    ],
+  });
+  assertEqual(diagnostic.code, 'resourceResolveFailed', 'resource request loop owns resource resolution diagnostics');
+  assert(diagnostic.fallback.includes(`missing-${token}`), 'resource request loop diagnostic includes unresolved target');
+  assert(
+    diagnostic.fallback.includes(`root-${token} -> /tmp/root-${token}`),
+    'resource request loop diagnostic includes available roots'
+  );
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {

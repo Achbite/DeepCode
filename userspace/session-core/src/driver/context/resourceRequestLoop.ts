@@ -9,6 +9,7 @@ import type {
   ResourcePacket,
   ResourcePacketItem,
 } from '../../context/types.js';
+import type { ResourceRequestResolution } from '../../resources/ResourceRequestResolver.js';
 
 export interface ResourceRequestLoopOptions {
   maxDerivedManifestEntries?: number;
@@ -22,6 +23,12 @@ export interface ResourceRequestLoopState {
 export interface ResourceRequestLoopResolvePorts {
   kernelCommand(request: KernelCommandEnvelope): Promise<KernelReply>;
   createId(prefix: string): string;
+}
+
+export interface ResourceRequestDiagnosticInfo {
+  code: string;
+  fallback: string;
+  params?: Record<string, string | number>;
 }
 
 export class ResourceRequestLoop {
@@ -42,6 +49,27 @@ export class ResourceRequestLoop {
       },
     });
     return this.findPacket(reply.events);
+  }
+
+  resolutionDiagnostic(resolution: ResourceRequestResolution): ResourceRequestDiagnosticInfo {
+    const unresolved = resolution.unresolved.join('; ');
+    const ambiguous = resolution.ambiguous.join('; ');
+    const roots = resolution.availableRoots.length
+      ? resolution.availableRoots.map((root) => `${root.rootId} -> ${root.displayPath}`).join('\n')
+      : '';
+    const fallback = [
+      'The requested resources could not be located in the current attachments or project directory; Session rejected the request.',
+      unresolved ? `Unresolved: ${unresolved}` : '',
+      ambiguous ? `Multiple candidate roots: ${ambiguous}` : '',
+      'Available project/attachment roots:',
+      roots || 'No available attachment or project directory.',
+      'Please specify an explicit attachment, rootId, or relative path.',
+    ].filter(Boolean).join('\n');
+    return {
+      code: 'resourceResolveFailed',
+      fallback,
+      params: { unresolved, ambiguous, roots },
+    };
   }
 
   findPacket(events: unknown[]): ResourcePacket | undefined {
