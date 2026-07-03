@@ -1409,6 +1409,11 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
   const blockId = `block-${token}`;
   const normalize = (value: string): string => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
   const scopeMatcher = new AcceptedPlanScopeMatcher();
+  const scopeCoverage = new AcceptedPlanScopeCoverage({
+    taskTargets: (record) => Array.isArray(record.targets)
+      ? record.targets.filter((item): item is string => typeof item === 'string')
+      : [],
+  });
   const resolver = new AcceptedPlanOperationTargetResolver({
     normalizeTargetScope: normalize,
     normalizePlanScope: normalize,
@@ -1432,6 +1437,13 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
     kernelExecutionContractId: (report) => typeof report?.contractId === 'string' ? report.contractId : undefined,
     proposalTargetScopes: (proposal, accepted) =>
       scopeMatcher.proposalTargetScopes(proposal, accepted).map((scope) => scope.normalized),
+    actionTargetScopes: (action, proposal, accepted) =>
+      scopeMatcher.actionTargetScopes(action, proposal)
+        .map((scope) => scopeMatcher.normalizeTargetScope(scope, accepted))
+        .filter(Boolean),
+    scopeCoveredForCapability: (scope, capability, accepted) =>
+      scopeCoverage.scopeCoveredForCapability(scope, capability, accepted),
+    resourceEvidenceIndex: new ResourceEvidenceIndex({ normalizeTarget: normalize }),
   });
   const acceptedPlan: AcceptedImplementationPlanContext = {
     planId: `plan-${token}`,
@@ -1517,6 +1529,105 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
   const canonicalPayload = canonicalized.proposal.payload as Record<string, any>;
   assertEqual(canonicalPayload.actionBundle.accessScopes.length, 1, 'accepted plan executor keeps valid top-level access scope');
   assertEqual(canonicalPayload.actionBundle.actions[0].accessScopes.length, 1, 'accepted plan executor keeps valid action access scope');
+  const patchText = `line-${randomSmokeToken('patch')}`;
+  const patchProposal = {
+    ...proposal,
+    proposalId: `patch-proposal-${token}`,
+    payload: {
+      ...(proposal.payload as Record<string, unknown>),
+      actionBundle: {
+        version: '1',
+        id: `patch-bundle-${token}`,
+        goal: 'Generic accepted patch batch',
+        actions: [{
+          actionId: `patch-action-${token}`,
+          capability: 'fs.patch',
+          kind: 'patch',
+          targetPath: target,
+          replacementBlockId: blockId,
+          patchSpec: {
+            match: {
+              kind: 'exactBlock',
+              text: patchText,
+            },
+          },
+        }],
+      },
+      codeBlocks: [{
+        id: blockId,
+        targetPath: target,
+        operation: 'patch',
+        content: `replacement-${token}`,
+      }],
+    },
+  } as ProposalEnvelope;
+  const unrelatedPacket = createResourcePacket({
+    packetId: `packet-unrelated-${token}`,
+    manifest: {
+      id: `manifest-unrelated-${token}`,
+      workspaceScopeKey: `workspace-${token}`,
+      entries: [{
+        id: `entry-unrelated-${token}`,
+        kind: 'file',
+        label: `File unrelated-${token}`,
+        resourceRef: `unrelated-${token}.txt`,
+        readPolicy: 'autoRead',
+        reason: 'Unrelated evidence.',
+      }],
+      budget: { maxEntries: 4, maxBytes: 4096 },
+      defaultDenyPatterns: [],
+    },
+    request: {
+      id: `request-unrelated-${token}`,
+      items: [{ id: `item-unrelated-${token}`, manifestEntryId: `entry-unrelated-${token}`, reason: 'Read unrelated evidence.' }],
+    },
+    kernelEvidence: {
+      [`entry-unrelated-${token}`]: {
+        contentKind: 'fileText',
+        promptContent: `unrelated-${token}`,
+        evidenceRefs: [`evidence-unrelated-${token}`],
+      },
+    },
+  });
+  const missingFreshness = executor.fileOperationFreshnessValidationReasons(acceptedPlan, patchProposal, [unrelatedPacket]);
+  assertEqual(missingFreshness.length, 1, 'accepted plan executor reports missing patch freshness evidence');
+  assert(
+    missingFreshness[0]?.includes(target),
+    'accepted plan executor includes normalized target in freshness reason'
+  );
+  const matchingPacket = createResourcePacket({
+    packetId: `packet-matching-${token}`,
+    manifest: {
+      id: `manifest-matching-${token}`,
+      workspaceScopeKey: `workspace-${token}`,
+      entries: [{
+        id: `entry-matching-${token}`,
+        kind: 'file',
+        label: `File ${target}`,
+        resourceRef: target,
+        readPolicy: 'autoRead',
+        reason: 'Matching evidence.',
+      }],
+      budget: { maxEntries: 4, maxBytes: 4096 },
+      defaultDenyPatterns: [],
+    },
+    request: {
+      id: `request-matching-${token}`,
+      items: [{ id: `item-matching-${token}`, manifestEntryId: `entry-matching-${token}`, reason: 'Read matching evidence.' }],
+    },
+    kernelEvidence: {
+      [`entry-matching-${token}`]: {
+        contentKind: 'fileText',
+        promptContent: `prefix\n${patchText}\nsuffix`,
+        evidenceRefs: [`evidence-matching-${token}`],
+      },
+    },
+  });
+  assertEqual(
+    executor.fileOperationFreshnessValidationReasons(acceptedPlan, patchProposal, [matchingPacket]).length,
+    0,
+    'accepted plan executor accepts patch when current evidence contains exact block'
+  );
 }
 
 function assertKernelEventStatusIndexReadsStructuredEvents(): void {

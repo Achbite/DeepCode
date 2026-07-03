@@ -71,6 +71,16 @@ export interface AcceptedPlanExecutorPorts {
   deleteActionRecursive(action: Record<string, unknown>): boolean;
   kernelExecutionContractId(report?: Record<string, unknown>): string | undefined;
   proposalTargetScopes(proposal: ProposalEnvelope, accepted: AcceptedImplementationPlanContext): string[];
+  actionTargetScopes(
+    action: ActionBundleDraft['actions'][number],
+    proposal: ProposalEnvelope,
+    accepted: AcceptedImplementationPlanContext
+  ): string[];
+  scopeCoveredForCapability(scope: string, capability: string | undefined, accepted: AcceptedImplementationPlanContext): boolean;
+  resourceEvidenceIndex: {
+    containsExactBlock(packets: ResourcePacket[], targets: string[], matchText: string): boolean;
+    mentionsAnyTarget(packets: ResourcePacket[], targets: string[]): boolean;
+  };
 }
 
 export type AcceptedPlanActionProposalAssessment =
@@ -185,6 +195,56 @@ export class AcceptedPlanExecutor {
       removedAccessScopes: topLevel.removed,
       actionTargets: base.actionTargets,
     };
+  }
+
+  fileOperationFreshnessValidationReasons(
+    accepted: AcceptedImplementationPlanContext,
+    proposal: ProposalEnvelope,
+    resourcePackets: ResourcePacket[]
+  ): string[] {
+    const ports = this.requirePorts();
+    const actionBundle = ports.readActionBundle(proposal);
+    const reasons: string[] = [];
+    for (const [index, action] of (actionBundle?.actions ?? []).entries()) {
+      const capability = actionEffectiveCapability(action as unknown as Record<string, unknown>);
+      const actionKind = stringValue(action.kind) ?? (capability === 'fs.patch' ? 'patch' : undefined);
+      const actionArgs = objectRecord(action.args) ?? objectRecord(action.toolArgs);
+      const targets = ports.actionTargetScopes(action, proposal, accepted).filter(Boolean);
+      if (capability === 'fs.patch' || ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(actionKind ?? '')) {
+        const patchSpec = objectRecord(action.patchSpec) ?? objectRecord(actionArgs?.patchSpec);
+        const match = objectRecord(patchSpec?.match);
+        const matchText = stringValue(match?.text);
+        if (!matchText) continue;
+        if (!ports.resourceEvidenceIndex.containsExactBlock(resourcePackets, targets, matchText)) {
+          const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
+          reasons.push(`patch action ${action.actionId || action.id || action.title || index} is missing current file/search evidence: patchSpec.match.text must come from recent ResourcePacket fileText/searchResults (target=${targetLabel}). Return resourceRequest kind="search" or read the target file/range first.`);
+        }
+        continue;
+      }
+      if (capability === 'fs.write') {
+        if (writeActionIsExplicitCreate(action, proposal)) continue;
+        const targetIsAccepted = targets.some((target) => ports.scopeCoveredForCapability(target, capability, accepted));
+        if (!targetIsAccepted && !ports.resourceEvidenceIndex.mentionsAnyTarget(resourcePackets, targets) && !actionDeclaresOverwritePlan(action)) {
+          const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
+          reasons.push(`write action ${action.actionId || action.id || action.title || index} is missing current read/search evidence or an explicit overwrite plan before overwriting an existing file (target=${targetLabel}). Return resourceRequest to read/search the target file or range first.`);
+        }
+        continue;
+      }
+      if (capability === 'fs.delete') {
+        if (!targets.some((target) => ports.scopeCoveredForCapability(target, capability, accepted)) && !ports.resourceEvidenceIndex.mentionsAnyTarget(resourcePackets, targets)) {
+          const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
+          reasons.push(`delete action ${action.actionId || action.id || action.title || index} is missing current directory/read/search evidence or confirmed file-level scope (target=${targetLabel}). Return resourceRequest to read the directory tree or target-file evidence first.`);
+        }
+        continue;
+      }
+      if (capability === 'fs.rename' || actionKind === 'rename') {
+        if (!ports.resourceEvidenceIndex.mentionsAnyTarget(resourcePackets, targets)) {
+          const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
+          reasons.push(`rename action ${action.actionId || action.id || action.title || index} is missing current source evidence (target=${targetLabel}). Return resourceRequest to read the source file or directory evidence first.`);
+        }
+      }
+    }
+    return reasons;
   }
 
   executionContext(input: {
@@ -526,6 +586,32 @@ function invalidAcceptedPlanExecutionAccessScopeReason(scope: unknown): string |
   if (normalized.includes('*')) return 'wildcard_scope';
   if (isAbsolutePath(normalized)) return 'absolute_scope_not_allowed_in_execution_batch';
   return undefined;
+}
+
+function writeActionIsExplicitCreate(action: ActionBundleDraft['actions'][number], proposal: ProposalEnvelope): boolean {
+  const actionKind = stringValue(action.kind);
+  if (actionKind === 'create') return true;
+  const actionArgs = objectRecord(action.args) ?? objectRecord(action.toolArgs);
+  const payload = objectRecord(proposal.payload) ?? {};
+  const codeBlocks = Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [];
+  const blockIds = new Set([
+    stringValue(action.sourceBlockId),
+    stringValue(action.replacementBlockId),
+    stringValue(actionArgs?.sourceBlockId),
+    stringValue(actionArgs?.replacementBlockId),
+  ].filter((item): item is string => Boolean(item)));
+  return codeBlocks.some((block) => {
+    const record = objectRecord(block);
+    const blockId = stringValue(record?.id) ?? stringValue(record?.blockId);
+    if (!blockId || !blockIds.has(blockId)) return false;
+    const operation = stringValue(record?.operation);
+    return operation === 'create' || operation === 'createEmpty';
+  });
+}
+
+function actionDeclaresOverwritePlan(action: ActionBundleDraft['actions'][number]): boolean {
+  const toolArgs = objectRecord(action.toolArgs) ?? objectRecord(action.args);
+  return toolArgs?.overwrite === true || toolArgs?.overwritePlan === true || toolArgs?.confirmedOverwrite === true;
 }
 
 function acceptedPlanCapabilityIsReadOnlyValidation(capability: string): boolean {

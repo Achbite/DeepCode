@@ -396,6 +396,13 @@ const acceptedPlanExecutor = new AcceptedPlanExecutor({
   kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
   proposalTargetScopes: (proposal, accepted) =>
     acceptedPlanScopeMatcher.proposalTargetScopes(proposal, accepted).map((target) => target.normalized),
+  actionTargetScopes: (action, proposal, accepted) =>
+    acceptedPlanScopeMatcher.actionTargetScopes(action, proposal)
+      .map((target) => acceptedPlanScopeMatcher.normalizeTargetScope(target, accepted))
+      .filter(Boolean),
+  scopeCoveredForCapability: (scope, capability, accepted) =>
+    acceptedPlanScopeCoverage.scopeCoveredForCapability(scope, capability, accepted),
+  resourceEvidenceIndex: resourceEvidenceIndex(),
 });
 const contextFrameBuilder = new ContextFrameBuilder();
 const resourceRequestLoop = new ResourceRequestLoop({
@@ -4918,7 +4925,8 @@ function acceptedImplementationPlanContextBuilder(): AcceptedImplementationPlanC
 function acceptedPlanAdmission(): AcceptedPlanAdmission {
   return new AcceptedPlanAdmission({
     scopeMatcher: new AcceptedPlanScopeMatcher(),
-    fileOperationFreshnessReasons: fileOperationFreshnessValidationReasons,
+    fileOperationFreshnessReasons: (accepted, proposal, resourcePackets) =>
+      acceptedPlanExecutor.fileOperationFreshnessValidationReasons(accepted, proposal, resourcePackets),
   });
 }
 
@@ -5609,102 +5617,6 @@ function recoverAcceptedPlanFromOverlay(
     ]);
   }
   return { plan, acceptedPlan };
-}
-
-function fileOperationFreshnessValidationReasons(
-  accepted: AcceptedImplementationPlanContext,
-  proposal: ProposalEnvelope,
-  resourcePackets: ResourcePacket[]
-): string[] {
-  const actionBundle = driverActivityBuilder.readActionBundle(proposal);
-  const reasons: string[] = [];
-  const evidenceIndex = resourceEvidenceIndex();
-  for (const [index, action] of (actionBundle?.actions ?? []).entries()) {
-    const capability = actionEffectiveCapability(action as unknown as Record<string, unknown>);
-    const actionKind = stringValue(action.kind) ?? (capability === 'fs.patch' ? 'patch' : undefined);
-    const actionArgs = objectRecord(action.args) ?? objectRecord(action.toolArgs);
-    const targets = acceptedPlanScopeMatcher.actionTargetScopes(action, proposal)
-      .map((target) => acceptedPlanScopeMatcher.normalizeTargetScope(target, accepted))
-      .filter(Boolean);
-    if (capability === 'fs.patch' || ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(actionKind ?? '')) {
-      const patchSpec = objectRecord(action.patchSpec) ?? objectRecord(actionArgs?.patchSpec);
-      const match = objectRecord(patchSpec?.match);
-      const matchText = stringValue(match?.text);
-      if (!matchText) continue;
-      if (!evidenceIndex.containsExactBlock(resourcePackets, targets, matchText)) {
-        const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
-        reasons.push(`patch action ${action.actionId || action.id || action.title || index} is missing current file/search evidence: patchSpec.match.text must come from recent ResourcePacket fileText/searchResults (target=${targetLabel}). Return resourceRequest kind="search" or read the target file/range first.`);
-      }
-      continue;
-    }
-    if (capability === 'fs.write') {
-      if (writeActionIsExplicitCreate(action, proposal)) continue;
-      const targetIsAccepted = targets.some((target) => acceptedPlanScopeCoverage.scopeCoveredForCapability(target, capability, accepted));
-      if (!targetIsAccepted && !evidenceIndex.mentionsAnyTarget(resourcePackets, targets) && !actionDeclaresOverwritePlan(action)) {
-        const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
-        reasons.push(`write action ${action.actionId || action.id || action.title || index} is missing current read/search evidence or an explicit overwrite plan before overwriting an existing file (target=${targetLabel}). Return resourceRequest to read/search the target file or range first.`);
-      }
-      continue;
-    }
-    if (capability === 'fs.delete') {
-      if (!targets.some((target) => acceptedPlanScopeCoverage.scopeCoveredForCapability(target, capability, accepted)) && !evidenceIndex.mentionsAnyTarget(resourcePackets, targets)) {
-        const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
-        reasons.push(`delete action ${action.actionId || action.id || action.title || index} is missing current directory/read/search evidence or confirmed file-level scope (target=${targetLabel}). Return resourceRequest to read the directory tree or target-file evidence first.`);
-      }
-      continue;
-    }
-    if (capability === 'fs.rename' || actionKind === 'rename') {
-      if (!evidenceIndex.mentionsAnyTarget(resourcePackets, targets)) {
-        const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
-        reasons.push(`rename action ${action.actionId || action.id || action.title || index} is missing current source evidence (target=${targetLabel}). Return resourceRequest to read the source file or directory evidence first.`);
-      }
-    }
-  }
-  return reasons;
-}
-
-function writeActionIsExplicitCreate(action: ActionBundleDraft['actions'][number], proposal: ProposalEnvelope): boolean {
-  const actionKind = stringValue(action.kind);
-  if (actionKind === 'create') return true;
-  const actionArgs = objectRecord(action.args) ?? objectRecord(action.toolArgs);
-  const payload = objectRecord(proposal.payload) ?? {};
-  const codeBlocks = Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [];
-  const blockIds = new Set([
-    stringValue(action.sourceBlockId),
-    stringValue(action.replacementBlockId),
-    stringValue(actionArgs?.sourceBlockId),
-    stringValue(actionArgs?.replacementBlockId),
-  ].filter((item): item is string => Boolean(item)));
-  return codeBlocks.some((block) => {
-    const record = objectRecord(block);
-    const blockId = stringValue(record?.id) ?? stringValue(record?.blockId);
-    if (!blockId || !blockIds.has(blockId)) return false;
-    const operation = stringValue(record?.operation);
-    return operation === 'create' || operation === 'createEmpty';
-  });
-}
-
-function actionDeclaresOverwritePlan(action: ActionBundleDraft['actions'][number]): boolean {
-  const toolArgs = objectRecord(action.toolArgs) ?? objectRecord(action.args);
-  return toolArgs?.overwrite === true || toolArgs?.overwritePlan === true || toolArgs?.confirmedOverwrite === true;
-}
-
-function looksLikeResourcePath(value: string): boolean {
-  if (!value || value.includes(' ') || value.includes('\n')) return false;
-  return value.includes('/') || /\.[A-Za-z0-9]+$/.test(value);
-}
-
-function looksLikeSearchEvidenceQuery(value: string): boolean {
-  const normalized = value.trim();
-  if (!normalized || normalized.length > 120 || normalized.includes('\n')) return false;
-  if (/\s/.test(normalized)) return false;
-  return /^[A-Za-z_$][A-Za-z0-9_$:.*#-]*$/.test(normalized);
-}
-
-function recordArray(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-    : [];
 }
 
 function normalizePlanScope(value: string): string {
