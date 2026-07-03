@@ -59,7 +59,7 @@ import {
 } from '../driver/execution/index.js';
 import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
 import { PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
-import { AssistantProjectionBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
+import { AssistantProjectionBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
 async function main(): Promise<void> {
@@ -94,6 +94,7 @@ async function main(): Promise<void> {
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   assertAssistantProjectionBuilderCreatesConversationEvents();
+  assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents();
   assertRequirementProjectionBuilderCreatesDecisionEvents();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
   assertPlanInteractionIndexFindsActivePlan();
@@ -1916,6 +1917,88 @@ function assertAssistantProjectionBuilderCreatesConversationEvents(): void {
     String((decisionAnswer.payload as any).answer.content).includes('Completed tasks: 2'),
     'assistant projection renders decision-effect answer ledger summary'
   );
+}
+
+function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): void {
+  const token = randomSmokeToken('session-progress');
+  const taskId = `task-${token}`;
+  const targetPath = `target-${token}.txt`;
+  const builder = new SessionProgressProjectionBuilder({
+    interactionOverlayPayload: (overlay) => overlay ? { overlayRunId: overlay.parentRunId } : {},
+    hasFailureOrBlocker: (events) => events.some((event) => (event as any).kind === 'work_unit.failed'),
+  });
+  const runState = builder.sessionRunStateEvent({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    phase: 'executing_accepted_plan',
+    reason: 'accepted_plan_execution',
+    decisionOwner: {
+      kind: 'plan',
+      runId: `run-${token}`,
+      planId: `plan-${token}`,
+    },
+    interactionOverlay: {
+      parentPhase: 'executing_accepted_plan',
+      parentRunId: `run-${token}`,
+      interactionRunId: `interaction-run-${token}`,
+      interactionId: `interaction-${token}`,
+    },
+    ts: '2026-01-01T00:00:00.000Z',
+    id: `run-state-${token}`,
+  });
+  assertEqual(runState.kind, 'session_run_state', 'session progress projection creates run state events');
+  assertEqual((runState.payload as any).messageKey, 'session.runState.acceptedPlanExecution', 'session progress projection uses run-state i18n key');
+  assertEqual((runState.payload as any).overlayRunId, `run-${token}`, 'session progress projection preserves overlay payload');
+
+  const accepted: AcceptedImplementationPlanContext = {
+    planId: `plan-${token}`,
+    runId: `run-${token}`,
+    tasks: [{
+      taskId,
+      title: `Task ${token}`,
+      capability: 'fs.write',
+      targets: [targetPath],
+      dependencies: [],
+      conflictKeys: [],
+    }],
+    capabilities: ['fs.write'],
+    targetScopes: [targetPath],
+    exactOperationGrants: [],
+    accessScopes: [],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: {},
+  };
+  const checkpoint = builder.acceptedPlanBatchCheckpointEvent(
+    `session-${token}`,
+    `run-${token}`,
+    accepted,
+    {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-${token}`,
+      runId: `run-${token}`,
+      source: 'llm',
+      kind: 'actionBundle',
+      payload: {},
+      referencedResourcePacketRefs: [],
+      referencedEvidenceRefs: [],
+    },
+    [],
+    {
+      actionIds: [`action-${token}`],
+      targetPaths: [targetPath],
+      workUnitIds: [`work-unit-${token}`],
+      newlyCompletedTaskIds: [taskId],
+      completedTaskIds: [taskId],
+      remainingTaskIds: [],
+    },
+    '2026-01-01T00:00:01.000Z',
+    `checkpoint-${token}`
+  );
+  const payload = checkpoint.payload as any;
+  assertEqual(payload.stage, 'accepted_plan.batch_checkpoint', 'session progress projection creates accepted-plan checkpoint');
+  assertEqual(payload.taskLedger.completedTaskIds[0], taskId, 'session progress projection builds task ledger');
+  assertEqual(payload.activity.kind, 'reviewCheckpoint', 'session progress projection marks complete accepted plan for review');
 }
 
 function assertPlanReviewReportAnalyzerKeepsReviewSemantics(): void {

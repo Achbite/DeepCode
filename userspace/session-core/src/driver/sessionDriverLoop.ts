@@ -129,6 +129,10 @@ import {
   PlanProjectionBuilder,
   RequirementProjectionBuilder,
   ReviewProjectionBuilder,
+  SessionProgressProjectionBuilder,
+  type DecisionOwnerRef,
+  type SessionRunStateReason,
+  type SessionRunStateStatus,
 } from './projection/index.js';
 import type { ProviderTurnContract } from './runFrame.js';
 
@@ -223,16 +227,6 @@ interface SessionDriverLoopRunState {
   interactionOverlay?: InteractionOverlayContext;
 }
 
-interface DecisionOwnerRef {
-  kind: 'requirement' | 'plan' | 'review' | 'permission';
-  runId: string;
-  targetId?: string;
-  planId?: string;
-  requirementId?: string;
-  reviewId?: string;
-  permissionId?: string;
-}
-
 interface AcceptedPlanAccessScopeCanonicalizationResult {
   proposal: ProposalEnvelope;
   changed: boolean;
@@ -248,16 +242,6 @@ interface RemovedAcceptedPlanAccessScope {
   scopeKind?: string;
   scope: unknown;
 }
-
-type SessionRunStateStatus = 'waiting' | 'running' | 'completed' | 'cancelled' | 'failed';
-
-type SessionRunStateReason =
-  | 'requirement'
-  | 'plan_review'
-  | 'permission'
-  | 'review'
-  | 'accepted_plan_execution'
-  | 'work_unit_failed';
 
 interface ActiveTurnState {
   turnId: string;
@@ -331,6 +315,10 @@ const requirementProjectionBuilder = new RequirementProjectionBuilder({
 const assistantProjectionBuilder = new AssistantProjectionBuilder({
   visibleLanguageForRequest,
   guidanceRevisionTransitionMessage: (language) => providerStreamCoordinator.guidanceRevisionTransitionMessage(language),
+});
+const sessionProgressProjectionBuilder = new SessionProgressProjectionBuilder({
+  interactionOverlayPayload: (overlay) => interactionOverlayCodec.toPayload(overlay),
+  hasFailureOrBlocker: (kernelEvents) => kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents),
 });
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
@@ -523,7 +511,7 @@ export class SessionDriverLoop {
         const payload = objectRecord(event.payload) ?? {};
         return this.append(sessionId, [
           event,
-          sessionRunStateEvent({
+          sessionProgressProjectionBuilder.sessionRunStateEvent({
             sessionId,
             runId: state.runId,
             phase: 'waiting_requirement_confirmation',
@@ -670,7 +658,7 @@ export class SessionDriverLoop {
         state.phase = 'waiting_requirement_confirmation';
         return this.append(sessionId, [
           confirmation,
-          sessionRunStateEvent({
+          sessionProgressProjectionBuilder.sessionRunStateEvent({
             sessionId,
             runId: state.runId,
             phase: 'waiting_requirement_confirmation',
@@ -706,7 +694,7 @@ export class SessionDriverLoop {
             ts: this.ts(),
             id: this.id('task-plan'),
           }),
-          sessionRunStateEvent({
+          sessionProgressProjectionBuilder.sessionRunStateEvent({
             sessionId,
             runId: state.runId,
             phase: 'waiting_plan_review',
@@ -849,7 +837,7 @@ export class SessionDriverLoop {
       const runId = stringValue(payload.runId) ?? input.runId ?? 'run-unknown';
       const resolvedRequirementId = stringValue(payload.requirementId) ?? requirementId;
       return this.append(input.sessionId, [
-        sessionRunStateEvent({
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: input.sessionId,
           runId,
           phase: 'cancelled',
@@ -1070,7 +1058,7 @@ export class SessionDriverLoop {
             userGuidance: input.guidance,
           }),
         }),
-        sessionRunStateEvent({
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: input.sessionId,
           runId,
           phase: 'completed',
@@ -1086,7 +1074,7 @@ export class SessionDriverLoop {
 
     if (stateDecision.kind === 'cancel') {
       return this.append(input.sessionId, [
-        sessionRunStateEvent({
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: input.sessionId,
           runId,
           phase: 'completed',
@@ -1102,7 +1090,7 @@ export class SessionDriverLoop {
 
     if (stateDecision.kind === 'waitForPlanReview') {
       return this.append(input.sessionId, [
-        sessionRunStateEvent({
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: input.sessionId,
           runId,
           phase: 'waiting_plan_review',
@@ -1148,7 +1136,7 @@ export class SessionDriverLoop {
 
     const checkpointId = this.id('requirement-driven-task-checkpoint');
     const events: AgentEvent[] = [
-      requirementDrivenTaskCheckpointEvent(
+      sessionProgressProjectionBuilder.requirementDrivenTaskCheckpointEvent(
         input.sessionId,
         runId,
         nextAccepted,
@@ -1162,7 +1150,7 @@ export class SessionDriverLoop {
       ),
     ];
     if (allDone) {
-      events.push(sessionRunStateEvent({
+      events.push(sessionProgressProjectionBuilder.sessionRunStateEvent({
         sessionId: input.sessionId,
         runId,
         phase: 'completed',
@@ -1309,7 +1297,7 @@ export class SessionDriverLoop {
       }
       if (input.decision === 'reject') {
         result = await this.append(input.sessionId, [
-          sessionRunStateEvent({
+          sessionProgressProjectionBuilder.sessionRunStateEvent({
             sessionId: input.sessionId,
             runId: plan.runId,
             phase: 'cancelled',
@@ -1368,7 +1356,7 @@ export class SessionDriverLoop {
     let result = initialResult;
     try {
       result = await this.append(input.sessionId, [
-        sessionRunStateEvent({
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: input.sessionId,
           runId: plan.runId,
           phase: 'executing_accepted_plan',
@@ -1479,7 +1467,7 @@ export class SessionDriverLoop {
         if (kernelEventStatusIndex.hasPermissionRequest(batchEvents)) {
           const permissionId = kernelEventStatusIndex.permissionId(batchEvents);
           return this.append(input.sessionId, [
-            sessionRunStateEvent({
+            sessionProgressProjectionBuilder.sessionRunStateEvent({
               sessionId: input.sessionId,
               runId: plan.runId,
               phase: 'waiting_permission',
@@ -1507,7 +1495,7 @@ export class SessionDriverLoop {
         const context = buildCurrentTaskContext(acceptedOverlay.acceptedPlan, cursor);
         const savepointId = this.id('accepted-plan-overlay-task-savepoint');
         result = await this.append(input.sessionId, [
-          acceptedPlanBatchCheckpointEvent(
+          sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(
             input.sessionId,
             plan.runId,
             acceptedOverlay.acceptedPlan,
@@ -1584,7 +1572,7 @@ export class SessionDriverLoop {
       const reviewPayload = objectRecord(review.payload) ?? {};
       return this.append(input.sessionId, [
         review,
-        sessionRunStateEvent({
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: input.sessionId,
           runId: plan.runId,
           phase: 'waiting_review',
@@ -1639,7 +1627,7 @@ export class SessionDriverLoop {
     if (input.decision === 'reject') {
       const runId = pending.runId ?? input.runId ?? kernelEventStatusIndex.runId(decisionReply.events ?? []) ?? 'run-unknown';
       return this.append(input.sessionId, [
-        sessionRunStateEvent({
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: input.sessionId,
           runId,
           phase: 'cancelled',
@@ -1662,7 +1650,7 @@ export class SessionDriverLoop {
         const runId = pending.runId ?? input.runId ?? kernelEventStatusIndex.runId(decisionReply.events ?? []) ?? 'run-unknown';
         const permissionId = kernelEventStatusIndex.permissionId(decisionReply.events ?? []);
         return this.append(input.sessionId, [
-          sessionRunStateEvent({
+          sessionProgressProjectionBuilder.sessionRunStateEvent({
             sessionId: input.sessionId,
             runId,
             phase: 'waiting_permission',
@@ -1706,7 +1694,7 @@ export class SessionDriverLoop {
     const reviewPayload = objectRecord(review.payload) ?? {};
     return this.append(input.sessionId, [
       review,
-      sessionRunStateEvent({
+      sessionProgressProjectionBuilder.sessionRunStateEvent({
         sessionId: input.sessionId,
         runId,
         phase: 'waiting_review',
@@ -1770,7 +1758,7 @@ export class SessionDriverLoop {
       });
       result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
       return this.append(input.sessionId, [
-        sessionRunStateEvent({
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: input.sessionId,
           runId: review.runId,
           phase: 'cancelled',
@@ -1890,7 +1878,7 @@ export class SessionDriverLoop {
     if (terminalAcceptedPlan || !review.continuations.length || continuationMode === 'off') {
       if (kernelEventStatusIndex.reviewGateStatus(gateReply.events) === 'accepted') {
         result = await this.append(input.sessionId, [
-          sessionRunStateEvent({
+          sessionProgressProjectionBuilder.sessionRunStateEvent({
             sessionId: input.sessionId,
             runId: review.runId,
             phase: 'completed',
@@ -2273,7 +2261,7 @@ export class SessionDriverLoop {
     if (!completion.ok) return null;
 
     const nextAccepted = acceptedPlanAfterBatch(accepted, completion.completedTaskIds);
-    const checkpoint = acceptedPlanResourceValidationCheckpointEvent(
+    const checkpoint = sessionProgressProjectionBuilder.acceptedPlanResourceValidationCheckpointEvent(
       state.sessionId,
       state.runId,
       accepted,
@@ -2352,7 +2340,7 @@ export class SessionDriverLoop {
     const reviewPayload = objectRecord(review.payload) ?? {};
     return this.append(state.sessionId, [
       review,
-      sessionRunStateEvent({
+      sessionProgressProjectionBuilder.sessionRunStateEvent({
         sessionId: state.sessionId,
         runId: state.runId,
         phase: 'waiting_review',
@@ -3228,7 +3216,7 @@ export class SessionDriverLoop {
       state.phase = 'waiting_plan_review';
       return this.append(state.sessionId, [
         confirmation,
-        sessionRunStateEvent({
+        sessionProgressProjectionBuilder.sessionRunStateEvent({
           sessionId: state.sessionId,
           runId: state.runId,
           phase: 'waiting_plan_review',
@@ -3385,7 +3373,7 @@ export class SessionDriverLoop {
     state.phase = 'waiting_plan_review';
     result = await this.append(state.sessionId, [
       planCard,
-      sessionRunStateEvent({
+      sessionProgressProjectionBuilder.sessionRunStateEvent({
         sessionId: state.sessionId,
         runId: state.runId,
         phase: 'waiting_plan_review',
@@ -3551,7 +3539,7 @@ export class SessionDriverLoop {
           state.phase = 'waiting_permission';
           return this.append(state.sessionId, [
             confirmation,
-            sessionRunStateEvent({
+            sessionProgressProjectionBuilder.sessionRunStateEvent({
               sessionId: state.sessionId,
               runId: state.runId,
               phase: 'waiting_permission',
@@ -3605,7 +3593,7 @@ export class SessionDriverLoop {
       ]) ?? result;
     }
     result = await this.append(state.sessionId, [
-      sessionRunStateEvent({
+      sessionProgressProjectionBuilder.sessionRunStateEvent({
         sessionId: state.sessionId,
         runId: state.runId,
         phase: 'executing_accepted_plan',
@@ -3811,7 +3799,7 @@ export class SessionDriverLoop {
       if (kernelEventStatusIndex.hasPermissionRequest(batchReply.events ?? [])) {
         const permissionId = kernelEventStatusIndex.permissionId(batchReply.events ?? []);
         return this.append(state.sessionId, [
-          sessionRunStateEvent({
+          sessionProgressProjectionBuilder.sessionRunStateEvent({
             sessionId: state.sessionId,
             runId: state.runId,
             phase: 'waiting_permission',
@@ -3835,7 +3823,7 @@ export class SessionDriverLoop {
     refreshTaskExecutionState(state);
     const savepointId = this.id('accepted-plan-task-savepoint');
     result = await this.append(state.sessionId, [
-      acceptedPlanBatchCheckpointEvent(
+      sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(
         state.sessionId,
         state.runId,
         accepted,
@@ -3920,7 +3908,7 @@ export class SessionDriverLoop {
     const reviewPayload = objectRecord(review.payload) ?? {};
     return this.append(state.sessionId, [
       review,
-      sessionRunStateEvent({
+      sessionProgressProjectionBuilder.sessionRunStateEvent({
         sessionId: state.sessionId,
         runId: state.runId,
         phase: 'waiting_review',
@@ -3979,7 +3967,7 @@ export class SessionDriverLoop {
     state.phase = 'waiting_permission';
     return this.append(state.sessionId, [
       confirmation,
-      sessionRunStateEvent({
+      sessionProgressProjectionBuilder.sessionRunStateEvent({
         sessionId: state.sessionId,
         runId: state.runId,
         phase: 'waiting_permission',
@@ -6392,268 +6380,6 @@ function planReviewDecisionEvent(
   };
 }
 
-function sessionRunStateEvent(input: {
-  sessionId: string;
-  runId: string;
-  phase: SessionTurnPhase;
-  status?: SessionRunStateStatus;
-  reason: SessionRunStateReason;
-  decisionOwner: DecisionOwnerRef;
-  interactionOverlay?: InteractionOverlayContext;
-  ts: string;
-  id: string;
-}): AgentEvent {
-  const status = input.status ?? 'waiting';
-  const overlayPayload = interactionOverlayCodec.toPayload(input.interactionOverlay);
-  const summary = sessionRunStateSummary(input.reason, status);
-  const messageArgs = { reason: input.reason, status };
-  return {
-    id: input.id,
-    sessionId: input.sessionId,
-    ts: input.ts,
-    kind: 'session_run_state',
-    payload: {
-      status,
-      phase: input.phase,
-      reason: input.reason,
-      runId: input.runId,
-      decisionKind: input.decisionOwner.kind,
-      targetId: input.decisionOwner.targetId,
-      decisionOwner: input.decisionOwner,
-      ...overlayPayload,
-      summary: summary.key,
-      summaryKey: summary.key,
-      messageKey: summary.key,
-      messageArgs,
-      channel: 'task',
-      visibility: 'debug',
-      presentation: 'stageSummary',
-    },
-  };
-}
-
-function sessionRunStateSummary(
-  reason: SessionRunStateReason,
-  status: SessionRunStateStatus
-): { key: string } {
-  if (status === 'cancelled') return { key: 'session.runState.cancelled' };
-  if (status === 'failed' && reason === 'work_unit_failed') return { key: 'session.runState.workUnitFailed' };
-  if (status === 'failed') return { key: 'session.runState.failed' };
-  if (status === 'completed' && reason === 'review') return { key: 'session.runState.reviewCompleted' };
-  if (status === 'completed') return { key: 'session.runState.completed' };
-  if (reason === 'accepted_plan_execution') return { key: 'session.runState.acceptedPlanExecution' };
-  if (status === 'running') return { key: 'session.runState.running' };
-  if (reason === 'requirement') return { key: 'session.runState.requirement' };
-  if (reason === 'permission') return { key: 'session.runState.permission' };
-  if (reason === 'review') return { key: 'session.runState.review' };
-  return { key: 'session.runState.planReview' };
-}
-
-function requirementDrivenTaskCheckpointEvent(
-  sessionId: string,
-  runId: string,
-  accepted: AcceptedImplementationPlanContext,
-  newlyCompletedTaskIds: string[],
-  completedTaskIds: string[],
-  remainingTaskIds: string[],
-  effectKind: RequirementOptionEffect['kind'],
-  selectedOptionId: string | undefined,
-  ts: string,
-  id: string
-): AgentEvent {
-  const complete = remainingTaskIds.length === 0;
-  const ledger = buildTaskLedgerSnapshot({
-    planId: accepted.planId,
-    runId,
-    tasks: accepted.tasks.map((task) => ({
-      taskId: task.taskId,
-      title: task.title,
-      targets: task.targets,
-      capability: task.capability,
-    })),
-    completedTaskIds,
-    skippedTaskIds: effectKind === 'skipCurrentTask' ? newlyCompletedTaskIds : [],
-    acceptedIncompleteTaskIds: effectKind === 'markAcceptedIncomplete' ? newlyCompletedTaskIds : [],
-  });
-  const summary = complete
-    ? 'Accepted plan tasks resolved via user requirement decision; ready for final review.'
-    : 'User requirement decision advanced the accepted plan task cursor.';
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'workflow_stage',
-    payload: {
-      stage: 'accepted_plan.batch_checkpoint',
-      status: 'completed',
-      summary,
-      runId,
-      planId: accepted.planId,
-      source: 'requirementDecision',
-      effectKind,
-      selectedOptionId,
-      batchIndex: accepted.batchIndex,
-      newlyCompletedTaskIds,
-      completedTaskIds,
-      remainingTaskIds,
-      taskLedger: ledger,
-      taskOrder: ledger.taskOrder,
-      nextPendingTaskIds: ledger.pendingTaskIds,
-      channel: 'progress',
-      visibility: 'conversation',
-      presentation: 'collapsible',
-      activity: conversationActivity({
-        activityId: id,
-        kind: complete ? 'reviewCheckpoint' : 'editBatchQueued',
-        status: 'completed',
-        title: complete ? 'Accepted plan complete' : 'Task advanced by user decision',
-        summary,
-        source: 'session',
-        runId,
-        planId: accepted.planId,
-      }),
-    },
-  };
-}
-
-function acceptedPlanBatchCheckpointEvent(
-  sessionId: string,
-  runId: string,
-  accepted: AcceptedImplementationPlanContext,
-  proposal: ProposalEnvelope,
-  kernelEvents: unknown[],
-  progress: AcceptedPlanBatchProgress,
-  ts: string,
-  id: string
-): AgentEvent {
-  const failedOrBlocked = kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents);
-  const complete = !failedOrBlocked && progress.remainingTaskIds.length === 0;
-  const ledger = buildTaskLedgerSnapshot({
-    planId: accepted.planId,
-    runId,
-    tasks: accepted.tasks.map((task) => ({
-      taskId: task.taskId,
-      title: task.title,
-      targets: task.targets,
-      capability: task.capability,
-    })),
-    completedTaskIds: progress.completedTaskIds,
-    failedTaskId: failedOrBlocked
-      ? accepted.tasks.find((task) => !progress.completedTaskIds.includes(task.taskId))?.taskId
-      : undefined,
-  });
-  const summary = failedOrBlocked
-    ? '已确认计划的当前执行批次存在失败或阻塞，已暂停自动推进。'
-    : complete
-      ? '已确认计划的任务清单已执行完成，准备进入最终 Review。'
-      : '已确认计划的当前执行批次已完成，Session 将继续生成下一批。';
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'workflow_stage',
-    payload: {
-      stage: 'accepted_plan.batch_checkpoint',
-      status: failedOrBlocked ? 'blocked' : 'completed',
-      summary,
-      runId,
-      planId: accepted.planId,
-      proposalId: proposal.proposalId,
-      batchIndex: accepted.batchIndex,
-      actionIds: progress.actionIds,
-      targetPaths: progress.targetPaths,
-      workUnitIds: progress.workUnitIds,
-      newlyCompletedTaskIds: progress.newlyCompletedTaskIds,
-      completedTaskIds: progress.completedTaskIds,
-      remainingTaskIds: progress.remainingTaskIds,
-      taskLedger: ledger,
-      taskOrder: ledger.taskOrder,
-      nextPendingTaskIds: ledger.pendingTaskIds,
-      channel: 'progress',
-      visibility: 'conversation',
-      presentation: 'collapsible',
-      activity: conversationActivity({
-        activityId: id,
-        kind: complete ? 'reviewCheckpoint' : failedOrBlocked ? 'diagnostic' : 'editBatchQueued',
-        status: failedOrBlocked ? 'blocked' : 'completed',
-        title: complete ? 'Accepted plan complete' : failedOrBlocked ? 'Accepted plan batch blocked' : 'Accepted plan batch completed',
-        summary,
-        source: 'session',
-        runId,
-        planId: accepted.planId,
-        targets: progress.targetPaths,
-        actionIds: progress.actionIds,
-        workUnitIds: progress.workUnitIds,
-      }),
-    },
-  };
-}
-
-function acceptedPlanResourceValidationCheckpointEvent(
-  sessionId: string,
-  runId: string,
-  accepted: AcceptedImplementationPlanContext,
-  packet: ResourcePacket,
-  completion: AcceptedPlanReadOnlyResourceCompletion,
-  ts: string,
-  id: string
-): AgentEvent {
-  const complete = completion.remainingTaskIds.length === 0;
-  const ledger = buildTaskLedgerSnapshot({
-    planId: accepted.planId,
-    runId,
-    tasks: accepted.tasks.map((task) => ({
-      taskId: task.taskId,
-      title: task.title,
-      targets: task.targets,
-      capability: task.capability,
-    })),
-    completedTaskIds: completion.completedTaskIds,
-  });
-  const summary = complete
-    ? 'Read-only evidence satisfied the remaining accepted task; ready for final review.'
-    : 'Read-only evidence satisfied the current accepted task; Session will continue with the next task.';
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'workflow_stage',
-    payload: {
-      stage: 'accepted_plan.batch_checkpoint',
-      status: 'completed',
-      summary,
-      runId,
-      planId: accepted.planId,
-      source: 'resourceValidation',
-      batchIndex: accepted.batchIndex,
-      resourcePacketId: packet.id,
-      validatedTaskId: completion.taskId,
-      coveredTargets: completion.coveredTargets,
-      targetPaths: completion.coveredTargets,
-      newlyCompletedTaskIds: completion.newlyCompletedTaskIds,
-      completedTaskIds: completion.completedTaskIds,
-      remainingTaskIds: completion.remainingTaskIds,
-      taskLedger: ledger,
-      taskOrder: ledger.taskOrder,
-      nextPendingTaskIds: ledger.pendingTaskIds,
-      channel: 'progress',
-      visibility: 'conversation',
-      presentation: 'collapsible',
-      activity: conversationActivity({
-        activityId: id,
-        kind: complete ? 'reviewCheckpoint' : 'editBatchQueued',
-        status: 'completed',
-        title: complete ? 'Accepted plan validation complete' : 'Accepted plan read-only validation completed',
-        summary,
-        source: 'session',
-        runId,
-        planId: accepted.planId,
-        targets: completion.coveredTargets,
-      }),
-    },
-  };
-}
-
 function acceptedPlanActionBatchPreflightEvent(
   sessionId: string,
   plan: SessionPlanContext,
@@ -6771,7 +6497,7 @@ function actionBundleAdmissionFailureEvents(
         }),
       },
     },
-    sessionRunStateEvent({
+    sessionProgressProjectionBuilder.sessionRunStateEvent({
       sessionId,
       runId,
       phase: 'failed',
@@ -6825,7 +6551,7 @@ function planActionBundlePreflightFailureEvents(
         }),
       },
     },
-    sessionRunStateEvent({
+    sessionProgressProjectionBuilder.sessionRunStateEvent({
       sessionId,
       runId: plan.runId,
       phase: 'failed',
@@ -6880,7 +6606,7 @@ function planActionBundleExecutionExceptionEvents(
         }),
       },
     },
-    sessionRunStateEvent({
+    sessionProgressProjectionBuilder.sessionRunStateEvent({
       sessionId,
       runId: plan.runId,
       phase: 'failed',
@@ -6944,7 +6670,7 @@ function planActionBundleExecutionFailureEvents(
         }),
       },
     },
-    sessionRunStateEvent({
+    sessionProgressProjectionBuilder.sessionRunStateEvent({
       sessionId,
       runId: plan.runId,
       phase: 'failed',
@@ -7000,7 +6726,7 @@ function acceptedPlanNormalizationFailureEvents(
         }),
       },
     },
-    sessionRunStateEvent({
+    sessionProgressProjectionBuilder.sessionRunStateEvent({
       sessionId,
       runId,
       phase: 'failed',
@@ -7065,7 +6791,7 @@ function acceptedPlanExecutionFailureEvents(
         }),
       },
     },
-    sessionRunStateEvent({
+    sessionProgressProjectionBuilder.sessionRunStateEvent({
       sessionId,
       runId,
       phase: 'failed',

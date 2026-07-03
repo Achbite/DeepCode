@@ -5,6 +5,12 @@ export {
 } from './assistantProjectionBuilder.js';
 export { KernelEventProjectionBuilder } from './kernelEventProjectionBuilder.js';
 export {
+  SessionProgressProjectionBuilder,
+  type DecisionOwnerRef,
+  type SessionRunStateReason,
+  type SessionRunStateStatus,
+} from './sessionProgressProjectionBuilder.js';
+export {
   PlanProjectionBuilder,
   type PlanProjectionGateIntervention,
   type PlanProjectionPermissionBundle,
