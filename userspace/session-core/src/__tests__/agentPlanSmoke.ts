@@ -1612,6 +1612,26 @@ function assertPlanReviewReportAnalyzerKeepsReviewSemantics(): void {
   assert(facts.some((fact) => fact.includes(targetPath)), 'plan review analyzer includes required file operation facts');
   assertEqual(analyzer.statusAwaitingUser('awaitingTemporaryGrant'), true, 'plan review analyzer keeps awaiting-user status semantics');
   assertEqual(
+    analyzer.planCardAwaitingDecision({ planId: `plan-${token}`, status: 'pending' }),
+    true,
+    'plan review analyzer detects waiting plan cards'
+  );
+  assertEqual(
+    analyzer.planCardAwaitingDecision({ planId: `plan-${token}`, status: 'accepted' }),
+    false,
+    'plan review analyzer rejects accepted plan cards'
+  );
+  assertEqual(
+    analyzer.planReviewEventAwaitingDecision({ planId: `plan-${token}`, status: 'awaitingUserApproval' }),
+    true,
+    'plan review analyzer detects waiting plan review events'
+  );
+  assertEqual(
+    analyzer.planReviewEventAwaitingDecision({ planId: `plan-${token}`, confirmable: false, status: 'pending' }),
+    false,
+    'plan review analyzer respects non-confirmable plan review events'
+  );
+  assertEqual(
     analyzer.acceptedPlanNeedsRepair({
       status: 'needsRevision',
       deniedReasons: [`access scope must not be the workspace root ${token}`],

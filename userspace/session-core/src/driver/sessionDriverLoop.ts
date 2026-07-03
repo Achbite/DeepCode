@@ -7548,8 +7548,8 @@ function findLatestActivePlanInteraction(events: AgentEvent[]): DriverInteractio
     const payload = objectRecord(event.payload);
     if (!payload) continue;
     const waiting = event.kind === 'plan_card'
-      ? planCardAwaitingDecision(payload)
-      : planReviewEventAwaitingDecision(payload);
+      ? planReviewReportAnalyzer.planCardAwaitingDecision(payload)
+      : planReviewReportAnalyzer.planReviewEventAwaitingDecision(payload);
     const runId = stringValue(payload.runId);
     const planId = stringValue(payload.planId);
     if (!waiting || !runId || !planId) continue;
@@ -7560,19 +7560,6 @@ function findLatestActivePlanInteraction(events: AgentEvent[]): DriverInteractio
     return { kind: 'plan', runId, planId };
   }
   return null;
-}
-
-function planCardAwaitingDecision(payload: Record<string, unknown>): boolean {
-  const confirmable = payload.confirmable;
-  if (confirmable === false) return false;
-  const status = stringValue(payload.status);
-  if (!status) return true;
-  return planReviewReportAnalyzer.statusAwaitingUser(status);
-}
-
-function planReviewEventAwaitingDecision(payload: Record<string, unknown>): boolean {
-  if (payload.confirmable === false) return false;
-  return planReviewReportAnalyzer.statusAwaitingUser(stringValue(payload.status));
 }
 
 function findLatestActiveRequirementInteraction(events: AgentEvent[]): DriverInteraction | null {

@@ -63,6 +63,19 @@ export class PlanReviewReportAnalyzer {
       status === undefined;
   }
 
+  planCardAwaitingDecision(payload: Record<string, unknown>): boolean {
+    const confirmable = payload.confirmable;
+    if (confirmable === false) return false;
+    const status = stringValue(payload.status);
+    if (!status) return true;
+    return this.statusAwaitingUser(status);
+  }
+
+  planReviewEventAwaitingDecision(payload: Record<string, unknown>): boolean {
+    if (payload.confirmable === false) return false;
+    return this.statusAwaitingUser(stringValue(payload.status));
+  }
+
   diagnosticSummary(report: Record<string, unknown>): string {
     const diagnostics = this.diagnostics(report);
     return diagnostics.filter(Boolean).join('; ') || 'Plan review did not pass.';
