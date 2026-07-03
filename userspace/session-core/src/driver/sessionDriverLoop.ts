@@ -33,6 +33,7 @@ import {
   ExecutionPromptCoordinator,
   ImplementationBatchContextBuilder,
   KernelEventStatusIndex,
+  RepairLoop,
   ReviewFactsAggregator,
   type AcceptedImplementationPlanContext,
   type AcceptedImplementationPlanExecutionRoot,
@@ -329,6 +330,7 @@ const requirementProjectionBuilder = new RequirementProjectionBuilder({
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
 const kernelEventStatusIndex = new KernelEventStatusIndex();
+const repairLoop = new RepairLoop();
 const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();
 const acceptedPlanScopeCoverage = new AcceptedPlanScopeCoverage({
   taskTargets: (task) => acceptedPlanTargetParser.taskTargets(task),
@@ -952,7 +954,7 @@ export class SessionDriverLoop {
     if (input.decision === 'revise' || selectedOptionId === 'revise-plan') {
       return this.runUserTurn({
         sessionId: input.sessionId,
-        content: acceptedPlanScopeRevisionRequest(confirmation, plan, input.guidance),
+        content: repairLoop.acceptedPlanScopeRevisionRequest({ confirmation, plan, guidance: input.guidance }),
         attachments: userInputPipeline.requirementAttachments(confirmation),
         existingEvents: current.events,
         workspaceBinding: input.workspaceBinding,
@@ -7594,31 +7596,6 @@ function acceptedPlanAccessScopesCanonicalizedEvent(
       presentation: 'collapsible',
     },
   };
-}
-
-function acceptedPlanScopeRevisionRequest(
-  confirmation: AgentEvent,
-  plan: SessionPlanContext | null,
-  guidance?: string
-): string {
-  const decisionRequest = objectRecord(objectRecord(confirmation.payload)?.decisionRequest) ?? {};
-  const implementationPlan = objectRecord(plan?.implementationPlan);
-  const planSummary = plan
-    ? {
-        planId: plan.planId,
-        title: stringValue(implementationPlan?.title),
-        summary: stringValue(implementationPlan?.summary),
-      }
-    : undefined;
-  return [
-    'User requested an accepted-plan scope revision.',
-    'Return a decisionRequest if a new user choice is required, or return a new actionBundle if the requested revision is already precise enough.',
-    'Do not output legacy implementationPlan, fileOperations, accessScopes, capability, resourceScope, commandBlocks, or large/multiline codeBlocks.content.',
-    'Only expand targets or toolIds when the user guidance or Kernel review reason requires it. Kernel will review the resulting execution contract and the user must confirm it before execution continues.',
-    guidance?.trim() ? `User guidance:\n${guidance.trim()}` : '',
-    planSummary ? `Current accepted execution summary:\n${JSON.stringify(planSummary, null, 2)}` : '',
-    Object.keys(decisionRequest).length ? `Accepted-plan scope decision:\n${JSON.stringify(decisionRequest, null, 2)}` : '',
-  ].filter(Boolean).join('\n\n');
 }
 
 function stringValue(value: unknown): string | undefined {

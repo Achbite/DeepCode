@@ -55,6 +55,7 @@ import {
   CompletedWorkUnitFactIndex,
   ImplementationBatchContextBuilder,
   KernelEventStatusIndex,
+  RepairLoop,
 } from '../driver/execution/index.js';
 import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
 import { PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
@@ -80,6 +81,7 @@ async function main(): Promise<void> {
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
+  assertRepairLoopBuildsAcceptedPlanScopeRevisionRequest();
   assertCompletedWorkUnitFactIndexMatchesActionAndTarget();
   assertActionBatchFailureIndexSummarizesKernelFailures();
   assertAcceptedPlanBatchPreflightAuditsDeleteActions();
@@ -1015,6 +1017,35 @@ function assertImplementationBatchContextBuilderExtractsConcreteContinuations():
     !context.continuationSummaries.some((summary) => summary.includes(`skip-${token}`)),
     'implementation batch context ignores non-concrete continuation scope'
   );
+}
+
+function assertRepairLoopBuildsAcceptedPlanScopeRevisionRequest(): void {
+  const token = randomSmokeToken('repair-loop');
+  const request = new RepairLoop().acceptedPlanScopeRevisionRequest({
+    confirmation: {
+      id: `confirmation-${token}`,
+      sessionId: `session-${token}`,
+      kind: 'requirement_confirmation',
+      ts: '2026-01-01T00:00:00.000Z',
+      payload: {
+        decisionRequest: {
+          acceptedPlanId: `plan-${token}`,
+          reason: `Reason ${token}`,
+        },
+      },
+    },
+    plan: {
+      planId: `plan-${token}`,
+      implementationPlan: {
+        title: `Title ${token}`,
+        summary: `Summary ${token}`,
+      },
+    },
+    guidance: `Guidance ${token}`,
+  });
+  assert(request.includes(`Guidance ${token}`), 'repair loop accepted-plan scope revision keeps guidance');
+  assert(request.includes(`Title ${token}`), 'repair loop accepted-plan scope revision keeps plan title');
+  assert(request.includes(`Reason ${token}`), 'repair loop accepted-plan scope revision keeps decision request context');
 }
 
 function assertCompletedWorkUnitFactIndexMatchesActionAndTarget(): void {
