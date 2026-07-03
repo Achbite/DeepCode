@@ -32,6 +32,8 @@ export type SessionRunStateReason =
 export interface SessionProgressProjectionBuilderPorts {
   interactionOverlayPayload(overlay: InteractionOverlayContext | undefined): Record<string, unknown>;
   hasFailureOrBlocker(kernelEvents: unknown[]): boolean;
+  auditAcceptedPlanBatch(batch: Record<string, unknown>): Record<string, unknown>;
+  actionBundleAdmissionBatch(proposal: ProposalEnvelope): Record<string, unknown>;
 }
 
 export class SessionProgressProjectionBuilder {
@@ -267,6 +269,92 @@ export class SessionProgressProjectionBuilder {
     };
   }
 
+  acceptedPlanActionBatchPreflightEvent(
+    sessionId: string,
+    plan: { runId: string; planId: string },
+    batch: Record<string, unknown>,
+    ts: string,
+    id: string
+  ): AgentEvent {
+    const audit = this.ports.auditAcceptedPlanBatch(batch);
+    const actionCount = Array.isArray(audit.actions) ? audit.actions.length : 0;
+    const summary = `Session completed accepted-plan actionBatch preflight audit for ${actionCount} action(s).`;
+    return {
+      id,
+      sessionId,
+      ts,
+      kind: 'workflow_stage',
+      payload: {
+        stage: 'accepted_plan.action_batch_preflight',
+        status: 'completed',
+        summary,
+        summaryKey: 'session.driver.acceptedPlanActionBatchPreflight',
+        messageKey: 'session.driver.acceptedPlanActionBatchPreflight',
+        messageArgs: { actionCount },
+        runId: plan.runId,
+        planId: plan.planId,
+        audit,
+        channel: 'progress',
+        visibility: 'debug',
+        presentation: 'collapsible',
+        activity: conversationActivity({
+          activityId: id,
+          kind: 'diagnostic',
+          status: 'completed',
+          title: 'Accepted plan action batch preflight',
+          summary,
+          source: 'session',
+          runId: plan.runId,
+          planId: plan.planId,
+        }),
+      },
+    };
+  }
+
+  actionBundleAdmissionRepairingEvent(
+    sessionId: string,
+    runId: string,
+    proposal: ProposalEnvelope,
+    reasons: string[],
+    ts: string,
+    id: string
+  ): AgentEvent {
+    const batch = this.ports.actionBundleAdmissionBatch(proposal);
+    const audit = this.ports.auditAcceptedPlanBatch(batch);
+    const summary = `ActionBundle requires revision before entering the Plan card: ${reasons.join('; ')}`;
+    return {
+      id,
+      sessionId,
+      ts,
+      kind: 'workflow_stage',
+      payload: {
+        stage: 'action_bundle_admission.repairing',
+        status: 'running',
+        summary,
+        summaryKey: 'session.driver.actionBundleAdmissionRepairing',
+        messageKey: 'session.driver.actionBundleAdmissionRepairing',
+        messageArgs: { reasonCount: reasons.length },
+        runId,
+        proposalId: proposal.proposalId,
+        reasons,
+        audit,
+        channel: 'progress',
+        visibility: 'conversation',
+        presentation: 'collapsible',
+        activity: conversationActivity({
+          activityId: id,
+          kind: 'diagnostic',
+          status: 'running',
+          title: 'ActionBundle admission repair',
+          summary,
+          source: 'session',
+          runId,
+          targets: actionTargetsFromAudit(audit),
+        }),
+      },
+    };
+  }
+
   private sessionRunStateSummary(
     reason: SessionRunStateReason,
     status: SessionRunStateStatus
@@ -301,4 +389,28 @@ export class SessionProgressProjectionBuilder {
 
 function conversationActivity(input: AgentConversationActivity): AgentConversationActivity {
   return { ...input };
+}
+
+function actionTargetsFromAudit(audit: Record<string, unknown>): string[] {
+  if (!Array.isArray(audit.actions)) return [];
+  return audit.actions.flatMap((item) => {
+    const record = objectRecord(item);
+    if (!record) return [];
+    return stringArrayValue(record.resourceScope).concat(stringValue(record.targetPath) ?? []);
+  });
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
 }

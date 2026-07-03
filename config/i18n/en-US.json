@@ -731,6 +731,8 @@
     "session.driver.defaultValidation.generic": "Kernel facts must show the requested side-effect operation completed.",
     "session.driver.defaultReview.targets": "Review the Kernel facts and resulting workspace state for: {targets}.",
     "session.driver.defaultReview.generic": "Review the Kernel facts and resulting workspace state for this action bundle.",
+    "session.driver.acceptedPlanActionBatchPreflight": "Session completed accepted-plan actionBatch preflight audit for {actionCount} action(s).",
+    "session.driver.actionBundleAdmissionRepairing": "ActionBundle requires revision before entering the Plan card.",
     "agent.composer.decision.plan": "Plan confirmation pending",
     "agent.composer.decision.requirement": "Requirement confirmation pending",
     "agent.composer.decision.choice": "Option selection pending",

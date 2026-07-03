@@ -731,6 +731,8 @@
     "session.driver.defaultValidation.generic": "Kernel facts 必须显示请求的副作用操作已完成。",
     "session.driver.defaultReview.targets": "请审查这些目标的 Kernel facts 与最终工作区状态：{targets}。",
     "session.driver.defaultReview.generic": "请审查本执行批次的 Kernel facts 与最终工作区状态。",
+    "session.driver.acceptedPlanActionBatchPreflight": "Session 已完成已确认计划 actionBatch 提交前审计：{actionCount} 个 action。",
+    "session.driver.actionBundleAdmissionRepairing": "ActionBundle 进入计划卡前需要修订。",
     "agent.composer.decision.plan": "等待计划确认",
     "agent.composer.decision.requirement": "等待需求确认",
     "agent.composer.decision.choice": "等待方案选择",

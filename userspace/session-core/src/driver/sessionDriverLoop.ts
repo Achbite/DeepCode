@@ -319,6 +319,8 @@ const assistantProjectionBuilder = new AssistantProjectionBuilder({
 const sessionProgressProjectionBuilder = new SessionProgressProjectionBuilder({
   interactionOverlayPayload: (overlay) => interactionOverlayCodec.toPayload(overlay),
   hasFailureOrBlocker: (kernelEvents) => kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents),
+  auditAcceptedPlanBatch: (batch) => acceptedPlanBatchPreflight.audit(batch),
+  actionBundleAdmissionBatch: (proposal) => proposalActionBundleAdmissionBatch(proposal),
 });
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
@@ -1381,7 +1383,7 @@ export class SessionDriverLoop {
         commandBlocks: plan.commandBlocks,
       };
       result = await this.append(input.sessionId, [
-        acceptedPlanActionBatchPreflightEvent(
+        sessionProgressProjectionBuilder.acceptedPlanActionBatchPreflightEvent(
           input.sessionId,
           plan,
           batch,
@@ -3105,7 +3107,7 @@ export class SessionDriverLoop {
     }
     state.actionBundleAdmissionRepairAttempted = true;
     let result = await this.append(state.sessionId, [
-      actionBundleAdmissionRepairingEvent(
+      sessionProgressProjectionBuilder.actionBundleAdmissionRepairingEvent(
         state.sessionId,
         state.runId,
         proposal,
@@ -6376,87 +6378,6 @@ function planReviewDecisionEvent(
       visibility: 'conversation',
       presentation: 'body',
       report: plan.planReviewReport,
-    },
-  };
-}
-
-function acceptedPlanActionBatchPreflightEvent(
-  sessionId: string,
-  plan: SessionPlanContext,
-  batch: Record<string, unknown>,
-  ts: string,
-  id: string
-): AgentEvent {
-  const audit = acceptedPlanBatchPreflight.audit(batch);
-  const summary = `Session 已完成已确认计划 actionBatch 提交前审计：${Array.isArray(audit.actions) ? audit.actions.length : 0} 个 action。`;
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'workflow_stage',
-    payload: {
-      stage: 'accepted_plan.action_batch_preflight',
-      status: 'completed',
-      summary,
-      runId: plan.runId,
-      planId: plan.planId,
-      audit,
-      channel: 'progress',
-      visibility: 'debug',
-      presentation: 'collapsible',
-      activity: conversationActivity({
-        activityId: id,
-        kind: 'diagnostic',
-        status: 'completed',
-        title: 'Accepted plan action batch preflight',
-        summary,
-        source: 'session',
-        runId: plan.runId,
-        planId: plan.planId,
-      }),
-    },
-  };
-}
-
-function actionBundleAdmissionRepairingEvent(
-  sessionId: string,
-  runId: string,
-  proposal: ProposalEnvelope,
-  reasons: string[],
-  ts: string,
-  id: string
-): AgentEvent {
-  const batch = proposalActionBundleAdmissionBatch(proposal);
-  const audit = acceptedPlanBatchPreflight.audit(batch);
-  const summary = `ActionBundle requires revision before entering the Plan card: ${reasons.join('; ')}`;
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'workflow_stage',
-    payload: {
-      stage: 'action_bundle_admission.repairing',
-      status: 'running',
-      summary,
-      runId,
-      proposalId: proposal.proposalId,
-      reasons,
-      audit,
-      channel: 'progress',
-      visibility: 'conversation',
-      presentation: 'collapsible',
-      activity: conversationActivity({
-        activityId: id,
-        kind: 'diagnostic',
-        status: 'running',
-        title: 'ActionBundle admission repair',
-        summary,
-        source: 'session',
-        runId,
-        targets: audit.actions && Array.isArray(audit.actions)
-          ? audit.actions.flatMap((item: unknown) => stringArrayValue(objectRecord(item)?.resourceScope).concat(stringValue(objectRecord(item)?.targetPath) ?? []))
-          : [],
-      }),
     },
   };
 }

@@ -1926,6 +1926,14 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
   const builder = new SessionProgressProjectionBuilder({
     interactionOverlayPayload: (overlay) => overlay ? { overlayRunId: overlay.parentRunId } : {},
     hasFailureOrBlocker: (events) => events.some((event) => (event as any).kind === 'work_unit.failed'),
+    auditAcceptedPlanBatch: (batch) => ({
+      actions: Array.isArray((batch as any).actions)
+        ? (batch as any).actions
+        : [{ actionId: `action-${token}`, targetPath }],
+    }),
+    actionBundleAdmissionBatch: () => ({
+      actions: [{ actionId: `admission-action-${token}`, resourceScope: [targetPath] }],
+    }),
   });
   const runState = builder.sessionRunStateEvent({
     sessionId: `session-${token}`,
@@ -1999,6 +2007,37 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
   assertEqual(payload.stage, 'accepted_plan.batch_checkpoint', 'session progress projection creates accepted-plan checkpoint');
   assertEqual(payload.taskLedger.completedTaskIds[0], taskId, 'session progress projection builds task ledger');
   assertEqual(payload.activity.kind, 'reviewCheckpoint', 'session progress projection marks complete accepted plan for review');
+
+  const preflight = builder.acceptedPlanActionBatchPreflightEvent(
+    `session-${token}`,
+    { runId: `run-${token}`, planId: `plan-${token}` },
+    { actions: [{ actionId: `preflight-action-${token}`, targetPath }] },
+    '2026-01-01T00:00:02.000Z',
+    `preflight-${token}`
+  );
+  assertEqual((preflight.payload as any).stage, 'accepted_plan.action_batch_preflight', 'session progress projection creates preflight events');
+  assertEqual((preflight.payload as any).messageKey, 'session.driver.acceptedPlanActionBatchPreflight', 'session progress projection marks preflight with i18n key');
+
+  const admissionRepair = builder.actionBundleAdmissionRepairingEvent(
+    `session-${token}`,
+    `run-${token}`,
+    {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-repair-${token}`,
+      runId: `run-${token}`,
+      source: 'llm',
+      kind: 'actionBundle',
+      payload: {},
+      referencedResourcePacketRefs: [],
+      referencedEvidenceRefs: [],
+    },
+    [`reason-${token}`],
+    '2026-01-01T00:00:03.000Z',
+    `admission-repair-${token}`
+  );
+  assertEqual((admissionRepair.payload as any).stage, 'action_bundle_admission.repairing', 'session progress projection creates admission repair events');
+  assertEqual((admissionRepair.payload as any).messageKey, 'session.driver.actionBundleAdmissionRepairing', 'session progress projection marks admission repair with i18n key');
+  assertEqual((admissionRepair.payload as any).activity.targets[0], targetPath, 'session progress projection extracts admission repair targets from audit');
 }
 
 function assertPlanReviewReportAnalyzerKeepsReviewSemantics(): void {
