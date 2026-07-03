@@ -43,7 +43,7 @@ import {
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
-import { AcceptedImplementationPlanContextBuilder, CompletedWorkUnitFactIndex, ImplementationBatchContextBuilder } from '../driver/execution/index.js';
+import { AcceptedImplementationPlanContextBuilder, AcceptedPlanTargetParser, CompletedWorkUnitFactIndex, ImplementationBatchContextBuilder } from '../driver/execution/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
 import { KernelEventProjectionBuilder, PlanProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
@@ -71,6 +71,7 @@ async function main(): Promise<void> {
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
+  assertAcceptedPlanTargetParserExtractsStructuredTargets();
   assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
@@ -1156,11 +1157,34 @@ function assertPlanReviewGrantProjectorBuildsExecutionReadModels(): void {
   );
 }
 
+function assertAcceptedPlanTargetParserExtractsStructuredTargets(): void {
+  const token = randomSmokeToken('target-parser');
+  const first = `src-${token}/first-${token}.txt`;
+  const second = `src-${token}/second-${token}.txt`;
+  const third = `src-${token}/third-${token}.txt`;
+  const parser = new AcceptedPlanTargetParser();
+  const targets = parser.taskTargets({
+    target: `./${first}`,
+    targets: [`${second},${third}`],
+    fileOperations: [{
+      targetRef: { path: `generated-${token}/artifact-${token}.txt` },
+    }],
+  });
+  assert(targets.includes(first), 'target parser normalizes direct task target');
+  assert(targets.includes(second), 'target parser expands comma-separated target list');
+  assert(targets.includes(third), 'target parser keeps every comma-separated target');
+  assert(
+    targets.includes(`generated-${token}/artifact-${token}.txt`),
+    'target parser extracts file operation target refs'
+  );
+}
+
 function assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext(): void {
   const token = randomSmokeToken('accepted-context');
   const fileTarget = `src-${token}/file-${token}.txt`;
   const moduleTarget = `module-${token}`;
   const projector = new PlanReviewGrantProjector();
+  const targetParser = new AcceptedPlanTargetParser();
   const builder = new AcceptedImplementationPlanContextBuilder({
     objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
       ? value as Record<string, unknown>
@@ -1173,10 +1197,7 @@ function assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext(): v
         : [],
     normalizePlanScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim(),
     uniqueStrings: (values) => [...new Set(values.filter((item): item is string => Boolean(item)))],
-    acceptedPlanTaskTargets: (record) => {
-      const targets = Array.isArray(record.targets) ? record.targets : [record.target];
-      return targets.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
-    },
+    acceptedPlanTaskTargets: (record) => targetParser.taskTargets(record),
     executionSliceRoleValue: (value) => value === 'sourceCode' || value === 'test' ? value : undefined,
     exactOperationGrantsFromImplementationPlan: (plan, executionRoot) =>
       projector.exactOperationGrantsFromImplementationPlan(plan, executionRoot),

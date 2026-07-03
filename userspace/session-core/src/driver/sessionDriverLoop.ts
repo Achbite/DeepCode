@@ -22,6 +22,7 @@ import {
   type AcceptedPlanReadOnlyResourceCompletion,
   AcceptedPlanScopeIntervention,
   AcceptedPlanScopeMatcher,
+  AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
   AcceptedImplementationPlanContextBuilder,
   ExecutionPromptCoordinator,
@@ -303,6 +304,7 @@ const providerPipeline = new ProviderPipeline();
 const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
 const providerStreamCoordinator = new ProviderStreamCoordinator();
 const providerTraceRecorder = new ProviderTraceRecorder();
+const acceptedPlanTargetParser = new AcceptedPlanTargetParser();
 const planReviewGrantProjector = new PlanReviewGrantProjector();
 const planReviewReportAnalyzer = new PlanReviewReportAnalyzer({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
@@ -4662,7 +4664,7 @@ function acceptedImplementationPlanContextBuilder(): AcceptedImplementationPlanC
     stringArrayValue,
     normalizePlanScope,
     uniqueStrings,
-    acceptedPlanTaskTargets,
+    acceptedPlanTaskTargets: (record) => acceptedPlanTargetParser.taskTargets(record),
     executionSliceRoleValue,
     exactOperationGrantsFromImplementationPlan: (plan, executionRoot) =>
       planReviewGrantProjector.exactOperationGrantsFromImplementationPlan(plan, executionRoot),
@@ -6116,104 +6118,6 @@ function acceptedPlanExecutionConsumed(
   return false;
 }
 
-function acceptedPlanTaskTargets(record: Record<string, unknown>): string[] {
-  const rawTargets = [
-    ...stringArrayValue(record.target),
-    ...stringArrayValue(record.targets),
-    ...stringArrayValue(record.targetPath),
-    ...stringArrayValue(record.targetPaths),
-    ...acceptedPlanTaskFileOperationTargets(record),
-  ];
-  const seen = new Set<string>();
-  const targets: string[] = [];
-  for (const target of rawTargets.flatMap(expandAcceptedPlanTargetValue)) {
-    const normalized = normalizePlanScope(target);
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
-    targets.push(normalized);
-  }
-  return targets;
-}
-
-function acceptedPlanTaskFileOperationTargets(record: Record<string, unknown>): string[] {
-  const operations = Array.isArray(record.fileOperations) ? record.fileOperations : [];
-  const targets: string[] = [];
-  for (const operation of operations) {
-    const item = objectRecord(operation);
-    if (!item) continue;
-    const target = stringValue(item.targetPath)
-      ?? stringValue(item.path)
-      ?? fileTargetRefPath(item.targetRef);
-    if (target) targets.push(target);
-  }
-  return targets;
-}
-
-function expandAcceptedPlanTargetValue(value: string): string[] {
-  const normalized = normalizePlanScope(value);
-  if (!normalized) return [];
-  if (normalized.includes(',')) {
-    const parts = normalized
-      .split(',')
-      .map((part) => normalizePlanScope(part))
-      .filter(Boolean);
-    if (parts.length > 1 && parts.every(acceptedPlanTargetListSegmentSafe)) return parts;
-    const extracted = extractAcceptedPlanTargetTokens(normalized);
-    return extracted.length ? extracted : [normalized];
-  }
-  const extracted = extractAcceptedPlanTargetTokens(normalized);
-  return extracted.length ? extracted : [normalized];
-}
-
-function acceptedPlanTargetListSegmentSafe(value: string): boolean {
-  const normalized = normalizePlanScope(value).replace(/\/+$/, '');
-  if (!normalized || normalized === '.' || normalized === '..' || normalized === '/') return false;
-  if (normalized.includes(',') || normalized.includes('*')) return false;
-  if (normalized.startsWith('../') || normalized.includes('/../')) return false;
-  if (/[\s()[\]{}<>（）【】]/.test(normalized)) return false;
-  if (isAbsolutePath(normalized)) return normalized.replace(/\/+$/, '').length > 1;
-  return true;
-}
-
-interface AcceptedPlanTargetToken {
-  value: string;
-  index: number;
-}
-
-function extractAcceptedPlanTargetTokens(target: string): string[] {
-  const tokens = acceptedPlanPathTokens(target);
-  if (!tokens.length) return [];
-  const hasFreeformBoundary = /[,;:()[\]{}<>（）【】]/.test(target) ||
-    Boolean(tokens[0]?.value.endsWith('/') && target.trim() !== tokens[0].value) ||
-    (tokens.length > 1 && tokens[0]?.value.endsWith('/'));
-  if (!hasFreeformBoundary) return [];
-  const first = tokens[0];
-  if (!first || first.index !== 0) return [];
-  const normalizedFirst = normalizePlanScope(first.value);
-  if (
-    normalizedFirst.endsWith('/') &&
-    tokens.slice(1).every((token) => !token.value.includes('/'))
-  ) {
-    return [normalizedFirst];
-  }
-  return uniqueStrings(tokens
-    .map((token) => normalizePlanScope(token.value))
-    .filter((token) => token && acceptedPlanTargetListSegmentSafe(token)));
-}
-
-function acceptedPlanPathTokens(value: string): AcceptedPlanTargetToken[] {
-  const tokens: AcceptedPlanTargetToken[] = [];
-  for (const match of value.matchAll(/[A-Za-z0-9_.\-/]+/g)) {
-    const token = match[0];
-    const index = match.index ?? -1;
-    if (!token || index < 0) continue;
-    if (token === '.' || token === '..') continue;
-    if (!token.includes('/') && !/\.[A-Za-z0-9]+$/.test(token)) continue;
-    tokens.push({ value: token, index });
-  }
-  return tokens;
-}
-
 function acceptedImplementationPlanContext(
   plan: SessionPlanContext,
   interventionLevel?: InterventionLevel,
@@ -6966,7 +6870,7 @@ function acceptedPlanTaskTargetsCoverScope(scope: string, accepted: AcceptedImpl
   const normalized = normalizePlanScopeIdentity(scope);
   if (!normalized) return false;
   return accepted.tasks.some((task) =>
-    task.targets
+    acceptedPlanTargetParser.taskTargets(task as unknown as Record<string, unknown>)
       .flatMap(expandPlanTargetTokens)
       .map(normalizePlanScopeIdentity)
       .filter(Boolean)
