@@ -3,4 +3,5 @@ export * from './planReviewGrantProjector.js';
 export * from './planContextIndex.js';
 export * from './planInteractionIndex.js';
 export * from './proposalRouter.js';
+export * from './proposalSemanticValidator.js';
 export * from './protocolGate.js';

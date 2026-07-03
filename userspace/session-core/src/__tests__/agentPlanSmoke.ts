@@ -60,7 +60,7 @@ import {
   RepairLoop,
 } from '../driver/execution/index.js';
 import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
-import { PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
+import { PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
@@ -69,6 +69,7 @@ async function main(): Promise<void> {
   assertLegacyProviderShapesAreRejected();
   assertActionBundleProtocolFields();
   assertProtocolGateCanonicalizesBareRepair();
+  assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
   assertProviderTurnContractFrameOrder();
@@ -252,6 +253,68 @@ function assertProviderTurnContractFrameOrder(): void {
   const memoryFrame = contract.frames.find((frame) => frame.kind === 'Memory');
   assertEqual(memoryFrame?.trust, 'compressedReference', 'memory is marked as compressed reference');
   assertEqual(contract.nextActionInstruction.kind, 'NextActionInstruction', 'contract exposes next action instruction directly');
+}
+
+function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
+  const token = randomSmokeToken('proposal-semantic');
+  const target = `targets/${token}.txt`;
+  const blockId = `block-${token}`;
+  const actionFileTargetPath = (action: Record<string, unknown>): string | undefined => {
+    if (typeof action.targetPath === 'string' && action.targetPath.trim()) return action.targetPath.trim();
+    const args = typeof action.args === 'object' && action.args && !Array.isArray(action.args)
+      ? action.args as Record<string, unknown>
+      : undefined;
+    return typeof args?.path === 'string' && args.path.trim() ? args.path.trim() : undefined;
+  };
+  const validator = new ProposalSemanticValidator({
+    maxActionBundleTotalCodeBytes: 64 * 1024,
+    sideEffectCapabilities: new Set(['fs.write', 'fs.patch', 'fs.delete']),
+    readActionBundle: (proposal) => (proposal.payload as Record<string, any>).actionBundle as ActionBundleDraft,
+    actionEffectiveCapability: (action) => typeof action.capability === 'string'
+      ? action.capability
+      : typeof action.toolId === 'string'
+        ? action.toolId
+        : '',
+    actionFileTargetPath,
+    deleteActionTargetResourceKind: (action) => typeof action.targetKind === 'string' ? action.targetKind : undefined,
+    deleteActionRecursive: (action) => action.recursive === true,
+  });
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId: `run-${token}`,
+    sessionId: `session-${token}`,
+    source: 'llm',
+    kind: 'actionBundle',
+    payload: {
+      userPlan: `Brief ${token}`,
+      actionBundle: {
+        version: '1',
+        id: `bundle-${token}`,
+        goal: `Goal ${token}`,
+        actions: [{
+          id: `action-${token}`,
+          title: `Write ${token}`,
+          capability: 'fs.write',
+          kind: 'write',
+          targetPath: target,
+          resourceScope: [target],
+        }],
+      },
+      codeBlocks: [{
+        id: blockId,
+        targetPath: target,
+        content: `content-${token}`,
+      }],
+    },
+  } as ProposalEnvelope;
+  validator.canonicalizeWriteActionSourceBlockRefs(proposal);
+  const action = (proposal.payload as Record<string, any>).actionBundle.actions[0];
+  assertEqual(action.sourceBlockId, blockId, 'proposal semantic validator canonicalizes write sourceBlockId');
+  validator.validateProposalSemantics(proposal, { allowBriefActionBundleUserPlan: true });
+  const bundle = (proposal.payload as Record<string, any>).actionBundle;
+  assertEqual(bundle.validationExpectations[0].messageKey, 'session.driver.defaultValidation.targets', 'proposal semantic validator adds validation expectation key');
+  assertEqual(bundle.reviewExpectations[0].messageKey, 'session.driver.defaultReview.targets', 'proposal semantic validator adds review expectation key');
 }
 
 async function assertProviderPipelineUsesProviderTurnContract(): Promise<void> {
