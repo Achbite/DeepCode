@@ -18,6 +18,7 @@ import {
   AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
   AcceptedPlanProgressAggregator,
+  CompletedWorkUnitFactIndex,
   type AcceptedPlanReadOnlyResourceCompletion,
   AcceptedPlanScopeIntervention,
   AcceptedPlanScopeMatcher,
@@ -297,6 +298,14 @@ const providerPipeline = new ProviderPipeline();
 const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
 const providerStreamCoordinator = new ProviderStreamCoordinator();
 const providerTraceRecorder = new ProviderTraceRecorder();
+const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
+  objectRecord,
+  stringValue,
+  stringArrayValue,
+  kernelEventTargets,
+  normalizeRelativePath,
+  comparablePath,
+});
 const nativeToolCoordinator = new NativeToolCoordinator();
 const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
 const acceptedPlanExecutor = new AcceptedPlanExecutor();
@@ -4523,44 +4532,6 @@ export class SessionDriverLoopError extends Error {
   }
 }
 
-function completedWorkUnitFacts(events: unknown[]): { actionIds: Set<string>; targets: Set<string> } {
-  const actionIds = new Set<string>();
-  const targets = new Set<string>();
-  for (const event of events) {
-    const record = objectRecord(event);
-    if (record?.kind !== 'work_unit.completed') continue;
-    const workUnit = objectRecord(record.workUnit);
-    const output = objectRecord(record.output);
-    for (const value of [
-      stringValue(record.actionId),
-      stringValue(workUnit?.actionId),
-      stringValue(output?.actionId),
-    ]) {
-      if (value) actionIds.add(value);
-    }
-    for (const target of kernelEventTargets(record)) {
-      const normalized = normalizeRelativePath(target) ?? target;
-      if (normalized && normalized !== '.') targets.add(comparablePath(normalized));
-    }
-  }
-  return { actionIds, targets };
-}
-
-function completedActionMatches(
-  actionId: string | undefined,
-  targetPath: string,
-  completed: { actionIds: Set<string>; targets: Set<string> }
-): boolean {
-  if (actionId && completed.actionIds.has(actionId)) return true;
-  return completed.targets.has(comparablePath(targetPath));
-}
-
-function codeBlockContent(block: Record<string, unknown>): string | undefined {
-  if (typeof block.content === 'string') return block.content;
-  const lines = stringArrayValue(block.contentLines);
-  return lines.length ? lines.join('\n') : undefined;
-}
-
 function resourceManifestBuilder(): ResourceManifestBuilder {
   return new ResourceManifestBuilder({
     maxDerivedManifestEntries: MAX_DERIVED_MANIFEST_ENTRIES,
@@ -4596,9 +4567,10 @@ function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex {
     batchActionRecords,
     actionEffectiveCapability,
     actionFileTargetPath,
-    completedWorkUnitFacts,
-    completedActionMatches,
-    codeBlockContent,
+    completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
+    completedActionMatches: (actionId, targetPath, completed) =>
+      completedWorkUnitFactIndex.completedActionMatches(actionId, targetPath, completed),
+    codeBlockContent: (block) => completedWorkUnitFactIndex.codeBlockContent(block),
     resolveRelativePath: (value, rootId, roots) =>
       resourceRequestResolver().resolveRelativePath(value, rootId, roots),
   });
@@ -4633,7 +4605,7 @@ function acceptedPlanScopeIntervention(createId: (prefix: string) => string): Ac
 
 function reviewAssembler(): ReviewAssembler {
   return new ReviewAssembler({
-    completedWorkUnitFacts,
+    completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
     batchActionRecords,
     actionEffectiveCapability,
     actionFileTargetPath,

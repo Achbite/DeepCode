@@ -43,7 +43,7 @@ import {
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
-import { ImplementationBatchContextBuilder } from '../driver/execution/index.js';
+import { CompletedWorkUnitFactIndex, ImplementationBatchContextBuilder } from '../driver/execution/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 import { ProtocolGate } from '../driver/proposal/index.js';
 import { ReviewAssembler } from '../driver/review/index.js';
@@ -64,6 +64,7 @@ async function main(): Promise<void> {
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
+  assertCompletedWorkUnitFactIndexMatchesActionAndTarget();
   assertReviewAssemblerFormatsReviewFacts();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
@@ -709,6 +710,46 @@ function assertImplementationBatchContextBuilderExtractsConcreteContinuations():
   assert(
     !context.continuationSummaries.some((summary) => summary.includes(`skip-${token}`)),
     'implementation batch context ignores non-concrete continuation scope'
+  );
+}
+
+function assertCompletedWorkUnitFactIndexMatchesActionAndTarget(): void {
+  const token = randomSmokeToken('completed-work-unit');
+  const actionId = `action-${token}`;
+  const targetPath = `scope-${token}/target-${randomSmokeToken('file')}.txt`;
+  const index = new CompletedWorkUnitFactIndex({
+    objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined,
+    stringValue: (value) => typeof value === 'string' && value.trim() ? value : undefined,
+    stringArrayValue: (value) => Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : typeof value === 'string' && value.trim()
+        ? [value]
+        : [],
+    kernelEventTargets: (record) => {
+      const output = record.output && typeof record.output === 'object' && !Array.isArray(record.output)
+        ? record.output as Record<string, unknown>
+        : {};
+      return typeof output.targetPath === 'string' ? [output.targetPath] : [];
+    },
+    normalizeRelativePath: (value) => value?.startsWith('./') ? value.slice(2) : value,
+    comparablePath: (value) => value.split('\\').join('/').replace(/\/$/, ''),
+  });
+  const completed = index.completedWorkUnitFacts([
+    {
+      kind: 'work_unit.completed',
+      workUnit: { actionId },
+      output: { targetPath: `./${targetPath}` },
+    },
+  ]);
+  assertEqual(completed.actionIds.has(actionId), true, 'completed work unit index records action id');
+  assertEqual(index.completedActionMatches(actionId, `other-${token}.txt`, completed), true, 'completed work unit index matches action id');
+  assertEqual(index.completedActionMatches(undefined, targetPath, completed), true, 'completed work unit index matches normalized target path');
+  assertEqual(
+    index.codeBlockContent({ contentLines: [`line-a-${token}`, `line-b-${token}`] }),
+    [`line-a-${token}`, `line-b-${token}`].join('\n'),
+    'completed work unit index reads code block content lines'
   );
 }
 
