@@ -141,6 +141,60 @@ function payloadText(payload: unknown): string {
   );
 }
 
+type PayloadI18nVariables = Record<string, string | number | boolean | null | undefined>;
+
+function payloadI18nVariables(payload: unknown, key: string): PayloadI18nVariables | undefined {
+  if (!isRecord(payload) || !isRecord(payload[key])) return undefined;
+  const variables: PayloadI18nVariables = {};
+  for (const [name, value] of Object.entries(payload[key])) {
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean' ||
+      value === null ||
+      value === undefined
+    ) {
+      variables[name] = value;
+    }
+  }
+  return variables;
+}
+
+function translatePayloadKey(
+  payload: unknown,
+  language: UiLanguage,
+  keyField: string,
+  fallback?: string,
+): string | undefined {
+  const key = stringField(payload, keyField);
+  if (!key) return fallback;
+  const variables =
+    payloadI18nVariables(payload, `${keyField.replace(/Key$/, '')}Args`) ??
+    payloadI18nVariables(payload, 'messageArgs');
+  const translated = t(language, key, variables);
+  return translated === key ? fallback : translated;
+}
+
+function localizedPayloadField(
+  payload: unknown,
+  language: UiLanguage,
+  field: string,
+  keyField: string,
+  fallbackKey?: string,
+): string | undefined {
+  const fallback = stringField(payload, field) ?? (fallbackKey ? t(language, fallbackKey) : undefined);
+  return translatePayloadKey(payload, language, keyField, fallback);
+}
+
+function localizedPayloadText(payload: unknown, language: UiLanguage): string {
+  return sanitizeDisplayText(
+    translatePayloadKey(payload, language, 'contentKey', stringField(payload, 'content')) ??
+    translatePayloadKey(payload, language, 'messageKey', stringField(payload, 'message')) ??
+    translatePayloadKey(payload, language, 'summaryKey', stringField(payload, 'summary')) ??
+    payloadText(payload)
+  );
+}
+
 function thinkingMarkdown(block: AgentTimelineBlock): string {
   for (let index = block.events.length - 1; index >= 0; index -= 1) {
     const text = thinkingEventText(block.events[index]);
@@ -1293,9 +1347,11 @@ function ReviewSummaryCard({
   event: AgentEvent;
   language: UiLanguage;
 }) {
-  const title = stringField(event.payload, 'title') ?? t(language, 'agent.review.title');
-  const summary = stringField(event.payload, 'summary') ?? payloadText(event.payload);
-  const content = stringField(event.payload, 'content');
+  const title = localizedPayloadField(event.payload, language, 'title', 'titleKey', 'agent.review.title') ??
+    t(language, 'agent.review.title');
+  const summary = localizedPayloadField(event.payload, language, 'summary', 'summaryKey') ??
+    localizedPayloadText(event.payload, language);
+  const content = translatePayloadKey(event.payload, language, 'contentKey', stringField(event.payload, 'content'));
   const llmGuidance = stringField(event.payload, 'llmGuidance');
   const status = stringField(event.payload, 'status') ?? 'waitingUserReview';
   const facts = payloadArray(event.payload, 'facts');
@@ -1434,7 +1490,7 @@ function renderTraceEvent(event: AgentEvent, language: UiLanguage) {
         <div className="agent-message__meta">
           {t(language, 'agent.trace.output', { stage: localizedStage(stage, language) })}
         </div>
-        <MarkdownContent content={payloadText(event.payload)} />
+        <MarkdownContent content={localizedPayloadText(event.payload, language)} />
       </div>
     );
   }
@@ -1890,7 +1946,7 @@ function renderMessage(
   const pending = isRecord(event.payload) && event.payload.pending === true;
   const isDiagnostic = isRecord(event.payload) && event.payload.diagnostic === true;
   const text = (isDiagnostic ? resolveDiagnosticText(event.payload as Record<string, unknown>, language) : undefined)
-    ?? payloadText(event.payload);
+    ?? localizedPayloadText(event.payload, language);
   const renderMarkdown = event.kind === 'assistant_msg' || event.kind === 'user_msg';
   const shouldCollapse = shouldCollapseAssistantMessage(event, text);
   const attachments = event.kind === 'user_msg' ? payloadAttachments(event.payload) : [];

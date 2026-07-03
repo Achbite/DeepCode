@@ -106,7 +106,7 @@ import {
   type TaskLedgerSnapshot,
 } from '../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
-import { ReviewAssembler } from './review/index.js';
+import { ReviewAssembler, ReviewDecisionProjectionBuilder } from './review/index.js';
 import { ProtocolGate } from './proposal/index.js';
 import type { ProviderTurnContract } from './runFrame.js';
 
@@ -1637,7 +1637,15 @@ export class SessionDriverLoop {
 
     if (input.decision === 'reject') {
       let result = await this.append(input.sessionId, [
-        reviewDecisionEvent(input.sessionId, review, 'rejected', input.guidance ?? '用户已忽略当前 Review，本轮会话已中止。', false, this.ts(), this.id('review-rejected')),
+        reviewDecisionProjection().event({
+          sessionId: input.sessionId,
+          review,
+          status: 'rejected',
+          content: input.guidance,
+          continuationRequested: false,
+          ts: this.ts(),
+          id: this.id('review-rejected'),
+        }),
       ]);
       const decisionReply = await this.kernel({
         command: {
@@ -1682,7 +1690,15 @@ export class SessionDriverLoop {
 
     if (input.decision !== 'accept') {
       let result = await this.append(input.sessionId, [
-        reviewDecisionEvent(input.sessionId, review, 'needsRevision', input.guidance ?? '用户要求补充或修改。', false, this.ts(), this.id('review-revise')),
+        reviewDecisionProjection().event({
+          sessionId: input.sessionId,
+          review,
+          status: 'needsRevision',
+          content: input.guidance,
+          continuationRequested: false,
+          ts: this.ts(),
+          id: this.id('review-revise'),
+        }),
       ]);
       result = await this.tryKernelAudit(
         input.sessionId,
@@ -1725,7 +1741,15 @@ export class SessionDriverLoop {
     }
 
     const terminalAcceptedPlan = reviewAssembler().isTerminalAcceptedPlan(events, review);
-    const accepted = reviewDecisionEvent(input.sessionId, review, 'accepted', acceptedReviewContent(review, terminalAcceptedPlan), false, this.ts(), this.id('review-accepted'));
+    const accepted = reviewDecisionProjection().event({
+      sessionId: input.sessionId,
+      review,
+      status: 'accepted',
+      continuationRequested: false,
+      terminalAcceptedPlan,
+      ts: this.ts(),
+      id: this.id('review-accepted'),
+    });
     let result = await this.append(input.sessionId, [accepted]);
     const decisionReply = await this.kernel({
       command: {
@@ -4613,6 +4637,10 @@ function reviewAssembler(): ReviewAssembler {
     comparablePath,
     resourceTextForTarget: (packets, target) => resourceEvidenceIndex().textForTarget(packets, target),
   });
+}
+
+function reviewDecisionProjection(): ReviewDecisionProjectionBuilder {
+  return new ReviewDecisionProjectionBuilder();
 }
 
 function implementationBatchHints(
@@ -8047,6 +8075,8 @@ function sessionRunStateEvent(input: {
 }): AgentEvent {
   const status = input.status ?? 'waiting';
   const overlayPayload = interactionOverlayProjection(input.interactionOverlay);
+  const summary = sessionRunStateSummary(input.reason, status);
+  const messageArgs = { reason: input.reason, status };
   return {
     id: input.id,
     sessionId: input.sessionId,
@@ -8061,7 +8091,10 @@ function sessionRunStateEvent(input: {
       targetId: input.decisionOwner.targetId,
       decisionOwner: input.decisionOwner,
       ...overlayPayload,
-      summary: sessionRunStateSummary(input.reason, status),
+      summary: summary.key,
+      summaryKey: summary.key,
+      messageKey: summary.key,
+      messageArgs,
       channel: 'task',
       visibility: 'debug',
       presentation: 'stageSummary',
@@ -8072,18 +8105,18 @@ function sessionRunStateEvent(input: {
 function sessionRunStateSummary(
   reason: SessionRunStateReason,
   status: SessionRunStateStatus
-): string {
-  if (status === 'cancelled') return '用户已忽略当前介入点，本轮会话已中止。';
-  if (status === 'failed' && reason === 'work_unit_failed') return 'Kernel work unit 执行失败，本轮 accepted plan 自动推进已停止。';
-  if (status === 'failed') return 'Session run failed.';
-  if (status === 'completed' && reason === 'review') return 'Review 已通过，本次计划执行完成。';
-  if (status === 'completed') return 'Session run is completed.';
-  if (reason === 'accepted_plan_execution') return 'Session run is executing the accepted implementation plan.';
-  if (status === 'running') return 'Session run is running.';
-  if (reason === 'requirement') return 'Session run is waiting for requirement confirmation.';
-  if (reason === 'permission') return 'Session run is waiting for a permission decision.';
-  if (reason === 'review') return 'Session run is waiting for user review.';
-  return 'Session run is waiting for plan review.';
+): { key: string } {
+  if (status === 'cancelled') return { key: 'session.runState.cancelled' };
+  if (status === 'failed' && reason === 'work_unit_failed') return { key: 'session.runState.workUnitFailed' };
+  if (status === 'failed') return { key: 'session.runState.failed' };
+  if (status === 'completed' && reason === 'review') return { key: 'session.runState.reviewCompleted' };
+  if (status === 'completed') return { key: 'session.runState.completed' };
+  if (reason === 'accepted_plan_execution') return { key: 'session.runState.acceptedPlanExecution' };
+  if (status === 'running') return { key: 'session.runState.running' };
+  if (reason === 'requirement') return { key: 'session.runState.requirement' };
+  if (reason === 'permission') return { key: 'session.runState.permission' };
+  if (reason === 'review') return { key: 'session.runState.review' };
+  return { key: 'session.runState.planReview' };
 }
 
 // R2 requirement decision 驱动的任务推进事件：
@@ -9909,63 +9942,6 @@ function findWaitingReview(events: AgentEvent[], runId?: string): SessionReviewC
   return null;
 }
 
-function reviewDecisionEvent(
-  sessionId: string,
-  review: SessionReviewContext,
-  status: 'accepted' | 'needsRevision' | 'rejected',
-  content: string,
-  continuationRequested: boolean,
-  ts: string,
-  id: string
-): AgentEvent {
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'review_summary',
-    payload: {
-      title: '审查',
-      summary: status === 'accepted'
-        ? '用户已通过 Review，本批次结束。'
-        : status === 'rejected'
-          ? '用户已忽略 Review，本轮会话已中止。'
-          : '用户要求补充或修改。',
-      content,
-      status,
-      runId: review.runId,
-      reviewId: review.reviewId,
-      sourcePlanId: review.sourcePlanId,
-      confirmable: false,
-      continuationRequested,
-      continuationCount: review.continuations.length,
-      continuations: review.continuations,
-      channel: status === 'accepted' ? 'progress' : 'final',
-      visibility: 'conversation',
-      presentation: 'body',
-    },
-  };
-}
-
-function acceptedReviewContent(review: SessionReviewContext, terminalAcceptedPlan = false): string {
-  const lines = [
-    '## Review 已通过',
-    '',
-    '用户已通过当前批次 Review；Kernel facts 已作为本批次事实源保留。',
-    '',
-    '### 后续意图',
-  ];
-  if (terminalAcceptedPlan) {
-    lines.push('- 已确认 implementationPlan 的任务清单已经完成；即使旧 actionBundle 带有 continuationExpectations，本次 Review 通过也会结束当前 run，不会自动发起新 Plan。');
-  } else if (!review.continuations.length) {
-    lines.push('- 当前计划没有登记后续批次。');
-  } else {
-    lines.push(`- 当前计划登记了 ${review.continuations.length} 个后续意图。Review 通过会按 agent.reviewContinuationMode 设置决定是否生成下一批 Plan；新 Plan 仍需确认，确认后的合规 actionBundle 会自动提交 Kernel 执行。`);
-    for (const continuation of review.continuations.slice(0, 6)) lines.push(`- ${continuationSummary(continuation)}`);
-  }
-  lines.push('', '### 决策边界', '- Review 通过只关闭当前批次。', '- 后续批次只能重新生成 Plan；新 Plan 经用户确认后，范围内 actionBundle 由 Session 自动提交 Kernel 执行。');
-  return lines.join('\n');
-}
-
 function kernelReviewGateStatus(kernelEvents: unknown[] | undefined): string | undefined {
   for (const event of [...(kernelEvents ?? [])].reverse()) {
     const record = objectRecord(event);
@@ -9980,22 +9956,22 @@ function kernelReviewGateStatus(kernelEvents: unknown[] | undefined): string | u
 function reviewContinuationRequest(review: SessionReviewContext): string {
   const continuations = review.continuations.map(continuationSummary).filter(Boolean);
   return [
-    '根据当前批次 Review 已通过的事实，继续规划下一批可审查 Plan。',
-    '这是一轮 Review accept 后的 continuation planning，不是已授权执行。',
-    '上一批 Plan 和 continuation expectations 只是 intentContext；只有 Kernel facts、ToolCompleted(ok=true)、WorkUnitCompleted 或 ResourcePacket 才能作为已生成文件事实。',
-    review.content ? `上一批 Review 卡内容：\n${review.content}` : '',
-    review.facts.length ? `上一批 Kernel facts：\n${review.facts.join('\n')}` : '上一批 Kernel facts：当前 Review 没有登记可复用事实。',
-    review.userPlan ? `上一批 Plan intent：\n${review.userPlan}` : '',
-    continuations.length ? `后续批次意图：\n${continuations.map((item) => `- ${item}`).join('\n')}` : '后续批次意图：当前没有登记后续批次。',
+    'Continue planning the next reviewable Plan from the fact that the current batch Review was accepted.',
+    'This is continuation planning after Review accept; it is not authorization to execute.',
+    'The previous Plan and continuation expectations are intentContext only. Generated-file facts can only come from Kernel facts, ToolCompleted(ok=true), WorkUnitCompleted, or ResourcePacket.',
+    review.content ? `Previous Review card content:\n${review.content}` : '',
+    review.facts.length ? `Previous Kernel facts:\n${review.facts.join('\n')}` : 'Previous Kernel facts: the current Review recorded no reusable facts.',
+    review.userPlan ? `Previous Plan intent:\n${review.userPlan}` : '',
+    continuations.length ? `Continuation intents:\n${continuations.map((item) => `- ${item}`).join('\n')}` : 'Continuation intents: none were recorded.',
     [
-      '下一步要求：',
-      '- 如需基于现有代码继续修改，先用 resourceRequest kind="search" 或 file/range 读取相关文件事实。',
-      '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
-      '- actionBundle.actions 必须使用 actionId、toolId、args、description；fs.write 使用 args.path/sourceBlockId，fs.patch 使用 args.path/replacementBlockId/patchSpec，fs.delete 使用 args.path/targetKind/recursive。',
-      '- codeBlocks 必须使用 contentLines；不得输出 commandBlocks、capability、permissionLabels、accessScopes、resourceScope 或大段 codeBlocks.content。',
-      '- patch 必须包含 args.patchSpec.match.kind="exactBlock" 和当前 ResourcePacket 证据中的 exact text。',
-      '- fs.delete action 必须明确相对文件 args.path；已确认目录删除必须额外设置 args.targetKind="directory"、args.recursive=true；不得使用 codeBlocks/sourceBlockId、空内容写入、fs.write 伪装删除、通配符或根目录。',
-      '- 新 Plan 必须等待用户确认，不要假定已经执行。',
+      'Next proposal requirements:',
+      '- If more edits require existing-code facts, request focused evidence first with resourceRequest kind="search" or file/range.',
+      '- Then output a new detailed Agent Protocol v3 actionBundle.',
+      '- actionBundle.actions must use actionId, toolId, args, and description. fs.write uses args.path/sourceBlockId; fs.patch uses args.path/replacementBlockId/patchSpec; fs.delete uses args.path/targetKind/recursive.',
+      '- codeBlocks must use contentLines. Do not output commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large codeBlocks.content fields.',
+      '- patch must include args.patchSpec.match.kind="exactBlock" and exact text from current ResourcePacket evidence.',
+      '- fs.delete must use a concrete relative args.path. Confirmed directory delete must also set args.targetKind="directory" and args.recursive=true. Do not use codeBlocks/sourceBlockId, empty writes, fs.write as delete, wildcards, or workspace root.',
+      '- The new Plan must wait for user confirmation. Do not assume execution already happened.',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
 }
@@ -10030,23 +10006,23 @@ function planRevisionRequest(plan: SessionPlanContext, guidance?: string): strin
 function reviewRevisionRequest(review: SessionReviewContext, guidance?: string): string {
   const continuations = review.continuations.map(continuationSummary).filter(Boolean);
   return [
-    '根据用户 Review 修订意见，重新理解需求并生成下一批可审查 Plan。',
-    '这是一轮 Review revise，不是 Review accept；不得把用户修订意见当成已授权执行。',
-    '上一批 Plan、Review guidance、continuation expectations 都是 intentContext；只有 Kernel facts、ToolCompleted(ok=true)、WorkUnitCompleted 或 ResourcePacket 才能作为已生成文件事实。',
-    guidance?.trim() ? `用户 Review 修订意见：\n${guidance.trim()}` : '用户 Review 修订意见：用户要求补充或修改当前批次。',
-    review.content ? `上一批 Review 卡内容：\n${review.content}` : '',
-    review.facts.length ? `上一批 Kernel facts：\n${review.facts.join('\n')}` : '上一批 Kernel facts：当前 Review 没有登记可复用事实。',
-    review.userPlan ? `上一批 Plan intent：\n${review.userPlan}` : '',
-    continuations.length ? `上一批 continuation intent：\n${continuations.map((item) => `- ${item}`).join('\n')}` : '',
+    'Reinterpret the request from the user Review revision guidance and generate the next reviewable Plan.',
+    'This is Review revise, not Review accept. Do not treat the user revision guidance as execution authorization.',
+    'The previous Plan, Review guidance, and continuation expectations are intentContext only. Generated-file facts can only come from Kernel facts, ToolCompleted(ok=true), WorkUnitCompleted, or ResourcePacket.',
+    guidance?.trim() ? `User Review revision guidance:\n${guidance.trim()}` : 'User Review revision guidance: the user requested additional work or changes for the current batch.',
+    review.content ? `Previous Review card content:\n${review.content}` : '',
+    review.facts.length ? `Previous Kernel facts:\n${review.facts.join('\n')}` : 'Previous Kernel facts: the current Review recorded no reusable facts.',
+    review.userPlan ? `Previous Plan intent:\n${review.userPlan}` : '',
+    continuations.length ? `Previous continuation intent:\n${continuations.map((item) => `- ${item}`).join('\n')}` : '',
     [
-      '下一步要求：',
-      '- 如需基于现有代码继续修改，先用 resourceRequest kind="search" 或 file/range 读取相关文件事实，例如构建脚本、入口源码、头文件、测试或容器配置。',
-      '- 然后输出新的详细 Agent Protocol v3 actionBundle。',
-      '- actionBundle.actions 必须使用 actionId、toolId、args、description；fs.write 使用 args.path/sourceBlockId，fs.patch 使用 args.path/replacementBlockId/patchSpec，fs.delete 使用 args.path/targetKind/recursive。',
-      '- codeBlocks 必须使用 contentLines；不得输出 commandBlocks、capability、permissionLabels、accessScopes、resourceScope 或大段 codeBlocks.content。',
-      '- patch 必须包含 args.patchSpec.match.kind="exactBlock" 和当前 ResourcePacket 证据中的 exact text。',
-      '- fs.delete action 必须明确相对文件 args.path；已确认目录删除必须额外设置 args.targetKind="directory"、args.recursive=true；不得使用 codeBlocks/sourceBlockId、空内容写入、fs.write 伪装删除、通配符或根目录。',
-      '- 新 Plan 等待用户确认，不要假定已经执行。',
+      'Next proposal requirements:',
+      '- If more edits require existing-code facts, request focused evidence first with resourceRequest kind="search" or file/range, such as build scripts, entry source files, headers, tests, or container configuration.',
+      '- Then output a new detailed Agent Protocol v3 actionBundle.',
+      '- actionBundle.actions must use actionId, toolId, args, and description. fs.write uses args.path/sourceBlockId; fs.patch uses args.path/replacementBlockId/patchSpec; fs.delete uses args.path/targetKind/recursive.',
+      '- codeBlocks must use contentLines. Do not output commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large codeBlocks.content fields.',
+      '- patch must include args.patchSpec.match.kind="exactBlock" and exact text from current ResourcePacket evidence.',
+      '- fs.delete must use a concrete relative args.path. Confirmed directory delete must also set args.targetKind="directory" and args.recursive=true. Do not use codeBlocks/sourceBlockId, empty writes, fs.write as delete, wildcards, or workspace root.',
+      '- The new Plan waits for user confirmation. Do not assume execution already happened.',
     ].join('\n'),
   ].filter(Boolean).join('\n\n');
 }
@@ -10064,16 +10040,13 @@ function continuationDecisionPromptEvent(sessionId: string, review: SessionRevie
     ts,
     kind: 'assistant_msg',
     payload: {
-      title: '后续批次确认',
-      content: [
-        '## 后续批次确认',
-        '',
-        '当前批次 Review 已通过，计划中登记了后续意图。当前设置要求先询问用户是否继续生成下一批 Plan。',
-        '',
-        continuations.length ? continuations.map((item) => `- ${item}`).join('\n') : '- 当前没有可展示的后续意图。',
-        '',
-        '如需继续，请在输入框描述下一步；系统会重新组装 Kernel facts 并生成新的 Plan，仍不会自动执行。',
-      ].join('\n'),
+      title: 'Continuation confirmation',
+      titleKey: 'review.continuationDecision.title',
+      messageKey: 'review.continuationDecision.summary',
+      messageArgs: { continuationCount: String(continuations.length) },
+      contentKey: 'review.continuationDecision.content',
+      contentArgs: { continuationCount: String(continuations.length) },
+      continuations,
       channel: 'progress',
       visibility: 'conversation',
       presentation: 'body',

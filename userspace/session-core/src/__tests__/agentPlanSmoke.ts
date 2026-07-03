@@ -46,7 +46,7 @@ import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestL
 import { CompletedWorkUnitFactIndex, ImplementationBatchContextBuilder } from '../driver/execution/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 import { ProtocolGate } from '../driver/proposal/index.js';
-import { ReviewAssembler } from '../driver/review/index.js';
+import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
 async function main(): Promise<void> {
   assertV3Parser();
@@ -66,6 +66,7 @@ async function main(): Promise<void> {
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
   assertCompletedWorkUnitFactIndexMatchesActionAndTarget();
   assertReviewAssemblerFormatsReviewFacts();
+  assertReviewDecisionProjectionUsesI18nKeys();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -825,6 +826,55 @@ function assertReviewAssemblerFormatsReviewFacts(): void {
     ], review),
     'review assembler detects terminal accepted plan checkpoints'
   );
+}
+
+function assertReviewDecisionProjectionUsesI18nKeys(): void {
+  const token = randomSmokeToken('review-decision');
+  const builder = new ReviewDecisionProjectionBuilder();
+  const review = {
+    runId: `run-${token}`,
+    reviewId: `review-${token}`,
+    sourcePlanId: `plan-${token}`,
+    continuations: [
+      {
+        title: `next-${token}`,
+        target: `target-${token}.txt`,
+        capability: `capability-${token}`,
+      },
+    ],
+  };
+  const accepted = builder.event({
+    sessionId: `session-${token}`,
+    review,
+    status: 'accepted',
+    continuationRequested: false,
+    ts: new Date(0).toISOString(),
+    id: `event-${token}`,
+  });
+  const acceptedPayload = accepted.payload as Record<string, unknown>;
+  assertEqual(acceptedPayload.title, 'Review', 'review decision projection uses locale-neutral title fallback');
+  assertEqual(acceptedPayload.titleKey, 'review.decision.title', 'review decision projection includes title key');
+  assertEqual(acceptedPayload.summaryKey, 'review.decision.accepted.summary', 'review decision projection includes accepted summary key');
+  assertEqual(acceptedPayload.messageKey, 'review.decision.accepted.summary', 'review decision projection exposes message key');
+  assertEqual(acceptedPayload.content, undefined, 'review decision projection does not emit session-generated localized content');
+  assertEqual(acceptedPayload.contentKey, 'review.decision.accepted.content', 'review decision projection emits accepted content key');
+  assertEqual((acceptedPayload.messageArgs as Record<string, unknown>).continuationCount, '1', 'review decision projection records continuation count as an i18n arg');
+  assertEqual(Array.isArray(acceptedPayload.continuations), true, 'review decision projection preserves continuation facts structurally');
+
+  const guidance = `guidance-${token}`;
+  const revision = builder.event({
+    sessionId: `session-${token}`,
+    review,
+    status: 'needsRevision',
+    content: guidance,
+    continuationRequested: false,
+    ts: new Date(0).toISOString(),
+    id: `revision-${token}`,
+  });
+  const revisionPayload = revision.payload as Record<string, unknown>;
+  assertEqual(revisionPayload.summaryKey, 'review.decision.needsRevision.summary', 'review decision projection includes revision summary key');
+  assertEqual(revisionPayload.content, guidance, 'review decision projection preserves user guidance content');
+  assertEqual(revisionPayload.contentKey, undefined, 'review decision projection does not assign content key to user guidance');
 }
 
 function assertProtocolGateCanonicalizesBareRepair(): void {
@@ -10077,7 +10127,11 @@ async function assertSessionDriverLoopReviewAcceptAutoGeneratesNextPlan(): Promi
   if (!acceptedReview) throw new Error('review accept records an accepted review event');
   const acceptedPayload = acceptedReview.payload as any;
   assertEqual(acceptedPayload.continuationRequested, false, 'review accept closes the current review before continuation planning');
-  assert(String(acceptedPayload.content ?? '').includes('确认后的合规 actionBundle 会自动提交 Kernel 执行'), 'accepted review explains confirmed continuation batches auto-submit to Kernel');
+  assertEqual(acceptedPayload.summaryKey, 'review.decision.accepted.summary', 'accepted review records localized summary key');
+  assertEqual(acceptedPayload.content, undefined, 'accepted review does not emit session-generated localized content');
+  assertEqual(acceptedPayload.contentKey, 'review.decision.accepted.content', 'accepted review records localized content key');
+  assertEqual(acceptedPayload.continuationCount, 1, 'accepted review records continuation count structurally');
+  assertEqual(Array.isArray(acceptedPayload.continuations), true, 'accepted review retains continuation facts structurally');
   assertEqual(
     result.events.some((event) =>
       event.kind === 'session_run_state' &&
@@ -10215,6 +10269,13 @@ async function assertSessionDriverLoopReviewAcceptOffStopsAtCurrentBatch(): Prom
   });
 
   assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any).status === 'accepted'), true, 'review accept records an accepted review event');
+  const completedState = result.events.find((event) =>
+    event.kind === 'session_run_state' &&
+    (event.payload as any)?.status === 'completed' &&
+    (event.payload as any)?.reason === 'review'
+  );
+  assertEqual((completedState?.payload as any)?.summary, 'session.runState.reviewCompleted', 'completed review run state stores i18n key as summary fallback');
+  assertEqual((completedState?.payload as any)?.summaryKey, 'session.runState.reviewCompleted', 'completed review run state records localized summary key');
   assertEqual(
     result.events.some((event) =>
       event.kind === 'session_run_state' &&
