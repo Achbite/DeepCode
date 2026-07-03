@@ -89,6 +89,7 @@ import {
   type NativeToolReadSignature,
   type NativeToolCallProposal,
 } from './pipelines/providerPipeline.js';
+import { PermissionPipeline } from './pipelines/permissionPipeline.js';
 import {
   ContextFrameBuilder,
   GeneratedArtifactEvidenceIndex,
@@ -309,6 +310,7 @@ const providerPipeline = new ProviderPipeline();
 const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
 const providerStreamCoordinator = new ProviderStreamCoordinator();
 const providerTraceRecorder = new ProviderTraceRecorder();
+const permissionPipeline = new PermissionPipeline();
 const acceptedPlanTargetParser = new AcceptedPlanTargetParser();
 const planReviewGrantProjector = new PlanReviewGrantProjector();
 const planReviewReportAnalyzer = new PlanReviewReportAnalyzer({
@@ -1584,7 +1586,7 @@ export class SessionDriverLoop {
 
   private async resolvePermissionDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
     const events = input.existingEvents ?? [];
-    const pending = findPendingPermissionContext(events, input.targetId);
+    const pending = permissionPipeline.findPendingPermissionContext(events, input.targetId);
     if (!pending) {
       return this.append(input.sessionId, [
         traceEvent(input.sessionId, 'trace/permission_accept_noop', '该权限请求已处理或已过期，没有重复执行。', this.ts(), this.id('permission-noop'), {
@@ -5831,30 +5833,6 @@ interface RecoveredAcceptedPlanContext {
   acceptedPlan: AcceptedImplementationPlanContext;
 }
 
-interface PendingPermissionContext {
-  id: string;
-  runId?: string;
-  planId?: string;
-}
-
-function findPendingPermissionContext(events: AgentEvent[], permissionId?: string): PendingPermissionContext | null {
-  const resolved = new Set<string>();
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    const result = permissionResultContext(event);
-    if (result?.id) {
-      resolved.add(result.id);
-      continue;
-    }
-    const request = permissionRequestContext(event);
-    if (!request?.id) continue;
-    if (permissionId && request.id !== permissionId) continue;
-    if (resolved.has(request.id)) continue;
-    return request;
-  }
-  return null;
-}
-
 function sessionProviderAllowedProposals(allowed: string[], state: SessionDriverLoopRunState): string[] {
   const merged = new Set(allowed);
   if (state.acceptedImplementationPlan) {
@@ -5865,43 +5843,6 @@ function sessionProviderAllowedProposals(allowed: string[], state: SessionDriver
     merged.add('taskPlan');
   }
   return [...merged];
-}
-
-function permissionResultContext(event: AgentEvent): PendingPermissionContext | null {
-  if (event.kind === 'permission_result') {
-    const payload = objectRecord(event.payload);
-    const id = stringValue(payload?.permissionId) ?? stringValue(payload?.id);
-    return id ? { id, runId: stringValue(payload?.runId) } : null;
-  }
-  const payload = objectRecord(event.payload);
-  const kernelEvent = objectRecord(payload?.kernelEvent);
-  if (kernelEvent?.kind === 'permission.resolved') {
-    const id = stringValue(kernelEvent.permissionId);
-    return id ? { id, runId: stringValue(kernelEvent.runId) } : null;
-  }
-  return null;
-}
-
-function permissionRequestContext(event: AgentEvent): PendingPermissionContext | null {
-  if (event.kind === 'permission_request') {
-    const payload = objectRecord(event.payload);
-    const id = stringValue(payload?.id);
-    return id ? {
-      id,
-      runId: stringValue(payload?.runId),
-      planId: stringValue(payload?.planId),
-    } : null;
-  }
-  const payload = objectRecord(event.payload);
-  const kernelEvent = objectRecord(payload?.kernelEvent);
-  if (kernelEvent?.kind !== 'permission.requested') return null;
-  const request = objectRecord(kernelEvent.request);
-  const id = stringValue(request?.id) ?? stringValue(kernelEvent.permissionId) ?? stringValue(kernelEvent.toolCallId);
-  return id ? {
-    id,
-    runId: stringValue(kernelEvent.runId),
-    planId: stringValue(kernelEvent.planId),
-  } : null;
 }
 
 function findPlanCard(events: AgentEvent[], runId?: string, planId?: string): SessionPlanContext | null {

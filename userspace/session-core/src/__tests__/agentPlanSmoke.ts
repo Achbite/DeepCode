@@ -56,7 +56,7 @@ import {
   ImplementationBatchContextBuilder,
   KernelEventStatusIndex,
 } from '../driver/execution/index.js';
-import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
+import { PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
 import { KernelEventProjectionBuilder, PlanProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -72,6 +72,7 @@ async function main(): Promise<void> {
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
   assertProviderStreamCoordinatorClassifiesStages();
+  assertPermissionPipelineFindsPendingPermission();
   await assertProviderTraceRecorderArchivesPayload();
   await assertResourceRequestLoopBuildsPacketEvents();
   assertResourceEvidenceIndexQueriesPackets();
@@ -360,6 +361,51 @@ function assertProviderStreamCoordinatorClassifiesStages(): void {
   assert(
     coordinator.guidanceRevisionTransitionMessage('en-US').length > 0,
     'provider stream coordinator renders guidance revision summary'
+  );
+}
+
+function assertPermissionPipelineFindsPendingPermission(): void {
+  const token = randomSmokeToken('permission-pipeline');
+  const pipeline = new PermissionPipeline();
+  const pendingId = `permission-${token}`;
+  const resolvedId = `resolved-${token}`;
+  const runId = `run-${token}`;
+  const planId = `plan-${token}`;
+  const events = [
+    {
+      kind: 'permission_request',
+      payload: {
+        id: resolvedId,
+        runId,
+        planId,
+      },
+    },
+    {
+      kind: 'permission_result',
+      payload: {
+        permissionId: resolvedId,
+        runId,
+      },
+    },
+    {
+      kind: 'kernel_event',
+      payload: {
+        kernelEvent: {
+          kind: 'permission.requested',
+          runId,
+          planId,
+          request: { id: pendingId },
+        },
+      },
+    },
+  ] as AgentEvent[];
+  const pending = pipeline.findPendingPermissionContext(events);
+  assertEqual(pending?.id, pendingId, 'permission pipeline finds latest unresolved permission request');
+  assertEqual(pending?.planId, planId, 'permission pipeline preserves plan id');
+  assertEqual(
+    pipeline.findPendingPermissionContext(events, resolvedId),
+    null,
+    'permission pipeline ignores resolved permission request'
   );
 }
 
