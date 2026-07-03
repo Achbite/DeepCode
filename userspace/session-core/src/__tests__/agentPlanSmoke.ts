@@ -47,6 +47,7 @@ import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestL
 import {
   AcceptedImplementationPlanContextBuilder,
   AcceptedPlanBatchPreflight,
+  AcceptedPlanOperationTargetResolver,
   AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionOverlay,
   AcceptedPlanTargetParser,
@@ -80,6 +81,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanBatchPreflightAuditsDeleteActions();
   assertAcceptedPlanScopeCoverageMatchesStructuredScopes();
   assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask();
+  assertAcceptedPlanOperationTargetResolverFindsExactGrant();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
@@ -1002,6 +1004,62 @@ function assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask(): void {
   assert(
     overlay.resumeGuidance({ kind: 'continueCurrentTask', taskId }).includes('current accepted task'),
     'scope decision overlay resume guidance stays on current task'
+  );
+}
+
+function assertAcceptedPlanOperationTargetResolverFindsExactGrant(): void {
+  const token = randomSmokeToken('operation-target');
+  const directoryTarget = `dir-${token}`;
+  const fileTarget = `file-${token}.txt`;
+  const resolver = new AcceptedPlanOperationTargetResolver({
+    normalizeTargetScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, ''),
+    normalizePlanScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, ''),
+    concreteDirectoryOperationTarget: (value) => value && !value.includes('*') ? value : undefined,
+    concreteFileOperationTarget: (value) => value && !value.endsWith('/') && !value.includes('*') ? value : undefined,
+    exactGrantCapabilityMatches: (grant, capability) =>
+      grant.capability === capability || (capability === 'fs.delete' && grant.operation === 'delete'),
+    actionEffectiveCapability: (action) => typeof action.capability === 'string'
+      ? action.capability
+      : typeof action.toolId === 'string'
+        ? action.toolId
+        : '',
+    actionFileTargetPath: (action) => typeof action.targetPath === 'string' ? action.targetPath : undefined,
+  });
+  const accepted: AcceptedImplementationPlanContext = {
+    planId: `plan-${token}`,
+    runId: `run-${token}`,
+    tasks: [],
+    capabilities: ['fs.delete', 'fs.write'],
+    targetScopes: [],
+    exactOperationGrants: [
+      {
+        operation: 'delete',
+        targetPath: directoryTarget,
+        targetResourceKind: 'directory',
+        capability: 'fs.delete',
+        source: 'implementationPlan',
+      },
+    ],
+    accessScopes: [],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: {},
+  };
+  const action = {
+    toolId: 'fs.delete',
+    targetPath: `./${directoryTarget}/`,
+  };
+  const grant = resolver.exactGrantForAction(action, accepted);
+  assertEqual(grant?.targetPath, directoryTarget, 'operation target resolver finds exact grant');
+  assertEqual(
+    resolver.concreteDeleteTarget(action.targetPath, accepted, grant),
+    directoryTarget,
+    'operation target resolver preserves directory delete target'
+  );
+  assertEqual(
+    resolver.concreteFileTarget(`./${fileTarget}`, accepted),
+    fileTarget,
+    'operation target resolver normalizes file target'
   );
 }
 

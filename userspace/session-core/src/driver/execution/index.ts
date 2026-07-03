@@ -1,5 +1,6 @@
 export * from './acceptedImplementationPlanContextBuilder.js';
 export * from './acceptedPlanBatchPreflight.js';
+export * from './acceptedPlanOperationTargetResolver.js';
 export * from './acceptedPlanScopeCoverage.js';
 export * from './acceptedPlanScopeDecisionOverlay.js';
 export * from './acceptedPlanTargetParser.js';

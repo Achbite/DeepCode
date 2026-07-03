@@ -19,6 +19,7 @@ import {
   AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
   AcceptedPlanProgressAggregator,
+  AcceptedPlanOperationTargetResolver,
   AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionOverlay,
   ActionBatchFailureIndex,
@@ -333,6 +334,15 @@ const actionBatchFailureIndex = new ActionBatchFailureIndex();
 const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();
 const acceptedPlanScopeCoverage = new AcceptedPlanScopeCoverage({
   taskTargets: (task) => acceptedPlanTargetParser.taskTargets(task),
+});
+const acceptedPlanOperationTargetResolver = new AcceptedPlanOperationTargetResolver({
+  normalizeTargetScope: (value, accepted) => acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted),
+  normalizePlanScope,
+  concreteDirectoryOperationTarget: (value) => planReviewGrantProjector.concreteDirectoryOperationTarget(value),
+  concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
+  exactGrantCapabilityMatches: (grant, capability) => acceptedPlanScopeCoverage.exactGrantCapabilityMatches(grant, capability),
+  actionEffectiveCapability,
+  actionFileTargetPath,
 });
 const acceptedPlanScopeDecisionOverlay = new AcceptedPlanScopeDecisionOverlay({
   planAcceptedAutoGrantCapability: (capability) => planReviewGrantProjector.planAcceptedAutoGrantCapability(capability),
@@ -6264,7 +6274,7 @@ function normalizeAcceptedPlanKernelBatch(
     if (!id) continue;
     record.id = id;
     record.blockId = stringValue(record.blockId) ?? id;
-    const path = acceptedPlanConcreteFileOperationTarget(
+    const path = acceptedPlanOperationTargetResolver.concreteFileTarget(
       stringValue(record.targetPath) ?? stringValue(record.path) ?? '',
       accepted
     );
@@ -6287,8 +6297,8 @@ function normalizeAcceptedPlanKernelBatch(
     const kind = stringValue(next.kind);
     if (capability === 'fs.delete') {
       next.kind = kind ?? 'delete';
-      const deleteGrant = acceptedPlanExactOperationGrantForAction(next, accepted);
-      const target = acceptedPlanConcreteDeleteOperationTarget(
+      const deleteGrant = acceptedPlanOperationTargetResolver.exactGrantForAction(next, accepted);
+      const target = acceptedPlanOperationTargetResolver.concreteDeleteTarget(
         actionFileTargetPath(next) ?? '',
         accepted,
         deleteGrant
@@ -6325,7 +6335,7 @@ function normalizeAcceptedPlanKernelBatch(
       reasons.push(`actionBundle.actions[${index}] references missing codeBlock "${blockRef}".`);
       return next;
     }
-    const target = acceptedPlanConcreteFileOperationTarget(
+    const target = acceptedPlanOperationTargetResolver.concreteFileTarget(
       actionFileTargetPath(next) ??
       stringValue(block.targetPath) ??
       stringValue(block.path) ??
@@ -6339,7 +6349,7 @@ function normalizeAcceptedPlanKernelBatch(
     next.targetPath = target;
     next.targetRef = objectRecord(next.targetRef) ?? fileTargetRefFromPath(target);
     const existingScope = stringArrayValue(next.resourceScope)
-      .map((scope) => acceptedPlanConcreteFileOperationTarget(scope, accepted))
+      .map((scope) => acceptedPlanOperationTargetResolver.concreteFileTarget(scope, accepted))
       .filter((scope): scope is string => Boolean(scope));
     next.resourceScope = existingScope.length ? existingScope : [target];
     block.targetPath = stringValue(block.targetPath) ?? target;
@@ -7393,42 +7403,6 @@ function acceptedPlanExecutionFailureEvents(
       id: `${id}-state`,
     }),
   ];
-}
-
-function acceptedPlanConcreteFileOperationTarget(
-  value: string,
-  accepted?: AcceptedImplementationPlanContext
-): string | undefined {
-  const normalized = accepted ? acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted) : normalizePlanScope(value);
-  return planReviewGrantProjector.concreteFileOperationTarget(normalized);
-}
-
-function acceptedPlanConcreteDeleteOperationTarget(
-  value: string,
-  accepted: AcceptedImplementationPlanContext | undefined,
-  grant?: AcceptedPlanExactOperationGrant
-): string | undefined {
-  const normalized = accepted ? acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted) : normalizePlanScope(value);
-  if (grant?.targetResourceKind === 'directory') {
-    return planReviewGrantProjector.concreteDirectoryOperationTarget(normalized);
-  }
-  return planReviewGrantProjector.concreteFileOperationTarget(normalized)
-    ?? planReviewGrantProjector.concreteDirectoryOperationTarget(normalized);
-}
-
-function acceptedPlanExactOperationGrantForAction(
-  action: Record<string, unknown>,
-  accepted?: AcceptedImplementationPlanContext
-): AcceptedPlanExactOperationGrant | undefined {
-  if (!accepted) return undefined;
-  const capability = actionEffectiveCapability(action);
-  const rawTarget = actionFileTargetPath(action);
-  if (!capability || !rawTarget) return undefined;
-  const normalized = acceptedPlanScopeMatcher.normalizeTargetScope(rawTarget, accepted).replace(/\/+$/, '');
-  return accepted.exactOperationGrants.find((grant) =>
-    acceptedPlanScopeCoverage.exactGrantCapabilityMatches(grant, capability) &&
-    normalizePlanScope(grant.targetPath).replace(/\/+$/, '') === normalized
-  );
 }
 
 function reviewSummaryEvent(
