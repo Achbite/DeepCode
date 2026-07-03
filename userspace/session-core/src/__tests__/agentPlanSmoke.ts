@@ -43,6 +43,7 @@ import {
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
+import { ImplementationBatchContextBuilder } from '../driver/execution/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 import { ProtocolGate } from '../driver/proposal/index.js';
 import { ReviewAssembler } from '../driver/review/index.js';
@@ -61,6 +62,7 @@ async function main(): Promise<void> {
   await assertResourceRequestLoopBuildsPacketEvents();
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
+  assertImplementationBatchContextBuilderExtractsConcreteContinuations();
   assertReviewAssemblerFormatsReviewFacts();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
@@ -628,6 +630,68 @@ function assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets(): void {
   );
   assertEqual(replay.remaining.items.length, 0, 'generated artifact index satisfies matching resource request');
   assertEqual(replay.packet?.items[0]?.promptContent, content, 'generated artifact replay packet contains prompt content');
+}
+
+function assertImplementationBatchContextBuilderExtractsConcreteContinuations(): void {
+  const token = randomSmokeToken('implementation-batch');
+  const targetPath = `scope-${token}/target-${randomSmokeToken('file')}.txt`;
+  const builder = new ImplementationBatchContextBuilder({
+    objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined,
+    stringArrayValue: (value) => Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : typeof value === 'string' && value.trim()
+        ? [value]
+        : [],
+    concreteFileOperationTarget: (value) => value && !value.includes('*') ? value : undefined,
+    clip: (value, max) => value.slice(0, max),
+  });
+  const context = builder.build([
+    {
+      id: `plan-a-${token}`,
+      sessionId: `session-${token}`,
+      kind: 'plan_card',
+      ts: '2026-01-01T00:00:00.000Z',
+      payload: {
+        summary: `summary-a-${token}`,
+        actionBundle: {
+          continuationExpectations: [
+            {
+              title: `continue-${token}`,
+              resourceScope: [targetPath],
+            },
+            {
+              title: `skip-${token}`,
+              resourceScope: ['*.tmp'],
+            },
+          ],
+        },
+      },
+    },
+    {
+      id: `plan-b-${token}`,
+      sessionId: `session-${token}`,
+      kind: 'plan_card',
+      ts: '2026-01-01T00:00:01.000Z',
+      payload: {
+        content: `summary-b-${token}`,
+      },
+    },
+  ]);
+  assertEqual(context.batchIndex, 3, 'implementation batch context counts prior plan cards');
+  assert(
+    context.recentPlanSummaries.some((summary) => summary.includes(`summary-b-${token}`)),
+    'implementation batch context keeps recent plan summary'
+  );
+  assert(
+    context.continuationSummaries.some((summary) => summary.includes(targetPath)),
+    'implementation batch context keeps concrete continuation scope'
+  );
+  assert(
+    !context.continuationSummaries.some((summary) => summary.includes(`skip-${token}`)),
+    'implementation batch context ignores non-concrete continuation scope'
+  );
 }
 
 function assertReviewAssemblerFormatsReviewFacts(): void {

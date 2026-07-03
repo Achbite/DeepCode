@@ -23,6 +23,7 @@ import {
   AcceptedPlanScopeMatcher,
   AcceptedPlanTaskLedgerCoordinator,
   ExecutionPromptCoordinator,
+  ImplementationBatchContextBuilder,
   ReviewFactsAggregator,
   type AcceptedImplementationPlanContext,
   type AcceptedImplementationPlanExecutionRoot,
@@ -34,6 +35,7 @@ import {
   type AcceptedPlanTargetScope,
   type CurrentTaskContext,
   type ExecutionSliceRole,
+  type ImplementationBatchContext,
   type TaskExecutionCursor,
 } from './execution/index.js';
 import {
@@ -233,12 +235,6 @@ interface InteractionOverlayContext {
   acceptedCompletedTaskIds?: string[];
 }
 
-interface ImplementationBatchContext {
-  batchIndex: number;
-  recentPlanSummaries: string[];
-  continuationSummaries: string[];
-}
-
 interface AcceptedPlanAccessScopeCanonicalizationResult {
   proposal: ProposalEnvelope;
   changed: boolean;
@@ -380,7 +376,7 @@ export class SessionDriverLoop {
 
     const manifestBuild = manifestBuilder.build(input, this.id('resource-manifest'));
     const acceptedImplementationPlan = input.acceptedImplementationPlan;
-    const implementationBatch = buildImplementationBatchContext(input.existingEvents ?? []);
+    const implementationBatch = implementationBatchContextBuilder().build(input.existingEvents ?? []);
     if (acceptedImplementationPlan) {
       implementationBatch.batchIndex = acceptedImplementationPlan.batchIndex;
     }
@@ -4625,6 +4621,15 @@ function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex {
   });
 }
 
+function implementationBatchContextBuilder(): ImplementationBatchContextBuilder {
+  return new ImplementationBatchContextBuilder({
+    objectRecord,
+    stringArrayValue,
+    concreteFileOperationTarget,
+    clip,
+  });
+}
+
 function acceptedPlanAdmission(): AcceptedPlanAdmission {
   return new AcceptedPlanAdmission({
     scopeMatcher: new AcceptedPlanScopeMatcher(),
@@ -4653,55 +4658,6 @@ function reviewAssembler(): ReviewAssembler {
     comparablePath,
     resourceTextForTarget: (packets, target) => resourceEvidenceIndex().textForTarget(packets, target),
   });
-}
-
-function buildImplementationBatchContext(events: AgentEvent[]): ImplementationBatchContext {
-  const recentPlanSummaries: string[] = [];
-  const continuationSummaries: string[] = [];
-  let planCount = 0;
-  for (const event of events.slice(-48)) {
-    if (event.kind !== 'plan_card') continue;
-    const payload = objectRecord(event.payload);
-    if (!payload) continue;
-    planCount += 1;
-    const summary = typeof payload.summary === 'string'
-      ? payload.summary
-      : typeof payload.content === 'string'
-        ? payload.content
-        : '';
-    if (summary.trim()) recentPlanSummaries.push(clip(summary.trim(), 240));
-    const actionBundle = objectRecord(payload.actionBundle);
-    const continuations = concreteContinuationExpectations(actionBundle?.continuationExpectations);
-    for (const continuation of continuations) {
-      const record = objectRecord(continuation);
-      const title = typeof record?.title === 'string' ? record.title.trim() : '';
-      const scope = Array.isArray(record?.resourceScope)
-        ? record.resourceScope.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).join(', ')
-        : '';
-      const text = [title, scope ? `scope=${scope}` : ''].filter(Boolean).join(' ');
-      if (text) continuationSummaries.push(clip(text, 240));
-    }
-  }
-  return {
-    batchIndex: planCount + 1,
-    recentPlanSummaries: recentPlanSummaries.slice(-3),
-    continuationSummaries: continuationSummaries.slice(-6),
-  };
-}
-
-function concreteContinuationExpectations(value: unknown): unknown[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((item) => continuationHasConcreteScope(item));
-}
-
-function continuationHasConcreteScope(item: unknown): boolean {
-  const record = objectRecord(item);
-  if (!record) return false;
-  const scopes = [
-    ...stringArrayValue(record.targetPath),
-    ...stringArrayValue(record.resourceScope),
-  ];
-  return scopes.some((scope) => Boolean(concreteFileOperationTarget(scope)));
 }
 
 function implementationBatchHints(
@@ -9404,7 +9360,7 @@ function reviewSummaryEvent(
     reviewFacts ? arrayLength(reviewFacts.toolResults) : 0,
     kernelEvents.filter((event) => objectRecord(event)?.kind === 'tool.completed').length
   );
-  const continuations = concreteContinuationExpectations(plan.actionBundle.continuationExpectations);
+  const continuations = implementationBatchContextBuilder().concreteContinuationExpectations(plan.actionBundle.continuationExpectations);
   const language = visibleLanguageForRequest(plan.userPlan);
   const summary = reviewWaitingSummary(failed, blocked, language);
   const readableReview = buildReadableReviewSummary(kernelEvents, reviewFacts);
