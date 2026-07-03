@@ -89,6 +89,7 @@ import {
   type NativeToolReadSignature,
   type NativeToolCallProposal,
 } from './pipelines/providerPipeline.js';
+import { InteractionOverlayCodec, type InteractionOverlayContext, type SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
 import { PermissionPipeline } from './pipelines/permissionPipeline.js';
 import { UserInputPipeline, type RequirementOptionEffect } from './pipelines/userInputPipeline.js';
 import {
@@ -220,19 +221,6 @@ interface SessionDriverLoopRunState {
   interactionOverlay?: InteractionOverlayContext;
 }
 
-type SessionTurnPhase =
-  | 'context_reading'
-  | 'provider_proposing'
-  | 'waiting_requirement_confirmation'
-  | 'waiting_plan_review'
-  | 'waiting_permission'
-  | 'executing_accepted_plan'
-  | 'executing'
-  | 'waiting_review'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
-
 interface DecisionOwnerRef {
   kind: 'requirement' | 'plan' | 'review' | 'permission';
   runId: string;
@@ -241,19 +229,6 @@ interface DecisionOwnerRef {
   requirementId?: string;
   reviewId?: string;
   permissionId?: string;
-}
-
-interface InteractionOverlayContext {
-  parentRunId: string;
-  parentPhase: SessionTurnPhase;
-  interactionRunId: string;
-  interactionId: string;
-  sourceInteractionId?: string;
-  resumedFromDecisionId?: string;
-  acceptedPlanId?: string;
-  acceptedPlanRunId?: string;
-  acceptedCurrentTaskId?: string;
-  acceptedCompletedTaskIds?: string[];
 }
 
 interface AcceptedPlanAccessScopeCanonicalizationResult {
@@ -319,6 +294,7 @@ const providerStreamCoordinator = new ProviderStreamCoordinator();
 const providerTraceRecorder = new ProviderTraceRecorder();
 const permissionPipeline = new PermissionPipeline();
 const userInputPipeline = new UserInputPipeline();
+const interactionOverlayCodec = new InteractionOverlayCodec();
 const acceptedPlanTargetParser = new AcceptedPlanTargetParser();
 const planReviewGrantProjector = new PlanReviewGrantProjector();
 const planReviewReportAnalyzer = new PlanReviewReportAnalyzer({
@@ -344,12 +320,12 @@ const planProjectionBuilder = new PlanProjectionBuilder({
   requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
   permissionBundlesFromReport: (report) => planReviewGrantProjector.permissionBundlesFromReport(report),
   gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
-  interactionOverlayProjection,
+  interactionOverlayProjection: (overlay) => interactionOverlayCodec.toPayload(overlay as InteractionOverlayContext | undefined),
   visibleLanguageForRequest,
 });
 const requirementProjectionBuilder = new RequirementProjectionBuilder({
   visibleLanguageForRequest,
-  interactionOverlayPayload: (payload) => interactionOverlayProjection(interactionOverlayFromPayload(payload)),
+  interactionOverlayPayload: (payload) => interactionOverlayCodec.toPayload(interactionOverlayCodec.fromPayload(payload)),
 });
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
@@ -681,7 +657,7 @@ export class SessionDriverLoop {
           proposal,
           originalUserRequest: input.content,
           attachments: input.attachments ?? [],
-          interactionOverlayPayload: interactionOverlayProjection(interactionOverlay),
+          interactionOverlayPayload: interactionOverlayCodec.toPayload(interactionOverlay),
           ts: this.ts(),
           id: this.id('decision-request'),
         });
@@ -860,7 +836,7 @@ export class SessionDriverLoop {
       ts: this.ts(),
       id: this.id('requirement-decision'),
     });
-    const interactionOverlay = interactionOverlayFromRequirementDecision(confirmation, decisionEvent);
+    const interactionOverlay = interactionOverlayCodec.fromRequirementDecision(confirmation, decisionEvent);
     let result = await this.append(input.sessionId, [decisionEvent]);
     if (input.decision === 'reject') {
       const payload = objectRecord(decisionEvent.payload) ?? {};
@@ -3550,7 +3526,7 @@ export class SessionDriverLoop {
             proposal: repaired,
             originalUserRequest: input.content,
             attachments: input.attachments ?? [],
-            interactionOverlayPayload: interactionOverlayProjection(interactionOverlay),
+            interactionOverlayPayload: interactionOverlayCodec.toPayload(interactionOverlay),
             ts: this.ts(),
             id: this.id('accepted-plan-scope-repair-decision'),
           });
@@ -3978,7 +3954,7 @@ export class SessionDriverLoop {
       proposal: decisionProposal,
       originalUserRequest: input.content,
       attachments: input.attachments ?? [],
-      interactionOverlayPayload: interactionOverlayProjection(interactionOverlay),
+      interactionOverlayPayload: interactionOverlayCodec.toPayload(interactionOverlay),
       ts: this.ts(),
       id: this.id('accepted-plan-scope-confirmation'),
     });
@@ -5985,7 +5961,7 @@ function planContextFromEvent(event: AgentEvent, payload: Record<string, unknown
     reviewGuide: stringValue(payload.reviewGuide) ?? '',
     planReviewReport: objectRecord(payload.planReviewReport) ?? undefined,
     implementationPlan,
-    interactionOverlay: interactionOverlayFromPayload(payload),
+    interactionOverlay: interactionOverlayCodec.fromPayload(payload),
     executionRoot: AcceptedPlanExecutionRootResolver.fromPayload(payload),
   };
 }
@@ -6010,76 +5986,6 @@ function proposalEnvelopeFromPlanContext(plan: SessionPlanContext): ProposalEnve
     referencedResourcePacketRefs: [],
     referencedEvidenceRefs: [],
   };
-}
-
-function interactionOverlayFromRequirementDecision(confirmation: AgentEvent, decision: AgentEvent): InteractionOverlayContext | undefined {
-  const confirmationPayload = objectRecord(confirmation.payload) ?? {};
-  const overlay = interactionOverlayFromPayload(confirmationPayload);
-  if (!overlay) return undefined;
-  return {
-    ...overlay,
-    resumedFromDecisionId: decision.id,
-  };
-}
-
-function interactionOverlayFromPayload(payload: Record<string, unknown> | undefined): InteractionOverlayContext | undefined {
-  if (!payload || payload.interactionOverlay !== true) return undefined;
-  const parentRunId = stringValue(payload.parentRunId);
-  const parentPhase = sessionTurnPhaseValue(payload.parentPhase);
-  const interactionRunId = stringValue(payload.interactionRunId) ?? stringValue(payload.runId);
-  const interactionId = stringValue(payload.interactionId)
-    ?? stringValue(payload.requirementId)
-    ?? stringValue(payload.targetId);
-  if (!parentRunId || !parentPhase || !interactionRunId || !interactionId) return undefined;
-  return {
-    parentRunId,
-    parentPhase,
-    interactionRunId,
-    interactionId,
-    sourceInteractionId: stringValue(payload.sourceInteractionId) ?? interactionId,
-    resumedFromDecisionId: stringValue(payload.resumedFromDecisionId),
-    acceptedPlanId: stringValue(payload.acceptedPlanId),
-    acceptedPlanRunId: stringValue(payload.acceptedPlanRunId),
-    acceptedCurrentTaskId: stringValue(payload.acceptedCurrentTaskId),
-    acceptedCompletedTaskIds: stringArrayValue(payload.acceptedCompletedTaskIds),
-  };
-}
-
-function interactionOverlayProjection(overlay: InteractionOverlayContext | undefined): Record<string, unknown> {
-  if (!overlay) return {};
-  return {
-    interactionOverlay: true,
-    parentRunId: overlay.parentRunId,
-    parentPhase: overlay.parentPhase,
-    interactionRunId: overlay.interactionRunId,
-    interactionId: overlay.interactionId,
-    sourceInteractionId: overlay.sourceInteractionId ?? overlay.interactionId,
-    resumedFromDecisionId: overlay.resumedFromDecisionId,
-    acceptedPlanId: overlay.acceptedPlanId,
-    acceptedPlanRunId: overlay.acceptedPlanRunId,
-    acceptedCurrentTaskId: overlay.acceptedCurrentTaskId,
-    acceptedCompletedTaskIds: overlay.acceptedCompletedTaskIds,
-  };
-}
-
-function sessionTurnPhaseValue(value: unknown): SessionTurnPhase | undefined {
-  const phase = stringValue(value);
-  if (
-    phase === 'context_reading' ||
-    phase === 'provider_proposing' ||
-    phase === 'waiting_requirement_confirmation' ||
-    phase === 'waiting_plan_review' ||
-    phase === 'waiting_permission' ||
-    phase === 'executing_accepted_plan' ||
-    phase === 'executing' ||
-    phase === 'waiting_review' ||
-    phase === 'completed' ||
-    phase === 'failed' ||
-    phase === 'cancelled'
-  ) {
-    return phase;
-  }
-  return undefined;
 }
 
 function planAliases(plan: SessionPlanContext): Set<string> {
@@ -6672,7 +6578,7 @@ function planReviewDecisionEvent(
   ts: string,
   id: string
 ): AgentEvent {
-  const overlayPayload = interactionOverlayProjection(plan.interactionOverlay);
+  const overlayPayload = interactionOverlayCodec.toPayload(plan.interactionOverlay);
   return {
     id,
     sessionId,
@@ -6711,7 +6617,7 @@ function sessionRunStateEvent(input: {
   id: string;
 }): AgentEvent {
   const status = input.status ?? 'waiting';
-  const overlayPayload = interactionOverlayProjection(input.interactionOverlay);
+  const overlayPayload = interactionOverlayCodec.toPayload(input.interactionOverlay);
   const summary = sessionRunStateSummary(input.reason, status);
   const messageArgs = { reason: input.reason, status };
   return {
@@ -7705,7 +7611,7 @@ function isAcceptedPlanScopeConfirmation(event: AgentEvent): boolean {
 
 function isAcceptedPlanExecutionConfirmation(event: AgentEvent): boolean {
   const payload = objectRecord(event.payload);
-  const overlay = interactionOverlayFromPayload(payload);
+  const overlay = interactionOverlayCodec.fromPayload(payload);
   return Boolean(overlay?.acceptedPlanId);
 }
 

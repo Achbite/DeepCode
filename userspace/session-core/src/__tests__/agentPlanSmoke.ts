@@ -56,7 +56,7 @@ import {
   ImplementationBatchContextBuilder,
   KernelEventStatusIndex,
 } from '../driver/execution/index.js';
-import { PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
 import { PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
 import { KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -73,6 +73,7 @@ async function main(): Promise<void> {
   assertProviderJsonModeCoordinator();
   assertProviderStreamCoordinatorClassifiesStages();
   assertPermissionPipelineFindsPendingPermission();
+  assertInteractionOverlayCodecRoundTrips();
   assertUserInputPipelineFindsRequirementInteractions();
   await assertProviderTraceRecorderArchivesPayload();
   await assertResourceRequestLoopBuildsPacketEvents();
@@ -410,6 +411,40 @@ function assertPermissionPipelineFindsPendingPermission(): void {
     null,
     'permission pipeline ignores resolved permission request'
   );
+}
+
+function assertInteractionOverlayCodecRoundTrips(): void {
+  const token = randomSmokeToken('interaction-overlay');
+  const codec = new InteractionOverlayCodec();
+  const payload = codec.toPayload({
+    parentRunId: `parent-${token}`,
+    parentPhase: 'executing_accepted_plan',
+    interactionRunId: `interaction-run-${token}`,
+    interactionId: `interaction-${token}`,
+    sourceInteractionId: `source-${token}`,
+    acceptedPlanId: `plan-${token}`,
+    acceptedPlanRunId: `plan-run-${token}`,
+    acceptedCurrentTaskId: `task-${token}`,
+    acceptedCompletedTaskIds: [`completed-${token}`],
+  });
+  const parsed = codec.fromPayload(payload);
+  assertEqual(parsed?.parentRunId, `parent-${token}`, 'interaction overlay codec parses parent run');
+  assertEqual(parsed?.parentPhase, 'executing_accepted_plan', 'interaction overlay codec parses parent phase');
+  assertEqual(parsed?.acceptedCompletedTaskIds?.[0], `completed-${token}`, 'interaction overlay codec preserves completed task ids');
+  const resumed = codec.fromRequirementDecision(
+    {
+      id: `confirmation-${token}`,
+      kind: 'requirement_confirmation',
+      payload,
+    } as AgentEvent,
+    {
+      id: `decision-${token}`,
+      kind: 'requirement_decision',
+      payload: {},
+    } as AgentEvent
+  );
+  assertEqual(resumed?.resumedFromDecisionId, `decision-${token}`, 'interaction overlay codec annotates resumed decision id');
+  assertEqual(codec.fromPayload({ ...payload, parentPhase: `unknown-${token}` }), undefined, 'interaction overlay codec rejects unknown phases');
 }
 
 function assertUserInputPipelineFindsRequirementInteractions(): void {
