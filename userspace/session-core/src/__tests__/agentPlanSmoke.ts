@@ -1094,6 +1094,45 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
   assertEqual(index.permissionId(events), permissionId, 'kernel event status index reads permission id');
   assertEqual(index.runId(events), runId, 'kernel event status index reads run id');
   assert(index.hasFailureOrBlocker(events), 'kernel event status index detects blocker status');
+  const queuedWorkUnitId = `queued-${token}`;
+  assertEqual(
+    index.actionBatchReadyForReview([
+      {
+        kind: 'work_unit.queued',
+        workUnit: { id: queuedWorkUnitId },
+      },
+      {
+        kind: 'work_unit.completed',
+        workUnitId: queuedWorkUnitId,
+      },
+    ]),
+    true,
+    'kernel event status index detects review-ready completed batches'
+  );
+  assertEqual(
+    index.actionBatchReadyForReview([
+      {
+        kind: 'permission.requested',
+        request: { id: `permission-${token}` },
+      },
+      {
+        kind: 'stage.changed',
+        phase: 'review',
+      },
+    ]),
+    false,
+    'kernel event status index keeps permission requests out of review-ready batches'
+  );
+  assertEqual(
+    index.reviewGateStatus([
+      {
+        kind: 'review_gate.evaluated',
+        result: { status: `status-${token}` },
+      },
+    ]),
+    `status-${token}`,
+    'kernel event status index reads review gate status'
+  );
 }
 
 function assertReviewAssemblerFormatsReviewFacts(): void {

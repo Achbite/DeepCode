@@ -1442,7 +1442,7 @@ export class SessionDriverLoop {
           this.id('accepted-action-plan-batch-failed')
         )) ?? result;
       }
-      if (!actionBatchReadyForReview(batchEvents)) {
+      if (!kernelEventStatusIndex.actionBatchReadyForReview(batchEvents)) {
         if (kernelEventStatusIndex.hasPermissionRequest(batchEvents)) {
           const permissionId = kernelEventStatusIndex.permissionId(batchEvents);
           return this.append(input.sessionId, [
@@ -1624,7 +1624,7 @@ export class SessionDriverLoop {
         }),
       ]) ?? result;
     }
-    if (!actionBatchReadyForReview(decisionReply.events ?? [])) {
+    if (!kernelEventStatusIndex.actionBatchReadyForReview(decisionReply.events ?? [])) {
       if (kernelEventStatusIndex.hasPermissionRequest(decisionReply.events ?? [])) {
         const runId = pending.runId ?? input.runId ?? kernelEventStatusIndex.runId(decisionReply.events ?? []) ?? 'run-unknown';
         const permissionId = kernelEventStatusIndex.permissionId(decisionReply.events ?? []);
@@ -1855,7 +1855,7 @@ export class SessionDriverLoop {
 
     const continuationMode = input.reviewContinuationMode ?? 'auto';
     if (terminalAcceptedPlan || !review.continuations.length || continuationMode === 'off') {
-      if (kernelReviewGateStatus(gateReply.events) === 'accepted') {
+      if (kernelEventStatusIndex.reviewGateStatus(gateReply.events) === 'accepted') {
         result = await this.append(input.sessionId, [
           sessionRunStateEvent({
             sessionId: input.sessionId,
@@ -3754,7 +3754,7 @@ export class SessionDriverLoop {
         resourceRequestLoop.packetEvent(state.sessionId, generatedPacket, this.ts(), this.id('accepted-plan-generated-artifact-evidence')),
       ]) ?? result;
     }
-    if (!actionBatchReadyForReview(batchReply.events ?? [])) {
+    if (!kernelEventStatusIndex.actionBatchReadyForReview(batchReply.events ?? [])) {
       if (kernelEventStatusIndex.hasPermissionRequest(batchReply.events ?? [])) {
         const permissionId = kernelEventStatusIndex.permissionId(batchReply.events ?? []);
         return this.append(state.sessionId, [
@@ -7498,49 +7498,8 @@ function reviewSummaryEvent(
   };
 }
 
-function actionBatchReadyForReview(kernelEvents: unknown[]): boolean {
-  if (kernelEventStatusIndex.hasPermissionRequest(kernelEvents)) {
-    return false;
-  }
-  if (kernelEvents.some((event) => {
-    const record = objectRecord(event);
-    return record?.kind === 'stage.changed' && stringValue(record.phase) === 'review';
-  })) {
-    return true;
-  }
-  const queued = new Set<string>();
-  const terminal = new Set<string>();
-  for (const event of kernelEvents) {
-    const record = objectRecord(event);
-    if (record?.kind === 'work_unit.queued') {
-      const workUnit = objectRecord(record.workUnit);
-      const id = stringValue(workUnit?.id);
-      if (id) queued.add(id);
-    } else if (
-      record?.kind === 'work_unit.completed' ||
-      record?.kind === 'work_unit.failed' ||
-      record?.kind === 'work_unit.blocked'
-    ) {
-      const id = stringValue(record.workUnitId);
-      if (id) terminal.add(id);
-    }
-  }
-  return queued.size > 0 && [...queued].every((id) => terminal.has(id));
-}
-
 function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
-}
-
-function kernelReviewGateStatus(kernelEvents: unknown[] | undefined): string | undefined {
-  for (const event of [...(kernelEvents ?? [])].reverse()) {
-    const record = objectRecord(event);
-    if (stringValue(record?.kind) !== 'review_gate.evaluated') continue;
-    const result = objectRecord(record?.result);
-    const status = stringValue(result?.status);
-    if (status) return status;
-  }
-  return undefined;
 }
 
 function implementationPlanExecutionRequest(

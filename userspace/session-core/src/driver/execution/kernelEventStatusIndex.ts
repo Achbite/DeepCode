@@ -24,6 +24,47 @@ export class KernelEventStatusIndex {
     return events.some((event) => objectRecord(event)?.kind === 'permission.requested');
   }
 
+  actionBatchReadyForReview(events: unknown[]): boolean {
+    if (this.hasPermissionRequest(events)) {
+      return false;
+    }
+    if (events.some((event) => {
+      const record = objectRecord(event);
+      return record?.kind === 'stage.changed' && stringValue(record.phase) === 'review';
+    })) {
+      return true;
+    }
+    const queued = new Set<string>();
+    const terminal = new Set<string>();
+    for (const event of events) {
+      const record = objectRecord(event);
+      if (record?.kind === 'work_unit.queued') {
+        const workUnit = objectRecord(record.workUnit);
+        const id = stringValue(workUnit?.id);
+        if (id) queued.add(id);
+      } else if (
+        record?.kind === 'work_unit.completed' ||
+        record?.kind === 'work_unit.failed' ||
+        record?.kind === 'work_unit.blocked'
+      ) {
+        const id = stringValue(record.workUnitId);
+        if (id) terminal.add(id);
+      }
+    }
+    return queued.size > 0 && [...queued].every((id) => terminal.has(id));
+  }
+
+  reviewGateStatus(events: unknown[] | undefined): string | undefined {
+    for (const event of [...(events ?? [])].reverse()) {
+      const record = objectRecord(event);
+      if (stringValue(record?.kind) !== 'review_gate.evaluated') continue;
+      const result = objectRecord(record?.result);
+      const status = stringValue(result?.status);
+      if (status) return status;
+    }
+    return undefined;
+  }
+
   permissionId(events: unknown[]): string | undefined {
     for (const event of events) {
       const record = objectRecord(event);
