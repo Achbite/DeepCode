@@ -1751,7 +1751,8 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
       summary: `delete ${targetPath}`,
     }],
     gateInterventionsFromReport: () => [],
-    interactionOverlayProjection: () => ({}),
+    planReviewFacts: () => [`fact-${token}`],
+    interactionOverlayProjection: (overlay) => overlay ? { overlayId: (overlay as any).overlayId } : {},
     visibleLanguageForRequest: () => 'en-US',
   });
   const planState = {
@@ -1833,6 +1834,24 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   const implementationPayload = implementationPlan.payload as any;
   assertEqual(implementationPayload.confirmable, true, 'plan projection keeps implementation plan confirmable');
   assert(String(implementationPayload.content).includes(targetPath), 'plan projection renders implementation plan target');
+
+  const decisionEvent = planProjection.planReviewDecisionEvent({
+    sessionId: `session-${token}`,
+    plan: {
+      runId,
+      planId: `plan-${token}`,
+      planReviewReport: { executionContract: { id: `contract-${token}` } },
+      interactionOverlay: { overlayId: `overlay-${token}` },
+    },
+    status: 'accepted',
+    ts: new Date(0).toISOString(),
+    id: `plan-decision-${token}`,
+  });
+  const decisionPayload = decisionEvent.payload as any;
+  assertEqual(decisionEvent.kind, 'plan_review', 'plan projection creates plan review decision event');
+  assertEqual(decisionPayload.messageKey, 'session.driver.planReviewAccepted', 'plan projection marks accepted plan review with i18n key');
+  assertEqual(decisionPayload.facts[0], `fact-${token}`, 'plan projection preserves plan review facts');
+  assertEqual(decisionPayload.overlayId, `overlay-${token}`, 'plan projection preserves interaction overlay payload');
 }
 
 function assertAssistantProjectionBuilderCreatesConversationEvents(): void {

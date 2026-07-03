@@ -22,6 +22,7 @@ export interface PlanProjectionBuilderPorts {
   requiredAccessScopesFromReport(report: Record<string, unknown> | undefined): unknown[];
   permissionBundlesFromReport(report: Record<string, unknown> | undefined): PlanProjectionPermissionBundle[];
   gateInterventionsFromReport(report: Record<string, unknown> | undefined): PlanProjectionGateIntervention[];
+  planReviewFacts(report: Record<string, unknown> | undefined): string[];
   interactionOverlayProjection(overlay: unknown): Record<string, unknown>;
   visibleLanguageForRequest(userRequest: string): PlanProjectionLanguage;
 }
@@ -56,6 +57,54 @@ interface KernelExecutionOperationProjection {
 
 export class PlanProjectionBuilder {
   constructor(private readonly ports: PlanProjectionBuilderPorts) {}
+
+  planReviewDecisionEvent(input: {
+    sessionId: string;
+    plan: {
+      runId: string;
+      planId: string;
+      planReviewReport?: Record<string, unknown>;
+      interactionOverlay?: unknown;
+    };
+    status: 'accepted' | 'rejected' | 'needsRevision';
+    summary?: string;
+    ts: string;
+    id: string;
+  }): AgentEvent {
+    const overlayPayload = this.ports.interactionOverlayProjection(input.plan.interactionOverlay);
+    const messageKey = input.status === 'accepted'
+      ? 'session.driver.planReviewAccepted'
+      : 'session.driver.planReviewNeedsRevision';
+    const summary = input.summary ?? defaultPlanReviewDecisionSummary(input.status);
+    return {
+      id: input.id,
+      sessionId: input.sessionId,
+      ts: input.ts,
+      kind: 'plan_review',
+      payload: {
+        title: 'Plan review',
+        titleKey: 'session.driver.planReviewDecision.title',
+        summary,
+        summaryKey: messageKey,
+        messageKey,
+        messageArgs: { status: input.status },
+        status: input.status,
+        runId: input.plan.runId,
+        planId: input.plan.planId,
+        confirmable: false,
+        facts: this.ports.planReviewFacts(input.plan.planReviewReport),
+        requiredFileOperations: this.ports.requiredFileOperationsFromReport(input.plan.planReviewReport),
+        permissionBundles: this.ports.permissionBundlesFromReport(input.plan.planReviewReport),
+        interventions: this.ports.gateInterventionsFromReport(input.plan.planReviewReport),
+        executionContract: objectRecord(input.plan.planReviewReport?.executionContract) ?? undefined,
+        ...overlayPayload,
+        channel: input.status === 'accepted' ? 'progress' : 'final',
+        visibility: 'conversation',
+        presentation: 'body',
+        report: input.plan.planReviewReport,
+      },
+    };
+  }
 
   actionBundlePlanCardEvent(input: {
     state: PlanProjectionState;
@@ -341,6 +390,12 @@ function planReviewStatusAwaitingUser(status: string | undefined): boolean {
     status === 'awaitingTemporaryGrant' ||
     status === 'pending' ||
     status === undefined;
+}
+
+function defaultPlanReviewDecisionSummary(status: 'accepted' | 'rejected' | 'needsRevision'): string {
+  return status === 'accepted'
+    ? 'The user accepted the plan; execution can continue.'
+    : 'The user requested plan changes.';
 }
 
 function accessScopesFromImplementationPlan(plan: Record<string, unknown> | undefined): unknown[] {

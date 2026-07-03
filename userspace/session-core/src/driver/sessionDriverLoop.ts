@@ -305,6 +305,7 @@ const planProjectionBuilder = new PlanProjectionBuilder({
   requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
   permissionBundlesFromReport: (report) => planReviewGrantProjector.permissionBundlesFromReport(report),
   gateInterventionsFromReport: (report) => planReviewGrantProjector.gateInterventionsFromReport(report),
+  planReviewFacts: (report) => planReviewReportAnalyzer.facts(report),
   interactionOverlayProjection: (overlay) => interactionOverlayCodec.toPayload(overlay as InteractionOverlayContext | undefined),
   visibleLanguageForRequest,
 });
@@ -1277,7 +1278,14 @@ export class SessionDriverLoop {
     if (input.decision !== 'accept') {
       const status = input.decision === 'revise' ? 'needsRevision' : 'rejected';
       let result = await this.append(input.sessionId, [
-        planReviewDecisionEvent(input.sessionId, plan, status, input.guidance, this.ts(), this.id('plan-decision')),
+        planProjectionBuilder.planReviewDecisionEvent({
+          sessionId: input.sessionId,
+          plan,
+          status,
+          summary: input.guidance,
+          ts: this.ts(),
+          id: this.id('plan-decision'),
+        }),
       ]);
       if (input.decision === 'revise') {
         return this.runUserTurn({
@@ -1321,7 +1329,13 @@ export class SessionDriverLoop {
     }
 
     let result = await this.append(input.sessionId, [
-      planReviewDecisionEvent(input.sessionId, plan, 'accepted', '用户已确认计划，准备进入执行。', this.ts(), this.id('plan-accepted')),
+      planProjectionBuilder.planReviewDecisionEvent({
+        sessionId: input.sessionId,
+        plan,
+        status: 'accepted',
+        ts: this.ts(),
+        id: this.id('plan-accepted'),
+      }),
     ]);
     if (plan.implementationPlan) {
       const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, result.events);
@@ -6345,41 +6359,6 @@ function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted
     : [];
   const acceptedCapabilities = new Set(accepted.capabilities);
   return gaps.filter((capability) => !planReviewGrantProjector.planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
-}
-
-function planReviewDecisionEvent(
-  sessionId: string,
-  plan: SessionPlanContext,
-  status: 'accepted' | 'rejected' | 'needsRevision',
-  summary: string | undefined,
-  ts: string,
-  id: string
-): AgentEvent {
-  const overlayPayload = interactionOverlayCodec.toPayload(plan.interactionOverlay);
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'plan_review',
-    payload: {
-      title: '计划确认',
-      summary: summary || (status === 'accepted' ? '用户已确认计划，准备进入执行。' : '用户要求修改计划。'),
-      status,
-      runId: plan.runId,
-      planId: plan.planId,
-      confirmable: false,
-      facts: planReviewReportAnalyzer.facts(plan.planReviewReport),
-      requiredFileOperations: planReviewGrantProjector.requiredFileOperationsFromReport(plan.planReviewReport),
-      permissionBundles: planReviewGrantProjector.permissionBundlesFromReport(plan.planReviewReport),
-      interventions: planReviewGrantProjector.gateInterventionsFromReport(plan.planReviewReport),
-      executionContract: objectRecord(plan.planReviewReport?.executionContract) ?? undefined,
-      ...overlayPayload,
-      channel: status === 'accepted' ? 'progress' : 'final',
-      visibility: 'conversation',
-      presentation: 'body',
-      report: plan.planReviewReport,
-    },
-  };
 }
 
 function actionBundleAdmissionFailureEvents(
