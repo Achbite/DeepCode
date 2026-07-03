@@ -338,7 +338,7 @@ const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, 
   concreteContinuationExpectations: (value) => implementationBatchContextBuilder().concreteContinuationExpectations(value),
   languageForRequest: (userPlan) => visibleLanguageForRequest(userPlan),
   acceptedPlanContext: (plan) => plan.implementationPlan
-    ? acceptedImplementationPlanContext(plan, undefined, plan.executionRoot)
+    ? acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot })
     : undefined,
   acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
     acceptedPlanBatchProgress(acceptedPlan, proposalEnvelopeFromPlanContext(plan), kernelEvents).completedTaskIds,
@@ -1009,7 +1009,7 @@ export class SessionDriverLoop {
 
     const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, current.events);
     const acceptedPlan = acceptedPlanWithLatestCheckpoint(
-      acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot),
+      acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: input.interventionLevel, executionRoot }),
       current.events
     );
     const selectedEffect = userInputPipeline.selectedRequirementDecisionOptionEffect(decisionEvent)
@@ -1226,7 +1226,7 @@ export class SessionDriverLoop {
       ?? findPlanCard(events, undefined, planId)
       ?? (runId ? latestExecutablePlan(events, runId) : null);
     if (!plan || !plan.implementationPlan) return undefined;
-    const base = acceptedImplementationPlanContext(plan, undefined, plan.executionRoot);
+    const base = acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot });
     return acceptedPlanWithLatestCheckpoint(base, events);
   }
 
@@ -1382,7 +1382,7 @@ export class SessionDriverLoop {
     ]);
     if (plan.implementationPlan) {
       const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, result.events);
-      const acceptedPlan = acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot);
+      const acceptedPlan = acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: input.interventionLevel, executionRoot });
       return this.runUserTurn({
         sessionId: input.sessionId,
         content: executionPromptCoordinator().executionRequest(plan, acceptedPlan, input.guidance),
@@ -5694,7 +5694,7 @@ function recoverAcceptedPlanFromOverlay(
   if (!plan?.implementationPlan) return undefined;
   const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, events);
   let acceptedPlan = acceptedPlanWithLatestCheckpoint(
-    acceptedImplementationPlanContext(plan, input.interventionLevel, executionRoot),
+    acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: input.interventionLevel, executionRoot }),
     events
   );
   const overlayCompletedTaskIds = overlay.acceptedCompletedTaskIds ?? [];
@@ -5844,18 +5844,6 @@ function acceptedPlanExecutionConsumed(
     }
   }
   return false;
-}
-
-function acceptedImplementationPlanContext(
-  plan: SessionPlanContext,
-  interventionLevel?: InterventionLevel,
-  executionRoot?: AcceptedImplementationPlanExecutionRoot
-): AcceptedImplementationPlanContext {
-  return acceptedImplementationPlanContextBuilder().build({
-    plan,
-    interventionLevel,
-    executionRoot,
-  });
 }
 
 function acceptedPlanExecutionContext(
