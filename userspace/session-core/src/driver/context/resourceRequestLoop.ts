@@ -72,6 +72,20 @@ export class ResourceRequestLoop {
     };
   }
 
+  containsDirectoryPath(resourcePackets: ResourcePacket[], targetPath: string): boolean {
+    const target = normalizeResourcePathIdentity(targetPath);
+    if (!target) return false;
+    for (const packet of resourcePackets) {
+      const items = Array.isArray(packet.items) ? packet.items : [];
+      for (const item of items) {
+        const record = objectRecord(item);
+        if (!record) continue;
+        if (resourceNodeListContainsDirectoryPath(record.nodes, target)) return true;
+      }
+    }
+    return false;
+  }
+
   findPacket(events: unknown[]): ResourcePacket | undefined {
     for (const event of events) {
       const record = objectRecord(event);
@@ -262,6 +276,32 @@ function flattenNodes(nodes: unknown[]): Array<Record<string, unknown>> {
     }
   }
   return output;
+}
+
+function resourceNodeListContainsDirectoryPath(value: unknown, targetPath: string): boolean {
+  if (!Array.isArray(value)) return false;
+  for (const item of value) {
+    const node = objectRecord(item);
+    if (!node) continue;
+    if (nodeString(node.type) === 'directory' && normalizeResourcePathIdentity(nodeString(node.path) ?? '') === targetPath) {
+      return true;
+    }
+    if (resourceNodeListContainsDirectoryPath(node.children, targetPath)) return true;
+  }
+  return false;
+}
+
+function nodeString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function normalizeResourcePathIdentity(value: string): string {
+  return value
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/+/g, '/')
+    .trim()
+    .replace(/\/+$/g, '');
 }
 
 function sanitizeId(value: string): string {

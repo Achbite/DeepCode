@@ -7754,7 +7754,7 @@ function acceptedPlanDeletePreflightReasons(
     } else {
       const targetResourceKind = deleteActionTargetResourceKind(action);
       const normalizedDirectory = normalizePlanScope(normalized).replace(/\/+$/, '');
-      const resourcePacketSaysDirectory = resourcePacketsContainDirectoryPath(resourcePackets, normalizedDirectory);
+      const resourcePacketSaysDirectory = resourceRequestLoop.containsDirectoryPath(resourcePackets, normalizedDirectory);
       if ((normalized.endsWith('/') || resourcePacketSaysDirectory) && targetResourceKind !== 'directory') {
         reasons.push(`actionBatch.actions[${index}] fs.delete target ${normalizedDirectory} 是目录；目录删除必须显式设置 targetKind="directory"。`);
       } else if (targetResourceKind === 'directory' && !deleteActionRecursive(action)) {
@@ -7766,33 +7766,6 @@ function acceptedPlanDeletePreflightReasons(
     }
   }
   return [...new Set(reasons)];
-}
-
-function resourcePacketsContainDirectoryPath(resourcePackets: ResourcePacket[], targetPath: string): boolean {
-  const target = normalizePlanScopeIdentity(targetPath);
-  if (!target) return false;
-  for (const packet of resourcePackets) {
-    const items = Array.isArray(packet.items) ? packet.items : [];
-    for (const item of items) {
-      const record = objectRecord(item);
-      if (!record) continue;
-      if (resourceNodeListContainsDirectoryPath(record.nodes, target)) return true;
-    }
-  }
-  return false;
-}
-
-function resourceNodeListContainsDirectoryPath(value: unknown, targetPath: string): boolean {
-  if (!Array.isArray(value)) return false;
-  for (const item of value) {
-    const node = objectRecord(item);
-    if (!node) continue;
-    if (stringValue(node.type) === 'directory' && normalizePlanScopeIdentity(stringValue(node.path) ?? '') === targetPath) {
-      return true;
-    }
-    if (resourceNodeListContainsDirectoryPath(node.children, targetPath)) return true;
-  }
-  return false;
 }
 
 function canonicalizeAcceptedPlanExecutionAccessScopes(

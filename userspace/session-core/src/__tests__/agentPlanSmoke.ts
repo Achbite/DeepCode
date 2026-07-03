@@ -37,6 +37,7 @@ import {
   SessionDriverLoop,
   type ActionBundleDraft,
   type ResourceManifest,
+  type ResourcePacket,
   type TranscriptEntry,
 } from '../index.js';
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
@@ -453,6 +454,37 @@ async function assertResourceRequestLoopBuildsPacketEvents(): Promise<void> {
   assert(
     diagnostic.fallback.includes(`root-${token} -> /tmp/root-${token}`),
     'resource request loop diagnostic includes available roots'
+  );
+
+  const directoryPacket = {
+    id: `dir-packet-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    requestId: `dir-request-${token}`,
+    items: [
+      {
+        requestItemId: `dir-item-${token}`,
+        manifestEntryId: `dir-entry-${token}`,
+        readPolicy: 'autoRead',
+        status: 'resolved',
+        contentKind: 'directoryTree',
+        nodes: [
+          {
+            type: 'directory',
+            path: `root-${token}`,
+            children: [
+              {
+                type: 'directory',
+                path: `root-${token}/nested-${token}`,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  } as unknown as ResourcePacket;
+  assert(
+    loop.containsDirectoryPath([directoryPacket], `./root-${token}/nested-${token}/`),
+    'resource request loop recognizes directory targets from ResourcePacket directory trees'
   );
 }
 
