@@ -43,7 +43,7 @@ import {
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
-import { CompletedWorkUnitFactIndex, ImplementationBatchContextBuilder } from '../driver/execution/index.js';
+import { AcceptedImplementationPlanContextBuilder, CompletedWorkUnitFactIndex, ImplementationBatchContextBuilder } from '../driver/execution/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
 import { KernelEventProjectionBuilder, PlanProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
@@ -71,6 +71,7 @@ async function main(): Promise<void> {
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
   assertPlanReviewGrantProjectorBuildsExecutionReadModels();
+  assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -1153,6 +1154,80 @@ function assertPlanReviewGrantProjectorBuildsExecutionReadModels(): void {
     fileTarget,
     'grant projector normalizes concrete file operation targets'
   );
+}
+
+function assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext(): void {
+  const token = randomSmokeToken('accepted-context');
+  const fileTarget = `src-${token}/file-${token}.txt`;
+  const moduleTarget = `module-${token}`;
+  const projector = new PlanReviewGrantProjector();
+  const builder = new AcceptedImplementationPlanContextBuilder({
+    objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined,
+    stringValue: (value) => typeof value === 'string' && value.trim() ? value.trim() : undefined,
+    stringArrayValue: (value) => Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : typeof value === 'string' && value.trim()
+        ? [value.trim()]
+        : [],
+    normalizePlanScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim(),
+    uniqueStrings: (values) => [...new Set(values.filter((item): item is string => Boolean(item)))],
+    acceptedPlanTaskTargets: (record) => {
+      const targets = Array.isArray(record.targets) ? record.targets : [record.target];
+      return targets.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+    },
+    executionSliceRoleValue: (value) => value === 'sourceCode' || value === 'test' ? value : undefined,
+    exactOperationGrantsFromImplementationPlan: (plan, executionRoot) =>
+      projector.exactOperationGrantsFromImplementationPlan(plan, executionRoot),
+    exactOperationGrantsFromPlanReviewReport: (report, executionRoot) =>
+      projector.exactOperationGrantsFromPlanReviewReport(report, executionRoot),
+    accessScopesFromImplementationPlan: (plan) => projector.accessScopesFromImplementationPlan(plan),
+    requiredAccessScopesFromReport: (report) => projector.requiredAccessScopesFromReport(report),
+  });
+  const accepted = builder.build({
+    plan: {
+      planId: `plan-${token}`,
+      runId: `run-${token}`,
+      implementationPlan: {
+        title: `Title ${token}`,
+        summary: `Summary ${token}`,
+        tasks: [{
+          taskId: `task-${token}`,
+          title: `Task ${token}`,
+          capability: 'fs.write',
+          targets: [fileTarget],
+          role: 'sourceCode',
+        }],
+        fileOperations: [{
+          operation: 'write',
+          capability: 'fs.write',
+          targetPath: fileTarget,
+          sourceTaskId: `task-${token}`,
+        }],
+        accessScopes: [{
+          scopeKind: 'workspaceModule',
+          path: moduleTarget,
+          capabilities: ['fs.patch'],
+        }],
+      },
+      planReviewReport: {
+        requiredFileOperations: [{
+          operation: 'write',
+          capability: 'fs.write',
+          targetPath: fileTarget,
+        }],
+      },
+    },
+    interventionLevel: 'medium',
+  });
+  assertEqual(accepted.planId, `plan-${token}`, 'accepted context builder keeps plan id');
+  assertEqual(accepted.tasks[0]?.taskId, `task-${token}`, 'accepted context builder builds task contexts');
+  assert(accepted.capabilities.includes('fs.write'), 'accepted context builder includes task capabilities');
+  assert(accepted.targetScopes.includes(fileTarget), 'accepted context builder includes task target scopes');
+  assert(accepted.exactOperationGrants.some((grant) => grant.targetPath === fileTarget), 'accepted context builder includes exact operation grants');
+  assert(accepted.accessScopes.some((scope) => scope.path === moduleTarget), 'accepted context builder includes access scopes');
+  assertEqual(accepted.interventionLevel, 'medium', 'accepted context builder keeps intervention level');
 }
 
 function assertProtocolGateCanonicalizesBareRepair(): void {

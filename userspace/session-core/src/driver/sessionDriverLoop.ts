@@ -23,12 +23,12 @@ import {
   AcceptedPlanScopeIntervention,
   AcceptedPlanScopeMatcher,
   AcceptedPlanTaskLedgerCoordinator,
+  AcceptedImplementationPlanContextBuilder,
   ExecutionPromptCoordinator,
   ImplementationBatchContextBuilder,
   ReviewFactsAggregator,
   type AcceptedImplementationPlanContext,
   type AcceptedImplementationPlanExecutionRoot,
-  type AcceptedImplementationPlanTaskContext,
   type AcceptedPlanAccessScope,
   type AcceptedPlanBatchValidationResult,
   type AcceptedPlanBatchProgress,
@@ -4655,6 +4655,24 @@ function implementationBatchContextBuilder(): ImplementationBatchContextBuilder 
   });
 }
 
+function acceptedImplementationPlanContextBuilder(): AcceptedImplementationPlanContextBuilder {
+  return new AcceptedImplementationPlanContextBuilder({
+    objectRecord,
+    stringValue,
+    stringArrayValue,
+    normalizePlanScope,
+    uniqueStrings,
+    acceptedPlanTaskTargets,
+    executionSliceRoleValue,
+    exactOperationGrantsFromImplementationPlan: (plan, executionRoot) =>
+      planReviewGrantProjector.exactOperationGrantsFromImplementationPlan(plan, executionRoot),
+    exactOperationGrantsFromPlanReviewReport: (report, executionRoot) =>
+      planReviewGrantProjector.exactOperationGrantsFromPlanReviewReport(report, executionRoot),
+    accessScopesFromImplementationPlan: (plan) => planReviewGrantProjector.accessScopesFromImplementationPlan(plan),
+    requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
+  });
+}
+
 function acceptedPlanAdmission(): AcceptedPlanAdmission {
   return new AcceptedPlanAdmission({
     scopeMatcher: new AcceptedPlanScopeMatcher(),
@@ -6201,61 +6219,11 @@ function acceptedImplementationPlanContext(
   interventionLevel?: InterventionLevel,
   executionRoot?: AcceptedImplementationPlanExecutionRoot
 ): AcceptedImplementationPlanContext {
-  const rawPlan = plan.implementationPlan ?? {};
-  const tasks = Array.isArray(rawPlan.tasks) ? rawPlan.tasks : [];
-  const taskContexts = tasks.flatMap((item, index): AcceptedImplementationPlanTaskContext[] => {
-    const record = objectRecord(item);
-    if (!record) return [];
-    const taskId = stringValue(record.taskId) ?? stringValue(record.id) ?? `task-${index + 1}`;
-    const legacyDependencies = stringArrayValue(record.dependencies)
-      .concat(stringArrayValue(record.dependsOn))
-      .map(normalizePlanScope)
-      .filter(Boolean);
-    const conflictKeys = stringArrayValue(record.conflictKeys)
-      .map(normalizePlanScope)
-      .filter(Boolean);
-    return [{
-      taskId,
-      title: stringValue(record.title),
-      capability: stringValue(record.capability),
-      targets: acceptedPlanTaskTargets(record),
-      dependencies: legacyDependencies,
-      conflictKeys,
-      batchKind: executionSliceRoleValue(record.batchKind) ?? executionSliceRoleValue(record.role),
-      role: executionSliceRoleValue(record.batchKind) ?? executionSliceRoleValue(record.role),
-    }];
-  });
-  const capabilities = [...new Set(taskContexts.map((task) => task.capability).filter((item): item is string => Boolean(item)))];
-  const targetScopes = [...new Set(taskContexts.flatMap((task) => task.targets).filter(Boolean))];
-  const exactOperationGrants = [
-    ...planReviewGrantProjector.exactOperationGrantsFromImplementationPlan(rawPlan, executionRoot),
-    ...planReviewGrantProjector.exactOperationGrantsFromPlanReviewReport(plan.planReviewReport, executionRoot),
-  ];
-  const accessScopes = [
-    ...planReviewGrantProjector.accessScopesFromImplementationPlan(rawPlan),
-    ...planReviewGrantProjector.requiredAccessScopesFromReport(plan.planReviewReport),
-  ];
-  const acceptedCapabilities = [...new Set([
-    ...capabilities,
-    ...exactOperationGrants.map((grant) => grant.capability),
-    ...accessScopes.flatMap((scope) => scope.capabilities),
-  ].filter(Boolean))];
-  return {
-    planId: plan.planId,
-    runId: plan.runId,
-    title: stringValue(rawPlan.title),
-    summary: stringValue(rawPlan.summary),
-    tasks: taskContexts,
-    capabilities: acceptedCapabilities,
-    targetScopes,
-    exactOperationGrants,
-    accessScopes,
-    executionRoot,
+  return acceptedImplementationPlanContextBuilder().build({
+    plan,
     interventionLevel,
-    batchIndex: 1,
-    completedTaskIds: [],
-    rawPlan,
-  };
+    executionRoot,
+  });
 }
 
 function acceptedPlanExecutionContext(
