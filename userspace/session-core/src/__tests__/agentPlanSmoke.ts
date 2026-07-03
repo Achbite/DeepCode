@@ -48,6 +48,7 @@ import {
   AcceptedImplementationPlanContextBuilder,
   AcceptedPlanBatchPreflight,
   AcceptedPlanScopeCoverage,
+  AcceptedPlanScopeDecisionOverlay,
   AcceptedPlanTargetParser,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
@@ -78,6 +79,7 @@ async function main(): Promise<void> {
   assertActionBatchFailureIndexSummarizesKernelFailures();
   assertAcceptedPlanBatchPreflightAuditsDeleteActions();
   assertAcceptedPlanScopeCoverageMatchesStructuredScopes();
+  assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
@@ -951,6 +953,55 @@ function assertAcceptedPlanScopeCoverageMatchesStructuredScopes(): void {
   assert(
     coverage.exactGrantCapabilityMatches(accepted.exactOperationGrants[0], 'fs.delete'),
     'accepted plan scope coverage matches exact grant capability'
+  );
+}
+
+function assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask(): void {
+  const token = randomSmokeToken('scope-overlay');
+  const targetDir = `overlay-${token}`;
+  const taskId = `task-${token}`;
+  const overlay = new AcceptedPlanScopeDecisionOverlay({
+    planAcceptedAutoGrantCapability: (capability) => capability === 'fs.delete',
+    concreteDirectoryOperationTarget: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, ''),
+    concreteFileOperationTarget: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, ''),
+    normalizeAcceptedPlanExactOperationGrants: (grants) => grants,
+    normalizeTargetForExecutionRoot: (value) => value.replace(/\\/g, '/').replace(/^\.\//, ''),
+  });
+  const accepted: AcceptedImplementationPlanContext = {
+    planId: `plan-${token}`,
+    runId: `run-${token}`,
+    tasks: [
+      {
+        taskId,
+        title: `Task ${token}`,
+        capability: 'fs.delete',
+        targets: [],
+        dependencies: [],
+        conflictKeys: [],
+      },
+    ],
+    capabilities: ['fs.delete'],
+    targetScopes: [],
+    exactOperationGrants: [],
+    accessScopes: [],
+    batchIndex: 1,
+    completedTaskIds: [],
+    rawPlan: {},
+  };
+  const next = overlay.apply(accepted, {
+    kind: 'expandCurrentTaskScope',
+    taskId,
+    targetPath: `./${targetDir}/`,
+    targetResourceKind: 'directory',
+    recursive: true,
+  });
+  assertEqual(next.tasks[0]?.targets[0], targetDir, 'scope decision overlay adds target to current task');
+  assertEqual(next.targetScopes[0], targetDir, 'scope decision overlay adds target scope');
+  assertEqual(next.exactOperationGrants[0]?.targetPath, targetDir, 'scope decision overlay adds exact grant');
+  assertEqual(next.exactOperationGrants[0]?.targetResourceKind, 'directory', 'scope decision overlay preserves directory target kind');
+  assert(
+    overlay.resumeGuidance({ kind: 'continueCurrentTask', taskId }).includes('current accepted task'),
+    'scope decision overlay resume guidance stays on current task'
   );
 }
 
