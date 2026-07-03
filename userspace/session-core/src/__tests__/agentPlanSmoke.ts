@@ -59,7 +59,7 @@ import {
 } from '../driver/execution/index.js';
 import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
 import { PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
-import { AssistantProjectionBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
+import { AssistantProjectionBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
 async function main(): Promise<void> {
@@ -95,6 +95,7 @@ async function main(): Promise<void> {
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   assertAssistantProjectionBuilderCreatesConversationEvents();
   assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents();
+  assertSessionFailureProjectionBuilderCreatesFailureEvents();
   assertRequirementProjectionBuilderCreatesDecisionEvents();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
   assertPlanInteractionIndexFindsActivePlan();
@@ -2057,6 +2058,100 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
   assertEqual((admissionRepair.payload as any).stage, 'action_bundle_admission.repairing', 'session progress projection creates admission repair events');
   assertEqual((admissionRepair.payload as any).messageKey, 'session.driver.actionBundleAdmissionRepairing', 'session progress projection marks admission repair with i18n key');
   assertEqual((admissionRepair.payload as any).activity.targets[0], targetPath, 'session progress projection extracts admission repair targets from audit');
+}
+
+function assertSessionFailureProjectionBuilderCreatesFailureEvents(): void {
+  const token = randomSmokeToken('session-failure');
+  const targetPath = `target-${token}.txt`;
+  const builder = new SessionFailureProjectionBuilder({
+    actionBatchFailureDetails: () => [{
+      status: 'failed',
+      workUnitId: `work-unit-${token}`,
+      actionId: `action-${token}`,
+      message: `message-${token}`,
+      code: `code-${token}`,
+      writeSet: [targetPath],
+    }],
+    actionBatchFailureSummary: (failure) => `${failure.actionId}:${failure.code}`,
+    sessionRunStateEvent: (input) => ({
+      id: input.id,
+      sessionId: input.sessionId,
+      ts: input.ts,
+      kind: 'session_run_state',
+      payload: {
+        runId: input.runId,
+        reason: input.reason,
+        status: input.status,
+        decisionOwner: input.decisionOwner,
+      },
+    }),
+  });
+
+  const admission = builder.actionBundleAdmissionFailureEvents(
+    `session-${token}`,
+    `run-${token}`,
+    {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-${token}`,
+      runId: `run-${token}`,
+      source: 'llm',
+      kind: 'actionBundle',
+      payload: {},
+      referencedResourcePacketRefs: [],
+      referencedEvidenceRefs: [],
+    },
+    [`reason-${token}`],
+    '2026-01-01T00:00:00.000Z',
+    `admission-${token}`
+  );
+  assertEqual(admission[0].kind, 'error', 'session failure projection creates admission failure error event');
+  assertEqual((admission[0].payload as any).messageKey, 'session.driver.actionBundleAdmissionFailed', 'session failure projection marks admission failure with i18n key');
+  assertEqual(admission[1].kind, 'session_run_state', 'session failure projection appends failed run state');
+
+  const batchFailure = builder.acceptedPlanExecutionFailureEvents(
+    `session-${token}`,
+    `run-${token}`,
+    {
+      planId: `plan-${token}`,
+      runId: `run-${token}`,
+      tasks: [],
+      capabilities: [],
+      targetScopes: [],
+      exactOperationGrants: [],
+      accessScopes: [],
+      batchIndex: 3,
+      completedTaskIds: [],
+      rawPlan: {},
+    },
+    [],
+    { actions: [{ actionId: `action-${token}`, targetPath }] },
+    '2026-01-01T00:00:01.000Z',
+    `batch-${token}`
+  );
+  assertEqual((batchFailure[0].payload as any).stage, 'accepted_plan.batch_failed', 'session failure projection creates accepted-plan batch failure stage');
+  assertEqual((batchFailure[0].payload as any).messageKey, 'session.driver.acceptedPlanBatchFailed', 'session failure projection marks batch failure with i18n key');
+  assertEqual((batchFailure[0].payload as any).activity.targets[0], targetPath, 'session failure projection preserves failed write set target');
+
+  const normalization = builder.acceptedPlanNormalizationFailureEvents(
+    `session-${token}`,
+    `run-${token}`,
+    {
+      planId: `plan-${token}`,
+      runId: `run-${token}`,
+      tasks: [],
+      capabilities: [],
+      targetScopes: [],
+      exactOperationGrants: [],
+      accessScopes: [],
+      batchIndex: 1,
+      completedTaskIds: [],
+      rawPlan: {},
+    },
+    [`reason-${token}`],
+    '2026-01-01T00:00:02.000Z',
+    `normalization-${token}`
+  );
+  assertEqual((normalization[0].payload as any).messageKey, 'session.driver.acceptedPlanBatchNormalizationFailed', 'session failure projection marks normalization failure with i18n key');
 }
 
 function assertPlanReviewReportAnalyzerKeepsReviewSemantics(): void {

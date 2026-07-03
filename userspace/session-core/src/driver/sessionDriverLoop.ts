@@ -129,6 +129,7 @@ import {
   PlanProjectionBuilder,
   RequirementProjectionBuilder,
   ReviewProjectionBuilder,
+  SessionFailureProjectionBuilder,
   SessionProgressProjectionBuilder,
   type DecisionOwnerRef,
   type SessionRunStateReason,
@@ -322,6 +323,11 @@ const sessionProgressProjectionBuilder = new SessionProgressProjectionBuilder({
   hasFailureOrBlocker: (kernelEvents) => kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents),
   auditAcceptedPlanBatch: (batch) => acceptedPlanBatchPreflight.audit(batch),
   actionBundleAdmissionBatch: (proposal) => proposalActionBundleAdmissionBatch(proposal),
+});
+const sessionFailureProjectionBuilder = new SessionFailureProjectionBuilder({
+  actionBatchFailureDetails: (kernelEvents, batch) => actionBatchFailureIndex.details(kernelEvents, batch),
+  actionBatchFailureSummary: (failure) => actionBatchFailureIndex.summary(failure),
+  sessionRunStateEvent: (input) => sessionProgressProjectionBuilder.sessionRunStateEvent(input),
 });
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
@@ -1407,7 +1413,7 @@ export class SessionDriverLoop {
       ]) ?? result;
       const deletePreflightReasons = acceptedPlanBatchPreflight.deleteReasons(batch, resourceRequestLoop.recentPackets(result.events));
       if (deletePreflightReasons.length) {
-        return this.append(input.sessionId, planActionBundlePreflightFailureEvents(
+        return this.append(input.sessionId, sessionFailureProjectionBuilder.planActionBundlePreflightFailureEvents(
           input.sessionId,
           plan,
           deletePreflightReasons,
@@ -1470,7 +1476,7 @@ export class SessionDriverLoop {
         );
       }
       if (kernelEventStatusIndex.hasFailureOrBlocker(batchEvents)) {
-        return this.append(input.sessionId, planActionBundleExecutionFailureEvents(
+        return this.append(input.sessionId, sessionFailureProjectionBuilder.planActionBundleExecutionFailureEvents(
           input.sessionId,
           plan,
           batchEvents,
@@ -1608,7 +1614,7 @@ export class SessionDriverLoop {
     } catch (error) {
       const message = error instanceof SessionDriverLoopError ? error.message : String(error);
       const code = error instanceof SessionDriverLoopError ? error.code : 'accepted_plan_execution_failed';
-      return this.append(input.sessionId, planActionBundleExecutionExceptionEvents(
+      return this.append(input.sessionId, sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(
         input.sessionId,
         plan,
         message,
@@ -3110,7 +3116,7 @@ export class SessionDriverLoop {
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
     if (state.actionBundleAdmissionRepairAttempted) {
-      return this.append(state.sessionId, actionBundleAdmissionFailureEvents(
+      return this.append(state.sessionId, sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
         state.sessionId,
         state.runId,
         proposal,
@@ -3148,7 +3154,7 @@ export class SessionDriverLoop {
       });
     } catch (error) {
       const message = error instanceof SessionDriverLoopError ? error.message : normalizeParseError(error).message;
-      return this.append(state.sessionId, actionBundleAdmissionFailureEvents(
+      return this.append(state.sessionId, sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
         state.sessionId,
         state.runId,
         proposal,
@@ -3177,7 +3183,7 @@ export class SessionDriverLoop {
       if (!subset.manifest.entries.length) {
         if (!generated.packet) {
           const diagnostic = resourceRequestLoop.resolutionDiagnostic(subset);
-          return this.append(state.sessionId, actionBundleAdmissionFailureEvents(
+          return this.append(state.sessionId, sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
             state.sessionId,
             state.runId,
             proposal,
@@ -3730,7 +3736,7 @@ export class SessionDriverLoop {
 
     const normalizedBatch = normalizeAcceptedPlanKernelBatch(accepted.planId, plan, accepted);
     if (!normalizedBatch.ok) {
-      return this.append(state.sessionId, acceptedPlanNormalizationFailureEvents(
+      return this.append(state.sessionId, sessionFailureProjectionBuilder.acceptedPlanNormalizationFailureEvents(
         state.sessionId,
         state.runId,
         accepted,
@@ -3742,7 +3748,7 @@ export class SessionDriverLoop {
     const batch = normalizedBatch.batch;
     const deletePreflightReasons = acceptedPlanBatchPreflight.deleteReasons(batch, state.resourcePackets);
     if (deletePreflightReasons.length) {
-      return this.append(state.sessionId, acceptedPlanNormalizationFailureEvents(
+      return this.append(state.sessionId, sessionFailureProjectionBuilder.acceptedPlanNormalizationFailureEvents(
         state.sessionId,
         state.runId,
         accepted,
@@ -3788,7 +3794,7 @@ export class SessionDriverLoop {
     result = await this.appendProjectedKernelEvents(state.sessionId, batchReply) ?? result;
     const batchEvents = batchReply.events ?? [];
     if (kernelEventStatusIndex.hasFailureOrBlocker(batchEvents)) {
-      return this.append(state.sessionId, acceptedPlanExecutionFailureEvents(
+      return this.append(state.sessionId, sessionFailureProjectionBuilder.acceptedPlanExecutionFailureEvents(
         state.sessionId,
         state.runId,
         accepted,
@@ -6359,354 +6365,6 @@ function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted
     : [];
   const acceptedCapabilities = new Set(accepted.capabilities);
   return gaps.filter((capability) => !planReviewGrantProjector.planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
-}
-
-function actionBundleAdmissionFailureEvents(
-  sessionId: string,
-  runId: string,
-  proposal: ProposalEnvelope,
-  reasons: string[],
-  ts: string,
-  id: string
-): AgentEvent[] {
-  const summary = `ActionBundle did not enter the Plan confirmation card; Session has stopped plan generation: ${reasons.join('; ')}`;
-  return [
-    {
-      id,
-      sessionId,
-      ts,
-      kind: 'error',
-      payload: {
-        message: summary,
-        code: 'action_bundle_admission_failed',
-        runId,
-        proposalId: proposal.proposalId,
-        reasons,
-        channel: 'error',
-        visibility: 'conversation',
-        activity: conversationActivity({
-          activityId: id,
-          kind: 'diagnostic',
-          status: 'failed',
-          title: 'ActionBundle admission failed',
-          summary,
-          source: 'session',
-          runId,
-          errorCode: 'action_bundle_admission_failed',
-          errorMessage: summary,
-        }),
-      },
-    },
-    sessionProgressProjectionBuilder.sessionRunStateEvent({
-      sessionId,
-      runId,
-      phase: 'failed',
-      status: 'failed',
-      reason: 'plan_review',
-      decisionOwner: {
-        kind: 'plan',
-        runId,
-        targetId: proposal.proposalId,
-        planId: proposal.proposalId,
-      },
-      ts,
-      id: `${id}-state`,
-    }),
-  ];
-}
-
-function planActionBundlePreflightFailureEvents(
-  sessionId: string,
-  plan: SessionPlanContext,
-  reasons: string[],
-  ts: string,
-  id: string
-): AgentEvent[] {
-  const summary = `Accepted plan actionBatch pre-submission audit failed; Session did not submit to Kernel: ${reasons.join('; ')}`;
-  return [
-    {
-      id,
-      sessionId,
-      ts,
-      kind: 'error',
-      payload: {
-        message: summary,
-        code: 'accepted_plan_action_batch_preflight_failed',
-        runId: plan.runId,
-        planId: plan.planId,
-        reasons,
-        channel: 'error',
-        visibility: 'conversation',
-        activity: conversationActivity({
-          activityId: id,
-          kind: 'diagnostic',
-          status: 'failed',
-          title: 'Accepted plan action batch preflight failed',
-          summary,
-          source: 'session',
-          runId: plan.runId,
-          planId: plan.planId,
-          errorCode: 'accepted_plan_action_batch_preflight_failed',
-          errorMessage: summary,
-        }),
-      },
-    },
-    sessionProgressProjectionBuilder.sessionRunStateEvent({
-      sessionId,
-      runId: plan.runId,
-      phase: 'failed',
-      status: 'failed',
-      reason: 'work_unit_failed',
-      decisionOwner: {
-        kind: 'plan',
-        runId: plan.runId,
-        targetId: plan.planId,
-        planId: plan.planId,
-      },
-      interactionOverlay: plan.interactionOverlay,
-      ts,
-      id: `${id}-state`,
-    }),
-  ];
-}
-
-function planActionBundleExecutionExceptionEvents(
-  sessionId: string,
-  plan: SessionPlanContext,
-  message: string,
-  code: string,
-  ts: string,
-  id: string
-): AgentEvent[] {
-  const summary = `已确认计划执行链路失败，Session 已停止自动推进：${message}`;
-  return [
-    {
-      id,
-      sessionId,
-      ts,
-      kind: 'error',
-      payload: {
-        message: summary,
-        code,
-        runId: plan.runId,
-        planId: plan.planId,
-        channel: 'error',
-        visibility: 'conversation',
-        activity: conversationActivity({
-          activityId: id,
-          kind: 'diagnostic',
-          status: 'failed',
-          title: 'Accepted plan execution failed',
-          summary,
-          source: 'session',
-          runId: plan.runId,
-          planId: plan.planId,
-          errorCode: code,
-          errorMessage: message,
-        }),
-      },
-    },
-    sessionProgressProjectionBuilder.sessionRunStateEvent({
-      sessionId,
-      runId: plan.runId,
-      phase: 'failed',
-      status: 'failed',
-      reason: 'work_unit_failed',
-      decisionOwner: {
-        kind: 'plan',
-        runId: plan.runId,
-        targetId: plan.planId,
-        planId: plan.planId,
-      },
-      interactionOverlay: plan.interactionOverlay,
-      ts,
-      id: `${id}-state`,
-    }),
-  ];
-}
-
-function planActionBundleExecutionFailureEvents(
-  sessionId: string,
-  plan: SessionPlanContext,
-  kernelEvents: unknown[],
-  batch: Record<string, unknown>,
-  ts: string,
-  id: string
-): AgentEvent[] {
-  const failures = actionBatchFailureIndex.details(kernelEvents, batch);
-  const summary = failures.length
-    ? `Accepted plan execution batch failed; Session has stopped auto-advancing: ${failures.map((failure) => actionBatchFailureIndex.summary(failure)).join('; ')}`
-    : 'Accepted plan execution batch failed or blocked; Session has stopped auto-advancing.';
-  return [
-    {
-      id,
-      sessionId,
-      ts,
-      kind: 'workflow_stage',
-      payload: {
-        stage: 'accepted_plan.batch_failed',
-        status: 'failed',
-        summary,
-        runId: plan.runId,
-        planId: plan.planId,
-        failures,
-        channel: 'progress',
-        visibility: 'conversation',
-        presentation: 'collapsible',
-        activity: conversationActivity({
-          activityId: id,
-          kind: 'diagnostic',
-          status: 'failed',
-          title: 'Accepted plan batch failed',
-          summary,
-          source: 'session',
-          runId: plan.runId,
-          planId: plan.planId,
-          targets: failures.flatMap((failure) => failure.writeSet),
-          actionIds: failures.flatMap((failure) => failure.actionId ? [failure.actionId] : []),
-          workUnitIds: failures.flatMap((failure) => failure.workUnitId ? [failure.workUnitId] : []),
-          errorCode: failures.find((failure) => failure.code)?.code,
-          errorMessage: failures.find((failure) => failure.message)?.message,
-        }),
-      },
-    },
-    sessionProgressProjectionBuilder.sessionRunStateEvent({
-      sessionId,
-      runId: plan.runId,
-      phase: 'failed',
-      status: 'failed',
-      reason: 'work_unit_failed',
-      decisionOwner: {
-        kind: 'plan',
-        runId: plan.runId,
-        targetId: plan.planId,
-        planId: plan.planId,
-      },
-      interactionOverlay: plan.interactionOverlay,
-      ts,
-      id: `${id}-state`,
-    }),
-  ];
-}
-
-function acceptedPlanNormalizationFailureEvents(
-  sessionId: string,
-  runId: string,
-  accepted: AcceptedImplementationPlanContext,
-  reasons: string[],
-  ts: string,
-  id: string
-): AgentEvent[] {
-  const summary = `Accepted plan actionBatch pre-submission canonicalization failed; Session did not submit to Kernel: ${reasons.join('; ')}`;
-  return [
-    {
-      id,
-      sessionId,
-      ts,
-      kind: 'error',
-      payload: {
-        message: summary,
-        code: 'accepted_plan_batch_normalization_failed',
-        runId,
-        planId: accepted.planId,
-        reasons,
-        channel: 'error',
-        visibility: 'conversation',
-        activity: conversationActivity({
-          activityId: id,
-          kind: 'diagnostic',
-          status: 'failed',
-          title: 'Accepted plan batch normalization failed',
-          summary,
-          source: 'session',
-          runId,
-          planId: accepted.planId,
-          errorCode: 'accepted_plan_batch_normalization_failed',
-          errorMessage: summary,
-        }),
-      },
-    },
-    sessionProgressProjectionBuilder.sessionRunStateEvent({
-      sessionId,
-      runId,
-      phase: 'failed',
-      status: 'failed',
-      reason: 'work_unit_failed',
-      decisionOwner: {
-        kind: 'plan',
-        runId,
-        targetId: accepted.planId,
-        planId: accepted.planId,
-      },
-      ts,
-      id: `${id}-state`,
-    }),
-  ];
-}
-
-function acceptedPlanExecutionFailureEvents(
-  sessionId: string,
-  runId: string,
-  accepted: AcceptedImplementationPlanContext,
-  kernelEvents: unknown[],
-  batch: Record<string, unknown> | undefined,
-  ts: string,
-  id: string
-): AgentEvent[] {
-  const failures = actionBatchFailureIndex.details(kernelEvents, batch);
-  const summary = failures.length
-    ? `Accepted plan execution batch failed; Session has stopped auto-advancing: ${failures.map((failure) => actionBatchFailureIndex.summary(failure)).join('; ')}`
-    : 'Accepted plan execution batch failed or blocked; Session has stopped auto-advancing.';
-  return [
-    {
-      id,
-      sessionId,
-      ts,
-      kind: 'workflow_stage',
-      payload: {
-        stage: 'accepted_plan.batch_failed',
-        status: 'failed',
-        summary,
-        runId,
-        planId: accepted.planId,
-        batchIndex: accepted.batchIndex,
-        failures,
-        channel: 'progress',
-        visibility: 'conversation',
-        presentation: 'collapsible',
-        activity: conversationActivity({
-          activityId: id,
-          kind: 'diagnostic',
-          status: 'failed',
-          title: 'Accepted plan batch failed',
-          summary,
-          source: 'session',
-          runId,
-          planId: accepted.planId,
-          targets: failures.flatMap((failure) => failure.writeSet),
-          actionIds: failures.flatMap((failure) => failure.actionId ? [failure.actionId] : []),
-          workUnitIds: failures.flatMap((failure) => failure.workUnitId ? [failure.workUnitId] : []),
-          errorCode: failures.find((failure) => failure.code)?.code,
-          errorMessage: failures.find((failure) => failure.message)?.message,
-        }),
-      },
-    },
-    sessionProgressProjectionBuilder.sessionRunStateEvent({
-      sessionId,
-      runId,
-      phase: 'failed',
-      status: 'failed',
-      reason: 'work_unit_failed',
-      decisionOwner: {
-        kind: 'plan',
-        runId,
-        targetId: accepted.planId,
-        planId: accepted.planId,
-      },
-      ts,
-      id: `${id}-state`,
-    }),
-  ];
 }
 
 function reviewSummaryEvent(

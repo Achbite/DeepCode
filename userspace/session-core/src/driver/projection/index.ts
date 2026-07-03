@@ -10,6 +10,7 @@ export {
   type SessionRunStateReason,
   type SessionRunStateStatus,
 } from './sessionProgressProjectionBuilder.js';
+export { SessionFailureProjectionBuilder } from './sessionFailureProjectionBuilder.js';
 export {
   PlanProjectionBuilder,
   type PlanProjectionGateIntervention,
