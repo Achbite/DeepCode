@@ -63,7 +63,6 @@ import {
   type PromptCachePlan,
   type ProjectMemoryMode,
   type SessionMemoryDocument,
-  type UserGuidanceEvent,
 } from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
@@ -86,6 +85,7 @@ import {
 } from './pipelines/providerPipeline.js';
 import { InteractionOverlayCodec, type InteractionOverlayContext, type SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
 import { PermissionPipeline } from './pipelines/permissionPipeline.js';
+import { UserGuidanceQueue } from './pipelines/userGuidanceQueue.js';
 import { UserInputPipeline, type RequirementOptionEffect } from './pipelines/userInputPipeline.js';
 import {
   ContextFrameBuilder,
@@ -269,6 +269,7 @@ const driverActivityBuilder = new DriverActivityBuilder({
 });
 const permissionPipeline = new PermissionPipeline();
 const userInputPipeline = new UserInputPipeline();
+const userGuidanceQueue = new UserGuidanceQueue();
 const interactionOverlayCodec = new InteractionOverlayCodec();
 const acceptedPlanTargetParser = new AcceptedPlanTargetParser();
 const planReviewGrantProjector = new PlanReviewGrantProjector();
@@ -612,7 +613,7 @@ export class SessionDriverLoop {
       });
       state.cachePlan = assembledContext.cachePlan;
       state.contextAssembly = assembledContext.contextAssembly;
-      lastResult = await this.appendConsumedUserGuidanceEvents(sessionId, lastResult, state.contextAssembly, state.runId);
+      lastResult = await this.appendConsumedUserGuidanceEvents(sessionId, lastResult, state.contextAssembly, state.runId, state.userRequest);
       const prompt = assembledContext.prompt;
       state.providerTurnContract = contextFrameBuilder.buildSessionProviderTurnContract({
         contractId: this.id('provider-turn-contract'),
@@ -2094,7 +2095,7 @@ export class SessionDriverLoop {
     state.terminalGuidanceRevisionAttempted = true;
 
     let result = await this.append(state.sessionId, []);
-    const guidance = collectQueuedUserGuidanceEvents(result.events, state.runId);
+    const guidance = userGuidanceQueue.collectQueued(result.events, state.runId);
     if (guidance.length === 0) return null;
 
     result = await this.append(state.sessionId, [
@@ -2135,6 +2136,7 @@ export class SessionDriverLoop {
       result,
       state.contextAssembly,
       state.runId,
+      state.userRequest,
       'guidance_revision'
     );
 
@@ -3109,35 +3111,18 @@ export class SessionDriverLoop {
     stage: string
   ): Promise<LlmChatRequest['messages']> {
     const current = await this.append(state.sessionId, []);
-    const guidance = collectQueuedUserGuidanceEvents(current.events, state.runId);
-    if (guidance.length === 0) return [];
     const language = visibleLanguageForRequest(state.userRequest);
-    const events = guidance.map((item) => {
-      const payload: Record<string, unknown> = {
-        title: 'User guidance',
-        summary: providerStreamCoordinator.userGuidanceConsumedSummary(language),
-        status: 'consumed',
-        guidanceId: item.id,
-        targetRunId: state.runId,
-        targetInteractionKind: 'runningRunGuidance',
-        effectiveCheckpoint: 'nextProviderCall',
-        checkpointKind: 'userGuidance',
-        appliedAtProviderStage: stage,
-        source: 'session',
-        channel: 'progress',
-        visibility: 'conversation',
-        presentation: 'body',
-      };
-      return this.event(state.sessionId, 'user_guidance', payload);
+    const resume = userGuidanceQueue.providerResume({
+      sessionId: state.sessionId,
+      events: current.events,
+      runId: state.runId,
+      stage,
+      summary: providerStreamCoordinator.userGuidanceConsumedSummary(language),
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
     });
-    await this.append(state.sessionId, events);
-    return [{
-      role: 'user',
-      content: [
-        'User guidance received before the provider resume. Apply it to the next response or tool decision without starting a parallel run:',
-        ...guidance.map((item) => `- ${item.id}: ${clip(item.content, 1200)}`),
-      ].join('\n'),
-    }];
+    if (resume.events.length) await this.append(state.sessionId, resume.events);
+    return resume.messages;
   }
 
   private async repairResourceRequest(
@@ -4736,53 +4721,20 @@ export class SessionDriverLoop {
     result: AgentSessionResult,
     contextAssembly: ContextAssemblyRecord | undefined,
     runId: string,
+    userRequest: string,
     appliedAtProviderStage = 'provider_call'
   ): Promise<AgentSessionResult> {
     const consumedIds = contextAssembly?.consumedUserGuidanceIds ?? [];
-    if (consumedIds.length === 0) return result;
-
-    const alreadyConsumed = new Set<string>();
-    const queuedGuidance = new Map<string, AgentEvent>();
-    for (const event of result.events) {
-      if (event.kind !== 'user_guidance') continue;
-      const payload = objectRecord(event.payload);
-      if (!payload) continue;
-      const guidanceId = stringValue(payload.guidanceId) ?? event.id;
-      if (stringValue(payload.status) === 'consumed') {
-        alreadyConsumed.add(guidanceId);
-      } else {
-        queuedGuidance.set(guidanceId, event);
-      }
-    }
-
-    const events: AgentEvent[] = [];
-    for (const guidanceId of consumedIds) {
-      if (alreadyConsumed.has(guidanceId)) continue;
-      const source = queuedGuidance.get(guidanceId);
-      if (!source) continue;
-      const payload = objectRecord(source.payload) ?? {};
-      events.push({
-        id: this.id('user-guidance-consumed'),
-        sessionId,
-        ts: this.ts(),
-        kind: 'user_guidance',
-        payload: {
-          title: 'User guidance',
-          summary: '用户引导已进入下一次 provider prompt。',
-          status: 'consumed',
-          guidanceId,
-          targetRunId: stringValue(payload.targetRunId) ?? stringValue(payload.runId) ?? runId,
-          targetInteractionKind: stringValue(payload.targetInteractionKind) ?? 'runningRunGuidance',
-          effectiveCheckpoint: 'nextProviderCall',
-          checkpointKind: 'userGuidance',
-          appliedAtProviderStage,
-          source: 'session',
-          channel: 'progress',
-          visibility: 'conversation',
-          presentation: 'body',
-        },
-      });
-    }
+    const events = userGuidanceQueue.consumedEvents({
+      sessionId,
+      events: result.events,
+      consumedIds,
+      runId,
+      appliedAtProviderStage,
+      summary: providerStreamCoordinator.userGuidanceConsumedSummary(visibleLanguageForRequest(userRequest)),
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+    });
 
     return events.length > 0 ? this.append(sessionId, events) : result;
   }
@@ -5282,39 +5234,6 @@ function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted
     : [];
   const acceptedCapabilities = new Set(accepted.capabilities);
   return gaps.filter((capability) => !planReviewGrantProjector.planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
-}
-
-function collectQueuedUserGuidanceEvents(events: AgentEvent[], runId?: string): UserGuidanceEvent[] {
-  const consumedIds = new Set<string>();
-  for (const event of events.slice(-120)) {
-    if (event.kind !== 'user_guidance') continue;
-    const payload = objectRecord(event.payload);
-    if (!payload || stringValue(payload.status) !== 'consumed') continue;
-    consumedIds.add(stringValue(payload.guidanceId) ?? event.id);
-  }
-
-  const collected: UserGuidanceEvent[] = [];
-  const seen = new Set<string>();
-  for (const event of events.slice(-80)) {
-    if (event.kind !== 'user_guidance') continue;
-    const payload = objectRecord(event.payload);
-    if (!payload || stringValue(payload.status) === 'consumed') continue;
-    const eventRunId = stringValue(payload.targetRunId) ?? stringValue(payload.runId);
-    if (runId && eventRunId && eventRunId !== runId) continue;
-    const guidanceId = stringValue(payload.guidanceId) ?? event.id;
-    if (consumedIds.has(guidanceId) || seen.has(guidanceId)) continue;
-    const content = stringValue(payload.content) ?? stringValue(payload.guidance) ?? stringValue(payload.summary);
-    if (!content) continue;
-    seen.add(guidanceId);
-    collected.push({
-      id: guidanceId,
-      ts: event.ts,
-      content: clip(content, 600),
-      source: 'user',
-      checkpointKind: 'nextProviderCall',
-    });
-  }
-  return collected.slice(-8);
 }
 
 type DriverInteraction =

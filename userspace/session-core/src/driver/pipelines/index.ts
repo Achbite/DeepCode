@@ -9,4 +9,5 @@ export * from './providerStreamCoordinator.js';
 export * from './providerTraceRecorder.js';
 export * from './stopPipeline.js';
 export * from './toolUsePipeline.js';
+export * from './userGuidanceQueue.js';
 export * from './userInputPipeline.js';

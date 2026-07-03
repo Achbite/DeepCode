@@ -59,7 +59,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -77,6 +77,7 @@ async function main(): Promise<void> {
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
   assertProviderStreamCoordinatorClassifiesStages();
+  assertUserGuidanceQueueBuildsResumeAndConsumedEvents();
   assertPermissionPipelineFindsPendingPermission();
   assertInteractionOverlayCodecRoundTrips();
   assertUserInputPipelineFindsRequirementInteractions();
@@ -508,6 +509,71 @@ function assertProviderStreamCoordinatorClassifiesStages(): void {
     coordinator.guidanceRevisionTransitionMessage('en-US').length > 0,
     'provider stream coordinator renders guidance revision summary'
   );
+}
+
+function assertUserGuidanceQueueBuildsResumeAndConsumedEvents(): void {
+  const token = randomSmokeToken('guidance-queue');
+  const queue = new UserGuidanceQueue();
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const guidanceId = `guidance-${token}`;
+  const otherRunGuidanceId = `guidance-other-${token}`;
+  const events: AgentEvent[] = [
+    {
+      id: guidanceId,
+      sessionId,
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'user_guidance',
+      payload: {
+        guidanceId,
+        targetRunId: runId,
+        content: `Apply generic guidance ${token}`,
+        status: 'queued',
+      },
+    },
+    {
+      id: otherRunGuidanceId,
+      sessionId,
+      ts: '2026-01-01T00:00:00.100Z',
+      kind: 'user_guidance',
+      payload: {
+        guidanceId: otherRunGuidanceId,
+        targetRunId: `other-${runId}`,
+        content: `Ignore other run ${token}`,
+        status: 'queued',
+      },
+    },
+  ];
+
+  const resume = queue.providerResume({
+    sessionId,
+    events,
+    runId,
+    stage: 'provider_resume',
+    summary: `summary-${token}`,
+    now: () => '2026-01-01T00:00:00.200Z',
+    createId: (prefix) => `${prefix}-${token}`,
+  });
+  assertEqual(resume.guidance.length, 1, 'user guidance queue filters to current run guidance');
+  assertEqual(resume.guidance[0]?.id, guidanceId, 'user guidance queue preserves guidance id');
+  assert(String(resume.messages[0]?.content ?? '').includes(`Apply generic guidance ${token}`), 'user guidance queue builds provider resume message');
+  assertEqual(resume.events.length, 1, 'user guidance queue emits one consumed event');
+  const consumedPayload = resume.events[0]?.payload as Record<string, unknown>;
+  assertEqual(consumedPayload?.status, 'consumed', 'user guidance queue marks guidance consumed');
+  assertEqual(consumedPayload?.summary, `summary-${token}`, 'user guidance queue uses caller-provided summary');
+  assertEqual(consumedPayload?.appliedAtProviderStage, 'provider_resume', 'user guidance queue records provider stage');
+
+  const duplicate = queue.consumedEvents({
+    sessionId,
+    events: [...events, ...resume.events],
+    consumedIds: [guidanceId],
+    runId,
+    appliedAtProviderStage: 'provider_resume',
+    summary: `summary-${token}`,
+    now: () => '2026-01-01T00:00:00.300Z',
+    createId: (prefix) => `${prefix}-duplicate-${token}`,
+  });
+  assertEqual(duplicate.length, 0, 'user guidance queue does not emit duplicate consumed events');
 }
 
 function assertPermissionPipelineFindsPendingPermission(): void {
