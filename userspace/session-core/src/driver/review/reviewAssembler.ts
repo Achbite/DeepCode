@@ -40,6 +40,26 @@ export interface ReviewContextRef {
   sourcePlanId?: string;
 }
 
+export interface ReviewActiveInteractionRef {
+  kind: string;
+  runId?: string;
+}
+
+export interface SessionReviewContext {
+  sessionId: string;
+  runId: string;
+  reviewId: string;
+  sourcePlanId?: string;
+  summary: string;
+  content: string;
+  userPlan: string;
+  continuations: unknown[];
+  reviewExpectations: unknown[];
+  expectedValidation: string;
+  reviewGuide: string;
+  facts: string[];
+}
+
 export class ReviewAssembler {
   constructor(private readonly ports: StaticSyntaxReviewAssemblerPorts) {}
 
@@ -246,6 +266,66 @@ export class ReviewAssembler {
       return status === 'completed' && remaining.length === 0;
     }
     return false;
+  }
+
+  findWaitingReview(
+    events: Array<{ sessionId?: string; kind?: unknown; payload?: unknown }>,
+    runId: string | undefined,
+    active: ReviewActiveInteractionRef | null | undefined
+  ): SessionReviewContext | null {
+    if (!active || active.kind !== 'review' || (runId && active.runId !== runId)) {
+      return null;
+    }
+    for (const event of [...events].reverse()) {
+      if (event.kind !== 'review_summary') continue;
+      const payload = objectRecord(event.payload);
+      if (!payload || stringValue(payload.status) !== 'waitingUserReview') continue;
+      const candidateRunId = stringValue(payload.runId);
+      if (!candidateRunId || (runId && candidateRunId !== runId)) continue;
+      return {
+        sessionId: stringValue(event.sessionId) ?? '',
+        runId: candidateRunId,
+        reviewId: stringValue(payload.reviewId) ?? candidateRunId,
+        sourcePlanId: stringValue(payload.sourcePlanId),
+        summary: stringValue(payload.summary) ?? '',
+        content: stringValue(payload.content) ?? '',
+        userPlan: stringValue(payload.userPlan) ?? '',
+        continuations: Array.isArray(payload.continuations) ? payload.continuations : [],
+        reviewExpectations: Array.isArray(payload.reviewExpectations) ? payload.reviewExpectations : [],
+        expectedValidation: stringValue(payload.expectedValidation) ?? '',
+        reviewGuide: stringValue(payload.reviewGuide) ?? '',
+        facts: Array.isArray(payload.facts) ? payload.facts.filter((item): item is string => typeof item === 'string') : [],
+      };
+    }
+    return null;
+  }
+
+  continuationRequest(review: SessionReviewContext): string {
+    const continuations = review.continuations.map((item) => this.continuationSummary(item)).filter(Boolean);
+    return [
+      'Continue planning the next reviewable Plan from the fact that the current batch Review was accepted.',
+      'This is continuation planning after Review accept; it is not authorization to execute.',
+      'The previous Plan and continuation expectations are intentContext only. Generated-file facts can only come from Kernel facts, ToolCompleted(ok=true), WorkUnitCompleted, or ResourcePacket.',
+      review.content ? `Previous Review card content:\n${review.content}` : '',
+      review.facts.length ? `Previous Kernel facts:\n${review.facts.join('\n')}` : 'Previous Kernel facts: the current Review recorded no reusable facts.',
+      review.userPlan ? `Previous Plan intent:\n${review.userPlan}` : '',
+      continuations.length ? `Continuation intents:\n${continuations.map((item) => `- ${item}`).join('\n')}` : 'Continuation intents: none were recorded.',
+      [
+        'Next proposal requirements:',
+        '- If more edits require existing-code facts, request focused evidence first with resourceRequest kind="search" or file/range.',
+        '- Then output a new detailed Agent Protocol v3 actionBundle.',
+        '- actionBundle.actions must use actionId, toolId, args, and description. fs.write uses args.path/sourceBlockId; fs.patch uses args.path/replacementBlockId/patchSpec; fs.delete uses args.path/targetKind/recursive.',
+        '- codeBlocks must use contentLines. Do not output commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large codeBlocks.content fields.',
+        '- patch must include args.patchSpec.match.kind="exactBlock" and exact text from current ResourcePacket evidence.',
+        '- fs.delete must use a concrete relative args.path. Confirmed directory delete must also set args.targetKind="directory" and args.recursive=true. Do not use codeBlocks/sourceBlockId, empty writes, fs.write as delete, wildcards, or workspace root.',
+        '- The new Plan must wait for user confirmation. Do not assume execution already happened.',
+      ].join('\n'),
+    ].filter(Boolean).join('\n\n');
+  }
+
+  continuationSummary(value: unknown): string {
+    const record = objectRecord(value);
+    return stringValue(record?.title) ?? stringValue(record?.description) ?? stringValue(record?.id) ?? clipJson(value, 160);
   }
 }
 

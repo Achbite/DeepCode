@@ -85,6 +85,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanOperationTargetResolverFindsExactGrant();
   assertKernelEventStatusIndexReadsStructuredEvents();
   assertReviewAssemblerFormatsReviewFacts();
+  assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
@@ -1166,6 +1167,58 @@ function assertReviewAssemblerFormatsReviewFacts(): void {
       },
     ], review),
     'review assembler detects terminal accepted plan checkpoints'
+  );
+}
+
+function assertReviewAssemblerFindsWaitingReviewContext(): void {
+  const token = randomSmokeToken('waiting-review');
+  const assembler = new ReviewAssembler({
+    completedWorkUnitFacts: () => ({ actionIds: new Set(), targets: new Set() }),
+    batchActionRecords: () => [],
+    actionEffectiveCapability: () => '',
+    actionFileTargetPath: () => undefined,
+    normalizeAcceptedPlanTargetScope: (target) => target,
+    comparablePath: (value) => value,
+    resourceTextForTarget: () => undefined,
+  });
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const reviewId = `review-${token}`;
+  const continuationTitle = `continue-${token}`;
+  const events = [
+    {
+      sessionId,
+      kind: 'review_summary',
+      payload: {
+        status: 'waitingUserReview',
+        runId,
+        reviewId,
+        sourcePlanId: `plan-${token}`,
+        summary: `summary-${token}`,
+        content: `content-${token}`,
+        userPlan: `plan-${token}`,
+        continuations: [{ id: `continuation-${token}`, title: continuationTitle }],
+        reviewExpectations: [{ id: `expectation-${token}` }],
+        expectedValidation: `validation-${token}`,
+        reviewGuide: `guide-${token}`,
+        facts: [`fact-${token}`],
+      },
+    },
+  ];
+  const review = assembler.findWaitingReview(events, runId, { kind: 'review', runId });
+  if (!review) {
+    throw new Error('review assembler finds waiting review context');
+  }
+  assertEqual(review.sessionId, sessionId, 'review assembler preserves session id');
+  assertEqual(review.reviewId, reviewId, 'review assembler preserves review id');
+  assertEqual(review.continuations.length, 1, 'review assembler preserves continuations');
+  const request = assembler.continuationRequest(review);
+  assert(request.includes(`fact-${token}`), 'review assembler continuation request includes review facts');
+  assert(request.includes(continuationTitle), 'review assembler continuation request includes continuation title');
+  assertEqual(
+    assembler.findWaitingReview(events, `other-${token}`, { kind: 'review', runId: `other-${token}` }),
+    null,
+    'review assembler rejects run mismatch'
   );
 }
 

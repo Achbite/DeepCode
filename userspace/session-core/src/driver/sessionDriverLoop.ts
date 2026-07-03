@@ -112,7 +112,7 @@ import {
   type TaskLedgerSnapshot,
 } from '../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
-import { ReviewAssembler, ReviewDecisionProjectionBuilder } from './review/index.js';
+import { ReviewAssembler, ReviewDecisionProjectionBuilder, type SessionReviewContext } from './review/index.js';
 import { PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from './proposal/index.js';
 import {
   KernelEventProjectionBuilder,
@@ -1693,7 +1693,7 @@ export class SessionDriverLoop {
 
   private async resolveReviewDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
     const events = input.existingEvents ?? [];
-    const review = findWaitingReview(events, input.runId);
+    const review = reviewAssembler().findWaitingReview(events, input.runId, findActiveDriverInteraction(events));
     if (!review || reviewAssembler().reviewAlreadyResolved(events, review)) {
       return this.append(input.sessionId, [
         traceEvent(input.sessionId, 'trace/review_accept_noop', '该 Review 已处理或已过期，没有重复推进任务。', this.ts(), this.id('review-noop'), {
@@ -1884,7 +1884,7 @@ export class SessionDriverLoop {
     }
     return this.runUserTurn({
       sessionId: input.sessionId,
-      content: reviewContinuationRequest(review),
+      content: reviewAssembler().continuationRequest(review),
       attachments: [],
       existingEvents: result.events,
       workspaceBinding: input.workspaceBinding,
@@ -5825,21 +5825,6 @@ interface RecoveredAcceptedPlanContext {
   acceptedPlan: AcceptedImplementationPlanContext;
 }
 
-interface SessionReviewContext {
-  sessionId: string;
-  runId: string;
-  reviewId: string;
-  sourcePlanId?: string;
-  summary: string;
-  content: string;
-  userPlan: string;
-  continuations: unknown[];
-  reviewExpectations: unknown[];
-  expectedValidation: string;
-  reviewGuide: string;
-  facts: string[];
-}
-
 interface PendingPermissionContext {
   id: string;
   runId?: string;
@@ -7541,35 +7526,6 @@ function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
 }
 
-function findWaitingReview(events: AgentEvent[], runId?: string): SessionReviewContext | null {
-  const active = findActiveDriverInteraction(events);
-  if (!active || active.kind !== 'review' || (runId && active.runId !== runId)) {
-    return null;
-  }
-  for (const event of [...events].reverse()) {
-    if (event.kind !== 'review_summary') continue;
-    const payload = objectRecord(event.payload);
-    if (!payload || stringValue(payload.status) !== 'waitingUserReview') continue;
-    const candidateRunId = stringValue(payload.runId);
-    if (!candidateRunId || (runId && candidateRunId !== runId)) continue;
-    return {
-      sessionId: event.sessionId,
-      runId: candidateRunId,
-      reviewId: stringValue(payload.reviewId) ?? candidateRunId,
-      sourcePlanId: stringValue(payload.sourcePlanId),
-      summary: stringValue(payload.summary) ?? '',
-      content: stringValue(payload.content) ?? '',
-      userPlan: stringValue(payload.userPlan) ?? '',
-      continuations: Array.isArray(payload.continuations) ? payload.continuations : [],
-      reviewExpectations: Array.isArray(payload.reviewExpectations) ? payload.reviewExpectations : [],
-      expectedValidation: stringValue(payload.expectedValidation) ?? '',
-      reviewGuide: stringValue(payload.reviewGuide) ?? '',
-      facts: Array.isArray(payload.facts) ? payload.facts.filter((item): item is string => typeof item === 'string') : [],
-    };
-  }
-  return null;
-}
-
 function kernelReviewGateStatus(kernelEvents: unknown[] | undefined): string | undefined {
   for (const event of [...(kernelEvents ?? [])].reverse()) {
     const record = objectRecord(event);
@@ -7579,29 +7535,6 @@ function kernelReviewGateStatus(kernelEvents: unknown[] | undefined): string | u
     if (status) return status;
   }
   return undefined;
-}
-
-function reviewContinuationRequest(review: SessionReviewContext): string {
-  const continuations = review.continuations.map(continuationSummary).filter(Boolean);
-  return [
-    'Continue planning the next reviewable Plan from the fact that the current batch Review was accepted.',
-    'This is continuation planning after Review accept; it is not authorization to execute.',
-    'The previous Plan and continuation expectations are intentContext only. Generated-file facts can only come from Kernel facts, ToolCompleted(ok=true), WorkUnitCompleted, or ResourcePacket.',
-    review.content ? `Previous Review card content:\n${review.content}` : '',
-    review.facts.length ? `Previous Kernel facts:\n${review.facts.join('\n')}` : 'Previous Kernel facts: the current Review recorded no reusable facts.',
-    review.userPlan ? `Previous Plan intent:\n${review.userPlan}` : '',
-    continuations.length ? `Continuation intents:\n${continuations.map((item) => `- ${item}`).join('\n')}` : 'Continuation intents: none were recorded.',
-    [
-      'Next proposal requirements:',
-      '- If more edits require existing-code facts, request focused evidence first with resourceRequest kind="search" or file/range.',
-      '- Then output a new detailed Agent Protocol v3 actionBundle.',
-      '- actionBundle.actions must use actionId, toolId, args, and description. fs.write uses args.path/sourceBlockId; fs.patch uses args.path/replacementBlockId/patchSpec; fs.delete uses args.path/targetKind/recursive.',
-      '- codeBlocks must use contentLines. Do not output commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large codeBlocks.content fields.',
-      '- patch must include args.patchSpec.match.kind="exactBlock" and exact text from current ResourcePacket evidence.',
-      '- fs.delete must use a concrete relative args.path. Confirmed directory delete must also set args.targetKind="directory" and args.recursive=true. Do not use codeBlocks/sourceBlockId, empty writes, fs.write as delete, wildcards, or workspace root.',
-      '- The new Plan must wait for user confirmation. Do not assume execution already happened.',
-    ].join('\n'),
-  ].filter(Boolean).join('\n\n');
 }
 
 function implementationPlanExecutionRequest(
@@ -7632,7 +7565,7 @@ function planRevisionRequest(plan: SessionPlanContext, guidance?: string): strin
 }
 
 function reviewRevisionRequest(review: SessionReviewContext, guidance?: string): string {
-  const continuations = review.continuations.map(continuationSummary).filter(Boolean);
+  const continuations = review.continuations.map((item) => reviewAssembler().continuationSummary(item)).filter(Boolean);
   return [
     'Reinterpret the request from the user Review revision guidance and generate the next reviewable Plan.',
     'This is Review revise, not Review accept. Do not treat the user revision guidance as execution authorization.',
@@ -7655,13 +7588,8 @@ function reviewRevisionRequest(review: SessionReviewContext, guidance?: string):
   ].filter(Boolean).join('\n\n');
 }
 
-function continuationSummary(value: unknown): string {
-  const record = objectRecord(value);
-  return stringValue(record?.title) ?? stringValue(record?.description) ?? stringValue(record?.id) ?? clipJson(value, 160);
-}
-
 function continuationDecisionPromptEvent(sessionId: string, review: SessionReviewContext, ts: string, id: string): AgentEvent {
-  const continuations = review.continuations.map(continuationSummary).filter(Boolean);
+  const continuations = review.continuations.map((item) => reviewAssembler().continuationSummary(item)).filter(Boolean);
   return {
     id,
     sessionId,
