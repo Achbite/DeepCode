@@ -1,4 +1,8 @@
 export {
+  DriverActivityBuilder,
+  type DriverActivityLanguage,
+} from './driverActivityBuilder.js';
+export {
   AssistantProjectionBuilder,
   type AssistantDiagnosticInfo,
   type AssistantProjectionLanguage,

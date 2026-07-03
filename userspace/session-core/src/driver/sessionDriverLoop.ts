@@ -1,6 +1,5 @@
 import type {
   AgentContextAttachment,
-  AgentConversationActivity,
   AgentEvent,
   AgentSessionResult,
   AgentStreamPartFrame,
@@ -127,6 +126,7 @@ import {
 } from './proposal/index.js';
 import {
   AssistantProjectionBuilder,
+  DriverActivityBuilder,
   KernelEventProjectionBuilder,
   PlanProjectionBuilder,
   RequirementProjectionBuilder,
@@ -280,6 +280,11 @@ const providerPipeline = new ProviderPipeline();
 const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
 const providerStreamCoordinator = new ProviderStreamCoordinator();
 const providerTraceRecorder = new ProviderTraceRecorder();
+const driverActivityBuilder = new DriverActivityBuilder({
+  providerStageSummary: (stage, part, language) => providerStreamCoordinator.stageSummary(stage, part, language),
+  visibleLanguageForRequest,
+  actionFileTargetPath,
+});
 const permissionPipeline = new PermissionPipeline();
 const userInputPipeline = new UserInputPipeline();
 const interactionOverlayCodec = new InteractionOverlayCodec();
@@ -307,7 +312,7 @@ const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
   planReviewFacts: (report) => planReviewReportAnalyzer.facts(report),
 });
 const planProjectionBuilder = new PlanProjectionBuilder({
-  readActionBundle,
+  readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
   requiredAccessScopesFromReport: (report) => planReviewGrantProjector.requiredAccessScopesFromReport(report),
   permissionBundlesFromReport: (report) => planReviewGrantProjector.permissionBundlesFromReport(report),
@@ -328,7 +333,7 @@ const sessionProgressProjectionBuilder = new SessionProgressProjectionBuilder({
   interactionOverlayPayload: (overlay) => interactionOverlayCodec.toPayload(overlay),
   hasFailureOrBlocker: (kernelEvents) => kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents),
   auditAcceptedPlanBatch: (batch) => acceptedPlanBatchPreflight.audit(batch),
-  actionBundleAdmissionBatch: (proposal) => proposalActionBundleAdmissionBatch(proposal),
+  actionBundleAdmissionBatch: (proposal) => driverActivityBuilder.proposalActionBundleAdmissionBatch(proposal),
   acceptedPlanTaskLedger: (accepted) => buildAcceptedPlanTaskLedger(accepted),
   acceptedPlanPromptFrame: (accepted, taskLedger) => buildAcceptedPlanPromptFrameForContext(accepted, taskLedger),
 });
@@ -378,7 +383,7 @@ const acceptedPlanScopeDecisionOverlay = new AcceptedPlanScopeDecisionOverlay({
     acceptedPlanScopeMatcher.normalizeTargetForExecutionRoot(value, executionRoot),
 });
 const acceptedPlanBatchPreflight = new AcceptedPlanBatchPreflight({
-  batchActionRecords,
+  batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
   objectRecord,
   stringValue,
   stringArrayValue,
@@ -2445,7 +2450,7 @@ export class SessionDriverLoop {
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult | null> {
     const accepted = state.acceptedImplementationPlan;
-    const actionBundle = readActionBundle(proposal);
+    const actionBundle = driverActivityBuilder.readActionBundle(proposal);
     if (!accepted || !actionBundle) return null;
     refreshTaskExecutionState(state);
     if (!acceptedPlanExecutor.currentTaskIsReadOnlyResourceValidation(
@@ -2720,7 +2725,7 @@ export class SessionDriverLoop {
               channel: 'progress',
               source: 'session',
               summary: 'native_tool_checkpoint',
-              activity: conversationActivity({
+              activity: driverActivityBuilder.conversationActivity({
                 activityId: `native-tool-round-${nativeToolRound + 1}`,
                 kind: 'toolExecution',
                 status: 'running',
@@ -2753,7 +2758,7 @@ export class SessionDriverLoop {
               source: 'session',
               itemId: toolCall.callId,
               summary: `Provider repeated ${toolCall.name} for an already resolved target; Session is reusing the existing ResourcePacket without another Kernel read.`,
-              activity: conversationActivity({
+              activity: driverActivityBuilder.conversationActivity({
                 activityId: `native-tool-duplicate-${toolCall.callId}`,
                 kind: 'resourceRead',
                 status: 'completed',
@@ -2789,7 +2794,7 @@ export class SessionDriverLoop {
               source: 'session',
               itemId: toolCall.callId,
               summary: providerStreamCoordinator.nativeToolResolveRunningSummary(toolCall.name, language),
-              activity: conversationActivity({
+              activity: driverActivityBuilder.conversationActivity({
                 activityId: `native-tool-${toolCall.callId}`,
                 kind: 'toolExecution',
                 status: 'running',
@@ -2894,7 +2899,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'session',
       summary: `Complete-stage provider requested native tool ${firstToolCall.name}; Session is retrying once with proposal-only contract.`,
-      activity: conversationActivity({
+      activity: driverActivityBuilder.conversationActivity({
         activityId: `accepted-plan-provider-tool-violation-${firstToolCall.callId}`,
         kind: 'diagnostic',
         status: 'failed',
@@ -2957,7 +2962,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'session',
       summary: 'side_effect_native_tool_blocked',
-      activity: conversationActivity({
+      activity: driverActivityBuilder.conversationActivity({
         activityId: `native-tool-side-effect-${toolCall.callId}`,
         kind: 'diagnostic',
         status: 'failed',
@@ -3044,7 +3049,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'session',
       summary: 'Provider repeated already resolved read-only native tool targets; Session is requesting a no-tool proposal.',
-      activity: conversationActivity({
+      activity: driverActivityBuilder.conversationActivity({
         activityId: `native-tool-duplicate-repair-${state.runId}`,
         kind: 'diagnostic',
         status: 'running',
@@ -3361,12 +3366,12 @@ export class SessionDriverLoop {
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
-    const actionBundle = readActionBundle(proposal);
+    const actionBundle = driverActivityBuilder.readActionBundle(proposal);
     if (actionBundle && state.acceptedImplementationPlan) {
       return this.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback);
     }
     if (actionBundle) {
-      const admissionBatch = proposalActionBundleAdmissionBatch(proposal);
+      const admissionBatch = driverActivityBuilder.proposalActionBundleAdmissionBatch(proposal);
       const admissionReasons = acceptedPlanBatchPreflight.deleteReasons(admissionBatch, state.resourcePackets);
       if (admissionReasons.length) {
         return this.repairActionBundleAdmission(input, state, prompt, proposal, admissionReasons, fallback);
@@ -3478,7 +3483,7 @@ export class SessionDriverLoop {
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
     const accepted = state.acceptedImplementationPlan;
-    const actionBundle = readActionBundle(proposal);
+    const actionBundle = driverActivityBuilder.readActionBundle(proposal);
     if (!accepted || !actionBundle) return fallback;
 
     const readOnlyActionResult = await this.tryCompleteAcceptedPlanReadOnlyActionBundle(
@@ -3826,8 +3831,8 @@ export class SessionDriverLoop {
       status: 'running',
       channel: 'progress',
       source: 'session',
-      summary: acceptedPlanBatchActivitySummary(batch),
-      activity: acceptedPlanBatchActivity(accepted, batch, 'running'),
+      summary: driverActivityBuilder.acceptedPlanBatchActivitySummary(batch),
+      activity: driverActivityBuilder.acceptedPlanBatchActivity({ accepted, batch, status: 'running' }),
       payload: {
         visibility: 'task',
         planId: accepted.planId,
@@ -4191,7 +4196,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'session',
       summary: providerStreamCoordinator.stageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
-      activity: providerActivity(state, stage, 'running'),
+      activity: driverActivityBuilder.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
     });
     const request: LlmChatRequest = {
       profileId,
@@ -4282,7 +4287,7 @@ export class SessionDriverLoop {
       channel: 'progress',
       source: 'provider',
       summary: providerStreamCoordinator.stageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
-      activity: providerActivity(state, stage, 'completed'),
+      activity: driverActivityBuilder.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'completed' }),
     });
     const content = stripProviderPartFrames(result.data.assistantMessage?.content
       ?? result.data.chunks
@@ -4356,7 +4361,7 @@ export class SessionDriverLoop {
         summary: chunk.toolCallDelta?.name
           ? providerStreamCoordinator.toolCallPreparingSummary(chunk.toolCallDelta.name, language)
           : providerStreamCoordinator.toolCallStreamingSummary(language),
-        activity: conversationActivity({
+        activity: driverActivityBuilder.conversationActivity({
           activityId: `provider-tool-${chunk.callId ?? chunk.index ?? 0}`,
           kind: 'toolExecution',
           status: 'running',
@@ -4398,7 +4403,7 @@ export class SessionDriverLoop {
         channel: 'progress',
         source: 'provider',
         summary: event.error ?? chunk?.error ?? 'Provider stream error.',
-        activity: conversationActivity({
+        activity: driverActivityBuilder.conversationActivity({
           activityId: `provider-${stage}-stream-error`,
           kind: 'diagnostic',
           status: 'failed',
@@ -4448,7 +4453,7 @@ export class SessionDriverLoop {
       source: 'provider',
       itemId: buffer.itemId,
       delta,
-      activity: providerActivity(state, stage, 'running'),
+      activity: driverActivityBuilder.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
       payload: {
         presentation: 'reasoningTrace',
         streamMode: 'markdownBlocks',
@@ -4517,7 +4522,7 @@ export class SessionDriverLoop {
       source: 'session',
       itemId: `${stage}-provider-json-progress`,
       summary,
-      activity: providerActivity(state, stage, 'running'),
+      activity: driverActivityBuilder.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
       payload: {
         stage,
         receivedChars: progress.receivedChars,
@@ -4848,8 +4853,8 @@ function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex {
     joinFsPath,
     objectRecord,
     stringValue,
-    uniqueStrings,
-    batchActionRecords,
+    uniqueStrings: (values) => driverActivityBuilder.uniqueStrings(values),
+    batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
     actionEffectiveCapability,
     actionFileTargetPath,
     completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
@@ -4876,7 +4881,7 @@ function acceptedImplementationPlanContextBuilder(): AcceptedImplementationPlanC
     stringValue,
     stringArrayValue,
     normalizePlanScope,
-    uniqueStrings,
+    uniqueStrings: (values) => driverActivityBuilder.uniqueStrings(values),
     acceptedPlanTaskTargets: (record) => acceptedPlanTargetParser.taskTargets(record),
     executionSliceRoleValue,
     exactOperationGrantsFromImplementationPlan: (plan, executionRoot) =>
@@ -4909,7 +4914,7 @@ function acceptedPlanScopeIntervention(createId: (prefix: string) => string): Ac
 function reviewAssembler(): ReviewAssembler {
   return new ReviewAssembler({
     completedWorkUnitFacts: (events) => completedWorkUnitFactIndex.completedWorkUnitFacts(events),
-    batchActionRecords,
+    batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
     actionEffectiveCapability,
     actionFileTargetPath,
     normalizeAcceptedPlanTargetScope: (value, accepted) =>
@@ -5107,107 +5112,6 @@ function firstString(events: unknown[], key: string): string | undefined {
     if (typeof value === 'string' && value.trim()) return value;
   }
   return undefined;
-}
-
-function conversationActivity(input: AgentConversationActivity): AgentConversationActivity {
-  return {
-    ...input,
-    targets: uniqueStrings(input.targets ?? []),
-    actionIds: uniqueStrings(input.actionIds ?? []),
-    workUnitIds: uniqueStrings(input.workUnitIds ?? []),
-  };
-}
-
-function providerActivity(
-  state: SessionDriverLoopRunState,
-  stage: string,
-  status: 'running' | 'completed'
-): AgentConversationActivity {
-  return conversationActivity({
-    activityId: `provider-${stage}`,
-    kind: 'providerThinking',
-    status,
-    title: status === 'running' ? 'Provider call running' : 'Provider call completed',
-    summary: providerStreamCoordinator.stageSummary(stage, status === 'running' ? 'request' : 'response', visibleLanguageForRequest(state.userRequest)),
-    source: 'provider',
-    runId: state.runId,
-  });
-}
-
-function acceptedPlanBatchActivity(
-  accepted: AcceptedImplementationPlanContext,
-  batch: unknown,
-  status: 'running' | 'completed'
-): AgentConversationActivity {
-  const actions = batchActionRecords(batch);
-  return conversationActivity({
-    activityId: `accepted-plan-batch-${accepted.planId}-${accepted.batchIndex}-${status}`,
-    kind: 'editBatchQueued',
-    status,
-    title: status === 'running' ? 'Submitting accepted-plan batch' : 'Accepted-plan batch submitted',
-    summary: acceptedPlanBatchActivitySummary(batch),
-    source: 'session',
-    runId: accepted.runId,
-    planId: accepted.planId,
-    targets: actions.flatMap(actionTargetCandidates),
-    actionIds: actions.flatMap((action) => stringValue(action.actionId) ?? stringValue(action.id) ?? []),
-    itemCount: actions.length,
-  });
-}
-
-function acceptedPlanBatchActivitySummary(batch: unknown): string {
-  const actions = batchActionRecords(batch);
-  const targetCount = uniqueStrings(actions.flatMap(actionTargetCandidates)).length;
-  return `Session is submitting ${actions.length} accepted-plan action(s) for ${targetCount} target(s).`;
-}
-
-function batchActionRecords(batch: unknown): Record<string, unknown>[] {
-  const record = objectRecord(batch);
-  const nested = objectRecord(record?.actionBundle);
-  const actions = Array.isArray(record?.actions)
-    ? record.actions
-    : Array.isArray(nested?.actions)
-      ? nested.actions
-      : [];
-  return actions.flatMap((item) => objectRecord(item) ? [objectRecord(item) as Record<string, unknown>] : []);
-}
-
-function actionTargetCandidates(action: Record<string, unknown>): string[] {
-  return uniqueStrings([
-    actionFileTargetPath(action),
-    stringValue(action.targetPath),
-    ...stringArrayValue(action.resourceScope),
-  ]);
-}
-
-function uniqueStrings(values: Array<string | undefined>): string[] {
-  const seen = new Set<string>();
-  const output: string[] = [];
-  for (const value of values) {
-    if (!value) continue;
-    const trimmed = value.trim();
-    if (!trimmed || seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    output.push(trimmed);
-  }
-  return output;
-}
-
-function readActionBundle(proposal: ProposalEnvelope): ActionBundleDraft | undefined {
-  const payload = objectRecord(proposal.payload);
-  const actionBundle = objectRecord(payload?.actionBundle);
-  return actionBundle as unknown as ActionBundleDraft | undefined;
-}
-
-function proposalActionBundleAdmissionBatch(proposal: ProposalEnvelope): Record<string, unknown> {
-  const payload = objectRecord(proposal.payload) ?? {};
-  const actionBundle = objectRecord(payload.actionBundle) ?? {};
-  return {
-    planId: stringValue(actionBundle.id) ?? proposal.proposalId,
-    actionBundle,
-    codeBlocks: Array.isArray(payload.codeBlocks) ? payload.codeBlocks : [],
-    commandBlocks: Array.isArray(payload.commandBlocks) ? payload.commandBlocks : [],
-  };
 }
 
 function protocolGate(): ProtocolGate {
@@ -5408,7 +5312,7 @@ function validateProposalSemantics(proposal: ProposalEnvelope, options?: {
 }): void {
   if (proposal.kind !== 'actionBundle') return;
   const payload = objectRecord(proposal.payload) ?? {};
-  const bundle = readActionBundle(proposal);
+  const bundle = driverActivityBuilder.readActionBundle(proposal);
   if (!bundle) {
     throw new AgentPlanParseError('invalid_action_bundle', 'Agent Protocol v3.actionBundle must include an actionBundle object.');
   }
@@ -5689,7 +5593,7 @@ function acceptedPlanExecutionContext(
 ): SessionPlanContext {
   const accepted = state.acceptedImplementationPlan;
   const payload = objectRecord(proposal.payload) ?? {};
-  const actionBundle = readActionBundle(proposal) ?? {
+  const actionBundle = driverActivityBuilder.readActionBundle(proposal) ?? {
     id: accepted?.planId ?? proposal.proposalId,
     version: '1',
     goal: stringValue(accepted?.summary) ?? 'Accepted implementation plan batch',
@@ -5996,7 +5900,7 @@ function fileOperationFreshnessValidationReasons(
   proposal: ProposalEnvelope,
   resourcePackets: ResourcePacket[]
 ): string[] {
-  const actionBundle = readActionBundle(proposal);
+  const actionBundle = driverActivityBuilder.readActionBundle(proposal);
   const reasons: string[] = [];
   const evidenceIndex = resourceEvidenceIndex();
   for (const [index, action] of (actionBundle?.actions ?? []).entries()) {

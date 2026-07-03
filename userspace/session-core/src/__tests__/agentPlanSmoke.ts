@@ -59,7 +59,7 @@ import {
 } from '../driver/execution/index.js';
 import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
 import { PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
-import { AssistantProjectionBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
+import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
 async function main(): Promise<void> {
@@ -93,6 +93,7 @@ async function main(): Promise<void> {
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
+  assertDriverActivityBuilderCreatesReadModels();
   assertAssistantProjectionBuilderCreatesConversationEvents();
   assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents();
   assertSessionFailureProjectionBuilderCreatesFailureEvents();
@@ -1934,6 +1935,93 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   assertEqual(decisionPayload.messageKey, 'session.driver.planReviewAccepted', 'plan projection marks accepted plan review with i18n key');
   assertEqual(decisionPayload.facts[0], `fact-${token}`, 'plan projection preserves plan review facts');
   assertEqual(decisionPayload.overlayId, `overlay-${token}`, 'plan projection preserves interaction overlay payload');
+}
+
+function assertDriverActivityBuilderCreatesReadModels(): void {
+  const token = randomSmokeToken('activity-builder');
+  const runId = `run-${token}`;
+  const planId = `plan-${token}`;
+  const targetPath = `dir-${token}/file-${randomSmokeToken('file')}.txt`;
+  const builder = new DriverActivityBuilder({
+    providerStageSummary: (stage, part, language) => `${stage}:${part}:${language}`,
+    visibleLanguageForRequest: () => 'en-US',
+    actionFileTargetPath: (action) => typeof action.targetPath === 'string' ? action.targetPath : undefined,
+  });
+  const generic = builder.conversationActivity({
+    activityId: `activity-${token}`,
+    kind: 'toolExecution',
+    status: 'running',
+    title: 'Generic activity',
+    summary: 'Generic activity summary',
+    source: 'session',
+    runId,
+    targets: [targetPath, targetPath],
+    actionIds: [`action-${token}`, `action-${token}`],
+    workUnitIds: [`work-${token}`, `work-${token}`],
+  });
+  assertEqual(generic.targets?.length, 1, 'driver activity builder deduplicates targets');
+  assertEqual(generic.actionIds?.length, 1, 'driver activity builder deduplicates action ids');
+  assertEqual(generic.workUnitIds?.length, 1, 'driver activity builder deduplicates work unit ids');
+  const provider = builder.providerActivity({
+    runId,
+    userRequest: `Request ${token}`,
+    stage: `stage-${token}`,
+    status: 'running',
+  });
+  assertEqual(provider.summary, `stage-${token}:request:en-US`, 'driver activity builder uses provider stage summary port');
+  const batch = {
+    actions: [{
+      id: `action-${token}`,
+      actionId: `action-${token}`,
+      targetPath,
+      resourceScope: [targetPath],
+    }],
+  };
+  const acceptedActivity = builder.acceptedPlanBatchActivity({
+    accepted: {
+      planId,
+      runId,
+      title: 'Accepted activity plan',
+      summary: 'Accepted activity plan summary',
+      tasks: [],
+      capabilities: [],
+      targetScopes: [],
+      exactOperationGrants: [],
+      accessScopes: [],
+      batchIndex: 2,
+      completedTaskIds: [],
+      rawPlan: {},
+    } as AcceptedImplementationPlanContext,
+    batch,
+    status: 'running',
+  });
+  assertEqual(acceptedActivity.targets?.[0], targetPath, 'driver activity builder extracts batch target path');
+  assertEqual(acceptedActivity.itemCount, 1, 'driver activity builder counts batch actions');
+  assertEqual(builder.batchActionRecords({ actionBundle: batch }).length, 1, 'driver activity builder reads nested action bundles');
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId,
+    sessionId: `session-${token}`,
+    source: 'llm',
+    kind: 'actionBundle',
+    payload: {
+      actionBundle: {
+        id: `bundle-${token}`,
+        version: '1',
+        goal: `Goal ${token}`,
+        actions: batch.actions,
+        validationExpectations: [],
+        reviewExpectations: [],
+      },
+      codeBlocks: [],
+      commandBlocks: [],
+    },
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  } as ProposalEnvelope;
+  assertEqual(builder.readActionBundle(proposal)?.id, `bundle-${token}`, 'driver activity builder reads actionBundle proposal payload');
+  assertEqual(builder.proposalActionBundleAdmissionBatch(proposal).planId, `bundle-${token}`, 'driver activity builder builds admission batch read-model');
 }
 
 function assertAssistantProjectionBuilderCreatesConversationEvents(): void {
