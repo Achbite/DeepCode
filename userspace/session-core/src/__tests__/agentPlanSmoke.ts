@@ -1215,6 +1215,14 @@ function assertReviewAssemblerFindsWaitingReviewContext(): void {
   const request = assembler.continuationRequest(review);
   assert(request.includes(`fact-${token}`), 'review assembler continuation request includes review facts');
   assert(request.includes(continuationTitle), 'review assembler continuation request includes continuation title');
+  const revisionRequest = assembler.revisionRequest(review, `guidance-${token}`);
+  assert(revisionRequest.includes(`guidance-${token}`), 'review assembler revision request includes user guidance');
+  assert(revisionRequest.includes(`fact-${token}`), 'review assembler revision request includes review facts');
+  assertEqual(
+    assembler.continuationSummaries(review)[0],
+    continuationTitle,
+    'review assembler exposes continuation summaries'
+  );
   assertEqual(
     assembler.findWaitingReview(events, `other-${token}`, { kind: 'review', runId: `other-${token}` }),
     null,
@@ -1269,6 +1277,19 @@ function assertReviewDecisionProjectionUsesI18nKeys(): void {
   assertEqual(revisionPayload.summaryKey, 'review.decision.needsRevision.summary', 'review decision projection includes revision summary key');
   assertEqual(revisionPayload.content, guidance, 'review decision projection preserves user guidance content');
   assertEqual(revisionPayload.contentKey, undefined, 'review decision projection does not assign content key to user guidance');
+
+  const continuationPrompt = builder.continuationPromptEvent({
+    sessionId: `session-${token}`,
+    review,
+    continuations: [`next-${token}`],
+    ts: new Date(0).toISOString(),
+    id: `continuation-${token}`,
+  });
+  const continuationPayload = continuationPrompt.payload as Record<string, unknown>;
+  assertEqual(continuationPayload.titleKey, 'review.continuationDecision.title', 'review decision projection emits continuation title key');
+  assertEqual(continuationPayload.messageKey, 'review.continuationDecision.summary', 'review decision projection emits continuation message key');
+  assertEqual((continuationPayload.messageArgs as Record<string, unknown>).continuationCount, '1', 'review decision projection emits continuation count');
+  assertEqual(Array.isArray(continuationPayload.continuations), true, 'review decision projection preserves continuation summaries');
 }
 
 function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {

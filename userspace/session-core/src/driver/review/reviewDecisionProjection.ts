@@ -20,6 +20,14 @@ export interface ReviewDecisionProjectionInput {
   id: string;
 }
 
+export interface ReviewContinuationDecisionPromptInput {
+  sessionId: string;
+  review: ReviewDecisionProjectionContext;
+  continuations: string[];
+  ts: string;
+  id: string;
+}
+
 export class ReviewDecisionProjectionBuilder {
   event(input: ReviewDecisionProjectionInput): AgentEvent {
     const summary = this.summaryDescriptor(input.status);
@@ -52,6 +60,30 @@ export class ReviewDecisionProjectionBuilder {
         continuationCount: input.review.continuations.length,
         continuations: input.review.continuations,
         channel: input.status === 'accepted' ? 'progress' : 'final',
+        visibility: 'conversation',
+        presentation: 'body',
+      },
+    };
+  }
+
+  continuationPromptEvent(input: ReviewContinuationDecisionPromptInput): AgentEvent {
+    return {
+      id: input.id,
+      sessionId: input.sessionId,
+      ts: input.ts,
+      kind: 'assistant_msg',
+      payload: {
+        title: 'Continuation confirmation',
+        titleKey: 'review.continuationDecision.title',
+        messageKey: 'review.continuationDecision.summary',
+        messageArgs: { continuationCount: String(input.continuations.length) },
+        contentKey: 'review.continuationDecision.content',
+        contentArgs: { continuationCount: String(input.continuations.length) },
+        continuations: input.continuations,
+        runId: input.review.runId,
+        reviewId: input.review.reviewId,
+        sourcePlanId: input.review.sourcePlanId,
+        channel: 'progress',
         visibility: 'conversation',
         presentation: 'body',
       },

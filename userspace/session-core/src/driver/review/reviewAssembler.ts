@@ -301,7 +301,7 @@ export class ReviewAssembler {
   }
 
   continuationRequest(review: SessionReviewContext): string {
-    const continuations = review.continuations.map((item) => this.continuationSummary(item)).filter(Boolean);
+    const continuations = this.continuationSummaries(review);
     return [
       'Continue planning the next reviewable Plan from the fact that the current batch Review was accepted.',
       'This is continuation planning after Review accept; it is not authorization to execute.',
@@ -321,6 +321,34 @@ export class ReviewAssembler {
         '- The new Plan must wait for user confirmation. Do not assume execution already happened.',
       ].join('\n'),
     ].filter(Boolean).join('\n\n');
+  }
+
+  revisionRequest(review: SessionReviewContext, guidance?: string): string {
+    const continuations = this.continuationSummaries(review);
+    return [
+      'Reinterpret the request from the user Review revision guidance and generate the next reviewable Plan.',
+      'This is Review revise, not Review accept. Do not treat the user revision guidance as execution authorization.',
+      'The previous Plan, Review guidance, and continuation expectations are intentContext only. Generated-file facts can only come from Kernel facts, ToolCompleted(ok=true), WorkUnitCompleted, or ResourcePacket.',
+      guidance?.trim() ? `User Review revision guidance:\n${guidance.trim()}` : 'User Review revision guidance: the user requested additional work or changes for the current batch.',
+      review.content ? `Previous Review card content:\n${review.content}` : '',
+      review.facts.length ? `Previous Kernel facts:\n${review.facts.join('\n')}` : 'Previous Kernel facts: the current Review recorded no reusable facts.',
+      review.userPlan ? `Previous Plan intent:\n${review.userPlan}` : '',
+      continuations.length ? `Previous continuation intent:\n${continuations.map((item) => `- ${item}`).join('\n')}` : '',
+      [
+        'Next proposal requirements:',
+        '- If more edits require existing-code facts, request focused evidence first with resourceRequest kind="search" or file/range, such as build scripts, entry source files, headers, tests, or container configuration.',
+        '- Then output a new detailed Agent Protocol v3 actionBundle.',
+        '- actionBundle.actions must use actionId, toolId, args, and description. fs.write uses args.path/sourceBlockId; fs.patch uses args.path/replacementBlockId/patchSpec; fs.delete uses args.path/targetKind/recursive.',
+        '- codeBlocks must use contentLines. Do not output commandBlocks, capability, permissionLabels, accessScopes, resourceScope, or large codeBlocks.content fields.',
+        '- patch must include args.patchSpec.match.kind="exactBlock" and exact text from current ResourcePacket evidence.',
+        '- fs.delete must use a concrete relative args.path. Confirmed directory delete must also set args.targetKind="directory" and args.recursive=true. Do not use codeBlocks/sourceBlockId, empty writes, fs.write as delete, wildcards, or workspace root.',
+        '- The new Plan waits for user confirmation. Do not assume execution already happened.',
+      ].join('\n'),
+    ].filter(Boolean).join('\n\n');
+  }
+
+  continuationSummaries(review: { continuations: unknown[] }): string[] {
+    return review.continuations.map((item) => this.continuationSummary(item)).filter(Boolean);
   }
 
   continuationSummary(value: unknown): string {
