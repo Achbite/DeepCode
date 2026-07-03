@@ -1,3 +1,8 @@
+export {
+  AssistantProjectionBuilder,
+  type AssistantDiagnosticInfo,
+  type AssistantProjectionLanguage,
+} from './assistantProjectionBuilder.js';
 export { KernelEventProjectionBuilder } from './kernelEventProjectionBuilder.js';
 export {
   PlanProjectionBuilder,

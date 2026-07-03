@@ -59,7 +59,7 @@ import {
 } from '../driver/execution/index.js';
 import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserInputPipeline } from '../driver/pipelines/index.js';
 import { PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProtocolGate } from '../driver/proposal/index.js';
-import { KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
+import { AssistantProjectionBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 
 async function main(): Promise<void> {
@@ -93,6 +93,7 @@ async function main(): Promise<void> {
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
+  assertAssistantProjectionBuilderCreatesConversationEvents();
   assertRequirementProjectionBuilderCreatesDecisionEvents();
   assertPlanReviewReportAnalyzerKeepsReviewSemantics();
   assertPlanInteractionIndexFindsActivePlan();
@@ -1831,6 +1832,73 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   const implementationPayload = implementationPlan.payload as any;
   assertEqual(implementationPayload.confirmable, true, 'plan projection keeps implementation plan confirmable');
   assert(String(implementationPayload.content).includes(targetPath), 'plan projection renders implementation plan target');
+}
+
+function assertAssistantProjectionBuilderCreatesConversationEvents(): void {
+  const token = randomSmokeToken('assistant-projection');
+  const builder = new AssistantProjectionBuilder({
+    visibleLanguageForRequest: () => 'en-US',
+    guidanceRevisionTransitionMessage: (language) => `transition-${language}-${token}`,
+  });
+  const proposal: ProposalEnvelope = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId: `run-${token}`,
+    source: 'llm',
+    kind: 'answer',
+    narration: `narration-${token}`,
+    payload: {
+      answer: {
+        content: `answer-${token}`,
+      },
+    },
+    referencedResourcePacketRefs: [],
+    referencedEvidenceRefs: [],
+  };
+  const answer = builder.answerEvent(`session-${token}`, proposal, '2026-01-01T00:00:00.000Z', `answer-${token}`);
+  assertEqual(answer.kind, 'assistant_msg', 'assistant projection creates answer event');
+  assertEqual((answer.payload as any).channel, 'final', 'assistant projection marks answer final');
+  assertEqual((answer.payload as any).content, `answer-${token}`, 'assistant projection extracts answer content');
+
+  const diagnostic = builder.finalDiagnosticEvent(
+    `session-${token}`,
+    { code: `code-${token}`, fallback: `fallback-${token}`, params: { token } },
+    '2026-01-01T00:00:01.000Z',
+    `diagnostic-${token}`
+  );
+  assertEqual((diagnostic.payload as any).diagnosticCode, `code-${token}`, 'assistant projection preserves diagnostic code');
+  assertEqual((diagnostic.payload as any).diagnosticParams.token, token, 'assistant projection preserves diagnostic params');
+
+  const reasoning = builder.reasoningEvent(`session-${token}`, `reasoning-${token}`, '2026-01-01T00:00:02.000Z', `reasoning-${token}`);
+  assertEqual((reasoning.payload as any).channel, 'reasoning', 'assistant projection marks provider reasoning');
+  assertEqual((reasoning.payload as any).presentation, 'collapsible', 'assistant projection keeps reasoning collapsible');
+
+  const progressProposal: ProposalEnvelope = { ...proposal, kind: 'taskPlan' };
+  const narration = builder.proposalNarrationEvent(
+    `session-${token}`,
+    progressProposal,
+    '2026-01-01T00:00:03.000Z',
+    `narration-${token}`
+  );
+  assertEqual((narration?.payload as any).channel, 'progress', 'assistant projection creates narration progress event');
+
+  const transition = builder.guidanceRevisionTransitionEvent(
+    `session-${token}`,
+    `run-${token}`,
+    [`guidance-${token}`],
+    `request-${token}`,
+    '2026-01-01T00:00:04.000Z',
+    `transition-${token}`
+  );
+  assertEqual((transition.payload as any).content, `transition-en-US-${token}`, 'assistant projection uses guidance transition port');
+
+  const overlay = builder.guidanceRevisionOverlay(`request-${token}`, proposal, [{
+    id: `guidance-${token}`,
+    source: 'user',
+    checkpointKind: 'nextProviderCall',
+    content: `guidance-${token}`,
+  }]);
+  assert(overlay.includes(`guidance-${token}`), 'assistant projection guidance overlay preserves guidance ids');
 }
 
 function assertPlanReviewReportAnalyzerKeepsReviewSemantics(): void {

@@ -124,6 +124,7 @@ import {
   ProtocolGate,
 } from './proposal/index.js';
 import {
+  AssistantProjectionBuilder,
   KernelEventProjectionBuilder,
   PlanProjectionBuilder,
   RequirementProjectionBuilder,
@@ -327,6 +328,10 @@ const requirementProjectionBuilder = new RequirementProjectionBuilder({
   visibleLanguageForRequest,
   interactionOverlayPayload: (payload) => interactionOverlayCodec.toPayload(interactionOverlayCodec.fromPayload(payload)),
 });
+const assistantProjectionBuilder = new AssistantProjectionBuilder({
+  visibleLanguageForRequest,
+  guidanceRevisionTransitionMessage: (language) => providerStreamCoordinator.guidanceRevisionTransitionMessage(language),
+});
 const reviewProjectionBuilder = new ReviewProjectionBuilder();
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
 const kernelEventStatusIndex = new KernelEventStatusIndex();
@@ -406,7 +411,7 @@ export class SessionDriverLoop {
     if (input.kind === 'permission') return this.resolvePermissionDecision(input);
     if (input.kind === 'review') return this.resolveReviewDecision(input);
     return this.append(input.sessionId, [
-      finalDiagnosticEvent(
+      assistantProjectionBuilder.finalDiagnosticEvent(
         input.sessionId,
         diag('decisionResolverMissing', `Decision kind "${input.kind}" is not yet connected to Session DecisionResolver.`, { kind: input.kind }),
         this.ts(),
@@ -536,7 +541,7 @@ export class SessionDriverLoop {
       } catch (error) {
         const message = error instanceof SessionDriverLoopError ? error.message : String(error);
         return this.append(sessionId, [
-          finalDiagnosticEvent(
+          assistantProjectionBuilder.finalDiagnosticEvent(
             sessionId,
             diag('requirementConfirmationFailed', `Requirement confirmation generation failed: ${message}`, { message }),
             this.ts(),
@@ -606,7 +611,7 @@ export class SessionDriverLoop {
       } catch (error) {
         if (error instanceof SessionDriverLoopError) {
           return this.append(sessionId, [
-            finalDiagnosticEvent(
+            assistantProjectionBuilder.finalDiagnosticEvent(
               sessionId,
               readableDriverFailureMessage(error.code, error.message),
               this.ts(),
@@ -615,7 +620,7 @@ export class SessionDriverLoop {
           ]);
         }
         return this.append(sessionId, [
-          finalDiagnosticEvent(
+          assistantProjectionBuilder.finalDiagnosticEvent(
             sessionId,
             readableProviderFailureMessage(error),
             this.ts(),
@@ -623,14 +628,14 @@ export class SessionDriverLoop {
           ),
         ]);
       }
-      const narration = proposalNarrationEvent(sessionId, proposal, this.ts(), this.id('progress-model-narration'));
+      const narration = assistantProjectionBuilder.proposalNarrationEvent(sessionId, proposal, this.ts(), this.id('progress-model-narration'));
       if (narration) {
         lastResult = await this.append(sessionId, [narration]);
       }
       if (proposal.kind === 'answer') {
         const revised = await this.maybeReviseTerminalAnswerWithGuidance(input, state, proposal);
         if (revised) return revised;
-        return this.append(sessionId, [answerEvent(sessionId, proposal, this.ts(), this.id('answer'))]);
+        return this.append(sessionId, [assistantProjectionBuilder.answerEvent(sessionId, proposal, this.ts(), this.id('answer'))]);
       }
       if (proposal.kind === 'decisionRequest') {
         const requirement = userInputPipeline.requirementRecordFromProposal({
@@ -688,7 +693,7 @@ export class SessionDriverLoop {
           ?? stringValue(diagnostic.details)
           ?? 'The model returned diagnostic information without generating a plan or execution queue.';
         return this.append(sessionId, [
-          finalDiagnosticEvent(sessionId, summary, this.ts(), this.id('diagnostic')),
+          assistantProjectionBuilder.finalDiagnosticEvent(sessionId, summary, this.ts(), this.id('diagnostic')),
         ]);
       }
       if (proposal.kind === 'taskPlan' || proposal.kind === 'implementationPlan') {
@@ -735,7 +740,7 @@ export class SessionDriverLoop {
             try {
               const repaired = await this.repairResourceRequest(input, state, prompt, proposal, subset);
               if (repaired.kind === 'answer') {
-                return this.append(sessionId, [answerEvent(sessionId, repaired, this.ts(), this.id('answer'))]);
+                return this.append(sessionId, [assistantProjectionBuilder.answerEvent(sessionId, repaired, this.ts(), this.id('answer'))]);
               }
               if (repaired.kind === 'resourceRequest') {
                 subset = resourceRequestResolver().resolve(state.manifest, repaired.payload as ResourceRequestDraft, state.conversationRoots);
@@ -747,7 +752,7 @@ export class SessionDriverLoop {
             } catch (error) {
               const message = error instanceof SessionDriverLoopError ? error.message : String(error);
               return this.append(sessionId, [
-                finalDiagnosticEvent(
+                assistantProjectionBuilder.finalDiagnosticEvent(
                   sessionId,
                   diag('resourceResolveRepairFailed', `The requested resources could not be located in attachments or project directory, and repair failed: ${message}`, { message }),
                   this.ts(),
@@ -759,7 +764,7 @@ export class SessionDriverLoop {
         }
         if (!subset.manifest.entries.length) {
           return this.append(sessionId, [
-            finalDiagnosticEvent(
+            assistantProjectionBuilder.finalDiagnosticEvent(
               sessionId,
               resourceRequestLoop.resolutionDiagnostic(subset),
               this.ts(),
@@ -973,7 +978,7 @@ export class SessionDriverLoop {
 
     if (!plan || !plan.implementationPlan) {
       return this.append(input.sessionId, [
-        finalDiagnosticEvent(
+        assistantProjectionBuilder.finalDiagnosticEvent(
           input.sessionId,
           'Accepted-plan scope decision could not recover the original implementationPlan; Session will not start a detached requirement flow.',
           this.ts(),
@@ -1037,7 +1042,7 @@ export class SessionDriverLoop {
 
     if (stateDecision.kind === 'finishWithAnswer') {
       return this.append(input.sessionId, [
-        answerEvent(input.sessionId, answerProposalFromDecisionEffect(
+        assistantProjectionBuilder.answerEvent(input.sessionId, answerProposalFromDecisionEffect(
           input.sessionId,
           runId,
           effect,
@@ -1203,7 +1208,7 @@ export class SessionDriverLoop {
     const acceptedContext = recoverAcceptedPlanFromOverlay(input, current.events, interactionOverlay);
     if (!acceptedContext) {
       return this.append(input.sessionId, [
-        finalDiagnosticEvent(
+        assistantProjectionBuilder.finalDiagnosticEvent(
           input.sessionId,
           'Accepted-plan interaction decision could not recover the parent implementationPlan; Session will not start a detached requirement flow.',
           this.ts(),
@@ -2010,7 +2015,7 @@ export class SessionDriverLoop {
     if (guidance.length === 0) return null;
 
     result = await this.append(state.sessionId, [
-      guidanceRevisionTransitionEvent(
+      assistantProjectionBuilder.guidanceRevisionTransitionEvent(
         state.sessionId,
         state.runId,
         guidance.map((item) => item.id),
@@ -2028,7 +2033,7 @@ export class SessionDriverLoop {
       projectMemoryMode: input.projectMemoryMode,
       extraMemoryHints: implementationBatchHints(state.implementationBatch),
       interventionLevel: input.interventionLevel,
-      userOverlay: guidanceRevisionOverlay(input.content, draftAnswer, guidance),
+      userOverlay: assistantProjectionBuilder.guidanceRevisionOverlay(input.content, draftAnswer, guidance),
       userGuidance: guidance,
       userRequest: input.content,
       initialContext: state.initialContext,
@@ -2071,7 +2076,7 @@ export class SessionDriverLoop {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.append(state.sessionId, [
-        guidanceRevisionDiagnosticEvent(
+        assistantProjectionBuilder.guidanceRevisionDiagnosticEvent(
           state.sessionId,
           `用户引导合并失败，已回退到初版回复：${message}`,
           this.ts(),
@@ -2079,7 +2084,7 @@ export class SessionDriverLoop {
         ),
       ]);
       return this.append(state.sessionId, [
-        answerEvent(state.sessionId, draftAnswer, this.ts(), this.id('answer'), {
+        assistantProjectionBuilder.answerEvent(state.sessionId, draftAnswer, this.ts(), this.id('answer'), {
           guidanceRevisionFailed: true,
           appliedGuidanceIds: guidance.map((item) => item.id),
           replacesDraftProposalId: draftAnswer.proposalId,
@@ -2087,12 +2092,12 @@ export class SessionDriverLoop {
       ]);
     }
 
-    const narration = answerNarrationEvent(state.sessionId, revised, this.ts(), this.id('guidance-revision-narration'));
+    const narration = assistantProjectionBuilder.answerNarrationEvent(state.sessionId, revised, this.ts(), this.id('guidance-revision-narration'));
     if (narration) {
       result = await this.append(state.sessionId, [narration]);
     }
     return this.append(state.sessionId, [
-      answerEvent(state.sessionId, revised, this.ts(), this.id('answer'), {
+      assistantProjectionBuilder.answerEvent(state.sessionId, revised, this.ts(), this.id('answer'), {
         guidanceRevision: true,
         appliedGuidanceIds: guidance.map((item) => item.id),
         replacesDraftProposalId: draftAnswer.proposalId,
@@ -2128,7 +2133,7 @@ export class SessionDriverLoop {
             message: 'LLM provider returned an empty response before emitting a JSON proposal.',
           };
           await this.append(state.sessionId, [
-            thinkingEvent(
+            assistantProjectionBuilder.thinkingEvent(
               state.sessionId,
               `Model output requires Agent Protocol v3 repair: ${parseError.message}`,
               this.ts(),
@@ -2161,7 +2166,7 @@ export class SessionDriverLoop {
           }
         }
         await this.append(state.sessionId, [
-          thinkingEvent(
+          assistantProjectionBuilder.thinkingEvent(
             state.sessionId,
             'The model did not return valid JSON; Session is asking it to narrow the response to the next reviewable actionBundle.',
             this.ts(),
@@ -2203,7 +2208,7 @@ export class SessionDriverLoop {
     } catch (error) {
       const parseError = normalizeParseError(error);
       await this.append(state.sessionId, [
-        thinkingEvent(
+        assistantProjectionBuilder.thinkingEvent(
           state.sessionId,
           `Model output requires Agent Protocol v3 repair: ${parseError.message}`,
           this.ts(),
@@ -2473,7 +2478,7 @@ export class SessionDriverLoop {
     } catch (error) {
       const parseError = normalizeParseError(error);
       await this.append(state.sessionId, [
-        thinkingEvent(
+        assistantProjectionBuilder.thinkingEvent(
           state.sessionId,
           `Accepted-plan resource resume output requires Agent Protocol v3 repair: ${parseError.message}`,
           this.ts(),
@@ -3229,7 +3234,7 @@ export class SessionDriverLoop {
     }
     if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
       return this.append(state.sessionId, [
-        finalDiagnosticEvent(
+        assistantProjectionBuilder.finalDiagnosticEvent(
           state.sessionId,
           diag(
             'actionBundleAdmissionRepairReturnedPlan',
@@ -3242,7 +3247,7 @@ export class SessionDriverLoop {
       ]) ?? result;
     }
     if (repaired.kind === 'answer') {
-      return this.append(state.sessionId, [answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]) ?? result;
+      return this.append(state.sessionId, [assistantProjectionBuilder.answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]) ?? result;
     }
     if (repaired.kind === 'diagnostic') {
       const diagnostic = objectRecord(repaired.payload) ?? {};
@@ -3250,7 +3255,7 @@ export class SessionDriverLoop {
         ?? stringValue(diagnostic.details)
         ?? 'actionBundle admission repair returned a diagnostic instead of a file-level plan.';
       return this.append(state.sessionId, [
-        finalDiagnosticEvent(state.sessionId, summary, this.ts(), this.id('action-bundle-admission-diagnostic')),
+        assistantProjectionBuilder.finalDiagnosticEvent(state.sessionId, summary, this.ts(), this.id('action-bundle-admission-diagnostic')),
       ]) ?? result;
     }
     return this.submitNonExecutableProposal(state, repaired, result);
@@ -3306,7 +3311,7 @@ export class SessionDriverLoop {
     }, this.ports);
     if (!reviewReport) {
       return this.append(state.sessionId, [
-        finalDiagnosticEvent(
+        assistantProjectionBuilder.finalDiagnosticEvent(
           state.sessionId,
           diag('planProposalReviewedMissing', 'Kernel did not return a proposal.reviewed event for the actionBundle; Session will not display a confirmable plan.'),
           this.ts(),
@@ -3317,7 +3322,7 @@ export class SessionDriverLoop {
     if (reviewReport && planReviewReportAnalyzer.needsRepair(reviewReport) && !state.planReviewRepairAttempted) {
       state.planReviewRepairAttempted = true;
       await this.append(state.sessionId, [
-        thinkingEvent(
+        assistantProjectionBuilder.thinkingEvent(
           state.sessionId,
           'Kernel PlanReview requires additional proposal evidence; Session is running one controlled repair attempt.',
           this.ts(),
@@ -3330,7 +3335,7 @@ export class SessionDriverLoop {
       } catch (error) {
         const message = error instanceof SessionDriverLoopError ? error.message : String(error);
         return this.append(state.sessionId, [
-          finalDiagnosticEvent(
+          assistantProjectionBuilder.finalDiagnosticEvent(
             state.sessionId,
             diag('planRevisionRepairFailed', `The plan needs revision, but model repair failed: ${message}`, { message }),
             this.ts(),
@@ -3342,14 +3347,14 @@ export class SessionDriverLoop {
         return this.submitActionProposal(input, state, prompt, repaired, fallback);
       }
       if (repaired.kind === 'answer') {
-        return this.append(state.sessionId, [answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]);
+        return this.append(state.sessionId, [assistantProjectionBuilder.answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]);
       }
       return this.submitNonExecutableProposal(state, repaired, fallback);
     }
     let result = await this.appendProjectedKernelEvents(state.sessionId, proposalReply);
     if (planReviewReportAnalyzer.denied(reviewReport)) {
       return this.append(state.sessionId, [
-        finalDiagnosticEvent(
+        assistantProjectionBuilder.finalDiagnosticEvent(
           state.sessionId,
           diag('planRejected', `Kernel rejected the plan: ${planReviewReportAnalyzer.diagnosticSummary(reviewReport)}`, { reasons: planReviewReportAnalyzer.diagnosticSummary(reviewReport) }),
           this.ts(),
@@ -3422,7 +3427,7 @@ export class SessionDriverLoop {
     if (assessment.kind === 'scopeRepair') {
       state.acceptedPlanScopeRepairAttempted = true;
       await this.append(state.sessionId, [
-        thinkingEvent(
+        assistantProjectionBuilder.thinkingEvent(
           state.sessionId,
           'The current execution batch is outside the confirmed current-task scope; Session is asking the model to continue the current task or request additional authorization.',
           this.ts(),
@@ -3456,7 +3461,7 @@ export class SessionDriverLoop {
             if (!generated.packet) {
               const diagnostic = resourceRequestLoop.resolutionDiagnostic(subset);
               return this.append(state.sessionId, [
-                finalDiagnosticEvent(
+                assistantProjectionBuilder.finalDiagnosticEvent(
                   state.sessionId,
                   diag(
                     'autoBatchResourceResolveFailed',
@@ -3553,7 +3558,7 @@ export class SessionDriverLoop {
         }
         if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
           return this.append(state.sessionId, [
-            finalDiagnosticEvent(
+            assistantProjectionBuilder.finalDiagnosticEvent(
               state.sessionId,
               diag(
                 'acceptedPlanScopeRepairReturnedPlan',
@@ -3623,7 +3628,7 @@ export class SessionDriverLoop {
     }, this.ports);
     if (!reviewReport) {
       return this.append(state.sessionId, [
-        finalDiagnosticEvent(
+        assistantProjectionBuilder.finalDiagnosticEvent(
           state.sessionId,
           diag('autoPlanProposalReviewedMissing', 'Kernel did not return a proposal.reviewed event for the accepted-plan actionBundle; Session will not auto-execute this batch.'),
           this.ts(),
@@ -3634,7 +3639,7 @@ export class SessionDriverLoop {
     if (reviewReport && planReviewReportAnalyzer.acceptedPlanNeedsRepair(reviewReport) && !state.planReviewRepairAttempted) {
       state.planReviewRepairAttempted = true;
       await this.append(state.sessionId, [
-        thinkingEvent(
+        assistantProjectionBuilder.thinkingEvent(
           state.sessionId,
           'Kernel PlanReview requires revising the current accepted-plan batch; Session is running one controlled repair attempt.',
           this.ts(),
@@ -3647,7 +3652,7 @@ export class SessionDriverLoop {
       } catch (error) {
         const message = error instanceof SessionDriverLoopError ? error.message : String(error);
         return this.append(state.sessionId, [
-          finalDiagnosticEvent(
+          assistantProjectionBuilder.finalDiagnosticEvent(
             state.sessionId,
             diag('autoBatchRevisionRepairFailed', `The automatic execution batch needs revision, but model repair failed: ${message}`, { message }),
             this.ts(),
@@ -3659,7 +3664,7 @@ export class SessionDriverLoop {
         return this.submitAcceptedPlanActionProposal(input, state, prompt, repaired, fallback);
       }
       if (repaired.kind === 'answer') {
-        return this.append(state.sessionId, [answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]);
+        return this.append(state.sessionId, [assistantProjectionBuilder.answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]);
       }
       return this.submitNonExecutableProposal(state, repaired, fallback);
     }
@@ -3667,7 +3672,7 @@ export class SessionDriverLoop {
     result = await this.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? result;
     if (planReviewReportAnalyzer.denied(reviewReport)) {
       return this.append(state.sessionId, [
-        finalDiagnosticEvent(
+        assistantProjectionBuilder.finalDiagnosticEvent(
           state.sessionId,
           diag('autoBatchRejected', `Kernel rejected the automatic execution batch: ${planReviewReportAnalyzer.diagnosticSummary(reviewReport)}`, { reasons: planReviewReportAnalyzer.diagnosticSummary(reviewReport) }),
           this.ts(),
@@ -4162,7 +4167,7 @@ export class SessionDriverLoop {
     const reasoning = collectReasoning(result.data);
     if (reasoning.trim()) {
       await this.append(state.sessionId, [
-        reasoningEvent(state.sessionId, reasoning, this.ts(), this.id(`reasoning-${stage}`)),
+        assistantProjectionBuilder.reasoningEvent(state.sessionId, reasoning, this.ts(), this.id(`reasoning-${stage}`)),
       ]);
     }
     await this.emitProjectionDelta(state, {
@@ -5172,30 +5177,6 @@ function uniqueStrings(values: Array<string | undefined>): string[] {
   return output;
 }
 
-function answerEvent(
-  sessionId: string,
-  proposal: ProposalEnvelope,
-  ts: string,
-  id: string,
-  metadata: Record<string, unknown> = {}
-): AgentEvent {
-  const content = answerContent(proposal);
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'assistant_msg',
-    payload: {
-      content,
-      channel: 'final',
-      visibility: 'conversation',
-      label: 'DeepCode',
-      proposalId: proposal.proposalId,
-      ...metadata,
-    },
-  };
-}
-
 function answerProposalFromDecisionEffect(
   sessionId: string,
   runId: string,
@@ -5250,157 +5231,6 @@ function recoverAcceptedPlanFromEvents(events: AgentEvent[], runId: string): Acc
   const plan = latestExecutablePlan(events, runId);
   if (!plan?.implementationPlan) return undefined;
   return acceptedPlanWithLatestCheckpoint(acceptedImplementationPlanContext(plan, undefined, plan.executionRoot), events);
-}
-
-function answerContent(proposal: ProposalEnvelope): string {
-  const payload = objectRecord(proposal.payload) ?? {};
-  const answer = objectRecord(payload.answer) ?? payload;
-  return typeof answer.content === 'string' ? answer.content : '';
-}
-
-function guidanceRevisionTransitionEvent(
-  sessionId: string,
-  runId: string,
-  guidanceIds: string[],
-  userRequest: string,
-  ts: string,
-  id: string
-): AgentEvent {
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'assistant_msg',
-    payload: {
-      content: providerStreamCoordinator.guidanceRevisionTransitionMessage(visibleLanguageForRequest(userRequest)),
-      channel: 'progress',
-      source: 'session',
-      visibility: 'conversation',
-      presentation: 'body',
-      label: 'DeepCode',
-      runId,
-      guidanceIds,
-    },
-  };
-}
-
-function guidanceRevisionDiagnosticEvent(sessionId: string, message: string, ts: string, id: string): AgentEvent {
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'error',
-    payload: {
-      message,
-      status: 'error',
-      channel: 'error',
-      visibility: 'conversation',
-      source: 'session',
-    },
-  };
-}
-
-function answerNarrationEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent | null {
-  const content = proposal.narration?.trim();
-  if (!content) return null;
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'assistant_msg',
-    payload: {
-      content,
-      channel: 'progress',
-      source: 'llm',
-      visibility: 'conversation',
-      presentation: 'body',
-      label: 'DeepCode',
-      proposalId: proposal.proposalId,
-    },
-  };
-}
-
-function guidanceRevisionOverlay(
-  originalRequest: string,
-  draftAnswer: ProposalEnvelope,
-  guidance: UserGuidanceEvent[]
-): string {
-  return [
-    'Terminal user guidance revision:',
-    'A draft answer was generated but has not been shown to the user because new user guidance arrived before the final response was committed.',
-    'Return a JSON ProposalEnvelope with kind="answer" only. Do not return resourceRequest, decisionRequest, actionBundle, or diagnostic.',
-    'Include a short top-level narration sentence that naturally acknowledges the guidance merge before the final answer.',
-    `Original user request:\n${clip(originalRequest, 1800)}`,
-    `Unshown draft answer:\n${clip(answerContent(draftAnswer), 3200)}`,
-    'Latest user guidance to apply:',
-    ...guidance.map((item) => `- id=${item.id} ${clip(item.content, 800)}`),
-  ].join('\n\n');
-}
-
-function finalDiagnosticEvent(sessionId: string, content: string | DiagnosticInfo, ts: string, id: string): AgentEvent {
-  const info: DiagnosticInfo = typeof content === 'string'
-    ? { code: 'generic', fallback: content }
-    : content;
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'assistant_msg',
-    payload: {
-      content: info.fallback,
-      channel: 'final',
-      visibility: 'conversation',
-      label: 'DeepCode',
-      diagnostic: true,
-      diagnosticCode: info.code,
-      ...(info.params ? { diagnosticParams: info.params } : {}),
-    },
-  };
-}
-
-function thinkingEvent(
-  sessionId: string,
-  content: string,
-  ts: string,
-  id: string,
-  message?: { messageKey: string; messageArgs?: Record<string, string> }
-): AgentEvent {
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'workflow_stage',
-    payload: {
-      stage: 'session.provider_status',
-      status: 'completed',
-      summary: content,
-      content,
-      channel: 'progress',
-      source: 'session',
-      visibility: 'conversation',
-      presentation: 'stageSummary',
-      label: 'Session status',
-      ...(message ? { messageKey: message.messageKey, messageArgs: message.messageArgs ?? {} } : {}),
-    },
-  };
-}
-
-function reasoningEvent(sessionId: string, content: string, ts: string, id: string): AgentEvent {
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'assistant_msg',
-    payload: {
-      content,
-      channel: 'reasoning',
-      source: 'provider',
-      visibility: 'conversation',
-      presentation: 'collapsible',
-      reasoningTrace: true,
-      label: 'Model reasoning',
-    },
-  };
 }
 
 function readActionBundle(proposal: ProposalEnvelope): ActionBundleDraft | undefined {
@@ -7661,28 +7491,6 @@ function collectReasoning(result: LlmChatResult): string {
     .map((chunk) => chunk.content)
     .join('');
   return result.assistantMessage?.reasoningContent ?? chunks;
-}
-
-function proposalNarrationEvent(sessionId: string, proposal: ProposalEnvelope, ts: string, id: string): AgentEvent | null {
-  if (proposal.source !== 'llm') return null;
-  if (proposal.kind === 'answer') return null;
-  const content = proposal.narration?.trim();
-  if (!content) return null;
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'assistant_msg',
-    payload: {
-      content,
-      channel: 'progress',
-      source: 'llm',
-      visibility: 'conversation',
-      presentation: 'body',
-      label: 'DeepCode',
-      proposalId: proposal.proposalId,
-    },
-  };
 }
 
 function planInitialUserRequest(plan: SessionPlanContext): string {
