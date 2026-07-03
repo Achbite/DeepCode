@@ -85,6 +85,7 @@ import {
 import {
   ContextFrameBuilder,
   ResourceManifestBuilder,
+  ResourceRequestLoop,
   ResourceRequestResolver,
   type ResourceRequestResolution,
 } from './context/index.js';
@@ -311,6 +312,7 @@ const nativeToolCoordinator = new NativeToolCoordinator();
 const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
 const acceptedPlanExecutor = new AcceptedPlanExecutor();
 const contextFrameBuilder = new ContextFrameBuilder();
+const resourceRequestLoop = new ResourceRequestLoop();
 const DEFAULT_SUB_AGENT_NO_DELTA_TIMEOUT_MS = 45_000;
 const DEFAULT_SUB_AGENT_TOTAL_TIMEOUT_MS = 240_000;
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
@@ -393,7 +395,7 @@ export class SessionDriverLoop {
       projectMemoryMode: input.projectMemoryMode,
     });
     const restoredResourcePackets = input.resumeResourcePackets
-      ? recentResourcePackets(input.existingEvents ?? [])
+      ? resourceRequestLoop.recentPackets(input.existingEvents ?? [])
       : [];
     const initialTaskCursor = buildTaskExecutionCursor(
       acceptedImplementationPlan,
@@ -441,7 +443,7 @@ export class SessionDriverLoop {
       const packet = await this.resolveResources(state, state.manifest);
       state.resourcePackets.push(packet);
       addDiscoveredManifestEntries(state.manifest, packet);
-      lastResult = await this.append(sessionId, [resourcePacketEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
+      lastResult = await this.append(sessionId, [resourceRequestLoop.packetEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
     }
 
     if (shouldRequestRequirementConfirmation(input, state)) {
@@ -650,7 +652,7 @@ export class SessionDriverLoop {
         );
         if (generated.packet) {
           state.resourcePackets.push(generated.packet);
-          lastResult = await this.append(sessionId, [resourcePacketEvent(sessionId, generated.packet, this.ts(), this.id('generated-artifact-resource-context'))]);
+          lastResult = await this.append(sessionId, [resourceRequestLoop.packetEvent(sessionId, generated.packet, this.ts(), this.id('generated-artifact-resource-context'))]);
           if (!generated.remaining.items.length) continue;
         }
         let subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
@@ -695,7 +697,7 @@ export class SessionDriverLoop {
         const packet = await this.resolveResources(state, subset.manifest);
         state.resourcePackets.push(packet);
         addDiscoveredManifestEntries(state.manifest, packet);
-        lastResult = await this.append(sessionId, [resourcePacketEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
+        lastResult = await this.append(sessionId, [resourceRequestLoop.packetEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
         if (state.acceptedImplementationPlan) {
           refreshTaskExecutionState(state);
           const resumeEvent = acceptedPlanResourceResumeEvent(
@@ -1298,7 +1300,7 @@ export class SessionDriverLoop {
           this.id('accepted-action-plan-preflight')
         ),
       ]) ?? result;
-      const deletePreflightReasons = acceptedPlanDeletePreflightReasons(batch, recentResourcePackets(result.events));
+      const deletePreflightReasons = acceptedPlanDeletePreflightReasons(batch, resourceRequestLoop.recentPackets(result.events));
       if (deletePreflightReasons.length) {
         return this.append(input.sessionId, planActionBundlePreflightFailureEvents(
           input.sessionId,
@@ -1400,7 +1402,7 @@ export class SessionDriverLoop {
         const progressProposal = proposalEnvelopeFromPlanContext(plan);
         const progress = acceptedPlanBatchProgress(acceptedOverlay.acceptedPlan, progressProposal, batchEvents);
         const nextAccepted = acceptedPlanAfterBatch(acceptedOverlay.acceptedPlan, progress.completedTaskIds);
-        const cursor = buildTaskExecutionCursor(acceptedOverlay.acceptedPlan, recentResourcePackets(result.events));
+        const cursor = buildTaskExecutionCursor(acceptedOverlay.acceptedPlan, resourceRequestLoop.recentPackets(result.events));
         const context = buildCurrentTaskContext(acceptedOverlay.acceptedPlan, cursor);
         const savepointId = this.id('accepted-plan-overlay-task-savepoint');
         result = await this.append(input.sessionId, [
@@ -2255,7 +2257,7 @@ export class SessionDriverLoop {
     state.resourcePackets.push(packet);
     addDiscoveredManifestEntries(state.manifest, packet);
     let result = await this.append(state.sessionId, [
-      resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-readonly-action-resource-context')),
+      resourceRequestLoop.packetEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-readonly-action-resource-context')),
       acceptedPlanResourceResumeEvent(
         state.sessionId,
         state.runId,
@@ -2605,7 +2607,7 @@ export class SessionDriverLoop {
             runState.resourcePackets.push(packet);
             addDiscoveredManifestEntries(runState.manifest, packet);
             await this.append(runState.sessionId, [
-              resourcePacketEvent(runState.sessionId, packet, this.ts(), this.id('native-resource-context')),
+              resourceRequestLoop.packetEvent(runState.sessionId, packet, this.ts(), this.id('native-resource-context')),
             ]);
           },
           emitResourceResolved: async (runState, toolCall, packet, nativeToolRound) => {
@@ -2618,7 +2620,7 @@ export class SessionDriverLoop {
               source: 'kernel',
               itemId: toolCall.callId,
               summary: nativeToolResolveCompletedSummary(toolCall.name, language),
-              activity: resourcePacketActivity(packet, `native-tool-resource-${toolCall.callId}`, runState.runId),
+              activity: resourceRequestLoop.packetActivity(packet, `native-tool-resource-${toolCall.callId}`, runState.runId),
               payload: {
                 callId: toolCall.callId,
                 packetId: packet.id,
@@ -3019,7 +3021,7 @@ export class SessionDriverLoop {
       if (generated.packet) {
         state.resourcePackets.push(generated.packet);
         result = await this.append(state.sessionId, [
-          resourcePacketEvent(state.sessionId, generated.packet, this.ts(), this.id('action-bundle-admission-generated-resource-context')),
+          resourceRequestLoop.packetEvent(state.sessionId, generated.packet, this.ts(), this.id('action-bundle-admission-generated-resource-context')),
         ]) ?? result;
       }
       const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
@@ -3039,7 +3041,7 @@ export class SessionDriverLoop {
         state.resourcePackets.push(packet);
         addDiscoveredManifestEntries(state.manifest, packet);
         result = await this.append(state.sessionId, [
-          resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('action-bundle-admission-resource-context')),
+          resourceRequestLoop.packetEvent(state.sessionId, packet, this.ts(), this.id('action-bundle-admission-resource-context')),
         ]) ?? result;
       }
       return this.runUserTurn({
@@ -3132,7 +3134,7 @@ export class SessionDriverLoop {
         request: { manifest },
       },
     });
-    const packet = findResourcePacket(reply.events);
+    const packet = resourceRequestLoop.findPacket(reply.events);
     if (!packet) {
       throw new SessionDriverLoopError('resource_packet_missing', 'Kernel ResourceResolve did not produce a ResourcePacket.');
     }
@@ -3311,7 +3313,7 @@ export class SessionDriverLoop {
           if (generated.packet) {
             state.resourcePackets.push(generated.packet);
             result = await this.append(state.sessionId, [
-              resourcePacketEvent(state.sessionId, generated.packet, this.ts(), this.id('accepted-plan-repair-generated-resource-context')),
+              resourceRequestLoop.packetEvent(state.sessionId, generated.packet, this.ts(), this.id('accepted-plan-repair-generated-resource-context')),
             ]) ?? result;
           }
           const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
@@ -3335,7 +3337,7 @@ export class SessionDriverLoop {
             state.resourcePackets.push(packet);
             addDiscoveredManifestEntries(state.manifest, packet);
             result = await this.append(state.sessionId, [
-              resourcePacketEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-repair-resource-context')),
+              resourceRequestLoop.packetEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-repair-resource-context')),
             ]) ?? result;
           }
           return this.runUserTurn({
@@ -3636,7 +3638,7 @@ export class SessionDriverLoop {
       indexGeneratedArtifactEvidence(state, generatedPacket);
       state.resourcePackets.push(generatedPacket);
       result = await this.append(state.sessionId, [
-        resourcePacketEvent(state.sessionId, generatedPacket, this.ts(), this.id('accepted-plan-generated-artifact-evidence')),
+        resourceRequestLoop.packetEvent(state.sessionId, generatedPacket, this.ts(), this.id('accepted-plan-generated-artifact-evidence')),
       ]) ?? result;
     }
     if (!actionBatchReadyForReview(batchReply.events ?? [])) {
@@ -5206,92 +5208,6 @@ function firstString(events: unknown[], key: string): string | undefined {
   return undefined;
 }
 
-function findResourcePacket(events: unknown[]): ResourcePacket | undefined {
-  for (const event of events) {
-    const record = objectRecord(event);
-    const payload = objectRecord(record?.payload);
-    const packet = objectRecord(record?.packet) ?? objectRecord(payload?.output);
-    if (!packet) continue;
-    const items = Array.isArray(packet.items) ? packet.items : [];
-    return {
-      id: typeof packet.id === 'string' ? packet.id : 'resource-packet',
-      workspaceScopeKey: typeof packet.workspaceScopeKey === 'string' ? packet.workspaceScopeKey : 'workspace',
-      requestId: typeof packet.requestId === 'string' ? packet.requestId : 'resource-request',
-      items: items
-        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-        .map(resourcePacketItemFromKernel),
-    };
-  }
-  return undefined;
-}
-
-function recentResourcePackets(events: unknown[]): ResourcePacket[] {
-  const packets: ResourcePacket[] = [];
-  for (const event of [...events].reverse()) {
-    const record = objectRecord(event);
-    const payload = objectRecord(record?.payload);
-    if (record?.kind !== 'tool_result' && !objectRecord(record?.packet)) continue;
-    const packet = objectRecord(record?.packet) ?? objectRecord(payload?.output);
-    if (!packet) continue;
-    const items = Array.isArray(packet.items) ? packet.items : [];
-    packets.push({
-      id: typeof packet.id === 'string' ? packet.id : `resource-packet-${packets.length + 1}`,
-      workspaceScopeKey: typeof packet.workspaceScopeKey === 'string' ? packet.workspaceScopeKey : 'workspace',
-      requestId: typeof packet.requestId === 'string' ? packet.requestId : 'resource-request',
-      items: items
-        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-        .map(resourcePacketItemFromKernel),
-    });
-    if (packets.length >= 8) break;
-  }
-  return packets.reverse();
-}
-
-function resourcePacketItemFromKernel(item: Record<string, unknown>): ResourcePacketItem {
-  const status = item.status === 'resolved' || item.status === 'provided' || item.status === 'skipped'
-    ? item.status
-    : item.status === 'denied'
-      ? 'denied'
-      : item.status === 'needsUserApproval'
-        ? 'needsUserApproval'
-        : 'error';
-  const nodes = Array.isArray(item.nodes) ? item.nodes : undefined;
-  const content = typeof item.content === 'string'
-    ? item.content
-    : nodes
-      ? JSON.stringify(nodes, null, 2)
-      : undefined;
-  const promptContent = content ?? (typeof item.promptContent === 'string' ? item.promptContent : undefined);
-  return {
-    ...(item as unknown as Record<string, unknown>),
-    requestItemId: typeof item.requestItemId === 'string' ? item.requestItemId : 'item',
-    manifestEntryId: typeof item.manifestEntryId === 'string' ? item.manifestEntryId : 'entry',
-    readPolicy: 'autoRead',
-    status,
-    contentKind: typeof item.contentKind === 'string' ? item.contentKind as ResourcePacketItem['contentKind'] : undefined,
-    contentSummary: typeof item.contentSummary === 'string' ? item.contentSummary : typeof item.message === 'string' ? item.message : undefined,
-    promptContent,
-    truncated: Boolean(item.truncated),
-    originalBytes: typeof item.originalBytes === 'number'
-      ? item.originalBytes
-      : typeof item.sizeBytes === 'number'
-        ? item.sizeBytes
-        : undefined,
-    offsetBytes: typeof item.offsetBytes === 'number' ? item.offsetBytes : undefined,
-    limitBytes: typeof item.limitBytes === 'number' ? item.limitBytes : undefined,
-    returnedBytes: typeof item.returnedBytes === 'number' ? item.returnedBytes : undefined,
-    rangeComplete: typeof item.rangeComplete === 'boolean' ? item.rangeComplete : undefined,
-    denialReason: typeof item.reason === 'string' ? item.reason : typeof item.message === 'string' ? item.message : undefined,
-    skipReason: typeof item.skipReason === 'string' ? item.skipReason : undefined,
-    skipMessage: typeof item.skipMessage === 'string' ? item.skipMessage : undefined,
-    fileClassification: objectRecord(item.fileClassification) ?? undefined,
-    evidenceRefs: Array.isArray(item.evidenceRefs)
-      ? item.evidenceRefs.filter((value): value is string => typeof value === 'string')
-      : [],
-    sourceKind: 'kernelResource',
-  };
-}
-
 function projectKernelEvent(sessionId: string, event: unknown, ts: string, id: string): AgentEvent {
   const record = objectRecord(event) ?? {};
   const kind = typeof record.kind === 'string' ? record.kind : 'kernel.event';
@@ -5440,26 +5356,6 @@ function kernelEventSummary(kind: string, record: Record<string, unknown>): stri
   return typeof record.summary === 'string' ? record.summary : kind;
 }
 
-function resourcePacketEvent(sessionId: string, packet: ResourcePacket, ts: string, id: string): AgentEvent {
-  const activity = resourcePacketActivity(packet, id);
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'tool_result',
-    payload: {
-      toolName: 'kernel.resourceResolve',
-      status: packet.items.some((item) => item.status === 'error' || item.status === 'denied') ? 'error' : 'ok',
-      summary: `Kernel resolved ${packet.items.length} resource item(s).`,
-      output: packet,
-      channel: 'tool',
-      visibility: 'conversation',
-      presentation: 'collapsible',
-      activity,
-    },
-  };
-}
-
 function conversationActivity(input: AgentConversationActivity): AgentConversationActivity {
   return {
     ...input,
@@ -5482,25 +5378,6 @@ function providerActivity(
     summary: providerStageSummary(stage, status === 'running' ? 'request' : 'response', visibleLanguageForRequest(state.userRequest)),
     source: 'provider',
     runId: state.runId,
-  });
-}
-
-function resourcePacketActivity(packet: ResourcePacket, activityId: string, runId?: string): AgentConversationActivity {
-  const failed = packet.items.some((item) => item.status === 'error' || item.status === 'denied');
-  const search = packet.items.some((item) => item.contentKind === 'searchResults');
-  return conversationActivity({
-    activityId,
-    kind: search ? 'resourceSearch' : 'resourceRead',
-    status: failed ? 'failed' : 'completed',
-    title: search ? 'Search results resolved' : 'Resource context resolved',
-    summary: `Kernel resolved ${packet.items.length} resource item(s).`,
-    source: 'kernel',
-    runId,
-    targets: packet.items.flatMap((item) => [
-      item.path,
-      item.manifestEntryId,
-    ]).filter((item): item is string => Boolean(item)),
-    itemCount: packet.items.length,
   });
 }
 

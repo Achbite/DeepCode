@@ -41,6 +41,7 @@ import {
 } from '../index.js';
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
+import { ResourceRequestLoop } from '../driver/context/index.js';
 import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 
 async function main(): Promise<void> {
@@ -53,6 +54,7 @@ async function main(): Promise<void> {
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
   await assertProviderTraceRecorderArchivesPayload();
+  assertResourceRequestLoopBuildsPacketEvents();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -321,6 +323,43 @@ async function assertProviderTraceRecorderArchivesPayload(): Promise<void> {
     'provider trace recorder stores compact archive payload'
   );
   assertEqual(archive?.kind, 'request', 'provider trace recorder archives request payloads');
+}
+
+function assertResourceRequestLoopBuildsPacketEvents(): void {
+  const token = randomSmokeToken('resource-request-loop');
+  const loop = new ResourceRequestLoop();
+  const packet = loop.findPacket([
+    {
+      kind: 'resource.packet_produced',
+      packet: {
+        id: `packet-${token}`,
+        workspaceScopeKey: `workspace-${token}`,
+        requestId: `request-${token}`,
+        items: [
+          {
+            requestItemId: `item-${token}`,
+            manifestEntryId: `entry-${token}`,
+            status: 'resolved',
+            contentKind: 'text',
+            path: `path-${token}.txt`,
+            content: `content-${token}`,
+            evidenceRefs: [`evidence-${token}`],
+          },
+        ],
+      },
+    },
+  ]);
+  assertEqual(packet?.id, `packet-${token}`, 'resource request loop extracts packet id');
+  assertEqual(packet?.items[0]?.sourceKind, 'kernelResource', 'resource request loop marks kernel resource facts');
+  const event = loop.packetEvent(`session-${token}`, packet!, '2026-01-01T00:00:00.000Z', `event-${token}`);
+  assertEqual(event.kind, 'tool_result', 'resource request loop emits tool_result projection event');
+  const payload = event.payload as Record<string, unknown>;
+  assertEqual(payload.toolName, 'kernel.resourceResolve', 'resource request loop keeps kernel resource tool name');
+  const activity = payload.activity as Record<string, unknown>;
+  assertEqual(activity.kind, 'resourceRead', 'resource request loop builds resource read activity');
+  const recent = loop.recentPackets([event]);
+  assertEqual(recent.length, 1, 'resource request loop reads recent packet from projection event');
+  assertEqual(recent[0]?.items[0]?.promptContent, `content-${token}`, 'resource request loop preserves prompt content');
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
