@@ -73,7 +73,7 @@ import {
   NativeToolTurnHandler,
   ProviderJsonModeCoordinator,
   ProviderPipeline,
-  ProviderTraceArchive,
+  ProviderTraceRecorder,
   ProviderPartFrameParser,
   ProviderToolCallBuffer,
   stripProviderPartFrames,
@@ -306,6 +306,7 @@ const providerRepairMessageBuilder = new ProviderRepairMessageBuilder(MAX_ACTION
 const acceptedPlanResourceResumePromptBuilder = new AcceptedPlanResourceResumePromptBuilder(providerRepairMessageBuilder);
 const providerPipeline = new ProviderPipeline();
 const providerJsonModeCoordinator = new ProviderJsonModeCoordinator();
+const providerTraceRecorder = new ProviderTraceRecorder();
 const nativeToolCoordinator = new NativeToolCoordinator();
 const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
 const acceptedPlanExecutor = new AcceptedPlanExecutor();
@@ -3167,11 +3168,11 @@ export class SessionDriverLoop {
     });
     if (!actionBundle) return await this.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? fallback;
     const reviewReport = findPlanReviewReport(proposalReply.events);
-    await this.appendProviderTrace(state, 'plan_review_report', {
+    await providerTraceRecorder.append(state, 'plan_review_report', {
       proposalId: proposal.proposalId,
       report: reviewReport,
       events: proposalReply.events,
-    });
+    }, this.ports);
     if (!reviewReport) {
       return this.append(state.sessionId, [
         finalDiagnosticEvent(
@@ -3463,12 +3464,12 @@ export class SessionDriverLoop {
       },
     });
     const reviewReport = findPlanReviewReport(proposalReply.events);
-    await this.appendProviderTrace(state, 'accepted_plan_batch_review_report', {
+    await providerTraceRecorder.append(state, 'accepted_plan_batch_review_report', {
       acceptedPlanId: accepted.planId,
       proposalId: proposal.proposalId,
       report: reviewReport,
       events: proposalReply.events,
-    });
+    }, this.ports);
     if (!reviewReport) {
       return this.append(state.sessionId, [
         finalDiagnosticEvent(
@@ -3578,11 +3579,11 @@ export class SessionDriverLoop {
         this.id('accepted-plan-delete-preflight-failed')
       )) ?? result;
     }
-    await this.appendProviderTrace(state, 'accepted_plan.action_batch_preflight', {
+    await providerTraceRecorder.append(state, 'accepted_plan.action_batch_preflight', {
       planId: accepted.planId,
       batchIndex: accepted.batchIndex,
       audit: acceptedPlanBatchPreflightAudit(batch),
-    });
+    }, this.ports);
 
     await this.emitProjectionDelta(state, {
       type: 'stage_delta',
@@ -3922,14 +3923,14 @@ export class SessionDriverLoop {
     options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {}
   ): Promise<LlmTurnResult> {
     const jsonModeMessages = providerJsonModeCoordinator.ensureMessages(messages, options.responseFormat);
-    await this.appendProviderTrace(state, `${stage}.request`, {
+    await providerTraceRecorder.append(state, `${stage}.request`, {
       profileId,
       messages: jsonModeMessages,
       cachePlan: state.cachePlan,
       contextAssembly: state.contextAssembly,
       responseFormat: options.responseFormat,
       responseFormatAudit: providerJsonModeCoordinator.audit(messages, options.responseFormat),
-    });
+    }, this.ports);
     await this.emitProjectionDelta(state, {
       type: 'active_turn',
       stage,
@@ -3968,10 +3969,10 @@ export class SessionDriverLoop {
     await this.flushProviderReasoningBuffer(state, stage, reasoningBuffer);
     if (this.ports.llmChatStream && (!result.ok || !result.data)) {
       const fallbackRequest: LlmChatRequest = { ...request, stream: false };
-      await this.appendProviderTrace(state, `${stage}.stream_fallback.request`, {
+      await providerTraceRecorder.append(state, `${stage}.stream_fallback.request`, {
         reason: result.message ?? result.error ?? 'streaming provider request failed',
         request: fallbackRequest,
-      });
+      }, this.ports);
       result = await this.ports.llmChat(fallbackRequest);
     }
     if (!result.ok || !result.data) {
@@ -4000,7 +4001,7 @@ export class SessionDriverLoop {
     if (cacheEvent) {
       await this.append(state.sessionId, [cacheEvent]);
     }
-    await this.appendProviderTrace(state, `${stage}.response`, result.data);
+    await providerTraceRecorder.append(state, `${stage}.response`, result.data, this.ports);
     const reasoning = collectReasoning(result.data);
     if (reasoning.trim()) {
       await this.append(state.sessionId, [
@@ -4368,25 +4369,6 @@ export class SessionDriverLoop {
         payload: event,
       });
     }
-  }
-
-  private async appendProviderTrace(
-    state: SessionDriverLoopRunState,
-    stage: string,
-    payload: unknown
-  ): Promise<void> {
-    await this.ports.appendTranscript?.(state.sessionId, {
-      type: 'metadata',
-      uuid: this.id(`provider-trace-${stage}`),
-      sessionId: state.sessionId,
-      kind: 'provider_trace',
-      payload: {
-        stage,
-        runId: state.runId,
-        payload: ProviderTraceArchive.archivePayload(stage, payload),
-      },
-      createdAt: this.ts(),
-    });
   }
 
   private async kernel(request: KernelCommandEnvelope): Promise<KernelReply> {

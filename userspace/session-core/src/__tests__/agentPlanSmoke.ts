@@ -41,7 +41,7 @@ import {
 } from '../index.js';
 import { AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { ProviderJsonModeCoordinator, ProviderPipeline } from '../driver/pipelines/index.js';
+import { ProviderJsonModeCoordinator, ProviderPipeline, ProviderTraceRecorder } from '../driver/pipelines/index.js';
 
 async function main(): Promise<void> {
   assertV3Parser();
@@ -52,6 +52,7 @@ async function main(): Promise<void> {
   assertProviderTurnContractFrameOrder();
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
+  await assertProviderTraceRecorderArchivesPayload();
   assertRunStateMachineTaskLedger();
   assertAcceptedTaskRegistryUsesExactOperationGrants();
   assertResourcePromptBlocksStabilize();
@@ -283,6 +284,43 @@ function assertProviderJsonModeCoordinator(): void {
   );
   assertEqual(alreadyJson.length, 1, 'provider json mode coordinator does not duplicate existing json instruction');
   assertEqual(coordinator.ensureMessages(messages, undefined), messages, 'provider json mode coordinator ignores non-json mode');
+}
+
+async function assertProviderTraceRecorderArchivesPayload(): Promise<void> {
+  const token = randomSmokeToken('provider-trace-recorder');
+  const entries: TranscriptEntry[] = [];
+  const recorder = new ProviderTraceRecorder();
+  await recorder.append(
+    { sessionId: `session-${token}`, runId: `run-${token}` },
+    `stage-${token}.request`,
+    {
+      profileId: `profile-${token}`,
+      messages: [{ role: 'user', content: `content-${token}` }],
+      responseFormat: { type: 'json_object' },
+      tools: [],
+    },
+    {
+      appendTranscript: async (_sessionId, entry) => {
+        entries.push(entry);
+      },
+      createId: (prefix) => `${prefix}-${token}`,
+      now: () => '2026-01-01T00:00:00.000Z',
+    }
+  );
+  assertEqual(entries.length, 1, 'provider trace recorder appends one transcript entry');
+  const entry = entries[0];
+  assertEqual(entry?.type, 'metadata', 'provider trace recorder writes metadata transcript entry');
+  if (!entry || entry.type !== 'metadata') throw new Error('provider trace recorder did not write metadata');
+  assertEqual(entry.kind, 'provider_trace', 'provider trace recorder writes provider trace kind');
+  const payload = entry.payload as Record<string, unknown>;
+  assertEqual(payload.runId, `run-${token}`, 'provider trace recorder keeps run id');
+  const archive = payload.payload as Record<string, unknown>;
+  assertEqual(
+    archive?.schemaVersion,
+    'deepcode.session.provider-trace-archive.v1',
+    'provider trace recorder stores compact archive payload'
+  );
+  assertEqual(archive?.kind, 'request', 'provider trace recorder archives request payloads');
 }
 
 async function assertSessionDriverLoopProjectsDecisionRequest(): Promise<void> {
