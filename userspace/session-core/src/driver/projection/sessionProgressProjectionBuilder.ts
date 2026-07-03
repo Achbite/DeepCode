@@ -3,6 +3,7 @@ import type { ProposalEnvelope } from '../../agent-plan/types.js';
 import type { ResourcePacket } from '../../context/types.js';
 import type {
   AcceptedImplementationPlanContext,
+  AcceptedPlanAccessScopeCanonicalizationResult,
   AcceptedPlanBatchProgress,
   AcceptedPlanReadOnlyResourceCompletion,
   CurrentTaskContext,
@@ -45,6 +46,85 @@ export interface SessionProgressProjectionBuilderPorts {
 
 export class SessionProgressProjectionBuilder {
   constructor(private readonly ports: SessionProgressProjectionBuilderPorts) {}
+
+  traceEvent(input: {
+    sessionId: string;
+    kind: AgentEvent['kind'];
+    summary: string;
+    extra: Record<string, unknown>;
+    ts: string;
+    id: string;
+  }): AgentEvent {
+    return {
+      id: input.id,
+      sessionId: input.sessionId,
+      ts: input.ts,
+      kind: input.kind,
+      payload: {
+        title: 'Session decision',
+        summary: input.summary,
+        status: 'noop',
+        channel: 'progress',
+        visibility: 'conversation',
+        presentation: 'collapsible',
+        ...input.extra,
+      },
+    };
+  }
+
+  cacheTelemetryEvent(input: {
+    sessionId: string;
+    profileId?: string;
+    provider?: string;
+    model?: string;
+    stage: string;
+    usage?: Record<string, unknown>;
+    promptSegmentDigests: Array<Record<string, unknown>>;
+    stablePrefixHash?: string;
+    dynamicSuffixHash?: string;
+    cacheHash?: string;
+    ts: string;
+    id: string;
+  }): AgentEvent | null {
+    const normalized = normalizeProviderUsage(input.usage);
+    if (
+      normalized.promptCacheHitTokens === undefined &&
+      normalized.promptCacheMissTokens === undefined &&
+      normalized.cachedTokens === undefined &&
+      normalized.promptTokens === undefined &&
+      normalized.completionTokens === undefined &&
+      normalized.totalTokens === undefined &&
+      input.promptSegmentDigests.length === 0
+    ) {
+      return null;
+    }
+
+    return {
+      id: input.id,
+      sessionId: input.sessionId,
+      ts: input.ts,
+      kind: 'cache_telemetry',
+      payload: {
+        provider: input.profileId ?? input.provider ?? 'unknown',
+        providerProfileId: input.profileId,
+        model: input.model,
+        stage: input.stage,
+        promptCacheHitTokens: normalized.promptCacheHitTokens,
+        promptCacheMissTokens: normalized.promptCacheMissTokens,
+        cachedTokens: normalized.cachedTokens,
+        promptTokens: normalized.promptTokens,
+        completionTokens: normalized.completionTokens,
+        totalTokens: normalized.totalTokens,
+        normalizedUsage: normalized,
+        rawUsage: input.usage,
+        promptSegmentDigests: input.promptSegmentDigests,
+        stablePrefixHash: input.stablePrefixHash,
+        dynamicSuffixHash: input.dynamicSuffixHash,
+        cacheHash: input.cacheHash,
+        cacheAffectsCorrectness: false,
+      },
+    };
+  }
 
   sessionRunStateEvent(input: {
     sessionId: string;
@@ -477,6 +557,36 @@ export class SessionProgressProjectionBuilder {
     };
   }
 
+  acceptedPlanAccessScopesCanonicalizedEvent(
+    sessionId: string,
+    runId: string,
+    accepted: AcceptedImplementationPlanContext,
+    canonicalization: AcceptedPlanAccessScopeCanonicalizationResult,
+    ts: string,
+    id: string
+  ): AgentEvent {
+    return {
+      id,
+      sessionId,
+      ts,
+      kind: 'workflow_stage',
+      payload: {
+        title: 'Accepted plan access scope canonicalized',
+        summary: 'Session removed invalid execution-batch accessScopes before Kernel PlanReview.',
+        stage: 'accepted_plan.access_scope_canonicalized',
+        status: 'completed',
+        runId,
+        planId: accepted.planId,
+        removedAccessScopes: canonicalization.removedAccessScopes,
+        actionTargets: [...new Set(canonicalization.actionTargets.filter(Boolean))],
+        reason: 'invalid_execution_scope',
+        channel: 'progress',
+        visibility: 'debug',
+        presentation: 'collapsible',
+      },
+    };
+  }
+
   private sessionRunStateSummary(
     reason: SessionRunStateReason,
     status: SessionRunStateStatus
@@ -535,4 +645,44 @@ function stringArrayValue(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     : [];
+}
+
+function normalizeProviderUsage(usage: Record<string, unknown> | undefined): Record<string, number | undefined> {
+  const promptTokens = numberValue(usage?.prompt_tokens) ?? numberValue(usage?.input_tokens);
+  const completionTokens = numberValue(usage?.completion_tokens) ?? numberValue(usage?.output_tokens);
+  const totalTokens = numberValue(usage?.total_tokens)
+    ?? (promptTokens !== undefined && completionTokens !== undefined ? promptTokens + completionTokens : undefined);
+  const cachedTokens = numberValue(usage?.cached_tokens)
+    ?? numberAtPath(usage, ['prompt_tokens_details', 'cached_tokens'])
+    ?? numberAtPath(usage, ['input_tokens_details', 'cached_tokens']);
+  const promptCacheHitTokens = numberValue(usage?.prompt_cache_hit_tokens)
+    ?? numberValue(usage?.cache_read_input_tokens)
+    ?? cachedTokens;
+  const promptCacheMissTokens = numberValue(usage?.prompt_cache_miss_tokens)
+    ?? numberValue(usage?.cache_creation_input_tokens)
+    ?? (promptTokens !== undefined && promptCacheHitTokens !== undefined
+      ? Math.max(0, promptTokens - promptCacheHitTokens)
+      : undefined);
+  return {
+    promptCacheHitTokens,
+    promptCacheMissTokens,
+    cachedTokens,
+    promptTokens,
+    completionTokens,
+    totalTokens,
+  };
+}
+
+function numberAtPath(value: unknown, path: string[]): number | undefined {
+  let current: unknown = value;
+  for (const key of path) {
+    const record = objectRecord(current);
+    if (!record) return undefined;
+    current = record[key];
+  }
+  return numberValue(current);
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }

@@ -1998,6 +1998,45 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
   assertEqual((runState.payload as any).messageKey, 'session.runState.acceptedPlanExecution', 'session progress projection uses run-state i18n key');
   assertEqual((runState.payload as any).overlayRunId, `run-${token}`, 'session progress projection preserves overlay payload');
 
+  const trace = builder.traceEvent({
+    sessionId: `session-${token}`,
+    kind: 'trace/plan_accept_noop',
+    summary: `noop-${token}`,
+    extra: { runId: `run-${token}`, planId: `plan-${token}` },
+    ts: '2026-01-01T00:00:00.250Z',
+    id: `trace-${token}`,
+  });
+  assertEqual(trace.kind, 'trace/plan_accept_noop', 'session progress projection creates generic trace events');
+  assertEqual((trace.payload as any).planId, `plan-${token}`, 'session progress projection preserves trace payload');
+
+  const cache = builder.cacheTelemetryEvent({
+    sessionId: `session-${token}`,
+    profileId: `profile-${token}`,
+    provider: `provider-${token}`,
+    model: `model-${token}`,
+    stage: `stage-${token}`,
+    usage: {
+      prompt_tokens: 12,
+      completion_tokens: 5,
+      prompt_tokens_details: { cached_tokens: 7 },
+    },
+    promptSegmentDigests: [{
+      id: `segment-${token}`,
+      name: `Segment ${token}`,
+      cacheClass: 'dynamic',
+      contentHash: `hash-${token}`,
+      charLength: 42,
+    }],
+    stablePrefixHash: `stable-${token}`,
+    dynamicSuffixHash: `dynamic-${token}`,
+    cacheHash: `cache-${token}`,
+    ts: '2026-01-01T00:00:00.500Z',
+    id: `cache-${token}`,
+  });
+  assert(cache, 'session progress projection emits cache telemetry when usage or segments exist');
+  assertEqual((cache?.payload as any).promptCacheHitTokens, 7, 'session progress projection normalizes cache usage tokens');
+  assertEqual((cache?.payload as any).promptSegmentDigests[0].id, `segment-${token}`, 'session progress projection preserves prompt segment digests');
+
   const accepted: AcceptedImplementationPlanContext = {
     planId: `plan-${token}`,
     runId: `run-${token}`,
@@ -2135,6 +2174,38 @@ function assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents(): 
   assertEqual((savepoint.payload as any).stage, 'accepted_plan.task_savepoint', 'session progress projection creates task savepoint events');
   assertEqual((savepoint.payload as any).messageKey, 'session.driver.acceptedPlanTaskSavepointComplete', 'session progress projection marks completed savepoint with i18n key');
   assertEqual((savepoint.payload as any).acceptedPlanPromptFrame.taskLedger.completedTaskIds[0], taskId, 'session progress projection stores accepted-plan prompt frame');
+
+  const canonicalized = builder.acceptedPlanAccessScopesCanonicalizedEvent(
+    `session-${token}`,
+    `run-${token}`,
+    accepted,
+    {
+      proposal: {
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        proposalId: `proposal-canonical-${token}`,
+        runId: `run-${token}`,
+        source: 'llm',
+        kind: 'actionBundle',
+        payload: {},
+        referencedResourcePacketRefs: [],
+        referencedEvidenceRefs: [],
+      },
+      changed: true,
+      removedAccessScopes: [{
+        index: 0,
+        reason: `reason-${token}`,
+        source: `source-${token}`,
+        path: targetPath,
+        scopeKind: 'file',
+        scope: { path: targetPath },
+      }],
+      actionTargets: [targetPath, targetPath],
+    },
+    '2026-01-01T00:00:01.875Z',
+    `access-scope-${token}`
+  );
+  assertEqual((canonicalized.payload as any).stage, 'accepted_plan.access_scope_canonicalized', 'session progress projection creates access scope canonicalization events');
+  assertEqual((canonicalized.payload as any).actionTargets.length, 1, 'session progress projection canonicalizes duplicate action targets');
 
   const preflight = builder.acceptedPlanActionBatchPreflightEvent(
     `session-${token}`,

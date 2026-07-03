@@ -825,10 +825,17 @@ export class SessionDriverLoop {
     );
     if (!confirmation) {
       return this.append(input.sessionId, [
-        traceEvent(input.sessionId, 'trace/requirement_decision_noop', '该需求确认已处理或已过期。', this.ts(), this.id('requirement-noop'), {
-          runId: input.runId,
-          requirementId,
-          decision: input.decision,
+        sessionProgressProjectionBuilder.traceEvent({
+          sessionId: input.sessionId,
+          kind: 'trace/requirement_decision_noop',
+          summary: '该需求确认已处理或已过期。',
+          ts: this.ts(),
+          id: this.id('requirement-noop'),
+          extra: {
+            runId: input.runId,
+            requirementId,
+            decision: input.decision,
+          },
         }),
       ]);
     }
@@ -1263,22 +1270,36 @@ export class SessionDriverLoop {
       (!input.targetId || active.planId === input.targetId || Boolean(findPlanCard(events, input.runId, input.targetId)));
     if (!activePlanMatches) {
       return this.append(input.sessionId, [
-        traceEvent(input.sessionId, 'trace/plan_accept_noop', '该计划已处理或已过期，没有再次提交执行。', this.ts(), this.id('plan-noop'), {
-          runId: input.runId,
-          planId: input.targetId,
-          decision: input.decision,
-          visibility: 'debug',
+        sessionProgressProjectionBuilder.traceEvent({
+          sessionId: input.sessionId,
+          kind: 'trace/plan_accept_noop',
+          summary: '该计划已处理或已过期，没有再次提交执行。',
+          ts: this.ts(),
+          id: this.id('plan-noop'),
+          extra: {
+            runId: input.runId,
+            planId: input.targetId,
+            decision: input.decision,
+            visibility: 'debug',
+          },
         }),
       ]);
     }
     const plan = findPlanCard(events, input.runId, input.targetId);
     if (!plan || planAlreadyResolved(events, plan)) {
       return this.append(input.sessionId, [
-        traceEvent(input.sessionId, 'trace/plan_accept_noop', '该计划已处理或已过期，没有再次提交执行。', this.ts(), this.id('plan-noop'), {
-          runId: input.runId,
-          planId: input.targetId,
-          decision: input.decision,
-          visibility: 'debug',
+        sessionProgressProjectionBuilder.traceEvent({
+          sessionId: input.sessionId,
+          kind: 'trace/plan_accept_noop',
+          summary: '该计划已处理或已过期，没有再次提交执行。',
+          ts: this.ts(),
+          id: this.id('plan-noop'),
+          extra: {
+            runId: input.runId,
+            planId: input.targetId,
+            decision: input.decision,
+            visibility: 'debug',
+          },
         }),
       ]);
     }
@@ -1632,10 +1653,17 @@ export class SessionDriverLoop {
     const pending = permissionPipeline.findPendingPermissionContext(events, input.targetId);
     if (!pending) {
       return this.append(input.sessionId, [
-        traceEvent(input.sessionId, 'trace/permission_accept_noop', '该权限请求已处理或已过期，没有重复执行。', this.ts(), this.id('permission-noop'), {
-          runId: input.runId,
-          permissionId: input.targetId,
-          decision: input.decision,
+        sessionProgressProjectionBuilder.traceEvent({
+          sessionId: input.sessionId,
+          kind: 'trace/permission_accept_noop',
+          summary: '该权限请求已处理或已过期，没有重复执行。',
+          ts: this.ts(),
+          id: this.id('permission-noop'),
+          extra: {
+            runId: input.runId,
+            permissionId: input.targetId,
+            decision: input.decision,
+          },
         }),
       ]);
     }
@@ -1741,9 +1769,16 @@ export class SessionDriverLoop {
     const review = reviewAssembler().findWaitingReview(events, input.runId, findActiveDriverInteraction(events));
     if (!review || reviewAssembler().reviewAlreadyResolved(events, review)) {
       return this.append(input.sessionId, [
-        traceEvent(input.sessionId, 'trace/review_accept_noop', '该 Review 已处理或已过期，没有重复推进任务。', this.ts(), this.id('review-noop'), {
-          runId: input.runId,
-          decision: input.decision,
+        sessionProgressProjectionBuilder.traceEvent({
+          sessionId: input.sessionId,
+          kind: 'trace/review_accept_noop',
+          summary: '该 Review 已处理或已过期，没有重复推进任务。',
+          ts: this.ts(),
+          id: this.id('review-noop'),
+          extra: {
+            runId: input.runId,
+            decision: input.decision,
+          },
         }),
       ]);
     }
@@ -3606,7 +3641,7 @@ export class SessionDriverLoop {
     let result = fallback;
     if (scopeCanonicalization.changed) {
       result = await this.append(state.sessionId, [
-        acceptedPlanAccessScopesCanonicalizedEvent(
+        sessionProgressProjectionBuilder.acceptedPlanAccessScopesCanonicalizedEvent(
           state.sessionId,
           state.runId,
           accepted,
@@ -4187,15 +4222,29 @@ export class SessionDriverLoop {
         result.message ?? result.error ?? 'LLM provider request failed.'
       );
     }
-    const cacheEvent = cacheTelemetryEvent(
-      state.sessionId,
+    const usage = objectRecord(result.data.usage);
+    const cacheEvent = sessionProgressProjectionBuilder.cacheTelemetryEvent({
+      sessionId: state.sessionId,
       profileId,
-      state,
+      provider: state.contextAssembly?.provider,
+      model: state.contextAssembly?.model,
       stage,
-      result.data,
-      this.ts(),
-      this.id(`cache-${stage}`)
-    );
+      usage,
+      promptSegmentDigests: state.contextAssembly?.segments.map((segment) => ({
+        id: segment.id,
+        name: segment.name,
+        cacheClass: segment.cacheClass,
+        stablePrefix: segment.stablePrefix,
+        auditOnly: segment.auditOnly,
+        contentHash: segment.contentHash,
+        charLength: segment.charLength,
+      })) ?? [],
+      stablePrefixHash: state.contextAssembly?.stablePrefixHash,
+      dynamicSuffixHash: state.contextAssembly?.dynamicSuffixHash,
+      cacheHash: state.contextAssembly?.cacheHash,
+      ts: this.ts(),
+      id: this.id(`cache-${stage}`),
+    });
     if (cacheEvent) {
       await this.append(state.sessionId, [cacheEvent]);
     }
@@ -4595,16 +4644,30 @@ export class SessionDriverLoop {
         return this.appendProjectedKernelEvents(sessionId, reply);
       }
       return this.append(sessionId, [
-        traceEvent(sessionId, traceKind, summary, this.ts(), this.id('kernel-audit-noop'), {
-          errorCode: reply.error?.code ?? 'kernel_audit_failed',
-          errorMessage: reply.error?.message ?? 'Kernel audit command failed.',
+        sessionProgressProjectionBuilder.traceEvent({
+          sessionId,
+          kind: traceKind,
+          summary,
+          ts: this.ts(),
+          id: this.id('kernel-audit-noop'),
+          extra: {
+            errorCode: reply.error?.code ?? 'kernel_audit_failed',
+            errorMessage: reply.error?.message ?? 'Kernel audit command failed.',
+          },
         }),
       ]);
     } catch (error) {
       return this.append(sessionId, [
-        traceEvent(sessionId, traceKind, summary, this.ts(), this.id('kernel-audit-noop'), {
-          errorCode: error instanceof SessionDriverLoopError ? error.code : 'kernel_audit_failed',
-          errorMessage: error instanceof Error ? error.message : String(error),
+        sessionProgressProjectionBuilder.traceEvent({
+          sessionId,
+          kind: traceKind,
+          summary,
+          ts: this.ts(),
+          id: this.id('kernel-audit-noop'),
+          extra: {
+            errorCode: error instanceof SessionDriverLoopError ? error.code : 'kernel_audit_failed',
+            errorMessage: error instanceof Error ? error.message : String(error),
+          },
         }),
       ]);
     }
@@ -6421,31 +6484,6 @@ function planRevisionRequest(plan: SessionPlanContext, guidance?: string): strin
   ].filter(Boolean).join('\n\n');
 }
 
-function traceEvent(
-  sessionId: string,
-  kind: AgentEvent['kind'],
-  summary: string,
-  ts: string,
-  id: string,
-  extra: Record<string, unknown>
-): AgentEvent {
-  return {
-    id,
-    sessionId,
-    ts,
-    kind,
-    payload: {
-      title: 'Session decision',
-      summary,
-      status: 'noop',
-      channel: 'progress',
-      visibility: 'conversation',
-      presentation: 'collapsible',
-      ...extra,
-    },
-  };
-}
-
 function collectQueuedUserGuidanceEvents(events: AgentEvent[], runId?: string): UserGuidanceEvent[] {
   const consumedIds = new Set<string>();
   for (const event of events.slice(-120)) {
@@ -6549,36 +6587,6 @@ function shouldRequestRequirementConfirmation(
   return false;
 }
 
-function acceptedPlanAccessScopesCanonicalizedEvent(
-  sessionId: string,
-  runId: string,
-  accepted: AcceptedImplementationPlanContext,
-  canonicalization: AcceptedPlanAccessScopeCanonicalizationResult,
-  ts: string,
-  id: string
-): AgentEvent {
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'workflow_stage',
-    payload: {
-      title: 'Accepted plan access scope canonicalized',
-      summary: 'Session removed invalid execution-batch accessScopes before Kernel PlanReview.',
-      stage: 'accepted_plan.access_scope_canonicalized',
-      status: 'completed',
-      runId,
-      planId: accepted.planId,
-      removedAccessScopes: canonicalization.removedAccessScopes,
-      actionTargets: [...new Set(canonicalization.actionTargets.filter(Boolean))],
-      reason: 'invalid_execution_scope',
-      channel: 'progress',
-      visibility: 'debug',
-      presentation: 'collapsible',
-    },
-  };
-}
-
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
@@ -6646,105 +6654,6 @@ function collectReasoning(result: LlmChatResult): string {
 
 function planInitialUserRequest(plan: SessionPlanContext): string {
   return plan.userPlan;
-}
-
-function cacheTelemetryEvent(
-  sessionId: string,
-  profileId: string | undefined,
-  state: SessionDriverLoopRunState,
-  stage: string,
-  result: LlmChatResult,
-  ts: string,
-  id: string
-): AgentEvent | null {
-  const usage = objectRecord(result.usage);
-  const normalized = normalizeProviderUsage(usage);
-  const promptSegmentDigests = state.contextAssembly?.segments.map((segment) => ({
-    id: segment.id,
-    name: segment.name,
-    cacheClass: segment.cacheClass,
-    stablePrefix: segment.stablePrefix,
-    auditOnly: segment.auditOnly,
-    contentHash: segment.contentHash,
-    charLength: segment.charLength,
-  })) ?? [];
-  if (
-    normalized.promptCacheHitTokens === undefined &&
-    normalized.promptCacheMissTokens === undefined &&
-    normalized.cachedTokens === undefined &&
-    normalized.promptTokens === undefined &&
-    normalized.completionTokens === undefined &&
-    normalized.totalTokens === undefined &&
-    promptSegmentDigests.length === 0
-  ) {
-    return null;
-  }
-
-  return {
-    id,
-    sessionId,
-    ts,
-    kind: 'cache_telemetry',
-    payload: {
-      provider: profileId ?? state.contextAssembly?.provider ?? 'unknown',
-      providerProfileId: profileId,
-      model: state.contextAssembly?.model,
-      stage,
-      promptCacheHitTokens: normalized.promptCacheHitTokens,
-      promptCacheMissTokens: normalized.promptCacheMissTokens,
-      cachedTokens: normalized.cachedTokens,
-      promptTokens: normalized.promptTokens,
-      completionTokens: normalized.completionTokens,
-      totalTokens: normalized.totalTokens,
-      normalizedUsage: normalized,
-      rawUsage: usage,
-      promptSegmentDigests,
-      stablePrefixHash: state.contextAssembly?.stablePrefixHash,
-      dynamicSuffixHash: state.contextAssembly?.dynamicSuffixHash,
-      cacheHash: state.contextAssembly?.cacheHash,
-      cacheAffectsCorrectness: false,
-    },
-  };
-}
-
-function normalizeProviderUsage(usage: Record<string, unknown> | undefined): Record<string, number | undefined> {
-  const promptTokens = numberValue(usage?.prompt_tokens) ?? numberValue(usage?.input_tokens);
-  const completionTokens = numberValue(usage?.completion_tokens) ?? numberValue(usage?.output_tokens);
-  const totalTokens = numberValue(usage?.total_tokens)
-    ?? (promptTokens !== undefined && completionTokens !== undefined ? promptTokens + completionTokens : undefined);
-  const cachedTokens = numberValue(usage?.cached_tokens)
-    ?? numberAtPath(usage, ['prompt_tokens_details', 'cached_tokens'])
-    ?? numberAtPath(usage, ['input_tokens_details', 'cached_tokens']);
-  const promptCacheHitTokens = numberValue(usage?.prompt_cache_hit_tokens)
-    ?? numberValue(usage?.cache_read_input_tokens)
-    ?? cachedTokens;
-  const promptCacheMissTokens = numberValue(usage?.prompt_cache_miss_tokens)
-    ?? numberValue(usage?.cache_creation_input_tokens)
-    ?? (promptTokens !== undefined && promptCacheHitTokens !== undefined
-      ? Math.max(0, promptTokens - promptCacheHitTokens)
-      : undefined);
-  return {
-    promptCacheHitTokens,
-    promptCacheMissTokens,
-    cachedTokens,
-    promptTokens,
-    completionTokens,
-    totalTokens,
-  };
-}
-
-function numberAtPath(value: unknown, path: string[]): number | undefined {
-  let current: unknown = value;
-  for (const key of path) {
-    const record = objectRecord(current);
-    if (!record) return undefined;
-    current = record[key];
-  }
-  return numberValue(current);
-}
-
-function numberValue(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 type VisibleLanguage = 'zh-CN' | 'en-US';
