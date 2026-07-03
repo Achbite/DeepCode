@@ -1041,19 +1041,31 @@ export class SessionDriverLoop {
     };
 
     if (stateDecision.kind === 'finishWithAnswer') {
+      const confirmationPayload = objectRecord(confirmation.payload) ?? {};
+      const accepted = this.recoverAcceptedPlanForRequirement(current.events, runId, undefined);
+      const taskLedger = buildAcceptedPlanTaskLedger(accepted);
+      const reason = effect.kind === 'finishWithAnswer'
+        ? effect.reason
+        : effect.kind === 'markAcceptedIncomplete'
+          ? effect.reason
+          : undefined;
+      const answerProposal = assistantProjectionBuilder.decisionEffectAnswerProposal({
+        sessionId: input.sessionId,
+        runId,
+        proposalId: this.id('finish-with-answer-proposal'),
+        completedTasks: taskLedger?.completedTaskIds.length ?? 0,
+        totalTasks: taskLedger?.taskOrder.length ?? 0,
+        pendingTasks: taskLedger?.pendingTaskIds.length ?? 0,
+        reason,
+        guidance: input.guidance,
+        language: visibleLanguageForRequest(stringValue(confirmationPayload.originalUserRequest) ?? input.guidance ?? ''),
+      });
       return this.append(input.sessionId, [
-        assistantProjectionBuilder.answerEvent(input.sessionId, answerProposalFromDecisionEffect(
-          input.sessionId,
-          runId,
-          effect,
-          current.events,
-          input.guidance,
-          this.id('finish-with-answer-proposal')
-        ), this.ts(), this.id('answer'), {
+        assistantProjectionBuilder.answerEvent(input.sessionId, answerProposal, this.ts(), this.id('answer'), {
           answerFactsContext: buildAnswerFactsContext({
             reviewFactsContext: buildReviewFactsContext({
               runId,
-              taskLedger: buildAcceptedPlanTaskLedger(this.recoverAcceptedPlanForRequirement(current.events, runId, undefined)),
+              taskLedger,
             }),
             userGuidance: input.guidance,
           }),
@@ -5175,62 +5187,6 @@ function uniqueStrings(values: Array<string | undefined>): string[] {
     output.push(trimmed);
   }
   return output;
-}
-
-function answerProposalFromDecisionEffect(
-  sessionId: string,
-  runId: string,
-  effect: RequirementOptionEffect,
-  events: AgentEvent[],
-  guidance: string | undefined,
-  proposalId: string
-): ProposalEnvelope {
-  const accepted = recoverAcceptedPlanFromEvents(events, runId);
-  const ledger = buildAcceptedPlanTaskLedger(accepted);
-  const completed = ledger?.completedTaskIds.length ?? 0;
-  const total = ledger?.taskOrder.length ?? 0;
-  const pending = ledger?.pendingTaskIds.length ?? 0;
-  const reason = effect.kind === 'finishWithAnswer'
-    ? effect.reason
-    : effect.kind === 'markAcceptedIncomplete'
-      ? effect.reason
-      : undefined;
-  const lines = [
-    '## 当前会话已按用户介入收口',
-    '',
-    '用户已要求停止继续执行并输出总结。以下内容只基于 Session ledger 与 Kernel facts 派生，不声明未发生的工具执行。',
-    '',
-    total ? `- 已确认任务总数：${total}` : '- 当前没有可恢复的 accepted plan 任务清单。',
-    total ? `- 已完成任务：${completed}` : '',
-    total ? `- 未继续执行任务：${pending}` : '',
-    reason ? `- 用户介入原因：${reason}` : '',
-    guidance?.trim() ? `- 用户补充说明：${guidance.trim()}` : '',
-    '',
-    '后续如需继续，需要重新生成或确认新的 Plan；未提交 Kernel 的任务不会被视为完成事实。',
-  ].filter(Boolean);
-  return {
-    schemaVersion: 'deepcode.agent.protocol.v3',
-    proposalId,
-    runId,
-    sessionId,
-    source: 'system',
-    kind: 'answer',
-    payload: {
-      answer: {
-        version: '1',
-        format: 'markdown',
-        content: lines.join('\n'),
-      },
-    },
-    referencedResourcePacketRefs: [],
-    referencedEvidenceRefs: [],
-  };
-}
-
-function recoverAcceptedPlanFromEvents(events: AgentEvent[], runId: string): AcceptedImplementationPlanContext | undefined {
-  const plan = latestExecutablePlan(events, runId);
-  if (!plan?.implementationPlan) return undefined;
-  return acceptedPlanWithLatestCheckpoint(acceptedImplementationPlanContext(plan, undefined, plan.executionRoot), events);
 }
 
 function readActionBundle(proposal: ProposalEnvelope): ActionBundleDraft | undefined {

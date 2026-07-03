@@ -1899,6 +1899,23 @@ function assertAssistantProjectionBuilderCreatesConversationEvents(): void {
     content: `guidance-${token}`,
   }]);
   assert(overlay.includes(`guidance-${token}`), 'assistant projection guidance overlay preserves guidance ids');
+
+  const decisionAnswer = builder.decisionEffectAnswerProposal({
+    sessionId: `session-${token}`,
+    runId: `run-${token}`,
+    proposalId: `decision-answer-${token}`,
+    completedTasks: 2,
+    totalTasks: 3,
+    pendingTasks: 1,
+    reason: `reason-${token}`,
+    guidance: `guidance-${token}`,
+    language: 'en-US',
+  });
+  assertEqual(decisionAnswer.kind, 'answer', 'assistant projection creates decision-effect answer proposal');
+  assert(
+    String((decisionAnswer.payload as any).answer.content).includes('Completed tasks: 2'),
+    'assistant projection renders decision-effect answer ledger summary'
+  );
 }
 
 function assertPlanReviewReportAnalyzerKeepsReviewSemantics(): void {
