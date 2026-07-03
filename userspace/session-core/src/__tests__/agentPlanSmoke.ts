@@ -1155,9 +1155,11 @@ async function assertSessionDriverLoopRequirementChoiceEntersResumePrompt(): Pro
 
   assertEqual(llmRequests.length, 1, 'accepted requirement choice resumes provider once');
   const promptText = llmRequests.flatMap((request) => request.messages.map((message) => message.content)).join('\n');
-  assert(promptText.includes('用户已完成用户介入选择'), 'resume prompt states that the user already selected an option');
+  assert(promptText.includes('The user has resolved the previous decisionRequest'), 'resume prompt states that the user already selected an option in English');
   assert(promptText.includes('Alpha branch'), 'resume prompt includes the selected option label');
-  assert(promptText.includes('不要重复输出同一个 decisionRequest'), 'resume prompt guards against repeating the same decision request');
+  assert(promptText.includes('Do not repeat the same decisionRequest'), 'resume prompt guards against repeating the same decision request');
+  assert(!/[\u3400-\u9FFF]/.test(promptText), 'resume prompt does not inject CJK system instructions for an English user request');
+  assert(promptText.includes('current user request language'), 'resume prompt constrains user-visible output language separately from English system instructions');
   assert(promptText.includes('kind: ConfirmedDecision'), 'resume prompt contains a formal confirmed decision frame');
   assert(promptText.includes('state=ConfirmedRequirementContinuation'), 'resume prompt narrows the next action after a confirmed requirement choice');
   assert(promptText.includes('Do not infer extra preserved/deleted/modified targets'), 'resume prompt prevents target guessing after a confirmed choice');
@@ -6303,6 +6305,7 @@ async function assertSessionDriverLoopActionBundleAdmissionRepairsDirectoryDelet
   };
   let llmCalls = 0;
   let proposalSubmits = 0;
+  const llmRequests: LlmChatRequest[] = [];
   const submittedPlans: Array<Record<string, any>> = [];
   const loop = new SessionDriverLoop({
     appendEvents: async (_sessionId, nextEvents): Promise<AgentSessionResult> => {
@@ -6314,7 +6317,8 @@ async function assertSessionDriverLoopActionBundleAdmissionRepairsDirectoryDelet
       if (command.kind === 'proposalSubmit') proposalSubmits += 1;
       return planKernel(request, session.id, submittedPlans);
     },
-    llmChat: async (): Promise<ApiResponse<LlmChatResult>> => {
+    llmChat: async (request): Promise<ApiResponse<LlmChatResult>> => {
+      llmRequests.push(request);
       llmCalls += 1;
       if (llmCalls === 1) return jsonLlmResponse(deleteActionBundleProposal('generic-dir'));
       return jsonLlmResponse(deleteActionBundleProposal('generic-dir/inside.txt'));
@@ -6333,6 +6337,10 @@ async function assertSessionDriverLoopActionBundleAdmissionRepairsDirectoryDelet
 
   const planCards = result.events.filter((event) => event.kind === 'plan_card');
   assertEqual(llmCalls, 2, 'directory delete admission repair calls provider once for a corrected file-level plan');
+  const repairPromptText = llmRequests[1]?.messages.map((message) => message.content).join('\n') ?? '';
+  assert(repairPromptText.includes('Session admission reasons:'), 'admission repair prompt includes structured admission reasons');
+  assert(repairPromptText.includes('directory deletion must explicitly set targetKind="directory"'), 'admission repair prompt uses English delete directory reason');
+  assert(!/[\u3400-\u9FFF]/.test(repairPromptText), 'admission repair prompt does not inject CJK system instructions for an English user request');
   assertEqual(proposalSubmits, 1, 'only the repaired file-level actionBundle enters Kernel PlanReview');
   assertEqual(planCards.length, 1, 'only the repaired actionBundle becomes a confirmable plan card');
   assertEqual(

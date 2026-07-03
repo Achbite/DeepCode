@@ -549,9 +549,8 @@ export class SessionDriverLoop {
             ),
           ]);
         }
-        // S5：provider 流式连接中断（undici "terminated"）、网络抖动、provider 超时等
-        // 原始错误不属于协议错误，过去会直接抛出成裸错误终止整轮；此处统一降级为可读、
-        // 可恢复的诊断，不影响此前已完成步骤。
+        // S5 provider stream failures, including undici "terminated", network jitter, and provider timeouts.
+        // Raw transport failures are not protocol failures; expose them as recoverable diagnostics without invalidating completed steps.
         return this.append(sessionId, [
           finalDiagnosticEvent(
             sessionId,
@@ -782,7 +781,16 @@ export class SessionDriverLoop {
       return this.runUserTurn({
         sessionId: input.sessionId,
         content: input.decision === 'revise' && input.guidance
-          ? `${originalRequest}\n\n用户对只读资源预算后的补充意见：${input.guidance}\n\n如果用户要求基于当前内容回答，请优先使用已有 ResourcePacket 收口；如果用户缩小范围且关键事实仍不足，可以在追加预算内继续按需读取。`
+          ? [
+              originalRequest,
+              '',
+              'User guidance after the read-only resource budget checkpoint (verbatim):',
+              input.guidance,
+              '',
+              'If the user asks for an answer from the current evidence, prefer closing with the existing ResourcePackets.',
+              'If the user narrowed the scope and key facts are still missing, continue with focused read-only resourceRequest within the additional budget.',
+              'Write user-visible proposal fields in the current user request language; keep protocol keys and evidence refs unchanged.',
+            ].join('\n')
           : originalRequest,
         attachments: requirementAttachments(confirmation),
         existingEvents: result.events,
@@ -805,9 +813,8 @@ export class SessionDriverLoop {
       return this.resolveAcceptedPlanExecutionRequirementDecision(input, confirmation, decisionEvent, interactionOverlay, result);
     }
 
-    // R2 状态机派发：如果用户接受的 option 携带 effect 合约，按其声明推进状态机，
-    // 不再让模型重新猜测。这是"卡片所读即事实"的兜底：选项已显式声明副作用，
-    // 系统据此产事实事件，避免模型再次伪造任务完成。
+    // R2 state-machine dispatch: when the selected option declares an effect contract,
+    // advance by that contract instead of asking the model to infer state again.
     if (input.decision === 'accept') {
       const optionEffect = selectedRequirementDecisionOptionEffect(decisionEvent);
       if (optionEffect) {
@@ -900,7 +907,7 @@ export class SessionDriverLoop {
       ?? (input.decision === 'accept' ? defaultRequirementDecisionOptionEffect(confirmation) : undefined);
     const nextAcceptedPlan = acceptedPlanWithScopeDecisionEffect(acceptedPlan, selectedEffect);
     const guidance = input.guidance?.trim()
-      ? `用户对 accepted-plan scope 介入的补充意见：${input.guidance.trim()}`
+      ? `User guidance for the accepted-plan scope intervention (verbatim):\n${input.guidance.trim()}`
       : acceptedPlanScopeDecisionResumeGuidance(selectedEffect);
     return this.runUserTurn({
       sessionId: input.sessionId,
@@ -922,10 +929,8 @@ export class SessionDriverLoop {
     });
   }
 
-  // R2 effect 派发：按用户选定 option 的 effect 合约推进状态机，
-  // 通过产 workflow_stage(stage=accepted_plan.batch_checkpoint, source=requirementDecision) 事件
-  // 复用现有"completedTaskIds 推进"机制——状态由事实事件驱动，GUI 所读即事实。
-  // 返回 undefined 表示降级到默认的 runUserTurn 路径（continueWithAction 或缺少 acceptedPlan 上下文）。
+  // R2 effect dispatch writes a checkpoint event from the selected option contract.
+  // Returning undefined falls back to the default runUserTurn path.
   private async applyRequirementOptionEffect(
     input: SessionDecisionResolverInput,
     confirmation: AgentEvent,
@@ -1012,7 +1017,7 @@ export class SessionDriverLoop {
       ]) ?? current;
     }
 
-    // skipTask / markAcceptedIncomplete：必须有 acceptedImplementationPlan 上下文。
+    // skipTask / markAcceptedIncomplete require acceptedImplementationPlan context.
     const confirmationPayload = objectRecord(confirmation.payload) ?? {};
     const decisionRequest = objectRecord(confirmationPayload.decisionRequest) ?? {};
     const planId = stringValue(decisionRequest.acceptedPlanId)
@@ -1073,7 +1078,7 @@ export class SessionDriverLoop {
       return this.append(input.sessionId, events) ?? current;
     }
 
-    // 尚有剩余任务：以更新后的 acceptedImplementationPlan 继续 runUserTurn
+    // Continue remaining tasks with the updated acceptedImplementationPlan.
     const result = await this.append(input.sessionId, events) ?? current;
     const originalRequest = requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
     return this.runUserTurn({
@@ -1095,7 +1100,7 @@ export class SessionDriverLoop {
     });
   }
 
-  // 从既有 events 中恢复 acceptedImplementationPlan：先找 plan_card+implementationPlan，再叠加最新 checkpoint。
+  // Recover acceptedImplementationPlan from events by locating the plan card and applying the latest checkpoint.
   private recoverAcceptedPlanForRequirement(
     events: AgentEvent[],
     runId: string,
@@ -2032,7 +2037,7 @@ export class SessionDriverLoop {
           await this.append(state.sessionId, [
             thinkingEvent(
               state.sessionId,
-              `模型输出需要按 Agent Protocol v3 修复：${parseError.message}`,
+              `Model output requires Agent Protocol v3 repair: ${parseError.message}`,
               this.ts(),
               this.id('protocol-repair')
             ),
@@ -2058,14 +2063,14 @@ export class SessionDriverLoop {
           } catch (repairError) {
             throw new SessionDriverLoopError(
               'agent_protocol_repair_failed',
-              `模型空响应 repair 后仍无法解析：${normalizeParseError(repairError).message}`
+              `Empty model response still could not be parsed after repair: ${normalizeParseError(repairError).message}`
             );
           }
         }
         await this.append(state.sessionId, [
           thinkingEvent(
             state.sessionId,
-            '模型没有返回有效 JSON，Session 正在要求其缩小为下一批可审查 actionBundle。',
+            'The model did not return valid JSON; Session is asking it to narrow the response to the next reviewable actionBundle.',
             this.ts(),
             this.id('action-bundle-compaction-repair')
           ),
@@ -2088,7 +2093,7 @@ export class SessionDriverLoop {
         } catch (repairError) {
           throw new SessionDriverLoopError(
             'agent_protocol_repair_failed',
-            `模型空响应 repair 后仍无法解析：${normalizeParseError(repairError).message}`
+            `Empty model response still could not be parsed after repair: ${normalizeParseError(repairError).message}`
           );
         }
       }
@@ -2107,7 +2112,7 @@ export class SessionDriverLoop {
       await this.append(state.sessionId, [
         thinkingEvent(
           state.sessionId,
-          `模型输出需要按 Agent Protocol v3 修复：${parseError.message}`,
+          `Model output requires Agent Protocol v3 repair: ${parseError.message}`,
           this.ts(),
           this.id('protocol-repair')
         ),
@@ -2134,7 +2139,7 @@ export class SessionDriverLoop {
       } catch (repairError) {
         throw new SessionDriverLoopError(
           'agent_protocol_repair_failed',
-          `模型输出不符合 Agent Protocol v3，repair 后仍无法解析：${normalizeParseError(repairError).message}`
+          `Model output still does not satisfy Agent Protocol v3 after repair: ${normalizeParseError(repairError).message}`
         );
       }
     }
@@ -2377,7 +2382,7 @@ export class SessionDriverLoop {
       await this.append(state.sessionId, [
         thinkingEvent(
           state.sessionId,
-          `accepted-plan resource resume 输出需要按 Agent Protocol v3 修复：${parseError.message}`,
+          `Accepted-plan resource resume output requires Agent Protocol v3 repair: ${parseError.message}`,
           this.ts(),
           this.id('accepted-plan-resource-resume-repair')
         ),
@@ -2400,7 +2405,7 @@ export class SessionDriverLoop {
       } catch (repairError) {
         throw new SessionDriverLoopError(
           'accepted_plan_resource_resume_repair_failed',
-          `accepted-plan resource resume repair 后仍无法解析：${normalizeParseError(repairError).message}`
+          `Accepted-plan resource resume output still could not be parsed after repair: ${normalizeParseError(repairError).message}`
         );
       }
     }
@@ -2977,7 +2982,7 @@ export class SessionDriverLoop {
     } catch (error) {
       throw new SessionDriverLoopError(
         'agent_protocol_repair_failed',
-        `模型资源请求 repair 后仍无法解析：${normalizeParseError(error).message}`
+        `Model resourceRequest output still could not be parsed after repair: ${normalizeParseError(error).message}`
       );
     }
   }
@@ -3215,7 +3220,7 @@ export class SessionDriverLoop {
       await this.append(state.sessionId, [
         thinkingEvent(
           state.sessionId,
-          'Kernel PlanReview 要求补充计划证据，Session 正在进行一次受控 repair。',
+          'Kernel PlanReview requires additional proposal evidence; Session is running one controlled repair attempt.',
           this.ts(),
           this.id('plan-review-repair')
         ),
@@ -3371,7 +3376,14 @@ export class SessionDriverLoop {
             content: implementationPlanExecutionRequest(
               acceptedPlanExecutionContext(state, proposal, {}),
               accepted,
-              'Session 已补充当前修改所需的只读 search/read 证据；请基于 ResourcePacket 输出同一 accepted taskPlan 范围内的下一批 actionBundle。'
+              [
+                'Session has resolved the read-only search/read evidence required for the current edit.',
+                'Use the ResourcePacket evidence to continue the same accepted taskPlan cursor.',
+                'If evidence is sufficient and the current task remains in scope, output the next actionBundle.',
+                'If evidence is still missing, output a focused resourceRequest.',
+                'If scope must expand, output decisionRequest instead of guessing.',
+                'Write user-visible proposal fields in the current user request language; keep protocol keys, toolIds, paths, and evidence refs unchanged.',
+              ].join('\n')
             ),
             attachments: accepted.executionRoot ? [accepted.executionRoot.attachment] : [],
             existingEvents: result.events,
@@ -3513,7 +3525,7 @@ export class SessionDriverLoop {
       await this.append(state.sessionId, [
         thinkingEvent(
           state.sessionId,
-          'Kernel PlanReview 要求修订当前自动执行批次，Session 正在进行一次受控 repair。',
+          'Kernel PlanReview requires revising the current accepted-plan batch; Session is running one controlled repair attempt.',
           this.ts(),
           this.id('accepted-plan-review-repair')
         ),
@@ -3555,7 +3567,7 @@ export class SessionDriverLoop {
     if (reviewReport.status === 'needsRevision') {
       return this.appendAcceptedPlanBatchOutOfScope(input, state, executionProposal, {
         ok: false,
-        reasons: [`Kernel PlanReview 要求修订当前批次：${planReviewDiagnosticSummary(reviewReport)}`],
+        reasons: [`Kernel PlanReview requires revising the current batch: ${planReviewDiagnosticSummary(reviewReport)}`],
       });
     }
 
@@ -3563,7 +3575,7 @@ export class SessionDriverLoop {
     if (autoGrantBlockers.length) {
       return this.appendAcceptedPlanBatchOutOfScope(input, state, executionProposal, {
         ok: false,
-        reasons: autoGrantBlockers.map((capability) => `当前批次需要额外权限 ${capability}，不属于 accepted taskPlan 自动执行范围。`),
+        reasons: autoGrantBlockers.map((capability) => `The current batch requires additional permission ${capability}, which is outside the accepted taskPlan automatic execution scope.`),
       });
     }
 
@@ -3875,7 +3887,7 @@ export class SessionDriverLoop {
     } catch (error) {
       throw new SessionDriverLoopError(
         'agent_protocol_repair_failed',
-        `模型计划 repair 后仍无法解析：${normalizeParseError(error).message}`
+        `Model plan output still could not be parsed after repair: ${normalizeParseError(error).message}`
       );
     }
   }
@@ -3905,7 +3917,7 @@ export class SessionDriverLoop {
     } catch (error) {
       throw new SessionDriverLoopError(
         'accepted_plan_scope_repair_failed',
-        `模型 accepted-plan scope repair 后仍无法解析：${normalizeParseError(error).message}`
+        `Accepted-plan scope repair output still could not be parsed after repair: ${normalizeParseError(error).message}`
       );
     }
   }
@@ -4895,8 +4907,7 @@ function basename(value: string): string {
   return parts[parts.length - 1] || normalized;
 }
 
-// i18n 诊断结构：session-core 产出语言无关的 code + params + 英文 fallback，
-// GUI 渲染时按 diagnosticCode 走 i18n 翻译，fallback 供无 i18n 消费者（CLI/日志）。
+// Diagnostic payloads carry language-neutral codes and params plus an English fallback for CLI/log consumers.
 interface DiagnosticInfo {
   code: string;
   fallback: string;
@@ -7242,7 +7253,7 @@ function normalizeAcceptedPlanKernelBatch(
   const normalizedActions = actions.map((action, index) => {
     const record = objectRecord(action);
     if (!record) {
-      reasons.push(`actionBundle.actions[${index}] 不是对象，不能提交 Kernel。`);
+      reasons.push(`actionBundle.actions[${index}] is not an object and cannot be submitted to Kernel.`);
       return action;
     }
     const next = { ...record };
@@ -7257,7 +7268,7 @@ function normalizeAcceptedPlanKernelBatch(
         deleteGrant
       );
       if (!target) {
-        reasons.push(`actionBundle.actions[${index}] fs.delete 缺少可执行的具体目标 targetPath/resourceScope。`);
+        reasons.push(`actionBundle.actions[${index}] fs.delete is missing an executable concrete targetPath/resourceScope.`);
       } else {
         next.targetPath = target;
         next.resourceScope = [target];
@@ -7280,12 +7291,12 @@ function normalizeAcceptedPlanKernelBatch(
     const patchLike = ['patch', 'replaceBlock', 'insertBefore', 'insertAfter'].includes(String(next.kind));
     const blockRef = stringValue(next.replacementBlockId) ?? stringValue(next.sourceBlockId);
     if (!blockRef) {
-      reasons.push(`actionBundle.actions[${index}] ${capability} 缺少 sourceBlockId/replacementBlockId。`);
+      reasons.push(`actionBundle.actions[${index}] ${capability} is missing sourceBlockId/replacementBlockId.`);
       return next;
     }
     const block = codeBlockById.get(blockRef);
     if (!block) {
-      reasons.push(`actionBundle.actions[${index}] 引用的 codeBlock "${blockRef}" 不存在。`);
+      reasons.push(`actionBundle.actions[${index}] references missing codeBlock "${blockRef}".`);
       return next;
     }
     const target = acceptedPlanConcreteFileOperationTarget(
@@ -7296,7 +7307,7 @@ function normalizeAcceptedPlanKernelBatch(
       accepted
     );
     if (!target) {
-      reasons.push(`actionBundle.actions[${index}] ${capability} 缺少可执行的文件 targetPath/resourceScope。`);
+      reasons.push(`actionBundle.actions[${index}] ${capability} is missing an executable file targetPath/resourceScope.`);
       return next;
     }
     next.targetPath = target;
@@ -7361,19 +7372,19 @@ function acceptedPlanDeletePreflightReasons(
     const target = actionFileTargetPath(action);
     const normalized = target ? normalizePlanScope(target) : undefined;
     if (!normalized || normalized === '.' || normalized === './') {
-      reasons.push(`actionBatch.actions[${index}] fs.delete 缺少具体目标 targetPath/resourceScope。`);
+      reasons.push(`actionBatch.actions[${index}] fs.delete is missing a concrete targetPath/resourceScope.`);
     } else {
       const targetResourceKind = deleteActionTargetResourceKind(action);
       const normalizedDirectory = normalizePlanScope(normalized).replace(/\/+$/, '');
       const resourcePacketSaysDirectory = resourceRequestLoop.containsDirectoryPath(resourcePackets, normalizedDirectory);
       if ((normalized.endsWith('/') || resourcePacketSaysDirectory) && targetResourceKind !== 'directory') {
-        reasons.push(`actionBatch.actions[${index}] fs.delete target ${normalizedDirectory} 是目录；目录删除必须显式设置 targetKind="directory"。`);
+        reasons.push(`actionBatch.actions[${index}] fs.delete target ${normalizedDirectory} is a directory; directory deletion must explicitly set targetKind="directory".`);
       } else if (targetResourceKind === 'directory' && !deleteActionRecursive(action)) {
-        reasons.push(`actionBatch.actions[${index}] fs.delete directory target ${normalizedDirectory} 必须显式设置 recursive=true，或改为删除空目录语义。`);
+        reasons.push(`actionBatch.actions[${index}] fs.delete directory target ${normalizedDirectory} must explicitly set recursive=true or use an empty-directory deletion semantic.`);
       }
     }
     if (stringValue(action.sourceBlockId) || stringValue(action.replacementBlockId)) {
-      reasons.push(`actionBatch.actions[${index}] fs.delete 不得引用 codeBlock。`);
+      reasons.push(`actionBatch.actions[${index}] fs.delete must not reference a codeBlock.`);
     }
   }
   return [...new Set(reasons)];
@@ -7501,7 +7512,7 @@ function fileOperationFreshnessValidationReasons(
       if (!matchText) continue;
       if (!evidenceIndex.containsExactBlock(resourcePackets, targets, matchText)) {
         const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
-        reasons.push(`patch action ${action.actionId || action.id || action.title || index} 缺少当前文件/search 证据：patchSpec.match.text 必须来自最近 ResourcePacket 的 fileText/searchResults（target=${targetLabel}）。请先返回 resourceRequest kind="search" 或读取目标文件/range。`);
+        reasons.push(`patch action ${action.actionId || action.id || action.title || index} is missing current file/search evidence: patchSpec.match.text must come from recent ResourcePacket fileText/searchResults (target=${targetLabel}). Return resourceRequest kind="search" or read the target file/range first.`);
       }
       continue;
     }
@@ -7510,21 +7521,21 @@ function fileOperationFreshnessValidationReasons(
       const targetIsAccepted = targets.some((target) => scopeCoveredByAcceptedPlanForCapability(target, capability, accepted));
       if (!targetIsAccepted && !evidenceIndex.mentionsAnyTarget(resourcePackets, targets) && !actionDeclaresOverwritePlan(action)) {
         const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
-        reasons.push(`write action ${action.actionId || action.id || action.title || index} 覆盖已有文件前缺少当前 read/search 证据或明确 overwrite plan（target=${targetLabel}）。请先返回 resourceRequest 读取目标文件/range/search。`);
+        reasons.push(`write action ${action.actionId || action.id || action.title || index} is missing current read/search evidence or an explicit overwrite plan before overwriting an existing file (target=${targetLabel}). Return resourceRequest to read/search the target file or range first.`);
       }
       continue;
     }
     if (capability === 'fs.delete') {
       if (!targets.some((target) => scopeCoveredByAcceptedPlanForCapability(target, capability, accepted)) && !evidenceIndex.mentionsAnyTarget(resourcePackets, targets)) {
         const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
-        reasons.push(`delete action ${action.actionId || action.id || action.title || index} 缺少当前目录/read/search 证据或已确认文件级范围（target=${targetLabel}）。请先返回 resourceRequest 读取目录树或目标文件证据。`);
+        reasons.push(`delete action ${action.actionId || action.id || action.title || index} is missing current directory/read/search evidence or confirmed file-level scope (target=${targetLabel}). Return resourceRequest to read the directory tree or target-file evidence first.`);
       }
       continue;
     }
     if (capability === 'fs.rename' || actionKind === 'rename') {
       if (!evidenceIndex.mentionsAnyTarget(resourcePackets, targets)) {
         const targetLabel = targets.length ? targets.join(', ') : `action index ${index}`;
-        reasons.push(`rename action ${action.actionId || action.id || action.title || index} 缺少 source 当前证据（target=${targetLabel}）。请先返回 resourceRequest 读取 source 文件或目录证据。`);
+        reasons.push(`rename action ${action.actionId || action.id || action.title || index} is missing current source evidence (target=${targetLabel}). Return resourceRequest to read the source file or directory evidence first.`);
       }
     }
   }
@@ -7591,12 +7602,12 @@ function acceptedPlanRelativeTargetError(
 ): string | undefined {
   const raw = target.raw;
   const normalized = target.normalized;
-  if (!normalized) return 'actionBundle 目标路径为空，不能自动执行。';
+  if (!normalized) return 'actionBundle target path is empty and cannot be auto-executed.';
   if (normalized === '.' || normalized === '..') {
-    return `目标 ${raw} 指向 primary root 目录本身，不是可写入文件。`;
+    return `target ${raw} points to the primary root directory itself, not a writable file target.`;
   }
   if (normalized === '.' || normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) {
-    return `目标 ${raw} 不能包含跨出 primary root 的相对路径。`;
+    return `target ${raw} must not contain a relative path that escapes the primary root.`;
   }
   const rootRef = accepted.executionRoot?.ref;
   if (isAbsolutePath(raw)) {
@@ -7609,7 +7620,7 @@ function acceptedPlanRelativeTargetError(
     const rootName = basename(rootRef);
     const rawNormalized = normalizePlanScope(raw);
     if (rootName && rawNormalized === rootName) {
-      return `目标 ${raw} 指向 primary root 目录本身，不是可写入文件。`;
+      return `target ${raw} points to the primary root directory itself, not a writable file target.`;
     }
   }
   return undefined;
@@ -7984,11 +7995,8 @@ function normalizePlanScopeIdentity(value: string): string {
   return normalizePlanScope(value).replace(/\/+$/, '');
 }
 
-// 任务编排修复：accepted taskPlan 的 task.targets 可能是自由文本（含路径与说明混排），
-// 直接做 scope 匹配会因多路径合并串永不命中，造成合法写入被判越界、任务死结。
-// 这里只做"语言无关的结构化路径提取"——按路径字符集取出 token，保留含 "/" 或带扩展名者；
-// 不依赖任何自然语言分隔词/描述词、不针对特定样例或语言，黑盒通用。目录 token 仍由
-// planScopeCovers 以前缀方式覆盖其下文件。
+// Accepted task targets can contain free text mixed with paths.
+// Extract only path-like tokens so scope checks stay language-independent and do not rely on sample-specific words.
 function expandPlanTargetTokens(target: string): string[] {
   if (!target || !target.trim()) return [];
   const candidates = target.match(/[A-Za-z0-9_.\-/]+/g) ?? [];
@@ -8119,9 +8127,8 @@ function sessionRunStateSummary(
   return { key: 'session.runState.planReview' };
 }
 
-// R2 requirement decision 驱动的任务推进事件：
-// 复用 stage='accepted_plan.batch_checkpoint' 以便 acceptedPlanWithLatestCheckpoint 自动识别，
-// 同时通过 source='requirementDecision' 字段保留审计来源（与正常批次完成区分）。
+// R2 requirement-decision task progress event.
+// Reuse the accepted_plan.batch_checkpoint stage so existing checkpoint recovery can consume it.
 function requirementDrivenTaskCheckpointEvent(
   sessionId: string,
   runId: string,
@@ -10451,9 +10458,15 @@ function requirementDecisionResumeRequest(
 ): string {
   const originalRequest = requirementOriginalRequest(confirmation);
   if (decision === 'revise') {
-    return guidance?.trim()
-      ? `${originalRequest}\n\n用户修订意见：${guidance.trim()}`
-      : `${originalRequest}\n\n用户要求修订当前用户介入请求。`;
+    return [
+      originalRequest,
+      '',
+      guidance?.trim()
+        ? `User revision guidance for the previous intervention request (verbatim):\n${guidance.trim()}`
+        : 'The user asked to revise the current intervention request.',
+      '',
+      'Write user-visible proposal fields in the current user request language; keep protocol keys, toolIds, paths, and evidence refs unchanged.',
+    ].join('\n');
   }
   if (decision !== 'accept') return originalRequest;
   const payload = objectRecord(decisionEvent.payload);
@@ -10461,19 +10474,21 @@ function requirementDecisionResumeRequest(
   const lines = [
     originalRequest,
     '',
-    '用户已完成用户介入选择，请基于该选择继续当前父流程；不要重复输出同一个 decisionRequest，除非后续出现新的独立决策点。',
+    'The user has resolved the previous decisionRequest. Continue the parent flow from that selected decision.',
+    'Do not repeat the same decisionRequest unless a new independent decision point appears later.',
+    'Write user-visible proposal fields in the current user request language; keep protocol keys, toolIds, paths, and evidence refs unchanged.',
   ];
   const id = stringValue(selectedOption?.id);
   const label = stringValue(selectedOption?.label);
   const description = stringValue(selectedOption?.description);
   if (id || label || description) {
-    lines.push('', '已选择的选项：');
+    lines.push('', 'Selected option:');
     if (id) lines.push(`- id: ${id}`);
     if (label) lines.push(`- label: ${label}`);
     if (description) lines.push(`- description: ${description}`);
   }
   if (guidance?.trim()) {
-    lines.push('', '用户补充信息：', guidance.trim());
+    lines.push('', 'Additional user guidance (verbatim):', guidance.trim());
   }
   return lines.join('\n');
 }
@@ -10512,7 +10527,7 @@ function clipJson(value: unknown, maxChars: number): string {
   return clip(text ?? '', maxChars);
 }
 
-// S4：协议解析/repair 失败 → 结构化 DiagnosticInfo，英文 fallback + code，不含硬编码中文。
+// S4 protocol parse/repair failures become structured DiagnosticInfo with code and English fallback.
 function readableDriverFailureMessage(code: string, message: string): DiagnosticInfo {
   const protocolFailureCodes = new Set([
     'agent_protocol_repair_failed',
@@ -10527,7 +10542,7 @@ function readableDriverFailureMessage(code: string, message: string): Diagnostic
   return diag('protocolRepairFailed', fallback, { message });
 }
 
-// S5：provider 调用/网络层失败 → 结构化 DiagnosticInfo，英文 fallback + code。
+// S5 provider or network failures become structured DiagnosticInfo with code and English fallback.
 function readableProviderFailureMessage(error: unknown): DiagnosticInfo {
   const raw = (error instanceof Error ? error.message : String(error)).trim() || 'unknown error';
   const fallback = `Model call failed: ${raw}\n\nThe connection to the model was interrupted (possibly due to network fluctuation, provider timeout, or response stream closure). Previously completed steps are not affected; please retry this turn.`;
@@ -10539,13 +10554,15 @@ function actionBundleAdmissionResourceFollowupRequest(
   reasons: string[]
 ): string {
   return [
-    'Session 已补充 actionBundle admission 所需的只读资源证据。',
-    '请继续生成同一用户请求的可确认计划，但必须满足具体目标删除约束。',
-    'fs.delete 必须使用 toolId="fs.delete" 和 args.path 列出具体文件或显式目录；workspace 目标使用相对路径，已确认的外部目标使用绝对路径。目录删除必须写成 args.targetKind="directory"、args.recursive=true，供 Kernel PlanReview 展示并申请用户确认；不得输出通配符、根目录或空目标。',
-    '如果 ResourcePacket 显示某个目标是目录，且用户意图确实是删除该目录，可以保留该目录 path 并显式 args.targetKind="directory"/args.recursive=true；如果目录范围不确定，请返回 decisionRequest。',
-    '如果仍无法确认具体文件范围，请返回 decisionRequest，而不是输出不可执行 actionBundle。',
-    reasons.length ? `上一次 admission 拒绝原因：\n${reasons.map((reason) => `- ${reason}`).join('\n')}` : '',
-    `当前 runId: ${state.runId}`,
+    'Session has resolved the read-only resource evidence required for actionBundle admission.',
+    'Continue the same user request by producing a confirmable plan, but satisfy the concrete target constraints for deletion.',
+    'fs.delete must use toolId="fs.delete" and args.path with concrete file targets or explicit directory targets. Workspace targets must be relative paths; user-confirmed outside targets may be absolute paths.',
+    'Directory deletion must use args.targetKind="directory" and args.recursive=true so Kernel PlanReview can display it and request user confirmation. Do not output wildcards, workspace root targets, empty targets, or ambiguous cleanup targets.',
+    'If ResourcePacket shows a target is a directory and the user intent really is to delete that directory, keep that directory path and set args.targetKind="directory" and args.recursive=true.',
+    'If the directory scope is uncertain, or if concrete file scope still cannot be confirmed, return decisionRequest instead of an unexecutable actionBundle.',
+    'Write user-visible proposal fields in the current user request language; keep protocol keys, toolIds, args keys, paths, and evidence refs unchanged.',
+    reasons.length ? `Previous admission rejection reasons:\n${reasons.map((reason) => `- ${reason}`).join('\n')}` : '',
+    `Current runId: ${state.runId}`,
   ].filter(Boolean).join('\n\n');
 }
 
@@ -10700,8 +10717,8 @@ function selectedRequirementDecisionOptionId(event: AgentEvent): string | undefi
   return stringValue(selectedOption?.id);
 }
 
-// R2：读取用户接受的 option 上声明的状态机副作用（effect）。
-// 缺失/非法时返回 undefined，调用方按 continueWithAction 处理（向下兼容）。
+// R2 reads the state-machine effect declared on the accepted option.
+// Missing or invalid effects return undefined and fall back to continueWithAction compatibility.
 function selectedRequirementDecisionOptionEffect(event: AgentEvent): RequirementOptionEffect | undefined {
   const payload = objectRecord(event.payload);
   const selectedOption = objectRecord(payload?.selectedOption);
@@ -10786,7 +10803,7 @@ function requirementDecisionOptionEffect(
   }
 }
 
-// R2：用户介入卡 option 的状态机副作用合约（运行时类型，与 protocolV3 normalizeOptionEffect 对齐）。
+// R2 runtime effect contract carried by user-intervention card options.
 type RequirementOptionEffect =
   | { kind: 'continueWithAction' }
   | { kind: 'skipCurrentTask' }
