@@ -10,6 +10,11 @@ import {
 } from '../../provider/ProviderEmptyProposalRetry.js';
 
 export { ProviderJsonModeCoordinator } from './providerJsonModeCoordinator.js';
+export {
+  NativeToolRepairCoordinator,
+  type NativeToolRepairDuplicate,
+  type NativeToolTurnProposalLike,
+} from './nativeToolRepairCoordinator.js';
 export { ProviderStreamCoordinator } from './providerStreamCoordinator.js';
 export { ProviderTraceRecorder } from './providerTraceRecorder.js';
 

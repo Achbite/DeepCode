@@ -1,6 +1,7 @@
 export * from './compactPipeline.js';
 export * from './interactionOverlayCodec.js';
 export * from './lifecyclePipeline.js';
+export * from './nativeToolRepairCoordinator.js';
 export * from './permissionPipeline.js';
 export * from './proposalPipeline.js';
 export * from './providerJsonModeCoordinator.js';

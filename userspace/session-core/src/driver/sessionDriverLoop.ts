@@ -70,6 +70,7 @@ import { ProviderRepairMessageBuilder, type ProviderRepairMessageState } from '.
 import {
   NativeToolCoordinator,
   NativeToolCoordinatorError,
+  NativeToolRepairCoordinator,
   NativeToolTurnHandler,
   ProviderJsonModeCoordinator,
   ProviderPipeline,
@@ -389,6 +390,11 @@ const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
 });
 const nativeToolCoordinator = new NativeToolCoordinator();
 const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
+const nativeToolRepairCoordinator = new NativeToolRepairCoordinator({
+  conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
+  parseProposal: (input) => protocolGate().parseAndValidateProposal(input),
+  parseRepairedProposal: (input) => protocolGate().parseAndValidateRepairedProposal(input),
+});
 const acceptedPlanExecutor = new AcceptedPlanExecutor({
   readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
   operationTargetResolver: acceptedPlanOperationTargetResolver,
@@ -2963,29 +2969,11 @@ export class SessionDriverLoop {
     toolCall: NativeToolCallProposal,
     turn: LlmTurnResult
   ): Promise<ProposalEnvelope> {
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'native_tool_side_effect_blocked',
-      status: 'failed',
-      channel: 'progress',
-      source: 'session',
-      summary: 'side_effect_native_tool_blocked',
-      activity: driverActivityBuilder.conversationActivity({
-        activityId: `native-tool-side-effect-${toolCall.callId}`,
-        kind: 'diagnostic',
-        status: 'failed',
-        title: 'Native tool blocked',
-        summary: 'Provider requested a side-effect tool. Session is converting it back through the plan/permission path.',
-        source: 'session',
-        runId: state.runId,
-        toolName: toolCall.name,
-      }),
-      payload: {
-        visibility: 'task',
-        callId: toolCall.callId,
-        name: toolCall.name,
-      },
-    });
+    await this.emitProjectionDelta(state, nativeToolRepairCoordinator.sideEffectBlockedDelta({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      toolCall,
+    }));
     const raw = await this.llm(
       input.profileId,
       state,
@@ -2999,14 +2987,11 @@ export class SessionDriverLoop {
       )
     );
     try {
-      return protocolGate().parseAndValidateRepairedProposal({
+      return nativeToolRepairCoordinator.parseSideEffectRepair({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds: state.acceptedImplementationPlan || state.implementationBatch.batchIndex > 1
-          ? ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']
-          : ['decisionRequest', 'taskPlan', 'resourceRequest', 'diagnostic'],
+        acceptedExecution: Boolean(state.acceptedImplementationPlan) || state.implementationBatch.batchIndex > 1,
       });
     } catch (error) {
       throw new SessionDriverLoopError(
@@ -3020,17 +3005,11 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     turn: LlmTurnResult
   ): ProposalEnvelope | null {
-    if (!turn.content.trim().startsWith('{')) return null;
-    try {
-      return protocolGate().parseAndValidateProposal({
-        raw: turn.content,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-      });
-    } catch {
-      return null;
-    }
+    return nativeToolRepairCoordinator.parseTurnProposal({
+      turn,
+      runId: state.runId,
+      sessionId: state.sessionId,
+    });
   }
 
   private async repairDuplicateNativeReadTool(
@@ -3041,44 +3020,15 @@ export class SessionDriverLoop {
     duplicates: Array<{ toolCall: NativeToolCallProposal; signature: NativeToolReadSignature; entry: NativeToolReadLedgerEntry }>
   ): Promise<ProposalEnvelope> {
     if (state.nativeToolDuplicateRepairAttempted) {
-      const duplicateSummary = duplicates
-        .map((item) => `${item.toolCall.name}:${item.signature.path}`)
-        .join(', ');
-      throw new SessionDriverLoopError(
-        'native_tool_duplicate_loop',
-        `Provider repeated already-resolved read-only native tool calls after repair: ${duplicateSummary}. Session stopped the run to avoid an infinite ResourceResolve loop.`
-      );
+      const failure = nativeToolRepairCoordinator.duplicateLoopError(duplicates);
+      throw new SessionDriverLoopError(failure.code, failure.message);
     }
     state.nativeToolDuplicateRepairAttempted = true;
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'native_tool_duplicate_repair',
-      status: 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: 'Provider repeated already resolved read-only native tool targets; Session is requesting a no-tool proposal.',
-      activity: driverActivityBuilder.conversationActivity({
-        activityId: `native-tool-duplicate-repair-${state.runId}`,
-        kind: 'diagnostic',
-        status: 'running',
-        title: 'Duplicate native read repair',
-        summary: 'Session detected repeated read-only native tool calls with no new evidence.',
-        source: 'session',
-        runId: state.runId,
-        targets: duplicates.map((item) => item.signature.path),
-      }),
-      payload: {
-        visibility: 'task',
-        duplicateTargets: duplicates.map((item) => ({
-          callId: item.toolCall.callId,
-          toolName: item.toolCall.name,
-          signature: item.signature,
-          packetId: item.entry.packet.id,
-          contentHash: item.entry.contentHash,
-          repeatCount: item.entry.repeatCount,
-        })),
-      },
-    });
+    await this.emitProjectionDelta(state, nativeToolRepairCoordinator.duplicateRepairDelta({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      duplicates,
+    }));
     const raw = await this.llm(
       input.profileId,
       state,
@@ -3092,12 +3042,10 @@ export class SessionDriverLoop {
       )
     );
     try {
-      return protocolGate().parseAndValidateRepairedProposal({
+      return nativeToolRepairCoordinator.parseDuplicateRepair({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds: ['resourceRequest', 'decisionRequest', 'diagnostic'],
       });
     } catch (error) {
       throw new SessionDriverLoopError(

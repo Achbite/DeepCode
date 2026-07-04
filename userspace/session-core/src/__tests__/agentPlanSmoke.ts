@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolRepairCoordinator, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -72,6 +72,7 @@ async function main(): Promise<void> {
   assertProtocolGateCanonicalizesBareRepair();
   assertActionBundleActionInspectorReadsActionShape();
   assertPathIdentityNormalizesWorkspacePaths();
+  assertNativeToolRepairCoordinatorBuildsRepairContracts();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -369,6 +370,74 @@ function assertPathIdentityNormalizesWorkspacePaths(): void {
     `${root}/${child}`,
     'path identity derives dirname-like parent'
   );
+}
+
+function assertNativeToolRepairCoordinatorBuildsRepairContracts(): void {
+  const token = randomSmokeToken('native-repair');
+  const runId = `run-${token}`;
+  const sessionId = `session-${token}`;
+  const targetPath = `scope-${token}/target-${randomSmokeToken('target')}.txt`;
+  let repairedAllowedKinds: string[] = [];
+  let parseProposalRaw = '';
+  const coordinator = new NativeToolRepairCoordinator({
+    conversationActivity: (input) => ({
+      activityId: input.activityId,
+      kind: input.kind,
+      status: input.status,
+      title: input.title,
+      summary: input.summary,
+      source: input.source,
+      runId: input.runId,
+      toolName: input.toolName,
+      targets: input.targets,
+    }),
+    parseProposal: (input) => {
+      parseProposalRaw = input.raw;
+      return { kind: 'diagnostic', runId: input.runId } as unknown as ProposalEnvelope;
+    },
+    parseRepairedProposal: (input) => {
+      repairedAllowedKinds = input.allowedKinds;
+      return { kind: input.allowedKinds[0], sessionId: input.sessionId } as unknown as ProposalEnvelope;
+    },
+  });
+  const toolCall = {
+    callId: `call-${token}`,
+    index: 0,
+    name: `read_${randomSmokeToken('tool')}`,
+    arguments: { path: targetPath },
+  };
+  const sideEffectDelta = coordinator.sideEffectBlockedDelta({ sessionId, runId, toolCall });
+  assertEqual(sideEffectDelta.stage, 'native_tool_side_effect_blocked', 'native tool repair coordinator builds side-effect delta stage');
+  assertEqual((sideEffectDelta.payload as any).callId, toolCall.callId, 'native tool repair coordinator carries blocked call id');
+  assertEqual(coordinator.sideEffectAllowedKinds(true)[0], 'actionBundle', 'native tool repair coordinator allows actionBundle in accepted execution');
+  assertEqual(coordinator.sideEffectAllowedKinds(false)[0], 'decisionRequest', 'native tool repair coordinator avoids actionBundle outside accepted execution');
+
+  const duplicate = {
+    toolCall,
+    signature: { key: `sig-${token}`, toolName: toolCall.name, path: targetPath, kind: 'file' as const },
+    entry: {
+      signature: { key: `sig-${token}`, toolName: toolCall.name, path: targetPath, kind: 'file' as const },
+      packet: {
+        id: `packet-${token}`,
+        requestId: `request-${token}`,
+        workspaceScopeKey: `scope-${token}`,
+        items: [],
+      },
+      contentHash: `hash-${token}`,
+      repeatCount: 2,
+    },
+  };
+  const duplicateDelta = coordinator.duplicateRepairDelta({ sessionId, runId, duplicates: [duplicate] });
+  assertEqual(duplicateDelta.stage, 'native_tool_duplicate_repair', 'native tool repair coordinator builds duplicate repair stage');
+  assertEqual((duplicateDelta.activity as any).targets[0], targetPath, 'native tool repair coordinator carries duplicate target path');
+  assert(coordinator.duplicateLoopError([duplicate]).message.includes(targetPath), 'native tool repair coordinator reports duplicate loop target');
+
+  assertEqual(coordinator.parseTurnProposal({ turn: { content: 'not-json' }, runId, sessionId }), null, 'native tool repair coordinator ignores non-json turn content');
+  assertEqual(coordinator.parseTurnProposal({ turn: { content: '{"kind":"diagnostic"}' }, runId, sessionId })?.kind, 'diagnostic', 'native tool repair coordinator parses json turn proposal');
+  assertEqual(parseProposalRaw, '{"kind":"diagnostic"}', 'native tool repair coordinator passes raw json to proposal parser');
+  assertEqual(coordinator.parseSideEffectRepair({ raw: '{}', runId, sessionId, acceptedExecution: true }).kind, 'actionBundle', 'native tool repair coordinator parses side-effect repair with accepted execution kinds');
+  assertEqual(repairedAllowedKinds[0], 'actionBundle', 'native tool repair coordinator forwards side-effect allowed kinds');
+  assertEqual(coordinator.parseDuplicateRepair({ raw: '{}', runId, sessionId }).kind, 'resourceRequest', 'native tool repair coordinator parses duplicate repair with focused kinds');
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
