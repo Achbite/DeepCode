@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -81,6 +81,7 @@ async function main(): Promise<void> {
   await assertNativeToolProviderLoopResumesAfterToolMessages();
   await assertNativeToolHandlerPortsFactoryBuildsPorts();
   await assertProposalOnlyProviderRunnerRepairsToolViolation();
+  await assertNativeToolRepairRunnerHandlesRepairs();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -1054,6 +1055,148 @@ async function assertProposalOnlyProviderRunnerRepairsToolViolation(): Promise<v
   });
   assertEqual(content.kind, 'content', 'proposal-only runner returns content when no tool call is present');
   assertEqual(content.kind === 'content' ? content.content : '', `content-${token}`, 'proposal-only runner preserves content response');
+}
+
+async function assertNativeToolRepairRunnerHandlesRepairs(): Promise<void> {
+  const token = randomSmokeToken('native-repair-runner');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const targetPath = `scope-${token}/target-${randomSmokeToken('target')}.txt`;
+  const toolCall = {
+    callId: `call-${token}`,
+    index: 0,
+    name: `read_${randomSmokeToken('tool')}`,
+    arguments: { path: targetPath },
+  };
+  const duplicate = {
+    toolCall,
+    signature: { key: `sig-${token}`, toolName: toolCall.name, path: targetPath, kind: 'file' as const },
+    entry: {
+      signature: { key: `sig-${token}`, toolName: toolCall.name, path: targetPath, kind: 'file' as const },
+      packet: {
+        id: `packet-${token}`,
+        requestId: `request-${token}`,
+        workspaceScopeKey: `scope-${token}`,
+        items: [],
+      },
+      contentHash: `hash-${token}`,
+      repeatCount: 2,
+    },
+  };
+  const sideEffectProposal = {
+    kind: 'diagnostic',
+    proposalId: `side-${token}`,
+    runId,
+    sessionId,
+    source: 'llm',
+    payload: {},
+  } as ProposalEnvelope;
+  const duplicateProposal = {
+    kind: 'resourceRequest',
+    proposalId: `duplicate-${token}`,
+    runId,
+    sessionId,
+    source: 'llm',
+    payload: {},
+  } as ProposalEnvelope;
+  const emitted: ProjectionDelta[] = [];
+  const stages: string[] = [];
+  let sideEffectAcceptedExecution = false;
+  let duplicateAcceptedExecution = false;
+  let duplicateMarked = false;
+  const runner = new NativeToolRepairRunner({
+    repairCoordinator: {
+      sideEffectBlockedDelta: (input: any) => ({ type: 'stage_delta', sessionId: input.sessionId, runId: input.runId, stage: `side-${input.toolCall.callId}`, status: 'failed' }),
+      duplicateRepairDelta: (input: any) => ({ type: 'stage_delta', sessionId: input.sessionId, runId: input.runId, stage: `duplicate-${input.duplicates[0]?.signature.path}`, status: 'running' }),
+      parseSideEffectRepair: (input: any) => {
+        assertEqual(input.raw, `side-raw-${token}`, 'native tool repair runner forwards side-effect raw');
+        assertEqual(input.acceptedExecution, true, 'native tool repair runner forwards side-effect accepted execution flag');
+        return sideEffectProposal;
+      },
+      parseTurnProposal: (input: any) => input.turn.content.includes(token) ? sideEffectProposal : null,
+      parseDuplicateRepair: (input: any) => {
+        assertEqual(input.raw, `duplicate-raw-${token}`, 'native tool repair runner forwards duplicate raw');
+        return duplicateProposal;
+      },
+      duplicateLoopError: (duplicates: any[]) => ({ code: `duplicate-loop-${token}`, message: duplicates[0]?.signature.path ?? '' }),
+    } as any,
+  });
+
+  const sideEffect = await runner.repairSideEffect({
+    state: { sessionId, runId },
+    toolCall,
+    turn: { content: `turn-${token}` },
+    acceptedExecution: true,
+    emitProjectionDelta: async (_state, delta) => {
+      emitted.push(delta);
+    },
+    buildRepairMessages: (_toolCall, _turn, acceptedExecution) => {
+      sideEffectAcceptedExecution = acceptedExecution;
+      return [{ role: 'user', content: `side-request-${token}` }];
+    },
+    runRepair: async (stage, messages) => {
+      stages.push(stage);
+      assertEqual((messages[0] as any).content, `side-request-${token}`, 'native tool repair runner uses side-effect repair messages');
+      return `side-raw-${token}`;
+    },
+    repairErrorMessage: (error) => String(error),
+  });
+
+  assertEqual(sideEffect.kind, 'proposal', 'native tool repair runner returns side-effect proposal');
+  assertEqual(sideEffect.kind === 'proposal' ? sideEffect.proposal.proposalId : '', sideEffectProposal.proposalId, 'native tool repair runner preserves side-effect proposal');
+  assertEqual(emitted[0]?.stage, `side-${toolCall.callId}`, 'native tool repair runner emits side-effect delta');
+  assertEqual(stages[0], 'native_tool_side_effect_repair', 'native tool repair runner uses side-effect repair stage');
+  assertEqual(sideEffectAcceptedExecution, true, 'native tool repair runner passes side-effect accepted execution to message builder');
+  assertEqual(runner.parseTurnProposal({ sessionId, runId }, { content: `content-${token}` })?.proposalId, sideEffectProposal.proposalId, 'native tool repair runner delegates turn proposal parsing');
+
+  const duplicateResult = await runner.repairDuplicate({
+    state: { sessionId, runId },
+    turn: { content: `duplicate-turn-${token}` },
+    duplicates: [duplicate],
+    duplicateRepairAttempted: false,
+    markDuplicateRepairAttempted: () => {
+      duplicateMarked = true;
+    },
+    emitProjectionDelta: async (_state, delta) => {
+      emitted.push(delta);
+    },
+    buildRepairMessages: (_turn, _duplicates, acceptedExecution) => {
+      duplicateAcceptedExecution = acceptedExecution;
+      return [{ role: 'user', content: `duplicate-request-${token}` }];
+    },
+    runRepair: async (stage, messages) => {
+      stages.push(stage);
+      assertEqual((messages[0] as any).content, `duplicate-request-${token}`, 'native tool repair runner uses duplicate repair messages');
+      return `duplicate-raw-${token}`;
+    },
+    repairErrorMessage: (error) => String(error),
+    acceptedExecution: false,
+  });
+
+  assertEqual(duplicateMarked, true, 'native tool repair runner marks duplicate repair attempt before provider repair');
+  assertEqual(duplicateResult.kind, 'proposal', 'native tool repair runner returns duplicate repair proposal');
+  assertEqual(duplicateResult.kind === 'proposal' ? duplicateResult.proposal.proposalId : '', duplicateProposal.proposalId, 'native tool repair runner preserves duplicate proposal');
+  assertEqual(stages[1], 'native_tool_duplicate_repair', 'native tool repair runner uses duplicate repair stage');
+  assertEqual(duplicateAcceptedExecution, false, 'native tool repair runner passes duplicate accepted execution to message builder');
+
+  const duplicateLoop = await runner.repairDuplicate({
+    state: { sessionId, runId },
+    turn: { content: `loop-${token}` },
+    duplicates: [duplicate],
+    duplicateRepairAttempted: true,
+    markDuplicateRepairAttempted: () => {
+      throw new Error('native tool repair runner must not mark duplicate repair twice');
+    },
+    emitProjectionDelta: async () => {
+      throw new Error('native tool repair runner must not emit duplicate loop delta');
+    },
+    buildRepairMessages: () => [],
+    runRepair: async () => '',
+    repairErrorMessage: (error) => String(error),
+    acceptedExecution: true,
+  });
+  assertEqual(duplicateLoop.kind, 'failed', 'native tool repair runner fails fast after duplicate repair loop');
+  assertEqual(duplicateLoop.kind === 'failed' ? duplicateLoop.code : '', `duplicate-loop-${token}`, 'native tool repair runner preserves duplicate loop failure code');
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {

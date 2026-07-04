@@ -75,6 +75,7 @@ import {
   NativeToolProviderLoop,
   NativeToolProjectionBuilder,
   NativeToolRepairCoordinator,
+  NativeToolRepairRunner,
   NativeToolResultMessageBuilder,
   NativeToolResourceRecorder,
   NativeToolResumeMessageBuilder,
@@ -452,6 +453,9 @@ const nativeToolProviderLoop = new NativeToolProviderLoop<SessionDriverLoopRunSt
 });
 const proposalOnlyProviderRunner = new ProposalOnlyProviderRunner<SessionDriverLoopRunState, LlmTurnResult>({
   providerPipeline,
+  repairCoordinator: nativeToolRepairCoordinator,
+});
+const nativeToolRepairRunner = new NativeToolRepairRunner({
   repairCoordinator: nativeToolRepairCoordinator,
 });
 const PROVIDER_REASONING_FLUSH_CHARS = 768;
@@ -2823,47 +2827,37 @@ export class SessionDriverLoop {
     toolCall: NativeToolCallProposal,
     turn: LlmTurnResult
   ): Promise<ProposalEnvelope> {
-    await this.emitProjectionDelta(state, nativeToolRepairCoordinator.sideEffectBlockedDelta({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      toolCall,
-    }));
-    const raw = await this.llm(
-      input.profileId,
+    const acceptedExecution = Boolean(state.acceptedImplementationPlan) || state.implementationBatch.batchIndex > 1;
+    const result = await nativeToolRepairRunner.repairSideEffect({
       state,
-      'native_tool_side_effect_repair',
-      providerRepairMessageBuilder.sideEffectNativeToolRepairMessages(
-        prompt,
-        providerRepairMessageState(state),
-        toolCall,
-        turn,
-        Boolean(state.acceptedImplementationPlan) || state.implementationBatch.batchIndex > 1
-      )
-    );
-    try {
-      return nativeToolRepairCoordinator.parseSideEffectRepair({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        acceptedExecution: Boolean(state.acceptedImplementationPlan) || state.implementationBatch.batchIndex > 1,
-      });
-    } catch (error) {
-      throw new SessionDriverLoopError(
-        'native_tool_side_effect_repair_failed',
-        `Provider requested side-effect native tool ${toolCall.name}; repair failed: ${normalizeParseError(error).message}`
-      );
+      toolCall,
+      turn,
+      acceptedExecution,
+      emitProjectionDelta: (runState, delta) => this.emitProjectionDelta(runState, delta),
+      buildRepairMessages: (repairToolCall, repairTurn, repairAcceptedExecution) =>
+        providerRepairMessageBuilder.sideEffectNativeToolRepairMessages(
+          prompt,
+          providerRepairMessageState(state),
+          repairToolCall,
+          repairTurn,
+          repairAcceptedExecution
+        ),
+      runRepair: (stage, messages) => this.llm(input.profileId, state, stage, messages),
+      repairErrorMessage: (error) => normalizeParseError(error).message,
+    });
+    if (result.kind === 'proposal') return result.proposal;
+    if (result.kind === 'failed') {
+      throw new SessionDriverLoopError(result.code, result.message);
     }
+    const exhaustive: never = result;
+    return exhaustive;
   }
 
   private tryParseNativeToolTurnProposal(
     state: SessionDriverLoopRunState,
     turn: LlmTurnResult
   ): ProposalEnvelope | null {
-    return nativeToolRepairCoordinator.parseTurnProposal({
-      turn,
-      runId: state.runId,
-      sessionId: state.sessionId,
-    });
+    return nativeToolRepairRunner.parseTurnProposal(state, turn);
   }
 
   private async repairDuplicateNativeReadTool(
@@ -2873,40 +2867,33 @@ export class SessionDriverLoop {
     turn: LlmTurnResult,
     duplicates: Array<{ toolCall: NativeToolCallProposal; signature: NativeToolReadSignature; entry: NativeToolReadLedgerEntry }>
   ): Promise<ProposalEnvelope> {
-    if (state.nativeToolDuplicateRepairAttempted) {
-      const failure = nativeToolRepairCoordinator.duplicateLoopError(duplicates);
-      throw new SessionDriverLoopError(failure.code, failure.message);
-    }
-    state.nativeToolDuplicateRepairAttempted = true;
-    await this.emitProjectionDelta(state, nativeToolRepairCoordinator.duplicateRepairDelta({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      duplicates,
-    }));
-    const raw = await this.llm(
-      input.profileId,
+    const result = await nativeToolRepairRunner.repairDuplicate({
       state,
-      'native_tool_duplicate_repair',
-      providerRepairMessageBuilder.nativeToolDuplicateRepairMessages(
-        prompt,
-        providerRepairMessageState(state),
-        turn,
-        duplicates,
-        Boolean(state.acceptedImplementationPlan) || state.implementationBatch.batchIndex > 1
-      )
-    );
-    try {
-      return nativeToolRepairCoordinator.parseDuplicateRepair({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-      });
-    } catch (error) {
-      throw new SessionDriverLoopError(
-        'native_tool_duplicate_repair_failed',
-        `Provider repeated read-only native tools and duplicate-loop repair did not return a valid Agent Protocol v3 proposal: ${normalizeParseError(error).message}`
-      );
+      turn,
+      duplicates,
+      duplicateRepairAttempted: state.nativeToolDuplicateRepairAttempted,
+      markDuplicateRepairAttempted: () => {
+        state.nativeToolDuplicateRepairAttempted = true;
+      },
+      emitProjectionDelta: (runState, delta) => this.emitProjectionDelta(runState, delta),
+      buildRepairMessages: (repairTurn, repairDuplicates, acceptedExecution) =>
+        providerRepairMessageBuilder.nativeToolDuplicateRepairMessages(
+          prompt,
+          providerRepairMessageState(state),
+          repairTurn,
+          repairDuplicates,
+          acceptedExecution
+        ),
+      runRepair: (stage, messages) => this.llm(input.profileId, state, stage, messages),
+      repairErrorMessage: (error) => normalizeParseError(error).message,
+      acceptedExecution: Boolean(state.acceptedImplementationPlan) || state.implementationBatch.batchIndex > 1,
+    });
+    if (result.kind === 'proposal') return result.proposal;
+    if (result.kind === 'failed') {
+      throw new SessionDriverLoopError(result.code, result.message);
     }
+    const exhaustive: never = result;
+    return exhaustive;
   }
 
   private async consumeQueuedGuidanceForProviderResume(

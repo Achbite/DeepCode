@@ -9,6 +9,7 @@ export * from './nativeToolResourceRecorder.js';
 export * from './nativeToolResumeMessageBuilder.js';
 export * from './lifecyclePipeline.js';
 export * from './nativeToolRepairCoordinator.js';
+export * from './nativeToolRepairRunner.js';
 export * from './permissionPipeline.js';
 export * from './proposalOnlyProviderRunner.js';
 export * from './proposalPipeline.js';
