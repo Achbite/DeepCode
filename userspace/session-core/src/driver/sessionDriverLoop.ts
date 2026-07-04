@@ -105,6 +105,7 @@ import {
   ResourceEvidenceIndex,
   ResourceManifestBuilder,
   ResourceOrchestrator,
+  ResourceRequestRepairCoordinator,
   ResourceRequestLoop,
   ResourceRequestResolver,
   type GeneratedArtifactEvidence,
@@ -475,6 +476,7 @@ export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
   private readonly acceptedPlanResourceResumeCoordinator: AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
+  private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
@@ -524,6 +526,19 @@ export class SessionDriverLoop {
       resourceRequestLoop,
       runtime: this.agentRunReactor,
       createError: (code, message) => new SessionDriverLoopError(code, message),
+    });
+    this.resourceRequestRepairCoordinator = new ResourceRequestRepairCoordinator<SessionDriverLoopRunState>({
+      repairMessageBuilder: providerRepairMessageBuilder,
+      repairState: (state) => providerRepairMessageState(state),
+      parseError: (error) => normalizeParseError(error),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+      parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+        allowedKinds,
+      }),
     });
     this.nativeToolHandlerPortsFactory = new NativeToolHandlerPortsFactory({
       progressEventBuilder: nativeToolProgressEventBuilder,
@@ -2945,31 +2960,13 @@ export class SessionDriverLoop {
     proposal: ProposalEnvelope,
     resolution: ResourceRequestResolution
   ): Promise<ProposalEnvelope> {
-    const raw = await this.llm(
-      input.profileId,
+    return this.resourceRequestRepairCoordinator.repair({
       state,
-      'resource_request_repair',
-      providerRepairMessageBuilder.resourceRequestRepairMessages(
-        prompt,
-        providerRepairMessageState(state),
-        proposal,
-        resourceRequestLoop.resolutionDiagnostic(resolution).fallback
-      )
-    );
-    try {
-      return protocolGate().parseAndValidateRepairedProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds: ['resourceRequest', 'decisionRequest', 'diagnostic'],
-      });
-    } catch (error) {
-      throw new SessionDriverLoopError(
-        'agent_protocol_repair_failed',
-        `Model resourceRequest output still could not be parsed after repair: ${normalizeParseError(error).message}`
-      );
-    }
+      prompt,
+      proposal,
+      resolutionDiagnostic: resourceRequestLoop.resolutionDiagnostic(resolution).fallback,
+      runRepair: (stage, messages) => this.llm(input.profileId, state, stage, messages),
+    });
   }
 
   private async repairActionBundleAdmission(

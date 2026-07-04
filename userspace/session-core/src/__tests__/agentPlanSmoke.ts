@@ -44,7 +44,7 @@ import {
 import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { AcceptedPlanResourceResumeCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop } from '../driver/context/index.js';
+import { AcceptedPlanResourceResumeCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator } from '../driver/context/index.js';
 import {
   AcceptedImplementationPlanContextBuilder,
   AcceptedPlanBatchPreflight,
@@ -103,6 +103,7 @@ async function main(): Promise<void> {
   await assertResourceRequestLoopBuildsPacketEvents();
   await assertResourceOrchestratorResolvesAndRecordsPackets();
   await assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn();
+  await assertResourceRequestRepairCoordinatorRepairsProposal();
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
@@ -2497,6 +2498,91 @@ async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): 
     'resource resume coordinator stores provider turn contract on state'
   );
   assertEqual(proposal.kind, 'diagnostic', 'resource resume coordinator parses provider proposal');
+}
+
+async function assertResourceRequestRepairCoordinatorRepairsProposal(): Promise<void> {
+  const token = randomSmokeToken('resource-request-repair');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const repairBuilder = new ProviderRepairMessageBuilder();
+  const coordinator = new ResourceRequestRepairCoordinator({
+    repairMessageBuilder: repairBuilder,
+    repairState: (state) => ({
+      runId: state.runId,
+      userRequest: state.userRequest,
+      conversationRoots: [],
+      resourcePackets: [],
+    }),
+    parseError: (error) => error instanceof Error
+      ? { code: 'error', message: error.message }
+      : { code: 'error', message: String(error) },
+    createError: (code, message) => Object.assign(new Error(message), { code }),
+    parseRepairedProposal: ({ raw, state, allowedKinds }) => {
+      assert(
+        allowedKinds.includes('resourceRequest') && allowedKinds.includes('decisionRequest') && allowedKinds.includes('diagnostic'),
+        'resource request repair coordinator preserves repair allowed kinds'
+      );
+      return parseProposalEnvelope({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+      });
+    },
+  });
+  const prompt: PromptEnvelope = {
+    stablePrefix: `stable-${token}`,
+    dynamicSuffix: '',
+    auditOnlyContext: '',
+    layers: [],
+    segments: [],
+    stableLayerNames: [],
+    dynamicLayerNames: [],
+    auditOnlyLayerNames: [],
+  };
+  const state = {
+    sessionId,
+    runId,
+    userRequest: `request-${token}`,
+  };
+  let observedStage = '';
+  let observedMessages: LlmChatRequest['messages'] = [];
+  const proposal = await coordinator.repair({
+    state,
+    prompt,
+    proposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-${token}`,
+      runId,
+      sessionId,
+      source: 'llm',
+      kind: 'resourceRequest',
+      payload: {
+        version: '1',
+        id: `request-${token}`,
+        items: [{
+          id: `item-${token}`,
+          path: `missing-${token}`,
+        }],
+      },
+    } as ProposalEnvelope,
+    resolutionDiagnostic: `unresolved-${token}`,
+    runRepair: async (stage, messages) => {
+      observedStage = stage;
+      observedMessages = messages;
+      return JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'diagnostic',
+        proposalId: `diagnostic-${token}`,
+        diagnostic: {
+          summary: `summary-${token}`,
+        },
+      });
+    },
+  });
+  assertEqual(observedStage, 'resource_request_repair', 'resource request repair coordinator uses stable repair stage');
+  assertEqual(observedMessages[0]?.role, 'system', 'resource request repair coordinator sends system repair contract');
+  assertEqual(proposal.kind, 'diagnostic', 'resource request repair coordinator parses repaired proposal');
 }
 
 function assertResourceEvidenceIndexQueriesPackets(): void {
