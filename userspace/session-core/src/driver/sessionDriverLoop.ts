@@ -18,6 +18,7 @@ import {
   AcceptedPlanExecutionRootResolver,
   AcceptedPlanOperationTargetResolver,
   AcceptedPlanScopeCoverage,
+  AcceptedPlanScopeDecisionCoordinator,
   AcceptedPlanScopeDecisionOverlay,
   AcceptedPlanScopeRepairCoordinator,
   AcceptedPlanScopeResourceFollowupCoordinator,
@@ -479,6 +480,7 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
 export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
   private readonly acceptedPlanResourceResumeCoordinator: AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>;
+  private readonly acceptedPlanScopeDecisionCoordinator: AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeRepairCoordinator: AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeResourceFollowupCoordinator: AcceptedPlanScopeResourceFollowupCoordinator<SessionDriverLoopRunState, AcceptedImplementationPlanContext>;
   private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
@@ -543,6 +545,15 @@ export class SessionDriverLoop {
         allowedKinds,
         allowBriefActionBundleUserPlan: true,
       }),
+    });
+    this.acceptedPlanScopeDecisionCoordinator = new AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      requirementPipeline: userInputPipeline,
+      interactionOverlayCodec,
+      requirementProjection: requirementProjectionBuilder,
+      progressProjection: sessionProgressProjectionBuilder,
+      append: (sessionId, events) => this.append(sessionId, events),
     });
     this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
@@ -3391,50 +3402,14 @@ export class SessionDriverLoop {
           });
         }
         if (repaired.kind === 'decisionRequest') {
-          const requirement = userInputPipeline.requirementRecordFromProposal({
+          return this.acceptedPlanScopeDecisionCoordinator.waitForDecision({
+            state,
             proposal: repaired,
-            sessionId: state.sessionId,
-            runId: state.runId,
-            userRequest: input.content,
-            timestamp: this.ts(),
+            request: {
+              content: input.content,
+              attachments: input.attachments,
+            },
           });
-          const interactionOverlay: InteractionOverlayContext = {
-            parentRunId: state.runId,
-            parentPhase: 'executing_accepted_plan',
-            interactionRunId: state.runId,
-            interactionId: requirement.requirementId,
-            sourceInteractionId: repaired.proposalId,
-          };
-          const confirmation = requirementProjectionBuilder.confirmationEvent({
-            sessionId: state.sessionId,
-            runId: state.runId,
-            requirement,
-            proposal: repaired,
-            originalUserRequest: input.content,
-            attachments: input.attachments ?? [],
-            interactionOverlayPayload: interactionOverlayCodec.toPayload(interactionOverlay),
-            ts: this.ts(),
-            id: this.id('accepted-plan-scope-repair-decision'),
-          });
-          state.phase = 'waiting_permission';
-          return this.append(state.sessionId, [
-            confirmation,
-            sessionProgressProjectionBuilder.sessionRunStateEvent({
-              sessionId: state.sessionId,
-              runId: state.runId,
-              phase: 'waiting_permission',
-              reason: 'requirement',
-              decisionOwner: {
-                kind: 'requirement',
-                runId: state.runId,
-                targetId: requirement.requirementId,
-                requirementId: requirement.requirementId,
-              },
-              interactionOverlay,
-              ts: this.ts(),
-              id: this.id('session-run-waiting-accepted-plan-repair-decision'),
-            }),
-          ]);
         }
         if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
           return this.append(state.sessionId, [

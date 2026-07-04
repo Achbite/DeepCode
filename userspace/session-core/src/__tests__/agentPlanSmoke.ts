@@ -51,6 +51,7 @@ import {
   AcceptedPlanBatchPreflight,
   AcceptedPlanOperationTargetResolver,
   AcceptedPlanScopeCoverage,
+  AcceptedPlanScopeDecisionCoordinator,
   AcceptedPlanScopeDecisionOverlay,
   AcceptedPlanScopeRepairCoordinator,
   AcceptedPlanScopeResourceFollowupCoordinator,
@@ -120,6 +121,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanScopeCoverageMatchesStructuredScopes();
   assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask();
   await assertAcceptedPlanScopeRepairCoordinatorRepairsProposal();
+  await assertAcceptedPlanScopeDecisionCoordinatorBuildsWaitingEvents();
   await assertAcceptedPlanScopeResourceFollowupCoordinatorHandlesResourceRequests();
   assertAcceptedPlanOperationTargetResolverFindsExactGrant();
   assertAcceptedPlanExecutorBuildsExecutionBatch();
@@ -3450,6 +3452,123 @@ async function assertAcceptedPlanScopeRepairCoordinatorRepairsProposal(): Promis
   assertEqual(observedStage, 'accepted_plan_scope_repair', 'accepted plan scope repair coordinator uses stable repair stage');
   assertEqual(observedMessages[0]?.role, 'system', 'accepted plan scope repair coordinator sends system repair contract');
   assertEqual(proposal.kind, 'diagnostic', 'accepted plan scope repair coordinator parses repaired proposal');
+}
+
+async function assertAcceptedPlanScopeDecisionCoordinatorBuildsWaitingEvents(): Promise<void> {
+  const token = randomSmokeToken('scope-decision');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const requirementId = `requirement-${token}`;
+  const state = {
+    sessionId,
+    runId,
+    phase: 'executing_accepted_plan' as const,
+  };
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId,
+    sessionId,
+    source: 'llm',
+    kind: 'decisionRequest',
+    payload: {
+      question: `question-${token}`,
+      options: [
+        { id: `option-a-${token}`, label: `option-a-${token}` },
+        { id: `option-b-${token}`, label: `option-b-${token}` },
+      ],
+    },
+  } as ProposalEnvelope;
+  let observedOverlayParentPhase = '';
+  let appendedSessionId = '';
+  let appendedEvents: AgentEvent[] = [];
+  const coordinator = new AcceptedPlanScopeDecisionCoordinator<typeof state>({
+    now: () => `ts-${token}`,
+    createId: (prefix) => `${prefix}-${token}`,
+    requirementPipeline: {
+      requirementRecordFromProposal: ({ runId: nextRunId, proposal: nextProposal, userRequest }) => {
+        assertEqual(nextRunId, runId, 'scope decision coordinator passes run state');
+        assertEqual(nextProposal.proposalId, proposal.proposalId, 'scope decision coordinator passes proposal');
+        assertEqual(userRequest, `request-${token}`, 'scope decision coordinator passes user request');
+        return {
+          requirementId,
+          sessionId,
+          initialUserRequest: userRequest,
+          status: 'probing',
+          createdAt: `ts-${token}`,
+          updatedAt: `ts-${token}`,
+        };
+      },
+    },
+    interactionOverlayCodec: {
+      toPayload: (overlay) => {
+        observedOverlayParentPhase = overlay.parentPhase;
+        return {
+          interactionOverlay: true,
+          parentRunId: overlay.parentRunId,
+          parentPhase: overlay.parentPhase,
+          interactionRunId: overlay.interactionRunId,
+          interactionId: overlay.interactionId,
+          sourceInteractionId: overlay.sourceInteractionId,
+        };
+      },
+    },
+    requirementProjection: {
+      confirmationEvent: ({ sessionId: nextSessionId, requirement, interactionOverlayPayload }) => ({
+        id: `confirmation-${token}`,
+        sessionId: nextSessionId,
+        ts: `ts-${token}`,
+        kind: 'requirement_confirmation',
+        payload: {
+          requirementId: requirement.requirementId,
+          ...interactionOverlayPayload,
+        },
+      }),
+    },
+    progressProjection: {
+      sessionRunStateEvent: ({ sessionId: nextSessionId, phase, decisionOwner, interactionOverlay }) => ({
+        id: `run-state-${token}`,
+        sessionId: nextSessionId,
+        ts: `ts-${token}`,
+        kind: 'session_run_state',
+        payload: {
+          phase,
+          requirementId: decisionOwner.requirementId,
+          parentPhase: interactionOverlay?.parentPhase,
+        },
+      }),
+    },
+    append: async (nextSessionId, events) => {
+      appendedSessionId = nextSessionId;
+      appendedEvents = events;
+      return {
+        session: {
+          id: nextSessionId,
+          mode: 'plan',
+          createdAt: `ts-${token}`,
+          updatedAt: `ts-${token}`,
+        },
+        events,
+      };
+    },
+  });
+
+  const result = await coordinator.waitForDecision({
+    state,
+    proposal,
+    request: {
+      content: `request-${token}`,
+      attachments: [],
+    },
+  });
+
+  assertEqual(state.phase, 'waiting_permission', 'scope decision coordinator moves state to waiting permission');
+  assertEqual(observedOverlayParentPhase, 'executing_accepted_plan', 'scope decision coordinator keeps execution parent phase');
+  assertEqual(appendedSessionId, sessionId, 'scope decision coordinator appends to current session');
+  assertEqual(appendedEvents.length, 2, 'scope decision coordinator appends confirmation and run-state events');
+  assertEqual(appendedEvents[0]?.kind, 'requirement_confirmation', 'scope decision coordinator appends confirmation first');
+  assertEqual(appendedEvents[1]?.kind, 'session_run_state', 'scope decision coordinator appends run-state second');
+  assertEqual(result.events.length, 2, 'scope decision coordinator returns append result');
 }
 
 async function assertAcceptedPlanScopeResourceFollowupCoordinatorHandlesResourceRequests(): Promise<void> {

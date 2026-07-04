@@ -2,6 +2,7 @@ export * from './acceptedImplementationPlanContextBuilder.js';
 export * from './acceptedPlanBatchPreflight.js';
 export * from './acceptedPlanOperationTargetResolver.js';
 export * from './acceptedPlanScopeCoverage.js';
+export * from './acceptedPlanScopeDecisionCoordinator.js';
 export * from './acceptedPlanScopeDecisionOverlay.js';
 export * from './acceptedPlanScopeRepairCoordinator.js';
 export * from './acceptedPlanScopeResourceFollowupCoordinator.js';
