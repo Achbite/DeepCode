@@ -2,14 +2,13 @@ import type {
   AgentContextAttachment,
   AgentEvent,
   AgentSessionResult,
-  AgentStreamPartFrame,
   AgentWorkspaceBinding,
   ApiResponse,
   KernelCommandEnvelope,
   KernelReply,
   LlmChatRequest,
-  LlmChatStreamEvent,
   LlmChatResult,
+  LlmChatStreamEvent,
   ProjectionDelta,
 } from '@deepcode/protocol';
 import {
@@ -84,10 +83,11 @@ import {
   ProviderJsonModeCoordinator,
   ProviderPipeline,
   ProviderStreamCoordinator,
+  ProviderStreamRuntime,
   ProviderTraceRecorder,
-  ProviderPartFrameParser,
   ProviderToolCallBuffer,
   stripProviderPartFrames,
+  type ProviderPartFrameParser,
   type NativeToolHandlingResult,
   type NativeToolReadLedgerEntry,
   type NativeToolReadSignature,
@@ -248,12 +248,6 @@ interface ActiveTurnState {
     receivedChars: number;
     lastEmittedChars: number;
   }>;
-}
-
-interface ProviderReasoningDeltaBuffer {
-  pending: string;
-  lastFlushAt: number;
-  itemId?: string;
 }
 
 interface LlmTurnResult {
@@ -476,6 +470,7 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
 
 export class SessionDriverLoop {
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
+  private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
 
   constructor(private readonly ports: SessionDriverLoopPorts) {
     this.nativeToolHandlerPortsFactory = new NativeToolHandlerPortsFactory({
@@ -488,6 +483,17 @@ export class SessionDriverLoop {
       append: (sessionId, events) => this.append(sessionId, events),
       emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
       now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+    });
+    this.providerStreamRuntime = new ProviderStreamRuntime<SessionDriverLoopRunState>({
+      reasoningFlushChars: PROVIDER_REASONING_FLUSH_CHARS,
+      reasoningFlushMs: PROVIDER_REASONING_FLUSH_MS,
+      streamCoordinator: providerStreamCoordinator,
+      visibleLanguageForRequest,
+      providerActivity: (input) => driverActivityBuilder.providerActivity(input),
+      conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
+      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      kernelCommand: (request) => this.ports.kernelCommand(request),
       createId: (prefix) => this.id(prefix),
     });
   }
@@ -4018,17 +4024,19 @@ export class SessionDriverLoop {
       parseArguments: (raw, toolName) => nativeToolCoordinator.parseArguments(raw, toolName),
       normalizeToolName: (name) => nativeToolCoordinator.normalizeToolName(name),
     });
-    const reasoningBuffer: ProviderReasoningDeltaBuffer = {
-      pending: '',
-      lastFlushAt: Date.now(),
-      itemId: undefined,
-    };
+    const reasoningBuffer = this.providerStreamRuntime.createReasoningBuffer();
     let result = this.ports.llmChatStream
       ? await this.ports.llmChatStream(request, async (event) => {
-        await this.handleLlmStreamEvent(state, stage, event, toolCallBuffer, reasoningBuffer);
+        await this.providerStreamRuntime.handleEvent({
+          state,
+          stage,
+          event,
+          toolCallBuffer,
+          reasoningBuffer,
+        });
       })
       : await this.ports.llmChat(request);
-    await this.flushProviderReasoningBuffer(state, stage, reasoningBuffer);
+    await this.providerStreamRuntime.flushReasoningBuffer(state, stage, reasoningBuffer);
     if (this.ports.llmChatStream && (!result.ok || !result.data)) {
       const fallbackRequest: LlmChatRequest = { ...request, stream: false };
       await providerTraceRecorder.append(state, `${stage}.stream_fallback.request`, {
@@ -4118,154 +4126,6 @@ export class SessionDriverLoop {
     };
   }
 
-  private async handleLlmStreamEvent(
-    state: SessionDriverLoopRunState,
-    stage: string,
-    event: LlmChatStreamEvent,
-    toolCallBuffer: ProviderToolCallBuffer,
-    reasoningBuffer: ProviderReasoningDeltaBuffer
-  ): Promise<void> {
-    const chunk = event.chunk;
-    if (event.type === 'provider_delta' && chunk?.content) {
-      const frames = this.consumeProviderPartFrames(state, stage, chunk.content);
-      for (const frame of frames) {
-        await this.submitProviderPartFrame(state, stage, frame);
-      }
-      if (providerStreamCoordinator.exposesAssistantDelta(stage)) {
-        await this.emitProjectionDelta(state, {
-          type: 'assistant_delta',
-          stage,
-          status: 'streaming',
-          channel: 'final',
-          source: 'provider',
-          itemId: chunk.callId,
-          delta: chunk.content,
-          payload: chunk.rawProvider,
-        });
-      } else if (providerStreamCoordinator.emitsJsonProgress(stage)) {
-        await this.emitProviderJsonStreamProgress(state, stage, chunk.content);
-      }
-      return;
-    }
-    if (event.type === 'provider_reasoning_delta' && chunk?.content) {
-      await this.bufferProviderReasoningDelta(state, stage, reasoningBuffer, chunk);
-      return;
-    }
-    if (event.type === 'provider_tool_call_delta' && chunk) {
-      const language = visibleLanguageForRequest(state.userRequest);
-      toolCallBuffer.addChunk(chunk);
-      await this.emitProjectionDelta(state, {
-        type: 'tool_call_delta',
-        stage,
-        status: 'streaming',
-        channel: 'tool',
-        source: 'provider',
-        itemId: chunk.callId ?? String(chunk.index ?? 0),
-        delta: chunk.toolCallDelta?.argumentsDelta,
-        summary: chunk.toolCallDelta?.name
-          ? providerStreamCoordinator.toolCallPreparingSummary(chunk.toolCallDelta.name, language)
-          : providerStreamCoordinator.toolCallStreamingSummary(language),
-        activity: driverActivityBuilder.conversationActivity({
-          activityId: `provider-tool-${chunk.callId ?? chunk.index ?? 0}`,
-          kind: 'toolExecution',
-          status: 'running',
-          title: 'Provider tool call',
-          summary: chunk.toolCallDelta?.name
-            ? providerStreamCoordinator.toolCallPreparingSummary(chunk.toolCallDelta.name, language)
-            : providerStreamCoordinator.toolCallStreamingSummary(language),
-          source: 'provider',
-          runId: state.runId,
-          toolName: chunk.toolCallDelta?.name,
-        }),
-        payload: {
-          index: chunk.index,
-          callId: chunk.callId,
-          finishReason: chunk.finishReason,
-          toolCallDelta: chunk.toolCallDelta,
-          rawProvider: chunk.rawProvider,
-        },
-      });
-      return;
-    }
-    if (event.type === 'provider_usage') {
-      await this.emitProjectionDelta(state, {
-        type: 'stage_delta',
-        stage,
-        status: 'running',
-        channel: 'progress',
-        source: 'provider',
-        summary: providerStreamCoordinator.usageSummary(visibleLanguageForRequest(state.userRequest)),
-        payload: event.usage ?? chunk?.usage,
-      });
-      return;
-    }
-    if (event.type === 'provider_error') {
-      await this.emitProjectionDelta(state, {
-        type: 'error',
-        stage,
-        status: 'failed',
-        channel: 'progress',
-        source: 'provider',
-        summary: event.error ?? chunk?.error ?? 'Provider stream error.',
-        activity: driverActivityBuilder.conversationActivity({
-          activityId: `provider-${stage}-stream-error`,
-          kind: 'diagnostic',
-          status: 'failed',
-          title: 'Provider stream error',
-          summary: event.error ?? chunk?.error ?? 'Provider stream error.',
-          source: 'provider',
-          runId: state.runId,
-        }),
-        payload: event.rawProvider ?? chunk?.rawProvider,
-      });
-    }
-  }
-
-  private async bufferProviderReasoningDelta(
-    state: SessionDriverLoopRunState,
-    stage: string,
-    buffer: ProviderReasoningDeltaBuffer,
-    chunk: LlmChatResult['chunks'][number]
-  ): Promise<void> {
-    if (typeof chunk.content !== 'string' || chunk.content.length === 0) return;
-    buffer.pending += chunk.content;
-    buffer.itemId = chunk.callId ?? buffer.itemId;
-    const now = Date.now();
-    if (
-      buffer.pending.length < PROVIDER_REASONING_FLUSH_CHARS &&
-      now - buffer.lastFlushAt < PROVIDER_REASONING_FLUSH_MS
-    ) {
-      return;
-    }
-    await this.flushProviderReasoningBuffer(state, stage, buffer);
-  }
-
-  private async flushProviderReasoningBuffer(
-    state: SessionDriverLoopRunState,
-    stage: string,
-    buffer: ProviderReasoningDeltaBuffer
-  ): Promise<void> {
-    if (!buffer.pending) return;
-    const delta = buffer.pending;
-    buffer.pending = '';
-    buffer.lastFlushAt = Date.now();
-    await this.emitProjectionDelta(state, {
-      type: 'reasoning_delta',
-      stage,
-      status: 'streaming',
-      channel: 'reasoning',
-      source: 'provider',
-      itemId: buffer.itemId,
-      delta,
-      activity: driverActivityBuilder.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
-      payload: {
-        presentation: 'reasoningTrace',
-        streamMode: 'markdownBlocks',
-        buffered: true,
-      },
-    });
-  }
-
   private async emitProjectionDelta(
     state: SessionDriverLoopRunState,
     delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>
@@ -4290,49 +4150,6 @@ export class SessionDriverLoop {
       runId: state.runId,
       turnId: activeTurn.turnId,
       seq: activeTurn.seq,
-    });
-  }
-
-  private async emitProviderJsonStreamProgress(
-    state: SessionDriverLoopRunState,
-    stage: string,
-    content: string
-  ): Promise<void> {
-    const activeTurn = state.activeTurn ?? {
-      turnId: this.id('active-turn'),
-      seq: 0,
-      stage,
-    };
-    activeTurn.providerJsonStreamProgress ??= {};
-    const progress = activeTurn.providerJsonStreamProgress[stage] ?? {
-      receivedChars: 0,
-      lastEmittedChars: 0,
-    };
-    progress.receivedChars += content.length;
-    activeTurn.providerJsonStreamProgress[stage] = progress;
-    state.activeTurn = activeTurn;
-
-    const shouldEmit = progress.lastEmittedChars === 0 ||
-      progress.receivedChars - progress.lastEmittedChars >= 1_500;
-    if (!shouldEmit) return;
-    progress.lastEmittedChars = progress.receivedChars;
-    const language = visibleLanguageForRequest(state.userRequest);
-    const summary = providerStreamCoordinator.jsonProgressSummary(language, progress.receivedChars);
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage,
-      status: 'streaming',
-      channel: 'progress',
-      source: 'session',
-      itemId: `${stage}-provider-json-progress`,
-      summary,
-      activity: driverActivityBuilder.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
-      payload: {
-        stage,
-        receivedChars: progress.receivedChars,
-        rawJsonHidden: true,
-        reason: 'proposal_json_stream_hidden_from_assistant',
-      },
     });
   }
 
@@ -4362,90 +4179,6 @@ export class SessionDriverLoop {
           kernelEvent: enriched,
           activity,
         },
-      });
-    }
-  }
-
-  private consumeProviderPartFrames(
-    state: SessionDriverLoopRunState,
-    stage: string,
-    content: string
-  ): AgentStreamPartFrame[] {
-    const activeTurn = state.activeTurn ?? {
-      turnId: this.id('active-turn'),
-      seq: 0,
-      stage,
-    };
-    activeTurn.partFrameParser ??= new ProviderPartFrameParser();
-    state.activeTurn = activeTurn;
-    return activeTurn.partFrameParser.push(content);
-  }
-
-  private async submitProviderPartFrame(
-    state: SessionDriverLoopRunState,
-    stage: string,
-    frame: AgentStreamPartFrame
-  ): Promise<void> {
-    const enrichedFrame = {
-      ...frame,
-      draftId: frame.draftId,
-      targetPath: frame.targetPath,
-    };
-    await this.emitProjectionDelta(state, {
-      type: 'part_delta',
-      stage,
-      status: 'streaming',
-      channel: enrichedFrame.partKind === 'thinkingDelta' ? 'reasoning' : 'draft',
-      source: 'session',
-      itemId: enrichedFrame.frameId ?? enrichedFrame.draftId,
-      draftId: enrichedFrame.draftId,
-      targetPath: enrichedFrame.targetPath,
-      delta: enrichedFrame.chunk,
-      summary: enrichedFrame.summary ?? `Provider stream part: ${enrichedFrame.partKind}`,
-      payload: enrichedFrame,
-    });
-
-    const reply = await this.ports.kernelCommand({
-      requestId: this.id('draft-ledger-submit'),
-      command: {
-        kind: 'draftLedgerSubmit',
-        requestId: this.id('draft-ledger'),
-        runId: state.runId,
-        sessionId: state.sessionId,
-        frame: {
-          ...enrichedFrame,
-          runId: enrichedFrame.runId ?? state.runId,
-        },
-      },
-    });
-    if (!reply.ok) {
-      await this.emitProjectionDelta(state, {
-        type: 'error',
-        stage,
-        status: 'failed',
-        channel: 'draft',
-        source: 'kernel',
-        itemId: enrichedFrame.frameId ?? enrichedFrame.draftId,
-        draftId: enrichedFrame.draftId,
-        targetPath: enrichedFrame.targetPath,
-        summary: reply.error?.message ?? 'Kernel draft ledger rejected provider stream part.',
-        payload: reply.error,
-      });
-      return;
-    }
-    for (const event of reply.events) {
-      const record = objectRecord(event);
-      await this.emitProjectionDelta(state, {
-        type: 'draft_delta',
-        stage,
-        status: 'streaming',
-        channel: 'draft',
-        source: 'kernel',
-        itemId: stringValue(record?.draftId) ?? enrichedFrame.draftId,
-        draftId: stringValue(record?.draftId) ?? enrichedFrame.draftId,
-        targetPath: enrichedFrame.targetPath,
-        summary: stringValue(record?.summary) ?? stringValue(objectRecord(record?.draft)?.summary),
-        payload: event,
       });
     }
   }

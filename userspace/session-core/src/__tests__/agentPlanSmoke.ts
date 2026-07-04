@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderStreamRuntime, ProviderToolCallBuffer, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -89,6 +89,7 @@ async function main(): Promise<void> {
   await assertProviderPipelineUsesProviderTurnContract();
   assertProviderJsonModeCoordinator();
   assertProviderStreamCoordinatorClassifiesStages();
+  await assertProviderStreamRuntimeHandlesStreamEvents();
   assertUserGuidanceQueueBuildsResumeAndConsumedEvents();
   assertPermissionPipelineFindsPendingPermission();
   assertInteractionOverlayCodecRoundTrips();
@@ -1382,6 +1383,198 @@ function assertProviderStreamCoordinatorClassifiesStages(): void {
   assert(
     coordinator.guidanceRevisionTransitionMessage('en-US').length > 0,
     'provider stream coordinator renders guidance revision summary'
+  );
+}
+
+async function assertProviderStreamRuntimeHandlesStreamEvents(): Promise<void> {
+  const token = randomSmokeToken('provider-runtime');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const deltas: Array<Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>> = [];
+  const kernelRequests: KernelCommandEnvelope[] = [];
+  const runtime = new ProviderStreamRuntime<any>({
+    reasoningFlushChars: 8,
+    reasoningFlushMs: 999_999,
+    streamCoordinator: new ProviderStreamCoordinator(),
+    visibleLanguageForRequest: () => 'en-US',
+    providerActivity: (input) => ({
+      activityId: `provider-${input.stage}-${token}`,
+      kind: 'providerThinking',
+      status: input.status,
+      title: `provider-${input.stage}`,
+      summary: `provider-${input.stage}-${input.status}`,
+      source: 'provider',
+      runId: input.runId,
+    }),
+    conversationActivity: (activity) => activity,
+    emitProjectionDelta: async (_state, delta) => {
+      deltas.push(delta);
+    },
+    kernelCommand: async (request) => {
+      kernelRequests.push(request);
+      return {
+        ok: true,
+        events: [
+          {
+            kind: 'draft_ledger.accepted',
+            draftId: `draft-${token}`,
+            summary: `draft accepted ${token}`,
+          },
+        ],
+      } as KernelReply;
+    },
+    createId: (prefix) => `${prefix}-${token}`,
+  });
+  const state = {
+    sessionId,
+    runId,
+    userRequest: `request-${token}`,
+  };
+  const toolCallBuffer = new ProviderToolCallBuffer({
+    parseArguments: (raw) => raw ? JSON.parse(raw) as Record<string, unknown> : {},
+    normalizeToolName: (name) => name,
+  });
+  const reasoningBuffer = runtime.createReasoningBuffer();
+
+  await runtime.handleEvent({
+    state,
+    stage: 'answer_stream',
+    event: {
+      type: 'provider_delta',
+      chunk: {
+        type: 'delta',
+        content: `answer-${token}`,
+        callId: `answer-call-${token}`,
+        rawProvider: { token },
+      },
+    } as any,
+    toolCallBuffer,
+    reasoningBuffer,
+  });
+  await runtime.handleEvent({
+    state,
+    stage: 'accepted_plan_provider_call',
+    event: {
+      type: 'provider_delta',
+      chunk: {
+        type: 'delta',
+        content: `json-${token}`,
+      },
+    } as any,
+    toolCallBuffer,
+    reasoningBuffer,
+  });
+  await runtime.handleEvent({
+    state,
+    stage: 'provider_call',
+    event: {
+      type: 'provider_reasoning_delta',
+      chunk: {
+        type: 'delta',
+        content: `reason-${token}`,
+        callId: `reason-call-${token}`,
+      },
+    } as any,
+    toolCallBuffer,
+    reasoningBuffer,
+  });
+  await runtime.flushReasoningBuffer(state, 'provider_call', reasoningBuffer);
+  await runtime.handleEvent({
+    state,
+    stage: 'provider_call',
+    event: {
+      type: 'provider_tool_call_delta',
+      chunk: {
+        type: 'delta',
+        index: 0,
+        callId: `tool-call-${token}`,
+        toolCallDelta: {
+          index: 0,
+          id: `tool-call-${token}`,
+          name: `read_${token}`,
+          argumentsDelta: JSON.stringify({ ref: token }),
+        },
+      },
+    } as any,
+    toolCallBuffer,
+    reasoningBuffer,
+  });
+  await runtime.handleEvent({
+    state,
+    stage: 'provider_call',
+    event: {
+      type: 'provider_usage',
+      usage: { inputTokens: 1, outputTokens: 2 },
+    } as any,
+    toolCallBuffer,
+    reasoningBuffer,
+  });
+  const frame = {
+    schemaVersion: 'deepcode.agent.stream.part.v1',
+    partKind: 'actionDraftChunk',
+    draftId: `draft-${token}`,
+    frameId: `frame-${token}`,
+    targetPath: `scope-${token}/target-${randomSmokeToken('file')}.txt`,
+    chunk: `draft-${token}`,
+    summary: `draft summary ${token}`,
+  };
+  await runtime.handleEvent({
+    state,
+    stage: 'provider_call',
+    event: {
+      type: 'provider_delta',
+      chunk: {
+        type: 'delta',
+        content: `<deepcode-part>${JSON.stringify(frame)}</deepcode-part>`,
+      },
+    } as any,
+    toolCallBuffer,
+    reasoningBuffer,
+  });
+  await runtime.handleEvent({
+    state,
+    stage: 'provider_call',
+    event: {
+      type: 'provider_error',
+      error: `err-${token}`,
+    } as any,
+    toolCallBuffer,
+    reasoningBuffer,
+  });
+
+  assert(
+    deltas.some((delta) => delta.type === 'assistant_delta' && delta.delta === `answer-${token}`),
+    'provider stream runtime emits assistant deltas for answer streaming'
+  );
+  assert(
+    deltas.some((delta) => delta.type === 'stage_delta' && delta.itemId === 'accepted_plan_provider_call-provider-json-progress'),
+    'provider stream runtime emits JSON progress deltas'
+  );
+  assert(
+    deltas.some((delta) => delta.type === 'reasoning_delta' && delta.delta === `reason-${token}`),
+    'provider stream runtime buffers and flushes reasoning deltas'
+  );
+  assertEqual(toolCallBuffer.toToolCalls().length, 1, 'provider stream runtime records tool call chunks');
+  assert(
+    deltas.some((delta) => delta.type === 'tool_call_delta' && delta.itemId === `tool-call-${token}`),
+    'provider stream runtime emits tool call deltas'
+  );
+  assert(
+    deltas.some((delta) => delta.type === 'stage_delta' && delta.source === 'provider'),
+    'provider stream runtime emits usage deltas'
+  );
+  assert(
+    deltas.some((delta) => delta.type === 'part_delta' && delta.itemId === `frame-${token}`),
+    'provider stream runtime emits provider part deltas'
+  );
+  assertEqual(kernelRequests.length, 1, 'provider stream runtime submits part frames to Kernel draft ledger');
+  assert(
+    deltas.some((delta) => delta.type === 'draft_delta' && delta.itemId === `draft-${token}`),
+    'provider stream runtime emits draft ledger response deltas'
+  );
+  assert(
+    deltas.some((delta) => delta.type === 'error' && delta.summary === `err-${token}`),
+    'provider stream runtime emits provider stream errors'
   );
 }
 
