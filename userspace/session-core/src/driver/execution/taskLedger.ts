@@ -22,6 +22,15 @@ export interface AcceptedPlanTaskRuntimeSnapshot {
   acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
 }
 
+export interface AcceptedPlanTaskRuntimeState {
+  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  resourcePackets: ResourcePacket[];
+  taskExecutionCursor?: TaskExecutionCursor;
+  currentTaskContext?: CurrentTaskContext;
+  taskLedger?: TaskLedgerSnapshot;
+  acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
+}
+
 export interface AcceptedPlanTaskLedgerCoordinatorPorts {
   workUnitIdsFromKernelEvents(kernelEvents: unknown[]): string[];
   actionBatchHasFailureOrBlocker(kernelEvents: unknown[]): boolean;
@@ -48,6 +57,18 @@ export class AcceptedPlanTaskLedgerCoordinator {
       taskLedger,
       acceptedPlanPromptFrame: this.promptFrame(input.acceptedPlan, taskLedger),
     };
+  }
+
+  refreshRuntimeState(state: AcceptedPlanTaskRuntimeState): void {
+    const snapshot = this.runtimeSnapshot({
+      acceptedPlan: state.acceptedImplementationPlan,
+      resourcePackets: state.resourcePackets,
+      lastSavepointId: state.taskExecutionCursor?.lastSavepointId,
+    });
+    state.taskExecutionCursor = snapshot.taskExecutionCursor;
+    state.currentTaskContext = snapshot.currentTaskContext;
+    state.taskLedger = snapshot.taskLedger;
+    state.acceptedPlanPromptFrame = snapshot.acceptedPlanPromptFrame;
   }
 
   ledger(

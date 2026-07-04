@@ -53,6 +53,7 @@ import {
   AcceptedPlanExecutor,
   AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
+  type AcceptedPlanTaskRuntimeState,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
   ImplementationBatchContextBuilder,
@@ -4337,6 +4338,18 @@ function assertRunStateMachineTaskLedger(): void {
   } as AgentEvent;
   const restored = coordinator.withLatestCheckpoint(acceptedPlan, [checkpoint]);
   assertEqual(coordinator.complete(restored), true, 'task ledger coordinator restores completed checkpoint state');
+  const runtimeState: AcceptedPlanTaskRuntimeState = {
+    acceptedImplementationPlan: acceptedPlan,
+    resourcePackets: [],
+    taskExecutionCursor: undefined,
+    currentTaskContext: undefined,
+    taskLedger: undefined,
+    acceptedPlanPromptFrame: undefined,
+  };
+  coordinator.refreshRuntimeState(runtimeState);
+  assertEqual(runtimeState.currentTaskContext?.taskId, taskIds[2], 'task ledger coordinator refreshes current task context');
+  assertEqual(runtimeState.taskLedger?.entries.length, taskIds.length, 'task ledger coordinator refreshes task ledger');
+  assertEqual(runtimeState.acceptedPlanPromptFrame?.taskLedger.currentTaskId, taskIds[2], 'task ledger coordinator refreshes prompt frame');
 }
 
 function assertAcceptedTaskRegistryUsesExactOperationGrants(): void {

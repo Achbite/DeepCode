@@ -317,8 +317,8 @@ const sessionProgressProjectionBuilder = new SessionProgressProjectionBuilder({
   hasFailureOrBlocker: (kernelEvents) => kernelEventStatusIndex.hasFailureOrBlocker(kernelEvents),
   auditAcceptedPlanBatch: (batch) => acceptedPlanBatchPreflight.audit(batch),
   actionBundleAdmissionBatch: (proposal) => driverActivityBuilder.proposalActionBundleAdmissionBatch(proposal),
-  acceptedPlanTaskLedger: (accepted) => buildAcceptedPlanTaskLedger(accepted),
-  acceptedPlanPromptFrame: (accepted, taskLedger) => buildAcceptedPlanPromptFrameForContext(accepted, taskLedger),
+  acceptedPlanTaskLedger: (accepted) => acceptedPlanTaskLedger().ledger(accepted),
+  acceptedPlanPromptFrame: (accepted, taskLedger) => acceptedPlanTaskLedger().promptFrame(accepted, taskLedger),
 });
 const sessionFailureProjectionBuilder = new SessionFailureProjectionBuilder({
   actionBatchFailureDetails: (kernelEvents, batch) => actionBatchFailureIndex.details(kernelEvents, batch),
@@ -337,7 +337,7 @@ const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, 
   acceptedPlanBatchCompletedTaskIds: (acceptedPlan, plan, kernelEvents) =>
     acceptedPlanTaskLedger().batchProgress({ acceptedPlan, proposal: planContextIndex.proposalEnvelope(plan), kernelEvents }).completedTaskIds,
   acceptedPlanAfterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(acceptedPlan, completedTaskIds),
-  acceptedPlanTaskLedger: (acceptedPlan) => buildAcceptedPlanTaskLedger(acceptedPlan),
+  acceptedPlanTaskLedger: (acceptedPlan) => acceptedPlanTaskLedger().ledger(acceptedPlan),
   buildReviewFactsContext: (input) => buildReviewFactsContext(input),
 });
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
@@ -491,14 +491,11 @@ export class SessionDriverLoop {
     const restoredResourcePackets = input.resumeResourcePackets
       ? resourceRequestLoop.recentPackets(input.existingEvents ?? [])
       : [];
-    const initialTaskCursor = buildTaskExecutionCursor(
-      acceptedImplementationPlan,
-      restoredResourcePackets,
-      lastAcceptedPlanTaskSavepointId(input.existingEvents ?? [])
-    );
-    const initialTaskContext = buildCurrentTaskContext(acceptedImplementationPlan, initialTaskCursor);
-    const initialTaskLedger = buildAcceptedPlanTaskLedger(acceptedImplementationPlan);
-    const initialAcceptedPlanPromptFrame = buildAcceptedPlanPromptFrameForContext(acceptedImplementationPlan, initialTaskLedger);
+    const initialTaskRuntime = acceptedPlanTaskLedger().runtimeSnapshot({
+      acceptedPlan: acceptedImplementationPlan,
+      resourcePackets: restoredResourcePackets,
+      lastSavepointId: acceptedPlanTaskLedger().lastSavepointId(input.existingEvents ?? []),
+    });
     const state: SessionDriverLoopRunState = {
       sessionId,
       runId,
@@ -518,10 +515,10 @@ export class SessionDriverLoop {
       generatedArtifactEvidence: generatedArtifactEvidenceIndex().fromPackets(restoredResourcePackets),
       memoryDocument,
       memoryHints: implementationBatchHints(implementationBatch, acceptedImplementationPlan),
-      taskExecutionCursor: initialTaskCursor,
-      currentTaskContext: initialTaskContext,
-      taskLedger: initialTaskLedger,
-      acceptedPlanPromptFrame: initialAcceptedPlanPromptFrame,
+      taskExecutionCursor: initialTaskRuntime.taskExecutionCursor,
+      currentTaskContext: initialTaskRuntime.currentTaskContext,
+      taskLedger: initialTaskRuntime.taskLedger,
+      acceptedPlanPromptFrame: initialTaskRuntime.acceptedPlanPromptFrame,
       implementationBatch,
       acceptedImplementationPlan,
       resourceRequestRepairAttempted: false,
@@ -576,7 +573,7 @@ export class SessionDriverLoop {
     }
 
     while (true) {
-      refreshTaskExecutionState(state);
+      acceptedPlanTaskLedger().refreshRuntimeState(state);
       const allowedProposals = sessionProviderAllowedProposals(state.stateContract?.allowedProposals ?? [
         'answer',
         'resourceRequest',
@@ -593,7 +590,7 @@ export class SessionDriverLoop {
         memoryDocument: state.memoryDocument,
         projectMemoryMode: input.projectMemoryMode,
         extraMemoryHints: [
-          ...currentTaskMemoryHints(state.currentTaskContext),
+          ...acceptedPlanTaskLedger().memoryHints(state.currentTaskContext),
           ...implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
         ],
         interventionLevel: input.interventionLevel,
@@ -801,7 +798,7 @@ export class SessionDriverLoop {
         resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
         lastResult = await this.append(sessionId, [resourceRequestLoop.packetEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
         if (state.acceptedImplementationPlan) {
-          refreshTaskExecutionState(state);
+          acceptedPlanTaskLedger().refreshRuntimeState(state);
           const resumeEvent = sessionProgressProjectionBuilder.acceptedPlanResourceResumeEvent(
             sessionId,
             state.runId,
@@ -1074,7 +1071,7 @@ export class SessionDriverLoop {
     if (stateDecision.kind === 'finishWithAnswer') {
       const confirmationPayload = objectRecord(confirmation.payload) ?? {};
       const accepted = this.recoverAcceptedPlanForRequirement(current.events, runId, undefined);
-      const taskLedger = buildAcceptedPlanTaskLedger(accepted);
+      const taskLedger = acceptedPlanTaskLedger().ledger(accepted);
       const reason = effect.kind === 'finishWithAnswer'
         ? effect.reason
         : effect.kind === 'markAcceptedIncomplete'
@@ -1561,8 +1558,10 @@ export class SessionDriverLoop {
         const progressProposal = planContextIndex.proposalEnvelope(plan);
         const progress = acceptedPlanTaskLedger().batchProgress({ acceptedPlan: acceptedOverlay.acceptedPlan, proposal: progressProposal, kernelEvents: batchEvents });
         const nextAccepted = acceptedPlanTaskLedger().afterBatch(acceptedOverlay.acceptedPlan, progress.completedTaskIds);
-        const cursor = buildTaskExecutionCursor(acceptedOverlay.acceptedPlan, resourceRequestLoop.recentPackets(result.events));
-        const context = buildCurrentTaskContext(acceptedOverlay.acceptedPlan, cursor);
+        const runtime = acceptedPlanTaskLedger().runtimeSnapshot({
+          acceptedPlan: acceptedOverlay.acceptedPlan,
+          resourcePackets: resourceRequestLoop.recentPackets(result.events),
+        });
         const savepointId = this.id('accepted-plan-overlay-task-savepoint');
         result = await this.append(input.sessionId, [
           sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(
@@ -1582,8 +1581,8 @@ export class SessionDriverLoop {
             nextAccepted,
             progress,
             batchEvents,
-            cursor,
-            context,
+            runtime.taskExecutionCursor,
+            runtime.currentTaskContext,
             this.ts(),
             savepointId
           ),
@@ -2336,7 +2335,7 @@ export class SessionDriverLoop {
   ): Promise<AgentSessionResult | null> {
     const accepted = state.acceptedImplementationPlan;
     if (!accepted) return null;
-    refreshTaskExecutionState(state);
+    acceptedPlanTaskLedger().refreshRuntimeState(state);
     const completion = acceptedPlanExecutor.readOnlyResourceCompletion(
       accepted,
       state.taskExecutionCursor,
@@ -2459,7 +2458,7 @@ export class SessionDriverLoop {
     const accepted = state.acceptedImplementationPlan;
     const actionBundle = driverActivityBuilder.readActionBundle(proposal);
     if (!accepted || !actionBundle) return null;
-    refreshTaskExecutionState(state);
+    acceptedPlanTaskLedger().refreshRuntimeState(state);
     if (!acceptedPlanExecutor.currentTaskIsReadOnlyResourceValidation(
       accepted,
       state.taskExecutionCursor,
@@ -3921,7 +3920,7 @@ export class SessionDriverLoop {
     }
     const batchProgress = acceptedPlanTaskLedger().batchProgress({ acceptedPlan: accepted, proposal: executionProposal, kernelEvents: batchReply.events ?? [] });
     const nextAccepted = acceptedPlanTaskLedger().afterBatch(accepted, batchProgress.completedTaskIds);
-    refreshTaskExecutionState(state);
+    acceptedPlanTaskLedger().refreshRuntimeState(state);
     const savepointId = this.id('accepted-plan-task-savepoint');
     result = await this.append(state.sessionId, [
       sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(
@@ -4949,53 +4948,6 @@ function implementationBatchHints(
   return hints;
 }
 
-function refreshTaskExecutionState(state: SessionDriverLoopRunState): void {
-  const snapshot = acceptedPlanTaskLedger().runtimeSnapshot({
-    acceptedPlan: state.acceptedImplementationPlan,
-    resourcePackets: state.resourcePackets,
-    lastSavepointId: state.taskExecutionCursor?.lastSavepointId,
-  });
-  state.taskExecutionCursor = snapshot.taskExecutionCursor;
-  state.currentTaskContext = snapshot.currentTaskContext;
-  state.taskLedger = snapshot.taskLedger;
-  state.acceptedPlanPromptFrame = snapshot.acceptedPlanPromptFrame;
-}
-
-function buildAcceptedPlanTaskLedger(
-  acceptedPlan: AcceptedImplementationPlanContext | undefined,
-  failedTaskId?: string,
-  skippedTaskIds: string[] = [],
-  acceptedIncompleteTaskIds: string[] = []
-): TaskLedgerSnapshot | undefined {
-  return acceptedPlanTaskLedger().ledger(acceptedPlan, failedTaskId, skippedTaskIds, acceptedIncompleteTaskIds);
-}
-
-function buildAcceptedPlanPromptFrameForContext(
-  acceptedPlan: AcceptedImplementationPlanContext | undefined,
-  taskLedger: TaskLedgerSnapshot | undefined
-): AcceptedPlanPromptFrame | undefined {
-  return acceptedPlanTaskLedger().promptFrame(acceptedPlan, taskLedger);
-}
-
-function buildTaskExecutionCursor(
-  acceptedPlan: AcceptedImplementationPlanContext | undefined,
-  resourcePackets: ResourcePacket[],
-  lastSavepointId?: string
-): TaskExecutionCursor | undefined {
-  return acceptedPlanTaskLedger().cursor(acceptedPlan, resourcePackets, lastSavepointId);
-}
-
-function buildCurrentTaskContext(
-  acceptedPlan: AcceptedImplementationPlanContext | undefined,
-  cursor: TaskExecutionCursor | undefined
-): CurrentTaskContext | undefined {
-  return acceptedPlanTaskLedger().currentTaskContext(acceptedPlan, cursor);
-}
-
-function currentTaskMemoryHints(context: CurrentTaskContext | undefined): string[] {
-  return acceptedPlanTaskLedger().memoryHints(context);
-}
-
 function providerRepairMessageState(state: SessionDriverLoopRunState): ProviderRepairMessageState {
   return {
     runId: state.runId,
@@ -5015,10 +4967,6 @@ function providerRepairMessageState(state: SessionDriverLoopRunState): ProviderR
       : undefined,
     completedTaskCount: state.acceptedImplementationPlan?.completedTaskIds.length ?? 0,
   };
-}
-
-function lastAcceptedPlanTaskSavepointId(events: AgentEvent[]): string | undefined {
-  return acceptedPlanTaskLedger().lastSavepointId(events);
 }
 
 function normalizedNonNegativeInteger(value: unknown): number | undefined {
