@@ -4,6 +4,7 @@ export * from './acceptedPlanOperationTargetResolver.js';
 export * from './acceptedPlanScopeCoverage.js';
 export * from './acceptedPlanScopeDecisionOverlay.js';
 export * from './acceptedPlanScopeRepairCoordinator.js';
+export * from './acceptedPlanScopeResourceFollowupCoordinator.js';
 export * from './acceptedPlanTargetParser.js';
 export * from './actionBundleAdmissionRepairCoordinator.js';
 export * from './actionBatchFailureIndex.js';

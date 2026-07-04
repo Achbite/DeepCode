@@ -53,6 +53,7 @@ import {
   AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionOverlay,
   AcceptedPlanScopeRepairCoordinator,
+  AcceptedPlanScopeResourceFollowupCoordinator,
   ActionBundleAdmissionRepairCoordinator,
   AcceptedPlanExecutor,
   AcceptedPlanTargetParser,
@@ -119,6 +120,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanScopeCoverageMatchesStructuredScopes();
   assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask();
   await assertAcceptedPlanScopeRepairCoordinatorRepairsProposal();
+  await assertAcceptedPlanScopeResourceFollowupCoordinatorHandlesResourceRequests();
   assertAcceptedPlanOperationTargetResolverFindsExactGrant();
   assertAcceptedPlanExecutorBuildsExecutionBatch();
   assertKernelEventStatusIndexReadsStructuredEvents();
@@ -3448,6 +3450,132 @@ async function assertAcceptedPlanScopeRepairCoordinatorRepairsProposal(): Promis
   assertEqual(observedStage, 'accepted_plan_scope_repair', 'accepted plan scope repair coordinator uses stable repair stage');
   assertEqual(observedMessages[0]?.role, 'system', 'accepted plan scope repair coordinator sends system repair contract');
   assertEqual(proposal.kind, 'diagnostic', 'accepted plan scope repair coordinator parses repaired proposal');
+}
+
+async function assertAcceptedPlanScopeResourceFollowupCoordinatorHandlesResourceRequests(): Promise<void> {
+  const token = randomSmokeToken('scope-followup');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const manifest: ResourceManifest = {
+    id: `manifest-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    entries: [],
+    budget: { maxEntries: 16, maxBytes: 4096 },
+    defaultDenyPatterns: [],
+  };
+  const request: ResourceRequestDraft = {
+    version: '1',
+    id: `request-${token}`,
+    reason: `reason-${token}`,
+    items: [{ id: `item-${token}`, path: `generated-${token}.txt`, reason: `item-reason-${token}` }],
+  };
+  const packet = {
+    id: `packet-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    requestId: `request-${token}`,
+    items: [],
+  } as ResourcePacket;
+  const initialResult = { events: [{ id: `initial-${token}` }] } as AgentSessionResult;
+  const appendedResult = { events: [{ id: `appended-${token}` }] } as AgentSessionResult;
+  const state = {
+    sessionId,
+    runId,
+    workspaceScopeKey: `workspace-${token}`,
+    manifest,
+    conversationRoots: [],
+    resourcePackets: [],
+    generatedArtifactEvidence: new Map(),
+  };
+  const acceptedPlan = { id: `accepted-${token}` };
+  const proposal = {
+    schemaVersion: 'deepcode.agent.protocol.v3',
+    proposalId: `proposal-${token}`,
+    runId,
+    sessionId,
+    source: 'llm',
+    kind: 'actionBundle',
+    payload: {},
+  } as ProposalEnvelope;
+  let followupGuidance = '';
+  const coordinator = new AcceptedPlanScopeResourceFollowupCoordinator<typeof state, typeof acceptedPlan>({
+    generatedEvidence: {
+      packetForRequest: () => ({ packet, remaining: { version: '1', id: `remaining-${token}`, reason: `remaining-${token}`, items: [] } }),
+    },
+    resolver: {
+      resolve: () => ({ manifest: { ...manifest, id: `subset-${token}` }, unresolved: [], ambiguous: [], availableRoots: [] }),
+    },
+    resourceLoop: {
+      resolutionDiagnostic: () => ({ fallback: `diagnostic-${token}` }),
+    },
+    orchestrator: {
+      recordAndAppend: async (_state, nextPacket, eventIdPrefix) => {
+        assertEqual(nextPacket.id, packet.id, 'scope follow-up records generated packet');
+        assertEqual(eventIdPrefix, 'accepted-plan-repair-generated-resource-context', 'scope follow-up uses stable generated resource event prefix');
+        return { result: appendedResult };
+      },
+      resolveRecordAndAppend: async () => {
+        throw new Error('generated scope follow-up should not resolve an empty remaining manifest');
+      },
+    },
+    createId: (prefix) => `${prefix}-${token}`,
+    appendFailure: async () => {
+      throw new Error('generated scope follow-up should not append a failure');
+    },
+    followupRequest: ({ guidance }) => {
+      followupGuidance = guidance;
+      return `followup-${token}`;
+    },
+  });
+  const resume = await coordinator.handle({
+    state,
+    acceptedPlan,
+    proposal,
+    request,
+    result: initialResult,
+  });
+  assertEqual(resume.kind, 'resume', 'scope follow-up resumes after generated evidence');
+  if (resume.kind === 'resume') {
+    assertEqual(resume.result, appendedResult, 'scope follow-up returns latest appended result');
+    assertEqual(resume.content, `followup-${token}`, 'scope follow-up returns follow-up content');
+  }
+  assert(followupGuidance.includes('same accepted taskPlan cursor'), 'scope follow-up includes execution resume guidance');
+
+  let failureDetail = '';
+  const failureResult = { events: [{ id: `failure-${token}` }] } as AgentSessionResult;
+  const failureCoordinator = new AcceptedPlanScopeResourceFollowupCoordinator<typeof state, typeof acceptedPlan>({
+    generatedEvidence: {
+      packetForRequest: () => ({ remaining: request }),
+    },
+    resolver: {
+      resolve: () => ({ manifest: { ...manifest, id: `empty-${token}` }, unresolved: [`missing-${token}`], ambiguous: [], availableRoots: [] }),
+    },
+    resourceLoop: {
+      resolutionDiagnostic: () => ({ fallback: `missing-${token}` }),
+    },
+    orchestrator: {
+      recordAndAppend: async () => {
+        throw new Error('unresolved scope follow-up should not record packets');
+      },
+      resolveRecordAndAppend: async () => {
+        throw new Error('unresolved scope follow-up should not resolve packets');
+      },
+    },
+    createId: (prefix) => `${prefix}-${token}`,
+    appendFailure: async ({ detail }) => {
+      failureDetail = detail;
+      return failureResult;
+    },
+    followupRequest: () => `unused-${token}`,
+  });
+  const failed = await failureCoordinator.handle({
+    state,
+    acceptedPlan,
+    proposal,
+    request,
+    result: initialResult,
+  });
+  assertEqual(failed.kind, 'failed', 'scope follow-up fails when resource request remains unresolved');
+  assertEqual(failureDetail, `missing-${token}`, 'scope follow-up failure passes resource diagnostic detail');
 }
 
 function assertAcceptedPlanOperationTargetResolverFindsExactGrant(): void {
