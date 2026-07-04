@@ -70,6 +70,7 @@ import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgr
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { AcceptedPlanReviewHandoffCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
+import { PermissionDecisionHandler } from '../driver/interactions/index.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import type { PromptEnvelope } from '../prompt/types.js';
@@ -102,6 +103,7 @@ async function main(): Promise<void> {
   await assertProviderTurnRunnerRunsProviderLifecycle();
   assertUserGuidanceQueueBuildsResumeAndConsumedEvents();
   assertPermissionPipelineFindsPendingPermission();
+  await assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts();
   assertInteractionOverlayCodecRoundTrips();
   assertUserInputPipelineFindsRequirementInteractions();
   await assertProviderTraceRecorderArchivesPayload();
@@ -1869,6 +1871,165 @@ function assertPermissionPipelineFindsPendingPermission(): void {
     null,
     'permission pipeline ignores resolved permission request'
   );
+}
+
+async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): Promise<void> {
+  const token = randomSmokeToken('permission-handler');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const planId = `plan-${token}`;
+  const permissionId = `permission-${token}`;
+  const workUnitId = `work-unit-${token}`;
+  const reviewId = `review-${token}`;
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: `ts-${token}`,
+    updatedAt: `ts-${token}`,
+  };
+  const planEvent = {
+    id: `plan-event-${token}`,
+    sessionId,
+    ts: `ts-${token}`,
+    kind: 'plan_card',
+    payload: {
+      runId,
+      planId,
+      proposalId: `proposal-${token}`,
+      content: `plan-${token}`,
+      actionBundle: { id: `bundle-${token}`, actions: [] },
+      codeBlocks: [],
+      commandBlocks: [],
+      expectedValidation: `validation-${token}`,
+      reviewGuide: `review-${token}`,
+    },
+  } as unknown as AgentEvent;
+  const permissionEvent = {
+    id: `permission-event-${token}`,
+    sessionId,
+    ts: `ts-${token}`,
+    kind: 'kernel_event',
+    payload: {
+      kernelEvent: {
+        kind: 'permission.requested',
+        runId,
+        planId,
+        request: { id: permissionId },
+      },
+    },
+  } as unknown as AgentEvent;
+  const decisionEvents = [
+    {
+      kind: 'work_unit.queued',
+      runId,
+      planId,
+      workUnit: { id: workUnitId },
+    },
+    {
+      kind: 'work_unit.completed',
+      runId,
+      planId,
+      workUnitId,
+    },
+  ];
+  const factsEvent = {
+    kind: 'review.facts_produced',
+    runId,
+    planId,
+    factsId: `facts-${token}`,
+  };
+  const planIndex = new PlanContextIndex({
+    interactionOverlayFromPayload: () => undefined,
+    executionRootFromPayload: () => undefined,
+  });
+  let projectedEvents: AgentEvent[] = [planEvent, permissionEvent];
+  let reviewKernelEvents: unknown[] = [];
+  let appendedEvents: AgentEvent[] = [];
+  const kernelCommands: string[] = [];
+  const handler = new PermissionDecisionHandler({
+    now: () => `ts-${token}`,
+    createId: (prefix) => `${prefix}-${token}`,
+    kernel: async (request: KernelCommandEnvelope): Promise<KernelReply> => {
+      const command = request.command as { kind?: string; permissionId?: string; decision?: string; runId?: string };
+      kernelCommands.push(command.kind ?? '');
+      if (command.kind === 'permissionResolve') {
+        assertEqual(command.permissionId, permissionId, 'permission handler resolves the pending permission');
+        assertEqual(command.decision, 'accept', 'permission handler forwards accept decision');
+        return { ok: true, events: decisionEvents };
+      }
+      if (command.kind === 'reviewFactsGet') {
+        assertEqual(command.runId, runId, 'permission handler requests review facts for current run');
+        return { ok: true, events: [factsEvent] };
+      }
+      throw new Error(`unexpected kernel command ${command.kind}`);
+    },
+    appendProjectedKernelEvents: async (nextSessionId, reply) => {
+      assertEqual(nextSessionId, sessionId, 'permission handler projects kernel events to current session');
+      const projected = (reply.events ?? []).map((kernelEvent, index) => ({
+        id: `kernel-${kernelCommands.length}-${index}-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind: 'kernel_event',
+        payload: { kernelEvent },
+      } as unknown as AgentEvent));
+      projectedEvents = [...projectedEvents, ...projected];
+      return { session, events: projectedEvents };
+    },
+    append: async (nextSessionId, events) => {
+      assertEqual(nextSessionId, sessionId, 'permission handler appends review events to current session');
+      appendedEvents = events;
+      return { session, events: [...projectedEvents, ...events] };
+    },
+    permissionPipeline: new PermissionPipeline(),
+    kernelStatus: new KernelEventStatusIndex(),
+    planIndex,
+    reviewProjection: {
+      summaryEvent: ({ kernelEvents }) => {
+        reviewKernelEvents = kernelEvents;
+        return {
+          id: `review-summary-${token}`,
+          sessionId,
+          ts: `ts-${token}`,
+          kind: 'review_summary',
+          payload: { reviewId },
+        };
+      },
+    },
+    progressProjection: {
+      traceEvent: ({ kind, summary, extra }) => ({
+        id: `trace-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind,
+        payload: { summary, ...extra },
+      }),
+      sessionRunStateEvent: ({ phase, reason, decisionOwner }) => ({
+        id: `run-state-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind: 'session_run_state',
+        payload: { phase, reason, decisionOwner },
+      }),
+    },
+  });
+
+  const result = await handler.resolve({
+    sessionId,
+    decision: 'accept',
+    runId,
+    targetId: permissionId,
+    existingEvents: [planEvent, permissionEvent],
+  });
+
+  assertEqual(kernelCommands.join(','), 'permissionResolve,reviewFactsGet', 'permission handler resolves permission then requests review facts');
+  assertEqual(reviewKernelEvents.length, 3, 'permission handler builds review from decision and facts events');
+  assertEqual(appendedEvents[0]?.kind, 'review_summary', 'permission handler appends review summary');
+  assertEqual(appendedEvents[1]?.kind, 'session_run_state', 'permission handler appends waiting review state');
+  const runStatePayload = appendedEvents[1]?.payload as Record<string, unknown> | undefined;
+  const decisionOwner = runStatePayload?.decisionOwner as Record<string, unknown> | undefined;
+  assertEqual(runStatePayload?.phase, 'waiting_review', 'permission handler enters waiting review');
+  assertEqual(decisionOwner?.reviewId, reviewId, 'permission handler uses review id from summary');
+  assertEqual(result.events.length, projectedEvents.length + appendedEvents.length, 'permission handler returns appended result');
 }
 
 function assertInteractionOverlayCodecRoundTrips(): void {

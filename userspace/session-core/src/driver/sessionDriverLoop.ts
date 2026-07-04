@@ -135,6 +135,7 @@ import {
   ReviewDecisionProjectionBuilder,
   type SessionReviewContext,
 } from './review/index.js';
+import { PermissionDecisionHandler } from './interactions/index.js';
 import {
   ActionBundleActionInspector,
   PlanContextIndex,
@@ -491,6 +492,7 @@ export class SessionDriverLoop {
   private readonly acceptedPlanReviewHandoffCoordinator: AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>;
   private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionResourceFollowupCoordinator: ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>;
+  private readonly permissionDecisionHandler: PermissionDecisionHandler<SessionPlanContext>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
@@ -569,6 +571,18 @@ export class SessionDriverLoop {
       append: (sessionId, events) => this.append(sessionId, events),
       assertKernelReplyOk,
       acceptedPlanKernelEvents: ReviewFactsAggregator.acceptedPlanKernelEvents,
+      reviewProjection: reviewProjectionBuilder,
+      progressProjection: sessionProgressProjectionBuilder,
+    });
+    this.permissionDecisionHandler = new PermissionDecisionHandler<SessionPlanContext>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      kernel: (request) => this.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
+      append: (sessionId, events) => this.append(sessionId, events),
+      permissionPipeline,
+      kernelStatus: kernelEventStatusIndex,
+      planIndex: planContextIndex,
       reviewProjection: reviewProjectionBuilder,
       progressProjection: sessionProgressProjectionBuilder,
     });
@@ -1916,119 +1930,13 @@ export class SessionDriverLoop {
   }
 
   private async resolvePermissionDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
-    const events = input.existingEvents ?? [];
-    const pending = permissionPipeline.findPendingPermissionContext(events, input.targetId);
-    if (!pending) {
-      return this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.traceEvent({
-          sessionId: input.sessionId,
-          kind: 'trace/permission_accept_noop',
-          summary: '该权限请求已处理或已过期，没有重复执行。',
-          ts: this.ts(),
-          id: this.id('permission-noop'),
-          extra: {
-            runId: input.runId,
-            permissionId: input.targetId,
-            decision: input.decision,
-          },
-        }),
-      ]);
-    }
-    const decisionReply = await this.kernel({
-      command: {
-        kind: 'permissionResolve',
-        requestId: this.id('permission-resolve'),
-        permissionId: pending.id,
-        decision: input.decision === 'accept' ? 'accept' : 'reject',
-      },
-    });
-    let result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
-    if (input.decision === 'reject') {
-      const runId = pending.runId ?? input.runId ?? kernelEventStatusIndex.runId(decisionReply.events ?? []) ?? 'run-unknown';
-      return this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.sessionRunStateEvent({
-          sessionId: input.sessionId,
-          runId,
-          phase: 'cancelled',
-          status: 'cancelled',
-          reason: 'permission',
-          decisionOwner: {
-            kind: 'permission',
-            runId,
-            targetId: pending.id,
-            permissionId: pending.id,
-            planId: pending.planId,
-          },
-          ts: this.ts(),
-          id: this.id('session-run-cancelled-permission'),
-        }),
-      ]) ?? result;
-    }
-    if (!kernelEventStatusIndex.actionBatchReadyForReview(decisionReply.events ?? [])) {
-      if (kernelEventStatusIndex.hasPermissionRequest(decisionReply.events ?? [])) {
-        const runId = pending.runId ?? input.runId ?? kernelEventStatusIndex.runId(decisionReply.events ?? []) ?? 'run-unknown';
-        const permissionId = kernelEventStatusIndex.permissionId(decisionReply.events ?? []);
-        return this.append(input.sessionId, [
-          sessionProgressProjectionBuilder.sessionRunStateEvent({
-            sessionId: input.sessionId,
-            runId,
-            phase: 'waiting_permission',
-            reason: 'permission',
-            decisionOwner: {
-              kind: 'permission',
-              runId,
-              targetId: permissionId,
-              permissionId,
-              planId: pending.planId,
-            },
-            ts: this.ts(),
-            id: this.id('session-run-waiting-permission'),
-          }),
-        ]) ?? result;
-      }
-      return result;
-    }
-
-    const runId = pending.runId ?? input.runId ?? kernelEventStatusIndex.runId(decisionReply.events ?? []);
-    if (!runId) return result;
-    const plan = planContextIndex.findPlanCard(result.events, runId, pending.planId);
-    if (!plan) return result;
-
-    const factsReply = await this.kernel({
-      command: {
-        kind: 'reviewFactsGet',
-        requestId: this.id('review-facts-get'),
-        runId,
-        sessionId: input.sessionId,
-      },
-    });
-    result = await this.appendProjectedKernelEvents(input.sessionId, factsReply);
-    const review = reviewProjectionBuilder.summaryEvent({
+    return this.permissionDecisionHandler.resolve({
       sessionId: input.sessionId,
-      plan,
-      kernelEvents: [...(decisionReply.events ?? []), ...(factsReply.events ?? [])],
-      ts: this.ts(),
-      id: this.id('review-summary'),
+      decision: input.decision,
+      runId: input.runId,
+      targetId: input.targetId,
+      existingEvents: input.existingEvents,
     });
-    const reviewPayload = objectRecord(review.payload) ?? {};
-    return this.append(input.sessionId, [
-      review,
-      sessionProgressProjectionBuilder.sessionRunStateEvent({
-        sessionId: input.sessionId,
-        runId,
-        phase: 'waiting_review',
-        reason: 'review',
-        decisionOwner: {
-          kind: 'review',
-          runId,
-          targetId: stringValue(reviewPayload.reviewId) ?? runId,
-          reviewId: stringValue(reviewPayload.reviewId) ?? runId,
-          planId: plan.planId,
-        },
-        ts: this.ts(),
-        id: this.id('session-run-waiting-review'),
-      }),
-    ]) ?? result;
   }
 
   private async resolveReviewDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
