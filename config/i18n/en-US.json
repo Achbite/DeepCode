@@ -948,6 +948,7 @@
     "session.driver.acceptedPlanScopeRepair": "The current execution batch is outside the confirmed current-task scope; Session is asking the model to continue the current task or request additional authorization.",
     "session.driver.planDecision.noop": "Plan review request is already resolved or expired; no duplicate action was taken.",
     "session.driver.permissionDecision.noop": "Permission request is already resolved or expired; no duplicate action was taken.",
+    "session.driver.requirementDecision.noop": "Requirement decision request is already resolved or expired; no duplicate action was taken.",
     "session.driver.reviewDecision.noop": "Review request is already resolved or expired; no duplicate action was taken.",
     "session.driver.reviewDecision.auditFailed": "Kernel did not accept the Review revision audit; Session will continue the revision flow from user guidance.",
     "requirement.optionsTitle": "Options",

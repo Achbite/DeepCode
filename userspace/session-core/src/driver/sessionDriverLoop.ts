@@ -100,7 +100,7 @@ import {
 import { InteractionOverlayCodec, type InteractionOverlayContext, type SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
 import { PermissionPipeline } from './pipelines/permissionPipeline.js';
 import { UserGuidanceQueue } from './pipelines/userGuidanceQueue.js';
-import { UserInputPipeline, type RequirementOptionEffect } from './pipelines/userInputPipeline.js';
+import { UserInputPipeline } from './pipelines/userInputPipeline.js';
 import {
   AcceptedPlanResourceResumeCoordinator,
   ActionBundleAdmissionResourceFollowupCoordinator,
@@ -120,11 +120,8 @@ import type { RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import {
   buildAcceptedPlanPromptFrame,
-  buildAnswerFactsContext,
   buildReviewFactsContext,
   buildTaskLedgerSnapshot,
-  evaluateRunState,
-  normalizeDecisionEffect,
   type AcceptedPlanPromptFrame,
   type TaskLedgerSnapshot,
 } from '../run-state/index.js';
@@ -135,7 +132,7 @@ import {
   ReviewDecisionProjectionBuilder,
   type SessionReviewContext,
 } from './review/index.js';
-import { PermissionDecisionHandler, PlanDecisionHandler, ReviewDecisionHandler } from './interactions/index.js';
+import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from './interactions/index.js';
 import {
   ActionBundleActionInspector,
   PlanContextIndex,
@@ -494,6 +491,7 @@ export class SessionDriverLoop {
   private readonly actionBundleAdmissionResourceFollowupCoordinator: ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>;
   private readonly permissionDecisionHandler: PermissionDecisionHandler<SessionPlanContext>;
   private readonly planDecisionHandler: PlanDecisionHandler;
+  private readonly requirementDecisionHandler: RequirementDecisionHandler;
   private readonly reviewDecisionHandler: ReviewDecisionHandler;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
@@ -607,6 +605,30 @@ export class SessionDriverLoop {
       planIndex: planContextIndex,
       planProjection: planProjectionBuilder,
       progressProjection: sessionProgressProjectionBuilder,
+    });
+    this.requirementDecisionHandler = new RequirementDecisionHandler({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
+      activeDriverInteraction: (events) => findActiveDriverInteraction(events),
+      executionRootFromDecision: (handlerInput, events) =>
+        AcceptedPlanExecutionRootResolver.fromDecision(handlerInput, events),
+      buildAcceptedImplementationPlan: ({ plan, interventionLevel, executionRoot }) =>
+        acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel, executionRoot }),
+      recoverAcceptedPlanFromOverlay: (handlerInput, events, overlay) =>
+        recoverAcceptedPlanFromOverlay({ ...handlerInput, kind: 'requirement' }, events, overlay),
+      visibleLanguageForRequest,
+      userInputPipeline,
+      interactionOverlayCodec,
+      requirementProjection: requirementProjectionBuilder,
+      assistantProjection: assistantProjectionBuilder,
+      progressProjection: sessionProgressProjectionBuilder,
+      planIndex: planContextIndex,
+      acceptedPlanLedger: acceptedPlanTaskLedger(),
+      acceptedPlanScopeDecisionOverlay,
+      executionPrompt: executionPromptCoordinator(),
+      repairLoop,
     });
     this.reviewDecisionHandler = new ReviewDecisionHandler({
       now: () => this.ts(),
@@ -1158,450 +1180,21 @@ export class SessionDriverLoop {
   }
 
   private async resolveRequirementDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
-    const events = input.existingEvents ?? [];
-    const requirementId = input.targetId;
-    const confirmation = userInputPipeline.findRequirementConfirmation(
-      events,
-      input.runId,
-      requirementId,
-      findActiveDriverInteraction(events)
-    );
-    if (!confirmation) {
-      return this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.traceEvent({
-          sessionId: input.sessionId,
-          kind: 'trace/requirement_decision_noop',
-          summary: '该需求确认已处理或已过期。',
-          ts: this.ts(),
-          id: this.id('requirement-noop'),
-          extra: {
-            runId: input.runId,
-            requirementId,
-            decision: input.decision,
-          },
-        }),
-      ]);
-    }
-
-    const decisionEvent = requirementProjectionBuilder.decisionEvent({
+    return this.requirementDecisionHandler.resolve({
       sessionId: input.sessionId,
-      event: confirmation,
       decision: input.decision,
       guidance: input.guidance,
-      ts: this.ts(),
-      id: this.id('requirement-decision'),
-    });
-    const interactionOverlay = interactionOverlayCodec.fromRequirementDecision(confirmation, decisionEvent);
-    let result = await this.append(input.sessionId, [decisionEvent]);
-    if (input.decision === 'reject') {
-      const payload = objectRecord(decisionEvent.payload) ?? {};
-      const runId = stringValue(payload.runId) ?? input.runId ?? 'run-unknown';
-      const resolvedRequirementId = stringValue(payload.requirementId) ?? requirementId;
-      return this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.sessionRunStateEvent({
-          sessionId: input.sessionId,
-          runId,
-          phase: 'cancelled',
-          status: 'cancelled',
-          reason: 'requirement',
-          decisionOwner: {
-            kind: 'requirement',
-            runId,
-            targetId: resolvedRequirementId,
-            requirementId: resolvedRequirementId,
-          },
-          interactionOverlay,
-          ts: this.ts(),
-          id: this.id('session-run-cancelled-requirement'),
-        }),
-      ]) ?? result;
-    }
-    if (userInputPipeline.isResourceBudgetConfirmation(confirmation)) {
-      const originalRequest = userInputPipeline.requirementOriginalRequest(confirmation);
-      return this.runUserTurn({
-        sessionId: input.sessionId,
-        content: input.decision === 'revise' && input.guidance
-          ? [
-              originalRequest,
-              '',
-              'User guidance after the read-only resource budget checkpoint (verbatim):',
-              input.guidance,
-              '',
-              'If the user asks for an answer from the current evidence, prefer closing with the existing ResourcePackets.',
-              'If the user narrowed the scope and key facts are still missing, continue with focused read-only resourceRequest within the additional budget.',
-              'Write user-visible proposal fields in the current user request language; keep protocol keys and evidence refs unchanged.',
-            ].join('\n')
-          : originalRequest,
-        attachments: userInputPipeline.requirementAttachments(confirmation),
-        existingEvents: result.events,
-        workspaceBinding: input.workspaceBinding,
-        projectWorkingDirectory: input.projectWorkingDirectory,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        appendUserMessage: false,
-        requirementConfirmationMode: 'off',
-        projectMemoryMode: input.projectMemoryMode,
-        interventionLevel: input.interventionLevel,
-        resumeResourcePackets: true,
-        interactionOverlay,
-      });
-    }
-    if (userInputPipeline.isAcceptedPlanScopeConfirmation(confirmation)) {
-      return this.resolveAcceptedPlanScopeRequirementDecision(input, confirmation, decisionEvent, interactionOverlay, result);
-    }
-    if (userInputPipeline.isAcceptedPlanExecutionConfirmation(confirmation)) {
-      return this.resolveAcceptedPlanExecutionRequirementDecision(input, confirmation, decisionEvent, interactionOverlay, result);
-    }
-
-    if (input.decision === 'accept') {
-      const optionEffect = userInputPipeline.selectedRequirementDecisionOptionEffect(decisionEvent);
-      if (optionEffect) {
-        const dispatched = await this.applyRequirementOptionEffect(
-          input,
-          confirmation,
-          decisionEvent,
-          interactionOverlay,
-          optionEffect,
-          result
-        );
-        if (dispatched) return dispatched;
-      }
-    }
-
-    const originalRequest = userInputPipeline.requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
-    const next = await this.runUserTurn({
-      sessionId: input.sessionId,
-      content: originalRequest,
-      attachments: userInputPipeline.requirementAttachments(confirmation),
-      existingEvents: result.events,
-      workspaceBinding: input.workspaceBinding,
-      projectMemoryMode: input.projectMemoryMode,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
-      confirmedRequirement: input.decision === 'accept' ? userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed') : undefined,
-      requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
-      interventionLevel: input.interventionLevel,
-      interactionOverlay,
-    });
-
-    return next;
-  }
-
-  private async resolveAcceptedPlanScopeRequirementDecision(
-    input: SessionDecisionResolverInput,
-    confirmation: AgentEvent,
-    decisionEvent: AgentEvent,
-    interactionOverlay: InteractionOverlayContext | undefined,
-    current: AgentSessionResult
-  ): Promise<AgentSessionResult> {
-    const confirmationPayload = objectRecord(confirmation.payload) ?? {};
-    const decisionRequest = objectRecord(confirmationPayload.decisionRequest) ?? {};
-    const runId = stringValue(confirmationPayload.runId) ?? input.runId;
-    const planId = stringValue(decisionRequest.acceptedPlanId);
-    const selectedOptionId = userInputPipeline.selectedRequirementDecisionOptionId(decisionEvent);
-    const plan = (runId ? planContextIndex.findPlanCard(current.events, runId, planId) : null)
-      ?? planContextIndex.findPlanCard(current.events, undefined, planId)
-      ?? (runId ? planContextIndex.latestExecutablePlan(current.events, runId) : null);
-
-    if (input.decision === 'revise' || selectedOptionId === 'revise-plan') {
-      return this.runUserTurn({
-        sessionId: input.sessionId,
-        content: repairLoop.acceptedPlanScopeRevisionRequest({ confirmation, plan, guidance: input.guidance }),
-        attachments: userInputPipeline.requirementAttachments(confirmation),
-        existingEvents: current.events,
-        workspaceBinding: input.workspaceBinding,
-        projectWorkingDirectory: input.projectWorkingDirectory,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        appendUserMessage: false,
-        requirementConfirmationMode: 'off',
-        reviewContinuationMode: input.reviewContinuationMode,
-        interventionLevel: input.interventionLevel,
-        projectMemoryMode: input.projectMemoryMode,
-        resumeResourcePackets: true,
-        interactionOverlay,
-      });
-    }
-
-    if (!plan || !plan.implementationPlan) {
-      return this.append(input.sessionId, [
-        assistantProjectionBuilder.finalDiagnosticEvent(
-          input.sessionId,
-          'Accepted-plan scope decision could not recover the original implementationPlan; Session will not start a detached requirement flow.',
-          this.ts(),
-          this.id('accepted-plan-scope-decision-missing-plan')
-        ),
-      ]) ?? current;
-    }
-
-    const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, current.events);
-    const acceptedPlan = acceptedPlanTaskLedger().withLatestCheckpoint(
-      acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: input.interventionLevel, executionRoot }),
-      current.events
-    );
-    const selectedEffect = userInputPipeline.selectedRequirementDecisionOptionEffect(decisionEvent)
-      ?? (input.decision === 'accept' ? userInputPipeline.defaultRequirementDecisionOptionEffect(confirmation) : undefined);
-    const nextAcceptedPlan = acceptedPlanScopeDecisionOverlay.apply(acceptedPlan, selectedEffect);
-    const guidance = input.guidance?.trim()
-      ? `User guidance for the accepted-plan scope intervention (verbatim):\n${input.guidance.trim()}`
-      : acceptedPlanScopeDecisionOverlay.resumeGuidance(selectedEffect);
-    return this.runUserTurn({
-      sessionId: input.sessionId,
-      content: executionPromptCoordinator().executionRequest(plan, nextAcceptedPlan, guidance),
-      attachments: nextAcceptedPlan.executionRoot ? [nextAcceptedPlan.executionRoot.attachment] : userInputPipeline.requirementAttachments(confirmation),
-      existingEvents: current.events,
+      runId: input.runId,
+      targetId: input.targetId,
+      existingEvents: input.existingEvents,
       workspaceBinding: input.workspaceBinding,
       projectWorkingDirectory: input.projectWorkingDirectory,
       profileId: input.profileId,
       workflow: input.workflow,
-      appendUserMessage: false,
-      requirementConfirmationMode: 'off',
       reviewContinuationMode: input.reviewContinuationMode,
       interventionLevel: input.interventionLevel,
       projectMemoryMode: input.projectMemoryMode,
-      resumeResourcePackets: true,
-      acceptedImplementationPlan: nextAcceptedPlan,
-      interactionOverlay,
-    });
-  }
-
-  private async applyRequirementOptionEffect(
-    input: SessionDecisionResolverInput,
-    confirmation: AgentEvent,
-    decisionEvent: AgentEvent,
-    interactionOverlay: InteractionOverlayContext | undefined,
-    effect: RequirementOptionEffect,
-    current: AgentSessionResult
-  ): Promise<AgentSessionResult | undefined> {
-    const normalizedEffect = normalizeDecisionEffect(effect);
-    const stateDecision = evaluateRunState({ decisionEffect: normalizedEffect });
-    if (stateDecision.kind === 'continueAcceptedPlan') return undefined;
-
-    const decisionPayload = objectRecord(decisionEvent.payload) ?? {};
-    const runId = stringValue(decisionPayload.runId) ?? input.runId ?? 'run-unknown';
-    const requirementId = stringValue(decisionPayload.requirementId) ?? input.targetId;
-    const baseOwner = {
-      kind: 'requirement' as const,
-      runId,
-      targetId: requirementId,
-      requirementId,
-    };
-
-    if (stateDecision.kind === 'finishWithAnswer') {
-      const confirmationPayload = objectRecord(confirmation.payload) ?? {};
-      const accepted = this.recoverAcceptedPlanForRequirement(current.events, runId, undefined);
-      const taskLedger = acceptedPlanTaskLedger().ledger(accepted);
-      const reason = effect.kind === 'finishWithAnswer'
-        ? effect.reason
-        : effect.kind === 'markAcceptedIncomplete'
-          ? effect.reason
-          : undefined;
-      const answerProposal = assistantProjectionBuilder.decisionEffectAnswerProposal({
-        sessionId: input.sessionId,
-        runId,
-        proposalId: this.id('finish-with-answer-proposal'),
-        completedTasks: taskLedger?.completedTaskIds.length ?? 0,
-        totalTasks: taskLedger?.taskOrder.length ?? 0,
-        pendingTasks: taskLedger?.pendingTaskIds.length ?? 0,
-        reason,
-        guidance: input.guidance,
-        language: visibleLanguageForRequest(stringValue(confirmationPayload.originalUserRequest) ?? input.guidance ?? ''),
-      });
-      return this.append(input.sessionId, [
-        assistantProjectionBuilder.answerEvent(input.sessionId, answerProposal, this.ts(), this.id('answer'), {
-          answerFactsContext: buildAnswerFactsContext({
-            reviewFactsContext: buildReviewFactsContext({
-              runId,
-              taskLedger,
-            }),
-            userGuidance: input.guidance,
-          }),
-        }),
-        sessionProgressProjectionBuilder.sessionRunStateEvent({
-          sessionId: input.sessionId,
-          runId,
-          phase: 'completed',
-          status: 'completed',
-          reason: 'requirement',
-          decisionOwner: baseOwner,
-          interactionOverlay,
-          ts: this.ts(),
-          id: this.id('session-run-completed-answer'),
-        }),
-      ]) ?? current;
-    }
-
-    if (stateDecision.kind === 'cancel') {
-      return this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.sessionRunStateEvent({
-          sessionId: input.sessionId,
-          runId,
-          phase: 'completed',
-          status: 'completed',
-          reason: 'requirement',
-          decisionOwner: baseOwner,
-          interactionOverlay,
-          ts: this.ts(),
-          id: this.id('session-run-completed-requirement'),
-        }),
-      ]) ?? current;
-    }
-
-    if (stateDecision.kind === 'waitForPlanReview') {
-      return this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.sessionRunStateEvent({
-          sessionId: input.sessionId,
-          runId,
-          phase: 'waiting_plan_review',
-          status: 'waiting',
-          reason: 'plan_review',
-          decisionOwner: baseOwner,
-          interactionOverlay,
-          ts: this.ts(),
-          id: this.id('session-run-replan-requirement'),
-        }),
-      ]) ?? current;
-    }
-
-    const confirmationPayload = objectRecord(confirmation.payload) ?? {};
-    const decisionRequest = objectRecord(confirmationPayload.decisionRequest) ?? {};
-    const planId = stringValue(decisionRequest.acceptedPlanId)
-      ?? stringValue(confirmationPayload.acceptedPlanId)
-      ?? stringValue(decisionPayload.acceptedPlanId);
-    const accepted = this.recoverAcceptedPlanForRequirement(current.events, runId, planId);
-    if (!accepted) return undefined;
-
-    const currentCompleted = new Set(accepted.completedTaskIds);
-    const currentTaskId = accepted.tasks.find((task) => !currentCompleted.has(task.taskId))?.taskId;
-    const newlyCompleted: string[] = [];
-    let acceptedIncompleteTaskIds: string[] = [];
-    if (normalizedEffect.kind === 'skipTask') {
-      if (!currentTaskId) return undefined;
-      newlyCompleted.push(currentTaskId);
-    } else if (normalizedEffect.kind === 'markAcceptedIncomplete') {
-      const ids = normalizedEffect.taskIds?.length ? normalizedEffect.taskIds : (currentTaskId ? [currentTaskId] : []);
-      acceptedIncompleteTaskIds = ids.filter((id) => !currentCompleted.has(id) && accepted.tasks.some((task) => task.taskId === id));
-      newlyCompleted.push(...acceptedIncompleteTaskIds);
-      if (newlyCompleted.length === 0) return undefined;
-    } else {
-      return undefined;
-    }
-    const mergedCompletedTaskIds = [...accepted.completedTaskIds, ...newlyCompleted];
-    const nextAccepted = acceptedPlanTaskLedger().afterBatch(accepted, mergedCompletedTaskIds);
-    const remainingTaskIds = accepted.tasks
-      .map((task) => task.taskId)
-      .filter((id) => !mergedCompletedTaskIds.includes(id));
-    const allDone = remainingTaskIds.length === 0;
-
-    const checkpointId = this.id('requirement-driven-task-checkpoint');
-    const events: AgentEvent[] = [
-      sessionProgressProjectionBuilder.requirementDrivenTaskCheckpointEvent(
-        input.sessionId,
-        runId,
-        nextAccepted,
-        newlyCompleted,
-        mergedCompletedTaskIds,
-        remainingTaskIds,
-        effect.kind,
-        stringValue(objectRecord(decisionPayload.selectedOption)?.id),
-        this.ts(),
-        checkpointId
-      ),
-    ];
-    if (allDone) {
-      events.push(sessionProgressProjectionBuilder.sessionRunStateEvent({
-        sessionId: input.sessionId,
-        runId,
-        phase: 'completed',
-        status: 'completed',
-        reason: 'requirement',
-        decisionOwner: baseOwner,
-        interactionOverlay,
-        ts: this.ts(),
-        id: this.id('session-run-completed-requirement-tasks'),
-      }));
-      return this.append(input.sessionId, events) ?? current;
-    }
-
-    const result = await this.append(input.sessionId, events) ?? current;
-    const originalRequest = userInputPipeline.requirementDecisionResumeRequest(confirmation, decisionEvent, input.decision, input.guidance);
-    return this.runUserTurn({
-      sessionId: input.sessionId,
-      content: originalRequest,
-      attachments: userInputPipeline.requirementAttachments(confirmation),
-      existingEvents: result.events,
-      workspaceBinding: input.workspaceBinding,
-      projectMemoryMode: input.projectMemoryMode,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
-      confirmedRequirement: userInputPipeline.requirementRecordFromEvent(confirmation, 'confirmed'),
-      requirementConfirmationMode: 'off',
-      interventionLevel: input.interventionLevel,
-      acceptedImplementationPlan: nextAccepted,
-      interactionOverlay,
-    });
-  }
-
-  private recoverAcceptedPlanForRequirement(
-    events: AgentEvent[],
-    runId: string,
-    planId: string | undefined
-  ): AcceptedImplementationPlanContext | undefined {
-    const plan = (runId ? planContextIndex.findPlanCard(events, runId, planId) : null)
-      ?? planContextIndex.findPlanCard(events, undefined, planId)
-      ?? (runId ? planContextIndex.latestExecutablePlan(events, runId) : null);
-    if (!plan || !plan.implementationPlan) return undefined;
-    const base = acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: undefined, executionRoot: plan.executionRoot });
-    return acceptedPlanTaskLedger().withLatestCheckpoint(base, events);
-  }
-
-  private async resolveAcceptedPlanExecutionRequirementDecision(
-    input: SessionDecisionResolverInput,
-    confirmation: AgentEvent,
-    decisionEvent: AgentEvent,
-    interactionOverlay: InteractionOverlayContext | undefined,
-    current: AgentSessionResult
-  ): Promise<AgentSessionResult> {
-    const acceptedContext = recoverAcceptedPlanFromOverlay(input, current.events, interactionOverlay);
-    if (!acceptedContext) {
-      return this.append(input.sessionId, [
-        assistantProjectionBuilder.finalDiagnosticEvent(
-          input.sessionId,
-          'Accepted-plan interaction decision could not recover the parent implementationPlan; Session will not start a detached requirement flow.',
-          this.ts(),
-          this.id('accepted-plan-interaction-missing-plan')
-        ),
-      ]) ?? current;
-    }
-    const guidance = userInputPipeline.acceptedPlanExecutionRequirementResumeRequest(
-      confirmation,
-      decisionEvent,
-      input.decision,
-      input.guidance
-    );
-    return this.runUserTurn({
-      sessionId: input.sessionId,
-      content: executionPromptCoordinator().executionRequest(acceptedContext.plan, acceptedContext.acceptedPlan, guidance),
-      attachments: acceptedContext.acceptedPlan.executionRoot
-        ? [acceptedContext.acceptedPlan.executionRoot.attachment]
-        : userInputPipeline.requirementAttachments(confirmation),
-      existingEvents: current.events,
-      workspaceBinding: input.workspaceBinding,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      appendUserMessage: false,
-      requirementConfirmationMode: input.decision === 'revise' ? 'always' : 'off',
-      reviewContinuationMode: input.reviewContinuationMode,
-      interventionLevel: input.interventionLevel,
-      projectMemoryMode: input.projectMemoryMode,
-      resumeResourcePackets: true,
-      acceptedImplementationPlan: acceptedContext.acceptedPlan,
-      interactionOverlay,
+      interactionOverlay: input.interactionOverlay,
     });
   }
 

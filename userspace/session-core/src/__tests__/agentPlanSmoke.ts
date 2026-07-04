@@ -70,7 +70,7 @@ import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgr
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { AcceptedPlanReviewHandoffCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
-import { PermissionDecisionHandler, PlanDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
+import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import type { PromptEnvelope } from '../prompt/types.js';
@@ -104,6 +104,7 @@ async function main(): Promise<void> {
   assertUserGuidanceQueueBuildsResumeAndConsumedEvents();
   assertPermissionPipelineFindsPendingPermission();
   await assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts();
+  await assertRequirementDecisionHandlerRejectsActiveRequirement();
   assertInteractionOverlayCodecRoundTrips();
   assertUserInputPipelineFindsRequirementInteractions();
   await assertProviderTraceRecorderArchivesPayload();
@@ -2032,6 +2033,117 @@ async function assertPermissionDecisionHandlerAcceptsAndRequestsReviewFacts(): P
   assertEqual(runStatePayload?.phase, 'waiting_review', 'permission handler enters waiting review');
   assertEqual(decisionOwner?.reviewId, reviewId, 'permission handler uses review id from summary');
   assertEqual(result.events.length, projectedEvents.length + appendedEvents.length, 'permission handler returns appended result');
+}
+
+async function assertRequirementDecisionHandlerRejectsActiveRequirement(): Promise<void> {
+  const token = randomSmokeToken('requirement-handler');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const requirementId = `requirement-${token}`;
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    title: `Session ${token}`,
+    createdAt: `created-${token}`,
+    updatedAt: `updated-${token}`,
+    eventCount: 0,
+  };
+  const store: AgentEvent[] = [{
+    id: `requirement-confirmation-${token}`,
+    sessionId,
+    ts: `ts-${token}`,
+    kind: 'requirement_confirmation',
+    payload: {
+      confirmable: true,
+      status: 'waitingUserConfirmation',
+      runId,
+      requirementId,
+      originalUserRequest: `request-${token}`,
+      decisionRequest: {
+        id: `decision-${token}`,
+        question: `Question ${token}?`,
+        options: [
+          { id: `accept-${token}`, label: `Accept ${token}` },
+          { id: `reject-${token}`, label: `Reject ${token}` },
+        ],
+      },
+    },
+  } as AgentEvent];
+  let resumed = 0;
+  const handler = new RequirementDecisionHandler({
+    now: () => `now-${token}`,
+    createId: (prefix) => `${prefix}-${token}`,
+    append: async (nextSessionId, events) => {
+      assertEqual(nextSessionId, sessionId, 'requirement handler appends to current session');
+      store.push(...events);
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    resumeUserTurn: async () => {
+      resumed += 1;
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    activeDriverInteraction: () => ({ kind: 'requirement', runId, requirementId }),
+    executionRootFromDecision: () => undefined,
+    buildAcceptedImplementationPlan: () => {
+      throw new Error('requirement reject must not build accepted implementation context');
+    },
+    recoverAcceptedPlanFromOverlay: () => undefined,
+    visibleLanguageForRequest: () => 'en-US',
+    userInputPipeline: new UserInputPipeline(),
+    interactionOverlayCodec: new InteractionOverlayCodec(),
+    requirementProjection: new RequirementProjectionBuilder({
+      visibleLanguageForRequest: () => 'en-US',
+      interactionOverlayPayload: () => ({}),
+    }),
+    assistantProjection: new AssistantProjectionBuilder({
+      visibleLanguageForRequest: () => 'en-US',
+      guidanceRevisionTransitionMessage: () => `transition-${token}`,
+    }),
+    progressProjection: new SessionProgressProjectionBuilder({
+      interactionOverlayPayload: () => ({}),
+      hasFailureOrBlocker: () => false,
+      auditAcceptedPlanBatch: () => ({}),
+      actionBundleAdmissionBatch: () => ({}),
+      acceptedPlanTaskLedger: () => undefined,
+      acceptedPlanPromptFrame: () => undefined,
+    }),
+    planIndex: new PlanContextIndex({
+      interactionOverlayFromPayload: () => undefined,
+      executionRootFromPayload: () => undefined,
+    }),
+    acceptedPlanLedger: new AcceptedPlanTaskLedgerCoordinator(),
+    acceptedPlanScopeDecisionOverlay: {
+      apply: () => {
+        throw new Error('requirement reject must not apply scope overlay');
+      },
+      resumeGuidance: () => {
+        throw new Error('requirement reject must not build scope guidance');
+      },
+    } as any,
+    executionPrompt: {
+      executionRequest: () => {
+        throw new Error('requirement reject must not resume accepted-plan execution');
+      },
+    } as any,
+    repairLoop: new RepairLoop(),
+  });
+
+  const result = await handler.resolve({
+    sessionId,
+    decision: 'reject',
+    runId,
+    targetId: requirementId,
+    existingEvents: [...store],
+  });
+
+  assertEqual(resumed, 0, 'requirement reject does not resume provider loop');
+  assertEqual(result.events.some((event) => event.kind === 'requirement_decision' && (event.payload as any)?.status === 'rejected'), true, 'requirement handler records rejected requirement decision');
+  const cancelled = result.events.find((event) => event.kind === 'session_run_state' && (event.payload as any)?.status === 'cancelled');
+  assert(Boolean(cancelled), 'requirement handler appends cancelled run state');
+  const cancelledPayload = cancelled?.payload as Record<string, unknown> | undefined;
+  assertEqual(cancelledPayload?.phase, 'cancelled', 'requirement handler cancelled state uses cancelled phase');
+  const owner = cancelledPayload?.decisionOwner as Record<string, unknown> | undefined;
+  assertEqual(owner?.requirementId, requirementId, 'requirement handler cancelled state keeps requirement owner');
 }
 
 function assertInteractionOverlayCodecRoundTrips(): void {
