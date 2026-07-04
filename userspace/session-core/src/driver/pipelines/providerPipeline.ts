@@ -15,6 +15,7 @@ export {
   type NativeToolRepairDuplicate,
   type NativeToolTurnProposalLike,
 } from './nativeToolRepairCoordinator.js';
+export { NativeToolHandlerPortsFactory } from './nativeToolHandlerPortsFactory.js';
 export { NativeToolProgressEventBuilder } from './nativeToolProgressEventBuilder.js';
 export { NativeToolProviderLoop } from './nativeToolProviderLoop.js';
 export { NativeToolProjectionBuilder } from './nativeToolProjectionBuilder.js';

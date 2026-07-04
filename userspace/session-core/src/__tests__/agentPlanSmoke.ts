@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -79,6 +79,7 @@ async function main(): Promise<void> {
   assertNativeToolResourceRecorderRecordsPackets();
   assertNativeToolResumeMessageBuilderAppendsToolMessages();
   await assertNativeToolProviderLoopResumesAfterToolMessages();
+  await assertNativeToolHandlerPortsFactoryBuildsPorts();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -820,6 +821,117 @@ async function assertNativeToolProviderLoopResumesAfterToolMessages(): Promise<v
   assertEqual(guidanceStages[0], 'provider_call', 'native tool provider loop consumes guidance after tool handling');
   assertEqual(messageCounts[0], 1, 'native tool provider loop starts from provider messages');
   assertEqual(messageCounts[1], 4, 'native tool provider loop resumes with assistant, tool, and guidance messages');
+}
+
+async function assertNativeToolHandlerPortsFactoryBuildsPorts(): Promise<void> {
+  const token = randomSmokeToken('native-ports');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const targetPath = `scope-${token}/target-${randomSmokeToken('target')}.txt`;
+  const toolCall = {
+    callId: `call-${token}`,
+    index: 0,
+    name: `read_${randomSmokeToken('tool')}`,
+    arguments: { path: targetPath },
+  };
+  const packet: ResourcePacket = {
+    id: `packet-${token}`,
+    requestId: `request-${token}`,
+    workspaceScopeKey: `scope-${token}`,
+    items: [],
+  };
+  const state = {
+    sessionId,
+    runId,
+    userRequest: `request-${token}`,
+    manifest: {
+      id: `manifest-${token}`,
+      workspaceScopeKey: `scope-${token}`,
+      entries: [],
+      budget: { maxEntries: 8, maxBytes: 4096 },
+      defaultDenyPatterns: [],
+    },
+    resourcePackets: [] as ResourcePacket[],
+    nativeToolReadLedger: new Map(),
+    nativeToolDuplicateRepairAttempted: false,
+  };
+  const appended: AgentEvent[] = [];
+  const deltas: ProjectionDelta[] = [];
+  const factory = new NativeToolHandlerPortsFactory<any, string, any>({
+    progressEventBuilder: {
+      assistantProgressPayload: (input) => ({
+        kind: `progress-${token}`,
+        runId: input.runId,
+        content: input.content,
+      }),
+    },
+    projectionBuilder: {
+      checkpointDelta: (input) => ({ type: 'stage_delta', sessionId: input.sessionId, runId: input.runId, stage: `checkpoint-${token}`, status: 'running' }),
+      duplicateReadDelta: (input) => ({ type: 'stage_delta', sessionId: input.sessionId, runId: input.runId, stage: `duplicate-${input.toolCall.callId}`, status: 'completed' }),
+      toolCallRunningDelta: (input) => ({ type: 'tool_call_delta', sessionId: input.sessionId, runId: input.runId, stage: `running-${input.language}`, status: 'running' }),
+      resourceResolvedDelta: (input) => ({ type: 'resource_delta', sessionId: input.sessionId, runId: input.runId, stage: `resolved-${input.packet.id}`, status: 'completed' }),
+    },
+    resultMessageBuilder: {
+      duplicateToolMessage: () => ({ role: 'tool', toolCallId: toolCall.callId, content: `duplicate-${token}` }),
+      packetToolMessage: () => ({ role: 'tool', toolCallId: toolCall.callId, content: `packet-${token}` }),
+    },
+    resourceRecorder: {
+      recordResolvedPacket: (_state, _signature, resolvedPacket, identity) => ({
+        id: identity.id,
+        sessionId,
+        ts: identity.ts,
+        kind: 'tool_result',
+        payload: { packetId: resolvedPacket.id },
+      }),
+    },
+    visibleLanguage: () => 'en-US',
+    event: (eventSessionId, kind, payload) => ({
+      id: `event-${token}`,
+      sessionId: eventSessionId,
+      ts: `ts-${token}`,
+      kind,
+      payload,
+    }),
+    append: async (_sessionId, events) => {
+      appended.push(...events);
+    },
+    emitProjectionDelta: async (_state, delta) => {
+      deltas.push(delta);
+    },
+    now: () => `now-${token}`,
+    createId: (prefix) => `${prefix}-${token}`,
+  });
+  let repairPrompt = '';
+  const ports = factory.create({
+    prompt: `prompt-${token}`,
+    repairSideEffect: async (_state, prompt) => {
+      repairPrompt = prompt;
+      return { kind: 'diagnostic', proposalId: `proposal-${token}`, runId, sessionId, source: 'llm', payload: {} } as ProposalEnvelope;
+    },
+    tryParseTurnProposal: () => null,
+    repairDuplicate: async () => ({ kind: 'diagnostic', proposalId: `duplicate-${token}`, runId, sessionId, source: 'llm', payload: {} } as ProposalEnvelope),
+    resolveReadToolCall: async () => packet,
+  });
+
+  await ports.appendAssistantProgress(state, `narration-${token}`);
+  await ports.emitCheckpoint(state, 2, 3);
+  await ports.emitToolCallRunning(state, toolCall, 4);
+  await ports.recordResolvedPacket(state, { key: `sig-${token}`, toolName: toolCall.name, path: targetPath }, packet);
+  await ports.emitResourceResolved(state, toolCall, packet, 5);
+  const repaired = await ports.repairSideEffect(state, `ignored-${token}`, toolCall, { content: '', reasoning: '', toolCalls: [] });
+
+  assertEqual((appended[0]?.payload as any).content, `narration-${token}`, 'native tool handler ports factory appends assistant progress content');
+  assertEqual(deltas.map((delta) => delta.stage).join(','), `checkpoint-${token},running-en-US,resolved-${packet.id}`, 'native tool handler ports factory emits checkpoint/running/resolved deltas');
+  assertEqual(appended[1]?.id, `native-resource-context-${token}`, 'native tool handler ports factory records resolved packet event');
+  assertEqual((ports.duplicateToolMessage(toolCall, {
+    signature: { key: `sig-${token}`, toolName: toolCall.name, path: targetPath },
+    packet,
+    contentHash: `hash-${token}`,
+    repeatCount: 1,
+  }) as any).content, `duplicate-${token}`, 'native tool handler ports factory delegates duplicate tool messages');
+  assertEqual((ports.packetToolMessage(toolCall, packet) as any).content, `packet-${token}`, 'native tool handler ports factory delegates packet tool messages');
+  assertEqual(repaired.kind, 'diagnostic', 'native tool handler ports factory delegates side-effect repair');
+  assertEqual(repairPrompt, `prompt-${token}`, 'native tool handler ports factory uses bound prompt for repair callbacks');
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
