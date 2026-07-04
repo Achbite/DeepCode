@@ -39,12 +39,13 @@ import {
   type ProposalEnvelope,
   type ResourceManifest,
   type ResourcePacket,
+  type ResourceRequestDraft,
   type TranscriptEntry,
 } from '../index.js';
 import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { AcceptedPlanResourceResumeCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator } from '../driver/context/index.js';
+import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator } from '../driver/context/index.js';
 import {
   AcceptedImplementationPlanContextBuilder,
   AcceptedPlanBatchPreflight,
@@ -107,6 +108,7 @@ async function main(): Promise<void> {
   await assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn();
   await assertResourceRequestRepairCoordinatorRepairsProposal();
   await assertActionBundleAdmissionRepairCoordinatorRepairsProposal();
+  await assertActionBundleAdmissionResourceFollowupCoordinatorHandlesResourceRequests();
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
@@ -2678,6 +2680,164 @@ async function assertActionBundleAdmissionRepairCoordinatorRepairsProposal(): Pr
   assertEqual(observedStage, 'action_bundle_admission_repair', 'action bundle admission repair coordinator uses stable repair stage');
   assertEqual(observedMessages[0]?.role, 'system', 'action bundle admission repair coordinator sends system repair contract');
   assertEqual(proposal.kind, 'diagnostic', 'action bundle admission repair coordinator parses repaired proposal');
+}
+
+async function assertActionBundleAdmissionResourceFollowupCoordinatorHandlesResourceRequests(): Promise<void> {
+  const token = randomSmokeToken('admission-followup');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const manifest: ResourceManifest = {
+    id: `manifest-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    entries: [],
+    budget: { maxEntries: 16, maxBytes: 4096 },
+    defaultDenyPatterns: [],
+  };
+  const request: ResourceRequestDraft = {
+    version: '1',
+    id: `request-${token}`,
+    reason: `reason-${token}`,
+    items: [{ id: `item-${token}`, path: `generated-${token}.txt`, reason: `item-reason-${token}` }],
+  };
+  const packet = {
+    id: `packet-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    requestId: `request-${token}`,
+    items: [],
+  } as ResourcePacket;
+  const initialResult = { events: [{ id: `initial-${token}` }] } as AgentSessionResult;
+  const appendedResult = { events: [{ id: `appended-${token}` }] } as AgentSessionResult;
+  const state = {
+    sessionId,
+    runId,
+    workspaceScopeKey: `workspace-${token}`,
+    manifest,
+    conversationRoots: [],
+    resourcePackets: [],
+    generatedArtifactEvidence: new Map(),
+  };
+  let recordedPacketId = '';
+  const coordinator = new ActionBundleAdmissionResourceFollowupCoordinator({
+    generatedEvidence: {
+      packetForRequest: (_state, _request, packetId) => {
+        recordedPacketId = packetId;
+        return { packet, remaining: { version: '1', id: `remaining-${token}`, reason: `remaining-${token}`, items: [] } };
+      },
+    },
+    resolver: {
+      resolve: (currentManifest, remaining) => {
+        assertEqual(currentManifest.id, manifest.id, 'admission follow-up resolves against current manifest');
+        assertEqual(remaining.id, `remaining-${token}`, 'admission follow-up resolves remaining request only');
+        return {
+          manifest: {
+            id: `subset-${token}`,
+            workspaceScopeKey: `workspace-${token}`,
+            entries: [],
+            budget: { maxEntries: 16, maxBytes: 4096 },
+            defaultDenyPatterns: [],
+          },
+          unresolved: [],
+          ambiguous: [],
+          availableRoots: [],
+        };
+      },
+    },
+    resourceLoop: {
+      resolutionDiagnostic: () => ({ fallback: `diagnostic-${token}` }),
+    },
+    orchestrator: {
+      recordAndAppend: async (_state, nextPacket, eventIdPrefix) => {
+        assertEqual(nextPacket.id, packet.id, 'admission follow-up records generated packet');
+        assertEqual(eventIdPrefix, 'action-bundle-admission-generated-resource-context', 'admission follow-up uses stable generated resource event prefix');
+        return { result: appendedResult };
+      },
+      resolveRecordAndAppend: async () => {
+        throw new Error('generated admission follow-up should not resolve an empty remaining manifest');
+      },
+    },
+    createId: (prefix) => `${prefix}-${token}`,
+    appendFailure: async () => {
+      throw new Error('generated admission follow-up should not append a failure');
+    },
+    followupRequest: ({ runId: nextRunId, reasons }) => `followup-${nextRunId}-${reasons[0]}`,
+  });
+  const resume = await coordinator.handle({
+    state,
+    proposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-${token}`,
+      runId,
+      sessionId,
+      source: 'llm',
+      kind: 'actionBundle',
+      payload: {},
+    } as ProposalEnvelope,
+    request,
+    reasons: [`reason-${token}`],
+    result: initialResult,
+  });
+  assertEqual(recordedPacketId, `action-bundle-admission-generated-resource-${token}`, 'admission follow-up creates generated packet id');
+  assertEqual(resume.kind, 'resume', 'admission follow-up resumes after generated evidence');
+  if (resume.kind === 'resume') {
+    assertEqual(resume.result, appendedResult, 'admission follow-up returns latest appended result');
+    assertEqual(resume.content, `followup-${runId}-reason-${token}`, 'admission follow-up builds resume content');
+  }
+
+  let failureReason = '';
+  const failureResult = { events: [{ id: `failure-${token}` }] } as AgentSessionResult;
+  const failureCoordinator = new ActionBundleAdmissionResourceFollowupCoordinator({
+    generatedEvidence: {
+      packetForRequest: () => ({ remaining: request }),
+    },
+    resolver: {
+      resolve: () => ({
+        manifest: {
+          id: `empty-${token}`,
+          workspaceScopeKey: `workspace-${token}`,
+          entries: [],
+          budget: { maxEntries: 16, maxBytes: 4096 },
+          defaultDenyPatterns: [],
+        },
+        unresolved: [`missing-${token}`],
+        ambiguous: [],
+        availableRoots: [],
+      }),
+    },
+    resourceLoop: {
+      resolutionDiagnostic: () => ({ fallback: `missing-${token}` }),
+    },
+    orchestrator: {
+      recordAndAppend: async () => {
+        throw new Error('unresolved admission follow-up should not record packets');
+      },
+      resolveRecordAndAppend: async () => {
+        throw new Error('unresolved admission follow-up should not resolve packets');
+      },
+    },
+    createId: (prefix) => `${prefix}-${token}`,
+    appendFailure: async ({ reasons }) => {
+      failureReason = reasons[0] ?? '';
+      return failureResult;
+    },
+    followupRequest: () => `unused-${token}`,
+  });
+  const failed = await failureCoordinator.handle({
+    state,
+    proposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `failed-${token}`,
+      runId,
+      sessionId,
+      source: 'llm',
+      kind: 'actionBundle',
+      payload: {},
+    } as ProposalEnvelope,
+    request,
+    reasons: [`reason-${token}`],
+    result: initialResult,
+  });
+  assertEqual(failed.kind, 'failed', 'admission follow-up fails when resource request remains unresolved');
+  assert(failureReason.includes(`missing-${token}`), 'admission follow-up failure includes resource diagnostic');
 }
 
 function assertResourceEvidenceIndexQueriesPackets(): void {

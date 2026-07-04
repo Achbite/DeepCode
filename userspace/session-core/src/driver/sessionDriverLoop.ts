@@ -101,6 +101,7 @@ import { UserGuidanceQueue } from './pipelines/userGuidanceQueue.js';
 import { UserInputPipeline, type RequirementOptionEffect } from './pipelines/userInputPipeline.js';
 import {
   AcceptedPlanResourceResumeCoordinator,
+  ActionBundleAdmissionResourceFollowupCoordinator,
   ContextFrameBuilder,
   GeneratedArtifactEvidenceIndex,
   PathIdentity,
@@ -479,6 +480,7 @@ export class SessionDriverLoop {
   private readonly acceptedPlanResourceResumeCoordinator: AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeRepairCoordinator: AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
+  private readonly actionBundleAdmissionResourceFollowupCoordinator: ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
@@ -551,6 +553,25 @@ export class SessionDriverLoop {
       resourceRequestLoop,
       runtime: this.agentRunReactor,
       createError: (code, message) => new SessionDriverLoopError(code, message),
+    });
+    this.actionBundleAdmissionResourceFollowupCoordinator = new ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>({
+      generatedEvidence: generatedArtifactEvidenceIndex(),
+      resolver: resourceRequestResolver(),
+      resourceLoop: resourceRequestLoop,
+      orchestrator: this.resourceOrchestrator,
+      createId: (prefix) => this.id(prefix),
+      appendFailure: ({ state, proposal, reasons, eventId }) => this.append(
+        state.sessionId,
+        sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
+          state.sessionId,
+          state.runId,
+          proposal,
+          reasons,
+          this.ts(),
+          eventId
+        )
+      ),
+      followupRequest: (request) => repairLoop.actionBundleAdmissionResourceFollowupRequest(request),
     });
     this.resourceRequestRepairCoordinator = new ResourceRequestRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
@@ -3046,43 +3067,19 @@ export class SessionDriverLoop {
       return this.submitActionProposal(input, state, prompt, repaired, result);
     }
     if (repaired.kind === 'resourceRequest') {
-      const generated = generatedArtifactEvidenceIndex().packetForRequest(
+      const followup = await this.actionBundleAdmissionResourceFollowupCoordinator.handle({
         state,
-        repaired.payload as ResourceRequestDraft,
-        this.id('action-bundle-admission-generated-resource')
-      );
-      if (generated.packet) {
-        result = (await this.resourceOrchestrator.recordAndAppend(
-          state,
-          generated.packet,
-          'action-bundle-admission-generated-resource-context'
-        )).result ?? result;
-      }
-      const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
-      if (!subset.manifest.entries.length) {
-        if (!generated.packet) {
-          const diagnostic = resourceRequestLoop.resolutionDiagnostic(subset);
-          return this.append(state.sessionId, sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
-            state.sessionId,
-            state.runId,
-            proposal,
-            [`actionBundle admission repair returned resourceRequest that cannot be resolved: ${diagnostic.fallback}`],
-            this.ts(),
-            this.id('action-bundle-admission-resource-invalid')
-          )) ?? result;
-        }
-      } else {
-        result = (await this.resourceOrchestrator.resolveRecordAndAppend(
-          state,
-          subset.manifest,
-          'action-bundle-admission-resource-context'
-        )).result ?? result;
-      }
+        proposal,
+        request: repaired.payload as ResourceRequestDraft,
+        reasons,
+        result,
+      });
+      if (followup.kind === 'failed') return followup.result;
       return this.runUserTurn({
         sessionId: input.sessionId,
-        content: repairLoop.actionBundleAdmissionResourceFollowupRequest({ runId: state.runId, reasons }),
+        content: followup.content,
         attachments: input.attachments ?? [],
-        existingEvents: result.events,
+        existingEvents: followup.result.events,
         workspaceBinding: input.workspaceBinding,
         projectWorkingDirectory: input.projectWorkingDirectory,
         profileId: input.profileId,

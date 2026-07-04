@@ -1,4 +1,5 @@
 export * from '../../resources/index.js';
+export * from './actionBundleAdmissionResourceFollowupCoordinator.js';
 export * from './acceptedPlanResourceResumeCoordinator.js';
 export * from './contextAuthority.js';
 export * from './contextFrameBuilder.js';
