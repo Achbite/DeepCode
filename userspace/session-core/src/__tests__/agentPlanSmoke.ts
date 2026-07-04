@@ -42,6 +42,7 @@ import {
   type TranscriptEntry,
 } from '../index.js';
 import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
+import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import {
@@ -113,6 +114,7 @@ async function main(): Promise<void> {
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
+  await assertAgentRunReactorCoordinatesPorts();
   assertDriverActivityBuilderCreatesReadModels();
   assertAssistantProjectionBuilderCreatesConversationEvents();
   assertSessionProgressProjectionBuilderCreatesRunAndCheckpointEvents();
@@ -3594,6 +3596,125 @@ function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
   assertEqual(decisionPayload.messageKey, 'session.driver.planReviewAccepted', 'plan projection marks accepted plan review with i18n key');
   assertEqual(decisionPayload.facts[0], `fact-${token}`, 'plan projection preserves plan review facts');
   assertEqual(decisionPayload.overlayId, `overlay-${token}`, 'plan projection preserves interaction overlay payload');
+}
+
+async function assertAgentRunReactorCoordinatesPorts(): Promise<void> {
+  const token = randomSmokeToken('run-reactor');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const targetPath = `dir-${token}/file-${randomSmokeToken('file')}.txt`;
+  const workUnitId = `work-unit-${token}`;
+  const actionId = `action-${token}`;
+  const appended: AgentEvent[][] = [];
+  const deltas: ProjectionDelta[] = [];
+  const kernelProjection = new KernelEventProjectionBuilder({
+    requiredFileOperationsFromReport: () => [],
+    requiredAccessScopesFromReport: () => [],
+    permissionBundlesFromReport: () => [],
+    gateInterventionsFromReport: () => [],
+    planReviewFacts: () => [],
+  });
+  const progressProjection = new SessionProgressProjectionBuilder({
+    interactionOverlayPayload: () => ({}),
+    hasFailureOrBlocker: () => false,
+    auditAcceptedPlanBatch: () => ({}),
+    actionBundleAdmissionBatch: () => ({}),
+    acceptedPlanTaskLedger: () => undefined,
+    acceptedPlanPromptFrame: () => undefined,
+  });
+  let kernelReply: KernelReply = {
+    ok: true,
+    events: [{
+      kind: 'work_unit.queued',
+      runId,
+      actionId,
+      workUnit: {
+        id: workUnitId,
+        actionId,
+        writeSet: [targetPath],
+      },
+    }, {
+      kind: 'work_unit.completed',
+      runId,
+      workUnitId,
+    }],
+  };
+  const reactor = new AgentRunReactor({
+    ports: {
+      appendEvents: async (appendSessionId, events) => {
+        appended.push(events);
+        return {
+          session: {
+            id: appendSessionId,
+            mode: 'plan',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          } satisfies AgentSession,
+          events,
+        };
+      },
+      kernelCommand: async () => kernelReply,
+      onProjectionDelta: async (delta) => {
+        deltas.push(delta);
+      },
+      now: () => '2026-01-01T00:00:00.000Z',
+      createId: (prefix) => `${prefix}-${token}`,
+    },
+    kernelProjection,
+    progressProjection,
+    createError: (code, message) => Object.assign(new Error(message), { code }),
+    errorCode: (error, fallback) => typeof (error as { code?: unknown })?.code === 'string'
+      ? (error as { code: string }).code
+      : fallback,
+    errorMessage: (error) => error instanceof Error ? error.message : String(error),
+  });
+  const state = { sessionId, runId };
+  await reactor.emitProjectionDelta(state, {
+    type: 'stage_delta',
+    stage: 'provider_call',
+    status: 'running',
+    channel: 'progress',
+    source: 'provider',
+    summary: `stage-${token}`,
+  });
+  assertEqual(deltas.length, 1, 'agent run reactor emits projection deltas through ports');
+  assertEqual(deltas[0]?.sessionId, sessionId, 'agent run reactor attaches session id');
+  assertEqual(deltas[0]?.runId, runId, 'agent run reactor attaches run id');
+  assertEqual(deltas[0]?.seq, 1, 'agent run reactor advances active turn sequence');
+
+  const projected = await reactor.appendProjectedKernelEvents(sessionId, kernelReply);
+  assertEqual(projected.events.length, 2, 'agent run reactor projects kernel events');
+  assertEqual(appended.at(-1)?.length, 2, 'agent run reactor appends projected kernel events');
+
+  await reactor.emitKernelActivityDeltas(state, kernelReply.events ?? [], 'kernel_activity');
+  assert(
+    deltas.some((delta) => delta.type === 'workunit_delta' && delta.targetPath === targetPath),
+    'agent run reactor emits enriched kernel activity deltas'
+  );
+
+  kernelReply = {
+    ok: false,
+    error: {
+      code: `kernel-${token}`,
+      message: `kernel message ${token}`,
+    },
+    events: [],
+  };
+  const audit = await reactor.tryKernelAudit(
+    sessionId,
+    { command: { kind: 'runCreate', requestId: `request-${token}`, sessionId, input: {} } } as KernelCommandEnvelope,
+    'session_run_state',
+    `audit-${token}`
+  );
+  assertEqual(audit.events[0]?.kind, 'session_run_state', 'agent run reactor records audit failures as trace events');
+  assertEqual((audit.events[0]?.payload as any)?.errorCode, `kernel-${token}`, 'agent run reactor preserves audit error code');
+  try {
+    await reactor.kernel({ command: { kind: 'runCreate', requestId: `request-${token}`, sessionId, input: {} } } as KernelCommandEnvelope);
+  } catch (error) {
+    assertEqual((error as any).code, `kernel-${token}`, 'agent run reactor wraps kernel failures with loop error code');
+    return;
+  }
+  throw new Error('expected agent run reactor kernel failure');
 }
 
 function assertDriverActivityBuilderCreatesReadModels(): void {

@@ -146,6 +146,7 @@ import {
   type SessionRunStateStatus,
 } from './projection/index.js';
 import type { ProviderTurnContract } from './runFrame.js';
+import { AgentRunReactor } from './agentRunReactor.js';
 
 export interface SessionDriverLoopPorts {
   appendEvents(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult>;
@@ -469,11 +470,20 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
 ]);
 
 export class SessionDriverLoop {
+  private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
 
   constructor(private readonly ports: SessionDriverLoopPorts) {
+    this.agentRunReactor = new AgentRunReactor<SessionDriverLoopRunState>({
+      ports: this.ports,
+      kernelProjection: kernelEventProjectionBuilder,
+      progressProjection: sessionProgressProjectionBuilder,
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+      errorCode: (error, fallback) => error instanceof SessionDriverLoopError ? error.code : fallback,
+      errorMessage: (error) => error instanceof Error ? error.message : String(error),
+    });
     this.nativeToolHandlerPortsFactory = new NativeToolHandlerPortsFactory({
       progressEventBuilder: nativeToolProgressEventBuilder,
       projectionBuilder: nativeToolProjectionBuilder,
@@ -4028,27 +4038,7 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     delta: Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>
   ): Promise<void> {
-    if (!this.ports.onProjectionDelta) return;
-    const activeTurn = state.activeTurn ?? {
-      turnId: this.id('active-turn'),
-      seq: 0,
-      stage: delta.stage ?? 'provider_call',
-    };
-    activeTurn.seq += 1;
-    activeTurn.stage = delta.stage ?? activeTurn.stage;
-    state.activeTurn = activeTurn;
-    const activity = delta.activity ?? kernelEventProjectionBuilder.projectionDeltaActivity({
-      runId: state.runId,
-      delta,
-    });
-    await this.ports.onProjectionDelta({
-      ...delta,
-      activity,
-      sessionId: state.sessionId,
-      runId: state.runId,
-      turnId: activeTurn.turnId,
-      seq: activeTurn.seq,
-    });
+    return this.agentRunReactor.emitProjectionDelta(state, delta);
   }
 
   private async emitKernelActivityDeltas(
@@ -4056,40 +4046,11 @@ export class SessionDriverLoop {
     kernelEvents: unknown[],
     stage: string
   ): Promise<void> {
-    const workUnitFacts = kernelEventProjectionBuilder.indexKernelWorkUnitFacts(kernelEvents);
-    for (let index = 0; index < kernelEvents.length; index += 1) {
-      const record = objectRecord(kernelEvents[index]);
-      if (!record) continue;
-      const enriched = kernelEventProjectionBuilder.enrichKernelWorkUnitRecord(record, workUnitFacts);
-      const activity = kernelEventProjectionBuilder.kernelEventActivity(enriched, `kernel-activity-${index}`, state.runId);
-      if (!activity) continue;
-      await this.emitProjectionDelta(state, {
-        type: kernelEventProjectionBuilder.kernelActivityDeltaType(enriched),
-        stage,
-        status: kernelEventProjectionBuilder.projectionStatusForActivity(activity),
-        channel: kernelEventProjectionBuilder.kernelActivityChannel(activity),
-        source: 'kernel',
-        itemId: activity.workUnitIds?.[0] ?? activity.actionIds?.[0] ?? activity.toolName ?? activity.activityId,
-        targetPath: activity.targets?.[0],
-        summary: activity.summary,
-        activity,
-        payload: {
-          kernelEvent: enriched,
-          activity,
-        },
-      });
-    }
+    return this.agentRunReactor.emitKernelActivityDeltas(state, kernelEvents, stage);
   }
 
   private async kernel(request: KernelCommandEnvelope): Promise<KernelReply> {
-    const reply = await this.ports.kernelCommand(request);
-    if (!reply.ok) {
-      throw new SessionDriverLoopError(
-        reply.error?.code ?? 'kernel_command_failed',
-        reply.error?.message ?? 'Kernel command failed.'
-      );
-    }
-    return reply;
+    return this.agentRunReactor.kernel(request);
   }
 
   private async tryKernelAudit(
@@ -4098,43 +4059,11 @@ export class SessionDriverLoop {
     traceKind: AgentEvent['kind'],
     summary: string
   ): Promise<AgentSessionResult> {
-    try {
-      const reply = await this.ports.kernelCommand(request);
-      if (reply.ok) {
-        return this.appendProjectedKernelEvents(sessionId, reply);
-      }
-      return this.append(sessionId, [
-        sessionProgressProjectionBuilder.traceEvent({
-          sessionId,
-          kind: traceKind,
-          summary,
-          ts: this.ts(),
-          id: this.id('kernel-audit-noop'),
-          extra: {
-            errorCode: reply.error?.code ?? 'kernel_audit_failed',
-            errorMessage: reply.error?.message ?? 'Kernel audit command failed.',
-          },
-        }),
-      ]);
-    } catch (error) {
-      return this.append(sessionId, [
-        sessionProgressProjectionBuilder.traceEvent({
-          sessionId,
-          kind: traceKind,
-          summary,
-          ts: this.ts(),
-          id: this.id('kernel-audit-noop'),
-          extra: {
-            errorCode: error instanceof SessionDriverLoopError ? error.code : 'kernel_audit_failed',
-            errorMessage: error instanceof Error ? error.message : String(error),
-          },
-        }),
-      ]);
-    }
+    return this.agentRunReactor.tryKernelAudit(sessionId, request, traceKind, summary);
   }
 
   private async append(sessionId: string, events: AgentEvent[]): Promise<AgentSessionResult> {
-    return this.ports.appendEvents(sessionId, events);
+    return this.agentRunReactor.append(sessionId, events);
   }
 
   private async appendConsumedUserGuidanceEvents(
@@ -4161,39 +4090,19 @@ export class SessionDriverLoop {
   }
 
   private async appendProjectedKernelEvents(sessionId: string, reply: KernelReply): Promise<AgentSessionResult> {
-    const workUnitFacts = kernelEventProjectionBuilder.indexKernelWorkUnitFacts(reply.events ?? []);
-    const events = (reply.events ?? []).map((event) => {
-      const record = objectRecord(event);
-      const projected = record ? kernelEventProjectionBuilder.enrichKernelWorkUnitRecord(record, workUnitFacts) : event;
-      return kernelEventProjectionBuilder.projectKernelEvent({
-        sessionId,
-        event: projected,
-        ts: this.ts(),
-        id: this.id('kernel'),
-      });
-    });
-    if (events.length === 0) {
-      return this.ports.appendEvents(sessionId, []);
-    }
-    return this.append(sessionId, events);
+    return this.agentRunReactor.appendProjectedKernelEvents(sessionId, reply);
   }
 
   private event(sessionId: string, kind: AgentEvent['kind'], payload: unknown): AgentEvent {
-    return {
-      id: this.id(kind),
-      sessionId,
-      ts: this.ts(),
-      kind,
-      payload,
-    };
+    return this.agentRunReactor.event(sessionId, kind, payload);
   }
 
   private id(prefix: string): string {
-    return this.ports.createId?.(prefix) ?? `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return this.agentRunReactor.id(prefix);
   }
 
   private ts(): string {
-    return this.ports.now?.() ?? new Date().toISOString();
+    return this.agentRunReactor.ts();
   }
 }
 
