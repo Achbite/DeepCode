@@ -19,6 +19,7 @@ import {
   AcceptedPlanOperationTargetResolver,
   AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionOverlay,
+  AcceptedPlanScopeRepairCoordinator,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
   type AcceptedPlanReadOnlyResourceCompletion,
@@ -475,6 +476,7 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
 export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
   private readonly acceptedPlanResourceResumeCoordinator: AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>;
+  private readonly acceptedPlanScopeRepairCoordinator: AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
@@ -514,6 +516,20 @@ export class SessionDriverLoop {
         allowBriefActionBundleUserPlan: true,
       }),
       parseRepairedProviderProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+        allowedKinds,
+        allowBriefActionBundleUserPlan: true,
+      }),
+    });
+    this.acceptedPlanScopeRepairCoordinator = new AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>({
+      repairMessageBuilder: providerRepairMessageBuilder,
+      repairState: (state) => providerRepairMessageState(state),
+      parseError: (error) => normalizeParseError(error),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+      parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
         sessionId: state.sessionId,
@@ -3308,7 +3324,13 @@ export class SessionDriverLoop {
         ),
       ]);
       try {
-        const repaired = await this.repairAcceptedPlanScope(input, state, prompt, proposal, assessment.validation);
+        const repaired = await this.acceptedPlanScopeRepairCoordinator.repair({
+          state,
+          prompt,
+          proposal,
+          validation: assessment.validation,
+          runRepair: (stage, messages) => this.llm(input.profileId, state, stage, messages),
+        });
         if (repaired.kind === 'actionBundle') {
           return this.submitAcceptedPlanActionProposal(input, state, prompt, repaired, fallback);
         }
@@ -3917,36 +3939,6 @@ export class SessionDriverLoop {
       throw new SessionDriverLoopError(
         'agent_protocol_repair_failed',
         `Model plan output still could not be parsed after repair: ${normalizeParseError(error).message}`
-      );
-    }
-  }
-
-  private async repairAcceptedPlanScope(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    validation: AcceptedPlanBatchValidationResult
-  ): Promise<ProposalEnvelope> {
-    const raw = await this.llm(
-      input.profileId,
-      state,
-      'accepted_plan_scope_repair',
-      providerRepairMessageBuilder.acceptedPlanScopeRepairMessages(prompt, providerRepairMessageState(state), proposal, validation.reasons)
-    );
-    try {
-      return protocolGate().parseAndValidateRepairedProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
-        allowBriefActionBundleUserPlan: true,
-      });
-    } catch (error) {
-      throw new SessionDriverLoopError(
-        'accepted_plan_scope_repair_failed',
-        `Accepted-plan scope repair output still could not be parsed after repair: ${normalizeParseError(error).message}`
       );
     }
   }

@@ -51,6 +51,7 @@ import {
   AcceptedPlanOperationTargetResolver,
   AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionOverlay,
+  AcceptedPlanScopeRepairCoordinator,
   AcceptedPlanExecutor,
   AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
@@ -113,6 +114,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanBatchPreflightAuditsDeleteActions();
   assertAcceptedPlanScopeCoverageMatchesStructuredScopes();
   assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask();
+  await assertAcceptedPlanScopeRepairCoordinatorRepairsProposal();
   assertAcceptedPlanOperationTargetResolverFindsExactGrant();
   assertAcceptedPlanExecutorBuildsExecutionBatch();
   assertKernelEventStatusIndexReadsStructuredEvents();
@@ -3101,6 +3103,98 @@ function assertAcceptedPlanScopeDecisionOverlayExpandsCurrentTask(): void {
     overlay.resumeGuidance({ kind: 'continueCurrentTask', taskId }).includes('current accepted task'),
     'scope decision overlay resume guidance stays on current task'
   );
+}
+
+async function assertAcceptedPlanScopeRepairCoordinatorRepairsProposal(): Promise<void> {
+  const token = randomSmokeToken('scope-repair');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const repairBuilder = new ProviderRepairMessageBuilder();
+  const coordinator = new AcceptedPlanScopeRepairCoordinator({
+    repairMessageBuilder: repairBuilder,
+    repairState: (state) => ({
+      runId: state.runId,
+      userRequest: state.userRequest,
+      conversationRoots: [],
+      resourcePackets: [],
+      implementationBatch: {},
+      acceptedContext: {
+        planId: `plan-${token}`,
+        currentTask: `task-${token}`,
+      },
+    }),
+    parseError: (error) => error instanceof Error
+      ? { code: 'error', message: error.message }
+      : { code: 'error', message: String(error) },
+    createError: (code, message) => Object.assign(new Error(message), { code }),
+    parseRepairedProposal: ({ raw, state, allowedKinds }) => {
+      assert(
+        allowedKinds.includes('actionBundle') && allowedKinds.includes('resourceRequest') && allowedKinds.includes('decisionRequest'),
+        'accepted plan scope repair coordinator preserves scope repair allowed kinds'
+      );
+      return parseProposalEnvelope({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+      });
+    },
+  });
+  const prompt: PromptEnvelope = {
+    stablePrefix: `stable-${token}`,
+    dynamicSuffix: '',
+    auditOnlyContext: '',
+    layers: [],
+    segments: [],
+    stableLayerNames: [],
+    dynamicLayerNames: [],
+    auditOnlyLayerNames: [],
+  };
+  const state = {
+    sessionId,
+    runId,
+    userRequest: `request-${token}`,
+  };
+  let observedStage = '';
+  let observedMessages: LlmChatRequest['messages'] = [];
+  const proposal = await coordinator.repair({
+    state,
+    prompt,
+    proposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-${token}`,
+      runId,
+      sessionId,
+      source: 'llm',
+      kind: 'actionBundle',
+      payload: {
+        actionBundle: {
+          version: '1',
+          id: `bundle-${token}`,
+          actions: [],
+        },
+      },
+    } as ProposalEnvelope,
+    validation: {
+      ok: false,
+      reasons: [`scope-${token}`],
+    },
+    runRepair: async (stage, messages) => {
+      observedStage = stage;
+      observedMessages = messages;
+      return JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'diagnostic',
+        proposalId: `diagnostic-${token}`,
+        diagnostic: {
+          summary: `summary-${token}`,
+        },
+      });
+    },
+  });
+  assertEqual(observedStage, 'accepted_plan_scope_repair', 'accepted plan scope repair coordinator uses stable repair stage');
+  assertEqual(observedMessages[0]?.role, 'system', 'accepted plan scope repair coordinator sends system repair contract');
+  assertEqual(proposal.kind, 'diagnostic', 'accepted plan scope repair coordinator parses repaired proposal');
 }
 
 function assertAcceptedPlanOperationTargetResolverFindsExactGrant(): void {
