@@ -135,7 +135,7 @@ import {
   ReviewDecisionProjectionBuilder,
   type SessionReviewContext,
 } from './review/index.js';
-import { PermissionDecisionHandler } from './interactions/index.js';
+import { PermissionDecisionHandler, ReviewDecisionHandler } from './interactions/index.js';
 import {
   ActionBundleActionInspector,
   PlanContextIndex,
@@ -493,6 +493,7 @@ export class SessionDriverLoop {
   private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionResourceFollowupCoordinator: ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>;
   private readonly permissionDecisionHandler: PermissionDecisionHandler<SessionPlanContext>;
+  private readonly reviewDecisionHandler: ReviewDecisionHandler;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
@@ -584,6 +585,19 @@ export class SessionDriverLoop {
       kernelStatus: kernelEventStatusIndex,
       planIndex: planContextIndex,
       reviewProjection: reviewProjectionBuilder,
+      progressProjection: sessionProgressProjectionBuilder,
+    });
+    this.reviewDecisionHandler = new ReviewDecisionHandler({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      kernel: (request) => this.kernel(request),
+      kernelAudit: (request) => this.ports.kernelCommand(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
+      append: (sessionId, events) => this.append(sessionId, events),
+      resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
+      reviewAssembler: reviewAssembler(),
+      reviewDecisionProjection: reviewDecisionProjection(),
+      kernelStatus: kernelEventStatusIndex,
       progressProjection: sessionProgressProjectionBuilder,
     });
     this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
@@ -1940,221 +1954,17 @@ export class SessionDriverLoop {
   }
 
   private async resolveReviewDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
-    const events = input.existingEvents ?? [];
-    const review = reviewAssembler().findWaitingReview(events, input.runId, findActiveDriverInteraction(events));
-    if (!review || reviewAssembler().reviewAlreadyResolved(events, review)) {
-      return this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.traceEvent({
-          sessionId: input.sessionId,
-          kind: 'trace/review_accept_noop',
-          summary: '该 Review 已处理或已过期，没有重复推进任务。',
-          ts: this.ts(),
-          id: this.id('review-noop'),
-          extra: {
-            runId: input.runId,
-            decision: input.decision,
-          },
-        }),
-      ]);
-    }
-
-    if (input.decision === 'reject') {
-      let result = await this.append(input.sessionId, [
-        reviewDecisionProjection().event({
-          sessionId: input.sessionId,
-          review,
-          status: 'rejected',
-          content: input.guidance,
-          continuationRequested: false,
-          ts: this.ts(),
-          id: this.id('review-rejected'),
-        }),
-      ]);
-      const decisionReply = await this.kernel({
-        command: {
-          kind: 'userDecisionSubmit',
-          requestId: this.id('user-decision-review'),
-          runId: review.runId,
-          sessionId: input.sessionId,
-          decision: {
-            decisionId: this.id('decision-review'),
-            decisionKind: 'review',
-            targetId: review.reviewId,
-            payload: {
-              decision: input.decision,
-              guidance: input.guidance,
-              continuationRequested: false,
-              revisionRequested: false,
-              ignored: true,
-            },
-          },
-        },
-      });
-      result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
-      return this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.sessionRunStateEvent({
-          sessionId: input.sessionId,
-          runId: review.runId,
-          phase: 'cancelled',
-          status: 'cancelled',
-          reason: 'review',
-          decisionOwner: {
-            kind: 'review',
-            runId: review.runId,
-            targetId: review.reviewId,
-            reviewId: review.reviewId,
-            planId: review.sourcePlanId,
-          },
-          ts: this.ts(),
-          id: this.id('session-run-cancelled-review'),
-        }),
-      ]) ?? result;
-    }
-
-    if (input.decision !== 'accept') {
-      let result = await this.append(input.sessionId, [
-        reviewDecisionProjection().event({
-          sessionId: input.sessionId,
-          review,
-          status: 'needsRevision',
-          content: input.guidance,
-          continuationRequested: false,
-          ts: this.ts(),
-          id: this.id('review-revise'),
-        }),
-      ]);
-      result = await this.tryKernelAudit(
-        input.sessionId,
-        {
-          command: {
-            kind: 'userDecisionSubmit',
-            requestId: this.id('user-decision-review'),
-            runId: review.runId,
-            sessionId: input.sessionId,
-            decision: {
-              decisionId: this.id('decision-review'),
-              decisionKind: 'review',
-              targetId: review.reviewId,
-              payload: {
-                decision: input.decision,
-                guidance: input.guidance,
-                continuationRequested: true,
-                revisionRequested: true,
-              },
-            },
-          },
-        },
-        'trace/review_accept_noop',
-        'Kernel 未接受 Review 修订决策审计；Session 将继续按用户补充信息发起修订流程。'
-      ) ?? result;
-      return this.runUserTurn({
-        sessionId: input.sessionId,
-        content: reviewAssembler().revisionRequest(review, input.guidance),
-        attachments: [],
-        existingEvents: result.events,
-        workspaceBinding: input.workspaceBinding,
-        projectWorkingDirectory: input.projectWorkingDirectory,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        appendUserMessage: false,
-        requirementConfirmationMode: 'off',
-        interventionLevel: input.interventionLevel,
-        projectMemoryMode: input.projectMemoryMode,
-      });
-    }
-
-    const terminalAcceptedPlan = reviewAssembler().isTerminalAcceptedPlan(events, review);
-    const accepted = reviewDecisionProjection().event({
+    return this.reviewDecisionHandler.resolve({
       sessionId: input.sessionId,
-      review,
-      status: 'accepted',
-      continuationRequested: false,
-      terminalAcceptedPlan,
-      ts: this.ts(),
-      id: this.id('review-accepted'),
-    });
-    let result = await this.append(input.sessionId, [accepted]);
-    const decisionReply = await this.kernel({
-      command: {
-        kind: 'userDecisionSubmit',
-        requestId: this.id('user-decision-review'),
-        runId: review.runId,
-        sessionId: input.sessionId,
-        decision: {
-          decisionId: this.id('decision-review'),
-          decisionKind: 'review',
-          targetId: review.reviewId,
-          payload: {
-            decision: input.decision,
-            guidance: input.guidance,
-            continuationRequested: false,
-            continuationRecorded: review.continuations.length > 0,
-          },
-        },
-      },
-    });
-    result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply);
-    const gateReply = await this.kernel({
-      command: {
-        kind: 'reviewGateEvaluate',
-        requestId: this.id('review-gate-evaluate'),
-        runId: review.runId,
-        sessionId: input.sessionId,
-        decision: {
-          decision: input.decision,
-          guidance: input.guidance,
-        },
-      },
-    });
-    result = await this.appendProjectedKernelEvents(input.sessionId, gateReply) ?? result;
-
-    const continuationMode = input.reviewContinuationMode ?? 'auto';
-    if (terminalAcceptedPlan || !review.continuations.length || continuationMode === 'off') {
-      if (kernelEventStatusIndex.reviewGateStatus(gateReply.events) === 'accepted') {
-        result = await this.append(input.sessionId, [
-          sessionProgressProjectionBuilder.sessionRunStateEvent({
-            sessionId: input.sessionId,
-            runId: review.runId,
-            phase: 'completed',
-            status: 'completed',
-            reason: 'review',
-            decisionOwner: {
-              kind: 'review',
-              runId: review.runId,
-              targetId: review.reviewId,
-              reviewId: review.reviewId,
-              planId: review.sourcePlanId,
-            },
-            ts: this.ts(),
-            id: this.id('session-run-completed-review'),
-          }),
-        ]) ?? result;
-      }
-      return result;
-    }
-    if (continuationMode === 'ask') {
-      return this.append(input.sessionId, [
-        reviewDecisionProjection().continuationPromptEvent({
-          sessionId: input.sessionId,
-          review,
-          continuations: reviewAssembler().continuationSummaries(review),
-          ts: this.ts(),
-          id: this.id('review-continuation-choice'),
-        }),
-      ]) ?? result;
-    }
-    return this.runUserTurn({
-      sessionId: input.sessionId,
-      content: reviewAssembler().continuationRequest(review),
-      attachments: [],
-      existingEvents: result.events,
+      decision: input.decision,
+      guidance: input.guidance,
+      runId: input.runId,
+      existingEvents: input.existingEvents,
       workspaceBinding: input.workspaceBinding,
       projectWorkingDirectory: input.projectWorkingDirectory,
       profileId: input.profileId,
       workflow: input.workflow,
-      appendUserMessage: false,
-      requirementConfirmationMode: 'off',
-      reviewContinuationMode: continuationMode,
+      reviewContinuationMode: input.reviewContinuationMode,
       interventionLevel: input.interventionLevel,
       projectMemoryMode: input.projectMemoryMode,
     });

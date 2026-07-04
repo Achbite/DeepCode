@@ -70,7 +70,7 @@ import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgr
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { AcceptedPlanReviewHandoffCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
-import { PermissionDecisionHandler } from '../driver/interactions/index.js';
+import { PermissionDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import type { PromptEnvelope } from '../prompt/types.js';
@@ -132,6 +132,7 @@ async function main(): Promise<void> {
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
+  await assertReviewDecisionHandlerAcceptsTerminalReview();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   await assertAgentRunReactorCoordinatesPorts();
   assertDriverActivityBuilderCreatesReadModels();
@@ -4573,6 +4574,131 @@ function assertReviewDecisionProjectionUsesI18nKeys(): void {
   assertEqual(continuationPayload.messageKey, 'review.continuationDecision.summary', 'review decision projection emits continuation message key');
   assertEqual((continuationPayload.messageArgs as Record<string, unknown>).continuationCount, '1', 'review decision projection emits continuation count');
   assertEqual(Array.isArray(continuationPayload.continuations), true, 'review decision projection preserves continuation summaries');
+}
+
+async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void> {
+  const token = randomSmokeToken('review-handler');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const reviewId = `review-${token}`;
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: `created-${token}`,
+    updatedAt: `updated-${token}`,
+  };
+  const store: AgentEvent[] = [{
+    id: `waiting-review-${token}`,
+    sessionId,
+    ts: `ts-${token}`,
+    kind: 'review_summary',
+    payload: {
+      status: 'waitingUserReview',
+      runId,
+      reviewId,
+      sourcePlanId: `plan-${token}`,
+      content: `Review content ${token}`,
+      userPlan: `Plan intent ${token}`,
+      facts: [`- work unit ${token} completed`],
+      continuations: [],
+      confirmable: true,
+    },
+  }];
+  const kernelCommands: string[] = [];
+  let resumeCalls = 0;
+  const handler = new ReviewDecisionHandler({
+    now: () => `ts-${token}`,
+    createId: (prefix) => `${prefix}-${kernelCommands.length}-${store.length}-${token}`,
+    kernel: async (request): Promise<KernelReply> => {
+      const command = request.command as Record<string, unknown>;
+      kernelCommands.push(String(command.kind));
+      if (command.kind === 'userDecisionSubmit') {
+        return {
+          ok: true,
+          events: [{ kind: 'review.decision_recorded', runId, reviewId }],
+        };
+      }
+      if (command.kind === 'reviewGateEvaluate') {
+        return {
+          ok: true,
+          events: [{
+            kind: 'review_gate.evaluated',
+            runId,
+            reviewId,
+            result: { status: 'accepted' },
+          }],
+        };
+      }
+      throw new Error(`unexpected review handler kernel command ${String(command.kind)}`);
+    },
+    kernelAudit: async () => {
+      throw new Error('terminal review accept must not use revision audit');
+    },
+    appendProjectedKernelEvents: async (nextSessionId, reply) => {
+      assertEqual(nextSessionId, sessionId, 'review handler projects kernel events to current session');
+      store.push(...(reply.events ?? []).map((kernelEvent, index) => ({
+        id: `kernel-${kernelCommands.length}-${index}-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind: 'kernel_event',
+        payload: { kernelEvent },
+      } as unknown as AgentEvent)));
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    append: async (nextSessionId, events) => {
+      assertEqual(nextSessionId, sessionId, 'review handler appends to current session');
+      store.push(...events);
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    resumeUserTurn: async () => {
+      resumeCalls += 1;
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    reviewAssembler: new ReviewAssembler({
+      completedWorkUnitFacts: () => ({ actionIds: new Set(), targets: new Set() }),
+      batchActionRecords: () => [],
+      actionEffectiveCapability: () => '',
+      actionFileTargetPath: () => undefined,
+      normalizeAcceptedPlanTargetScope: (target) => target,
+      comparablePath: (value) => value,
+      resourceTextForTarget: () => undefined,
+    }),
+    reviewDecisionProjection: new ReviewDecisionProjectionBuilder(),
+    kernelStatus: new KernelEventStatusIndex(),
+    progressProjection: {
+      traceEvent: ({ kind, summary, extra }) => ({
+        id: `trace-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind,
+        payload: { summary, ...extra },
+      }),
+      sessionRunStateEvent: ({ phase, status, reason, decisionOwner }) => ({
+        id: `run-state-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind: 'session_run_state',
+        payload: { phase, status, reason, decisionOwner },
+      }),
+    },
+  });
+
+  const result = await handler.resolve({
+    sessionId,
+    decision: 'accept',
+    runId,
+    existingEvents: [...store],
+  });
+
+  assertEqual(kernelCommands.join(','), 'userDecisionSubmit,reviewGateEvaluate', 'review handler submits user decision then evaluates ReviewGate');
+  assertEqual(resumeCalls, 0, 'terminal review accept does not resume provider loop');
+  assertEqual(result.events.some((event) => event.kind === 'review_summary' && (event.payload as any)?.status === 'accepted'), true, 'review handler records accepted review');
+  const completed = result.events.find((event) => event.kind === 'session_run_state' && (event.payload as any)?.status === 'completed');
+  assert(Boolean(completed), 'review handler appends completed run state');
+  const completedPayload = completed?.payload as Record<string, unknown> | undefined;
+  assertEqual(completedPayload?.phase, 'completed', 'review handler completed state uses completed phase');
+  const owner = completedPayload?.decisionOwner as Record<string, unknown> | undefined;
+  assertEqual(owner?.reviewId, reviewId, 'review handler completed state keeps review owner');
 }
 
 function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
