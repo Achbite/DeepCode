@@ -15,6 +15,7 @@ export {
   type NativeToolRepairDuplicate,
   type NativeToolTurnProposalLike,
 } from './nativeToolRepairCoordinator.js';
+export { NativeToolProjectionBuilder } from './nativeToolProjectionBuilder.js';
 export { ProviderStreamCoordinator } from './providerStreamCoordinator.js';
 export { ProviderTraceRecorder } from './providerTraceRecorder.js';
 

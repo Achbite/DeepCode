@@ -70,6 +70,7 @@ import { ProviderRepairMessageBuilder, type ProviderRepairMessageState } from '.
 import {
   NativeToolCoordinator,
   NativeToolCoordinatorError,
+  NativeToolProjectionBuilder,
   NativeToolRepairCoordinator,
   NativeToolTurnHandler,
   ProviderJsonModeCoordinator,
@@ -416,6 +417,12 @@ const acceptedPlanExecutor = new AcceptedPlanExecutor({
 const contextFrameBuilder = new ContextFrameBuilder();
 const resourceRequestLoop = new ResourceRequestLoop({
   maxDerivedManifestEntries: MAX_DERIVED_MANIFEST_ENTRIES,
+});
+const nativeToolProjectionBuilder = new NativeToolProjectionBuilder({
+  conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
+  packetActivity: (packet, activityId, runId) => resourceRequestLoop.packetActivity(packet, activityId, runId),
+  runningSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveRunningSummary(toolName, language),
+  completedSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveCompletedSummary(toolName, language),
 });
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
 const PROVIDER_REASONING_FLUSH_CHARS = 768;
@@ -2732,30 +2739,13 @@ export class SessionDriverLoop {
             ]);
           },
           emitCheckpoint: async (runState, nativeToolRound, toolCallCount) => {
-            await this.emitProjectionDelta(runState, {
-              type: 'stage_delta',
-              stage: `native_tool_round_${nativeToolRound + 1}`,
-              status: 'running',
-              channel: 'progress',
-              source: 'session',
-              summary: 'native_tool_checkpoint',
-              activity: driverActivityBuilder.conversationActivity({
-                activityId: `native-tool-round-${nativeToolRound + 1}`,
-                kind: 'toolExecution',
-                status: 'running',
-                title: 'Native tool checkpoint',
-                summary: 'Provider requested read-only native tools. Session is routing them through Kernel resource boundaries.',
-                source: 'session',
-                runId: runState.runId,
-                itemCount: toolCallCount,
-              }),
-              payload: {
-                visibility: 'task',
-                nativeToolRound,
-                toolCallCount,
-                resourcePacketCount: runState.resourcePackets.length,
-              },
-            });
+            await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.checkpointDelta({
+              sessionId: runState.sessionId,
+              runId: runState.runId,
+              nativeToolRound,
+              toolCallCount,
+              resourcePacketCount: runState.resourcePackets.length,
+            }));
           },
           repairSideEffect: (runState, repairPrompt, toolCall, turn) =>
             this.repairSideEffectNativeTool(input, runState, repairPrompt, toolCall, turn),
@@ -2764,34 +2754,12 @@ export class SessionDriverLoop {
           repairDuplicate: (runState, repairPrompt, turn, duplicates) =>
             this.repairDuplicateNativeReadTool(input, runState, repairPrompt, turn, duplicates),
           emitDuplicateRead: async (runState, toolCall, existing) => {
-            await this.emitProjectionDelta(runState, {
-              type: 'stage_delta',
-              stage: 'native_tool_duplicate_read',
-              status: 'completed',
-              channel: 'tool',
-              source: 'session',
-              itemId: toolCall.callId,
-              summary: `Provider repeated ${toolCall.name} for an already resolved target; Session is reusing the existing ResourcePacket without another Kernel read.`,
-              activity: driverActivityBuilder.conversationActivity({
-                activityId: `native-tool-duplicate-${toolCall.callId}`,
-                kind: 'resourceRead',
-                status: 'completed',
-                title: 'Duplicate native read reused',
-                summary: `Session reused ${existing.packet.id} for a repeated ${toolCall.name} request.`,
-                source: 'session',
-                runId: runState.runId,
-                toolName: toolCall.name,
-                targets: [existing.signature.path],
-              }),
-              payload: {
-                callId: toolCall.callId,
-                name: toolCall.name,
-                duplicateOfPacketId: existing.packet.id,
-                duplicateCount: existing.repeatCount,
-                signature: existing.signature,
-                contentHash: existing.contentHash,
-              },
-            });
+            await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.duplicateReadDelta({
+              sessionId: runState.sessionId,
+              runId: runState.runId,
+              toolCall,
+              existing,
+            }));
           },
           duplicateToolMessage: (toolCall, existing) => ({
             role: 'tool',
@@ -2800,31 +2768,13 @@ export class SessionDriverLoop {
           }),
           emitToolCallRunning: async (runState, toolCall, nativeToolRound) => {
             const language = visibleLanguageForRequest(runState.userRequest);
-            await this.emitProjectionDelta(runState, {
-              type: 'tool_call_delta',
-              stage: 'native_tool_call',
-              status: 'running',
-              channel: 'tool',
-              source: 'session',
-              itemId: toolCall.callId,
-              summary: providerStreamCoordinator.nativeToolResolveRunningSummary(toolCall.name, language),
-              activity: driverActivityBuilder.conversationActivity({
-                activityId: `native-tool-${toolCall.callId}`,
-                kind: 'toolExecution',
-                status: 'running',
-                title: 'Resolving native read tool',
-                summary: providerStreamCoordinator.nativeToolResolveRunningSummary(toolCall.name, language),
-                source: 'session',
-                runId: runState.runId,
-                toolName: toolCall.name,
-              }),
-              payload: {
-                callId: toolCall.callId,
-                name: toolCall.name,
-                arguments: toolCall.arguments,
-                nativeToolRound,
-              },
-            });
+            await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.toolCallRunningDelta({
+              sessionId: runState.sessionId,
+              runId: runState.runId,
+              language,
+              toolCall,
+              nativeToolRound,
+            }));
           },
           resolveReadToolCall: (runState, toolCall) =>
             this.resolveNativeReadToolCall(runState, toolCall),
@@ -2843,23 +2793,15 @@ export class SessionDriverLoop {
           },
           emitResourceResolved: async (runState, toolCall, packet, nativeToolRound) => {
             const language = visibleLanguageForRequest(runState.userRequest);
-            await this.emitProjectionDelta(runState, {
-              type: 'resource_delta',
-              stage: 'native_tool_resource_resolve',
-              status: 'completed',
-              channel: 'resource',
-              source: 'kernel',
-              itemId: toolCall.callId,
-              summary: providerStreamCoordinator.nativeToolResolveCompletedSummary(toolCall.name, language),
-              activity: resourceRequestLoop.packetActivity(packet, `native-tool-resource-${toolCall.callId}`, runState.runId),
-              payload: {
-                callId: toolCall.callId,
-                packetId: packet.id,
-                itemCount: packet.items.length,
-                nativeToolRound,
-                resourcePacketCount: runState.resourcePackets.length,
-              },
-            });
+            await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.resourceResolvedDelta({
+              sessionId: runState.sessionId,
+              runId: runState.runId,
+              language,
+              toolCall,
+              packet,
+              nativeToolRound,
+              resourcePacketCount: runState.resourcePackets.length,
+            }));
           },
           packetToolMessage: (toolCall, packet) => ({
             role: 'tool',

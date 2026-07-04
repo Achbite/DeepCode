@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolRepairCoordinator, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolProjectionBuilder, NativeToolRepairCoordinator, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -73,6 +73,7 @@ async function main(): Promise<void> {
   assertActionBundleActionInspectorReadsActionShape();
   assertPathIdentityNormalizesWorkspacePaths();
   assertNativeToolRepairCoordinatorBuildsRepairContracts();
+  assertNativeToolProjectionBuilderBuildsDeltas();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -448,6 +449,103 @@ function assertNativeToolRepairCoordinatorBuildsRepairContracts(): void {
   assertEqual(repairedAllowedKinds[0], 'actionBundle', 'native tool repair coordinator forwards side-effect allowed kinds');
   assertEqual(coordinator.parseDuplicateRepair({ raw: '{}', runId, sessionId }).kind, 'resourceRequest', 'native tool repair coordinator parses duplicate repair with focused kinds');
   assertEqual(coordinator.parseProposalOnlyRepair({ raw: '{}', runId, sessionId }).kind, 'actionBundle', 'native tool repair coordinator parses proposal-only repair with executable kinds');
+}
+
+function assertNativeToolProjectionBuilderBuildsDeltas(): void {
+  const token = randomSmokeToken('native-projection');
+  const runId = `run-${token}`;
+  const sessionId = `session-${token}`;
+  const targetPath = `scope-${token}/target-${randomSmokeToken('target')}.txt`;
+  const toolName = `read_${randomSmokeToken('tool')}`;
+  const packet: ResourcePacket = {
+    id: `packet-${token}`,
+    requestId: `request-${token}`,
+    workspaceScopeKey: `scope-${token}`,
+    items: [{
+      requestItemId: `item-${token}`,
+      manifestEntryId: `manifest-${token}`,
+      readPolicy: 'autoRead',
+      status: 'provided',
+      path: targetPath,
+      contentKind: 'fileText',
+      promptContent: `payload-${randomSmokeToken('payload')}`,
+    }],
+  };
+  const toolCall = {
+    callId: `call-${token}`,
+    index: 0,
+    name: toolName,
+    arguments: { path: targetPath, marker: token },
+  };
+  const builder = new NativeToolProjectionBuilder({
+    conversationActivity: (input) => ({
+      ...input,
+      targets: input.targets ?? [],
+    }),
+    packetActivity: (_packet, activityId, activityRunId) => ({
+      activityId,
+      kind: 'resourceRead',
+      status: 'completed',
+      title: `packet-${token}`,
+      summary: `packet-${token}`,
+      source: 'kernel',
+      runId: activityRunId,
+      targets: [targetPath],
+      itemCount: _packet.items.length,
+    }),
+    runningSummary: (name, language) => `running-${name}-${language}-${token}`,
+    completedSummary: (name, language) => `completed-${name}-${language}-${token}`,
+  });
+
+  const checkpoint = builder.checkpointDelta({
+    sessionId,
+    runId,
+    nativeToolRound: 3,
+    toolCallCount: 2,
+    resourcePacketCount: 5,
+  });
+  assertEqual(checkpoint.stage, 'native_tool_round_4', 'native tool projection builder creates checkpoint stage');
+  assertEqual((checkpoint.payload as any).toolCallCount, 2, 'native tool projection builder carries checkpoint tool count');
+
+  const duplicate = builder.duplicateReadDelta({
+    sessionId,
+    runId,
+    toolCall,
+    existing: {
+      signature: { key: `sig-${token}`, toolName, path: targetPath },
+      packet,
+      contentHash: `hash-${token}`,
+      repeatCount: 4,
+    },
+  });
+  assertEqual(duplicate.stage, 'native_tool_duplicate_read', 'native tool projection builder creates duplicate read stage');
+  assertEqual((duplicate.payload as any).duplicateOfPacketId, packet.id, 'native tool projection builder carries duplicate packet id');
+  assertEqual((duplicate.activity as any).targets[0], targetPath, 'native tool projection builder carries duplicate target');
+
+  const running = builder.toolCallRunningDelta({
+    sessionId,
+    runId,
+    language: 'en-US',
+    toolCall,
+    nativeToolRound: 1,
+  });
+  assertEqual(running.type, 'tool_call_delta', 'native tool projection builder creates tool call delta');
+  assertEqual(running.summary, `running-${toolName}-en-US-${token}`, 'native tool projection builder uses running summary port');
+  assertEqual((running.payload as any).arguments.marker, token, 'native tool projection builder carries tool arguments');
+
+  const resolved = builder.resourceResolvedDelta({
+    sessionId,
+    runId,
+    language: 'zh-CN',
+    toolCall,
+    packet,
+    nativeToolRound: 2,
+    resourcePacketCount: 6,
+  });
+  assertEqual(resolved.type, 'resource_delta', 'native tool projection builder creates resource delta');
+  assertEqual(resolved.summary, `completed-${toolName}-zh-CN-${token}`, 'native tool projection builder uses completed summary port');
+  assertEqual((resolved.payload as any).packetId, packet.id, 'native tool projection builder carries packet id');
+  assertEqual((resolved.activity as any).itemCount, 1, 'native tool projection builder uses packet activity port');
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
