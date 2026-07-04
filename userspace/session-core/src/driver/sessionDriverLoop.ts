@@ -72,6 +72,7 @@ import {
   NativeToolCoordinatorError,
   NativeToolProjectionBuilder,
   NativeToolRepairCoordinator,
+  NativeToolResultMessageBuilder,
   NativeToolTurnHandler,
   ProviderJsonModeCoordinator,
   ProviderPipeline,
@@ -425,6 +426,10 @@ const nativeToolProjectionBuilder = new NativeToolProjectionBuilder({
   completedSummary: (toolName, language) => providerStreamCoordinator.nativeToolResolveCompletedSummary(toolName, language),
 });
 const NATIVE_TOOL_RESULT_MAX_CHARS = 12 * 1024;
+const nativeToolResultMessageBuilder = new NativeToolResultMessageBuilder({
+  duplicateResult: (toolCall, existing) => nativeToolCoordinator.duplicateResult(toolCall, existing),
+  resultFromPacket: (toolCall, packet) => nativeToolCoordinator.resultFromPacket(toolCall, packet),
+}, NATIVE_TOOL_RESULT_MAX_CHARS);
 const PROVIDER_REASONING_FLUSH_CHARS = 768;
 const PROVIDER_REASONING_FLUSH_MS = 120;
 const SIDE_EFFECT_CAPABILITIES = new Set([
@@ -2761,11 +2766,8 @@ export class SessionDriverLoop {
               existing,
             }));
           },
-          duplicateToolMessage: (toolCall, existing) => ({
-            role: 'tool',
-            toolCallId: toolCall.callId,
-            content: clipJson(nativeToolCoordinator.duplicateResult(toolCall, existing), NATIVE_TOOL_RESULT_MAX_CHARS),
-          }),
+          duplicateToolMessage: (toolCall, existing) =>
+            nativeToolResultMessageBuilder.duplicateToolMessage(toolCall, existing),
           emitToolCallRunning: async (runState, toolCall, nativeToolRound) => {
             const language = visibleLanguageForRequest(runState.userRequest);
             await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.toolCallRunningDelta({
@@ -2803,11 +2805,8 @@ export class SessionDriverLoop {
               resourcePacketCount: runState.resourcePackets.length,
             }));
           },
-          packetToolMessage: (toolCall, packet) => ({
-            role: 'tool',
-            toolCallId: toolCall.callId,
-            content: clipJson(nativeToolCoordinator.resultFromPacket(toolCall, packet), NATIVE_TOOL_RESULT_MAX_CHARS),
-          }),
+          packetToolMessage: (toolCall, packet) =>
+            nativeToolResultMessageBuilder.packetToolMessage(toolCall, packet),
         },
       });
       if (handled.kind === 'proposal') return handled.proposal;
@@ -5014,11 +5013,6 @@ function findActiveDriverInteraction(events: AgentEvent[]): DriverInteraction | 
 
 function safeSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'item';
-}
-
-function clipJson(value: unknown, maxChars: number): string {
-  const text = typeof value === 'string' ? value : JSON.stringify(value);
-  return clip(text ?? '', maxChars);
 }
 
 function readableDriverFailureMessage(code: string, message: string): DiagnosticInfo {

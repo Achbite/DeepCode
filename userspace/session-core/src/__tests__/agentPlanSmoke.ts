@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolProjectionBuilder, NativeToolRepairCoordinator, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResultMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -74,6 +74,7 @@ async function main(): Promise<void> {
   assertPathIdentityNormalizesWorkspacePaths();
   assertNativeToolRepairCoordinatorBuildsRepairContracts();
   assertNativeToolProjectionBuilderBuildsDeltas();
+  assertNativeToolResultMessageBuilderBuildsToolMessages();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -546,6 +547,52 @@ function assertNativeToolProjectionBuilderBuildsDeltas(): void {
   assertEqual(resolved.summary, `completed-${toolName}-zh-CN-${token}`, 'native tool projection builder uses completed summary port');
   assertEqual((resolved.payload as any).packetId, packet.id, 'native tool projection builder carries packet id');
   assertEqual((resolved.activity as any).itemCount, 1, 'native tool projection builder uses packet activity port');
+}
+
+function assertNativeToolResultMessageBuilderBuildsToolMessages(): void {
+  const token = randomSmokeToken('native-result');
+  const targetPath = `scope-${token}/target-${randomSmokeToken('target')}.txt`;
+  const toolCall = {
+    callId: `call-${token}`,
+    index: 0,
+    name: `read_${randomSmokeToken('tool')}`,
+    arguments: { path: targetPath },
+  };
+  const packet: ResourcePacket = {
+    id: `packet-${token}`,
+    requestId: `request-${token}`,
+    workspaceScopeKey: `scope-${token}`,
+    items: [],
+  };
+  const existing = {
+    signature: { key: `sig-${token}`, toolName: toolCall.name, path: targetPath },
+    packet,
+    contentHash: `hash-${token}`,
+    repeatCount: 1,
+  };
+  const builder = new NativeToolResultMessageBuilder({
+    duplicateResult: (call, entry) => ({
+      kind: `duplicate-${token}`,
+      callId: call.callId,
+      packetId: entry.packet.id,
+    }),
+    resultFromPacket: (call, resolvedPacket) => ({
+      kind: `packet-${token}`,
+      callId: call.callId,
+      packetId: resolvedPacket.id,
+      content: 'x'.repeat(128),
+    }),
+  }, 64);
+
+  const duplicateMessage = builder.duplicateToolMessage(toolCall, existing);
+  assertEqual(duplicateMessage.role, 'tool', 'native tool result message builder creates tool role for duplicate');
+  assertEqual((duplicateMessage as any).toolCallId, toolCall.callId, 'native tool result message builder carries duplicate call id');
+  assert((duplicateMessage as any).content.includes(`duplicate-${token}`), 'native tool result message builder serializes duplicate result');
+
+  const packetMessage = builder.packetToolMessage(toolCall, packet);
+  assertEqual(packetMessage.role, 'tool', 'native tool result message builder creates tool role for packet');
+  assertEqual((packetMessage as any).toolCallId, toolCall.callId, 'native tool result message builder carries packet call id');
+  assertEqual((packetMessage as any).content.endsWith('...'), true, 'native tool result message builder clips long packet result');
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
