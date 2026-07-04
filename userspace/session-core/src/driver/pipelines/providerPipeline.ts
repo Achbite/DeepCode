@@ -15,6 +15,7 @@ export {
   type NativeToolRepairDuplicate,
   type NativeToolTurnProposalLike,
 } from './nativeToolRepairCoordinator.js';
+export { NativeToolProgressEventBuilder } from './nativeToolProgressEventBuilder.js';
 export { NativeToolProjectionBuilder } from './nativeToolProjectionBuilder.js';
 export { NativeToolResultMessageBuilder } from './nativeToolResultMessageBuilder.js';
 export { NativeToolResourceRecorder } from './nativeToolResourceRecorder.js';

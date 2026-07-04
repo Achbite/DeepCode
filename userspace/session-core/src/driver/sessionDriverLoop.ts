@@ -70,6 +70,7 @@ import { ProviderRepairMessageBuilder, type ProviderRepairMessageState } from '.
 import {
   NativeToolCoordinator,
   NativeToolCoordinatorError,
+  NativeToolProgressEventBuilder,
   NativeToolProjectionBuilder,
   NativeToolRepairCoordinator,
   NativeToolResultMessageBuilder,
@@ -440,6 +441,7 @@ const nativeToolResourceRecorder = new NativeToolResourceRecorder({
 const nativeToolResumeMessageBuilder = new NativeToolResumeMessageBuilder({
   callToProtocol: (toolCall) => nativeToolCoordinator.callToProtocol(toolCall),
 });
+const nativeToolProgressEventBuilder = new NativeToolProgressEventBuilder();
 const PROVIDER_REASONING_FLUSH_CHARS = 768;
 const PROVIDER_REASONING_FLUSH_MS = 120;
 const SIDE_EFFECT_CAPABILITIES = new Set([
@@ -2743,14 +2745,10 @@ export class SessionDriverLoop {
         ports: {
           appendAssistantProgress: async (runState, narration) => {
             await this.append(runState.sessionId, [
-              this.event(runState.sessionId, 'assistant_msg', {
-                content: narration,
-                channel: 'progress',
-                source: 'llm',
-                visibility: 'conversation',
-                presentation: 'body',
+              this.event(runState.sessionId, 'assistant_msg', nativeToolProgressEventBuilder.assistantProgressPayload({
                 runId: runState.runId,
-              }),
+                content: narration,
+              })),
             ]);
           },
           emitCheckpoint: async (runState, nativeToolRound, toolCallCount) => {

@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolProgressEventBuilder, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -73,6 +73,7 @@ async function main(): Promise<void> {
   assertActionBundleActionInspectorReadsActionShape();
   assertPathIdentityNormalizesWorkspacePaths();
   assertNativeToolRepairCoordinatorBuildsRepairContracts();
+  assertNativeToolProgressEventBuilderBuildsAssistantProgress();
   assertNativeToolProjectionBuilderBuildsDeltas();
   assertNativeToolResultMessageBuilderBuildsToolMessages();
   assertNativeToolResourceRecorderRecordsPackets();
@@ -549,6 +550,30 @@ function assertNativeToolProjectionBuilderBuildsDeltas(): void {
   assertEqual(resolved.summary, `completed-${toolName}-zh-CN-${token}`, 'native tool projection builder uses completed summary port');
   assertEqual((resolved.payload as any).packetId, packet.id, 'native tool projection builder carries packet id');
   assertEqual((resolved.activity as any).itemCount, 1, 'native tool projection builder uses packet activity port');
+}
+
+function assertNativeToolProgressEventBuilderBuildsAssistantProgress(): void {
+  const token = randomSmokeToken('native-progress');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const content = `progress-${randomSmokeToken('content')}`;
+  const builder = new NativeToolProgressEventBuilder();
+  const payload = builder.assistantProgressPayload({ runId, content });
+  const event: AgentEvent = {
+    id: `event-${token}`,
+    sessionId,
+    ts: `ts-${token}`,
+    kind: 'assistant_msg',
+    payload,
+  };
+  assertEqual(event.sessionId, sessionId, 'native tool progress event builder preserves session id');
+  assertEqual(event.kind, 'assistant_msg', 'native tool progress event builder creates assistant message events');
+  assertEqual(payload.content, content, 'native tool progress event builder carries visible content');
+  assertEqual(payload.channel, 'progress', 'native tool progress event builder preserves progress channel');
+  assertEqual(payload.source, 'llm', 'native tool progress event builder preserves llm source');
+  assertEqual(payload.visibility, 'conversation', 'native tool progress event builder keeps conversation visibility');
+  assertEqual(payload.presentation, 'body', 'native tool progress event builder keeps body presentation');
+  assertEqual(payload.runId, runId, 'native tool progress event builder carries run id');
 }
 
 function assertNativeToolResultMessageBuilderBuildsToolMessages(): void {
