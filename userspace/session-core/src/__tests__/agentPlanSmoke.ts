@@ -69,7 +69,7 @@ import {
 import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderStreamRuntime, ProviderToolCallBuffer, ProviderTraceRecorder, ProviderTurnRunner, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
-import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
+import { AcceptedPlanReviewHandoffCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import type { PromptEnvelope } from '../prompt/types.js';
@@ -126,6 +126,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanOperationTargetResolverFindsExactGrant();
   assertAcceptedPlanExecutorBuildsExecutionBatch();
   assertKernelEventStatusIndexReadsStructuredEvents();
+  await assertAcceptedPlanReviewHandoffCoordinatorBuildsReviewState();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
@@ -4047,6 +4048,153 @@ function assertKernelEventStatusIndexReadsStructuredEvents(): void {
     `status-${token}`,
     'kernel event status index reads review gate status'
   );
+}
+
+async function assertAcceptedPlanReviewHandoffCoordinatorBuildsReviewState(): Promise<void> {
+  const token = randomSmokeToken('review-handoff');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const planId = `plan-${token}`;
+  const reviewId = `review-${token}`;
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: `ts-${token}`,
+    updatedAt: `ts-${token}`,
+  };
+  const seedEvent = {
+    id: `seed-${token}`,
+    sessionId,
+    ts: `ts-${token}`,
+    kind: 'assistant_msg',
+    payload: {},
+  } as AgentEvent;
+  const initialResult: AgentSessionResult = { session, events: [seedEvent] };
+  const completedEvent = {
+    kind: 'work_unit.completed',
+    runId,
+    planId,
+    workUnitId: `work-${token}`,
+  };
+  const factsEvent = {
+    kind: 'review.facts_produced',
+    runId,
+    planId,
+    factsId: `facts-${token}`,
+  };
+  const plan = {
+    sessionId,
+    runId,
+    planId,
+    userPlan: `user-plan-${token}`,
+    actionBundle: { id: `bundle-${token}` },
+    codeBlocks: [],
+    commandBlocks: [],
+    expectedValidation: `validation-${token}`,
+    reviewGuide: `guide-${token}`,
+  };
+  let kernelRequestId = '';
+  let assertCalled = false;
+  let aggregationCurrentEvents: unknown[] = [];
+  let reviewKernelEvents: unknown[] = [];
+  let appendedEvents: AgentEvent[] = [];
+  const coordinator = new AcceptedPlanReviewHandoffCoordinator<typeof plan>({
+    now: () => `ts-${token}`,
+    createId: (prefix) => `${prefix}-${token}`,
+    kernel: async (request: KernelCommandEnvelope): Promise<KernelReply> => {
+      const command = request.command as { kind?: string; requestId?: string };
+      assertEqual(command.kind, 'reviewFactsGet', 'review handoff requests review facts');
+      kernelRequestId = command.requestId ?? '';
+      return { ok: true, events: [factsEvent] };
+    },
+    appendProjectedKernelEvents: async (nextSessionId, reply) => {
+      assertEqual(nextSessionId, sessionId, 'review handoff projects facts into current session');
+      assertEqual(reply.events?.[0], factsEvent, 'review handoff projects facts reply');
+      return {
+        session,
+        events: [
+          ...initialResult.events,
+          {
+            id: `projected-${token}`,
+            sessionId,
+            ts: `ts-${token}`,
+            kind: 'kernel_event',
+            payload: { kernelEvent: factsEvent },
+          } as unknown as AgentEvent,
+        ],
+      };
+    },
+    append: async (nextSessionId, events) => {
+      assertEqual(nextSessionId, sessionId, 'review handoff appends review events to current session');
+      appendedEvents = events;
+      return { session, events };
+    },
+    assertKernelReplyOk: (reply, code) => {
+      assertEqual(reply.ok, true, 'review handoff asserts successful facts reply');
+      assertEqual(code, `code-${token}`, 'review handoff forwards assert code');
+      assertCalled = true;
+    },
+    acceptedPlanKernelEvents: (events, nextRunId, nextPlanId, currentEvents) => {
+      assertEqual(events.length, 2, 'review handoff aggregates from projected timeline');
+      assertEqual(nextRunId, runId, 'review handoff aggregates by run id');
+      assertEqual(nextPlanId, planId, 'review handoff aggregates by plan id');
+      aggregationCurrentEvents = currentEvents;
+      return currentEvents;
+    },
+    reviewProjection: {
+      summaryEvent: ({ kernelEvents }) => {
+        reviewKernelEvents = kernelEvents;
+        return {
+          id: `review-summary-${token}`,
+          sessionId,
+          ts: `ts-${token}`,
+          kind: 'review_summary',
+          payload: { reviewId },
+        };
+      },
+    },
+    progressProjection: {
+      sessionRunStateEvent: ({ phase, reason, decisionOwner }) => ({
+        id: `run-state-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind: 'session_run_state',
+        payload: {
+          phase,
+          reason,
+          decisionOwner,
+        },
+      }),
+    },
+  });
+
+  const result = await coordinator.handoff({
+    sessionId,
+    runId,
+    planId,
+    plan,
+    result: initialResult,
+    currentKernelEvents: [completedEvent],
+    requestIdPrefix: `request-${token}`,
+    assertFactsReplyOk: {
+      code: `code-${token}`,
+      fallback: `fallback-${token}`,
+    },
+  });
+
+  assertEqual(kernelRequestId, `request-${token}-${token}`, 'review handoff uses caller request id prefix');
+  assert(assertCalled, 'review handoff applies optional facts reply assertion');
+  assertEqual(aggregationCurrentEvents.length, 2, 'review handoff includes current and facts events in aggregation');
+  assertEqual(aggregationCurrentEvents[0], completedEvent, 'review handoff preserves current kernel events first');
+  assertEqual(aggregationCurrentEvents[1], factsEvent, 'review handoff appends facts reply events');
+  assertEqual(reviewKernelEvents.length, 2, 'review handoff passes aggregated events to review projection');
+  assertEqual(appendedEvents[0]?.kind, 'review_summary', 'review handoff appends review first');
+  assertEqual(appendedEvents[1]?.kind, 'session_run_state', 'review handoff appends waiting review state second');
+  const runStatePayload = appendedEvents[1]?.payload as Record<string, unknown> | undefined;
+  const decisionOwner = runStatePayload?.decisionOwner as Record<string, unknown> | undefined;
+  assertEqual(runStatePayload?.phase, 'waiting_review', 'review handoff enters waiting review');
+  assertEqual(decisionOwner?.reviewId, reviewId, 'review handoff uses review id from summary');
+  assertEqual(result.events.length, 2, 'review handoff returns append result');
 }
 
 function assertReviewAssemblerFormatsReviewFacts(): void {

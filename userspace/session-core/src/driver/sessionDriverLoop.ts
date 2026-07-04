@@ -129,7 +129,12 @@ import {
   type TaskLedgerSnapshot,
 } from '../run-state/index.js';
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
-import { ReviewAssembler, ReviewDecisionProjectionBuilder, type SessionReviewContext } from './review/index.js';
+import {
+  AcceptedPlanReviewHandoffCoordinator,
+  ReviewAssembler,
+  ReviewDecisionProjectionBuilder,
+  type SessionReviewContext,
+} from './review/index.js';
 import {
   ActionBundleActionInspector,
   PlanContextIndex,
@@ -483,6 +488,7 @@ export class SessionDriverLoop {
   private readonly acceptedPlanScopeDecisionCoordinator: AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeRepairCoordinator: AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeResourceFollowupCoordinator: AcceptedPlanScopeResourceFollowupCoordinator<SessionDriverLoopRunState, AcceptedImplementationPlanContext>;
+  private readonly acceptedPlanReviewHandoffCoordinator: AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>;
   private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionResourceFollowupCoordinator: ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
@@ -554,6 +560,17 @@ export class SessionDriverLoop {
       requirementProjection: requirementProjectionBuilder,
       progressProjection: sessionProgressProjectionBuilder,
       append: (sessionId, events) => this.append(sessionId, events),
+    });
+    this.acceptedPlanReviewHandoffCoordinator = new AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      kernel: (request) => this.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
+      append: (sessionId, events) => this.append(sessionId, events),
+      assertKernelReplyOk,
+      acceptedPlanKernelEvents: ReviewFactsAggregator.acceptedPlanKernelEvents,
+      reviewProjection: reviewProjectionBuilder,
+      progressProjection: sessionProgressProjectionBuilder,
     });
     this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
@@ -1870,49 +1887,20 @@ export class SessionDriverLoop {
       }
       const staticReviewEvents: AgentEvent[] = [];
 
-      const factsReply = await this.kernel({
-        command: {
-          kind: 'reviewFactsGet',
-          requestId: this.id('review-facts-get'),
-          runId: plan.runId,
-          sessionId: input.sessionId,
+      return this.acceptedPlanReviewHandoffCoordinator.handoff({
+        sessionId: input.sessionId,
+        runId: plan.runId,
+        planId: plan.planId,
+        plan,
+        result,
+        currentKernelEvents: [...batchEvents, ...staticReviewEvents.map((event) => event.payload)],
+        requestIdPrefix: 'review-facts-get',
+        interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
+        assertFactsReplyOk: {
+          code: 'accepted_plan_review_facts_failed',
+          fallback: 'Kernel reviewFactsGet failed',
         },
       });
-      assertKernelReplyOk(factsReply, 'accepted_plan_review_facts_failed', 'Kernel reviewFactsGet failed');
-      result = await this.appendProjectedKernelEvents(input.sessionId, factsReply) ?? result;
-      const reviewKernelEvents = ReviewFactsAggregator.acceptedPlanKernelEvents(
-        result.events,
-        plan.runId,
-        plan.planId,
-        [...batchEvents, ...staticReviewEvents.map((event) => event.payload), ...(factsReply.events ?? [])]
-      );
-      const review = reviewProjectionBuilder.summaryEvent({
-        sessionId: input.sessionId,
-        plan,
-        kernelEvents: reviewKernelEvents,
-        ts: this.ts(),
-        id: this.id('review-summary'),
-      });
-      const reviewPayload = objectRecord(review.payload) ?? {};
-      return this.append(input.sessionId, [
-        review,
-        sessionProgressProjectionBuilder.sessionRunStateEvent({
-          sessionId: input.sessionId,
-          runId: plan.runId,
-          phase: 'waiting_review',
-          reason: 'review',
-          decisionOwner: {
-            kind: 'review',
-            runId: plan.runId,
-            targetId: stringValue(reviewPayload.reviewId) ?? plan.runId,
-            reviewId: stringValue(reviewPayload.reviewId) ?? plan.runId,
-            planId: plan.planId,
-          },
-          interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-          ts: this.ts(),
-          id: this.id('session-run-waiting-review'),
-        }),
-      ]) ?? result;
     } catch (error) {
       const message = error instanceof SessionDriverLoopError ? error.message : String(error);
       const code = error instanceof SessionDriverLoopError ? error.code : 'accepted_plan_execution_failed';
@@ -3770,47 +3758,15 @@ export class SessionDriverLoop {
       result = await this.append(state.sessionId, staticReviewEvents) ?? result;
     }
 
-    const factsReply = await this.kernel({
-      command: {
-        kind: 'reviewFactsGet',
-        requestId: this.id('accepted-plan-review-facts-get'),
-        runId: state.runId,
-        sessionId: state.sessionId,
-      },
-    });
-    result = await this.appendProjectedKernelEvents(state.sessionId, factsReply) ?? result;
-    const reviewKernelEvents = ReviewFactsAggregator.acceptedPlanKernelEvents(
-      result.events,
-      state.runId,
-      accepted.planId,
-      [...(batchReply.events ?? []), ...staticReviewEvents.map((event) => event.payload), ...(factsReply.events ?? [])]
-    );
-    const review = reviewProjectionBuilder.summaryEvent({
+    return this.acceptedPlanReviewHandoffCoordinator.handoff({
       sessionId: state.sessionId,
+      runId: state.runId,
+      planId: accepted.planId,
       plan,
-      kernelEvents: reviewKernelEvents,
-      ts: this.ts(),
-      id: this.id('review-summary'),
+      result,
+      currentKernelEvents: [...(batchReply.events ?? []), ...staticReviewEvents.map((event) => event.payload)],
+      requestIdPrefix: 'accepted-plan-review-facts-get',
     });
-    const reviewPayload = objectRecord(review.payload) ?? {};
-    return this.append(state.sessionId, [
-      review,
-      sessionProgressProjectionBuilder.sessionRunStateEvent({
-        sessionId: state.sessionId,
-        runId: state.runId,
-        phase: 'waiting_review',
-        reason: 'review',
-        decisionOwner: {
-          kind: 'review',
-          runId: state.runId,
-          targetId: stringValue(reviewPayload.reviewId) ?? state.runId,
-          reviewId: stringValue(reviewPayload.reviewId) ?? state.runId,
-          planId: accepted.planId,
-        },
-        ts: this.ts(),
-        id: this.id('session-run-waiting-review'),
-      }),
-    ]) ?? result;
   }
 
   private async appendAcceptedPlanBatchOutOfScope(
