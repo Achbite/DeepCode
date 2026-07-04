@@ -73,6 +73,7 @@ import {
   NativeToolProjectionBuilder,
   NativeToolRepairCoordinator,
   NativeToolResultMessageBuilder,
+  NativeToolResourceRecorder,
   NativeToolTurnHandler,
   ProviderJsonModeCoordinator,
   ProviderPipeline,
@@ -430,6 +431,11 @@ const nativeToolResultMessageBuilder = new NativeToolResultMessageBuilder({
   duplicateResult: (toolCall, existing) => nativeToolCoordinator.duplicateResult(toolCall, existing),
   resultFromPacket: (toolCall, packet) => nativeToolCoordinator.resultFromPacket(toolCall, packet),
 }, NATIVE_TOOL_RESULT_MAX_CHARS);
+const nativeToolResourceRecorder = new NativeToolResourceRecorder({
+  packetContentHash: (packet) => nativeToolCoordinator.packetContentHash(packet),
+  addDiscoveredManifestEntries: (manifest, packet) => resourceRequestLoop.addDiscoveredManifestEntries(manifest, packet),
+  packetEvent: (sessionId, packet, ts, id) => resourceRequestLoop.packetEvent(sessionId, packet, ts, id),
+});
 const PROVIDER_REASONING_FLUSH_CHARS = 768;
 const PROVIDER_REASONING_FLUSH_MS = 120;
 const SIDE_EFFECT_CAPABILITIES = new Set([
@@ -2781,17 +2787,11 @@ export class SessionDriverLoop {
           resolveReadToolCall: (runState, toolCall) =>
             this.resolveNativeReadToolCall(runState, toolCall),
           recordResolvedPacket: async (runState, signature, packet) => {
-            runState.nativeToolReadLedger.set(signature.key, {
-              signature,
-              packet,
-              contentHash: nativeToolCoordinator.packetContentHash(packet),
-              repeatCount: 0,
+            const packetEvent = nativeToolResourceRecorder.recordResolvedPacket(runState, signature, packet, {
+              ts: this.ts(),
+              id: this.id('native-resource-context'),
             });
-            runState.resourcePackets.push(packet);
-            resourceRequestLoop.addDiscoveredManifestEntries(runState.manifest, packet);
-            await this.append(runState.sessionId, [
-              resourceRequestLoop.packetEvent(runState.sessionId, packet, this.ts(), this.id('native-resource-context')),
-            ]);
+            await this.append(runState.sessionId, [packetEvent]);
           },
           emitResourceResolved: async (runState, toolCall, packet, nativeToolRound) => {
             const language = visibleLanguageForRequest(runState.userRequest);

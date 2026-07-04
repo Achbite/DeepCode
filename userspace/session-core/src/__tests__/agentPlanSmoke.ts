@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResultMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -75,6 +75,7 @@ async function main(): Promise<void> {
   assertNativeToolRepairCoordinatorBuildsRepairContracts();
   assertNativeToolProjectionBuilderBuildsDeltas();
   assertNativeToolResultMessageBuilderBuildsToolMessages();
+  assertNativeToolResourceRecorderRecordsPackets();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -593,6 +594,79 @@ function assertNativeToolResultMessageBuilderBuildsToolMessages(): void {
   assertEqual(packetMessage.role, 'tool', 'native tool result message builder creates tool role for packet');
   assertEqual((packetMessage as any).toolCallId, toolCall.callId, 'native tool result message builder carries packet call id');
   assertEqual((packetMessage as any).content.endsWith('...'), true, 'native tool result message builder clips long packet result');
+}
+
+function assertNativeToolResourceRecorderRecordsPackets(): void {
+  const token = randomSmokeToken('native-recorder');
+  const sessionId = `session-${token}`;
+  const targetPath = `scope-${token}/target-${randomSmokeToken('target')}.txt`;
+  const packet: ResourcePacket = {
+    id: `packet-${token}`,
+    requestId: `request-${token}`,
+    workspaceScopeKey: `scope-${token}`,
+    items: [{
+      requestItemId: `item-${token}`,
+      manifestEntryId: `manifest-${token}`,
+      readPolicy: 'autoRead',
+      status: 'provided',
+      path: targetPath,
+      contentKind: 'fileText',
+      promptContent: `payload-${randomSmokeToken('payload')}`,
+    }],
+  };
+  const manifest: ResourceManifest = {
+    id: `manifest-${token}`,
+    workspaceScopeKey: `scope-${token}`,
+    entries: [],
+    budget: { maxEntries: 8, maxBytes: 4096 },
+    defaultDenyPatterns: [],
+  };
+  let discoveredPacketId = '';
+  const recorder = new NativeToolResourceRecorder({
+    packetContentHash: (value) => `hash-${value.id}`,
+    addDiscoveredManifestEntries: (targetManifest, value) => {
+      discoveredPacketId = value.id;
+      targetManifest.entries.push({
+        id: `entry-${token}`,
+        kind: 'file',
+        label: targetPath,
+        resourceRef: targetPath,
+        readPolicy: 'autoRead',
+        reason: `reason-${token}`,
+      });
+    },
+    packetEvent: (eventSessionId, value, ts, id) => ({
+      id,
+      sessionId: eventSessionId,
+      ts,
+      kind: 'tool_result',
+      payload: {
+        output: value,
+      },
+    }),
+  });
+  const state = {
+    sessionId,
+    manifest,
+    resourcePackets: [] as ResourcePacket[],
+    nativeToolReadLedger: new Map(),
+  };
+  const signature = {
+    key: `sig-${token}`,
+    toolName: `read_${randomSmokeToken('tool')}`,
+    path: targetPath,
+  };
+  const event = recorder.recordResolvedPacket(state, signature, packet, {
+    ts: `ts-${token}`,
+    id: `event-${token}`,
+  });
+
+  assertEqual(state.resourcePackets[0]?.id, packet.id, 'native tool resource recorder appends packet to run state');
+  assertEqual(state.nativeToolReadLedger.get(signature.key)?.contentHash, `hash-${packet.id}`, 'native tool resource recorder stores packet content hash');
+  assertEqual(discoveredPacketId, packet.id, 'native tool resource recorder updates manifest entries through port');
+  assertEqual(state.manifest.entries.length, 1, 'native tool resource recorder keeps discovered manifest mutation');
+  assertEqual(event.id, `event-${token}`, 'native tool resource recorder returns packet event');
+  assertEqual(event.sessionId, sessionId, 'native tool resource recorder keeps session id on packet event');
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
