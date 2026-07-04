@@ -71,6 +71,7 @@ import {
   NativeToolCoordinator,
   NativeToolCoordinatorError,
   NativeToolProgressEventBuilder,
+  NativeToolProviderLoop,
   NativeToolProjectionBuilder,
   NativeToolRepairCoordinator,
   NativeToolResultMessageBuilder,
@@ -442,6 +443,11 @@ const nativeToolResumeMessageBuilder = new NativeToolResumeMessageBuilder({
   callToProtocol: (toolCall) => nativeToolCoordinator.callToProtocol(toolCall),
 });
 const nativeToolProgressEventBuilder = new NativeToolProgressEventBuilder();
+const nativeToolProviderLoop = new NativeToolProviderLoop<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>({
+  providerPipeline,
+  turnHandler: nativeToolTurnHandler,
+  resumeMessageBuilder: nativeToolResumeMessageBuilder,
+});
 const PROVIDER_REASONING_FLUSH_CHARS = 768;
 const PROVIDER_REASONING_FLUSH_MS = 120;
 const SIDE_EFFECT_CAPABILITIES = new Set([
@@ -2719,108 +2725,86 @@ export class SessionDriverLoop {
     prompt: PromptEnvelope,
     contract: ProviderTurnContract
   ): Promise<string | ProposalEnvelope> {
-    let currentMessages = providerPipeline.messages(contract);
-    for (let round = 0; ; round += 1) {
-      const stage = round === 0 ? 'provider_call' : `provider_tool_resume_${round}`;
-      const effectiveTurn = await providerPipeline.runWithNativeTools({
-        profileId: input.profileId,
-        state,
-        contract,
-        stage,
-        messages: currentMessages,
-        options: {
-          tools: nativeToolCoordinator.providerTools(state),
+    return nativeToolProviderLoop.run({
+      profileId: input.profileId,
+      state,
+      prompt,
+      contract,
+      providerTools: nativeToolCoordinator.providerTools(state),
+      runTurn: (profileId, runState, retryStage, retryMessages, options) =>
+        this.llmTurn(profileId, runState, retryStage, retryMessages, options),
+      isEmptyResponseError,
+      consumeGuidanceMessages: (runState, stage) =>
+        this.consumeQueuedGuidanceForProviderResume(runState, stage),
+      handlerPorts: {
+        appendAssistantProgress: async (runState, narration) => {
+          await this.append(runState.sessionId, [
+            this.event(runState.sessionId, 'assistant_msg', nativeToolProgressEventBuilder.assistantProgressPayload({
+              runId: runState.runId,
+              content: narration,
+            })),
+          ]);
         },
-        runTurn: (profileId, runState, retryStage, retryMessages, options) =>
-          this.llmTurn(profileId, runState, retryStage, retryMessages, options),
-        isEmptyResponseError,
-      });
-      if (effectiveTurn.toolCalls.length === 0) return effectiveTurn.content;
-
-      const handled = await nativeToolTurnHandler.handle({
-        state,
-        prompt,
-        turn: effectiveTurn,
-        round,
-        ports: {
-          appendAssistantProgress: async (runState, narration) => {
-            await this.append(runState.sessionId, [
-              this.event(runState.sessionId, 'assistant_msg', nativeToolProgressEventBuilder.assistantProgressPayload({
-                runId: runState.runId,
-                content: narration,
-              })),
-            ]);
-          },
-          emitCheckpoint: async (runState, nativeToolRound, toolCallCount) => {
-            await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.checkpointDelta({
-              sessionId: runState.sessionId,
-              runId: runState.runId,
-              nativeToolRound,
-              toolCallCount,
-              resourcePacketCount: runState.resourcePackets.length,
-            }));
-          },
-          repairSideEffect: (runState, repairPrompt, toolCall, turn) =>
-            this.repairSideEffectNativeTool(input, runState, repairPrompt, toolCall, turn),
-          tryParseTurnProposal: (runState, turn) =>
-            this.tryParseNativeToolTurnProposal(runState, turn),
-          repairDuplicate: (runState, repairPrompt, turn, duplicates) =>
-            this.repairDuplicateNativeReadTool(input, runState, repairPrompt, turn, duplicates),
-          emitDuplicateRead: async (runState, toolCall, existing) => {
-            await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.duplicateReadDelta({
-              sessionId: runState.sessionId,
-              runId: runState.runId,
-              toolCall,
-              existing,
-            }));
-          },
-          duplicateToolMessage: (toolCall, existing) =>
-            nativeToolResultMessageBuilder.duplicateToolMessage(toolCall, existing),
-          emitToolCallRunning: async (runState, toolCall, nativeToolRound) => {
-            const language = visibleLanguageForRequest(runState.userRequest);
-            await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.toolCallRunningDelta({
-              sessionId: runState.sessionId,
-              runId: runState.runId,
-              language,
-              toolCall,
-              nativeToolRound,
-            }));
-          },
-          resolveReadToolCall: (runState, toolCall) =>
-            this.resolveNativeReadToolCall(runState, toolCall),
-          recordResolvedPacket: async (runState, signature, packet) => {
-            const packetEvent = nativeToolResourceRecorder.recordResolvedPacket(runState, signature, packet, {
-              ts: this.ts(),
-              id: this.id('native-resource-context'),
-            });
-            await this.append(runState.sessionId, [packetEvent]);
-          },
-          emitResourceResolved: async (runState, toolCall, packet, nativeToolRound) => {
-            const language = visibleLanguageForRequest(runState.userRequest);
-            await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.resourceResolvedDelta({
-              sessionId: runState.sessionId,
-              runId: runState.runId,
-              language,
-              toolCall,
-              packet,
-              nativeToolRound,
-              resourcePacketCount: runState.resourcePackets.length,
-            }));
-          },
-          packetToolMessage: (toolCall, packet) =>
-            nativeToolResultMessageBuilder.packetToolMessage(toolCall, packet),
+        emitCheckpoint: async (runState, nativeToolRound, toolCallCount) => {
+          await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.checkpointDelta({
+            sessionId: runState.sessionId,
+            runId: runState.runId,
+            nativeToolRound,
+            toolCallCount,
+            resourcePacketCount: runState.resourcePackets.length,
+          }));
         },
-      });
-      if (handled.kind === 'proposal') return handled.proposal;
-
-      currentMessages = nativeToolResumeMessageBuilder.nextMessages(
-        currentMessages,
-        effectiveTurn,
-        handled.toolMessages
-      );
-      const guidanceMessages = await this.consumeQueuedGuidanceForProviderResume(state, stage);
-      currentMessages.push(...guidanceMessages);
-    }
+        repairSideEffect: (runState, repairPrompt, toolCall, turn) =>
+          this.repairSideEffectNativeTool(input, runState, repairPrompt, toolCall, turn),
+        tryParseTurnProposal: (runState, turn) =>
+          this.tryParseNativeToolTurnProposal(runState, turn),
+        repairDuplicate: (runState, repairPrompt, turn, duplicates) =>
+          this.repairDuplicateNativeReadTool(input, runState, repairPrompt, turn, duplicates),
+        emitDuplicateRead: async (runState, toolCall, existing) => {
+          await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.duplicateReadDelta({
+            sessionId: runState.sessionId,
+            runId: runState.runId,
+            toolCall,
+            existing,
+          }));
+        },
+        duplicateToolMessage: (toolCall, existing) =>
+          nativeToolResultMessageBuilder.duplicateToolMessage(toolCall, existing),
+        emitToolCallRunning: async (runState, toolCall, nativeToolRound) => {
+          const language = visibleLanguageForRequest(runState.userRequest);
+          await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.toolCallRunningDelta({
+            sessionId: runState.sessionId,
+            runId: runState.runId,
+            language,
+            toolCall,
+            nativeToolRound,
+          }));
+        },
+        resolveReadToolCall: (runState, toolCall) =>
+          this.resolveNativeReadToolCall(runState, toolCall),
+        recordResolvedPacket: async (runState, signature, packet) => {
+          const packetEvent = nativeToolResourceRecorder.recordResolvedPacket(runState, signature, packet, {
+            ts: this.ts(),
+            id: this.id('native-resource-context'),
+          });
+          await this.append(runState.sessionId, [packetEvent]);
+        },
+        emitResourceResolved: async (runState, toolCall, packet, nativeToolRound) => {
+          const language = visibleLanguageForRequest(runState.userRequest);
+          await this.emitProjectionDelta(runState, nativeToolProjectionBuilder.resourceResolvedDelta({
+            sessionId: runState.sessionId,
+            runId: runState.runId,
+            language,
+            toolCall,
+            packet,
+            nativeToolRound,
+            resourcePacketCount: runState.resourcePackets.length,
+          }));
+        },
+        packetToolMessage: (toolCall, packet) =>
+          nativeToolResultMessageBuilder.packetToolMessage(toolCall, packet),
+      },
+    });
   }
 
   private async callProviderProposalOnly(

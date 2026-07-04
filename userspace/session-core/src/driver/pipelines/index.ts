@@ -1,6 +1,7 @@
 export * from './compactPipeline.js';
 export * from './interactionOverlayCodec.js';
 export * from './nativeToolProgressEventBuilder.js';
+export * from './nativeToolProviderLoop.js';
 export * from './nativeToolProjectionBuilder.js';
 export * from './nativeToolResultMessageBuilder.js';
 export * from './nativeToolResourceRecorder.js';

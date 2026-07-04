@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolProgressEventBuilder, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -78,6 +78,7 @@ async function main(): Promise<void> {
   assertNativeToolResultMessageBuilderBuildsToolMessages();
   assertNativeToolResourceRecorderRecordsPackets();
   assertNativeToolResumeMessageBuilderAppendsToolMessages();
+  await assertNativeToolProviderLoopResumesAfterToolMessages();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -734,6 +735,91 @@ function assertNativeToolResumeMessageBuilderAppendsToolMessages(): void {
   assertEqual((messages[2] as any).reasoningContent, `reasoning-${token}`, 'native tool resume message builder preserves reasoning content');
   assertEqual((messages[2] as any).toolCalls[0].id, toolCall.callId, 'native tool resume message builder converts native tool call to protocol call');
   assertEqual(messages[3]?.role, 'tool', 'native tool resume message builder appends tool message after assistant');
+}
+
+async function assertNativeToolProviderLoopResumesAfterToolMessages(): Promise<void> {
+  const token = randomSmokeToken('native-loop');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const toolCall = {
+    callId: `call-${token}`,
+    index: 0,
+    name: `read_${randomSmokeToken('tool')}`,
+    arguments: { path: `scope-${token}/target-${randomSmokeToken('target')}.txt` },
+  };
+  const turns = [
+    { content: `assistant-${token}`, reasoning: '', toolCalls: [toolCall] },
+    { content: `final-${token}`, reasoning: '', toolCalls: [] },
+  ];
+  const stages: string[] = [];
+  const messageCounts: number[] = [];
+  const guidanceStages: string[] = [];
+  const handlerPorts = { marker: token } as any;
+  const loop = new NativeToolProviderLoop<any, string, any>({
+    providerPipeline: {
+      messages: () => [{ role: 'system', content: `system-${token}` }],
+      runWithNativeTools: async (request: any) => {
+        stages.push(request.stage);
+        messageCounts.push(request.messages.length);
+        assertEqual(request.options.tools[0].name, `tool-${token}`, 'native tool provider loop forwards provider tools');
+        return turns.shift();
+      },
+    },
+    turnHandler: {
+      handle: async (request: any) => {
+        assertEqual(request.round, 0, 'native tool provider loop starts handler at round zero');
+        assertEqual(request.ports, handlerPorts, 'native tool provider loop forwards handler ports');
+        return {
+          kind: 'resume',
+          toolMessages: [{ role: 'tool', toolCallId: toolCall.callId, content: `tool-result-${token}` }],
+        };
+      },
+    },
+    resumeMessageBuilder: {
+      nextMessages: (currentMessages: LlmChatRequest['messages'], turn: any, toolMessages: LlmChatRequest['messages']) => [
+        ...currentMessages,
+        { role: 'assistant', content: turn.content },
+        ...toolMessages,
+      ],
+    },
+  });
+
+  const result = await loop.run({
+    profileId: `profile-${token}`,
+    state: {
+      sessionId,
+      runId,
+      userRequest: `request-${token}`,
+      manifest: {
+        id: `manifest-${token}`,
+        workspaceScopeKey: `scope-${token}`,
+        entries: [],
+        budget: { maxEntries: 8, maxBytes: 4096 },
+        defaultDenyPatterns: [],
+      },
+      resourcePackets: [],
+      nativeToolReadLedger: new Map(),
+      nativeToolDuplicateRepairAttempted: false,
+    },
+    prompt: `prompt-${token}`,
+    contract: {} as any,
+    providerTools: [{ name: `tool-${token}` } as any],
+    handlerPorts,
+    runTurn: async () => {
+      throw new Error('native tool provider loop test uses fake provider pipeline');
+    },
+    isEmptyResponseError: () => false,
+    consumeGuidanceMessages: async (_state, stage) => {
+      guidanceStages.push(stage);
+      return [{ role: 'user', content: `guidance-${token}` }];
+    },
+  });
+
+  assertEqual(result, `final-${token}`, 'native tool provider loop returns final content after resume');
+  assertEqual(stages.join(','), 'provider_call,provider_tool_resume_1', 'native tool provider loop advances resume stage names');
+  assertEqual(guidanceStages[0], 'provider_call', 'native tool provider loop consumes guidance after tool handling');
+  assertEqual(messageCounts[0], 1, 'native tool provider loop starts from provider messages');
+  assertEqual(messageCounts[1], 4, 'native tool provider loop resumes with assistant, tool, and guidance messages');
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
