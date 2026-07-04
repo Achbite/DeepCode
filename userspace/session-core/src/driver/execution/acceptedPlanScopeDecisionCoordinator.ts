@@ -74,6 +74,8 @@ export interface AcceptedPlanScopeDecisionRunInput<
   state: State;
   proposal: ProposalEnvelope;
   request: AcceptedPlanScopeDecisionRequest;
+  confirmationIdPrefix?: string;
+  runStateIdPrefix?: string;
 }
 
 export class AcceptedPlanScopeDecisionCoordinator<
@@ -107,7 +109,7 @@ export class AcceptedPlanScopeDecisionCoordinator<
       attachments: runInput.request.attachments ?? [],
       interactionOverlayPayload: this.input.interactionOverlayCodec.toPayload(interactionOverlay),
       ts: this.input.now(),
-      id: this.input.createId('accepted-plan-scope-repair-decision'),
+      id: this.input.createId(runInput.confirmationIdPrefix ?? 'accepted-plan-scope-repair-decision'),
     });
     runInput.state.phase = 'waiting_permission';
     return this.input.append(runInput.state.sessionId, [
@@ -125,7 +127,7 @@ export class AcceptedPlanScopeDecisionCoordinator<
         },
         interactionOverlay,
         ts: this.input.now(),
-        id: this.input.createId('session-run-waiting-accepted-plan-repair-decision'),
+        id: this.input.createId(runInput.runStateIdPrefix ?? 'session-run-waiting-accepted-plan-repair-decision'),
       }),
     ]);
   }

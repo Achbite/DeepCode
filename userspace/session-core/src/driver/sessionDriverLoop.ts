@@ -2978,50 +2978,16 @@ export class SessionDriverLoop {
       acceptedPlan: state.acceptedImplementationPlan,
       currentTaskId: state.currentTaskContext?.taskId,
     }, proposal, validation);
-    const requirement = userInputPipeline.requirementRecordFromProposal({
+    return this.acceptedPlanScopeDecisionCoordinator.waitForDecision({
+      state,
       proposal: decisionProposal,
-      sessionId: state.sessionId,
-      runId: state.runId,
-      userRequest: input.content,
-      timestamp: this.ts(),
+      request: {
+        content: input.content,
+        attachments: input.attachments ?? [],
+      },
+      confirmationIdPrefix: 'accepted-plan-scope-confirmation',
+      runStateIdPrefix: 'session-run-waiting-accepted-plan-scope',
     });
-    const interactionOverlay: InteractionOverlayContext = {
-      parentRunId: state.runId,
-      parentPhase: 'executing_accepted_plan',
-      interactionRunId: state.runId,
-      interactionId: requirement.requirementId,
-      sourceInteractionId: proposal.proposalId,
-    };
-    const confirmation = requirementProjectionBuilder.confirmationEvent({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      requirement,
-      proposal: decisionProposal,
-      originalUserRequest: input.content,
-      attachments: input.attachments ?? [],
-      interactionOverlayPayload: interactionOverlayCodec.toPayload(interactionOverlay),
-      ts: this.ts(),
-      id: this.id('accepted-plan-scope-confirmation'),
-    });
-    state.phase = 'waiting_permission';
-    return this.append(state.sessionId, [
-      confirmation,
-      sessionProgressProjectionBuilder.sessionRunStateEvent({
-        sessionId: state.sessionId,
-        runId: state.runId,
-        phase: 'waiting_permission',
-        reason: 'requirement',
-        decisionOwner: {
-          kind: 'requirement',
-          runId: state.runId,
-          targetId: requirement.requirementId,
-          requirementId: requirement.requirementId,
-        },
-        interactionOverlay,
-        ts: this.ts(),
-        id: this.id('session-run-waiting-accepted-plan-scope'),
-      }),
-    ]);
   }
 
   private async repairPlanReview(
