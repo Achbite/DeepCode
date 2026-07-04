@@ -90,6 +90,7 @@ import { UserInputPipeline, type RequirementOptionEffect } from './pipelines/use
 import {
   ContextFrameBuilder,
   GeneratedArtifactEvidenceIndex,
+  PathIdentity,
   ResourceEvidenceIndex,
   ResourceManifestBuilder,
   ResourceRequestLoop,
@@ -343,13 +344,14 @@ const reviewProjectionBuilder = new ReviewProjectionBuilder<SessionPlanContext, 
 const actionBatchFailureIndex = new ActionBatchFailureIndex();
 const kernelEventStatusIndex = new KernelEventStatusIndex();
 const repairLoop = new RepairLoop();
+const pathIdentity = new PathIdentity();
 const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();
 const acceptedPlanScopeCoverage = new AcceptedPlanScopeCoverage({
   taskTargets: (task) => acceptedPlanTargetParser.taskTargets(task),
 });
 const acceptedPlanOperationTargetResolver = new AcceptedPlanOperationTargetResolver({
   normalizeTargetScope: (value, accepted) => acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted),
-  normalizePlanScope,
+  normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
   concreteDirectoryOperationTarget: (value) => planReviewGrantProjector.concreteDirectoryOperationTarget(value),
   concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
   exactGrantCapabilityMatches: (grant, capability) => acceptedPlanScopeCoverage.exactGrantCapabilityMatches(grant, capability),
@@ -374,7 +376,7 @@ const acceptedPlanBatchPreflight = new AcceptedPlanBatchPreflight({
   actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
   deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),
   deleteActionRecursive: (action) => actionBundleActionInspector.deleteActionRecursive(action),
-  normalizePlanScope,
+  normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
   containsDirectoryPath: (resourcePackets, path) => resourceRequestLoop.containsDirectoryPath(resourcePackets, path),
 });
 const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
@@ -382,8 +384,8 @@ const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
   stringValue,
   stringArrayValue,
   kernelEventTargets: (record) => kernelEventProjectionBuilder.kernelEventTargets(record),
-  normalizeRelativePath,
-  comparablePath,
+  normalizeRelativePath: (value) => pathIdentity.normalizeRelativePath(value),
+  comparablePath: (value) => pathIdentity.comparablePath(value),
 });
 const nativeToolCoordinator = new NativeToolCoordinator();
 const nativeToolTurnHandler = new NativeToolTurnHandler(nativeToolCoordinator);
@@ -4806,8 +4808,8 @@ function resourceManifestBuilder(): ResourceManifestBuilder {
   return new ResourceManifestBuilder({
     maxDerivedManifestEntries: MAX_DERIVED_MANIFEST_ENTRIES,
     resourceManifestMaxBytes: RESOURCE_MANIFEST_MAX_BYTES,
-    comparablePath,
-    isAbsolutePath,
+    comparablePath: (value) => pathIdentity.comparablePath(value),
+    isAbsolutePath: (value) => pathIdentity.isAbsolutePath(value),
     sanitizeId,
     objectRecord,
   });
@@ -4819,15 +4821,15 @@ function resourceRequestResolver(): ResourceRequestResolver {
 
 function resourceEvidenceIndex(): ResourceEvidenceIndex {
   return new ResourceEvidenceIndex({
-    normalizeTarget: normalizePlanScope,
+    normalizeTarget: (value) => pathIdentity.normalizePlanScope(value),
     clip,
   });
 }
 
 function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex {
   return new GeneratedArtifactEvidenceIndex({
-    normalizeRelativePath,
-    comparablePath,
+    normalizeRelativePath: (value) => pathIdentity.normalizeRelativePath(value),
+    comparablePath: (value) => pathIdentity.comparablePath(value),
     utf8Bytes,
     sanitizeId,
     joinFsPath,
@@ -4860,7 +4862,7 @@ function acceptedImplementationPlanContextBuilder(): AcceptedImplementationPlanC
     objectRecord,
     stringValue,
     stringArrayValue,
-    normalizePlanScope,
+    normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
     uniqueStrings: (values) => driverActivityBuilder.uniqueStrings(values),
     acceptedPlanTaskTargets: (record) => acceptedPlanTargetParser.taskTargets(record),
     executionSliceRoleValue,
@@ -4903,7 +4905,7 @@ function reviewAssembler(): ReviewAssembler {
     actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
     normalizeAcceptedPlanTargetScope: (value, accepted) =>
       acceptedPlanScopeMatcher.normalizeTargetScope(value, accepted),
-    comparablePath,
+    comparablePath: (value) => pathIdentity.comparablePath(value),
     resourceTextForTarget: (packets, target) => resourceEvidenceIndex().textForTarget(packets, target),
   });
 }
@@ -4978,36 +4980,6 @@ function normalizedNonNegativeInteger(value: unknown): number | undefined {
 function normalizedPositiveInteger(value: unknown): number | undefined {
   const integer = normalizedNonNegativeInteger(value);
   return typeof integer === 'number' && integer > 0 ? integer : undefined;
-}
-
-function normalizeRelativePath(value: string | undefined): string | undefined {
-  if (!value) return undefined;
-  const normalized = normalizeSlashes(value).replace(/^\.\/+/, '').replace(/^\/+/, '');
-  const parts: string[] = [];
-  for (const part of normalized.split('/')) {
-    if (!part || part === '.') continue;
-    if (part === '..') return undefined;
-    parts.push(part);
-  }
-  return parts.join('/') || '.';
-}
-
-function normalizeSlashes(value: string): string {
-  return value.trim().replace(/\\/g, '/').replace(/\/+/g, '/');
-}
-
-function comparablePath(value: string): string {
-  return normalizeSlashes(value).replace(/\/+$/g, '');
-}
-
-function isAbsolutePath(value: string): boolean {
-  return value.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(value);
-}
-
-function basename(value: string): string {
-  const normalized = normalizeSlashes(value).replace(/\/+$/g, '');
-  const parts = normalized.split('/');
-  return parts[parts.length - 1] || normalized;
 }
 
 interface DiagnosticInfo {
@@ -5132,32 +5104,6 @@ function recoverAcceptedPlanFromOverlay(
     ]);
   }
   return { plan, acceptedPlan };
-}
-
-function normalizePlanScope(value: string): string {
-  return value
-    .replace(/\\/g, '/')
-    .replace(/^\.\//, '')
-    .replace(/\/+/g, '/')
-    .trim();
-}
-
-function normalizePlanScopeIdentity(value: string): string {
-  return normalizePlanScope(value).replace(/\/+$/, '');
-}
-
-function expandPlanTargetTokens(target: string): string[] {
-  if (!target || !target.trim()) return [];
-  const candidates = target.match(/[A-Za-z0-9_.\-/]+/g) ?? [];
-  const pathLike = candidates.filter((token) => token.includes('/') || /\.[A-Za-z0-9]+$/.test(token));
-  return pathLike.length ? pathLike : [target.trim()];
-}
-
-function dirnameLike(value: string): string | undefined {
-  const normalized = normalizePlanScope(value).replace(/\/+$/, '');
-  const index = normalized.lastIndexOf('/');
-  if (index <= 0) return undefined;
-  return normalized.slice(0, index);
 }
 
 function executionSliceRoleValue(value: unknown): ExecutionSliceRole | undefined {

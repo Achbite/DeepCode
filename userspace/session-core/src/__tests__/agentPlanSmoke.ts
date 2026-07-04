@@ -43,7 +43,7 @@ import {
 } from '../index.js';
 import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { GeneratedArtifactEvidenceIndex, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
+import { GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
 import {
   AcceptedImplementationPlanContextBuilder,
   AcceptedPlanBatchPreflight,
@@ -71,6 +71,7 @@ async function main(): Promise<void> {
   assertActionBundleProtocolFields();
   assertProtocolGateCanonicalizesBareRepair();
   assertActionBundleActionInspectorReadsActionShape();
+  assertPathIdentityNormalizesWorkspacePaths();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -323,6 +324,50 @@ function assertActionBundleActionInspectorReadsActionShape(): void {
     inspector.fileTargetRefFromPath(workspacePath).kind,
     'workspaceRelative',
     'action inspector marks workspace relative target refs'
+  );
+}
+
+function assertPathIdentityNormalizesWorkspacePaths(): void {
+  const token = randomSmokeToken('path-identity');
+  const root = `scope-${token}`;
+  const child = `child-${randomSmokeToken('child')}`;
+  const file = `file-${randomSmokeToken('file')}.txt`;
+  const identity = new PathIdentity();
+
+  assertEqual(
+    identity.normalizeRelativePath(`./${root}//./${child}/${file}`),
+    `${root}/${child}/${file}`,
+    'path identity normalizes workspace relative paths'
+  );
+  assertEqual(
+    identity.normalizeRelativePath(`${root}/../${file}`),
+    undefined,
+    'path identity rejects upward traversal'
+  );
+  assertEqual(
+    identity.comparablePath(`${root}//${child}/`),
+    `${root}/${child}`,
+    'path identity compares paths without trailing slash'
+  );
+  assertEqual(
+    identity.normalizePlanScope(`./${root}//${child}/`),
+    `${root}/${child}/`,
+    'path identity normalizes plan scope slashes'
+  );
+  assertEqual(
+    identity.normalizePlanScopeIdentity(`./${root}//${child}/`),
+    `${root}/${child}`,
+    'path identity normalizes plan scope identity'
+  );
+  assertEqual(
+    identity.expandPlanTargetTokens(`delete ${root}/${child}/${file}`).includes(`${root}/${child}/${file}`),
+    true,
+    'path identity extracts path-like target tokens'
+  );
+  assertEqual(
+    identity.dirnameLike(`${root}/${child}/${file}`),
+    `${root}/${child}`,
+    'path identity derives dirname-like parent'
   );
 }
 
