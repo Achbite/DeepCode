@@ -17,6 +17,7 @@ export * from './providerJsonModeCoordinator.js';
 export * from './providerPipeline.js';
 export * from './providerStreamCoordinator.js';
 export * from './providerStreamRuntime.js';
+export * from './providerTurnRunner.js';
 export * from './providerTraceRecorder.js';
 export * from './stopPipeline.js';
 export * from './toolUsePipeline.js';

@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderStreamRuntime, ProviderToolCallBuffer, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderStreamRuntime, ProviderToolCallBuffer, ProviderTraceRecorder, ProviderTurnRunner, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -90,6 +90,7 @@ async function main(): Promise<void> {
   assertProviderJsonModeCoordinator();
   assertProviderStreamCoordinatorClassifiesStages();
   await assertProviderStreamRuntimeHandlesStreamEvents();
+  await assertProviderTurnRunnerRunsProviderLifecycle();
   assertUserGuidanceQueueBuildsResumeAndConsumedEvents();
   assertPermissionPipelineFindsPendingPermission();
   assertInteractionOverlayCodecRoundTrips();
@@ -1575,6 +1576,169 @@ async function assertProviderStreamRuntimeHandlesStreamEvents(): Promise<void> {
   assert(
     deltas.some((delta) => delta.type === 'error' && delta.summary === `err-${token}`),
     'provider stream runtime emits provider stream errors'
+  );
+}
+
+async function assertProviderTurnRunnerRunsProviderLifecycle(): Promise<void> {
+  const token = randomSmokeToken('provider-turn');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const deltas: Array<Omit<ProjectionDelta, 'sessionId' | 'runId' | 'turnId' | 'seq'>> = [];
+  const appendedEvents: AgentEvent[] = [];
+  const traceStages: string[] = [];
+  const requests: LlmChatRequest[] = [];
+  const streamRuntime = new ProviderStreamRuntime<any>({
+    reasoningFlushChars: 8,
+    reasoningFlushMs: 999_999,
+    streamCoordinator: new ProviderStreamCoordinator(),
+    visibleLanguageForRequest: () => 'en-US',
+    providerActivity: (input) => ({
+      activityId: `activity-${input.stage}-${token}`,
+      kind: 'providerThinking',
+      status: input.status,
+      title: `activity-${input.stage}`,
+      summary: `activity-${input.stage}-${input.status}`,
+      source: 'provider',
+      runId: input.runId,
+    }),
+    conversationActivity: (activity) => activity,
+    emitProjectionDelta: async (_state, delta) => {
+      deltas.push(delta);
+    },
+    kernelCommand: async () => ({ ok: true, events: [] }) as KernelReply,
+    createId: (prefix) => `${prefix}-${token}`,
+  });
+  const runner = new ProviderTurnRunner<any>({
+    jsonModeCoordinator: new ProviderJsonModeCoordinator(),
+    streamCoordinator: new ProviderStreamCoordinator(),
+    streamRuntime,
+    traceRecorder: new ProviderTraceRecorder(),
+    visibleLanguageForRequest: () => 'en-US',
+    providerActivity: (input) => ({
+      activityId: `provider-${input.stage}-${token}`,
+      kind: 'providerThinking',
+      status: input.status,
+      title: `provider-${input.stage}`,
+      summary: `provider-${input.stage}-${input.status}`,
+      source: 'provider',
+      runId: input.runId,
+    }),
+    emitProjectionDelta: async (_state, delta) => {
+      deltas.push(delta);
+    },
+    cacheTelemetryEvent: (input) => ({
+      id: input.id,
+      sessionId: input.sessionId,
+      ts: input.ts,
+      kind: 'cache_telemetry',
+      payload: {
+        stage: input.stage,
+        usage: input.usage,
+      },
+    } as unknown as AgentEvent),
+    reasoningEvent: (eventSessionId, reasoning, ts, id) => ({
+      id,
+      sessionId: eventSessionId,
+      ts,
+      kind: 'assistant_msg',
+      payload: {
+        channel: 'assistant',
+        presentation: 'reasoning',
+        content: reasoning,
+      },
+    } as AgentEvent),
+    createToolCallBuffer: () => new ProviderToolCallBuffer({
+      parseArguments: (raw) => raw ? JSON.parse(raw) as Record<string, unknown> : {},
+      normalizeToolName: (name) => name,
+    }),
+    collectToolCalls: () => [],
+    nativeToolError: () => undefined,
+    createError: (code, message) => new Error(`${code}:${message}`),
+    now: () => '2026-01-01T00:00:00.000Z',
+    createId: (prefix) => `${prefix}-${token}`,
+  });
+  const result = await runner.run({
+    profileId: `profile-${token}`,
+    state: {
+      sessionId,
+      runId,
+      userRequest: `request-${token}`,
+      cachePlan: { mode: 'off', reasons: [`reason-${token}`], segments: [] },
+      contextAssembly: {
+        provider: `provider-${token}`,
+        model: `model-${token}`,
+        segments: [
+          {
+            id: `segment-${token}`,
+            name: `segment-${token}`,
+            cacheClass: 'dynamic',
+            stablePrefix: false,
+            auditOnly: false,
+            contentHash: `hash-${token}`,
+            charLength: 3,
+          },
+        ],
+        stablePrefixHash: `stable-${token}`,
+        dynamicSuffixHash: `dynamic-${token}`,
+        cacheHash: `cache-${token}`,
+      },
+    },
+    stage: `stage-${token}`,
+    messages: [{ role: 'user', content: `Return structured output ${token}.` }],
+    options: { responseFormat: { type: 'json_object' } },
+    ports: {
+      llmChat: async (request) => {
+        requests.push(request);
+        return {
+          ok: true,
+          data: {
+            chunks: [
+              { type: 'reasoning_delta', content: `reason-${token}` },
+              { type: 'delta', content: `answer-${token}` },
+            ],
+            assistantMessage: {
+              role: 'assistant',
+              content: `answer-${token}`,
+              reasoningContent: `reason-${token}`,
+            },
+            usage: { inputTokens: 2, outputTokens: 3 },
+          },
+        } as ApiResponse<LlmChatResult>;
+      },
+      appendEvents: async (_eventSessionId, events) => {
+        appendedEvents.push(...events);
+        return {};
+      },
+      appendTranscript: async (_eventSessionId, entry) => {
+        if (entry.type === 'metadata') {
+          const payload = entry.payload as Record<string, unknown>;
+          if (typeof payload.stage === 'string') traceStages.push(payload.stage);
+        }
+      },
+      createId: (prefix) => `${prefix}-${token}`,
+      now: () => '2026-01-01T00:00:00.000Z',
+    },
+  });
+
+  assertEqual(result.content, `answer-${token}`, 'provider turn runner returns assistant content');
+  assertEqual(result.reasoning, `reason-${token}`, 'provider turn runner returns assistant reasoning');
+  assertEqual(requests.length, 1, 'provider turn runner sends one provider request');
+  assertEqual(Boolean(requests[0]?.messages[0]?.content.toString().includes('valid JSON object')), true, 'provider turn runner applies JSON mode');
+  const deepcodeOptions = (requests[0]?.providerOptions as any)?.deepcode as Record<string, any> | undefined;
+  assertEqual(deepcodeOptions?.cachePlan?.mode, 'off', 'provider turn runner forwards cache plan');
+  assert(
+    traceStages.includes(`stage-${token}.request`) && traceStages.includes(`stage-${token}.response`),
+    'provider turn runner records request and response traces'
+  );
+  assert(
+    deltas.some((delta) => delta.type === 'active_turn' && delta.status === 'running') &&
+      deltas.some((delta) => delta.type === 'active_turn' && delta.status === 'completed'),
+    'provider turn runner emits active turn lifecycle deltas'
+  );
+  assert(
+    appendedEvents.some((event) => event.kind === 'cache_telemetry') &&
+      appendedEvents.some((event) => event.kind === 'assistant_msg'),
+    'provider turn runner appends cache telemetry and reasoning events'
   );
 }
 

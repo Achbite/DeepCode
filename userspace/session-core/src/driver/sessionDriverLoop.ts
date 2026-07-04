@@ -84,9 +84,9 @@ import {
   ProviderPipeline,
   ProviderStreamCoordinator,
   ProviderStreamRuntime,
+  ProviderTurnRunner,
   ProviderTraceRecorder,
   ProviderToolCallBuffer,
-  stripProviderPartFrames,
   type ProviderPartFrameParser,
   type NativeToolHandlingResult,
   type NativeToolReadLedgerEntry,
@@ -471,6 +471,7 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
 export class SessionDriverLoop {
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
+  private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
 
   constructor(private readonly ports: SessionDriverLoopPorts) {
     this.nativeToolHandlerPortsFactory = new NativeToolHandlerPortsFactory({
@@ -494,6 +495,29 @@ export class SessionDriverLoop {
       conversationActivity: (input) => driverActivityBuilder.conversationActivity(input),
       emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
       kernelCommand: (request) => this.ports.kernelCommand(request),
+      createId: (prefix) => this.id(prefix),
+    });
+    this.providerTurnRunner = new ProviderTurnRunner<SessionDriverLoopRunState>({
+      jsonModeCoordinator: providerJsonModeCoordinator,
+      streamCoordinator: providerStreamCoordinator,
+      streamRuntime: this.providerStreamRuntime,
+      traceRecorder: providerTraceRecorder,
+      visibleLanguageForRequest,
+      providerActivity: (input) => driverActivityBuilder.providerActivity(input),
+      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      cacheTelemetryEvent: (input) => sessionProgressProjectionBuilder.cacheTelemetryEvent(input),
+      reasoningEvent: (sessionId, reasoning, ts, id) =>
+        assistantProjectionBuilder.reasoningEvent(sessionId, reasoning, ts, id),
+      createToolCallBuffer: () => new ProviderToolCallBuffer({
+        parseArguments: (raw, toolName) => nativeToolCoordinator.parseArguments(raw, toolName),
+        normalizeToolName: (name) => nativeToolCoordinator.normalizeToolName(name),
+      }),
+      collectToolCalls: (result, buffer) => nativeToolCoordinator.collectCalls(result, buffer),
+      nativeToolError: (error) => error instanceof NativeToolCoordinatorError
+        ? { code: error.code, message: error.message }
+        : undefined,
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+      now: () => this.ts(),
       createId: (prefix) => this.id(prefix),
     });
   }
@@ -3990,140 +4014,14 @@ export class SessionDriverLoop {
     messages: LlmChatRequest['messages'],
     options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {}
   ): Promise<LlmTurnResult> {
-    const jsonModeMessages = providerJsonModeCoordinator.ensureMessages(messages, options.responseFormat);
-    await providerTraceRecorder.append(state, `${stage}.request`, {
+    return this.providerTurnRunner.run({
       profileId,
-      messages: jsonModeMessages,
-      cachePlan: state.cachePlan,
-      contextAssembly: state.contextAssembly,
-      responseFormat: options.responseFormat,
-      responseFormatAudit: providerJsonModeCoordinator.audit(messages, options.responseFormat),
-    }, this.ports);
-    await this.emitProjectionDelta(state, {
-      type: 'active_turn',
+      state,
       stage,
-      status: this.ports.llmChatStream ? 'streaming' : 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: providerStreamCoordinator.stageSummary(stage, 'request', visibleLanguageForRequest(state.userRequest)),
-      activity: driverActivityBuilder.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'running' }),
+      messages,
+      options,
+      ports: this.ports,
     });
-    const request: LlmChatRequest = {
-      profileId,
-      messages: jsonModeMessages,
-      responseFormat: options.responseFormat,
-      tools: options.tools,
-      stream: Boolean(this.ports.llmChatStream),
-      providerOptions: {
-        deepcode: {
-          cachePlan: state.cachePlan,
-        },
-      },
-    };
-    const toolCallBuffer = new ProviderToolCallBuffer({
-      parseArguments: (raw, toolName) => nativeToolCoordinator.parseArguments(raw, toolName),
-      normalizeToolName: (name) => nativeToolCoordinator.normalizeToolName(name),
-    });
-    const reasoningBuffer = this.providerStreamRuntime.createReasoningBuffer();
-    let result = this.ports.llmChatStream
-      ? await this.ports.llmChatStream(request, async (event) => {
-        await this.providerStreamRuntime.handleEvent({
-          state,
-          stage,
-          event,
-          toolCallBuffer,
-          reasoningBuffer,
-        });
-      })
-      : await this.ports.llmChat(request);
-    await this.providerStreamRuntime.flushReasoningBuffer(state, stage, reasoningBuffer);
-    if (this.ports.llmChatStream && (!result.ok || !result.data)) {
-      const fallbackRequest: LlmChatRequest = { ...request, stream: false };
-      await providerTraceRecorder.append(state, `${stage}.stream_fallback.request`, {
-        reason: result.message ?? result.error ?? 'streaming provider request failed',
-        request: fallbackRequest,
-      }, this.ports);
-      result = await this.ports.llmChat(fallbackRequest);
-    }
-    if (!result.ok || !result.data) {
-      await this.emitProjectionDelta(state, {
-        type: 'error',
-        stage,
-        status: 'failed',
-        channel: 'progress',
-        source: 'provider',
-        summary: result.message ?? result.error ?? 'LLM provider request failed.',
-      });
-      throw new SessionDriverLoopError(
-        'llm_chat_failed',
-        result.message ?? result.error ?? 'LLM provider request failed.'
-      );
-    }
-    const usage = objectRecord(result.data.usage);
-    const cacheEvent = sessionProgressProjectionBuilder.cacheTelemetryEvent({
-      sessionId: state.sessionId,
-      profileId,
-      provider: state.contextAssembly?.provider,
-      model: state.contextAssembly?.model,
-      stage,
-      usage,
-      promptSegmentDigests: state.contextAssembly?.segments.map((segment) => ({
-        id: segment.id,
-        name: segment.name,
-        cacheClass: segment.cacheClass,
-        stablePrefix: segment.stablePrefix,
-        auditOnly: segment.auditOnly,
-        contentHash: segment.contentHash,
-        charLength: segment.charLength,
-      })) ?? [],
-      stablePrefixHash: state.contextAssembly?.stablePrefixHash,
-      dynamicSuffixHash: state.contextAssembly?.dynamicSuffixHash,
-      cacheHash: state.contextAssembly?.cacheHash,
-      ts: this.ts(),
-      id: this.id(`cache-${stage}`),
-    });
-    if (cacheEvent) {
-      await this.append(state.sessionId, [cacheEvent]);
-    }
-    await providerTraceRecorder.append(state, `${stage}.response`, result.data, this.ports);
-    const reasoning = collectReasoning(result.data);
-    if (reasoning.trim()) {
-      await this.append(state.sessionId, [
-        assistantProjectionBuilder.reasoningEvent(state.sessionId, reasoning, this.ts(), this.id(`reasoning-${stage}`)),
-      ]);
-    }
-    await this.emitProjectionDelta(state, {
-      type: 'active_turn',
-      stage,
-      status: 'completed',
-      channel: 'progress',
-      source: 'provider',
-      summary: providerStreamCoordinator.stageSummary(stage, 'response', visibleLanguageForRequest(state.userRequest)),
-      activity: driverActivityBuilder.providerActivity({ runId: state.runId, userRequest: state.userRequest, stage, status: 'completed' }),
-    });
-    const content = stripProviderPartFrames(result.data.assistantMessage?.content
-      ?? result.data.chunks
-        .filter((chunk) => chunk.type === 'delta' && typeof chunk.content === 'string')
-        .map((chunk) => chunk.content)
-        .join(''));
-    let toolCalls: NativeToolCallProposal[];
-    try {
-      toolCalls = nativeToolCoordinator.collectCalls(result.data, toolCallBuffer);
-    } catch (error) {
-      if (error instanceof NativeToolCoordinatorError) {
-        throw new SessionDriverLoopError(error.code, error.message);
-      }
-      throw error;
-    }
-    if (!content.trim() && toolCalls.length === 0) {
-      throw new SessionDriverLoopError('llm_empty_response', 'LLM provider returned an empty response.');
-    }
-    return {
-      result: result.data,
-      content,
-      reasoning,
-      toolCalls,
-    };
   }
 
   private async emitProjectionDelta(
@@ -4718,14 +4616,6 @@ function normalizeParseError(error: unknown): { code: string; message: string } 
   if (error instanceof AgentPlanParseError) return { code: error.code, message: error.message };
   if (error instanceof Error) return { code: 'parse_failed', message: error.message };
   return { code: 'parse_failed', message: String(error) };
-}
-
-function collectReasoning(result: LlmChatResult): string {
-  const chunks = result.chunks
-    .filter((chunk) => chunk.type === 'reasoning_delta' && typeof chunk.content === 'string')
-    .map((chunk) => chunk.content)
-    .join('');
-  return result.assistantMessage?.reasoningContent ?? chunks;
 }
 
 function planInitialUserRequest(plan: SessionPlanContext): string {
