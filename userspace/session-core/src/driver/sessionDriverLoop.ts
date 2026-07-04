@@ -2640,15 +2640,6 @@ export class SessionDriverLoop {
       });
     }
 
-    const factsReply = await this.kernel({
-      command: {
-        kind: 'reviewFactsGet',
-        requestId: this.id('accepted-plan-review-facts-get'),
-        runId: state.runId,
-        sessionId: state.sessionId,
-      },
-    });
-    result = await this.appendProjectedKernelEvents(state.sessionId, factsReply) ?? result;
     const plan = acceptedPlanExecutor.readOnlyReviewContext({
       sessionId: state.sessionId,
       runId: state.runId,
@@ -2663,32 +2654,16 @@ export class SessionDriverLoop {
       summary: `Kernel resolved ${packet.items.length} resource item(s) for accepted-plan read-only validation.`,
       output: packet,
     };
-    const review = reviewProjectionBuilder.summaryEvent({
+
+    return this.acceptedPlanReviewHandoffCoordinator.handoff({
       sessionId: state.sessionId,
+      runId: state.runId,
+      planId: accepted.planId,
       plan,
-      kernelEvents: [resourceFact, ...(factsReply.events ?? [])],
-      ts: this.ts(),
-      id: this.id('review-summary'),
+      result,
+      currentKernelEvents: [resourceFact],
+      requestIdPrefix: 'accepted-plan-review-facts-get',
     });
-    const reviewPayload = objectRecord(review.payload) ?? {};
-    return this.append(state.sessionId, [
-      review,
-      sessionProgressProjectionBuilder.sessionRunStateEvent({
-        sessionId: state.sessionId,
-        runId: state.runId,
-        phase: 'waiting_review',
-        reason: 'review',
-        decisionOwner: {
-          kind: 'review',
-          runId: state.runId,
-          targetId: stringValue(reviewPayload.reviewId) ?? state.runId,
-          reviewId: stringValue(reviewPayload.reviewId) ?? state.runId,
-          planId: accepted.planId,
-        },
-        ts: this.ts(),
-        id: this.id('session-run-waiting-review'),
-      }),
-    ]) ?? result;
   }
 
   private async tryCompleteAcceptedPlanReadOnlyActionBundle(
