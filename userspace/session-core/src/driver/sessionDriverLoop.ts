@@ -135,7 +135,7 @@ import {
   ReviewDecisionProjectionBuilder,
   type SessionReviewContext,
 } from './review/index.js';
-import { PermissionDecisionHandler, ReviewDecisionHandler } from './interactions/index.js';
+import { PermissionDecisionHandler, PlanDecisionHandler, ReviewDecisionHandler } from './interactions/index.js';
 import {
   ActionBundleActionInspector,
   PlanContextIndex,
@@ -493,6 +493,7 @@ export class SessionDriverLoop {
   private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionResourceFollowupCoordinator: ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>;
   private readonly permissionDecisionHandler: PermissionDecisionHandler<SessionPlanContext>;
+  private readonly planDecisionHandler: PlanDecisionHandler;
   private readonly reviewDecisionHandler: ReviewDecisionHandler;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
@@ -585,6 +586,26 @@ export class SessionDriverLoop {
       kernelStatus: kernelEventStatusIndex,
       planIndex: planContextIndex,
       reviewProjection: reviewProjectionBuilder,
+      progressProjection: sessionProgressProjectionBuilder,
+    });
+    this.planDecisionHandler = new PlanDecisionHandler({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
+      executeAcceptedActionBundlePlan: (handlerInput, plan, initialResult, acceptedOverlay) =>
+        this.executeAcceptedActionBundlePlan({ ...handlerInput, kind: 'plan' }, plan, initialResult, acceptedOverlay),
+      activeDriverInteraction: (events) => findActiveDriverInteraction(events),
+      executionRootFromDecision: (handlerInput, events) =>
+        AcceptedPlanExecutionRootResolver.fromDecision(handlerInput, events),
+      buildAcceptedImplementationPlan: ({ plan, interventionLevel, executionRoot }) =>
+        acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel, executionRoot }),
+      recoverAcceptedPlanFromOverlay: (handlerInput, events, overlay) =>
+        recoverAcceptedPlanFromOverlay({ ...handlerInput, kind: 'plan' }, events, overlay),
+      planRevisionRequest: (request) => repairLoop.planRevisionRequest(request),
+      executionRequest: (plan, acceptedPlan, guidance) => executionPromptCoordinator().executionRequest(plan, acceptedPlan, guidance),
+      planIndex: planContextIndex,
+      planProjection: planProjectionBuilder,
       progressProjection: sessionProgressProjectionBuilder,
     });
     this.reviewDecisionHandler = new ReviewDecisionHandler({
@@ -1585,133 +1606,22 @@ export class SessionDriverLoop {
   }
 
   private async resolvePlanDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
-    const events = input.existingEvents ?? [];
-    const active = findActiveDriverInteraction(events);
-    const activePlanMatches = active?.kind === 'plan' &&
-      active.runId === input.runId &&
-      (!input.targetId || active.planId === input.targetId || Boolean(planContextIndex.findPlanCard(events, input.runId, input.targetId)));
-    if (!activePlanMatches) {
-      return this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.traceEvent({
-          sessionId: input.sessionId,
-          kind: 'trace/plan_accept_noop',
-          summary: '该计划已处理或已过期，没有再次提交执行。',
-          ts: this.ts(),
-          id: this.id('plan-noop'),
-          extra: {
-            runId: input.runId,
-            planId: input.targetId,
-            decision: input.decision,
-            visibility: 'debug',
-          },
-        }),
-      ]);
-    }
-    const plan = planContextIndex.findPlanCard(events, input.runId, input.targetId);
-    if (!plan || planContextIndex.alreadyResolved(events, plan)) {
-      return this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.traceEvent({
-          sessionId: input.sessionId,
-          kind: 'trace/plan_accept_noop',
-          summary: '该计划已处理或已过期，没有再次提交执行。',
-          ts: this.ts(),
-          id: this.id('plan-noop'),
-          extra: {
-            runId: input.runId,
-            planId: input.targetId,
-            decision: input.decision,
-            visibility: 'debug',
-          },
-        }),
-      ]);
-    }
-
-    if (input.decision !== 'accept') {
-      const status = input.decision === 'revise' ? 'needsRevision' : 'rejected';
-      let result = await this.append(input.sessionId, [
-        planProjectionBuilder.planReviewDecisionEvent({
-          sessionId: input.sessionId,
-          plan,
-          status,
-          summary: input.guidance,
-          ts: this.ts(),
-          id: this.id('plan-decision'),
-        }),
-      ]);
-      if (input.decision === 'revise') {
-        return this.runUserTurn({
-          sessionId: input.sessionId,
-          content: repairLoop.planRevisionRequest({ plan, guidance: input.guidance }),
-          attachments: [],
-          existingEvents: result.events,
-          workspaceBinding: input.workspaceBinding,
-          projectWorkingDirectory: input.projectWorkingDirectory,
-          profileId: input.profileId,
-          workflow: input.workflow,
-          appendUserMessage: false,
-          requirementConfirmationMode: 'off',
-          reviewContinuationMode: input.reviewContinuationMode,
-          interventionLevel: input.interventionLevel,
-          projectMemoryMode: input.projectMemoryMode,
-          interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-        });
-      }
-      if (input.decision === 'reject') {
-        result = await this.append(input.sessionId, [
-          sessionProgressProjectionBuilder.sessionRunStateEvent({
-            sessionId: input.sessionId,
-            runId: plan.runId,
-            phase: 'cancelled',
-            status: 'cancelled',
-            reason: 'plan_review',
-            decisionOwner: {
-              kind: 'plan',
-              runId: plan.runId,
-              targetId: plan.planId,
-              planId: plan.planId,
-            },
-            interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-            ts: this.ts(),
-            id: this.id('session-run-cancelled-plan'),
-          }),
-        ]) ?? result;
-      }
-      return result;
-    }
-
-    let result = await this.append(input.sessionId, [
-      planProjectionBuilder.planReviewDecisionEvent({
-        sessionId: input.sessionId,
-        plan,
-        status: 'accepted',
-        ts: this.ts(),
-        id: this.id('plan-accepted'),
-      }),
-    ]);
-    if (plan.implementationPlan) {
-      const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, result.events);
-      const acceptedPlan = acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: input.interventionLevel, executionRoot });
-      return this.runUserTurn({
-        sessionId: input.sessionId,
-        content: executionPromptCoordinator().executionRequest(plan, acceptedPlan, input.guidance),
-        attachments: acceptedPlan.executionRoot ? [acceptedPlan.executionRoot.attachment] : [],
-        existingEvents: result.events,
-        workspaceBinding: input.workspaceBinding,
-        projectWorkingDirectory: input.projectWorkingDirectory,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        projectMemoryMode: input.projectMemoryMode,
-        appendUserMessage: false,
-        requirementConfirmationMode: 'off',
-        reviewContinuationMode: input.reviewContinuationMode,
-        interventionLevel: input.interventionLevel,
-        resumeResourcePackets: true,
-        acceptedImplementationPlan: acceptedPlan,
-        interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-      });
-    }
-    const acceptedOverlay = recoverAcceptedPlanFromOverlay(input, result.events, plan.interactionOverlay ?? input.interactionOverlay);
-    return this.executeAcceptedActionBundlePlan(input, plan, result, acceptedOverlay);
+    return this.planDecisionHandler.resolve({
+      sessionId: input.sessionId,
+      decision: input.decision,
+      guidance: input.guidance,
+      runId: input.runId,
+      targetId: input.targetId,
+      existingEvents: input.existingEvents,
+      workspaceBinding: input.workspaceBinding,
+      projectWorkingDirectory: input.projectWorkingDirectory,
+      profileId: input.profileId,
+      workflow: input.workflow,
+      reviewContinuationMode: input.reviewContinuationMode,
+      interventionLevel: input.interventionLevel,
+      projectMemoryMode: input.projectMemoryMode,
+      interactionOverlay: input.interactionOverlay,
+    });
   }
 
   private async executeAcceptedActionBundlePlan(

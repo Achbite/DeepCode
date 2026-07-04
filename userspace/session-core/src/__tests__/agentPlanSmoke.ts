@@ -70,7 +70,7 @@ import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgr
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { AcceptedPlanReviewHandoffCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
-import { PermissionDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
+import { PermissionDecisionHandler, PlanDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
 import type { PromptEnvelope } from '../prompt/types.js';
@@ -133,6 +133,7 @@ async function main(): Promise<void> {
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
   await assertReviewDecisionHandlerAcceptsTerminalReview();
+  await assertPlanDecisionHandlerRejectsActivePlan();
   assertProjectionBuildersKeepKernelAndReviewReadModels();
   await assertAgentRunReactorCoordinatesPorts();
   assertDriverActivityBuilderCreatesReadModels();
@@ -4699,6 +4700,114 @@ async function assertReviewDecisionHandlerAcceptsTerminalReview(): Promise<void>
   assertEqual(completedPayload?.phase, 'completed', 'review handler completed state uses completed phase');
   const owner = completedPayload?.decisionOwner as Record<string, unknown> | undefined;
   assertEqual(owner?.reviewId, reviewId, 'review handler completed state keeps review owner');
+}
+
+async function assertPlanDecisionHandlerRejectsActivePlan(): Promise<void> {
+  const token = randomSmokeToken('plan-handler');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const planId = `plan-${token}`;
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    title: `Session ${token}`,
+    createdAt: `created-${token}`,
+    updatedAt: `updated-${token}`,
+    eventCount: 0,
+  };
+  const store: AgentEvent[] = [{
+    id: `plan-card-${token}`,
+    sessionId,
+    ts: `ts-${token}`,
+    kind: 'plan_card',
+    payload: {
+      runId,
+      planId,
+      status: 'pending',
+      confirmable: true,
+      content: `Plan ${token}`,
+      actionBundle: { id: planId, version: '1', actions: [] },
+      codeBlocks: [],
+      commandBlocks: [],
+      expectedValidation: '',
+      reviewGuide: '',
+    },
+  } as AgentEvent];
+  let resumed = 0;
+  let executed = 0;
+  const handler = new PlanDecisionHandler({
+    now: () => `now-${token}`,
+    createId: (prefix) => `${prefix}-${token}`,
+    append: async (nextSessionId, events) => {
+      assertEqual(nextSessionId, sessionId, 'plan handler appends to current session');
+      store.push(...events);
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    resumeUserTurn: async () => {
+      resumed += 1;
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    executeAcceptedActionBundlePlan: async () => {
+      executed += 1;
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    activeDriverInteraction: () => ({ kind: 'plan', runId, planId }),
+    executionRootFromDecision: () => undefined,
+    buildAcceptedImplementationPlan: () => {
+      throw new Error('rejecting a plan must not build accepted implementation context');
+    },
+    recoverAcceptedPlanFromOverlay: () => undefined,
+    planRevisionRequest: () => `revision-${token}`,
+    executionRequest: () => `execution-${token}`,
+    planIndex: new PlanContextIndex({
+      interactionOverlayFromPayload: () => undefined,
+      executionRootFromPayload: () => undefined,
+    }),
+    planProjection: new PlanProjectionBuilder({
+      readActionBundle: () => undefined,
+      requiredFileOperationsFromReport: () => [],
+      requiredAccessScopesFromReport: () => [],
+      permissionBundlesFromReport: () => [],
+      gateInterventionsFromReport: () => [],
+      planReviewFacts: () => [],
+      interactionOverlayProjection: () => ({}),
+      visibleLanguageForRequest: () => 'en-US',
+    }),
+    progressProjection: {
+      traceEvent: ({ kind, summary, extra }) => ({
+        id: `trace-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind,
+        payload: { summary, ...extra },
+      }),
+      sessionRunStateEvent: ({ phase, status, reason, decisionOwner, interactionOverlay }) => ({
+        id: `run-state-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind: 'session_run_state',
+        payload: { phase, status, reason, decisionOwner, interactionOverlay },
+      }),
+    },
+  });
+
+  const result = await handler.resolve({
+    sessionId,
+    decision: 'reject',
+    runId,
+    targetId: planId,
+    existingEvents: [...store],
+  });
+
+  assertEqual(resumed, 0, 'plan reject does not resume provider loop');
+  assertEqual(executed, 0, 'plan reject does not execute accepted action bundle');
+  assertEqual(result.events.some((event) => event.kind === 'plan_review' && (event.payload as any)?.status === 'rejected'), true, 'plan handler records rejected plan review');
+  const cancelled = result.events.find((event) => event.kind === 'session_run_state' && (event.payload as any)?.status === 'cancelled');
+  assert(Boolean(cancelled), 'plan handler appends cancelled run state');
+  const cancelledPayload = cancelled?.payload as Record<string, unknown> | undefined;
+  assertEqual(cancelledPayload?.phase, 'cancelled', 'plan handler cancelled state uses cancelled phase');
+  const owner = cancelledPayload?.decisionOwner as Record<string, unknown> | undefined;
+  assertEqual(owner?.planId, planId, 'plan handler cancelled state keeps plan owner');
 }
 
 function assertProjectionBuildersKeepKernelAndReviewReadModels(): void {
