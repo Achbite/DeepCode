@@ -74,6 +74,7 @@ import {
   NativeToolRepairCoordinator,
   NativeToolResultMessageBuilder,
   NativeToolResourceRecorder,
+  NativeToolResumeMessageBuilder,
   NativeToolTurnHandler,
   ProviderJsonModeCoordinator,
   ProviderPipeline,
@@ -435,6 +436,9 @@ const nativeToolResourceRecorder = new NativeToolResourceRecorder({
   packetContentHash: (packet) => nativeToolCoordinator.packetContentHash(packet),
   addDiscoveredManifestEntries: (manifest, packet) => resourceRequestLoop.addDiscoveredManifestEntries(manifest, packet),
   packetEvent: (sessionId, packet, ts, id) => resourceRequestLoop.packetEvent(sessionId, packet, ts, id),
+});
+const nativeToolResumeMessageBuilder = new NativeToolResumeMessageBuilder({
+  callToProtocol: (toolCall) => nativeToolCoordinator.callToProtocol(toolCall),
 });
 const PROVIDER_REASONING_FLUSH_CHARS = 768;
 const PROVIDER_REASONING_FLUSH_MS = 120;
@@ -2811,16 +2815,11 @@ export class SessionDriverLoop {
       });
       if (handled.kind === 'proposal') return handled.proposal;
 
-      currentMessages = [
-        ...currentMessages,
-        {
-          role: 'assistant',
-          content: effectiveTurn.content,
-          reasoningContent: effectiveTurn.reasoning || undefined,
-          toolCalls: effectiveTurn.toolCalls.map((toolCall) => nativeToolCoordinator.callToProtocol(toolCall)),
-        },
-        ...handled.toolMessages,
-      ];
+      currentMessages = nativeToolResumeMessageBuilder.nextMessages(
+        currentMessages,
+        effectiveTurn,
+        handled.toolMessages
+      );
       const guidanceMessages = await this.consumeQueuedGuidanceForProviderResume(state, stage);
       currentMessages.push(...guidanceMessages);
     }

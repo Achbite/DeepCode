@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -76,6 +76,7 @@ async function main(): Promise<void> {
   assertNativeToolProjectionBuilderBuildsDeltas();
   assertNativeToolResultMessageBuilderBuildsToolMessages();
   assertNativeToolResourceRecorderRecordsPackets();
+  assertNativeToolResumeMessageBuilderAppendsToolMessages();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -667,6 +668,47 @@ function assertNativeToolResourceRecorderRecordsPackets(): void {
   assertEqual(state.manifest.entries.length, 1, 'native tool resource recorder keeps discovered manifest mutation');
   assertEqual(event.id, `event-${token}`, 'native tool resource recorder returns packet event');
   assertEqual(event.sessionId, sessionId, 'native tool resource recorder keeps session id on packet event');
+}
+
+function assertNativeToolResumeMessageBuilderAppendsToolMessages(): void {
+  const token = randomSmokeToken('native-resume');
+  const toolCall = {
+    callId: `call-${token}`,
+    index: 0,
+    name: `read_${randomSmokeToken('tool')}`,
+    arguments: { path: `scope-${token}/target-${randomSmokeToken('target')}.txt` },
+  };
+  const builder = new NativeToolResumeMessageBuilder({
+    callToProtocol: (call) => ({
+      id: call.callId,
+      name: call.name,
+      arguments: call.arguments,
+    }),
+  });
+  const currentMessages: LlmChatRequest['messages'] = [
+    { role: 'system', content: `system-${token}` },
+    { role: 'user', content: `user-${token}` },
+  ];
+  const toolMessages: LlmChatRequest['messages'] = [{
+    role: 'tool',
+    toolCallId: toolCall.callId,
+    content: `tool-result-${token}`,
+  }];
+  const messages = builder.nextMessages(
+    currentMessages,
+    {
+      content: `assistant-${token}`,
+      reasoning: `reasoning-${token}`,
+      toolCalls: [toolCall],
+    },
+    toolMessages
+  );
+
+  assertEqual(messages.length, 4, 'native tool resume message builder appends assistant and tool messages');
+  assertEqual(messages[2]?.role, 'assistant', 'native tool resume message builder places assistant resume before tool result');
+  assertEqual((messages[2] as any).reasoningContent, `reasoning-${token}`, 'native tool resume message builder preserves reasoning content');
+  assertEqual((messages[2] as any).toolCalls[0].id, toolCall.callId, 'native tool resume message builder converts native tool call to protocol call');
+  assertEqual(messages[3]?.role, 'tool', 'native tool resume message builder appends tool message after assistant');
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
