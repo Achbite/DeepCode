@@ -103,6 +103,7 @@ import {
   PathIdentity,
   ResourceEvidenceIndex,
   ResourceManifestBuilder,
+  ResourceOrchestrator,
   ResourceRequestLoop,
   ResourceRequestResolver,
   type GeneratedArtifactEvidence,
@@ -471,6 +472,7 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
 
 export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
+  private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
@@ -483,6 +485,11 @@ export class SessionDriverLoop {
       createError: (code, message) => new SessionDriverLoopError(code, message),
       errorCode: (error, fallback) => error instanceof SessionDriverLoopError ? error.code : fallback,
       errorMessage: (error) => error instanceof Error ? error.message : String(error),
+    });
+    this.resourceOrchestrator = new ResourceOrchestrator<SessionDriverLoopRunState>({
+      resourceRequestLoop,
+      runtime: this.agentRunReactor,
+      createError: (code, message) => new SessionDriverLoopError(code, message),
     });
     this.nativeToolHandlerPortsFactory = new NativeToolHandlerPortsFactory({
       progressEventBuilder: nativeToolProgressEventBuilder,
@@ -634,10 +641,11 @@ export class SessionDriverLoop {
       interactionOverlay: input.interactionOverlay,
     };
     if (state.manifest.entries.length > 0 && !input.resumeResourcePackets) {
-      const packet = await this.resolveResources(state, state.manifest);
-      state.resourcePackets.push(packet);
-      resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
-      lastResult = await this.append(sessionId, [resourceRequestLoop.packetEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
+      lastResult = (await this.resourceOrchestrator.resolveRecordAndAppend(
+        state,
+        state.manifest,
+        'resource-context'
+      )).result;
     }
 
     if (shouldRequestRequirementConfirmation(input, state)) {
@@ -853,8 +861,11 @@ export class SessionDriverLoop {
           this.id('generated-artifact-resource')
         );
         if (generated.packet) {
-          state.resourcePackets.push(generated.packet);
-          lastResult = await this.append(sessionId, [resourceRequestLoop.packetEvent(sessionId, generated.packet, this.ts(), this.id('generated-artifact-resource-context'))]);
+          lastResult = (await this.resourceOrchestrator.recordAndAppend(
+            state,
+            generated.packet,
+            'generated-artifact-resource-context'
+          )).result;
           if (!generated.remaining.items.length) continue;
         }
         let subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
@@ -896,10 +907,13 @@ export class SessionDriverLoop {
             ),
           ]);
         }
-        const packet = await this.resolveResources(state, subset.manifest);
-        state.resourcePackets.push(packet);
-        resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
-        lastResult = await this.append(sessionId, [resourceRequestLoop.packetEvent(sessionId, packet, this.ts(), this.id('resource-context'))]);
+        const resourceAppend = await this.resourceOrchestrator.resolveRecordAndAppend(
+          state,
+          subset.manifest,
+          'resource-context'
+        );
+        const packet = resourceAppend.packet;
+        lastResult = resourceAppend.result;
         if (state.acceptedImplementationPlan) {
           acceptedPlanTaskLedger().refreshRuntimeState(state);
           const resumeEvent = sessionProgressProjectionBuilder.acceptedPlanResourceResumeEvent(
@@ -2579,11 +2593,9 @@ export class SessionDriverLoop {
     const subset = resourceRequestResolver().resolve(state.manifest, request, state.conversationRoots);
     if (!subset.manifest.entries.length) return null;
 
-    const packet = await this.resolveResources(state, subset.manifest);
-    state.resourcePackets.push(packet);
-    resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
+    const packet = await this.resourceOrchestrator.resolveAndRecord(state, subset.manifest);
     let result = await this.append(state.sessionId, [
-      resourceRequestLoop.packetEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-readonly-action-resource-context')),
+      this.resourceOrchestrator.packetEvent(state, packet, 'accepted-plan-readonly-action-resource-context'),
       sessionProgressProjectionBuilder.acceptedPlanResourceResumeEvent(
         state.sessionId,
         state.runId,
@@ -2857,7 +2869,7 @@ export class SessionDriverLoop {
     toolCall: NativeToolCallProposal
   ): Promise<ResourcePacket> {
     const manifest = nativeToolCoordinator.readManifest(state, toolCall);
-    return this.resolveResources(state, manifest);
+    return this.resourceOrchestrator.resolve(state, manifest);
   }
 
   private async repairSideEffectNativeTool(
@@ -3056,10 +3068,11 @@ export class SessionDriverLoop {
         this.id('action-bundle-admission-generated-resource')
       );
       if (generated.packet) {
-        state.resourcePackets.push(generated.packet);
-        result = await this.append(state.sessionId, [
-          resourceRequestLoop.packetEvent(state.sessionId, generated.packet, this.ts(), this.id('action-bundle-admission-generated-resource-context')),
-        ]) ?? result;
+        result = (await this.resourceOrchestrator.recordAndAppend(
+          state,
+          generated.packet,
+          'action-bundle-admission-generated-resource-context'
+        )).result ?? result;
       }
       const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
       if (!subset.manifest.entries.length) {
@@ -3075,12 +3088,11 @@ export class SessionDriverLoop {
           )) ?? result;
         }
       } else {
-        const packet = await this.resolveResources(state, subset.manifest);
-        state.resourcePackets.push(packet);
-        resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
-        result = await this.append(state.sessionId, [
-          resourceRequestLoop.packetEvent(state.sessionId, packet, this.ts(), this.id('action-bundle-admission-resource-context')),
-        ]) ?? result;
+        result = (await this.resourceOrchestrator.resolveRecordAndAppend(
+          state,
+          subset.manifest,
+          'action-bundle-admission-resource-context'
+        )).result ?? result;
       }
       return this.runUserTurn({
         sessionId: input.sessionId,
@@ -3163,20 +3175,6 @@ export class SessionDriverLoop {
       ]) ?? result;
     }
     return this.submitNonExecutableProposal(state, repaired, result);
-  }
-
-  private async resolveResources(
-    state: SessionDriverLoopRunState,
-    manifest: ResourceManifest
-  ): Promise<ResourcePacket> {
-    const packet = await resourceRequestLoop.resolvePacket(state, manifest, {
-      kernelCommand: (request) => this.kernel(request),
-      createId: (prefix) => this.id(prefix),
-    });
-    if (!packet) {
-      throw new SessionDriverLoopError('resource_packet_missing', 'Kernel ResourceResolve did not produce a ResourcePacket.');
-    }
-    return packet;
   }
 
   private async submitActionProposal(
@@ -3354,10 +3352,11 @@ export class SessionDriverLoop {
             this.id('accepted-plan-repair-generated-resource')
           );
           if (generated.packet) {
-            state.resourcePackets.push(generated.packet);
-            result = await this.append(state.sessionId, [
-              resourceRequestLoop.packetEvent(state.sessionId, generated.packet, this.ts(), this.id('accepted-plan-repair-generated-resource-context')),
-            ]) ?? result;
+            result = (await this.resourceOrchestrator.recordAndAppend(
+              state,
+              generated.packet,
+              'accepted-plan-repair-generated-resource-context'
+            )).result ?? result;
           }
           const subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
           if (!subset.manifest.entries.length) {
@@ -3377,12 +3376,11 @@ export class SessionDriverLoop {
               ]);
             }
           } else {
-            const packet = await this.resolveResources(state, subset.manifest);
-            state.resourcePackets.push(packet);
-            resourceRequestLoop.addDiscoveredManifestEntries(state.manifest, packet);
-            result = await this.append(state.sessionId, [
-              resourceRequestLoop.packetEvent(state.sessionId, packet, this.ts(), this.id('accepted-plan-repair-resource-context')),
-            ]) ?? result;
+            result = (await this.resourceOrchestrator.resolveRecordAndAppend(
+              state,
+              subset.manifest,
+              'accepted-plan-repair-resource-context'
+            )).result ?? result;
           }
           return this.runUserTurn({
             sessionId: input.sessionId,
@@ -3721,10 +3719,11 @@ export class SessionDriverLoop {
     );
     if (generatedPacket) {
       generatedArtifactEvidenceIndex().indexPacket(state.generatedArtifactEvidence, generatedPacket);
-      state.resourcePackets.push(generatedPacket);
-      result = await this.append(state.sessionId, [
-        resourceRequestLoop.packetEvent(state.sessionId, generatedPacket, this.ts(), this.id('accepted-plan-generated-artifact-evidence')),
-      ]) ?? result;
+      result = (await this.resourceOrchestrator.recordAndAppend(
+        state,
+        generatedPacket,
+        'accepted-plan-generated-artifact-evidence'
+      )).result ?? result;
     }
     if (!kernelEventStatusIndex.actionBatchReadyForReview(batchReply.events ?? [])) {
       if (kernelEventStatusIndex.hasPermissionRequest(batchReply.events ?? [])) {

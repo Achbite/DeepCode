@@ -4,4 +4,5 @@ export * from './contextFrameBuilder.js';
 export * from './generatedArtifactEvidenceIndex.js';
 export * from './pathIdentity.js';
 export * from './resourceEvidenceIndex.js';
+export * from './resourceOrchestrator.js';
 export * from './resourceRequestLoop.js';

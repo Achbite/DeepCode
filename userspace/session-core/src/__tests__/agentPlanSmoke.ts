@@ -44,7 +44,7 @@ import {
 import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceRequestLoop } from '../driver/context/index.js';
+import { GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop } from '../driver/context/index.js';
 import {
   AcceptedImplementationPlanContextBuilder,
   AcceptedPlanBatchPreflight,
@@ -98,6 +98,7 @@ async function main(): Promise<void> {
   assertUserInputPipelineFindsRequirementInteractions();
   await assertProviderTraceRecorderArchivesPayload();
   await assertResourceRequestLoopBuildsPacketEvents();
+  await assertResourceOrchestratorResolvesAndRecordsPackets();
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
@@ -2258,6 +2259,88 @@ async function assertResourceRequestLoopBuildsPacketEvents(): Promise<void> {
     loop.containsDirectoryPath([directoryPacket], `./root-${token}/nested-${token}/`),
     'resource request loop recognizes directory targets from ResourcePacket directory trees'
   );
+}
+
+async function assertResourceOrchestratorResolvesAndRecordsPackets(): Promise<void> {
+  const token = randomSmokeToken('resource-orchestrator');
+  const childFile = `child-${randomSmokeToken('file')}.txt`;
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const manifest: ResourceManifest = {
+    id: `manifest-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    entries: [{
+      id: `entry-${token}`,
+      kind: 'directory',
+      label: `Directory ${token}`,
+      resourceRef: `/tmp/root-${token}`,
+      readPolicy: 'autoRead',
+      reason: `reason-${token}`,
+    }],
+    budget: { maxEntries: 20, maxBytes: 4096 },
+    defaultDenyPatterns: [],
+  };
+  const state = {
+    sessionId,
+    runId,
+    manifest,
+    resourcePackets: [] as ResourcePacket[],
+  };
+  const appended: AgentEvent[][] = [];
+  const orchestrator = new ResourceOrchestrator({
+    resourceRequestLoop: new ResourceRequestLoop({ maxDerivedManifestEntries: 20 }),
+    runtime: {
+      kernel: async (request) => {
+        assertEqual((request.command as any).kind, 'resourceResolve', 'resource orchestrator submits resourceResolve commands');
+        assertEqual((request.command as any).runId, runId, 'resource orchestrator carries run id');
+        return {
+          ok: true,
+          events: [{
+            kind: 'resource.packet_produced',
+            runId,
+            packet: {
+              id: `packet-${token}`,
+              workspaceScopeKey: `workspace-${token}`,
+              requestId: `request-${token}`,
+              items: [{
+                requestItemId: `item-${token}`,
+                manifestEntryId: `entry-${token}`,
+                status: 'resolved',
+                contentKind: 'directoryTree',
+                absolutePath: `/tmp/root-${token}`,
+                nodes: [{ path: childFile, type: 'file' }],
+                evidenceRefs: [`evidence-${token}`],
+              }],
+            },
+          }],
+        };
+      },
+      append: async (appendSessionId, events) => {
+        appended.push(events);
+        return {
+          session: {
+            id: appendSessionId,
+            mode: 'plan',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          } satisfies AgentSession,
+          events,
+        };
+      },
+      id: (prefix) => `${prefix}-${token}`,
+      ts: () => '2026-01-01T00:00:00.000Z',
+    },
+    createError: (code, message) => Object.assign(new Error(message), { code }),
+  });
+  const output = await orchestrator.resolveRecordAndAppend(state, manifest, 'resource-context');
+  assertEqual(output.packet.id, `packet-${token}`, 'resource orchestrator returns resolved packet');
+  assertEqual(state.resourcePackets.length, 1, 'resource orchestrator records packet in state');
+  assert(
+    state.manifest.entries.some((entry) => entry.resourceRef.endsWith(childFile)),
+    'resource orchestrator discovers directory children into manifest'
+  );
+  assertEqual(output.event.kind, 'tool_result', 'resource orchestrator creates packet projection event');
+  assertEqual(appended[0]?.[0]?.id, `resource-context-${token}`, 'resource orchestrator appends packet event through runtime');
 }
 
 function assertResourceEvidenceIndexQueriesPackets(): void {
