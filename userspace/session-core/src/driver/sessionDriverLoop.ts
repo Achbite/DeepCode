@@ -79,6 +79,7 @@ import {
   NativeToolResourceRecorder,
   NativeToolResumeMessageBuilder,
   NativeToolTurnHandler,
+  ProposalOnlyProviderRunner,
   ProviderJsonModeCoordinator,
   ProviderPipeline,
   ProviderStreamCoordinator,
@@ -448,6 +449,10 @@ const nativeToolProviderLoop = new NativeToolProviderLoop<SessionDriverLoopRunSt
   providerPipeline,
   turnHandler: nativeToolTurnHandler,
   resumeMessageBuilder: nativeToolResumeMessageBuilder,
+});
+const proposalOnlyProviderRunner = new ProposalOnlyProviderRunner<SessionDriverLoopRunState, LlmTurnResult>({
+  providerPipeline,
+  repairCoordinator: nativeToolRepairCoordinator,
 });
 const PROVIDER_REASONING_FLUSH_CHARS = 768;
 const PROVIDER_REASONING_FLUSH_MS = 120;
@@ -2774,7 +2779,7 @@ export class SessionDriverLoop {
     stage: string,
     messages?: LlmChatRequest['messages']
   ): Promise<string | ProposalEnvelope> {
-    const effectiveTurn = await providerPipeline.runProposalOnly({
+    const result = await proposalOnlyProviderRunner.run({
       profileId: input.profileId,
       state,
       contract,
@@ -2783,35 +2788,24 @@ export class SessionDriverLoop {
       runTurn: (profileId, runState, retryStage, retryMessages, options) =>
         this.llmTurn(profileId, runState, retryStage, retryMessages, options),
       isEmptyResponseError,
-    });
-    if (effectiveTurn.toolCalls.length === 0) return effectiveTurn.content;
-
-    const firstToolCall = effectiveTurn.toolCalls[0];
-    await this.emitProjectionDelta(state, nativeToolRepairCoordinator.proposalOnlyToolViolationDelta({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      stage,
       acceptedPlanId: state.acceptedImplementationPlan?.planId,
-      toolCall: firstToolCall,
-    }));
-    const repairedRaw = await this.llm(
-      input.profileId,
-      state,
-      `${stage}_tool_violation_repair`,
-      providerRepairMessageBuilder.completeStageToolViolationRepairMessages(prompt, providerRepairMessageState(state), firstToolCall, effectiveTurn)
-    );
-    try {
-      return nativeToolRepairCoordinator.parseProposalOnlyRepair({
-        raw: repairedRaw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-      });
-    } catch (error) {
+      emitProjectionDelta: (runState, delta) => this.emitProjectionDelta(runState, delta),
+      buildRepairMessages: (toolCall, turn) =>
+        providerRepairMessageBuilder.completeStageToolViolationRepairMessages(prompt, providerRepairMessageState(state), toolCall, turn),
+      runRepair: (repairStage, repairMessages) =>
+        this.llm(input.profileId, state, repairStage, repairMessages),
+      repairErrorMessage: (error) => normalizeParseError(error).message,
+    });
+    if (result.kind === 'content') return result.content;
+    if (result.kind === 'proposal') return result.proposal;
+    if (result.kind === 'repairFailed') {
       throw new SessionDriverLoopError(
         'accepted_plan_provider_tool_violation',
-        `Complete-stage provider requested native tool ${firstToolCall.name}; proposal-only repair failed: ${normalizeParseError(error).message}`
+        `Complete-stage provider requested native tool ${result.toolCall.name}; proposal-only repair failed: ${result.message}`
       );
     }
+    const exhaustive: never = result;
+    return exhaustive;
   }
 
   private async resolveNativeReadToolCall(

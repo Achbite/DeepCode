@@ -22,6 +22,7 @@ export { NativeToolProjectionBuilder } from './nativeToolProjectionBuilder.js';
 export { NativeToolResultMessageBuilder } from './nativeToolResultMessageBuilder.js';
 export { NativeToolResourceRecorder } from './nativeToolResourceRecorder.js';
 export { NativeToolResumeMessageBuilder } from './nativeToolResumeMessageBuilder.js';
+export { ProposalOnlyProviderRunner } from './proposalOnlyProviderRunner.js';
 export { ProviderStreamCoordinator } from './providerStreamCoordinator.js';
 export { ProviderTraceRecorder } from './providerTraceRecorder.js';
 

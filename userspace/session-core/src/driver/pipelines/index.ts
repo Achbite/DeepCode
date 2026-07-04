@@ -10,6 +10,7 @@ export * from './nativeToolResumeMessageBuilder.js';
 export * from './lifecyclePipeline.js';
 export * from './nativeToolRepairCoordinator.js';
 export * from './permissionPipeline.js';
+export * from './proposalOnlyProviderRunner.js';
 export * from './proposalPipeline.js';
 export * from './providerJsonModeCoordinator.js';
 export * from './providerPipeline.js';

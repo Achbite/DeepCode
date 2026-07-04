@@ -60,7 +60,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
 } from '../driver/execution/index.js';
-import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
+import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderTraceRecorder, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
@@ -80,6 +80,7 @@ async function main(): Promise<void> {
   assertNativeToolResumeMessageBuilderAppendsToolMessages();
   await assertNativeToolProviderLoopResumesAfterToolMessages();
   await assertNativeToolHandlerPortsFactoryBuildsPorts();
+  await assertProposalOnlyProviderRunnerRepairsToolViolation();
   assertProposalSemanticValidatorCanonicalizesAndDefaults();
   assertPromptEnvelope();
   assertContextAssemblerCachePlan();
@@ -932,6 +933,127 @@ async function assertNativeToolHandlerPortsFactoryBuildsPorts(): Promise<void> {
   assertEqual((ports.packetToolMessage(toolCall, packet) as any).content, `packet-${token}`, 'native tool handler ports factory delegates packet tool messages');
   assertEqual(repaired.kind, 'diagnostic', 'native tool handler ports factory delegates side-effect repair');
   assertEqual(repairPrompt, `prompt-${token}`, 'native tool handler ports factory uses bound prompt for repair callbacks');
+}
+
+async function assertProposalOnlyProviderRunnerRepairsToolViolation(): Promise<void> {
+  const token = randomSmokeToken('proposal-only');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const stage = `stage-${token}`;
+  const toolCall = {
+    callId: `call-${token}`,
+    index: 0,
+    name: `read_${randomSmokeToken('tool')}`,
+    arguments: { path: `scope-${token}/target-${randomSmokeToken('target')}.txt` },
+  };
+  const repairedProposal = {
+    kind: 'diagnostic',
+    proposalId: `proposal-${token}`,
+    runId,
+    sessionId,
+    source: 'llm',
+    payload: { message: `diagnostic-${token}` },
+  } as ProposalEnvelope;
+  const emitted: ProjectionDelta[] = [];
+  const repairStages: string[] = [];
+  const repairMessages: LlmChatRequest['messages'][] = [];
+  let providerStage = '';
+
+  const runner = new ProposalOnlyProviderRunner<any, any>({
+    providerPipeline: {
+      runProposalOnly: async (request: any) => {
+        providerStage = request.stage;
+        return {
+          content: `assistant-${token}`,
+          reasoning: '',
+          toolCalls: [toolCall],
+        };
+      },
+    },
+    repairCoordinator: {
+      proposalOnlyToolViolationDelta: (input) => ({
+        type: 'stage_delta',
+        sessionId: input.sessionId,
+        runId: input.runId,
+        stage: `tool-violation-${input.toolCall.callId}`,
+        status: 'running',
+      }),
+      parseProposalOnlyRepair: (input) => {
+        assertEqual(input.raw, `repair-raw-${token}`, 'proposal-only runner forwards repair raw response');
+        assertEqual(input.runId, runId, 'proposal-only runner forwards run id to repair parser');
+        assertEqual(input.sessionId, sessionId, 'proposal-only runner forwards session id to repair parser');
+        return repairedProposal;
+      },
+    },
+  });
+
+  const repaired = await runner.run({
+    profileId: `profile-${token}`,
+    state: { sessionId, runId },
+    contract: {} as any,
+    stage,
+    acceptedPlanId: `plan-${token}`,
+    runTurn: async () => {
+      throw new Error('proposal-only runner smoke uses fake provider pipeline');
+    },
+    isEmptyResponseError: () => false,
+    emitProjectionDelta: async (_state, delta) => {
+      emitted.push(delta);
+    },
+    buildRepairMessages: (call, turn) => {
+      assertEqual(call.callId, toolCall.callId, 'proposal-only runner builds repair messages with offending tool call');
+      assertEqual(turn.content, `assistant-${token}`, 'proposal-only runner builds repair messages with original turn');
+      return [{ role: 'user', content: `repair-request-${token}` }];
+    },
+    runRepair: async (repairStage, messages) => {
+      repairStages.push(repairStage);
+      repairMessages.push(messages);
+      return `repair-raw-${token}`;
+    },
+    repairErrorMessage: (error) => String(error),
+  });
+
+  assertEqual(providerStage, stage, 'proposal-only runner delegates provider stage');
+  assertEqual(emitted[0]?.stage, `tool-violation-${toolCall.callId}`, 'proposal-only runner emits tool violation delta');
+  assertEqual(repairStages[0], `${stage}_tool_violation_repair`, 'proposal-only runner uses repair stage suffix');
+  assertEqual((repairMessages[0]?.[0] as any)?.content, `repair-request-${token}`, 'proposal-only runner uses repair messages');
+  assertEqual(repaired.kind, 'proposal', 'proposal-only runner returns parsed repair proposal');
+  assertEqual(repaired.kind === 'proposal' ? repaired.proposal.proposalId : '', repairedProposal.proposalId, 'proposal-only runner preserves repaired proposal');
+
+  const contentRunner = new ProposalOnlyProviderRunner<any, any>({
+    providerPipeline: {
+      runProposalOnly: async () => ({
+        content: `content-${token}`,
+        reasoning: '',
+        toolCalls: [],
+      }),
+    },
+    repairCoordinator: {
+      proposalOnlyToolViolationDelta: () => {
+        throw new Error('proposal-only runner must not emit repair delta without tool calls');
+      },
+      parseProposalOnlyRepair: () => {
+        throw new Error('proposal-only runner must not parse repair without tool calls');
+      },
+    },
+  });
+  const content = await contentRunner.run({
+    state: { sessionId, runId },
+    contract: {} as any,
+    stage: `${stage}-content`,
+    runTurn: async () => {
+      throw new Error('proposal-only runner content smoke uses fake provider pipeline');
+    },
+    isEmptyResponseError: () => false,
+    emitProjectionDelta: async () => {
+      throw new Error('proposal-only runner must not emit content-only delta');
+    },
+    buildRepairMessages: () => [],
+    runRepair: async () => '',
+    repairErrorMessage: (error) => String(error),
+  });
+  assertEqual(content.kind, 'content', 'proposal-only runner returns content when no tool call is present');
+  assertEqual(content.kind === 'content' ? content.content : '', `content-${token}`, 'proposal-only runner preserves content response');
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {
