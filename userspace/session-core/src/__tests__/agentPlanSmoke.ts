@@ -52,6 +52,7 @@ import {
   AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionOverlay,
   AcceptedPlanScopeRepairCoordinator,
+  ActionBundleAdmissionRepairCoordinator,
   AcceptedPlanExecutor,
   AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
@@ -105,6 +106,7 @@ async function main(): Promise<void> {
   await assertResourceOrchestratorResolvesAndRecordsPackets();
   await assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn();
   await assertResourceRequestRepairCoordinatorRepairsProposal();
+  await assertActionBundleAdmissionRepairCoordinatorRepairsProposal();
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
@@ -2585,6 +2587,97 @@ async function assertResourceRequestRepairCoordinatorRepairsProposal(): Promise<
   assertEqual(observedStage, 'resource_request_repair', 'resource request repair coordinator uses stable repair stage');
   assertEqual(observedMessages[0]?.role, 'system', 'resource request repair coordinator sends system repair contract');
   assertEqual(proposal.kind, 'diagnostic', 'resource request repair coordinator parses repaired proposal');
+}
+
+async function assertActionBundleAdmissionRepairCoordinatorRepairsProposal(): Promise<void> {
+  const token = randomSmokeToken('admission-repair');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const repairBuilder = new ProviderRepairMessageBuilder();
+  const coordinator = new ActionBundleAdmissionRepairCoordinator({
+    repairMessageBuilder: repairBuilder,
+    repairState: (state) => ({
+      runId: state.runId,
+      userRequest: state.userRequest,
+      conversationRoots: [],
+      resourcePackets: [],
+    }),
+    parseError: (error) => error instanceof Error
+      ? { code: 'error', message: error.message }
+      : { code: 'error', message: String(error) },
+    createError: (code, message) => Object.assign(new Error(message), { code }),
+    parseRepairedProposal: ({ raw, state, allowedKinds }) => {
+      assert(
+        allowedKinds.includes('taskPlan')
+          && allowedKinds.includes('resourceRequest')
+          && allowedKinds.includes('decisionRequest')
+          && allowedKinds.includes('diagnostic'),
+        'action bundle admission repair coordinator preserves admission repair allowed kinds'
+      );
+      assert(
+        !allowedKinds.includes('actionBundle'),
+        'action bundle admission repair coordinator preserves current admission repair gate'
+      );
+      return parseProposalEnvelope({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+      });
+    },
+  });
+  const prompt: PromptEnvelope = {
+    stablePrefix: `stable-${token}`,
+    dynamicSuffix: '',
+    auditOnlyContext: '',
+    layers: [],
+    segments: [],
+    stableLayerNames: [],
+    dynamicLayerNames: [],
+    auditOnlyLayerNames: [],
+  };
+  const state = {
+    sessionId,
+    runId,
+    userRequest: `request-${token}`,
+  };
+  let observedStage = '';
+  let observedMessages: LlmChatRequest['messages'] = [];
+  const proposal = await coordinator.repair({
+    state,
+    prompt,
+    proposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-${token}`,
+      runId,
+      sessionId,
+      source: 'llm',
+      kind: 'actionBundle',
+      payload: {
+        actionBundle: {
+          version: '1',
+          id: `bundle-${token}`,
+          actions: [],
+        },
+      },
+    } as ProposalEnvelope,
+    reasons: [`reason-${token}`],
+    runRepair: async (stage, messages) => {
+      observedStage = stage;
+      observedMessages = messages;
+      return JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'diagnostic',
+        proposalId: `diagnostic-${token}`,
+        diagnostic: {
+          summary: `summary-${token}`,
+        },
+      });
+    },
+  });
+  assertEqual(observedStage, 'action_bundle_admission_repair', 'action bundle admission repair coordinator uses stable repair stage');
+  assertEqual(observedMessages[0]?.role, 'system', 'action bundle admission repair coordinator sends system repair contract');
+  assertEqual(proposal.kind, 'diagnostic', 'action bundle admission repair coordinator parses repaired proposal');
 }
 
 function assertResourceEvidenceIndexQueriesPackets(): void {

@@ -20,6 +20,7 @@ import {
   AcceptedPlanScopeCoverage,
   AcceptedPlanScopeDecisionOverlay,
   AcceptedPlanScopeRepairCoordinator,
+  ActionBundleAdmissionRepairCoordinator,
   ActionBatchFailureIndex,
   CompletedWorkUnitFactIndex,
   type AcceptedPlanReadOnlyResourceCompletion,
@@ -477,6 +478,7 @@ export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
   private readonly acceptedPlanResourceResumeCoordinator: AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeRepairCoordinator: AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>;
+  private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
@@ -537,6 +539,13 @@ export class SessionDriverLoop {
         allowedKinds,
         allowBriefActionBundleUserPlan: true,
       }),
+    });
+    this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
+      repairMessageBuilder: providerRepairMessageBuilder,
+      repairState: providerRepairMessageState,
+      parseError: normalizeParseError,
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+      parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({ raw, runId: state.runId, sessionId: state.sessionId, source: 'llm', allowedKinds }),
     });
     this.resourceOrchestrator = new ResourceOrchestrator<SessionDriverLoopRunState>({
       resourceRequestLoop,
@@ -3017,18 +3026,9 @@ export class SessionDriverLoop {
 
     let repaired: ProposalEnvelope;
     try {
-      const raw = await this.llm(
-        input.profileId,
-        state,
-        'action_bundle_admission_repair',
-        providerRepairMessageBuilder.actionBundleAdmissionRepairMessages(prompt, providerRepairMessageState(state), proposal, reasons)
-      );
-      repaired = protocolGate().parseAndValidateRepairedProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds: ['taskPlan', 'resourceRequest', 'decisionRequest', 'diagnostic'],
+      repaired = await this.actionBundleAdmissionRepairCoordinator.repair({
+        state, prompt, proposal, reasons,
+        runRepair: (stage, messages) => this.llm(input.profileId, state, stage, messages),
       });
     } catch (error) {
       const message = error instanceof SessionDriverLoopError ? error.message : normalizeParseError(error).message;
