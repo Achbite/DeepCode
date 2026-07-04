@@ -2906,32 +2906,13 @@ export class SessionDriverLoop {
     if (effectiveTurn.toolCalls.length === 0) return effectiveTurn.content;
 
     const firstToolCall = effectiveTurn.toolCalls[0];
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'accepted_plan.provider_tool_violation',
-      status: 'failed',
-      channel: 'progress',
-      source: 'session',
-      summary: `Complete-stage provider requested native tool ${firstToolCall.name}; Session is retrying once with proposal-only contract.`,
-      activity: driverActivityBuilder.conversationActivity({
-        activityId: `accepted-plan-provider-tool-violation-${firstToolCall.callId}`,
-        kind: 'diagnostic',
-        status: 'failed',
-        title: 'Complete-stage native tool blocked',
-        summary: `Provider requested ${firstToolCall.name} during proposal-only accepted-plan execution.`,
-        source: 'session',
-        runId: state.runId,
-        toolName: firstToolCall.name,
-      }),
-      payload: {
-        visibility: 'task',
-        callId: firstToolCall.callId,
-        name: firstToolCall.name,
-        arguments: firstToolCall.arguments,
-        stage,
-        acceptedPlanId: state.acceptedImplementationPlan?.planId,
-      },
-    });
+    await this.emitProjectionDelta(state, nativeToolRepairCoordinator.proposalOnlyToolViolationDelta({
+      sessionId: state.sessionId,
+      runId: state.runId,
+      stage,
+      acceptedPlanId: state.acceptedImplementationPlan?.planId,
+      toolCall: firstToolCall,
+    }));
     const repairedRaw = await this.llm(
       input.profileId,
       state,
@@ -2939,12 +2920,10 @@ export class SessionDriverLoop {
       providerRepairMessageBuilder.completeStageToolViolationRepairMessages(prompt, providerRepairMessageState(state), firstToolCall, effectiveTurn)
     );
     try {
-      return protocolGate().parseAndValidateRepairedProposal({
+      return nativeToolRepairCoordinator.parseProposalOnlyRepair({
         raw: repairedRaw,
         runId: state.runId,
         sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
       });
     } catch (error) {
       throw new SessionDriverLoopError(

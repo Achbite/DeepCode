@@ -411,6 +411,15 @@ function assertNativeToolRepairCoordinatorBuildsRepairContracts(): void {
   assertEqual((sideEffectDelta.payload as any).callId, toolCall.callId, 'native tool repair coordinator carries blocked call id');
   assertEqual(coordinator.sideEffectAllowedKinds(true)[0], 'actionBundle', 'native tool repair coordinator allows actionBundle in accepted execution');
   assertEqual(coordinator.sideEffectAllowedKinds(false)[0], 'decisionRequest', 'native tool repair coordinator avoids actionBundle outside accepted execution');
+  const proposalOnlyDelta = coordinator.proposalOnlyToolViolationDelta({
+    sessionId,
+    runId,
+    stage: `stage-${token}`,
+    acceptedPlanId: `plan-${token}`,
+    toolCall,
+  });
+  assertEqual(proposalOnlyDelta.stage, 'accepted_plan.provider_tool_violation', 'native tool repair coordinator builds proposal-only violation stage');
+  assertEqual((proposalOnlyDelta.payload as any).acceptedPlanId, `plan-${token}`, 'native tool repair coordinator carries accepted plan id');
 
   const duplicate = {
     toolCall,
@@ -438,6 +447,7 @@ function assertNativeToolRepairCoordinatorBuildsRepairContracts(): void {
   assertEqual(coordinator.parseSideEffectRepair({ raw: '{}', runId, sessionId, acceptedExecution: true }).kind, 'actionBundle', 'native tool repair coordinator parses side-effect repair with accepted execution kinds');
   assertEqual(repairedAllowedKinds[0], 'actionBundle', 'native tool repair coordinator forwards side-effect allowed kinds');
   assertEqual(coordinator.parseDuplicateRepair({ raw: '{}', runId, sessionId }).kind, 'resourceRequest', 'native tool repair coordinator parses duplicate repair with focused kinds');
+  assertEqual(coordinator.parseProposalOnlyRepair({ raw: '{}', runId, sessionId }).kind, 'actionBundle', 'native tool repair coordinator parses proposal-only repair with executable kinds');
 }
 
 function assertProposalSemanticValidatorCanonicalizesAndDefaults(): void {

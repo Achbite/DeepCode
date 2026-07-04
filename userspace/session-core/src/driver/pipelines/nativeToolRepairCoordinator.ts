@@ -59,6 +59,10 @@ export class NativeToolRepairCoordinator {
     return ['resourceRequest', 'decisionRequest', 'diagnostic'];
   }
 
+  proposalOnlyRepairAllowedKinds(): string[] {
+    return ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'];
+  }
+
   sideEffectBlockedDelta(input: {
     sessionId: string;
     runId: string;
@@ -129,6 +133,43 @@ export class NativeToolRepairCoordinator {
     };
   }
 
+  proposalOnlyToolViolationDelta(input: {
+    sessionId: string;
+    runId: string;
+    stage: string;
+    acceptedPlanId?: string;
+    toolCall: NativeToolCallProposal;
+  }): ProjectionDelta {
+    return {
+      type: 'stage_delta',
+      sessionId: input.sessionId,
+      runId: input.runId,
+      stage: 'accepted_plan.provider_tool_violation',
+      status: 'failed',
+      channel: 'progress',
+      source: 'session',
+      summary: `Complete-stage provider requested native tool ${input.toolCall.name}; Session is retrying once with proposal-only contract.`,
+      activity: this.ports.conversationActivity({
+        activityId: `accepted-plan-provider-tool-violation-${input.toolCall.callId}`,
+        kind: 'diagnostic',
+        status: 'failed',
+        title: 'Complete-stage native tool blocked',
+        summary: `Provider requested ${input.toolCall.name} during proposal-only accepted-plan execution.`,
+        source: 'session',
+        runId: input.runId,
+        toolName: input.toolCall.name,
+      }),
+      payload: {
+        visibility: 'task',
+        callId: input.toolCall.callId,
+        name: input.toolCall.name,
+        arguments: input.toolCall.arguments,
+        stage: input.stage,
+        acceptedPlanId: input.acceptedPlanId,
+      },
+    };
+  }
+
   duplicateLoopError(duplicates: NativeToolRepairDuplicate[]): { code: string; message: string } {
     const duplicateSummary = duplicates
       .map((item) => `${item.toolCall.name}:${item.signature.path}`)
@@ -183,6 +224,20 @@ export class NativeToolRepairCoordinator {
       sessionId: input.sessionId,
       source: 'llm',
       allowedKinds: this.duplicateRepairAllowedKinds(),
+    });
+  }
+
+  parseProposalOnlyRepair(input: {
+    raw: string;
+    runId: string;
+    sessionId: string;
+  }): ProposalEnvelope {
+    return this.ports.parseRepairedProposal({
+      raw: input.raw,
+      runId: input.runId,
+      sessionId: input.sessionId,
+      source: 'llm',
+      allowedKinds: this.proposalOnlyRepairAllowedKinds(),
     });
   }
 }
