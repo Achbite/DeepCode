@@ -44,7 +44,7 @@ import {
 import { AcceptedPlanScopeMatcher, AcceptedTaskRegistry, type AcceptedImplementationPlanContext } from '../accepted-plan/index.js';
 import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
-import { GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop } from '../driver/context/index.js';
+import { AcceptedPlanResourceResumeCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop } from '../driver/context/index.js';
 import {
   AcceptedImplementationPlanContextBuilder,
   AcceptedPlanBatchPreflight,
@@ -65,6 +65,9 @@ import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgr
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
 import { ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
+import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
+import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
+import type { PromptEnvelope } from '../prompt/types.js';
 
 async function main(): Promise<void> {
   assertV3Parser();
@@ -99,6 +102,7 @@ async function main(): Promise<void> {
   await assertProviderTraceRecorderArchivesPayload();
   await assertResourceRequestLoopBuildsPacketEvents();
   await assertResourceOrchestratorResolvesAndRecordsPackets();
+  await assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn();
   assertResourceEvidenceIndexQueriesPackets();
   assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets();
   assertImplementationBatchContextBuilderExtractsConcreteContinuations();
@@ -2341,6 +2345,158 @@ async function assertResourceOrchestratorResolvesAndRecordsPackets(): Promise<vo
   );
   assertEqual(output.event.kind, 'tool_result', 'resource orchestrator creates packet projection event');
   assertEqual(appended[0]?.[0]?.id, `resource-context-${token}`, 'resource orchestrator appends packet event through runtime');
+}
+
+async function assertAcceptedPlanResourceResumeCoordinatorBuildsProviderTurn(): Promise<void> {
+  const token = randomSmokeToken('resource-resume');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const repairBuilder = new ProviderRepairMessageBuilder();
+  const coordinator = new AcceptedPlanResourceResumeCoordinator({
+    promptBuilder: new AcceptedPlanResourceResumePromptBuilder(repairBuilder),
+    contextFrameBuilder: new ContextFrameBuilder(),
+    repairMessageBuilder: repairBuilder,
+    repairState: (state) => ({
+      runId: state.runId,
+      userRequest: state.userRequest,
+      conversationRoots: [],
+      resourcePackets: state.resourcePackets,
+      acceptedContext: {},
+      currentTaskContext: state.currentTaskContext,
+      completedTaskCount: state.acceptedImplementationPlan?.completedTaskIds.length,
+    }),
+    createId: (prefix) => `${prefix}-${token}`,
+    parseError: (error) => error instanceof Error
+      ? { code: 'error', message: error.message }
+      : { code: 'error', message: String(error) },
+    createError: (code, message) => Object.assign(new Error(message), { code }),
+    appendRepairNotice: async () => {
+      throw new Error('resource resume coordinator should not repair valid provider output');
+    },
+    parseProviderProposal: ({ raw, state }) => parseProposalEnvelope({
+      raw,
+      runId: state.runId,
+      sessionId: state.sessionId,
+      source: 'llm',
+    }),
+    parseRepairedProviderProposal: ({ raw, state }) => parseProposalEnvelope({
+      raw,
+      runId: state.runId,
+      sessionId: state.sessionId,
+      source: 'llm',
+    }),
+  });
+  const prompt: PromptEnvelope = {
+    stablePrefix: `stable-${token}`,
+    dynamicSuffix: '',
+    auditOnlyContext: '',
+    layers: [],
+    segments: [],
+    stableLayerNames: [],
+    dynamicLayerNames: [],
+    auditOnlyLayerNames: [],
+  };
+  const packet = {
+    id: `packet-${token}`,
+    workspaceScopeKey: `workspace-${token}`,
+    requestId: `request-${token}`,
+    items: [{
+      requestItemId: `item-${token}`,
+      manifestEntryId: `entry-${token}`,
+      status: 'resolved',
+      contentKind: 'fileText',
+      path: `target-${token}.txt`,
+      text: `content-${token}`,
+    }],
+  } as unknown as ResourcePacket;
+  const state = {
+    sessionId,
+    runId,
+    userRequest: `request-${token}`,
+    acceptedImplementationPlan: {
+      planId: `plan-${token}`,
+      runId,
+      tasks: [{ taskId: `task-${token}`, targets: [], dependencies: [], conflictKeys: [] }],
+      capabilities: [],
+      targetScopes: [],
+      exactOperationGrants: [],
+      accessScopes: [],
+      batchIndex: 1,
+      completedTaskIds: [],
+      rawPlan: {},
+    } as AcceptedImplementationPlanContext,
+    taskExecutionCursor: {
+      cursorId: `cursor-${token}`,
+      planId: `plan-${token}`,
+      currentTaskId: `task-${token}`,
+      taskOrder: [`task-${token}`],
+      pendingTaskIds: [`task-${token}`],
+      completedTaskIds: [],
+      lastResourcePacketIds: [packet.id],
+    },
+    currentTaskContext: {
+      goal: `goal-${token}`,
+      taskId: `task-${token}`,
+      targets: [`target-${token}.txt`],
+      capabilities: ['fs.read'],
+      taskOrder: [`task-${token}`],
+      pendingTaskIds: [`task-${token}`],
+      dependsOn: [],
+      evidenceNeeds: [],
+      completedTaskIds: [],
+    },
+    resourcePackets: [packet],
+    generatedArtifactEvidence: { size: 0 },
+  };
+  let observedStage = '';
+  let observedMessages: LlmChatRequest['messages'] = [];
+  const proposal = await coordinator.run({
+    state,
+    prompt,
+    userRequest: state.userRequest,
+    requestProposal: {
+      schemaVersion: 'deepcode.agent.protocol.v3',
+      proposalId: `proposal-${token}`,
+      runId,
+      sessionId,
+      source: 'llm',
+      kind: 'resourceRequest',
+      payload: {
+        version: '1',
+        id: `resource-request-${token}`,
+        items: [],
+      },
+    } as ProposalEnvelope,
+    packet,
+    callProposalOnly: async ({ contract, stage, messages }) => {
+      observedStage = stage;
+      observedMessages = messages;
+      assertEqual(contract.turnMode, 'resourceResume', 'resource resume coordinator builds resourceResume contract');
+      assert(
+        contract.nextActionInstruction.summary?.includes('ResourcePacket'),
+        'resource resume coordinator keeps NextActionInstruction explicit'
+      );
+      return JSON.stringify({
+        schemaVersion: 'deepcode.agent.protocol.v3',
+        kind: 'diagnostic',
+        proposalId: `diagnostic-${token}`,
+        diagnostic: {
+          summary: `summary-${token}`,
+        },
+      });
+    },
+    runRepair: async () => {
+      throw new Error('resource resume coordinator should not run repair for valid provider output');
+    },
+  });
+  assertEqual(observedStage, 'accepted_plan_resource_resume', 'resource resume coordinator uses stable provider stage');
+  assertEqual(observedMessages[0]?.role, 'system', 'resource resume coordinator sends stable prefix as system message');
+  assertEqual(
+    (state as { providerTurnContract?: { turnMode?: string } }).providerTurnContract?.turnMode,
+    'resourceResume',
+    'resource resume coordinator stores provider turn contract on state'
+  );
+  assertEqual(proposal.kind, 'diagnostic', 'resource resume coordinator parses provider proposal');
 }
 
 function assertResourceEvidenceIndexQueriesPackets(): void {

@@ -98,6 +98,7 @@ import { PermissionPipeline } from './pipelines/permissionPipeline.js';
 import { UserGuidanceQueue } from './pipelines/userGuidanceQueue.js';
 import { UserInputPipeline, type RequirementOptionEffect } from './pipelines/userInputPipeline.js';
 import {
+  AcceptedPlanResourceResumeCoordinator,
   ContextFrameBuilder,
   GeneratedArtifactEvidenceIndex,
   PathIdentity,
@@ -472,6 +473,7 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
 
 export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
+  private readonly acceptedPlanResourceResumeCoordinator: AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
@@ -485,6 +487,38 @@ export class SessionDriverLoop {
       createError: (code, message) => new SessionDriverLoopError(code, message),
       errorCode: (error, fallback) => error instanceof SessionDriverLoopError ? error.code : fallback,
       errorMessage: (error) => error instanceof Error ? error.message : String(error),
+    });
+    this.acceptedPlanResourceResumeCoordinator = new AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>({
+      promptBuilder: acceptedPlanResourceResumePromptBuilder,
+      contextFrameBuilder,
+      repairMessageBuilder: providerRepairMessageBuilder,
+      repairState: (state) => providerRepairMessageState(state),
+      createId: (prefix) => this.id(prefix),
+      parseError: (error) => normalizeParseError(error),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+      appendRepairNotice: (state, message) => this.append(state.sessionId, [
+        assistantProjectionBuilder.thinkingEvent(
+          state.sessionId,
+          message,
+          this.ts(),
+          this.id('accepted-plan-resource-resume-repair')
+        ),
+      ]),
+      parseProviderProposal: ({ raw, state }) => protocolGate().parseAndValidateProposal({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+        allowBriefActionBundleUserPlan: true,
+      }),
+      parseRepairedProviderProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+        allowedKinds,
+        allowBriefActionBundleUserPlan: true,
+      }),
     });
     this.resourceOrchestrator = new ResourceOrchestrator<SessionDriverLoopRunState>({
       resourceRequestLoop,
@@ -2633,85 +2667,22 @@ export class SessionDriverLoop {
     requestProposal: ProposalEnvelope,
     packet: ResourcePacket
   ): Promise<ProposalEnvelope> {
-    const messages: LlmChatRequest['messages'] = [
-      { role: 'system', content: prompt.stablePrefix },
-      {
-        role: 'user',
-        content: acceptedPlanResourceResumePromptBuilder.render({
-          repairState: providerRepairMessageState(state),
-          acceptedPlan: state.acceptedImplementationPlan,
-          cursor: state.taskExecutionCursor,
-          currentTask: state.currentTaskContext,
-          requestProposal,
-          packet,
-        }),
-      },
-    ];
-    const contract = contextFrameBuilder.buildSessionProviderTurnContract({
-      contractId: this.id('provider-turn-contract-resource-resume'),
-      sessionId: state.sessionId,
-      runId: state.runId,
-      turnMode: 'resourceResume',
-      allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
-      prompt,
-      contextAssembly: state.contextAssembly,
-      userRequest: input.content,
-      acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
-      currentTaskContext: state.currentTaskContext,
-      resourcePackets: state.resourcePackets,
-      generatedArtifactCount: state.generatedArtifactEvidence.size,
-      nextActionInstruction: 'Use the newly resolved ResourcePacket for the current accepted task. Return one actionBundle, resourceRequest, decisionRequest, or diagnostic proposal.',
-    });
-    state.providerTurnContract = contract;
-    const providerResult = await this.callProviderProposalOnly(
-      input,
+    return this.acceptedPlanResourceResumeCoordinator.run({
       state,
       prompt,
-      contract,
-      'accepted_plan_resource_resume',
-      messages
-    );
-    if (typeof providerResult !== 'string') return providerResult;
-    try {
-      return protocolGate().parseAndValidateProposal({
-        raw: providerResult,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowBriefActionBundleUserPlan: true,
-      });
-    } catch (error) {
-      const parseError = normalizeParseError(error);
-      await this.append(state.sessionId, [
-        assistantProjectionBuilder.thinkingEvent(
-          state.sessionId,
-          `Accepted-plan resource resume output requires Agent Protocol v3 repair: ${parseError.message}`,
-          this.ts(),
-          this.id('accepted-plan-resource-resume-repair')
+      userRequest: input.content,
+      requestProposal,
+      packet,
+      callProposalOnly: ({ state: runState, prompt: runPrompt, contract, stage, messages }) =>
+        this.callProviderProposalOnly(input, runState, runPrompt, contract, stage, messages),
+      runRepair: (stage, messages) =>
+        this.llm(
+          input.profileId,
+          state,
+          stage,
+          messages
         ),
-      ]);
-      const repairedRaw = await this.llm(
-        input.profileId,
-        state,
-        'accepted_plan_resource_resume_repair',
-        providerRepairMessageBuilder.repairMessages(prompt, providerRepairMessageState(state), providerResult, parseError)
-      );
-      try {
-        return protocolGate().parseAndValidateRepairedProposal({
-          raw: repairedRaw,
-          runId: state.runId,
-          sessionId: state.sessionId,
-          source: 'llm',
-          allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
-          allowBriefActionBundleUserPlan: true,
-        });
-      } catch (repairError) {
-        throw new SessionDriverLoopError(
-          'accepted_plan_resource_resume_repair_failed',
-          `Accepted-plan resource resume output still could not be parsed after repair: ${normalizeParseError(repairError).message}`
-        );
-      }
-    }
+    });
   }
 
   private async maybeRunStaticSyntaxReview(
