@@ -103,6 +103,7 @@ import {
 import { InteractionOverlayCodec, type InteractionOverlayContext, type SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
 import { RunLifecyclePipeline } from './pipelines/lifecyclePipeline.js';
 import { PermissionPipeline } from './pipelines/permissionPipeline.js';
+import { ProviderTurnCycle } from './pipelines/providerTurnCycle.js';
 import { UserGuidanceQueue } from './pipelines/userGuidanceQueue.js';
 import { UserInputPipeline } from './pipelines/userInputPipeline.js';
 import {
@@ -525,6 +526,7 @@ export class SessionDriverLoop {
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
   private readonly providerProposalCoordinator: ProviderProposalCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly providerTurnContextCoordinator: ProviderTurnContextCoordinator<SessionDriverLoopRunState>;
+  private readonly providerTurnCycle: ProviderTurnCycle<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly runLifecyclePipeline: RunLifecyclePipeline<SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
 
@@ -1490,6 +1492,42 @@ export class SessionDriverLoop {
       buildProviderTurnContract: (contractInput) =>
         contextFrameBuilder.buildSessionProviderTurnContract(contractInput),
     });
+    this.providerTurnCycle = new ProviderTurnCycle<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
+      prepareProviderContext: (handlerInput, state, lastResult) =>
+        this.providerTurnContextCoordinator.prepare(state, {
+          contextAssemblyId: this.id('context-assembly'),
+          contractId: this.id('provider-turn-contract'),
+          inputContent: handlerInput.content,
+          projectMemoryMode: handlerInput.projectMemoryMode,
+          interventionLevel: handlerInput.interventionLevel,
+          confirmedRequirement: handlerInput.confirmedRequirement,
+          lastResult,
+        }),
+      callProviderAndParse: (handlerInput, state, prompt) =>
+        this.callProviderAndParse(handlerInput, state, prompt),
+      route: (routerInput) => this.proposalRouter.route(routerInput),
+      appendDriverFailure: async (state, error) => {
+        if (!(error instanceof SessionDriverLoopError)) return null;
+        return this.append(state.sessionId, [
+          assistantProjectionBuilder.finalDiagnosticEvent(
+            state.sessionId,
+            readableDriverFailureMessage(error.code, error.message),
+            this.ts(),
+            this.id(error.code)
+          ),
+        ]);
+      },
+      appendProviderFailure: (state, error) =>
+        this.append(state.sessionId, [
+          assistantProjectionBuilder.finalDiagnosticEvent(
+            state.sessionId,
+            readableProviderFailureMessage(error),
+            this.ts(),
+            this.id('provider_call_failed')
+          ),
+        ]),
+    });
   }
 
   async resolveDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
@@ -1538,54 +1576,16 @@ export class SessionDriverLoop {
     }
 
     while (true) {
-      acceptedPlanTaskLedger().refreshRuntimeState(state);
-      const providerContext = await this.providerTurnContextCoordinator.prepare(state, {
-        contextAssemblyId: this.id('context-assembly'),
-        contractId: this.id('provider-turn-contract'),
-        inputContent: input.content,
-        projectMemoryMode: input.projectMemoryMode,
-        interventionLevel: input.interventionLevel,
-        confirmedRequirement: input.confirmedRequirement,
-        lastResult,
-      });
-      lastResult = providerContext.lastResult;
-      const prompt = providerContext.prompt;
-      state.phase = 'provider_proposing';
-      let proposal: ProposalEnvelope;
-      try {
-        proposal = await this.callProviderAndParse(input, state, prompt);
-      } catch (error) {
-        if (error instanceof SessionDriverLoopError) {
-          return this.append(sessionId, [
-            assistantProjectionBuilder.finalDiagnosticEvent(
-              sessionId,
-              readableDriverFailureMessage(error.code, error.message),
-              this.ts(),
-              this.id(error.code)
-            ),
-          ]);
-        }
-        return this.append(sessionId, [
-          assistantProjectionBuilder.finalDiagnosticEvent(
-            sessionId,
-            readableProviderFailureMessage(error),
-            this.ts(),
-            this.id('provider_call_failed')
-          ),
-        ]);
-      }
-      const routed = await this.proposalRouter.route({
+      const cycle = await this.providerTurnCycle.run({
         input,
         state,
-        prompt,
-        proposal,
         lastResult,
       });
-      if (routed.kind === 'return') {
-        return routed.result;
+      if (cycle.kind === 'return') {
+        return cycle.result;
       }
-      lastResult = routed.lastResult;
-      if (proposal.kind === 'resourceRequest') {
+      lastResult = cycle.lastResult;
+      if (cycle.proposal.kind === 'resourceRequest') {
         continue;
       }
     }
