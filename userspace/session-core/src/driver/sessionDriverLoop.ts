@@ -101,6 +101,7 @@ import {
   type NativeToolCallProposal,
 } from './pipelines/providerPipeline.js';
 import { InteractionOverlayCodec, type InteractionOverlayContext, type SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
+import { RunLifecyclePipeline } from './pipelines/lifecyclePipeline.js';
 import { PermissionPipeline } from './pipelines/permissionPipeline.js';
 import { UserGuidanceQueue } from './pipelines/userGuidanceQueue.js';
 import { UserInputPipeline } from './pipelines/userInputPipeline.js';
@@ -524,6 +525,7 @@ export class SessionDriverLoop {
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
   private readonly providerProposalCoordinator: ProviderProposalCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly providerTurnContextCoordinator: ProviderTurnContextCoordinator<SessionDriverLoopRunState>;
+  private readonly runLifecyclePipeline: RunLifecyclePipeline<SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
 
   constructor(private readonly ports: SessionDriverLoopPorts) {
@@ -1077,6 +1079,35 @@ export class SessionDriverLoop {
       runtime: this.agentRunReactor,
       createError: (code, message) => new SessionDriverLoopError(code, message),
     });
+    this.runLifecyclePipeline = new RunLifecyclePipeline<SessionDriverLoopRunState>({
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      kernel: (request) => this.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
+      userMessageEvent: ({ sessionId, content, attachments }) =>
+        this.event(sessionId, 'user_msg', {
+          content,
+          attachments,
+          channel: 'user',
+          visibility: 'conversation',
+        }),
+      kernelRunAttachments: (input) => resourceManifestBuilder().kernelRunAttachments(input),
+      buildManifest: (input, manifestId) => resourceManifestBuilder().build(input, manifestId),
+      buildImplementationBatch: (events) => implementationBatchContextBuilder().build(events),
+      buildMemoryDocument: (events, options) => buildSessionMemoryDocument(events, options),
+      recentResourcePackets: (events) => resourceRequestLoop.recentPackets(events),
+      generatedArtifactEvidenceFromPackets: (packets) => generatedArtifactEvidenceIndex().fromPackets(packets),
+      initialTaskRuntime: (snapshotInput) => acceptedPlanTaskLedger().runtimeSnapshot(snapshotInput),
+      lastSavepointId: (events) => acceptedPlanTaskLedger().lastSavepointId(events),
+      implementationBatchHints,
+      resolveInitialResources: async (state) => (
+        await this.resourceOrchestrator.resolveRecordAndAppend(
+          state,
+          state.manifest,
+          'resource-context'
+        )
+      ).result,
+    });
     this.resourceRequestProposalHandler = new ResourceRequestProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.ts(),
       createId: (prefix) => this.id(prefix),
@@ -1467,97 +1498,9 @@ export class SessionDriverLoop {
 
   async runUserTurn(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
     const sessionId = input.sessionId;
-    let lastResult = input.appendUserMessage === false
-      ? await this.append(sessionId, [])
-      : await this.append(sessionId, [
-        this.event(sessionId, 'user_msg', {
-          content: input.content,
-          attachments: input.attachments ?? [],
-          channel: 'user',
-          visibility: 'conversation',
-        }),
-      ]);
-
-    const manifestBuilder = resourceManifestBuilder();
-    const kernelAttachments = manifestBuilder.kernelRunAttachments(input);
-    const runReply = await this.kernel({
-      command: {
-        kind: 'runCreate',
-        requestId: this.id('run-create'),
-        sessionId,
-        input: {
-          text: input.content,
-          attachments: kernelAttachments,
-        },
-        workspaceBinding: input.workspaceBinding,
-        profileRef: input.profileId ? { id: input.profileId, kind: 'llm' } : undefined,
-        workflowRef: input.workflow ? { id: input.workflow } : undefined,
-        runOverrides: undefined,
-      },
-    });
-    lastResult = await this.appendProjectedKernelEvents(sessionId, runReply);
-    const runId = firstString(runReply.events, 'runId') ?? this.id('run');
-    const stateContract = findStateContract(runReply.events);
-    const driverRequest = findDriverRequest(runReply.events);
-
-    const manifestBuild = manifestBuilder.build(input, this.id('resource-manifest'));
-    const acceptedImplementationPlan = input.acceptedImplementationPlan;
-    const implementationBatch = implementationBatchContextBuilder().build(input.existingEvents ?? []);
-    if (acceptedImplementationPlan) {
-      implementationBatch.batchIndex = acceptedImplementationPlan.batchIndex;
-    }
-    const memoryDocument = buildSessionMemoryDocument(input.existingEvents ?? [], {
-      projectMemoryMode: input.projectMemoryMode,
-    });
-    const restoredResourcePackets = input.resumeResourcePackets
-      ? resourceRequestLoop.recentPackets(input.existingEvents ?? [])
-      : [];
-    const initialTaskRuntime = acceptedPlanTaskLedger().runtimeSnapshot({
-      acceptedPlan: acceptedImplementationPlan,
-      resourcePackets: restoredResourcePackets,
-      lastSavepointId: acceptedPlanTaskLedger().lastSavepointId(input.existingEvents ?? []),
-    });
-    const state: SessionDriverLoopRunState = {
-      sessionId,
-      runId,
-      userRequest: input.content,
-      phase: 'context_reading',
-      workspaceScopeKey: manifestBuild.manifest.workspaceScopeKey,
-      stateContract,
-      driverRequest,
-      manifest: manifestBuild.manifest,
-      conversationRoots: manifestBuild.conversationRoots,
-      initialContext: {
-        id: this.id('initial-context'),
-        workspaceScopeKey: manifestBuild.manifest.workspaceScopeKey,
-        manifest: manifestBuild.manifest,
-      },
-      resourcePackets: [...restoredResourcePackets],
-      generatedArtifactEvidence: generatedArtifactEvidenceIndex().fromPackets(restoredResourcePackets),
-      memoryDocument,
-      memoryHints: implementationBatchHints(implementationBatch, acceptedImplementationPlan),
-      taskExecutionCursor: initialTaskRuntime.taskExecutionCursor,
-      currentTaskContext: initialTaskRuntime.currentTaskContext,
-      taskLedger: initialTaskRuntime.taskLedger,
-      acceptedPlanPromptFrame: initialTaskRuntime.acceptedPlanPromptFrame,
-      implementationBatch,
-      acceptedImplementationPlan,
-      resourceRequestRepairAttempted: false,
-      actionBundleAdmissionRepairAttempted: false,
-      planReviewRepairAttempted: false,
-      acceptedPlanScopeRepairAttempted: false,
-      terminalGuidanceRevisionAttempted: false,
-      nativeToolReadLedger: new Map(),
-      nativeToolDuplicateRepairAttempted: false,
-      interactionOverlay: input.interactionOverlay,
-    };
-    if (state.manifest.entries.length > 0 && !input.resumeResourcePackets) {
-      lastResult = (await this.resourceOrchestrator.resolveRecordAndAppend(
-        state,
-        state.manifest,
-        'resource-context'
-      )).result;
-    }
+    const lifecycle = await this.runLifecyclePipeline.initialize(input);
+    const state = lifecycle.state;
+    let lastResult = lifecycle.lastResult;
 
     if (shouldRequestRequirementConfirmation(input, state)) {
       try {
@@ -2125,33 +2068,6 @@ interface DiagnosticInfo {
 
 function diag(code: string, fallback: string, params?: Record<string, string | number>): DiagnosticInfo {
   return { code, fallback, params };
-}
-
-function findStateContract(events: unknown[]): KernelStateContractRef | undefined {
-  for (const event of events) {
-    const record = objectRecord(event);
-    const contract = objectRecord(record?.stateContract);
-    if (contract) return contract as unknown as KernelStateContractRef;
-  }
-  return undefined;
-}
-
-function findDriverRequest(events: unknown[]): DriverRequestRef | undefined {
-  for (const event of events) {
-    const record = objectRecord(event);
-    const driverRequest = objectRecord(record?.driverRequest);
-    if (driverRequest) return driverRequest as unknown as DriverRequestRef;
-  }
-  return undefined;
-}
-
-function firstString(events: unknown[], key: string): string | undefined {
-  for (const event of events) {
-    const record = objectRecord(event);
-    const value = record?.[key];
-    if (typeof value === 'string' && value.trim()) return value;
-  }
-  return undefined;
 }
 
 function protocolGate(): ProtocolGate {
