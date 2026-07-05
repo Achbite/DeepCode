@@ -126,6 +126,7 @@ import {
   type GeneratedArtifactEvidence,
   type ResourceRequestResolution,
 } from './context/index.js';
+import { DriverFailureMessageCatalog } from './diagnostics/index.js';
 import type { RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import {
@@ -514,6 +515,7 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
 const providerTurnPolicy = new ProviderTurnPolicy({
   sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
 });
+const driverFailureMessageCatalog = new DriverFailureMessageCatalog();
 
 export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
@@ -1590,7 +1592,7 @@ export class SessionDriverLoop {
         return this.append(state.sessionId, [
           assistantProjectionBuilder.finalDiagnosticEvent(
             state.sessionId,
-            readableDriverFailureMessage(error.code, error.message),
+            driverFailureMessageCatalog.driverFailure(error.code, error.message),
             this.ts(),
             this.id(error.code)
           ),
@@ -1600,7 +1602,7 @@ export class SessionDriverLoop {
         this.append(state.sessionId, [
           assistantProjectionBuilder.finalDiagnosticEvent(
             state.sessionId,
-            readableProviderFailureMessage(error),
+            driverFailureMessageCatalog.providerFailure(error),
             this.ts(),
             this.id('provider_call_failed')
           ),
@@ -2053,26 +2055,6 @@ function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted
 
 function safeSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'item';
-}
-
-function readableDriverFailureMessage(code: string, message: string): DiagnosticInfo {
-  const protocolFailureCodes = new Set([
-    'agent_protocol_repair_failed',
-    'accepted_plan_resource_resume_repair_failed',
-    'invalid_json_envelope',
-    'invalid_action_bundle',
-    'invalid_action_bundle_expectation',
-    'invalid_action_bundle_continuation',
-  ]);
-  if (!protocolFailureCodes.has(code)) return diag('generic', message, { message });
-  const fallback = `${message}\n\nThe model output could not form a valid structured proposal (protocol format issue); automatic repair was attempted but unsuccessful. Previously completed steps are not affected. You may retry this turn or rephrase your request.`;
-  return diag('protocolRepairFailed', fallback, { message });
-}
-
-function readableProviderFailureMessage(error: unknown): DiagnosticInfo {
-  const raw = (error instanceof Error ? error.message : String(error)).trim() || 'unknown error';
-  const fallback = `Model call failed: ${raw}\n\nThe connection to the model was interrupted (possibly due to network fluctuation, provider timeout, or response stream closure). Previously completed steps are not affected; please retry this turn.`;
-  return diag('providerCallFailed', fallback, { raw });
 }
 
 function shouldRequestRequirementConfirmation(
