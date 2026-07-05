@@ -11,6 +11,7 @@ export * from './acceptedPlanScopeRepairCoordinator.js';
 export * from './acceptedPlanScopeResourceFollowupCoordinator.js';
 export * from './acceptedPlanTargetParser.js';
 export * from './actionBundleAdmissionRepairCoordinator.js';
+export * from './actionBundleAdmissionCoordinator.js';
 export * from './actionBatchFailureIndex.js';
 export * from '../../accepted-plan/index.js';
 export * from './acceptedPlanExecutor.js';

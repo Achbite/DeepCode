@@ -32,6 +32,7 @@ import {
   AcceptedPlanScopeMatcher,
   AcceptedPlanTargetParser,
   AcceptedPlanTaskLedgerCoordinator,
+  ActionBundleAdmissionCoordinator,
   AcceptedImplementationPlanContextBuilder,
   ExecutionPromptCoordinator,
   ImplementationBatchContextBuilder,
@@ -495,6 +496,7 @@ export class SessionDriverLoop {
   private readonly acceptedPlanScopeResourceFollowupCoordinator: AcceptedPlanScopeResourceFollowupCoordinator<SessionDriverLoopRunState, AcceptedImplementationPlanContext>;
   private readonly acceptedPlanReviewHandoffCoordinator: AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>;
   private readonly acceptedPlanStaticSyntaxReviewCoordinator: AcceptedPlanStaticSyntaxReviewCoordinator<SessionDriverLoopRunState>;
+  private readonly actionBundleAdmissionCoordinator: ActionBundleAdmissionCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionResourceFollowupCoordinator: ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>;
   private readonly decisionResolver: DecisionResolver;
@@ -1056,6 +1058,76 @@ export class SessionDriverLoop {
         )
       ),
       followupRequest: (request) => repairLoop.actionBundleAdmissionResourceFollowupRequest(request),
+    });
+    this.actionBundleAdmissionCoordinator = new ActionBundleAdmissionCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      admissionFailureEvents: (admissionInput) =>
+        sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
+          admissionInput.sessionId,
+          admissionInput.runId,
+          admissionInput.proposal,
+          admissionInput.reasons,
+          admissionInput.ts,
+          admissionInput.id
+        ),
+      admissionRepairingEvent: (admissionInput) =>
+        sessionProgressProjectionBuilder.actionBundleAdmissionRepairingEvent(
+          admissionInput.sessionId,
+          admissionInput.runId,
+          admissionInput.proposal,
+          admissionInput.reasons,
+          admissionInput.ts,
+          admissionInput.id
+        ),
+      repair: (repairInput) =>
+        this.actionBundleAdmissionRepairCoordinator.repair({
+          ...repairInput,
+          runRepair: (stage, messages) => this.llm(repairInput.input.profileId, repairInput.state, stage, messages),
+        }),
+      repairErrorMessage: (error) =>
+        error instanceof SessionDriverLoopError ? error.message : normalizeParseError(error).message,
+      resourceFollowup: (followupInput) =>
+        this.actionBundleAdmissionResourceFollowupCoordinator.handle(followupInput),
+      resumeAfterResourceFollowup: ({ originalInput, followup }) =>
+        this.runUserTurn({
+          sessionId: originalInput.sessionId,
+          content: followup.content,
+          attachments: originalInput.attachments ?? [],
+          existingEvents: followup.result.events,
+          workspaceBinding: originalInput.workspaceBinding,
+          projectWorkingDirectory: originalInput.projectWorkingDirectory,
+          profileId: originalInput.profileId,
+          workflow: originalInput.workflow,
+          appendUserMessage: false,
+          requirementConfirmationMode: 'off',
+          reviewContinuationMode: originalInput.reviewContinuationMode,
+          interventionLevel: originalInput.interventionLevel,
+          projectMemoryMode: originalInput.projectMemoryMode,
+          resumeResourcePackets: true,
+        }),
+      submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
+        this.submitActionProposal(handlerInput, state, prompt, proposal, fallback),
+      submitNonExecutableProposal: (state, proposal, fallback) =>
+        this.submitNonExecutableProposal(state, proposal, fallback),
+      requirementRecordFromProposal: (recordInput) =>
+        userInputPipeline.requirementRecordFromProposal(recordInput),
+      confirmationEvent: (confirmationInput) =>
+        requirementProjectionBuilder.confirmationEvent(confirmationInput),
+      sessionRunStateEvent: (runStateInput) =>
+        sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
+      finalDiagnosticEvent: (sessionId, content, ts, id) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
+      answerEvent: (sessionId, proposal, ts, id) =>
+        assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
+      diagnosticSummary: (proposal) => {
+        const diagnostic = objectRecord(proposal.payload) ?? {};
+        return stringValue(diagnostic.summary)
+          ?? stringValue(diagnostic.details)
+          ?? 'actionBundle admission repair returned a diagnostic instead of a file-level plan.';
+      },
+      diagnostic: (code, fallback, params) => diag(code, fallback, params),
     });
     this.resourceRequestRepairCoordinator = new ResourceRequestRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
@@ -1774,139 +1846,7 @@ export class SessionDriverLoop {
     reasons: string[],
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
-    if (state.actionBundleAdmissionRepairAttempted) {
-      return this.append(state.sessionId, sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
-        state.sessionId,
-        state.runId,
-        proposal,
-        reasons,
-        this.ts(),
-        this.id('action-bundle-admission-failed')
-      )) ?? fallback;
-    }
-    state.actionBundleAdmissionRepairAttempted = true;
-    let result = await this.append(state.sessionId, [
-      sessionProgressProjectionBuilder.actionBundleAdmissionRepairingEvent(
-        state.sessionId,
-        state.runId,
-        proposal,
-        reasons,
-        this.ts(),
-        this.id('action-bundle-admission-repairing')
-      ),
-    ]) ?? fallback;
-
-    let repaired: ProposalEnvelope;
-    try {
-      repaired = await this.actionBundleAdmissionRepairCoordinator.repair({
-        state, prompt, proposal, reasons,
-        runRepair: (stage, messages) => this.llm(input.profileId, state, stage, messages),
-      });
-    } catch (error) {
-      const message = error instanceof SessionDriverLoopError ? error.message : normalizeParseError(error).message;
-      return this.append(state.sessionId, sessionFailureProjectionBuilder.actionBundleAdmissionFailureEvents(
-        state.sessionId,
-        state.runId,
-        proposal,
-        [`actionBundle admission repair failed: ${message}`],
-        this.ts(),
-        this.id('action-bundle-admission-repair-failed')
-      )) ?? result;
-    }
-
-    if (repaired.kind === 'actionBundle') {
-      return this.submitActionProposal(input, state, prompt, repaired, result);
-    }
-    if (repaired.kind === 'resourceRequest') {
-      const followup = await this.actionBundleAdmissionResourceFollowupCoordinator.handle({
-        state,
-        proposal,
-        request: repaired.payload as ResourceRequestDraft,
-        reasons,
-        result,
-      });
-      if (followup.kind === 'failed') return followup.result;
-      return this.runUserTurn({
-        sessionId: input.sessionId,
-        content: followup.content,
-        attachments: input.attachments ?? [],
-        existingEvents: followup.result.events,
-        workspaceBinding: input.workspaceBinding,
-        projectWorkingDirectory: input.projectWorkingDirectory,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        appendUserMessage: false,
-        requirementConfirmationMode: 'off',
-        reviewContinuationMode: input.reviewContinuationMode,
-        interventionLevel: input.interventionLevel,
-        projectMemoryMode: input.projectMemoryMode,
-        resumeResourcePackets: true,
-      });
-    }
-    if (repaired.kind === 'decisionRequest') {
-      const requirement = userInputPipeline.requirementRecordFromProposal({
-        proposal: repaired,
-        sessionId: state.sessionId,
-        runId: state.runId,
-        userRequest: input.content,
-        timestamp: this.ts(),
-      });
-      const confirmation = requirementProjectionBuilder.confirmationEvent({
-        sessionId: state.sessionId,
-        runId: state.runId,
-        requirement,
-        proposal: repaired,
-        originalUserRequest: input.content,
-        attachments: input.attachments ?? [],
-        ts: this.ts(),
-        id: this.id('action-bundle-admission-decision'),
-      });
-      state.phase = 'waiting_plan_review';
-      return this.append(state.sessionId, [
-        confirmation,
-        sessionProgressProjectionBuilder.sessionRunStateEvent({
-          sessionId: state.sessionId,
-          runId: state.runId,
-          phase: 'waiting_plan_review',
-          reason: 'requirement',
-          decisionOwner: {
-            kind: 'requirement',
-            runId: state.runId,
-            targetId: requirement.requirementId,
-            requirementId: requirement.requirementId,
-          },
-          ts: this.ts(),
-          id: this.id('session-run-waiting-action-bundle-admission-decision'),
-        }),
-      ]) ?? result;
-    }
-    if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
-      return this.append(state.sessionId, [
-        assistantProjectionBuilder.finalDiagnosticEvent(
-          state.sessionId,
-          diag(
-            'actionBundleAdmissionRepairReturnedPlan',
-            'Action-bundle admission repair returned a plan proposal during execution. Session will not switch execution repair back into plan review; request a scoped actionBundle, resourceRequest, decisionRequest, or diagnostic instead.',
-            { returnedKind: repaired.kind, proposalId: repaired.proposalId }
-          ),
-          this.ts(),
-          this.id('action-bundle-admission-repair-plan-forbidden')
-        ),
-      ]) ?? result;
-    }
-    if (repaired.kind === 'answer') {
-      return this.append(state.sessionId, [assistantProjectionBuilder.answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]) ?? result;
-    }
-    if (repaired.kind === 'diagnostic') {
-      const diagnostic = objectRecord(repaired.payload) ?? {};
-      const summary = stringValue(diagnostic.summary)
-        ?? stringValue(diagnostic.details)
-        ?? 'actionBundle admission repair returned a diagnostic instead of a file-level plan.';
-      return this.append(state.sessionId, [
-        assistantProjectionBuilder.finalDiagnosticEvent(state.sessionId, summary, this.ts(), this.id('action-bundle-admission-diagnostic')),
-      ]) ?? result;
-    }
-    return this.submitNonExecutableProposal(state, repaired, result);
+    return this.actionBundleAdmissionCoordinator.repair(input, state, prompt, proposal, reasons, fallback);
   }
 
   private async submitActionProposal(
