@@ -14,6 +14,7 @@ import type {
 import {
   AcceptedPlanAdmission,
   AcceptedActionBundlePlanExecutor,
+  AcceptedPlanActionProposalSubmitter,
   AcceptedPlanBatchPreflight,
   AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
@@ -485,6 +486,7 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
 export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
   private readonly acceptedActionBundlePlanExecutor: AcceptedActionBundlePlanExecutor;
+  private readonly acceptedPlanActionProposalSubmitter: AcceptedPlanActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly acceptedPlanResourceResumeCoordinator: AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeDecisionCoordinator: AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeRepairCoordinator: AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>;
@@ -557,6 +559,139 @@ export class SessionDriverLoop {
       runtimeSnapshot: (input) => acceptedPlanTaskLedger().runtimeSnapshot(input),
       acceptedPlanComplete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
       executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
+      reviewHandoff: (handoffInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(handoffInput),
+    });
+    this.acceptedPlanActionProposalSubmitter = new AcceptedPlanActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      kernel: (request) => this.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
+      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      emitKernelActivityDeltas: (state, events, stage) => this.emitKernelActivityDeltas(state, events, stage),
+      readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
+      tryCompleteReadOnlyActionBundle: (handlerInput, state, prompt, proposal, fallback) =>
+        this.tryCompleteAcceptedPlanReadOnlyActionBundle(handlerInput, state, prompt, proposal, fallback),
+      assessActionProposal: (assessmentInput) => acceptedPlanExecutor.assessActionProposal(assessmentInput as unknown as Parameters<typeof acceptedPlanExecutor.assessActionProposal>[0]),
+      admission: () => acceptedPlanAdmission(),
+      appendScopeIntervention: (handlerInput, state, proposal, validation) =>
+        this.appendAcceptedPlanBatchOutOfScope(handlerInput, state, proposal, validation as AcceptedPlanBatchValidationResult),
+      appendThinking: async (state, message, idPrefix, metadata) => {
+        await this.append(state.sessionId, [
+          assistantProjectionBuilder.thinkingEvent(
+            state.sessionId,
+            message,
+            this.ts(),
+            this.id(idPrefix),
+            metadata as Parameters<typeof assistantProjectionBuilder.thinkingEvent>[4]
+          ),
+        ]);
+      },
+      repairScope: ({ state, prompt, proposal, validation, input: handlerInput }) =>
+        this.acceptedPlanScopeRepairCoordinator.repair({
+          state,
+          prompt,
+          proposal,
+          validation: validation as AcceptedPlanBatchValidationResult,
+          runRepair: (stage, messages) => this.llm(handlerInput.profileId, state, stage, messages),
+        }),
+      handleScopeResourceFollowup: ({ state, acceptedPlan, proposal, request, result }) =>
+        this.acceptedPlanScopeResourceFollowupCoordinator.handle({
+          state,
+          acceptedPlan,
+          proposal,
+          request,
+          result,
+        }),
+      waitForScopeDecision: ({ state, proposal, request }) =>
+        this.acceptedPlanScopeDecisionCoordinator.waitForDecision({
+          state,
+          proposal,
+          request,
+        }),
+      appendDiagnostic: (state, code, fallback, params, idPrefix) => this.append(state.sessionId, [
+        assistantProjectionBuilder.finalDiagnosticEvent(
+          state.sessionId,
+          diag(code, fallback, params),
+          this.ts(),
+          this.id(idPrefix)
+        ),
+      ]),
+      submitNonExecutableProposal: (state, proposal, fallback) => this.submitNonExecutableProposal(state, proposal, fallback),
+      sessionRunStateEvent: (eventInput) =>
+        sessionProgressProjectionBuilder.sessionRunStateEvent(eventInput as Parameters<typeof sessionProgressProjectionBuilder.sessionRunStateEvent>[0]),
+      accessScopesCanonicalizedEvent: (sessionId, runId, accepted, canonicalization, ts, id) =>
+        sessionProgressProjectionBuilder.acceptedPlanAccessScopesCanonicalizedEvent(
+          sessionId,
+          runId,
+          accepted,
+          canonicalization as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanAccessScopesCanonicalizedEvent>[3],
+          ts,
+          id
+        ),
+      findReviewReport: (events) => planReviewReportAnalyzer.findReport(events),
+      appendTrace: (state, stage, payload) => providerTraceRecorder.append(state, stage, payload, this.ports),
+      acceptedPlanNeedsRepair: (report) => planReviewReportAnalyzer.acceptedPlanNeedsRepair(report),
+      repairPlanReview: (handlerInput, state, prompt, proposal, report) =>
+        this.repairPlanReview(handlerInput, state, prompt, proposal, report),
+      answerEvent: (sessionId, proposal, ts, id) => assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
+      denied: (report) => planReviewReportAnalyzer.denied(report),
+      diagnosticSummary: (report) => planReviewReportAnalyzer.diagnosticSummary(report),
+      nonAcceptedPermissionGaps: (report, accepted) => nonAcceptedPlanPermissionGaps(report, accepted),
+      executionContext: (contextInput) => acceptedPlanExecutor.executionContext(contextInput as Parameters<typeof acceptedPlanExecutor.executionContext>[0]),
+      temporaryGrantsForPlan: (plan) => planReviewGrantProjector.temporaryGrantsForPlan(plan),
+      normalizeKernelBatch: (normalizeInput) => acceptedPlanExecutor.normalizeKernelBatch(normalizeInput as Parameters<typeof acceptedPlanExecutor.normalizeKernelBatch>[0]),
+      normalizationFailureEvents: (sessionId, runId, accepted, reasons, ts, id) =>
+        sessionFailureProjectionBuilder.acceptedPlanNormalizationFailureEvents(sessionId, runId, accepted, reasons, ts, id),
+      executionExceptionEvents: (sessionId, planRef, message, code, ts, id) =>
+        sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(sessionId, planRef, message, code, ts, id),
+      executionFailureEvents: (sessionId, runId, accepted, batchEvents, batch, ts, id) =>
+        sessionFailureProjectionBuilder.acceptedPlanExecutionFailureEvents(sessionId, runId, accepted, batchEvents, batch, ts, id),
+      deletePreflightReasons: (batch, resourcePackets) => acceptedPlanBatchPreflight.deleteReasons(batch, resourcePackets as ResourcePacket[]),
+      preflightAudit: (batch) => acceptedPlanBatchPreflight.audit(batch),
+      acceptedPlanBatchActivitySummary: (batch) => driverActivityBuilder.acceptedPlanBatchActivitySummary(batch),
+      acceptedPlanBatchActivity: (activityInput) => driverActivityBuilder.acceptedPlanBatchActivity(activityInput as Parameters<typeof driverActivityBuilder.acceptedPlanBatchActivity>[0]),
+      generatedPacketFromSuccessfulBatch: (state, batch, events, id) =>
+        generatedArtifactEvidenceIndex().packetFromSuccessfulBatch(state, batch, events, id),
+      indexGeneratedPacket: (index, packet) =>
+        generatedArtifactEvidenceIndex().indexPacket(index as Parameters<ReturnType<typeof generatedArtifactEvidenceIndex>['indexPacket']>[0], packet as Parameters<ReturnType<typeof generatedArtifactEvidenceIndex>['indexPacket']>[1]),
+      recordGeneratedPacket: (state, packet, stage) =>
+        this.resourceOrchestrator.recordAndAppend(state, packet as ResourcePacket, stage),
+      hasFailureOrBlocker: (events) => kernelEventStatusIndex.hasFailureOrBlocker(events),
+      actionBatchReadyForReview: (events) => kernelEventStatusIndex.actionBatchReadyForReview(events),
+      hasPermissionRequest: (events) => kernelEventStatusIndex.hasPermissionRequest(events),
+      permissionId: (events) => kernelEventStatusIndex.permissionId(events),
+      batchProgress: (progressInput) => acceptedPlanTaskLedger().batchProgress(progressInput),
+      afterBatch: (accepted, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(accepted, completedTaskIds),
+      refreshRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
+      complete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
+      batchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id) =>
+        sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(
+          sessionId,
+          runId,
+          accepted,
+          proposal,
+          kernelEvents,
+          progress as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent>[5],
+          ts,
+          id
+        ),
+      taskSavepointEvent: (sessionId, runId, accepted, nextAccepted, progress, kernelEvents, cursor, context, ts, id) =>
+        sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
+          sessionId,
+          runId,
+          accepted,
+          nextAccepted,
+          progress as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[4],
+          kernelEvents,
+          cursor as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[6],
+          context as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[7],
+          ts,
+          id
+        ),
+      executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
+      runUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
+      staticSyntaxReview: (reviewInput) => this.acceptedPlanStaticSyntaxReviewCoordinator.run(reviewInput),
       reviewHandoff: (handoffInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(handoffInput),
     });
     this.acceptedPlanResourceResumeCoordinator = new AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>({
@@ -2257,461 +2392,7 @@ export class SessionDriverLoop {
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
-    const accepted = state.acceptedImplementationPlan;
-    const actionBundle = driverActivityBuilder.readActionBundle(proposal);
-    if (!accepted || !actionBundle) return fallback;
-
-    const readOnlyActionResult = await this.tryCompleteAcceptedPlanReadOnlyActionBundle(
-      input,
-      state,
-      prompt,
-      proposal,
-      fallback
-    );
-    if (readOnlyActionResult) return readOnlyActionResult;
-
-    const assessment = acceptedPlanExecutor.assessActionProposal({
-      accepted,
-      proposal,
-      actionBundle,
-      resourcePackets: state.resourcePackets,
-      scopeRepairAttempted: state.acceptedPlanScopeRepairAttempted,
-      admission: acceptedPlanAdmission(),
-    });
-    if (assessment.kind === 'missingActionBundle') return fallback;
-    if (assessment.kind === 'deterministicScopeIntervention') {
-      return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, assessment.validation);
-    }
-    if (assessment.kind === 'scopeRepair') {
-      state.acceptedPlanScopeRepairAttempted = true;
-      await this.append(state.sessionId, [
-        assistantProjectionBuilder.thinkingEvent(
-          state.sessionId,
-          'The current execution batch is outside the confirmed current-task scope; Session is asking the model to continue the current task or request additional authorization.',
-          this.ts(),
-          this.id('accepted-plan-scope-repair'),
-          {
-            messageKey: 'session.driver.acceptedPlanScopeRepair',
-            messageArgs: {},
-          }
-        ),
-      ]);
-      try {
-        const repaired = await this.acceptedPlanScopeRepairCoordinator.repair({
-          state,
-          prompt,
-          proposal,
-          validation: assessment.validation,
-          runRepair: (stage, messages) => this.llm(input.profileId, state, stage, messages),
-        });
-        if (repaired.kind === 'actionBundle') {
-          return this.submitAcceptedPlanActionProposal(input, state, prompt, repaired, fallback);
-        }
-        if (repaired.kind === 'resourceRequest') {
-          const followup = await this.acceptedPlanScopeResourceFollowupCoordinator.handle({
-            state,
-            acceptedPlan: accepted,
-            proposal,
-            request: repaired.payload as ResourceRequestDraft,
-            result: fallback,
-          });
-          if (followup.kind === 'failed') return followup.result;
-          return this.runUserTurn({
-            sessionId: input.sessionId,
-            content: followup.content,
-            attachments: accepted.executionRoot ? [accepted.executionRoot.attachment] : [],
-            existingEvents: followup.result.events,
-            workspaceBinding: input.workspaceBinding,
-            projectWorkingDirectory: input.projectWorkingDirectory,
-            profileId: input.profileId,
-            workflow: input.workflow,
-            appendUserMessage: false,
-            requirementConfirmationMode: 'off',
-            reviewContinuationMode: input.reviewContinuationMode,
-            interventionLevel: input.interventionLevel,
-            projectMemoryMode: input.projectMemoryMode,
-            resumeResourcePackets: true,
-            acceptedImplementationPlan: accepted,
-          });
-        }
-        if (repaired.kind === 'decisionRequest') {
-          return this.acceptedPlanScopeDecisionCoordinator.waitForDecision({
-            state,
-            proposal: repaired,
-            request: {
-              content: input.content,
-              attachments: input.attachments,
-            },
-          });
-        }
-        if (repaired.kind === 'taskPlan' || repaired.kind === 'implementationPlan') {
-          return this.append(state.sessionId, [
-            assistantProjectionBuilder.finalDiagnosticEvent(
-              state.sessionId,
-              diag(
-                'acceptedPlanScopeRepairReturnedPlan',
-                'Accepted-plan execution repair returned a plan proposal. Session will not re-enter plan review from an accepted task; request a scoped actionBundle, resourceRequest, decisionRequest, or diagnostic instead.',
-                { returnedKind: repaired.kind, proposalId: repaired.proposalId }
-              ),
-              this.ts(),
-              this.id('accepted-plan-scope-repair-plan-forbidden')
-            ),
-          ]);
-        }
-        return this.submitNonExecutableProposal(state, repaired, fallback);
-      } catch (error) {
-        return this.appendAcceptedPlanBatchOutOfScope(input, state, proposal, assessment.validation);
-      }
-    }
-
-    const scopeCanonicalization = assessment.scopeCanonicalization;
-    const executionProposal = scopeCanonicalization.proposal;
-    state.phase = 'executing_accepted_plan';
-    let result = fallback;
-    if (scopeCanonicalization.changed) {
-      result = await this.append(state.sessionId, [
-        sessionProgressProjectionBuilder.acceptedPlanAccessScopesCanonicalizedEvent(
-          state.sessionId,
-          state.runId,
-          accepted,
-          scopeCanonicalization,
-          this.ts(),
-          this.id('accepted-plan-access-scopes-canonicalized')
-        ),
-      ]) ?? result;
-    }
-    result = await this.append(state.sessionId, [
-      sessionProgressProjectionBuilder.sessionRunStateEvent({
-        sessionId: state.sessionId,
-        runId: state.runId,
-        phase: 'executing_accepted_plan',
-        status: 'running',
-        reason: 'accepted_plan_execution',
-        decisionOwner: {
-          kind: 'plan',
-          runId: state.runId,
-          targetId: accepted.planId,
-          planId: accepted.planId,
-        },
-        ts: this.ts(),
-        id: this.id('session-run-accepted-plan-execution'),
-      }),
-    ]) ?? result;
-
-    const proposalReply = await this.kernel({
-      command: {
-        kind: 'proposalSubmit',
-        requestId: this.id('proposal-submit-accepted-plan'),
-        runId: state.runId,
-        sessionId: state.sessionId,
-        proposal: executionProposal,
-      },
-    });
-    const reviewReport = planReviewReportAnalyzer.findReport(proposalReply.events);
-    await providerTraceRecorder.append(state, 'accepted_plan_batch_review_report', {
-      acceptedPlanId: accepted.planId,
-      proposalId: proposal.proposalId,
-      report: reviewReport,
-      events: proposalReply.events,
-    }, this.ports);
-    if (!reviewReport) {
-      return this.append(state.sessionId, [
-        assistantProjectionBuilder.finalDiagnosticEvent(
-          state.sessionId,
-          diag('autoPlanProposalReviewedMissing', 'Kernel did not return a proposal.reviewed event for the accepted-plan actionBundle; Session will not auto-execute this batch.'),
-          this.ts(),
-          this.id('accepted-plan-review-missing')
-        ),
-      ]);
-    }
-    if (reviewReport && planReviewReportAnalyzer.acceptedPlanNeedsRepair(reviewReport) && !state.planReviewRepairAttempted) {
-      state.planReviewRepairAttempted = true;
-      await this.append(state.sessionId, [
-        assistantProjectionBuilder.thinkingEvent(
-          state.sessionId,
-          'Kernel PlanReview requires revising the current accepted-plan batch; Session is running one controlled repair attempt.',
-          this.ts(),
-          this.id('accepted-plan-review-repair')
-        ),
-      ]);
-      let repaired: ProposalEnvelope;
-      try {
-        repaired = await this.repairPlanReview(input, state, prompt, executionProposal, reviewReport);
-      } catch (error) {
-        const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-        return this.append(state.sessionId, [
-          assistantProjectionBuilder.finalDiagnosticEvent(
-            state.sessionId,
-            diag('autoBatchRevisionRepairFailed', `The automatic execution batch needs revision, but model repair failed: ${message}`, { message }),
-            this.ts(),
-            this.id('accepted-plan-review-repair-failed')
-          ),
-        ]);
-      }
-      if (repaired.kind === 'actionBundle') {
-        return this.submitAcceptedPlanActionProposal(input, state, prompt, repaired, fallback);
-      }
-      if (repaired.kind === 'answer') {
-        return this.append(state.sessionId, [assistantProjectionBuilder.answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]);
-      }
-      return this.submitNonExecutableProposal(state, repaired, fallback);
-    }
-
-    result = await this.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? result;
-    if (planReviewReportAnalyzer.denied(reviewReport)) {
-      return this.append(state.sessionId, [
-        assistantProjectionBuilder.finalDiagnosticEvent(
-          state.sessionId,
-          diag('autoBatchRejected', `Kernel rejected the automatic execution batch: ${planReviewReportAnalyzer.diagnosticSummary(reviewReport)}`, { reasons: planReviewReportAnalyzer.diagnosticSummary(reviewReport) }),
-          this.ts(),
-          this.id('accepted-plan-review-denied')
-        ),
-      ]);
-    }
-    if (reviewReport.status === 'needsRevision') {
-      return this.appendAcceptedPlanBatchOutOfScope(input, state, executionProposal, {
-        ok: false,
-        reasons: [`Kernel PlanReview requires revising the current batch: ${planReviewReportAnalyzer.diagnosticSummary(reviewReport)}`],
-      });
-    }
-
-    const autoGrantBlockers = nonAcceptedPlanPermissionGaps(reviewReport, accepted);
-    if (autoGrantBlockers.length) {
-      return this.appendAcceptedPlanBatchOutOfScope(input, state, executionProposal, {
-        ok: false,
-        reasons: autoGrantBlockers.map((capability) => `The current batch requires additional permission ${capability}, which is outside the accepted taskPlan automatic execution scope.`),
-      });
-    }
-
-    const plan = acceptedPlanExecutor.executionContext({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      acceptedPlan: accepted,
-      proposal: executionProposal,
-      planReviewReport: reviewReport,
-    });
-    const grantEvents: unknown[] = [];
-    for (const grant of planReviewGrantProjector.temporaryGrantsForPlan(plan)) {
-      const grantReply = await this.kernel({
-        command: {
-          kind: 'permissionGrantTemporary',
-          requestId: this.id('accepted-plan-temp-grant'),
-          runId: state.runId,
-          grant,
-        },
-      });
-      grantEvents.push(...(grantReply.events ?? []));
-    }
-    if (grantEvents.length) {
-      result = await this.appendProjectedKernelEvents(state.sessionId, { ok: true, events: grantEvents }) ?? result;
-    }
-
-    const normalizedBatch = acceptedPlanExecutor.normalizeKernelBatch({
-      planId: accepted.planId,
-      plan,
-      acceptedPlan: accepted,
-    });
-    if (!normalizedBatch.ok) {
-      return this.append(state.sessionId, sessionFailureProjectionBuilder.acceptedPlanNormalizationFailureEvents(
-        state.sessionId,
-        state.runId,
-        accepted,
-        normalizedBatch.reasons,
-        this.ts(),
-        this.id('accepted-plan-batch-normalization-failed')
-      )) ?? result;
-    }
-    const batch = normalizedBatch.batch;
-    const deletePreflightReasons = acceptedPlanBatchPreflight.deleteReasons(batch, state.resourcePackets);
-    if (deletePreflightReasons.length) {
-      return this.append(state.sessionId, sessionFailureProjectionBuilder.acceptedPlanNormalizationFailureEvents(
-        state.sessionId,
-        state.runId,
-        accepted,
-        deletePreflightReasons,
-        this.ts(),
-        this.id('accepted-plan-delete-preflight-failed')
-      )) ?? result;
-    }
-    await providerTraceRecorder.append(state, 'accepted_plan.action_batch_preflight', {
-      planId: accepted.planId,
-      batchIndex: accepted.batchIndex,
-      audit: acceptedPlanBatchPreflight.audit(batch),
-    }, this.ports);
-
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'accepted_plan.action_batch_submit',
-      status: 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: driverActivityBuilder.acceptedPlanBatchActivitySummary(batch),
-      activity: driverActivityBuilder.acceptedPlanBatchActivity({ accepted, batch, status: 'running' }),
-      payload: {
-        visibility: 'task',
-        planId: accepted.planId,
-        batchIndex: accepted.batchIndex,
-        actionCount: Array.isArray((batch as Record<string, unknown>).actions)
-          ? ((batch as Record<string, unknown>).actions as unknown[]).length
-          : undefined,
-      },
-    });
-
-    const batchReply = await this.kernel({
-      command: {
-        kind: 'actionBatchSubmit',
-        requestId: this.id('accepted-plan-action-batch-submit'),
-        runId: state.runId,
-        sessionId: state.sessionId,
-        batch,
-      },
-    });
-    await this.emitKernelActivityDeltas(state, batchReply.events ?? [], 'accepted_plan.action_batch_submit');
-    result = await this.appendProjectedKernelEvents(state.sessionId, batchReply) ?? result;
-    if (!batchReply.ok) {
-      const message = kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed');
-      const code = stringValue(objectRecord(batchReply.error)?.code) ?? 'accepted_plan_execution_failed';
-      return this.append(state.sessionId, sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(
-        state.sessionId,
-        { runId: state.runId, planId: accepted.planId },
-        message,
-        code,
-        this.ts(),
-        this.id('accepted-plan-action-batch-submit-failed')
-      )) ?? result;
-    }
-    const batchEvents = batchReply.events ?? [];
-    if (kernelEventStatusIndex.hasFailureOrBlocker(batchEvents)) {
-      return this.append(state.sessionId, sessionFailureProjectionBuilder.acceptedPlanExecutionFailureEvents(
-        state.sessionId,
-        state.runId,
-        accepted,
-        batchEvents,
-        batch,
-        this.ts(),
-        this.id('accepted-plan-batch-failed')
-      )) ?? result;
-    }
-    const generatedPacket = generatedArtifactEvidenceIndex().packetFromSuccessfulBatch(
-      state,
-      batch,
-      batchEvents,
-      this.id('generated-artifact-evidence')
-    );
-    if (generatedPacket) {
-      generatedArtifactEvidenceIndex().indexPacket(state.generatedArtifactEvidence, generatedPacket);
-      result = (await this.resourceOrchestrator.recordAndAppend(
-        state,
-        generatedPacket,
-        'accepted-plan-generated-artifact-evidence'
-      )).result ?? result;
-    }
-    if (!kernelEventStatusIndex.actionBatchReadyForReview(batchReply.events ?? [])) {
-      if (kernelEventStatusIndex.hasPermissionRequest(batchReply.events ?? [])) {
-        const permissionId = kernelEventStatusIndex.permissionId(batchReply.events ?? []);
-        return this.append(state.sessionId, [
-          sessionProgressProjectionBuilder.sessionRunStateEvent({
-            sessionId: state.sessionId,
-            runId: state.runId,
-            phase: 'waiting_permission',
-            reason: 'permission',
-            decisionOwner: {
-              kind: 'permission',
-              runId: state.runId,
-              targetId: permissionId,
-              permissionId,
-              planId: accepted.planId,
-            },
-            ts: this.ts(),
-            id: this.id('session-run-waiting-permission'),
-          }),
-        ]) ?? result;
-      }
-      return result;
-    }
-    const batchProgress = acceptedPlanTaskLedger().batchProgress({ acceptedPlan: accepted, proposal: executionProposal, kernelEvents: batchReply.events ?? [] });
-    const nextAccepted = acceptedPlanTaskLedger().afterBatch(accepted, batchProgress.completedTaskIds);
-    acceptedPlanTaskLedger().refreshRuntimeState(state);
-    const savepointId = this.id('accepted-plan-task-savepoint');
-    result = await this.append(state.sessionId, [
-      sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(
-        state.sessionId,
-        state.runId,
-        accepted,
-        executionProposal,
-        batchReply.events ?? [],
-        batchProgress,
-        this.ts(),
-        this.id('accepted-plan-batch-checkpoint')
-      ),
-      sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
-        state.sessionId,
-        state.runId,
-        accepted,
-        nextAccepted,
-        batchProgress,
-        batchReply.events ?? [],
-        state.taskExecutionCursor,
-        state.currentTaskContext,
-        this.ts(),
-        savepointId
-      ),
-    ]) ?? result;
-    if (state.taskExecutionCursor) state.taskExecutionCursor.lastSavepointId = savepointId;
-
-    if (!kernelEventStatusIndex.hasFailureOrBlocker(batchReply.events ?? []) && !acceptedPlanTaskLedger().complete(nextAccepted)) {
-      return this.runUserTurn({
-        sessionId: input.sessionId,
-        content: executionPromptCoordinator().executionRequest(
-          {
-            ...acceptedPlanExecutor.executionContext({
-              sessionId: state.sessionId,
-              runId: state.runId,
-              acceptedPlan: accepted,
-              proposal: executionProposal,
-              planReviewReport: reviewReport,
-            }),
-            implementationPlan: accepted.rawPlan,
-          },
-          nextAccepted
-        ),
-        attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
-        existingEvents: result.events,
-        workspaceBinding: input.workspaceBinding,
-        projectWorkingDirectory: input.projectWorkingDirectory,
-        profileId: input.profileId,
-        workflow: input.workflow,
-        appendUserMessage: false,
-        requirementConfirmationMode: 'off',
-        reviewContinuationMode: input.reviewContinuationMode,
-        interventionLevel: input.interventionLevel,
-        projectMemoryMode: input.projectMemoryMode,
-        resumeResourcePackets: true,
-        acceptedImplementationPlan: nextAccepted,
-      });
-    }
-
-    const staticReviewEvents = await this.acceptedPlanStaticSyntaxReviewCoordinator.run({
-      profileId: input.profileId,
-      state,
-      prompt,
-      accepted,
-      batch,
-      batchEvents,
-    });
-    if (staticReviewEvents.length) {
-      result = await this.append(state.sessionId, staticReviewEvents) ?? result;
-    }
-
-    return this.acceptedPlanReviewHandoffCoordinator.handoff({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      planId: accepted.planId,
-      plan,
-      result,
-      currentKernelEvents: [...(batchReply.events ?? []), ...staticReviewEvents.map((event) => event.payload)],
-      requestIdPrefix: 'accepted-plan-review-facts-get',
-    });
+    return this.acceptedPlanActionProposalSubmitter.submit(input, state, prompt, proposal, fallback);
   }
 
   private async appendAcceptedPlanBatchOutOfScope(
