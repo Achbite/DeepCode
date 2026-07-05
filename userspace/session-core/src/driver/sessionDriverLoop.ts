@@ -137,7 +137,7 @@ import {
   ReviewDecisionProjectionBuilder,
   type SessionReviewContext,
 } from './review/index.js';
-import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler, TerminalGuidanceRevisionCoordinator } from './interactions/index.js';
+import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, ProviderDecisionRequestHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler, TerminalGuidanceRevisionCoordinator } from './interactions/index.js';
 import {
   ActionProposalSubmitter,
   ActionBundleActionInspector,
@@ -503,6 +503,7 @@ export class SessionDriverLoop {
   private readonly decisionResolver: DecisionResolver;
   private readonly permissionDecisionHandler: PermissionDecisionHandler<SessionPlanContext>;
   private readonly planDecisionHandler: PlanDecisionHandler;
+  private readonly providerDecisionRequestHandler: ProviderDecisionRequestHandler<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementConfirmationCoordinator: RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementDecisionHandler: RequirementDecisionHandler;
   private readonly reviewDecisionHandler: ReviewDecisionHandler;
@@ -932,6 +933,18 @@ export class SessionDriverLoop {
       planHandler: this.planDecisionHandler,
       permissionHandler: this.permissionDecisionHandler,
       reviewHandler: this.reviewDecisionHandler,
+    });
+    this.providerDecisionRequestHandler = new ProviderDecisionRequestHandler<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      requirementRecordFromProposal: (proposalInput) =>
+        userInputPipeline.requirementRecordFromProposal(proposalInput),
+      confirmationEvent: (confirmationInput) =>
+        requirementProjectionBuilder.confirmationEvent(confirmationInput),
+      interactionOverlayPayload: (overlay) => interactionOverlayCodec.toPayload(overlay),
+      sessionRunStateEvent: (runStateInput) =>
+        sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
     });
     this.requirementConfirmationCoordinator = new RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.ts(),
@@ -1589,54 +1602,7 @@ export class SessionDriverLoop {
         return this.append(sessionId, [assistantProjectionBuilder.answerEvent(sessionId, proposal, this.ts(), this.id('answer'))]);
       }
       if (proposal.kind === 'decisionRequest') {
-        const requirement = userInputPipeline.requirementRecordFromProposal({
-          proposal,
-          sessionId: state.sessionId,
-          runId: state.runId,
-          userRequest: input.content,
-          timestamp: this.ts(),
-        });
-        const interactionOverlay: InteractionOverlayContext = {
-          parentRunId: state.interactionOverlay?.parentRunId ?? state.runId,
-          parentPhase: state.phase,
-          interactionRunId: state.runId,
-          interactionId: requirement.requirementId,
-          sourceInteractionId: requirement.requirementId,
-          acceptedPlanId: state.acceptedImplementationPlan?.planId,
-          acceptedPlanRunId: state.acceptedImplementationPlan?.runId,
-          acceptedCurrentTaskId: state.currentTaskContext?.taskId,
-          acceptedCompletedTaskIds: state.acceptedImplementationPlan?.completedTaskIds,
-        };
-        const confirmation = requirementProjectionBuilder.confirmationEvent({
-          sessionId,
-          runId: state.runId,
-          requirement,
-          proposal,
-          originalUserRequest: input.content,
-          attachments: input.attachments ?? [],
-          interactionOverlayPayload: interactionOverlayCodec.toPayload(interactionOverlay),
-          ts: this.ts(),
-          id: this.id('decision-request'),
-        });
-        state.phase = 'waiting_requirement_confirmation';
-        return this.append(sessionId, [
-          confirmation,
-          sessionProgressProjectionBuilder.sessionRunStateEvent({
-            sessionId,
-            runId: state.runId,
-            phase: 'waiting_requirement_confirmation',
-            reason: 'requirement',
-            decisionOwner: {
-              kind: 'requirement',
-              runId: state.runId,
-              targetId: requirement.requirementId,
-              requirementId: requirement.requirementId,
-            },
-            interactionOverlay,
-            ts: this.ts(),
-            id: this.id('session-run-waiting-requirement'),
-          }),
-        ]);
+        return this.providerDecisionRequestHandler.handle(input, state, proposal);
       }
       if (proposal.kind === 'diagnostic') {
         const diagnostic = objectRecord(proposal.payload) ?? {};

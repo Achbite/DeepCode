@@ -1,6 +1,7 @@
 export * from './decisionResolver.js';
 export * from './planDecisionHandler.js';
 export * from './permissionDecisionHandler.js';
+export * from './providerDecisionRequestHandler.js';
 export * from './requirementConfirmationCoordinator.js';
 export * from './requirementDecisionHandler.js';
 export * from './reviewDecisionHandler.js';
