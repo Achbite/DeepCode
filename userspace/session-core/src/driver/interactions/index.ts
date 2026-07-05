@@ -1,3 +1,4 @@
+export * from './decisionResolver.js';
 export * from './planDecisionHandler.js';
 export * from './permissionDecisionHandler.js';
 export * from './requirementDecisionHandler.js';

@@ -135,7 +135,7 @@ import {
   ReviewDecisionProjectionBuilder,
   type SessionReviewContext,
 } from './review/index.js';
-import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from './interactions/index.js';
+import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from './interactions/index.js';
 import {
   ActionBundleActionInspector,
   PlanContextIndex,
@@ -496,6 +496,7 @@ export class SessionDriverLoop {
   private readonly acceptedPlanStaticSyntaxReviewCoordinator: AcceptedPlanStaticSyntaxReviewCoordinator<SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionResourceFollowupCoordinator: ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>;
+  private readonly decisionResolver: DecisionResolver;
   private readonly permissionDecisionHandler: PermissionDecisionHandler<SessionPlanContext>;
   private readonly planDecisionHandler: PlanDecisionHandler;
   private readonly requirementDecisionHandler: RequirementDecisionHandler;
@@ -909,6 +910,19 @@ export class SessionDriverLoop {
       kernelStatus: kernelEventStatusIndex,
       progressProjection: sessionProgressProjectionBuilder,
     });
+    this.decisionResolver = new DecisionResolver({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      finalDiagnosticEvent: (sessionId, content, ts, id) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
+      missingDecisionKindMessage: (kind) =>
+        diag('decisionResolverMissing', `Decision kind "${kind}" is not yet connected to Session DecisionResolver.`, { kind }),
+      requirementHandler: this.requirementDecisionHandler,
+      planHandler: this.planDecisionHandler,
+      permissionHandler: this.permissionDecisionHandler,
+      reviewHandler: this.reviewDecisionHandler,
+    });
     this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
       repairState: providerRepairMessageState,
@@ -1032,18 +1046,7 @@ export class SessionDriverLoop {
   }
 
   async resolveDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
-    if (input.kind === 'requirement') return this.resolveRequirementDecision(input);
-    if (input.kind === 'plan') return this.resolvePlanDecision(input);
-    if (input.kind === 'permission') return this.resolvePermissionDecision(input);
-    if (input.kind === 'review') return this.resolveReviewDecision(input);
-    return this.append(input.sessionId, [
-      assistantProjectionBuilder.finalDiagnosticEvent(
-        input.sessionId,
-        diag('decisionResolverMissing', `Decision kind "${input.kind}" is not yet connected to Session DecisionResolver.`, { kind: input.kind }),
-        this.ts(),
-        this.id('decision-unsupported')
-      ),
-    ]);
+    return this.decisionResolver.resolve(input);
   }
 
   async runUserTurn(input: SessionDriverLoopInput): Promise<AgentSessionResult> {
@@ -1443,71 +1446,6 @@ export class SessionDriverLoop {
     }
 
     return lastResult;
-  }
-
-  private async resolveRequirementDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
-    return this.requirementDecisionHandler.resolve({
-      sessionId: input.sessionId,
-      decision: input.decision,
-      guidance: input.guidance,
-      runId: input.runId,
-      targetId: input.targetId,
-      existingEvents: input.existingEvents,
-      workspaceBinding: input.workspaceBinding,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      reviewContinuationMode: input.reviewContinuationMode,
-      interventionLevel: input.interventionLevel,
-      projectMemoryMode: input.projectMemoryMode,
-      interactionOverlay: input.interactionOverlay,
-    });
-  }
-
-  private async resolvePlanDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
-    return this.planDecisionHandler.resolve({
-      sessionId: input.sessionId,
-      decision: input.decision,
-      guidance: input.guidance,
-      runId: input.runId,
-      targetId: input.targetId,
-      existingEvents: input.existingEvents,
-      workspaceBinding: input.workspaceBinding,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      reviewContinuationMode: input.reviewContinuationMode,
-      interventionLevel: input.interventionLevel,
-      projectMemoryMode: input.projectMemoryMode,
-      interactionOverlay: input.interactionOverlay,
-    });
-  }
-
-  private async resolvePermissionDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
-    return this.permissionDecisionHandler.resolve({
-      sessionId: input.sessionId,
-      decision: input.decision,
-      runId: input.runId,
-      targetId: input.targetId,
-      existingEvents: input.existingEvents,
-    });
-  }
-
-  private async resolveReviewDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
-    return this.reviewDecisionHandler.resolve({
-      sessionId: input.sessionId,
-      decision: input.decision,
-      guidance: input.guidance,
-      runId: input.runId,
-      existingEvents: input.existingEvents,
-      workspaceBinding: input.workspaceBinding,
-      projectWorkingDirectory: input.projectWorkingDirectory,
-      profileId: input.profileId,
-      workflow: input.workflow,
-      reviewContinuationMode: input.reviewContinuationMode,
-      interventionLevel: input.interventionLevel,
-      projectMemoryMode: input.projectMemoryMode,
-    });
   }
 
   private async buildRequirementConfirmation(
