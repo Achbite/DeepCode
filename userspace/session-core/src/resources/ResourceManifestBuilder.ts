@@ -34,8 +34,6 @@ export interface ResourceManifestBuilderPorts {
   resourceManifestMaxBytes: number;
   comparablePath(value: string): string;
   isAbsolutePath(value: string): boolean;
-  sanitizeId(value: string): string;
-  objectRecord(value: unknown): Record<string, unknown> | undefined;
 }
 
 export class ResourceManifestBuilder {
@@ -114,7 +112,7 @@ export class ResourceManifestBuilder {
         seenRootRefs.add(refKey);
         conversationRoots.push({
           ...workingDirectory,
-          rootId: workingDirectory.rootId || `project-root-${this.ports.sanitizeId(workingDirectory.displayPath)}`,
+          rootId: workingDirectory.rootId || `project-root-${sanitizeId(workingDirectory.displayPath)}`,
           kind: 'directory',
           absolutePath: workingDirectory.absolutePath ?? (this.ports.isAbsolutePath(resourceRef) ? resourceRef : undefined),
           primary: this.ports.comparablePath(resourceRef) === primaryRootRef,
@@ -128,7 +126,7 @@ export class ResourceManifestBuilder {
       if (!seenRootRefs.has(refKey)) {
         seenRootRefs.add(refKey);
         conversationRoots.push({
-          rootId: `editor-workspace-${this.ports.sanitizeId(resourceRef)}`,
+          rootId: `editor-workspace-${sanitizeId(resourceRef)}`,
           kind: 'directory',
           label: `Editor workspace ${resourceRef}`,
           displayPath: resourceRef,
@@ -230,7 +228,7 @@ export class ResourceManifestBuilder {
     for (const event of [...events].reverse()) {
       if (output.length >= 16) break;
       if (event.kind !== 'user_msg') continue;
-      const payload = this.ports.objectRecord(event.payload);
+      const payload = objectRecord(event.payload);
       const attachments = Array.isArray(payload?.attachments) ? payload.attachments : [];
       for (const item of attachments) {
         if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
@@ -249,11 +247,19 @@ export class ResourceManifestBuilder {
     index: number,
     source: ConversationResourceRoot['source']
   ): string {
-    const base = (attachment.path || attachment.absolutePath || `attachment-${index}`)
-      .replace(/[^a-zA-Z0-9._/-]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 96);
+    const sourceRef = attachment.path || attachment.absolutePath || `attachment-${index}`;
+    const base = sanitizeId(sourceRef).slice(0, 96);
     const prefix = source === 'recentAttachment' ? 'recent-attachment' : 'attachment';
     return `${prefix}-${index}-${base || 'resource'}`;
   }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function sanitizeId(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._/-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 128) || 'resource';
 }

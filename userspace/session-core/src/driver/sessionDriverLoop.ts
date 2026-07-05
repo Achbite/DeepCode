@@ -1860,8 +1860,6 @@ function resourceManifestBuilder(): ResourceManifestBuilder {
     resourceManifestMaxBytes: RESOURCE_MANIFEST_MAX_BYTES,
     comparablePath: (value) => pathIdentity.comparablePath(value),
     isAbsolutePath: (value) => pathIdentity.isAbsolutePath(value),
-    sanitizeId,
-    objectRecord,
   });
 }
 
@@ -2031,8 +2029,4 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function clip(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 20)}... [truncated]`;
-}
-
-function sanitizeId(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._/-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 128) || 'resource';
 }
