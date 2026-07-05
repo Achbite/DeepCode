@@ -110,6 +110,7 @@ import {
   ContextFrameBuilder,
   GeneratedArtifactEvidenceIndex,
   PathIdentity,
+  ProviderTurnContextCoordinator,
   ResourceEvidenceIndex,
   ResourceManifestBuilder,
   ResourceOrchestrator,
@@ -522,6 +523,7 @@ export class SessionDriverLoop {
   private readonly nativeToolProviderCoordinator: NativeToolProviderCoordinator<SessionDriverLoopRunState, LlmTurnResult>;
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
   private readonly providerProposalCoordinator: ProviderProposalCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
+  private readonly providerTurnContextCoordinator: ProviderTurnContextCoordinator<SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
 
   constructor(private readonly ports: SessionDriverLoopPorts) {
@@ -1428,6 +1430,35 @@ export class SessionDriverLoop {
       isDriverErrorCode: (error, code) =>
         error instanceof SessionDriverLoopError && error.code === code,
     });
+    this.providerTurnContextCoordinator = new ProviderTurnContextCoordinator<SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      assembleContext: (contextInput) => assembleContext(contextInput),
+      allowedProposals: (kernelAllowed, state) =>
+        sessionProviderAllowedProposals(kernelAllowed, state),
+      capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
+      memoryHints: (state) => [
+        ...acceptedPlanTaskLedger().memoryHints(state.currentTaskContext),
+        ...implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
+      ],
+      collectUserGuidanceEvents: (events, runId) => collectUserGuidanceEvents(events, runId),
+      consumedUserGuidanceEvents: (guidanceInput) =>
+        userGuidanceQueue.consumedEvents({
+          sessionId: guidanceInput.sessionId,
+          events: guidanceInput.events,
+          consumedIds: guidanceInput.consumedIds,
+          runId: guidanceInput.runId,
+          appliedAtProviderStage: guidanceInput.appliedAtProviderStage,
+          summary: providerStreamCoordinator.userGuidanceConsumedSummary(
+            visibleLanguageForRequest(guidanceInput.userRequest)
+          ),
+          now: () => this.ts(),
+          createId: (prefix) => this.id(prefix),
+        }),
+      buildProviderTurnContract: (contractInput) =>
+        contextFrameBuilder.buildSessionProviderTurnContract(contractInput),
+    });
   }
 
   async resolveDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
@@ -1565,57 +1596,17 @@ export class SessionDriverLoop {
 
     while (true) {
       acceptedPlanTaskLedger().refreshRuntimeState(state);
-      const allowedProposals = sessionProviderAllowedProposals(state.stateContract?.allowedProposals ?? [
-        'answer',
-        'resourceRequest',
-        'decisionRequest',
-        'taskPlan',
-        'actionBundle',
-        'diagnostic',
-      ], state);
-      const assembledContext = assembleContext({
+      const providerContext = await this.providerTurnContextCoordinator.prepare(state, {
         contextAssemblyId: this.id('context-assembly'),
-        workflowState: state.stateContract?.stateId ?? state.driverRequest?.kind ?? 'needProposal',
-        allowedProposals,
-        capabilityCatalogSummary: nativeToolCoordinator.capabilityCatalogSummary(state),
-        memoryDocument: state.memoryDocument,
-        projectMemoryMode: input.projectMemoryMode,
-        extraMemoryHints: [
-          ...acceptedPlanTaskLedger().memoryHints(state.currentTaskContext),
-          ...implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
-        ],
-        interventionLevel: input.interventionLevel,
-        userGuidance: collectUserGuidanceEvents(lastResult.events, state.runId),
-        userRequest: input.content,
-        currentTaskGoal: state.currentTaskContext?.goal,
-        currentTaskContext: state.currentTaskContext,
-        taskCursor: state.taskExecutionCursor,
-        initialContext: state.initialContext,
-        resourcePackets: state.resourcePackets,
-        conversationRoots: state.conversationRoots,
-        requirement: input.confirmedRequirement,
-        auditOnly: {
-          runId: state.runId,
-          sessionId,
-        },
-      });
-      state.cachePlan = assembledContext.cachePlan;
-      state.contextAssembly = assembledContext.contextAssembly;
-      lastResult = await this.appendConsumedUserGuidanceEvents(sessionId, lastResult, state.contextAssembly, state.runId, state.userRequest);
-      const prompt = assembledContext.prompt;
-      state.providerTurnContract = contextFrameBuilder.buildSessionProviderTurnContract({
         contractId: this.id('provider-turn-contract'),
-        sessionId,
-        runId: state.runId,
-        allowedKinds: allowedProposals,
-        prompt,
-        contextAssembly: state.contextAssembly,
-        userRequest: input.content,
-        acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
-        currentTaskContext: state.currentTaskContext,
-        resourcePackets: state.resourcePackets,
-        generatedArtifactCount: state.generatedArtifactEvidence.size,
+        inputContent: input.content,
+        projectMemoryMode: input.projectMemoryMode,
+        interventionLevel: input.interventionLevel,
+        confirmedRequirement: input.confirmedRequirement,
+        lastResult,
       });
+      lastResult = providerContext.lastResult;
+      const prompt = providerContext.prompt;
       state.phase = 'provider_proposing';
       let proposal: ProposalEnvelope;
       try {

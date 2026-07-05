@@ -5,6 +5,7 @@ export * from './contextAuthority.js';
 export * from './contextFrameBuilder.js';
 export * from './generatedArtifactEvidenceIndex.js';
 export * from './pathIdentity.js';
+export * from './providerTurnContextCoordinator.js';
 export * from './resourceEvidenceIndex.js';
 export * from './resourceOrchestrator.js';
 export * from './resourceRequestProposalHandler.js';
