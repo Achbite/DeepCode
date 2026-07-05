@@ -1619,7 +1619,7 @@ export class SessionDriverLoop {
     const state = lifecycle.state;
     let lastResult = lifecycle.lastResult;
 
-    if (shouldRequestRequirementConfirmation(input, state)) {
+    if (this.requirementConfirmationCoordinator.shouldBuild(input)) {
       try {
         const event = await this.requirementConfirmationCoordinator.build(input, state);
         state.phase = 'waiting_requirement_confirmation';
@@ -1968,17 +1968,6 @@ function reviewDecisionProjection(): ReviewDecisionProjectionBuilder {
   return new ReviewDecisionProjectionBuilder();
 }
 
-function normalizedNonNegativeInteger(value: unknown): number | undefined {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
-  const integer = Math.floor(value);
-  return integer >= 0 ? integer : undefined;
-}
-
-function normalizedPositiveInteger(value: unknown): number | undefined {
-  const integer = normalizedNonNegativeInteger(value);
-  return typeof integer === 'number' && integer > 0 ? integer : undefined;
-}
-
 interface DiagnosticInfo {
   code: string;
   fallback: string;
@@ -2035,21 +2024,6 @@ function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted
   return gaps.filter((capability) => !planReviewGrantProjector.planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
 }
 
-function safeSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'item';
-}
-
-function shouldRequestRequirementConfirmation(
-  input: SessionDriverLoopInput,
-  _state: SessionDriverLoopRunState
-): boolean {
-  if (input.confirmedRequirement) return false;
-  const mode = input.requirementConfirmationMode ?? 'auto';
-  if (mode === 'off') return false;
-  if (mode === 'always') return true;
-  return false;
-}
-
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
@@ -2070,10 +2044,6 @@ function normalizeParseError(error: unknown): { code: string; message: string } 
   return { code: 'parse_failed', message: String(error) };
 }
 
-function planInitialUserRequest(plan: SessionPlanContext): string {
-  return plan.userPlan;
-}
-
 type VisibleLanguage = 'zh-CN' | 'en-US';
 
 function visibleLanguageForRequest(userRequest: string): VisibleLanguage {
@@ -2092,16 +2062,6 @@ function clip(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 20)}... [truncated]`;
 }
 
-function compactString(value: unknown): string {
-  if (value === undefined || value === null) return '';
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value) ?? '';
-  } catch {
-    return String(value);
-  }
-}
-
 function sanitizeId(value: string): string {
   return value.replace(/[^a-zA-Z0-9._/-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 128) || 'resource';
 }
@@ -2110,8 +2070,4 @@ function joinFsPath(root: string, child: string): string {
   const cleanRoot = root.replace(/\/+$/g, '');
   const cleanChild = child.replace(/^\/+/g, '');
   return `${cleanRoot}/${cleanChild}`;
-}
-
-function fenced(value: string): string {
-  return `\`\`\`text\n${value}\n\`\`\``;
 }

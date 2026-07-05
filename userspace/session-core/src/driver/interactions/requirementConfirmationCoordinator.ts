@@ -23,6 +23,8 @@ export interface RequirementConfirmationInput {
   content: string;
   attachments?: AgentContextAttachment[];
   existingEvents?: AgentEvent[];
+  confirmedRequirement?: RequirementRecord;
+  requirementConfirmationMode?: 'auto' | 'always' | 'off';
   projectMemoryMode?: ProjectMemoryMode;
   interventionLevel?: ContextAssemblyInput['interventionLevel'];
 }
@@ -93,6 +95,14 @@ export class RequirementConfirmationCoordinator<
   State extends RequirementConfirmationState,
 > {
   constructor(private readonly ports: RequirementConfirmationCoordinatorPorts<Input, State>) {}
+
+  shouldBuild(input: Input): boolean {
+    if (input.confirmedRequirement) return false;
+    const mode = input.requirementConfirmationMode ?? 'auto';
+    if (mode === 'off') return false;
+    if (mode === 'always') return true;
+    return false;
+  }
 
   async build(input: Input, state: State): Promise<AgentEvent> {
     const assembledContext = this.ports.assembleContext({
