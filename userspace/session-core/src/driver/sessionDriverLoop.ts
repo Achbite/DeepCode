@@ -135,7 +135,7 @@ import {
   ReviewDecisionProjectionBuilder,
   type SessionReviewContext,
 } from './review/index.js';
-import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from './interactions/index.js';
+import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler } from './interactions/index.js';
 import {
   ActionBundleActionInspector,
   PlanContextIndex,
@@ -499,6 +499,7 @@ export class SessionDriverLoop {
   private readonly decisionResolver: DecisionResolver;
   private readonly permissionDecisionHandler: PermissionDecisionHandler<SessionPlanContext>;
   private readonly planDecisionHandler: PlanDecisionHandler;
+  private readonly requirementConfirmationCoordinator: RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementDecisionHandler: RequirementDecisionHandler;
   private readonly reviewDecisionHandler: ReviewDecisionHandler;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
@@ -923,6 +924,26 @@ export class SessionDriverLoop {
       permissionHandler: this.permissionDecisionHandler,
       reviewHandler: this.reviewDecisionHandler,
     });
+    this.requirementConfirmationCoordinator = new RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      assembleContext: (contextInput) => assembleContext(contextInput),
+      capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
+      collectUserGuidanceEvents: (events, runId) => collectUserGuidanceEvents(events, runId),
+      buildProviderTurnContract: (contractInput) =>
+        contextFrameBuilder.buildSessionProviderTurnContract(contractInput),
+      callProviderAndParse: (handlerInput, state, prompt) =>
+        this.callProviderAndParse(handlerInput, state, prompt),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+      requirementRecordFromProposal: (proposalInput) =>
+        userInputPipeline.requirementRecordFromProposal(proposalInput),
+      confirmationEvent: (confirmationInput) =>
+        requirementProjectionBuilder.confirmationEvent(confirmationInput),
+      executionRootPayload: (state) =>
+        AcceptedPlanExecutionRootResolver.toPayload(
+          AcceptedPlanExecutionRootResolver.fromState(state)
+        ),
+    });
     this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
       repairState: providerRepairMessageState,
@@ -1145,7 +1166,7 @@ export class SessionDriverLoop {
 
     if (shouldRequestRequirementConfirmation(input, state)) {
       try {
-        const event = await this.buildRequirementConfirmation(input, state);
+        const event = await this.requirementConfirmationCoordinator.build(input, state);
         state.phase = 'waiting_requirement_confirmation';
         const payload = objectRecord(event.payload) ?? {};
         return this.append(sessionId, [
@@ -1446,82 +1467,6 @@ export class SessionDriverLoop {
     }
 
     return lastResult;
-  }
-
-  private async buildRequirementConfirmation(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState
-  ): Promise<AgentEvent> {
-    const assembledContext = assembleContext({
-      contextAssemblyId: this.id('context-assembly'),
-      workflowState: 'needDecisionRequest',
-      allowedProposals: ['decisionRequest'],
-      capabilityCatalogSummary: nativeToolCoordinator.capabilityCatalogSummary(state),
-      memoryDocument: state.memoryDocument,
-      projectMemoryMode: input.projectMemoryMode,
-      extraMemoryHints: state.memoryHints,
-      interventionLevel: input.interventionLevel,
-      userGuidance: collectUserGuidanceEvents(input.existingEvents ?? [], state.runId),
-      userOverlay: [
-        'Before proposing side-effect work, request user intervention only if a concrete decision is needed.',
-        'Return kind="decisionRequest" only.',
-        'Provide 2-3 clear options with one recommended option and impact descriptions.',
-        'Do not output actionBundle yet.',
-      ].join('\n'),
-      userRequest: input.content,
-      initialContext: state.initialContext,
-      resourcePackets: state.resourcePackets,
-      conversationRoots: state.conversationRoots,
-      auditOnly: {
-        runId: state.runId,
-        sessionId: state.sessionId,
-      },
-    });
-    state.cachePlan = assembledContext.cachePlan;
-    state.contextAssembly = assembledContext.contextAssembly;
-    const prompt = assembledContext.prompt;
-    state.providerTurnContract = contextFrameBuilder.buildSessionProviderTurnContract({
-      contractId: this.id('provider-turn-contract-requirement'),
-      sessionId: state.sessionId,
-      runId: state.runId,
-      turnMode: 'requirementDecision',
-      allowedKinds: ['decisionRequest'],
-      requiredKind: 'decisionRequest',
-      prompt,
-      contextAssembly: state.contextAssembly,
-      userRequest: input.content,
-      resourcePackets: state.resourcePackets,
-      generatedArtifactCount: state.generatedArtifactEvidence.size,
-      repairPolicy: 'deterministicIntervention',
-      nextActionInstruction: 'Return exactly one decisionRequest proposal for the concrete user decision needed before planning side-effect work.',
-    });
-    const proposal = await this.callProviderAndParse(input, state, prompt);
-    if (proposal.kind !== 'decisionRequest') {
-      throw new SessionDriverLoopError(
-        'decision_request_expected',
-        `Expected decisionRequest before side-effect planning, got ${proposal.kind}.`
-      );
-    }
-    const requirement = userInputPipeline.requirementRecordFromProposal({
-      proposal,
-      sessionId: state.sessionId,
-      runId: state.runId,
-      userRequest: input.content,
-      timestamp: this.ts(),
-    });
-    return requirementProjectionBuilder.confirmationEvent({
-      sessionId: state.sessionId,
-      runId: state.runId,
-      requirement,
-      proposal,
-      originalUserRequest: input.content,
-      attachments: input.attachments ?? [],
-      executionRootPayload: AcceptedPlanExecutionRootResolver.toPayload(
-        AcceptedPlanExecutionRootResolver.fromState(state)
-      ),
-      ts: this.ts(),
-      id: this.id('requirement-confirmation'),
-    });
   }
 
   private async maybeReviseTerminalAnswerWithGuidance(
