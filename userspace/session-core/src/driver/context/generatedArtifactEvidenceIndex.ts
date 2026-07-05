@@ -24,12 +24,6 @@ export interface CompletedWorkUnitFacts {
 export interface GeneratedArtifactEvidenceIndexPorts {
   normalizeRelativePath(value: string | undefined): string | undefined;
   comparablePath(value: string): string;
-  utf8Bytes(value: string): number;
-  sanitizeId(value: string): string;
-  joinFsPath(root: string, child: string): string;
-  objectRecord(value: unknown): Record<string, unknown> | undefined;
-  stringValue(value: unknown): string | undefined;
-  uniqueStrings(values: Array<string | undefined>): string[];
   batchActionRecords(batch: unknown): Record<string, unknown>[];
   actionEffectiveCapability(action: { capability?: unknown; toolId?: unknown }): string;
   actionFileTargetPath(action: {
@@ -91,28 +85,28 @@ export class GeneratedArtifactEvidenceIndex {
     const codeBlocks = Array.isArray(batch.codeBlocks) ? batch.codeBlocks : [];
     const codeBlockById = new Map<string, Record<string, unknown>>();
     for (const block of codeBlocks) {
-      const record = this.ports.objectRecord(block);
-      const id = this.ports.stringValue(record?.id) ?? this.ports.stringValue(record?.blockId);
+      const record = objectRecord(block);
+      const id = stringValue(record?.id) ?? stringValue(record?.blockId);
       if (record && id) codeBlockById.set(id, record);
     }
     const items: ResourcePacketItem[] = [];
     for (const action of this.ports.batchActionRecords(batch)) {
       const capability = this.ports.actionEffectiveCapability(action);
       if (capability !== 'fs.write' && capability !== 'fs.create') continue;
-      const actionId = this.ports.stringValue(action.actionId) ?? this.ports.stringValue(action.id);
-      const args = this.ports.objectRecord(action.args) ?? this.ports.objectRecord(action.toolArgs);
-      const sourceBlockId = this.ports.stringValue(action.sourceBlockId) ?? this.ports.stringValue(args?.sourceBlockId);
+      const actionId = stringValue(action.actionId) ?? stringValue(action.id);
+      const args = objectRecord(action.args) ?? objectRecord(action.toolArgs);
+      const sourceBlockId = stringValue(action.sourceBlockId) ?? stringValue(args?.sourceBlockId);
       const block = sourceBlockId ? codeBlockById.get(sourceBlockId) : undefined;
       const targetPath = this.ports.normalizeRelativePath(
         this.ports.actionFileTargetPath(action) ??
-        this.ports.stringValue(block?.targetPath) ??
-        this.ports.stringValue(block?.path)
+        stringValue(block?.targetPath) ??
+        stringValue(block?.path)
       );
       if (!targetPath || targetPath === '.') continue;
       if (!this.ports.completedActionMatches(actionId, targetPath, completed)) continue;
       const content = block ? this.ports.codeBlockContent(block) : undefined;
       if (typeof content !== 'string') continue;
-      const manifestEntryId = `generated-${this.ports.sanitizeId(targetPath)}`;
+      const manifestEntryId = `generated-${sanitizeId(targetPath)}`;
       const absolutePath = this.absolutePath(state, targetPath);
       const contentHash = stableHash(content);
       state.generatedArtifactEvidence.set(this.ports.comparablePath(targetPath), {
@@ -124,7 +118,7 @@ export class GeneratedArtifactEvidenceIndex {
         actionId,
       });
       items.push({
-        requestItemId: `generated-${this.ports.sanitizeId(actionId ?? targetPath)}`,
+        requestItemId: `generated-${sanitizeId(actionId ?? targetPath)}`,
         manifestEntryId,
         readPolicy: 'autoRead',
         status: 'resolved',
@@ -133,8 +127,8 @@ export class GeneratedArtifactEvidenceIndex {
         contentKind: 'fileText',
         contentSummary: `Generated artifact from completed Kernel work unit: ${targetPath}`,
         promptContent: content,
-        originalBytes: this.ports.utf8Bytes(content),
-        returnedBytes: this.ports.utf8Bytes(content),
+        originalBytes: utf8Bytes(content),
+        returnedBytes: utf8Bytes(content),
         rangeComplete: true,
         evidenceRefs: ['generatedArtifactEvidence'],
       });
@@ -172,8 +166,8 @@ export class GeneratedArtifactEvidenceIndex {
         contentKind: 'fileText',
         contentSummary: `Run-local generated artifact evidence: ${evidence.targetPath}`,
         promptContent: evidence.content,
-        originalBytes: this.ports.utf8Bytes(evidence.content),
-        returnedBytes: this.ports.utf8Bytes(evidence.content),
+        originalBytes: utf8Bytes(evidence.content),
+        returnedBytes: utf8Bytes(evidence.content),
         rangeComplete: true,
         evidenceRefs: ['generatedArtifactEvidence'],
       });
@@ -199,9 +193,9 @@ export class GeneratedArtifactEvidenceIndex {
     item: ResourceRequestDraft['items'][number]
   ): GeneratedArtifactEvidence | undefined {
     if (item.kind === 'search' || item.query?.trim()) return undefined;
-    const candidates = this.ports.uniqueStrings([
-      this.ports.stringValue(item.path),
-      this.ports.stringValue(item.manifestEntryId),
+    const candidates = uniqueStrings([
+      stringValue(item.path),
+      stringValue(item.manifestEntryId),
     ]);
     for (const candidate of candidates) {
       const targetPath = this.ports.resolveRelativePath(candidate, item.rootId, state.conversationRoots)
@@ -217,6 +211,34 @@ export class GeneratedArtifactEvidenceIndex {
   private absolutePath(state: GeneratedArtifactEvidenceState, targetPath: string): string | undefined {
     const root = state.conversationRoots.find((item) => item.primary) ?? state.conversationRoots[0];
     const base = root?.absolutePath ?? root?.displayPath;
-    return base ? this.ports.joinFsPath(base, targetPath) : undefined;
+    return base ? joinFsPath(base, targetPath) : undefined;
   }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function uniqueStrings(values: Array<string | undefined>): string[] {
+  return Array.from(new Set(values.filter((value): value is string => Boolean(value))));
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+function sanitizeId(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._/-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 128) || 'resource';
+}
+
+function joinFsPath(root: string, child: string): string {
+  const cleanRoot = root.replace(/\/+$/g, '');
+  const cleanChild = child.replace(/^\/+/g, '');
+  return `${cleanRoot}/${cleanChild}`;
 }

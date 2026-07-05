@@ -3171,14 +3171,6 @@ function assertGeneratedArtifactEvidenceIndexBuildsRunLocalPackets(): void {
   const index = new GeneratedArtifactEvidenceIndex({
     normalizeRelativePath: (value) => value?.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/g, ''),
     comparablePath: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/g, ''),
-    utf8Bytes: (value) => value.length,
-    sanitizeId: (value) => value.replace(/[^a-zA-Z0-9_-]+/g, '-'),
-    joinFsPath: (root, child) => `${root.replace(/\/+$/g, '')}/${child.replace(/^\/+/g, '')}`,
-    objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : undefined,
-    stringValue: (value) => typeof value === 'string' ? value : undefined,
-    uniqueStrings: (values) => Array.from(new Set(values.filter((value): value is string => typeof value === 'string' && value.length > 0))),
     batchActionRecords: (batch) => Array.isArray((batch as Record<string, unknown>).actions)
       ? (batch as Record<string, unknown>).actions as Record<string, unknown>[]
       : [],

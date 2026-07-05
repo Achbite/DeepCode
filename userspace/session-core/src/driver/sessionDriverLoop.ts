@@ -1880,12 +1880,6 @@ function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex {
   return new GeneratedArtifactEvidenceIndex({
     normalizeRelativePath: (value) => pathIdentity.normalizeRelativePath(value),
     comparablePath: (value) => pathIdentity.comparablePath(value),
-    utf8Bytes,
-    sanitizeId,
-    joinFsPath,
-    objectRecord,
-    stringValue,
-    uniqueStrings: (values) => driverActivityBuilder.uniqueStrings(values),
     batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
     actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
     actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
@@ -2035,20 +2029,10 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function utf8Bytes(value: string): number {
-  return new TextEncoder().encode(value).length;
-}
-
 function clip(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 20)}... [truncated]`;
 }
 
 function sanitizeId(value: string): string {
   return value.replace(/[^a-zA-Z0-9._/-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 128) || 'resource';
-}
-
-function joinFsPath(root: string, child: string): string {
-  const cleanRoot = root.replace(/\/+$/g, '');
-  const cleanChild = child.replace(/^\/+/g, '');
-  return `${cleanRoot}/${cleanChild}`;
 }
