@@ -135,7 +135,7 @@ import {
   ReviewDecisionProjectionBuilder,
   type SessionReviewContext,
 } from './review/index.js';
-import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler } from './interactions/index.js';
+import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler, TerminalGuidanceRevisionCoordinator } from './interactions/index.js';
 import {
   ActionBundleActionInspector,
   PlanContextIndex,
@@ -502,6 +502,7 @@ export class SessionDriverLoop {
   private readonly requirementConfirmationCoordinator: RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementDecisionHandler: RequirementDecisionHandler;
   private readonly reviewDecisionHandler: ReviewDecisionHandler;
+  private readonly terminalGuidanceRevisionCoordinator: TerminalGuidanceRevisionCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
@@ -943,6 +944,55 @@ export class SessionDriverLoop {
         AcceptedPlanExecutionRootResolver.toPayload(
           AcceptedPlanExecutionRootResolver.fromState(state)
         ),
+    });
+    this.terminalGuidanceRevisionCoordinator = new TerminalGuidanceRevisionCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      collectQueued: (events, runId) => userGuidanceQueue.collectQueued(events, runId),
+      transitionEvent: (transitionInput) =>
+        assistantProjectionBuilder.guidanceRevisionTransitionEvent(
+          transitionInput.sessionId,
+          transitionInput.runId,
+          transitionInput.guidanceIds,
+          transitionInput.userRequest,
+          transitionInput.ts,
+          transitionInput.id
+        ),
+      overlay: (overlayInput) =>
+        assistantProjectionBuilder.guidanceRevisionOverlay(
+          overlayInput.originalRequest,
+          overlayInput.draftAnswer,
+          overlayInput.guidance
+        ),
+      answerNarrationEvent: (sessionId, proposal, ts, id) =>
+        assistantProjectionBuilder.answerNarrationEvent(sessionId, proposal, ts, id),
+      answerEvent: (sessionId, proposal, ts, id, metadata) =>
+        assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id, metadata),
+      diagnosticEvent: (sessionId, message, ts, id) =>
+        assistantProjectionBuilder.guidanceRevisionDiagnosticEvent(sessionId, message, ts, id),
+      assembleContext: (contextInput) => assembleContext(contextInput),
+      capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
+      implementationBatchHints: (state) => implementationBatchHints(state.implementationBatch),
+      appendConsumedGuidanceEvents: (guidanceInput) =>
+        this.appendConsumedUserGuidanceEvents(
+          guidanceInput.sessionId,
+          guidanceInput.result,
+          guidanceInput.contextAssembly,
+          guidanceInput.runId,
+          guidanceInput.userRequest,
+          guidanceInput.appliedAtProviderStage
+        ),
+      runRevision: (revisionInput, state, messages) =>
+        this.llm(revisionInput.profileId, state, 'guidance_revision', messages),
+      parseProposal: (raw, state) =>
+        protocolGate().parseAndValidateProposal({
+          raw,
+          runId: state.runId,
+          sessionId: state.sessionId,
+          source: 'llm',
+        }),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
     });
     this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
@@ -1474,103 +1524,7 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     draftAnswer: ProposalEnvelope
   ): Promise<AgentSessionResult | null> {
-    if (state.terminalGuidanceRevisionAttempted) return null;
-    state.terminalGuidanceRevisionAttempted = true;
-
-    let result = await this.append(state.sessionId, []);
-    const guidance = userGuidanceQueue.collectQueued(result.events, state.runId);
-    if (guidance.length === 0) return null;
-
-    result = await this.append(state.sessionId, [
-      assistantProjectionBuilder.guidanceRevisionTransitionEvent(
-        state.sessionId,
-        state.runId,
-        guidance.map((item) => item.id),
-        input.content,
-        this.ts(),
-        this.id('guidance-revision-transition')
-      ),
-    ]);
-    const assembledContext = assembleContext({
-      contextAssemblyId: this.id('context-assembly-guidance-revision'),
-      workflowState: 'guidanceRevision',
-      allowedProposals: ['answer'],
-      capabilityCatalogSummary: nativeToolCoordinator.capabilityCatalogSummary(state),
-      memoryDocument: state.memoryDocument,
-      projectMemoryMode: input.projectMemoryMode,
-      extraMemoryHints: implementationBatchHints(state.implementationBatch),
-      interventionLevel: input.interventionLevel,
-      userOverlay: assistantProjectionBuilder.guidanceRevisionOverlay(input.content, draftAnswer, guidance),
-      userGuidance: guidance,
-      userRequest: input.content,
-      initialContext: state.initialContext,
-      resourcePackets: state.resourcePackets,
-      conversationRoots: state.conversationRoots,
-      requirement: input.confirmedRequirement,
-      auditOnly: {
-        runId: state.runId,
-        sessionId: state.sessionId,
-      },
-    });
-    state.cachePlan = assembledContext.cachePlan;
-    state.contextAssembly = assembledContext.contextAssembly;
-    result = await this.appendConsumedUserGuidanceEvents(
-      state.sessionId,
-      result,
-      state.contextAssembly,
-      state.runId,
-      state.userRequest,
-      'guidance_revision'
-    );
-
-    let revised: ProposalEnvelope;
-    try {
-      const raw = await this.llm(input.profileId, state, 'guidance_revision', [
-        { role: 'system', content: assembledContext.prompt.stablePrefix },
-        { role: 'user', content: assembledContext.prompt.dynamicSuffix },
-      ]);
-      revised = protocolGate().parseAndValidateProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-      });
-      if (revised.kind !== 'answer') {
-        throw new SessionDriverLoopError(
-          'guidance_revision_non_answer',
-          `Guidance revision expected answer, got ${revised.kind}.`
-        );
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await this.append(state.sessionId, [
-        assistantProjectionBuilder.guidanceRevisionDiagnosticEvent(
-          state.sessionId,
-          `用户引导合并失败，已回退到初版回复：${message}`,
-          this.ts(),
-          this.id('guidance-revision-failed')
-        ),
-      ]);
-      return this.append(state.sessionId, [
-        assistantProjectionBuilder.answerEvent(state.sessionId, draftAnswer, this.ts(), this.id('answer'), {
-          guidanceRevisionFailed: true,
-          appliedGuidanceIds: guidance.map((item) => item.id),
-          replacesDraftProposalId: draftAnswer.proposalId,
-        }),
-      ]);
-    }
-
-    const narration = assistantProjectionBuilder.answerNarrationEvent(state.sessionId, revised, this.ts(), this.id('guidance-revision-narration'));
-    if (narration) {
-      result = await this.append(state.sessionId, [narration]);
-    }
-    return this.append(state.sessionId, [
-      assistantProjectionBuilder.answerEvent(state.sessionId, revised, this.ts(), this.id('answer'), {
-        guidanceRevision: true,
-        appliedGuidanceIds: guidance.map((item) => item.id),
-        replacesDraftProposalId: draftAnswer.proposalId,
-      }),
-    ]);
+    return this.terminalGuidanceRevisionCoordinator.revise(input, state, draftAnswer);
   }
 
   private async callProviderAndParse(
