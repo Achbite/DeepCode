@@ -7,5 +7,6 @@ export * from './generatedArtifactEvidenceIndex.js';
 export * from './pathIdentity.js';
 export * from './resourceEvidenceIndex.js';
 export * from './resourceOrchestrator.js';
+export * from './resourceRequestProposalHandler.js';
 export * from './resourceRequestRepairCoordinator.js';
 export * from './resourceRequestLoop.js';

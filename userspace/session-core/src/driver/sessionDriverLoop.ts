@@ -113,6 +113,7 @@ import {
   ResourceEvidenceIndex,
   ResourceManifestBuilder,
   ResourceOrchestrator,
+  ResourceRequestProposalHandler,
   ResourceRequestRepairCoordinator,
   ResourceRequestLoop,
   ResourceRequestResolver,
@@ -508,6 +509,7 @@ export class SessionDriverLoop {
   private readonly terminalGuidanceRevisionCoordinator: TerminalGuidanceRevisionCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly actionProposalSubmitter: ActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
+  private readonly resourceRequestProposalHandler: ResourceRequestProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
   private readonly nativeToolProviderCoordinator: NativeToolProviderCoordinator<SessionDriverLoopRunState, LlmTurnResult>;
@@ -1011,6 +1013,49 @@ export class SessionDriverLoop {
       resourceRequestLoop,
       runtime: this.agentRunReactor,
       createError: (code, message) => new SessionDriverLoopError(code, message),
+    });
+    this.resourceRequestProposalHandler = new ResourceRequestProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      generatedPacketForRequest: (state, request, packetId) =>
+        generatedArtifactEvidenceIndex().packetForRequest(state, request, packetId),
+      recordAndAppend: (state, packet, eventIdPrefix) =>
+        this.resourceOrchestrator.recordAndAppend(state, packet, eventIdPrefix),
+      resolveRecordAndAppend: (state, manifest, eventIdPrefix) =>
+        this.resourceOrchestrator.resolveRecordAndAppend(state, manifest, eventIdPrefix),
+      resolveResourceRequest: (manifest, request, roots) =>
+        resourceRequestResolver().resolve(manifest, request, roots),
+      repairResourceRequest: (input, state, prompt, proposal, resolution) =>
+        this.repairResourceRequest(input, state, prompt, proposal, resolution),
+      answerEvent: (sessionId, proposal, ts, id) =>
+        assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
+      finalDiagnosticEvent: (sessionId, content, ts, id) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
+      resourceResolutionDiagnostic: (resolution) => resourceRequestLoop.resolutionDiagnostic(resolution),
+      resourceRepairFailedDiagnostic: (message) =>
+        diag('resourceResolveRepairFailed', `The requested resources could not be located in attachments or project directory, and repair failed: ${message}`, { message }),
+      refreshTaskRuntimeState: (state) => acceptedPlanTaskLedger().refreshRuntimeState(state),
+      acceptedPlanResourceResumeEvent: (state, packet, ts, id) =>
+        sessionProgressProjectionBuilder.acceptedPlanResourceResumeEvent(
+          state.sessionId,
+          state.runId,
+          state.acceptedImplementationPlan!,
+          state.taskExecutionCursor,
+          state.currentTaskContext,
+          packet,
+          ts,
+          id
+        ),
+      tryCompleteResourceTask: (input, state, packet, fallback) =>
+        this.acceptedPlanReadOnlyTaskExecutor.tryCompleteResourceTask(input, state, packet, fallback),
+      callResourceResume: (input, state, prompt, proposal, packet) =>
+        this.acceptedPlanReadOnlyTaskExecutor.callResourceResume(input, state, prompt, proposal, packet),
+      submitActionProposal: (input, state, prompt, proposal, fallback) =>
+        this.submitActionProposal(input, state, prompt, proposal, fallback),
+      submitNonExecutableProposal: (state, proposal, fallback) =>
+        this.submitNonExecutableProposal(state, proposal, fallback),
+      errorMessage: (error) => error instanceof Error ? error.message : String(error),
     });
     this.acceptedPlanScopeResourceFollowupCoordinator = new AcceptedPlanScopeResourceFollowupCoordinator<SessionDriverLoopRunState, AcceptedImplementationPlanContext>({
       generatedEvidence: generatedArtifactEvidenceIndex(),
@@ -1629,93 +1674,15 @@ export class SessionDriverLoop {
         ]);
       }
       if (proposal.kind === 'resourceRequest') {
-        const generated = generatedArtifactEvidenceIndex().packetForRequest(
+        const handled = await this.resourceRequestProposalHandler.handle({
+          input,
           state,
-          proposal.payload as ResourceRequestDraft,
-          this.id('generated-artifact-resource')
-        );
-        if (generated.packet) {
-          lastResult = (await this.resourceOrchestrator.recordAndAppend(
-            state,
-            generated.packet,
-            'generated-artifact-resource-context'
-          )).result;
-          if (!generated.remaining.items.length) continue;
-        }
-        let subset = resourceRequestResolver().resolve(state.manifest, generated.remaining, state.conversationRoots);
-        if (!subset.manifest.entries.length) {
-          if (!state.resourceRequestRepairAttempted) {
-            state.resourceRequestRepairAttempted = true;
-            try {
-              const repaired = await this.repairResourceRequest(input, state, prompt, proposal, subset);
-              if (repaired.kind === 'answer') {
-                return this.append(sessionId, [assistantProjectionBuilder.answerEvent(sessionId, repaired, this.ts(), this.id('answer'))]);
-              }
-              if (repaired.kind === 'resourceRequest') {
-                subset = resourceRequestResolver().resolve(state.manifest, repaired.payload as ResourceRequestDraft, state.conversationRoots);
-              } else if (repaired.kind === 'actionBundle') {
-                return this.submitActionProposal(input, state, prompt, repaired, lastResult);
-              } else {
-                return this.submitNonExecutableProposal(state, repaired, lastResult);
-              }
-            } catch (error) {
-              const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-              return this.append(sessionId, [
-                assistantProjectionBuilder.finalDiagnosticEvent(
-                  sessionId,
-                  diag('resourceResolveRepairFailed', `The requested resources could not be located in attachments or project directory, and repair failed: ${message}`, { message }),
-                  this.ts(),
-                  this.id('resource-repair-failed')
-                ),
-              ]);
-            }
-          }
-        }
-        if (!subset.manifest.entries.length) {
-          return this.append(sessionId, [
-            assistantProjectionBuilder.finalDiagnosticEvent(
-              sessionId,
-              resourceRequestLoop.resolutionDiagnostic(subset),
-              this.ts(),
-              this.id('resource-invalid')
-            ),
-          ]);
-        }
-        const resourceAppend = await this.resourceOrchestrator.resolveRecordAndAppend(
-          state,
-          subset.manifest,
-          'resource-context'
-        );
-        const packet = resourceAppend.packet;
-        lastResult = resourceAppend.result;
-        if (state.acceptedImplementationPlan) {
-          acceptedPlanTaskLedger().refreshRuntimeState(state);
-          const resumeEvent = sessionProgressProjectionBuilder.acceptedPlanResourceResumeEvent(
-            sessionId,
-            state.runId,
-            state.acceptedImplementationPlan,
-            state.taskExecutionCursor,
-            state.currentTaskContext,
-            packet,
-            this.ts(),
-            this.id('accepted-plan-resource-resume')
-          );
-          lastResult = await this.append(sessionId, [resumeEvent]) ?? lastResult;
-          const readOnlyCompletion = await this.acceptedPlanReadOnlyTaskExecutor.tryCompleteResourceTask(
-            input,
-            state,
-            packet,
-            lastResult
-          );
-          if (readOnlyCompletion) return readOnlyCompletion;
-          const resumed = await this.acceptedPlanReadOnlyTaskExecutor.callResourceResume(input, state, prompt, proposal, packet);
-          if (resumed.kind === 'actionBundle') {
-            return this.submitActionProposal(input, state, prompt, resumed, lastResult);
-          }
-          if (resumed.kind !== 'resourceRequest') {
-            return this.submitNonExecutableProposal(state, resumed, lastResult);
-          }
-        }
+          prompt,
+          proposal,
+          lastResult,
+        });
+        if (handled.kind === 'return') return handled.result;
+        lastResult = handled.lastResult;
         continue;
       }
       if (proposal.kind === 'actionBundle') {
