@@ -1889,10 +1889,7 @@ function generatedArtifactEvidenceIndex(): GeneratedArtifactEvidenceIndex {
 
 function implementationBatchContextBuilder(): ImplementationBatchContextBuilder {
   return new ImplementationBatchContextBuilder({
-    objectRecord,
-    stringArrayValue,
     concreteFileOperationTarget: (value) => planReviewGrantProjector.concreteFileOperationTarget(value),
-    clip,
   });
 }
 

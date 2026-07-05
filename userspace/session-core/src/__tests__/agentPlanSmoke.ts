@@ -3255,16 +3255,7 @@ function assertImplementationBatchContextBuilderExtractsConcreteContinuations():
   const token = randomSmokeToken('implementation-batch');
   const targetPath = `scope-${token}/target-${randomSmokeToken('file')}.txt`;
   const builder = new ImplementationBatchContextBuilder({
-    objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : undefined,
-    stringArrayValue: (value) => Array.isArray(value)
-      ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-      : typeof value === 'string' && value.trim()
-        ? [value]
-        : [],
     concreteFileOperationTarget: (value) => value && !value.includes('*') ? value : undefined,
-    clip: (value, max) => value.slice(0, max),
   });
   const context = builder.build([
     {

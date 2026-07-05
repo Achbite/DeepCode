@@ -7,10 +7,7 @@ export interface ImplementationBatchContext {
 }
 
 export interface ImplementationBatchContextBuilderPorts {
-  objectRecord(value: unknown): Record<string, unknown> | undefined;
-  stringArrayValue(value: unknown): string[];
   concreteFileOperationTarget(value: string): string | undefined;
-  clip(value: string, max: number): string;
 }
 
 export class ImplementationBatchContextBuilder {
@@ -22,7 +19,7 @@ export class ImplementationBatchContextBuilder {
     let planCount = 0;
     for (const event of events.slice(-48)) {
       if (event.kind !== 'plan_card') continue;
-      const payload = this.ports.objectRecord(event.payload);
+      const payload = objectRecord(event.payload);
       if (!payload) continue;
       planCount += 1;
       const summary = typeof payload.summary === 'string'
@@ -30,17 +27,17 @@ export class ImplementationBatchContextBuilder {
         : typeof payload.content === 'string'
           ? payload.content
           : '';
-      if (summary.trim()) recentPlanSummaries.push(this.ports.clip(summary.trim(), 240));
-      const actionBundle = this.ports.objectRecord(payload.actionBundle);
+      if (summary.trim()) recentPlanSummaries.push(clip(summary.trim(), 240));
+      const actionBundle = objectRecord(payload.actionBundle);
       const continuations = this.concreteContinuationExpectations(actionBundle?.continuationExpectations);
       for (const continuation of continuations) {
-        const record = this.ports.objectRecord(continuation);
+        const record = objectRecord(continuation);
         const title = typeof record?.title === 'string' ? record.title.trim() : '';
         const scope = Array.isArray(record?.resourceScope)
           ? record.resourceScope.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).join(', ')
           : '';
         const text = [title, scope ? `scope=${scope}` : ''].filter(Boolean).join(' ');
-        if (text) continuationSummaries.push(this.ports.clip(text, 240));
+        if (text) continuationSummaries.push(clip(text, 240));
       }
     }
     return {
@@ -56,12 +53,36 @@ export class ImplementationBatchContextBuilder {
   }
 
   private continuationHasConcreteScope(item: unknown): boolean {
-    const record = this.ports.objectRecord(item);
+    const record = objectRecord(item);
     if (!record) return false;
     const scopes = [
-      ...this.ports.stringArrayValue(record.targetPath),
-      ...this.ports.stringArrayValue(record.resourceScope),
+      ...stringArrayValue(record.targetPath),
+      ...stringArrayValue(record.resourceScope),
     ];
     return scopes.some((scope) => Boolean(this.ports.concreteFileOperationTarget(scope)));
   }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    const single = stringValue(value);
+    return single ? [single] : [];
+  }
+  return value
+    .map((item) => stringValue(item))
+    .filter((item): item is string => Boolean(item));
+}
+
+function clip(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max - 20)}... [truncated]`;
 }
