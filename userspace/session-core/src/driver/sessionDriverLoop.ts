@@ -13,6 +13,7 @@ import type {
 } from '@deepcode/protocol';
 import {
   AcceptedPlanAdmission,
+  AcceptedActionBundlePlanExecutor,
   AcceptedPlanBatchPreflight,
   AcceptedPlanExecutor,
   AcceptedPlanExecutionRootResolver,
@@ -483,6 +484,7 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
 
 export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
+  private readonly acceptedActionBundlePlanExecutor: AcceptedActionBundlePlanExecutor;
   private readonly acceptedPlanResourceResumeCoordinator: AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeDecisionCoordinator: AcceptedPlanScopeDecisionCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeRepairCoordinator: AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>;
@@ -509,6 +511,53 @@ export class SessionDriverLoop {
       createError: (code, message) => new SessionDriverLoopError(code, message),
       errorCode: (error, fallback) => error instanceof SessionDriverLoopError ? error.code : fallback,
       errorMessage: (error) => error instanceof Error ? error.message : String(error),
+    });
+    this.acceptedActionBundlePlanExecutor = new AcceptedActionBundlePlanExecutor({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      kernel: (request) => this.kernel(request),
+      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
+      resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
+      kernelExecutionContractId: (report) => planReviewGrantProjector.kernelExecutionContractId(report),
+      temporaryGrantsForPlan: (plan) => planReviewGrantProjector.temporaryGrantsForPlan(plan),
+      recentResourcePackets: (events) => resourceRequestLoop.recentPackets(events),
+      sessionRunStateEvent: (input) => sessionProgressProjectionBuilder.sessionRunStateEvent(input as Parameters<typeof sessionProgressProjectionBuilder.sessionRunStateEvent>[0]),
+      acceptedPlanActionBatchPreflightEvent: (sessionId, plan, batch, ts, id) =>
+        sessionProgressProjectionBuilder.acceptedPlanActionBatchPreflightEvent(sessionId, plan, batch, ts, id),
+      planActionBundlePreflightFailureEvents: (sessionId, plan, reasons, ts, id) =>
+        sessionFailureProjectionBuilder.planActionBundlePreflightFailureEvents(sessionId, plan, reasons, ts, id),
+      planActionBundleExecutionFailureEvents: (sessionId, plan, batchEvents, batch, ts, id) =>
+        sessionFailureProjectionBuilder.planActionBundleExecutionFailureEvents(sessionId, plan, batchEvents, batch, ts, id),
+      planActionBundleExecutionExceptionEvents: (sessionId, plan, message, code, ts, id) =>
+        sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(sessionId, plan, message, code, ts, id),
+      acceptedPlanBatchCheckpointEvent: (sessionId, runId, accepted, proposal, kernelEvents, progress, ts, id) =>
+        sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(sessionId, runId, accepted, proposal as ProposalEnvelope, kernelEvents, progress as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent>[5], ts, id),
+      acceptedPlanTaskSavepointEvent: (sessionId, runId, accepted, nextAccepted, progress, kernelEvents, cursor, context, ts, id) =>
+        sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
+          sessionId,
+          runId,
+          accepted,
+          nextAccepted,
+          progress as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[4],
+          kernelEvents,
+          cursor as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[6],
+          context as Parameters<typeof sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent>[7],
+          ts,
+          id
+        ),
+      deletePreflightReasons: (batch, resourcePackets) => acceptedPlanBatchPreflight.deleteReasons(batch, resourcePackets),
+      hasFailureOrBlocker: (events) => kernelEventStatusIndex.hasFailureOrBlocker(events),
+      actionBatchReadyForReview: (events) => kernelEventStatusIndex.actionBatchReadyForReview(events),
+      hasPermissionRequest: (events) => kernelEventStatusIndex.hasPermissionRequest(events),
+      permissionId: (events) => kernelEventStatusIndex.permissionId(events),
+      planProposal: (plan) => planContextIndex.proposalEnvelope(plan),
+      batchProgress: (input) => acceptedPlanTaskLedger().batchProgress(input as Parameters<ReturnType<typeof acceptedPlanTaskLedger>['batchProgress']>[0]),
+      acceptedPlanAfterBatch: (accepted, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(accepted, completedTaskIds),
+      runtimeSnapshot: (input) => acceptedPlanTaskLedger().runtimeSnapshot(input),
+      acceptedPlanComplete: (accepted) => acceptedPlanTaskLedger().complete(accepted),
+      executionRequest: (plan, acceptedPlan) => executionPromptCoordinator().executionRequest(plan, acceptedPlan),
+      reviewHandoff: (handoffInput) => this.acceptedPlanReviewHandoffCoordinator.handoff(handoffInput),
     });
     this.acceptedPlanResourceResumeCoordinator = new AcceptedPlanResourceResumeCoordinator<SessionDriverLoopRunState>({
       promptBuilder: acceptedPlanResourceResumePromptBuilder,
@@ -603,7 +652,7 @@ export class SessionDriverLoop {
       append: (sessionId, events) => this.append(sessionId, events),
       resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
       executeAcceptedActionBundlePlan: (handlerInput, plan, initialResult, acceptedOverlay) =>
-        this.executeAcceptedActionBundlePlan({ ...handlerInput, kind: 'plan' }, plan, initialResult, acceptedOverlay),
+        this.acceptedActionBundlePlanExecutor.execute(handlerInput, plan, initialResult, acceptedOverlay),
       activeDriverInteraction: (events) => findActiveDriverInteraction(events),
       executionRootFromDecision: (handlerInput, events) =>
         AcceptedPlanExecutionRootResolver.fromDecision(handlerInput, events),
@@ -1226,235 +1275,6 @@ export class SessionDriverLoop {
       projectMemoryMode: input.projectMemoryMode,
       interactionOverlay: input.interactionOverlay,
     });
-  }
-
-  private async executeAcceptedActionBundlePlan(
-    input: SessionDecisionResolverInput,
-    plan: SessionPlanContext,
-    initialResult: AgentSessionResult,
-    acceptedOverlay?: RecoveredAcceptedPlanContext
-  ): Promise<AgentSessionResult> {
-    let result = initialResult;
-    try {
-      result = await this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.sessionRunStateEvent({
-          sessionId: input.sessionId,
-          runId: plan.runId,
-          phase: 'executing_accepted_plan',
-          status: 'running',
-          reason: 'accepted_plan_execution',
-          decisionOwner: {
-            kind: 'plan',
-            runId: plan.runId,
-            targetId: plan.planId,
-            planId: plan.planId,
-          },
-          interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-          ts: this.ts(),
-          id: this.id('session-run-accepted-action-plan-execution'),
-        }),
-      ]) ?? result;
-      const batch: Record<string, unknown> = {
-        planId: plan.planId,
-        contractId: planReviewGrantProjector.kernelExecutionContractId(plan.planReviewReport),
-        actionBundle: plan.actionBundle,
-        codeBlocks: plan.codeBlocks,
-        commandBlocks: plan.commandBlocks,
-      };
-      result = await this.append(input.sessionId, [
-        sessionProgressProjectionBuilder.acceptedPlanActionBatchPreflightEvent(
-          input.sessionId,
-          plan,
-          batch,
-          this.ts(),
-          this.id('accepted-action-plan-preflight')
-        ),
-      ]) ?? result;
-      const deletePreflightReasons = acceptedPlanBatchPreflight.deleteReasons(batch, resourceRequestLoop.recentPackets(result.events));
-      if (deletePreflightReasons.length) {
-        return this.append(input.sessionId, sessionFailureProjectionBuilder.planActionBundlePreflightFailureEvents(
-          input.sessionId,
-          plan,
-          deletePreflightReasons,
-          this.ts(),
-          this.id('accepted-action-plan-preflight-failed')
-        )) ?? result;
-      }
-      const decisionReply = await this.kernel({
-        command: {
-          kind: 'userDecisionSubmit',
-          requestId: this.id('user-decision-plan'),
-          runId: plan.runId,
-          sessionId: input.sessionId,
-          decision: {
-            decisionId: this.id('decision-plan'),
-            decisionKind: 'plan',
-            targetId: plan.planId,
-            payload: {
-              decision: input.decision,
-              guidance: input.guidance,
-            },
-          },
-        },
-      });
-      assertKernelReplyOk(decisionReply, 'accepted_plan_user_decision_failed', 'Kernel plan decision submit failed');
-      result = await this.appendProjectedKernelEvents(input.sessionId, decisionReply) ?? result;
-
-      const grantEvents: unknown[] = [];
-      for (const grant of planReviewGrantProjector.temporaryGrantsForPlan(plan)) {
-        const grantReply = await this.kernel({
-          command: {
-            kind: 'permissionGrantTemporary',
-            requestId: this.id('plan-temp-grant'),
-            runId: plan.runId,
-            grant,
-          },
-        });
-        assertKernelReplyOk(grantReply, 'accepted_plan_grant_failed', 'Kernel temporary grant failed');
-        grantEvents.push(...(grantReply.events ?? []));
-      }
-      if (grantEvents.length) {
-        result = await this.appendProjectedKernelEvents(input.sessionId, { ok: true, events: grantEvents }) ?? result;
-      }
-
-      const batchReply = await this.kernel({
-        command: {
-          kind: 'actionBatchSubmit',
-          requestId: this.id('action-batch-submit'),
-          runId: plan.runId,
-          sessionId: input.sessionId,
-          batch,
-        },
-      });
-      result = await this.appendProjectedKernelEvents(input.sessionId, batchReply) ?? result;
-      const batchEvents = batchReply.events ?? [];
-      if (!batchReply.ok && batchEvents.length === 0) {
-        throw new SessionDriverLoopError(
-          stringValue(objectRecord(batchReply.error)?.code) ?? 'accepted_plan_action_batch_submit_failed',
-          kernelReplyErrorMessage(batchReply, 'Kernel actionBatchSubmit failed without execution facts')
-        );
-      }
-      if (kernelEventStatusIndex.hasFailureOrBlocker(batchEvents)) {
-        return this.append(input.sessionId, sessionFailureProjectionBuilder.planActionBundleExecutionFailureEvents(
-          input.sessionId,
-          plan,
-          batchEvents,
-          batch,
-          this.ts(),
-          this.id('accepted-action-plan-batch-failed')
-        )) ?? result;
-      }
-      if (!kernelEventStatusIndex.actionBatchReadyForReview(batchEvents)) {
-        if (kernelEventStatusIndex.hasPermissionRequest(batchEvents)) {
-          const permissionId = kernelEventStatusIndex.permissionId(batchEvents);
-          return this.append(input.sessionId, [
-            sessionProgressProjectionBuilder.sessionRunStateEvent({
-              sessionId: input.sessionId,
-              runId: plan.runId,
-              phase: 'waiting_permission',
-              reason: 'permission',
-              decisionOwner: {
-                kind: 'permission',
-                runId: plan.runId,
-                targetId: permissionId,
-                permissionId,
-                planId: plan.planId,
-              },
-              interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-              ts: this.ts(),
-              id: this.id('session-run-waiting-permission'),
-            }),
-          ]) ?? result;
-        }
-        return result;
-      }
-      if (acceptedOverlay) {
-        const progressProposal = planContextIndex.proposalEnvelope(plan);
-        const progress = acceptedPlanTaskLedger().batchProgress({ acceptedPlan: acceptedOverlay.acceptedPlan, proposal: progressProposal, kernelEvents: batchEvents });
-        const nextAccepted = acceptedPlanTaskLedger().afterBatch(acceptedOverlay.acceptedPlan, progress.completedTaskIds);
-        const runtime = acceptedPlanTaskLedger().runtimeSnapshot({
-          acceptedPlan: acceptedOverlay.acceptedPlan,
-          resourcePackets: resourceRequestLoop.recentPackets(result.events),
-        });
-        const savepointId = this.id('accepted-plan-overlay-task-savepoint');
-        result = await this.append(input.sessionId, [
-          sessionProgressProjectionBuilder.acceptedPlanBatchCheckpointEvent(
-            input.sessionId,
-            plan.runId,
-            acceptedOverlay.acceptedPlan,
-            progressProposal,
-            batchEvents,
-            progress,
-            this.ts(),
-            this.id('accepted-plan-overlay-batch-checkpoint')
-          ),
-          sessionProgressProjectionBuilder.acceptedPlanTaskSavepointEvent(
-            input.sessionId,
-            plan.runId,
-            acceptedOverlay.acceptedPlan,
-            nextAccepted,
-            progress,
-            batchEvents,
-            runtime.taskExecutionCursor,
-            runtime.currentTaskContext,
-            this.ts(),
-            savepointId
-          ),
-        ]) ?? result;
-        if (!acceptedPlanTaskLedger().complete(nextAccepted)) {
-          return this.runUserTurn({
-            sessionId: input.sessionId,
-            content: executionPromptCoordinator().executionRequest(acceptedOverlay.plan, nextAccepted),
-            attachments: nextAccepted.executionRoot ? [nextAccepted.executionRoot.attachment] : [],
-            existingEvents: result.events,
-            workspaceBinding: input.workspaceBinding,
-            projectWorkingDirectory: input.projectWorkingDirectory,
-            profileId: input.profileId,
-            workflow: input.workflow,
-            appendUserMessage: false,
-            requirementConfirmationMode: 'off',
-            reviewContinuationMode: input.reviewContinuationMode,
-            interventionLevel: input.interventionLevel,
-            projectMemoryMode: input.projectMemoryMode,
-            resumeResourcePackets: true,
-            acceptedImplementationPlan: nextAccepted,
-            interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-          });
-        }
-        plan = {
-          ...plan,
-          planId: acceptedOverlay.acceptedPlan.planId,
-          implementationPlan: acceptedOverlay.acceptedPlan.rawPlan,
-        };
-      }
-      const staticReviewEvents: AgentEvent[] = [];
-
-      return this.acceptedPlanReviewHandoffCoordinator.handoff({
-        sessionId: input.sessionId,
-        runId: plan.runId,
-        planId: plan.planId,
-        plan,
-        result,
-        currentKernelEvents: [...batchEvents, ...staticReviewEvents.map((event) => event.payload)],
-        requestIdPrefix: 'review-facts-get',
-        interactionOverlay: plan.interactionOverlay ?? input.interactionOverlay,
-        assertFactsReplyOk: {
-          code: 'accepted_plan_review_facts_failed',
-          fallback: 'Kernel reviewFactsGet failed',
-        },
-      });
-    } catch (error) {
-      const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-      const code = error instanceof SessionDriverLoopError ? error.code : 'accepted_plan_execution_failed';
-      return this.append(input.sessionId, sessionFailureProjectionBuilder.planActionBundleExecutionExceptionEvents(
-        input.sessionId,
-        plan,
-        message,
-        code,
-        this.ts(),
-        this.id('accepted-action-plan-execution-failed')
-      )) ?? result;
-    }
   }
 
   private async resolvePermissionDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {

@@ -47,6 +47,7 @@ import { AgentRunReactor } from '../driver/agentRunReactor.js';
 import { ContextFrameBuilder } from '../driver/context/contextFrameBuilder.js';
 import { AcceptedPlanResourceResumeCoordinator, ActionBundleAdmissionResourceFollowupCoordinator, GeneratedArtifactEvidenceIndex, PathIdentity, ResourceEvidenceIndex, ResourceOrchestrator, ResourceRequestLoop, ResourceRequestRepairCoordinator } from '../driver/context/index.js';
 import {
+  AcceptedActionBundlePlanExecutor,
   AcceptedImplementationPlanContextBuilder,
   AcceptedPlanBatchPreflight,
   AcceptedPlanOperationTargetResolver,
@@ -128,6 +129,7 @@ async function main(): Promise<void> {
   await assertAcceptedPlanScopeResourceFollowupCoordinatorHandlesResourceRequests();
   assertAcceptedPlanOperationTargetResolverFindsExactGrant();
   assertAcceptedPlanExecutorBuildsExecutionBatch();
+  await assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews();
   assertKernelEventStatusIndexReadsStructuredEvents();
   await assertAcceptedPlanReviewHandoffCoordinatorBuildsReviewState();
   await assertAcceptedPlanStaticSyntaxReviewCoordinatorBuildsEvents();
@@ -4254,6 +4256,150 @@ function assertAcceptedPlanExecutorBuildsExecutionBatch(): void {
     executor.fileOperationFreshnessValidationReasons(acceptedPlan, patchProposal, [matchingPacket]).length,
     0,
     'accepted plan executor accepts patch when current evidence contains exact block'
+  );
+}
+
+async function assertAcceptedActionBundlePlanExecutorSubmitsBatchAndReviews(): Promise<void> {
+  const token = randomSmokeToken('accepted-action-executor');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const planId = `plan-${token}`;
+  const session: AgentSession = {
+    id: sessionId,
+    mode: 'plan',
+    createdAt: `ts-${token}`,
+    updatedAt: `ts-${token}`,
+  };
+  const store: AgentEvent[] = [{
+    id: `seed-${token}`,
+    sessionId,
+    ts: `ts-${token}`,
+    kind: 'assistant_msg',
+    payload: {},
+  }];
+  const commands: string[] = [];
+  let reviewHandoffEvents: unknown[] = [];
+  const executor = new AcceptedActionBundlePlanExecutor({
+    now: () => `ts-${token}`,
+    createId: (prefix) => `${prefix}-${token}`,
+    append: async (nextSessionId, events) => {
+      assertEqual(nextSessionId, sessionId, 'accepted action executor appends to current session');
+      store.push(...events);
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    kernel: async (request) => {
+      const kind = (request.command as Record<string, unknown>).kind;
+      assertEqual(typeof kind, 'string', 'accepted action executor submits structured kernel commands');
+      commands.push(kind as string);
+      if (kind === 'actionBatchSubmit') {
+        return {
+          ok: true,
+          events: [{
+            kind: 'work_unit.completed',
+            runId,
+            planId,
+            workUnitId: `work-unit-${token}`,
+          }],
+        };
+      }
+      return { ok: true, events: [{ kind: `${kind}.ok`, runId, planId }] };
+    },
+    appendProjectedKernelEvents: async (nextSessionId, reply) => {
+      assertEqual(nextSessionId, sessionId, 'accepted action executor projects kernel events to current session');
+      store.push(...(reply.events ?? []).map((event, index) => ({
+        id: `kernel-${commands.length}-${index}-${token}`,
+        sessionId,
+        ts: `ts-${token}`,
+        kind: 'workflow_stage',
+        payload: event,
+      } as AgentEvent)));
+      return { session: { ...session, eventCount: store.length }, events: [...store] };
+    },
+    resumeUserTurn: async () => {
+      throw new Error('single batch success should not resume provider loop');
+    },
+    kernelExecutionContractId: () => `contract-${token}`,
+    temporaryGrantsForPlan: () => [],
+    recentResourcePackets: () => [],
+    sessionRunStateEvent: (input) => ({
+      id: `run-state-${token}`,
+      sessionId,
+      ts: `ts-${token}`,
+      kind: 'session_run_state',
+      payload: input,
+    } as AgentEvent),
+    acceptedPlanActionBatchPreflightEvent: (_sessionId, _plan, batch) => ({
+      id: `preflight-${token}`,
+      sessionId,
+      ts: `ts-${token}`,
+      kind: 'workflow_stage',
+      payload: { stage: 'accepted_plan.action_batch_preflight', batch },
+    } as AgentEvent),
+    planActionBundlePreflightFailureEvents: () => [],
+    planActionBundleExecutionFailureEvents: () => [],
+    planActionBundleExecutionExceptionEvents: () => [],
+    acceptedPlanBatchCheckpointEvent: () => {
+      throw new Error('overlay checkpoint is not expected for non-overlay execution');
+    },
+    acceptedPlanTaskSavepointEvent: () => {
+      throw new Error('overlay savepoint is not expected for non-overlay execution');
+    },
+    deletePreflightReasons: () => [],
+    hasFailureOrBlocker: () => false,
+    actionBatchReadyForReview: () => true,
+    hasPermissionRequest: () => false,
+    permissionId: () => undefined,
+    planProposal: () => ({ proposalId: `proposal-${token}` }),
+    batchProgress: () => ({ completedTaskIds: [] }),
+    acceptedPlanAfterBatch: (accepted) => accepted,
+    runtimeSnapshot: () => ({}),
+    acceptedPlanComplete: () => true,
+    executionRequest: () => `execution-${token}`,
+    reviewHandoff: async (input) => {
+      reviewHandoffEvents = input.currentKernelEvents;
+      return input.result;
+    },
+  });
+
+  const plan = {
+    sessionId,
+    runId,
+    planId,
+    actionBundle: {
+      id: `bundle-${token}`,
+      actions: [{
+        actionId: `action-${token}`,
+        toolId: 'fs.write',
+        args: { path: `target-${token}.txt`, content: token },
+      }],
+    },
+    codeBlocks: [],
+    commandBlocks: [],
+    planReviewReport: {},
+  } as any;
+
+  const result = await executor.execute(
+    {
+      sessionId,
+      decision: 'accept',
+      guidance: `guidance-${token}`,
+    },
+    plan,
+    { session, events: [...store] }
+  );
+
+  assertEqual(commands[0], 'userDecisionSubmit', 'accepted action executor submits user decision first');
+  assertEqual(commands[1], 'actionBatchSubmit', 'accepted action executor submits action batch after decision');
+  assertEqual(reviewHandoffEvents.length, 1, 'accepted action executor passes batch events to review handoff');
+  assertEqual(
+    (reviewHandoffEvents[0] as Record<string, unknown>).workUnitId,
+    `work-unit-${token}`,
+    'accepted action executor preserves work unit fact for review'
+  );
+  assertEqual(
+    result.events.some((event) => event.kind === 'session_run_state'),
+    true,
+    'accepted action executor records executing run state'
   );
 }
 
