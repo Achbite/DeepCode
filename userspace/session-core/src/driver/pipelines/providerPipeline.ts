@@ -24,6 +24,7 @@ export { NativeToolResultMessageBuilder } from './nativeToolResultMessageBuilder
 export { NativeToolResourceRecorder } from './nativeToolResourceRecorder.js';
 export { NativeToolResumeMessageBuilder } from './nativeToolResumeMessageBuilder.js';
 export { ProposalOnlyProviderRunner } from './proposalOnlyProviderRunner.js';
+export { ProviderProposalCoordinator } from './providerProposalCoordinator.js';
 export { ProviderStreamCoordinator } from './providerStreamCoordinator.js';
 export { ProviderStreamRuntime, type ProviderReasoningDeltaBuffer } from './providerStreamRuntime.js';
 export { ProviderTurnRunner, type ProviderTurnResult } from './providerTurnRunner.js';

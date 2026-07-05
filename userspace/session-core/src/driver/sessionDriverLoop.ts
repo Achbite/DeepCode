@@ -88,6 +88,7 @@ import {
   ProposalOnlyProviderRunner,
   ProviderJsonModeCoordinator,
   ProviderPipeline,
+  ProviderProposalCoordinator,
   ProviderStreamCoordinator,
   ProviderStreamRuntime,
   ProviderTurnRunner,
@@ -507,6 +508,7 @@ export class SessionDriverLoop {
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
+  private readonly providerProposalCoordinator: ProviderProposalCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
 
   constructor(private readonly ports: SessionDriverLoopPorts) {
@@ -1114,6 +1116,48 @@ export class SessionDriverLoop {
       now: () => this.ts(),
       createId: (prefix) => this.id(prefix),
     });
+    this.providerProposalCoordinator = new ProviderProposalCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      append: (sessionId, events) => this.append(sessionId, events),
+      createId: (prefix) => this.id(prefix),
+      now: () => this.ts(),
+      thinkingEvent: (sessionId, content, ts, id) =>
+        assistantProjectionBuilder.thinkingEvent(sessionId, content, ts, id),
+      providerResult: (providerInput, state, prompt, contract) =>
+        state.acceptedImplementationPlan
+          ? this.callProviderProposalOnly(providerInput, state, prompt, contract, 'accepted_plan_provider_call')
+          : this.callProviderWithNativeTools(providerInput, state, prompt, contract),
+      runRepair: (providerInput, state, stage, messages) =>
+        this.llm(providerInput.profileId, state, stage, messages),
+      repairMessageState: (state) => providerRepairMessageState(state),
+      repairMessages: (prompt, repairState, raw, error) =>
+        providerRepairMessageBuilder.repairMessages(prompt, repairState as ProviderRepairMessageState, raw, error),
+      actionBundleCompactionRepairMessages: (prompt, repairState, reason, raw) =>
+        providerRepairMessageBuilder.actionBundleCompactionRepairMessages(prompt, repairState as ProviderRepairMessageState, reason, raw),
+      repairAllowedKinds: (repairInput) => protocolGate().repairAllowedKinds(repairInput),
+      parseProposal: (parseInput) =>
+        protocolGate().parseAndValidateProposal({
+          raw: parseInput.raw,
+          runId: parseInput.state.runId,
+          sessionId: parseInput.state.sessionId,
+          source: 'llm',
+          allowBriefActionBundleUserPlan: parseInput.allowBriefActionBundleUserPlan,
+        }),
+      parseRepairedProposal: (parseInput) =>
+        protocolGate().parseAndValidateRepairedProposal({
+          raw: parseInput.raw,
+          runId: parseInput.state.runId,
+          sessionId: parseInput.state.sessionId,
+          source: 'llm',
+          allowedKinds: parseInput.allowedKinds,
+          allowBriefActionBundleUserPlan: parseInput.allowBriefActionBundleUserPlan,
+        }),
+      shouldAttemptActionBundleCompactionRepair: (state) =>
+        shouldAttemptActionBundleCompactionRepair(state),
+      normalizeParseError: (error) => normalizeParseError(error),
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+      isDriverErrorCode: (error, code) =>
+        error instanceof SessionDriverLoopError && error.code === code,
+    });
   }
 
   async resolveDecision(input: SessionDecisionResolverInput): Promise<AgentSessionResult> {
@@ -1532,137 +1576,7 @@ export class SessionDriverLoop {
     state: SessionDriverLoopRunState,
     prompt: PromptEnvelope
   ): Promise<ProposalEnvelope> {
-    let raw: string;
-    try {
-      const contract = state.providerTurnContract;
-      if (!contract) {
-        throw new SessionDriverLoopError(
-          'provider_turn_contract_missing',
-          'Provider turn contract is required before calling the provider.'
-        );
-      }
-      const providerResult = state.acceptedImplementationPlan
-        ? await this.callProviderProposalOnly(input, state, prompt, contract, 'accepted_plan_provider_call')
-        : await this.callProviderWithNativeTools(input, state, prompt, contract);
-      if (typeof providerResult !== 'string') return providerResult;
-      raw = providerResult;
-    } catch (error) {
-      if (error instanceof SessionDriverLoopError
-        && error.code === 'llm_empty_response') {
-        if (!shouldAttemptActionBundleCompactionRepair(state)) {
-          const parseError = {
-            code: 'llm_empty_response',
-            message: 'LLM provider returned an empty response before emitting a JSON proposal.',
-          };
-          await this.append(state.sessionId, [
-            assistantProjectionBuilder.thinkingEvent(
-              state.sessionId,
-              `Model output requires Agent Protocol v3 repair: ${parseError.message}`,
-              this.ts(),
-              this.id('protocol-repair')
-            ),
-          ]);
-          const repairedRaw = await this.llm(
-            input.profileId,
-            state,
-            'protocol_repair',
-            providerRepairMessageBuilder.repairMessages(prompt, providerRepairMessageState(state), '', parseError)
-          );
-          try {
-            return protocolGate().parseAndValidateRepairedProposal({
-              raw: repairedRaw,
-              runId: state.runId,
-              sessionId: state.sessionId,
-              source: 'llm',
-              allowedKinds: protocolGate().repairAllowedKinds({
-                acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
-                errorCode: 'llm_empty_response',
-              }),
-              allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
-            });
-          } catch (repairError) {
-            throw new SessionDriverLoopError(
-              'agent_protocol_repair_failed',
-              `Empty model response still could not be parsed after repair: ${normalizeParseError(repairError).message}`
-            );
-          }
-        }
-        await this.append(state.sessionId, [
-          assistantProjectionBuilder.thinkingEvent(
-            state.sessionId,
-            'The model did not return valid JSON; Session is asking it to narrow the response to the next reviewable actionBundle.',
-            this.ts(),
-            this.id('action-bundle-compaction-repair')
-          ),
-        ]);
-        const repairedRaw = await this.llm(
-          input.profileId,
-          state,
-          'action_bundle_compaction_repair',
-          providerRepairMessageBuilder.actionBundleCompactionRepairMessages(prompt, providerRepairMessageState(state), 'LLM provider returned an empty response before emitting a JSON proposal.', '')
-        );
-        try {
-          return protocolGate().parseAndValidateRepairedProposal({
-            raw: repairedRaw,
-            runId: state.runId,
-            sessionId: state.sessionId,
-            source: 'llm',
-            allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
-            allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
-          });
-        } catch (repairError) {
-          throw new SessionDriverLoopError(
-            'agent_protocol_repair_failed',
-            `Empty model response still could not be parsed after repair: ${normalizeParseError(repairError).message}`
-          );
-        }
-      }
-      throw error;
-    }
-    try {
-      return protocolGate().parseAndValidateProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
-      });
-    } catch (error) {
-      const parseError = normalizeParseError(error);
-      await this.append(state.sessionId, [
-        assistantProjectionBuilder.thinkingEvent(
-          state.sessionId,
-          `Model output requires Agent Protocol v3 repair: ${parseError.message}`,
-          this.ts(),
-          this.id('protocol-repair')
-        ),
-      ]);
-      const repairStage = parseError.code === 'action_bundle_budget_exceeded'
-        ? 'action_bundle_budget_repair'
-        : 'protocol_repair';
-      const repairPrompt = parseError.code === 'action_bundle_budget_exceeded'
-        ? providerRepairMessageBuilder.actionBundleCompactionRepairMessages(prompt, providerRepairMessageState(state), parseError.message, raw)
-        : providerRepairMessageBuilder.repairMessages(prompt, providerRepairMessageState(state), raw, parseError);
-      const repairedRaw = await this.llm(input.profileId, state, repairStage, repairPrompt);
-      try {
-        return protocolGate().parseAndValidateRepairedProposal({
-          raw: repairedRaw,
-          runId: state.runId,
-          sessionId: state.sessionId,
-          source: 'llm',
-          allowedKinds: protocolGate().repairAllowedKinds({
-            acceptedPlanActive: Boolean(state.acceptedImplementationPlan),
-            errorCode: parseError.code,
-          }),
-          allowBriefActionBundleUserPlan: Boolean(state.acceptedImplementationPlan),
-        });
-      } catch (repairError) {
-        throw new SessionDriverLoopError(
-          'agent_protocol_repair_failed',
-          `Model output still does not satisfy Agent Protocol v3 after repair: ${normalizeParseError(repairError).message}`
-        );
-      }
-    }
+    return this.providerProposalCoordinator.callAndParse(input, state, prompt);
   }
 
   private async callProviderWithNativeTools(
