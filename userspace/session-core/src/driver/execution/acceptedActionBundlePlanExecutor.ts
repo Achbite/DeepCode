@@ -11,6 +11,7 @@ import type { ProjectWorkingDirectory, ResourcePacket } from '../../context/type
 import type { AcceptedImplementationPlanContext } from '../../accepted-plan/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
 import type { PlanContext } from '../proposal/planContextIndex.js';
+import { assertKernelReplyOk, kernelReplyErrorMessage } from './kernelReplyGuard.js';
 
 export type AcceptedActionBundlePlanDecision = 'accept' | 'reject' | 'revise';
 export type AcceptedActionBundlePlanReviewContinuationMode = 'auto' | 'ask' | 'off';
@@ -229,7 +230,12 @@ export class AcceptedActionBundlePlanExecutor {
           },
         },
       });
-      assertKernelReplyOk(decisionReply, 'accepted_plan_user_decision_failed', 'Kernel plan decision submit failed');
+      assertKernelReplyOk(
+        decisionReply,
+        (code, message) => new AcceptedActionBundlePlanExecutionError(code, message),
+        'accepted_plan_user_decision_failed',
+        'Kernel plan decision submit failed'
+      );
       result = await this.ports.appendProjectedKernelEvents(input.sessionId, decisionReply) ?? result;
 
       const grantEvents: unknown[] = [];
@@ -242,7 +248,12 @@ export class AcceptedActionBundlePlanExecutor {
             grant,
           },
         });
-        assertKernelReplyOk(grantReply, 'accepted_plan_grant_failed', 'Kernel temporary grant failed');
+        assertKernelReplyOk(
+          grantReply,
+          (code, message) => new AcceptedActionBundlePlanExecutionError(code, message),
+          'accepted_plan_grant_failed',
+          'Kernel temporary grant failed'
+        );
         grantEvents.push(...(grantReply.events ?? []));
       }
       if (grantEvents.length) {
@@ -405,19 +416,6 @@ export class AcceptedActionBundlePlanExecutionError extends Error {
     super(message);
     this.name = 'AcceptedActionBundlePlanExecutionError';
   }
-}
-
-function assertKernelReplyOk(reply: KernelReply, code: string, fallback: string): void {
-  if (reply.ok) return;
-  if ((reply.events ?? []).length > 0) return;
-  throw new AcceptedActionBundlePlanExecutionError(code, kernelReplyErrorMessage(reply, fallback));
-}
-
-function kernelReplyErrorMessage(reply: KernelReply, fallback: string): string {
-  const message = reply.error?.message?.trim();
-  const code = reply.error?.code?.trim();
-  if (message && code) return `${code}: ${message}`;
-  return message || code || fallback;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

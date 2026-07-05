@@ -13,6 +13,7 @@ import type { AcceptedImplementationPlanContext } from '../../accepted-plan/type
 import type { ProposalEnvelope, ResourceRequestDraft } from '../../agent-plan/types.js';
 import type { PromptEnvelope } from '../../prompt/types.js';
 import type { InteractionOverlayContext } from '../pipelines/interactionOverlayCodec.js';
+import { kernelReplyErrorMessage } from './kernelReplyGuard.js';
 
 export interface AcceptedPlanActionProposalInput {
   sessionId: string;
@@ -661,13 +662,6 @@ export class AcceptedPlanActionProposalSubmitter<
       requestIdPrefix: 'accepted-plan-review-facts-get',
     });
   }
-}
-
-function kernelReplyErrorMessage(reply: KernelReply, fallback: string): string {
-  const message = reply.error?.message?.trim();
-  const code = reply.error?.code?.trim();
-  if (message && code) return `${code}: ${message}`;
-  return message || code || fallback;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

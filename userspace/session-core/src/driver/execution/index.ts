@@ -18,5 +18,6 @@ export * from './acceptedPlanExecutor.js';
 export * from './completedWorkUnitFactIndex.js';
 export * from './implementationBatchContext.js';
 export * from './kernelEventStatusIndex.js';
+export * from './kernelReplyGuard.js';
 export * from './repairLoop.js';
 export * from './taskLedger.js';

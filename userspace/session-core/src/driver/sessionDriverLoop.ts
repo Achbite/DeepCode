@@ -39,6 +39,7 @@ import {
   KernelEventStatusIndex,
   RepairLoop,
   ReviewFactsAggregator,
+  assertKernelReplyOk as assertExecutionKernelReplyOk,
   type AcceptedImplementationPlanContext,
   type AcceptedImplementationPlanExecutionRoot,
   type AcceptedPlanAccessScope,
@@ -884,7 +885,13 @@ export class SessionDriverLoop {
       kernel: (request) => this.kernel(request),
       appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
       append: (sessionId, events) => this.append(sessionId, events),
-      assertKernelReplyOk,
+      assertKernelReplyOk: (reply, code, fallback) =>
+        assertExecutionKernelReplyOk(
+          reply,
+          (errorCode, message) => new SessionDriverLoopError(errorCode, message),
+          code,
+          fallback
+        ),
       acceptedPlanKernelEvents: ReviewFactsAggregator.acceptedPlanKernelEvents,
       reviewProjection: reviewProjectionBuilder,
       progressProjection: sessionProgressProjectionBuilder,
@@ -1835,19 +1842,6 @@ export class SessionDriverLoop {
 
 function isEmptyResponseError(error: unknown): boolean {
   return error instanceof SessionDriverLoopError && error.code === 'llm_empty_response';
-}
-
-function assertKernelReplyOk(reply: KernelReply, code: string, fallback: string): void {
-  if (reply.ok) return;
-  if ((reply.events ?? []).length > 0) return;
-  throw new SessionDriverLoopError(code, kernelReplyErrorMessage(reply, fallback));
-}
-
-function kernelReplyErrorMessage(reply: KernelReply, fallback: string): string {
-  const message = reply.error?.message?.trim();
-  const code = reply.error?.code?.trim();
-  if (message && code) return `${code}: ${message}`;
-  return message || code || fallback;
 }
 
 export class SessionDriverLoopError extends Error {
