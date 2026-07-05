@@ -1,4 +1,5 @@
 export * from './actionBundleActionInspector.js';
+export * from './actionProposalSubmitter.js';
 export * from './planReviewReportAnalyzer.js';
 export * from './planReviewGrantProjector.js';
 export * from './planContextIndex.js';

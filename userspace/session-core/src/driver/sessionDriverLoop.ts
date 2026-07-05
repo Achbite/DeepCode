@@ -138,6 +138,7 @@ import {
 } from './review/index.js';
 import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler, TerminalGuidanceRevisionCoordinator } from './interactions/index.js';
 import {
+  ActionProposalSubmitter,
   ActionBundleActionInspector,
   PlanContextIndex,
   PlanInteractionIndex,
@@ -505,6 +506,7 @@ export class SessionDriverLoop {
   private readonly requirementDecisionHandler: RequirementDecisionHandler;
   private readonly reviewDecisionHandler: ReviewDecisionHandler;
   private readonly terminalGuidanceRevisionCoordinator: TerminalGuidanceRevisionCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
+  private readonly actionProposalSubmitter: ActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
@@ -711,7 +713,7 @@ export class SessionDriverLoop {
       appendTrace: (state, stage, payload) => providerTraceRecorder.append(state, stage, payload, this.ports),
       acceptedPlanNeedsRepair: (report) => planReviewReportAnalyzer.acceptedPlanNeedsRepair(report),
       repairPlanReview: (handlerInput, state, prompt, proposal, report) =>
-        this.repairPlanReview(handlerInput, state, prompt, proposal, report),
+        this.actionProposalSubmitter.repairPlanReview(handlerInput, state, prompt, proposal, report),
       answerEvent: (sessionId, proposal, ts, id) => assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
       denied: (report) => planReviewReportAnalyzer.denied(report),
       diagnosticSummary: (report) => planReviewReportAnalyzer.diagnosticSummary(report),
@@ -1127,6 +1129,63 @@ export class SessionDriverLoop {
           ?? stringValue(diagnostic.details)
           ?? 'actionBundle admission repair returned a diagnostic instead of a file-level plan.';
       },
+      diagnostic: (code, fallback, params) => diag(code, fallback, params),
+    });
+    this.actionProposalSubmitter = new ActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      appendProjectedKernelEvents: (sessionId, reply) => this.appendProjectedKernelEvents(sessionId, reply),
+      readActionBundle: (proposal) => driverActivityBuilder.readActionBundle(proposal),
+      actionBundleAdmissionBatch: (proposal) => driverActivityBuilder.proposalActionBundleAdmissionBatch(proposal),
+      deleteAdmissionReasons: (batch, resourcePackets) =>
+        acceptedPlanBatchPreflight.deleteReasons(batch, resourcePackets),
+      repairActionBundleAdmission: (handlerInput, state, prompt, proposal, reasons, fallback) =>
+        this.repairActionBundleAdmission(handlerInput, state, prompt, proposal, reasons, fallback),
+      submitAcceptedPlanActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
+        this.submitAcceptedPlanActionProposal(handlerInput, state, prompt, proposal, fallback),
+      submitProposal: (state, proposal, requestId) => this.kernel({
+        command: {
+          kind: 'proposalSubmit',
+          requestId,
+          runId: state.runId,
+          sessionId: state.sessionId,
+          proposal,
+        },
+      }),
+      findReviewReport: (events) => planReviewReportAnalyzer.findReport(events),
+      appendTrace: (state, stage, payload) =>
+        providerTraceRecorder.append(state, stage, payload, this.ports),
+      needsRepair: (report) => planReviewReportAnalyzer.needsRepair(report),
+      denied: (report) => planReviewReportAnalyzer.denied(report),
+      diagnosticSummary: (report) => planReviewReportAnalyzer.diagnosticSummary(report),
+      buildRepairMessages: (prompt, state, proposal, report) =>
+        providerRepairMessageBuilder.planReviewRepairMessages(
+          prompt,
+          providerRepairMessageState(state),
+          proposal,
+          report
+        ),
+      runRepair: (handlerInput, state, stage, messages) =>
+        this.llm(handlerInput.profileId, state, stage, messages),
+      parseRepairedProposal: (raw, state, allowedKinds) => protocolGate().parseAndValidateRepairedProposal({
+        raw,
+        runId: state.runId,
+        sessionId: state.sessionId,
+        source: 'llm',
+        allowedKinds,
+      }),
+      repairErrorMessage: (error) => normalizeParseError(error).message,
+      thinkingEvent: (sessionId, content, ts, id) =>
+        assistantProjectionBuilder.thinkingEvent(sessionId, content, ts, id),
+      finalDiagnosticEvent: (sessionId, content, ts, id) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(sessionId, content, ts, id),
+      answerEvent: (sessionId, proposal, ts, id) =>
+        assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
+      planCardEvent: (planCardInput) =>
+        planProjectionBuilder.actionBundlePlanCardEvent(planCardInput),
+      sessionRunStateEvent: (runStateInput) =>
+        sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
       diagnostic: (code, fallback, params) => diag(code, fallback, params),
     });
     this.resourceRequestRepairCoordinator = new ResourceRequestRepairCoordinator<SessionDriverLoopRunState>({
@@ -1788,113 +1847,7 @@ export class SessionDriverLoop {
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
-    const actionBundle = driverActivityBuilder.readActionBundle(proposal);
-    if (actionBundle && state.acceptedImplementationPlan) {
-      return this.submitAcceptedPlanActionProposal(input, state, prompt, proposal, fallback);
-    }
-    if (actionBundle) {
-      const admissionBatch = driverActivityBuilder.proposalActionBundleAdmissionBatch(proposal);
-      const admissionReasons = acceptedPlanBatchPreflight.deleteReasons(admissionBatch, state.resourcePackets);
-      if (admissionReasons.length) {
-        return this.repairActionBundleAdmission(input, state, prompt, proposal, admissionReasons, fallback);
-      }
-    }
-    const proposalReply = await this.kernel({
-      command: {
-        kind: 'proposalSubmit',
-        requestId: this.id('proposal-submit'),
-        runId: state.runId,
-        sessionId: state.sessionId,
-        proposal,
-      },
-    });
-    if (!actionBundle) return await this.appendProjectedKernelEvents(state.sessionId, proposalReply) ?? fallback;
-    const reviewReport = planReviewReportAnalyzer.findReport(proposalReply.events);
-    await providerTraceRecorder.append(state, 'plan_review_report', {
-      proposalId: proposal.proposalId,
-      report: reviewReport,
-      events: proposalReply.events,
-    }, this.ports);
-    if (!reviewReport) {
-      return this.append(state.sessionId, [
-        assistantProjectionBuilder.finalDiagnosticEvent(
-          state.sessionId,
-          diag('planProposalReviewedMissing', 'Kernel did not return a proposal.reviewed event for the actionBundle; Session will not display a confirmable plan.'),
-          this.ts(),
-          this.id('plan-review-missing')
-        ),
-      ]);
-    }
-    if (reviewReport && planReviewReportAnalyzer.needsRepair(reviewReport) && !state.planReviewRepairAttempted) {
-      state.planReviewRepairAttempted = true;
-      await this.append(state.sessionId, [
-        assistantProjectionBuilder.thinkingEvent(
-          state.sessionId,
-          'Kernel PlanReview requires additional proposal evidence; Session is running one controlled repair attempt.',
-          this.ts(),
-          this.id('plan-review-repair')
-        ),
-      ]);
-      let repaired: ProposalEnvelope;
-      try {
-        repaired = await this.repairPlanReview(input, state, prompt, proposal, reviewReport);
-      } catch (error) {
-        const message = error instanceof SessionDriverLoopError ? error.message : String(error);
-        return this.append(state.sessionId, [
-          assistantProjectionBuilder.finalDiagnosticEvent(
-            state.sessionId,
-            diag('planRevisionRepairFailed', `The plan needs revision, but model repair failed: ${message}`, { message }),
-            this.ts(),
-            this.id('plan-review-repair-failed')
-          ),
-        ]);
-      }
-      if (repaired.kind === 'actionBundle') {
-        return this.submitActionProposal(input, state, prompt, repaired, fallback);
-      }
-      if (repaired.kind === 'answer') {
-        return this.append(state.sessionId, [assistantProjectionBuilder.answerEvent(state.sessionId, repaired, this.ts(), this.id('answer'))]);
-      }
-      return this.submitNonExecutableProposal(state, repaired, fallback);
-    }
-    let result = await this.appendProjectedKernelEvents(state.sessionId, proposalReply);
-    if (planReviewReportAnalyzer.denied(reviewReport)) {
-      return this.append(state.sessionId, [
-        assistantProjectionBuilder.finalDiagnosticEvent(
-          state.sessionId,
-          diag('planRejected', `Kernel rejected the plan: ${planReviewReportAnalyzer.diagnosticSummary(reviewReport)}`, { reasons: planReviewReportAnalyzer.diagnosticSummary(reviewReport) }),
-          this.ts(),
-          this.id('plan-review-denied')
-        ),
-      ]);
-    }
-    const planCard = planProjectionBuilder.actionBundlePlanCardEvent({
-      state,
-      proposal,
-      report: reviewReport,
-      ts: this.ts(),
-      id: this.id('plan-card'),
-    });
-    const planId = stringValue(objectRecord(planCard.payload)?.planId) ?? proposal.proposalId;
-    state.phase = 'waiting_plan_review';
-    result = await this.append(state.sessionId, [
-      planCard,
-      sessionProgressProjectionBuilder.sessionRunStateEvent({
-        sessionId: state.sessionId,
-        runId: state.runId,
-        phase: 'waiting_plan_review',
-        reason: 'plan_review',
-        decisionOwner: {
-          kind: 'plan',
-          runId: state.runId,
-          targetId: planId,
-          planId,
-        },
-        ts: this.ts(),
-        id: this.id('session-run-waiting-plan'),
-      }),
-    ]);
-    return result ?? fallback;
+    return this.actionProposalSubmitter.submit(input, state, prompt, proposal, fallback);
   }
 
   private async submitAcceptedPlanActionProposal(
@@ -1932,51 +1885,12 @@ export class SessionDriverLoop {
     });
   }
 
-  private async repairPlanReview(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    proposal: ProposalEnvelope,
-    report: Record<string, unknown>
-  ): Promise<ProposalEnvelope> {
-    const raw = await this.llm(
-      input.profileId,
-      state,
-      'plan_review_repair',
-      providerRepairMessageBuilder.planReviewRepairMessages(prompt, providerRepairMessageState(state), proposal, report)
-    );
-    try {
-      return protocolGate().parseAndValidateRepairedProposal({
-        raw,
-        runId: state.runId,
-        sessionId: state.sessionId,
-        source: 'llm',
-        allowedKinds: ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic'],
-      });
-    } catch (error) {
-      throw new SessionDriverLoopError(
-        'agent_protocol_repair_failed',
-        `Model plan output still could not be parsed after repair: ${normalizeParseError(error).message}`
-      );
-    }
-  }
-
   private async submitNonExecutableProposal(
     state: SessionDriverLoopRunState,
     proposal: ProposalEnvelope,
     fallback: AgentSessionResult
   ): Promise<AgentSessionResult> {
-    const proposalReply = await this.kernel({
-      command: {
-        kind: 'proposalSubmit',
-        requestId: this.id('proposal-submit'),
-        runId: state.runId,
-        sessionId: state.sessionId,
-        proposal,
-      },
-    });
-    const result = await this.appendProjectedKernelEvents(state.sessionId, proposalReply);
-    return result ?? fallback;
+    return this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback);
   }
 
   private async llm(
