@@ -103,6 +103,7 @@ import {
 import { InteractionOverlayCodec, type InteractionOverlayContext, type SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
 import { RunLifecyclePipeline } from './pipelines/lifecyclePipeline.js';
 import { PermissionPipeline } from './pipelines/permissionPipeline.js';
+import { ProviderRuntimeBridge } from './pipelines/providerRuntimeBridge.js';
 import { ProviderTurnCycle } from './pipelines/providerTurnCycle.js';
 import { UserGuidanceQueue } from './pipelines/userGuidanceQueue.js';
 import { UserInputPipeline } from './pipelines/userInputPipeline.js';
@@ -525,6 +526,7 @@ export class SessionDriverLoop {
   private readonly nativeToolProviderCoordinator: NativeToolProviderCoordinator<SessionDriverLoopRunState, LlmTurnResult>;
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
   private readonly providerProposalCoordinator: ProviderProposalCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
+  private readonly providerRuntimeBridge: ProviderRuntimeBridge<SessionDriverLoopRunState, LlmTurnResult>;
   private readonly providerTurnContextCoordinator: ProviderTurnContextCoordinator<SessionDriverLoopRunState>;
   private readonly providerTurnCycle: ProviderTurnCycle<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly runLifecyclePipeline: RunLifecyclePipeline<SessionDriverLoopRunState>;
@@ -648,9 +650,16 @@ export class SessionDriverLoop {
         ),
       resourceResume: (resumeInput) => this.acceptedPlanResourceResumeCoordinator.run(resumeInput),
       callProviderProposalOnly: (handlerInput, state, prompt, contract, stage, messages) =>
-        this.callProviderProposalOnly(handlerInput, state, prompt, contract, stage, messages),
+        this.providerRuntimeBridge.runProposalOnly({
+          profileId: handlerInput.profileId,
+          state,
+          prompt,
+          contract,
+          stage,
+          messages,
+        }),
       runRepair: (handlerInput, state, stage, messages) =>
-        this.llm(handlerInput.profileId, state, stage, messages),
+        this.providerRuntimeBridge.llm(handlerInput.profileId, state, stage, messages),
       submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
         this.submitActionProposal(handlerInput, state, prompt, proposal, fallback),
       submitNonExecutableProposal: (state, proposal, fallback) =>
@@ -688,7 +697,7 @@ export class SessionDriverLoop {
           prompt,
           proposal,
           validation: validation as AcceptedPlanBatchValidationResult,
-          runRepair: (stage, messages) => this.llm(handlerInput.profileId, state, stage, messages),
+          runRepair: (stage, messages) => this.providerRuntimeBridge.llm(handlerInput.profileId, state, stage, messages),
         }),
       handleScopeResourceFollowup: ({ state, acceptedPlan, proposal, request, result }) =>
         this.acceptedPlanScopeResourceFollowupCoordinator.handle({
@@ -861,7 +870,7 @@ export class SessionDriverLoop {
       createId: (prefix) => this.id(prefix),
       emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
       runStaticSyntaxReview: ({ profileId, state, stage, messages }) =>
-        this.llm(profileId, state, stage, messages),
+        this.providerRuntimeBridge.llm(profileId, state, stage, messages),
       event: (sessionId, kind, payload) => this.event(sessionId, kind, payload),
       reviewAssembler: reviewAssembler(),
     });
@@ -1059,7 +1068,7 @@ export class SessionDriverLoop {
           guidanceInput.appliedAtProviderStage
         ),
       runRevision: (revisionInput, state, messages) =>
-        this.llm(revisionInput.profileId, state, 'guidance_revision', messages),
+        this.providerRuntimeBridge.llm(revisionInput.profileId, state, 'guidance_revision', messages),
       parseProposal: (raw, state) =>
         protocolGate().parseAndValidateProposal({
           raw,
@@ -1227,7 +1236,7 @@ export class SessionDriverLoop {
       repair: (repairInput) =>
         this.actionBundleAdmissionRepairCoordinator.repair({
           ...repairInput,
-          runRepair: (stage, messages) => this.llm(repairInput.input.profileId, repairInput.state, stage, messages),
+          runRepair: (stage, messages) => this.providerRuntimeBridge.llm(repairInput.input.profileId, repairInput.state, stage, messages),
         }),
       repairErrorMessage: (error) =>
         error instanceof SessionDriverLoopError ? error.message : normalizeParseError(error).message,
@@ -1308,7 +1317,7 @@ export class SessionDriverLoop {
           report
         ),
       runRepair: (handlerInput, state, stage, messages) =>
-        this.llm(handlerInput.profileId, state, stage, messages),
+        this.providerRuntimeBridge.llm(handlerInput.profileId, state, stage, messages),
       parseRepairedProposal: (raw, state, allowedKinds) => protocolGate().parseAndValidateRepairedProposal({
         raw,
         runId: state.runId,
@@ -1362,10 +1371,10 @@ export class SessionDriverLoop {
       readManifest: (state, toolCall) => nativeToolCoordinator.readManifest(state, toolCall),
       resolveResource: (state, manifest) => this.resourceOrchestrator.resolve(state, manifest),
       runTurn: (profileId, state, stage, messages, options) =>
-        this.llmTurn(profileId, state, stage, messages, options),
+        this.providerRuntimeBridge.llmTurn(profileId, state, stage, messages, options),
       isEmptyResponseError,
       consumeGuidanceMessages: (state, stage) =>
-        this.consumeQueuedGuidanceForProviderResume(state, stage),
+        this.providerRuntimeBridge.consumeGuidanceMessages(state, stage),
       emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
       buildSideEffectRepairMessages: (prompt, state, toolCall, turn, acceptedExecution) =>
         providerRepairMessageBuilder.sideEffectNativeToolRepairMessages(
@@ -1383,7 +1392,7 @@ export class SessionDriverLoop {
           duplicates,
           acceptedExecution
         ),
-      runRepair: (profileId, state, stage, messages) => this.llm(profileId, state, stage, messages),
+      runRepair: (profileId, state, stage, messages) => this.providerRuntimeBridge.llm(profileId, state, stage, messages),
       repairErrorMessage: (error) => normalizeParseError(error).message,
       createError: (code, message) => new SessionDriverLoopError(code, message),
     });
@@ -1421,6 +1430,41 @@ export class SessionDriverLoop {
       now: () => this.ts(),
       createId: (prefix) => this.id(prefix),
     });
+    this.providerRuntimeBridge = new ProviderRuntimeBridge<SessionDriverLoopRunState, LlmTurnResult>({
+      nativeToolProviderCoordinator: this.nativeToolProviderCoordinator,
+      proposalOnlyProviderRunner,
+      providerTurnRunner: this.providerTurnRunner,
+    }, {
+      ...this.ports,
+      append: (sessionId, events) => this.append(sessionId, events),
+      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      consumeGuidanceMessages: async (state, stage) => {
+        const current = await this.append(state.sessionId, []);
+        const language = visibleLanguageForRequest(state.userRequest);
+        const resume = userGuidanceQueue.providerResume({
+          sessionId: state.sessionId,
+          events: current.events,
+          runId: state.runId,
+          stage,
+          summary: providerStreamCoordinator.userGuidanceConsumedSummary(language),
+          now: () => this.ts(),
+          createId: (prefix) => this.id(prefix),
+        });
+        if (resume.events.length) await this.append(state.sessionId, resume.events);
+        return resume.messages;
+      },
+      acceptedPlanId: (state) => state.acceptedImplementationPlan?.planId,
+      buildProposalOnlyRepairMessages: ({ prompt, state, toolCall, turn }) =>
+        providerRepairMessageBuilder.completeStageToolViolationRepairMessages(
+          prompt,
+          providerRepairMessageState(state),
+          toolCall,
+          turn
+        ),
+      repairErrorMessage: (error) => normalizeParseError(error).message,
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+      isEmptyResponseError,
+    });
     this.providerProposalCoordinator = new ProviderProposalCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
       append: (sessionId, events) => this.append(sessionId, events),
       createId: (prefix) => this.id(prefix),
@@ -1429,10 +1473,21 @@ export class SessionDriverLoop {
         assistantProjectionBuilder.thinkingEvent(sessionId, content, ts, id),
       providerResult: (providerInput, state, prompt, contract) =>
         state.acceptedImplementationPlan
-          ? this.callProviderProposalOnly(providerInput, state, prompt, contract, 'accepted_plan_provider_call')
-          : this.callProviderWithNativeTools(providerInput, state, prompt, contract),
+          ? this.providerRuntimeBridge.runProposalOnly({
+            profileId: providerInput.profileId,
+            state,
+            prompt,
+            contract,
+            stage: 'accepted_plan_provider_call',
+          })
+          : this.providerRuntimeBridge.runWithNativeTools({
+            profileId: providerInput.profileId,
+            state,
+            prompt,
+            contract,
+          }),
       runRepair: (providerInput, state, stage, messages) =>
-        this.llm(providerInput.profileId, state, stage, messages),
+        this.providerRuntimeBridge.llm(providerInput.profileId, state, stage, messages),
       repairMessageState: (state) => providerRepairMessageState(state),
       repairMessages: (prompt, repairState, raw, error) =>
         providerRepairMessageBuilder.repairMessages(prompt, repairState as ProviderRepairMessageState, raw, error),
@@ -1609,76 +1664,6 @@ export class SessionDriverLoop {
     return this.providerProposalCoordinator.callAndParse(input, state, prompt);
   }
 
-  private async callProviderWithNativeTools(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    contract: ProviderTurnContract
-  ): Promise<string | ProposalEnvelope> {
-    return this.nativeToolProviderCoordinator.run({
-      profileId: input.profileId,
-      state,
-      prompt,
-      contract,
-    });
-  }
-
-  private async callProviderProposalOnly(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    contract: ProviderTurnContract,
-    stage: string,
-    messages?: LlmChatRequest['messages']
-  ): Promise<string | ProposalEnvelope> {
-    const result = await proposalOnlyProviderRunner.run({
-      profileId: input.profileId,
-      state,
-      contract,
-      stage,
-      messages,
-      runTurn: (profileId, runState, retryStage, retryMessages, options) =>
-        this.llmTurn(profileId, runState, retryStage, retryMessages, options),
-      isEmptyResponseError,
-      acceptedPlanId: state.acceptedImplementationPlan?.planId,
-      emitProjectionDelta: (runState, delta) => this.emitProjectionDelta(runState, delta),
-      buildRepairMessages: (toolCall, turn) =>
-        providerRepairMessageBuilder.completeStageToolViolationRepairMessages(prompt, providerRepairMessageState(state), toolCall, turn),
-      runRepair: (repairStage, repairMessages) =>
-        this.llm(input.profileId, state, repairStage, repairMessages),
-      repairErrorMessage: (error) => normalizeParseError(error).message,
-    });
-    if (result.kind === 'content') return result.content;
-    if (result.kind === 'proposal') return result.proposal;
-    if (result.kind === 'repairFailed') {
-      throw new SessionDriverLoopError(
-        'accepted_plan_provider_tool_violation',
-        `Complete-stage provider requested native tool ${result.toolCall.name}; proposal-only repair failed: ${result.message}`
-      );
-    }
-    const exhaustive: never = result;
-    return exhaustive;
-  }
-
-  private async consumeQueuedGuidanceForProviderResume(
-    state: SessionDriverLoopRunState,
-    stage: string
-  ): Promise<LlmChatRequest['messages']> {
-    const current = await this.append(state.sessionId, []);
-    const language = visibleLanguageForRequest(state.userRequest);
-    const resume = userGuidanceQueue.providerResume({
-      sessionId: state.sessionId,
-      events: current.events,
-      runId: state.runId,
-      stage,
-      summary: providerStreamCoordinator.userGuidanceConsumedSummary(language),
-      now: () => this.ts(),
-      createId: (prefix) => this.id(prefix),
-    });
-    if (resume.events.length) await this.append(state.sessionId, resume.events);
-    return resume.messages;
-  }
-
   private async repairResourceRequest(
     input: SessionDriverLoopInput,
     state: SessionDriverLoopRunState,
@@ -1691,7 +1676,7 @@ export class SessionDriverLoop {
       prompt,
       proposal,
       resolutionDiagnostic: resourceRequestLoop.resolutionDiagnostic(resolution).fallback,
-      runRepair: (stage, messages) => this.llm(input.profileId, state, stage, messages),
+      runRepair: (stage, messages) => this.providerRuntimeBridge.llm(input.profileId, state, stage, messages),
     });
   }
 
@@ -1748,38 +1733,6 @@ export class SessionDriverLoop {
       },
       confirmationIdPrefix: 'accepted-plan-scope-confirmation',
       runStateIdPrefix: 'session-run-waiting-accepted-plan-scope',
-    });
-  }
-
-  private async llm(
-    profileId: string | undefined,
-    state: SessionDriverLoopRunState,
-    stage: string,
-    messages: LlmChatRequest['messages']
-  ): Promise<string> {
-    const turn = await this.llmTurn(profileId, state, stage, messages, {
-      responseFormat: { type: 'json_object' },
-    });
-    if (!turn.content.trim()) {
-      throw new SessionDriverLoopError('llm_empty_response', 'LLM provider returned an empty response.');
-    }
-    return turn.content;
-  }
-
-  private async llmTurn(
-    profileId: string | undefined,
-    state: SessionDriverLoopRunState,
-    stage: string,
-    messages: LlmChatRequest['messages'],
-    options: Pick<LlmChatRequest, 'responseFormat' | 'tools'> = {}
-  ): Promise<LlmTurnResult> {
-    return this.providerTurnRunner.run({
-      profileId,
-      state,
-      stage,
-      messages,
-      options,
-      ports: this.ports,
     });
   }
 

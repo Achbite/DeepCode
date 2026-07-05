@@ -16,6 +16,7 @@ export * from './proposalOnlyProviderRunner.js';
 export * from './proposalPipeline.js';
 export * from './providerJsonModeCoordinator.js';
 export * from './providerPipeline.js';
+export * from './providerRuntimeBridge.js';
 export * from './providerStreamCoordinator.js';
 export * from './providerStreamRuntime.js';
 export * from './providerTurnRunner.js';
