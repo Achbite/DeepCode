@@ -147,6 +147,7 @@ import {
   PlanReviewReportAnalyzer,
   ProviderPlanProposalHandler,
   ProviderTerminalProposalHandler,
+  ProposalRouter,
   ProposalSemanticValidator,
   ProtocolGate,
   type PlanContext as SessionPlanContext,
@@ -508,6 +509,7 @@ export class SessionDriverLoop {
   private readonly providerDecisionRequestHandler: ProviderDecisionRequestHandler<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly providerPlanProposalHandler: ProviderPlanProposalHandler<SessionDriverLoopRunState>;
   private readonly providerTerminalProposalHandler: ProviderTerminalProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>;
+  private readonly proposalRouter: ProposalRouter<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementConfirmationCoordinator: RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementDecisionHandler: RequirementDecisionHandler;
   private readonly reviewDecisionHandler: ReviewDecisionHandler;
@@ -646,7 +648,7 @@ export class SessionDriverLoop {
       submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
         this.submitActionProposal(handlerInput, state, prompt, proposal, fallback),
       submitNonExecutableProposal: (state, proposal, fallback) =>
-        this.submitNonExecutableProposal(state, proposal, fallback),
+        this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
     });
     this.acceptedPlanActionProposalSubmitter = new AcceptedPlanActionProposalSubmitter<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.ts(),
@@ -704,7 +706,8 @@ export class SessionDriverLoop {
           this.id(idPrefix)
         ),
       ]),
-      submitNonExecutableProposal: (state, proposal, fallback) => this.submitNonExecutableProposal(state, proposal, fallback),
+      submitNonExecutableProposal: (state, proposal, fallback) =>
+        this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
       sessionRunStateEvent: (eventInput) =>
         sessionProgressProjectionBuilder.sessionRunStateEvent(eventInput as Parameters<typeof sessionProgressProjectionBuilder.sessionRunStateEvent>[0]),
       accessScopesCanonicalizedEvent: (sessionId, runId, accepted, canonicalization, ts, id) =>
@@ -970,6 +973,27 @@ export class SessionDriverLoop {
       finalDiagnosticEvent: (diagnosticSessionId, summary, ts, id) =>
         assistantProjectionBuilder.finalDiagnosticEvent(diagnosticSessionId, summary, ts, id),
     });
+    this.proposalRouter = new ProposalRouter<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      proposalNarrationEvent: (narrationSessionId, proposal, ts, id) =>
+        assistantProjectionBuilder.proposalNarrationEvent(narrationSessionId, proposal, ts, id),
+      handleAnswer: (handlerInput, state, proposal) =>
+        this.providerTerminalProposalHandler.handleAnswer(handlerInput, state, proposal),
+      handleDecisionRequest: (handlerInput, state, proposal) =>
+        this.providerDecisionRequestHandler.handle(handlerInput, state, proposal),
+      handleDiagnostic: (state, proposal) =>
+        this.providerTerminalProposalHandler.handleDiagnostic(state, proposal),
+      handlePlan: (state, proposal) =>
+        this.providerPlanProposalHandler.handle(state, proposal),
+      handleResourceRequest: (handlerInput) =>
+        this.resourceRequestProposalHandler.handle(handlerInput),
+      submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
+        this.submitActionProposal(handlerInput, state, prompt, proposal, fallback),
+      submitNonExecutableProposal: (state, proposal, fallback) =>
+        this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
+    });
     this.requirementConfirmationCoordinator = new RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.ts(),
       createId: (prefix) => this.id(prefix),
@@ -1091,7 +1115,7 @@ export class SessionDriverLoop {
       submitActionProposal: (input, state, prompt, proposal, fallback) =>
         this.submitActionProposal(input, state, prompt, proposal, fallback),
       submitNonExecutableProposal: (state, proposal, fallback) =>
-        this.submitNonExecutableProposal(state, proposal, fallback),
+        this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
       errorMessage: (error) => error instanceof Error ? error.message : String(error),
     });
     this.acceptedPlanScopeResourceFollowupCoordinator = new AcceptedPlanScopeResourceFollowupCoordinator<SessionDriverLoopRunState, AcceptedImplementationPlanContext>({
@@ -1194,7 +1218,7 @@ export class SessionDriverLoop {
       submitActionProposal: (handlerInput, state, prompt, proposal, fallback) =>
         this.submitActionProposal(handlerInput, state, prompt, proposal, fallback),
       submitNonExecutableProposal: (state, proposal, fallback) =>
-        this.submitNonExecutableProposal(state, proposal, fallback),
+        this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback),
       requirementRecordFromProposal: (recordInput) =>
         userInputPipeline.requirementRecordFromProposal(recordInput),
       confirmationEvent: (confirmationInput) =>
@@ -1616,38 +1640,20 @@ export class SessionDriverLoop {
           ),
         ]);
       }
-      const narration = assistantProjectionBuilder.proposalNarrationEvent(sessionId, proposal, this.ts(), this.id('progress-model-narration'));
-      if (narration) {
-        lastResult = await this.append(sessionId, [narration]);
+      const routed = await this.proposalRouter.route({
+        input,
+        state,
+        prompt,
+        proposal,
+        lastResult,
+      });
+      if (routed.kind === 'return') {
+        return routed.result;
       }
-      if (proposal.kind === 'answer') {
-        return this.providerTerminalProposalHandler.handleAnswer(input, state, proposal);
-      }
-      if (proposal.kind === 'decisionRequest') {
-        return this.providerDecisionRequestHandler.handle(input, state, proposal);
-      }
-      if (proposal.kind === 'diagnostic') {
-        return this.providerTerminalProposalHandler.handleDiagnostic(state, proposal);
-      }
-      if (proposal.kind === 'taskPlan' || proposal.kind === 'implementationPlan') {
-        return this.providerPlanProposalHandler.handle(state, proposal);
-      }
+      lastResult = routed.lastResult;
       if (proposal.kind === 'resourceRequest') {
-        const handled = await this.resourceRequestProposalHandler.handle({
-          input,
-          state,
-          prompt,
-          proposal,
-          lastResult,
-        });
-        if (handled.kind === 'return') return handled.result;
-        lastResult = handled.lastResult;
         continue;
       }
-      if (proposal.kind === 'actionBundle') {
-        return this.submitActionProposal(input, state, prompt, proposal, lastResult);
-      }
-      return this.submitNonExecutableProposal(state, proposal, lastResult);
     }
 
     return lastResult;
@@ -1809,14 +1815,6 @@ export class SessionDriverLoop {
       confirmationIdPrefix: 'accepted-plan-scope-confirmation',
       runStateIdPrefix: 'session-run-waiting-accepted-plan-scope',
     });
-  }
-
-  private async submitNonExecutableProposal(
-    state: SessionDriverLoopRunState,
-    proposal: ProposalEnvelope,
-    fallback: AgentSessionResult
-  ): Promise<AgentSessionResult> {
-    return this.actionProposalSubmitter.submitNonExecutable(state, proposal, fallback);
   }
 
   private async llm(
