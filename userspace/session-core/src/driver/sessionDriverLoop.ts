@@ -765,7 +765,8 @@ export class SessionDriverLoop {
       answerEvent: (sessionId, proposal, ts, id) => assistantProjectionBuilder.answerEvent(sessionId, proposal, ts, id),
       denied: (report) => planReviewReportAnalyzer.denied(report),
       diagnosticSummary: (report) => planReviewReportAnalyzer.diagnosticSummary(report),
-      nonAcceptedPermissionGaps: (report, accepted) => nonAcceptedPlanPermissionGaps(report, accepted),
+      nonAcceptedPermissionGaps: (report, accepted) =>
+        planReviewGrantProjector.nonAcceptedPermissionGaps(report, accepted.capabilities),
       executionContext: (contextInput) => acceptedPlanExecutor.executionContext(contextInput as Parameters<typeof acceptedPlanExecutor.executionContext>[0]),
       temporaryGrantsForPlan: (plan) => planReviewGrantProjector.temporaryGrantsForPlan(plan),
       normalizeKernelBatch: (normalizeInput) => acceptedPlanExecutor.normalizeKernelBatch(normalizeInput as Parameters<typeof acceptedPlanExecutor.normalizeKernelBatch>[0]),
@@ -2014,14 +2015,6 @@ function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanCon
     defaultValidationExpectation: (actions) => validator.defaultValidationExpectation(actions),
     defaultReviewExpectation: (actions) => validator.defaultReviewExpectation(actions),
   });
-}
-
-function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted: AcceptedImplementationPlanContext): string[] {
-  const gaps = Array.isArray(report.permissionGaps)
-    ? report.permissionGaps.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-    : [];
-  const acceptedCapabilities = new Set(accepted.capabilities);
-  return gaps.filter((capability) => !planReviewGrantProjector.planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
 }
 
 function stringValue(value: unknown): string | undefined {

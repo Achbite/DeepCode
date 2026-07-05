@@ -157,6 +157,17 @@ export class PlanReviewGrantProjector {
     return grants;
   }
 
+  nonAcceptedPermissionGaps(
+    report: Record<string, unknown>,
+    acceptedCapabilities: Iterable<string>
+  ): string[] {
+    const gaps = Array.isArray(report.permissionGaps)
+      ? report.permissionGaps.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    const accepted = new Set(acceptedCapabilities);
+    return gaps.filter((capability) => !this.planAcceptedAutoGrantCapability(capability) && !accepted.has(capability));
+  }
+
   requiredFileOperationsFromReport(report: Record<string, unknown> | undefined): RequiredFileOperationProjection[] {
     const operations = Array.isArray(report?.requiredFileOperations) ? report.requiredFileOperations : [];
     const output: RequiredFileOperationProjection[] = [];
