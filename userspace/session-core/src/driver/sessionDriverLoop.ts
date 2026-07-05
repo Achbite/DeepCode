@@ -45,7 +45,6 @@ import {
   type AcceptedPlanBatchValidationResult,
   type AcceptedPlanExactOperationGrant,
   type CurrentTaskContext,
-  type ExecutionSliceRole,
   type ImplementationBatchContext,
   type TaskExecutionCursor,
 } from './execution/index.js';
@@ -1921,7 +1920,6 @@ function acceptedImplementationPlanContextBuilder(): AcceptedImplementationPlanC
     normalizePlanScope: (value) => pathIdentity.normalizePlanScope(value),
     uniqueStrings: (values) => driverActivityBuilder.uniqueStrings(values),
     acceptedPlanTaskTargets: (record) => acceptedPlanTargetParser.taskTargets(record),
-    executionSliceRoleValue,
     exactOperationGrantsFromImplementationPlan: (plan, executionRoot) =>
       planReviewGrantProjector.exactOperationGrantsFromImplementationPlan(plan, executionRoot),
     exactOperationGrantsFromPlanReviewReport: (report, executionRoot) =>
@@ -2027,22 +2025,6 @@ function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanCon
     defaultValidationExpectation: (actions) => validator.defaultValidationExpectation(actions),
     defaultReviewExpectation: (actions) => validator.defaultReviewExpectation(actions),
   });
-}
-
-function executionSliceRoleValue(value: unknown): ExecutionSliceRole | undefined {
-  const role = stringValue(value);
-  if (
-    role === 'sourceCode' ||
-    role === 'infra' ||
-    role === 'script' ||
-    role === 'test' ||
-    role === 'docs' ||
-    role === 'config' ||
-    role === 'review'
-  ) {
-    return role;
-  }
-  return undefined;
 }
 
 function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted: AcceptedImplementationPlanContext): string[] {

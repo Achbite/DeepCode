@@ -6324,7 +6324,6 @@ function assertAcceptedImplementationPlanContextBuilderBuildsRuntimeContext(): v
     normalizePlanScope: (value) => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/').trim(),
     uniqueStrings: (values) => [...new Set(values.filter((item): item is string => Boolean(item)))],
     acceptedPlanTaskTargets: (record) => targetParser.taskTargets(record),
-    executionSliceRoleValue: (value) => value === 'sourceCode' || value === 'test' ? value : undefined,
     exactOperationGrantsFromImplementationPlan: (plan, executionRoot) =>
       projector.exactOperationGrantsFromImplementationPlan(plan, executionRoot),
     exactOperationGrantsFromPlanReviewReport: (report, executionRoot) =>

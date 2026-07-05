@@ -22,7 +22,6 @@ export interface AcceptedImplementationPlanContextBuilderPorts {
   normalizePlanScope(value: string): string;
   uniqueStrings(values: Array<string | undefined>): string[];
   acceptedPlanTaskTargets(record: Record<string, unknown>): string[];
-  executionSliceRoleValue(value: unknown): ExecutionSliceRole | undefined;
   exactOperationGrantsFromImplementationPlan(
     plan: Record<string, unknown> | undefined,
     executionRoot?: AcceptedImplementationPlanExecutionRoot
@@ -64,8 +63,8 @@ export class AcceptedImplementationPlanContextBuilder {
         targets: this.ports.acceptedPlanTaskTargets(record),
         dependencies: legacyDependencies,
         conflictKeys,
-        batchKind: this.ports.executionSliceRoleValue(record.batchKind) ?? this.ports.executionSliceRoleValue(record.role),
-        role: this.ports.executionSliceRoleValue(record.batchKind) ?? this.ports.executionSliceRoleValue(record.role),
+        batchKind: executionSliceRoleValue(record.batchKind) ?? executionSliceRoleValue(record.role),
+        role: executionSliceRoleValue(record.batchKind) ?? executionSliceRoleValue(record.role),
       }];
     });
     const capabilities = this.ports.uniqueStrings(taskContexts.map((task) => task.capability));
@@ -100,4 +99,20 @@ export class AcceptedImplementationPlanContextBuilder {
       rawPlan,
     };
   }
+}
+
+function executionSliceRoleValue(value: unknown): ExecutionSliceRole | undefined {
+  const role = typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  if (
+    role === 'sourceCode' ||
+    role === 'infra' ||
+    role === 'script' ||
+    role === 'test' ||
+    role === 'docs' ||
+    role === 'config' ||
+    role === 'review'
+  ) {
+    return role;
+  }
+  return undefined;
 }
