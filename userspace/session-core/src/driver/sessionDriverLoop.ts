@@ -113,6 +113,7 @@ import {
   ContextFrameBuilder,
   GeneratedArtifactEvidenceIndex,
   PathIdentity,
+  ProviderContextSupport,
   ProviderTurnContextCoordinator,
   ResourceEvidenceIndex,
   ResourceManifestBuilder,
@@ -374,6 +375,13 @@ const actionBatchFailureIndex = new ActionBatchFailureIndex();
 const kernelEventStatusIndex = new KernelEventStatusIndex();
 const repairLoop = new RepairLoop();
 const pathIdentity = new PathIdentity();
+const providerContextSupport = new ProviderContextSupport({
+  currentTaskOperations: (acceptedPlan) => {
+    const operations = objectRecord(executionPromptCoordinator().sanitizedContext(acceptedPlan))?.currentTaskOperations;
+    return Array.isArray(operations) ? operations : undefined;
+  },
+  acceptedContext: (acceptedPlan) => executionPromptCoordinator().sanitizedContext(acceptedPlan),
+});
 const acceptedPlanScopeMatcher = new AcceptedPlanScopeMatcher();
 const acceptedPlanScopeCoverage = new AcceptedPlanScopeCoverage({
   taskTargets: (task) => acceptedPlanTargetParser.taskTargets(task),
@@ -803,7 +811,7 @@ export class SessionDriverLoop {
       promptBuilder: acceptedPlanResourceResumePromptBuilder,
       contextFrameBuilder,
       repairMessageBuilder: providerRepairMessageBuilder,
-      repairState: (state) => providerRepairMessageState(state),
+      repairState: (state) => providerContextSupport.repairMessageState(state),
       createId: (prefix) => this.id(prefix),
       parseError: (error) => normalizeParseError(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
@@ -833,7 +841,7 @@ export class SessionDriverLoop {
     });
     this.acceptedPlanScopeRepairCoordinator = new AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
-      repairState: (state) => providerRepairMessageState(state),
+      repairState: (state) => providerContextSupport.repairMessageState(state),
       parseError: (error) => normalizeParseError(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
@@ -1057,7 +1065,7 @@ export class SessionDriverLoop {
         assistantProjectionBuilder.guidanceRevisionDiagnosticEvent(sessionId, message, ts, id),
       assembleContext: (contextInput) => assembleContext(contextInput),
       capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
-      implementationBatchHints: (state) => implementationBatchHints(state.implementationBatch),
+      implementationBatchHints: (state) => providerContextSupport.implementationBatchHints(state.implementationBatch),
       appendConsumedGuidanceEvents: (guidanceInput) =>
         this.appendConsumedUserGuidanceEvents(
           guidanceInput.sessionId,
@@ -1080,7 +1088,7 @@ export class SessionDriverLoop {
     });
     this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
-      repairState: providerRepairMessageState,
+      repairState: (state) => providerContextSupport.repairMessageState(state),
       parseError: normalizeParseError,
       createError: (code, message) => new SessionDriverLoopError(code, message),
       parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({ raw, runId: state.runId, sessionId: state.sessionId, source: 'llm', allowedKinds }),
@@ -1110,7 +1118,8 @@ export class SessionDriverLoop {
       generatedArtifactEvidenceFromPackets: (packets) => generatedArtifactEvidenceIndex().fromPackets(packets),
       initialTaskRuntime: (snapshotInput) => acceptedPlanTaskLedger().runtimeSnapshot(snapshotInput),
       lastSavepointId: (events) => acceptedPlanTaskLedger().lastSavepointId(events),
-      implementationBatchHints,
+      implementationBatchHints: (context, acceptedPlan) =>
+        providerContextSupport.implementationBatchHints(context, acceptedPlan),
       resolveInitialResources: async (state) => (
         await this.resourceOrchestrator.resolveRecordAndAppend(
           state,
@@ -1312,7 +1321,7 @@ export class SessionDriverLoop {
       buildRepairMessages: (prompt, state, proposal, report) =>
         providerRepairMessageBuilder.planReviewRepairMessages(
           prompt,
-          providerRepairMessageState(state),
+          providerContextSupport.repairMessageState(state),
           proposal,
           report
         ),
@@ -1340,7 +1349,7 @@ export class SessionDriverLoop {
     });
     this.resourceRequestRepairCoordinator = new ResourceRequestRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
-      repairState: (state) => providerRepairMessageState(state),
+      repairState: (state) => providerContextSupport.repairMessageState(state),
       parseError: (error) => normalizeParseError(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
@@ -1379,7 +1388,7 @@ export class SessionDriverLoop {
       buildSideEffectRepairMessages: (prompt, state, toolCall, turn, acceptedExecution) =>
         providerRepairMessageBuilder.sideEffectNativeToolRepairMessages(
           prompt,
-          providerRepairMessageState(state),
+          providerContextSupport.repairMessageState(state),
           toolCall,
           turn,
           acceptedExecution
@@ -1387,7 +1396,7 @@ export class SessionDriverLoop {
       buildDuplicateRepairMessages: (prompt, state, turn, duplicates, acceptedExecution) =>
         providerRepairMessageBuilder.nativeToolDuplicateRepairMessages(
           prompt,
-          providerRepairMessageState(state),
+          providerContextSupport.repairMessageState(state),
           turn,
           duplicates,
           acceptedExecution
@@ -1457,7 +1466,7 @@ export class SessionDriverLoop {
       buildProposalOnlyRepairMessages: ({ prompt, state, toolCall, turn }) =>
         providerRepairMessageBuilder.completeStageToolViolationRepairMessages(
           prompt,
-          providerRepairMessageState(state),
+          providerContextSupport.repairMessageState(state),
           toolCall,
           turn
         ),
@@ -1488,7 +1497,7 @@ export class SessionDriverLoop {
           }),
       runRepair: (providerInput, state, stage, messages) =>
         this.providerRuntimeBridge.llm(providerInput.profileId, state, stage, messages),
-      repairMessageState: (state) => providerRepairMessageState(state),
+      repairMessageState: (state) => providerContextSupport.repairMessageState(state),
       repairMessages: (prompt, repairState, raw, error) =>
         providerRepairMessageBuilder.repairMessages(prompt, repairState as ProviderRepairMessageState, raw, error),
       actionBundleCompactionRepairMessages: (prompt, repairState, reason, raw) =>
@@ -1528,7 +1537,7 @@ export class SessionDriverLoop {
       capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
       memoryHints: (state) => [
         ...acceptedPlanTaskLedger().memoryHints(state.currentTaskContext),
-        ...implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
+        ...providerContextSupport.implementationBatchHints(state.implementationBatch, state.acceptedImplementationPlan),
       ],
       collectUserGuidanceEvents: (events, runId) => collectUserGuidanceEvents(events, runId),
       consumedUserGuidanceEvents: (guidanceInput) =>
@@ -1943,63 +1952,6 @@ function reviewAssembler(): ReviewAssembler {
 
 function reviewDecisionProjection(): ReviewDecisionProjectionBuilder {
   return new ReviewDecisionProjectionBuilder();
-}
-
-function implementationBatchHints(
-  context: ImplementationBatchContext,
-  acceptedPlan?: AcceptedImplementationPlanContext
-): string[] {
-  const hints = [
-    `Implementation batch context: nextBatchIndex=${context.batchIndex}. Generate only the next reviewable batch when proposing side-effect actions.`,
-    'Context boundary: plan cards and continuation expectations are intent only; they are not evidence that files exist or were modified.',
-    'Authoritative generated-file facts come only from ResourcePacket contents, ToolCompleted(ok=true), or WorkUnitCompleted facts.',
-  ];
-  if (acceptedPlan) {
-    const currentTask = acceptedPlan.tasks.find((task) => !acceptedPlan.completedTaskIds.includes(task.taskId));
-    const currentTaskOperations = objectRecord(executionPromptCoordinator().sanitizedContext(acceptedPlan))?.currentTaskOperations;
-    hints.push(
-      `Accepted taskPlan active: planId=${acceptedPlan.planId}; currentTask=${currentTask?.taskId ?? 'complete'}; completedTasks=${acceptedPlan.completedTaskIds.length}/${acceptedPlan.tasks.length}. Automatic execution is allowed only for the current task when targets and capabilities stay inside the accepted plan.`,
-      currentTask
-        ? `Current accepted taskPlan task: taskId=${currentTask.taskId}; targets=${currentTask.targets.length ? currentTask.targets.join(', ') : 'none'}; capability=${currentTask.capability ?? 'none'}.`
-        : 'Current accepted taskPlan task is complete or unavailable; return diagnostic or review-ready summary rather than expanding scope.',
-      Array.isArray(currentTaskOperations) && currentTaskOperations.length
-        ? `Accepted current task operations: ${JSON.stringify(currentTaskOperations)}.`
-        : 'Accepted current task operations: none.',
-      'Exact file operations such as fs.delete/fs.rename are authorized by exact operation grants, not by provider-declared scope fields.',
-      acceptedPlan.executionRoot
-        ? `Accepted taskPlan primary root: ${acceptedPlan.executionRoot.ref}. Workspace actionBundle targetPath/codeBlock paths must be relative to this root and must not include the root directory name. Absolute paths are allowed only for outside-workspace targets already reviewed in the accepted plan.`
-        : 'Accepted taskPlan primary root is not explicit; use relative target paths from the authorized workspace root unless the accepted plan explicitly contains outside-workspace absolute file targets.',
-      'Do not ask the user to reconfirm routine implementation batches already covered by the accepted taskPlan. If new targets, capabilities, or material technical choices are needed during accepted execution, return decisionRequest instead of an out-of-scope actionBundle.'
-    );
-  }
-  if (context.recentPlanSummaries.length) {
-    hints.push(`Recent implementation batch plans (intent only, not execution facts): ${context.recentPlanSummaries.join(' | ')}`);
-  }
-  if (context.continuationSummaries.length) {
-    hints.push(`Pending continuation expectations (intent only, not files already created): ${context.continuationSummaries.join(' | ')}`);
-  }
-  return hints;
-}
-
-function providerRepairMessageState(state: SessionDriverLoopRunState): ProviderRepairMessageState {
-  return {
-    runId: state.runId,
-    userRequest: state.userRequest,
-    conversationRoots: state.conversationRoots,
-    resourcePackets: state.resourcePackets,
-    implementationBatch: state.implementationBatch,
-    acceptedContext: executionPromptCoordinator().sanitizedContext(state.acceptedImplementationPlan),
-    currentTaskContext: state.currentTaskContext
-      ? {
-        taskId: state.currentTaskContext.taskId,
-        taskTitle: state.currentTaskContext.taskTitle,
-        goal: state.currentTaskContext.goal,
-        targets: state.currentTaskContext.targets,
-        capabilities: state.currentTaskContext.capabilities,
-      }
-      : undefined,
-    completedTaskCount: state.acceptedImplementationPlan?.completedTaskIds.length ?? 0,
-  };
 }
 
 function normalizedNonNegativeInteger(value: unknown): number | undefined {
