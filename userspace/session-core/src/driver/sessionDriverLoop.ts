@@ -145,6 +145,7 @@ import {
   PlanInteractionIndex,
   PlanReviewGrantProjector,
   PlanReviewReportAnalyzer,
+  ProviderPlanProposalHandler,
   ProposalSemanticValidator,
   ProtocolGate,
   type PlanContext as SessionPlanContext,
@@ -504,6 +505,7 @@ export class SessionDriverLoop {
   private readonly permissionDecisionHandler: PermissionDecisionHandler<SessionPlanContext>;
   private readonly planDecisionHandler: PlanDecisionHandler;
   private readonly providerDecisionRequestHandler: ProviderDecisionRequestHandler<SessionDriverLoopInput, SessionDriverLoopRunState>;
+  private readonly providerPlanProposalHandler: ProviderPlanProposalHandler<SessionDriverLoopRunState>;
   private readonly requirementConfirmationCoordinator: RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementDecisionHandler: RequirementDecisionHandler;
   private readonly reviewDecisionHandler: ReviewDecisionHandler;
@@ -943,6 +945,15 @@ export class SessionDriverLoop {
       confirmationEvent: (confirmationInput) =>
         requirementProjectionBuilder.confirmationEvent(confirmationInput),
       interactionOverlayPayload: (overlay) => interactionOverlayCodec.toPayload(overlay),
+      sessionRunStateEvent: (runStateInput) =>
+        sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
+    });
+    this.providerPlanProposalHandler = new ProviderPlanProposalHandler<SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      implementationPlanCardEvent: (planInput) =>
+        planProjectionBuilder.implementationPlanCardEvent(planInput),
       sessionRunStateEvent: (runStateInput) =>
         sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
     });
@@ -1614,30 +1625,7 @@ export class SessionDriverLoop {
         ]);
       }
       if (proposal.kind === 'taskPlan' || proposal.kind === 'implementationPlan') {
-        const planId = stringValue(objectRecord(proposal.payload)?.id) ?? proposal.proposalId;
-        state.phase = 'waiting_plan_review';
-        return this.append(sessionId, [
-          planProjectionBuilder.implementationPlanCardEvent({
-            state,
-            proposal,
-            ts: this.ts(),
-            id: this.id('task-plan'),
-          }),
-          sessionProgressProjectionBuilder.sessionRunStateEvent({
-            sessionId,
-            runId: state.runId,
-            phase: 'waiting_plan_review',
-            reason: 'plan_review',
-            decisionOwner: {
-              kind: 'plan',
-              runId: state.runId,
-              targetId: planId,
-              planId,
-            },
-            ts: this.ts(),
-            id: this.id('session-run-waiting-plan'),
-          }),
-        ]);
+        return this.providerPlanProposalHandler.handle(state, proposal);
       }
       if (proposal.kind === 'resourceRequest') {
         const handled = await this.resourceRequestProposalHandler.handle({
