@@ -3,6 +3,7 @@ export * from './interactionOverlayCodec.js';
 export * from './nativeToolHandlerPortsFactory.js';
 export * from './nativeToolProgressEventBuilder.js';
 export * from './nativeToolProviderLoop.js';
+export * from './nativeToolProviderCoordinator.js';
 export * from './nativeToolProjectionBuilder.js';
 export * from './nativeToolResultMessageBuilder.js';
 export * from './nativeToolResourceRecorder.js';

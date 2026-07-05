@@ -78,6 +78,7 @@ import {
   NativeToolCoordinatorError,
   NativeToolHandlerPortsFactory,
   NativeToolProgressEventBuilder,
+  NativeToolProviderCoordinator,
   NativeToolProviderLoop,
   NativeToolProjectionBuilder,
   NativeToolRepairCoordinator,
@@ -96,9 +97,7 @@ import {
   ProviderTraceRecorder,
   ProviderToolCallBuffer,
   type ProviderPartFrameParser,
-  type NativeToolHandlingResult,
   type NativeToolReadLedgerEntry,
-  type NativeToolReadSignature,
   type NativeToolCallProposal,
 } from './pipelines/providerPipeline.js';
 import { InteractionOverlayCodec, type InteractionOverlayContext, type SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
@@ -509,6 +508,7 @@ export class SessionDriverLoop {
   private readonly resourceOrchestrator: ResourceOrchestrator<SessionDriverLoopRunState>;
   private readonly resourceRequestRepairCoordinator: ResourceRequestRepairCoordinator<SessionDriverLoopRunState>;
   private readonly nativeToolHandlerPortsFactory: NativeToolHandlerPortsFactory<SessionDriverLoopRunState, PromptEnvelope, LlmTurnResult>;
+  private readonly nativeToolProviderCoordinator: NativeToolProviderCoordinator<SessionDriverLoopRunState, LlmTurnResult>;
   private readonly providerStreamRuntime: ProviderStreamRuntime<SessionDriverLoopRunState>;
   private readonly providerProposalCoordinator: ProviderProposalCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly providerTurnRunner: ProviderTurnRunner<SessionDriverLoopRunState>;
@@ -1154,6 +1154,39 @@ export class SessionDriverLoop {
       now: () => this.ts(),
       createId: (prefix) => this.id(prefix),
     });
+    this.nativeToolProviderCoordinator = new NativeToolProviderCoordinator<SessionDriverLoopRunState, LlmTurnResult>({
+      providerLoop: nativeToolProviderLoop,
+      handlerPortsFactory: this.nativeToolHandlerPortsFactory,
+      repairRunner: nativeToolRepairRunner,
+      providerTools: (state) => nativeToolCoordinator.providerTools(state),
+      readManifest: (state, toolCall) => nativeToolCoordinator.readManifest(state, toolCall),
+      resolveResource: (state, manifest) => this.resourceOrchestrator.resolve(state, manifest),
+      runTurn: (profileId, state, stage, messages, options) =>
+        this.llmTurn(profileId, state, stage, messages, options),
+      isEmptyResponseError,
+      consumeGuidanceMessages: (state, stage) =>
+        this.consumeQueuedGuidanceForProviderResume(state, stage),
+      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      buildSideEffectRepairMessages: (prompt, state, toolCall, turn, acceptedExecution) =>
+        providerRepairMessageBuilder.sideEffectNativeToolRepairMessages(
+          prompt,
+          providerRepairMessageState(state),
+          toolCall,
+          turn,
+          acceptedExecution
+        ),
+      buildDuplicateRepairMessages: (prompt, state, turn, duplicates, acceptedExecution) =>
+        providerRepairMessageBuilder.nativeToolDuplicateRepairMessages(
+          prompt,
+          providerRepairMessageState(state),
+          turn,
+          duplicates,
+          acceptedExecution
+        ),
+      runRepair: (profileId, state, stage, messages) => this.llm(profileId, state, stage, messages),
+      repairErrorMessage: (error) => normalizeParseError(error).message,
+      createError: (code, message) => new SessionDriverLoopError(code, message),
+    });
     this.providerStreamRuntime = new ProviderStreamRuntime<SessionDriverLoopRunState>({
       reasoningFlushChars: PROVIDER_REASONING_FLUSH_CHARS,
       reasoningFlushMs: PROVIDER_REASONING_FLUSH_MS,
@@ -1657,28 +1690,11 @@ export class SessionDriverLoop {
     prompt: PromptEnvelope,
     contract: ProviderTurnContract
   ): Promise<string | ProposalEnvelope> {
-    return nativeToolProviderLoop.run({
+    return this.nativeToolProviderCoordinator.run({
       profileId: input.profileId,
       state,
       prompt,
       contract,
-      providerTools: nativeToolCoordinator.providerTools(state),
-      runTurn: (profileId, runState, retryStage, retryMessages, options) =>
-        this.llmTurn(profileId, runState, retryStage, retryMessages, options),
-      isEmptyResponseError,
-      consumeGuidanceMessages: (runState, stage) =>
-        this.consumeQueuedGuidanceForProviderResume(runState, stage),
-      handlerPorts: this.nativeToolHandlerPortsFactory.create({
-        prompt,
-        repairSideEffect: (runState, repairPrompt, toolCall, turn) =>
-          this.repairSideEffectNativeTool(input, runState, repairPrompt, toolCall, turn),
-        tryParseTurnProposal: (runState, turn) =>
-          this.tryParseNativeToolTurnProposal(runState, turn),
-        repairDuplicate: (runState, repairPrompt, turn, duplicates) =>
-          this.repairDuplicateNativeReadTool(input, runState, repairPrompt, turn, duplicates),
-        resolveReadToolCall: (runState, toolCall) =>
-          this.resolveNativeReadToolCall(runState, toolCall),
-      }),
     });
   }
 
@@ -1714,90 +1730,6 @@ export class SessionDriverLoop {
         'accepted_plan_provider_tool_violation',
         `Complete-stage provider requested native tool ${result.toolCall.name}; proposal-only repair failed: ${result.message}`
       );
-    }
-    const exhaustive: never = result;
-    return exhaustive;
-  }
-
-  private async resolveNativeReadToolCall(
-    state: SessionDriverLoopRunState,
-    toolCall: NativeToolCallProposal
-  ): Promise<ResourcePacket> {
-    const manifest = nativeToolCoordinator.readManifest(state, toolCall);
-    return this.resourceOrchestrator.resolve(state, manifest);
-  }
-
-  private async repairSideEffectNativeTool(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    toolCall: NativeToolCallProposal,
-    turn: LlmTurnResult
-  ): Promise<ProposalEnvelope> {
-    const acceptedExecution = Boolean(state.acceptedImplementationPlan) || state.implementationBatch.batchIndex > 1;
-    const result = await nativeToolRepairRunner.repairSideEffect({
-      state,
-      toolCall,
-      turn,
-      acceptedExecution,
-      emitProjectionDelta: (runState, delta) => this.emitProjectionDelta(runState, delta),
-      buildRepairMessages: (repairToolCall, repairTurn, repairAcceptedExecution) =>
-        providerRepairMessageBuilder.sideEffectNativeToolRepairMessages(
-          prompt,
-          providerRepairMessageState(state),
-          repairToolCall,
-          repairTurn,
-          repairAcceptedExecution
-        ),
-      runRepair: (stage, messages) => this.llm(input.profileId, state, stage, messages),
-      repairErrorMessage: (error) => normalizeParseError(error).message,
-    });
-    if (result.kind === 'proposal') return result.proposal;
-    if (result.kind === 'failed') {
-      throw new SessionDriverLoopError(result.code, result.message);
-    }
-    const exhaustive: never = result;
-    return exhaustive;
-  }
-
-  private tryParseNativeToolTurnProposal(
-    state: SessionDriverLoopRunState,
-    turn: LlmTurnResult
-  ): ProposalEnvelope | null {
-    return nativeToolRepairRunner.parseTurnProposal(state, turn);
-  }
-
-  private async repairDuplicateNativeReadTool(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    turn: LlmTurnResult,
-    duplicates: Array<{ toolCall: NativeToolCallProposal; signature: NativeToolReadSignature; entry: NativeToolReadLedgerEntry }>
-  ): Promise<ProposalEnvelope> {
-    const result = await nativeToolRepairRunner.repairDuplicate({
-      state,
-      turn,
-      duplicates,
-      duplicateRepairAttempted: state.nativeToolDuplicateRepairAttempted,
-      markDuplicateRepairAttempted: () => {
-        state.nativeToolDuplicateRepairAttempted = true;
-      },
-      emitProjectionDelta: (runState, delta) => this.emitProjectionDelta(runState, delta),
-      buildRepairMessages: (repairTurn, repairDuplicates, acceptedExecution) =>
-        providerRepairMessageBuilder.nativeToolDuplicateRepairMessages(
-          prompt,
-          providerRepairMessageState(state),
-          repairTurn,
-          repairDuplicates,
-          acceptedExecution
-        ),
-      runRepair: (stage, messages) => this.llm(input.profileId, state, stage, messages),
-      repairErrorMessage: (error) => normalizeParseError(error).message,
-      acceptedExecution: Boolean(state.acceptedImplementationPlan) || state.implementationBatch.batchIndex > 1,
-    });
-    if (result.kind === 'proposal') return result.proposal;
-    if (result.kind === 'failed') {
-      throw new SessionDriverLoopError(result.code, result.message);
     }
     const exhaustive: never = result;
     return exhaustive;
