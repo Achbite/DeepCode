@@ -4,9 +4,6 @@ export interface CompletedWorkUnitFacts {
 }
 
 export interface CompletedWorkUnitFactIndexPorts {
-  objectRecord(value: unknown): Record<string, unknown> | undefined;
-  stringValue(value: unknown): string | undefined;
-  stringArrayValue(value: unknown): string[];
   kernelEventTargets(record: Record<string, unknown>): string[];
   normalizeRelativePath(value: string | undefined): string | undefined;
   comparablePath(value: string): string;
@@ -19,14 +16,14 @@ export class CompletedWorkUnitFactIndex {
     const actionIds = new Set<string>();
     const targets = new Set<string>();
     for (const event of events) {
-      const record = this.ports.objectRecord(event);
+      const record = objectRecord(event);
       if (record?.kind !== 'work_unit.completed') continue;
-      const workUnit = this.ports.objectRecord(record.workUnit);
-      const output = this.ports.objectRecord(record.output);
+      const workUnit = objectRecord(record.workUnit);
+      const output = objectRecord(record.output);
       for (const value of [
-        this.ports.stringValue(record.actionId),
-        this.ports.stringValue(workUnit?.actionId),
-        this.ports.stringValue(output?.actionId),
+        stringValue(record.actionId),
+        stringValue(workUnit?.actionId),
+        stringValue(output?.actionId),
       ]) {
         if (value) actionIds.add(value);
       }
@@ -49,7 +46,27 @@ export class CompletedWorkUnitFactIndex {
 
   codeBlockContent(block: Record<string, unknown>): string | undefined {
     if (typeof block.content === 'string') return block.content;
-    const lines = this.ports.stringArrayValue(block.contentLines);
+    const lines = stringArrayValue(block.contentLines);
     return lines.length ? lines.join('\n') : undefined;
   }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    const single = stringValue(value);
+    return single ? [single] : [];
+  }
+  return value
+    .map((item) => stringValue(item))
+    .filter((item): item is string => Boolean(item));
 }

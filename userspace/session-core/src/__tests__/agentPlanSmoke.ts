@@ -3359,15 +3359,6 @@ function assertCompletedWorkUnitFactIndexMatchesActionAndTarget(): void {
   const actionId = `action-${token}`;
   const targetPath = `scope-${token}/target-${randomSmokeToken('file')}.txt`;
   const index = new CompletedWorkUnitFactIndex({
-    objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : undefined,
-    stringValue: (value) => typeof value === 'string' && value.trim() ? value : undefined,
-    stringArrayValue: (value) => Array.isArray(value)
-      ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-      : typeof value === 'string' && value.trim()
-        ? [value]
-        : [],
     kernelEventTargets: (record) => {
       const output = record.output && typeof record.output === 'object' && !Array.isArray(record.output)
         ? record.output as Record<string, unknown>

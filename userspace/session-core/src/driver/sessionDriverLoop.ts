@@ -425,9 +425,6 @@ const acceptedPlanBatchPreflight = new AcceptedPlanBatchPreflight({
   containsDirectoryPath: (resourcePackets, path) => resourceRequestLoop.containsDirectoryPath(resourcePackets, path),
 });
 const completedWorkUnitFactIndex = new CompletedWorkUnitFactIndex({
-  objectRecord,
-  stringValue,
-  stringArrayValue,
   kernelEventTargets: (record) => kernelEventProjectionBuilder.kernelEventTargets(record),
   normalizeRelativePath: (value) => pathIdentity.normalizeRelativePath(value),
   comparablePath: (value) => pathIdentity.comparablePath(value),
