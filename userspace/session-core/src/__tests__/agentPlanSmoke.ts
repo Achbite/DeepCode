@@ -3462,15 +3462,6 @@ function assertAcceptedPlanBatchPreflightAuditsDeleteActions(): void {
         ? record.actions.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
         : [];
     },
-    objectRecord: (value) => value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : undefined,
-    stringValue: (value) => typeof value === 'string' && value.trim() ? value.trim() : undefined,
-    stringArrayValue: (value) => Array.isArray(value)
-      ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-      : typeof value === 'string' && value.trim()
-        ? [value.trim()]
-        : [],
     actionEffectiveCapability: (action) => typeof action.capability === 'string' && action.capability.trim()
       ? action.capability.trim()
       : typeof action.toolId === 'string'

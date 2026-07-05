@@ -417,9 +417,6 @@ const acceptedPlanScopeDecisionOverlay = new AcceptedPlanScopeDecisionOverlay({
 });
 const acceptedPlanBatchPreflight = new AcceptedPlanBatchPreflight({
   batchActionRecords: (batch) => driverActivityBuilder.batchActionRecords(batch),
-  objectRecord,
-  stringValue,
-  stringArrayValue,
   actionEffectiveCapability: (action) => actionBundleActionInspector.actionEffectiveCapability(action),
   actionFileTargetPath: (action) => actionBundleActionInspector.actionFileTargetPath(action),
   deleteActionTargetResourceKind: (action) => actionBundleActionInspector.deleteActionTargetResourceKind(action),

@@ -2,9 +2,6 @@ import type { ResourcePacket } from '../../context/types.js';
 
 export interface AcceptedPlanBatchPreflightPorts {
   batchActionRecords(batch: unknown): Record<string, unknown>[];
-  objectRecord(value: unknown): Record<string, unknown> | undefined;
-  stringValue(value: unknown): string | undefined;
-  stringArrayValue(value: unknown): string[];
   actionEffectiveCapability(action: Record<string, unknown>): string;
   actionFileTargetPath(action: Record<string, unknown>): string | undefined;
   deleteActionTargetResourceKind(action: Record<string, unknown>): 'file' | 'directory' | undefined;
@@ -20,17 +17,17 @@ export class AcceptedPlanBatchPreflight {
     return {
       actionCount: this.ports.batchActionRecords(batch).length,
       actions: this.ports.batchActionRecords(batch).map((action) => ({
-        actionId: this.ports.stringValue(action.actionId) ?? this.ports.stringValue(action.id),
-        toolId: this.ports.stringValue(action.toolId),
+        actionId: stringValue(action.actionId) ?? stringValue(action.id),
+        toolId: stringValue(action.toolId),
         capability: this.ports.actionEffectiveCapability(action),
-        kind: this.ports.stringValue(action.kind),
-        targetRef: this.ports.objectRecord(action.targetRef) ?? this.ports.stringValue(action.targetRef),
-        targetPath: this.ports.stringValue(action.targetPath),
-        targetKind: this.ports.stringValue(action.targetKind) ?? this.ports.stringValue(action.targetResourceKind),
+        kind: stringValue(action.kind),
+        targetRef: objectRecord(action.targetRef) ?? stringValue(action.targetRef),
+        targetPath: stringValue(action.targetPath),
+        targetKind: stringValue(action.targetKind) ?? stringValue(action.targetResourceKind),
         recursive: action.recursive === true,
-        resourceScope: this.ports.stringArrayValue(action.resourceScope),
-        sourceBlockId: this.ports.stringValue(action.sourceBlockId),
-        replacementBlockId: this.ports.stringValue(action.replacementBlockId),
+        resourceScope: stringArrayValue(action.resourceScope),
+        sourceBlockId: stringValue(action.sourceBlockId),
+        replacementBlockId: stringValue(action.replacementBlockId),
       })),
     };
   }
@@ -56,10 +53,30 @@ export class AcceptedPlanBatchPreflight {
           reasons.push(`actionBatch.actions[${index}] fs.delete directory target ${normalizedDirectory} must explicitly set recursive=true or use an empty-directory deletion semantic.`);
         }
       }
-      if (this.ports.stringValue(action.sourceBlockId) || this.ports.stringValue(action.replacementBlockId)) {
+      if (stringValue(action.sourceBlockId) || stringValue(action.replacementBlockId)) {
         reasons.push(`actionBatch.actions[${index}] fs.delete must not reference a codeBlock.`);
       }
     }
     return [...new Set(reasons)];
   }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    const single = stringValue(value);
+    return single ? [single] : [];
+  }
+  return value
+    .map((item) => stringValue(item))
+    .filter((item): item is string => Boolean(item));
 }
