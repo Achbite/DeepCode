@@ -93,6 +93,7 @@ import {
   ProviderProposalCoordinator,
   ProviderStreamCoordinator,
   ProviderStreamRuntime,
+  ProviderTurnPolicy,
   ProviderTurnRunner,
   ProviderTraceRecorder,
   ProviderToolCallBuffer,
@@ -510,6 +511,9 @@ const SIDE_EFFECT_CAPABILITIES = new Set([
   'browser.control',
   'provider.egress',
 ]);
+const providerTurnPolicy = new ProviderTurnPolicy({
+  sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
+});
 
 export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
@@ -1531,7 +1535,7 @@ export class SessionDriverLoop {
           allowBriefActionBundleUserPlan: parseInput.allowBriefActionBundleUserPlan,
         }),
       shouldAttemptActionBundleCompactionRepair: (state) =>
-        shouldAttemptActionBundleCompactionRepair(state),
+        providerTurnPolicy.shouldAttemptActionBundleCompactionRepair(state),
       normalizeParseError: (error) => normalizeParseError(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       isDriverErrorCode: (error, code) =>
@@ -1543,7 +1547,7 @@ export class SessionDriverLoop {
       append: (sessionId, events) => this.append(sessionId, events),
       assembleContext: (contextInput) => assembleContext(contextInput),
       allowedProposals: (kernelAllowed, state) =>
-        sessionProviderAllowedProposals(kernelAllowed, state),
+        providerTurnPolicy.allowedProposals(kernelAllowed, state),
       capabilityCatalogSummary: (state) => nativeToolCoordinator.capabilityCatalogSummary(state),
       memoryHints: (state) => [
         ...acceptedPlanTaskLedger().memoryHints(state.currentTaskContext),
@@ -2021,26 +2025,6 @@ function executionPromptCoordinator(): ExecutionPromptCoordinator<SessionPlanCon
     defaultValidationExpectation: (actions) => validator.defaultValidationExpectation(actions),
     defaultReviewExpectation: (actions) => validator.defaultReviewExpectation(actions),
   });
-}
-
-function shouldAttemptActionBundleCompactionRepair(state: SessionDriverLoopRunState): boolean {
-  if (!state.acceptedImplementationPlan && !state.currentTaskContext) return false;
-  const allowed = state.stateContract?.allowedProposals ?? state.driverRequest?.stateContract?.allowedProposals ?? [];
-  if (allowed.length && !allowed.includes('actionBundle')) return false;
-  const capabilities = state.stateContract?.capabilityProjection ?? state.driverRequest?.stateContract?.capabilityProjection ?? [];
-  return capabilities.some((capability) => SIDE_EFFECT_CAPABILITIES.has(capability));
-}
-
-function sessionProviderAllowedProposals(allowed: string[], state: SessionDriverLoopRunState): string[] {
-  const merged = new Set(allowed);
-  if (state.acceptedImplementationPlan) {
-    merged.delete('taskPlan');
-    merged.delete('implementationPlan');
-    for (const kind of ['actionBundle', 'resourceRequest', 'decisionRequest', 'diagnostic']) merged.add(kind);
-  } else {
-    merged.add('taskPlan');
-  }
-  return [...merged];
 }
 
 function executionSliceRoleValue(value: unknown): ExecutionSliceRole | undefined {

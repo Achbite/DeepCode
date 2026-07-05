@@ -28,6 +28,7 @@ export { ProposalOnlyProviderRunner } from './proposalOnlyProviderRunner.js';
 export { ProviderProposalCoordinator } from './providerProposalCoordinator.js';
 export { ProviderStreamCoordinator } from './providerStreamCoordinator.js';
 export { ProviderStreamRuntime, type ProviderReasoningDeltaBuffer } from './providerStreamRuntime.js';
+export { ProviderTurnPolicy } from './providerTurnPolicy.js';
 export { ProviderTurnRunner, type ProviderTurnResult } from './providerTurnRunner.js';
 export { ProviderTraceRecorder } from './providerTraceRecorder.js';
 

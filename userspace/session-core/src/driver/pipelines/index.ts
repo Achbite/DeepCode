@@ -19,6 +19,7 @@ export * from './providerPipeline.js';
 export * from './providerRuntimeBridge.js';
 export * from './providerStreamCoordinator.js';
 export * from './providerStreamRuntime.js';
+export * from './providerTurnPolicy.js';
 export * from './providerTurnRunner.js';
 export * from './providerTurnCycle.js';
 export * from './providerTraceRecorder.js';
