@@ -146,6 +146,7 @@ import {
   PlanReviewGrantProjector,
   PlanReviewReportAnalyzer,
   ProviderPlanProposalHandler,
+  ProviderTerminalProposalHandler,
   ProposalSemanticValidator,
   ProtocolGate,
   type PlanContext as SessionPlanContext,
@@ -506,6 +507,7 @@ export class SessionDriverLoop {
   private readonly planDecisionHandler: PlanDecisionHandler;
   private readonly providerDecisionRequestHandler: ProviderDecisionRequestHandler<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly providerPlanProposalHandler: ProviderPlanProposalHandler<SessionDriverLoopRunState>;
+  private readonly providerTerminalProposalHandler: ProviderTerminalProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementConfirmationCoordinator: RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>;
   private readonly requirementDecisionHandler: RequirementDecisionHandler;
   private readonly reviewDecisionHandler: ReviewDecisionHandler;
@@ -956,6 +958,17 @@ export class SessionDriverLoop {
         planProjectionBuilder.implementationPlanCardEvent(planInput),
       sessionRunStateEvent: (runStateInput) =>
         sessionProgressProjectionBuilder.sessionRunStateEvent(runStateInput),
+    });
+    this.providerTerminalProposalHandler = new ProviderTerminalProposalHandler<SessionDriverLoopInput, SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      append: (sessionId, events) => this.append(sessionId, events),
+      reviseAnswer: (handlerInput, state, proposal) =>
+        this.maybeReviseTerminalAnswerWithGuidance(handlerInput, state, proposal),
+      answerEvent: (answerSessionId, proposal, ts, id) =>
+        assistantProjectionBuilder.answerEvent(answerSessionId, proposal, ts, id),
+      finalDiagnosticEvent: (diagnosticSessionId, summary, ts, id) =>
+        assistantProjectionBuilder.finalDiagnosticEvent(diagnosticSessionId, summary, ts, id),
     });
     this.requirementConfirmationCoordinator = new RequirementConfirmationCoordinator<SessionDriverLoopInput, SessionDriverLoopRunState>({
       now: () => this.ts(),
@@ -1608,21 +1621,13 @@ export class SessionDriverLoop {
         lastResult = await this.append(sessionId, [narration]);
       }
       if (proposal.kind === 'answer') {
-        const revised = await this.maybeReviseTerminalAnswerWithGuidance(input, state, proposal);
-        if (revised) return revised;
-        return this.append(sessionId, [assistantProjectionBuilder.answerEvent(sessionId, proposal, this.ts(), this.id('answer'))]);
+        return this.providerTerminalProposalHandler.handleAnswer(input, state, proposal);
       }
       if (proposal.kind === 'decisionRequest') {
         return this.providerDecisionRequestHandler.handle(input, state, proposal);
       }
       if (proposal.kind === 'diagnostic') {
-        const diagnostic = objectRecord(proposal.payload) ?? {};
-        const summary = stringValue(diagnostic.summary)
-          ?? stringValue(diagnostic.details)
-          ?? 'The model returned diagnostic information without generating a plan or execution queue.';
-        return this.append(sessionId, [
-          assistantProjectionBuilder.finalDiagnosticEvent(sessionId, summary, this.ts(), this.id('diagnostic')),
-        ]);
+        return this.providerTerminalProposalHandler.handleDiagnostic(state, proposal);
       }
       if (proposal.kind === 'taskPlan' || proposal.kind === 'implementationPlan') {
         return this.providerPlanProposalHandler.handle(state, proposal);
