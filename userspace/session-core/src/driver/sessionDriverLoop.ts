@@ -48,10 +48,9 @@ import {
   type ImplementationBatchContext,
   type TaskExecutionCursor,
 } from './execution/index.js';
-import {
-  AgentPlanParseError,
-  type ProposalEnvelope,
-  type ResourceRequestDraft,
+import type {
+  ProposalEnvelope,
+  ResourceRequestDraft,
 } from '../agent-plan/types.js';
 import type {
   InitialContextPacket,
@@ -125,7 +124,7 @@ import {
   type GeneratedArtifactEvidence,
   type ResourceRequestResolution,
 } from './context/index.js';
-import { DriverFailureMessageCatalog } from './diagnostics/index.js';
+import { DriverFailureMessageCatalog, DriverParseErrorCatalog } from './diagnostics/index.js';
 import type { RequirementRecord } from '../requirement/types.js';
 import type { TranscriptEntry } from '../transcript.js';
 import {
@@ -515,6 +514,7 @@ const providerTurnPolicy = new ProviderTurnPolicy({
   sideEffectCapabilities: SIDE_EFFECT_CAPABILITIES,
 });
 const driverFailureMessageCatalog = new DriverFailureMessageCatalog();
+const driverParseErrorCatalog = new DriverParseErrorCatalog();
 
 export class SessionDriverLoop {
   private readonly agentRunReactor: AgentRunReactor<SessionDriverLoopRunState>;
@@ -829,7 +829,7 @@ export class SessionDriverLoop {
       repairMessageBuilder: providerRepairMessageBuilder,
       repairState: (state) => providerContextSupport.repairMessageState(state),
       createId: (prefix) => this.id(prefix),
-      parseError: (error) => normalizeParseError(error),
+      parseError: (error) => driverParseErrorCatalog.normalize(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       appendRepairNotice: (state, message) => this.append(state.sessionId, [
         assistantProjectionBuilder.thinkingEvent(
@@ -858,7 +858,7 @@ export class SessionDriverLoop {
     this.acceptedPlanScopeRepairCoordinator = new AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
       repairState: (state) => providerContextSupport.repairMessageState(state),
-      parseError: (error) => normalizeParseError(error),
+      parseError: (error) => driverParseErrorCatalog.normalize(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
         raw,
@@ -1105,7 +1105,7 @@ export class SessionDriverLoop {
     this.actionBundleAdmissionRepairCoordinator = new ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
       repairState: (state) => providerContextSupport.repairMessageState(state),
-      parseError: normalizeParseError,
+      parseError: (error) => driverParseErrorCatalog.normalize(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({ raw, runId: state.runId, sessionId: state.sessionId, source: 'llm', allowedKinds }),
     });
@@ -1264,7 +1264,7 @@ export class SessionDriverLoop {
           runRepair: (stage, messages) => this.providerRuntimeBridge.llm(repairInput.input.profileId, repairInput.state, stage, messages),
         }),
       repairErrorMessage: (error) =>
-        error instanceof SessionDriverLoopError ? error.message : normalizeParseError(error).message,
+        error instanceof SessionDriverLoopError ? error.message : driverParseErrorCatalog.message(error),
       resourceFollowup: (followupInput) =>
         this.actionBundleAdmissionResourceFollowupCoordinator.handle(followupInput),
       resumeAfterResourceFollowup: ({ originalInput, followup }) =>
@@ -1350,7 +1350,7 @@ export class SessionDriverLoop {
         source: 'llm',
         allowedKinds,
       }),
-      repairErrorMessage: (error) => normalizeParseError(error).message,
+      repairErrorMessage: (error) => driverParseErrorCatalog.message(error),
       thinkingEvent: (sessionId, content, ts, id) =>
         assistantProjectionBuilder.thinkingEvent(sessionId, content, ts, id),
       finalDiagnosticEvent: (sessionId, content, ts, id) =>
@@ -1366,7 +1366,7 @@ export class SessionDriverLoop {
     this.resourceRequestRepairCoordinator = new ResourceRequestRepairCoordinator<SessionDriverLoopRunState>({
       repairMessageBuilder: providerRepairMessageBuilder,
       repairState: (state) => providerContextSupport.repairMessageState(state),
-      parseError: (error) => normalizeParseError(error),
+      parseError: (error) => driverParseErrorCatalog.normalize(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       parseRepairedProposal: ({ raw, state, allowedKinds }) => protocolGate().parseAndValidateRepairedProposal({
         raw,
@@ -1418,7 +1418,7 @@ export class SessionDriverLoop {
           acceptedExecution
         ),
       runRepair: (profileId, state, stage, messages) => this.providerRuntimeBridge.llm(profileId, state, stage, messages),
-      repairErrorMessage: (error) => normalizeParseError(error).message,
+      repairErrorMessage: (error) => driverParseErrorCatalog.message(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
     });
     this.providerStreamRuntime = new ProviderStreamRuntime<SessionDriverLoopRunState>({
@@ -1486,7 +1486,7 @@ export class SessionDriverLoop {
           toolCall,
           turn
         ),
-      repairErrorMessage: (error) => normalizeParseError(error).message,
+      repairErrorMessage: (error) => driverParseErrorCatalog.message(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       isEmptyResponseError,
     });
@@ -1538,7 +1538,7 @@ export class SessionDriverLoop {
         }),
       shouldAttemptActionBundleCompactionRepair: (state) =>
         providerTurnPolicy.shouldAttemptActionBundleCompactionRepair(state),
-      normalizeParseError: (error) => normalizeParseError(error),
+      normalizeParseError: (error) => driverParseErrorCatalog.normalize(error),
       createError: (code, message) => new SessionDriverLoopError(code, message),
       isDriverErrorCode: (error, code) =>
         error instanceof SessionDriverLoopError && error.code === code,
@@ -2029,12 +2029,6 @@ function stringArrayValue(value: unknown): string[] {
   return value
     .map((item) => stringValue(item))
     .filter((item): item is string => Boolean(item));
-}
-
-function normalizeParseError(error: unknown): { code: string; message: string } {
-  if (error instanceof AgentPlanParseError) return { code: error.code, message: error.message };
-  if (error instanceof Error) return { code: 'parse_failed', message: error.message };
-  return { code: 'parse_failed', message: String(error) };
 }
 
 type VisibleLanguage = 'zh-CN' | 'en-US';
