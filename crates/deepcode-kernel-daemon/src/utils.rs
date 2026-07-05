@@ -37,7 +37,6 @@ pub(crate) fn distribution_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-
 pub(crate) fn env_truthy(name: &str) -> bool {
     std::env::var(name)
         .map(|value| {
