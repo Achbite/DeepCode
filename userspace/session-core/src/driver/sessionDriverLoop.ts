@@ -142,7 +142,7 @@ import {
   ReviewDecisionProjectionBuilder,
   type SessionReviewContext,
 } from './review/index.js';
-import { DecisionResolver, PermissionDecisionHandler, PlanDecisionHandler, ProviderDecisionRequestHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler, TerminalGuidanceRevisionCoordinator } from './interactions/index.js';
+import { DecisionResolver, DriverInteractionIndex, PermissionDecisionHandler, PlanDecisionHandler, ProviderDecisionRequestHandler, RequirementConfirmationCoordinator, RequirementDecisionHandler, ReviewDecisionHandler, TerminalGuidanceRevisionCoordinator } from './interactions/index.js';
 import {
   ActionProposalSubmitter,
   ActionBundleActionInspector,
@@ -317,6 +317,16 @@ const planInteractionIndex = new PlanInteractionIndex<SessionPlanContext>({
   planContextFromEvent: (event, payload) => planContextIndex.contextFromEvent(event, payload),
   findPlanCard: (events, runId, planId) => planContextIndex.findPlanCard(events, runId, planId),
   planAlreadyResolved: (events, plan) => planContextIndex.alreadyResolved(events, plan),
+});
+const driverInteractionIndex = new DriverInteractionIndex({
+  latestActiveReviewInteraction: (events) => reviewAssembler().findLatestActiveReviewInteraction(events),
+  latestActivePlanInteraction: (events) => planInteractionIndex.findLatestActivePlanInteraction(events),
+  latestActiveRequirementInteraction: (events) => userInputPipeline.findLatestActiveRequirementInteraction(events),
+  findPlanCard: (events, runId, planId) => planContextIndex.findPlanCard(events, runId, planId),
+  executionRootFromDecision: (input, events) => AcceptedPlanExecutionRootResolver.fromDecision(input, events),
+  buildAcceptedPlan: (input) => acceptedImplementationPlanContextBuilder().build(input),
+  withLatestCheckpoint: (acceptedPlan, events) => acceptedPlanTaskLedger().withLatestCheckpoint(acceptedPlan, events),
+  afterBatch: (acceptedPlan, completedTaskIds) => acceptedPlanTaskLedger().afterBatch(acceptedPlan, completedTaskIds),
 });
 const kernelEventProjectionBuilder = new KernelEventProjectionBuilder({
   requiredFileOperationsFromReport: (report) => planReviewGrantProjector.requiredFileOperationsFromReport(report),
@@ -901,13 +911,13 @@ export class SessionDriverLoop {
       resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
       executeAcceptedActionBundlePlan: (handlerInput, plan, initialResult, acceptedOverlay) =>
         this.acceptedActionBundlePlanExecutor.execute(handlerInput, plan, initialResult, acceptedOverlay),
-      activeDriverInteraction: (events) => findActiveDriverInteraction(events),
+      activeDriverInteraction: (events) => driverInteractionIndex.active(events),
       executionRootFromDecision: (handlerInput, events) =>
         AcceptedPlanExecutionRootResolver.fromDecision(handlerInput, events),
       buildAcceptedImplementationPlan: ({ plan, interventionLevel, executionRoot }) =>
         acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel, executionRoot }),
       recoverAcceptedPlanFromOverlay: (handlerInput, events, overlay) =>
-        recoverAcceptedPlanFromOverlay({ ...handlerInput, kind: 'plan' }, events, overlay),
+        driverInteractionIndex.recoverAcceptedPlanFromOverlay(handlerInput, events, overlay),
       planRevisionRequest: (request) => repairLoop.planRevisionRequest(request),
       executionRequest: (plan, acceptedPlan, guidance) => executionPromptCoordinator().executionRequest(plan, acceptedPlan, guidance),
       planIndex: planContextIndex,
@@ -919,13 +929,13 @@ export class SessionDriverLoop {
       createId: (prefix) => this.id(prefix),
       append: (sessionId, events) => this.append(sessionId, events),
       resumeUserTurn: (resumeInput) => this.runUserTurn(resumeInput),
-      activeDriverInteraction: (events) => findActiveDriverInteraction(events),
+      activeDriverInteraction: (events) => driverInteractionIndex.active(events),
       executionRootFromDecision: (handlerInput, events) =>
         AcceptedPlanExecutionRootResolver.fromDecision(handlerInput, events),
       buildAcceptedImplementationPlan: ({ plan, interventionLevel, executionRoot }) =>
         acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel, executionRoot }),
       recoverAcceptedPlanFromOverlay: (handlerInput, events, overlay) =>
-        recoverAcceptedPlanFromOverlay({ ...handlerInput, kind: 'requirement' }, events, overlay),
+        driverInteractionIndex.recoverAcceptedPlanFromOverlay(handlerInput, events, overlay),
       visibleLanguageForRequest,
       userInputPipeline,
       interactionOverlayCodec,
@@ -2021,11 +2031,6 @@ function shouldAttemptActionBundleCompactionRepair(state: SessionDriverLoopRunSt
   return capabilities.some((capability) => SIDE_EFFECT_CAPABILITIES.has(capability));
 }
 
-interface RecoveredAcceptedPlanContext {
-  plan: SessionPlanContext;
-  acceptedPlan: AcceptedImplementationPlanContext;
-}
-
 function sessionProviderAllowedProposals(allowed: string[], state: SessionDriverLoopRunState): string[] {
   const merged = new Set(allowed);
   if (state.acceptedImplementationPlan) {
@@ -2036,30 +2041,6 @@ function sessionProviderAllowedProposals(allowed: string[], state: SessionDriver
     merged.add('taskPlan');
   }
   return [...merged];
-}
-
-function recoverAcceptedPlanFromOverlay(
-  input: SessionDecisionResolverInput,
-  events: AgentEvent[],
-  overlay: InteractionOverlayContext | undefined
-): RecoveredAcceptedPlanContext | undefined {
-  const planId = overlay?.acceptedPlanId;
-  if (!planId) return undefined;
-  const plan = (overlay.acceptedPlanRunId ? planContextIndex.findPlanCard(events, overlay.acceptedPlanRunId, planId) : null)
-    ?? planContextIndex.findPlanCard(events, undefined, planId);
-  if (!plan?.implementationPlan) return undefined;
-  const executionRoot = plan.executionRoot ?? AcceptedPlanExecutionRootResolver.fromDecision(input, events);
-  let acceptedPlan = acceptedPlanTaskLedger().withLatestCheckpoint(
-    acceptedImplementationPlanContextBuilder().build({ plan, interventionLevel: input.interventionLevel, executionRoot }),
-    events
-  );
-  const overlayCompletedTaskIds = overlay.acceptedCompletedTaskIds ?? [];
-  if (overlayCompletedTaskIds.length) {
-    acceptedPlan = acceptedPlanTaskLedger().afterBatch(acceptedPlan, [
-      ...new Set([...acceptedPlan.completedTaskIds, ...overlayCompletedTaskIds]),
-    ]);
-  }
-  return { plan, acceptedPlan };
 }
 
 function executionSliceRoleValue(value: unknown): ExecutionSliceRole | undefined {
@@ -2084,19 +2065,6 @@ function nonAcceptedPlanPermissionGaps(report: Record<string, unknown>, accepted
     : [];
   const acceptedCapabilities = new Set(accepted.capabilities);
   return gaps.filter((capability) => !planReviewGrantProjector.planAcceptedAutoGrantCapability(capability) && !acceptedCapabilities.has(capability));
-}
-
-type DriverInteraction =
-  | { kind: 'review'; runId: string }
-  | { kind: 'plan'; runId: string; planId: string }
-  | { kind: 'requirement'; runId: string; requirementId: string };
-
-function findActiveDriverInteraction(events: AgentEvent[]): DriverInteraction | null {
-  const review = reviewAssembler().findLatestActiveReviewInteraction(events);
-  if (review) return review;
-  const plan = planInteractionIndex.findLatestActivePlanInteraction(events);
-  if (plan) return plan;
-  return userInputPipeline.findLatestActiveRequirementInteraction(events);
 }
 
 function safeSegment(value: string): string {

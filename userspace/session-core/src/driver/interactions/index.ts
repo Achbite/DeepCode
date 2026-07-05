@@ -1,4 +1,5 @@
 export * from './decisionResolver.js';
+export * from './driverInteractionIndex.js';
 export * from './planDecisionHandler.js';
 export * from './permissionDecisionHandler.js';
 export * from './providerDecisionRequestHandler.js';
