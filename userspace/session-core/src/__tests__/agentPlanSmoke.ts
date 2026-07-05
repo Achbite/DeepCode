@@ -69,7 +69,7 @@ import {
 import { InteractionOverlayCodec, NativeToolHandlerPortsFactory, NativeToolProgressEventBuilder, NativeToolProviderLoop, NativeToolProjectionBuilder, NativeToolRepairCoordinator, NativeToolRepairRunner, NativeToolResourceRecorder, NativeToolResultMessageBuilder, NativeToolResumeMessageBuilder, PermissionPipeline, ProposalOnlyProviderRunner, ProviderJsonModeCoordinator, ProviderPipeline, ProviderStreamCoordinator, ProviderStreamRuntime, ProviderToolCallBuffer, ProviderTraceRecorder, ProviderTurnRunner, UserGuidanceQueue, UserInputPipeline } from '../driver/pipelines/index.js';
 import { ActionBundleActionInspector, PlanContextIndex, PlanInteractionIndex, PlanReviewGrantProjector, PlanReviewReportAnalyzer, ProposalSemanticValidator, ProtocolGate } from '../driver/proposal/index.js';
 import { AssistantProjectionBuilder, DriverActivityBuilder, KernelEventProjectionBuilder, PlanProjectionBuilder, RequirementProjectionBuilder, ReviewProjectionBuilder, SessionFailureProjectionBuilder, SessionProgressProjectionBuilder } from '../driver/projection/index.js';
-import { AcceptedPlanReviewHandoffCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
+import { AcceptedPlanReviewHandoffCoordinator, AcceptedPlanStaticSyntaxReviewCoordinator, ReviewAssembler, ReviewDecisionProjectionBuilder } from '../driver/review/index.js';
 import { PermissionDecisionHandler, PlanDecisionHandler, RequirementDecisionHandler, ReviewDecisionHandler } from '../driver/interactions/index.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
 import { ProviderRepairMessageBuilder } from '../prompt/ProviderRepairMessageBuilder.js';
@@ -130,6 +130,7 @@ async function main(): Promise<void> {
   assertAcceptedPlanExecutorBuildsExecutionBatch();
   assertKernelEventStatusIndexReadsStructuredEvents();
   await assertAcceptedPlanReviewHandoffCoordinatorBuildsReviewState();
+  await assertAcceptedPlanStaticSyntaxReviewCoordinatorBuildsEvents();
   assertReviewAssemblerFormatsReviewFacts();
   assertReviewAssemblerFindsWaitingReviewContext();
   assertReviewDecisionProjectionUsesI18nKeys();
@@ -4470,6 +4471,87 @@ async function assertAcceptedPlanReviewHandoffCoordinatorBuildsReviewState(): Pr
   assertEqual(runStatePayload?.phase, 'waiting_review', 'review handoff enters waiting review');
   assertEqual(decisionOwner?.reviewId, reviewId, 'review handoff uses review id from summary');
   assertEqual(result.events.length, 2, 'review handoff returns append result');
+}
+
+async function assertAcceptedPlanStaticSyntaxReviewCoordinatorBuildsEvents(): Promise<void> {
+  const token = randomSmokeToken('static-review');
+  const sessionId = `session-${token}`;
+  const runId = `run-${token}`;
+  const planId = `plan-${token}`;
+  const targetPath = `generated-${token}.ts`;
+  const deltas: ProjectionDelta[] = [];
+  let providerStage = '';
+  let providerMessages: LlmChatRequest['messages'] = [];
+  const coordinator = new AcceptedPlanStaticSyntaxReviewCoordinator({
+    now: () => `ts-${token}`,
+    createId: (prefix) => `${prefix}-${token}`,
+    emitProjectionDelta: async (_state, delta) => {
+      deltas.push(delta);
+    },
+    runStaticSyntaxReview: async ({ stage, messages }) => {
+      providerStage = stage;
+      providerMessages = messages;
+      return JSON.stringify({
+        kind: 'staticSyntaxReview',
+        summary: `summary-${token}`,
+        issues: [{
+          targetPath,
+          severity: 'warning',
+          message: `issue-${token}`,
+        }],
+      });
+    },
+    event: (nextSessionId, kind, payload) => ({
+      id: `event-${token}`,
+      sessionId: nextSessionId,
+      ts: `ts-${token}`,
+      kind,
+      payload,
+    }),
+    reviewAssembler: {
+      staticSyntaxReviewPacket: () => ({
+        planId,
+        files: [{
+          targetPath,
+          language: 'typescript',
+          content: `const value${token.replace(/-/g, '')} = 1;`,
+          contentHash: `hash-${token}`,
+        }],
+      }),
+      staticSyntaxReviewMessages: () => [{
+        role: 'user',
+        content: `packet-${token}`,
+      }],
+      normalizeStaticSyntaxIssues: (value: unknown) => Array.isArray(value) ? value as Array<Record<string, unknown>> : [],
+    } as unknown as ReviewAssembler,
+  });
+
+  const events = await coordinator.run({
+    profileId: `profile-${token}`,
+    state: {
+      sessionId,
+      runId,
+      generatedArtifactEvidence: new Map(),
+      resourcePackets: [],
+    },
+    prompt: { stablePrefix: `stable-${token}`, messages: [] } as unknown as PromptEnvelope,
+    accepted: { planId } as unknown as AcceptedImplementationPlanContext,
+    batch: {},
+    batchEvents: [],
+  });
+
+  assertEqual(deltas.length, 1, 'static syntax review coordinator emits running projection delta');
+  assertEqual(deltas[0]?.sessionId, sessionId, 'static syntax review delta carries session id');
+  assertEqual((deltas[0]?.payload as any)?.messageKey, 'session.driver.acceptedPlanStaticSyntaxReviewRunning', 'static syntax review delta carries i18n key');
+  assertEqual(providerStage, 'accepted_plan_static_syntax_review', 'static syntax review coordinator uses expected provider stage');
+  assertEqual(providerMessages[0]?.content, `packet-${token}`, 'static syntax review coordinator uses assembler messages');
+  assertEqual(events.length, 1, 'static syntax review coordinator returns one workflow event');
+  assertEqual(events[0]?.kind, 'workflow_stage', 'static syntax review coordinator emits workflow stage event');
+  const payload = events[0]?.payload as Record<string, any>;
+  assertEqual(payload.stage, 'accepted_plan.static_syntax_review', 'static syntax review event uses accepted plan static review stage');
+  assertEqual(payload.status, 'blocked', 'static syntax review marks issues as blocked');
+  assertEqual(payload.messageKey, 'session.driver.acceptedPlanStaticSyntaxReviewBlocked', 'static syntax review event carries blocked i18n key');
+  assertEqual(payload.issues?.[0]?.targetPath, targetPath, 'static syntax review event carries normalized issue target');
 }
 
 function assertReviewAssemblerFormatsReviewFacts(): void {

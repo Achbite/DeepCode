@@ -128,6 +128,7 @@ import {
 import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 import {
   AcceptedPlanReviewHandoffCoordinator,
+  AcceptedPlanStaticSyntaxReviewCoordinator,
   ReviewAssembler,
   ReviewDecisionProjectionBuilder,
   type SessionReviewContext,
@@ -487,6 +488,7 @@ export class SessionDriverLoop {
   private readonly acceptedPlanScopeRepairCoordinator: AcceptedPlanScopeRepairCoordinator<SessionDriverLoopRunState>;
   private readonly acceptedPlanScopeResourceFollowupCoordinator: AcceptedPlanScopeResourceFollowupCoordinator<SessionDriverLoopRunState, AcceptedImplementationPlanContext>;
   private readonly acceptedPlanReviewHandoffCoordinator: AcceptedPlanReviewHandoffCoordinator<SessionPlanContext>;
+  private readonly acceptedPlanStaticSyntaxReviewCoordinator: AcceptedPlanStaticSyntaxReviewCoordinator<SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionRepairCoordinator: ActionBundleAdmissionRepairCoordinator<SessionDriverLoopRunState>;
   private readonly actionBundleAdmissionResourceFollowupCoordinator: ActionBundleAdmissionResourceFollowupCoordinator<SessionDriverLoopRunState>;
   private readonly permissionDecisionHandler: PermissionDecisionHandler<SessionPlanContext>;
@@ -573,6 +575,15 @@ export class SessionDriverLoop {
       acceptedPlanKernelEvents: ReviewFactsAggregator.acceptedPlanKernelEvents,
       reviewProjection: reviewProjectionBuilder,
       progressProjection: sessionProgressProjectionBuilder,
+    });
+    this.acceptedPlanStaticSyntaxReviewCoordinator = new AcceptedPlanStaticSyntaxReviewCoordinator<SessionDriverLoopRunState>({
+      now: () => this.ts(),
+      createId: (prefix) => this.id(prefix),
+      emitProjectionDelta: (state, delta) => this.emitProjectionDelta(state, delta),
+      runStaticSyntaxReview: ({ profileId, state, stage, messages }) =>
+        this.llm(profileId, state, stage, messages),
+      event: (sessionId, kind, payload) => this.event(sessionId, kind, payload),
+      reviewAssembler: reviewAssembler(),
     });
     this.permissionDecisionHandler = new PermissionDecisionHandler<SessionPlanContext>({
       now: () => this.ts(),
@@ -1973,88 +1984,6 @@ export class SessionDriverLoop {
     });
   }
 
-  private async maybeRunStaticSyntaxReview(
-    input: SessionDriverLoopInput,
-    state: SessionDriverLoopRunState,
-    prompt: PromptEnvelope,
-    accepted: AcceptedImplementationPlanContext,
-    batch: Record<string, unknown>,
-    batchEvents: unknown[]
-  ): Promise<AgentEvent[]> {
-    const packet = reviewAssembler().staticSyntaxReviewPacket({
-      accepted,
-      batch,
-      batchEvents,
-      generatedArtifactEvidence: state.generatedArtifactEvidence,
-      resourcePackets: state.resourcePackets,
-    });
-    if (!packet.files.length) return [];
-    await this.emitProjectionDelta(state, {
-      type: 'stage_delta',
-      stage: 'accepted_plan.static_syntax_review',
-      status: 'running',
-      channel: 'progress',
-      source: 'session',
-      summary: `Session 正在对 ${packet.files.length} 个生成代码文件做 Review 前静态语法/API 审查。`,
-      payload: {
-        runId: state.runId,
-        planId: accepted.planId,
-        targetPaths: packet.files.map((file) => file.targetPath),
-      },
-    });
-    let parsed: Record<string, unknown>;
-    try {
-      const raw = await this.llm(
-        input.profileId,
-        state,
-        'accepted_plan_static_syntax_review',
-        reviewAssembler().staticSyntaxReviewMessages({
-          prompt,
-          runId: state.runId,
-          accepted,
-          packet,
-        })
-      );
-      parsed = JSON.parse(raw) as Record<string, unknown>;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return [
-        this.event(state.sessionId, 'workflow_stage', {
-          kind: 'accepted_plan.static_syntax_review',
-          stage: 'accepted_plan.static_syntax_review',
-          status: 'failed',
-          channel: 'progress',
-          visibility: 'conversation',
-          presentation: 'collapsible',
-          runId: state.runId,
-          planId: accepted.planId,
-          summary: `Review 前静态审查未能解析：${message}`,
-          targetPaths: packet.files.map((file) => file.targetPath),
-          issues: [{ severity: 'warning', message }],
-        }),
-      ];
-    }
-    const issues = reviewAssembler().normalizeStaticSyntaxIssues(parsed.issues);
-    const status = issues.length ? 'blocked' : 'completed';
-    const summary = stringValue(parsed.summary)
-      ?? (issues.length ? `Review 前静态审查发现 ${issues.length} 个潜在问题。` : 'Review 前静态审查未发现明显语法/API 问题。');
-    return [
-      this.event(state.sessionId, 'workflow_stage', {
-        kind: 'accepted_plan.static_syntax_review',
-        stage: 'accepted_plan.static_syntax_review',
-        status,
-        channel: 'progress',
-        visibility: 'conversation',
-        presentation: 'collapsible',
-        runId: state.runId,
-        planId: accepted.planId,
-        summary,
-        targetPaths: packet.files.map((file) => file.targetPath),
-        issues,
-      }),
-    ];
-  }
-
   private async callProviderWithNativeTools(
     input: SessionDriverLoopInput,
     state: SessionDriverLoopRunState,
@@ -2942,14 +2871,14 @@ export class SessionDriverLoop {
       });
     }
 
-    const staticReviewEvents = await this.maybeRunStaticSyntaxReview(
-      input,
+    const staticReviewEvents = await this.acceptedPlanStaticSyntaxReviewCoordinator.run({
+      profileId: input.profileId,
       state,
       prompt,
       accepted,
       batch,
-      batchEvents
-    );
+      batchEvents,
+    });
     if (staticReviewEvents.length) {
       result = await this.append(state.sessionId, staticReviewEvents) ?? result;
     }
