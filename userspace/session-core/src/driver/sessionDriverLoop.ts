@@ -63,10 +63,8 @@ import {
   assembleContext,
   buildSessionMemoryDocument,
   collectUserGuidanceEvents,
-  type ContextAssemblyRecord,
   type PromptCachePlan,
   type ProjectMemoryMode,
-  type SessionMemoryDocument,
 } from '../context/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
 import { AcceptedPlanResourceResumePromptBuilder } from '../prompt/AcceptedPlanResourceResumePromptBuilder.js';
@@ -95,9 +93,6 @@ import {
   ProviderTurnRunner,
   ProviderTraceRecorder,
   ProviderToolCallBuffer,
-  type ProviderPartFrameParser,
-  type NativeToolReadLedgerEntry,
-  type NativeToolCallProposal,
 } from './pipelines/providerPipeline.js';
 import { InteractionOverlayCodec, type InteractionOverlayContext, type SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
 import { RunLifecyclePipeline } from './pipelines/lifecyclePipeline.js';
@@ -169,7 +164,7 @@ import {
   type SessionRunStateReason,
   type SessionRunStateStatus,
 } from './projection/index.js';
-import type { DriverProviderTurnFrame } from './runFrame.js';
+import type { DriverProviderTurnFrame, LlmTurnResult, SessionDriverLoopRunState } from './runFrame.js';
 import { AgentRunReactor } from './agentRunReactor.js';
 
 export interface SessionDriverLoopPorts {
@@ -226,60 +221,6 @@ export interface SessionDecisionResolverInput {
   interventionLevel?: InterventionLevel;
   projectMemoryMode?: ProjectMemoryMode;
   interactionOverlay?: InteractionOverlayContext;
-}
-
-interface SessionDriverLoopRunState {
-  sessionId: string;
-  runId: string;
-  userRequest: string;
-  phase: SessionTurnPhase;
-  workspaceScopeKey: string;
-  stateContract?: KernelStateContractRef;
-  driverRequest?: DriverRequestRef;
-  manifest: ResourceManifest;
-  conversationRoots: ConversationResourceRoot[];
-  initialContext: InitialContextPacket;
-  resourcePackets: ResourcePacket[];
-  generatedArtifactEvidence: Map<string, GeneratedArtifactEvidence>;
-  memoryDocument: SessionMemoryDocument;
-  memoryHints: string[];
-  cachePlan?: PromptCachePlan;
-  contextAssembly?: ContextAssemblyRecord;
-  taskExecutionCursor?: TaskExecutionCursor;
-  currentTaskContext?: CurrentTaskContext;
-  taskLedger?: TaskLedgerSnapshot;
-  acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
-  providerTurnFrame?: DriverProviderTurnFrame;
-  implementationBatch: ImplementationBatchContext;
-  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
-  resourceRequestRepairAttempted: boolean;
-  actionBundleAdmissionRepairAttempted: boolean;
-  planReviewRepairAttempted: boolean;
-  acceptedPlanScopeRepairAttempted: boolean;
-  terminalGuidanceRevisionAttempted: boolean;
-  nativeToolReadLedger: Map<string, NativeToolReadLedgerEntry>;
-  nativeToolDuplicateRepairAttempted: boolean;
-  activeTurn?: ActiveTurnState;
-  interactionOverlay?: InteractionOverlayContext;
-}
-
-interface ActiveTurnState {
-  turnId: string;
-  seq: number;
-  stage: string;
-  providerCallId?: string;
-  partFrameParser?: ProviderPartFrameParser;
-  providerJsonStreamProgress?: Record<string, {
-    receivedChars: number;
-    lastEmittedChars: number;
-  }>;
-}
-
-interface LlmTurnResult {
-  result: LlmChatResult;
-  content: string;
-  reasoning: string;
-  toolCalls: NativeToolCallProposal[];
 }
 
 const MAX_DERIVED_MANIFEST_ENTRIES = 240;

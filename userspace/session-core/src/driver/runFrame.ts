@@ -1,5 +1,31 @@
-import type { ContextAssemblyRecord } from '../context/index.js';
+import type { LlmChatResult } from '@deepcode/protocol';
+import type {
+  ContextAssemblyRecord,
+  PromptCachePlan,
+  SessionMemoryDocument,
+} from '../context/index.js';
+import type {
+  ConversationResourceRoot,
+  InitialContextPacket,
+  ResourceManifest,
+  ResourcePacket,
+} from '../context/types.js';
+import type {
+  AcceptedImplementationPlanContext,
+  CurrentTaskContext,
+  ImplementationBatchContext,
+  TaskExecutionCursor,
+} from './execution/index.js';
 import type { PromptEnvelope } from '../prompt/types.js';
+import type { AcceptedPlanPromptFrame, TaskLedgerSnapshot } from '../run-state/index.js';
+import type {
+  NativeToolCallProposal,
+  NativeToolReadLedgerEntry,
+  ProviderPartFrameParser,
+} from '../provider/providerStreamParts.js';
+import type { GeneratedArtifactEvidence } from './context/index.js';
+import type { InteractionOverlayContext, SessionTurnPhase } from './pipelines/interactionOverlayCodec.js';
+import type { DriverRequestRef, KernelStateContractRef } from './types.js';
 
 export interface RunFrame {
   readonly sessionId: string;
@@ -79,4 +105,58 @@ export interface DriverProviderTurnFrame {
   readonly nextActionInstruction: ProviderContextFrame;
   readonly prompt: PromptEnvelope;
   readonly contextAssembly?: ContextAssemblyRecord;
+}
+
+export interface SessionDriverLoopRunState {
+  sessionId: string;
+  runId: string;
+  userRequest: string;
+  phase: SessionTurnPhase;
+  workspaceScopeKey: string;
+  stateContract?: KernelStateContractRef;
+  driverRequest?: DriverRequestRef;
+  manifest: ResourceManifest;
+  conversationRoots: ConversationResourceRoot[];
+  initialContext: InitialContextPacket;
+  resourcePackets: ResourcePacket[];
+  generatedArtifactEvidence: Map<string, GeneratedArtifactEvidence>;
+  memoryDocument: SessionMemoryDocument;
+  memoryHints: string[];
+  cachePlan?: PromptCachePlan;
+  contextAssembly?: ContextAssemblyRecord;
+  taskExecutionCursor?: TaskExecutionCursor;
+  currentTaskContext?: CurrentTaskContext;
+  taskLedger?: TaskLedgerSnapshot;
+  acceptedPlanPromptFrame?: AcceptedPlanPromptFrame;
+  providerTurnFrame?: DriverProviderTurnFrame;
+  implementationBatch: ImplementationBatchContext;
+  acceptedImplementationPlan?: AcceptedImplementationPlanContext;
+  resourceRequestRepairAttempted: boolean;
+  actionBundleAdmissionRepairAttempted: boolean;
+  planReviewRepairAttempted: boolean;
+  acceptedPlanScopeRepairAttempted: boolean;
+  terminalGuidanceRevisionAttempted: boolean;
+  nativeToolReadLedger: Map<string, NativeToolReadLedgerEntry>;
+  nativeToolDuplicateRepairAttempted: boolean;
+  activeTurn?: ActiveTurnState;
+  interactionOverlay?: InteractionOverlayContext;
+}
+
+export interface ActiveTurnState {
+  turnId: string;
+  seq: number;
+  stage: string;
+  providerCallId?: string;
+  partFrameParser?: ProviderPartFrameParser;
+  providerJsonStreamProgress?: Record<string, {
+    receivedChars: number;
+    lastEmittedChars: number;
+  }>;
+}
+
+export interface LlmTurnResult {
+  result: LlmChatResult;
+  content: string;
+  reasoning: string;
+  toolCalls: NativeToolCallProposal[];
 }
